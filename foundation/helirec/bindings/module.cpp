@@ -787,8 +787,8 @@ NB_MODULE(_core, m) {
           },
           "rows"_a, "weights"_a.none(), "angles"_a, "N"_a, "rot"_a, "algorithm"_a, "params"_a = nb::dict(), "device"_a = "cpu",
           "R"_a = 0.f,
-          "one whole slice with sirt, mlem or gridrec (per-pixel units; weights: half-acquisition balanced weights or "
-          "None); R: disk radius");
+          "one whole slice (per-pixel units); weights: measured support for sirt/mlem, balanced weights for gridrec, "
+          "or None for ones; R: disk radius");
     m.def("mend_null_weights",
           [](HostIn R, HostIn RW, float threshold, int x0, int x1, const std::string& device) {
               require(R.ndim() == 2 && RW.ndim() == 2 && R.shape(0) == RW.shape(0) && R.shape(1) == RW.shape(1),

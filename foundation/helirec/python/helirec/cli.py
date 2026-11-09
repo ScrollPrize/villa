@@ -3,7 +3,7 @@ folders with helirec (C++/CUDA).
 
 Two modes:
 
-* fractions (independent single slices, TIFF + PNG previews):
+* fractions (independent single slices, TIFF; PNG previews opt in with --previews):
     helirec-slices PROJ -n 8 --tag baseline
     helirec-slices PROJ --fractions 0.4 0.5 --set "filters=paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)" --tag db500
     helirec-slices PROJ --fractions 0.5 --set "filters=paganin(delta_beta=2000)+median(radius=1,stage=log)"
@@ -118,7 +118,8 @@ def run_fractions(a, r, out, manifest):
         f0, f1 = (A + (B - A) * x for x in a.range)
         n = a.n_slices
         fractions = [0.5 * (f0 + f1)] if n == 1 else [f0 + (f1 - f0) * i / (n - 1) for i in range(n)]
-    os.makedirs(os.path.join(out, "preview"), exist_ok=True)
+    if not a.no_preview:
+        os.makedirs(os.path.join(out, "preview"), exist_ok=True)
     previews = []
     for i, f in enumerate(fractions):
         si = r.slice_info(f)
@@ -272,7 +273,10 @@ def main(argv=None):
                           "vc_reader builds older than the preset codec")
     out.add_argument("--tag", default=None)
     out.add_argument("--out_root", default=os.path.abspath("helirec_slices"))
-    out.add_argument("--no_preview", action="store_true")
+    previews = out.add_mutually_exclusive_group()
+    previews.add_argument("--previews", dest="no_preview", action="store_false", help="also write PNG previews (default: off)")
+    previews.add_argument("--no_preview", dest="no_preview", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(no_preview=True)
     out.add_argument("--overwrite", action="store_true")
     rc = p.add_argument_group("reconstruction")
     rc.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",

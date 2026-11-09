@@ -53,6 +53,9 @@ struct AccumParams {
     int NX = 0;             // merged width
     float non_zero = 1e-14f;
     int border = 100;       // border padding width of the reference
+    bool measured_only = false;  // iterative data: exclude padding and invalid detector pixels
+    bool log_values = false;     // -log each valid sample before gridding (no intensity processing)
+    float log_clip_min = 1e-6f, log_clip_max = 10.f;
 };
 
 namespace cpu {
@@ -87,6 +90,9 @@ void luminosity_apply(float* R, const float* RW, const float* W_prev, const floa
 void divide(float* R, const float* RW, std::size_t n);
 // nabuxx mend_null_weights (row-wise nearest valid replacement) on the usable merged columns [x0, x1)
 void mend_null_weights(float* R, const float* RW, int L, int H, int NX, float threshold, int x0, int x1);
+// Remove unreliable measured support; optionally fill only unsupported values for filter context.
+// Filling never changes RW, so these values cannot become equations in an iterative solver.
+void prepare_measured(float* R, float* RW, int L, int H, int NX, float threshold, bool fill, float empty);
 }  // namespace cpu
 #ifdef HELIREC_WITH_CUDA
 namespace cuda {
@@ -98,6 +104,8 @@ void luminosity_apply(float* R, const float* RW, const float* W_prev, const floa
 void divide(float* R, const float* RW, std::size_t n, void* stream = nullptr);
 void mend_null_weights(float* R, const float* RW, int L, int H, int NX, float threshold, int x0, int x1,
                        void* stream = nullptr);
+void prepare_measured(float* R, float* RW, int L, int H, int NX, float threshold, bool fill, float empty,
+                      void* stream = nullptr);
 }  // namespace cuda
 #endif
 

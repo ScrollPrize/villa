@@ -65,6 +65,13 @@ HR_HD bool is_nan(float x) {
     return std::isnan(x);
 #endif
 }
+HR_HD bool is_finite(float x) {
+#if defined(__CUDA_ARCH__)
+    return isfinite(x);
+#else
+    return std::isfinite(x);
+#endif
+}
 HR_HD int imin(int a, int b) { return a < b ? a : b; }
 HR_HD int imax(int a, int b) { return a > b ? a : b; }
 

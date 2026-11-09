@@ -37,7 +37,7 @@ TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p) {
     if (!is_tomo_method(algorithm)) throw Error("unknown method '" + algorithm + "' (sirt, mlem, gridrec)");
     const bool gridrec = algorithm == "gridrec", sirt = algorithm == "sirt";
     const std::string known = gridrec ? "filter_name, filter_par"
-                              : sirt  ? "num_iter, relax, norm, projector, init, init_value"
+                              : sirt  ? "num_iter, relax, norm, weighting, projector, init, init_value"
                                       : "num_iter, projector, init, init_value";
     for (const auto& [k, v] : p.values) {
         const std::string err = algorithm + ": unknown parameter '" + k + "' (" + known + ")";
@@ -45,7 +45,12 @@ TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p) {
             if (k == "filter_name") a.filter_name = v;
             else if (k == "filter_par") a.filter_par = float_list(v);
             else throw Error(err);
-        } else if (k == "num_iter") a.num_iter = static_cast<int>(p.num(k));
+        } else if (k == "num_iter") {
+            const double n = p.num(k);
+            if (!std::isfinite(n) || n < 0 || n > 2147483647.0 || n != std::floor(n))
+                throw Error(algorithm + ": num_iter must be a nonnegative integer");
+            a.num_iter = static_cast<int>(n);
+        }
         else if (k == "init") a.init = v;
         else if (k == "init_value") a.init_value = static_cast<float>(p.num(k));
         else if (k == "projector") {
@@ -53,15 +58,21 @@ TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p) {
             else if (v == "sf") a.projector = 1;
             else throw Error(algorithm + ": projector must be chord or sf");
         } else if (sirt && k == "relax") a.relax = static_cast<float>(p.num(k));
+        else if (sirt && k == "weighting") {
+            if (v != "mask" && v != "confidence") throw Error("sirt: weighting must be mask or confidence");
+            a.confidence_weights = v == "confidence";
+        }
         else if (sirt && k == "norm") {
-            if (v == "len2") a.norm = 1;
-            else if (v == "rowsum") a.norm = 2;
-            else throw Error("sirt: norm must be len2 or rowsum");
+            if (v != "rowsum") throw Error("sirt: norm must be rowsum; len2 has no supported stable relaxation bound");
+            a.norm = 2;
         } else
             throw Error(err);
     }
     if (a.init != "constant" && a.init != "gridrec") throw Error(algorithm + ": init must be constant or gridrec");
     if (a.num_iter < 0) throw Error(algorithm + ": num_iter >= 0");
+    if (!std::isfinite(a.init_value)) throw Error(algorithm + ": init_value must be finite");
+    if (sirt && (!std::isfinite(a.relax) || a.relax <= 0.f || a.relax >= 2.f))
+        throw Error("sirt: relax must be finite and strictly between 0 and 2");
     return a;
 }
 
@@ -72,6 +83,7 @@ class TomoBackprojector final : public ExternalBackprojector {
   public:
     explicit TomoBackprojector(TomoArgs a) : a_(std::move(a)) {}
     bool filtered() const override { return false; }
+    bool measured_only() const override { return a_.algorithm != "gridrec"; }
     void slice(int, const float* rows, const float* weights, int n_angles, int n_det, const float* angles,
                const BackprojectParams& p, int N, const SliceRoi& roi, Device device, float* out) override {
         const float c = p.center >= 0 ? p.center : 0.5f * (N - 1), rad = p.clip_radius >= 0 ? p.clip_radius : c;

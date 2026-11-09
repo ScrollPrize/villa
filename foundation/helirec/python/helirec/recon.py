@@ -19,6 +19,7 @@ Modes (params["mode"]):
 """
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 
@@ -108,7 +109,7 @@ def backprojector_config(spec):
       fbp(interp=linear|cubic|lanczos3|bspline3|bspline5, oversample=1..8)   exact pixel-driven backprojector
                                             (default interp=bspline3, oversample=2: ~ideal interpolation)
                                             (oversample: FFT upsampling of the filtered rows before interpolating)
-      sirt(num_iter=, relax=, norm=rowsum|len2, projector=sf|chord, init=constant|gridrec, init_value=)
+      sirt(num_iter=, relax=, norm=rowsum, weighting=mask|confidence, projector=sf|chord, init=constant|gridrec, init_value=)
       mlem(num_iter=, projector=sf|chord, init=constant|gridrec, init_value=)
       gridrec(filter_name=shepp|ramlak|..., filter_par=a:b)
                                             whole-slice methods (tomo.hpp)
@@ -230,9 +231,10 @@ class HelicalRecon:
 
     def provenance(self) -> dict:
         """Everything that defines the reconstruction: mode and its conventions, resolved parameters, calibration
-        (source measured / override + fingerprint), geometry, physics and the build."""
+        (source measured / override + fingerprint), geometry, physics and the build. Parameters are a snapshot
+        so later method/filter changes cannot alter saved provenance."""
         mode = self.params["mode"]
-        return dict(mode=mode, conventions=CONVENTIONS[mode], params=self.params,
+        return dict(mode=mode, conventions=CONVENTIONS[mode], params=copy.deepcopy(self.params),
                     pinned=sorted(LEGACY_REFERENCE) if mode == "legacy_reference" else [],
                     output_units=CONVENTIONS[mode]["output_units"],
                     calibration=dict(source=self.cal.source, fingerprint=self.cal.fingerprint,

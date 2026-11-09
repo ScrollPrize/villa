@@ -181,6 +181,12 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     I.fctx = FilterContext{I.cfg.energy_kev, I.cfg.distance_m, I.cfg.pixel_size_m, m.det_rows, m.det_cols,
                            I.cfg.legacy_reference};
     I.margin = I.cfg.margin >= 0 ? I.cfg.margin : I.pipeline(I.cfg.filters)->margin_rows();
+    // Sequential operations need the sum of their supports: filter context must itself
+    // have a full luminosity window. Keep this separate from each filter's kernel support.
+    if (I.cfg.external && I.cfg.external->measured_only()) {
+        const int lum_margin = I.scans.size() == 2 && I.cfg.luminosity_repartition != 0.f ? I.lum.radius : 0;
+        I.margin = std::max(I.margin, I.pipeline(I.cfg.filters)->margin_rows() + lum_margin);
+    }
     I.n_grid = I.cfg.n_grid > 0 ? I.cfg.n_grid : grid_angle_count(m.angles_deg);
     // merged width: main width + ceil(max |companion offset|)
     float max_off = 0.f;
@@ -429,10 +435,11 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     tick("setup");
 
     // ---------------------------------------------------------------- per-scan chunk geometry
+    const bool measured_only = cfg.external && cfg.external->measured_only();
     std::vector<ScanChunk> chunks(I.scans.size());
     for (std::size_t s = 0; s < I.scans.size(); ++s) {
         chunks[s].cs = prepare_chunk_scan(I.scans[s].traj, I.spans[s], I.scans[s].control_A, I.scans[s].flat_info,
-                                          h_lo, h_hi, m, NG);
+                                          h_lo, h_hi, m, NG, 0.2, measured_only);
         chunks[s].win_rows = H + 1;
         if (timing) {
             const double np = chunks[s].cs.p1 - chunks[s].cs.p0;
@@ -446,6 +453,15 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     AccumParams ap;
     ap.H = H;
     ap.NX = NX;
+    ap.measured_only = measured_only;
+    // Keep phase retrieval and luminosity correction in intensity space. With neither,
+    // interpolate line integrals, avoiding -log(mean(I)) != mean(-log(I)).
+    ap.log_values = ap.measured_only && (scans.size() == 1 || cfg.luminosity_repartition == 0.f);
+    for (const auto& step : sets[0]->steps())
+        if (step.stage == FilterStage::Intensity) ap.log_values = false;
+    ap.log_clip_min = cfg.log_clip_min;
+    ap.log_clip_max = cfg.log_clip_max;
+    const bool filter_context = !sets[0]->steps().empty();
     const int BL = std::max(1, cfg.block_angles);
     const std::size_t blk = static_cast<std::size_t>(BL) * H * NX;
     const std::size_t sino_n = static_cast<std::size_t>(NG) * DY * NX;
@@ -494,13 +510,15 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 tick("luminosity");
             }
             cpu::divide(R.data(), RW.data(), n_el);
-            if (cfg.mend_threshold > 0)
+            if (ap.measured_only)
+                cpu::prepare_measured(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, filter_context, ap.log_values ? 0.f : 1.f);
+            else if (cfg.mend_threshold > 0)
                 cpu::mend_null_weights(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
             tick("divide_mend");
-            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, m);
+            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, measured_only ? -1 : m);
             tick("filters");
-            cpu::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
-            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, m);
+            if (!ap.log_values) cpu::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
+            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, measured_only ? -1 : m);
             tick("log");
             for (int j = 0; j < L; ++j)
                 for (int y = 0; y < DY; ++y) {
@@ -513,7 +531,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         }
         for (auto& ch : chunks) std::vector<uint16_t>().swap(ch.raw);
         if (dbg && dbg->keep) { dbg->sino = S; dbg->weights = Wc; }
-        cpu::rebalance(S.data(), Wc.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        if (!ap.measured_only) cpu::rebalance(S.data(), Wc.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
         if (dbg && dbg->keep) { dbg->wbal = Wc; dbg->filtered.resize(static_cast<std::size_t>(DY) * NG * NX); }
         tick("rebalance");
         std::vector<float> row(static_cast<std::size_t>(NG) * NX), wrow(row.size());
@@ -685,7 +703,9 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             tick("luminosity");
         }
         cuda::divide(R.data(), RW.data(), n_el);
-        if (cfg.mend_threshold > 0)
+        if (ap.measured_only)
+            cuda::prepare_measured(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, filter_context, ap.log_values ? 0.f : 1.f);
+        else if (cfg.mend_threshold > 0)
             cuda::mend_null_weights(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
         tick("divide_mend");
         if (spectral) {  // sweep: keep the spectra of the padded intensity; filter / inverse / log / crop per chain below
@@ -696,10 +716,10 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             HELIREC_CUDA_CHECK(cudaMemcpyAsync(Icache.data() + static_cast<std::size_t>(g0) * H * NX, R.data(),
                                                n_el * sizeof(float), cudaMemcpyDeviceToDevice));
         } else {
-            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, m);
+            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, measured_only ? -1 : m);
             tick("filters");
-            cuda::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
-            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, m);
+            if (!ap.log_values) cuda::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
+            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, measured_only ? -1 : m);
             tick("log");
             // rows [m, m + DY) of each grid angle -> device sinogram (NG, DY, NX)
             HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(S.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
@@ -742,7 +762,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             HELIREC_CUDA_CHECK(cudaMemcpy(dbg->sino.data(), S.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
             HELIREC_CUDA_CHECK(cudaMemcpy(dbg->weights.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
         }
-        cuda::rebalance(S.data(), W.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        if (!ap.measured_only) cuda::rebalance(S.data(), W.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
         if (dbg && dbg->keep) {
             dbg->wbal.resize(sino_n);
             HELIREC_CUDA_CHECK(cudaMemcpy(dbg->wbal.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));

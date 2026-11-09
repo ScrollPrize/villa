@@ -7,7 +7,7 @@ name = "helirec"
 version = "0.1.0"
 description = "Compact helical (extended-FOV) tomography reconstruction: C++ core, CPU + CUDA kernels, nanobind bindings"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "h5py>=3.8", "tifffile"]
+dependencies = ["numpy>=1.24", "h5py>=3.8", "tifffile", "vc-reader"]
 
 [project.scripts]
 helirec-slices = "helirec.cli:main"
@@ -15,7 +15,9 @@ helirec-composite = "helirec.composite:main"
 
 [project.optional-dependencies]
 test = ["pytest", "tifffile", "h5py", "hdf5plugin"]
-composite = ["tifffile", "vc-reader"]  # vc_reader: pip install ../../vc_reader (villa/vc_reader)
+
+[tool.uv.sources]
+vc-reader = { path = "../../vc_reader" }
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"

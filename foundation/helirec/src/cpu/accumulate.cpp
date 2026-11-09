@@ -57,7 +57,7 @@ void accumulate(const AccumScanView& s, const ContributorList& c, const AccumPar
             for (int X = 0; X < p.NX; ++X) {
                 float a = r[X], b = w[X];
                 for (int e = c.offsets[jl]; e < c.offsets[jl + 1]; ++e)
-                    contribute(s, c.proj[e], c.role[e], t, X, p.NX, p.non_zero, p.border, a, b);
+                    contribute(s, c.proj[e], c.role[e], t, X, p, a, b);
                 r[X] = a;
                 w[X] = b;
             }
@@ -96,6 +96,21 @@ void mend_null_weights(float* R, const float* RW, int L, int H, int NX, float th
         for (int t = 0; t < H; ++t) {
             const std::size_t o = (static_cast<std::size_t>(j) * H + t) * NX;
             mend_row(R + o, RW + o, NX, thr, x0, x1);
+        }
+}
+
+void prepare_measured(float* R, float* RW, int L, int H, int NX, float thr, bool fill, float empty) {
+#pragma omp parallel for
+    for (int q = 0; q < L * H; ++q) {
+        const std::size_t o = static_cast<std::size_t>(q) * NX;
+        measured_support(R + o, RW + o, NX, thr);
+    }
+    if (!fill) return;
+#pragma omp parallel for collapse(2)
+    for (int j = 0; j < L; ++j)
+        for (int t = 0; t < H; ++t) {
+            const std::size_t o = static_cast<std::size_t>(j) * H * NX;
+            fill_measured_row(R + o, RW + o, H, NX, t, empty);
         }
 }
 

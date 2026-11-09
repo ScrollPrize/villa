@@ -1,0 +1,69 @@
+{
+  "projections": "/mnt/raid_nvme/343p_recon_work/projections",
+  "cache_dir": "/mnt/raid_nvme/343p_recon_work/output/baselines/_calibration",
+  "device": "cuda",
+  "params": {
+    "mode": "corrected",
+    "filters": []
+  },
+  "slices": {
+    "n": 5
+  },
+  "roi": null,
+  "window": "auto",
+  "tile": 1024,
+  "methods": [
+    {
+      "name": "fbp_no_paganin_v2",
+      "backprojector": "fbp",
+      "desc": "FBP, cubic B-spline, 2x oversampling; no projection filters"
+    },
+    {
+      "name": "fbp_paganin_unsharp_v3",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ]
+      },
+      "desc": "FBP, cubic B-spline, 2x oversampling; Paganin delta/beta 1000 + unsharp 1.2/4"
+    },
+    {
+      "name": "sirt_no_paganin_v2",
+      "backprojector": "sirt(num_iter=20,init=gridrec,norm=rowsum,relax=1)",
+      "desc": "SIRT, 20 iterations from gridrec; no projection filters; measured support, separate gridrec initialization"
+    },
+    {
+      "name": "sirt_paganin_unsharp_v3",
+      "backprojector": "sirt(num_iter=20,init=gridrec,norm=rowsum,relax=1)",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ]
+      },
+      "desc": "SIRT, 20 iterations from gridrec; Paganin delta/beta 1000 + unsharp 1.2/4; measured support, separate gridrec initialization"
+    },
+    {
+      "name": "legacy_reference",
+      "mode": "legacy_reference",
+      "backprojector": "ghbp",
+      "desc": "Pinned nabuxx / Night Rail: GHBP, Paganin 1000, unsharp 1.2/4; native half-attenuation reference units"
+    }
+  ]
+}

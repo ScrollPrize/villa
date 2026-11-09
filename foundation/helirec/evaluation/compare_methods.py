@@ -1,4 +1,4 @@
-"""Reconstruct the same slices with several methods; write every slice as single images and contact sheets.
+"""Reconstruct the same slices with several methods; write float32 TIFFs (previews opt in).
 
     python evaluation/compare_methods.py --projections PROJ --cache_dir CAL --out OUT     # default_methods.json
     python evaluation/compare_methods.py my_methods.json --out OUT -n 3
@@ -19,12 +19,12 @@ Config (JSON):
   methods                              [{"name", "backprojector", "desc"?, "params"?}, ...]; backprojector is a
                                        helirec spec (fbp(...), sirt(...), gridrec(...), ghbp); params override the
                                        shared ones for this method
+                                       mode=legacy_reference on a method uses its pinned settings, ignoring shared
+                                       corrected-mode parameters. TIFFs retain the method's native output units.
 
 Output (OUT):
   slices/<method>/z<Z>.tif             float32 slice (pipeline units)
-  slices/<method>/z<Z>.png             8-bit, the slice's shared window
-  sheets/z<Z>.png                      that slice, methods side by side (labelled)
-  contact_sheet.png                    rows: slices, columns: methods
+  With --previews: slices/<method>/z<Z>.png, sheets/z<Z>.png, contact_sheet.png
   config.json, manifest.json           the resolved config; per method / slice timing and statistics
 Existing slice TIFFs are reused only when their provenance fingerprint matches.
 """
@@ -80,6 +80,22 @@ def recon_params(p):
     if isinstance(p.get("filters"), str):
         p["filters"] = parse_chain(p["filters"]) if p["filters"].strip() else []
     return p
+
+
+def method_params(shared, method):
+    overrides = recon_params(method.get("params", {}))
+    mode = method.get("mode", overrides.get("mode", shared.get("mode", "corrected")))
+    if mode == "legacy_reference":
+        return {**overrides, "mode": mode, "backprojector": method["backprojector"]}
+    return {**DEFAULTS, **shared, **overrides, "mode": mode, "backprojector": method["backprojector"]}
+
+
+def display_scale(units):
+    if units == "attenuation_cm-1":
+        return 1.0
+    if units == "reference_units (attenuation / 2)":
+        return 2.0
+    raise ValueError(f"unsupported output units: {units}")
 
 
 def slice_heights(r, spec):
@@ -202,12 +218,19 @@ def main(argv=None):
     p.add_argument("--cache_dir", default=None)
     p.add_argument("--device", default=None, choices=["cuda", "cpu"])
     p.add_argument("--overwrite", action="store_true", help="recompute slices that already exist")
+    p.add_argument("--previews", action="store_true", help="also write PNG slices and contact sheets (default: TIFFs only)")
+    p.add_argument("--run-name", default="", help="suffix for metadata and preview sheets, preserving earlier runs")
     a = p.parse_args(argv)
     if a.roi is not None and a.roi != [-1] and len(a.roi) != 4:
         sys.exit("--roi takes X0 X1 Y0 Y1 (or -1)")
     cfg = load_config(a)
+    if a.run_name and not all(c.isalnum() or c in "_-" for c in a.run_name):
+        p.error("--run-name must contain only letters, digits, underscores or hyphens")
+    suffix = "_" + a.run_name if a.run_name else ""
     out = os.path.abspath(a.out)
-    os.makedirs(os.path.join(out, "sheets"), exist_ok=True)
+    os.makedirs(out, exist_ok=True)
+    if a.previews:
+        os.makedirs(os.path.join(out, "sheets" + suffix), exist_ok=True)
 
     shared = recon_params(cfg.get("params", {}))
     r = HelicalRecon(cfg["projections"], cache_dir=cfg.get("cache_dir"), device=cfg.get("device", "cuda"),
@@ -218,8 +241,8 @@ def main(argv=None):
     if roi is not None and not (0 <= roi[0] < roi[1] <= N and 0 <= roi[2] < roi[3] <= N):
         sys.exit(f"roi must lie within [0, {N}]")
     cfg["resolved_slices"] = [dict(z=z, view_height=h) for z, h in slices]
-    json.dump(cfg, open(os.path.join(out, "config.json"), "w"), indent=1)
-    manifest_path = os.path.join(out, "manifest.json")
+    json.dump(cfg, open(os.path.join(out, "config" + suffix + ".json"), "w"), indent=1)
+    manifest_path = os.path.join(out, "manifest" + suffix + ".json")
     manifest = json.load(open(manifest_path)) if os.path.exists(manifest_path) else {}
     print(f"{len(cfg['methods'])} methods x {len(slices)} slices (z {[z for z, _ in slices]}), "
           f"roi {roi or 'whole slice'} -> {out}", flush=True)
@@ -230,12 +253,11 @@ def main(argv=None):
         d = os.path.join(out, "slices", m["name"])
         os.makedirs(d, exist_ok=True)
         # Reset per-method state: set_params otherwise retains previous overrides.
-        r.set_params(**{**DEFAULTS, **shared, **recon_params(m.get("params", {})), "backprojector": m["backprojector"]})
+        r.set_params(**method_params(shared, m))
         r.log = lambda *x: None
         provenance = r.provenance()
         units = provenance["output_units"]
-        if units != "attenuation_cm-1":
-            raise ValueError("comparison requires quantitative corrected units")
+        display_scale(units)  # check known conventions; preserve native TIFF values
         keys = {str(z): fingerprint(dict(provenance=provenance, height=h, roi=roi)) for z, h in slices}
         todo = [(z, h) for z, h in slices if a.overwrite
                 or not os.path.exists(os.path.join(d, f"z{z:05d}.tif"))
@@ -253,11 +275,16 @@ def main(argv=None):
             json.dump(manifest, open(manifest_path, "w"), indent=1)
             print(f"  {m['name']:>12s}  z {z:5d}  {dt:7.1f}s", flush=True)
 
-    # 2. images: shared window per slice; per-slice sheets; the overall contact sheet
+    if not a.previews:
+        print("wrote TIFF slices under", os.path.join(out, "slices"))
+        return
+
+    # 2. optional images: shared window per slice; per-slice sheets; the overall contact sheet
     tile = int(cfg.get("tile", 1024))
     rows = []
     for z, h in slices:
-        imgs = [tifffile.imread(os.path.join(out, "slices", m["name"], f"z{z:05d}.tif")) for m in cfg["methods"]]
+        imgs = [tifffile.imread(os.path.join(out, "slices", m["name"], f"z{z:05d}.tif"))
+                * display_scale(manifest[m["name"]][str(z)]["output_units"]) for m in cfg["methods"]]
         win = window_of(imgs[0], cfg.get("window", "auto"))
         tiles = []
         for m, img in zip(cfg["methods"], imgs):
@@ -268,11 +295,11 @@ def main(argv=None):
             band = label_band(th.shape[1], [(f"{m['name']}   z {z}  (h {h})", 255),
                                             (m.get("desc", m["backprojector"]), 190)], size)
             tiles.append(np.concatenate([band, th], 0))
-        write_png_gray(os.path.join(out, "sheets", f"z{z:05d}.png"), grid([tiles]))
+        write_png_gray(os.path.join(out, "sheets" + suffix, f"z{z:05d}.png"), grid([tiles]))
         rows.append(tiles)
         print(f"  z {z}: window [{win[0]:.4g}, {win[1]:.4g}]", flush=True)
-    write_png_gray(os.path.join(out, "contact_sheet.png"), grid(rows))
-    print("wrote", os.path.join(out, "contact_sheet.png"))
+    write_png_gray(os.path.join(out, "contact_sheet" + suffix + ".png"), grid(rows))
+    print("wrote", os.path.join(out, "contact_sheet" + suffix + ".png"))
 
 
 if __name__ == "__main__":

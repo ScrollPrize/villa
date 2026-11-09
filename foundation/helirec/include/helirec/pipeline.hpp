@@ -74,7 +74,7 @@ struct ChunkDebug {
     bool keep = false;
     std::vector<float> sino;      // (n_grid, DY, NX) -log sinogram before rebalance
     std::vector<float> weights;   // (n_grid, DY, NX) accumulated weights (cropped)
-    std::vector<float> wbal;      // (n_grid, DY, NX) balanced weights
+    std::vector<float> wbal;      // backprojector weights: balanced for FBP/gridrec, measured support for SIRT/MLEM
     std::vector<float> filtered;  // (DY, n_grid, NX) backprojector input
     // per-stage wall time (seconds); with timing on, the GPU is synchronised at stage boundaries
     bool timing = false;
@@ -88,12 +88,15 @@ struct SliceRoi {   // [x0, x1) x [y0, y1) of the (N, N) slice
 
 // A backprojector outside the library (bindings: Python functions). Per slice it gets the rows on the
 // reconstructor's device: ramp-filtered x balanced weights (filtered() == true), or the -log rows and the balanced
-// weights (filtered() == false, for methods that filter / model the data themselves), and writes the ROI slice to
+// weights (filtered() == false, for methods that filter / model the data themselves); measured_only() instead
+// requests measured support and values before hole filling / balancing. Writes the ROI slice to
 // `out` (host, (y1 - y0, x1 - x0)). `p`: the exact backprojector's geometry (angles: u = x cos a + y sin a + rot).
 class ExternalBackprojector {
   public:
     virtual ~ExternalBackprojector() = default;
     virtual bool filtered() const = 0;
+    // Request measured-only gridding, with support preserved before any hole filling or rebalance.
+    virtual bool measured_only() const { return false; }
     virtual void slice(int view_height, const float* rows, const float* weights, int n_angles, int n_det,
                        const float* angles, const BackprojectParams& p, int grid_size, const SliceRoi& roi, Device device,
                        float* out) = 0;

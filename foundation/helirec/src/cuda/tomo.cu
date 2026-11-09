@@ -13,6 +13,7 @@
 #include "common/tomo_core.hpp"
 #include "cuda_utils.cuh"
 #include "helirec/tomo.hpp"
+#include "helirec/sino.hpp"
 
 namespace helirec::cuda {
 
@@ -306,6 +307,11 @@ struct CudaBackend final : TomoWorkspace {
     }
     void fill(float* d, float v, std::size_t n) { each(n, FillF{d, v}); }
     void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) { each(n, WeightF{rows, w, out}); }
+    void initial_rows(const float* rows, const float* weights, float* out, float* iw, std::size_t n) {
+        each(n, tomo_algos::InitialCopyF{rows, weights, out, iw});
+        cuda::rebalance(out, iw, n_angles, 1, g.n_det, g.rot, false);
+        weighted_rows(out, iw, out, n);
+    }
 
     void gridrec(const float* wrows, float* out, const TomoArgs& a) {
         using namespace tomo_gridrec;

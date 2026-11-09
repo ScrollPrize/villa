@@ -8,11 +8,13 @@
 //   gridrec  Fourier gridding with a prolate spheroidal kernel; filters none, shepp, cosine, hann, hamming,
 //            ramlak, parzen, butterworth (filter_name, filter_par)
 //
-// Data: the -log rows (n_angles x n_det) and the half-acquisition balanced weights. SIRT / MLEM use the rays with
-// weight > 0 (360 deg data, each ray at its measured position); gridrec reconstructs the weighted rows (each pair of
+// Data: the -log rows (n_angles x n_det). SIRT / MLEM receive measured support before hole filling and balancing;
+// SIRT can optionally use that support as confidence instead of a binary mask. Gridrec receives balanced weights.
+// SIRT / MLEM use the rays with weight > 0; gridrec reconstructs the weighted rows (each pair of
 // opposite rays sums to one full projection). Projector (tomo_core.hpp): exact chord lengths at the cell centre
 // (chord) or the separable footprint integrated over the cell (sf). Image: the pipeline's N x N grid; unknowns: the
-// pixels inside the reconstruction disk (radius R). Initial image (sirt / mlem): init_value, or init=gridrec.
+// pixels inside the reconstruction disk (radius R). Initial image (sirt / mlem): init_value, or init=gridrec;
+// gridrec initialization fills/balances a separate copy, never the iterative observations.
 // The whole slice is always reconstructed; the pipeline crops the requested ROI afterwards.
 #include <memory>
 #include <string>
@@ -28,9 +30,8 @@ struct TomoArgs {
     std::string algorithm = "sirt";
     int num_iter = 1;
     float relax = 1.f;                       // sirt relaxation
-    int norm = 2;                            // sirt ray normalisation: 2 row sum (stable for relax < 2 with either
-                                             // projector), 1 |a_i|^2 (unstable with sf, whose small footprint-tail
-                                             // weights shrink |a_i|^2 below the row sum)
+    int norm = 2;                           // row sums; squared ray norms are no longer supported by SIRT
+    bool confidence_weights = false;       // false: validity mask; true: nonnegative measurement confidence
     std::string filter_name = "shepp";       // gridrec
     std::vector<float> filter_par = {0.5f, 8.f};
     std::string init = "constant";           // constant | gridrec
@@ -52,7 +53,8 @@ struct TomoWorkspace {
 TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p);   // name + text parameters
 std::vector<std::string> tomo_algorithms();
 
-// one slice: rows (n_angles, n_det) -log sinogram, weights (n_angles, n_det) balanced weights; angles: the exact
+// one slice: rows (n_angles, n_det) -log sinogram, weights (n_angles, n_det) measured support (iterative) or
+// balanced weights (gridrec); angles: the exact
 // backprojector's (u = x cos a + y sin a + rot); out: the N x N image (row-major) in per-pixel units.
 // ws (optional): workspace kept between calls with the same geometry.
 namespace cpu {

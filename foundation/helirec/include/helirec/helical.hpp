@@ -71,7 +71,7 @@ FlatInterpolation interpolate_flats(const FlatSeriesInfo&, float angle);
 // h_lo..h_hi-1: slice heights of the chunk; margin: phase margin (rows)
 ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const std::vector<double>& control_A,
                              const FlatSeriesInfo& flats, int h_lo, int h_hi, int margin, int n_grid,
-                             double nominal_current = 0.2);
+                             double nominal_current = 0.2, bool measured_context = false);
 
 // number of grid angles: round(360 / |mean step|) over the whole scan
 int grid_angle_count(const std::vector<double>& angles_deg);

@@ -188,4 +188,5 @@ def test_sirt_noisy(device):
     run = lambda alg, **p: err(_core.tomo_reconstruct(s, None, ANG, N, ROT, alg, {k: str(v) for k, v in p.items()},
                                                       R=31, device=device))
     assert run("sirt", num_iter=200) < 0.13
-    assert run("sirt", num_iter=200, norm="len2") > 1.0
+    with pytest.raises(Exception, match="norm must be rowsum"):
+        run("sirt", num_iter=200, norm="len2")

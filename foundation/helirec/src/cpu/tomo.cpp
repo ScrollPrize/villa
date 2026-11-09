@@ -14,6 +14,7 @@
 #include "common/tomo_algorithms.hpp"
 #include "common/tomo_core.hpp"
 #include "helirec/tomo.hpp"
+#include "helirec/sino.hpp"
 
 namespace helirec {
 
@@ -259,6 +260,11 @@ struct CpuBackend final : TomoWorkspace {
     }
     void gridrec(const float* wrows, float* out, const TomoArgs& a) {
         gridrec_slice(wrows, n_angles, g.n_det, angles.data(), g.rot, g.N, a, out);
+    }
+    void initial_rows(const float* rows, const float* weights, float* out, float* iw, std::size_t n) {
+        each(n, tomo_algos::InitialCopyF{rows, weights, out, iw});
+        cpu::rebalance(out, iw, n_angles, 1, g.n_det, g.rot, false);
+        weighted_rows(out, iw, out, n);
     }
 };
 
