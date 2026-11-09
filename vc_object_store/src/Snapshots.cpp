@@ -119,7 +119,7 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
             if (recordContent(edgeToJson(*existing)) == recordContent(edgeToJson(e))) continue;
             throw std::runtime_error("object store: snapshot conflicts with existing edge: " + e.uuid);
         }
-        addEdgeImpl(db, impl_->options.author, impl_->hostname, e, true);
+        addEdgeImpl(db, author(), impl_->hostname, e, true);
         recordRelationshipValidation(db, *edgeByUuid(txn, e.uuid));
     }
     savepoint.release();

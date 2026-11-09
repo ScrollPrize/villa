@@ -25,7 +25,7 @@ std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
     }
     auto* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
-    const auto inserted = addEdgeImpl(db, impl_->options.author, impl_->hostname, record, false);
+    const auto inserted = addEdgeImpl(db, author(), impl_->hostname, record, false);
     {GeometryPhase validate("native.edge.validation");recordRelationshipValidation(db,inserted);}
     savepoint.release();
     return inserted.uuid;
@@ -98,7 +98,7 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     clearCurrentExtensionRows(db, "edges", uuid);
     execute(db,"UPDATE edges SET state=2,commit_sequence=?,changed_by=?,changed_at=?,changed_host=? WHERE id=?",
         writeCommitSequence(db),author(),nowIsoUtc(),hostname(),row.i64(0));
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge", kind);
+    appendJournal(db, author(), impl_->hostname, bytes, 0, "remove_edge", kind);
     savepoint.release();
 }
 

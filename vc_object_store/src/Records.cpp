@@ -91,8 +91,8 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
     clearGeometryMaterialization(db,uuid);
     execute(db,"UPDATE objects SET state=2,lifecycle_epoch='',geometry_manifest=NULL,storage_kind='',storage_ref='',data_checksum=NULL,"
         "commit_sequence=?,changed_by=?,changed_host=?,changed_at=? WHERE id=?",
-        writeCommitSequence(db),impl_->options.author,impl_->hostname,nowIsoUtc(),row.i64(0));
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete", kind);
+        writeCommitSequence(db),author(),impl_->hostname,nowIsoUtc(),row.i64(0));
+    appendJournal(db, author(), impl_->hostname, bytes, 0, "delete", kind);
     savepoint.release();
 }
 

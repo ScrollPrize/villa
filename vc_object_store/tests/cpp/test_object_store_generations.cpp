@@ -1,5 +1,6 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
 #include "internal/Digest.hpp"
@@ -27,6 +28,85 @@ ObjectRecord fiber(const std::string& uuid)
     ObjectRecord record;
     record.uuid = uuid; record.kind = "fiber"; record.fiber = FiberDetail{};
     return record;
+}
+
+void transactionAuthors(HistoryMode history)
+{
+    TemporaryDirectory dir;
+    OpenOptions options; options.author = "store-owner"; options.history = history;
+    auto store = ObjectStore::create(dir.path / "authors.vcobj", options);
+    const auto a = util::newUuid(), b = util::newUuid();
+    {
+        auto txn = store.write();
+        store.upsertObject(txn, fiber(a)); store.upsertObject(txn, fiber(b));
+        txn.commit();
+    }
+    EdgeRecord edge; edge.uuid = util::newUuid(); edge.kind = "perpendicular";
+    edge.aUuid = a; edge.bUuid = b;
+    edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
+    TransactionRequest request;
+    {
+        auto txn = store.read(); const auto status = store.status(txn);
+        request.requestUuid = util::newUuid(); request.storeUuid = status.storeUuid;
+        request.generation = status.generation; request.author = "edge-author";
+        request.expectedObjects = {{a, store.currentVersion(txn, a)}, {b, store.currentVersion(txn, b)}};
+    }
+    request.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});
+    store.submit(request);
+    TransactionContext deletion; deletion.author = "deletion-author";
+    int64_t cursor = 0;
+    std::string snapshot;
+    {
+        auto txn = store.read(); const auto record = store.edgeByUuid(txn, edge.uuid);
+        require(record && record->createdBy == "edge-author" && record->changedBy == "edge-author",
+                "checked request author stamps new relationships");
+        deletion.expectedObjects = {{a, store.currentVersion(txn, a)}, {b, store.currentVersion(txn, b)}};
+        snapshot = store.exportJson(txn);
+        if (history == HistoryMode::On) {
+            const auto events = store.journalSince(txn, 0);
+            require(events.back().recordUuid == edge.uuid && events.back().author == "edge-author",
+                    "relationship journal uses request author");
+            cursor = store.journalPosition(txn);
+            const auto status = store.status(txn);
+            const auto version = store.relationshipAtVersion(txn, {status.storeUuid, status.generation, edge.uuid, 1});
+            require(version && version->record.createdBy == "edge-author", "relationship history preserves request author");
+        }
+    }
+    {
+        auto txn = store.write(deletion);
+        store.removeEdge(txn, edge.uuid); store.deleteObject(txn, b);
+        txn.commit();
+    }
+    {
+        auto txn = store.read(); auto* sql = ObjectStoreImplAccess::conn(txn);
+        for (const auto& [table, uuid] : {std::pair{"objects", b}, std::pair{"edges", edge.uuid}}) {
+            detail::Statement row(sql, std::string("SELECT state,changed_by FROM ") + table + " WHERE uuid=?", detail::parseUuid(uuid));
+            require(row.row() && row.i64(0) == 2 && row.text(1) == "deletion-author",
+                    "object and relationship tombstones use transaction author");
+        }
+        if (history == HistoryMode::On) {
+            const auto events = store.journalSince(txn, cursor);
+            require(events.size() == 2, "both deletions are journaled");
+            for (const auto& event : events) require(event.author == "deletion-author", "deletion journal uses transaction author");
+        }
+    }
+    require(store.author() == "store-owner", "transaction identity does not change the store default");
+
+    auto imported = ObjectStore::create(dir.path / "imported.vcobj", options);
+    TransactionContext context; context.author = "import-author";
+    context.expectedObjects = {{a, std::nullopt}, {b, std::nullopt}};
+    {
+        auto txn = imported.write(context); imported.importJson(txn, snapshot); txn.commit();
+    }
+    {
+        auto txn = imported.read();
+        require(imported.edgeByUuid(txn, edge.uuid)->createdBy == "edge-author", "snapshot retains original creator");
+        if (history == HistoryMode::On) {
+            const auto events = imported.journalSince(txn, 0);
+            require(events.size() == 3, "snapshot journals two objects and one relationship");
+            for (const auto& event : events) require(event.author == "import-author", "snapshot journal uses transaction author");
+        }
+    }
 }
 
 void nativeChanges(HistoryMode history)
@@ -289,6 +369,8 @@ void metadataImport(HistoryMode history)
 
 int main()
 {
+    transactionAuthors(HistoryMode::On);
+    transactionAuthors(HistoryMode::Off);
     nativeChanges(HistoryMode::On);
     nativeChanges(HistoryMode::Off);
     deletedTrackIdentity(HistoryMode::On);
