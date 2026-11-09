@@ -37,7 +37,7 @@ std::optional<GeometryRevision> ObjectStore::geometryRevision(const Txn& txn, co
     (void)connection(txn);
     if(auto current=parseCurrentGeometryToken(revisionUuid)){
         if(historyEnabled(static_cast<sqlite3*>(connection(txn))))return std::nullopt;
-        Statement s(static_cast<sqlite3*>(connection(txn)),"SELECT ?,uuid,NULL,data_checksum,geometry_manifest,data_generation,changed_by,changed_at,changed_host FROM objects WHERE uuid=? AND data_generation=? AND deleted=0 AND geometry_manifest IS NOT NULL",
+        Statement s(static_cast<sqlite3*>(connection(txn)),"SELECT ?,uuid,NULL,data_checksum,geometry_manifest,data_generation,changed_by,changed_at,changed_host FROM objects WHERE uuid=? AND data_generation=? AND state<>2 AND geometry_manifest IS NOT NULL",
             canonicalGeometryToken(revisionUuid),parseUuid(current->objectUuid),current->generation);
         return s.row()?std::optional(readGeometryRevision(s)):std::nullopt;
     }
@@ -50,7 +50,7 @@ std::optional<GeometryRevision> ObjectStore::currentGeometry(const Txn& txn, con
 {
     auto* db=static_cast<sqlite3*>(connection(txn));
     Statement row(db,"SELECT storage_ref,uuid,NULL,data_checksum,geometry_manifest,data_generation,changed_by,changed_at,changed_host "
-        "FROM objects WHERE uuid=? AND deleted=0 AND geometry_manifest IS NOT NULL",parseUuid(objectUuid));
+        "FROM objects WHERE uuid=? AND state<>2 AND geometry_manifest IS NOT NULL",parseUuid(objectUuid));
     if(!row.row())return std::nullopt;
     auto result=readGeometryRevision(row);
     // Current content lives on the object in both history modes. History only

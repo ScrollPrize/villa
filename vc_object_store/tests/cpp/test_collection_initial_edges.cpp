@@ -88,7 +88,7 @@ int main()
         auto rawOptions=options;rawOptions.physicalPartitionOnly=true;
         auto store=ObjectStore::open(dir.path/"bulk-deferred.vcobj",rawOptions);
         auto read=store.read();auto* db=ObjectStoreImplAccess::conn(read);
-        detail::Statement record(db,"SELECT uuid,deleted FROM objects");
+        detail::Statement record(db,"SELECT uuid,state FROM objects");
         require(record.row()&&detail::formatUuid(record.blob16(0))==d.objectUuid&&
             record.i64(1)==0&&!record.row(),"actual override must retain its original UUID");
         detail::Statement redundant(db,"SELECT count(*) FROM sqlite_schema WHERE name IN "

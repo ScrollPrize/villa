@@ -81,6 +81,7 @@ struct InitialShardImport::Impl {
 InitialShardImport::InitialShardImport(std::unique_ptr<Impl> impl):impl_(std::move(impl)){}
 InitialShardImport::~InitialShardImport()=default;
 const std::string& InitialShardImport::storeUuid() const {impl_->check();return impl_->owner;}
+void InitialShardImport::checkCancelled() const {impl_->check();}
 
 std::vector<InitialObjectIdentity> InitialShardImport::appendObjects(std::span<const InitialObjectRecord> objects)
 {

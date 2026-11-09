@@ -19,7 +19,7 @@ std::set<std::string> changedObjects(sqlite3* db, const std::set<std::string>& c
     std::set<std::string> objects;
     Statement known(db, "SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1");
     for (const auto& id : changed) {
-        known.reset(); known.bind(1, id);
+        known.reset(); known.bind(1, parseUuid(id));
         if (known.row()) objects.insert(id);
     }
     return objects;
@@ -28,9 +28,9 @@ std::set<std::string> changedObjects(sqlite3* db, const std::set<std::string>& c
 struct Lease { std::string holder, author, host; int64_t expiresUs = 0; };
 std::optional<Lease> lease(sqlite3* db, const std::string& object)
 {
-    Statement row(db, "SELECT holder,author,host,expires_us FROM hub_leases WHERE object_uuid=?", object);
+    Statement row(db, "SELECT holder,author,host,expires_us FROM hub_leases WHERE object_uuid=?", parseUuid(object));
     if (!row.row()) return std::nullopt;
-    return Lease{row.text(0), row.text(1), row.text(2), row.i64(3)};
+    return Lease{formatUuid(row.blob16(0)), row.text(1), row.text(2), row.i64(3)};
 }
 
 std::string describe(const Lease& lease)
@@ -52,8 +52,8 @@ void createHubTables(sqlite3* db)
 {
     exec(db, R"SQL(
 CREATE TABLE hub_leases(
-  object_uuid TEXT PRIMARY KEY,
-  holder TEXT NOT NULL, author TEXT NOT NULL, host TEXT NOT NULL,
+  object_uuid BLOB PRIMARY KEY CHECK(typeof(object_uuid)='blob' AND length(object_uuid)=16),
+  holder BLOB NOT NULL CHECK(typeof(holder)='blob' AND length(holder)=16), author TEXT NOT NULL, host TEXT NOT NULL,
   acquired_us INTEGER NOT NULL, expires_us INTEGER NOT NULL
 );)SQL");
 }
@@ -64,13 +64,13 @@ void createReplicaTables(sqlite3* db)
     exec(db, R"SQL(
 CREATE TABLE hub_upstream(
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-  hub_path TEXT NOT NULL, hub_replica TEXT NOT NULL,
+  hub_path TEXT NOT NULL, hub_replica BLOB NOT NULL CHECK(typeof(hub_replica)='blob' AND length(hub_replica)=16),
   clone_journal INTEGER NOT NULL, journal_cursor INTEGER NOT NULL, geometry_cursor INTEGER NOT NULL
 );
-CREATE TABLE hub_versions(record_uuid TEXT PRIMARY KEY, version INTEGER NOT NULL);
-CREATE TABLE hub_pending(record_uuid TEXT PRIMARY KEY, counter INTEGER NOT NULL, geometry_after INTEGER NOT NULL);
-CREATE TABLE hub_inflight(record_uuid TEXT PRIMARY KEY, record_hash TEXT NOT NULL);
-CREATE TABLE hub_conflicts(record_uuid TEXT PRIMARY KEY, version INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE TABLE hub_versions(record_uuid BLOB PRIMARY KEY CHECK(typeof(record_uuid)='blob' AND length(record_uuid)=16), version INTEGER NOT NULL);
+CREATE TABLE hub_pending(record_uuid BLOB PRIMARY KEY CHECK(typeof(record_uuid)='blob' AND length(record_uuid)=16), counter INTEGER NOT NULL, geometry_after INTEGER NOT NULL);
+CREATE TABLE hub_inflight(record_uuid BLOB PRIMARY KEY CHECK(typeof(record_uuid)='blob' AND length(record_uuid)=16), record_hash TEXT NOT NULL);
+CREATE TABLE hub_conflicts(record_uuid BLOB PRIMARY KEY CHECK(typeof(record_uuid)='blob' AND length(record_uuid)=16), version INTEGER NOT NULL, record TEXT NOT NULL);
 )SQL");
 }
 
@@ -99,7 +99,7 @@ std::string replicaIdentity(sqlite3* db)
     requireSyncReplica(db);
     Statement row(db, "SELECT uuid FROM sync_replica WHERE singleton=1");
     if (!row.row()) throw std::runtime_error("object store: missing replica identity");
-    return row.text(0);
+    return formatUuid(row.blob16(0));
 }
 
 int64_t hubVersion(sqlite3* hub, const std::string& record)
@@ -111,7 +111,7 @@ int64_t hubVersion(sqlite3* hub, const std::string& record)
 
 int64_t knownHubVersion(sqlite3* replica, const std::string& record)
 {
-    Statement known(replica, "SELECT version FROM hub_versions WHERE record_uuid=?", record);
+    Statement known(replica, "SELECT version FROM hub_versions WHERE record_uuid=?", parseUuid(record));
     if (known.row()) return known.i64(0);
     // Untouched since the clone: the copied journal holds the hub's sequences.
     Statement cloned(replica, "SELECT coalesce(max(j.seq),0) FROM journal j, hub_upstream u "
@@ -152,6 +152,6 @@ void enforceHubRules(sqlite3* db, const StatementPool& pool, HubRole role)
             : " is not leased by this replica; acquire a lease before editing"));
     }
     Statement pending(db, "INSERT INTO hub_pending VALUES(?,1,?) ON CONFLICT(record_uuid) DO UPDATE SET counter=counter+1");
-    for (const auto& id : changed) pending.run(id, pool.startGeometry);
+    for (const auto& id : changed) pending.run(parseUuid(id), pool.startGeometry);
 }
 }

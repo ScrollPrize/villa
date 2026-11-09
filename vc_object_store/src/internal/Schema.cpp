@@ -10,12 +10,11 @@ void createGeometryChunkTable(sqlite3* db, const std::string& name)
         "data BLOB NOT NULL CHECK(length(data)>0 AND length(data)<=1048576))").c_str());
 }
 void createSchema(sqlite3* db, bool history, const std::optional<std::string>& storeUuid, bool immutable) {
-    exec(db,"INSERT INTO store_required_features VALUES('direct-geometry-v1'),('binary-sha256-v1'),('direct-endpoint-keys-v1'),('inline-lifecycle-v1');");
+    exec(db,"INSERT INTO store_required_features VALUES('direct-geometry-v1'),('binary-sha256-v1'),('direct-endpoint-keys-v1'),('object-state-v1'),('binary-uuid-v1');");
     exec(db, R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
-  deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),
-  retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)),
+  state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0,1,2)),
   lifecycle_epoch TEXT NOT NULL DEFAULT '',
   kind TEXT NOT NULL CHECK(length(kind)>0),
   name TEXT NOT NULL DEFAULT '',
@@ -74,7 +73,7 @@ CREATE INDEX journal_record ON journal(record_uuid, seq);
     exec(db, R"SQL(CREATE TABLE edges(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
-  deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),
+  state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0,2)),
   a_uuid BLOB NOT NULL CHECK(length(a_uuid)=16),
   b_uuid BLOB NOT NULL CHECK(length(b_uuid)=16),
   kind TEXT NOT NULL CHECK(length(kind)>0),
@@ -168,8 +167,8 @@ CREATE TABLE geometry_current_chunks(
 
 )SQL");
     if(!immutable){
-        exec(db, "CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);");
-        execute(db, "INSERT INTO sync_replica VALUES(1,?)", util::newUuid());
+        exec(db, "CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL CHECK(typeof(uuid)='blob' AND length(uuid)=16));");
+        execute(db, "INSERT INTO sync_replica VALUES(1,?)", parseUuid(util::newUuid()));
     }
     exec(db, "CREATE INDEX objects_kind_uuid ON objects(kind,uuid);");
     if (spatialEnabled(db)) detail::createSpatialSchema(db);

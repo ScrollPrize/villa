@@ -42,6 +42,9 @@ public:
     InitialShardImport(const InitialShardImport&)=delete;
     InitialShardImport& operator=(const InitialShardImport&)=delete;
     const std::string& storeUuid() const;
+    // Long-running/queued producers should poll this while awaiting input so a
+    // failure in another shard can cancel them even before their next append.
+    void checkCancelled() const;
     std::vector<InitialObjectIdentity> appendObjects(std::span<const InitialObjectRecord>);
     int64_t importEdges(const std::function<bool(std::vector<InitialCollectionEdge>&)>&);
 private:

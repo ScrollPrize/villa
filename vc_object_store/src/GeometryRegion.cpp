@@ -337,8 +337,8 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             const std::string family = kind.surface ? "''" : "COALESCE(f.family,'')";
             std::string sql="SELECT o.uuid,o.id,o.storage_ref," + family + " FROM " + from +
                 "LEFT JOIN " + std::string(kind.table) + " f ON f.object_id=o.id "
-                "WHERE o.deleted=0 AND o.kind=?12 AND b.array_name='' "
-                "AND o.geometry_manifest IS NOT NULL AND o.retired=0 AND "+spatialOverlapSql()+
+                "WHERE o.state=0 AND o.kind=?12 AND b.array_name='' "
+                "AND o.geometry_manifest IS NOT NULL AND "+spatialOverlapSql()+
                 (kind.surface ? std::string() : " AND COALESCE(f.length,0)>=?7 AND (?8 IS NULL OR "+family+"=?8)");
             if(includedIds)sql+=" AND o.id IN (SELECT value FROM json_each(?10))";
             if(options.coordinates)sql+=coordinateFilterSql("o", "?11");

@@ -142,7 +142,7 @@ struct AfcSource::Impl {
     sqlite3* db=nullptr;
     std::unique_ptr<detail::Statement> rows;
     std::string metadata,uuid;
-    int64_t count=0,read=0;
+    int64_t count=0,read=0,fiberEnd=INT64_MAX;
     bool full=false,finished=false;
     ~Impl(){rows.reset();if(db)sqlite3_close(db);}
 };
@@ -150,7 +150,7 @@ AfcSource::AfcSource(const std::filesystem::path& path,const std::string& afvUui
     : impl_(std::make_unique<Impl>())
 {
     if(firstConstraintId<0 || pastLastConstraintId<=firstConstraintId)throw std::invalid_argument("invalid AFC ID range");
-    auto& p=*impl_; p.uuid=util::canonicalUuid(afvUuid);p.full=pastLastFiberId==INT64_MAX && firstConstraintId==0 && pastLastConstraintId==INT64_MAX;
+    auto& p=*impl_; p.uuid=util::canonicalUuid(afvUuid);p.fiberEnd=pastLastFiberId;p.full=pastLastFiberId==INT64_MAX && firstConstraintId==0 && pastLastConstraintId==INT64_MAX;
     detail::check(sqlite3_open_v2(path.string().c_str(),&p.db,SQLITE_OPEN_READONLY,nullptr),p.db,"open AFC source");
     detail::exec(p.db,"PRAGMA query_only=ON;PRAGMA cache_size=-32768;BEGIN;");
     nlohmann::json meta=nlohmann::json::object();
@@ -186,9 +186,14 @@ std::vector<std::array<int64_t,2>> AfcSource::idRanges(size_t partitions,int64_t
     if(partitions<1 || limit<0)throw std::invalid_argument("invalid AFC partition count/limit");
     // Full-volume partitioning needs only the two B-tree endpoints, not a
     // min/max aggregate that scans every large constraint record first.
-    detail::Statement bounds(impl_->db,limit?
+    std::unique_ptr<detail::Statement> filtered;
+    if(impl_->fiberEnd!=INT64_MAX)filtered=std::make_unique<detail::Statement>(impl_->db,
+        "SELECT min(id),max(id) FROM (SELECT id FROM constraints WHERE fiber_a<? AND fiber_b<? ORDER BY id LIMIT ?)",
+        impl_->fiberEnd,impl_->fiberEnd,limit?limit:int64_t(-1));
+    else filtered=std::make_unique<detail::Statement>(impl_->db,limit?
         "SELECT min(id),max(id) FROM (SELECT id FROM constraints ORDER BY id LIMIT ?)":
         "SELECT (SELECT id FROM constraints ORDER BY id LIMIT 1),(SELECT id FROM constraints ORDER BY id DESC LIMIT 1) WHERE ?=0",limit);
+    auto& bounds=*filtered;
     if(!bounds.row() || sqlite3_column_type(bounds.value,0)==SQLITE_NULL)return {};
     const auto first=bounds.i64(0),last=bounds.i64(1);
     if(first<0 || last==INT64_MAX)throw std::invalid_argument("AFC IDs cannot be partitioned safely");

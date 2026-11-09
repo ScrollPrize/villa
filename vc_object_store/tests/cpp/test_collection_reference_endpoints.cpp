@@ -272,7 +272,7 @@ void uuidPrecedence()
     {
         auto raw=ObjectStore::open(path,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
         auto read=raw.read();auto* sql=ObjectStoreImplAccess::conn(read);
-        Statement record(sql,"SELECT uuid,deleted FROM objects");
+        Statement record(sql,"SELECT uuid,state FROM objects");
         require(record.row()&&formatUuid(record.blob16(0))==shared&&record.i64(1)==0&&!record.row(),
                 "overlay stores one same-key replacement, not an alias record");
         require(tableRows(sql,"geometry_chunks")==0,"metadata replacement copied geometry");
@@ -286,8 +286,8 @@ void uuidPrecedence()
     {
         auto raw=ObjectStore::open(path,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
         auto read=raw.read();auto* sql=ObjectStoreImplAccess::conn(read);
-        Statement record(sql,"SELECT uuid,deleted FROM objects");
-        require(record.row()&&formatUuid(record.blob16(0))==shared&&record.i64(1)==1&&!record.row(),
+        Statement record(sql,"SELECT uuid,state FROM objects");
+        require(record.row()&&formatUuid(record.blob16(0))==shared&&record.i64(1)==2&&!record.row(),
                 "deletion belongs to the same-key object row");
         Statement removed(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN "
             "('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones')");
@@ -457,7 +457,7 @@ void siblingReferences()
             Statement registrations(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN "
                 "('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones')");
             require(registrations.row()&&registrations.i64(0)==0,"sibling references require no local registration structures");
-            Statement endpoints(sql,"SELECT a_uuid,b_uuid FROM edges WHERE deleted=0");
+            Statement endpoints(sql,"SELECT a_uuid,b_uuid FROM edges WHERE state=0");
             while(endpoints.row()) {
                 const auto endpointA=formatUuid(endpoints.blob16(0)),endpointB=formatUuid(endpoints.blob16(1));
                 require((endpointA==ids[0]&&endpointB==ids[1])||(endpointA==ids[1]&&endpointB==ids[0]),

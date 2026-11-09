@@ -7,6 +7,8 @@
 #include "internal/RecordJson.hpp"
 #include "internal/Database.hpp"
 #include "internal/Sqlite.hpp"
+#include "imports/AfvRecords.hpp"
+#include "../apps/support/ProcessMetrics.hpp"
 #include <fstream>
 #include <iostream>
 #include <unordered_map>
@@ -38,7 +40,7 @@ struct Prepared {
     uint64_t points=0,bytes=0;
     int64_t sourceFibers=0,sourcePoints=0,sourceConstraints=0;
     size_t geometryReaders=0,geometryRanges=0;
-    double readSeconds=0,baselineEncodingSeconds=0;
+    double readSeconds=0,sourceOpenSeconds=0,sourceSelectSeconds=0,sourceDecodeSeconds=0,recordSeconds=0,baselineEncodingSeconds=0;
 };
 InitialObjectRecord geometryRecord(Prepared& data,AfvFiber&& fiber,const std::string& uuid,int64_t id,uint64_t maxBytes)
 {
@@ -56,6 +58,7 @@ InitialObjectRecord geometryRecord(Prepared& data,AfvFiber&& fiber,const std::st
 Prepared prepare(const Json& config){
     Prepared data;const auto start=Clock::now();
     const auto sourcePath=config.at("source").get<std::string>();AfvSource source(sourcePath,0,0);
+    data.sourceOpenSeconds=elapsed(start);
     data.sourceFibers=source.fiberCount();data.sourcePoints=source.pointCount();
     const size_t limit=config.at("count");require(limit>0,"count must be positive");
     const uint64_t maxBytes=config.value("max_prepared_xyz_bytes",uint64_t(1024)*1024*1024);
@@ -105,20 +108,42 @@ Prepared prepare(const Json& config){
         }
     }else{
         require(workload=="geometry","unknown workload");
+        const bool production=config.value("afv_records",false);
+        const bool includeConstraints=config.value("include_constraints",false);
+        require(!includeConstraints||(production&&config.contains("constraints")),"include_constraints requires afv_records and constraints");
+        const auto volume=config.value("volume_id",std::string{});
+        const Json coordinates={{"volume_uuid",volume.empty()?Json(nullptr):Json(volume)},
+                                {"scale_factor",config.value("scale_factor",1.)}};
         if(config.contains("constraints")) {
             AfcSource constraints(config.at("constraints").get<std::string>(),source.uuid());
             data.sourceConstraints=constraints.constraintCount();
         }
         const auto sampling=config.value("geometry_sampling",std::string("prefix"));
         require(sampling=="prefix"||sampling=="uniform","unknown geometry_sampling");
+        require(!includeConstraints||sampling=="prefix","matched constraint import requires prefix geometry");
+        int64_t lastSourceId=-1;
         const auto accept=[&](AfvFiber&& fiber) {
-            const auto uuid=util::nameUuid(source.uuid(),"fiber:"+std::to_string(fiber.id));
-            data.objects.push_back(geometryRecord(data,std::move(fiber),uuid,int64_t(data.objects.size()+1),maxBytes));
+            const auto recordStart=Clock::now();
+            lastSourceId=fiber.id;
+            if(production){
+                require(fiber.xyz.size()<=maxBytes&&data.bytes<=maxBytes-fiber.xyz.size(),"prepared XYZ exceeds budget");
+                InitialObjectRecord row;row.id=int64_t(data.objects.size()+1);row.record=imports::afvObjectRecord(fiber,source.uuid(),coordinates);
+                data.points+=fiber.detail.linePointCount;data.bytes+=fiber.xyz.size();
+                row.geometry=imports::afvGeometry(fiber);data.objects.push_back(std::move(row));
+            }else {
+                const auto uuid=util::nameUuid(source.uuid(),"fiber:"+std::to_string(fiber.id));
+                data.objects.push_back(geometryRecord(data,std::move(fiber),uuid,int64_t(data.objects.size()+1),maxBytes));
+            }
+            data.recordSeconds+=elapsed(recordStart);
         };
         AfvFiber fiber;
         if(sampling=="prefix") {
-            source.selectRange(0,INT64_MAX);data.geometryReaders=1;++data.geometryRanges;
-            while(data.objects.size()<limit&&source.next(fiber))accept(std::move(fiber));
+            const auto selection=Clock::now();source.selectRange(0,INT64_MAX);data.sourceSelectSeconds+=elapsed(selection);
+            data.geometryReaders=1;++data.geometryRanges;
+            while(data.objects.size()<limit){
+                const auto read=Clock::now();const bool available=source.next(fiber);data.sourceDecodeSeconds+=elapsed(read);
+                if(!available)break;accept(std::move(fiber));
+            }
         } else {
             // One catalog-only partition scan, not one scan per sample. The
             // first fiber in each balanced interval is a deterministic sample.
@@ -130,6 +155,30 @@ Prepared prepare(const Json& config){
             }
         }
         require(data.objects.size()==limit,"insufficient fibers");
+        Json constraintMetadata;
+        if(includeConstraints){
+            require(lastSourceId<INT64_MAX,"last source ID cannot form a bounded interval");
+            AfcSource constraints(config.at("constraints").get<std::string>(),source.uuid(),lastSourceId+1);
+            constraintMetadata=Json::parse(constraints.metadataJson());
+            std::unordered_map<std::string,int64_t> ids;
+            for(const auto& row:data.objects)ids.emplace(row.record.uuid,*row.id);
+            const auto constraintLimit=config.at("constraint_limit").get<size_t>();
+            require(constraintLimit>0,"matched benchmark needs a positive constraint_limit");
+            EdgeRecord edge;
+            while(data.edges.size()<constraintLimit&&constraints.next(edge)){
+                require(ids.contains(edge.aUuid)&&ids.contains(edge.bUuid),"constraint endpoint is absent from the prepared geometry");
+                data.endpoints.emplace_back(ids.at(edge.aUuid),ids.at(edge.bUuid));data.edges.push_back(std::move(edge));
+            }
+            require(data.edges.size()==constraintLimit,"insufficient eligible constraints");
+        }
+        if(production){
+            InitialObjectRecord metadata;metadata.id=int64_t(data.objects.size()+1);metadata.record.uuid=source.uuid();metadata.record.kind="collection";
+            metadata.record.name=fs::path(sourcePath).stem().string();
+            Json fields={{"coordinates",coordinates},{"afv",{{"metadata",Json::parse(source.metadataJson())}}}};
+            if(includeConstraints)fields["afc"]=std::move(constraintMetadata);
+            metadata.record.meta=fields.dump();
+            data.objects.push_back(std::move(metadata));
+        }
     }
     data.readSeconds=elapsed(start);return data;
 }
@@ -184,7 +233,7 @@ Json reduced(const Prepared& data,const fs::path& path,bool verifyReadback){
         chunk(db.p,"INSERT INTO geometry_chunks VALUES(?,?) ON CONFLICT(hash) DO NOTHING"),mapping(db.p,"INSERT INTO geometry_revision_chunks VALUES(?,'line_points',?,?)");
     for(size_t i=0;i<data.objects.size();++i){const auto& o=data.objects[i];
         object.run(*o.id,data.objectIds[i],o.record.kind,data.objectPayload[i]);
-        fiber.run(*o.id,o.record.fiber->linePointCount);
+        if(o.record.fiber)fiber.run(*o.id,o.record.fiber->linePointCount);
         if(o.geometry){
             d::forEachGeometryChunk(o.geometry->arrays.back(),0,[&](int64_t index,std::span<const uint8_t> bytes){
                 const auto t=Clock::now();const auto key=d::geometryPayloadHash("line_points",bytes);hash+=elapsed(t);
@@ -346,7 +395,9 @@ int main(int argc,char** argv){try{
         indexedAnchors+=!anchor->points.empty();positionAnchors+=bool(anchor->position);wholeAnchors+=anchor->wholeGeometry;
     }
     std::cout<<Json({{"stage","prepared"},{"objects",data.objects.size()},{"constraints",data.edges.size()},
-        {"points",data.points},{"xyz_bytes",data.bytes},{"source_seconds",data.readSeconds},
+        {"points",data.points},{"xyz_bytes",data.bytes},{"source_seconds",data.readSeconds},{"peak_rss_bytes",benchmark::peakRssBytes()},
+        {"source_open_seconds",data.sourceOpenSeconds},{"source_select_seconds",data.sourceSelectSeconds},
+        {"source_decode_seconds",data.sourceDecodeSeconds},{"record_preparation_seconds",data.recordSeconds},
         {"prototype_encoding_seconds",data.baselineEncodingSeconds},{"prototype_encoding_performed",needsPrototype},
         {"geometry_reader_count",data.geometryReaders},{"geometry_range_count",data.geometryRanges},{"indexed_anchors",indexedAnchors},
         {"position_anchors",positionAnchors},{"whole_geometry_anchors",wholeAnchors},
@@ -384,7 +435,7 @@ int main(int argc,char** argv){try{
         uint64_t bytes=0;
         if(fs::is_directory(path)){for(const auto& member:fs::directory_iterator(path))if(member.path().extension()==".vcobj")bytes+=fs::file_size(member.path());}
         else bytes=fs::file_size(path);
-        result["database_bytes"]=bytes;std::cout<<result.dump()<<std::endl;
+        result["database_bytes"]=bytes;result["peak_rss_bytes"]=benchmark::peakRssBytes();std::cout<<result.dump()<<std::endl;
         // Outputs are private benchmark fixtures, not experiment deliverables.
         // Remove only successfully created paths; the runner handles aborts.
         if(config.value("remove_completed_outputs",true)) {

@@ -59,8 +59,8 @@ std::vector<std::string> remoteSurfacesIn(sqlite3* db, const Bounds& bounds, con
 {
     std::string sql = "SELECT o.uuid FROM spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id "
         "CROSS JOIN objects o ON o.id=b.object_id "
-        "WHERE o.deleted=0 AND o.kind='surface' AND b.array_name='' "
-        "AND o.geometry_manifest IS NULL AND o.storage_kind!='' AND o.retired=0 AND " + spatialOverlapSql();
+        "WHERE o.state=0 AND o.kind='surface' AND b.array_name='' "
+        "AND o.geometry_manifest IS NULL AND o.storage_kind!='' AND " + spatialOverlapSql();
     if (includedIds) sql += " AND o.id IN (SELECT value FROM json_each(?8))";
     if (coordinates) sql += coordinateFilterSql("o", "?7");
     sql += " ORDER BY o.uuid";

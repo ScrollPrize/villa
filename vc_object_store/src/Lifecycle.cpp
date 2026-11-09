@@ -10,32 +10,32 @@ using namespace detail;
 
 void detail::readLifecycle(sqlite3* db, int64_t id, ObjectRecord& record)
 {
-    Statement s(db, "SELECT retired,lifecycle_epoch FROM objects WHERE id=?", id);
-    if (s.row()) { record.retired = s.i64(0); record.lifecycleEpoch = s.text(1); }
+    Statement s(db, "SELECT state,lifecycle_epoch FROM objects WHERE id=?", id);
+    if (s.row()) { record.retired = s.i64(0)==1; record.lifecycleEpoch = s.text(1); }
 }
 
 void detail::writeLifecycle(sqlite3* db, int64_t id, const ObjectRecord& record)
 {
     beforeCurrentObjectEdit(db,record.uuid);
-    execute(db, "UPDATE objects SET retired=?,lifecycle_epoch=? WHERE id=?",int64_t(record.retired),
+    execute(db, "UPDATE objects SET state=?,lifecycle_epoch=? WHERE id=?",int64_t(record.retired),
         record.lifecycleEpoch,id);
 }
 
 std::string detail::activeObjectSql(const std::string& id)
 {
-    return "NOT EXISTS(SELECT 1 FROM objects owned WHERE owned.id="+id+" AND (owned.deleted=1 OR owned.retired=1))";
+    return "NOT EXISTS(SELECT 1 FROM objects owned WHERE owned.id="+id+" AND owned.state<>0)";
 }
 
 std::string detail::activeEdgeSql()
 {
-    return "edges.deleted=0 AND NOT EXISTS(SELECT 1 FROM objects owned "
-        "WHERE (owned.uuid=edges.a_uuid OR owned.uuid=edges.b_uuid) AND (owned.deleted=1 OR owned.retired=1))";
+    return "edges.state=0 AND NOT EXISTS(SELECT 1 FROM objects owned "
+        "WHERE (owned.uuid=edges.a_uuid OR owned.uuid=edges.b_uuid) AND owned.state<>0)";
 }
 
 namespace {
 ObjectRecord endpointLifecycle(sqlite3* db,const std::string& uuid)
 {
-    Statement row(db,"SELECT id,deleted FROM objects WHERE uuid=?",parseUuid(uuid));
+    Statement row(db,"SELECT id,state FROM objects WHERE uuid=?",parseUuid(uuid));
     if(!row.row())return externalEndpointRecord(db,uuid);
     ObjectRecord record;readLifecycle(db,row.i64(0),record);
     record.retired=record.retired||row.i64(1)!=0;return record;

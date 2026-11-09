@@ -67,8 +67,8 @@ void Txn::release(bool commit)
             enforceHubRules(conn, *activeStatementPools.at(conn), db_->impl_->hubRole);
             for (const auto& [uuid, expected] : expectedRevisions_) {
                 Statement head(conn, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?",
-                               formatUuid(parseUuid(uuid)));
-                if(head.row())committedRevisions_[uuid]=head.text(0);
+                               parseUuid(uuid));
+                if(head.row())committedRevisions_[uuid]=formatUuid(head.blob16(0));
                 else committedRevisions_[uuid]=externalEndpointKey(conn,uuid)?std::optional(externalEndpointVersion(conn,uuid)):std::nullopt;
             }
         }

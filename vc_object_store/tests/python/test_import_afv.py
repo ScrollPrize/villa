@@ -126,3 +126,95 @@ def test_native_batch_command_readback_is_opt_in(tmp_path, shards, verify):
     assert rejected.returncode != 0
     assert 'initial_batch:false is removed' in rejected.stderr
     assert not Path(config['output']).exists()
+
+
+def constraint_fixture(path, source_uuid):
+    with sqlite3.connect(path) as db:
+        db.executescript('''CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);
+            CREATE TABLE constraints(id INTEGER PRIMARY KEY,fiber_a INTEGER,fiber_b INTEGER,
+                arc_a REAL,arc_b REAL,ax REAL,ay REAL,az REAL,bx REAL,by REAL,bz REAL,
+                parallel_score REAL,perpendicular_score REAL,winding_distance REAL,
+                parallel_winding_distance REAL,evidence_weight REAL,normal_a TEXT,normal_b TEXT,measurement TEXT);''')
+        metadata = dict(format='fiber-constraints', schema_version=1, complete=True,
+                        provenance=dict(afv_uuid=source_uuid), statistics=dict(constraints=17))
+        db.executemany('INSERT INTO metadata VALUES(?,?)', [(k, json.dumps(v)) for k, v in metadata.items()])
+        for i in range(17):
+            db.execute('INSERT INTO constraints VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                       (i * 3, 0, 9, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, .5, .5, 1, None, None, '{}'))
+
+
+@pytest.mark.parametrize('packed', [False, True])
+def test_native_uuid_dispatch_combined_and_linked(tmp_path, packed):
+    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
+    tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
+    if not tool or not tool.exists():
+        pytest.skip('needs native importer')
+    source, constraints = tmp_path / 'source.afv', tmp_path / 'source.afc'
+    metadata, _ = fixture(source)
+    constraint_fixture(constraints, metadata['uuid'])
+    config = dict(source=str(source), constraints=str(constraints), unbound=True,
+                  shards=4, readers=2, batch_size=1, batch_bytes=256, queue_bytes=128,
+                  packed=packed, verify_readback=True, memory_first=True, resident_bytes=128 * 1024**2)
+    path = tmp_path / 'config.json'
+    for mode in ('combined', 'geometry', 'linked', 'limited', 'failure'):
+        output, report = tmp_path / mode, tmp_path / (mode + '.json')
+        current = dict(config, output=str(output), report=str(report))
+        if mode == 'geometry':
+            del current['constraints']
+        elif mode == 'linked':
+            current['geometry_collection'] = str(tmp_path / 'geometry' if packed else tmp_path / 'geometry' / 'collection.vcobj')
+        elif mode == 'limited':
+            current['constraint_limit'] = 5
+        elif mode == 'failure':
+            with sqlite3.connect(source) as db:
+                db.execute('UPDATE blocks SET points=zeroblob(25) WHERE fiber_id=9')
+        path.write_text(json.dumps(current))
+        result = subprocess.run([str(tool), str(path)], text=True, capture_output=True, timeout=30)
+        if mode == 'failure':
+            assert result.returncode != 0
+            assert not output.exists()
+            assert not list(tmp_path.glob('.failure-*'))
+            continue
+        assert result.returncode == 0, result.stderr
+        data = json.loads(report.read_text())
+        assert data['uuid_hash_routing'] and data['readback_verified']
+        assert data['fibers'] == (0 if mode == 'linked' else 2)
+        assert data['constraints'] == (0 if mode == 'geometry' else 5 if mode == 'limited' else 17)
+        if mode == 'limited':
+            assert data['estimated_full_import_seconds'] is None
+            assert 'sampling fractions differ' in data['estimate_basis']
+        else:
+            assert data['estimated_full_import_seconds'] >= 0
+        if not packed:
+            seen = 0
+            for shard in output.glob('part-*.vcobj'):
+                with sqlite3.connect(shard) as db:
+                    for (uuid,) in db.execute('SELECT uuid FROM objects'):
+                        h = 14695981039346656037
+                        for byte in uuid:
+                            h = ((h ^ byte) * 1099511628211) & ((1 << 64) - 1)
+                        assert h % 4 == int(shard.stem.split('-')[-1])
+                        seen += 1
+            assert seen == (1 if mode == 'linked' else 3)
+
+
+@pytest.mark.parametrize('key,value', [
+    ('queue_bytes', -1), ('queue_bytes', 0), ('queue_bytes', .5),
+    ('queue_bytes', 2**64 - 1), ('shards', 2**32 + 1),
+    ('readers', 2**32 + 1), ('constraint_limit', .5),
+])
+def test_native_queue_limits_reject_invalid_integers(tmp_path, key, value):
+    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
+    tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
+    if not tool or not tool.exists():
+        pytest.skip('needs native importer')
+    source, output = tmp_path / 'source.afv', tmp_path / 'output'
+    fixture(source)
+    config = dict(source=str(source), output=str(output), unbound=True)
+    config[key] = value
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps(config))
+    result = subprocess.run([str(tool), str(path)], text=True, capture_output=True, timeout=30)
+    assert result.returncode != 0
+    assert key in result.stderr
+    assert not output.exists()

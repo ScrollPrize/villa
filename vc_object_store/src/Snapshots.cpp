@@ -38,7 +38,7 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
         out["objects"].push_back(std::move(record));
     }
     std::string members = "SELECT e.id FROM json_each(?1) selected CROSS JOIN objects selected_object ON selected_object.id=selected.value "
-        "CROSS JOIN edges e INDEXED BY edges_a WHERE e.deleted=0 AND e.a_uuid=selected_object.uuid "
+        "CROSS JOIN edges e INDEXED BY edges_a WHERE e.state=0 AND e.a_uuid=selected_object.uuid "
         "AND e.b_uuid IN (SELECT uuid FROM objects WHERE id IN (SELECT value FROM json_each(?1)))";
     if (!options.selection.includeRetired)
         members += " AND e.id IN (SELECT id FROM edges WHERE " + activeEdgeSql() + ")";

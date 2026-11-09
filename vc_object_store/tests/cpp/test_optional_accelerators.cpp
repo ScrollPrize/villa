@@ -135,6 +135,10 @@ void lifecycle(HistoryMode history)
     {auto read=store.read();require(store.edgeByUuid(read,relation).has_value()&&!store.objectByUuid(read,a.uuid)->retired,"retire rollback restores relationships and state");}
     {auto txn=write();store.retireObject(txn,a.uuid);txn.commit();}
     {auto read=store.read();require(store.objectByUuid(read,a.uuid)->lifecycleEpoch==std::to_string(store.provisioning(read).generation),"retire token is publication generation");}
+    {auto txn=write();auto retired=*store.objectByUuid(txn,a.uuid);retired.name="still-retired";store.upsertObject(txn,retired);
+        require(store.objectByUuid(txn,a.uuid)->retired,"ordinary upsert must not activate a retired object");
+        Statement state(ObjectStoreImplAccess::conn(txn),"SELECT state FROM objects WHERE uuid=?",parseUuid(a.uuid));
+        require(state.row()&&state.i64(0)==1,"retirement has the single state value one");txn.commit();}
     {auto txn=write();store.restoreObject(txn,a.uuid);txn.commit();}
     {auto read=store.read();require(!store.edgeByUuid(read,relation),"restore never revives retired relationships");
         require(store.objectByUuid(read,a.uuid)->lifecycleEpoch==std::to_string(store.provisioning(read).generation),"restore token is publication generation");}

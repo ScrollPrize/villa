@@ -28,8 +28,8 @@ nlohmann::json detail::currentDependencyMetadata(sqlite3* db,const std::string& 
     // serialization are dependencies. Do not even fetch/parse meta when the
     // relationship declares no metadata keys; lifecycle checks remain present.
     Statement row(db,anchor.metadataKeys.empty()
-        ? "SELECT (deleted OR retired),lifecycle_epoch,NULL FROM objects WHERE uuid=?"
-        : "SELECT (deleted OR retired),lifecycle_epoch,meta FROM objects WHERE uuid=?",
+        ? "SELECT (state<>0),lifecycle_epoch,NULL FROM objects WHERE uuid=?"
+        : "SELECT (state<>0),lifecycle_epoch,meta FROM objects WHERE uuid=?",
         parseUuid(object));
     if(!row.row()) {
         const auto record=externalEndpointRecord(db,object);
@@ -42,10 +42,33 @@ nlohmann::json detail::currentDependencyMetadata(sqlite3* db,const std::string& 
 namespace {
 using Json = nlohmann::json;
 
+// UUID references use the same BLOB16 representation as current records.
+// Explicit external/current version tokens are not UUIDs and remain tagged text.
+using SqlReference=std::variant<std::array<unsigned char,16>,std::string>;
+SqlReference sqlReference(const std::string& value)
+{
+    if(auto external=parseExternalEndpointToken(value))
+        return externalEndpointToken(external->ownerUuid,external->objectUuid,external->generation);
+    if(auto current=parseCurrentGeometryToken(value))
+        return currentGeometryToken(current->objectUuid,current->generation);
+    return parseUuid(value);
+}
+std::optional<SqlReference> sqlReference(const std::optional<std::string>& value)
+{return value?std::optional(sqlReference(*value)):std::nullopt;}
+std::string referenceColumn(const Statement& row,int column)
+{
+    if(sqlite3_column_type(row.value,column)==SQLITE_BLOB)return formatUuid(row.blob16(column));
+    const auto text=row.text(column);
+    if(parseExternalEndpointToken(text)||parseCurrentGeometryToken(text))return text;
+    throw std::runtime_error("object history: UUID reference must be BLOB16");
+}
+std::optional<std::string> optionalReference(const Statement& row,int column)
+{return row.isNull(column)?std::nullopt:std::optional(referenceColumn(row,column));}
+
 std::optional<std::string> head(sqlite3* db, const std::string& object)
 {
-    Statement s(db, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?", object);
-    if(s.row())return s.text(0);
+    Statement s(db, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?", parseUuid(object));
+    if(s.row())return formatUuid(s.blob16(0));
     if(externalEndpointKey(db,object))return externalEndpointVersion(db,object);
     return {};
 }
@@ -55,17 +78,18 @@ std::optional<std::string> optionalUuid(Statement& s, int column)
     return s.isNull(column) ? std::nullopt : std::optional(formatUuid(s.blob16(column)));
 }
 
-Json metadata(sqlite3* db, const std::string& revision)
+Json metadata(sqlite3* db, const std::string& revision, bool legacyTextUuid=false)
 {
     if(auto endpoint=externalEndpointObject(db,revision))return objectToJson(externalEndpointRecord(db,*endpoint));
     // Common case: the materialized head, without any history replay.
-    Statement current(db, "SELECT record FROM object_head_records WHERE revision_uuid=?", revision);
+    const SqlReference key=legacyTextUuid?SqlReference{revision}:SqlReference{parseUuid(revision)};
+    Statement current(db, "SELECT record FROM object_head_records WHERE revision_uuid=?", key);
     if (current.row()) return Json::parse(current.text(0));
     Statement chain(db,
         "WITH RECURSIVE chain(uuid,parent_uuid,seq,metadata_delta) AS ("
         "SELECT uuid,parent_uuid,seq,metadata_delta FROM object_revisions WHERE uuid=? UNION ALL "
         "SELECT r.uuid,r.parent_uuid,r.seq,r.metadata_delta FROM object_revisions r "
-        "JOIN chain c ON r.uuid=c.parent_uuid) SELECT metadata_delta FROM chain ORDER BY seq", revision);
+        "JOIN chain c ON r.uuid=c.parent_uuid) SELECT metadata_delta FROM chain ORDER BY seq", key);
     auto result = Json::object();
     while (chain.row()) result = result.patch(Json::parse(chain.text(0)));
     return result;
@@ -75,14 +99,14 @@ std::map<std::string, std::string> members(sqlite3* db, const std::string& revis
 {
     std::map<std::string, std::string> result;
     if(auto endpoint=externalEndpointObject(db,revision)) {
-        Statement rows(db,"SELECT edge_uuid,relationship_uuid FROM object_relationship_heads WHERE object_uuid=?",*endpoint);
-        while(rows.row())result.emplace(rows.text(0),rows.text(1));return result;
+        Statement rows(db,"SELECT edge_uuid,relationship_uuid FROM object_relationship_heads WHERE object_uuid=?",parseUuid(*endpoint));
+        while(rows.row())result.emplace(formatUuid(rows.blob16(0)),formatUuid(rows.blob16(1)));return result;
     }
-    Statement isHead(db, "SELECT object_uuid FROM object_heads WHERE revision_uuid=?", revision);
+    Statement isHead(db, "SELECT object_uuid FROM object_heads WHERE revision_uuid=?", parseUuid(revision));
     if (isHead.row()) {
         Statement s(db, "SELECT edge_uuid,relationship_uuid FROM object_relationship_heads WHERE object_uuid=?",
-            isHead.text(0));
-        while (s.row()) result.emplace(s.text(0), s.text(1));
+            isHead.blob16(0));
+        while (s.row()) result.emplace(formatUuid(s.blob16(0)), formatUuid(s.blob16(1)));
         return result;
     }
     Statement s(db,
@@ -90,10 +114,10 @@ std::map<std::string, std::string> members(sqlite3* db, const std::string& revis
         "SELECT uuid,parent_uuid,seq FROM object_revisions WHERE uuid=? UNION ALL "
         "SELECT r.uuid,r.parent_uuid,r.seq FROM object_revisions r JOIN chain c ON r.uuid=c.parent_uuid) "
         "SELECT d.edge_uuid,d.relationship_uuid FROM chain c JOIN object_relationship_deltas d "
-        "ON d.revision_uuid=c.uuid ORDER BY c.seq", revision);
+        "ON d.revision_uuid=c.uuid ORDER BY c.seq", parseUuid(revision));
     while (s.row()) {
-        if (s.isNull(1)) result.erase(s.text(0));
-        else result[s.text(0)] = s.text(1);
+        if (s.isNull(1)) result.erase(formatUuid(s.blob16(0)));
+        else result[formatUuid(s.blob16(0))] = formatUuid(s.blob16(1));
     }
     return result;
 }
@@ -101,14 +125,14 @@ std::map<std::string, std::string> members(sqlite3* db, const std::string& revis
 RelationshipRevision relationship(sqlite3* db, const std::string& uuid)
 {
     Statement s(db, "SELECT record,a_revision,b_revision,a_geometry,b_geometry,generation FROM relationship_revisions WHERE uuid=?",
-        uuid);
+        parseUuid(uuid));
     if (!s.row()) throw std::runtime_error("object history: missing relationship revision");
     RelationshipRevision result;
     result.uuid = uuid;
     const auto record = Json::parse(s.text(0));
     result.record = edgeFromJson(record);
-    result.aRevision = s.text(1); result.bRevision = s.text(2);
-    result.aGeometryRevision = s.optText(3); result.bGeometryRevision = s.optText(4);
+    result.aRevision = referenceColumn(s,1); result.bRevision = referenceColumn(s,2);
+    result.aGeometryRevision = optionalReference(s,3); result.bGeometryRevision = optionalReference(s,4);
     result.generation = s.i64(5);
     return result;
 }
@@ -129,15 +153,15 @@ bool endpointApplies(const ObjectStore& store, const Txn& txn, const Anchor& anc
 
 Json currentRecord(sqlite3* db, const std::string& object)
 {
-    Statement row(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=? AND deleted=0", parseUuid(object));
+    Statement row(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=? AND state<>2", parseUuid(object));
     if (!row.row()) throw std::runtime_error("object history: endpoint missing");
     return objectToJson(readObjectRow(db, row));
 }
 }
 
-nlohmann::json detail::historicalDependencyMetadata(sqlite3* db,const std::string& revision,const Anchor& anchor)
+nlohmann::json detail::historicalDependencyMetadata(sqlite3* db,const std::string& revision,const Anchor& anchor,bool legacyTextUuid)
 {
-    return dependencyMetadata(metadata(db,revision),anchor);
+    return dependencyMetadata(metadata(db,revision,legacyTextUuid),anchor);
 }
 
 void detail::createHistorySchema(sqlite3* db)
@@ -145,9 +169,9 @@ void detail::createHistorySchema(sqlite3* db)
     exec(db, R"SQL(
 CREATE TABLE object_revisions(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  uuid TEXT NOT NULL UNIQUE,
-  object_uuid TEXT NOT NULL,
-  parent_uuid TEXT REFERENCES object_revisions(uuid),
+  uuid BLOB NOT NULL UNIQUE,
+  object_uuid BLOB NOT NULL,
+  parent_uuid BLOB REFERENCES object_revisions(uuid),
   geometry_uuid BLOB REFERENCES geometry_revisions(uuid),
   metadata_delta TEXT NOT NULL CHECK(json_valid(metadata_delta)),
   metadata_complete INTEGER NOT NULL DEFAULT 1,
@@ -158,36 +182,36 @@ CREATE TABLE object_revisions(
 CREATE INDEX object_revision_history ON object_revisions(object_uuid,seq);
 CREATE INDEX object_revision_time ON object_revisions(object_uuid,published_at_us DESC,seq DESC);
 CREATE INDEX object_publication_time ON object_revisions(published_at_us);
-CREATE TABLE object_heads(object_uuid TEXT PRIMARY KEY, revision_uuid TEXT NOT NULL UNIQUE REFERENCES object_revisions(uuid));
-CREATE TABLE object_head_records(object_uuid TEXT PRIMARY KEY, revision_uuid TEXT NOT NULL UNIQUE, record TEXT NOT NULL);
+CREATE TABLE object_heads(object_uuid BLOB PRIMARY KEY, revision_uuid BLOB NOT NULL UNIQUE REFERENCES object_revisions(uuid));
+CREATE TABLE object_head_records(object_uuid BLOB PRIMARY KEY, revision_uuid BLOB NOT NULL UNIQUE, record TEXT NOT NULL);
 CREATE TABLE relationship_revisions(
-  uuid TEXT PRIMARY KEY,
-  edge_uuid TEXT NOT NULL,
+  uuid BLOB PRIMARY KEY,
+  edge_uuid BLOB NOT NULL,
   record TEXT NOT NULL CHECK(json_valid(record)),
-  a_revision TEXT NOT NULL,
-  b_revision TEXT NOT NULL,
-  a_geometry TEXT, b_geometry TEXT,
+  a_revision BLOB NOT NULL,
+  b_revision BLOB NOT NULL,
+  a_geometry BLOB, b_geometry BLOB,
   generation INTEGER NOT NULL
 );
 CREATE INDEX relationship_history ON relationship_revisions(edge_uuid);
 CREATE TABLE object_relationship_deltas(
-  revision_uuid TEXT NOT NULL REFERENCES object_revisions(uuid),
-  edge_uuid TEXT NOT NULL,
-  relationship_uuid TEXT REFERENCES relationship_revisions(uuid),
+  revision_uuid BLOB NOT NULL REFERENCES object_revisions(uuid),
+  edge_uuid BLOB NOT NULL,
+  relationship_uuid BLOB REFERENCES relationship_revisions(uuid),
   PRIMARY KEY(revision_uuid,edge_uuid)
 );
 CREATE TABLE object_relationship_heads(
-  object_uuid TEXT NOT NULL, edge_uuid TEXT NOT NULL,
-  relationship_uuid TEXT NOT NULL REFERENCES relationship_revisions(uuid),
+  object_uuid BLOB NOT NULL, edge_uuid BLOB NOT NULL,
+  relationship_uuid BLOB NOT NULL REFERENCES relationship_revisions(uuid),
   PRIMARY KEY(object_uuid,edge_uuid)
 );
 CREATE INDEX object_relationship_edges ON object_relationship_heads(edge_uuid);
 CREATE TABLE history_dirty_objects(uuid BLOB PRIMARY KEY);
 CREATE TABLE history_dirty_edges(uuid BLOB PRIMARY KEY);
-CREATE TABLE history_expected(uuid TEXT PRIMARY KEY, revision_uuid TEXT);
+CREATE TABLE history_expected(uuid BLOB PRIMARY KEY, revision_uuid BLOB);
 CREATE TABLE history_checked(singleton INTEGER PRIMARY KEY CHECK(singleton=1));
-CREATE TABLE history_required(uuid TEXT PRIMARY KEY);
-CREATE TABLE history_validated_edges(uuid TEXT PRIMARY KEY, a_meta TEXT NOT NULL, b_meta TEXT NOT NULL, recorded_only INTEGER NOT NULL);
+CREATE TABLE history_required(uuid BLOB PRIMARY KEY);
+CREATE TABLE history_validated_edges(uuid BLOB PRIMARY KEY, a_meta TEXT NOT NULL, b_meta TEXT NOT NULL, recorded_only INTEGER NOT NULL);
 )SQL");
     for (const auto* table : {"object_revisions", "relationship_revisions", "object_relationship_deltas"}) {
         for (const auto* operation : {"UPDATE", "DELETE"}) {
@@ -234,7 +258,7 @@ void detail::expectHistory(sqlite3* db, const RevisionSelection& expected)
         const auto wanted = revision ? std::optional(parseExternalEndpointToken(*revision)?*revision:formatUuid(parseUuid(*revision))) : std::nullopt;
         if (head(db, uuid) != wanted)
             throw std::runtime_error("object history: expected revision conflict for " + uuid);
-        execute(db, "INSERT INTO history_expected VALUES(?,?)", uuid, wanted);
+        execute(db, "INSERT INTO history_expected VALUES(?,?)", parseUuid(uuid), sqlReference(wanted));
     }
 }
 
@@ -267,10 +291,10 @@ void detail::recordRelationshipValidation(sqlite3* db, const EdgeRecord& edge, b
     }
     execute(db, "INSERT INTO history_validated_edges VALUES(?,?,?,?) ON CONFLICT(uuid) "
         "DO UPDATE SET a_meta=excluded.a_meta,b_meta=excluded.b_meta,recorded_only=excluded.recorded_only",
-        edge.uuid, a.dump(), b.dump(), int64_t(recordedOnly));
+        parseUuid(edge.uuid), a.dump(), b.dump(), int64_t(recordedOnly));
     for (const auto& object : {edge.aUuid, edge.bUuid}) {
         if(externalEndpointKey(db,object))continue;
-        execute(db, "INSERT OR IGNORE INTO history_required VALUES(?)", object);
+        execute(db, "INSERT OR IGNORE INTO history_required VALUES(?)", parseUuid(object));
         if (!recordedOnly) {
             execute(db, "INSERT OR IGNORE INTO history_dirty_objects VALUES(?)", parseUuid(object));
         }
@@ -303,7 +327,7 @@ void detail::beforeCurrentObjectEdit(sqlite3* db,const std::string& input)
     const auto uuid=formatUuid(parseUuid(input));
     const auto& state=activeStatementPools.at(db)->currentWrite;
     if(state&&state->before.contains(uuid))return;
-    Statement object(db,"SELECT meta,(deleted OR retired),lifecycle_epoch FROM objects WHERE uuid=?",parseUuid(uuid));
+    Statement object(db,"SELECT meta,(state<>0),lifecycle_epoch FROM objects WHERE uuid=?",parseUuid(uuid));
     if(!object.row())return;
     mutableCurrentWrite(db).before.emplace(uuid,Json{{"meta",Json::parse(object.text(0))},
         {"retired",bool(object.i64(1))},{"lifecycle_epoch",object.text(2)}});
@@ -319,7 +343,7 @@ void detail::validateCurrentRelationships(sqlite3* db)
     if(!state)return;
     std::set<std::string> seen;
     for(const auto& [uuid,before]:state->before) {
-        Statement incident(db,std::string("SELECT ")+kEdgeCols+" FROM edges WHERE deleted=0 AND (a_uuid=?1 OR b_uuid=?1)",parseUuid(uuid));
+        Statement incident(db,std::string("SELECT ")+kEdgeCols+" FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1)",parseUuid(uuid));
         while(incident.row()) {
             const auto edge=readEdgeRow(db,incident);
             if(!seen.insert(edge.uuid).second)continue;
@@ -359,9 +383,9 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
     if (strict) {
         Statement required(db, "SELECT uuid FROM history_required");
         while (required.row()) {
-            Statement expected(db, "SELECT revision_uuid FROM history_expected WHERE uuid=?", required.text(0));
-            if (!expected.row() || expected.optText(0) != head(db, required.text(0)))
-                throw std::runtime_error("object history: missing expected validation endpoint " + required.text(0));
+            Statement expected(db, "SELECT revision_uuid FROM history_expected WHERE uuid=?", required.blob16(0));
+            if (!expected.row() || optionalReference(expected,0) != head(db, formatUuid(required.blob16(0))))
+                throw std::runtime_error("object history: missing expected validation endpoint " + formatUuid(required.blob16(0)));
         }
     }
     while (dirty.row()) {
@@ -370,11 +394,11 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         Pending p;
         p.parent = head(db, object);
         if (strict) {
-            Statement expected(db, "SELECT revision_uuid FROM history_expected WHERE uuid=?", object);
-            if (!expected.row() || expected.optText(0) != p.parent)
+            Statement expected(db, "SELECT revision_uuid FROM history_expected WHERE uuid=?", parseUuid(object));
+            if (!expected.row() || optionalReference(expected,0) != p.parent)
                 throw std::runtime_error("object history: missing or conflicting expected revision for " + object);
         }
-        Statement row(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=? AND deleted=0", parseUuid(object));
+        Statement row(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=? AND state<>2", parseUuid(object));
         p.exists = row.row();
         if (p.exists) {
             p.record = objectToJson(readObjectRow(db, row));
@@ -382,7 +406,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             p.delta = Json::diff(p.parent ? metadata(db, *p.parent) : Json::object(), p.record);
             p.changed = !p.parent || !p.delta.empty();
             if (p.parent) {
-                Statement previous(db, "SELECT geometry_uuid FROM object_revisions WHERE uuid=?", *p.parent); previous.row();
+                Statement previous(db, "SELECT geometry_uuid FROM object_revisions WHERE uuid=?", parseUuid(*p.parent)); previous.row();
                 p.changed |= optionalUuid(previous, 0) != p.geometry;
             }
         }
@@ -400,7 +424,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         const bool lifecycleChanged = before.value("lifecycle_epoch", "") != p.record.value("lifecycle_epoch", "");
         if (!lifecycleChanged && before.at("meta") == p.record.at("meta")) continue;
         Statement incident(db, std::string("SELECT ") + kEdgeCols +
-            " FROM edges WHERE deleted=0 AND (a_uuid=? OR b_uuid=?)",
+            " FROM edges WHERE state=0 AND (a_uuid=? OR b_uuid=?)",
             parseUuid(object), parseUuid(object));
         while (incident.row()) {
             const auto edge = readEdgeRow(db, incident);
@@ -413,7 +437,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             // separate revalidation. It does not import the peer's timeline.
             if (importedBindings && lifecycleChanged) recordRelationshipValidation(db, edge, true);
             Statement validated(db, "SELECT a_meta,b_meta,recorded_only FROM history_validated_edges WHERE uuid=?",
-                edge.uuid);
+                parseUuid(edge.uuid));
             if (!validated.row() ||
                 Json::parse(validated.text(0)) != currentDependencyMetadata(db,edge.aUuid,edge.aAnchor) ||
                 Json::parse(validated.text(1)) != currentDependencyMetadata(db,edge.bUuid,edge.bAnchor))
@@ -438,12 +462,12 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         e.uuid = formatUuid(dirtyEdges.blob16(0));
         std::optional<RelationshipRevision> previous;
         Statement old(db, "SELECT object_uuid,relationship_uuid FROM object_relationship_heads WHERE edge_uuid=?",
-            e.uuid);
+            parseUuid(e.uuid));
         while (old.row()) {
-            e.owners.insert(old.text(0));
-            if (!previous) previous = relationship(db, old.text(1));
+            e.owners.insert(formatUuid(old.blob16(0)));
+            if (!previous) previous = relationship(db, formatUuid(old.blob16(1)));
         }
-        Statement row(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=? AND deleted=0", parseUuid(e.uuid));
+        Statement row(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=? AND state=0", parseUuid(e.uuid));
         if (row.row()) {
             e.record = readEdgeRow(db, row);
             // Legacy snapshots can retain a different endpoint side order.
@@ -458,7 +482,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             e.owners.insert(e.record->aUuid); e.owners.insert(e.record->bUuid);
             e.aGeometry = geometryHead(db,e.record->aUuid);
             e.bGeometry = geometryHead(db,e.record->bUuid);
-            Statement validated(db, "SELECT recorded_only FROM history_validated_edges WHERE uuid=?", e.uuid);
+            Statement validated(db, "SELECT recorded_only FROM history_validated_edges WHERE uuid=?", parseUuid(e.uuid));
             const bool revalidated = validated.row() && !validated.i64(0);
             const auto importedEpochs = lifecycleBinding(db, *e.record);
             if (previous && !revalidated) {
@@ -485,8 +509,8 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
                 Pending p;
                 p.parent = head(db, owner);
                 if (strict) {
-                    Statement expected(db, "SELECT revision_uuid FROM history_expected WHERE uuid=?", owner);
-                    if (!expected.row() || expected.optText(0) != p.parent)
+                    Statement expected(db, "SELECT revision_uuid FROM history_expected WHERE uuid=?", parseUuid(owner));
+                    if (!expected.row() || optionalReference(expected,0) != p.parent)
                         throw std::runtime_error("object history: missing expected relationship endpoint " + owner);
                 }
                 p.exists = true; p.record = currentRecord(db, owner);
@@ -514,35 +538,35 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
                 // Record a physical deletion without changing existing deletion
                 // eligibility. This prevents time-based reads resurrecting it.
                 execute(db, "INSERT INTO object_revisions(uuid,object_uuid,parent_uuid,"
-                    "metadata_delta,published_at_us,deleted,generation) VALUES(?,?,?,'[]',?,1,?)", util::newUuid(),
-                    object, *p.parent, publishedAtUs, writeGeneration(db));
+                    "metadata_delta,published_at_us,deleted,generation) VALUES(?,?,?,'[]',?,1,?)", parseUuid(util::newUuid()),
+                    parseUuid(object), parseUuid(*p.parent), publishedAtUs, writeGeneration(db));
             }
             for (const auto* table : {"object_heads", "object_head_records", "object_relationship_heads"}) {
-                execute(db, std::string("DELETE FROM ") + table + " WHERE object_uuid=?", object);
+                execute(db, std::string("DELETE FROM ") + table + " WHERE object_uuid=?", parseUuid(object));
             }
             continue;
         }
         if (!p.changed) continue;
         p.uuid = util::newUuid();
         Statement insert(db, "INSERT INTO object_revisions(uuid,object_uuid,parent_uuid,geometry_uuid,"
-            "metadata_delta,metadata_complete,published_at_us,generation) VALUES(?,?,?,?,?,?,?,?)", p.uuid, object, p.parent);
+            "metadata_delta,metadata_complete,published_at_us,generation) VALUES(?,?,?,?,?,?,?,?)", parseUuid(p.uuid), parseUuid(object), sqlReference(p.parent));
         if (p.geometry) insert.bind(4, parseUuid(*p.geometry)); else insert.bindNull(4);
         insert.bind(5, p.delta.dump()); insert.bind(6, int64_t(1));
         insert.bind(7, publishedAtUs); insert.bind(8, writeGeneration(db)); insert.stepDone();
         execute(db, "INSERT INTO object_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid",
-            object, p.uuid);
+            parseUuid(object), parseUuid(p.uuid));
         execute(db, "INSERT INTO object_head_records VALUES(?,?,?) ON CONFLICT(object_uuid) "
-            "DO UPDATE SET revision_uuid=excluded.revision_uuid,record=excluded.record", object, p.uuid,
+            "DO UPDATE SET revision_uuid=excluded.revision_uuid,record=excluded.record", parseUuid(object), parseUuid(p.uuid),
             p.record.dump());
     }
     auto pin = [&](const std::string& object, const std::optional<std::string>& geometry,
                    const std::optional<std::string>& epoch = std::nullopt) {
         if(externalEndpointKey(db,object))return externalEndpointVersion(db,object);
         Statement s(db, "SELECT uuid FROM object_revisions WHERE object_uuid=? AND geometry_uuid IS ? ORDER BY seq DESC",
-            object);
+            parseUuid(object));
         if (geometry) s.bind(2, parseUuid(*geometry)); else s.bindNull(2);
         while (s.row())
-            if (!epoch || metadata(db, s.text(0)).value("lifecycle_epoch", "") == *epoch) return s.text(0);
+            if (!epoch || metadata(db, formatUuid(s.blob16(0))).value("lifecycle_epoch", "") == *epoch) return formatUuid(s.blob16(0));
         if (!importedBindings)
             throw std::runtime_error("object history: relationship binding has no object revision");
         // Hub pulls can supply older geometry
@@ -550,7 +574,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         // incomplete, untimed baseline, never fabricated historical metadata.
         const auto uuid = util::newUuid();
         Statement baseline(db, "INSERT INTO object_revisions(uuid,object_uuid,geometry_uuid,metadata_delta,metadata_complete,generation) VALUES(?,?,?,?,0,?)",
-            uuid, object);
+            parseUuid(uuid), parseUuid(object));
         if (geometry) baseline.bind(3, parseUuid(*geometry)); else baseline.bindNull(3);
         auto record = currentRecord(db, object);
         if (epoch) { record["lifecycle_epoch"] = *epoch; record["retired"] = false; }
@@ -564,26 +588,26 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
                 importedBindings ? std::optional(epochs.first) : std::nullopt);
             const auto bPin = edge.bPin ? *edge.bPin : pin(edge.record->bUuid, edge.bGeometry,
                 importedBindings ? std::optional(epochs.second) : std::nullopt);
-            execute(db, "INSERT INTO relationship_revisions VALUES(?,?,?,?,?,?,?,?)", edge.version, edge.uuid,
-                edgeToJson(*edge.record, nullptr, false).dump(), aPin, bPin, edge.aGeometry, edge.bGeometry, writeGeneration(db));
+            execute(db, "INSERT INTO relationship_revisions VALUES(?,?,?,?,?,?,?,?)", parseUuid(edge.version), parseUuid(edge.uuid),
+                edgeToJson(*edge.record, nullptr, false).dump(), sqlReference(aPin), sqlReference(bPin), sqlReference(edge.aGeometry), sqlReference(edge.bGeometry), writeGeneration(db));
             const auto a = metadata(db, aPin);
             const auto b = metadata(db, bPin);
             bindLifecycle(db, *edge.record, a.value("lifecycle_epoch", ""), b.value("lifecycle_epoch", ""));
         }
         for (const auto& owner : edge.owners) {
             if(externalEndpointKey(db,owner)){
-                execute(db,"DELETE FROM object_relationship_heads WHERE object_uuid=? AND edge_uuid=?",owner,edge.uuid);
-                if(edge.record)execute(db,"INSERT INTO object_relationship_heads VALUES(?,?,?)",owner,edge.uuid,edge.version);
+                execute(db,"DELETE FROM object_relationship_heads WHERE object_uuid=? AND edge_uuid=?",parseUuid(owner),parseUuid(edge.uuid));
+                if(edge.record)execute(db,"INSERT INTO object_relationship_heads VALUES(?,?,?)",parseUuid(owner),parseUuid(edge.uuid),parseUuid(edge.version));
                 continue;
             }
             const auto& p = objects.at(owner);
             if (!p.exists) continue;
-            Statement delta(db, "INSERT INTO object_relationship_deltas VALUES(?,?,?)", p.uuid, edge.uuid);
-            if (edge.record) delta.bind(3, edge.version); else delta.bindNull(3);
+            Statement delta(db, "INSERT INTO object_relationship_deltas VALUES(?,?,?)", parseUuid(p.uuid), parseUuid(edge.uuid));
+            if (edge.record) delta.bind(3, parseUuid(edge.version)); else delta.bindNull(3);
             delta.stepDone();
-            execute(db, "DELETE FROM object_relationship_heads WHERE object_uuid=? AND edge_uuid=?", owner, edge.uuid);
+            execute(db, "DELETE FROM object_relationship_heads WHERE object_uuid=? AND edge_uuid=?", parseUuid(owner), parseUuid(edge.uuid));
             if (edge.record) {
-                execute(db, "INSERT INTO object_relationship_heads VALUES(?,?,?)", owner, edge.uuid, edge.version);
+                execute(db, "INSERT INTO object_relationship_heads VALUES(?,?,?)", parseUuid(owner), parseUuid(edge.uuid), parseUuid(edge.version));
             }
         }
     }
@@ -604,10 +628,10 @@ std::optional<ObjectRevision> ObjectStore::objectRevision(const Txn& txn, const 
     }
     const auto canonical = formatUuid(parseUuid(uuid));
     Statement s(db, "SELECT object_uuid,parent_uuid,geometry_uuid,seq,metadata_complete,published_at_us,deleted,generation "
-        "FROM object_revisions WHERE uuid=?", canonical);
+        "FROM object_revisions WHERE uuid=?", parseUuid(canonical));
     if (!s.row()) return std::nullopt;
     ObjectRevision result;
-    result.uuid = canonical; result.objectUuid = s.text(0); result.parentUuid = s.optText(1);
+    result.uuid = canonical; result.objectUuid = formatUuid(s.blob16(0)); result.parentUuid = optionalUuid(s,1);
     result.geometryRevision = optionalUuid(s, 2); result.sequence = s.i64(3);
     result.metadataComplete = s.i64(4) != 0;
     if (!s.isNull(5)) result.publishedAtUs = s.i64(5);
@@ -629,9 +653,9 @@ std::vector<ObjectRevision> ObjectStore::objectHistory(const Txn& txn, const std
 {
     requireHistory(static_cast<sqlite3*>(connection(txn)));
     Statement s(static_cast<sqlite3*>(connection(txn)), "SELECT uuid FROM object_revisions WHERE object_uuid=? ORDER BY seq",
-        formatUuid(parseUuid(object)));
+        parseUuid(object));
     std::vector<ObjectRevision> result;
-    while (s.row()) result.push_back(*objectRevision(txn, s.text(0)));
+    while (s.row()) result.push_back(*objectRevision(txn, formatUuid(s.blob16(0))));
     return result;
 }
 
@@ -646,8 +670,8 @@ RevisionSelection ObjectStore::revisionSelectionAt(const Txn& txn, int64_t publi
         publishedAtUs);
     RevisionSelection result;
     while (s.row())
-        if (includeRetired || !objectRevision(txn, s.text(1))->record.retired)
-            result.emplace(s.text(0), s.text(1));
+        if (includeRetired || !objectRevision(txn, formatUuid(s.blob16(1)))->record.retired)
+            result.emplace(formatUuid(s.blob16(0)), formatUuid(s.blob16(1)));
     return result;
 }
 

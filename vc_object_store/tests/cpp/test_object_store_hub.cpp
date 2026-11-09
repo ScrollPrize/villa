@@ -1,5 +1,6 @@
 #include "TestSupport.hpp"
 #include "HubTestSupport.hpp"
+#include "UuidStorageTest.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
@@ -189,7 +190,8 @@ int main() try
     acquireLeases(alice, {a});
     setNote(alice, a, "2");
     require(hubPush(alice).pushed == 1, "push before simulated crash");
-    sql(alicePath, "INSERT INTO hub_pending VALUES('" + a + "',7,0);DELETE FROM hub_versions WHERE record_uuid='" + a + "';");
+    auto compactA=a;std::erase(compactA,'-');
+    sql(alicePath, "INSERT INTO hub_pending VALUES(X'" + compactA + "',7,0);DELETE FROM hub_versions WHERE record_uuid=X'" + compactA + "';");
     report = hubPush(alice);
     require(report.pushed == 0 && report.conflicts.empty() && hubStatus(alice)->pending.empty(), "idempotent retry");
 
@@ -375,6 +377,7 @@ int main() try
         hubSync(alice);
     }
 
+    for(auto* store:{&alice,&bob}){auto read=store->read();requireBinaryUuidStorage(*store,read);}
     // Detaching leaves an ordinary store.
     { auto closing = std::move(bob); }
     detachHub(bobPath, "bob");

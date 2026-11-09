@@ -47,7 +47,7 @@ int main() try {
     {auto r=overlay.read();owner=overlay.uuid(r);}
     {
         auto raw=ObjectStore::open(overlayPath,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});auto r=raw.read();
-        Statement record(ObjectStoreImplAccess::conn(r),"SELECT uuid,deleted FROM objects");
+        Statement record(ObjectStoreImplAccess::conn(r),"SELECT uuid,state FROM objects");
         require(record.row()&&formatUuid(record.blob16(0))==a.objectUuid&&record.i64(1)==0&&!record.row(),
             "changed inherited record must be stored once at its original UUID");
     }

@@ -77,7 +77,7 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
 std::optional<EdgeRecord> ObjectStore::edgeByUuid(const Txn& txn, const std::string& uuid) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=? AND deleted=0", parseUuid(uuid));
+    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=? AND state=0", parseUuid(uuid));
     if (!s.row()) return std::nullopt;
     return readEdgeRow(db, s);
 }
@@ -87,10 +87,10 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
     const auto bytes = parseUuid(uuid);
-    Statement row(db, "SELECT id,kind FROM edges WHERE uuid=? AND deleted=0", bytes);
+    Statement row(db, "SELECT id,kind FROM edges WHERE uuid=? AND state=0", bytes);
     if (!row.row()) throw std::runtime_error("object store: edge not found: " + uuid);
     const auto kind = row.text(1);
-    execute(db,"UPDATE edges SET deleted=1,generation=?,changed_by=?,changed_at=?,changed_host=? WHERE id=?",
+    execute(db,"UPDATE edges SET state=2,generation=?,changed_by=?,changed_at=?,changed_host=? WHERE id=?",
         writeGeneration(db),author(),nowIsoUtc(),hostname(),row.i64(0));
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge", kind);
     savepoint.release();
@@ -101,10 +101,10 @@ std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& 
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     const auto key=parseUuid(objectUuid);
     if(!objectIdByUuid(db,key)) {
-        Statement present(db,"SELECT 1 FROM edges WHERE deleted=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
+        Statement present(db,"SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
         if(!present.row())throw std::runtime_error("object store: object not found: "+objectUuid);
     }
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE deleted=0 AND (a_uuid=? OR b_uuid=?)" +
+    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE state=0 AND (a_uuid=? OR b_uuid=?)" +
         (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id", key, key);
     return readEdgeRows(db, s);
 }
@@ -112,7 +112,7 @@ std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& 
 std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::string& edgeKind, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE deleted=0 AND kind=?" +
+    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE state=0 AND kind=?" +
         (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id", edgeKind);
     return readEdgeRows(db, s);
 }
@@ -123,7 +123,7 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
     validateEdgeSelection(selection);
     const bool candidates = endpointIds || selection.endpointUuids || selection.uuids || selection.tag;
     std::string sql = "SELECT " + columns + " FROM edges" +
-        (candidates ? " NOT INDEXED" : "") + " WHERE deleted=0";
+        (candidates ? " NOT INDEXED" : "") + " WHERE state=0";
     if (!selection.includeRetired) sql += " AND " + activeEdgeSql();
     sql += fiberAdjacencySql(selection.adjacent);
     std::vector<std::variant<std::string,std::vector<uint8_t>>> parameters;
@@ -143,7 +143,7 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
     if (endpointIds || selection.endpointUuids) {
         std::string members;
         if(endpointIds) {
-            members=" IN (SELECT uuid FROM objects WHERE deleted=0 AND id IN (SELECT value FROM json_each("+
+            members=" IN (SELECT uuid FROM objects WHERE state<>2 AND id IN (SELECT value FROM json_each("+
                 parameter(nlohmann::json(*endpointIds).dump())+")))";
         } else {
             std::vector<uint8_t> keys;keys.reserve(selection.endpointUuids->size()*16);

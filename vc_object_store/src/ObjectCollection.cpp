@@ -75,7 +75,9 @@ std::filesystem::path resolve(const std::filesystem::path& parent,const std::str
     if(ref.starts_with("@packed:")) return resolvePackedDatabasePath(parent,ref);
     if(isPackedDatabasePath(ref)) throw std::runtime_error("collection: nonportable packed member locator");
     const auto base=isPackedDatabasePath(parent)?packedContainerPath(parent):parent;
-    return normalized(std::filesystem::path(ref).is_absolute()?std::filesystem::path(ref):base.parent_path()/ref);
+    // Resolve external paths lexically. Opening/identifying a packed file here
+    // would throw before the configured relocation candidates can be tried.
+    return std::filesystem::absolute(std::filesystem::path(ref).is_absolute()?std::filesystem::path(ref):base.parent_path()/ref).lexically_normal();
 }
 std::string locator(const std::filesystem::path& parent,const std::filesystem::path& target) {
     if(isBuildingPackedDatabasePath(parent)&&isBuildingPackedDatabasePath(target)) {
@@ -88,7 +90,8 @@ std::string locator(const std::filesystem::path& parent,const std::filesystem::p
         // The manifest separately stores database_uuid; the resolver selects it.
         const auto container=packedContainerPath(target);
         const auto base=isPackedDatabasePath(parent)?packedContainerPath(parent):parent;
-        return container.lexically_relative(base.parent_path()).generic_string();
+        const auto relative=container.lexically_relative(base.parent_path());
+        return (relative.empty()?container:relative).generic_string();
     }
     const auto base=isPackedDatabasePath(parent)?packedContainerPath(parent):parent;
     auto relative=target.lexically_relative(base.parent_path());
@@ -352,9 +355,47 @@ const Txn& ObjectCollection::Impl::txn(const CollectionTxn& t,size_t n)const{
 WriteTxn& ObjectCollection::Impl::writer(CollectionTxn& t){check(t);if(!t.writable())throw std::runtime_error("collection: read-only transaction");if(t.impl_->producingInitialEdges)throw std::runtime_error("collection: initial edge producer cannot mutate the destination");return std::get<WriteTxn>(t.impl_->root);}
 
 void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,const std::optional<CollectionMember>& expected,std::set<std::string>& visiting,sqlite3* existingRoot) {
-    auto path=normalized(input); auto opt=options;opt.physicalPartitionOnly=true;if(!root)opt.readOnly=true;
+    auto path=input;auto opt=options;opt.physicalPartitionOnly=true;if(!root)opt.readOnly=true;
     std::unique_ptr<ObjectStore> store;std::unique_ptr<ReadTxn> read;
-    if(!existingRoot){store=std::make_unique<ObjectStore>(ObjectStore::open(path,opt));read=std::make_unique<ReadTxn>(store->read());}
+    if(expected&&!existingRoot){
+        // Reuse the successful candidate's connection/snapshot. This is file
+        // discovery by the pinned database identity, never per-object routing.
+        std::set<std::filesystem::path> attempted;std::string directError;
+        const auto attempt=[&](const std::filesystem::path& candidate){
+            std::filesystem::path selected;
+            try{
+                if(isPackedDatabasePath(candidate))selected=candidate;
+                else if(isPackedStore(candidate))selected=packedDatabasePath(candidate,expected->databaseUuid);
+                else selected=std::filesystem::absolute(candidate).lexically_normal();
+                if(!attempted.insert(selected).second)return false;
+                auto opened=std::make_unique<ObjectStore>(ObjectStore::open(selected,opt));
+                auto snapshot=std::make_unique<ReadTxn>(opened->read());auto* candidateSql=ObjectStoreImplAccess::conn(*snapshot);
+                Statement pin(candidateSql,"SELECT s.uuid,d.uuid,m.generation,m.sealed FROM store_identity s,database_identity d,store_manifest m");
+                if(!pin.row()||formatUuid(pin.blob16(0))!=expected->storeUuid||formatUuid(pin.blob16(1))!=expected->databaseUuid||
+                   pin.i64(2)!=expected->generation||pin.i64(3)==0||
+                   (expected->partition&&(reservation(candidateSql,"objects")!=expected->objectIds||reservation(candidateSql,"edges")!=expected->edgeIds)))
+                    throw std::runtime_error("dependency identity/generation/sealed policy/reservation mismatch");
+                path=std::move(selected);store=std::move(opened);read=std::move(snapshot);return true;
+            }catch(const std::bad_alloc&){throw;}
+            catch(const std::exception& error){if(directError.empty())directError=error.what();return false;}
+        };
+        bool found=attempt(input);
+        for(const auto& candidate:options.linkedStoreFiles)if(!found)found=attempt(candidate);
+        for(const auto& directory:options.linkedStoreDirectories){
+            if(found)break;
+            std::vector<std::filesystem::path> candidates;std::error_code error;
+            for(std::filesystem::directory_iterator it(directory,error),end;!error&&it!=end;it.increment(error)){
+                std::error_code statusError;if(it->is_regular_file(statusError)&&!statusError)candidates.push_back(it->path());
+            }
+            std::sort(candidates.begin(),candidates.end());
+            for(const auto& candidate:candidates)if(attempt(candidate)){found=true;break;}
+        }
+        if(!found)throw std::runtime_error("collection: cannot locate pinned dependency "+expected->databaseUuid+
+            " at "+input.string()+" or configured search locations: "+directError);
+    }else{
+        path=normalized(input);
+        if(!existingRoot){store=std::make_unique<ObjectStore>(ObjectStore::open(path,opt));read=std::make_unique<ReadTxn>(store->read());}
+    }
     auto* sql=existingRoot?existingRoot:ObjectStoreImplAccess::conn(*read);
     Statement header(sql,"SELECT s.uuid,d.uuid,m.generation,m.sealed FROM store_identity s,database_identity d,store_manifest m");
     if(!header.row())throw std::runtime_error("collection: absent manifest identity");
@@ -375,8 +416,8 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
         Statement s(sql,"SELECT database_uuid,store_uuid,generation,locator,partition,object_low,object_high,edge_low,edge_high FROM collection_members ORDER BY ordinal");
         while(s.row()){
             CollectionMember child{formatUuid(s.blob16(0)),formatUuid(s.blob16(1)),s.i64(2),resolve(path,s.text(3)),s.i64(4)!=0,{s.i64(5),s.i64(6)},{s.i64(7),s.i64(8)}};
-            // For an external packed file, select its declared physical member.
-            if(!s.text(3).starts_with("@packed:")&&isPackedDatabasePath(child.locator))child.locator=packedDatabasePath(packedContainerPath(child.locator),child.databaseUuid);
+            // load() identifies external packed files and selects the pinned
+            // physical member while trying the recorded/search locators.
             if(child.partition?(child.storeUuid!=member.storeUuid||child.generation!=member.generation):
                                (child.storeUuid==member.storeUuid||child.generation>=member.generation))
                 throw std::runtime_error("collection: invalid dependency generation/ownership ordering");
@@ -428,9 +469,9 @@ std::optional<ObjectCollection::Impl::Located> ObjectCollection::Impl::locateSql
     // UUID is the complete key. The first present row wins, including deletion.
     for(const auto n:uuidReadOrder(key.objectUuid,"objects"))if(n>=start&&(!eligible||eligible(n))){
         auto* sql=get(n);
-        Statement state(sql,"SELECT deleted FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
+        Statement state(sql,"SELECT state FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
         if(!state.row())continue;
-        if(state.i64(0))return {};
+        if(state.i64(0)==2)return {};
         Statement row(sql,std::string("SELECT ")+kObjectCols+" FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
         if(!row.row())throw std::runtime_error("collection: object disappeared inside a read snapshot");
         return Located{n,key.objectUuid,readObjectRow(sql,row)};
@@ -488,7 +529,8 @@ ObjectCollection ObjectCollection::open(const std::filesystem::path& path,const 
 }
 ObjectCollection ObjectCollection::create(const std::filesystem::path& path,const std::vector<std::filesystem::path>& bases,const OpenOptions& options){
     std::vector<CollectionMember> members;int64_t generation=1;
-    for(const auto& base:bases){auto c=open(base,OpenOptions{.readOnly=true});auto t=c.read();auto p=c.provisioning(t);
+    auto readOptions=options;readOptions.readOnly=true;
+    for(const auto& base:bases){auto c=open(base,readOptions);auto t=c.read();auto p=c.provisioning(t);
         if(!p.sealed)throw std::runtime_error("collection: base must be sealed");
         if(p.generation>=INT64_MAX-1)throw std::runtime_error("collection: dependency generation exhausted");
         generation=std::max(generation,p.generation);members.push_back(c.impl_->nodes[0].member);
@@ -499,7 +541,7 @@ ObjectCollection ObjectCollection::create(const std::filesystem::path& path,cons
      int64_t i=0;for(const auto& m:members){if(m.storeUuid==store.uuid(w))throw std::runtime_error("collection: overlay needs an independent store UUID");
          insertMember(db,i++,m,locator(normalized(path),m.locator));}
      w.commit();store.checkpoint();}
-    {auto verified=open(staged.path,OpenOptions{.readOnly=true});}
+    {auto verified=open(staged.path,readOptions);}
     staged.publish();
     return open(path,options);
 }
@@ -509,7 +551,8 @@ ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::
     // This path is private to the initial builder, which owns staging and
     // publication. No intermediate writable store is published or reopened.
     std::vector<CollectionMember> members;int64_t generation=options.initialGeneration;
-    for(const auto& base:bases){auto c=ObjectCollection::open(base,OpenOptions{.readOnly=true});auto r=c.read();
+    auto readOptions=options;readOptions.readOnly=true;
+    for(const auto& base:bases){auto c=ObjectCollection::open(base,readOptions);auto r=c.read();
         const auto p=c.provisioning(r);if(!p.sealed||p.generation>=INT64_MAX-1)
             throw std::runtime_error("initial collection needs sealed, non-exhausted dependencies");
         generation=std::max(generation,p.generation);members.push_back(c.impl_->nodes[0].member);}
@@ -549,8 +592,9 @@ void detail::InitialCollectionAccess::writeManifest(const std::filesystem::path&
 }
 ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& path,const std::vector<std::filesystem::path>& shards,const OpenOptions& options,const std::vector<KeyRoute>& requestedRoutes){
     if(shards.empty())throw std::runtime_error("collection: empty shard list");
+    auto readOptions=options;readOptions.readOnly=true;
     std::vector<CollectionMember> members;for(const auto& shard:shards){
-        auto c=open(shard,OpenOptions{.readOnly=true});auto t=c.read();if(!c.provisioning(t).sealed)throw std::runtime_error("collection: unpublished shard");
+        auto c=open(shard,readOptions);auto t=c.read();if(!c.provisioning(t).sealed)throw std::runtime_error("collection: unpublished shard");
         // A physical partition may itself have immutable dependencies (for
         // example relation-only shards referencing a geometry collection).
         // Its own content still resides in one independent SQLite database.
@@ -579,7 +623,7 @@ ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& pa
     StagedDatabase staged(path,packed);const auto& stage=staged.path;
     {auto store=ObjectStore::create(stage,opt);writeShardManifest(store,normalized(path),members,routes);}
     // Validate all targets and the routing map before the publication name exists.
-    {auto verified=open(stage,OpenOptions{.readOnly=true});}
+    {auto verified=open(stage,readOptions);}
     staged.publish();
     auto readonly=options;readonly.readOnly=true;return open(path,readonly);
 }
@@ -680,9 +724,9 @@ std::vector<CollectionEdge> ObjectCollection::edgesByKind(const CollectionTxn& t
 std::optional<CollectionEdge> ObjectCollection::edge(const CollectionTxn& t,const ObjectKey& input)const{
     const auto key=canonical(input);
     for(const auto n:impl_->uuidReadOrder(key.objectUuid,"edges")){
-        Statement state(impl_->db(t,n),"SELECT deleted FROM edges WHERE uuid=?",parseUuid(key.objectUuid));
+        Statement state(impl_->db(t,n),"SELECT state FROM edges WHERE uuid=?",parseUuid(key.objectUuid));
         if(!state.row())continue;
-        if(state.i64(0))return {};
+        if(state.i64(0)==2)return {};
         auto r=impl_->nodes[n].store->edgeByUuid(impl_->txn(t,n),key.objectUuid);
         if(!r)throw std::runtime_error("collection: edge disappeared inside read snapshot");
         auto result=impl_->edge(t,n,std::move(*r));

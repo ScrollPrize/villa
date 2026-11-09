@@ -32,7 +32,7 @@ class ResidentSpatialIndex {
 public:
     bool load(sqlite3* db, size_t budget) {
         {
-            Statement states(db, "SELECT uuid FROM objects WHERE retired=1 OR deleted=1");
+            Statement states(db, "SELECT uuid FROM objects WHERE state<>0");
             while (states.row()) {
                 retired_.insert(formatUuid(states.blob16(0)));
                 if (retired_.size() > budget / 128) return false;

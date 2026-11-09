@@ -262,7 +262,7 @@ EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string
     // A caller explicitly inserting this UUID may replace its deletion marker.
     // Merely reviving an endpoint never reactivates relationships. Historical
     // relationship revisions retain the earlier state independently.
-    execute(db,"DELETE FROM edges WHERE uuid=? AND deleted=1",parseUuid(rec.uuid));
+    execute(db,"DELETE FROM edges WHERE uuid=? AND state=2",parseUuid(rec.uuid));
     const auto id=allocateRecordId(db,"edges");
     insertEdgeRow(db,rec,id,writeGeneration(db),author,host,nowIsoUtc(),preserveRecord);
     if (preserveRecord) restoreCommon(db, "edges", rec);

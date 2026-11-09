@@ -1,4 +1,5 @@
 #include "TestSupport.hpp"
+#include "UuidStorageTest.hpp"
 #include "internal/ExternalEndpoint.hpp"
 #include "internal/History.hpp"
 #include "internal/RecordSql.hpp"
@@ -34,7 +35,7 @@ int main() try {
         record.aAnchor.metadataKeys={"quality"};edge=store.addEdge(txn,record);txn.commit();
     }
     {
-        auto txn=store.read();install(txn);auto* db=ObjectStoreImplAccess::conn(txn);
+        auto txn=store.read();install(txn);auto* db=ObjectStoreImplAccess::conn(txn);requireBinaryUuidStorage(store,txn);
         Statement objects(db,"SELECT (SELECT count(*) FROM objects),(SELECT count(*) FROM object_revisions),(SELECT count(*) FROM object_head_records)");objects.row();
         require(objects.i64(0)==0&&objects.i64(1)==0&&objects.i64(2)==0,"external edges never fabricate objects or histories");
         const auto pinned=store.currentObjectRevision(txn,a);require(pinned&&pinned->uuid==externalEndpointToken(owner,a,7),"external endpoint has sealed version token");

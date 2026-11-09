@@ -7,6 +7,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <variant>
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 namespace vc::objects { struct StatementPool; struct CurrentWriteState; }
@@ -38,6 +39,9 @@ public:
     // until replaced, clear/reset(), or destruction. Never pass a temporary.
     void bindBorrowedText(int i, const std::string& v);
     void bind(int i, std::span<const uint8_t> bytes);
+    template<class... T> void bind(int i, const std::variant<T...>& value) {
+        std::visit([&](const auto& item){bind(i,item);},value);
+    }
     template<class T> void bind(int i, const std::optional<T>& value) {
         if (value) bind(i, *value); else bindNull(i);
     }

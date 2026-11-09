@@ -41,8 +41,10 @@ void nativeChanges(HistoryMode history)
         auto txn=store.read();auto* sql=ObjectStoreImplAccess::conn(txn);
         detail::Statement removed(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN ('object_lifecycle','retired_objects')");
         require(removed.row()&&removed.i64(0)==0,"lifecycle has no separate table or index");
-        detail::Statement columns(sql,"SELECT count(*) FROM pragma_table_info('objects') WHERE name IN ('retired','lifecycle_epoch')");
+        detail::Statement columns(sql,"SELECT count(*) FROM pragma_table_info('objects') WHERE name IN ('state','lifecycle_epoch')");
         require(columns.row()&&columns.i64(0)==2,"lifecycle state is directly on objects");
+        detail::Statement oldColumns(sql,"SELECT count(*) FROM pragma_table_info('objects') WHERE name IN ('retired','deleted')");
+        require(oldColumns.row()&&oldColumns.i64(0)==0,"one state replaces independent lifecycle flags");
         require(!store.replicaUuid(txn).empty(),"ordinary editable store retains its sync identity");
     }
     const auto a = util::newUuid(), b = util::newUuid();
@@ -126,10 +128,10 @@ void nativeChanges(HistoryMode history)
                 "deleted objects and relations are absent from current UUID lookups");
         require(store.objectCount(txn,"fiber",true)==1&&store.edgesOf(txn,a,true).empty(),
                 "include-retired queries do not expose deleted records");
-        detail::Statement object(sql,"SELECT deleted,generation FROM objects WHERE uuid=?",detail::parseUuid(b));
-        require(object.row()&&object.i64(0)==1&&object.i64(1)==4,"object deletion is an ordinary stamped tombstone");
-        detail::Statement relation(sql,"SELECT deleted,generation,a_uuid,b_uuid FROM edges WHERE uuid=?",detail::parseUuid(edge));
-        require(relation.row()&&relation.i64(0)==1&&relation.i64(1)==4,"edge deletion is an ordinary stamped tombstone");
+        detail::Statement object(sql,"SELECT state,generation FROM objects WHERE uuid=?",detail::parseUuid(b));
+        require(object.row()&&object.i64(0)==2&&object.i64(1)==4,"object deletion is an ordinary stamped tombstone");
+        detail::Statement relation(sql,"SELECT state,generation,a_uuid,b_uuid FROM edges WHERE uuid=?",detail::parseUuid(edge));
+        require(relation.row()&&relation.i64(0)==2&&relation.i64(1)==4,"edge deletion is an ordinary stamped tombstone");
         const auto first=detail::formatUuid(relation.blob16(2)),second=detail::formatUuid(relation.blob16(3));
         require((first==a&&second==b)||(first==b&&second==a),"tombstones retain original endpoint UUIDs");
     }

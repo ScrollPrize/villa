@@ -12,21 +12,21 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto key=parseUuid(objectUuid);
-    Statement own(db,"SELECT deleted FROM objects WHERE uuid=?",key);
-    if(own.row()) {if(own.i64(0))return {};}
-    else {Statement known(db,"SELECT 1 FROM edges WHERE deleted=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
+    Statement own(db,"SELECT state FROM objects WHERE uuid=?",key);
+    if(own.row()) {if(own.i64(0)==2)return {};}
+    else {Statement known(db,"SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
         if(!known.row())throw std::runtime_error("object store: object not found: "+objectUuid);
         if(!includeRetired&&externalEndpointRecord(db,objectUuid).retired)return {};
     }
     if (applicableOnly) requirePublishedGraphRead(txn);
-    const std::string filter = " AND deleted=0" + fiberAdjacencySql(adjacentFilter) +
+    const std::string filter = " AND state=0" + fiberAdjacencySql(adjacentFilter) +
         (edgeKind ? std::string(" AND kind=?2") : " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'") +
         (includeRetired ? "" : " AND " + activeEdgeSql());
     // Filter before deduplication: a rejected parallel edge must not hide a
     // later applicable edge to the same neighbour. Preserve first-edge order.
     std::string sql = "SELECT e.neighbour,e.uuid,owned.id,owned.kind FROM (SELECT id,uuid,b_uuid AS neighbour FROM edges INDEXED BY edges_a WHERE a_uuid=?1" + filter +
         " UNION SELECT id,uuid,a_uuid AS neighbour FROM edges INDEXED BY edges_b WHERE b_uuid=?1" + filter +
-        ") e LEFT JOIN objects owned ON owned.uuid=e.neighbour WHERE coalesce(owned.deleted,0)=0";
+        ") e LEFT JOIN objects owned ON owned.uuid=e.neighbour WHERE coalesce(owned.state,0)<>2";
     sql += " ORDER BY e.id";
     Statement rows(db, sql, key);
     if (edgeKind) rows.bind(2, *edgeKind);
@@ -92,16 +92,16 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
             const_cast<std::atomic_bool*>(cancel));
     const auto startBytes = parseUuid(startUuid);
     auto active=[&](const std::string& uuid) {
-        Statement local(db,"SELECT deleted,retired FROM objects WHERE uuid=?",parseUuid(uuid));
-        if(local.row())return !local.i64(0)&&(includeRetired||!local.i64(1));
+        Statement local(db,"SELECT state FROM objects WHERE uuid=?",parseUuid(uuid));
+        if(local.row())return local.i64(0)!=2&&(includeRetired||local.i64(0)==0);
         return includeRetired||!externalEndpointRecord(db,uuid).retired;
     };
-    Statement known(db,"SELECT 1 FROM objects WHERE uuid=?1 UNION ALL SELECT 1 FROM edges WHERE deleted=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",startBytes);
+    Statement known(db,"SELECT 1 FROM objects WHERE uuid=?1 UNION ALL SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",startBytes);
     if(!known.row())throw std::runtime_error("object store: object not found: "+startUuid);
     if(!active(startUuid))return {};
     // Probe the endpoint indexes only for nodes reached by this traversal.
     // Visit neighbours in stable internal-ID order.
-    std::string filter=" AND deleted=0";
+    std::string filter=" AND state=0";
     if (!edgeKindFilter.empty()) {
         filter += " AND kind IN (";
         for (size_t i = 0; i < edgeKindFilter.size(); ++i)

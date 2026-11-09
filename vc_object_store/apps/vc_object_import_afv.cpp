@@ -5,6 +5,9 @@
 #include "vc_object_store/Uuid.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "support/SqliteMutexProfile.hpp"
+#include "support/ShardQueue.hpp"
+#include "support/ProcessMetrics.hpp"
+#include "imports/AfvRecords.hpp"
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <climits>
@@ -17,9 +20,6 @@
 #include <mutex>
 #include <csignal>
 #include <sqlite3.h>
-#ifndef _WIN32
-#include <sys/resource.h>
-#endif
 
 using namespace vc::objects;
 using Json = nlohmann::json;
@@ -28,64 +28,13 @@ using Clock = std::chrono::steady_clock;
 volatile std::sig_atomic_t cancelled=0;
 void cancelImport(int) { cancelled=1; }
 void checkCancelled(const std::atomic<bool>* failed=nullptr) { if(cancelled || (failed && failed->load()))throw std::runtime_error("import cancelled"); }
-struct CancelPeersOnFailure {
-    std::atomic<bool>& failed;
-    int exceptions=std::uncaught_exceptions();
-    ~CancelPeersOnFailure(){if(std::uncaught_exceptions()>exceptions)failed=true;}
-};
-Json collectWorkers(std::vector<std::future<Json>>& workers)
-{
-    Json results=Json::array();std::exception_ptr failure,cancellation;
-    for(auto& worker:workers){
-        try{results.push_back(worker.get());}
-        catch(const std::exception& error){
-            if(std::string_view(error.what())=="import cancelled")cancellation=std::current_exception();
-            else if(!failure)failure=std::current_exception();
-        }
-        catch(...){if(!failure)failure=std::current_exception();}
-    }
-    if(failure)std::rethrow_exception(failure);
-    if(cancellation)std::rethrow_exception(cancellation);
-    return results;
-}
 double seconds(Clock::time_point start) { return std::chrono::duration<double>(Clock::now()-start).count(); }
-Json peakRssBytes()
-{
-#ifndef _WIN32
-    rusage usage{};
-    if(getrusage(RUSAGE_SELF,&usage)==0){
-#ifdef __APPLE__
-        return int64_t(usage.ru_maxrss);
-#else
-        return int64_t(usage.ru_maxrss)*1024;
-#endif
-    }
-#endif
-    return nullptr;
-}
 OpenOptions readOptions(const Json& config)
 {
     OpenOptions options;options.readOnly=true;options.readerPoolSize=1;
     options.geometryCacheBytes=0;options.spatialCacheBytes=0;
     options.sqliteCacheBytes=config.value("sqlite_cache_bytes",options.sqliteCacheBytes);
     return options;
-}
-GeometryData geometry(const AfvFiber& fiber)
-{
-    GeometryData g; g.kind="fiber";
-    // Empty native arrays declare that the source has NO controls; no endpoints
-    // or other artificial samples are introduced. Only line_points has payload.
-    g.arrays={{"control_points","<f8",{0,3},{}}, {"control_point_ids","<i8",{0},{}},
-              {"line_points","<f8",{fiber.detail.linePointCount,3},fiber.xyz}};
-    return g;
-}
-ObjectRecord recordFor(const AfvFiber& fiber,const std::string& sourceUuid,const Json& coordinates)
-{
-    ObjectRecord record;record.uuid=util::nameUuid(sourceUuid,"fiber:"+std::to_string(fiber.id));
-    record.kind="fiber";record.name=fiber.name;record.formatVersion=4;record.fiber=fiber.detail;
-    record.meta=Json({{"coordinates",coordinates},{"source",{{"afv",{{"collection_uuid",sourceUuid},
-        {"fiber_id",fiber.id},{"annotation",Json::parse(fiber.annotation)}}}}}}).dump();
-    return record;
 }
 template<class Read>
 void verifyFiberData(const ObjectRecord* record,bool hasGeometry,const AfvFiber& fiber,Read&& read)
@@ -100,28 +49,33 @@ void verifyFiberData(const ObjectRecord* record,bool hasGeometry,const AfvFiber&
 Json importNative(const Json& config,const std::filesystem::path& input,const std::filesystem::path& output,
                   const Json& coordinates,AfvSource& source,int64_t limit)
 {
+    using namespace vc::objects::imports;
     const bool linked=config.contains("geometry_collection"),hasEdges=config.contains("constraints");
-    const auto edgeLimit=config.value("constraint_limit",int64_t(0));
-    const auto workers=config.value("shards",1);
-    const auto batchSize=config.value("batch_size",size_t(1024));
-    const auto batchBytes=config.value("batch_bytes",size_t(64*1024*1024));
-    if(workers<1||workers>256||edgeLimit<0||!batchSize||batchSize>1000000||!batchBytes)
-        throw std::invalid_argument("invalid initial import limits");
+    const auto integerOption=[&](const char* key,uint64_t fallback,uint64_t maximum,bool allowZero=false){
+        const auto it=config.find(key);if(it==config.end())return fallback;
+        if(!it->is_number_integer()||(!it->is_number_unsigned()&&it->get<int64_t>()<0))
+            throw std::invalid_argument(std::string("invalid nonnegative integer option: ")+key);
+        const auto value=it->get<uint64_t>();
+        if((!allowZero&&!value)||value>maximum)throw std::invalid_argument(std::string("option outside supported range: ")+key);
+        return value;
+    };
+    const auto sizeLimit=std::min<uint64_t>(std::numeric_limits<size_t>::max(),INT64_MAX);
+    const int workers=int(integerOption("shards",1,256)),readers=int(integerOption("readers",std::min(workers,8),256));
+    const auto edgeLimit=int64_t(integerOption("constraint_limit",0,INT64_MAX,true));
+    const size_t batchSize=integerOption("batch_size",1024,1000000);
+    const size_t batchBytes=integerOption("batch_bytes",8*1024*1024,sizeLimit);
+    const size_t queueBytes=integerOption("queue_bytes",256*1024*1024,sizeLimit);
     if(linked&&!hasEdges)throw std::invalid_argument("geometry_collection requires constraints");
     const auto start=Clock::now();const auto sourceUuid=source.uuid();
-    const auto afvMetadata=source.metadataJson();
+    const auto fiberRanges=linked?std::vector<std::array<int64_t,2>>{}:source.idRanges(readers,limit);
+    const int64_t fiberEnd=!linked&&limit&&!fiberRanges.empty()?fiberRanges.back()[1]:INT64_MAX;
     std::unique_ptr<AfcSource> edgeSource;
-    if(linked)edgeSource=std::make_unique<AfcSource>(config.at("constraints").get<std::string>(),sourceUuid);
-    const auto ranges=linked?edgeSource->idRanges(workers,edgeLimit):source.idRanges(workers,limit);
-    if(ranges.empty())throw std::invalid_argument("initial import source is empty");
-    if(!linked&&hasEdges&&ranges.size()>1)
-        throw std::invalid_argument("combined geometry/constraint import requires one shard; use a sealed geometry_collection for relation shards");
-    if(!linked&&hasEdges)edgeSource=std::make_unique<AfcSource>(config.at("constraints").get<std::string>(),sourceUuid,
-        limit?ranges.back()[1]:INT64_MAX);
+    std::vector<std::array<int64_t,2>> edgeRanges;
+    if(hasEdges){
+        edgeSource=std::make_unique<AfcSource>(config.at("constraints").get<std::string>(),sourceUuid,fiberEnd);
+        edgeRanges=edgeSource->idRanges(readers,edgeLimit);
+    }
     InitialImportOptions options;options.store.author=config.value("author",std::string("afv-import"));
-    // This streaming source partitions by AFV numeric ID ranges, not UUID hash.
-    // Do not advertise direct UUID routing until the producer is repartitioned.
-    options.uuidHashRouting=false;
     options.store.sqliteCacheBytes=config.value("sqlite_cache_bytes",options.store.sqliteCacheBytes);
     options.store.readerPoolSize=1;options.store.geometryCacheBytes=0;options.store.spatialCacheBytes=0;
     options.edges.deferIndexes=config.value("defer_indexes",true);
@@ -132,179 +86,212 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         options.packed->memoryFirst=config.value("memory_first",false);
         options.packed->backgroundFlush=config.value("background_flush",true);
     }
-    std::string fiberOwner;
-    if(linked){const auto base=std::filesystem::absolute(config.at("geometry_collection").get<std::string>());
-        options.dependencies={base};auto geometryStore=ObjectCollection::open(base,readOptions(config));auto t=geometryStore.read();fiberOwner=geometryStore.uuid(t);}
+    if(linked)options.dependencies={std::filesystem::absolute(config.at("geometry_collection").get<std::string>())};
     options.shards.clear();
-    for(size_t i=0;i<ranges.size();++i){
-        if(linked){constexpr int64_t reservation=int64_t(1)<<40;
-            options.shards.push_back({{int64_t(i)*reservation+1,int64_t(i+1)*reservation},{int64_t(i)*reservation+1,int64_t(i+1)*reservation}});
-        }else{
-            if(ranges[i][1]>INT64_MAX-2)throw std::invalid_argument("source IDs exceed native ID mapping range");
-            options.shards.push_back({{i?ranges[i][0]+2:1,ranges[i][1]+1},
-                hasEdges?std::array<int64_t,2>{1,INT64_MAX}:std::array<int64_t,2>{int64_t(i+1),int64_t(i+1)}});
-        }
-    }
-    struct Counts {int64_t fibers=0,points=0,metadata=0,edges=0,edgeMetadata=0,first=-1,last=-1;double read=0,insert=0,edgeRead=0,edgeInsert=0;};
-    std::vector<Counts> counts(ranges.size());std::vector<Json> phases(ranges.size());
-    std::atomic<int64_t> completedFibers{0},completedEdges{0};std::mutex progressMutex;auto progress=start;
-    const auto imported=importInitialCollection(output,options,[&](size_t i,InitialShardImport& shard){
-        auto& c=counts[i];detail::GeometryWork work;std::optional<detail::GeometryWorkScope> scope;
-        if(config.value("profile",false))scope.emplace(work);
-        auto workerProgress=Clock::now();
-        auto report=[&]{std::lock_guard lock(progressMutex);if(seconds(scope?workerProgress:progress)<5)return;
-            Json line={{"stage",linked?"relation_shard_import":"shard_import"},{"fibers",completedFibers.load()},
-                {"constraints",completedEdges.load()},{"shards",ranges.size()},{"elapsed_seconds",seconds(start)}};
-            if(scope){line["worker"]=i;line["worker_constraints"]=c.edges;line["source_read_seconds"]=linked?c.edgeRead:c.read;
-                line["native_import_seconds"]=linked?c.edgeInsert:c.insert;line["phase_nanoseconds"]=work.phaseNanoseconds;workerProgress=Clock::now();}
-            if(config.value("profile_sqlite_mutex",false)){line["worker"]=i;line["sqlite_mutex_profile"]=benchmark::sqlite_profile::snapshot();}
-            std::cout<<line.dump()<<std::endl;progress=Clock::now();};
-        if(i==0){ObjectRecord metadata;metadata.uuid=linked?shard.storeUuid():sourceUuid;metadata.kind="collection";
-            metadata.name=linked?"constraint-source":input.stem().string();
-            Json fields=linked?Json::object():Json{{"coordinates",coordinates},{"afv",{{"metadata",Json::parse(afvMetadata)}}}};
-            if(edgeSource)fields["afc"]=Json::parse(edgeSource->metadataJson());metadata.meta=fields.dump();
-            InitialObjectRecord row{std::move(metadata),linked?std::optional<int64_t>{}:std::optional<int64_t>{1},{}};
-            shard.appendObjects(std::span(&row,1));}
-        if(!linked){AfvSource part(input,ranges[i][0],ranges[i][1]);AfvFiber fiber;bool eof=false;
-            if(part.uuid()!=sourceUuid)throw std::runtime_error("AFV identity changed between partitions");
-            while(!eof){checkCancelled();const auto decode=Clock::now();std::vector<InitialObjectRecord> rows;size_t bytes=0;rows.reserve(batchSize);
-                while(rows.size()<batchSize&&bytes<batchBytes){if(!part.next(fiber)){eof=true;break;}
-                    auto r=recordFor(fiber,sourceUuid,coordinates);c.metadata+=r.meta.size();bytes+=fiber.xyz.size();
-                    rows.push_back({std::move(r),fiber.id+2,geometry(fiber)});
-                    ++c.fibers;c.points+=fiber.detail.linePointCount;if(c.first<0)c.first=fiber.id;c.last=fiber.id;
-                }
-                c.read+=seconds(decode);const auto writing=Clock::now();
-                if(!rows.empty()){shard.appendObjects(rows);completedFibers+=int64_t(rows.size());}
-                c.insert+=seconds(writing);report();
-            }
-        }
-        if(hasEdges){std::unique_ptr<AfcSource> partition;
-            if(linked)partition=std::make_unique<AfcSource>(config.at("constraints").get<std::string>(),sourceUuid,INT64_MAX,ranges[i][0],ranges[i][1]);
-            auto& part=linked?*partition:*edgeSource;
-            size_t pending=0;auto previous=Clock::now();EdgeRecord edge;
-            const auto count=shard.importEdges([&](std::vector<InitialCollectionEdge>& rows){
-                checkCancelled();if(pending){c.edgeInsert+=seconds(previous);c.edges+=int64_t(pending);completedEdges+=int64_t(pending);report();}
-                const auto decode=Clock::now();rows.reserve(batchSize);
-                while(rows.size()<batchSize&&(linked||!edgeLimit||c.edges+int64_t(rows.size())<edgeLimit)&&part.next(edge)){
-                    c.edgeMetadata+=edge.meta.size();const auto& owner=linked?fiberOwner:shard.storeUuid();
-                    ObjectKey a{owner,edge.aUuid},b{owner,edge.bUuid};rows.push_back({std::move(a),std::move(b),std::move(edge)});
-                }
-                c.edgeRead+=seconds(decode);pending=rows.size();previous=Clock::now();return !rows.empty();
+    const int64_t reservation=INT64_MAX/workers;
+    for(int i=0;i<workers;++i)options.shards.push_back({{int64_t(i)*reservation+1,int64_t(i+1)*reservation},
+        {int64_t(i)*reservation+1,int64_t(i+1)*reservation}});
+    StreamFailure failure;
+    ShardQueues<InitialObjectRecord> objects(workers,std::max(size_t(1),queueBytes/size_t(workers)),failure);
+    ShardQueues<InitialCollectionEdge> edges(workers,std::max(size_t(1),queueBytes/size_t(workers)),failure);
+    // Readers batch across UUID destinations. Each reader holds at most
+    // batchBytes plus one record; queue_bytes is each stream's queued budget
+    // (plus one oversize batch per destination). SQLite consumers own no source.
+    const auto dispatch=[&]<class T>(auto& queues,auto&& scan){
+        std::vector<std::vector<T>> buckets(workers);std::vector<size_t> sizes(workers);size_t bytes=0;
+        double waiting=0;
+        const auto flush=[&](size_t i){if(buckets[i].empty())return;bytes-=sizes[i];const auto start=Clock::now();
+            queues.push(i,std::move(buckets[i]),sizes[i]);waiting+=seconds(start);buckets[i].clear();sizes[i]=0;};
+        scan([&](T row,size_t size,const std::string& uuid){
+            checkCancelled();failure.check();const size_t i=uuidShardIndex(uuid,workers);
+            buckets[i].push_back(std::move(row));sizes[i]+=size;bytes+=size;
+            if(buckets[i].size()>=batchSize)flush(i);
+            if(bytes>=batchBytes)for(size_t k=0;k<size_t(workers);++k)flush(k);
+        });
+        for(size_t i=0;i<size_t(workers);++i)flush(i);
+        return waiting;
+    };
+    double sourceSeconds=0;
+    std::atomic<double> fiberPreparation{0},edgePreparation{0};
+    std::atomic<int64_t> sourceFibers{0},sourcePoints{0},sourceEdges{0};
+    auto inputJob=std::async(std::launch::async,[&]{
+        const auto inputStart=Clock::now();
+        try {
+            ObjectRecord metadata;metadata.uuid=linked?util::nameUuid(sourceUuid,"constraint-source"):sourceUuid;
+            metadata.kind="collection";metadata.name=linked?"constraint-source":input.stem().string();
+            Json fields=linked?Json::object():Json{{"coordinates",coordinates},{"afv",{{"metadata",Json::parse(source.metadataJson())}}}};
+            if(edgeSource)fields["afc"]=Json::parse(edgeSource->metadataJson());
+            metadata.meta=fields.dump();const auto shard=uuidShardIndex(metadata.uuid,workers);
+            objects.push(shard,{{std::move(metadata),{}, {}}},fields.dump().size()+sizeof(InitialObjectRecord));
+            const auto parallel=[&](const auto& ranges,auto&& read){
+                std::vector<std::future<void>> jobs;
+                try {for(const auto& range:ranges)jobs.push_back(std::async(std::launch::async,[&,range]{
+                    try {read(range);}catch(...){failure.fail(std::current_exception());throw;}
+                }));}catch(...){failure.fail(std::current_exception());}
+                for(auto& job:jobs)try{job.get();}catch(...){failure.fail(std::current_exception());}
+                failure.check();
+            };
+            if(!linked)parallel(fiberRanges,[&](const auto& range){
+                const auto preparing=Clock::now();
+                AfvSource part(input,range[0],range[1]);if(part.uuid()!=sourceUuid)throw std::runtime_error("AFV source identity changed");
+                int64_t n=0,points=0;
+                const auto waiting=dispatch.template operator()<InitialObjectRecord>(objects,[&](auto&& emit){
+                    AfvFiber fiber;while(part.next(fiber)){
+                        ++n;points+=fiber.detail.linePointCount;
+                        auto r=afvObjectRecord(fiber,sourceUuid,coordinates);auto uuid=r.uuid;
+                        const size_t bytes=fiber.xyz.size()+r.meta.size()+r.name.size()+sizeof(InitialObjectRecord);
+                        auto g=afvGeometry(fiber);emit(InitialObjectRecord{std::move(r),{},std::move(g)},bytes,uuid);
+                    }
+                });
+                sourceFibers.fetch_add(n);sourcePoints.fetch_add(points);
+                fiberPreparation.fetch_add(seconds(preparing)-waiting);
             });
-            c.edgeInsert+=seconds(previous);if(count!=c.edges)throw std::runtime_error("initial relation count mismatch");
-        }
-        phases[i]=work.phaseNanoseconds;
+            if(!linked&&(sourceFibers.load()!=(limit?std::min(limit,source.fiberCount()):source.fiberCount())||
+                         (!limit&&sourcePoints.load()!=source.pointCount())))
+                throw std::runtime_error("initial fiber aggregate totals differ from source");
+            objects.close();
+            // Start reading edges after sources finished producing objects, not
+            // after shard commits: no global database/object barrier is needed.
+            if(hasEdges)parallel(edgeRanges,[&](const auto& range){
+                const auto preparing=Clock::now();
+                AfcSource part(config.at("constraints").get<std::string>(),sourceUuid,fiberEnd,range[0],range[1]);
+                int64_t n=0;
+                const auto waiting=dispatch.template operator()<InitialCollectionEdge>(edges,[&](auto&& emit){
+                    EdgeRecord e;while(part.next(e)){
+                        ++n;
+                        const auto uuid=e.uuid;const size_t bytes=e.meta.size()+sizeof(InitialCollectionEdge);
+                        ObjectKey a{"",e.aUuid},b{"",e.bUuid};
+                        emit(InitialCollectionEdge{std::move(a),std::move(b),std::move(e)},bytes,uuid);
+                    }
+                });
+                sourceEdges.fetch_add(n);
+                edgePreparation.fetch_add(seconds(preparing)-waiting);
+            });
+            if(hasEdges&&fiberEnd==INT64_MAX&&sourceEdges.load()!=(edgeLimit?std::min(edgeLimit,edgeSource->constraintCount()):edgeSource->constraintCount()))
+                throw std::runtime_error("initial constraint aggregate totals differ from source");
+            edges.close();sourceSeconds=seconds(inputStart);
+        }catch(...){failure.fail(std::current_exception());throw;}
     });
-    int64_t fibers=0,points=0,edges=0,metadata=0,edgeMetadata=0;
-    Json perShard=Json::array();
-    for(size_t i=0;i<ranges.size();++i){
-        const auto& c=counts[i];const auto& timing=imported.shards[i];
-        if(timing.objects!=c.fibers+(i==0?1:0)||timing.edges!=c.edges)throw std::runtime_error("native initial counts differ from producer");
-        perShard.push_back({{"shard",i},{"fibers",c.fibers},{"points",c.points},{"constraints",c.edges},{"first_id",c.first},{"last_id",c.last},
-            {"source_read_seconds",linked?c.edgeRead:c.read},{"native_import_seconds",linked?c.edgeInsert:c.insert},
-            {"constraint_source_read_seconds",c.edgeRead},{"constraint_import_seconds",c.edgeInsert},{"metadata_json_bytes",linked?c.edgeMetadata:c.metadata},
-            {"creation_seconds",timing.creationSeconds},{"seal_commit_seconds",timing.sealCommitSeconds},
-            {"import_wall_seconds",timing.producerSeconds+timing.objectSeconds+timing.edgeSeconds+timing.creationSeconds+timing.sealCommitSeconds},
-            {"validation_seconds",0.0},{"phase_nanoseconds",phases[i]}});
+    struct Counts {int64_t fibers=0,points=0,edges=0,metadata=0,edgeMetadata=0;};
+    std::vector<Counts> counts(workers);std::vector<detail::GeometryWork> profiles(workers);
+    std::vector<Json> mutexProfiles(workers);
+    std::atomic<int64_t> completedFibers{0},completedEdges{0};
+    std::mutex progressMutex;auto lastProgress=start;
+    const auto progress=[&]{
+        std::lock_guard lock(progressMutex);if(seconds(lastProgress)<5)return;
+        std::cout<<Json({{"stage","uuid_shard_import"},{"fibers",completedFibers.load()},
+            {"constraints",completedEdges.load()},{"shards",workers},{"elapsed_seconds",seconds(start)}}).dump()<<std::endl;
+        lastProgress=Clock::now();
+    };
+    InitialImportResult imported;
+    try {
+        imported=importInitialCollection(output,options,[&](size_t i,InitialShardImport& shard){
+            try {
+                std::optional<detail::GeometryWorkScope> profile;
+                if(config.value("profile",false))profile.emplace(profiles[i]);
+                std::vector<InitialObjectRecord> rows;
+                while(objects.pop(i,rows,[&]{checkCancelled();shard.checkCancelled();})){checkCancelled();
+                    for(const auto& row:rows)if(row.record.fiber){
+                        ++counts[i].fibers;counts[i].points+=row.record.fiber->linePointCount;
+                        counts[i].metadata+=row.record.meta.size();
+                    }
+                    shard.appendObjects(rows);
+                    // Counters are per batch; never read another worker's Counts.
+                    int64_t n=0;for(const auto& row:rows)n+=bool(row.record.fiber);
+                    completedFibers.fetch_add(n);progress();
+                }
+            }catch(...){failure.fail(std::current_exception());throw;}
+        },[&](size_t i,InitialShardImport& shard){
+            try {
+                std::optional<detail::GeometryWorkScope> profile;
+                if(config.value("profile",false))profile.emplace(profiles[i]);
+                if(hasEdges)shard.importEdges([&](std::vector<InitialCollectionEdge>& rows){
+                    checkCancelled();if(!edges.pop(i,rows,[&]{checkCancelled();shard.checkCancelled();}))return false;
+                    for(const auto& row:rows)counts[i].edgeMetadata+=row.record.meta.size();
+                    counts[i].edges+=int64_t(rows.size());completedEdges.fetch_add(int64_t(rows.size()));progress();return true;
+                });
+                if(config.value("profile_sqlite_mutex",false))mutexProfiles[i]=benchmark::sqlite_profile::snapshot();
+            }catch(...){failure.fail(std::current_exception());throw;}
+        });
+        inputJob.get();
+    }catch(...){failure.fail(std::current_exception());try{inputJob.get();}catch(...){}throw;}
+    int64_t fibers=0,points=0,nedges=0,metadataBytes=0,edgeMetadataBytes=0;Json perShard=Json::array();
+    double objectSeconds=0,edgeSeconds=0,sealSeconds=0;
+    for(size_t i=0;i<counts.size();++i){const auto& c=counts[i];const auto& t=imported.shards[i];
+        fibers+=c.fibers;points+=c.points;nedges+=c.edges;
+        metadataBytes+=c.metadata;edgeMetadataBytes+=c.edgeMetadata;
+        objectSeconds+=t.objectSeconds;edgeSeconds+=t.edgeSeconds;sealSeconds+=t.sealCommitSeconds;
+        perShard.push_back({{"shard",i},{"fibers",c.fibers},{"points",c.points},{"constraints",c.edges},
+            {"native_import_seconds",t.objectSeconds+t.edgeSeconds},{"creation_seconds",t.creationSeconds},
+            {"seal_commit_seconds",t.sealCommitSeconds},{"phase_nanoseconds",profiles[i].phaseNanoseconds}});
+        if(config.value("profile_sqlite_mutex",false))perShard.back()["sqlite_mutex_profile"]=mutexProfiles[i];
     }
-    const bool verify=config.value("verify_readback",false);
-    double validationSeconds=0;
-    if(verify) {
-    const auto verifyStart=Clock::now();
-    auto joined=ObjectCollection::open(imported.path,readOptions(config));const auto members=joined.members();
-    struct FiberSample {int64_t id;std::string uuid;std::vector<uint8_t> xyz;};
-    std::vector<std::vector<FiberSample>> fiberSamples(ranges.size());
-    std::vector<std::optional<EdgeRecord>> edgeSamples(ranges.size());
-    std::vector<std::future<Json>> validationJobs;std::atomic<bool> validationFailed{false};
-    for(size_t i=0;i<ranges.size();++i)validationJobs.push_back(std::async(std::launch::async,[&,i]{
-        CancelPeersOnFailure cancelPeers{validationFailed};
-        const auto& c=counts[i];const auto validation=Clock::now();checkCancelled(&validationFailed);
-        auto physical=imported.path;
-        if(ranges.size()>1){
-            const auto found=std::find_if(members.begin(),members.end(),[&](const auto& m){return m.partition&&m.storeUuid==imported.storeUuid&&
-                m.objectIds==options.shards[i].objectIds&&m.edgeIds==options.shards[i].edgeIds;});
-            if(found==members.end())throw std::runtime_error("published shard routing metadata missing");physical=found->locator;
-        }
-        auto published=ObjectCollection::open(physical,readOptions(config));auto txn=published.read();
-        if(!linked){AfvSource part(input,ranges[i][0],ranges[i][1]);AfvFiber fiber;int64_t verified=0;
-            while(part.next(fiber)){checkCancelled(&validationFailed);const ObjectKey key{imported.storeUuid,util::nameUuid(sourceUuid,"fiber:"+std::to_string(fiber.id))};
-                const auto value=published.object(txn,key);const auto g=published.currentGeometry(txn,key);
-                verifyFiberData(value?&value->record:nullptr,bool(g),fiber,[&](const char* name){return published.readGeometryArray(txn,key,name);});++verified;
-                if(fiber.id==c.first||fiber.id==c.last)fiberSamples[i].push_back({fiber.id,key.objectUuid,fiber.xyz});}
-            if(verified!=c.fibers)throw std::runtime_error("published fiber count differs from import");
-            for(const auto id:{c.first,c.last})if(id>=0){const auto routed=published.objectById(txn,imported.storeUuid,id+2);
-                if(!routed||routed->record.uuid!=util::nameUuid(sourceUuid,"fiber:"+std::to_string(id)))throw std::runtime_error("published fiber ID routing mismatch");}
-        }
-        if(hasEdges){AfcSource part(config.at("constraints").get<std::string>(),sourceUuid,
-                !linked&&limit?c.last+1:INT64_MAX,linked?ranges[i][0]:0,linked?ranges[i][1]:INT64_MAX);
-            EdgeRecord expected;const auto& owner=linked?fiberOwner:imported.storeUuid;
-            for(int64_t n=0;n<c.edges;++n){checkCancelled(&validationFailed);if(!part.next(expected))throw std::runtime_error("constraint source ended during readback");
-                const auto actual=published.edge(txn,{imported.storeUuid,expected.uuid});if(!actual)throw std::runtime_error("published relation missing");
-                if(actual->a.objectUuid==expected.bUuid){std::swap(expected.aUuid,expected.bUuid);std::swap(expected.aAnchor,expected.bAnchor);}
-                if(actual->a!=ObjectKey{owner,expected.aUuid}||actual->b!=ObjectKey{owner,expected.bUuid}||
-                    actual->record.aAnchor!=expected.aAnchor||actual->record.bAnchor!=expected.bAnchor||actual->record.kind!=expected.kind||
-                    Json::parse(actual->record.meta)!=Json::parse(expected.meta))
-                    throw std::runtime_error("published constraint differs from source");
-                if(n==0)edgeSamples[i]=expected;
-            }
-        }
-        return Json({{"validation_seconds",seconds(validation)}});
-    }));
-    const auto validation=collectWorkers(validationJobs);
-    for(size_t i=0;i<ranges.size();++i)perShard[i]["validation_seconds"]=validation[i].at("validation_seconds");
-    // Full exact readback above stays parallel and shard-local. Test composed
-    // numeric/UUID/dependency routing on representative already-read samples.
-    {auto txn=joined.read();for(size_t i=0;i<ranges.size();++i){
-        for(const auto& sample:fiberSamples[i]){
-            const auto value=joined.objectById(txn,imported.storeUuid,sample.id+2);
-            if(!value||value->record.uuid!=sample.uuid||joined.readGeometryArray(txn,value->key,"line_points")!=sample.xyz)
-                throw std::runtime_error("composed fiber routing differs from source");
-        }
-        if(edgeSamples[i]){
-            auto expected=*edgeSamples[i];const auto actual=joined.edge(txn,{imported.storeUuid,expected.uuid});
-            if(!actual)throw std::runtime_error("composed relation routing missing");
-            if(actual->a.objectUuid==expected.bUuid){std::swap(expected.aUuid,expected.bUuid);std::swap(expected.aAnchor,expected.bAnchor);}
-            const auto& owner=linked?fiberOwner:imported.storeUuid;
-            if(actual->a!=ObjectKey{owner,expected.aUuid}||actual->b!=ObjectKey{owner,expected.bUuid}||
-                actual->record.aAnchor!=expected.aAnchor||actual->record.bAnchor!=expected.bAnchor||Json::parse(actual->record.meta)!=Json::parse(expected.meta))
-                throw std::runtime_error("composed relation routing differs from source");
-            if(linked)for(const auto& endpoint:{actual->a,actual->b})
-                if(!joined.currentGeometry(txn,endpoint)||joined.readGeometryArray(txn,endpoint,"line_points").empty())
-                    throw std::runtime_error("composed linked geometry routing failed");
-        }
-    }}
-    validationSeconds=seconds(verifyStart);
-    }
-    for(const auto& c:counts){fibers+=c.fibers;points+=c.points;edges+=c.edges;metadata+=c.metadata;edgeMetadata+=c.edgeMetadata;}
     if(!linked&&(fibers!=(limit?std::min(limit,source.fiberCount()):source.fiberCount())||(!limit&&points!=source.pointCount())))
         throw std::runtime_error("initial fiber aggregate totals differ from source");
-    if(linked&&edges!=(edgeLimit?std::min(edgeLimit,edgeSource->constraintCount()):edgeSource->constraintCount()))
-        throw std::runtime_error("initial constraint aggregate total differs from source");
-    double sourceSeconds=0,nativeSeconds=0,edgeReadSeconds=0,edgeWriteSeconds=0,sealSeconds=0;
-    for(size_t i=0;i<counts.size();++i){sourceSeconds+=counts[i].read;nativeSeconds+=counts[i].insert;
-        edgeReadSeconds+=counts[i].edgeRead;edgeWriteSeconds+=counts[i].edgeInsert;sealSeconds+=imported.shards[i].sealCommitSeconds;}
-    uintmax_t bytes=0;if(std::filesystem::is_regular_file(output))bytes=std::filesystem::file_size(output);
-    else for(const auto& e:std::filesystem::recursive_directory_iterator(output))if(e.is_regular_file())bytes+=e.file_size();
-    Json result={{"stage","complete"},{"mode",linked?"relations":"geometry"},{"source",linked?std::filesystem::absolute(config.at("constraints").get<std::string>()).string():input.string()},{"output",output.string()},
-        {"store_uuid",imported.storeUuid},{"source_uuid",sourceUuid},{"initial_batch",true},{"shards",ranges.size()},
-        {"batch_size",batchSize},{"sql_batch_rows",options.edges.sqlBatchRows},{"packed",bool(options.packed)},
+    if(hasEdges && fiberEnd==INT64_MAX && nedges!=(edgeLimit?std::min(edgeLimit,edgeSource->constraintCount()):edgeSource->constraintCount()))
+        throw std::runtime_error("initial constraint aggregate totals differ from source");
+    const double pipelineSeconds=seconds(start);
+    const bool verify=config.value("verify_readback",false);double validationSeconds=0;
+    if(verify){
+        const auto vstart=Clock::now();auto joined=ObjectCollection::open(imported.path,readOptions(config));auto txn=joined.read();
+        if(!linked)for(const auto& range:fiberRanges){
+            AfvSource part(input,range[0],range[1]);AfvFiber fiber;
+            while(part.next(fiber)){
+                checkCancelled();
+                const ObjectKey key{"",util::nameUuid(sourceUuid,"fiber:"+std::to_string(fiber.id))};
+                const auto value=joined.object(txn,key);const auto g=joined.currentGeometry(txn,key);
+                verifyFiberData(value?&value->record:nullptr,bool(g),fiber,[&](const char* name){return joined.readGeometryArray(txn,key,name);});
+            }
+        }
+        int64_t verifiedEdges=0;
+        for(const auto& range:edgeRanges){
+            AfcSource part(config.at("constraints").get<std::string>(),sourceUuid,fiberEnd,range[0],range[1]);EdgeRecord e;
+            while(part.next(e)){
+                checkCancelled();
+                const auto actual=joined.edge(txn,{"",e.uuid});if(!actual)throw std::runtime_error("published relation missing");
+                if(actual->a.objectUuid==e.bUuid){std::swap(e.aUuid,e.bUuid);std::swap(e.aAnchor,e.bAnchor);}
+                if(actual->a.objectUuid!=e.aUuid||actual->b.objectUuid!=e.bUuid||actual->record.aAnchor!=e.aAnchor||
+                   actual->record.bAnchor!=e.bAnchor||actual->record.kind!=e.kind||Json::parse(actual->record.meta)!=Json::parse(e.meta))
+                    throw std::runtime_error("published constraint differs from source");
+                for(const auto& endpoint:{actual->a,actual->b})if(!joined.currentGeometry(txn,endpoint))
+                    throw std::runtime_error("constraint endpoint geometry missing");
+                ++verifiedEdges;
+            }
+        }
+        if(verifiedEdges!=nedges)throw std::runtime_error("constraint count mismatch");
+        validationSeconds=seconds(vstart);
+    }
+    uintmax_t bytes=0;
+    if(std::filesystem::is_directory(output))for(const auto& entry:std::filesystem::recursive_directory_iterator(output))
+        {if(entry.is_regular_file())bytes+=entry.file_size();}
+    else bytes=std::filesystem::file_size(output);
+    Json result={{"source",input.string()},{"output",output.string()},{"store_uuid",imported.storeUuid},
+        {"stage","complete"},{"mode",linked?"relations":hasEdges?"combined":"geometry"},
+        {"source_uuid",sourceUuid},{"initial_batch",true},{"uuid_hash_routing",true},{"shards",workers},{"readers",readers},
+        {"batch_size",batchSize},{"batch_bytes",batchBytes},{"queue_bytes",queueBytes},{"packed",bool(options.packed)},
+        {"fibers",fibers},{"points",points},{"constraints",nedges},{"constraints_imported",hasEdges},{"source_pipeline_seconds",sourceSeconds},
+        {"geometry_bytes",points*24},{"metadata_json_bytes",metadataBytes},{"constraint_metadata_json_bytes",edgeMetadataBytes},
+        {"source_metadata_json_bytes",linked?edgeSource->metadataJson().size():source.metadataJson().size()},
+        {"source_read_seconds",fiberPreparation.load()},{"constraint_source_read_seconds",edgePreparation.load()},
+        {"source_read_timing","reader-worker preparation sum (decode/UUID/batching), excludes queue push time"},
+        {"native_import_seconds",objectSeconds},{"constraint_import_seconds",edgeSeconds},{"seal_seconds",sealSeconds},
+        {"constraint_limit",edgeLimit},{"sql_batch_rows",options.edges.sqlBatchRows},{"sqlite_cache_bytes",options.store.sqliteCacheBytes},
         {"memory_first",config.value("memory_first",false)},{"background_flush",config.value("background_flush",true)},
-        {"sqlite_memory_statistics",config.value("sqlite_memory_statistics",true)},{"sqlite_cache_bytes",options.store.sqliteCacheBytes},
+        {"sqlite_memory_statistics",config.value("sqlite_memory_statistics",true)},
         {"sqlite_pagecache_bulk_bytes",config.value("sqlite_pagecache_bulk_bytes",int64_t(0))},
-        {"fibers",fibers},{"points",points},{"geometry_bytes",points*24},{"constraints",edges},{"constraints_imported",hasEdges},
-        {"metadata_json_bytes",metadata},{"constraint_metadata_json_bytes",edgeMetadata},{"source_metadata_json_bytes",linked?edgeSource->metadataJson().size():afvMetadata.size()},
-        {"source_read_seconds",sourceSeconds},{"native_import_seconds",nativeSeconds},{"seal_seconds",sealSeconds},
-        {"constraint_source_read_seconds",edgeReadSeconds},{"constraint_import_seconds",edgeWriteSeconds},{"constraint_limit",edgeLimit},
-        {"close_checkpoint_seconds",nullptr},{"close_checkpoint_timing","included in ingestion_seconds"},
-        {"estimated_full_import_seconds",linked?(edges?imported.ingestionSeconds*edgeSource->constraintCount()/edges:0.):
-            (fibers?imported.ingestionSeconds*source.fiberCount()/fibers:0.)},
-        {"worker_timing_aggregation","source/native/seal durations are sums over workers; ingestion/total are wall time"},
-        {"ingestion_seconds",imported.ingestionSeconds},{"workers_including_readback_seconds",imported.ingestionSeconds+validationSeconds},
-        {"manifest_seconds",imported.manifestSeconds},{"persistence_seconds",imported.persistenceSeconds},
-        {"publication_seconds",imported.manifestSeconds+imported.persistenceSeconds},{"validation_seconds",validationSeconds},{"readback_verified",verify},
-        {"published_reopen_seconds",validationSeconds},
-        {"total_seconds",seconds(start)},{"output_bytes",bytes},{"peak_rss_bytes",peakRssBytes()},{"per_shard",perShard}};
+        {"source_pipeline_timing","wall time including queue backpressure; overlaps native ingestion"},
+        {"ingestion_seconds",imported.ingestionSeconds},{"manifest_seconds",imported.manifestSeconds},
+        {"persistence_seconds",imported.persistenceSeconds},{"validation_seconds",validationSeconds},{"readback_verified",verify},
+        {"total_seconds",seconds(start)},{"output_bytes",bytes},{"peak_rss_bytes",benchmark::peakRssBytes()},{"per_shard",perShard}};
     if(linked){result["geometry_collection"]=options.dependencies.front().string();result["geometry_copied"]=false;}
+    if(!linked&&hasEdges&&edgeLimit){
+        result["estimated_full_import_seconds"]=nullptr;
+        result["estimate_basis"]="unavailable for combined import with constraint_limit: fiber and relation sampling fractions differ; do not scale both phases by fiber count";
+    }else{
+        result["estimated_full_import_seconds"]=linked?(nedges?pipelineSeconds*edgeSource->constraintCount()/nedges:0.):
+            (fibers?pipelineSeconds*source.fiberCount()/fibers:0.);
+        result["estimate_basis"]="linear record-count projection, source preparation included; not a full-volume measurement";
+    }
     return result;
 }
 }
@@ -345,10 +332,13 @@ int main(int argc,char** argv)
         const auto scale=config.value("scale_factor",1.);
         if (!std::isfinite(scale) || scale<=0) throw std::invalid_argument("invalid scale_factor");
         const Json coordinates={{"volume_uuid",volume.empty()?Json(nullptr):Json(volume)}, {"scale_factor",scale}};
-        AfvSource source(input);
+        const auto sourceStart=Clock::now();AfvSource source(input);
+        const auto sourceOpenSeconds=seconds(sourceStart);
         if(!config.value("initial_batch",true))
             throw std::invalid_argument("initial_batch:false is removed; this command only uses the native batch importer");
-        const auto result=importNative(config,input,output,coordinates,source,limit);
+        auto result=importNative(config,input,output,coordinates,source,limit);
+        result["source_open_seconds"]=sourceOpenSeconds;
+        result["end_to_end_seconds"]=seconds(sourceStart);
         std::cout<<result.dump(2)<<std::endl;
         if(config.contains("report")){std::ofstream report(config.at("report").get<std::string>());report<<result.dump(2)<<'\n';
             if(!report)throw std::runtime_error("report write failed");}

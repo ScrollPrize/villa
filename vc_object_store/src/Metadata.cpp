@@ -6,9 +6,9 @@ using namespace detail;
 namespace {
 std::pair<const char*, int64_t> recordLocation(sqlite3* db, const std::array<unsigned char, 16>& bytes, const std::string& uuid)
 {
-    Statement object(db,"SELECT id FROM objects WHERE uuid=? AND deleted=0",bytes);
+    Statement object(db,"SELECT id FROM objects WHERE uuid=? AND state<>2",bytes);
     if(object.row())return {"objects",object.i64(0)};
-    Statement edge(db,"SELECT id FROM edges WHERE uuid=? AND deleted=0",bytes);
+    Statement edge(db,"SELECT id FROM edges WHERE uuid=? AND state=0",bytes);
     if(edge.row())return {"edges",edge.i64(0)};
     throw std::runtime_error("object store: record not found: " + uuid);
 }

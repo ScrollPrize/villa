@@ -62,8 +62,8 @@ void appendJournal(sqlite3* db, const std::string& author, const std::string& ho
 {
     if (!historyEnabled(db)) return;
     generation = writeGeneration(db);
-    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? AND deleted=0 "
-        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=? AND deleted=0",
+    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? AND state<>2 "
+        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=? AND state=0",
         uuid, uuid);
     const bool hasState = state.row();
     // Deleted entries have no current approval state. Their caller supplies
@@ -389,7 +389,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         if (cur.text(0) != rec.kind)
             throw std::runtime_error("object store: object kind cannot change (" + cur.text(0) + " -> " + rec.kind + ")");
         beforeCurrentObjectEdit(db,rec.uuid);
-        execute(db, "UPDATE objects SET deleted=0,name=?,generation=?,changed_by=?,changed_at=?,changed_host=?,"
+        execute(db, "UPDATE objects SET state=CASE WHEN state=2 THEN 0 ELSE state END,name=?,generation=?,changed_by=?,changed_at=?,changed_host=?,"
                         "approval_state='pending',approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_generation=NULL,"
                         "format_version=?,storage_kind=?,storage_ref=?,data_generation=?,data_checksum=?,meta=? WHERE id=?",
             rec.name, generation, author, now, host, rec.formatVersion, rec.storageKind, rec.storageRef,
@@ -441,7 +441,7 @@ std::string jsonPathForKey(const std::string& key)
 
 std::optional<std::string> geometryHead(sqlite3* db, const std::string& objectUuid)
 {
-    Statement s(db,"SELECT storage_ref FROM objects WHERE uuid=? AND deleted=0 AND geometry_manifest IS NOT NULL",parseUuid(objectUuid));
+    Statement s(db,"SELECT storage_ref FROM objects WHERE uuid=? AND state<>2 AND geometry_manifest IS NOT NULL",parseUuid(objectUuid));
     return s.row()?std::optional(s.text(0)):std::nullopt;
 }
 } // namespace vc::objects::detail

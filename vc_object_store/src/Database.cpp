@@ -55,12 +55,13 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         if (manifest.i64(2) && !options.readOnly)
             throw std::runtime_error("object store: sealed store requires a read-only open");
         Statement features(db, "SELECT name FROM store_required_features");
-        bool currentState=false,binaryHashes=false,endpointKeys=false,inlineLifecycle=false;
+        bool currentState=false,binaryHashes=false,endpointKeys=false,stateLayout=false,binaryUuids=false;
         while (features.row()) {
             if(features.text(0)=="direct-geometry-v1"){currentState=true;continue;}
             if(features.text(0)=="binary-sha256-v1"){binaryHashes=true;continue;}
             if(features.text(0)=="direct-endpoint-keys-v1"){endpointKeys=true;continue;}
-            if(features.text(0)=="inline-lifecycle-v1"){inlineLifecycle=true;continue;}
+            if(features.text(0)=="object-state-v1"){stateLayout=true;continue;}
+            if(features.text(0)=="binary-uuid-v1"){binaryUuids=true;continue;}
             if(features.text(0)=="uuid-hash-routing-v1")continue;
             if (features.text(0)=="collection-v1" && options.physicalPartitionOnly) continue;
             if (features.text(0)==immutableImportFeature) {
@@ -71,7 +72,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             throw std::runtime_error("object store: unsupported required feature (use ObjectCollection for collections): " + features.text(0));
         }
         if(!currentState) throw std::runtime_error("object store: legacy current-state layout requires separate conversion; refusing mixed v2 semantics");
-        if(!binaryHashes||!endpointKeys||!inlineLifecycle) throw std::runtime_error("object store: earlier experimental v2 layout requires rebuilding (binary hashes/direct endpoint UUIDs/inline lifecycle absent)");
+        if(!binaryHashes||!endpointKeys||!stateLayout||!binaryUuids) throw std::runtime_error("object store: earlier experimental v2 layout requires rebuilding (binary hashes/direct endpoint UUIDs/single state/binary UUIDs absent)");
         Statement physical(db, "SELECT schema_version FROM database_identity WHERE singleton=1");
         if (!physical.row() || physical.i64(0) != kSchemaVersion)
             throw std::runtime_error("object store: invalid database identity/schema");

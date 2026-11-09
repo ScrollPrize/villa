@@ -56,7 +56,7 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection, cons
         connected.insert(ids.begin(), ids.end());
     }
     SelectionFilter filter;
-    filter.sql = " AND o.deleted=0";
+    filter.sql = " AND o.state<>2";
     if (!selection.includeRetired) filter.sql += " AND " + activeObjectSql("o.id");
     auto bind = [&](const std::string& clause, const std::string& value) {
         filter.sql += clause; filter.parameters.push_back(value);

@@ -1,6 +1,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/AfvSource.hpp"
 #include "internal/Sqlite.hpp"
+#include "imports/AfvRecords.hpp"
 #include <nlohmann/json.hpp>
 #include <bit>
 #include <cmath>
@@ -44,6 +45,16 @@ int main()
         require(source.idRanges(2)==std::vector<std::array<int64_t,2>>{{0,9},{9,10}},"balanced sparse intervals");
         require(source.idRanges(2,1)==std::vector<std::array<int64_t,2>>{{0,1}},"limited interval");
         require(source.next(f) && f.id==0 && f.xyz.size()==260*24 && f.detail.controlPointCount==0,"multi-block fiber");
+        const Json coordinates={{"volume_uuid","test-volume"},{"scale_factor",1.}};
+        const auto record=imports::afvObjectRecord(f,source.uuid(),coordinates);
+        require(record.uuid==util::nameUuid(source.uuid(),"fiber:0")&&record.kind=="fiber"&&record.formatVersion==4,
+            "shared AFV record identity and format");
+        const auto meta=Json::parse(record.meta);
+        require(meta.at("coordinates")==coordinates&&meta.at("source").at("afv").at("fiber_id")==0&&
+            meta.at("source").at("afv").at("annotation")==Json::object(),"shared AFV record metadata");
+        const auto original=f.xyz;const auto geometry=imports::afvGeometry(f);
+        require(geometry.kind=="fiber"&&geometry.arrays.size()==3&&geometry.arrays[0].bytes.empty()&&geometry.arrays[1].bytes.empty()&&
+            geometry.arrays[2].name=="line_points"&&geometry.arrays[2].bytes==original,"shared AFV geometry preserves exact points without controls");
         require(source.next(f) && f.id==9 && f.xyz.size()==48,"sparse IDs");
         require(!source.next(f),"EOF");
     }

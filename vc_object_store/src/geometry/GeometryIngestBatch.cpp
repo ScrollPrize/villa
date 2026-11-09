@@ -54,7 +54,7 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
             detail::parseUuid(p.object.uuid));
         bool previouslyImported = false;
         if (detail::historyEnabled(connection)) {
-            detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", p.object.uuid);
+            detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", detail::parseUuid(p.object.uuid));
             previouslyImported = prior.row();
         }
         if(registeredInitial ? (!existing || existing->retired || history.row()) : (existing.has_value() || previouslyImported))

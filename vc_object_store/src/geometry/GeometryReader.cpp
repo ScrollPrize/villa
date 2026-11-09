@@ -108,7 +108,7 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
     if(currentOnly_==historyEnabled(db_))throw std::invalid_argument("geometry: revision belongs to a different history layout");
     revision_=parseUuid(current ? current->objectUuid : revision);
     Statement row(db_, current ?
-        "SELECT data_checksum,geometry_manifest,uuid,NULL FROM objects WHERE uuid=? AND data_generation=? AND deleted=0 AND geometry_manifest IS NOT NULL" :
+        "SELECT data_checksum,geometry_manifest,uuid,NULL FROM objects WHERE uuid=? AND data_generation=? AND state<>2 AND geometry_manifest IS NOT NULL" :
         "SELECT content_hash,manifest,object_uuid,parent_uuid FROM geometry_revisions WHERE uuid=?");
     row.bind(1,revision_);if(current)row.bind(2,current->generation);
     if (!row.row()) throw std::invalid_argument("geometry: revision not found");
@@ -119,7 +119,7 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
     manifest_ = loadGeometryManifest(db_, revision, text, current ? row.text(0) : readDigest(row,0));
     std::optional<nlohmann::json> currentDescriptor;
     if(!current) {
-        Statement object(db_,"SELECT geometry_manifest,data_checksum FROM objects WHERE uuid=? AND storage_ref=? AND deleted=0 AND geometry_manifest IS NOT NULL",
+        Statement object(db_,"SELECT geometry_manifest,data_checksum FROM objects WHERE uuid=? AND storage_ref=? AND state<>2 AND geometry_manifest IS NOT NULL",
             row.blob16(2),revision);
         if(object.row()) {
             if(object.text(1)!=readDigest(row,0))

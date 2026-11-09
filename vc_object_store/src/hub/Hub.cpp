@@ -45,7 +45,7 @@ Upstream upstream(sqlite3* db)
     if (detectHubRole(db) != HubRole::Replica) throw std::runtime_error("hub: store is not a hosted replica");
     Statement row(db, "SELECT hub_path,hub_replica,journal_cursor,geometry_cursor FROM hub_upstream");
     if (!row.row()) throw std::runtime_error("hub: missing upstream");
-    return {row.text(0), row.text(1), {row.i64(2), row.i64(3)}};
+    return {row.text(0), formatUuid(row.blob16(1)), {row.i64(2), row.i64(3)}};
 }
 
 // Hub handles stay open between operations. A new connection rereads
@@ -98,8 +98,8 @@ std::vector<HubLease> readLeases(sqlite3* db, const std::optional<std::string>& 
     std::vector<HubLease> result;
     Statement rows(db, "SELECT object_uuid,holder,author,host,acquired_us,expires_us FROM hub_leases ORDER BY object_uuid");
     while (rows.row())
-        if (!holder || rows.text(1) == *holder)
-            result.push_back({rows.text(0), rows.text(1), rows.text(2), rows.text(3), rows.i64(4), rows.i64(5)});
+        if (!holder || formatUuid(rows.blob16(1)) == *holder)
+            result.push_back({formatUuid(rows.blob16(0)), formatUuid(rows.blob16(1)), rows.text(2), rows.text(3), rows.i64(4), rows.i64(5)});
     return result;
 }
 
@@ -109,14 +109,14 @@ void writeLeases(sqlite3* db, const std::vector<HubLease>& leases)
                       "holder=excluded.holder,author=excluded.author,host=excluded.host,"
                       "acquired_us=excluded.acquired_us,expires_us=excluded.expires_us");
     for (const auto& lease : leases)
-        put.run(lease.objectUuid, lease.holder, lease.author, lease.host, lease.acquiredUs, lease.expiresUs);
+        put.run(parseUuid(lease.objectUuid), parseUuid(lease.holder), lease.author, lease.host, lease.acquiredUs, lease.expiresUs);
 }
 
 std::set<std::string> uuidColumn(sqlite3* db, const char* sql)
 {
     std::set<std::string> ids;
     Statement rows(db, sql);
-    while (rows.row()) ids.insert(rows.text(0));
+    while (rows.row()) ids.insert(formatUuid(rows.blob16(0)));
     return ids;
 }
 
@@ -125,8 +125,8 @@ std::vector<HubConflict> conflicts(ObjectStore& replica, const Txn& txn)
     std::vector<HubConflict> result;
     Statement rows(conn(txn), "SELECT record_uuid,version,record FROM hub_conflicts ORDER BY record_uuid");
     while (rows.row())
-        result.push_back({rows.text(0), rows.i64(1), recordContent(Json::parse(rows.text(2))).dump(),
-                          syncRecord(replica, txn, rows.text(0)).dump()});
+        result.push_back({formatUuid(rows.blob16(0)), rows.i64(1), recordContent(Json::parse(rows.text(2))).dump(),
+                          syncRecord(replica, txn, formatUuid(rows.blob16(0))).dump()});
     return result;
 }
 
@@ -188,8 +188,8 @@ std::vector<HubLease> grantLeases(ObjectStore& replica, const std::vector<std::s
         std::string message = "hub: cannot lease";
         std::vector<std::string> held, stale;
         for (const auto& [object, version] : known) {
-            Statement row(conn(txn), "SELECT holder,author,host,expires_us FROM hub_leases WHERE object_uuid=?", object);
-            if (row.row() && row.text(0) != self && row.i64(3) > now) {
+            Statement row(conn(txn), "SELECT holder,author,host,expires_us FROM hub_leases WHERE object_uuid=?", parseUuid(object));
+            if (row.row() && formatUuid(row.blob16(0)) != self && row.i64(3) > now) {
                 held.push_back(object);
                 message += "\n  " + object + " is leased to " + row.text(1) + "@" + row.text(2) + " until " + isoFromMicros(row.i64(3));
                 continue;
@@ -342,7 +342,7 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
             requireHostedProvisioning(target);
             createReplicaTables(target);
             const auto cursor = syncCursor(target);
-            execute(target, "INSERT INTO hub_upstream VALUES(1,?,?,?,?,?)", hub, replicaIdentity(target),
+            execute(target, "INSERT INTO hub_upstream VALUES(1,?,?,?,?,?)", hub, parseUuid(replicaIdentity(target)),
                 cursor.journal, cursor.journal, cursor.geometry);
             publishHostedProvisioning(target);
             exec(target, "COMMIT;");
@@ -473,16 +473,16 @@ HubSyncReport hubPull(ObjectStore& replica)
     Statement version(db, "INSERT INTO hub_versions VALUES(?,?) ON CONFLICT(record_uuid) DO UPDATE SET version=excluded.version");
     for (const auto& [id, record] : hubRecords) {
         const auto local = syncRecord(replica, txn, id);
-        if (local == record) { version.run(id, versions.at(id)); continue; }
+        if (local == record) { version.run(parseUuid(id), versions.at(id)); continue; }
         if (pending.contains(id)) {
             // Our own earlier push: the hub has nothing newer than our base.
             if (versions.at(id) == knownHubVersion(db, id)) continue;
-            conflict.run(id, versions.at(id), record.dump());
+            conflict.run(parseUuid(id), versions.at(id), record.dump());
             report.conflicts.push_back({id, versions.at(id), record.dump(), local.dump()});
             continue;
         }
         install[id] = record;
-        version.run(id, versions.at(id));
+        version.run(parseUuid(id), versions.at(id));
     }
     installHubRecords(replica, txn, geometry, hubTxn, install, up.cursor.geometry);
     execute(db, "UPDATE hub_upstream SET journal_cursor=?,geometry_cursor=?", cursor.journal, cursor.geometry);
@@ -510,9 +510,9 @@ HubSyncReport hubPush(ObjectStore& replica)
         Statement rows(db, "SELECT p.record_uuid,p.counter,p.geometry_after,i.record_hash FROM hub_pending p "
                            "LEFT JOIN hub_inflight i ON i.record_uuid=p.record_uuid");
         while (rows.row()) {
-            Change change{syncRecord(replica, local, rows.text(0)), rows.i64(1), rows.i64(2),
-                          knownHubVersion(db, rows.text(0)), rows.optText(3)};
-            changes.emplace(rows.text(0), std::move(change));
+            Change change{syncRecord(replica, local, formatUuid(rows.blob16(0))), rows.i64(1), rows.i64(2),
+                          knownHubVersion(db, formatUuid(rows.blob16(0))), rows.optText(3)};
+            changes.emplace(formatUuid(rows.blob16(0)), std::move(change));
         }
     }
     if (changes.empty()) return report;
@@ -521,7 +521,7 @@ HubSyncReport hubPush(ObjectStore& replica)
         auto mark = replica.write();
         pool(mark).hubApply = true;
         Statement put(conn(mark), "INSERT INTO hub_inflight VALUES(?,?) ON CONFLICT(record_uuid) DO UPDATE SET record_hash=excluded.record_hash");
-        for (const auto& [id, change] : changes) put.run(id, hash(change.record));
+        for (const auto& [id, change] : changes) put.run(parseUuid(id), hash(change.record));
         mark.commit();
     }
     RemoteHubScope remoteScope(up.hub);
@@ -546,8 +546,8 @@ HubSyncReport hubPush(ObjectStore& replica)
                 continue;
             }
             if (!current.is_null() && isObjectRecord(current)) {
-                Statement lease(hubDb, "SELECT holder,expires_us FROM hub_leases WHERE object_uuid=?", id);
-                if (!lease.row() || lease.text(0) != self || lease.i64(1) <= now) unleased.push_back(id);
+                Statement lease(hubDb, "SELECT holder,expires_us FROM hub_leases WHERE object_uuid=?", parseUuid(id));
+                if (!lease.row() || formatUuid(lease.blob16(0)) != self || lease.i64(1) <= now) unleased.push_back(id);
             }
             if (!current.is_null()) before[id] = current;
             if (!change.record.is_null()) merged[id] = change.record;
@@ -558,7 +558,7 @@ HubSyncReport hubPush(ObjectStore& replica)
             pool(mark).hubApply = true;
             Statement put(conn(mark), "INSERT INTO hub_conflicts VALUES(?,?,?) ON CONFLICT(record_uuid) DO UPDATE SET "
                                       "version=excluded.version,record=excluded.record");
-            for (const auto& conflict : report.conflicts) put.run(conflict.uuid, conflict.hubVersion, conflict.hubRecord);
+            for (const auto& conflict : report.conflicts) put.run(parseUuid(conflict.uuid), conflict.hubVersion, conflict.hubRecord);
             mark.commit();
             return report;
         }
@@ -621,8 +621,8 @@ HubSyncReport hubPush(ObjectStore& replica)
     Statement version(conn(mark), "INSERT INTO hub_versions VALUES(?,?) ON CONFLICT(record_uuid) DO UPDATE SET version=excluded.version");
     Statement done(conn(mark), "DELETE FROM hub_pending WHERE record_uuid=? AND counter=?");
     for (const auto& [id, value] : published) {
-        version.run(id, value);
-        done.run(id, changes.at(id).counter);
+        version.run(parseUuid(id), value);
+        done.run(parseUuid(id), changes.at(id).counter);
     }
     exec(conn(mark), "DELETE FROM hub_inflight;");
     writeLeases(conn(mark), created);
@@ -667,14 +667,14 @@ void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects
     {
         auto txn = hub.write();
         Statement drop(conn(txn), "DELETE FROM hub_leases WHERE object_uuid=? AND holder=?");
-        for (const auto& id : ids) drop.run(id, self);
+        for (const auto& id : ids) drop.run(parseUuid(id), parseUuid(self));
         txn.commit();
     }
     local.commit();
     auto mirror = replica.write();
     pool(mirror).hubApply = true;
     Statement drop(conn(mirror), "DELETE FROM hub_leases WHERE object_uuid=? AND holder=?");
-    for (const auto& id : ids) drop.run(id, self);
+    for (const auto& id : ids) drop.run(parseUuid(id), parseUuid(self));
     mirror.commit();
 }
 
@@ -686,7 +686,7 @@ std::optional<HubStatus> hubStatus(ObjectStore& store)
     status.hub = upstream(conn(txn)).hub;
     status.replica = replicaIdentity(conn(txn));
     Statement pending(conn(txn), "SELECT record_uuid FROM hub_pending ORDER BY record_uuid");
-    while (pending.row()) status.pending.push_back(pending.text(0));
+    while (pending.row()) status.pending.push_back(formatUuid(pending.blob16(0)));
     status.conflicts = conflicts(store, txn);
     status.leases = readLeases(conn(txn));
     return status;
@@ -703,11 +703,11 @@ HubSyncReport resolveHubConflict(ObjectStore& replica, const std::string& uuid, 
     {
         auto local = replica.read();
         up = upstream(conn(local));
-        Statement row(conn(local), "SELECT 1 FROM hub_conflicts WHERE record_uuid=?", id);
+        Statement row(conn(local), "SELECT 1 FROM hub_conflicts WHERE record_uuid=?", parseUuid(id));
         if (!row.row()) throw std::runtime_error("hub: no conflict for " + id);
         if (keep == "local") {
             Statement lease(conn(local), "SELECT 1 FROM hub_leases WHERE object_uuid=? AND holder=? AND expires_us>?",
-                id, replicaIdentity(conn(local)), nowMicros());
+                parseUuid(id), parseUuid(replicaIdentity(conn(local))), nowMicros());
             if (!lease.row() && isObjectRecord(syncRecord(replica, local, id)))
                 throw std::runtime_error("hub: lease " + id + " before keeping the local record");
         }
@@ -724,11 +724,11 @@ HubSyncReport resolveHubConflict(ObjectStore& replica, const std::string& uuid, 
     if (keep == "hub") {
         // Earlier hub geometry may have been skipped while the conflict stood.
         installHubRecords(replica, txn, geometry, hubTxn, {{id, record}}, 0);
-        execute(conn(txn), "DELETE FROM hub_pending WHERE record_uuid=?", id);
+        execute(conn(txn), "DELETE FROM hub_pending WHERE record_uuid=?", parseUuid(id));
     }
     // Keeping local: the next push compares against the version seen now.
-    execute(conn(txn), "INSERT INTO hub_versions VALUES(?,?) ON CONFLICT(record_uuid) DO UPDATE SET version=excluded.version", id, version);
-    execute(conn(txn), "DELETE FROM hub_conflicts WHERE record_uuid=?", id);
+    execute(conn(txn), "INSERT INTO hub_versions VALUES(?,?) ON CONFLICT(record_uuid) DO UPDATE SET version=excluded.version", parseUuid(id), version);
+    execute(conn(txn), "DELETE FROM hub_conflicts WHERE record_uuid=?", parseUuid(id));
     txn.commit();
     hubTxn.commit();
     hub.reset();

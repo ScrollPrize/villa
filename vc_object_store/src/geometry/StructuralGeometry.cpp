@@ -14,7 +14,7 @@ void checked(sqlite3* db) {
 }
 void requireSource(sqlite3* db,const std::string& uuid) {
     if (!historyEnabled(db)) return;
-    execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", uuid);
+    execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", parseUuid(uuid));
 }
 std::vector<int64_t> idsOf(GeometryReader& reader,const std::string& ids,int64_t count) {
     std::vector<int64_t> values(count);

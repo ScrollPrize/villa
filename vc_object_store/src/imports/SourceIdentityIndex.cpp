@@ -46,9 +46,9 @@ CREATE TABLE source_identity_dirty(
 CREATE TRIGGER source_identity_object_insert AFTER INSERT ON objects
  WHEN new.kind='point_collection' BEGIN
  INSERT OR IGNORE INTO source_identity_dirty VALUES(new.uuid); END;
-CREATE TRIGGER source_identity_object_update AFTER UPDATE OF meta,storage_ref,kind,geometry_manifest,deleted ON objects
+CREATE TRIGGER source_identity_object_update AFTER UPDATE OF meta,storage_ref,kind,geometry_manifest,state ON objects
  WHEN (new.kind='point_collection' OR old.kind='point_collection') AND
- (new.deleted IS NOT old.deleted OR new.kind IS NOT old.kind OR new.geometry_manifest IS NOT old.geometry_manifest OR
+ (new.state IS NOT old.state OR new.kind IS NOT old.kind OR new.geometry_manifest IS NOT old.geometry_manifest OR
  json_extract(new.meta,'$.source.origin') IS NOT json_extract(old.meta,'$.source.origin') OR
  json_extract(new.meta,'$.source.source_collection_id') IS NOT json_extract(old.meta,'$.source.source_collection_id') OR
  (json_extract(new.meta,'$.source.origin') IS NULL AND new.storage_ref IS NOT old.storage_ref)) BEGIN
@@ -60,11 +60,11 @@ void refreshSourceIdentityIndex(sqlite3* db) {
     if(!hasSourceIdentityIndex(db)) {
         // Fiber-only/native object stores need no source-point accelerator.
         // Install it only once there is actual source identity to resolve.
-        Statement source(db,"SELECT 1 FROM objects WHERE deleted=0 AND kind='point_collection' "
+        Statement source(db,"SELECT 1 FROM objects WHERE state<>2 AND kind='point_collection' "
             "AND json_type(meta,'$.source.source_collection_id') IS NOT NULL LIMIT 1");
         if(!source.row())return;
         createSourceIdentityIndex(db);
-        exec(db,"INSERT INTO source_identity_dirty SELECT uuid FROM objects WHERE deleted=0 AND kind='point_collection';");
+        exec(db,"INSERT INTO source_identity_dirty SELECT uuid FROM objects WHERE state<>2 AND kind='point_collection';");
         // Publication's initial schema check precedes this lazy creation.
         registerStorageTables(db);
     }
@@ -72,7 +72,7 @@ void refreshSourceIdentityIndex(sqlite3* db) {
     Statement pending(db,"SELECT object_uuid FROM source_identity_dirty ORDER BY object_uuid");
     while(pending.row()) dirty.push_back(formatUuid(pending.blob16(0)));
     for(const auto& object:dirty) {
-        Statement record(db,"SELECT o.kind,o.meta,o.storage_ref,CASE WHEN o.geometry_manifest IS NOT NULL THEN o.storage_ref END FROM objects o WHERE o.uuid=? AND o.deleted=0",
+        Statement record(db,"SELECT o.kind,o.meta,o.storage_ref,CASE WHEN o.geometry_manifest IS NOT NULL THEN o.storage_ref END FROM objects o WHERE o.uuid=? AND o.state<>2",
             parseUuid(object));
         if(!record.row()) {
             execute(db,"DELETE FROM source_collections WHERE object_uuid=?",parseUuid(object));
@@ -119,7 +119,7 @@ void updateSourcePointIdentities(sqlite3* db, const std::string& object,
     const std::string& previous, const std::string& revision, const Json& manifest,
     const std::vector<int64_t>& changed) {
     if(!hasSourceIdentityIndex(db))return;
-    Statement state(db,"SELECT s.origin FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid WHERE o.deleted=0 AND s.object_uuid=? AND s.revision_uuid=? AND s.origin=coalesce(json_extract(o.meta,'$.source.origin'),o.storage_ref) AND s.collection_id=json_extract(o.meta,'$.source.source_collection_id')");
+    Statement state(db,"SELECT s.origin FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid WHERE o.state<>2 AND s.object_uuid=? AND s.revision_uuid=? AND s.origin=coalesce(json_extract(o.meta,'$.source.origin'),o.storage_ref) AND s.collection_id=json_extract(o.meta,'$.source.source_collection_id')");
     state.bind(1,parseUuid(object));bindGeometryToken(state,2,previous);
     if(!state.row()) return; // The source index is created at publication.
     const auto origin=state.text(0);
@@ -136,7 +136,7 @@ void updateSourcePointIdentities(sqlite3* db, const std::string& object,
 }
 std::optional<SourcePoint> sourcePoint(sqlite3* db, const std::string& origin, int64_t id) {
     if(!hasSourceIdentityIndex(db))return std::nullopt;
-    Statement s(db,"SELECT p.object_uuid,p.point_offset FROM source_points p JOIN objects o ON o.uuid=p.object_uuid WHERE o.deleted=0 AND p.origin=? AND p.point_id=? AND o.retired=0 LIMIT 2",
+    Statement s(db,"SELECT p.object_uuid,p.point_offset FROM source_points p JOIN objects o ON o.uuid=p.object_uuid WHERE o.state=0 AND p.origin=? AND p.point_id=? LIMIT 2",
         origin, id);
     if(geometryWork) ++geometryWork->identityRows;
     if(!s.row()) return std::nullopt;
@@ -146,7 +146,7 @@ std::optional<SourcePoint> sourcePoint(sqlite3* db, const std::string& origin, i
 }
 std::optional<std::string> sourceCollection(sqlite3* db, const std::string& origin, const std::string& id) {
     if(!hasSourceIdentityIndex(db))return std::nullopt;
-    Statement s(db,"SELECT s.object_uuid FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid WHERE o.deleted=0 AND s.origin=? AND s.collection_id=? AND o.retired=0 LIMIT 2",
+    Statement s(db,"SELECT s.object_uuid FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid WHERE o.state=0 AND s.origin=? AND s.collection_id=? LIMIT 2",
         origin, id);
     if(geometryWork) ++geometryWork->identityRows;
     if(!s.row()) return std::nullopt;

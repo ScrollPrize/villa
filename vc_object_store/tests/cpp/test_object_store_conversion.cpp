@@ -29,8 +29,8 @@ void schema17(const std::filesystem::path& path)
     exec(db.get(),"CREATE TABLE object_lifecycle(object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,"
         "retired INTEGER NOT NULL CHECK(retired IN (0,1)),epoch TEXT NOT NULL);"
         "CREATE INDEX retired_objects ON object_lifecycle(retired,object_id);"
-        "INSERT INTO object_lifecycle SELECT id,retired,lifecycle_epoch FROM objects WHERE retired<>0 OR lifecycle_epoch<>'';"
-        "ALTER TABLE objects DROP COLUMN retired; ALTER TABLE objects DROP COLUMN lifecycle_epoch;");
+        "INSERT INTO object_lifecycle SELECT id,(state=1),lifecycle_epoch FROM objects WHERE state<>0 OR lifecycle_epoch<>'';"
+        "ALTER TABLE objects DROP COLUMN lifecycle_epoch;");
     exec(db.get(),"CREATE TABLE geometry_heads(object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE RESTRICT,"
         "revision_uuid BLOB NOT NULL,FOREIGN KEY(object_uuid,revision_uuid) REFERENCES geometry_revisions(object_uuid,uuid));");
     {
@@ -41,7 +41,7 @@ void schema17(const std::filesystem::path& path)
         "DROP TABLE store_required_features; DROP TABLE store_write_state; DROP TABLE store_manifest;"
         "ALTER TABLE object_revisions DROP COLUMN generation; ALTER TABLE relationship_revisions DROP COLUMN generation;"
         "ALTER TABLE objects DROP COLUMN geometry_manifest;"
-        "ALTER TABLE objects DROP COLUMN deleted;"
+        "ALTER TABLE objects DROP COLUMN state;"
         "DROP INDEX IF EXISTS edges_unique;"
         "PRAGMA user_version=17;");
     // Real v1 stored current pins and a duplicate dependency index. New native
@@ -62,10 +62,27 @@ void schema17(const std::filesystem::path& path)
     // Real v1 chunks are NOT NULL. Keep native triggers while reconstructing
     // that legacy table, before adding the extension dependency regression.
     exec(db.get(),"PRAGMA foreign_keys=OFF;");
-    for(const auto& [table,digest]:std::map<std::string,std::string>{
+    const std::map<std::string,std::set<std::string>> textUuidColumns{
+        {"object_revisions",{"uuid","object_uuid","parent_uuid"}},
+        {"object_heads",{"object_uuid","revision_uuid"}},
+        {"object_head_records",{"object_uuid","revision_uuid"}},
+        {"relationship_revisions",{"uuid","edge_uuid","a_revision","b_revision","a_geometry","b_geometry"}},
+        {"object_relationship_deltas",{"revision_uuid","edge_uuid","relationship_uuid"}},
+        {"object_relationship_heads",{"object_uuid","edge_uuid","relationship_uuid"}},
+        {"history_expected",{"uuid","revision_uuid"}}, {"history_required",{"uuid"}},
+        {"history_validated_edges",{"uuid"}}, {"sync_replica",{"uuid"}},
+        {"hub_leases",{"object_uuid","holder"}}, {"hub_upstream",{"hub_replica"}},
+        {"hub_versions",{"record_uuid"}}, {"hub_pending",{"record_uuid"}},
+        {"hub_inflight",{"record_uuid"}}, {"hub_conflicts",{"record_uuid"}}};
+    std::map<std::string,std::string> rebuild{
         {"geometry_chunks","hash"},{"geometry_revisions","content_hash"},
         {"geometry_revision_chunks","hash"},{"geometry_deltas","manifest_hash"},
-        {"geometry_current_chunks","hash"},{"edges",""},{"relationship_revisions",""}}) {
+        {"geometry_current_chunks","hash"},{"edges",""},{"relationship_revisions",""}};
+    for(const auto& [table,columns]:textUuidColumns){
+        Statement exists(db.get(),"SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?",table);
+        if(exists.row())rebuild.emplace(table,"");
+    }
+    for(const auto& [table,digest]:rebuild) {
         Statement schema(db.get(),"SELECT sql FROM sqlite_schema WHERE name=?",table);require(schema.row(),"native digest schema");
         auto definition=schema.text(0);definition=definition.substr(definition.find('('));schema.reset();
         const auto replace=[&](const std::string& before,const std::string& after) {
@@ -75,8 +92,13 @@ void schema17(const std::filesystem::path& path)
             replace(digest+" BLOB",digest+" TEXT");
             replace("CHECK(typeof("+digest+")='blob' AND length("+digest+")=32)","CHECK(length("+digest+")=64)");
         }
+        if(const auto columns=textUuidColumns.find(table);columns!=textUuidColumns.end())
+            for(const auto& name:columns->second){
+                replace(name+" BLOB",name+" TEXT");
+                replace(" CHECK(typeof("+name+")='blob' AND length("+name+")=16)","");
+            }
         if(table=="edges"){
-            replace("deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),","");
+            replace("state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0,2)),","");
             for(const auto* side:{"a","b"}){
                 const auto from=std::string(side)+"_uuid",to=std::string(side)+"_id";
                 replace(from+" BLOB NOT NULL CHECK(length("+from+")=16)",to+" INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT");
@@ -101,14 +123,18 @@ void schema17(const std::filesystem::path& path)
         Statement fields(db.get(),"SELECT name FROM pragma_table_xinfo(?) ORDER BY cid",table);
         while(fields.row()) {
             const auto name=fields.text(0);
-            if(table=="edges"&&name=="deleted")continue;
+            if(table=="edges"&&name=="state")continue;
             if(table=="edges"&&(name=="a_uuid"||name=="b_uuid")){
                 columns+=name=="a_uuid"?",a_id":",b_id";
                 projection+=",(SELECT id FROM objects WHERE uuid=edges."+name+")";
                 continue;
             }
             columns+=",\""+name+"\"";
-            projection+=name==digest?",lower(hex(\""+name+"\"))":",\""+name+"\"";
+            if(textUuidColumns.contains(table)&&textUuidColumns.at(table).contains(name)){
+                const auto field="\""+name+"\"",hex="lower(hex("+field+"))";
+                projection+=",CASE WHEN typeof("+field+")='blob' THEN substr("+hex+",1,8)||'-'||substr("+hex+
+                    ",9,4)||'-'||substr("+hex+",13,4)||'-'||substr("+hex+",17,4)||'-'||substr("+hex+",21,12) ELSE "+field+" END";
+            }else projection+=name==digest?",lower(hex(\""+name+"\"))":",\""+name+"\"";
         }
         exec(db.get(),("CREATE TABLE legacy_digest"+definition+"; INSERT INTO legacy_digest("+columns+") SELECT "+projection+
             " FROM \""+table+"\"; DROP TABLE \""+table+"\"; ALTER TABLE legacy_digest RENAME TO \""+table+"\";").c_str());
@@ -173,9 +199,19 @@ void digestHistory(const std::filesystem::path& path)
         Statement deltas(ObjectStoreImplAccess::conn(txn),"SELECT count(*) FROM geometry_deltas");
         require(deltas.row()&&deltas.i64(0)>0,"legacy fixture includes sparse historical delta");
     }
-    schema17(path);convertV1ToV2(path);
+    schema17(path);
+    int64_t reservedSequence=0;
+    {
+        std::unique_ptr<sqlite3,decltype(&sqlite3_close)> legacy(openConnection(path,SQLITE_OPEN_READWRITE,{},false),sqlite3_close);
+        exec(legacy.get(),"UPDATE sqlite_sequence SET seq=seq+700 WHERE name='object_revisions';");
+        Statement high(legacy.get(),"SELECT seq FROM sqlite_sequence WHERE name='object_revisions'");
+        require(high.row(),"legacy history sequence exists");reservedSequence=high.i64(0);
+    }
+    convertV1ToV2(path);
     {
         auto store=ObjectStore::open(path,OpenOptions{.readOnly=true});auto txn=store.read();
+        Statement high(ObjectStoreImplAccess::conn(txn),"SELECT seq FROM sqlite_sequence WHERE name='object_revisions'");
+        require(high.row()&&high.i64(0)==reservedSequence,"conversion preserves reserved AUTOINCREMENT high-water mark");
         const auto lifecycle=store.objectByUuid(txn,retired);
         require(lifecycle&&lifecycle->retired&&lifecycle->lifecycleEpoch==epoch,"conversion preserves lifecycle state directly on object");
         Statement removed(ObjectStoreImplAccess::conn(txn),"SELECT count(*) FROM sqlite_schema WHERE name='object_lifecycle'");
@@ -188,6 +224,12 @@ void digestHistory(const std::filesystem::path& path)
             Statement invalid(ObjectStoreImplAccess::conn(txn),"SELECT count(*) FROM "+table+" WHERE typeof("+column+")!='blob' OR length("+column+")!=32");
             require(invalid.row()&&invalid.i64(0)==0,"converted SQL digests are canonical binary32");
         }
+    }
+    {
+        auto store=ObjectStore::open(path,OpenOptions{.author="sequence-test"});
+        auto write=store.write();store.setMeta(write,object,"sequence_probe","true");write.commit();
+        auto read=store.read();require(store.currentObjectRevision(read,object)->sequence>reservedSequence,
+            "post-conversion publication must not reuse previously reserved history sequence values");
     }
     for(const auto mode:{HistoryMode::Off,HistoryMode::On}) {
         changeHistoryMode(path,mode);auto store=ObjectStore::open(path,OpenOptions{.readOnly=true});auto txn=store.read();
@@ -256,7 +298,7 @@ int main() try
         auto* sql=ObjectStoreImplAccess::conn(read);
         {Statement removed(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN ('edge_geometry_bindings','edge_lifecycle_bindings','geometry_edge_dependencies')");
             require(removed.row()&&removed.i64(0)==0,"conversion removes duplicate current-state binding materialization");}
-        {Statement endpoints(sql,"SELECT length(a_uuid),length(b_uuid),deleted FROM edges");
+        {Statement endpoints(sql,"SELECT length(a_uuid),length(b_uuid),state FROM edges");
             require(endpoints.row()&&endpoints.i64(0)==16&&endpoints.i64(1)==16&&endpoints.i64(2)==0,"conversion stores original endpoint UUIDs directly");}
         {Statement triggers(sql,"SELECT sql FROM sqlite_schema WHERE type='trigger' AND (name GLOB 'edges_history_*' OR name GLOB 'edge_tags_history_*')");
             int count=0;while(triggers.row()) {const auto definition=triggers.text(0);

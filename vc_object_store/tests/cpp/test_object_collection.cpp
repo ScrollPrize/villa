@@ -62,10 +62,10 @@ int main()try{
     {
         auto raw=ObjectStore::open(dir.path/"child.vcobj",OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
         auto r=raw.read();auto* sql=ObjectStoreImplAccess::conn(r);
-        Statement object(sql,"SELECT deleted FROM objects WHERE uuid=?",parseUuid(a.objectUuid));
-        require(object.row()&&object.i64(0)==1,"inherited object deletion must use its original UUID row");
-        Statement relation(sql,"SELECT deleted FROM edges WHERE uuid=?",parseUuid(edge.objectUuid));
-        require(relation.row()&&relation.i64(0)==1,"inherited edge deletion must use its original UUID row");
+        Statement object(sql,"SELECT state FROM objects WHERE uuid=?",parseUuid(a.objectUuid));
+        require(object.row()&&object.i64(0)==2,"inherited object deletion must use its original UUID row");
+        Statement relation(sql,"SELECT state FROM edges WHERE uuid=?",parseUuid(edge.objectUuid));
+        require(relation.row()&&relation.i64(0)==2,"inherited edge deletion must use its original UUID row");
         Statement redundant(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN "
             "('collection_refs','collection_edge_tombstones','external_object_keys','endpoint_keys')");
         require(redundant.row()&&redundant.i64(0)==0,"overlay must not add alias or tombstone tables");
