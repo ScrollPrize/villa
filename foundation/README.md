@@ -6,6 +6,7 @@ Small, mostly standalone projects that support the rest of the repository.
 
 - [comparison-website](comparison-website/) — Collects pairwise image preferences through a small FastAPI and Nginx app.
 - [datasets](datasets/) **(OLD)** — Scripts for generating and registering fiber, mesh, and volumetric-label datasets.
+- [helirec](helirec/) — Reconstruction of extended-field-of-view helical tomography (BM18 HA + TA scan pairs) from raw Bliss projections to slices and OME-Zarr volumes, with CPU and CUDA kernels.
 - [kaggle-visualizer](kaggle-visualizer/) — Napari helper for browsing paired 3D TIFF volumes and binary labels.
 - [obj2nml](obj2nml/) **(OLD)** — Converts OBJ meshes into WebKnossos NML skeleton annotations.
 - [photogrammetry-docs](photogrammetry-docs/INSTRUCTIONS.md) — End-to-end photogrammetry and scroll-case instructions with a pinned PGS-Recon workflow.

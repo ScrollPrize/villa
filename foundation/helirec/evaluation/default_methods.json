@@ -1,0 +1,13 @@
+{
+  "params": {"filters": []},
+  "slices": {"n": 5},
+  "roi": null,
+  "window": "auto",
+  "tile": 1024,
+  "methods": [
+    {"name": "fbp", "backprojector": "fbp", "desc": "exact FBP, cubic B-spline interpolation, 2x FFT oversampling"},
+    {"name": "sirt", "backprojector": "sirt(num_iter=20,init=gridrec)", "desc": "SIRT, 20 iterations from gridrec"},
+    {"name": "mlem", "backprojector": "mlem(num_iter=20,init=gridrec)", "desc": "MLEM, 20 iterations from gridrec"},
+    {"name": "gridrec", "backprojector": "gridrec(filter_name=shepp)", "desc": "gridrec, Shepp-Logan filter"}
+  ]
+}

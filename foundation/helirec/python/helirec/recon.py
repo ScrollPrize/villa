@@ -1,0 +1,305 @@
+"""High-level API: raw projection folders -> calibrated -> reconstructed xy slices.
+
+    from helirec.recon import HelicalRecon
+    r = HelicalRecon("/path/to/projections", cache_dir="/path/to/cache", device="cuda")
+    slices = r.reconstruct_fractions([0.4, 0.5])          # (n, N, N) float32, attenuation in cm^-1
+
+Slice positions use the reference conventions: a fraction f of the doable view-height span
+[lo, hi) maps to view height h = hi - 1 - round_half_even(f * (hi - lo)) (f = 0 bottom, 1 top).
+
+Modes (params["mode"]):
+  corrected          (default) attenuation in cm^-1, periodic opposite-view rebalance, ramp padding reflected about
+                     the true rotation axis, mending over the merged columns the scans cover, fixed unit-DC Paganin
+                     kernel (when a Paganin filter is requested); no projection filters by default.
+  legacy_reference   reproduces reconstructions of the reference workflow (Night Rail BM18 / nabu-helical / nabuxx):
+                     its conventions (half-attenuation "reference units",
+                     nabuxx rebalance endpoints, integer padding reflection, index-as-width mending bounds,
+                     chunk-truncated Paganin) and every parameter pinned to LEGACY_REFERENCE. Pinned parameters cannot
+                     be changed in this mode, and the calibration must be the measured one (no overrides).
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from . import _core, bliss, calibration
+from .filters import DEFAULT_CHAIN, REFERENCE_CHAIN, is_filter_key, override, parse_chain
+
+MODES = ("corrected", "legacy_reference")
+
+# default reconstruction parameters: the reference workflow's (Night Rail BM18 defaults) with the corrected conventions
+# (mode "corrected") and no projection filters
+DEFAULTS = dict(
+    mode="corrected", filters=DEFAULT_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
+    luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
+    backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
+    axis_source_meters=1e9,
+)
+
+# mode "legacy_reference": every parameter pinned to the reference workflow
+LEGACY_REFERENCE = dict(
+    filters=REFERENCE_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
+    luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
+    backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
+    axis_source_meters=1e9,
+)
+assert set(LEGACY_REFERENCE) == set(DEFAULTS) - {"mode"}
+
+# uint8 display window of the reference workflow (legacy reference units); the same physical window in
+# attenuation (cm^-1) is twice as wide
+REFERENCE_WINDOW = (-0.03, 0.145)
+
+
+def display_window(mode):
+    """default uint8 window for outputs of `mode` (the reference window in that mode's units)"""
+    k = 1.0 if mode == "legacy_reference" else 2.0
+    return tuple(k * v for v in REFERENCE_WINDOW)
+
+
+# conventions of each mode (provenance)
+CONVENTIONS = {
+    "corrected": dict(output_units="attenuation_cm-1", ramp_angular_weight="2pi/n_angles",
+                      rebalance="periodic_opposite_view", ramp_padding_reflection="2*rot_center (interpolated)",
+                      mending_domain="merged columns covered by the scans' weight maps",
+                      paganin_kernel="fixed, rows [-m, m], unit DC"),
+    "legacy_reference": dict(output_units="reference_units (attenuation / 2)", ramp_angular_weight="pi/n_angles",
+                             rebalance="nabuxx (endpoint quirks)", ramp_padding_reflection="lround(2*rot_center)",
+                             mending_domain="main-scan first/last column as left/right widths",
+                             paganin_kernel="nabuxx pag_version 2 (truncated per chunk, DC not renormalised)"),
+}
+
+
+def _chain_norm(chain):
+    """filter chain with numeric parameter values as floats (1000 == 1000.0 == '1000')"""
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return v
+    return [{k: (v if k == "type" else num(v)) for k, v in f.items()} for f in parse_chain(chain)]
+
+
+def _same(key, a, b):
+    if key == "filters":
+        return _chain_norm(a) == _chain_norm(b)
+    if isinstance(b, bool) or isinstance(a, bool):
+        return bool(a) == bool(b)
+    if isinstance(b, (int, float)):
+        try:
+            return float(a) == float(b)
+        except (TypeError, ValueError):
+            return False
+    return a == b
+
+
+def legacy_reference_config():
+    """SliceReconstructor config keys of mode legacy_reference (all but geometry / physics / device), for callers
+    that build the reconstructor themselves"""
+    p = {k: v for k, v in LEGACY_REFERENCE.items() if k != "backprojector"}
+    p["filters"] = [dict(f) for f in LEGACY_REFERENCE["filters"]]
+    return dict(p, legacy_reference=True, **backprojector_config(LEGACY_REFERENCE["backprojector"]))
+
+
+def backprojector_config(spec):
+    """Backprojector spec -> reconstructor config keys. Specs (text or dict):
+      ghbp                                  the reference hierarchical backprojector
+      fbp(interp=linear|cubic|lanczos3|bspline3|bspline5, oversample=1..8)   exact pixel-driven backprojector
+                                            (default interp=bspline3, oversample=2: ~ideal interpolation)
+                                            (oversample: FFT upsampling of the filtered rows before interpolating)
+      sirt(num_iter=, relax=, norm=rowsum|len2, projector=sf|chord, init=constant|gridrec, init_value=)
+      mlem(num_iter=, projector=sf|chord, init=constant|gridrec, init_value=)
+      gridrec(filter_name=shepp|ramlak|..., filter_par=a:b)
+                                            whole-slice methods (tomo.hpp)
+      python(fn=NAME, ...)                  a function registered in helirec.backprojectors"""
+    from .filters import parse_chain
+    s = dict(spec) if isinstance(spec, dict) else parse_chain(str(spec))[0]
+    typ = s.pop("type")
+    if typ == "ghbp":
+        out = dict(backprojector="ghbp")
+    elif typ == "fbp":
+        out = dict(backprojector="fbp", bp_interp=str(s.pop("interp", "bspline3")), bp_oversample=int(s.pop("oversample", 2)))
+    elif typ in ("sirt", "mlem", "gridrec"):
+        out = dict(backprojector=typ, tomo_params={k: str(v) for k, v in s.items()})
+        s = {}
+    elif typ == "python":
+        out = dict(backprojector="external", external_bp=dict(s))
+        s = {}
+    else:
+        raise ValueError(f"unknown backprojector '{typ}' (ghbp, fbp, sirt, mlem, gridrec, python)")
+    if s:
+        raise ValueError(f"backprojector {typ}: unknown parameters {sorted(s)}")
+    return out
+
+
+@dataclass
+class SliceInfo:
+    fraction: float
+    view_height: int
+    nabu_index: int
+    height_mm: float
+
+
+@dataclass
+class HelicalRecon:
+    projections_dir: str
+    cache_dir: str | None = None
+    device: str = "cuda"
+    params: dict = field(default_factory=dict)
+    cor_override: float | None = None          # rotation axis in the MAIN scan's detector columns
+    vector_override: tuple | None = None       # (dy, dx) main -> companion
+    log: object = print
+
+    def __post_init__(self):
+        scans = bliss.discover_scans(self.projections_dir)
+        pair = bliss.pair_companions(scans)
+        self.main, self.companion = pair["main"], pair["companion"]
+        for s in (self.main, self.companion):
+            s.check_files()
+        given = dict(self.params)
+        self.params = {**DEFAULTS, "filters": [dict(f) for f in DEFAULTS["filters"]]}
+        self._update(given)   # (validates the mode before the calibration)
+        self.cal, self.arrays = calibration.calibrate(self.main, self.companion, cache_dir=self.cache_dir,
+                                                      log=self.log, cor_override=self.cor_override,
+                                                      vector_override=self.vector_override)
+        self._check_calibration()
+        self._build()
+
+    # ------------------------------------------------------------------ setup
+    def _scan_data(self, scan, tag):
+        pl = self.cal.placement[scan.name]
+        reader = _core.RawReader(list(scan.projections.files), scan.projections.dataset, *scan.frame_shape)
+        flats = (self.arrays[f"{tag}_flats"] - self.arrays[f"{tag}_dark"][None]).astype(np.float32)
+        return _core.make_scan_data(
+            np.ascontiguousarray(scan.unwrapped_angles_deg, np.float64),
+            np.ascontiguousarray(scan.z_translation_m, np.float64), scan.pixel_size_m, scan.frame_shape[0],
+            scan.frame_shape[1], pl.shift_x, pl.x_readjustment, pl.z_readjustment,
+            np.ascontiguousarray(scan.control_A, np.float64),
+            np.ascontiguousarray(scan.flats_unwrapped_angles_deg, np.float32),
+            np.ascontiguousarray(self.arrays[f"{tag}_dark"]), np.ascontiguousarray(flats),
+            np.ascontiguousarray(self.arrays[f"{tag}_weight"]), reader, scan.projections.file_index,
+            scan.projections.frame_index)
+
+    def _build(self):
+        p = dict(self.params)
+        m = self.main
+        mode = p.pop("mode")
+        cfg = dict(p, device=self.device, energy_kev=m.energy_kev, distance_m=m.distance_m,
+                   pixel_size_m=m.pixel_size_m, rot_center=self.cal.rot_center,
+                   legacy_reference=mode == "legacy_reference")
+        cfg.update(backprojector_config(p["backprojector"]))
+        scans = [self._scan_data(self.main, "main"), self._scan_data(self.companion, "companion")]
+        self.rec = _core.SliceReconstructor(scans, cfg)
+        self.info = self.rec.info
+        self.lo, self.hi = self.info["doable"]
+
+    @property
+    def legacy(self) -> bool:
+        return self.params["mode"] == "legacy_reference"
+
+    def _check_calibration(self):
+        if self.legacy and self.cal.source != "measured":
+            raise ValueError("mode legacy_reference reproduces the reference reconstruction: it needs the measured "
+                             "calibration (no cor / vector overrides)")
+
+    def _update(self, kw):
+        regular = {k: v for k, v in kw.items() if not is_filter_key(k) or k == "filters"}
+        unknown = set(regular) - set(DEFAULTS)
+        if unknown:
+            raise KeyError(f"unknown parameters {sorted(unknown)}; known: {sorted(DEFAULTS)} and TYPE.param filter keys")
+        mode = regular.get("mode", self.params["mode"])
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
+        if mode == "legacy_reference":
+            # no partial legacy: the reference's parameters are pinned; anything else is an error
+            bad = sorted(k for k, v in regular.items() if k != "mode" and not _same(k, v, LEGACY_REFERENCE[k]))
+            bad += sorted(k for k in kw if is_filter_key(k) and k != "filters")
+            if bad:
+                raise ValueError(f"mode legacy_reference pins {bad} to the reference values "
+                                 f"({ {k: LEGACY_REFERENCE[k] for k in bad if k in LEGACY_REFERENCE} }); vary them in "
+                                 f"mode 'corrected' instead")
+            self.params = {"mode": mode, **LEGACY_REFERENCE, "filters": [dict(f) for f in LEGACY_REFERENCE["filters"]]}
+            return
+        if self.params["mode"] == "legacy_reference":   # leaving the legacy mode: start again from the defaults
+            self.params = {**DEFAULTS, "filters": [dict(f) for f in DEFAULTS["filters"]]}
+        self.params.update(regular)
+        changes = {k: v for k, v in kw.items() if is_filter_key(k) and k != "filters"}
+        if changes:
+            self.params["filters"] = override(self.params["filters"], changes)
+
+    def provenance(self) -> dict:
+        """Everything that defines the reconstruction: mode and its conventions, resolved parameters, calibration
+        (source measured / override + fingerprint), geometry, physics and the build."""
+        mode = self.params["mode"]
+        return dict(mode=mode, conventions=CONVENTIONS[mode], params=self.params,
+                    pinned=sorted(LEGACY_REFERENCE) if mode == "legacy_reference" else [],
+                    output_units=CONVENTIONS[mode]["output_units"],
+                    calibration=dict(source=self.cal.source, fingerprint=self.cal.fingerprint,
+                                     version=self.cal.version, rot_center=self.cal.rot_center,
+                                     vector=list(self.cal.vector), cor_main_detector=self.cal.cor_main_detector),
+                    reconstructor=dict(self.info), pixel_size_m=self.main.pixel_size_m,
+                    energy_kev=self.main.energy_kev, distance_m=self.main.distance_m,
+                    helirec=_build_identity())
+
+    def set_params(self, **kw):
+        """Change reconstruction parameters (rebuilds the reconstructor; calibration is kept). Filter chain:
+        filters=[...] or dotted keys, e.g. set_params(**{"paganin.delta_beta": 500}). mode="legacy_reference" pins
+        every other parameter (see the module docstring)."""
+        self._update(kw)
+        self._check_calibration()
+        self._build()
+
+    def chains(self, sweep):
+        """Override dicts ({"paganin.delta_beta": 500, ...}) -> filter chains based on the current one."""
+        if self.legacy and any(sweep):
+            raise ValueError("mode legacy_reference: the filter chain is pinned (sweeps belong in mode 'corrected')")
+        return [override(self.params["filters"], s) for s in sweep]
+
+    # ------------------------------------------------------------------ slice addressing
+    def slice_info(self, fraction: float) -> SliceInfo:
+        if not 0.0 < fraction < 1.0:
+            raise ValueError("fraction must be in (0, 1)")
+        k = int(round(fraction * (self.hi - self.lo)))     # python round: half to even (reference)
+        h = self.hi - 1 - k
+        z0 = float(self.main.z_translation_m[0])
+        px_mm = self.main.pixel_size_m * 1e3
+        rows = self.main.frame_shape[0]
+        height = px_mm * ((rows - 1) / 2 - h) - z0 * 1e3
+        return SliceInfo(fraction, h, 999999 - (self.hi - h), height)
+
+    def reconstruct_heights(self, h_lo: int, h_hi: int, debug=False, timing=False, roi=None):
+        """Slices [h_lo, h_hi) -> (n, N, N), or (n, y1 - y0, x1 - x0) with roi = (x0, x1, y0, y1)."""
+        return self.rec.reconstruct(int(h_lo), int(h_hi), debug, timing, None if roi is None else tuple(map(int, roi)))
+
+    def reconstruct_fractions(self, fractions):
+        out = []
+        for f in fractions:
+            si = self.slice_info(f)
+            out.append(self.reconstruct_heights(si.view_height, si.view_height + 1)[0])
+        return np.stack(out)
+
+
+def _build_identity():
+    """helirec source revision (git) and extension build, for provenance"""
+    import os
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out = dict(extension=os.path.abspath(_core.__file__))
+    try:
+        out["git"] = subprocess.run(["git", "-C", root, "describe", "--always", "--dirty"], capture_output=True,
+                                    text=True, timeout=10).stdout.strip()
+    except Exception:  # noqa: BLE001 (no git)
+        pass
+    try:
+        out["extension_mtime"] = os.path.getmtime(_core.__file__)
+        import hashlib
+        from pathlib import Path
+        digest = hashlib.sha256()
+        for path in sorted(Path(__file__).parent.rglob("*.py")) + sorted(Path(__file__).parent.rglob("*.h")):
+            digest.update(str(path.relative_to(Path(__file__).parent)).encode())
+            digest.update(path.read_bytes())
+        out["python_source_sha256"] = digest.hexdigest()
+    except OSError:
+        pass
+    return out

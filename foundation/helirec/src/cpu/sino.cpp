@@ -1,0 +1,226 @@
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <set>
+#include <vector>
+
+#include "common/rebalance_core.hpp"
+#include "common/sino_core.hpp"
+#include "helirec/sino.hpp"
+
+namespace helirec {
+
+using namespace helirec::sino_core;
+
+namespace {
+
+long cround(double x) { return std::lround(x); }  // half away from zero (C lround)
+
+// adj = Gb - Ga for row y (mirror row m): Gaussian-weighted means near the axis
+float ramp_adj(const float* row, const float* mrow, const RampGeometry& g) {
+    if (!g.legacy) return ramp_adj_exact(row, mrow, g);
+    if (g.R <= 0) return 0.f;
+    const float sigma = static_cast<float>(g.R) / 3.0f;
+    const float inv2s2 = 1.0f / (2.0f * sigma * sigma);
+    const float my_rot_f = g.rot_center, two_rots_f = 2.0f * g.rot_center;
+    const float mirror_center = two_rots_f - my_rot_f;
+    const int i0 = std::max(0, g.my_rot - g.R), i1 = std::min(g.n_bins - 1, g.my_rot + g.R);
+    float sa = 0, wa = 0, sb = 0, wb = 0;
+    for (int ix = i0; ix <= i1; ++ix) {
+        const float dA = static_cast<float>(ix) - my_rot_f;
+        const float wA = std::exp(-(dA * dA) * inv2s2);
+        sa += row[ix] * wA;
+        wa += wA;
+        const int xm = g.two_rots - ix;
+        if (xm >= 0 && xm < g.n_bins) {
+            const float dB = static_cast<float>(xm) - mirror_center;
+            const float wB = std::exp(-(dB * dB) * inv2s2);
+            sb += mrow[xm] * wB;
+            wb += wB;
+        }
+    }
+    if (wa > 0 && wb > 0) return sb / wb - sa / wa;
+    return 0.f;
+}
+
+}  // namespace
+
+// ------------------------------------------------------------------ ramp geometry/filter
+RampGeometry ramp_geometry(int n_bins, int n_proj, float rot_center, int pad_factor, bool legacy) {
+    static const std::vector<long> powers = [] {
+        std::set<long> p;
+        for (int a = 2; a <= 15; ++a)
+            for (int b = 0; b <= 9; ++b)
+                for (int c = 0; c <= 6; ++c)
+                    for (int d = 0; d <= 5; ++d)
+                        p.insert((1L << a) * static_cast<long>(std::pow(3, b)) * static_cast<long>(std::pow(5, c)) *
+                                 static_cast<long>(std::pow(7, d)));
+        return std::vector<long>(p.begin(), p.end());
+    }();
+    auto it = std::lower_bound(powers.begin(), powers.end(), static_cast<long>(n_bins));
+    const long base = it == powers.end() ? powers.back() : *it;
+    RampGeometry g;
+    g.n_bins = n_bins;
+    g.n_proj = n_proj;
+    g.rot_center = rot_center;
+    g.npad = static_cast<int>(2 * base * std::max(1, pad_factor));
+    g.pad_l = (g.npad - n_bins) / 2;
+    g.two_rots = static_cast<int>(cround(static_cast<double>(2.0f * rot_center)));
+    g.my_rot = static_cast<int>(cround(static_cast<double>(rot_center)));
+    int R = g.two_rots > n_bins ? std::min(30, n_bins - 1 - std::max(g.my_rot, g.two_rots - g.my_rot))
+                                : std::min(30, std::min(g.my_rot, g.two_rots - g.my_rot) - 1);
+    g.R = std::max(R, 0);
+    g.switch_pos = g.npad - g.pad_l;
+    g.legacy = legacy;
+    if (n_proj % 2 != 0) throw Error("ramp filter: odd number of grid angles is not supported");
+    return g;
+}
+
+float ramp_scale(int n_proj, bool legacy) {
+    return static_cast<float>(M_PI) * (legacy ? 1.f : 2.f) / static_cast<float>(n_proj);
+}
+
+std::vector<float> ramlak_half_spectrum(int npad, float scale) {
+    std::vector<double> h(npad, 0.0);
+    const int L2 = npad / 2 + 1;
+    std::vector<float> hf(npad, 0.f);
+    hf[0] = 0.25f;
+    const float pi = static_cast<float>(M_PI);
+    for (int n = 1; n <= L2 - 2; n += 2) hf[n] = -1.0f / (pi * pi * static_cast<float>(n) * static_cast<float>(n));
+    for (int q = 0; q < npad - L2; ++q) hf[L2 + q] = hf[(L2 - 2) - q];
+    // real part of the DFT (double), as numpy.fft.rfft(h.astype(float64)).real
+    const int nh = npad / 2 + 1;
+    std::vector<float> H(nh);
+    for (int k = 0; k < nh; ++k) {
+        double acc = 0;
+        for (int n = 0; n < npad; ++n) {
+            if (hf[n] == 0.f) continue;
+            acc += static_cast<double>(hf[n]) * std::cos(2 * M_PI * static_cast<double>((static_cast<long>(k) * n) % npad) / npad);
+        }
+        float v = static_cast<float>(acc);
+        if (v < 0 && std::abs(v) < 1e-7f) v = 0.f;
+        H[k] = v;
+    }
+    for (auto& v : H) v *= scale;
+    return H;
+}
+
+FourierFilterSpec ramp_filter_spec(const RampGeometry& g, float scale) {
+    FourierFilterSpec s;
+    s.ndim = 1;
+    s.h = 1;
+    s.w = g.npad;
+    s.ph = 1;
+    s.pw = g.npad;
+    s.pad_top = 0;
+    s.pad_left = 0;
+    s.mode = PadMode::Zero;
+    s.filter = ramlak_half_spectrum(g.npad, scale);
+    return s;
+}
+
+namespace cpu {
+
+void minus_log(float* x, std::size_t n, float lo, float hi) {
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = sino_core::minus_log(x[i], lo, hi);
+}
+
+void multiply(float* x, const float* w, std::size_t n) {
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = x[i] * w[i];
+}
+
+void ramp_pad(const float* sino, float* padded, const RampGeometry& g) {
+#pragma omp parallel for schedule(static)
+    for (int y = 0; y < g.n_proj; ++y) {
+        const int m = (y + g.n_proj / 2) % g.n_proj;
+        const float* row = sino + static_cast<std::size_t>(y) * g.n_bins;
+        const float* mrow = sino + static_cast<std::size_t>(m) * g.n_bins;
+        const float adj = ramp_adj(row, mrow, g);
+        float* out = padded + static_cast<std::size_t>(y) * g.npad;
+        for (int x = 0; x < g.npad; ++x)
+            out[x] = ramp_pad_value(row, mrow, adj, x, g);
+    }
+}
+
+void ramp_crop(const float* padded, float* out, const RampGeometry& g) {
+#pragma omp parallel for schedule(static)
+    for (int y = 0; y < g.n_proj; ++y)
+        std::memcpy(out + static_cast<std::size_t>(y) * g.n_bins, padded + static_cast<std::size_t>(y) * g.npad,
+                    sizeof(float) * g.n_bins);
+}
+
+// ------------------------------------------------------------------ rebalance
+namespace {
+using rebalance_core::Contribution;
+using rebalance_core::OddMap;
+inline float mapped(const float* row, const OddMap& e) {
+    float v = 0.f;
+    if (e.src0 >= 0) v += e.w0 * row[e.src0];
+    if (e.src1 >= 0) v += e.w1 * row[e.src1];
+    return v;
+}
+}  // namespace
+
+int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy) {
+    const std::size_t plane = static_cast<std::size_t>(n_rows) * n_cols;
+    // ---- hole filling (mid-row emptiness test, cyclic merge)
+    const int mid = n_rows / 2;
+    std::vector<char> nonempty(n_proj, 0);
+    for (int i = 0; i < n_proj; ++i) {
+        const float* w = W + i * plane + static_cast<std::size_t>(mid) * n_cols;
+        for (int c = 0; c < n_cols; ++c)
+            if (w[c] != 0.0f) { nonempty[i] = 1; break; }
+    }
+    bool any = false;
+    for (char v : nonempty) any |= v;
+    if (!any) return 0;
+    const auto holes = rebalance_core::holes_from(nonempty);
+    std::vector<float> rf(plane), wf(plane);
+    for (auto [s, e] : holes) {
+        const int left = (s + n_proj - 1) % n_proj, right = e % n_proj;
+        for (std::size_t k = 0; k < plane; ++k) {
+            rf[k] = 0.5f * (R[left * plane + k] + R[right * plane + k]);
+            wf[k] = 0.5f * (W[left * plane + k] + W[right * plane + k]);
+        }
+        for (int idx = s; idx < e; ++idx) {
+            std::memcpy(R + (idx % n_proj) * plane, rf.data(), plane * sizeof(float));
+            std::memcpy(W + (idx % n_proj) * plane, wf.data(), plane * sizeof(float));
+        }
+    }
+    // ---- contribution table
+    const auto table = rebalance_core::contribution_table(n_proj, legacy);
+    const auto omap = rebalance_core::odd_shift_map(n_cols, rot_center);
+    // ---- balanced weights, row by row
+    std::vector<float> Wsrc(static_cast<std::size_t>(n_proj) * n_cols);
+    for (int row = 0; row < n_rows; ++row) {
+        for (int i = 0; i < n_proj; ++i)
+            std::memcpy(Wsrc.data() + static_cast<std::size_t>(i) * n_cols, W + i * plane + static_cast<std::size_t>(row) * n_cols,
+                        n_cols * sizeof(float));
+#pragma omp parallel
+        {
+            std::vector<float> B(n_cols);
+#pragma omp for schedule(static)
+            for (int i = 0; i < n_proj; ++i) {
+                const float* Wi = Wsrc.data() + static_cast<std::size_t>(i) * n_cols;
+                std::copy(Wi, Wi + n_cols, B.begin());
+                for (const auto& m : table[i]) {
+                    const float* r0 = Wsrc.data() + static_cast<std::size_t>(m.k0) * n_cols;
+                    const float* r1 = m.has_two ? Wsrc.data() + static_cast<std::size_t>(m.k1) * n_cols : nullptr;
+                    const float beta = 1.0f - m.alpha, alpha = m.alpha;
+                    for (int c = 0; c < n_cols; ++c) {
+                        if (!m.odd) B[c] += m.has_two ? beta * r0[c] + alpha * r1[c] : r0[c];
+                        else B[c] += m.has_two ? beta * mapped(r0, omap[c]) + alpha * mapped(r1, omap[c]) : mapped(r0, omap[c]);
+                    }
+                }
+                float* dst = W + i * plane + static_cast<std::size_t>(row) * n_cols;
+                for (int c = 0; c < n_cols; ++c) dst[c] = Wi[c] == 0.0f ? 0.0f : Wi[c] / B[c];
+            }
+        }
+    }
+    return static_cast<int>(holes.size());
+}
+
+}  // namespace cpu
+}  // namespace helirec
