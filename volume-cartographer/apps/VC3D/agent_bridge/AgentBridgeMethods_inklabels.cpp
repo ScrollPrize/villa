@@ -76,6 +76,39 @@ AgentBridgeParam connectivityParam()
 
 void AgentBridgeServer::registerInkLabelHandlers()
 {
+    const auto expect = Params::requiredObject(QStringLiteral("expect"), {
+        Params::requiredString(QStringLiteral("segment")),
+        Params::requiredSafeId(QStringLiteral("serial")),
+    });
+    registerMethod({
+        .name = QStringLiteral("ink_labels.panel"),
+        .params = {Params::optionalStringEnum(QStringLiteral("section"),
+            {QStringLiteral("labels"), QStringLiteral("assist"), QStringLiteral("files")}, QStringLiteral("labels")),
+            Params::optionalBoolean(QStringLiteral("floating"))},
+        .errors = {-32602, -32000, -32002, -32004},
+        .mcp = Mcp::exact(QStringLiteral("vc3d_ink_labels_panel")),
+    }, [this](const QJsonValue& p) { return handleInkLabelsPanel(p); });
+    registerMethod({
+        .name = QStringLiteral("ink_labels.control"),
+        .params = {Params::requiredStringEnum(QStringLiteral("control"), {
+            QStringLiteral("mode"), QStringLiteral("ink"), QStringLiteral("background"),
+            QStringLiteral("validation"), QStringLiteral("erase"), QStringLiteral("keep_ink"),
+            QStringLiteral("brush"), QStringLiteral("polygon"), QStringLiteral("fill"),
+            QStringLiteral("show"), QStringLiteral("show_ink"), QStringLiteral("show_supervision"),
+            QStringLiteral("show_validation"), QStringLiteral("radius"), QStringLiteral("opacity"),
+            QStringLiteral("undo"), QStringLiteral("redo")}), Params::optionalInteger(QStringLiteral("value")), expect},
+        .errors = {-32602, -32000, -32002, -32004, -32007, -32009},
+        .mcp = Mcp::exact(QStringLiteral("vc3d_ink_labels_control")),
+    }, [this](const QJsonValue& p) { return handleInkLabelsControl(p); });
+    registerMethod({
+        .name = QStringLiteral("ink_labels.viewport_stroke"),
+        .params = {Params::optionalString(QStringLiteral("viewer")),
+            Params::requiredArray(QStringLiteral("points"), Params::optionalObject(QString(), {
+                Params::requiredNumber(QStringLiteral("x")), Params::requiredNumber(QStringLiteral("y"))})), expect},
+        .errors = {-32602, -32000, -32002, -32004, -32007, -32009},
+        .mcp = Mcp::exact(QStringLiteral("vc3d_ink_labels_viewport_stroke")),
+    }, [this](const QJsonValue& p) { return handleInkLabelsViewportStroke(p); });
+
     registerMethod(
         {
             .name = QStringLiteral("ink_labels.state"),

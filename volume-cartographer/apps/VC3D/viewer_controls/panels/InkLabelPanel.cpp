@@ -66,7 +66,27 @@ QPushButton* makeButton(const QString& text, QWidget* parent, bool checkable)
     auto* button = new QPushButton(text, parent);
     button->setCheckable(checkable);
     button->setFocusPolicy(Qt::NoFocus);
+    if (checkable) {
+        button->setProperty("inkLabelBaseText", text);
+        button->setAccessibleName(text);
+        // A shape and text cue supplement color in both light and dark themes.
+        // Scope this style to label toggles; ordinary action buttons stay native.
+        button->setStyleSheet(QStringLiteral(
+            "QPushButton { background-color: palette(button); color: palette(button-text);"
+            " border: 2px solid transparent; border-radius: 3px; padding: 2px 4px; }"
+            "QPushButton:checked { border-color: palette(highlight); font-weight: bold; }"
+            "QPushButton:disabled { color: palette(mid); }"));
+    }
     return button;
+}
+
+// Refresh from the controller even when QSignalBlocker suppresses toggled().
+void setCheckedFeedback(QPushButton* button, bool checked)
+{
+    button->setChecked(checked);
+    const QString text = button->property("inkLabelBaseText").toString();
+    button->setText(checked ? text + QStringLiteral(" \u2713") : text);
+    button->setAccessibleDescription(checked ? InkLabelPanel::tr("Selected") : InkLabelPanel::tr("Not selected"));
 }
 
 QCheckBox* makeCheck(const QString& text, QWidget* parent)
@@ -230,7 +250,14 @@ InkLabelPanel::InkLabelPanel(InkLabelController* labels, QWidget* parent)
     _opacitySlider = new QSlider(Qt::Horizontal, opacityRow);
     _opacitySlider->setRange(0, 100);
     _opacitySlider->setFocusPolicy(Qt::NoFocus);
+    _opacitySlider->setAccessibleName(tr("Label opacity"));
+    _opacityLabel = new QLabel(opacityRow);
+    _opacityLabel->setObjectName(QStringLiteral("inkLabelOpacityValue"));
+    _opacityLabel->setAccessibleName(tr("Label opacity percentage"));
+    _opacityLabel->setMinimumWidth(QFontMetrics(_opacityLabel->font()).horizontalAdvance(QStringLiteral("100%")));
+    _opacityLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     opacityRow->addControl(_opacitySlider, 1);
+    opacityRow->addControl(_opacityLabel);
     layout->addWidget(opacityRow);
 
     auto* historyRow = new LabeledControlRow(tr("History"), this);
@@ -401,6 +428,22 @@ InkLabelPanel::InkLabelPanel(InkLabelController* labels, QWidget* parent)
     assist->addWidget(cleanupButtons);
     outer->addWidget(_filesGroup);
 
+    _inkButton->setObjectName(QStringLiteral("inkLabelControl_ink"));
+    _backgroundButton->setObjectName(QStringLiteral("inkLabelControl_background"));
+    _validationButton->setObjectName(QStringLiteral("inkLabelControl_validation"));
+    _eraserButton->setObjectName(QStringLiteral("inkLabelControl_erase"));
+    _keepsInkCheck->setObjectName(QStringLiteral("inkLabelControl_keep_ink"));
+    _brushButton->setObjectName(QStringLiteral("inkLabelControl_brush"));
+    _polygonButton->setObjectName(QStringLiteral("inkLabelControl_polygon"));
+    _fillButton->setObjectName(QStringLiteral("inkLabelControl_fill"));
+    _showCheck->setObjectName(QStringLiteral("inkLabelControl_show"));
+    _showInkCheck->setObjectName(QStringLiteral("inkLabelControl_show_ink"));
+    _showSupervisionCheck->setObjectName(QStringLiteral("inkLabelControl_show_supervision"));
+    _showValidationCheck->setObjectName(QStringLiteral("inkLabelControl_show_validation"));
+    _opacitySlider->setObjectName(QStringLiteral("inkLabelControl_opacity"));
+    _undoButton->setObjectName(QStringLiteral("inkLabelControl_undo"));
+    _redoButton->setObjectName(QStringLiteral("inkLabelControl_redo"));
+
     if (!_labels) {
         setEnabled(false);
         return;
@@ -481,6 +524,18 @@ InkLabelPanel::InkLabelPanel(InkLabelController* labels, QWidget* parent)
     refreshAssist();
 }
 
+bool InkLabelPanel::clickUndoForAgent()
+{
+    if (!_labels || !_undoButton || !_undoButton->isEnabled())
+        return false;
+    const auto* history = _labels->history();
+    const auto* top = history ? history->top() : nullptr;
+    if (!top || top->actor != Actor::Agent)
+        return false;
+    _undoButton->click();
+    return true;
+}
+
 void InkLabelPanel::refreshSession()
 {
     if (!_labels)
@@ -489,7 +544,7 @@ void InkLabelPanel::refreshSession()
     const QString refusal = _labels->labelModeRefusal();
     {
         const QSignalBlocker blocker(_modeButton);
-        _modeButton->setChecked(_labels->labelModeEnabled());
+        setCheckedFeedback(_modeButton, _labels->labelModeEnabled());
     }
     if (!session) {
         _folderLabel->setText(tr("No labels open. Select a segment and press I."));
@@ -554,14 +609,14 @@ void InkLabelPanel::refreshTools()
         return;
     const QSignalBlocker b1(_inkButton), b2(_backgroundButton), b3(_validationButton), b4(_eraserButton), b5(_keepsInkCheck),
         b6(_brushButton), b7(_polygonButton), b8(_radiusSlider), b9(_fillButton);
-    _inkButton->setChecked(_labels->paintClass() == PaintClass::Ink);
-    _backgroundButton->setChecked(_labels->paintClass() == PaintClass::Background);
-    _validationButton->setChecked(_labels->paintClass() == PaintClass::Validation);
-    _eraserButton->setChecked(_labels->erase());
+    setCheckedFeedback(_inkButton, _labels->paintClass() == PaintClass::Ink);
+    setCheckedFeedback(_backgroundButton, _labels->paintClass() == PaintClass::Background);
+    setCheckedFeedback(_validationButton, _labels->paintClass() == PaintClass::Validation);
+    setCheckedFeedback(_eraserButton, _labels->erase());
     _keepsInkCheck->setChecked(_labels->backgroundKeepsInk());
-    _brushButton->setChecked(_labels->tool() == InkLabelController::Tool::Brush);
-    _polygonButton->setChecked(_labels->tool() == InkLabelController::Tool::Polygon);
-    _fillButton->setChecked(_labels->tool() == InkLabelController::Tool::Fill);
+    setCheckedFeedback(_brushButton, _labels->tool() == InkLabelController::Tool::Brush);
+    setCheckedFeedback(_polygonButton, _labels->tool() == InkLabelController::Tool::Polygon);
+    setCheckedFeedback(_fillButton, _labels->tool() == InkLabelController::Tool::Fill);
     _radiusSlider->setValue(radiusToSlider(_labels->radius()));
     _radiusLabel->setText(tr("%1 px").arg(QString::number(_labels->radius(), 'g', 3)));
 }
@@ -577,6 +632,7 @@ void InkLabelPanel::refreshDisplay()
     _showSupervisionCheck->setChecked(_labels->showSupervision());
     _showValidationCheck->setChecked(_labels->showValidation());
     _opacitySlider->setValue(int(std::lround(_labels->opacity() * 100.0)));
+    _opacityLabel->setText(tr("%1%").arg(_opacitySlider->value()));
 }
 
 void InkLabelPanel::refreshHistory()

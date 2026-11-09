@@ -264,3 +264,52 @@ suggestions are shown.
 ## Object-store projects
 
 On current Villa, a surface in a local or hosted object store is identified by its stable object UUID. Label exports use that UUID under the local project's `ink_labels` folder, rather than a temporary downloaded geometry folder. The label folder is shown in the Ink labels panel and can be selected and copied. Labels remain local trainer exports; Save does not submit them to a hosted store. Geometry and canvas checks still guard reopening an export after the surface changes. Export matching surface geometry and a surface volume separately before training.
+
+
+## Inspecting the controls and viewport input through the bridge
+
+`ink_labels.panel` shows the real Ink Detection dock, expands `labels`,
+`assist` or `files`, and optionally sets `floating` through the existing
+status-panel host's detach/attach lifecycle. The host owns the attached content;
+the empty dock shell is never used for lookup or capture. Use
+`screenshot.capture` with `target: "ink_labels"` for an unmodified Qt grab of
+the visible attached page or floating dock; a collapsed or different active
+page is refused. Use the segmentation target separately for the CT view.
+The panel reply also reports the segmentation viewport size, pixel ratio and
+affine scene-to-viewport transform. Re-read after layout settles before targeting
+a stroke. Switch to the segmentation workspace before showing it. Hidden or degenerate
+capture targets are refused. A native capture requires a native Qt platform.
+
+`ink_labels.control` operates only the named controls in its descriptor. It
+requires an open writable label session and `expect: {segment, serial}` from
+the latest state. Buttons emit their normal click signals; sliders set their
+integer widget value. The radius slider is logarithmic: its value is not a
+radius in label pixels. Read the returned controller radius. Invisible,
+clipped, disabled and unsupported controls are refused. Undo refuses a human
+top history entry before emitting any click, with `other_actor_entry`; deliberate
+forced undo remains on `ink_labels.history` with explicit `force: true`. An agent
+entry still uses the normal Undo widget signal. Save, version changes,
+imports and assisted raster edits keep their existing bridge methods.
+
+`ink_labels.viewport_stroke` delivers press, zero or more moves, and release
+to the actual graphics viewport. Its `points` are logical viewport pixels,
+not screenshot pixels (Retina captures may have a different scale). The path
+has 1 to 256 points and must lie in both the viewport and label canvas. Label
+mode and Brush must already be active. It refuses a stale expected state,
+locked/read-only session, other surface tool, suggestions, open polygon,
+ongoing stroke, inactive workspace, hidden/unbound viewer or modal dialog.
+No controller paint call substitutes for event delivery. Each event reports
+whether InkLabelController's filter consumed it. Edits retain `actor: agent`.
+These are non-spontaneous Qt events, not physical mouse or OS input.
+
+On failure, retain the error and inspect its state. If delivery started, a
+partial edit can remain; the bridge releases the brush and never retries or
+silently rolls back. `deliveredEvents == labelHandledEvents` alone does not
+prove a pixel changed. Compare the complete raster and history separately,
+then use the established save, reopen and cold-restart checks.
+
+For a human tutorial, capture the main controls, Assist and Versions/import
+sections separately. Show CT and the annotation overlay beside the relevant
+controls. Keep the raw captures and label a GIF assembled from stills as
+illustrative timing. Do not infer physical mouse parity, keyboard shortcut
+coverage or anatomical alignment from these bridge operations.

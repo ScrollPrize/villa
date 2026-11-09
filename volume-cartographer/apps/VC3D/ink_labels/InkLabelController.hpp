@@ -345,6 +345,17 @@ public:
     // camera, so labels can be drawn and painted there.
     [[nodiscard]] bool viewerShowsSession(VolumeViewerBase* viewer) const;
 
+    struct ViewportStrokeOutcome {
+        bool ok = false;
+        int delivered = 0;
+        int handled = 0;
+        QString error;
+    };
+    // App-local Qt events, delivered to the real viewport filter. Never OS input.
+    // Validate the entire brush path first; edits retain Actor::Agent provenance.
+    ViewportStrokeOutcome dispatchViewportStroke(VolumeViewerBase* viewer,
+                                                 const std::vector<QPointF>& points);
+
 signals:
     void sessionChanged();
     void rasterChanged(QRect labelRect);
@@ -492,7 +503,8 @@ private:
     void updateCursor(BoundViewer& bound, const QPointF& devicePos);
     void hideCursors();
     // Left-press decision shared by the event filter and tests.
-    bool handlePress(cv::Point2d labelPx, Qt::KeyboardModifiers modifiers, double devicePxPerLabelPx);
+    bool handlePress(cv::Point2d labelPx, Qt::KeyboardModifiers modifiers, double devicePxPerLabelPx,
+                     vc3d::ink_labels::Actor actor = vc3d::ink_labels::Actor::User);
     void handleDrag(cv::Point2d labelPx, double devicePxPerLabelPx);
     void handleRelease();
     void closePolygon();

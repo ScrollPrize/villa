@@ -27,6 +27,9 @@ class InkLabelPanel : public QWidget
 
 public:
     explicit InkLabelPanel(InkLabelController* labels, QWidget* parent = nullptr);
+    // Keep the normal widget signal, but never implicitly force an agent undo
+    // across a human history entry. Explicit force remains on the history RPC.
+    bool clickUndoForAgent();
 
 private:
     void refreshSession();
@@ -65,6 +68,7 @@ private:
     QCheckBox* _showSupervisionCheck{nullptr};
     QCheckBox* _showValidationCheck{nullptr};
     QSlider* _opacitySlider{nullptr};
+    QLabel* _opacityLabel{nullptr};
     QPushButton* _undoButton{nullptr};
     QPushButton* _redoButton{nullptr};
     QPushButton* _saveButton{nullptr};

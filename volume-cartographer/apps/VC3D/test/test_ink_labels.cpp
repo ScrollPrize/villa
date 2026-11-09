@@ -3,6 +3,7 @@
 #include "Keybinds.hpp"
 #include "CState.hpp"
 #include "SurfaceCatalog.hpp"
+#include "StatusDockPanelHost.hpp"
 #include "../../../core/test/support/TestProject.hpp"
 #include "SpiralBrushCursorWidget.hpp"
 #include "ink_labels/InkLabelAssist.hpp"
@@ -19,6 +20,9 @@
 #include <vc_reader/zarr_write.hpp>
 
 #include <QApplication>
+#include <QDockWidget>
+#include <QScrollArea>
+#include <QVBoxLayout>
 #include <QCheckBox>
 #include <QFile>
 #include <QJsonArray>
@@ -258,6 +262,12 @@ private slots:
     void displayTilesPoolExactly();
     void displayTilesMeetOnDevicePixels();
     void panelDrivesController();
+    void panelSelectionFeedbackTracksController();
+    void panelOpacityReadoutTracksController();
+    void namedPanelControls();
+    void statusHostRoutesInkLabels();
+    void panelAgentUndoPreservesHumanEntry();
+    void viewportStrokeRefusesMissingViewer();
     void panelRetainsFailedActivationRefusal();
     void panelRetainsToolRefusal();
     void predictionGuideMapsWithFlips();
@@ -1661,6 +1671,150 @@ void TestInkLabels::displayTilesMeetOnDevicePixels()
     QCOMPARE(InkLabelOverlayController::snapToDevicePixel({3.25, 4.5}, QTransform(0, 0, 0, 0, 0, 0)), QPointF(3.25, 4.5));
 }
 
+void TestInkLabels::statusHostRoutesInkLabels()
+{
+    Labeler l;
+    QWidget window;
+    window.resize(1200, 1000);
+    auto* layout = new QVBoxLayout(&window);
+    auto* host = new StatusDockPanelHost(new QWidget, &window);
+    layout->addWidget(host);
+    auto* dock = new QDockWidget(QStringLiteral("Ink Detection"), &window);
+    dock->setObjectName(QStringLiteral("dockWidgetInkDetection"));
+    auto* scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    auto* panel = new InkLabelPanel(l.labels.get());
+    scroll->setWidget(panel);
+    dock->setWidget(scroll);
+    host->addDock(dock); // Same reparenting step as ordinary CWindow startup.
+    QVERIFY(!dock->widget());
+    QVERIFY(!dock->findChild<InkLabelPanel*>());
+    QCOMPARE(host->contentForDock(dock), static_cast<QWidget*>(scroll));
+    QCOMPARE(host->contentForDock(dock)->findChild<InkLabelPanel*>(), panel);
+    QVERIFY(!host->panelWidgetForDock(dock));
+    window.show();
+    host->showDock(dock);
+    auto* attached = host->panelWidgetForDock(dock);
+    QVERIFY(attached && attached != dock && attached->isAncestorOf(panel));
+    QTRY_VERIFY(attached->isVisible());
+    QVERIFY(!attached->grab().isNull());
+    for (const QString& name : {QStringLiteral("inkLabelGroup"), QStringLiteral("inkLabelAssistGroup"),
+                               QStringLiteral("inkLabelFilesGroup")}) {
+        auto* group = panel->findChild<CollapsibleSettingsGroup*>(name);
+        QVERIFY(group);
+        group->setExpanded(true);
+        QVERIFY(group->isExpanded());
+    }
+    QVERIFY(host->setDockDetached(dock, true));
+    QVERIFY(host->isDockDetached(dock));
+    QCOMPARE(host->contentForDock(dock), static_cast<QWidget*>(scroll));
+    QCOMPARE(host->panelWidgetForDock(dock), static_cast<QWidget*>(dock));
+    QCOMPARE(dock->widget(), static_cast<QWidget*>(scroll));
+    QVERIFY(dock->isFloating());
+    QTRY_VERIFY(dock->isVisible());
+    QVERIFY(!host->panelWidgetForDock(dock)->grab().isNull());
+    QVERIFY(host->setDockDetached(dock, false));
+    QVERIFY(!host->isDockDetached(dock));
+    QVERIFY(!dock->widget());
+    QCOMPARE(host->panelWidgetForDock(dock), attached);
+    QCOMPARE(host->contentForDock(dock)->findChild<InkLabelPanel*>(), panel);
+    QVERIFY(host->setDockDetached(dock, true));
+    dock->hide(); // Existing close/visibility path must attach content again.
+    QTRY_VERIFY(!host->isDockDetached(dock));
+    QVERIFY(!host->panelWidgetForDock(dock));
+    host->showDock(dock);
+    QCOMPARE(host->panelWidgetForDock(dock), attached);
+
+    auto* other = new QDockWidget(QStringLiteral("Other"), &window);
+    other->setObjectName(QStringLiteral("otherPanelForTest"));
+    other->setWidget(new QWidget);
+    host->addDock(other);
+    host->showDock(other);
+    QVERIFY(!host->panelWidgetForDock(dock)); // Never capture another active page.
+    QVERIFY(host->panelWidgetForDock(other));
+    QDockWidget unknown;
+    QVERIFY(!host->contentForDock(&unknown));
+    QVERIFY(!host->setDockDetached(&unknown, true));
+    QVERIFY(!host->panelWidgetForDock(&unknown));
+}
+
+void TestInkLabels::panelAgentUndoPreservesHumanEntry()
+{
+    QTemporaryDir dir;
+    Labeler l;
+    InkLabelPanel panel(l.labels.get());
+    QVERIFY(l.labels->openForTesting(testCanvas({80, 80}), toPath(dir), "undo-guard").ok);
+    auto* undo = panel.findChild<QPushButton*>(QStringLiteral("inkLabelControl_undo"));
+    QVERIFY(undo);
+    QSignalSpy clicked(undo, &QPushButton::clicked);
+    QVERIFY(l.labels->applyShape(disc(20, 20, 3), Actor::User) > 0);
+    const auto human = fullImage(*l.labels->raster());
+    const auto serial = l.labels->session()->stateSerial;
+    const auto depth = l.labels->history()->undoDepth();
+    QVERIFY(undo->isEnabled());
+    QVERIFY(!panel.clickUndoForAgent());
+    QCOMPARE(clicked.count(), 0);
+    QCOMPARE(l.labels->session()->stateSerial, serial);
+    QCOMPARE(l.labels->history()->undoDepth(), depth);
+    QCOMPARE(l.labels->history()->redoDepth(), std::size_t(0));
+    QCOMPARE(l.labels->history()->top()->actor, Actor::User);
+    QVERIFY(sameImage(human, fullImage(*l.labels->raster())));
+
+    QVERIFY(l.labels->applyShape(disc(40, 40, 3), Actor::Agent) > 0);
+    QVERIFY(panel.clickUndoForAgent());
+    QCOMPARE(clicked.count(), 1); // Positive path still emits the widget signal.
+    QVERIFY(sameImage(human, fullImage(*l.labels->raster())));
+    QCOMPARE(l.labels->history()->undoDepth(), depth);
+    QCOMPARE(l.labels->history()->top()->actor, Actor::User);
+    QVERIFY(!panel.clickUndoForAgent());
+    QCOMPARE(clicked.count(), 1);
+    QVERIFY(sameImage(human, fullImage(*l.labels->raster())));
+    QVERIFY(l.labels->undo(Actor::Agent, true)); // Explicit force remains separate.
+}
+
+void TestInkLabels::namedPanelControls()
+{
+    Labeler l;
+    InkLabelPanel panel(l.labels.get());
+    for (const QString& name : {QStringLiteral("ink"), QStringLiteral("background"),
+                               QStringLiteral("validation"), QStringLiteral("erase"),
+                               QStringLiteral("brush"), QStringLiteral("polygon"), QStringLiteral("fill"),
+                               QStringLiteral("show"), QStringLiteral("show_ink"),
+                               QStringLiteral("show_supervision"), QStringLiteral("show_validation"),
+                               QStringLiteral("keep_ink"), QStringLiteral("undo"), QStringLiteral("redo")})
+        QVERIFY2(panel.findChild<QAbstractButton*>(QStringLiteral("inkLabelControl_") + name), qPrintable(name));
+    QVERIFY(panel.findChild<QSlider*>(QStringLiteral("inkLabelControl_opacity")));
+    QVERIFY(panel.findChild<QSlider*>(QStringLiteral("inkLabelRadius")));
+    QVERIFY(!panel.findChild<QWidget*>(QStringLiteral("inkLabelControl_import")));
+}
+
+void TestInkLabels::viewportStrokeRefusesMissingViewer()
+{
+    QTemporaryDir dir;
+    Labeler l;
+    const auto result = l.labels->dispatchViewportStroke(nullptr, {QPointF(10, 10)});
+    QVERIFY(!result.ok);
+    QVERIFY(!result.error.isEmpty());
+    QCOMPARE(result.delivered, 0);
+    QCOMPARE(result.handled, 0);
+    QVERIFY(!l.labels->session());
+    QVERIFY(!l.labels->strokeOpen());
+    QVERIFY(l.labels->openForTesting(testCanvas({80, 80}), toPath(dir), "viewport-refusal").ok);
+    l.labels->setLabelModeEnabled(true);
+    const auto before = fullImage(*l.labels->raster());
+    const auto serial = l.labels->session()->stateSerial;
+    const auto missing = l.labels->dispatchViewportStroke(nullptr, {QPointF(10, 10)});
+    QVERIFY(!missing.ok);
+    QCOMPARE(missing.delivered, 0);
+    QVERIFY(sameImage(before, fullImage(*l.labels->raster())));
+    QCOMPARE(l.labels->session()->stateSerial, serial);
+    l.labels->setTool(InkLabelController::Tool::Polygon);
+    const auto wrongTool = l.labels->dispatchViewportStroke(nullptr, {QPointF(10, 10)});
+    QVERIFY(!wrongTool.ok);
+    QCOMPARE(wrongTool.delivered, 0);
+    QVERIFY(sameImage(before, fullImage(*l.labels->raster())));
+}
+
 void TestInkLabels::panelDrivesController()
 {
     QTemporaryDir dir;
@@ -1708,6 +1862,94 @@ void TestInkLabels::panelDrivesController()
     byText(QStringLiteral("Undo"))->click();
     QCOMPARE(int(l.labels->history()->undoDepth()), 0);
     QVERIFY(panel.findChild<QLabel*>(QStringLiteral("inkLabelStatus"))->text().contains(QStringLiteral("no unsaved changes")));
+}
+
+void TestInkLabels::panelSelectionFeedbackTracksController()
+{
+    QTemporaryDir dir;
+    Labeler l;
+    QVERIFY(l.labels->openForTesting(testCanvas({200, 160}), toPath(dir), "seg").ok);
+    InkLabelPanel panel(l.labels.get());
+    const auto button = [&panel](const QString& name) {
+        return panel.findChild<QPushButton*>(name == QLatin1String("mode") ? QStringLiteral("inkLabelModeButton")
+                                                                        : QStringLiteral("inkLabelControl_") + name);
+    };
+    const auto matches = [&button](const QString& name, bool selected) {
+        const auto* b = button(name);
+        return b && b->isChecked() == selected && b->text().contains(QChar(0x2713)) == selected &&
+               !b->accessibleName().isEmpty() &&
+               b->accessibleDescription() == (selected ? QStringLiteral("Selected") : QStringLiteral("Not selected"));
+    };
+    QVERIFY(matches(QStringLiteral("mode"), false));
+    QVERIFY(matches(QStringLiteral("ink"), true));
+    QVERIFY(matches(QStringLiteral("brush"), true));
+    const QStringList classes{QStringLiteral("ink"), QStringLiteral("background"), QStringLiteral("validation")};
+    for (const auto& name : classes) {
+        QVERIFY(button(name));
+        button(name)->click();
+        for (const auto& other : classes)
+            QVERIFY(matches(other, other == name));
+    }
+    // Controller/keyboard changes refresh under QSignalBlocker too.
+    l.labels->setPaintClass(PaintClass::Ink);
+    QVERIFY(matches(QStringLiteral("ink"), true));
+    QVERIFY(matches(QStringLiteral("validation"), false));
+    const QStringList tools{QStringLiteral("brush"), QStringLiteral("polygon"), QStringLiteral("fill")};
+    for (const auto& name : tools) {
+        QVERIFY(button(name));
+        button(name)->click();
+        for (const auto& other : tools)
+            QVERIFY(matches(other, other == name));
+    }
+    l.labels->setTool(InkLabelController::Tool::Brush);
+    QVERIFY(matches(QStringLiteral("brush"), true));
+    QVERIFY(matches(QStringLiteral("fill"), false));
+    QVERIFY(button(QStringLiteral("erase")));
+    button(QStringLiteral("erase"))->click();
+    QVERIFY(matches(QStringLiteral("erase"), true));
+    l.labels->setErase(false);
+    QVERIFY(matches(QStringLiteral("erase"), false));
+    button(QStringLiteral("mode"))->click();
+    QVERIFY(l.labels->labelModeEnabled());
+    QVERIFY(matches(QStringLiteral("mode"), true));
+    l.labels->setLabelModeEnabled(false);
+    QVERIFY(matches(QStringLiteral("mode"), false));
+    l.editing = true;
+    button(QStringLiteral("mode"))->click();
+    QVERIFY(!l.labels->labelModeEnabled());
+    QVERIFY(matches(QStringLiteral("mode"), false)); // Refusal must not leave a selected marker.
+    QCOMPARE(int(l.labels->history()->undoDepth()), 0);
+    QVERIFY(!l.labels->session()->dirty);
+}
+
+void TestInkLabels::panelOpacityReadoutTracksController()
+{
+    QTemporaryDir dir;
+    Labeler l;
+    QVERIFY(l.labels->openForTesting(testCanvas({200, 160}), toPath(dir), "seg").ok);
+    l.labels->setDisplay(true, true, true, true, 0.70);
+    InkLabelPanel panel(l.labels.get());
+    auto* slider = panel.findChild<QSlider*>(QStringLiteral("inkLabelControl_opacity"));
+    auto* value = panel.findChild<QLabel*>(QStringLiteral("inkLabelOpacityValue"));
+    QVERIFY(slider && value);
+    QCOMPARE(value->text(), QStringLiteral("70%"));
+    QVERIFY(!slider->accessibleName().isEmpty());
+    QSignalSpy changed(l.labels.get(), &InkLabelController::displayChanged);
+    slider->setValue(37);
+    QCOMPARE(l.labels->opacity(), 0.37);
+    QCOMPARE(value->text(), QStringLiteral("37%"));
+    QCOMPARE(changed.size(), 1); // The readout must not create a display feedback loop.
+    // External display updates also synchronize the value without valueChanged.
+    l.labels->setDisplay(true, true, true, true, 0.0);
+    QCOMPARE(slider->value(), 0);
+    QCOMPARE(value->text(), QStringLiteral("0%"));
+    slider->setValue(100);
+    QCOMPARE(value->text(), QStringLiteral("100%"));
+    QCOMPARE(l.labels->opacity(), 1.0);
+    InkLabelPanel reopened(l.labels.get());
+    QCOMPARE(reopened.findChild<QLabel*>(QStringLiteral("inkLabelOpacityValue"))->text(), QStringLiteral("100%"));
+    QCOMPARE(int(l.labels->history()->undoDepth()), 0);
+    QVERIFY(!l.labels->session()->dirty);
 }
 
 // A real catalog frame failure leaves the same null state consumed by the

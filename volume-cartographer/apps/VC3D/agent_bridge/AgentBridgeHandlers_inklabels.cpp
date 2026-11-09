@@ -2,6 +2,14 @@
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
 #include <QDir>
+#include <QApplication>
+#include <QAbstractButton>
+#include <QDockWidget>
+#include <QScrollArea>
+#include <QSlider>
+#include <QScreen>
+#include "elements/CollapsibleSettingsGroup.hpp"
+#include "viewer_controls/panels/InkLabelPanel.hpp"
 #include <QFutureWatcher>
 #include <QJsonArray>
 #include <QPointer>
@@ -17,10 +25,12 @@
 
 #include "CState.hpp"
 #include "CWindow.hpp"
+#include "StatusDockPanelHost.hpp"
 #include "ViewerManager.hpp"
 #include "ink_labels/InkLabelController.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
 
@@ -292,6 +302,24 @@ QJsonObject stateJson(const InkLabelController& labels, const InkDetectionOverla
     fail(-32005, QStringLiteral("Cannot open the ink labels"), data);
 }
 
+void requireExpectedState(const QJsonObject& p, const InkLabelController::SessionInfo* session)
+{
+    if (p.contains("expect")) {
+        const QJsonObject expect = p.value("expect").toObject();
+        const bool segmentOk = !expect.contains("segment") || expect.value("segment").toString() == qstr(session->segment);
+        const bool serialOk = !expect.contains("serial") || uint64_t(expect.value("serial").toDouble()) == session->stateSerial;
+        if (!segmentOk || !serialOk) {
+            QJsonObject current;
+            current["segment"] = qstr(session->segment);
+            current["serial"] = double(session->stateSerial);
+            QJsonObject data;
+            data["current"] = current;
+            data["kind"] = QStringLiteral("expect_mismatch");
+            throwParamError(QStringLiteral("expect"), QStringLiteral("The label state changed since the caller looked"), data);
+        }
+    }
+}
+
 // The open, writable session, or the error that says why there is none.
 const InkLabelController::SessionInfo& writableSession(const InkLabelController& labels)
 {
@@ -444,6 +472,159 @@ QJsonObject AgentBridgeServer::handleInkLabelsOpen(const QJsonValue& params)
 }
 
 
+InkLabelPanel* AgentBridgeServer::inkLabelPanel() const
+{
+    auto* host = _window ? _window->_statusDockPanelHost : nullptr;
+    auto* content = host ? host->contentForDock(_window->_inkDetectionDock) : nullptr;
+    return content ? content->findChild<InkLabelPanel*>() : nullptr;
+}
+
+QWidget* AgentBridgeServer::inkLabelCaptureWidget() const
+{
+    auto* host = _window ? _window->_statusDockPanelHost : nullptr;
+    return host ? host->panelWidgetForDock(_window->_inkDetectionDock) : nullptr;
+}
+
+QJsonObject AgentBridgeServer::handleInkLabelsPanel(const QJsonValue& params)
+{
+    requireInkLabelProject();
+    if (QApplication::activeModalWidget())
+        failKind(-32004, QStringLiteral("Close the modal dialog before showing label controls"), QStringLiteral("modal"));
+    auto* dock = _window->_inkDetectionDock;
+    auto* host = _window->_statusDockPanelHost;
+    auto* panel = inkLabelPanel();
+    if (!host || !panel)
+        fail(-32002, QStringLiteral("The Ink Labels panel is unavailable"));
+    const QString section = params.toObject().value("section").toString(QStringLiteral("labels"));
+    const QString name = section == QLatin1String("assist") ? QStringLiteral("inkLabelAssistGroup")
+                       : section == QLatin1String("files") ? QStringLiteral("inkLabelFilesGroup")
+                                                          : QStringLiteral("inkLabelGroup");
+    auto* group = panel->findChild<CollapsibleSettingsGroup*>(name);
+    if (!group)
+        fail(-32002, QStringLiteral("The requested label section is unavailable"));
+    const auto p = params.toObject();
+    if (p.contains("floating") && !host->setDockDetached(dock, p.value("floating").toBool()))
+        fail(-32002, QStringLiteral("The Ink Labels host could not change attachment"));
+    host->showDock(dock);
+    const bool floating = host->isDockDetached(dock);
+    if (floating && dock->screen()) {
+        const QRect available = dock->screen()->availableGeometry();
+        dock->resize(QSize(640, 900).boundedTo(available.size()));
+    }
+    group->setExpanded(true);
+    for (auto* parent = panel->parentWidget(); parent; parent = parent->parentWidget()) {
+        if (auto* scroll = qobject_cast<QScrollArea*>(parent)) {
+            scroll->ensureWidgetVisible(group, 0, 0);
+            break;
+        }
+    }
+    auto* capture = inkLabelCaptureWidget();
+    QJsonObject result{{"dockVisible", capture && capture->isVisible()}, {"panelVisible", panel->isVisible()},
+                       {"section", section}, {"expanded", group->isExpanded()}, {"floating", floating},
+                       {"captureTarget", QStringLiteral("ink_labels")},
+                       {"route", QStringLiteral("StatusDockPanelHost lifecycle and section expansion")}};
+    // Read-only targeting metadata. Layout can settle after this RPC, so callers
+    // re-read the panel before converting scene points or checking capture size.
+    try {
+        auto* viewer = resolveViewer(QJsonValue(QStringLiteral("segmentation")));
+        auto* view = viewer->graphicsView();
+        if (view && view->viewport()) {
+            const auto t = view->viewportTransform();
+            result["viewport"] = QJsonObject{{"width", view->viewport()->width()},
+                {"height", view->viewport()->height()}, {"devicePixelRatio", view->viewport()->devicePixelRatioF()},
+                {"m11", t.m11()}, {"m12", t.m12()}, {"m21", t.m21()}, {"m22", t.m22()},
+                {"dx", t.dx()}, {"dy", t.dy()}, {"visible", view->viewport()->isVisible()}};
+        }
+    } catch (const AgentBridgeError& error) {
+        if (error.code != -32002)
+            throw;
+        result["viewport"] = QJsonValue::Null;
+    }
+    return result;
+}
+
+QJsonObject AgentBridgeServer::handleInkLabelsControl(const QJsonValue& params)
+{
+    requireInkLabelProject();
+    auto* labels = inkLabelController();
+    const auto& session = writableSession(*labels);
+    const auto p = params.toObject();
+    requireExpectedState(p, &session);
+    if (QApplication::activeModalWidget() || labels->assistRunning() || !labels->openPolygon().empty())
+        failKind(-32004, QStringLiteral("Label controls require an idle session without a modal dialog"), QStringLiteral("busy"));
+    auto* panel = inkLabelPanel();
+    const QString control = p.value("control").toString();
+    const QString object = control == QLatin1String("mode") ? QStringLiteral("inkLabelModeButton")
+                         : control == QLatin1String("radius") ? QStringLiteral("inkLabelRadius")
+                         : QStringLiteral("inkLabelControl_") + control;
+    auto* widget = panel ? panel->findChild<QWidget*>(object) : nullptr;
+    if (!widget || !widget->isVisible() || !widget->isEnabled() || widget->visibleRegion().isEmpty())
+        fail(-32002, QStringLiteral("The requested label control is hidden, disabled or unavailable"));
+    QString route;
+    if (auto* slider = qobject_cast<QSlider*>(widget)) {
+        if (!p.contains("value") || p.value("value").toDouble() < slider->minimum() ||
+            p.value("value").toDouble() > slider->maximum())
+            throwParamError(QStringLiteral("value"), QStringLiteral("Slider value is required within the widget range"));
+        slider->setValue(p.value("value").toInt());
+        route = QStringLiteral("QSlider::setValue/valueChanged");
+    } else if (auto* button = qobject_cast<QAbstractButton*>(widget)) {
+        if (p.contains("value"))
+            throwParamError(QStringLiteral("value"), QStringLiteral("Buttons take no value; each call clicks once"));
+        if (control == QLatin1String("undo")) {
+            if (!panel->clickUndoForAgent()) {
+                const auto* history = labels->history();
+                const auto* top = history ? history->top() : nullptr;
+                if (top && top->actor != Actor::Agent) {
+                    QJsonObject data{{"serial", double(top->serial)}, {"label", qstr(top->label)}};
+                    failKind(-32009, QStringLiteral("The last label edit is the user's; use ink_labels.history with explicit force to undo it"),
+                             QStringLiteral("other_actor_entry"), data);
+                }
+                fail(-32004, QStringLiteral("The Undo control could not apply an agent edit"));
+            }
+        } else {
+            button->click();
+        }
+        route = QStringLiteral("QAbstractButton::click/clicked");
+    } else {
+        fail(-32002, QStringLiteral("Unsupported label control type"));
+    }
+    QJsonObject result = stateJson(*labels, inkDetectionOverlay());
+    result["control"] = control;
+    result["route"] = route;
+    return result;
+}
+
+QJsonObject AgentBridgeServer::handleInkLabelsViewportStroke(const QJsonValue& params)
+{
+    requireInkLabelProject();
+    auto* labels = inkLabelController();
+    const auto& session = writableSession(*labels);
+    const auto p = params.toObject();
+    requireExpectedState(p, &session);
+    if (QApplication::activeModalWidget())
+        failKind(-32004, QStringLiteral("Close the modal dialog before viewport input"), QStringLiteral("modal"));
+    const auto list = p.value("points").toArray();
+    if (list.isEmpty() || list.size() > 256)
+        throwParamError(QStringLiteral("points"), QStringLiteral("Supply 1 to 256 viewport positions"));
+    std::vector<QPointF> points;
+    for (const auto& value : list) {
+        const auto point = value.toObject();
+        if (point.contains("z"))
+            throwParamError(QStringLiteral("points"), QStringLiteral("Viewport input takes x/y logical pixels, not volume z"));
+        points.emplace_back(jsonRequireFinite(point.value("x"), "x"), jsonRequireFinite(point.value("y"), "y"));
+    }
+    const auto outcome = labels->dispatchViewportStroke(resolveViewer(p.value("viewer")), points);
+    QJsonObject result = stateJson(*labels, inkDetectionOverlay());
+    result["deliveredEvents"] = outcome.delivered;
+    result["labelHandledEvents"] = outcome.handled;
+    result["route"] = QStringLiteral("QCoreApplication::sendEvent -> viewport -> InkLabelController::eventFilter");
+    result["actor"] = QStringLiteral("agent");
+    result["spontaneous"] = false;
+    if (!outcome.ok)
+        failKind(-32004, outcome.error, QStringLiteral("viewport_input"), result);
+    return result;
+}
+
 QJsonObject AgentBridgeServer::handleInkLabelsPaint(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
@@ -462,20 +643,7 @@ QJsonObject AgentBridgeServer::handleInkLabelsPaint(const QJsonValue& params)
     if (!values && !p.contains("class"))
         throwParamError(QStringLiteral("class"), QStringLiteral("class is required unless mask.format is \"values\""));
 
-    if (p.contains("expect")) {
-        const QJsonObject expect = p.value("expect").toObject();
-        const bool segmentOk = !expect.contains("segment") || expect.value("segment").toString() == qstr(session->segment);
-        const bool serialOk = !expect.contains("serial") || uint64_t(expect.value("serial").toDouble()) == session->stateSerial;
-        if (!segmentOk || !serialOk) {
-            QJsonObject current;
-            current["segment"] = qstr(session->segment);
-            current["serial"] = double(session->stateSerial);
-            QJsonObject data;
-            data["current"] = current;
-            data["kind"] = QStringLiteral("expect_mismatch");
-            throwParamError(QStringLiteral("expect"), QStringLiteral("The label state changed since the caller looked"), data);
-        }
-    }
+    requireExpectedState(p, session);
     writableSession(*labels);
 
     const QString clsName = p.value("class").toString();

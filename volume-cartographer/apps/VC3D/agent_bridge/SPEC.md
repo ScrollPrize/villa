@@ -792,6 +792,9 @@ history.
 | `vc3d_ink_labels_read` | `ink_labels.read` | Write the current (also unsaved) label pixels of a rectangle to a PNG or TIFF. |
 | `vc3d_ink_labels_save` | `ink_labels.save` | Save the labels as the trainer's TIFFs (optionally as a new version) and wait for the write. |
 | `vc3d_ink_labels_set_tool_state` | `ink_labels.set_tool_state` | Set label mode, class, eraser, tool, radius, display and assist settings. |
+| `vc3d_ink_labels_panel` | `ink_labels.panel` | Show a named section of the native Ink Labels dock; optional floating window. |
+| `vc3d_ink_labels_control` | `ink_labels.control` | Operate an allowlisted, visible label control through its Qt signal, guarded by expected state. |
+| `vc3d_ink_labels_viewport_stroke` | `ink_labels.viewport_stroke` | Send 1..256 logical viewport positions through the label event filter, with per-event consumption and agent attribution. |
 | `vc3d_ink_labels_state` | `ink_labels.state` | Report the ink label session: store, canvas mapping, versions, tool, history, counts, assist, prediction and last save. |
 | `vc3d_ink_labels_suggest` | `ink_labels.suggest` | Find ink suggestions from the prediction, leaving labeled pixels out. |
 | `vc3d_ink_labels_versions` | `ink_labels.versions` | List the label versions in the store. |

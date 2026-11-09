@@ -849,6 +849,72 @@
         "type": "object"
       }
     },
+    "ink_labels.control": {
+      "errors": [
+        -32602,
+        -32000,
+        -32002,
+        -32004,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_control"
+      },
+      "params": {
+        "properties": {
+          "control": {
+            "enum": [
+              "mode",
+              "ink",
+              "background",
+              "validation",
+              "erase",
+              "keep_ink",
+              "brush",
+              "polygon",
+              "fill",
+              "show",
+              "show_ink",
+              "show_supervision",
+              "show_validation",
+              "radius",
+              "opacity",
+              "undo",
+              "redo"
+            ],
+            "type": "string"
+          },
+          "expect": {
+            "properties": {
+              "segment": {
+                "type": "string"
+              },
+              "serial": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "segment",
+              "serial"
+            ],
+            "type": "object"
+          },
+          "value": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "control",
+          "expect"
+        ],
+        "type": "object"
+      }
+    },
     "ink_labels.dataset_entry": {
       "errors": [
         -32000,
@@ -1287,6 +1353,34 @@
         "type": "object"
       }
     },
+    "ink_labels.panel": {
+      "errors": [
+        -32602,
+        -32000,
+        -32002,
+        -32004
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_panel"
+      },
+      "params": {
+        "properties": {
+          "floating": {
+            "type": "boolean"
+          },
+          "section": {
+            "default": "labels",
+            "enum": [
+              "labels",
+              "assist",
+              "files"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
     "ink_labels.read": {
       "errors": [
         -32602,
@@ -1590,6 +1684,66 @@
       },
       "params": {
         "properties": {},
+        "type": "object"
+      }
+    },
+    "ink_labels.viewport_stroke": {
+      "errors": [
+        -32602,
+        -32000,
+        -32002,
+        -32004,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_viewport_stroke"
+      },
+      "params": {
+        "properties": {
+          "expect": {
+            "properties": {
+              "segment": {
+                "type": "string"
+              },
+              "serial": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "segment",
+              "serial"
+            ],
+            "type": "object"
+          },
+          "points": {
+            "items": {
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "viewer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "points",
+          "expect"
+        ],
         "type": "object"
       }
     },

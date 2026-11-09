@@ -34,6 +34,9 @@ from vc3d_mcp.tools.ink_labels import (
     vc3d_ink_labels_save,
     vc3d_ink_labels_set_tool_state,
     vc3d_ink_labels_state,
+    vc3d_ink_labels_panel,
+    vc3d_ink_labels_control,
+    vc3d_ink_labels_viewport_stroke,
     vc3d_ink_labels_suggest,
     vc3d_ink_labels_versions,
 )
@@ -56,6 +59,20 @@ class InkLabelsToolTest(unittest.IsolatedAsyncioTestCase):
         req = self.fake.received_requests[-1]
         self.assertEqual(req["method"], method)
         self.assertEqual(req["params"], params)
+
+    async def test_panel_controls_and_viewport_wire(self) -> None:
+        await vc3d_ink_labels_panel(floating=True)
+        self._assert_wire("ink_labels.panel", {"section": "labels", "floating": True})
+        await vc3d_ink_labels_panel(section="assist")
+        self._assert_wire("ink_labels.panel", {"section": "assist"})
+        expect = {"segment": "surface", "serial": 17}
+        await vc3d_ink_labels_control("ink", expect)
+        self._assert_wire("ink_labels.control", {"control": "ink", "expect": expect})
+        await vc3d_ink_labels_control("opacity", expect, value=80)
+        self._assert_wire("ink_labels.control", {"control": "opacity", "expect": expect, "value": 80})
+        points = [{"x": 10.25, "y": 12.5}, {"x": 20.25, "y": 12.5}]
+        await vc3d_ink_labels_viewport_stroke(points, expect, viewer="segmentation")
+        self._assert_wire("ink_labels.viewport_stroke", {"points": points, "expect": expect, "viewer": "segmentation"})
 
     async def test_state(self) -> None:
         result = await vc3d_ink_labels_state()

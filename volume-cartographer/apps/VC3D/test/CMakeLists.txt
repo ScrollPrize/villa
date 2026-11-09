@@ -743,6 +743,8 @@ vc_register_ctest(grow_patch_seed_dialog test_grow_patch_seed_dialog)
 find_package(TIFF REQUIRED)
 add_executable(test_ink_labels
     test_ink_labels.cpp
+    ../StatusDockPanelHost.cpp
+    ../StatusDockPanelHost.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelRaster.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelRaster.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelStore.cpp

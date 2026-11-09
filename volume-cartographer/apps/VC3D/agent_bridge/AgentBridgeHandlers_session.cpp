@@ -17,6 +17,7 @@
 #include <QPointF>
 #include <QRegularExpression>
 #include <QWidget>
+#include <QDockWidget>
 
 #include <algorithm>
 #include <filesystem>
@@ -407,6 +408,11 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     QWidget* widget = nullptr;
     if (target.isEmpty() || target == QLatin1String("window")) {
         widget = _window;
+    } else if (target == QLatin1String("ink_labels")) {
+        // The status host owns attached content; a detached dock owns it
+        // only while floating. A collapsed/other panel is not a capture target.
+        // The existing visibility, size, image and output guards still apply.
+        widget = inkLabelCaptureWidget();
     } else {
         VolumeViewerBase* viewer = resolveViewer(QJsonValue(target));
         widget = dynamic_cast<QWidget*>(viewer);

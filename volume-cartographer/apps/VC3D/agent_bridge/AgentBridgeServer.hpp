@@ -36,6 +36,8 @@ class QTimer;
 class CWindow;
 class InkDetectionOverlayController;
 class InkLabelController;
+class InkLabelPanel;
+class QWidget;
 class VolumeViewerBase;
 struct CommandLaunchError;
 struct StoreImportOutcome;
@@ -135,9 +137,14 @@ private:
     // --- Handlers ---
     // Ink labels (AgentBridgeHandlers_inklabels.cpp).
     InkLabelController* inkLabelController() const;
+    InkLabelPanel* inkLabelPanel() const;
+    QWidget* inkLabelCaptureWidget() const;
     const InkDetectionOverlayController* inkDetectionOverlay() const;
     void requireInkLabelProject() const;
     QJsonObject handleInkLabelsState(const QJsonValue& params);
+    QJsonObject handleInkLabelsPanel(const QJsonValue& params);
+    QJsonObject handleInkLabelsControl(const QJsonValue& params);
+    QJsonObject handleInkLabelsViewportStroke(const QJsonValue& params);
     QJsonObject handleInkLabelsOpen(const QJsonValue& params);
     QJsonObject handleInkLabelsPaint(const QJsonValue& params);
     QJsonObject handleInkLabelsRead(const QJsonValue& params);

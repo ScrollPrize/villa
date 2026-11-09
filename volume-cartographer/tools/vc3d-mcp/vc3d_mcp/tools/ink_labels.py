@@ -505,3 +505,69 @@ async def vc3d_ink_labels_import(
         ),
         timeout=_IMPORT_TIMEOUT_S,
     )
+
+
+class _ViewportPoint(TypedDict):
+    x: float
+    y: float
+
+
+class _ViewportExpect(TypedDict):
+    segment: str
+    serial: int
+
+
+@mcp.tool()
+async def vc3d_ink_labels_panel(
+    section: Literal["labels", "assist", "files"] = "labels",
+    floating: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Show the actual Ink Labels dock and expand a named section.
+
+    Switch to the segmentation workspace first. floating=True gives the dock
+    its own window through the status host's detach/attach lifecycle; omit
+    floating to retain its current state. Capture the visible attached page or
+    floating dock with vc3d_screenshot(target="ink_labels"). No label file changes.
+    """
+    return await _call("ink_labels.panel", _strip_none({"section": section, "floating": floating}))
+
+
+@mcp.tool()
+async def vc3d_ink_labels_control(
+    control: Literal["mode", "ink", "background", "validation", "erase", "keep_ink",
+                     "brush", "polygon", "fill", "show", "show_ink", "show_supervision",
+                     "show_validation", "radius", "opacity", "undo", "redo"],
+    expect: _ViewportExpect,
+    value: Optional[int] = None,
+) -> dict[str, Any]:
+    """Operate one visible, enabled label control through its Qt signal.
+
+    Require an open writable session and its current segment/stateSerial in
+    expect. Buttons click once; omit value. Sliders require their raw integer
+    widget value: radius 0..1000 (log scale, NOT label pixels), opacity 0..100.
+    Read returned state to confirm the outcome. This is app-local Qt input,
+    not physical mouse input. Undo refuses a human top history entry before
+    clicking; explicit forced undo remains on the history endpoint. Save/import/
+    version operations use existing APIs.
+    """
+    return await _call("ink_labels.control", _strip_none({"control": control, "expect": expect, "value": value}))
+
+
+@mcp.tool()
+async def vc3d_ink_labels_viewport_stroke(
+    points: list[_ViewportPoint],
+    expect: _ViewportExpect,
+    viewer: Optional[str] = None,
+) -> dict[str, Any]:
+    """Send a bounded brush stroke to the real label viewport event filter.
+
+    Supply 1..256 x/y points in logical viewport pixels (NOT screenshot/device,
+    label or volume pixels). All points must map inside the current canvas.
+    Label mode/Brush must already be enabled, with no other tool or modal
+    dialog. The complete path is checked before press/move/release delivery.
+    Returns deliveredEvents, labelHandledEvents, route, actor=agent and
+    spontaneous=False alongside label state. A refused mid-path delivery may
+    leave a partial edit: inspect the returned error state, never auto-retry.
+    This verifies the Qt event-filter path, not physical mouse or OS input.
+    """
+    return await _call("ink_labels.viewport_stroke", _strip_none({"points": points, "expect": expect, "viewer": viewer}))

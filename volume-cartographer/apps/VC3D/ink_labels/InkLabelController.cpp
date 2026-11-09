@@ -50,6 +50,16 @@ using namespace vc3d::ink_labels;
 
 namespace {
 
+// Only this translation unit can construct the bridge event marker. The filter
+// explicitly acknowledges consumption, rather than relying on sendEvent's return
+// value (which could also mean that an unrelated filter handled the event).
+class BridgeLabelMouseEvent final : public QMouseEvent
+{
+public:
+    using QMouseEvent::QMouseEvent;
+    bool labelHandled = false;
+};
+
 constexpr int kAutosaveTickMs = 2000;
 constexpr qint64 kAutosaveQuietMs = 2000;
 constexpr qint64 kAutosaveIntervalMs = 120000;
@@ -1904,7 +1914,7 @@ void InkLabelController::hideCursors()
 // Mouse and keys
 // ---------------------------------------------------------------------------
 
-bool InkLabelController::handlePress(cv::Point2d labelPx, Qt::KeyboardModifiers modifiers, double deviceScale)
+bool InkLabelController::handlePress(cv::Point2d labelPx, Qt::KeyboardModifiers modifiers, double deviceScale, Actor actor)
 {
     if (_deps.otherSurfaceToolActive && _deps.otherSurfaceToolActive()) {
         setLabelModeEnabled(false);
@@ -1927,7 +1937,7 @@ bool InkLabelController::handlePress(cv::Point2d labelPx, Qt::KeyboardModifiers 
     }
     _leftDown = true;
     if (_tool == Tool::Brush) {
-        beginStroke(labelPx, modifiers.testFlag(Qt::ShiftModifier), Actor::User);
+        beginStroke(labelPx, modifiers.testFlag(Qt::ShiftModifier), actor);
         return true;
     }
     if (_polygon.empty()) {
@@ -2006,11 +2016,91 @@ void InkLabelController::updatePolygonPreview(std::optional<cv::Point2d> hover)
     updateShortcutStates();
 }
 
+InkLabelController::ViewportStrokeOutcome InkLabelController::dispatchViewportStroke(
+    VolumeViewerBase* viewer, const std::vector<QPointF>& points)
+{
+    ViewportStrokeOutcome out;
+    const auto refuse = [&](const QString& why) {
+        out.error = why;
+        return out;
+    };
+    if (!_labelMode || !_session || _tool != Tool::Brush || _suggestions ||
+        _assistRunning || strokeOpen() || _leftDown || !_polygon.empty())
+        return refuse(tr("Viewport input needs an idle brush in an open Label mode session"));
+    QString why;
+    if (!canEdit(&why))
+        return refuse(why);
+    if ((_deps.otherSurfaceToolActive && _deps.otherSurfaceToolActive()) ||
+        (_deps.workspaceActive && !_deps.workspaceActive()))
+        return refuse(tr("The label workspace must be active with no other surface tool"));
+    if (points.empty() || points.size() > 256)
+        return refuse(tr("A viewport stroke needs 1 to 256 points"));
+    if (!viewer || !viewerShowsSession(viewer) || !viewer->graphicsView())
+        return refuse(tr("The viewer does not show this label session"));
+    auto* view = viewer->graphicsView();
+    auto* viewport = view->viewport();
+    if (!viewport || !viewport->isVisible() || !viewport->isEnabled() || !boundFor(viewport))
+        return refuse(tr("The label viewport is hidden, disabled or not bound"));
+    bool invertible = false;
+    const QTransform toScene = view->viewportTransform().inverted(&invertible);
+    if (!invertible)
+        return refuse(tr("The viewport transform cannot be inverted"));
+    for (const QPointF& point : points) {
+        if (!std::isfinite(point.x()) || !std::isfinite(point.y()) ||
+            point.x() < 0 || point.y() < 0 ||
+            point.x() >= viewport->width() || point.y() >= viewport->height())
+            return refuse(tr("Every stroke point must lie inside the viewport in logical pixels"));
+        const auto label = sceneToLabel(viewer, toScene.map(point));
+        if (!label || !std::isfinite(label->x) || !std::isfinite(label->y) ||
+            label->x < 0 || label->y < 0 ||
+            label->x >= _session->info.canvas.size.width || label->y >= _session->info.canvas.size.height)
+            return refuse(tr("Every stroke point must map inside the label canvas"));
+    }
+    // No event-loop pumping between events: the validated viewer/session and
+    // brush state cannot be changed by another RPC halfway through this path.
+    const auto send = [&](QEvent::Type type, const QPointF& point, Qt::MouseButton button,
+                          Qt::MouseButtons buttons) {
+        const QPointF global = QPointF(viewport->mapToGlobal(QPoint(0, 0))) + point;
+        BridgeLabelMouseEvent event(type, point, global, button, buttons, Qt::NoModifier);
+        ++out.delivered;
+        QCoreApplication::sendEvent(viewport, &event);
+        if (event.labelHandled)
+            ++out.handled;
+        return event.labelHandled;
+    };
+    bool handled = send(QEvent::MouseButtonPress, points.front(), Qt::LeftButton, Qt::LeftButton);
+    const bool started = strokeOpen();
+    QPointF last = points.front();
+    for (size_t i = 1; handled && started && i < points.size(); ++i) {
+        last = points[i];
+        handled = send(QEvent::MouseMove, last, Qt::NoButton, Qt::LeftButton);
+    }
+    // Always release after a press, including a failed acknowledgement. A
+    // partial stroke remains honest evidence and is never silently retried.
+    const bool released = send(QEvent::MouseButtonRelease, last, Qt::LeftButton, Qt::NoButton);
+    if (strokeOpen() || _leftDown) {
+        endStroke();
+        _leftDown = false;
+        return refuse(tr("Viewport release did not finish the stroke; partial edit may exist"));
+    }
+    out.ok = handled && started && released && out.delivered == int(points.size()) + 1 &&
+             out.handled == out.delivered;
+    if (!out.ok)
+        out.error = tr("The label filter did not consume the complete stroke; partial edit may exist");
+    return out;
+}
+
 bool InkLabelController::eventFilter(QObject* watched, QEvent* event)
 {
     BoundViewer* bound = boundFor(watched);
     if (!bound || !bound->viewer || !event)
         return false;
+    auto* bridgeEvent = dynamic_cast<BridgeLabelMouseEvent*>(event);
+    const auto consumed = [&](bool handled) {
+        if (bridgeEvent)
+            bridgeEvent->labelHandled = handled;
+        return handled;
+    };
     const QEvent::Type type = event->type();
     if (type == QEvent::FocusOut || type == QEvent::WindowDeactivate || type == QEvent::Hide) {
         if (strokeOpen())
@@ -2066,7 +2156,7 @@ bool InkLabelController::eventFilter(QObject* watched, QEvent* event)
             if (_leftDown && mouse->buttons().testFlag(Qt::LeftButton)) {
                 if (label)
                     handleDrag(*label, devicePxPerLabelPx(viewer, *label));
-                return true;
+                return consumed(true);
             }
             if (!_polygon.empty() && label)
                 updatePolygonPreview(*label);
@@ -2087,14 +2177,15 @@ bool InkLabelController::eventFilter(QObject* watched, QEvent* event)
                 return true;
             }
             _pressBound = visibleLabelRect(viewer);
-            return handlePress(*label, mouse->modifiers(), devicePxPerLabelPx(viewer, *label));
+            return consumed(handlePress(*label, mouse->modifiers(), devicePxPerLabelPx(viewer, *label),
+                                        bridgeEvent ? Actor::Agent : Actor::User));
         }
         case QEvent::MouseButtonRelease: {
             auto* mouse = static_cast<QMouseEvent*>(event);
             if (mouse->button() != Qt::LeftButton || !_leftDown)
                 return false;
             handleRelease();
-            return true;
+            return consumed(true);
         }
         case QEvent::KeyPress:
             // Normally the window shortcuts take these keys first.
