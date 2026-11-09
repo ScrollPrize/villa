@@ -16,7 +16,6 @@ const PREVIEW_CONTEXT = 'progress-prizes/vercel-preview';
 const PREVIEW_DESCRIPTION = 'Exact Progress Prize preview verified';
 const PREVIEW_WORKFLOW_PATH = '.github/workflows/progress-prizes-vercel-preview.yml';
 const TEST_CHECK = 'Public no-secret tests';
-const SUCCESSFUL_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 const REPOSITORY_ID = 890972577;
 const OWNER_ID = 121906140;
 const GITHUB_ACTIONS_BOT_ID = 41898282;
@@ -25,11 +24,18 @@ const SAFE_DIAGNOSTIC_CODES = new Set([
   'ambiguous-pr',
   'completed-state-missing',
   'invalid-main-ref',
-  'invalid-page-head',
   'invalid-pr-association',
-  'main-ref-moved',
   'unexpected-error',
 ]);
+const READY_COMMENT = [
+  'The deadline has passed, so this rollover page is ready to merge.',
+  '',
+  'Manual cutoff steps:',
+  '',
+  '1. In Google Forms, close the previous month\'s form (stop accepting responses).',
+  '2. Open the new month\'s form (it is already published and closed).',
+  '3. Merge this pull request.',
+].join('\n');
 
 class SafeCoordinationError extends Error {
   constructor(code, message) {
@@ -199,9 +205,9 @@ export function assertSinglePageCommit(commit, { headSha, baseSha } = {}) {
   return commit;
 }
 
-export function activationCommitNeedsRefresh(commit, { headSha, baseSha } = {}) {
+/** A page-only commit's single parent, which may be an older main commit. */
+export function pageCommitParent(commit, { headSha } = {}) {
   assertSha(headSha);
-  assertSha(baseSha);
   if (
     commit?.sha !== headSha
     || commit.parents?.length !== 1
@@ -209,13 +215,9 @@ export function activationCommitNeedsRefresh(commit, { headSha, baseSha } = {}) 
     || commit.files[0]?.filename !== PAGE_PATH
     || commit.files[0]?.status !== 'modified'
   ) {
-    failWithDiagnostic(
-      'invalid-page-head',
-      'Only a page-only commit with a stale parent may be refreshed.',
-    );
+    fail('Automation head must be one page-only commit with a single parent.');
   }
-  const parentSha = assertSha(commit.parents[0]?.sha ?? '');
-  return parentSha !== baseSha;
+  return assertSha(commit.parents[0]?.sha ?? '');
 }
 
 export function isTrustedPreviewRun({ status, run, expectedSha } = {}) {
@@ -301,28 +303,44 @@ async function findPull(head, base) {
   return assertPullAssociation(pull, { head, base });
 }
 
-export async function resolveProductionActivationState({
+export async function resolveRolloverState({
   head,
   base,
   cycle,
-  expectedBaseSha,
 } = {}, {
   listPulls = () => github(
     `/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(`${OWNER}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
   ),
-  readCommit = (sha) => github(`/repos/${OWNER}/${REPO}/commits/${sha}`),
   readMainRef = () => github(`/repos/${OWNER}/${REPO}/git/ref/heads/main`),
   readPage = (sha) => readPageAt(sha),
 } = {}) {
-  if (typeof head !== 'string' || head === '') fail('Missing production activation head.');
-  if (typeof base !== 'string' || base === '') fail('Missing production activation base.');
+  if (typeof head !== 'string' || head === '') fail('Missing rollover head.');
+  if (typeof base !== 'string' || base === '') fail('Missing rollover base.');
   const targetCycle = assertCycle(cycle);
-  const trustedBaseSha = assertSha(expectedBaseSha);
-  const contract = assertAutomationBranch(head, base);
-  if (contract.kind !== 'production') fail('Activation-state recovery is production-only.');
+  assertAutomationBranch(head, base);
   const pulls = await listPulls();
   if (!Array.isArray(pulls) || pulls.length > 1) {
-    failWithDiagnostic('ambiguous-pr', 'Production activation PR state is ambiguous.');
+    failWithDiagnostic('ambiguous-pr', 'Rollover PR state is ambiguous.');
+  }
+  if (pulls.length === 1) {
+    const pull = pulls[0];
+    let sha;
+    try {
+      assertPullAssociation(pull, { head, base });
+      sha = assertSha(pull.head?.sha ?? '');
+      if (!Number.isInteger(pull.number) || pull.number < 1) fail('Invalid pull request number.');
+    } catch {
+      failWithDiagnostic(
+        'invalid-pr-association',
+        'The rollover pull request association is invalid.',
+      );
+    }
+    return {
+      state: 'pending',
+      headSha: sha,
+      pullNumber: String(pull.number),
+      draft: pull.draft === true,
+    };
   }
   const ref = await readMainRef();
   if (
@@ -332,64 +350,31 @@ export async function resolveProductionActivationState({
   ) {
     failWithDiagnostic('invalid-main-ref', 'The authoritative production main ref is invalid.');
   }
-  const baseSha = ref.object.sha;
-  if (baseSha !== trustedBaseSha) {
-    failWithDiagnostic('main-ref-moved', 'Production main moved after the workflow was dispatched.');
-  }
-  let state;
-  let sha;
-  let number = '';
-  let refreshRequired = false;
-  if (pulls.length === 1) {
-    const pull = pulls[0];
-    try {
-      assertPullAssociation(pull, { head, base });
-      sha = assertSha(pull.head?.sha ?? '');
-      // pull.base.sha is cached pull metadata. Validate its shape, but never use it
-      // to decide whether the authoritative refs/heads/main has moved.
-      assertSha(pull.base?.sha ?? '');
-      if (!Number.isInteger(pull.number) || pull.number < 1) fail('Invalid pull request number.');
-    } catch {
-      failWithDiagnostic(
-        'invalid-pr-association',
-        'The production activation pull request association is invalid.',
-      );
-    }
-    const commit = await readCommit(sha);
-    refreshRequired = activationCommitNeedsRefresh(commit, { headSha: sha, baseSha });
-    state = 'pending';
-    number = String(pull.number);
-  } else {
-    sha = baseSha;
-    const page = await readPage(sha);
-    if (page.cycle !== targetCycle) {
-      failWithDiagnostic(
-        'completed-state-missing',
-        'Neither a pending PR nor a completed production cycle exists.',
-      );
-    }
-    state = 'completed';
+  const page = await readPage(ref.object.sha);
+  if (page.cycle !== targetCycle) {
+    failWithDiagnostic(
+      'completed-state-missing',
+      'Neither a pending PR nor a completed production cycle exists.',
+    );
   }
   return {
-    state,
-    headSha: sha,
-    baseSha,
-    pullNumber: number,
-    refreshRequired,
+    state: 'completed',
+    headSha: ref.object.sha,
+    pullNumber: '',
+    draft: false,
   };
 }
 
-async function activationState(options) {
-  const result = await resolveProductionActivationState({
+async function rolloverState(options) {
+  const result = await resolveRolloverState({
     head: required(options, 'head'),
     base: required(options, 'base'),
     cycle: required(options, 'cycle'),
-    expectedBaseSha: required(options, 'expected-base-sha'),
   });
   if (process.env.GITHUB_OUTPUT) {
     await appendFile(
       process.env.GITHUB_OUTPUT,
-      `state=${result.state}\nhead-sha=${result.headSha}\nbase-sha=${result.baseSha}\npr-number=${result.pullNumber}\nrefresh-required=${result.refreshRequired}\n`,
+      `state=${result.state}\nhead-sha=${result.headSha}\npr-number=${result.pullNumber}\ndraft=${result.draft}\n`,
     );
   }
   return result;
@@ -463,73 +448,38 @@ async function readPreviewRun(status, expectedSha) {
   return isTrustedPreviewRun({ status, run, expectedSha }) ? run : undefined;
 }
 
+/**
+ * Only the two checks the rollover depends on gate the draft-to-ready flip: the
+ * public no-secret tests and the exact Vercel preview. Unrelated repository
+ * workflows may run on the same commit and be cancelled or fail without
+ * blocking the cutoff.
+ */
 export function gateSnapshot({ statuses, checks, previewRun, expectedSha }) {
   const preview = latestPreviewStatus(statuses);
   const runs = checks?.check_runs;
-  const publicTest = Array.isArray(runs) && runs.find((run) => run.name === TEST_CHECK);
-  const allFinishedSuccessfully = Array.isArray(runs)
+  const publicTest = Array.isArray(runs)
     && checks.total_count <= 100
-    && runs.length > 0
-    && runs.every((run) => run.status === 'completed' && SUCCESSFUL_CONCLUSIONS.has(run.conclusion));
+    && runs.find((run) => run.name === TEST_CHECK);
   return {
     ready: isTrustedPreviewRun({ status: preview, run: previewRun, expectedSha })
       && publicTest?.status === 'completed'
       && publicTest?.conclusion === 'success'
-      && publicTest?.app?.slug === 'github-actions'
-      && allFinishedSuccessfully,
+      && publicTest?.app?.slug === 'github-actions',
     previewState: preview?.state,
     publicTestConclusion: publicTest?.conclusion,
   };
 }
 
-async function gate(options) {
-  const head = required(options, 'head');
-  const base = required(options, 'base');
-  const sourceCycle = assertCycle(required(options, 'source-cycle'));
-  const targetCycle = assertCycle(required(options, 'cycle'));
-  const expectedSha = assertSha(required(options, 'sha'));
-  const expectedBaseSha = assertSha(required(options, 'base-sha'));
-  assertAutomationBranch(head, base);
-  const timeoutSeconds = Number(options['timeout-seconds'] ?? '1800');
-  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 3600) {
-    fail('Gate timeout must be between zero and 3600 seconds.');
-  }
+async function waitForChecks({ sha, timeoutSeconds }) {
   const deadline = Date.now() + timeoutSeconds * 1000;
-
   while (true) {
-    const pull = await findPull(head, base);
-    const sha = assertSha(pull.head.sha);
-    assertPullBinding(pull, {
-      head,
-      base,
-      headSha: expectedSha,
-      baseSha: expectedBaseSha,
-    });
-    if (sha !== expectedSha) fail('Pull request head changed after preparation.');
     const [statuses, checks] = await Promise.all([
       github(`/repos/${OWNER}/${REPO}/commits/${sha}/statuses?per_page=100`),
       github(`/repos/${OWNER}/${REPO}/commits/${sha}/check-runs?per_page=100`),
-      verifyPageDelta({
-        head,
-        base,
-        headSha: expectedSha,
-        baseSha: expectedBaseSha,
-        sourceCycle,
-        targetCycle,
-      }),
     ]);
-    const preview = latestPreviewStatus(statuses);
-    const previewRun = await readPreviewRun(preview, expectedSha);
-    if (gateSnapshot({ statuses, checks, previewRun, expectedSha }).ready) {
-      if (process.env.GITHUB_OUTPUT) {
-        await appendFile(
-          process.env.GITHUB_OUTPUT,
-          `pr-number=${pull.number}\nhead-sha=${sha}\nbase-sha=${expectedBaseSha}\n`,
-        );
-      }
-      return { pullNumber: pull.number, headSha: sha, baseSha: expectedBaseSha };
-    }
-    if (Date.now() >= deadline) fail('Timed out waiting for exact-commit code and Vercel checks.');
+    const previewRun = await readPreviewRun(latestPreviewStatus(statuses), sha);
+    if (gateSnapshot({ statuses, checks, previewRun, expectedSha: sha }).ready) return;
+    if (Date.now() >= deadline) fail('Timed out waiting for the public tests and Vercel preview.');
     await new Promise((resolve) => setTimeout(resolve, 15_000));
   }
 }
@@ -600,71 +550,66 @@ async function ensurePull(options) {
   return { pullNumber: pull.number, headSha, baseSha };
 }
 
-async function merge(options) {
+/**
+ * Flip the rollover PR from draft to ready once its page-only commit passed
+ * the public tests and the exact Vercel preview. Merging stays manual.
+ */
+async function ready(options) {
   const head = required(options, 'head');
   const base = required(options, 'base');
-  const sha = assertSha(required(options, 'sha'));
-  const baseSha = assertSha(required(options, 'base-sha'));
   const sourceCycle = assertCycle(required(options, 'source-cycle'));
   const targetCycle = assertCycle(required(options, 'cycle'));
-  const number = Number(required(options, 'pr-number'));
-  if (!Number.isInteger(number) || number < 1) fail('Invalid pull request number.');
-  const pull = await findPull(head, base);
-  if (pull.number !== number) {
-    fail('Pull request changed after the activation gate.');
+  const timeoutSeconds = Number(options['timeout-seconds'] ?? '1800');
+  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 3600) {
+    fail('Ready timeout must be between zero and 3600 seconds.');
   }
-  assertPullBinding(pull, { head, base, headSha: sha, baseSha });
-  await verifyPageDelta({
-    head,
-    base,
-    headSha: sha,
-    baseSha,
-    sourceCycle,
-    targetCycle,
-  });
+  const pull = await findPull(head, base);
+  const sha = assertSha(pull.head?.sha ?? '');
+  const commit = await github(`/repos/${OWNER}/${REPO}/commits/${sha}`);
+  const parentSha = pageCommitParent(commit, { headSha: sha });
+  const [baseMarkdown, headMarkdown] = await Promise.all([
+    readPageMarkdownAt(parentSha),
+    readPageMarkdownAt(sha),
+  ]);
+  assertDeterministicPageDelta({ baseMarkdown, headMarkdown, sourceCycle, targetCycle });
+
+  let flipped = false;
   if (pull.draft === true) {
-    const ready = await github('/graphql', {
+    await waitForChecks({ sha, timeoutSeconds });
+    const current = await findPull(head, base);
+    if (current.number !== pull.number || current.head?.sha !== sha) {
+      fail('Pull request changed while waiting for its checks.');
+    }
+    const result = await github('/graphql', {
       method: 'POST',
       body: {
         query: 'mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}',
         variables: { id: pull.node_id },
       },
     });
-    if (ready?.errors?.length || ready?.data?.markPullRequestReadyForReview?.pullRequest?.isDraft !== false) {
-      fail('Could not mark the gated pull request ready for review.');
+    if (result?.errors?.length || result?.data?.markPullRequestReadyForReview?.pullRequest?.isDraft !== false) {
+      fail('Could not mark the rollover pull request ready for review.');
     }
+    await github(`/repos/${OWNER}/${REPO}/issues/${pull.number}/comments`, {
+      method: 'POST',
+      body: { body: READY_COMMENT },
+    });
+    flipped = true;
   }
-  const readyPull = await github(`/repos/${OWNER}/${REPO}/pulls/${number}`);
-  assertPullBinding(readyPull, { head, base, headSha: sha, baseSha });
-  await verifyPageDelta({
-    head,
-    base,
-    headSha: sha,
-    baseSha,
-    sourceCycle,
-    targetCycle,
-  });
-  const result = await github(`/repos/${OWNER}/${REPO}/pulls/${number}/merge`, {
-    method: 'PUT',
-    body: {
-      sha,
-      merge_method: 'squash',
-      commit_title: `Progress Prize rollover ${targetCycle}`,
-    },
-  });
-  if (result?.merged !== true || !/^[a-f0-9]{40}$/.test(result.sha ?? '')) {
-    fail('GitHub did not merge the gated pull request.');
+  if (process.env.GITHUB_OUTPUT) {
+    await appendFile(
+      process.env.GITHUB_OUTPUT,
+      `pr-number=${pull.number}\nhead-sha=${sha}\nflipped=${flipped}\n`,
+    );
   }
-  if (process.env.GITHUB_OUTPUT) await appendFile(process.env.GITHUB_OUTPUT, `merge-sha=${result.sha}\n`);
-  return { mergeSha: result.sha };
+  return { pullNumber: pull.number, headSha: sha, flipped };
 }
 
 async function main(argv) {
   const { command, options } = parseArgs(argv);
-  if (command === 'gate') return gate(options);
-  if (command === 'activation-state') return activationState(options);
+  if (command === 'rollover-state') return rolloverState(options);
   if (command === 'ensure-pr') return ensurePull(options);
-  if (command === 'merge') return merge(options);
+  if (command === 'ready') return ready(options);
   fail('Unknown trusted GitHub helper command.');
 }
 
