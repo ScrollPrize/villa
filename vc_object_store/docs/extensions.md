@@ -21,6 +21,19 @@ The optional `extension_tables` registry has one descriptor per physical extensi
 
 Numerical data is stored as `INTEGER`, `REAL`, `TEXT` or `BLOB` columns. UUID fields use binary 16-byte values, matching the rest of the store. Primary keys and optional indexes are ordinary SQL indexes; no per-row JSON parsing is needed for indexed measurement lookups. NULL is distinct from zero.
 
+### Provisioning contract: metadata, not payload
+
+Every extension must construct its provisioning JSON explicitly from the relevant values. Do not copy a source metadata/configuration/report tree and then filter it with an allowlist or denylist. Provisioning describes how to identify and interpret the data; it is not an archive of the import operation or another storage location for the dataset.
+
+- Source identity: an actual source UUID or checksum, if available, solely to identify/check that source. Omit unknown identity rather than inventing it. Do not store filesystem paths, source locations or command lines containing them in provisioning; store resolution belongs to the separate collection/location APIs.
+- Interpretation: compact format identifiers, units, field meanings, coordinate conventions and categorical encodings. Use the table definition for columns/indexes and the common input-state references for vcobj versions instead of duplicating them in JSON.
+- Settings and summary statistics: explicitly chosen small configuration values and aggregate counts/statistics are permitted. Per-run settings or summaries belong to the run when the table contains multiple runs, not to a repeatedly rewritten table descriptor.
+- No data dumps: selection-ID lists, per-object mappings, samples, coordinates, normals, probabilities, constraint records, per-iteration histories and full reports belong in typed rows or appropriate binary payloads. Do not put them in provisioning, including under nested `provenance`, `settings` or `stats` keys. Compact schema/category descriptions are metadata; arrays whose size follows the imported objects, constraints, samples or iterations are payload.
+
+Provisioning size should depend on the extension's description and compact configuration, not on dataset size. This matters especially for sharded stores, where a descriptor exists in each physical table. Keep shared input references at table or run scope; do not add per-object identity lists to reproduce them.
+
+This is an extension-author contract, not a generic JSON sanitizer or a universal field allowlist. The generic API validates the provisioning JSON object but cannot infer whether arbitrary extension-owned fields are metadata or payload. Each producer must construct the intended small descriptor directly and test that source paths and dataset-sized arrays are not copied. The fiber import builders enforce this by accepting explicit identity/count inputs rather than an arbitrary source JSON object.
+
 ## Input versions are not write versions
 
 `ExtensionSource` identifies `(storeUuid, generation, commitSequence)`. Here `generation` is the source's lineage UUID, not a numeric counter. The common source-reference format is shared across extensions.
