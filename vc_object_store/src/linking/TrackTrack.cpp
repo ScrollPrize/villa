@@ -35,7 +35,7 @@ detail::Detection detail::detectTracksToTracks(StoredGeometry& inputs, const Tra
     const auto& progressCallback = params.progress;
     objects::util::reportProgress(progressCallback, "loading track registrations");
     Detection detection;
-    detection.detector = kTrackTrackDetector; detection.version = 1;
+    detection.detector = kTrackTrackDetector; detection.version = kTrackTrackVersion;
     detection.replaceStalePending = params.replaceStalePending;
     DetectorReport& report = detection.report;
     std::vector<LinkCandidate> candidates;

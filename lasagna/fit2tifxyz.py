@@ -1000,6 +1000,7 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 				  components: list[list[int]] | None = None,
 				  base_shape_zyx: tuple[int, int, int] | None = None,
 				  lasagna_base_shape_zyx: tuple[int, int, int] | None = None,
+				  export_coordinate_scale: float = 1.0,
 				  extra_channels: dict[str, np.ndarray] | None = None,
 				  extra_channel_specs: list[dict] | None = None,
 				  atlas_control_points_summary: dict | None = None,
@@ -1037,6 +1038,9 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		meta["base_shape_zyx"] = [int(v) for v in base_shape_zyx]
 	if lasagna_base_shape_zyx is not None:
 		meta["lasagna_base_shape_zyx"] = [int(v) for v in lasagna_base_shape_zyx]
+	# The factor taking Lasagna base coordinates to the exported ones, so a reader can check the frame
+	# instead of inferring it from which shape keys are present.
+	meta["export_coordinate_scale"] = float(export_coordinate_scale)
 	if components is not None:
 		meta["components"] = components
 	if area is not None:
@@ -1229,6 +1233,7 @@ def _export_flatten_checkpoint(
 		area=area,
 		base_shape_zyx=output_base_shape_zyx,
 		lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+		export_coordinate_scale=export_factor,
 		atlas_control_points_summary=_atlas_summary_for_meta(atlas_control_export),
 		store=store,
 	)
@@ -1474,6 +1479,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 					  area=area, components=components if D > 1 else None,
 					  base_shape_zyx=output_base_shape_zyx,
 					  lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+					  export_coordinate_scale=export_factor,
 					  extra_channels=extra_all,
 					  extra_channel_specs=flow_gate_channel_specs,
 					  atlas_control_points_summary=_atlas_summary_for_meta(atlas_control_export),
@@ -1548,6 +1554,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 						  area=area,
 						  base_shape_zyx=output_base_shape_zyx,
 						  lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+						  export_coordinate_scale=export_factor,
 						  extra_channels=extra_layer,
 						  extra_channel_specs=flow_gate_channel_specs,
 						  atlas_control_points_summary=_atlas_summary_for_meta(atlas_control_export),

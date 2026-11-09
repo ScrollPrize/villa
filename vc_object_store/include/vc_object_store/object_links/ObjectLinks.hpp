@@ -10,11 +10,13 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/Progress.hpp"
 
 namespace vc::object_links {
@@ -26,6 +28,17 @@ inline constexpr const char* kFiberSurfaceDetector = "fiber-surface";
 inline constexpr const char* kTrackTrackDetector = "track-track";
 inline constexpr const char* kTrackSurfaceDetector = "track-surface";
 inline constexpr const char* kPointCollectionSurfaceDetector = "point-collection-surface";
+
+// Detector versions recorded in edge meta ("detector.version"). Bump one
+// whenever its results change for the same inputs and parameters: callers
+// that cache "links are current" (a link marker) compare these.
+inline constexpr int kSurfaceOverlapVersion = 1;
+inline constexpr int kFiberSurfaceVersion = 3;
+inline constexpr int kTrackTrackVersion = 1;
+inline constexpr int kTrackSurfaceVersion = 1;
+inline constexpr int kPointCollectionSurfaceVersion = 1;
+// {detector name: version} of every detector above.
+std::map<std::string, int> detectorVersions();
 
 // One proposed connection. `kind` is the edge kind metadata to store
 // (detectors default it to "same-surface"); `score` and `meta` are
@@ -46,15 +59,35 @@ struct DetectorReport {
     int64_t edgesUpdated = 0;
     int64_t edgesSkippedExisting = 0;
     int64_t staleRemoved = 0;        // own pending edges replaced on re-run
+    // Objects that could not be loaded or linked (left out of stale-edge
+    // removal, so their existing edges are unchanged), rejected candidate
+    // pairs, an unavailable strip cache, and a cancellation.
     std::vector<std::string> problems;
 };
+// Invalid parameters, and objects whose coordinate frame cannot be resolved
+// in the params' volume, throw std::invalid_argument before any work. Other
+// errors that abort a whole detector may throw; nothing is committed then.
 
 // Optional stale-edge scope for a partial detector run. Both endpoints
-// must be in objectUuids; empty sets deliberately remove nothing.
+// must be in objectUuids; empty sets deliberately remove nothing. A
+// nonempty `touching` also requires one endpoint in it (an incremental
+// run's new objects).
 struct StaleEdgeScope {
     std::vector<std::string> edgeKinds;
     std::vector<std::string> objectUuids;
+    std::vector<std::string> touching;
 };
+
+// Incremental runs (a detector's newUuids, set): the selection is the
+// partner set, and only pairs with at least one new object are examined.
+// Every new UUID must be among the selection (an empty selection: every
+// object of the kind). Partners are the selected objects of the other side
+// whose stored bounds overlap a new object's, grown by the detector's
+// search margin; only new objects and their partners are loaded. Stale
+// removal is limited to edges with a new endpoint and both endpoints
+// selected. Results for pairs of a new object are the full run's, except
+// where noted per detector; effects on pairs of existing objects (a new
+// surface winning a point over an older one) are not propagated.
 
 // Commits candidates as edges in one write transaction:
 // - each new edge gets meta.detector = {name, version, score?} merged
@@ -89,7 +122,15 @@ DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn
                                 const objects::util::ProgressCallback& progress = {});
 
 // --- Detectors ---
-struct PointCollectionSurfaceParams {
+// Opt-in metadata conversion: all working distances are reference-volume voxels.
+// Without volumeUuid, the existing explicit-scale APIs retain their behavior.
+// With volumeUuid, explicit scale multipliers must remain at their identity
+// defaults; each object's meta.coordinates is authoritative.
+struct CoordinateParams {
+    std::optional<std::string> volumeUuid;
+};
+
+struct PointCollectionSurfaceParams : CoordinateParams {
     std::vector<std::string> collectionUuids, surfaceUuids;
     double tolerance = 2.5;       // working voxels, matching fit_spiral's default
     double pointScale = 1.0;      // source XYZ -> working XYZ
@@ -101,6 +142,10 @@ struct PointCollectionSurfaceParams {
     std::string edgeKind = "point-surface";
     bool replaceStalePending = true;
     objects::util::ProgressCallback progress;
+    // Incremental run (see above). A new collection is linked as in a full
+    // run; an existing collection near a new surface is linked to the new
+    // surfaces alone (its existing links are kept).
+    std::optional<std::vector<std::string>> newUuids;
 };
 
 // Stored point collections -> stored surfaces. Anchors retain point IDs and
@@ -110,7 +155,7 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
     const PointCollectionSurfaceParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
 // Surface overlap distances are in working voxels unless noted.
-struct SurfaceOverlapParams {
+struct SurfaceOverlapParams : CoordinateParams {
     std::vector<std::string> surfaceUuids;
     int workers = 0; // 0: auto, at most 8; positive: requested search concurrency
     objects::util::ProgressCallback progress; // optional; no terminal output from the library
@@ -143,15 +188,76 @@ struct SurfaceOverlapParams {
     bool allowReflection = true;
     std::string edgeKind = "same-surface";
     bool replaceStalePending = true;
+    // Incremental run (see above): pairs with a new surface. Each pair's
+    // result is the full run's.
+    std::optional<std::vector<std::string>> newUuids;
 };
 // Stored surfaces on the same sheet, using 3D correspondences, robust UV fitting
 // and dense overlap agreement. Accepted pairs become pending edges.
+// With volumeUuid, accepted edges record meta.fit.pose (row-major [r00,r01,tx,
+// r10,r11,ty]) mapping metric UV of surface fit.pose_from to fit.pose_to, in volume
+// voxels, fit.grid_scales {uuid: [u, v]} (grid steps per voxel) and
+// fit.agreement_radius (tolerance + uvInlierTolerance, volume voxels). Stored edge
+// endpoint order is unrelated to the pose direction.
 DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
     const SurfaceOverlapParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
+// Concrete point pairs for accepted surface-overlap edges, from each edge's stored
+// pose and the current endpoint geometry. Surface a's valid vertices are sampled
+// every `spacing` voxels in row-major order and mapped to surface b's metric UV;
+// a pair is kept when b is valid there and the two points lie within the
+// detector's recorded fit.agreement_radius. Callers wanting a tighter bound
+// filter on each pair's distance.
+// More than maxPairs agreeing pairs are thinned evenly in sample order. The
+// result is deterministic for the same geometry, metadata and parameters.
+struct OverlapCorrespondenceParams {
+    std::string volumeUuid;      // required: the edges' coordinate frame
+    double spacing = 8.0;        // volume voxels between sampled vertices of surface a
+    std::size_t maxPairs = 256;
+};
+struct OverlapCorrespondence {
+    std::array<double, 2> aGrid, bGrid;  // (row, column) in each surface's stored grid
+    std::array<double, 3> aXyz, bXyz;    // volume voxels; b is bilinear in its quad
+    double distance = 0;                 // |aXyz - bXyz|, volume voxels
+};
+// Pairs follow the stored edge's endpoint order. A nonempty error means the edge
+// could not be materialized (wrong kind or frame, stale geometry, changed grid
+// scales, no agreeing pairs); pairs are then empty.
+struct OverlapCorrespondences {
+    std::string edgeUuid, aUuid, bUuid, aGeometryRevision, bGeometryRevision;
+    std::vector<OverlapCorrespondence> pairs;
+    std::string error;
+};
+// Edges are processed independently, in the given order. Invalid parameters throw.
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
+    const std::vector<std::string>& edgeUuids, const OverlapCorrespondenceParams& params);
+
+// An overlap edge as a reader saw it at some earlier state (a pinned input position,
+// say): the edge record's stored endpoint order, whole-geometry anchors and
+// metadata, and each endpoint's object metadata and geometry revision then.
+// The caller has decided the edge applies at that state; it is not checked
+// for staleness against the store's current state.
+struct OverlapEdgeAt {
+    std::string uuid, aUuid, bUuid;
+    bool wholeGeometry = true;  // both anchors
+    std::string meta;           // the edge's metadata JSON (its fit and pose)
+    std::string aObjectMeta, bObjectMeta;
+    std::string aGeometryRevision, bGeometryRevision;
+};
+// Point pairs from these records and geometry revisions instead of the
+// store's current ones (the revisions must be in this store); otherwise as
+// above.
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
+    const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params);
+// The same over any reader (a session's local or hosted attachment): the
+// geometry revisions are read through it, so a hosted client materializes
+// pinned overlaps without a server route.
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(const objects::StoreReader& reader,
+    const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params);
+
 // Fiber/track-to-surface strips have stripRowsEachSide rows at stripSpacing
 // on each side of the centerline. Distances are in working voxels.
-struct LineSurfaceParams {
+struct LineSurfaceParams : CoordinateParams {
     std::vector<std::string> surfaceUuids;
     objects::util::ProgressCallback progress; // optional; no terminal output from the library
     // Isotropic coordinate multipliers: source XYZ * scale = working XYZ.
@@ -207,6 +313,11 @@ struct FiberSurfaceParams : LineSurfaceParams {
     // metadata invalidate the cache. CT/normal voxel data is assumed immutable;
     // set this after editing it in place without changing its metadata.
     bool rebuildStrips = false;
+    // Incremental run (see above), over fibers and surfaces. A new fiber is
+    // linked as in a full run; an existing fiber near a new surface is
+    // linked to the new surfaces alone (anchors and growth among them; its
+    // existing links are kept).
+    std::optional<std::vector<std::string>> newUuids;
 };
 
 // Stored fibers -> stored surfaces. CT (ctVolume), lasagna normals

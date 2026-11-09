@@ -103,6 +103,14 @@ Most tools never touch the client classes directly: a store **location** is
 a file path or an `http(s)://` endpoint, and the Python helpers
 (`surfaces.read_surface`, `surfaces.create_surface`,
 `documents.attach_document`, `locations.attached(location)`) work on either.
+`locations.open_store(location, author=, read_only=, link_timeout_s=,
+cache_directory=)` yields the `ObjectStore` itself for a file and a
+`HostedStoreHandle` for an endpoint: the same reading and request methods
+(status, submit and receipts, the change feed, current and numbered records,
+relationships at versions, geometry descriptors, arrays and annotations,
+object and edge selections, pinned overlap correspondences) over one session
+attachment, with `cache_directory` as its persistent cache, so one code path
+reads, links and writes a store wherever it is.
 
 ## Sessions: `ObjectStoreSession`
 
@@ -148,10 +156,14 @@ session.submit(attachment, request); // TransactionConflict when the object move
   registered for its meta key (`setGeometryFetcher`,
   [objects/CatalogStore.hpp](../include/vc_object_store/objects/CatalogStore.hpp)),
   in any writable attachment.
-- Python mirrors this: `ObjectStoreSession` with `attach_hosted`, `hosted`,
-  `attach_location`, `status`, `submit`, `receipt`, `current_object`,
-  `objects_at_versions`, `select_objects`, `read_surface_grid`,
-  `read_geometry_arrays`, `create_surface`, `attach_document`,
+- Python mirrors this: `ObjectStoreSession` with `attach_hosted` (its
+  `cache_directory`, `disk_cache_bytes` and `min_free_bytes` are the
+  persistent cache below), `hosted`, `attach_location`, `location`,
+  `status`, `submit`, `receipt`, `current_object`, `objects_at_versions`,
+  `relationships_at_versions`, `changes_since`, `select_objects`,
+  `select_edges`, `read_surface_grid`, `read_geometry_arrays`,
+  `geometry_revision`, `read_geometry_array`, `geometry_point_annotations`,
+  `overlap_correspondences_at`, `create_surface`, `attach_document`,
   `attached_document`, `point_collections`, `artifacts`,
   `publish_artifacts`, `materialize_artifacts`, and the draft calls below.
 

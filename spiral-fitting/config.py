@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 
@@ -23,6 +24,7 @@ _ENUMS = {
     "track_radius_target": ["mean", "median"],
     "dense_spacing_mode": ["grad_mag", "winding_model"],
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
+    "spiral_outward_sense": ["CW", "ACW"],
 }
 
 _NULL_TYPES = {
@@ -31,16 +33,33 @@ _NULL_TYPES = {
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "loss_start_unattached_pcl_dt": "integer",
-    "patch_uuid_filter_regex": "string",
+    "object_store_location": "string",
+    "object_store_author": "string",
+    "object_store_link_timeout_s": "integer",
+    "object_store_input_position": "mapping",
+    "object_store_patch_uuids": "strings",
+    "object_store_patch_tags": "strings",
+    "object_store_pcl_uuids": "strings",
+    "object_store_pcl_tags": "strings",
+    "object_store_fiber_uuids": "strings",
+    "object_store_fiber_tags": "strings",
+    "object_store_track_uuids": "strings",
+    "object_store_track_tags": "strings",
+    "object_store_normal_ct_path": "string",
+    "object_store_normal_ct_volume_uuid": "string",
+    "fit_volume_uuid": "string",
+    "spiral_outward_sense": "string",
 }
 
-# Settings host preparation consumes irreversibly: the patch loader erodes and
-# filters entries before they reach the resident pools, and the dense-spacing
-# mode decides which dense stores are opened. Nothing retained by a resident
-# session can re-derive their effect, so they demand a full rebuild.
+# Settings host preparation consumes irreversibly: patch materialization
+# erodes patches before they reach the resident pools, the patch-loss z
+# margin decides which attachments materialization keeps (and is recorded in
+# the input manifest), and the dense-spacing mode decides which dense stores
+# are opened. Nothing retained by a resident session can re-derive their
+# effect, so they demand a full rebuild.
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
-    "patch_uuid_filter_regex",
+    "patch_loss_z_margin",
     "dense_spacing_mode",
 }
 
@@ -100,6 +119,7 @@ _INPUT_TOGGLE_KEYS = frozenset({
     "input_use_pcl_relative",
     "input_use_pcl_same_winding",
     "input_use_pcl_drawn_control_points",
+    "input_use_patch_overlaps",
     "input_use_normals",
     "input_use_gradient_magnitude",
     "input_use_winding_inference",
@@ -165,6 +185,7 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_gap_expander_lr_scale",
     "model_gap_expander_min_gap", "model_gap_expander_softplus_bias",
     "model_initial_dr_per_winding", "model_linear_z_resolution",
+    "fit_volume_level",
 )
 
 
@@ -227,25 +248,26 @@ _RUN_MUTABLE_MODEL_KEYS = frozenset({
     "model_gap_expander_num_windings",
 })
 
-# input_ keys a resident session applies at a Run boundary: the participation
-# toggles of the editable point-collection roles (same-winding, relative).
-# Their documents are ordinary regular collections, so FitContext.apply_config
-# loads them through the live-incorporation path when a toggle turns on (the
-# dataset's conventional document plus any document the session request
-# named) and drops the role's resident collections when it turns off. The
-# other roles keep their load-time semantics: absolute annotations are
-# consumed by the theta/winding supervision set up at build, and drawn
-# control points have no live add/remove path.
-_RUN_MUTABLE_INPUT_KEYS = frozenset({
-    "input_use_pcl_relative",
-    "input_use_pcl_same_winding",
-})
-
 # input_ keys: hard participation gates deciding what host preparation loads
 # and which dense stores open. Always a rebuild.
-_INPUT_GATE_KEYS = (_INPUT_TOGGLE_KEYS - _RUN_MUTABLE_INPUT_KEYS) | {
+_INPUT_GATE_KEYS = _INPUT_TOGGLE_KEYS | {
     "input_disable_patches",
 }
+
+# pcl_ settings that shape the frozen object-store inputs: the startup link
+# refresh (object_store_inputs.refresh_links), materialization and the point
+# views derived from them. A resident fit cannot re-derive them; they are a
+# rebuild, and FitContext.apply_config refuses them.
+OBJECT_STORE_PCL_KEYS = frozenset({
+    "pcl_link_distance_tolerance",
+    "pcl_link_window_points",
+    "pcl_link_window_min_points",
+    "pcl_fiber_min_point_spacing",
+    "pcl_patch_overlap_pair_spacing",
+    "pcl_patch_overlap_max_pairs",
+    "pcl_use_fiber_links",
+    "pcl_unattached_pcl_min_point_spacing",
+})
 
 _RUN_MUTABLE_PCL_KEYS = frozenset({
     "pcl_vertical_fiber_radial_offset_enabled",
@@ -253,41 +275,53 @@ _RUN_MUTABLE_PCL_KEYS = frozenset({
     "pcl_rel_winding_adjacent_patches_only",
     "pcl_stratified_pcl_sampling",
     "pcl_sampling_weights",
-    "pcl_use_fiber_links",
-    "pcl_use_pending_fiber_links",
-    "pcl_unattached_pcl_min_point_spacing",
-    "pcl_fiber_min_point_spacing",
-    # The fiber link side rules relink every resident fiber (the fiber
-    # catalog is re-linked against the resident patches and its views
-    # re-materialised); see FitContext._relink_fibers_to_patches. The
-    # tolerance and window settings relink every resident collection, regular
-    # and fiber, and re-derive every view from the retained catalogs; see
-    # FitContext._relink_all_points_to_patches.
-    "pcl_fiber_link_side_filter",
-    "pcl_fiber_link_side_margin_voxels",
-    "pcl_fiber_link_model_direction_step",
-    "pcl_link_distance_tolerance",
-    "pcl_link_window_points",
-    "pcl_link_window_min_points",
+})
+
+# The object-store input selection and frames decide what host preparation
+# reads, refreshes and materializes (object_store_inputs.load_fit_inputs).
+OBJECT_STORE_INPUT_KEYS = frozenset({
+    "object_store_location",
+    "object_store_author",
+    "object_store_link_timeout_s",
+    "object_store_input_position",
+    "object_store_refresh_links",
+    "object_store_full_link_refresh",
+    "object_store_approved_links_only",
+    "object_store_allow_changed_inputs",
+    "object_store_patch_uuids",
+    "object_store_patch_tags",
+    "object_store_pcl_uuids",
+    "object_store_pcl_tags",
+    "object_store_fiber_uuids",
+    "object_store_fiber_tags",
+    "object_store_track_uuids",
+    "object_store_track_tags",
+    "object_store_normal_ct_path",
+    "object_store_normal_ct_level",
+    "object_store_normal_ct_downsampling",
+    "object_store_normal_ct_volume_uuid",
+    "fit_volume_uuid",
+    "fit_volume_level",
 })
 
 NEW_FIT_KEYS = frozenset(
     set(_Z_RANGE_KEYS)
     | _MODEL_STRUCTURE_KEYS
+    | OBJECT_STORE_INPUT_KEYS
+    | OBJECT_STORE_PCL_KEYS
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
-       "pcl_vertical_fiber_min_z_fraction"}
+       "pcl_vertical_fiber_min_z_fraction", "spiral_outward_sense"}
 )
 
-_AUDITED_PREFIXES = ("model_", "input_", "pcl_")
+_AUDITED_PREFIXES = ("model_", "input_", "pcl_", "object_store_")
 
 
 def _runtime_impact(key):
     if key in NEW_FIT_KEYS:
         return "new_fit"
-    if (key in _RUN_MUTABLE_MODEL_KEYS or key in _RUN_MUTABLE_PCL_KEYS
-            or key in _RUN_MUTABLE_INPUT_KEYS):
+    if key in _RUN_MUTABLE_MODEL_KEYS or key in _RUN_MUTABLE_PCL_KEYS:
         return "run_boundary"
     if key.startswith(_AUDITED_PREFIXES):
         return "new_fit"
@@ -300,8 +334,7 @@ def unaudited_prefixed_keys(keys):
     Such a key is reported as "new_fit" by construction; this exists so the
     tests (and anyone adding a setting) can see the omission explicitly.
     """
-    tables = (NEW_FIT_KEYS | _RUN_MUTABLE_MODEL_KEYS | _RUN_MUTABLE_PCL_KEYS
-              | _RUN_MUTABLE_INPUT_KEYS)
+    tables = NEW_FIT_KEYS | _RUN_MUTABLE_MODEL_KEYS | _RUN_MUTABLE_PCL_KEYS
     return sorted(key for key in keys
                   if key.startswith(_AUDITED_PREFIXES) and key not in tables)
 
@@ -372,8 +405,10 @@ def _field_spec(key, default):
                     "dt_target_update_interval",
                     "pcl_link_window_points",
                     "pcl_link_window_min_points",
+                    "pcl_patch_overlap_max_pairs",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
+                     else 16 if key == "fit_volume_level"
                      else 1_000_000_000),
             step=1 if kind == "integer" else .01,
         )
@@ -495,51 +530,47 @@ class Config:
         self.input_use_pcl_relative = True
         self.input_use_pcl_same_winding = True
         self.input_use_pcl_drawn_control_points = True
+        # Patch-overlap links: refreshed by the store's overlap detector and
+        # materialized as same-surface point pairs. Off skips both.
+        self.input_use_patch_overlaps = True
         self.input_use_normals = True
         self.input_use_gradient_magnitude = True
         self.input_use_winding_inference = True
         self.input_use_outer_shell = True
         self.input_disable_patches = False
-        # When set, only patch directory entries (uuid-named) whose name
-        # matches this regex (re.search) are loaded; None loads everything.
-        self.patch_uuid_filter_regex = None
         self.pcl_rel_winding_adjacent_patches_only = True
         self.pcl_stratified_pcl_sampling = True
         self.pcl_sampling_weights = None
         self.pcl_fiber_min_point_spacing = 40.0
         self.pcl_unattached_pcl_min_point_spacing = 16.0
-        # Point-to-patch linking (point_collection.link_points_to_patches;
-        # see descriptions.json). Every point attaches to a patch surface
-        # within this many scroll voxels; window_min_points > 1 additionally
+        # The object store's point-surface link detector, run by the startup
+        # link refresh (object_store_inputs.refresh_links; see
+        # descriptions.json): a point attaches to a patch surface within this
+        # many reference-volume voxels; window_min_points > 1 additionally
         # requires that many of a centred window of window_points consecutive
         # points to lie within tolerance of a candidate before it is eligible.
         self.pcl_link_distance_tolerance = 2.5
         self.pcl_link_window_points = 1
         self.pcl_link_window_min_points = 1
-        # Fiber side rules: vertical fibers (on the sheet's back) attach only
-        # to patches in front of them (inward, toward the umbilicus / lower
-        # winding), horizontal fibers (on the sheet's front) only to patches
-        # behind them, each with a margin for points on the surface itself.
-        # The inward direction comes from the umbilicus until
-        # pcl_fiber_link_model_direction_step steps have run, then from the
-        # fitted winding (every fiber relinks once at the switch, or at the
-        # first step after loading a checkpoint that far along).
-        self.pcl_fiber_link_side_filter = False
-        self.pcl_fiber_link_side_margin_voxels = 0.5
-        self.pcl_fiber_link_model_direction_step = 10000
-        # Cross-fiber links ("branches"): same-winding continuations between
-        # fibers. When on, linked collections merge into per-component
-        # cross-patch pcls with an explicit fiber graph (winding ties propagate
-        # through junctions whether or not the junction points attach to
-        # patches), and the unattached-strip loss samples chain walks that hop
-        # fibers at junctions. Link endpoints are resolved by their explicit
-        # control_point indices (mapped through decimation via
-        # kept_orig_indices).
+        # Cross-fiber links (the store's fiber_branch relationships):
+        # same-winding continuations between fibers, or adjacent-winding
+        # links between an H and a V fiber (the V one winding inside). When
+        # on, linked fibers
+        # merge into per-component cross-patch pcls with an explicit fiber
+        # graph (winding ties propagate through junctions whether or not the
+        # junction points attach to patches), and the unattached-strip loss
+        # samples chain walks that hop fibers at junctions. Pending branches
+        # are used unless object_store_approved_links_only.
         self.pcl_use_fiber_links = True
-        # Include unapproved (pending) links.
-        self.pcl_use_pending_fiber_links = False
+        # Object-store patch overlaps become same-surface point pairs sampled
+        # this many reference-volume voxels apart, at most max_pairs per edge
+        # (object_store_inputs.materialize_patch_overlaps). Each edge weighs
+        # the same in the 'patch_overlaps' sampling group however many pairs
+        # it yields.
+        self.pcl_patch_overlap_pair_spacing = 8.0
+        self.pcl_patch_overlap_max_pairs = 16
         # Vertical/horizontal classification of fiber strips, used for radial
-        # offsets and patch-side linking. VC3D's manual tag wins, then its automatic
+        # offsets. VC3D's manual tag wins, then its automatic
         # tag when the recorded certainty (0..1) reaches the threshold, then a
         # geometric fallback: a strip whose z extent is at least this fraction
         # of its path length is vertical.
@@ -630,6 +661,66 @@ class Config:
         self.shell_min_confidence = 0.25
         self.output_save_png_visualizations = False
         self.output_num_slices_for_visualization = 20
+        # Patches, fibers, point collections and tracks come from one
+        # vc_object_store database (object_store_inputs.load_fit_inputs).
+        # Startup refreshes the store's automatic PCL-patch, fiber-patch,
+        # patch-overlap and track-crossing links, writing them back as
+        # object_store_author, unless refresh_links is off; approved_links_only
+        # consumes only approved relationships. A checkpoint resumes only
+        # against identical inputs and frames unless allow_changed_inputs.
+        # A store file on this host, or the endpoint of the vc_object_server
+        # serving one (object_store_inputs.open_store).
+        self.object_store_location = None
+        self.object_store_author = None
+        # How long one link_objects request of a served store may take: its
+        # detectors run on the server, which answers when they are done. Set
+        # with the server's --request-deadline; None is the default 300 s.
+        self.object_store_link_timeout_s = None
+        # The inputs are a position of the store ({store, generation,
+        # commit_sequence}). None links and pins the store's head at load
+        # (object_store_inputs.prepare_position); a position is read exactly
+        # as pinned, without linking. The service sets it from the position
+        # it prepared; a client never does.
+        self.object_store_input_position = None
+        self.object_store_refresh_links = True
+        # A refresh skips the detectors when the store's link marker shows the
+        # links current, and an input update links only new objects; true
+        # always runs every detector over the whole selection.
+        self.object_store_full_link_refresh = False
+        self.object_store_approved_links_only = False
+        self.object_store_allow_changed_inputs = False
+        # Object selection per kind: None selects every active object with
+        # geometry; otherwise the listed UUIDs plus objects carrying any
+        # listed tag (an empty list selects nothing).
+        self.object_store_patch_uuids = None
+        self.object_store_patch_tags = None
+        self.object_store_pcl_uuids = None
+        self.object_store_pcl_tags = None
+        self.object_store_fiber_uuids = None
+        self.object_store_fiber_tags = None
+        self.object_store_track_uuids = None
+        self.object_store_track_tags = None
+        # CT structure-tensor normals for fiber-patch link refresh when the fit
+        # loads no lasagna normals: a CT zarr whose group object_store_normal_
+        # ct_level is downsampled by object_store_normal_ct_downsampling
+        # relative to the fit volume, which object_store_normal_ct_volume_uuid
+        # must name.
+        self.object_store_normal_ct_path = None
+        self.object_store_normal_ct_level = 0
+        self.object_store_normal_ct_downsampling = 1.0
+        self.object_store_normal_ct_volume_uuid = None
+        # The reference volume every fit coordinate is a voxel of; None infers
+        # it from the selected objects' declared frames.
+        self.fit_volume_uuid = None
+        # The pyramid level of that volume the fit works in: a fit voxel is
+        # 2^level of its voxels. Inputs and scroll facts are converted to it,
+        # and exported surfaces back to the volume's own voxels.
+        self.fit_volume_level = 0
+        # The direction ("CW" or "ACW") the spiral winds outwards, where the
+        # fit volume's orientation (the catalog's z direction and handedness)
+        # does not decide it; one that disagrees with it is refused. Read off
+        # the CT by a person, or from an already-fitted spiral.
+        self.spiral_outward_sense = None
 
         defaults = vars(self)
         fields = {key: _field_spec(key, value)
@@ -653,7 +744,11 @@ class Config:
                 "string": lambda: isinstance(value, str),
                 "enum": lambda: value in spec["values"],
                 "vector": lambda: isinstance(value, list),
+                "strings": lambda: isinstance(value, list) and all(
+                    isinstance(item, str) for item in value),
                 "dictionary": lambda: isinstance(value, dict),
+                # Any JSON object (a store position).
+                "mapping": lambda: isinstance(value, dict),
             }
             if not valid[spec["type"]]():
                 raise ValueError(f"Invalid value for {key}")
@@ -670,6 +765,10 @@ class Config:
                     or type(item) not in (int, float)
                     for item_key, item in value.items()):
                 raise ValueError(f"Invalid dictionary value for {key}")
+        for key in ("object_store_normal_ct_downsampling",):
+            if values[key] is not None and not (
+                    math.isfinite(values[key]) and values[key] > 0):
+                raise ValueError(f"{key} must be finite and positive")
         if values["model_gap_expander_capacity_windings"] < 3:
             raise ValueError(
                 "model_gap_expander_capacity_windings must be at least 3")

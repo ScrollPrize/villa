@@ -52,8 +52,23 @@ bool flag(const Json& value, const std::string& key)
     throw std::invalid_argument(std::string("link_objects: ") + detector + ": unknown parameter '" + key + "'");
 }
 
+// The parameters every detector with a coordinate frame takes: volume_uuid
+// (null: explicit scales) and, for an incremental run, new_uuids.
+bool setCoordinateParameter(CoordinateParams& p, const std::string& key, const Json& value)
+{
+    if (key == "volume_uuid") p.volumeUuid = value.is_null() ? std::nullopt : std::optional(text(value, key));
+    else return false;
+    return true;
+}
+
+std::optional<std::vector<std::string>> newUuids(const Json& value, const std::string& key)
+{
+    return value.is_null() ? std::nullopt : std::optional(uuids(value, key));
+}
+
 bool setLineSurfaceParameter(LineSurfaceParams& p, const std::string& key, const Json& value)
 {
+    if (setCoordinateParameter(p, key, value)) return true;
     if (key == "surface_uuids") p.surfaceUuids = uuids(value, key);
     else if (key == "surface_scale") p.surfaceScale = number<double>(value, key);
     else if (key == "ct_level") p.ctLevel = number<int>(value, key);
@@ -95,7 +110,9 @@ PointCollectionSurfaceParams pointCollectionSurfaceParamsFromJson(const Json& js
 {
     PointCollectionSurfaceParams p;
     for (const auto& [key, value] : object(json, "params").items()) {
+        if (setCoordinateParameter(p, key, value)) continue;
         if (key == "collection_uuids") p.collectionUuids = uuids(value, key);
+        else if (key == "new_uuids") p.newUuids = newUuids(value, key);
         else if (key == "surface_uuids") p.surfaceUuids = uuids(value, key);
         else if (key == "tolerance") p.tolerance = number<double>(value, key);
         else if (key == "point_scale") p.pointScale = number<double>(value, key);
@@ -114,7 +131,9 @@ SurfaceOverlapParams surfaceOverlapParamsFromJson(const Json& json)
 {
     SurfaceOverlapParams p;
     for (const auto& [key, value] : object(json, "params").items()) {
+        if (setCoordinateParameter(p, key, value)) continue;
         if (key == "surface_uuids") p.surfaceUuids = uuids(value, key);
+        else if (key == "new_uuids") p.newUuids = newUuids(value, key);
         else if (key == "workers") p.workers = number<int>(value, key);
         else if (key == "tolerance") p.tolerance = number<double>(value, key);
         else if (key == "sample_spacing") p.sampleSpacing = number<double>(value, key);
@@ -162,6 +181,7 @@ FiberSurfaceParams fiberSurfaceParamsFromJson(const Json& json)
         else if (key == "cache_directory") p.cacheDirectory = text(value, key);
         else if (key == "fiber_scale") p.fiberScale = number<double>(value, key);
         else if (key == "rebuild_strips") p.rebuildStrips = flag(value, key);
+        else if (key == "new_uuids") p.newUuids = newUuids(value, key);
         else if (!setLineSurfaceParameter(p, key, value)) unknown(kFiberSurfaceDetector, key);
     }
     return p;

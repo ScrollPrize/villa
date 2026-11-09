@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit, render, and score one Spiral dataset sequentially."""
+"""Fit, render, and score one Spiral fit sequentially."""
 
 from __future__ import annotations
 
@@ -105,7 +105,24 @@ def add_common_arguments(
     parser: argparse.ArgumentParser, *, include_gpus: bool = True
 ) -> None:
     """Register operational arguments shared by the single and sweep runners."""
-    parser.add_argument("--dataset", required=True, type=Path)
+    parser.add_argument(
+        "--inputs",
+        required=True,
+        type=Path,
+        metavar="MANIFEST",
+        help="fit input manifest (fit_spiral.py --inputs)",
+    )
+    parser.add_argument(
+        "--object-store",
+        required=True,
+        help="object store the fit reads its inputs from: a store file (.vcobj), or "
+             "the endpoint of the vc_object_server serving one (fit_spiral.py --object-store)",
+    )
+    parser.add_argument(
+        "--object-store-author",
+        default=None,
+        help="author of refreshed links (default: fit CLI's $USER / $USERNAME / spiral-fit)",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -313,8 +330,6 @@ def fit_environment(
     if num_threads is not None:
         env.update(_native_thread_env(num_threads))
         env["FIT_SPIRAL_NUM_THREADS"] = str(num_threads)
-        env["FIT_SPIRAL_PATCH_LOAD_WORKERS"] = str(num_threads)
-        env["FIT_SPIRAL_PATCH_LOAD_IO_THREADS"] = "1"
     return env
 
 
@@ -331,12 +346,18 @@ def downstream_environment(
     return env
 
 
-def fit_command(dataset: Path, gpu_ids: tuple[int, ...] | None) -> list[str]:
+def fit_command(
+    args: argparse.Namespace, gpu_ids: tuple[int, ...] | None
+) -> list[str]:
     script_args = [
         str(SPIRAL_DIR / "fit_spiral.py"),
-        "--dataset",
-        str(dataset),
+        "--inputs",
+        str(args.inputs),
+        "--object-store",
+        str(args.object_store),
     ]
+    if args.object_store_author is not None:
+        script_args += ["--object-store-author", args.object_store_author]
     if gpu_ids is not None and len(gpu_ids) > 1:
         return [
             sys.executable,
@@ -639,7 +660,7 @@ def run_pipeline(
         output.mkdir(parents=True, exist_ok=False)
 
     gpu_ids = getattr(args, "gpus", None)
-    fit_cmd = fit_command(args.dataset, gpu_ids)
+    fit_cmd = fit_command(args, gpu_ids)
     subprocess.run(
         fit_cmd,
         check=True,
@@ -713,6 +734,12 @@ def _atomic_write_json(path: Path, value: dict) -> None:
 def _resume_invocation(
     args: argparse.Namespace, overrides: dict, project: str, entity: str
 ) -> dict:
+    from vc_object_store.locations import open_store
+
+    # Store identity survives relocation and replication. Check it even when
+    # the saved fit is complete and the fitter's input checks will not run.
+    with open_store(str(args.object_store), read_only=True) as store:
+        store_uuid = store.uuid
     gpu_ids = getattr(args, "gpus", None)
     return {
         "effective_config": {
@@ -721,7 +748,8 @@ def _resume_invocation(
             "wandb_entity": entity,
         },
         "inputs": {
-            "dataset": str(args.dataset.resolve()),
+            "input_manifest": str(args.inputs.resolve()),
+            "object_store_uuid": store_uuid,
             "ink_volume": str(args.ink_volume.resolve()),
         },
         "operational_args": {
@@ -982,7 +1010,7 @@ def _run_resumable_pipeline(
 
         def fit() -> None:
             subprocess.run(
-                fit_command(args.dataset, gpu_ids), check=True,
+                fit_command(args, gpu_ids), check=True,
                 env=fit_environment(
                     overrides, output, args.num_threads, wandb_project=project,
                     wandb_entity=entity, wandb_enabled=not args.no_wandb,
@@ -1099,13 +1127,17 @@ def run_resumable(
 
 
 def run(args: argparse.Namespace) -> None:
+    from vc_object_store.locations import is_endpoint
+
     output = args.output.resolve()
     overrides, wandb_project, wandb_entity = load_run_config(args.config)
     overwrite = getattr(args, "overwrite", False)
     if overwrite and getattr(args, "resume", False):
         raise ValueError("--overwrite cannot be combined with --resume")
     if overwrite:
-        protected_paths = [args.dataset, args.ink_volume, args.vc_render_bin]
+        protected_paths = [args.inputs, args.ink_volume, args.vc_render_bin]
+        if not is_endpoint(args.object_store):
+            protected_paths.append(Path(args.object_store))
         if args.config is not None:
             protected_paths.append(args.config)
         overwrite_output(args.output, protected_paths=protected_paths)

@@ -11,6 +11,13 @@ template <class Run> auto withTracks(detail::StoredGeometry& inputs, const Track
                                      const std::atomic_bool* cancel, Run&& run)
 {
     const auto tracks = inputs.select("track", params.trackUuids);
+    // Tracks and surfaces are checked together before any work, so one
+    // refusal names every object of the run without a frame.
+    auto frames = detail::resolveCoordinateScales(tracks, params, params.trackScale);
+    detail::appendCoordinateScales(frames,
+        detail::resolveCoordinateScales(inputs.select("surface", params.surfaceUuids), params, params.surfaceScale));
+    frames.check(params);
+    const auto& scales = frames.scales;
     const detail::LineLoader load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
         const auto& object = tracks[index];
         try {
@@ -21,13 +28,14 @@ template <class Run> auto withTracks(detail::StoredGeometry& inputs, const Track
             detail::LineData line;
             line.uuid = object.uuid;
             line.object = object;
+            line.sourceScale = scales.at(object.uuid);
             line.lastLine = count - 1;
             line.line.reserve(count);
             line.arclength.reserve(count);
             for (size_t i = 0; i < count; ++i) {
                 if ((i & 1023) == 0 && cancel && cancel->load())
                     throw std::runtime_error("track-surface linking cancelled");
-                const cv::Vec3d xyz = cv::Vec3d(points[3*i], points[3*i+1], points[3*i+2]) * params.trackScale;
+                const cv::Vec3d xyz = cv::Vec3d(points[3*i], points[3*i+1], points[3*i+2]) * line.sourceScale;
                 for (int a = 0; a < 3; ++a)
                     if (points[3*i+a] < 0 || points[3*i+a] >= (1 << 20) || !std::isfinite(xyz[a]))
                         throw std::runtime_error("invalid scaled track coordinate");
@@ -62,8 +70,11 @@ detail::Detection detail::detectTracksToSurfaces(StoredGeometry& inputs, const s
     detail::validateLineSurfaceParams(params, params.trackScale);
     try {
         return withTracks(inputs, params, cancel, [&](size_t count, const LineLoader& load) {
-            return detectLinesToSurfaces(inputs, count, load, ctVolume, params, params.trackScale, kTrackSurfaceDetector, 1, cancel);
+            return detectLinesToSurfaces(inputs, count, load, ctVolume, params, params.trackScale, kTrackSurfaceDetector,
+                                         kTrackSurfaceVersion, cancel);
         });
+    } catch (const std::invalid_argument&) {
+        throw; // invalid parameters or object frames: the caller's error, as for every detector
     } catch (const std::exception& error) {
         Detection detection;
         detection.detector = kTrackSurfaceDetector;
@@ -80,8 +91,11 @@ DetectorReport linkTracksToSurfaces(objects::ObjectStore& db, const std::filesys
     try {
         detail::StoredGeometry inputs(db);
         return withTracks(inputs, params, cancel, [&](size_t count, const detail::LineLoader& load) {
-            return detail::linkLinesToSurfaces(db, inputs, count, load, ctVolume, params, params.trackScale, kTrackSurfaceDetector, 1, cancel);
+            return detail::linkLinesToSurfaces(db, inputs, count, load, ctVolume, params, params.trackScale,
+                                               kTrackSurfaceDetector, kTrackSurfaceVersion, cancel);
         });
+    } catch (const std::invalid_argument&) {
+        throw; // invalid parameters or object frames: the caller's error, as for every detector
     } catch (const std::exception& error) {
         return failed(error);
     }
