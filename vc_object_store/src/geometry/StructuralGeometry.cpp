@@ -12,7 +12,8 @@ void checked(sqlite3* db) {
     if (!activeStatementPools.at(db)->checkedAction) throw std::runtime_error("structural editing requires a checked write (expected versions)");
 }
 void requireSource(sqlite3* db,const std::string& uuid) {
-    execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", uuid);
+    if (!historyEnabled(db)) return;
+    execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", parseUuid(uuid));
 }
 std::vector<int64_t> idsOf(GeometryReader& reader,const std::string& ids,int64_t count) {
     std::vector<int64_t> values(count);
@@ -70,7 +71,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
     auto* db=static_cast<sqlite3*>(connection(txn)); checked(db); Savepoint savepoint(db); MetadataCacheScope cache;
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
-        if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
+        if (!current || current->uuid!=canonicalGeometryToken(expected)) historyConflict(db,"geometry: current revision changed; reload before committing");
         if (current->kind=="surface" || (current->kind=="fiber" ? edit.array!="control_points" && edit.array!="line_points" : edit.array!="points"))
             throw std::invalid_argument("invalid structural sequence array");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
@@ -86,7 +87,8 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
         if(!idsName.empty()) {
             originalIds=idsOf(reader,idsName,oldCount);
             // Restoration must not allow a previously allocated ID to be reused.
-            Statement latest(db,"SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation DESC,rowid DESC LIMIT 1",
+            Statement latest(db,historyEnabled(db) ? "SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY rowid DESC LIMIT 1" :
+                "SELECT geometry_manifest FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
                 parseUuid(uuid));
             if(latest.row()) {
                 const auto tip=Json::parse(latest.text(0));
@@ -185,7 +187,7 @@ std::string ObjectStore::resizeSurface(WriteTxn& txn,const std::string& objectId
     auto* db=static_cast<sqlite3*>(connection(txn)); checked(db); Savepoint savepoint(db); MetadataCacheScope cache;
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
-        if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
+        if (!current || current->uuid!=canonicalGeometryToken(expected)) historyConflict(db,"geometry: current revision changed; reload before committing");
         if (current->kind!="surface") throw std::invalid_argument("surface resize requires a surface");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
         if (resize.rows<0 || resize.columns<0) throw std::invalid_argument("negative surface shape");

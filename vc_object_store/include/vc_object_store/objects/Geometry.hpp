@@ -75,14 +75,15 @@ struct GeometrySurfaceResize {
     std::vector<GeometryArray> fill; // shape {1,1[,components]}, matching dtype
 };
 
-// Descriptors do not load payloads. Revision UUIDs are independent of object
-// UUIDs and content hashes. Parentage records edits, including undo/reverts.
+// Descriptors do not load payloads. Treat uuid as an opaque geometry token:
+// history-on uses independent revision UUIDs and parentage; history-off derives
+// it from object UUID and object version and retains no archival parent.
 struct GeometryRevision {
     std::string uuid, objectUuid;
     std::optional<std::string> parentUuid;
     std::string contentHash, kind, coordinateSystem, attributes;
     int64_t formatVersion = 1;
-    int64_t objectGeneration = 0;
+    int64_t objectVersion = 0;
     std::string createdBy, createdAt, createdHost;
     std::vector<GeometryArrayInfo> arrays;
     std::array<int64_t, 2> gridOrigin{0, 0}; // stable surface grid coordinates

@@ -4,11 +4,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <memory>
 #include <span>
 #include <string>
+#include <variant>
 #include "vc_object_store/objects/ObjectStore.hpp"
 
-namespace vc::objects { struct StatementPool; }
+namespace vc::objects { struct StatementPool; struct CurrentWriteState; }
 namespace vc::objects::detail {
 [[noreturn]] void fail(sqlite3* db, const std::string& what);
 void check(int rc, sqlite3* db, const char* what = "sqlite");
@@ -40,13 +42,20 @@ public:
     void bind(int i, int64_t v);
     void bind(int i, double v);
     void bind(int i, const std::string& v);
+    // The referenced bytes must outlive statement stepping and remain valid
+    // until replaced, clear/reset(), or destruction. Never pass a temporary.
+    void bindBorrowedText(int i, const std::string& v);
     void bind(int i, std::span<const uint8_t> bytes);
+    template<class... T> void bind(int i, const std::variant<T...>& value) {
+        std::visit([&](const auto& item){bind(i,item);},value);
+    }
     template<class T> void bind(int i, const std::optional<T>& value) {
         if (value) bind(i, *value); else bindNull(i);
     }
     void bindNull(int i);
     void bind(int i, const std::array<unsigned char, 16>& v);
     void bind(int i, const HashKey& v);
+    template<size_t N> void bind(int i, const std::array<uint8_t,N>& v) { bind(i,std::span<const uint8_t>(v)); }
     template<class... Args> void bindAll(const Args&... args) {
         int index = 1;
         (bind(index++, args), ...);
@@ -59,6 +68,7 @@ public:
     bool row();
     void stepDone();
     void reset();
+    void resetKeepingBindings();
     bool isNull(int c) const;
     int64_t i64(int c) const;
     double f64(int c) const;
@@ -96,5 +106,7 @@ public:
     void release();
 private:
     sqlite3* db_;
+    StatementPool* pool_ = nullptr;
+    std::shared_ptr<CurrentWriteState> currentWrite_;
 };
 } // namespace vc::objects::detail

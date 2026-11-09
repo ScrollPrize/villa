@@ -15,13 +15,106 @@
 
 using namespace vc::objects;
 
+namespace {
+void editCurrentLifecycle(HistoryMode history)
+{
+    TemporaryDirectory directory;
+    OpenOptions options; options.author = "lifecycle-test"; options.history = history;
+    const auto path = directory.path / "lifecycle.vcobj";
+    auto store = ObjectStore::create(path, options);
+    const auto a = util::newUuid(), b = util::newUuid(), c = util::newUuid();
+    auto makeEdge = [](const std::string& first, const std::string& second) {
+        EdgeRecord edge; edge.uuid = util::newUuid(); edge.kind = "attachment";
+        edge.aUuid = first; edge.bUuid = second;
+        edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
+        return edge;
+    };
+    auto ab = makeEdge(a, b), bc = makeEdge(b, c);
+    {
+        auto txn = store.write();
+        for (const auto& uuid : {a, b, c}) {
+            ObjectRecord record; record.uuid = uuid; record.kind = "surface";
+            store.upsertObject(txn, record);
+        }
+        store.addEdge(txn, ab); store.addEdge(txn, bc); txn.commit();
+    }
+    ObjectStoreSession session;
+    const auto attachment = session.attach(path, options);
+    session.editCurrent(attachment, {a, b}, [&](const StoreReader&, const std::string& uuid) {
+        if (uuid == a) return std::vector<TransactionOperation>{RetireObjectOp{a}};
+        return std::vector<TransactionOperation>{SetMetaOp{b, "note", "1"}};
+    });
+    {
+        auto txn = store.read();
+        require(store.objectByUuid(txn, a)->retired, "editCurrent retires an object with relationships");
+        require(!store.edgeByUuid(txn, ab.uuid), "retirement removes its incident relationship");
+        require(store.edgeByUuid(txn, bc.uuid).has_value(), "editCurrent retains unrelated surviving relationships");
+    }
+    session.editCurrent(attachment, {a}, [&](const StoreReader&, const std::string&) {
+        return std::vector<TransactionOperation>{RestoreObjectOp{a, {}}};
+    });
+    {
+        auto txn = store.read();
+        require(!store.objectByUuid(txn, a)->retired && !store.edgeByUuid(txn, ab.uuid),
+                "restoration does not revive removed relationships");
+    }
+    // A no-op restore of an active endpoint must still retain its relationships
+    // when the same request also edits its metadata.
+    session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+        return std::vector<TransactionOperation>{RestoreObjectOp{b, {}}, SetMetaOp{b, "note", "2"}};
+    });
+    {
+        auto txn = store.read();
+        require(store.edgeByUuid(txn, bc.uuid).has_value(), "no-op restore does not suppress normal retention");
+    }
+    if (history == HistoryMode::On) {
+        ObjectVersion source;
+        { auto txn = store.read(); source = store.versionReference(txn, *store.currentObjectRevision(txn, b)); }
+        session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+            return std::vector<TransactionOperation>{RestoreObjectOp{b, source}};
+        });
+        { auto txn = store.read(); require(!store.edgeByUuid(txn, bc.uuid), "historical restore removes old observations without retaining them"); }
+        bc = makeEdge(b, c);
+        VersionSelection expected;
+        { auto txn = store.read(); expected = {{b, store.currentVersion(txn, b)}, {c, store.currentVersion(txn, c)}}; }
+        { auto txn = store.write(expected); store.addEdge(txn, bc); txn.commit(); }
+    }
+    // The standalone request helper must also omit an explicitly removed edge.
+    auto removal = session.newRequest(attachment);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        editCurrentRequest(reader, removal, {b}, {SetMetaOp{b, "note", "3"}, RemoveEdgeOp{bc.uuid}});
+    });
+    require(removal.operations.size() == 2, "no generated retention for an explicitly removed edge");
+    session.submit(attachment, removal);
+    { auto txn = store.read(); require(!store.edgeByUuid(txn, bc.uuid), "explicit relationship removal succeeds through editCurrentRequest"); }
+    // Explicitly asking to retain a missing edge is still an error, not ignored.
+    mustFail([&] {
+        session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+            return std::vector<TransactionOperation>{RetainRelationshipOp{bc.uuid}};
+        });
+    });
+    // Capturing versions must precede callbacks, even if a callback causes a
+    // newer head to become visible (as a hosted reader could).
+    mustFail([&] {
+        session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+            auto txn = store.write(); store.setMeta(txn, b, "external", "true"); txn.commit();
+            return std::vector<TransactionOperation>{SetMetaOp{b, "stale_callback", "true"}};
+        });
+    });
+    { auto txn = store.read(); require(store.objectByUuid(txn, b)->meta.find("stale_callback") == std::string::npos,
+                                      "callback cannot advance the captured edit expectations"); }
+}
+}
+
 int main() try
 {
+    editCurrentLifecycle(HistoryMode::On);
+    editCurrentLifecycle(HistoryMode::Off);
     TemporaryDirectory directory;
     OpenOptions options; options.author = "session-test";
     // Older formats are rejected before the new journal is queried; the ones
-    // vc_object_convert reads (16 to 19) name it.
-    for (const int version : {14, 15, 16, 19}) {
+    // vc_object_convert reads (16 to 20) name it.
+    for (const int version : {14, 15, 16, 19, 20}) {
         const auto oldPath = directory.path / ("schema-" + std::to_string(version) + ".vcobj");
         { auto db = ObjectStore::create(oldPath, options); }
         sqlite3* raw = nullptr;
@@ -37,7 +130,7 @@ int main() try
             catch (const std::runtime_error& error) {
                 const std::string message = error.what();
                 rejected = message.find("unsupported database schema") != std::string::npos &&
-                           (version < 16) == (message.find("vc_object_convert") == std::string::npos);
+                           (version < 16 || message.find("vc_object_convert") != std::string::npos);
             }
             require(rejected, "old formats are explicitly rejected in read-only and writable mode");
         }
@@ -421,5 +514,84 @@ int main() try
         session.takeEvents();
     }
     session.detach(replacement);
+    // Current-only stores use exactly the same checked request/version API.
+    // Their notifications invalidate current state rather than invent a journal.
+    {
+        auto directOptions = options;
+        directOptions.history = HistoryMode::Off;
+        const auto directPath = directory.path / "direct.vcobj";
+        auto direct = ObjectStore::create(directPath, directOptions);
+        auto directAttachment = session.attach(directPath, directOptions);
+        session.takeEvents();
+        const auto uuid = util::newUuid();
+        ObjectRecord record; record.uuid = uuid; record.kind = "fiber";
+        const auto firstRequest = create(directAttachment, {record});
+        const auto first = session.submit(directAttachment, firstRequest);
+        require(first.objects.at(uuid) == 1, "history-off record starts at version one");
+        require(first.created == std::vector<std::string>{uuid}, "history-off receipt reports created objects");
+        const auto head = session.currentObject(directAttachment, uuid);
+        require(head && head->version == 1 && head->uuid.empty(), "current version does not invent an archival revision");
+        auto notifications = session.takeEvents();
+        require(notifications.size() == 1 && notifications.front().revalidate && notifications.front().changes.empty(),
+                "history-off commit requests whole-store revalidation without fabricated journal entries");
+        const auto pin = pinOf(directAttachment, *head, first.generation);
+        session.requireCurrent(pin);
+        auto update = metaRequest(directAttachment, {{uuid, 1}}, {{uuid, "a", "1"}, {uuid, "b", "2"}});
+        const auto second = session.submit(directAttachment, update);
+        require(second.objects.at(uuid) == 2, "several setters advance one record version once");
+        const auto repeated = session.submit(directAttachment, firstRequest);
+        require(repeated.replayed && repeated.objects.at(uuid) == 1 && repeated.commitSequence == first.commitSequence,
+                "history-off request replay returns the original durable receipt after later edits");
+        require(session.currentObject(directAttachment, uuid)->version == 2, "retry does not repeat the original mutation");
+        auto mismatched = firstRequest;
+        mismatched.operations.push_back(SetMetaOp{uuid, "bad_retry", "true"});
+        mustFail([&] { session.submit(directAttachment, mismatched); });
+        mustFail([&] { session.requireCurrent(pin); });
+        mustFail([&] { session.submit(directAttachment, metaRequest(directAttachment, {{uuid, 1}}, {{uuid, "stale", "true"}})); });
+        session.takeEvents();
+        { auto txn = direct.write(); direct.setMeta(txn, uuid, "external", "true"); txn.commit(); }
+        notifications = session.takeEvents();
+        require(notifications.size() == 1 && notifications.front().revalidate && notifications.front().touches({"fiber"}),
+                "history-off changes from another handle invalidate session consumers");
+        // A checked current-only write must not silently edit an undeclared object.
+        mustFail([&] {
+            auto write = direct.write(VersionSelection{});
+            direct.setMeta(write, uuid, "unguarded", "true");
+            write.commit();
+        });
+        const auto peer = util::newUuid();
+        ObjectRecord peerRecord; peerRecord.uuid = peer; peerRecord.kind = "fiber";
+        session.submit(directAttachment, create(directAttachment, {peerRecord}));
+        auto link = session.newRequest(directAttachment);
+        link.expectedObjects = {{uuid, 3}, {peer, 1}};
+        EdgeRecord edge; edge.uuid = util::newUuid(); edge.kind = "test_link";
+        edge.aUuid = uuid; edge.bUuid = peer;
+        edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
+        link.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});
+        const auto linked = session.submit(directAttachment, link);
+        require(linked.objects.at(uuid) == 4 && linked.objects.at(peer) == 2 &&
+                linked.relationships.at(edge.uuid) == 1,
+                "history-off relationship edits number both endpoints and the relationship");
+        require(linked.created == std::vector<std::string>{edge.uuid}, "relationship creation is included in the receipt");
+        auto missingEndpoint = session.newRequest(directAttachment);
+        missingEndpoint.expectedObjects = {{uuid, 4}};
+        missingEndpoint.operations.push_back(RemoveEdgeOp{edge.uuid});
+        mustFail([&] { session.submit(directAttachment, missingEndpoint); });
+        auto remove = session.newRequest(directAttachment);
+        remove.expectedObjects = {{uuid, 4}, {peer, 2}};
+        remove.operations.push_back(RemoveEdgeOp{edge.uuid});
+        const auto removed = session.submit(directAttachment, remove);
+        require(removed.objects.at(uuid) == 5 && removed.objects.at(peer) == 3 &&
+                removed.relationships.contains(edge.uuid) && !removed.relationships.at(edge.uuid),
+                "history-off relationship deletion reports absence and endpoint versions");
+        auto noop = session.newRequest(directAttachment);
+        noop.expectedObjects = {{uuid, 5}};
+        const auto sequence = session.status(directAttachment).commitSequence;
+        const auto nochange = session.submit(directAttachment, noop);
+        require(!nochange.commitSequence && nochange.objects.at(uuid) == 5 &&
+                session.status(directAttachment).commitSequence == sequence,
+                "history-off no-op receipt does not advance the store clock");
+        session.detach(directAttachment);
+    }
     std::cout << "session tests passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

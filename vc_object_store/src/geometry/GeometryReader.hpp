@@ -17,6 +17,7 @@ public:
     GeometryReader(const GeometryReader&) = delete;
     GeometryReader& operator=(const GeometryReader&) = delete;
     const nlohmann::json& manifest() const { return manifest_; }
+    const std::string& contentHash() const { return contentHash_; }
     std::vector<uint8_t> chunk(const std::string& name, int64_t index);
     size_t retainedCharge() const { return metadataCharge_ + cachedBytes_ + chunks_.size() * 256; }
     std::vector<uint8_t> read(const std::string& name, int64_t offset, std::optional<int64_t> count = std::nullopt);
@@ -37,8 +38,10 @@ private:
 
     sqlite3* db_;
     std::array<unsigned char, 16> revision_;
+    bool currentOnly_ = false;
     bool cacheChunks_;
     nlohmann::json manifest_;
+    std::string contentHash_;
     std::map<std::string, GeometryLayout> layouts_;
     std::map<ChunkKey, CachedChunk> chunks_;
     std::list<ChunkKey> recency_;

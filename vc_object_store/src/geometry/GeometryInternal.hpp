@@ -1,6 +1,8 @@
 #pragma once
 #include "vc_object_store/objects/Geometry.hpp"
 #include "geometry/ArrayLayout.hpp"
+#include "geometry/GeometryToken.hpp"
+#include "internal/Digest.hpp"
 #include "internal/ReadRequest.hpp"
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
@@ -53,24 +55,24 @@ public:
     }
 };
 inline constexpr size_t geometryChunkSize = 1024 * 1024;
-inline std::string geometryHash(std::span<const uint8_t> bytes)
+inline Digest geometryDigest(std::span<const uint8_t> bytes)
 {
     requestBytes(bytes.size(), &RegionStats::verifiedBytes);
-    unsigned char digest[EVP_MAX_MD_SIZE];
+    Digest digest;
     unsigned int size = 0;
-    if (EVP_Digest(bytes.data(), bytes.size(), digest, &size, EVP_sha256(), nullptr) != 1)
+    if (EVP_Digest(bytes.data(), bytes.size(), digest.data(), &size, EVP_sha256(), nullptr) != 1 || size!=digest.size())
         throw std::runtime_error("geometry: SHA-256 failed");
-    std::string result;
-    for (unsigned int i = 0; i < size; ++i) {
-        result += "0123456789abcdef"[digest[i] >> 4];
-        result += "0123456789abcdef"[digest[i] & 15];
-    }
-    return result;
+    return digest;
+}
+inline std::string geometryHash(std::span<const uint8_t> bytes) { return formatDigest(geometryDigest(bytes)); }
+inline Digest geometryPayloadDigest(const std::string& name, std::span<const uint8_t> bytes)
+{
+    if (geometryWork) geometryWork->hashedBytes[name] += bytes.size();
+    return geometryDigest(bytes);
 }
 inline std::string geometryPayloadHash(const std::string& name, std::span<const uint8_t> bytes)
 {
-    if (geometryWork) geometryWork->hashedBytes[name] += bytes.size();
-    return geometryHash(bytes);
+    return formatDigest(geometryPayloadDigest(name,bytes));
 }
 inline nlohmann::json verifiedGeometryManifest(const std::string& text, const std::string& hash)
 {

@@ -73,9 +73,9 @@ struct StoreSessionEvent {
     // Hosted attachments: journalPosition is the store's commit sequence, and
     // a change whose kind could not be learned has an empty kind.
     std::vector<JournalEntry> changes;
-    // Committed, hosted: the attachment lost its place in the store's change
-    // feed (another history generation, a restored store), so any record may
-    // have changed; reread what is shown.
+    // Committed: the attachment lost its place in the store's change feed,
+    // or a history-off store changed without retaining a feed. Any record
+    // may have changed; reread what is shown.
     bool revalidate = false;
     // Whether it may have changed records of these kinds: a commit or draft
     // touching one (or a change of unknown kind), a revalidation, or any

@@ -178,7 +178,6 @@ int main() try {
     });
     storeAct(store, currentNetworkPins, [&](auto& db, auto& txn) {
         db.retireObject(txn, b);
-        db.keepRecordedRelationship(txn, adjacent);
     });
     storeReader(store, [&](const StoreReader& reader, const auto&) {
         for (auto& [objectUuid, pin] : currentNetworkPins) pin = reader.currentObject(objectUuid)->version;

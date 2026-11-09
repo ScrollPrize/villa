@@ -284,12 +284,13 @@ int main() try {
         {auto r=db.read();const auto area=db.objectByUuid(r,uuid)->surface->area;
          require(std::abs(area-complete)<=1e-12*complete,"an edit updates the area by its cells' change");}
     }
-    {
+    for(const auto policy:{HistoryMode::On,HistoryMode::Off}) {
         // Importing an umbilicus file: the store reads it, decides its frame
         // against the volume, and replaces the volume's umbilicus.
-        const auto storePath=directory.path/"umbilicus-import.vcobj";
-        {auto created=ObjectStore::create(storePath,options);}
-        ObjectStoreSession session;const auto attachment=session.attach(storePath,options);
+        const auto storePath=directory.path/(policy==HistoryMode::On ? "umbilicus-import.vcobj" : "umbilicus-direct.vcobj");
+        auto importOptions=options; importOptions.history=policy;
+        {auto created=ObjectStore::create(storePath,importOptions);}
+        ObjectStoreSession session;const auto attachment=session.attach(storePath,importOptions);
         const auto write=[&](const std::string& name,const std::string& text){
             const auto path=directory.path/name;std::ofstream(path)<<text;return path;};
         const auto stamped=readUmbilicusFile(write("stamped.json",
@@ -300,6 +301,8 @@ int main() try {
         require(!binding.refusal&&!binding.confirm&&binding.storedUnitsPerVoxel==2.0,"a stamped grid binds as stated");
         importVolumeUmbilicus(session,attachment,"v",stamped,*binding.storedUnitsPerVoxel,"stamped",{{"tool","test"}});
         auto found=volumeUmbilicus(session,attachment,{"v"});
+        require(found && found->version.version > 0 && !found->version.generation.empty(),
+                "umbilici carry ordinary numbered versions with or without retained history");
         require(found&&found->name=="stamped"&&found->points.front()==std::array<double,3>{10,5,0},"imported in the volume's voxels");
         require(volumeUmbilicus(session,attachment,{"v",0.5})->points.front()==std::array<double,3>{5,2.5,0},
                 "an umbilicus is read at a scale of the volume's voxels");
@@ -314,13 +317,14 @@ int main() try {
         require(umbilicusBinding(stamped,{{150,150,600},std::nullopt},std::nullopt).refusal.has_value(),
                 "a stamped grid that is no rescale of the volume is refused");
     }
-    {
+    for(const auto policy:{HistoryMode::On,HistoryMode::Off}) {
         // A volume's point collections: written in its voxels, revised keeping
         // point identity, retired; read through views (here a registration).
-        const auto storePath=directory.path/"collections.vcobj";
-        {auto created=ObjectStore::create(storePath,options);
+        const auto storePath=directory.path/(policy==HistoryMode::On ? "collections.vcobj" : "collections-direct.vcobj");
+        auto collectionOptions=options; collectionOptions.history=policy;
+        {auto created=ObjectStore::create(storePath,collectionOptions);
          auto txn=created.write();(void)created.registerVolumeTransform(txn,"w","w2",VolumeAffine::scale(2),"twice");txn.commit();}
-        ObjectStoreSession session;const auto attachment=session.attach(storePath,options);
+        ObjectStoreSession session;const auto attachment=session.attach(storePath,collectionOptions);
         AttachedCollection collection;collection.uuid=vc::objects::util::newUuid();collection.name="seeds";
         collection.points.ids={4,9};collection.points.points={{1,2,3},{4,5,6}};
         collection.annotations=nlohmann::json::array({{{"wind_a",1}},{{"wind_a",2}}});

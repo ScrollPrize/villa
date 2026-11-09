@@ -292,7 +292,7 @@ int main() try {
                 [&](const std::vector<EdgeRecord>& affected) {
                     std::vector<GeometryEdgeEdit> result;
                     for (const auto& edge : affected) {
-                        GeometryEdgeEdit edit; edit.edgeUuid = edge.uuid; edit.expectedGeneration = edge.generation;
+                        GeometryEdgeEdit edit; edit.edgeUuid = edge.uuid; edit.expectedVersion = edge.version.value();
                         edit.action = "keep_recorded";
                         edit.aRevision = db.currentGeometry(txn, edge.aUuid)->uuid;
                         edit.bRevision = db.currentGeometry(txn, edge.bUuid)->uuid;

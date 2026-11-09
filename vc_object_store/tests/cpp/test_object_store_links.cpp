@@ -2,6 +2,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -61,7 +62,7 @@ std::string track(ObjectStore& db, const std::string& key, const std::vector<int
 
 GeometryEdgeEdit choice(ObjectStore& db, const Txn& txn, const EdgeRecord& edge, const std::string& action)
 {
-    GeometryEdgeEdit result; result.edgeUuid = edge.uuid; result.expectedGeneration = edge.generation; result.action = action;
+    GeometryEdgeEdit result; result.edgeUuid = edge.uuid; result.expectedVersion = edge.version.value(); result.action = action;
     if (const auto head = db.currentGeometry(txn, edge.aUuid)) result.aRevision = head->uuid;
     if (const auto head = db.currentGeometry(txn, edge.bUuid)) result.bRevision = head->uuid;
     return result;
@@ -108,17 +109,31 @@ void surfaceDiscoveryUsesCurrentRevisionsAndPreservesReview(const TemporaryDirec
 {
     auto db = create(directory, "overlaps.vcobj");
     const auto a = plane(db), b = plane(db);
-    const auto generations = [&] {
+    const auto snapshot = [&] {
         auto txn = db.read();
-        return std::pair{db.objectByUuid(txn, a)->generation, db.objectByUuid(txn, b)->generation};
+        return Json::parse(objectQueryResultToJson(db.status(txn),
+            {*db.objectByUuid(txn, a), *db.objectByUuid(txn, b)}, std::nullopt)).at("objects");
     };
-    const auto before = generations();
+    const auto before = snapshot();
     require(links::linkSurfaceOverlaps(db).edgesCreated == 1, "overlap found");
-    require(generations() == before, "discovery leaves the objects unchanged");
+    const auto after = snapshot();
+    for (size_t i=0;i<before.size();++i) {
+        require(after[i].at("version").get<int64_t>()==before[i].at("version").get<int64_t>()+1,
+                "publishing a new relationship advances each endpoint's numbered graph version");
+        require(after[i].at("commit_sequence").get<int64_t>()>before[i].at("commit_sequence").get<int64_t>(),
+                "new relationship publishes its endpoints in a newer commit");
+        auto content=after[i];content["version"]=before[i].at("version");content["commit_sequence"]=before[i].at("commit_sequence");
+        require(content==before[i],
+                "discovery preserves endpoint metadata, geometry, provenance, approval and lineage");
+    }
     const auto edge = edgesOf(db, a).at(0).uuid;
     const auto stale = [&] { auto txn = db.read(); return db.edgeGeometryState(txn, edge).stale; };
     require(!stale(), "a new link is current");
     require(links::linkSurfaceOverlaps(db).edgesSkippedExisting == 1, "a rerun keeps the link");
+    const auto unchanged=snapshot();
+    for(size_t i=0;i<after.size();++i)
+        require(unchanged[i]==after[i],
+                "no-op discovery preserves endpoint versions as well as content");
     // A new revision with identical coordinates still needs revalidation.
     {
         auto txn = db.write();
@@ -132,10 +147,10 @@ void surfaceDiscoveryUsesCurrentRevisionsAndPreservesReview(const TemporaryDirec
     require(links::linkSurfaceOverlaps(db).edgesSkippedExisting == 1 && edgesOf(db, a).at(0).uuid == edge, "same link after a rerun");
     require(!stale(), "still current");
     { auto txn = db.write(); db.setApproval(txn, edge, "approved"); txn.commit(); }
-    const auto approved = [&] { auto txn = db.read(); return db.edgeByUuid(txn, edge)->generation; }();
+    const auto approved = [&] { auto txn = db.read(); return db.edgeByUuid(txn, edge)->version; }();
     links::SurfaceOverlapParams strict; strict.minInliers = 10000;
     require(links::linkSurfaceOverlaps(db, strict).staleRemoved == 0, "reviewed links are never stale-removed");
-    require([&] { auto txn = db.read(); return db.edgeByUuid(txn, edge)->generation; }() == approved, "reviewed link untouched");
+    require([&] { auto txn = db.read(); return db.edgeByUuid(txn, edge)->version; }() == approved, "reviewed link untouched");
 }
 
 void surfaceSelectionMissingGeometryAndStaleScope(const TemporaryDirectory& directory)

@@ -6,6 +6,7 @@
 #include "vc_object_store/objects/FiberJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryOutput.hpp"
+#include <vc_reader/publication.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <bit>
@@ -18,15 +19,6 @@
 #include <map>
 #include <set>
 #include <system_error>
-#ifdef __linux__
-#include <fcntl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#include <linux/fs.h>
-#elif defined(__APPLE__)
-#include <cerrno>
-#include <cstdio>
-#endif
 
 namespace vc::objects {
 namespace {
@@ -39,26 +31,8 @@ struct Stage {
 };
 void publish(const fs::path& source, const fs::path& destination, bool overwrite, bool directory)
 {
-    const auto status = fs::symlink_status(destination);
-    const bool exists = fs::exists(status);
-    if (exists && !overwrite) throw std::runtime_error("destination already exists (use overwrite): " + destination.string());
-    if (exists && (fs::is_symlink(status) || (directory ? !fs::is_directory(status) : !fs::is_regular_file(status))))
-        throw std::runtime_error("destination must have the same file/directory type and cannot be a symlink");
-#ifdef __linux__
-    // NOREPLACE closes the check/rename race; EXCHANGE replaces nonempty dirs
-    // without a missing-path window. The old destination is cleaned by Stage.
-    const unsigned flags = exists ? RENAME_EXCHANGE : RENAME_NOREPLACE;
-    if (syscall(SYS_renameat2, AT_FDCWD, source.c_str(), AT_FDCWD, destination.c_str(), flags) != 0)
-        throw std::system_error(errno, std::generic_category(), "atomic geometry export publication");
-#elif defined(__APPLE__)
-    // The same exchange/no-replace guarantees as renameat2 on Linux.
-    if (renamex_np(source.c_str(), destination.c_str(), exists ? RENAME_SWAP : RENAME_EXCL) != 0)
-        throw std::system_error(errno, std::generic_category(), "atomic geometry export publication");
-#else
-    if (directory) throw std::runtime_error("atomic directory export requires Linux renameat2 or macOS renamex_np");
-    if (overwrite) fs::rename(source, destination);
-    else fs::create_hard_link(source, destination);
-#endif
+    if (fs::is_directory(source) != directory) throw std::runtime_error("geometry export staging type mismatch");
+    vcr::files::publishPath(source, destination, overwrite);
 }
 } // namespace
 
@@ -100,25 +74,26 @@ ObjectVersion exportGeometry(const ObjectStore& db, const ReadTxn& read, const s
         if (!object->geometryRevision) throw std::runtime_error("object revision has no geometry");
         const auto revision = db.geometryRevision(read, *object->geometryRevision);
         if (!revision) throw std::runtime_error("geometry revision not found");
-        RevisionSelection selection;
-        if (version) {
+        std::optional<RevisionSelection> selection;
+        if (version && db.provisioning(read).history == HistoryMode::On) {
             if (!object->publishedAtUs) throw std::runtime_error("object version has no publication time");
             selection = ObjectStoreImplAccess::revisionSelectionAt(db, read, *object->publishedAtUs, true);
-        } else {
-            ObjectSelection all; all.includeRetired = true;
-            for (const auto& record : db.selectObjects(read, all))
-                selection[record.uuid] = db.currentObjectRevision(read, record.uuid)->uuid;
         }
         snapshot.revision = *revision;
         if (revision->kind == "fiber") {
-            const auto store = db.status(read).storeUuid;
-            std::vector<ObjectVersion> fibers;
-            for (const auto& [uuid, pin] : selection)
-                if (pin)
-                    if (const auto pinned = ObjectStoreImplAccess::objectRevision(db, read, *pin); pinned->record.kind == "fiber")
-                        fibers.push_back({store, pinned->generation, uuid, pinned->version});
-            fiberJson = fiberNetworkJson(LocalStoreReader(db, read), fibers, {object->objectUuid},
-                                         std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
+            if (!selection) {
+                fiberJson = currentFiberNetworkJson(db, read, {object->objectUuid},
+                    std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
+            } else {
+                const auto store = db.status(read).storeUuid;
+                std::vector<ObjectVersion> fibers;
+                for (const auto& [uuid, pin] : *selection)
+                    if (pin)
+                        if (const auto pinned = ObjectStoreImplAccess::objectRevision(db, read, *pin); pinned && pinned->record.kind == "fiber")
+                            fibers.push_back({store, pinned->generation, uuid, pinned->version});
+                fiberJson = fiberNetworkJson(LocalStoreReader(db, read), fibers, {object->objectUuid},
+                                             std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
+            }
         } else attributes = detail::nativeMetadata(db, read, object->record, *revision, selection);
         if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
             throw std::runtime_error("unsupported geometry format for native export");

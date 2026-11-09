@@ -58,12 +58,22 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
         if(!incoming.insert(p.object.uuid).second)
             throw GeometrySourceRejected("duplicate object UUID in import: "+p.object.uuid);
         const auto existing=db.objectByUuid(write,p.object.uuid);
-        detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1",
+        detail::Statement history(connection,detail::historyEnabled(connection)?"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1":
+            "SELECT 1 FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
             detail::parseUuid(p.object.uuid));
-        detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", detail::parseUuid(p.object.uuid));
+        bool previouslyImported = false;
+        if (detail::historyEnabled(connection)) {
+            detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", detail::parseUuid(p.object.uuid));
+            previouslyImported = prior.row();
+        } else {
+            // Current tombstones retain UUID/version identity even without
+            // archived records. Re-import must not bypass them via active reads.
+            detail::Statement prior(connection,"SELECT 1 FROM objects WHERE uuid=?",detail::parseUuid(p.object.uuid));
+            previouslyImported = prior.row();
+        }
         if (registeredInitial && (!existing || existing->retired || history.row()))
             throw GeometrySourceRejected("object already exists or was previously imported; re-import is unsupported: "+p.object.uuid);
-        if (!registeredInitial && (existing.has_value() || prior.row())) clashes.push_back(p.object.uuid);
+        if (!registeredInitial && (existing.has_value() || previouslyImported)) clashes.push_back(p.object.uuid);
     }
     if (!clashes.empty()) throw GeometryIdentitiesExist(std::move(clashes));
 

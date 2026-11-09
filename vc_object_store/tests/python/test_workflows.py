@@ -205,12 +205,13 @@ def test_checked_relationships_lifecycle_and_graph(db):
     assert db.component(a, adjacent=True) == [a]
     assert db.neighbours(a) == [b] and db.edges_by_kind('fiber_branch')[0]['uuid'] == edge
     before = db.journal_since()
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError, match='missing or conflicting expected revision'):
         with db.write(expected_versions={a: db.current_version(a)}) as tx:
             tx.set_meta(a, 'rollback', True)
             tx.remove_edge(edge)  # b is also modified, but has no expectation
     assert db.journal_since() == before and db.edge(edge)
     with db.graph_read(versions=selected, approval_states=[]) as graph:
+        assert sorted(graph.versions) == sorted(ref['version'] for ref in selected)
         edits = [dict(array='points', element_offset=0, data=struct.pack('<i', 9))]
         read = selected[0]['version']
         assert db.affected_geometry_edit_edges(a, edits, read)[0]['uuid'] == edge
@@ -230,12 +231,9 @@ def test_checked_relationships_lifecycle_and_graph(db):
     for action in ('retire_object', 'restore_object'):
         with db.write(expected_versions=versions(db, a, b)) as tx:
             getattr(tx, action)(a)
-            if action == 'retire_object':
-                tx.keep_recorded_relationship(edge)
-            else:
-                tx.keep_recorded_relationships_of(a)  # every relationship of a, as recorded
         assert db.current_geometry(a)['uuid'] == second
         assert db.component(b, applicable_only=True) == [b]
+        assert db.edge(edge) is None
     assert not db.object(a)['retired']
     pinned = db.objects_at_versions(selected)[0]
     assert pinned['geometry_revision'] == first
@@ -243,8 +241,8 @@ def test_checked_relationships_lifecycle_and_graph(db):
     restored = db.current_version(a)
     with db.write(expected_versions=versions(db, a, b)) as tx:
         tx.restore_object(a, source_version=selected[0]['version'])
-        tx.keep_recorded_relationships_of(a)
     assert db.current_geometry(a)['uuid'] == first and db.current_version(a) == restored + 1
+    assert db.edge(edge) is None
     with pytest.raises(ValueError):
         with db.write(expected_versions=versions(db, a, b)) as tx:
             tx.restore_object(a, source_version=99)
@@ -280,7 +278,7 @@ def test_reads_detect_corruption_after_success(db, damage):
     sql = {
         'payload': 'DROP TRIGGER geometry_chunks_immutable_update; UPDATE geometry_chunks SET data=zeroblob(length(data));',
         'manifest': "DROP TRIGGER geometry_revisions_immutable_update; UPDATE geometry_revisions SET manifest='{}';",
-        'missing_chunk': 'DROP TRIGGER geometry_revision_chunks_immutable_delete; DELETE FROM geometry_revision_chunks;',
+        'missing_chunk': 'DROP TRIGGER geometry_chunks_immutable_delete; DELETE FROM geometry_chunks;',
     }[damage]
     # Separate SQLite builds must not share POSIX WAL locks in this process.
     subprocess.run([sys.executable, '-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.argv[2]); c.close()', db.path, sql], check=True)
@@ -335,21 +333,24 @@ def test_unsupported_schema_is_rejected(db, version, read_only):
 def test_record_fields_and_transaction_bindings(db, kind, detail):
     with db.write() as tx:
         uid = tx.upsert_object(dict(kind=kind, name='sample', format_version=2,
-            storage_kind='file', storage_ref='source', data_generation=3, data_checksum='checksum',
+            storage_kind='file', storage_ref='source', data_checksum='checksum',
             tags=iter(['review']), meta={'annotation': None}, **{kind: detail}))
         tx.set_meta(uid, 'remove', True)
         tx.remove_meta(uid, 'remove')
         tx.set_approval(uid, 'approved')
     record = db.object(uid)
     assert record[kind] == detail and record['tags'] == ['review']
-    assert record['approved_by'] == 'pytest' and record['approved_generation'] == record['generation']
-    fields = ['name', 'format_version', 'storage_kind', 'storage_ref', 'data_generation', 'data_checksum', kind]
+    assert record['approved_by'] == 'pytest' and record['approved_version'] == record['version']
+    fields = ['name', 'format_version', 'storage_kind', 'storage_ref', 'data_checksum', kind]
     rows = db.select_objects(fields=fields)
     assert rows[0].pop('version') >= 1 and rows[0].pop('version_generation') == db.status()['generation']
     assert rows == [{key: record[key] for key in ['uuid', 'kind', *fields]}]
     with ObjectStore.create(db.path + '.copy', author='copy') as other:
         other.import_json(db.export_json())
-        assert other.object(uid) == record
+        imported = other.object(uid)
+        assert imported['version_generation'] == other.status()['generation']
+        assert imported['version_generation'] != record['version_generation']
+        assert {**imported, 'version_generation': record['version_generation']} == record
     with db.write() as tx:
         peer = tx.upsert_object(dict(kind='note'))
         edge = tx.add_edge(dict(a=uid, b=peer, kind='related'))

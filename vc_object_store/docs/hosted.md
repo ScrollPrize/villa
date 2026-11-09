@@ -184,12 +184,14 @@ feed reports them changed, all within `cacheBytes` — cached data stays
 readable while the host is unreachable, but listings and spatial queries
 always need the host.
 
-Underneath, every publishing transaction appends to one ordered feed:
-`status()` (`storeUuid`, `generation`, `commitSequence`, `feedStart`) and
+With history enabled, every publishing transaction appends to one ordered feed:
+`status()` (`storeUuid`, `generation`, `commitSequence`, `feedStart`, `historyEnabled`) and
 `changes_since(cursor, max_changes)` return whole commits (continuing inside
 a commit only when it alone exceeds the page). A cursor from another
 generation, the future, or before `feedStart` comes back invalid — revalidate
 cached heads and rerun queries.
+
+History-off stores keep numbered current versions and the commit sequence, but not a replayable feed. Sessions detect a lineage/sequence change and emit `revalidate` without fabricated change entries; hosted snapshots validate that the sequence stayed fixed during their reads. Explicit historical requests remain unavailable. A lineage UUID and commit sequence are distinct from the session-local attachment generation.
 
 ## What differs on a hosted attachment
 

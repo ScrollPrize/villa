@@ -96,7 +96,6 @@ std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kin
     if (!requested.empty() && objects.size() != requested.size())
         throw std::invalid_argument("requested objects are missing or not of kind " + kind);
     for (const auto& object : objects) {
-        generations_[object.uuid] = object.generation;
         if (!object.version) throw std::runtime_error("object " + object.uuid + " has no numbered version");
         versions_[object.uuid] = *object.version;
     }
@@ -151,9 +150,9 @@ objects::detail::GeometrySnapshot loadGeometrySnapshot(const objects::StoreReade
 }
 void StoredGeometry::validate(const objects::WriteTxn& txn) const
 {
-    for (const auto& [uuid, generation] : generations_) {
+    for (const auto& [uuid, version] : versions_) {
         const auto object = db_.objectByUuid(txn, uuid);
-        if (!object || object->generation != generation)
+        if (!object || object->version != version)
             throw std::runtime_error("object changed during discovery; retry: " + uuid);
     }
     for (const auto& [uuid, revision] : revisions_) {

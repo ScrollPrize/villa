@@ -3,6 +3,8 @@
 #include "TestSupport.hpp"
 #include "../../src/HostedSession.hpp"
 #include "vc_object_store/server/Server.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include <vc_reader/http.hpp>
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -197,6 +199,67 @@ void multiPageCommitInvalidatesHeads()
     require(events.size() == 1, "bulk feed cursor advances past the entire commit");
     attachment.stop();
 }
+
+void oldMetadataCacheDoesNotShadowConvertedStore()
+{
+    TemporaryDirectory directory;
+    const auto path = directory.path / "converted.vcobj";
+    OpenOptions options; options.author = "cache-upgrade-test";
+    StoreStatus status;
+    ObjectVersion reference;
+    std::string geometry;
+    std::vector<uint8_t> expected;
+    nlohmann::json oldObject, oldGeometry;
+    {
+        auto store = ObjectStore::create(path, options);
+        std::string uuid;
+        {
+            auto txn = store.write();
+            ObjectRecord record; record.kind = "track";
+            uuid = store.upsertObject(txn, record);
+            vc::geometry::Track track; track.points = {{1, 2, 3}, {4, 5, 6}};
+            geometry = store.putGeometry(txn, uuid, vc::geometry::encode(track));
+            txn.commit();
+        }
+        auto txn = store.read();
+        status = store.status(txn);
+        const auto current = store.currentObjectRevision(txn, uuid);
+        reference = store.versionReference(txn, *current);
+        oldObject = nlohmann::json::parse(objectRevisionToJson(*current));
+        auto& record = oldObject["record"];
+        record["generation"] = 2; record["approved_generation"] = nullptr;
+        for (const auto* name : {"version", "version_generation", "commit_sequence", "approved_version"}) record.erase(name);
+        oldGeometry = nlohmann::json::parse(geometryRevisionToJson(*store.currentGeometry(txn, uuid)));
+        oldGeometry["object_generation"] = 2; oldGeometry.erase("object_version");
+        expected = store.readGeometryArray(txn, geometry, "points");
+    }
+    HostedSessionOptions hosted;
+    hosted.cacheDirectory = directory.path / "cache"; hosted.minFreeBytes = 0;
+    const auto cacheRoot = hosted.cacheDirectory / "objects";
+    std::filesystem::create_directories(cacheRoot);
+    const auto bytes = [](const std::string& text) { return std::vector<uint8_t>(text.begin(), text.end()); };
+    const auto cache = [&](const std::string& key, const std::vector<uint8_t>& value) {
+        std::ofstream file(cacheRoot / payloadHash(bytes(key)), std::ios::binary);
+        file << payloadHash(value);
+        file.write(reinterpret_cast<const char*>(value.data()), value.size());
+    };
+    cache("version/" + status.storeUuid + "/" + status.generation + "/" + reference.objectUuid + "/" +
+        std::to_string(reference.version), bytes(oldObject.dump()));
+    const auto prefix = status.storeUuid + "/" + status.generation + "/";
+    cache(prefix + "geometry/" + geometry, bytes(oldGeometry.dump()));
+    cache(prefix + "block/" + geometry + "/points/" + std::to_string(expected.size()) + "/0", expected);
+    server::Server server(path, {}); server.start();
+    PausingProxy proxy("http://127.0.0.1:" + std::to_string(server.port()), "never");
+    detail::HostedAttachment attachment(proxy.endpoint(), hosted);
+    const auto found = attachment.objectsAtVersions({reference});
+    require(found.front() && found.front()->record.uuid == reference.objectUuid,
+            "schema-20 cached records cannot break current numbered reads");
+    const auto descriptor = attachment.geometryRevision(geometry);
+    require(descriptor && descriptor->objectVersion == reference.version,
+            "schema-20 cached descriptors are refetched in the current metadata namespace");
+    require(*attachment.geometryArray(geometry, "points") == expected && proxy.payloadRequests == 0,
+            "wire metadata upgrade reuses existing raw geometry blocks without download");
+}
 #ifdef VC_REAL_SURFACE
 void persistentObjects()
 {
@@ -367,6 +430,7 @@ try {
     invalidationDuringRead(false);
     invalidationDuringRead(true);
     multiPageCommitInvalidatesHeads();
+    oldMetadataCacheDoesNotShadowConvertedStore();
     std::cout << "object_store_hosted_cache: ok\n";
 } catch (const std::exception& error) {
     std::cerr << "object_store_hosted_cache: " << error.what() << '\n';

@@ -429,9 +429,9 @@ namespace {
 // request's digest independent of the stamps its author happened to read.
 Json writableFields(Json j)
 {
-    for (const auto* key : {"generation", "created_by", "created_at", "created_host", "changed_by", "changed_at",
+    for (const auto* key : {"version", "version_generation", "commit_sequence", "created_by", "created_at", "created_host", "changed_by", "changed_at",
                             "changed_host", "approval_state", "approved_by", "approved_at", "approved_host",
-                            "approved_generation", "retired", "lifecycle_epoch"})
+                            "approved_version", "retired", "lifecycle_epoch"})
         j.erase(key);
     return j;
 }
@@ -458,7 +458,8 @@ TransactionReceipt transactionReceiptFromJson(const std::string& text)
 std::string storeStatusToJson(const StoreStatus& status)
 {
     return Json{{"store", status.storeUuid}, {"generation", status.generation},
-                {"commit_sequence", status.commitSequence}, {"feed_start", status.feedStart}}.dump();
+                {"commit_sequence", status.commitSequence}, {"feed_start", status.feedStart},
+                {"history_enabled", status.historyEnabled}, {"extensions_present", status.extensionsPresent}}.dump();
 }
 
 std::string changePageToJson(const ChangePage& page) { return pageJson(page).dump(); }
@@ -503,7 +504,7 @@ struct Executor {
             const auto edge = store.edgeByUuid(txn, edit.relationshipUuid);
             if (!edge) throw std::invalid_argument("transaction: unknown relationship " + edit.relationshipUuid);
             GeometryEdgeEdit e;
-            e.edgeUuid = edge->uuid; e.expectedGeneration = edge->generation; e.action = edit.action;
+            e.edgeUuid = edge->uuid; e.expectedVersion = edge->version.value_or(0); e.action = edit.action;
             const auto a = store.currentGeometry(txn, edge->aUuid), b = store.currentGeometry(txn, edge->bUuid);
             if (a) e.aRevision = a->uuid;
             if (b) e.bRevision = b->uuid;
@@ -564,7 +565,7 @@ struct Executor {
         auto record = edgeInput(Json::parse(op.recordJson));
         const auto current = store.edgeByUuid(txn, record.uuid);
         if (!current) throw std::invalid_argument("transaction: update_relationship of unknown relationship");
-        record.generation = current->generation;
+        record.version = current->version;
         store.updateEdge(txn, record);
     }
     void operator()(const RemoveEdgeOp& op) { store.removeEdge(txn, op.uuid); }
@@ -758,8 +759,7 @@ TransactionReceipt ObjectStore::submit(const TransactionRequest& request, const 
             guard != context.readDependencies.end() && guard->second == version)
             context.readDependencies.erase(guard);
     RevisionSelection expected;
-    checkTransactionContext(db, context, expected);
-    expectHistory(db, expected);
+    prepareCheckedWrite(db, context, expected);
     txn.expectedRevisions_ = expected;
     txn.expectedObjectVersions_ = context.expectedObjects;
     txn.expectedRelationshipVersions_ = request.expectedRelationships;

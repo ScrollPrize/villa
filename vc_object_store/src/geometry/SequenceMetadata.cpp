@@ -78,6 +78,7 @@ SharedJson MetadataSnapshot::save() {
 }
 SharedJson identityGet(sqlite3* db,const SharedJson& root,int64_t id) {return MetadataSnapshot(db,root).get(id);}
 SharedJson initialSequences(sqlite3* db, const GeometryData& data, SharedJson& source) {
+    GeometryPhase phase("initial.geometry.sequences");
     auto sequences = SharedJson::object();
     if (data.kind == "surface") return sequences;
     for (const auto& array : data.arrays) {
@@ -94,7 +95,9 @@ SharedJson initialSequences(sqlite3* db, const GeometryData& data, SharedJson& s
             ids.resize(count); copyScalars<int64_t>(idArray->bytes, ids);
         }
         MetadataSnapshot metadata(db), allocated(db);
-        for (int64_t row = 0; row < count; ++row) {
+        // No identities and no annotations means an empty descriptor, not one
+        // temporary JSON object per line point. Preserve null/empty semantics.
+        for (int64_t row = 0; row < ((!idsName.empty()||!attrs.is_null())?count:0); ++row) {
             const auto attr = attrs.is_null() ? SharedJson::object() : attrs.at(row);
             if (!attr.is_object() && !attr.is_null()) throw std::invalid_argument("invalid point annotation");
             if (idsName.empty()) {

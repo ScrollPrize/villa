@@ -27,11 +27,11 @@ using formats::track;
 using formats::readJson;
 // One committed write transaction (placeholder ingestion).
 using Commit = std::function<void(const std::function<void(ObjectStore&, WriteTxn&)>&)>;
-struct Expected { std::optional<int64_t> generation; };
+struct Expected { std::optional<int64_t> version; };
 Expected expectedAt(ObjectStore& db, const Txn& read, const std::string& id)
 {
     Expected e;
-    if (const auto object = db.objectByUuid(read, id)) e.generation = object->generation;
+    if (const auto object = db.objectByUuid(read, id)) e.version = object->version;
     return e;
 }
 Commit directCommit(ObjectStore& db)
@@ -50,7 +50,7 @@ void ingestBatch(const Commit& commit, std::vector<Prepared> batch,
         for (const auto& p : batch) {
             const auto existing = db.objectByUuid(write, p.object.uuid);
             const auto& e = expectations.at(p.object.uuid);
-            if ((existing ? std::optional(existing->generation) : std::nullopt) != e.generation)
+            if ((existing ? existing->version : std::nullopt) != e.version)
                 throw GeometrySourceRejected("object changed while reading source; retry ingestion");
             if (existing && existing->kind != p.object.kind) throw GeometrySourceRejected("source UUID belongs to another object kind");
         }

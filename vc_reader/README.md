@@ -84,7 +84,7 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | Object store over a local directory or S3 prefix | `zarr_write.hpp`: `zarr::Store` | `zarr/store.cpp` | `ObjectStore` |
 | Build pyramids and OME multiscales metadata | `zarr_write.hpp`: `zarr::writePyramid`, `writePyramidLevel`, `createPyramidLevels`, `omeMultiscales` | `zarr/pyramid.cpp` | `write_pyramid`, `write_pyramid_level`, `create_pyramid_levels`, `ome_multiscales` |
 | Compress and decompress bytes | `zarr_write.hpp`: `zarr::compressBytes`, `decompressBytes` | `zarr/writer.cpp`, `codecs.hpp`, `lzw.hpp` | `compress_bytes`, `decompress_bytes` |
-| Atomic and durable file writes; directory publication with rollback; snapshots | `zarr.hpp`: `zarr::atomicWrite`, `Durability`; `publication.hpp`: `files::publishDirectory`, `replaceFile`, `recoverDirectory`, `snapshot` | `atomic_file.hpp`, `zarr/layers.cpp`, `publication.cpp` | `snapshot` |
+| Atomic and durable file writes; directory publication with rollback; snapshots | `zarr.hpp`: `zarr::atomicWrite`, `Durability`; `publication.hpp` (`vc_reader::catalog`): `files::publishDirectory`, `replaceFile`, `recoverDirectory`, `snapshot` | `atomic_file.hpp`, `zarr/layers.cpp`, `publication.cpp` | `snapshot` |
 
 ### Images and labelled sources
 

@@ -1,5 +1,7 @@
 #include "internal/EdgeSql.hpp"
 #include "internal/History.hpp"
+#include "geometry/GeometryToken.hpp"
+#include "internal/ExternalEndpoint.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -9,27 +11,34 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
                                              std::optional<bool> adjacentFilter, bool applicableOnly) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
-    const auto id = objectIdByUuid(db, parseUuid(objectUuid));
-    if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
+    const auto key=parseUuid(objectUuid);
+    Statement own(db,"SELECT state FROM objects WHERE uuid=?",key);
+    if(own.row()) {if(own.i64(0)==2)return {};}
+    else {Statement known(db,"SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
+        if(!known.row())throw std::runtime_error("object store: object not found: "+objectUuid);
+        if(!includeRetired&&externalEndpointRecord(db,objectUuid).retired)return {};
+    }
     if (applicableOnly) requirePublishedGraphRead(txn);
-    const std::string filter = fiberAdjacencySql(adjacentFilter) +
+    const std::string filter = " AND state=0" + fiberAdjacencySql(adjacentFilter) +
         (edgeKind ? std::string(" AND kind=?2") : " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'") +
         (includeRetired ? "" : " AND " + activeEdgeSql());
     // Filter before deduplication: a rejected parallel edge must not hide a
     // later applicable edge to the same neighbour. Preserve first-edge order.
-    std::string sql = "SELECT o.uuid,e.uuid FROM (SELECT id,uuid,b_id AS neighbour FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
-        " UNION SELECT id,uuid,a_id AS neighbour FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter +
-        ") e JOIN objects o ON o.id=e.neighbour";
-    if (neighbourKind) sql += " WHERE o.kind=?3";
+    std::string sql = "SELECT e.neighbour,e.uuid,owned.id,owned.kind FROM (SELECT id,uuid,b_uuid AS neighbour FROM edges INDEXED BY edges_a WHERE a_uuid=?1" + filter +
+        " UNION SELECT id,uuid,a_uuid AS neighbour FROM edges INDEXED BY edges_b WHERE b_uuid=?1" + filter +
+        ") e LEFT JOIN objects owned ON owned.uuid=e.neighbour WHERE coalesce(owned.state,0)<>2";
     sql += " ORDER BY e.id";
-    Statement rows(db, sql, *id);
+    Statement rows(db, sql, key);
     if (edgeKind) rows.bind(2, *edgeKind);
-    if (neighbourKind) rows.bind(3, *neighbourKind);
     std::vector<std::string> out;
     std::unordered_set<std::string> seen;
     while (rows.row()) {
         const auto next = formatUuid(rows.blob16(0));
         if (seen.contains(next)) continue;
+        if(rows.isNull(2)&&(!includeRetired||neighbourKind)){
+            const auto endpoint=externalEndpointRecord(db,next);
+            if((!includeRetired&&endpoint.retired)||(neighbourKind&&endpoint.kind!=*neighbourKind))continue;
+        }else if(neighbourKind&&rows.text(3)!=*neighbourKind)continue;
         if (applicableOnly && !currentRelationshipApplicable(*this, txn, formatUuid(rows.blob16(1)))) continue;
         seen.insert(next); out.push_back(next);
     }
@@ -69,7 +78,7 @@ struct ProgressGuard {
     ~ProgressGuard() { sqlite3_progress_handler(db, 0, nullptr, nullptr); }
 };
 
-std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int maxDepth,
+std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int maxDepth,
                                   const std::vector<std::string>& edgeKindFilter, const std::atomic_bool* cancel, bool includeRetired,
                                   std::optional<bool> adjacentFilter = std::nullopt,
                                   const ObjectStore* store = nullptr, const Txn* txn = nullptr)
@@ -82,38 +91,45 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
             db, 1000, [](void* p) { return static_cast<const std::atomic_bool*>(p)->load() ? 1 : 0; },
             const_cast<std::atomic_bool*>(cancel));
     const auto startBytes = parseUuid(startUuid);
-    if (!objectIdByUuid(db, startBytes))
-        throw std::runtime_error("object store: object not found: " + startUuid);
-    if (!includeRetired) {
-        Statement active(db, "SELECT 1 FROM objects WHERE uuid=? AND " + activeObjectSql("objects.id"), startBytes);
-        if (!active.row()) return {};
-    }
+    auto active=[&](const std::string& uuid) {
+        Statement local(db,"SELECT state FROM objects WHERE uuid=?",parseUuid(uuid));
+        if(local.row())return local.i64(0)!=2&&(includeRetired||local.i64(0)==0);
+        return includeRetired||!externalEndpointRecord(db,uuid).retired;
+    };
+    Statement known(db,"SELECT 1 FROM objects WHERE uuid=?1 UNION ALL SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",startBytes);
+    if(!known.row())throw std::runtime_error("object store: object not found: "+startUuid);
+    if(!active(startUuid))return {};
     // Probe the endpoint indexes only for nodes reached by this traversal.
     // Visit neighbours in stable internal-ID order.
-    std::string filter;
+    std::string filter=" AND state=0";
     if (!edgeKindFilter.empty()) {
-        filter = " AND kind IN (";
+        filter += " AND kind IN (";
         for (size_t i = 0; i < edgeKindFilter.size(); ++i)
             filter += (i ? ",?" : "?") + std::to_string(i + 2);
         filter += ")";
     } else {
-        filter = " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'";
+        filter += " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'";
     }
     filter += fiberAdjacencySql(adjacentFilter);
     if (!includeRetired) filter += " AND " + activeEdgeSql();
     // Each UNION arm uses an endpoint-leading index even without ANALYZE.
-    std::string sql = "SELECT id,b_id,uuid FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
-        " UNION SELECT id,a_id,uuid FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter + " ORDER BY id";
+    std::string sql = "SELECT id,b_uuid,uuid FROM edges INDEXED BY edges_a WHERE a_uuid=?1" + filter +
+        " UNION SELECT id,a_uuid,uuid FROM edges INDEXED BY edges_b WHERE b_uuid=?1" + filter + " ORDER BY id";
     Statement adjacent(db, sql);
-    const int64_t startId = *objectIdByUuid(db, startBytes);
+    std::unordered_map<std::string,bool> activeNodes;
+    activeNodes.emplace(startUuid,true);
     try {
-        return breadthFirst(startId, maxDepth, cancel, [&](int64_t id, auto visit) {
-            adjacent.reset(); adjacent.bind(1, id);
-            for (size_t i = 0; i < edgeKindFilter.size(); ++i) adjacent.bind(int(i) + 2, edgeKindFilter[i]);
-            while (adjacent.row())
-                visit(adjacent.i64(1), [&] {
-                    return !store || currentRelationshipApplicable(*store, *txn, formatUuid(adjacent.blob16(2)));
+        return breadthFirst(formatUuid(startBytes), maxDepth, cancel, [&](const std::string& uuid, auto visit) {
+            adjacent.reset(); adjacent.bind(1, parseUuid(uuid));
+            for(size_t i=0;i<edgeKindFilter.size();++i)adjacent.bind(int(i)+2,edgeKindFilter[i]);
+            while(adjacent.row()) {
+                const auto endpoint=formatUuid(adjacent.blob16(1));
+                visit(endpoint,[&] {
+                    auto found=activeNodes.find(endpoint);
+                    if(found==activeNodes.end())found=activeNodes.emplace(endpoint,active(endpoint)).first;
+                    return found->second&&(!store||currentRelationshipApplicable(*store,*txn,formatUuid(adjacent.blob16(2))));
                 });
+            }
         });
     } catch (const std::runtime_error&) {
         checkCancelled(); // Translate SQLite interrupts into the cancellation contract.
@@ -121,17 +137,6 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
     }
 }
 
-std::vector<std::string> uuidList(sqlite3* db, const std::vector<int64_t>& ids)
-{
-    Statement rows(db, "SELECT id,uuid FROM objects WHERE id IN (SELECT value FROM json_each(?))",
-        nlohmann::json(ids).dump());
-    std::unordered_map<int64_t, std::string> uuids;
-    while (rows.row()) uuids.emplace(rows.i64(0), formatUuid(rows.blob16(1)));
-    std::vector<std::string> result;
-    result.reserve(ids.size());
-    for (auto id : ids) result.push_back(uuids.at(id));
-    return result;
-}
 }  // namespace
 
 namespace {
@@ -144,21 +149,18 @@ std::shared_ptr<StatementPool::Component> cachedComponent(
     StatementPool* pool = nullptr;
     if (auto it = activeStatementPools.find(db); it != activeStatementPools.end() && it->second->readSnapshot)
         pool = it->second;
-    const auto startId = pool ? objectIdByUuid(db, parseUuid(start)) : std::nullopt;
     const auto prefix = nlohmann::json({kinds, includeRetired, adjacentFilter ? nlohmann::json(*adjacentFilter) : nlohmann::json(nullptr)}).dump() + "/";
-    if (startId) if (auto it = pool->components.find(prefix + std::to_string(*startId)); it != pool->components.end()) return it->second;
-    // Cancellation only stops a walk; a completed one is the same component.
-    auto ids = traverse(db, start, INT_MAX, kinds, cancel, includeRetired, adjacentFilter);
-    // Bound the membership cache; it is reused across snapshots only while
-    // nothing has been committed (see beginReadCaches). Every member has the same component (the walk is undirected,
-    // and without retired records an edge is only followed between active
-    // endpoints), so it is filed under each of them: a component is walked once
-    // however many of its members are asked for.
-    if (startId && ids.size() <= 262144) {
+    const auto key = prefix + formatUuid(parseUuid(start));
+    if (pool) if (auto it = pool->components.find(key); it != pool->components.end()) return it->second;
+    const auto keys=traverse(db,start,INT_MAX,kinds,cancel,includeRetired,adjacentFilter);
+    std::vector<int64_t> ids;ids.reserve(keys.size());
+    for(const auto& uuid:keys)if(const auto id=objectIdByUuid(db,parseUuid(uuid)))ids.push_back(*id);
+    // Bound the transaction-local membership cache; never reuse across snapshots.
+    if (pool && ids.size() <= 262144) {
         if (pool->componentNodes + ids.size() > 262144) { pool->components.clear(); pool->componentNodes = 0; }
         pool->componentNodes += ids.size();
         const auto shared = std::make_shared<StatementPool::Component>(StatementPool::Component{std::move(ids), std::nullopt});
-        for (const auto id : shared->ids) pool->components.emplace(prefix + std::to_string(id), shared);
+        for (const auto& uuid : keys) pool->components.emplace(prefix + uuid, shared);
         return shared;
     }
     walked = std::move(ids);
@@ -182,13 +184,7 @@ std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::str
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (applicableOnly) requirePublishedGraphRead(txn);
-    if (applicableOnly)
-        return uuidList(db, traverse(db, objectUuid, INT_MAX, edgeKindFilter, cancel, includeRetired, adjacentFilter, this, &txn));
-    std::vector<int64_t> walked;
-    const auto component = cachedComponent(db, objectUuid, edgeKindFilter, includeRetired, adjacentFilter, cancel, walked);
-    if (!component) return uuidList(db, walked);
-    if (!component->uuids) component->uuids = uuidList(db, component->ids);
-    return *component->uuids;
+    return traverse(db,objectUuid,INT_MAX,edgeKindFilter,cancel,includeRetired,adjacentFilter,applicableOnly?this:nullptr,&txn);
 }
 
 std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
@@ -199,8 +195,8 @@ std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std:
     if (maxDepth < 0) throw std::runtime_error("object store: maxDepth must be >= 0");
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (applicableOnly) requirePublishedGraphRead(txn);
-    return uuidList(db, traverse(db, objectUuid, maxDepth, edgeKindFilter, cancel, includeRetired,
-                                adjacentFilter, applicableOnly ? this : nullptr, &txn));
+    return traverse(db, objectUuid, maxDepth, edgeKindFilter, cancel, includeRetired,
+                                adjacentFilter, applicableOnly ? this : nullptr, &txn);
 }
 
 namespace {
@@ -218,8 +214,10 @@ void finishGraph(GraphReadView& result, sqlite3* db)
             result.neighbours[slot] = to; result.edgeIndices[slot] = edge;
         }
     }
-    Statement journal(db, "SELECT coalesce(max(seq),0) FROM journal");
-    (void)journal.row(); result.journalSequence = journal.i64(0);
+    if(historyEnabled(db)) {
+        Statement journal(db, "SELECT coalesce(max(seq),0) FROM journal");
+        (void)journal.row(); result.journalSequence = journal.i64(0);
+    }
 }
 }
 
@@ -230,18 +228,18 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     GraphReadView result;
     if (edges.endpointUuids)
         throw std::invalid_argument("graph endpoint scope is specified by its object selection");
-    std::unordered_map<int64_t, uint64_t> nodes;
+    std::unordered_map<std::string, uint64_t> nodes;
     std::vector<int64_t> ids;
     auto objectsQuery = objectSelectionQuery(db, objects,
-        "o.id,o.uuid,o.generation,(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=o.uuid)");
+        "o.id,o.uuid,o.version,CASE WHEN o.geometry_manifest IS NOT NULL THEN o.storage_ref END");
     while (objectsQuery->row()) {
         const auto node = result.objectUuids.size();
         const auto id = objectsQuery->i64(0);
-        nodes.emplace(id, node); ids.push_back(id);
+        nodes.emplace(formatUuid(objectsQuery->blob16(1)), node); ids.push_back(id);
         result.objectUuids.push_back(formatUuid(objectsQuery->blob16(1)));
-        result.generations.push_back(objectsQuery->i64(2));
+        result.versions.push_back(objectsQuery->i64(2));
         result.geometryRevisions.push_back(objectsQuery->isNull(3) ? std::nullopt :
-            std::optional(formatUuid(objectsQuery->blob16(3))));
+            std::optional(readGeometryTokenColumn(*objectsQuery,3)));
     }
     auto selection = edges; selection.bothEndpoints = true;
     selection.includeRetired = objects.includeRetired;
@@ -251,14 +249,14 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
         selection.endpointUuids = result.objectUuids;
         for (const auto& edge : selectEdges(txn, selection, std::vector<std::string>{})) {
             result.edgeUuids.push_back(edge.uuid);
-            result.endpoints.push_back({nodes.at(*objectIdByUuid(db, parseUuid(edge.aUuid))),
-                                        nodes.at(*objectIdByUuid(db, parseUuid(edge.bUuid)))});
+            result.endpoints.push_back({nodes.at(edge.aUuid),
+                                        nodes.at(edge.bUuid)});
         }
     } else {
-        auto links = edgeSelectionQuery(db, selection, "uuid,a_id,b_id", ids);
+        auto links = edgeSelectionQuery(db, selection, "uuid,a_uuid,b_uuid", ids);
         while (links->row()) {
             result.edgeUuids.push_back(formatUuid(links->blob16(0)));
-            result.endpoints.push_back({nodes.at(links->i64(1)), nodes.at(links->i64(2))});
+            result.endpoints.push_back({nodes.at(formatUuid(links->blob16(1))), nodes.at(formatUuid(links->blob16(2)))});
         }
     }
     finishGraph(result, db);
@@ -303,7 +301,7 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
     for (const auto& [object, revision] : resolved) {
         auto value = *objectRevision(txn, *revision);
         nodes.emplace(object, result.objectUuids.size());
-        result.objectUuids.push_back(object); result.generations.push_back(value.record.generation);
+        result.objectUuids.push_back(object); result.versions.push_back(value.record.version.value_or(0));
         result.geometryRevisions.push_back(value.geometryRevision);
         result.selectedObjects->push_back(std::move(value));
     }

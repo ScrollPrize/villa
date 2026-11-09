@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <ctime>
@@ -32,12 +33,35 @@
 
 namespace vc::objects {
 namespace detail { class GeometryReadCache; class SpatialReadCache; }
+// Only ordinary history-off edits need this transaction-local validation
+// state. Savepoints retain copy-on-write snapshots; nothing is stored in SQL.
+struct CurrentWriteState {
+    std::map<std::string,nlohmann::json> before;
+    std::map<std::string,std::pair<nlohmann::json,nlohmann::json>> validated;
+    // Savepoint-aware receipt changes, never persisted as per-record history.
+    std::set<std::string> changedObjects, changedRelationships, created;
+};
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
+    // Installed only by a collection transaction with pinned dependencies.
+    // Hashes resolve directly through pinned readonly dependencies, without
+    // per-reference registration. Size returns zero when no dependency owns it.
+    std::function<std::vector<uint8_t>(const std::string&)> externalGeometryChunk;
+    std::function<int64_t(const std::string&)> externalGeometryChunkSize;
+    std::function<ObjectRecord(const std::string&)> externalEndpointRecord;
+    std::function<std::string(const std::string&)> externalEndpointVersion;
+    std::function<std::optional<std::string>(const std::string&)> externalEndpointOwner;
+    std::function<void(const std::string&,const Anchor&)> externalEndpointValidateAnchor;
+    std::shared_ptr<CurrentWriteState> currentWrite;
+    bool historyEnabled = true;
+    bool spatialEnabled = true;
+    bool immutableInitial = false;
+    int startSchemaVersion = 0;
     std::map<std::string,double> transformedLengths;
     bool readSnapshot = false;
     bool checkedAction = false, actionConflict = false;
+    VersionSelection checkedObjects;
     // Attribution and request identity of the active write (see
     // TransactionContext). actingAuthor overrides the open author for
     // mutation stamps; commit* attribute the store commit.
@@ -63,13 +87,28 @@ struct StatementPool {
 // a dynamically initialized inline thread_local, so each TU would define it.
 extern thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
 namespace detail {
+bool historyEnabled(sqlite3*);
+void requireHistory(sqlite3*);
+bool spatialEnabled(sqlite3*);
+void requireSpatial(sqlite3*);
+int64_t writeCommitSequence(sqlite3*);
+int64_t writeObjectVersion(sqlite3*, const std::string& uuid);
+int64_t writeRecordVersion(sqlite3*, const char* table, const std::string& uuid);
+int64_t allocateRecordId(sqlite3*, const char* keySpace);
+void createProvisioning(sqlite3*, bool history, bool spatial = true);
+void createChangeTracking(sqlite3*);
+void createStorageDirectory(sqlite3*, const std::string& databaseUuid = {});
+void registerStorageTables(sqlite3*);
+void forkStorageIdentity(sqlite3*);
+void validateCurrentRelationships(sqlite3*);
 // Called only after a read connection has pinned its new SQLite snapshot.
 void beginReadCaches(sqlite3*, StatementPool&, size_t geometryBudget, size_t spatialBudget);
 void beginSpatialRead(StatementPool&, size_t budget, int version);
+void beforeCurrentObjectEdit(sqlite3*, const std::string& uuid);
 // The current schema version and the whole schema of a new store (one
 // history generation), inside the caller's transaction. The offline
 // converter builds its destination with the same function.
-inline constexpr int kSchemaVersion = 20;
+inline constexpr int kSchemaVersion = 21;
 void createStoreSchema(sqlite3*, const std::string& generation);
 }
 struct ObjectStore::Impl {
@@ -78,6 +117,7 @@ struct ObjectStore::Impl {
     std::filesystem::path path;
     OpenOptions options;
     std::string hostname;
+    bool immutableInitial = false;
     sqlite3* writer = nullptr;
     std::mutex writerMutex;
     std::vector<sqlite3*> readerPool;
@@ -95,6 +135,7 @@ struct ObjectStore::Impl {
 
     sqlite3* checkoutReader()
     {
+        if(options.readerPoolSize==0)throw std::logic_error("private initial construction has no reader connections");
         std::unique_lock<std::mutex> lock(poolMutex);
         poolCv.wait(lock, [&] { return !readerPool.empty(); });
         sqlite3* conn = readerPool.back();
@@ -112,6 +153,9 @@ struct ObjectStore::Impl {
 };
 
 struct ObjectStoreImplAccess {
+    static ObjectStore createInitial(const std::filesystem::path& path,const OpenOptions& options) {
+        return ObjectStore(ObjectStore::openImpl(path,options,true,true));
+    }
     static sqlite3* conn(const Txn& txn)
     {
         if (!txn.active())

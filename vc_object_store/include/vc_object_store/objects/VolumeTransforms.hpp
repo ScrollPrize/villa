@@ -36,7 +36,8 @@ struct VolumeTransforms {
     std::vector<Related> related(const std::string& target) const;
 };
 // The transform context of recorded registrations (each `volume_transform`
-// record with its head revision UUID, the registration's revision evidence)
+// record with its head revision UUID, or its ordinary lineage/version when
+// history is disabled, as the registration's revision evidence)
 // and route choices (`volume_transform_choice` records), plus `catalog`
 // registrations the store has not recorded. Local and hosted stores build it
 // the same way.

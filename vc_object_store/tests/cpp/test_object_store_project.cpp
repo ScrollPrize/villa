@@ -1,6 +1,9 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/Project.hpp"
+#include "vc_object_store/objects/PackedStore.hpp"
+#include "vc_object_store/objects/ObjectCopy.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <iostream>
@@ -38,6 +41,143 @@ int main() try
 {
     TemporaryDirectory directory;
     const auto path = directory.path / "project.vcobj";
+
+    {
+        const auto sourcePath = directory.path / "extensions.vcobj";
+        const auto targetPath = directory.path / "extensions-copy.vcobj";
+        createProject(sourcePath, "extension source", Json::object(), as("alice"));
+        const auto owner = vc::objects::util::newUuid();
+        ExtensionTable immutable;
+        immutable.name = "ext_copy_result"; immutable.extension = "test.copy";
+        immutable.columns = {{"owner", ExtensionType::Blob}, {"score", ExtensionType::Real}};
+        immutable.primaryKey = {"owner"}; immutable.keySpace = "objects";
+        auto manual = immutable; manual.name = "ext_copy_manual"; manual.versioned = true;
+        const std::vector<ExtensionRow> first{{extensionUuid(owner), 1.25}}, second{{extensionUuid(owner), 2.5}};
+        ObjectVersion sourceFirst;
+        std::string sourceTable;
+        {
+            auto store = ObjectStore::open(sourcePath, as("alice"));
+            {
+                auto txn = store.write();
+                store.createExtensionTable(txn, immutable); store.createExtensionTable(txn, manual);
+                ObjectRecord object; object.uuid = owner; object.kind = "custom_annotation";
+                store.upsertObject(txn, object);
+                store.appendExtensionRows(txn, immutable.name, first);
+                store.replaceExtensionRows(txn, manual.name, owner, first); txn.commit();
+            }
+            {
+                auto txn = store.read();
+                sourceFirst = store.versionReference(txn, *store.currentObjectRevision(txn, owner));
+                for (const auto& info : store.extensionTables(txn)) if (info.name == manual.name) sourceTable = info.tableUuid;
+                const auto status = store.status(txn);
+                require(status.extensionsPresent && storeStatusFromJson(storeStatusToJson(status)).extensionsPresent,
+                    "extension presence survives the hosted-reader status protocol");
+                // The object-level copier cannot know which immutable result
+                // rows belong in a new independent object, so it must refuse.
+                const auto project = projectRecord(LocalStoreReader(store, txn));
+                mustFail([&] { readObjectCopy(LocalStoreReader(store, txn), project->uuid); });
+            }
+            {
+                auto txn = store.write(VersionSelection{{owner, sourceFirst.version}});
+                store.replaceExtensionRows(txn, manual.name, owner, second); txn.commit();
+            }
+        }
+        ObjectStoreSession session;
+        const auto attachment = session.attach(sourcePath, as("alice"));
+        copyProject(session, attachment, targetPath, "extension copy", as("alice"));
+        auto copied = ObjectStore::open(targetPath, as("alice")); auto txn = copied.read();
+        std::vector<ExtensionRow> results, current, historical;
+        copied.scanExtensionRows(txn, immutable.name, [&](const auto& row) { results.push_back(row); return true; });
+        copied.scanExtensionRows(txn, manual.name, [&](const auto& row) { current.push_back(row); return true; });
+        auto old = sourceFirst; old.storeUuid = copied.status(txn).storeUuid;
+        copied.scanExtensionRowsAtVersion(txn, manual.name, old, [&](const auto& row) { historical.push_back(row); return true; });
+        require(results == first && current == second && historical == first,
+            "database fork preserves immutable results and all manual field versions");
+        for (const auto& info : copied.extensionTables(txn)) if (info.name == manual.name)
+            require(info.tableUuid != sourceTable, "fork remaps physical extension table UUID without breaking old snapshots");
+    }
+
+    {
+        auto directOptions=as("alice"); directOptions.history=HistoryMode::Off;
+        const auto directPath=directory.path/"direct.vcobj", copiedPath=directory.path/"direct-copy.vcobj";
+        createProject(directPath,"direct",Json::object(),directOptions);
+        ObjectStoreSession direct;
+        const auto attached=direct.attach(directPath,directOptions);
+        setProjectName(direct,attached,"renamed direct");
+        require(addProjectResource(direct,attached,kVolumeResource,"/datasets/volume"),"direct resource created");
+        const auto uuid=projectResourceUuid(kVolumeResource,"/datasets/volume");
+        updateProjectResourceMeta(direct,attached,uuid,{{"quality","checked"}});
+        require(resources(direct,attached,kVolumeResource).front().meta.at("quality")=="checked","direct resource edited");
+        setProjectView(direct,attached,"alice",{{"volume","one"}});
+        require(view(direct,attached,"alice").at("volume")=="one","direct project view edited");
+        DatabaseIdentity sourceId;
+        { auto store=ObjectStore::open(directPath,directOptions); auto txn=store.read(); sourceId=store.databaseIdentity(txn); }
+        auto sourceRequest = direct.newRequest(attached);
+        direct.readStore(attached, [&](const StoreReader& reader, const auto&) {
+            const auto record = projectRecord(reader);
+            sourceRequest.expectedObjects[record->uuid] = record->version;
+            sourceRequest.operations.push_back(SetMetaOp{record->uuid, "copy_test", "true"});
+        });
+        direct.submit(attached, sourceRequest);
+        const auto sameNamePath = directory.path / "same-name-copy.vcobj";
+        const auto sourceSequence = direct.status(attached).commitSequence;
+        copyProject(direct, attached, sameNamePath, "renamed direct", directOptions);
+        {
+            auto copied = ObjectStore::open(sameNamePath, directOptions);
+            { auto read = copied.read(); require(copied.status(read).commitSequence == sourceSequence + 1,
+                "independent copy publishes its identity even without a rename"); }
+            { auto read = copied.read(); require(!copied.receipt(read, sourceRequest.requestUuid),
+                "independent copy cannot replay source-store request receipts"); }
+            mustFail([&] { copied.submit(sourceRequest); });
+            { auto write = copied.write(); write.commit(); }
+            { auto read = copied.read(); require(copied.status(read).commitSequence == sourceSequence + 1,
+                "copy finalization leaves no dirty state for the next no-op"); }
+        }
+        copyProject(direct,attached,copiedPath,"copy direct",directOptions);
+        {
+            auto copied=ObjectStore::open(copiedPath,directOptions); auto read=copied.read();
+            const auto copyId=copied.databaseIdentity(read);
+            require(copyId.uuid!=sourceId.uuid,"copied project has independent physical identity");
+            for(const auto& table:sourceId.tables)
+                for(const auto& other:copyId.tables)
+                    if(table.name==other.name) require(table.uuid!=other.uuid,"copied project has independent table identity");
+            require(copied.provisioning(read).history==HistoryMode::Off && projectRecord(LocalStoreReader(copied,read))->name=="copy direct",
+                    "copied direct project remains history-off and can be renamed");
+        }
+        require(removeProjectResource(direct,attached,uuid),"direct resource retired");
+        require(resources(direct,attached,kVolumeResource).empty(),"direct retired resource hidden");
+        require(addProjectResource(direct,attached,kVolumeResource,"/datasets/volume"),"direct resource restored");
+        int64_t sequence=0;
+        {
+            auto store=ObjectStore::open(directPath,directOptions);
+            { auto txn=store.read(); sequence=store.provisioning(txn).commitSequence; }
+            auto txn=store.write(); store.seal(txn); txn.commit();
+        }
+        const auto sealedCopy=directory.path/"sealed-copy.vcobj";
+        copyProject(direct,attached,sealedCopy,"mutable copy",directOptions);
+        {
+            auto copied=ObjectStore::open(sealedCopy,directOptions); auto read=copied.read();
+            require(!copied.provisioning(read).sealed && projectRecord(LocalStoreReader(copied,read))->name=="mutable copy","sealed project copies into a mutable independent store");
+        }
+        const auto packedPath=directory.path/"packed-project.vcobj";
+        {
+            PackedStoreBuilder packed(packedPath);
+            packed.importDatabase(sourceId.uuid,directPath); packed.finalize(sourceId.uuid);
+        }
+        auto readOnly=directOptions;readOnly.readOnly=true;
+        ObjectStoreSession packedSession;
+        const auto packedAttachment=packedSession.attach(packedPath,readOnly);
+        const auto packedCopy=directory.path/"packed-copy.vcobj";
+        copyProject(packedSession,packedAttachment,packedCopy,"unpacked copy",directOptions);
+        {
+            auto copied=ObjectStore::open(packedCopy,directOptions); auto read=copied.read();
+            require(!copied.provisioning(read).sealed && projectRecord(LocalStoreReader(copied,read))->name=="unpacked copy","packed project copies through the native VFS into a mutable store");
+        }
+        {
+            auto store=ObjectStore::open(directPath,readOnly); auto txn=store.read();
+            require(store.provisioning(txn).sealed && store.provisioning(txn).commitSequence==sequence+1 && store.databaseIdentity(txn).uuid==sourceId.uuid,"copy never unseals or modifies original project");
+        }
+    }
 
     // A new project names itself; any other store is an unnamed project.
     createProject(path, "PHerc", {{"open_data", {{"sample", "PHerc0139"}}}}, as("alice"));

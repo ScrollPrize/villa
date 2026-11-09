@@ -40,6 +40,8 @@ struct ObjectStoreSession::Attachment {
     // writer serializes accepted actions; journal guards journalPosition.
     std::mutex writer, journal;
     int64_t journalPosition = 0;
+    // Current-only stores have no journal; compare their committed state instead.
+    std::optional<StoreStatus> observedState;
     // Writable attachments: fetches the geometry of objects published elsewhere
     // (setGeometryFetcher).
     std::unique_ptr<detail::FetchQueue> fetches;
@@ -101,7 +103,9 @@ std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::open(const s
     next->author = next->store().author();
     auto txn = next->store().read();
     next->identity.storeUuid = next->store().uuid(txn);
-    next->journalPosition = next->store().journalPosition(txn);
+    next->observedState = next->store().status(txn);
+    next->journalPosition = next->observedState->historyEnabled
+        ? next->store().journalPosition(txn) : next->observedState->commitSequence;
     return next;
 }
 
@@ -594,13 +598,12 @@ std::optional<TransactionReceipt> ObjectStoreSession::editCurrent(const Attachme
     readStore(identity, [&](const StoreReader& reader, const auto&) {
         // Guard the versions before callbacks read or compute their edits. A
         // hosted poll during a callback must not advance these expectations.
-        editCurrentRequest(reader, request, objectUuids, {});
-        std::vector<TransactionOperation> edits;
-        for (const auto& objectUuid : objectUuids)
-            for (auto& operation : operations(reader, util::canonicalUuid(objectUuid))) edits.push_back(std::move(operation));
-        // Relationship decisions still run after the edits they describe.
-        for (auto& operation : request.operations) edits.push_back(std::move(operation));
-        request.operations = std::move(edits);
+        buildCurrentEditRequest(reader, request, objectUuids, [&] {
+            std::vector<TransactionOperation> edits;
+            for (const auto& objectUuid : objectUuids)
+                for (auto& operation : operations(reader, util::canonicalUuid(objectUuid))) edits.push_back(std::move(operation));
+            return edits;
+        });
     });
     return submit(identity, request);
 }
@@ -1310,12 +1313,32 @@ void ObjectStoreSession::observe(Attachment& attachment)
     if (attachment.remote) return; // its poller delivers its commits
     std::lock_guard journal(attachment.journal);
     auto txn = attachment.store().read();
+    const auto state = attachment.store().status(txn);
+    const bool changedLineage = attachment.observedState &&
+        (state.generation != attachment.observedState->generation || state.historyEnabled != attachment.observedState->historyEnabled);
+    if (!state.historyEnabled || changedLineage) {
+        if (attachment.observedState && state.generation == attachment.observedState->generation &&
+            state.commitSequence == attachment.observedState->commitSequence) return;
+        std::lock_guard lock(mutex_);
+        events_.push_back({StoreSessionEvent::Kind::Committed, attachment.identity, state.commitSequence, {}, true});
+        attachment.observedState = state;
+        attachment.journalPosition = state.historyEnabled ? attachment.store().journalPosition(txn) : state.commitSequence;
+        return;
+    }
     auto changes = attachment.store().journalSince(txn, attachment.journalPosition);
-    if (changes.empty()) return;
+    if (changes.empty()) {
+        if(attachment.observedState && attachment.observedState->commitSequence != state.commitSequence) {
+            std::lock_guard lock(mutex_);
+            events_.push_back({StoreSessionEvent::Kind::Committed, attachment.identity, state.commitSequence, {}, true});
+        }
+        attachment.observedState = state;
+        return;
+    }
     const auto position = changes.back().seq;
     std::lock_guard lock(mutex_);
     events_.push_back({StoreSessionEvent::Kind::Committed, attachment.identity, position, std::move(changes)});
     attachment.journalPosition = position;
+    attachment.observedState = state;
 }
 
 std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()

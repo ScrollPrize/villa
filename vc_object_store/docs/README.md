@@ -7,6 +7,8 @@ summary, then the operations for one kind of use, with Python, C++, and CLI
 forms where they exist. Python examples assume
 `from vc_object_store import ObjectStore` and an open `store`.
 
+Current schema 21 also supports history-off stores, immutable store_references and overlays, independent shards and optional packed SQLite containers. Current versions and the store commit sequence remain available without archival history. See the [schema integration contract](schema-integration.md) for version semantics.
+
 | Document | Covers |
 | --- | --- |
 | [Ingestion](ingestion.md) | One-time import of surfaces, fibers, point collections, tracks, umbilici; registered placeholders; coordinate context; `vc_object_ingest` |
@@ -16,6 +18,7 @@ forms where they exist. Python examples assume
 | [Graph edges](graph-edges.md) | Relationship records and kinds, anchors and dependencies, decisions when geometry changes, applicability, traversal and `graph_read`, link detectors, `vc_object_links` |
 | [Transforms](transforms.md) | `meta.coordinates` (volume identity and scale), volume registrations and route choices, transformed views and edits, volume-target queries |
 | [Typed geometry](typed-geometry.md) | Owned geometry values (`PointCollection`, `Fiber`, `Track`, `Surface`, `Umbilicus`), snapshot views, encoding, validation |
+| [Typed extensions](extensions.md) | Optional indexed result/measurement tables, extension provisioning, input-state references and versioning |
 | [Hosted stores and sessions](hosted.md) | `vc_object_server`, `HostedStore` clients, `ObjectStoreSession` attachments, change events, hosted artifacts, durable drafts |
 
 ## Shared rules
@@ -52,3 +55,11 @@ C++ signatures live under
 Link `vc_object_store::vc_objects` (storage), `vc_object_geometry` (native
 formats), or `vc_object_links` (detectors). Build and test commands are in the
 [package README](../README.md#build-and-test).
+
+## Immutable and large-scale stores
+
+- [Store format and policies](store-format.md): schema 21, history retention, sealing and database identities.
+- [Offline schema conversion](schema-conversion.md): supported upstream inputs, validation and history maintenance.
+- [Collections](collections.md): direct-key store_references and overlays, immutable dependencies and sharding.
+- [Initial batch import](initial-import.md): shared source-independent, parallel ingestion.
+- [Packed stores](packed-stores.md): optional single-file containers and their VFS.

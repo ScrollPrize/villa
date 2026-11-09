@@ -23,7 +23,11 @@ std::size_t cost(const ObjectRevision& revision) { return revision.record.meta.s
 std::size_t cost(const GeometryRevision& geometry) { return geometry.attributes.size() + 512 + 64 * geometry.arrays.size(); }
 
 std::string headKey(const std::string& object) { return "head/" + object; }
-std::string versionKey(const ObjectVersion& v) { return "version/" + v.storeUuid + "/" + v.generation + "/" + v.objectUuid + "/" + std::to_string(v.version); }
+// Conversion preserves logical identities, but schema-20 cached JSON has the
+// old generation fields. Version metadata separately; raw payload keys stay
+// unchanged so a schema upgrade never duplicates geometry/artifact blocks.
+std::string metadataKey(const std::string& key) { return "schema21/" + key; }
+std::string versionKey(const ObjectVersion& v) { return metadataKey("version/" + v.storeUuid + "/" + v.generation + "/" + v.objectUuid + "/" + std::to_string(v.version)); }
 bool isTransformKind(const std::string& kind)
 {
     return kind.empty() || kind == "volume_transform" || kind == "volume_transform_choice";
@@ -377,7 +381,9 @@ void HostedAttachment::check()
         // Keep each feed page's commit once: copying it per change duplicates
         // its entire change vector and makes bulk edits quadratic in memory.
         std::vector<FeedCommit> commits;
-        bool revalidate = false;
+        bool revalidate = !status.historyEnabled &&
+            (cursor.generation != status.generation || cursor.sequence != status.commitSequence || cursor.offset);
+        if (revalidate) cursor = {status.storeUuid, status.generation, status.commitSequence, 0};
         while (cursor.generation != status.generation || cursor.sequence < status.commitSequence || cursor.offset) {
             auto page = client_.changesSince(cursor);
             if (!page.cursorValid) {
@@ -598,7 +604,7 @@ std::vector<SelectedRelationship> HostedAttachment::relationshipsAt(const std::v
 {
     if (!disk_) return client_.relationshipsAt(versions);
     const auto query = objectVersionsRequestToJson(versions);
-    const auto bytes = cachedPayload(payloadKey("relationships/" + payloadHash(bytesOf(query))), [&] {
+    const auto bytes = cachedPayload(payloadKey(metadataKey("relationships/" + payloadHash(bytesOf(query)))), [&] {
         StoreStatus asOf;
         const auto relationships = client_.relationshipsAt(versions, &asOf);
         return bytesOf(relationshipQueryResultToJson(asOf, relationships));
@@ -608,7 +614,7 @@ std::vector<SelectedRelationship> HostedAttachment::relationshipsAt(const std::v
 
 std::optional<GeometryRevision> HostedAttachment::geometryRevision(const std::string& revisionUuid)
 {
-    const auto key = payloadKey("geometry/" + revisionUuid);
+    const auto key = payloadKey(metadataKey("geometry/" + revisionUuid));
     {
         std::lock_guard lock(cacheMutex_);
         if (const auto* entry = cache_.get(key); entry && entry->geometry && !prefetchAudit) return entry->geometry;

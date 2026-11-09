@@ -122,7 +122,7 @@ void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::stri
         if (include(key)) d[key] = value;
     });
     if (include("meta")) d["meta"] = jsonLoads(r.meta);
-    // Selected in a read snapshot: the numbered head version it was read from.
+    // Inline numbered version (including pending edits inside a write).
     if (r.version) { d["version"] = *r.version; d["version_generation"] = r.versionGeneration; }
 }
 
@@ -247,7 +247,7 @@ nb::dict geometryToPy(const vo::GeometryRevision& r)
     result["kind"] = r.kind; result["format_version"] = r.formatVersion;
     result["coordinate_system"] = r.coordinateSystem; result["attributes"] = jsonLoads(r.attributes);
     result["grid_origin"] = r.gridOrigin;
-    result["object_generation"] = r.objectGeneration;
+    result["object_version"] = r.objectVersion;
     result["created_by"] = r.createdBy; result["created_at"] = r.createdAt; result["created_host"] = r.createdHost;
     nb::list arrays;
     for (const auto& a : r.arrays) {
@@ -278,7 +278,7 @@ std::vector<vo::GeometryEdgeEdit> edgeEditsFromPy(const nb::list& edits)
         const auto d = nb::cast<nb::dict>(item);
         vo::GeometryEdgeEdit edit;
         edit.edgeUuid = nb::cast<std::string>(d["edge_uuid"]);
-        edit.expectedGeneration = nb::cast<int64_t>(d["expected_generation"]);
+        edit.expectedVersion = nb::cast<int64_t>(d["expected_version"]);
         edit.action = nb::cast<std::string>(d["action"]);
         edit.aRevision = nb::cast<std::optional<std::string>>(d["a_revision"]);
         edit.bRevision = nb::cast<std::optional<std::string>>(d["b_revision"]);
@@ -303,9 +303,12 @@ struct PyObjectStore {
 
     static PyObjectStore create(const std::string& path, const std::string& author,
                                              const std::optional<std::string>& hostname, int readerPoolSize,
-                                             size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog)
+                                             size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog,
+                                             bool historyEnabled, bool spatialIndex)
     {
         vo::OpenOptions o;
+        o.history = historyEnabled ? vo::HistoryMode::On : vo::HistoryMode::Off;
+        o.spatialIndex = spatialIndex;
         o.author = author;
         o.hostnameOverride = hostname;
         o.readerPoolSize = readerPoolSize;

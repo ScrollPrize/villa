@@ -46,7 +46,8 @@ void createProject(const std::filesystem::path& path, const std::string& name, c
                    const OpenOptions& options);
 // A standalone copy of a locally attached project at `destination` (which
 // must not exist), named `name`: every object, relationship and its history,
-// under a store identity of its own, with the project's artifacts.
+// under a store identity of its own, with the project's artifacts. Operational
+// retry receipts are not copied into the new store identity.
 void copyProject(ObjectStoreSession&, const AttachmentIdentity&, const std::filesystem::path& destination,
                  const std::string& name, const OpenOptions& options);
 // The store's project record; nullopt for a store without one.

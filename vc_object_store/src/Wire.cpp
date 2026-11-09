@@ -85,7 +85,8 @@ StoreStatus storeStatusFromJson(const std::string& text)
 {
     const auto j = Json::parse(text);
     return {j.at("store").get<std::string>(), j.at("generation").get<std::string>(),
-            j.at("commit_sequence").get<int64_t>(), j.at("feed_start").get<int64_t>()};
+            j.at("commit_sequence").get<int64_t>(), j.at("feed_start").get<int64_t>(),
+            j.value("history_enabled", true), j.value("extensions_present", false)};
 }
 
 ChangePage changePageFromJson(const std::string& text)
@@ -160,7 +161,7 @@ std::string geometryRevisionToJson(const GeometryRevision& g)
     return Json{{"uuid", g.uuid}, {"object", g.objectUuid}, {"parent", optionalText(g.parentUuid)},
                 {"content_hash", g.contentHash}, {"kind", g.kind}, {"coordinate_system", g.coordinateSystem},
                 {"attributes", g.attributes}, {"format_version", g.formatVersion},
-                {"object_generation", g.objectGeneration}, {"created_by", g.createdBy}, {"created_at", g.createdAt},
+                {"object_version", g.objectVersion}, {"created_by", g.createdBy}, {"created_at", g.createdAt},
                 {"created_host", g.createdHost}, {"arrays", arrays}, {"grid_origin", g.gridOrigin}}
         .dump();
 }
@@ -177,7 +178,7 @@ GeometryRevision geometryRevisionFromJson(const std::string& text)
     g.coordinateSystem = j.at("coordinate_system").get<std::string>();
     g.attributes = j.at("attributes").get<std::string>(); // exact stored text
     g.formatVersion = j.at("format_version").get<int64_t>();
-    g.objectGeneration = j.at("object_generation").get<int64_t>();
+    g.objectVersion = j.at("object_version").get<int64_t>();
     g.createdBy = j.at("created_by").get<std::string>();
     g.createdAt = j.at("created_at").get<std::string>();
     g.createdHost = j.at("created_host").get<std::string>();

@@ -290,6 +290,8 @@ private:
             auto records = page(cursor, start ? &first : &status);
             if (start) status = first;
             if (!sameLineage(first, status)) return std::nullopt;
+            // With no retained feed, every page must come from the same committed state.
+            if (!first.historyEnabled && status.commitSequence != first.commitSequence) return std::nullopt;
             high = std::max(high, status.commitSequence);
             const bool last = int64_t(records.size()) < pageSize;
             if (!records.empty()) cursor = records.back().uuid;
@@ -297,6 +299,15 @@ private:
             if (last) break;
         }
         FeedCursor feed{first.storeUuid, first.generation, first.commitSequence, 0};
+        if (!first.historyEnabled) {
+            const auto current = store.status();
+            if (!sameLineage(first, current) || first.commitSequence != current.commitSequence) return std::nullopt;
+            if (asOf) *asOf = current;
+            std::vector<Record> result;
+            result.reserve(found.size());
+            for (auto& [uuid, record] : found) result.push_back(std::move(record));
+            return result;
+        }
         for (int round = 0; round < maxRounds; ++round) {
             std::set<std::string> changed;
             StoreStatus end = first;

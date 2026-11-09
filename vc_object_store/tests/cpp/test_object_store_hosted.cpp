@@ -308,7 +308,7 @@ try {
         require(all.size() == 7 && ids(all) == ids(localTracks), "paged selection parity");
         require(asOf.commitSequence == hosted.status().commitSequence, "listing snapshot");
         for (std::size_t i = 0; i < all.size(); ++i) {
-            require(all[i].meta == localTracks[i].meta && all[i].generation == localTracks[i].generation &&
+            require(all[i].meta == localTracks[i].meta && all[i].version == localTracks[i].version &&
                 all[i].changedBy == localTracks[i].changedBy && all[i].track->externalKey == localTracks[i].track->externalKey,
                 "record parity");
             // Listings pin what they returned: the published head's numbered version.
@@ -382,7 +382,8 @@ try {
                 {{hostedInitial.storeUuid, hostedInitial.generation, a, va}, {hostedInitial.storeUuid, hostedInitial.generation, b, vb}});
             require(l.size() == 1 && h.size() == 1 && h[0].relationship.record.uuid == edge &&
                 h[0].relationship.version == l[0].relationship.version && h[0].applicable == l[0].applicable &&
-                h[0].relationship.aVersion == va && h[0].relationship.bVersion == vb, "numbered relationship parity");
+                h[0].relationship.aVersion == (h[0].relationship.record.aUuid == a ? va : vb) &&
+                h[0].relationship.bVersion == (h[0].relationship.record.bUuid == b ? vb : va), "numbered relationship parity");
         }
         mustFail([&] { (void)hosted.relationshipsAt({{hostedInitial.storeUuid, hostedInitial.generation, a, 99}}); });
         mustFail([&] { (void)hosted.relationshipsAt({{hostedInitial.storeUuid, util::newUuid(), a, 1}}); });

@@ -80,7 +80,7 @@ void bindGraphReadView(nb::module_& m) {
         .def("reachable_within", [](PyGraphReadView& self, const std::string& uuid, int maxDepth) {
             self.require(); nb::gil_scoped_release release; return self.graph->reachableWithin(uuid, maxDepth);
         }, nb::arg("uuid"), nb::arg("max_depth"))
-        .def_prop_ro("generations", [](PyGraphReadView& self) { self.require(); return self.graph->generations; })
+        .def_prop_ro("versions", [](PyGraphReadView& self) { self.require(); return self.graph->versions; })
         .def_prop_ro("journal_sequence", [](PyGraphReadView& self) { self.require(); return self.graph->journalSequence; })
         .def_prop_ro("offsets", [](PyGraphReadView& self) {
             self.require(); return self.array(self.graph->offsets, 0, self.graph->offsets.size());

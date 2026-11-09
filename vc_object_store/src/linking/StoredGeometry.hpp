@@ -59,7 +59,6 @@ public:
 private:
     objects::ObjectStore& db_;
     std::optional<objects::ReadTxn> read_;
-    std::map<std::string, int64_t> generations_;
     std::map<std::string, int64_t> versions_;
     std::map<std::string, std::string> revisions_;
 };

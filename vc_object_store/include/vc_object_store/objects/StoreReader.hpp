@@ -14,6 +14,7 @@
 
 #include <limits>
 #include <set>
+#include <functional>
 
 namespace vc::objects {
 
@@ -86,8 +87,8 @@ public:
 std::vector<EdgeRecord> attachments(const StoreReader&, const std::string& ownerUuid,
                                     const std::optional<std::string>& role = std::nullopt);
 
-// The version a checked request expects of `uuid` as it stands: its head,
-// which for a deleted object is its deletion; nullopt only when it never existed.
+// The current head version, or the latest retained deletion version when
+// history is enabled. Missing/deleted objects return nullopt without history.
 std::optional<int64_t> currentVersionOf(const StoreReader&, const std::string& objectUuid);
 
 // Request expectations read through a reader (objects/Transactions.hpp).
@@ -100,9 +101,18 @@ void expectRelationshipEndpoints(const StoreReader&, VersionSelection& expected)
 // relationships as recorded (ObjectStoreSession::editCurrent): expects each of
 // `objectUuids` at its current version (throws when one is absent) and every
 // endpoint of their relationships, appends `operations`, then keeps every
-// relationship of each object (retired ones included) as recorded.
+// surviving relationship of each object as recorded. Relationships removed
+// explicitly or by retirement/historical restoration are not retained. With
+// history disabled there is no archival binding; retain and validate the
+// current relationships instead. Geometry-changing requests must make their
+// affected-relationship decisions explicitly.
 void editCurrentRequest(const StoreReader&, TransactionRequest&, const std::vector<std::string>& objectUuids,
                         std::vector<TransactionOperation> operations);
+// Callback form: capture expected versions before computing the edits, then
+// choose surviving relationships after the operations are known. This keeps
+// hosted reads during the callback from advancing the request's expectations.
+void buildCurrentEditRequest(const StoreReader&, TransactionRequest&, const std::vector<std::string>& objectUuids,
+                             const std::function<std::vector<TransactionOperation>()>& operations);
 // The operation that declares `record`'s coordinate frame
 // (ObjectStore::bindGeometryCoordinates): stored at `storedUnitsPerVoxel`
 // units per voxel of `volume`, merged into its meta.coordinates; throws for a

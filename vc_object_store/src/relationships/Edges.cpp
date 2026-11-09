@@ -2,23 +2,40 @@
 #include "internal/Versions.hpp"
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
+#include "geometry/GeometryInternal.hpp"
 #include "internal/History.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include <nlohmann/json.hpp>
+#include <variant>
 
 namespace vc::objects {
 using namespace detail;
 std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
 {
+    GeometryPhase phase("native.edge");
     detail::DependencyScope dependencyScope;
-    for (const auto& [uuid, anchor] : {std::pair{record.aUuid, record.aAnchor}, std::pair{record.bUuid, record.bAnchor}})
+    {GeometryPhase geometryPhase("native.edge.geometry");
+    for (const auto& [uuid, anchor] : {std::pair{record.aUuid, record.aAnchor}, std::pair{record.bUuid, record.bAnchor}}) {
+        // validateDependencies immediately accepts this case. Anchor syntax
+        // and finite values are still checked by canonicalizeEdge below.
+        if (anchor.wholeGeometry && anchor.points.empty()) continue;
         if (const auto revision = currentGeometry(txn, uuid))
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
+    }
+    }
     auto* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
-    const auto uuid = addEdgeImpl(db, author(), impl_->hostname, record, false);
-    recordRelationshipValidation(db, *edgeByUuid(txn, uuid));
+    const auto inserted = addEdgeImpl(db, author(), impl_->hostname, record, false);
+    {GeometryPhase validate("native.edge.validation");recordRelationshipValidation(db,inserted);}
     savepoint.release();
-    return uuid;
+    return inserted.uuid;
+}
+
+std::string ObjectStore::insertEdgeWithId(WriteTxn& txn,const EdgeRecord& record,int64_t id)
+{
+    ExplicitRecordId allocation(static_cast<sqlite3*>(connection(txn)),"edges",record.uuid,id);
+    const auto result=addEdge(txn,record);
+    allocation.finish();return result;
 }
 
 void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
@@ -29,6 +46,7 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     if (!existing) throw std::runtime_error("object store: edge not found: " + record.uuid);
     auto rec = record;
     canonicalizeEdge(rec);
+    checkExtensionMetadata(existing->meta, rec.meta);
     if (rec.aUuid != rec.bUuid && rec.aUuid == existing->bUuid && rec.bUuid == existing->aUuid)
         swapEndpoints(rec);
     if (rec.kind != existing->kind || rec.aUuid != existing->aUuid || rec.bUuid != existing->bUuid)
@@ -63,7 +81,7 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
 std::optional<EdgeRecord> ObjectStore::edgeByUuid(const Txn& txn, const std::string& uuid) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=?", parseUuid(uuid));
+    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=? AND state=0", parseUuid(uuid));
     if (!s.row()) return std::nullopt;
     return readEdgeRow(db, s);
 }
@@ -73,10 +91,13 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
     const auto bytes = parseUuid(uuid);
-    Statement row(db, "SELECT id,kind FROM edges WHERE uuid=?", bytes);
+    Statement row(db, "SELECT id,kind FROM edges WHERE uuid=? AND state=0", bytes);
     if (!row.row()) throw std::runtime_error("object store: edge not found: " + uuid);
     const auto kind = row.text(1);
-    execute(db, "DELETE FROM edges WHERE id=?", row.i64(0));
+    writeRecordVersion(db, "edges", uuid);
+    clearCurrentExtensionRows(db, "edges", uuid);
+    execute(db,"UPDATE edges SET state=2,commit_sequence=?,changed_by=?,changed_at=?,changed_host=? WHERE id=?",
+        writeCommitSequence(db),author(),nowIsoUtc(),hostname(),row.i64(0));
     appendJournal(db, author(), impl_->hostname, bytes, 0, "remove_edge", kind);
     savepoint.release();
 }
@@ -84,17 +105,20 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
 std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& objectUuid, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    auto id = objectIdByUuid(db, parseUuid(objectUuid));
-    if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE (a_id=? OR b_id=?)" +
-        (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id", *id, *id);
+    const auto key=parseUuid(objectUuid);
+    if(!objectIdByUuid(db,key)) {
+        Statement present(db,"SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
+        if(!present.row())throw std::runtime_error("object store: object not found: "+objectUuid);
+    }
+    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE state=0 AND (a_uuid=? OR b_uuid=?)" +
+        (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id", key, key);
     return readEdgeRows(db, s);
 }
 
 std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::string& edgeKind, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE kind=?" +
+    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE state=0 AND kind=?" +
         (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id", edgeKind);
     return readEdgeRows(db, s);
 }
@@ -105,10 +129,11 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
     validateEdgeSelection(selection);
     const bool candidates = endpointIds || selection.endpointUuids || selection.uuids || selection.tag;
     std::string sql = "SELECT " + columns + " FROM edges" +
-        (candidates ? " NOT INDEXED" : "") + " WHERE 1";
+        (candidates ? " NOT INDEXED" : "") + " WHERE state=0";
     if (!selection.includeRetired) sql += " AND " + activeEdgeSql();
     sql += fiberAdjacencySql(selection.adjacent);
-    std::vector<std::string> parameters;
+    std::vector<std::variant<std::string,std::vector<uint8_t>>> parameters;
+    std::string prefix;
     auto parameter = [&](const std::string& value) {
         parameters.push_back(value);
         return "?" + std::to_string(parameters.size());
@@ -122,16 +147,26 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
     if (selection.tag)
         sql += " AND id IN (SELECT edge_id FROM edge_tags WHERE tag=" + parameter(*selection.tag) + ")";
     if (endpointIds || selection.endpointUuids) {
-        nlohmann::json ids = endpointIds ? nlohmann::json(*endpointIds) : nlohmann::json::array();
-        if (!endpointIds) for (const auto& uuid : *selection.endpointUuids)
-            if (auto id = objectIdByUuid(db, parseUuid(uuid))) ids.push_back(*id);
-        const auto members = " IN (SELECT value FROM json_each(" + parameter(ids.dump()) + "))";
+        std::string members;
+        if(endpointIds) {
+            members=" IN (SELECT uuid FROM objects WHERE state<>2 AND id IN (SELECT value FROM json_each("+
+                parameter(nlohmann::json(*endpointIds).dump())+")))";
+        } else {
+            std::vector<uint8_t> keys;keys.reserve(selection.endpointUuids->size()*16);
+            for(const auto& uuid:*selection.endpointUuids){const auto bytes=parseUuid(uuid);keys.insert(keys.end(),bytes.begin(),bytes.end());}
+            parameters.emplace_back(std::move(keys));
+            const auto blob="?"+std::to_string(parameters.size());
+            prefix="WITH RECURSIVE requested_key_offsets(pos) AS (SELECT 1 WHERE length("+blob+
+                ")>0 UNION ALL SELECT pos+16 FROM requested_key_offsets WHERE pos+16<=length("+blob+
+                ")), requested_keys(uuid) AS MATERIALIZED (SELECT substr("+blob+",pos,16) FROM requested_key_offsets) ";
+            members=" IN (SELECT uuid FROM requested_keys)";
+        }
         const std::string kind = selection.kind ? " AND kind=?1" : "";
         // Materialize endpoint-index candidates, then probe by primary key.
         // Otherwise SQLite may scan an entire kind's UUID index to avoid sorting.
-        sql += " AND id IN (SELECT id FROM edges INDEXED BY edges_a WHERE a_id" + members + kind;
-        if (selection.bothEndpoints) sql += " AND b_id" + members;
-        else sql += " UNION SELECT id FROM edges INDEXED BY edges_b WHERE b_id" + members + kind;
+        sql += " AND id IN (SELECT id FROM edges INDEXED BY edges_a WHERE a_uuid" + members + kind;
+        if (selection.bothEndpoints) sql += " AND b_uuid" + members;
+        else sql += " UNION SELECT id FROM edges INDEXED BY edges_b WHERE b_uuid" + members + kind;
         sql += ")";
     }
     if (selection.uuids) {
@@ -143,9 +178,9 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
     const auto cursorParameter = parameters.size() + 1;
     if (selection.afterUuid) sql += " AND uuid>?" + std::to_string(cursorParameter);
     sql += " ORDER BY uuid LIMIT ?" + std::to_string(cursorParameter + (selection.afterUuid ? 1 : 0));
-    auto rows = std::make_unique<Statement>(db, sql);
+    auto rows = std::make_unique<Statement>(db, prefix+sql);
     int next = 1;
-    for (const auto& value : parameters) rows->bind(next++, value);
+    for (const auto& value : parameters) std::visit([&](const auto& bound){rows->bind(next++,bound);},value);
     if (selection.afterUuid) rows->bind(next++, parseUuid(*selection.afterUuid));
     rows->bind(next, selection.limit.value_or(-1));
     return rows;

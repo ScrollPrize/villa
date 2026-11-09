@@ -4,6 +4,7 @@
 #include "internal/CoordinateFilter.hpp"
 #include "internal/VolumeFrames.hpp"
 #include "internal/TransformedLength.hpp"
+#include "geometry/GeometryToken.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -56,7 +57,8 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection, cons
         connected.insert(ids.begin(), ids.end());
     }
     SelectionFilter filter;
-    if (!selection.includeRetired) filter.sql = " AND " + activeObjectSql("o.id");
+    filter.sql = " AND o.state<>2";
+    if (!selection.includeRetired) filter.sql += " AND " + activeObjectSql("o.id");
     auto bind = [&](const std::string& clause, const std::string& value) {
         filter.sql += clause; filter.parameters.push_back(value);
     };
@@ -205,9 +207,9 @@ std::vector<VolumeRow> registeredVolumeSelection(sqlite3* db,const ObjectSelecti
         while(query->row()) {
             VolumeRow row{formatUuid(query->blob16(0))};
             if(byLength||selection.minLength) {
-                Statement head(db,"SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?",parseUuid(row.uuid));
+                Statement head(db,"SELECT storage_ref FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",parseUuid(row.uuid));
                 if(!head.row())continue;
-                row.volume=transformedLength(db,formatUuid(head.blob16(0)),frame.mapping,*selection.kind);
+                row.volume=transformedLength(db,readGeometryTokenColumn(head,0),frame.mapping,*selection.kind);
                 if(selection.minLength&&row.volume<*selection.minLength)continue;
             }
             if(selection.afterUuid) {
@@ -303,6 +305,7 @@ std::vector<VolumeRow> volumeSelection(sqlite3* db, const ObjectSelection& selec
 std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const ObjectSelection& selection,
                                                        const std::string& columns, const FrameFilter* frame)
 {
+    if (selection.bbox) requireSpatial(db);
     auto filter = objectFilter(db, selection, frame);
     const bool candidates = selection.bbox || !selection.uuids.empty() || selection.connectedTo || selection.tag ||
                             !selection.tagGroups.empty() ||
@@ -332,6 +335,7 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     const std::optional<std::vector<std::string>>& projection) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
+    if (requested.bbox) requireSpatial(db);
     auto selection=requested;
     if(selection.volume&&!selection.transforms)selection.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     const ObjectFields fields = projection ? ObjectFields(std::in_place, projection->begin(), projection->end()) : std::nullopt;
@@ -379,6 +383,7 @@ int64_t ObjectStore::unboundObjectCount(const Txn& txn, const std::string& kind,
 std::vector<SpatialRegion> ObjectStore::spatialRegions(const Txn& txn, const ObjectSelection& requested) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
+    requireSpatial(db);
     auto selection=requested;
     if(selection.volume&&!selection.transforms)selection.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     if (selection.orderBy != "uuid") throw std::invalid_argument("spatial regions use UUID order");

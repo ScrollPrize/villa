@@ -170,6 +170,25 @@ int main() try
     const auto surfaces = sample.surfaces(sample.segments.front());
     require(surfaces.size() == 1, "one catalog surface");
     const auto uuid = catalogSurfaceUuid(surfaces.front());
+    {
+        // Current-only catalog placeholders, fetching and refresh need no
+        // historical head. Restoring an older publication remains unavailable.
+        OpenOptions direct;direct.author="direct-catalog";direct.history=HistoryMode::Off;
+        FileServer directServer(served);
+        const auto directSample=vcr::catalog::parseOpenDataManifest(sampleJson(directServer,"seg-a.tifxyz/","missing.tifxyz/")).samples.front();
+        const auto directPath=directory.path/"direct.vcobj";
+        {auto created=ObjectStore::create(directPath,direct);}
+        ObjectStoreSession current;
+        current.setGeometryFetcher(kCatalogMetaKey,fetchCatalogSurface);
+        const auto attachment=current.attach(directPath,direct);
+        require(addCatalogSample(current,attachment,directSample).added==2,"current-only catalog import");
+        current.ensureGeometry(attachment,uuid);
+        current.readStore(attachment,[&](const StoreReader& reader,const auto&){
+            require(GeometrySnapshot(reader).surface(uuid).rows()==6,"current-only catalog fetched geometry");
+        });
+        require(refreshCatalog(current,attachment,directSample).updated==0,"current-only unchanged catalog refresh");
+        mustFail([&]{restoreCatalogVersion(current,attachment,uuid);});
+    }
     // RFC 4122 version 5, as Python uuid.uuid5 computes it.
     require(util::nameUuid("3f0c2b8e-6a8d-4d5f-9a3e-7c1b2d4e5f60", "sample-seg-a-derived-native-L0-0123456789abcdef") ==
                 "d25d990e-3c53-59d3-9c1c-ad1de1b2956e",
@@ -245,12 +264,17 @@ int main() try
     // Published files are fetched to where the caller keeps them; the store is not written.
     std::optional<CatalogFile> published;
     session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
-        for (const auto& file : catalogReference(reader.currentObject(uuid)->record)->files)
+        // Keep the optional alive while iterating its vector. In C++20 the
+        // temporary behind optional::operator-> does not survive this range-for.
+        const auto reference = catalogReference(reader.currentObject(uuid)->record);
+        require(reference.has_value(), "fetched surface retains catalog reference");
+        for (const auto& file : reference->files)
             if (file.name == "ink-detection.jpg") published = file;
     });
     const auto target = directory.path / "published" / "ink-detection.jpg";
-    require(published && fetchPublishedFile(*published, target) == target && fs::is_regular_file(target) &&
-            !fs::exists(session.path(catalog).string() + ".artifacts"), "published image fetched");
+    require(published.has_value(), "published image remains in catalog metadata");
+    require(fetchPublishedFile(*published, target) == target && fs::is_regular_file(target), "published image fetched");
+    require(!fs::exists(session.path(catalog).string() + ".artifacts"), "published image stays outside store artifacts");
     const auto written = fs::last_write_time(target);
     require(fetchPublishedFile(*published, target) == target && fs::last_write_time(target) == written, "fetched once");
 

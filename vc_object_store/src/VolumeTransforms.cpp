@@ -158,7 +158,13 @@ VolumeTransforms volumeTransformsFrom(const std::vector<std::pair<ObjectRecord,s
             id=meta.at("catalog_registration").at("id").get<std::string>();
             recordedIds.insert(id);
         }
-        recorded.push_back({id,headRevision,
+        // A current-only store has no archival revision UUID. Its ordinary
+        // lineage/version pair still identifies the registration for route
+        // choices, without fabricating a retained object-history entry.
+        const auto revision = headRevision.empty()
+            ? object.versionGeneration + ":" + std::to_string(object.version.value())
+            : headRevision;
+        recorded.push_back({id,revision,
             value.at("source_volume").get<std::string>(),value.at("target_volume").get<std::string>(),
             VolumeAffine::fromJson(value.at("matrix")),value.value("description",std::string{})});
     }

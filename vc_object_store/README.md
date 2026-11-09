@@ -15,8 +15,7 @@ without copies.
 - **Versions everything.** Every object and relationship has a stable UUID and
   a numbered version, starting at 1, advancing once per transaction that
   changes it. A historical reference is
-  `(store, generation, object, version)`; old revisions stay readable forever
-  and restore is a new checked edit, never a moved head.
+  `(store, generation, object, version)`; with history enabled, retained revisions stay readable and restore is a new checked edit, never a moved head.
 - **Checked writes.** A write names the versions it read. If another writer
   moved them first, the write conflicts and commits nothing.
 - **Graph edges.** Relationships (same-winding/same-surface links, fiber
@@ -39,6 +38,12 @@ without copies.
 - **Local or hosted.** One writer can serve a store with `vc_object_server`;
   C++ (through `ObjectStoreSession`) and Python clients then use the same API
   without opening the database file.
+
+## Immutable and large-scale stores
+
+Schema 21 supports current-only storage (`history_enabled=False`), optional spatial indexing, sealing, [store_references, overlays and independent shards](docs/collections.md), and optional [packed SQLite containers](docs/packed-stores.md). Current record versions and the store commit sequence remain available with history disabled; requests for unavailable history fail explicitly. A lineage UUID is not a numeric change counter. Spatial queries require the spatial index.
+
+For large immutable datasets, the C++ [initial batch construction API](docs/initial-import.md) accepts objects, geometry and relationships from a shared parallel streaming source. See the [format and policy reference](docs/store-format.md) and [schema integration contract](docs/schema-integration.md). The redesigned lazy/delta history layout remains deferred.
 
 ## Examples
 
@@ -132,7 +137,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python 
   /path/to/python -m pytest vc_object_store/tests/python -q
 ```
 
-Older stores (schema 16–19; the runtime opens schema 20) convert with
+Older upstream stores (schema 16–20; the runtime opens schema 21) convert with
 `vc_object_convert old.vcobj new.vcobj`, which also writes a revision mapping
 and a report beside the destination. Native directory export currently
 requires Linux `renameat2` or macOS `renamex_np`.

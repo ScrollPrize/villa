@@ -151,13 +151,13 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
             if (validateGeometry) {
                 const auto updated = *db.edgeByUuid(txn, e.uuid);
                 objects::EdgeGeometryRepair repair;
-                repair.edgeUuid = updated.uuid; repair.expectedGeneration = updated.generation;
+                repair.edgeUuid = updated.uuid; repair.expectedVersion = updated.version.value();
                 if (const auto revision = db.currentGeometry(txn, updated.aUuid)) repair.aRevision = revision->uuid;
                 if (const auto revision = db.currentGeometry(txn, updated.bUuid)) repair.bRevision = revision->uuid;
                 repair.aAnchor = updated.aAnchor; repair.bAnchor = updated.bAnchor;
                 db.repairEdgeGeometry(txn, repair);
             }
-            if (db.edgeByUuid(txn, e.uuid)->generation == old.generation) ++report.edgesSkippedExisting;
+            if (db.edgeByUuid(txn, e.uuid)->version == old.version) ++report.edgesSkippedExisting;
             else ++report.edgesUpdated;
         } else {
             db.addEdge(txn, e);  // starts 'pending' until reviewed

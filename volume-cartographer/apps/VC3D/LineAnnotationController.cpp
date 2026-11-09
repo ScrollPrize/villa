@@ -15082,7 +15082,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             fiber.readOnly = readOnly;
             fiber.linePointsLoaded = withLines;
             fiber.fileName = object.name + ".json";
-            fiber.generation = object.generation;
+            fiber.generation = object.version.value();
             fiber.tags = object.tags;
             fiber.storePin = pinOf(*attachment, head, activeGeneration);
             fiber.id = context.idForUuid(object.uuid);
@@ -15214,7 +15214,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     dependency.relationships.insert(edge.uuid);
                     const auto peer = edge.aUuid == uuid ? edge.bUuid : edge.aUuid;
                     const auto object = reader.currentObject(peer);
-                    dependency.peers[peer] = object ? std::optional(object->record.generation) : std::nullopt;
+                    dependency.peers[peer] = object ? std::optional<uint64_t>(object->version) : std::nullopt;
                 }
             }
         }
@@ -15391,17 +15391,17 @@ std::vector<LineAnnotationController::StoredFiberPtr> LineAnnotationController::
         }
         context.position = position;
         std::map<std::string, vc::objects::ObjectRecord> records;
-        for (auto& record : reader.selectObjects(selection, std::vector<std::string>{"generation", "retired"}))
+        for (auto& record : reader.selectObjects(selection, std::vector<std::string>{"version", "retired"}))
             records.emplace(record.uuid, std::move(record));
         const auto generationOf = [&](const std::string& uuid) -> std::optional<uint64_t> {
             const auto found = records.find(uuid);
-            return found == records.end() ? std::nullopt : std::optional<uint64_t>(found->second.generation);
+            return found == records.end() ? std::nullopt : std::optional<uint64_t>(found->second.version.value());
         };
         std::set<std::string> seen;
         for (const auto& uuid : uuids)
             if (const auto object = records.find(vc::objects::util::canonicalUuid(uuid)); object != records.end()) {
                 if (object->second.kind == "fiber" && !object->second.retired && seen.insert(object->first).second)
-                    live.emplace_back(object->first, object->second.generation);
+                    live.emplace_back(object->first, object->second.version.value());
             }
         for (const auto& [uuid, generation] : live) {
             const auto cached = context.cache.find(uuid);
@@ -15708,7 +15708,12 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         std::set<std::string> edited;
         for (const auto& snapshot : edits) edited.insert(snapshot.fiber.uuid);
         for (const auto& [uuid,edge] : incident) {
-            if (edge.kind != "fiber_branch") { operations.push_back(KeepRecordedRelationshipOp{uuid}); continue; }
+            if (edge.kind != "fiber_branch") {
+                if (!reader.status().historyEnabled)
+                    throw std::runtime_error("This edit must preserve a related link's earlier state, but this store has history disabled. Enable history, edit through a history-enabled overlay, or explicitly remove/revalidate the related links before saving.");
+                operations.push_back(KeepRecordedRelationshipOp{uuid});
+                continue;
+            }
             if ((edited.contains(edge.aUuid) || edited.contains(edge.bUuid) || retiredUuids.contains(edge.aUuid) || retiredUuids.contains(edge.bUuid)) && !retainedBranches.contains(uuid))
                 operations.push_back(RemoveEdgeOp{uuid});
         }
@@ -15732,7 +15737,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     for (size_t i = 0; i < edits.size(); ++i) {
         auto& fiber = edits[i].fiber;
         if (!saved[i]) throw std::logic_error("A saved fiber version is not in its object store");
-        fiber.generation = saved[i]->record.generation;
+        fiber.generation = saved[i]->version;
         fiber.storePin = pinOf(*attachment, *saved[i], receipt.generation);
         registerFiberId(fiber.uuid, fiber.id);
     }

@@ -2,9 +2,11 @@
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
-#include "internal/Sqlite.hpp"
+#include "internal/Database.hpp"
+#include "internal/Versions.hpp"
 #include <algorithm>
 #include <map>
+#include <limits>
 #include <tuple>
 
 namespace vc::objects {
@@ -75,11 +77,12 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
         sqlite3* from = nullptr;
         sqlite3* to = nullptr;
         const auto close = [&] { sqlite3_close(from); sqlite3_close(to); };
-        if (sqlite3_open_v2(reinterpret_cast<const char*>(source.u8string().c_str()), &from, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
-            sqlite3_open_v2(reinterpret_cast<const char*>(destination.u8string().c_str()), &to, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
-            const std::string error = from ? sqlite3_errmsg(to ? to : from) : "out of memory";
+        try {
+            from = detail::openConnection(source, SQLITE_OPEN_READONLY, options, true);
+            to = detail::openConnection(destination, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, options, false);
+        } catch (...) {
             close();
-            throw std::runtime_error("object store: cannot copy " + source.string() + ": " + error);
+            throw;
         }
         auto* backup = sqlite3_backup_init(to, "main", from, "main");
         const int rc = backup ? sqlite3_backup_step(backup, -1) : SQLITE_ERROR;
@@ -96,12 +99,23 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
         auto* db = detail::openConnection(destination, SQLITE_OPEN_READWRITE, options, false);
         try {
             detail::exec(db, "BEGIN IMMEDIATE;");
+            detail::forkStorageIdentity(db);
+            // A copy is an independent mutable publication, never an unseal of its source.
+            detail::exec(db, "UPDATE store_manifest SET sealed=0;");
+            const auto newStore = detail::parseUuid(util::newUuid());
             detail::exec(db, "DROP TRIGGER store_identity_immutable_update; DROP TRIGGER store_identity_immutable_delete;");
-            detail::execute(db, "UPDATE store_identity SET uuid=?", detail::parseUuid(util::newUuid()));
+            detail::execute(db, "UPDATE store_identity SET uuid=?", newStore);
+            detail::execute(db, "UPDATE key_allocators SET namespace_uuid=?", newStore);
+            detail::clearTransactionReceipts(db);
             detail::exec(db, "CREATE TRIGGER store_identity_immutable_update BEFORE UPDATE ON store_identity "
                              "BEGIN SELECT RAISE(ABORT,'store identity is immutable'); END;"
                              "CREATE TRIGGER store_identity_immutable_delete BEFORE DELETE ON store_identity "
                              "BEGIN SELECT RAISE(ABORT,'store identity is retained'); END;");
+            detail::Statement clock(db, "SELECT commit_sequence FROM store_manifest WHERE singleton=1");
+            if (!clock.row() || clock.i64(0) == std::numeric_limits<int64_t>::max())
+                throw std::overflow_error("object store: copied store commit sequence exhausted");
+            detail::execute(db, "UPDATE store_manifest SET commit_sequence=? WHERE singleton=1", clock.i64(0) + 1);
+            detail::exec(db, "UPDATE store_write_state SET dirty=0 WHERE singleton=1;");
             detail::exec(db, "COMMIT;");
         } catch (...) { sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr); sqlite3_close(db); throw; }
         sqlite3_close(db);
@@ -128,7 +142,7 @@ std::optional<ObjectRecord> projectRecord(const StoreReader& reader)
     if (records.size() == 1) return std::move(records.front());
     // A store holds one; with several, the first added.
     const auto added = [&](const ObjectRecord& record) {
-        const auto history = reader.objectHistory(record.uuid);
+        const auto history = reader.status().historyEnabled ? reader.objectHistory(record.uuid) : std::vector<ObjectRevision>{};
         return history.empty() ? std::nullopt : history.front().publishedAtUs;
     };
     auto first = std::min_element(records.begin(), records.end(), [&](const auto& a, const auto& b) {
@@ -164,7 +178,7 @@ std::vector<ProjectResource> projectResources(const StoreReader& reader, const s
     // created (seconds) for an imported baseline without its publication time.
     std::map<std::string, std::pair<std::string, int64_t>> added;
     for (const auto& record : records) {
-        const auto history = reader.objectHistory(record.uuid);
+        const auto history = reader.status().historyEnabled ? reader.objectHistory(record.uuid) : std::vector<ObjectRevision>{};
         const auto published = history.empty() ? std::nullopt : history.front().publishedAtUs;
         added[record.uuid] = published ? std::pair(std::string{}, *published) : std::pair(record.createdAt, int64_t(0));
     }

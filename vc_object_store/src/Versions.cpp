@@ -1,5 +1,6 @@
 #include "internal/Versions.hpp"
 #include "internal/History.hpp"
+#include "internal/Extensions.hpp"
 
 #include <limits>
 
@@ -10,12 +11,6 @@ using Json = nlohmann::json;
 void detail::createVersionSchema(sqlite3* db, const std::string& generation, const std::string& reason)
 {
     exec(db, R"SQL(
-CREATE TABLE store_history(
-  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-  active_generation BLOB NOT NULL,
-  commit_sequence INTEGER NOT NULL DEFAULT 0 CHECK(commit_sequence>=0),
-  feed_start INTEGER NOT NULL DEFAULT 0 CHECK(feed_start>=0)
-);
 CREATE TABLE history_generations(
   generation BLOB PRIMARY KEY CHECK(length(generation)=16),
   after_sequence INTEGER NOT NULL,
@@ -55,16 +50,9 @@ CREATE TABLE relationship_versions(
   deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted=(revision_uuid IS NULL)),
   PRIMARY KEY(edge_uuid,version)
 ) WITHOUT ROWID;
-CREATE TABLE transaction_receipts(
-  request_uuid BLOB PRIMARY KEY CHECK(length(request_uuid)=16),
-  generation BLOB NOT NULL REFERENCES history_generations(generation),
-  digest TEXT NOT NULL,
-  commit_seq INTEGER REFERENCES store_commits(seq),
-  receipt TEXT NOT NULL CHECK(json_valid(receipt))
-);
 )SQL");
     for (const auto* table : {"history_generations", "store_commits", "store_changes", "object_versions",
-                              "relationship_versions", "transaction_receipts"}) {
+                              "relationship_versions"}) {
         for (const auto* operation : {"UPDATE", "DELETE"}) {
             const std::string name = std::string(table) + "_" + operation;
             exec(db, ("CREATE TRIGGER " + name + " BEFORE " + operation + " ON " + table +
@@ -74,19 +62,44 @@ CREATE TABLE transaction_receipts(
     const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     execute(db, "INSERT INTO history_generations VALUES(?,0,?,?)", parseUuid(generation), int64_t(now), reason);
-    execute(db, "INSERT INTO store_history(singleton,active_generation) VALUES(1,?)", parseUuid(generation));
+    createReceiptSchema(db);
+}
+
+void detail::createReceiptSchema(sqlite3* db)
+{
+    exec(db, R"SQL(
+CREATE TABLE IF NOT EXISTS transaction_receipts(
+ request_uuid BLOB PRIMARY KEY CHECK(length(request_uuid)=16),
+ generation BLOB NOT NULL CHECK(length(generation)=16),
+ digest TEXT NOT NULL,
+ commit_seq INTEGER,
+ receipt TEXT NOT NULL CHECK(json_valid(receipt))
+);
+CREATE TRIGGER IF NOT EXISTS transaction_receipts_UPDATE BEFORE UPDATE ON transaction_receipts
+ BEGIN SELECT RAISE(ABORT,'transaction receipts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS transaction_receipts_DELETE BEFORE DELETE ON transaction_receipts
+ BEGIN SELECT RAISE(ABORT,'transaction receipts are immutable'); END;
+)SQL");
 }
 
 std::string detail::activeGeneration(sqlite3* db)
 {
-    Statement s(db, "SELECT active_generation FROM store_history");
+    Statement s(db, "SELECT generation FROM store_manifest WHERE singleton=1");
     if (!s.row()) throw std::runtime_error("object store: missing history generation");
     return s.uuid(0);
 }
 
+void detail::clearTransactionReceipts(sqlite3* db)
+{
+    Statement table(db, "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='transaction_receipts'");
+    if (!table.row()) return;
+    exec(db, "DROP TRIGGER IF EXISTS transaction_receipts_DELETE; DELETE FROM transaction_receipts;");
+    createReceiptSchema(db);
+}
+
 int64_t detail::commitSequence(sqlite3* db)
 {
-    Statement s(db, "SELECT commit_sequence FROM store_history");
+    Statement s(db, "SELECT commit_sequence FROM store_manifest WHERE singleton=1");
     if (!s.row()) throw std::runtime_error("object store: missing commit sequence");
     return s.i64(0);
 }
@@ -100,8 +113,7 @@ std::string detail::storeUuidText(sqlite3* db)
 
 std::optional<int64_t> detail::headVersion(sqlite3* db, const std::string& objectUuid)
 {
-    Statement s(db, "SELECT v.version FROM object_heads h JOIN object_versions v ON v.revision_uuid=h.revision_uuid "
-                    "WHERE h.object_uuid=?", parseUuid(objectUuid));
+    Statement s(db, "SELECT version FROM objects WHERE uuid=? AND state<>2", parseUuid(objectUuid));
     return s.row() ? std::optional(s.i64(0)) : std::nullopt;
 }
 
@@ -109,7 +121,7 @@ void detail::attachObjectVersions(sqlite3* db, std::vector<ObjectRecord>& record
 {
     // A selected (live, published) object's head is its newest version: one
     // backward seek in the (object_uuid, version) key instead of a head join.
-    Statement s(db, "SELECT version,generation FROM object_versions WHERE object_uuid=? ORDER BY version DESC LIMIT 1");
+    Statement s(db, "SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)) FROM objects WHERE uuid=?");
     for (auto& record : records) {
         s.reset();
         s.bind(1, parseUuid(record.uuid));
@@ -122,8 +134,7 @@ void detail::attachObjectVersions(sqlite3* db, std::vector<ObjectRecord>& record
 
 void detail::attachRelationshipVersions(sqlite3* db, std::vector<EdgeRecord>& records)
 {
-    Statement s(db, "SELECT version,generation,deleted FROM relationship_versions WHERE edge_uuid=? "
-                    "ORDER BY version DESC LIMIT 1");
+    Statement s(db, "SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)),state=2 FROM edges WHERE uuid=?");
     for (auto& record : records) {
         s.reset();
         s.bind(1, parseUuid(record.uuid));
@@ -136,7 +147,7 @@ void detail::attachRelationshipVersions(sqlite3* db, std::vector<EdgeRecord>& re
 
 std::optional<int64_t> detail::relationshipHeadVersion(sqlite3* db, const std::string& edgeUuid)
 {
-    Statement s(db, "SELECT version,deleted FROM relationship_versions WHERE edge_uuid=? ORDER BY version DESC LIMIT 1",
+    Statement s(db, "SELECT version,state=2 FROM edges WHERE uuid=?",
         parseUuid(edgeUuid));
     if (!s.row() || s.i64(1)) return std::nullopt;
     return s.i64(0);
@@ -148,15 +159,15 @@ int64_t detail::revisionVersion(sqlite3* db, const std::string& revisionUuid)
     return s.row() ? s.i64(0) : 0;
 }
 
-CommitPublisher::CommitPublisher(sqlite3* db, int64_t publishedAtUs)
-    : db_(db), generation_(activeGeneration(db)), publishedAtUs_(publishedAtUs) {}
+CommitPublisher::CommitPublisher(sqlite3* db, int64_t publishedAtUs, bool baseline)
+    : db_(db), generation_(activeGeneration(db)), publishedAtUs_(publishedAtUs), baseline_(baseline) {}
 
 void CommitPublisher::begin()
 {
     if (sequence_) return;
     const auto current = commitSequence(db_);
     if (current == std::numeric_limits<int64_t>::max()) throw std::overflow_error("object store: commit sequence exhausted");
-    sequence_ = current + 1;
+    sequence_ = writeCommitSequence(db_);
     std::optional<std::string> request;
     std::string author = "unknown", host = "unknown";
     if (const auto pool = activeStatementPools.find(db_); pool != activeStatementPools.end()) {
@@ -167,18 +178,21 @@ void CommitPublisher::begin()
     }
     execute(db_, "INSERT INTO store_commits VALUES(?,?,?,?,?,?)", *sequence_, parseUuid(generation_),
         parseOptionalUuid(request), author, host, publishedAtUs_);
-    execute(db_, "UPDATE store_history SET commit_sequence=?", *sequence_);
 }
 
 int64_t CommitPublisher::nextObject(const std::string& objectUuid)
 {
-    Statement s(db_, "SELECT coalesce(max(version),0) FROM object_versions WHERE object_uuid=?", parseUuid(objectUuid));
-    s.row();
-    return s.i64(0) + 1;
+    return writeObjectVersion(db_, objectUuid);
 }
 
 int64_t CommitPublisher::object(const std::string& objectUuid, const std::string& revisionUuid, bool deleted)
 {
+    if (baseline_) {
+        Statement row(db_, "SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)) FROM objects WHERE uuid=?", parseUuid(objectUuid));
+        if (!row.row()) throw std::runtime_error("baseline object is absent");
+        execute(db_, "INSERT INTO object_versions VALUES(?,?,?,NULL,?)", parseUuid(objectUuid), row.i64(0), row.blob16(1), parseUuid(revisionUuid));
+        return row.i64(0);
+    }
     begin();
     const auto version = nextObject(objectUuid);
     execute(db_, "INSERT INTO object_versions VALUES(?,?,?,?,?)", parseUuid(objectUuid), version, parseUuid(generation_),
@@ -190,10 +204,14 @@ int64_t CommitPublisher::object(const std::string& objectUuid, const std::string
 
 int64_t CommitPublisher::relationship(const std::string& edgeUuid, const std::optional<std::string>& revisionUuid)
 {
+    if (baseline_) {
+        Statement row(db_, "SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)) FROM edges WHERE uuid=?", parseUuid(edgeUuid));
+        if (!row.row()) throw std::runtime_error("baseline relationship is absent");
+        execute(db_, "INSERT INTO relationship_versions VALUES(?,?,?,NULL,?,?)", parseUuid(edgeUuid), row.i64(0), row.blob16(1), parseOptionalUuid(revisionUuid), int64_t(!revisionUuid));
+        return row.i64(0);
+    }
     begin();
-    Statement next(db_, "SELECT coalesce(max(version),0)+1 FROM relationship_versions WHERE edge_uuid=?", parseUuid(edgeUuid));
-    next.row();
-    const auto version = next.i64(0);
+    const auto version = writeRecordVersion(db_, "edges", edgeUuid);
     execute(db_, "INSERT INTO relationship_versions VALUES(?,?,?,?,?,?)", parseUuid(edgeUuid), version, parseUuid(generation_),
         *sequence_, parseOptionalUuid(revisionUuid), int64_t(!revisionUuid));
     execute(db_, "INSERT INTO store_changes VALUES(?,(SELECT count(*) FROM store_changes WHERE seq=?),'relationship',?,?,?)",
@@ -242,6 +260,44 @@ TransactionReceipt detail::receiptFromJson(const Json& j)
     return r;
 }
 
+void detail::recordCurrentChange(sqlite3* db, const std::array<unsigned char,16>& key, const char* changeKind)
+{
+    const auto found=activeStatementPools.find(db);
+    if(found==activeStatementPools.end() || found->second->immutableInitial) return;
+    auto& pool=*found->second;
+    auto& state=pool.currentWrite;
+    if(!state) state=std::make_shared<CurrentWriteState>();
+    else if(state.use_count()!=1) state=std::make_shared<CurrentWriteState>(*state);
+    const auto uuid=formatUuid(key);
+    const auto expectObject=[&](const std::string& object) {
+        if(pool.checkedAction && !pool.checkedObjects.contains(object)) {
+            pool.actionConflict=true;
+            throw std::runtime_error("object store: missing expected validation endpoint " + object);
+        }
+    };
+    Statement object(db,"SELECT version,state FROM objects WHERE uuid=?",key);
+    if(object.row()) {
+        expectObject(uuid);
+        state->changedObjects.insert(uuid);
+        const auto expected=pool.checkedObjects.find(uuid);
+        if(object.i64(1)!=2 && (object.i64(0)==1 ||
+           (expected!=pool.checkedObjects.end() && !expected->second))) state->created.insert(uuid);
+        return;
+    }
+    Statement edge(db,"SELECT a_uuid,b_uuid,state FROM edges WHERE uuid=?",key);
+    if(!edge.row()) throw std::logic_error("object store: changed record is absent: "+uuid);
+    state->changedRelationships.insert(uuid);
+    if(edge.i64(2)!=2 && std::string_view(changeKind)=="add_edge") state->created.insert(uuid);
+    for(const auto column:{0,1}) {
+        const auto endpoint=edge.uuid(column);
+        // An immutable dependency cannot be versioned by this overlay.
+        if(!headVersion(db,endpoint)) continue;
+        expectObject(endpoint);
+        writeObjectVersion(db,endpoint);
+        state->changedObjects.insert(endpoint);
+    }
+}
+
 TransactionReceipt detail::finishReceipt(sqlite3* db, const StatementPool& pool, const VersionSelection& expectedObjects,
                                          const VersionSelection& expectedRelationships)
 {
@@ -254,6 +310,8 @@ TransactionReceipt detail::finishReceipt(sqlite3* db, const StatementPool& pool,
         receipt.relationships[canonical(uuid)] = relationshipHeadVersion(db, canonical(uuid));
     if (pool.publishedSequence) {
         receipt.commitSequence = pool.publishedSequence;
+    }
+    if (pool.publishedSequence && historyEnabled(db)) {
         Statement changes(db, "SELECT record_kind,record_uuid,version,deleted FROM store_changes WHERE seq=? ORDER BY position",
             *pool.publishedSequence);
         while (changes.row()) {
@@ -271,6 +329,12 @@ TransactionReceipt detail::finishReceipt(sqlite3* db, const StatementPool& pool,
             if (!previous.row()) receipt.created.push_back(uuid);
         }
     }
+    if (!historyEnabled(db) && pool.currentWrite) {
+        for(const auto& uuid:pool.currentWrite->changedObjects) receipt.objects[uuid]=headVersion(db,uuid);
+        for(const auto& uuid:pool.currentWrite->changedRelationships) receipt.relationships[uuid]=relationshipHeadVersion(db,uuid);
+        for(const auto& uuid:pool.currentWrite->created)
+            if(headVersion(db,uuid) || relationshipHeadVersion(db,uuid)) receipt.created.push_back(uuid);
+    }
     if (pool.requestUuid) {
         execute(db, "INSERT INTO transaction_receipts VALUES(?,?,?,?,?)", parseUuid(*pool.requestUuid),
             parseUuid(receipt.generation), pool.requestDigest.value_or(""), receipt.commitSequence, receiptToJson(receipt).dump());
@@ -280,6 +344,8 @@ TransactionReceipt detail::finishReceipt(sqlite3* db, const StatementPool& pool,
 
 std::optional<TransactionReceipt> detail::savedReceipt(sqlite3* db, const std::string& requestUuid, std::string* digest)
 {
+    Statement table(db,"SELECT 1 FROM sqlite_schema WHERE type='table' AND name='transaction_receipts'");
+    if (!table.row()) return std::nullopt;
     Statement s(db, "SELECT receipt,digest FROM transaction_receipts WHERE request_uuid=?", parseUuid(requestUuid));
     if (!s.row()) return std::nullopt;
     if (digest) *digest = s.text(1);
@@ -322,10 +388,34 @@ void detail::checkTransactionContext(sqlite3* db, const TransactionContext& cont
     if (!conflicts.empty())
         throw TransactionConflict(Reason::ReadDependency, conflicts,
             "object history: read dependency changed: " + conflicts.front().uuid);
+    if (!historyEnabled(db)) return;
     for (const auto& [uuid, expected] : context.expectedObjects) {
         const auto id = canonical(uuid);
         Statement head(db, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?", parseUuid(id));
         expectedRevisions[id] = head.row() ? std::optional(head.uuid(0)) : std::nullopt;
+    }
+}
+
+void detail::prepareCheckedWrite(sqlite3* db, const TransactionContext& context, RevisionSelection& expected)
+{
+    checkTransactionContext(db, context, expected);
+    auto& pool = *activeStatementPools.at(db);
+    if (historyEnabled(db)) expectHistory(db, expected);
+    else pool.checkedAction = true;
+    for (const auto& [uuid, version] : context.expectedObjects)
+        pool.checkedObjects.emplace(util::canonicalUuid(uuid), version);
+    if (pool.requestUuid) {
+        Statement receipts(db, "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='transaction_receipts'");
+        if (!receipts.row()) {
+            // Operational deduplication storage is not a logical object edit.
+            Statement dirty(db, "SELECT dirty FROM store_write_state WHERE singleton=1");
+            dirty.row();
+            const auto wasDirty = dirty.i64(0);
+            createReceiptSchema(db);
+            registerStorageTables(db);
+            execute(db, "UPDATE store_write_state SET dirty=? WHERE singleton=1", wasDirty);
+            pool.startSchemaVersion = pragmaInt(db, "schema_version");
+        }
     }
 }
 
@@ -334,9 +424,9 @@ void detail::checkTransactionContext(sqlite3* db, const TransactionContext& cont
 StoreStatus ObjectStore::status(const Txn& txn) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, "SELECT active_generation,commit_sequence,feed_start FROM store_history");
+    Statement s(db, "SELECT generation,commit_sequence,feed_start,history_enabled FROM store_manifest WHERE singleton=1");
     if (!s.row()) throw std::runtime_error("object store: missing history state");
-    return {storeUuidText(db), s.uuid(0), s.i64(1), s.i64(2)};
+    return {storeUuidText(db), s.uuid(0), s.i64(1), s.i64(2), s.i64(3)!=0, hasExtensionTables(db)};
 }
 
 std::optional<TransactionReceipt> ObjectStore::receipt(const Txn& txn, const std::string& requestUuid) const
@@ -367,6 +457,21 @@ ObjectVersion ObjectStore::versionReference(const Txn& txn, const ObjectRevision
 
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectVersion>& versions) const
 {
+    if (!historyEnabled(static_cast<sqlite3*>(connection(txn)))) {
+        std::vector<std::string> ids;
+        for (const auto& reference : versions) {
+            if (!objectAtVersion(txn,reference)) throw std::invalid_argument("historical selection is unavailable with history off");
+            ids.push_back(reference.objectUuid);
+        }
+        EdgeSelection query; query.endpointUuids=ids; query.bothEndpoints=true; query.approvalStates.clear(); query.attachments=true;
+        std::vector<SelectedRelationship> result;
+        const auto store=status(txn).storeUuid;
+        for (const auto& edge : selectEdges(txn,query)) {
+            const auto current=relationshipAtVersion(txn,{store,edge.versionGeneration,edge.uuid,edge.version.value_or(0)});
+            if (current) result.push_back({*current,currentRelationshipApplicable(*this,txn,edge.uuid)});
+        }
+        return result;
+    }
     RevisionSelection selection;
     for (const auto& reference : versions) {
         const auto revision = objectAtVersion(txn, reference);
@@ -386,6 +491,12 @@ ChangePage ObjectStore::changesSince(const Txn& txn, const FeedCursor& cursor, i
     const auto state = status(txn);
     ChangePage page;
     const FeedCursor head{state.storeUuid, state.generation, state.commitSequence, 0};
+    if (!state.historyEnabled) {
+        page.cursorValid = cursor.storeUuid==state.storeUuid && cursor.generation==state.generation &&
+            cursor.sequence==state.commitSequence && cursor.offset==0;
+        page.next=head;
+        return page;
+    }
     // Commits made before a generation change remain in the feed, but a cursor
     // from another lineage cannot be continued.
     if (cursor.storeUuid != state.storeUuid || cursor.generation != state.generation ||
@@ -423,6 +534,9 @@ ChangePage ObjectStore::changesSince(const Txn& txn, const FeedCursor& cursor, i
             break;
         }
     }
+    // Provisioning commits and store_reference ordering can leave sequence gaps
+    // without record changes. A completely consumed feed advances over them.
+    if (!page.more) page.next = head;
     return page;
 }
 
@@ -434,8 +548,9 @@ std::string ObjectStore::startHistoryGeneration(const std::string& reason)
     const auto generation = util::newUuid();
     const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    execute(db, "INSERT INTO history_generations VALUES(?,?,?,?)", parseUuid(generation), commitSequence(db), int64_t(now), reason);
-    execute(db, "UPDATE store_history SET active_generation=?", parseUuid(generation));
+    if (historyEnabled(db)) execute(db, "INSERT INTO history_generations VALUES(?,?,?,?)", parseUuid(generation), commitSequence(db), int64_t(now), reason);
+    execute(db, "UPDATE store_manifest SET generation=?", parseUuid(generation));
+    exec(db, "UPDATE store_write_state SET dirty=1 WHERE singleton=1;");
     txn.commit();
     return generation;
 }

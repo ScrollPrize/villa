@@ -35,14 +35,39 @@ void Txn::release(bool commit)
     auto* conn = static_cast<sqlite3*>(handle_);
     handle_ = nullptr;
     auto releaseConnection = [&] {
+        // Collection resolvers capture the transaction's pinned dependencies;
+        // pooled connections must never retain those captures after release.
+        if (const auto pool = activeStatementPools.find(conn); pool != activeStatementPools.end()) {
+            pool->second->externalGeometryChunk = {};
+            pool->second->externalGeometryChunkSize = {};
+            pool->second->externalEndpointRecord = {};
+            pool->second->externalEndpointVersion = {};
+            pool->second->externalEndpointOwner = {};
+            pool->second->externalEndpointValidateAnchor = {};
+            pool->second->currentWrite.reset();
+        }
         activeStatementPools.erase(conn);
         if (write_) db_->impl_->writerMutex.unlock();
         else db_->impl_->checkinReader(conn);
     };
     try {
         if (commit && write_) {
+            auto& pool = *activeStatementPools.at(conn);
+            if(pool.actionConflict) throw std::runtime_error("object store: checked action failed; all changes rolled back");
+            if (pragmaInt(conn, "schema_version") != pool.startSchemaVersion) {
+                registerStorageTables(conn);
+                exec(conn, "UPDATE store_write_state SET dirty=1 WHERE singleton=1;");
+            }
             refreshSourceIdentityIndex(conn);
-            publishHistory(conn);
+            if (historyEnabled(conn)) publishHistory(conn);
+            else if (!pool.immutableInitial) validateCurrentRelationships(conn);
+            if (pool.immutableInitial) exec(conn, "UPDATE store_write_state SET dirty=1 WHERE singleton=1;");
+            Statement dirty(conn, "SELECT dirty FROM store_write_state WHERE singleton=1");
+            if (dirty.row() && dirty.i64(0)) {
+                pool.publishedSequence = writeCommitSequence(conn);
+                execute(conn, "UPDATE store_manifest SET commit_sequence=? WHERE singleton=1", *pool.publishedSequence);
+                exec(conn, "UPDATE store_write_state SET dirty=0 WHERE singleton=1;");
+            }
             auto expectedObjects = expectedObjectVersions_;
             for (const auto& [uuid, expected] : expectedRevisions_) expectedObjects.emplace(uuid, std::nullopt);
             receipt_ = finishReceipt(conn, *activeStatementPools.at(conn), expectedObjects, expectedRelationshipVersions_);
@@ -75,7 +100,7 @@ ReadTxn ObjectStore::read()
         Statement pin(conn, "SELECT uuid FROM store_identity LIMIT 1");
         (void)pin.row();
         detail::beginReadCaches(conn, *impl_->statementPools.at(conn),
-                               impl_->options.geometryCacheBytes, impl_->options.spatialCacheBytes);
+                               impl_->options.geometryCacheBytes, impl_->options.spatialIndex ? impl_->options.spatialCacheBytes : 0);
     } catch (...) {
         sqlite3_exec(conn, "ROLLBACK;", nullptr, nullptr, nullptr);
         activeStatementPools.erase(conn);
@@ -97,10 +122,20 @@ WriteTxn ObjectStore::write()
     {
         auto& pool = *impl_->statementPools.at(impl_->writer);
         pool.actingAuthor.reset(); pool.requestUuid.reset(); pool.requestDigest.reset();
+        pool.checkedObjects.clear();
         pool.publishedSequence.reset();
         pool.commitAuthor = impl_->options.author; pool.commitHost = impl_->hostname;
     }
-    try { exec(impl_->writer, "BEGIN IMMEDIATE;"); }
+    try {
+        exec(impl_->writer, "BEGIN IMMEDIATE;");
+        auto& pool = *impl_->statementPools.at(impl_->writer);
+        pool.startSchemaVersion = pragmaInt(impl_->writer, "schema_version");
+        Statement manifest(impl_->writer, "SELECT sealed,commit_sequence,history_enabled FROM store_manifest WHERE singleton=1");
+        if (!manifest.row() || manifest.i64(0)) throw std::runtime_error("object store: store is sealed");
+        if (manifest.i64(1)==INT64_MAX) throw std::overflow_error("object store: commit sequence exhausted");
+        pool.historyEnabled = manifest.i64(2)!=0;
+        beginCurrentWrite(impl_->writer);
+    }
     catch (...) { sqlite3_exec(impl_->writer, "ROLLBACK;", nullptr, nullptr, nullptr); activeStatementPools.erase(impl_->writer); throw; }
     lock.release(); // WriteTxn releases the mutex on commit or rollback.
     return WriteTxn(this, impl_->writer);
@@ -128,8 +163,7 @@ WriteTxn ObjectStore::write(const TransactionContext& context)
     }
     if (context.author) pool.actingAuthor = *context.author;
     RevisionSelection expected;
-    checkTransactionContext(db, context, expected);
-    expectHistory(db, expected);
+    prepareCheckedWrite(db, context, expected);
     txn.expectedRevisions_ = expected;
     txn.expectedObjectVersions_ = context.expectedObjects;
     txn.expectedRelationshipVersions_ = context.expectedRelationships;
@@ -151,6 +185,7 @@ void ObjectStore::checkpoint()
     if (!impl_->writer)
         throw std::runtime_error("object store: checkpoint on read-only handle");
     std::lock_guard<std::mutex> lock(impl_->writerMutex);
+    if(impl_->immutableInitial)return; // journal-off private build; publication owns persistence
     // Bulk-import callers checkpoint after publication. Maintain planner
     // statistics here, outside their atomic write transaction.
     exec(impl_->writer, "PRAGMA optimize;");

@@ -203,7 +203,7 @@ try {
     // keep their generation, and never resolve under another one.
     const auto before = status();
     const auto generation = db.startHistoryGeneration("test restore");
-    require(status().generation == generation && status().commitSequence == before.commitSequence, "rotation");
+    require(status().generation == generation && status().commitSequence == before.commitSequence + 1, "rotation is a logical provisioning commit");
     {
         auto stale = request({{a, 7}}, {SetMetaOp{a, "after", "1"}});
         stale.generation = before.generation;
@@ -234,10 +234,16 @@ try {
         }
     }
     {
+        VersionSelection before;
+        {
+            auto txn = db.read();
+            for (const auto& record : db.selectObjects(txn, ObjectSelection{})) before[record.uuid] = record.version;
+        }
         auto txn = db.write();
         db.setMeta(txn, a, "unpublished", "1");
         for (const auto& record : db.selectObjects(txn, ObjectSelection{}))
-            require(!record.version, "no version inside a write");
+            require(record.version == *before.at(record.uuid) + (record.uuid == a ? 1 : 0),
+                    "inline versions reflect pending edits exactly once inside a write");
     }
 
     // Catalog registrations become versioned records; once recorded they
@@ -401,6 +407,18 @@ try {
         require(readOnly.status(txn).generation == generation, "read-only open while hosted");
     }
     (void)ObjectStore::open(path, options);
+    {
+        auto provisioned = ObjectStore::create(directory.path / "feed-gap.vcobj", options);
+        StoreStatus before;
+        { auto read = provisioned.read(); before = provisioned.status(read); }
+        { auto write = provisioned.write(); provisioned.seal(write); write.commit(); }
+        auto read = provisioned.read();
+        const auto after = provisioned.status(read);
+        require(after.commitSequence == before.commitSequence + 1, "sealing is a logical provisioning commit");
+        const auto page = provisioned.changesSince(read, {before.storeUuid, before.generation, before.commitSequence, 0});
+        require(page.cursorValid && page.commits.empty() && !page.more && page.next.sequence == after.commitSequence,
+                "empty change feed advances over a provisioning-only sequence gap");
+    }
     std::cout << "object store versions: ok\n";
     return 0;
 } catch (const std::exception& error) {

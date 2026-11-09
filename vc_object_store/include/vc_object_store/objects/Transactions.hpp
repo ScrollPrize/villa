@@ -58,6 +58,10 @@ struct StoreStatus {
     // Changes after this sequence are retained in the feed; a cursor below it
     // cannot be continued and requires revalidating cached state.
     int64_t feedStart = 0;
+    bool historyEnabled = true;
+    // Generic record-only copies cannot preserve extension-owned rows. This
+    // capability is advertised by local and hosted readers before such copies.
+    bool extensionsPresent = false;
 };
 
 // Writes are attributed to `author` (falling back to the store's open

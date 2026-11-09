@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/Selections.hpp"
 
 #include "internal/Sqlite.hpp"
+#include "internal/History.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 
@@ -126,6 +127,7 @@ bool selectionUsesTransforms(const ObjectSelection& selection)
 
 SelectionRecord recordSelection(const ObjectStore& store, const Txn& txn, const ObjectSelection& selection)
 {
+    detail::requirePublishedGraphRead(txn);
     if (selection.transforms)
         throw std::invalid_argument("selection record: selections use the store's recorded transforms, not explicit ones");
     if (selection.limit) throw std::invalid_argument("selection record: records a whole selection; remove the limit");

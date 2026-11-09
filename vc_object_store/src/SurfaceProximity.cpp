@@ -1,4 +1,5 @@
 #include "geometry/GeometryReader.hpp"
+#include "geometry/GeometryToken.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include "internal/CoordinateFilter.hpp"
@@ -20,6 +21,7 @@ bool before(const SurfaceProximityHit& a, const SurfaceProximityHit& b)
 
 std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn, const SurfaceProximityQuery& requested) const
 {
+    detail::requireSpatial(static_cast<sqlite3*>(connection(txn)));
     auto query = requested;
     if(query.volume&&!query.transforms) query.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     auto* db = static_cast<sqlite3*>(connection(txn));
@@ -55,10 +57,9 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
     if (impl_->options.remoteGeometryReached)
         if (const auto remote = remoteSurfacesIn(db, sourceBox, includedIds, query.coordinates); !remote.empty())
             impl_->options.remoteGeometryReached(remote);
-    std::string sql = "SELECT o.uuid,h.revision_uuid,b.row_start,b.col_start,b.row_count,b.col_count "
+    std::string sql = "SELECT o.uuid,o.storage_ref,b.row_start,b.col_start,b.row_count,b.col_count "
         "FROM spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id CROSS JOIN objects o ON o.id=b.object_id "
-        "JOIN geometry_heads h ON h.object_uuid=o.uuid LEFT JOIN object_lifecycle l ON l.object_id=o.id "
-        "WHERE o.kind='surface' AND b.array_name='points' AND COALESCE(l.retired,0)=0 AND " + spatialOverlapSql();
+        "WHERE o.state=0 AND o.geometry_manifest IS NOT NULL AND o.kind='surface' AND b.array_name='points' AND " + spatialOverlapSql();
     if (includedIds) sql += " AND o.id IN (SELECT value FROM json_each(?8))";
     if (query.coordinates) sql += coordinateFilterSql("o", "?7");
     sql += " ORDER BY o.uuid,b.row_start,b.col_start";
@@ -76,7 +77,7 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
         if (uuid != object) {
             finish();
             object = uuid;
-            objectRevision = formatUuid(tiles.blob16(1));
+            objectRevision = readGeometryTokenColumn(tiles,1);
             reader.emplace(db, objectRevision);
         }
         const auto row0 = tiles.i64(2), col0 = tiles.i64(3), rows = tiles.i64(4), cols = tiles.i64(5);
