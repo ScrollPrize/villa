@@ -8,6 +8,10 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "local/fiber_tests.json"
 SUITES = {
+    "compound-gui-configure": ("local/test_compound_gui.py::test_configure",),
+    "compound-gui-build": ("local/test_compound_gui.py::test_build",),
+    "compound-gui-tests": ("local/test_compound_gui.py::test_regressions",),
+    "compound-gui-real-volume": ("local/test_compound_gui.py::test_real_volume",),
     "stream-0332-dependencies": ("local/test_stream_0332.py::test_restore_dependencies",),
     "stream-0332-build": ("local/test_stream_0332.py::test_build",),
     "stream-0332-input-audit": ("local/test_stream_0332.py::test_input_audit",),
