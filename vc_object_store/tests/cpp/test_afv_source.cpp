@@ -38,12 +38,20 @@ void fixture(const std::filesystem::path& path)
 }
 int main()
 {
+    require(util::nameUuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8","www.widgets.com")=="21f7f8de-8051-5b89-8680-0195ef798b6a","RFC UUIDv5 value");
+    require(util::nameUuid(detail::parseUuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),"www.widgets.com")=="21f7f8de-8051-5b89-8680-0195ef798b6a","binary namespace UUIDv5 value");
     TemporaryDirectory dir; const auto good=dir.path/"source.afv"; fixture(good);
     {
         AfvSource source(good); AfvFiber f;
+        source.setCacheBytes(128*1024*1024);mustFail([&]{source.setCacheBytes(0);});
+        require(source.setMmapBytes(16*1024*1024)<=16*1024*1024,"source mapping exceeds configured budget");
         require(source.fiberCount()==2 && source.pointCount()==262,"metadata counts");
         require(source.idRanges(2)==std::vector<std::array<int64_t,2>>{{0,9},{9,10}},"balanced sparse intervals");
         require(source.idRanges(2,1)==std::vector<std::array<int64_t,2>>{{0,1}},"limited interval");
+        require(source.workRanges(100,100)==std::vector<std::array<int64_t,2>>{{0,9},{9,10}},"point-budgeted long fiber stays whole");
+        require(source.workRanges(1000,1)==source.idRanges(2),"row-budgeted chunks cover sparse IDs");
+        require(source.workRanges(1000,100,1)==source.idRanges(1,1),"work chunks preserve prefix selection");
+        mustFail([&]{source.workRanges(0,100);});
         require(source.next(f) && f.id==0 && f.xyz.size()==260*24 && f.detail.controlPointCount==0,"multi-block fiber");
         const Json coordinates={{"volume_uuid","test-volume"},{"scale_factor",1.}};
         const auto record=imports::afvObjectRecord(f,source.uuid(),coordinates);
@@ -113,17 +121,37 @@ int main()
     sqlite3_close(db);
     {
         AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4");EdgeRecord edge;
+        source.setCacheBytes(128*1024*1024);mustFail([&]{source.setCacheBytes(0);});
+        require(source.setMmapBytes(16*1024*1024)<=16*1024*1024,"constraint mapping exceeds configured budget");
         require(source.next(edge)&&edge.kind=="perpendicular"&&!edge.aAnchor.direction,"one perpendicular with normals not tangents");
         const auto values=Json::parse(edge.meta).at("afc");
         require(values.at("arc_a")==1.25&&values.at("winding_distance")==.75&&values.at("measurement").at("custom")==7,"unsupported values retained");
         require(edge.aAnchor.position==std::array<double,3>{1,2,3}&&!source.next(edge),"native anchors and EOF");
         require(!source.next(edge)&&!source.next(edge),"AFC EOF remains terminal across producer batches");
+        const auto before=edge;source.selectRange(0,1);require(source.next(edge)&&edge.uuid==before.uuid&&!source.next(edge),"AFC reuses cursor with identical identity");
+        source.selectRange(1,1);require(!source.next(edge),"AFC empty task");
+        mustFail([&]{source.selectRange(2,1);});
     }
     {AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4",5);EdgeRecord edge;require(!source.next(edge),"subset excludes missing endpoint");}
     {AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4");
         require(source.idRanges(8)==std::vector<std::array<int64_t,2>>{{0,1}},"AFC sparse partition bounds");}
     {AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4",INT64_MAX,1,10);EdgeRecord edge;
         require(!source.next(edge)&&!source.next(edge),"empty AFC ID range remains terminal");}
+    {
+        const auto reused=dir.path/"reuse.sqlite";std::filesystem::copy_file(afc,reused);
+        detail::check(sqlite3_open(reused.string().c_str(),&db),db);
+        detail::exec(db,"INSERT INTO constraints SELECT 10,fiber_a,fiber_b,NULL,NULL,ax,ay,az,bx,by,bz,"
+            "1,0,NULL,NULL,NULL,NULL,NULL,'{\"different\":true}' FROM constraints;"
+            "UPDATE metadata SET value='{\"constraints\":2}' WHERE key='statistics';");sqlite3_close(db);
+        AfcSource source(reused,"1482bcc8-f93e-4c3b-b380-2ddf369318f4");EdgeRecord edge;
+        require(source.next(edge),"first reusable metadata row");const auto first=edge.meta;
+        require(source.next(edge)&&edge.kind=="parallel","second reusable metadata row");
+        const auto second=Json::parse(edge.meta).at("afc");
+        require(second.at("arc_a").is_null()&&second.at("normal_a").is_null()&&second.at("normal_b").is_null()&&
+            second.at("measurement")==Json({{"different",true}}),"metadata values leaked between rows");
+        require(!source.next(edge),"reused metadata EOF");source.selectRange(0,1);
+        require(source.next(edge)&&edge.meta==first,"reused metadata changes canonical serialization");
+    }
     detail::check(sqlite3_open(afc.string().c_str(),&db),db);
     detail::exec(db,"UPDATE constraints SET parallel_winding_distance=NULL");sqlite3_close(db);
     {AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4");EdgeRecord edge;

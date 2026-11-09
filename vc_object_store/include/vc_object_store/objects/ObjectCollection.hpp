@@ -112,6 +112,9 @@ public:
     // history off. A failed batch rolls back every object and geometry row.
     std::vector<InitialObjectIdentity> importInitialObjects(CollectionTxn&,
         std::span<const InitialObjectRecord>);
+    // Borrowed records: no geometry copy; pointed-to records live through this call.
+    std::vector<InitialObjectIdentity> importInitialObjectRefs(CollectionTxn&,
+        std::span<const InitialObjectRecord* const>);
     // Construct the first edge graph of a history-off store. The producer fills
     // each batch and returns true, or returns false with an empty batch at EOF.
     // It may read external inputs, but must not mutate this collection. All

@@ -331,21 +331,26 @@ void normalizeObjectCoordinates(ObjectRecord& rec,bool defaults,sqlite3* existin
 {
     if (hasGeometryCoordinates(rec.kind)) {
         auto meta = nlohmann::json::parse(rec.meta);
-        if (meta.contains("coordinates"))
-            meta["coordinates"] = geometryCoordinates(meta["coordinates"]);
-        else if (defaults&&(!existingStore||!objectIdByUuid(existingStore,parseUuid(rec.uuid))))
-            meta["coordinates"] = geometryCoordinates(nlohmann::json::object());
+        normalizeObjectCoordinates(meta,rec.kind,defaults&&(meta.contains("coordinates")||!existingStore||!objectIdByUuid(existingStore,parseUuid(rec.uuid))));
         if(existingStore)validateGeometrySourceMetadata(existingStore,rec.uuid,meta.value("source",nlohmann::json::object()));
         rec.meta = meta.dump();
     }
 }
 
+void normalizeObjectCoordinates(nlohmann::json& meta,const std::string& kind,bool defaults)
+{
+    if(!hasGeometryCoordinates(kind))return;
+    if(meta.contains("coordinates"))meta["coordinates"]=geometryCoordinates(meta["coordinates"]);
+    else if(defaults)meta["coordinates"]=geometryCoordinates(nlohmann::json::object());
+}
+
 void insertObjectRow(sqlite3* db,const ObjectRecord& rec,int64_t id,int64_t generation,
-                     const std::string& author,const std::string& host,const std::string& now,bool preserveRecord)
+                     const std::string& author,const std::string& host,const std::string& now,bool preserveRecord,
+                     const std::string* geometryManifest)
 {
     Statement s(db, "INSERT INTO objects(uuid,kind,name,generation,created_by,created_at,created_host,changed_by,changed_at,"
                     "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,"
-                    "storage_kind,storage_ref,data_generation,data_checksum,meta,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "storage_kind,storage_ref,data_generation,data_checksum,meta,id,geometry_manifest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         parseUuid(rec.uuid), rec.kind, rec.name, generation, author, now, host, author, now, host);
     const std::string state = preserveRecord ? rec.approvalState : "pending";
     s.bind(11, state.empty() ? std::string("pending") : state);
@@ -354,7 +359,9 @@ void insertObjectRow(sqlite3* db,const ObjectRecord& rec,int64_t id,int64_t gene
     if (preserveRecord && rec.approvedHost) s.bind(14, *rec.approvedHost); else s.bindNull(14);
     if (preserveRecord && rec.approvedGeneration) s.bind(15, *rec.approvedGeneration); else s.bindNull(15);
     s.bind(16, rec.formatVersion); s.bind(17, rec.storageKind); s.bind(18, rec.storageRef); s.bind(19, rec.dataGeneration);
-    s.bind(20, rec.dataChecksum);s.bind(21, rec.meta);s.bind(22, id);s.stepDone();
+    s.bind(20, rec.dataChecksum);s.bind(21, rec.meta);s.bind(22, id);
+    if(geometryManifest)s.bindBorrowedText(23,*geometryManifest);else s.bindNull(23);
+    s.stepDone();
 }
 
 std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,

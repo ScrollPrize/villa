@@ -11,7 +11,7 @@ struct PreparedInitialGeometry {
     nlohmann::json manifest;
 };
 
-// Internal initial-construction primitive. Input record is already normalized;
+// Internal initial-construction primitive. Normalizes coordinate metadata once;
 // caller owns one savepoint covering preparation, object insertion and payload
 // publication. Preparation may insert shared annotation/identity payloads.
 // The exact same GeometryData must remain unchanged until write completes.

@@ -85,12 +85,18 @@ void InitialShardImport::checkCancelled() const {impl_->check();}
 
 std::vector<InitialObjectIdentity> InitialShardImport::appendObjects(std::span<const InitialObjectRecord> objects)
 {
+    std::vector<const InitialObjectRecord*> refs;refs.reserve(objects.size());
+    for(const auto& record:objects)refs.push_back(&record);
+    return appendObjectRefs(refs);
+}
+std::vector<InitialObjectIdentity> InitialShardImport::appendObjectRefs(std::span<const InitialObjectRecord* const> objects)
+{
     auto& p=*impl_;p.check();
     if(p.edgesStarted || p.insideProducer || p.objectsClosed)p.reject("initial objects must precede edge import");
     try {
         if(objects.size()>uint64_t(INT64_MAX-p.result.objects))throw std::overflow_error("initial object count overflow");
         const auto start=Clock::now();
-        auto identities=p.store.importInitialObjects(p.transaction,objects);
+        auto identities=p.store.importInitialObjectRefs(p.transaction,objects);
         p.result.objectSeconds+=elapsed(start);
         p.result.objects+=static_cast<int64_t>(identities.size());
         return identities;

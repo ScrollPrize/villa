@@ -65,8 +65,10 @@ void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
 void insertObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
 ObjectRecord prepareObjectRecord(const ObjectRecord&);
 void normalizeObjectCoordinates(ObjectRecord&,bool addDefaultCoordinates,sqlite3* existingStore=nullptr);
+void normalizeObjectCoordinates(nlohmann::json& meta,const std::string& kind,bool addDefaultCoordinates);
 void insertObjectRow(sqlite3*,const ObjectRecord&,int64_t id,int64_t generation,
-    const std::string& author,const std::string& host,const std::string& time,bool preserveRecord=false);
+    const std::string& author,const std::string& host,const std::string& time,bool preserveRecord=false,
+    const std::string* geometryManifest=nullptr);
 
 void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags);
 void insertTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags);

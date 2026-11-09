@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/AfvSource.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "internal/Sqlite.hpp"
+#include "geometry/GeometryInternal.hpp"
 #include <nlohmann/json.hpp>
 #include <cmath>
 #include <bit>
@@ -9,6 +10,18 @@
 #include <set>
 
 namespace vc::objects {
+namespace {
+void sourceCache(sqlite3* db,size_t bytes){
+    const auto kib=bytes/1024+(bytes%1024!=0);
+    if(!kib||kib>size_t(std::numeric_limits<int>::max()))throw std::invalid_argument("source SQLite cache budget outside range");
+    detail::exec(db,("PRAGMA cache_size=-"+std::to_string(kib)).c_str());
+}
+size_t sourceMmap(sqlite3* db,size_t bytes){
+    if(bytes>uint64_t(INT64_MAX))throw std::invalid_argument("source SQLite mapping budget outside range");
+    detail::Statement setting(db,"PRAGMA mmap_size="+std::to_string(bytes));
+    return setting.row()?size_t(std::max(int64_t(0),setting.i64(0))):0;
+}
+}
 struct AfvSource::Impl {
     sqlite3* db = nullptr;
     std::unique_ptr<detail::Statement> rows;
@@ -23,7 +36,8 @@ AfvSource::AfvSource(const std::filesystem::path& path, int64_t firstId, int64_t
 {
     if (firstId < 0 || pastLastId < firstId) throw std::invalid_argument("invalid AFV ID interval");
     auto& p = *impl_;
-    const auto rc = sqlite3_open_v2(path.string().c_str(), &p.db, SQLITE_OPEN_READONLY, nullptr);
+    // A source cursor belongs to one reader, including all of its SQLite calls.
+    const auto rc = sqlite3_open_v2(path.string().c_str(), &p.db, SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX, nullptr);
     detail::check(rc, p.db, "open AFV source");
     detail::exec(p.db, "PRAGMA query_only=ON; PRAGMA cache_size=-32768; BEGIN;");
     if (detail::pragmaInt(p.db, "application_id") != 0x56434643 || detail::pragmaInt(p.db, "user_version") != 1)
@@ -70,6 +84,8 @@ const std::string& AfvSource::metadataJson() const { return impl_->metadata; }
 const std::string& AfvSource::uuid() const { return impl_->uuid; }
 int64_t AfvSource::fiberCount() const { return impl_->fibers; }
 int64_t AfvSource::pointCount() const { return impl_->points; }
+void AfvSource::setCacheBytes(size_t bytes){sourceCache(impl_->db,bytes);}
+size_t AfvSource::setMmapBytes(size_t bytes){return sourceMmap(impl_->db,bytes);}
 std::vector<std::array<int64_t,2>> AfvSource::idRanges(size_t partitions,int64_t limit) const
 {
     if(!partitions || limit<0)throw std::invalid_argument("invalid AFV partition count or limit");
@@ -87,6 +103,21 @@ std::vector<std::array<int64_t,2>> AfvSource::idRanges(size_t partitions,int64_t
     for(size_t i=0;i<partitions;++i)ranges.push_back({i?ids[ids.size()*i/partitions]:0,
         i+1==partitions?ids.back()+1:ids[ids.size()*(i+1)/partitions]});
     return ranges;
+}
+std::vector<std::array<int64_t,2>> AfvSource::workRanges(size_t targetPoints,size_t maxFibers,int64_t limit) const
+{
+    if(!targetPoints||!maxFibers||limit<0)throw std::invalid_argument("invalid AFV work chunk budget");
+    detail::Statement rows(impl_->db,"SELECT id,point_count FROM fibers ORDER BY id LIMIT ?",limit?limit:int64_t(-1));
+    std::vector<std::array<int64_t,2>> result;int64_t start=0,last=-1,count=0;uint64_t points=0;size_t fibers=0;
+    while(rows.row()) {
+        const auto id=rows.i64(0),n=rows.i64(1);
+        if(id<0||id>INT64_MAX-3||n<2)throw std::invalid_argument("invalid AFV task catalog entry");
+        if(fibers&&(points>=targetPoints||fibers>=maxFibers)){result.push_back({start,id});start=id;points=0;fibers=0;}
+        points+=uint64_t(n);++fibers;++count;last=id;
+    }
+    if(count!=(limit?std::min(limit,impl_->fibers):impl_->fibers))throw std::invalid_argument("AFV fiber catalog count mismatch");
+    if(fibers)result.push_back({start,last+1});
+    return result;
 }
 bool AfvSource::next(AfvFiber& fiber)
 {
@@ -142,6 +173,8 @@ struct AfcSource::Impl {
     sqlite3* db=nullptr;
     std::unique_ptr<detail::Statement> rows;
     std::string metadata,uuid;
+    std::array<unsigned char,16> uuidBytes;
+    nlohmann::json edgeMetadata={{"afc",nlohmann::json::object()}};
     int64_t count=0,read=0,fiberEnd=INT64_MAX;
     bool full=false,finished=false;
     ~Impl(){rows.reset();if(db)sqlite3_close(db);}
@@ -151,7 +184,8 @@ AfcSource::AfcSource(const std::filesystem::path& path,const std::string& afvUui
 {
     if(firstConstraintId<0 || pastLastConstraintId<=firstConstraintId)throw std::invalid_argument("invalid AFC ID range");
     auto& p=*impl_; p.uuid=util::canonicalUuid(afvUuid);p.fiberEnd=pastLastFiberId;p.full=pastLastFiberId==INT64_MAX && firstConstraintId==0 && pastLastConstraintId==INT64_MAX;
-    detail::check(sqlite3_open_v2(path.string().c_str(),&p.db,SQLITE_OPEN_READONLY,nullptr),p.db,"open AFC source");
+    p.uuidBytes=detail::parseUuid(p.uuid);
+    detail::check(sqlite3_open_v2(path.string().c_str(),&p.db,SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX,nullptr),p.db,"open AFC source");
     detail::exec(p.db,"PRAGMA query_only=ON;PRAGMA cache_size=-32768;BEGIN;");
     nlohmann::json meta=nlohmann::json::object();
     detail::Statement m(p.db,"SELECT key,value FROM metadata");
@@ -176,11 +210,21 @@ AfcSource::AfcSource(const std::filesystem::path& path,const std::string& afvUui
     p.rows=std::make_unique<detail::Statement>(p.db,
         "SELECT id,fiber_a,fiber_b,arc_a,arc_b,ax,ay,az,bx,by,bz,parallel_score,perpendicular_score,"
         "winding_distance,parallel_winding_distance,evidence_weight,normal_a,normal_b,measurement "
-        "FROM constraints WHERE fiber_a<? AND fiber_b<? AND id>=? AND id<? ORDER BY id",pastLastFiberId,pastLastFiberId,firstConstraintId,pastLastConstraintId);
+        "FROM constraints WHERE fiber_a<? AND fiber_b<? AND id>=? AND id<? ORDER BY id");
+    selectRange(firstConstraintId,pastLastConstraintId);
+}
+void AfcSource::selectRange(int64_t firstId,int64_t pastLastId)
+{
+    if(firstId<0||pastLastId<firstId)throw std::invalid_argument("invalid AFC ID range");
+    auto& p=*impl_;p.rows->reset();p.read=0;p.finished=false;
+    p.full=p.fiberEnd==INT64_MAX&&firstId==0&&pastLastId==INT64_MAX;
+    p.rows->bindAll(p.fiberEnd,p.fiberEnd,firstId,pastLastId);
 }
 AfcSource::~AfcSource()=default;
 const std::string& AfcSource::metadataJson()const{return impl_->metadata;}
 int64_t AfcSource::constraintCount()const{return impl_->count;}
+void AfcSource::setCacheBytes(size_t bytes){sourceCache(impl_->db,bytes);}
+size_t AfcSource::setMmapBytes(size_t bytes){return sourceMmap(impl_->db,bytes);}
 std::vector<std::array<int64_t,2>> AfcSource::idRanges(size_t partitions,int64_t limit)const
 {
     if(partitions<1 || limit<0)throw std::invalid_argument("invalid AFC partition count/limit");
@@ -209,16 +253,20 @@ bool AfcSource::next(EdgeRecord& edge)
 {
     auto& p=*impl_;auto& s=*p.rows;
     if(p.finished)return false;
-    if(!s.row()){
+    detail::GeometryPhase total("source.afc.decode");bool hasRow;
+    {detail::GeometryPhase step("source.afc.sqlite_step");hasRow=s.row();}
+    if(!hasRow){
         p.finished=true;
         if(p.full && p.read!=p.count)throw std::invalid_argument("AFC declared count mismatch");
         return false;
     }
     for(int col:{0,1,2})if(sqlite3_column_type(s.value,col)!=SQLITE_INTEGER || s.i64(col)<0)
         throw std::invalid_argument("missing or invalid AFC constraint/fiber ID");
-    edge={};edge.uuid=util::nameUuid(p.uuid,"constraint:"+std::to_string(s.i64(0)));
-    edge.aUuid=util::nameUuid(p.uuid,"fiber:"+std::to_string(s.i64(1)));
-    edge.bUuid=util::nameUuid(p.uuid,"fiber:"+std::to_string(s.i64(2)));
+    {detail::GeometryPhase identity("source.afc.uuid");
+    edge={};edge.uuid=util::nameUuid(p.uuidBytes,"constraint:"+std::to_string(s.i64(0)));
+    edge.aUuid=util::nameUuid(p.uuidBytes,"fiber:"+std::to_string(s.i64(1)));
+    edge.bUuid=util::nameUuid(p.uuidBytes,"fiber:"+std::to_string(s.i64(2)));
+    }
     for(int col:{5,6,7,8,9,10,11,12})
         if(sqlite3_column_type(s.value,col)==SQLITE_NULL || !std::isfinite(s.f64(col)))
             throw std::invalid_argument("missing or non-finite AFC position/classification score");
@@ -226,15 +274,22 @@ bool AfcSource::next(EdgeRecord& edge)
     edge.aAnchor.position=std::array<double,3>{s.f64(5),s.f64(6),s.f64(7)};
     edge.bAnchor.position=std::array<double,3>{s.f64(8),s.f64(9),s.f64(10)};
     edge.aAnchor.wholeGeometry=true;edge.bAnchor.wholeGeometry=true;
-    nlohmann::json fields={{"id",s.i64(0)},{"source_fiber_a",s.i64(1)},{"source_fiber_b",s.i64(2)},
-        {"a_uuid",edge.aUuid},{"b_uuid",edge.bUuid}};
+    // Keep the fixed object/map nodes between records; only the values change.
+    // This preserves the canonical JSON and every source field without
+    // allocating/freeing the entire descriptor tree for each constraint.
+    auto& fields=p.edgeMetadata["afc"];
+    fields["id"]=s.i64(0);fields["source_fiber_a"]=s.i64(1);fields["source_fiber_b"]=s.i64(2);
+    fields["a_uuid"]=edge.aUuid;fields["b_uuid"]=edge.bUuid;
     for(int col:{3,4,11,12,13,14,15}){
         if(sqlite3_column_type(s.value,col)==SQLITE_NULL){fields[sqlite3_column_name(s.value,col)]=nullptr;continue;}
         if(!std::isfinite(s.f64(col)))throw std::invalid_argument("non-finite AFC scalar");
         fields[sqlite3_column_name(s.value,col)]=s.f64(col);
     }
+    {detail::GeometryPhase parse("source.afc.json_parse");
     for(int col=16;col<=18;++col)fields[sqlite3_column_name(s.value,col)]=
         sqlite3_column_type(s.value,col)==SQLITE_NULL?nlohmann::json(nullptr):nlohmann::json::parse(s.text(col));
-    edge.meta=nlohmann::json({{"afc",std::move(fields)}}).dump();++p.read;return true;
+    }
+    {detail::GeometryPhase dump("source.afc.json_dump");edge.meta=p.edgeMetadata.dump();}
+    ++p.read;return true;
 }
 }

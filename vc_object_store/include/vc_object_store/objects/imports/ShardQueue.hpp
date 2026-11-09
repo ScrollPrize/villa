@@ -42,11 +42,14 @@ public:
         failure_.check();q.bytes+=bytes;q.batches.push_back({std::move(rows),bytes});q.cv.notify_all();
     }
     template<class Check> bool pop(size_t shard,std::vector<T>& rows,Check&& check) {
+        // Destruct previous payloads outside the queue lock. This can free
+        // megabytes and must not serialize every producer targeting this shard.
+        rows.clear();
         auto& q=*queues_.at(shard);std::unique_lock lock(q.mutex);
         while(q.batches.empty()&&!q.closed) {
             failure_.check();check();q.cv.wait_for(lock,std::chrono::milliseconds(50));
         }
-        failure_.check();rows.clear();if(q.batches.empty())return false;
+        failure_.check();if(q.batches.empty())return false;
         auto batch=std::move(q.batches.front());q.batches.pop_front();q.bytes-=batch.bytes;
         rows=std::move(batch.rows);q.cv.notify_all();return true;
     }

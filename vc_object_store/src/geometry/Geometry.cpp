@@ -273,6 +273,7 @@ PreparedInitialGeometry detail::prepareInitialGeometry(sqlite3* db,const ObjectR
     { GeometryPhase manifest("initial.geometry.manifest_and_hash");
       result.manifest=geometryManifest(data,storage.surfaceTileSize); }
     auto meta=nlohmann::json::parse(object.meta);
+    normalizeObjectCoordinates(meta,object.kind,true);
     if(data.kind!="surface") {
         auto source=meta.value("source",nlohmann::json::object());
         result.manifest["sequences"]=initialSequences(db,data,source);
@@ -298,6 +299,7 @@ PreparedInitialGeometry detail::prepareInitialGeometry(sqlite3* db,const ObjectR
     result.contentHash=geometryHash(std::span(reinterpret_cast<const uint8_t*>(result.manifestText.data()),result.manifestText.size()));
     result.revisionUuid=newGeometryToken(db,object.uuid);
     result.record.storageKind="sqlite";
+    result.record.storageRef=result.revisionUuid;
     result.record.dataGeneration=writeGeneration(db);
     result.record.dataChecksum=result.contentHash;
     return result;
@@ -310,8 +312,8 @@ void detail::writeInitialGeometry(ObjectStore& store,WriteTxn& txn,const Prepare
     auto* db=ObjectStoreImplAccess::conn(txn);
     if(historyEnabled(db)||spatialEnabled(db)||objectId<=0)
         throw std::invalid_argument("initial geometry requires a new object in history-off/spatial-off storage");
-    insertCurrentGeometry(db,prepared.record.uuid,prepared.revisionUuid,
-        prepared.contentHash,prepared.manifestText);
+    // The initial object INSERT already includes the complete current descriptor.
+    // Do not rewrite its metadata/indexes merely to attach the same manifest.
     writeArrays(db,prepared.revisionUuid,data.arrays,prepared.manifest);
 }
 

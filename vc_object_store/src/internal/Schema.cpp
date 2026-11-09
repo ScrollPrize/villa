@@ -14,7 +14,9 @@ void createSchema(sqlite3* db, bool history, const std::optional<std::string>& s
     exec(db, R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
-  state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0,1,2)),
+  -- Keep scalar comparisons: IN with three literals opens a temporary B-tree
+  -- per INSERT on SQLite 3.45, serializing independent writers on PCACHE locks.
+  state INTEGER NOT NULL DEFAULT 0 CHECK(state=0 OR state=1 OR state=2),
   lifecycle_epoch TEXT NOT NULL DEFAULT '',
   kind TEXT NOT NULL CHECK(length(kind)>0),
   name TEXT NOT NULL DEFAULT '',

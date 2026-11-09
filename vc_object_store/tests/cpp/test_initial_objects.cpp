@@ -47,6 +47,16 @@ void geometry(){
     require(nlohmann::json::parse(ra.meta)==nlohmann::json::parse(rb.meta),"source annotation ownership and coordinates preserved");
     require(initial.readGeometryArray(b,gb->uuid,"control_points").empty(),"no invented control points");
 }
+void scalarStateCheck(){
+    TemporaryDirectory dir;OpenOptions o;o.author="test";o.history=HistoryMode::Off;o.spatialIndex=false;
+    auto store=ObjectStore::create(dir.path/"state",o);auto txn=store.write();auto* db=ObjectStoreImplAccess::conn(txn);
+    {Statement program(db,"EXPLAIN INSERT INTO objects(uuid,kind,created_by,created_at,created_host,changed_by,changed_at,changed_host) VALUES(?, 'note','','','','','','')",parseUuid(util::newUuid()));
+    while(program.row())require(program.text(1)!="OpenEphemeral","object INSERT constructs a temporary B-tree");}
+    const auto item=record();store.upsertObject(txn,item);
+    for(int64_t state:{0,1,2})execute(db,"UPDATE objects SET state=? WHERE uuid=?",state,parseUuid(item.uuid));
+    for(const auto* invalid:{"-1","3","0.5","NULL","'invalid'"})
+        mustFail([&]{exec(db,(std::string("UPDATE objects SET state=")+invalid).c_str());});
+}
 void rollbackAndLifecycle(){
     TemporaryDirectory dir;OpenOptions o;o.author="test";o.history=HistoryMode::Off;o.spatialIndex=false;o.objectIdRange={10,30};
     auto store=ObjectStore::create(dir.path/"objects",o);auto a=record(),b=record();std::string relation;
@@ -74,5 +84,5 @@ void rollbackAndLifecycle(){
     mustFail([&]{insertInitialObjects(history,t,{});});
 }
 }
-int main(){try{parity(false);parity(true);geometry();rollbackAndLifecycle();std::cout<<"initial objects passed\n";return 0;}
+int main(){try{parity(false);parity(true);geometry();scalarStateCheck();rollbackAndLifecycle();std::cout<<"initial objects passed\n";return 0;}
 catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

@@ -46,6 +46,7 @@ public:
     // failure in another shard can cancel them even before their next append.
     void checkCancelled() const;
     std::vector<InitialObjectIdentity> appendObjects(std::span<const InitialObjectRecord>);
+    std::vector<InitialObjectIdentity> appendObjectRefs(std::span<const InitialObjectRecord* const>);
     int64_t importEdges(const std::function<bool(std::vector<InitialCollectionEdge>&)>&);
 private:
     struct Impl;

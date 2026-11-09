@@ -2,6 +2,7 @@
 // Source decoding and UUID generation finish before any import timer starts.
 #include "vc_object_store/objects/AfvSource.hpp"
 #include "vc_object_store/objects/InitialImport.hpp"
+#include "vc_object_store/objects/imports/ParallelImportStream.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "geometry/SharedGeometry.hpp"
 #include "internal/RecordJson.hpp"
@@ -270,60 +271,67 @@ Json reduced(const Prepared& data,const fs::path& path,bool verifyReadback){
     result["verify_seconds"]=elapsed(verify);
     return result;
 }
-Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,size_t workers,size_t sqlRows,
-    size_t exportWorkers,bool preSizeExport,size_t residentBytes,bool verifyReadback){
-    InitialImportOptions opt;opt.store.author="prepared-benchmark";opt.store.sqliteCacheBytes=512*1024*1024;
+Json native(Prepared& data,const fs::path& path,bool linked,bool packed,size_t workers,size_t sqlRows,
+    size_t exportWorkers,bool preSizeExport,size_t residentBytes,bool verifyReadback,size_t sqliteCacheBytes){
+    using namespace vc::objects::imports;
+    InitialImportOptions opt;opt.store.author="prepared-benchmark";opt.store.sqliteCacheBytes=sqliteCacheBytes;
     opt.edges.sqlBatchRows=sqlRows;
     require(workers>0&&workers<=data.objects.size(),"sharded benchmark needs at least one object per worker");
-    // Partition once, outside ingestion timing. The writer sees contiguous
-    // batches already matching the UUID routing contract; no endpoint map or
-    // per-record dispatch is added to its timed insertion path.
+    // Retain benchmark-local prototype IDs, but let native shards allocate their
+    // own disjoint numeric ranges. Geometry and metadata are never copied here.
     const auto partitionStart=Clock::now();
-    std::vector<std::vector<InitialObjectRecord>> objectsByWorker(workers);
-    std::vector<std::vector<size_t>> edgesByWorker(workers);
-    for(const auto& o:data.objects)objectsByWorker[uuidShardIndex(o.record.uuid,workers)].push_back(o);
-    for(size_t i=0;i<data.edges.size();++i)edgesByWorker[uuidShardIndex(data.edges[i].uuid,workers)].push_back(i);
-    opt.shards.clear();int64_t nextObject=1,nextEdge=1;
+    struct RestoreIds {Prepared& data;std::vector<std::optional<int64_t>> ids;
+        ~RestoreIds(){for(size_t i=0;i<ids.size();++i)data.objects[i].id=ids[i];}} restore{data,{}};
+    restore.ids.reserve(data.objects.size());
+    for(auto& row:data.objects){restore.ids.push_back(row.id);row.id.reset();}
+    opt.shards.clear();const auto reservation=INT64_MAX/int64_t(workers);
     for(size_t i=0;i<workers;++i){
-        const auto objectCount=int64_t(std::max(size_t(1),objectsByWorker[i].size()));
-        const auto edgeCount=int64_t(std::max(size_t(1),edgesByWorker[i].size()));
-        opt.shards.push_back({{nextObject,nextObject+objectCount-1},{nextEdge,nextEdge+edgeCount-1}});
-        for(size_t j=0;j<objectsByWorker[i].size();++j)objectsByWorker[i][j].id=nextObject+int64_t(j);
-        nextObject+=objectCount;nextEdge+=edgeCount;
+        const std::array<int64_t,2> range{int64_t(i)*reservation+1,int64_t(i+1)*reservation};opt.shards.push_back({range,range});
     }
     const auto partitionSeconds=elapsed(partitionStart);
     if(packed){opt.packed.emplace();opt.packed->disposableBulk=true;opt.packed->memoryFirst=true;
         opt.packed->backgroundFlush=false;opt.packed->residentBytes=residentBytes;
         opt.packed->exportWorkers=exportWorkers;opt.packed->preSizeExport=preSizeExport;}
-    // Same 256-record native batches and statement size as the production pilot.
     std::string owner;double dependency=0;
-    const auto appendObjects=[&](size_t worker,InitialShardImport& part){
-        const auto& objects=objectsByWorker[worker];
-        for(size_t i=0;i<objects.size();i+=256)part.appendObjects(std::span(objects).subspan(i,std::min(size_t(256),objects.size()-i)));
-    };
-    if(linked){const auto base=path.string()+".base";const auto start=Clock::now();
-        const auto result=importInitialCollection(base,opt,[&](size_t i,InitialShardImport& part){appendObjects(i,part);});
-        owner=result.storeUuid;dependency=elapsed(start);opt.dependencies={base};}
     std::vector<d::GeometryWork> work(workers);
-    const auto objectProducer=[&](size_t i,InitialShardImport& part){
+    Json perReader=Json::array();
+    const auto runImport=[&](const fs::path& target,bool withObjects,bool withEdges,bool profile){
+      ParallelImportStream stream({workers,workers,256,8*1024*1024,256*1024*1024});
+      constexpr size_t objectChunk=1024,edgeChunk=2048;
+      stream.start(withObjects?(data.objects.size()+objectChunk-1)/objectChunk:0,
+        withEdges?(data.edges.size()+edgeChunk-1)/edgeChunk:0,
+        [&](size_t,size_t task,ObjectEmitter& emit){
+            for(size_t i=task*objectChunk;i<std::min((task+1)*objectChunk,data.objects.size());++i)
+                emit.emit(ImportObject{&data.objects[i]},sizeof(ImportObject),data.objects[i].record.uuid);
+        },[&](size_t,size_t task,EdgeEmitter& emit){
+            for(size_t i=task*edgeChunk;i<std::min((task+1)*edgeChunk,data.edges.size());++i){
+                const auto& e=data.edges[i];emit.emit({{"",e.aUuid},{"",e.bUuid},e},sizeof(InitialCollectionEdge)+e.meta.size(),e.uuid);
+            }
+        });
+      const auto objectProducer=[&](size_t i,InitialShardImport& part){try{
         // The builder uses fresh std::async worker threads and joins them before
         // returning. Keep profiling until thread exit so seal/commit/checkpoint
         // are covered too; work remains alive until after every thread joins.
-        thread_local std::unique_ptr<d::GeometryWorkScope> profile;
-        profile=std::make_unique<d::GeometryWorkScope>(work[i]);
-        if(!linked)appendObjects(i,part);
+        thread_local std::unique_ptr<d::GeometryWorkScope> profileScope;
+        if(profile)profileScope=std::make_unique<d::GeometryWorkScope>(work[i]);
+        std::vector<ImportObject> rows;std::vector<const InitialObjectRecord*> refs;
+        while(stream.popObjects(i,rows,[&]{part.checkCancelled();})){
+            refs.clear();refs.reserve(rows.size());for(const auto& row:rows)refs.push_back(&row.get());part.appendObjectRefs(refs);
+        }
+      }catch(...){stream.fail(std::current_exception());throw;}};
+      const auto edgeProducer=[&](size_t i,InitialShardImport& part){try{
+        if(withEdges)part.importEdges([&](std::vector<InitialCollectionEdge>& batch){return stream.popEdges(i,batch,[&]{part.checkCancelled();});});
+      }catch(...){stream.fail(std::current_exception());throw;}};
+      InitialImportResult result;
+      try{result=importInitialCollection(target,opt,objectProducer,edgeProducer);stream.finish();}
+      catch(...){stream.fail(std::current_exception());try{stream.finish();}catch(...){}throw;}
+      if(profile)for(size_t i=0;i<stream.readers.size();++i){const auto& r=stream.readers[i];perReader.push_back({{"reader",i},
+        {"object_tasks",r.objectTasks},{"edge_tasks",r.edgeTasks},{"object_seconds",r.objectSeconds},{"edge_seconds",r.edgeSeconds},{"queue_wait_seconds",r.queueWaitSeconds}});}
+      return result;
     };
-    const auto edgeProducer=[&](size_t i,InitialShardImport& part){
-        const auto& endpointOwner=linked?owner:part.storeUuid();
-        const auto& indices=edgesByWorker[i];const auto last=indices.size();size_t next=0;
-        if(!data.edges.empty())part.importEdges([&](std::vector<InitialCollectionEdge>& batch){
-            batch.clear();const auto end=std::min(next+256,last);batch.reserve(end-next);
-            for(;next<end;++next){const auto& e=data.edges[indices[next]];batch.push_back({{endpointOwner,e.aUuid},{endpointOwner,e.bUuid},e});}
-            return !batch.empty();
-        });
-    };
-    const auto result=workers>1?importInitialCollection(path,opt,objectProducer,edgeProducer):
-        importInitialCollection(path,opt,[&](size_t i,auto& part){objectProducer(i,part);edgeProducer(i,part);});
+    if(linked){const auto base=path.string()+".base";const auto start=Clock::now();const auto result=runImport(base,true,false,false);
+        owner=result.storeUuid;dependency=elapsed(start);opt.dependencies={base};}
+    const auto result=runImport(path,!linked,true,true);
     if(!linked)owner=result.storeUuid;
     InitialShardResult summed;
     for(const auto& shard:result.shards){summed.objectSeconds+=shard.objectSeconds;summed.edgeSeconds+=shard.edgeSeconds;
@@ -343,15 +351,15 @@ Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,si
         {"edges_seconds",summed.edgeSeconds},{"producer_seconds",summed.producerSeconds},
         {"creation_seconds",summed.creationSeconds},{"seal_commit_seconds",summed.sealCommitSeconds},
         {"manifest_seconds",result.manifestSeconds},{"persistence_seconds",result.persistenceSeconds},
-        {"uuid_partition_preparation_seconds_excluded",partitionSeconds},{"uuid_hash_routing",true},
+        {"uuid_partition_preparation_seconds_excluded",partitionSeconds},{"uuid_hash_routing",true},{"parallel_stream",true},{"per_reader",perReader},
         {"dependency_preparation_seconds_excluded",dependency},{"phase_seconds",phases},{"per_worker",perWorker},
         {"workers",workers},{"component_times_are_worker_sums",workers>1},{"ingestion_seconds",result.ingestionSeconds}};
     if(workers>1) {
         size_t crossShard=0,remote=0;
-        for(size_t i=0;i<workers;++i){for(const auto n:edgesByWorker[i]){
+        for(size_t n=0;n<data.edges.size();++n){const auto i=uuidShardIndex(data.edges[n].uuid,workers);
             const auto left=uuidShardIndex(data.edges[n].aUuid,workers),right=uuidShardIndex(data.edges[n].bUuid,workers);
             crossShard+=left!=right;remote+=(left!=i)+(right!=i);
-        }}
+        }
         out["cross_shard_constraints"]=crossShard;out["remote_endpoint_references"]=remote;
     }
     out["readback_verified"]=verifyReadback;out["verify_seconds"]=0.0;
@@ -380,8 +388,8 @@ int main(int argc,char** argv){try{
     for(const auto& run:cases) {
         require(run.is_object(),"each case must be an object");
         for(const auto& [key,value]:run.items())require(key=="variant"||key=="workers"||key=="sql_batch_rows"||key=="repetitions"||key=="label"||
-            key=="export_workers"||key=="pre_size_export"||key=="resident_bytes",
-            "cases may change only variant, workers, sql_batch_rows, repetitions, label, export_workers, pre_size_export or resident_bytes; input is shared");
+            key=="export_workers"||key=="pre_size_export"||key=="resident_bytes"||key=="sqlite_cache_bytes",
+            "cases may change only variant, workers, sql_batch_rows, repetitions, label, export_workers, pre_size_export, resident_bytes or sqlite_cache_bytes; input is shared");
         const std::string variant=run.at("variant");
         require(variant=="prototype"||variant=="native"||variant=="linked"||variant=="native_packed"||
             variant=="native_sharded"||variant=="native_packed_sharded","unknown variant");
@@ -421,7 +429,8 @@ int main(int argc,char** argv){try{
         std::cout<<Json({{"stage","case_start"},{"case",caseIndex},{"variant",variant},{"workers",workers},{"repetition",repeat}}).dump()<<std::endl;
         const bool verifyReadback=config.value("verify_readback",false);
         Json result=variant=="prototype"?reduced(data,path,verifyReadback):native(data,path,variant=="linked",variant.starts_with("native_packed"),workers,sqlRows,
-            exportWorkers,preSizeExport,residentBytes,verifyReadback);
+            exportWorkers,preSizeExport,residentBytes,verifyReadback,run.value("sqlite_cache_bytes",config.value("sqlite_cache_bytes",size_t(512)*1024*1024)));
+        result["sqlite_cache_bytes"]=run.value("sqlite_cache_bytes",config.value("sqlite_cache_bytes",size_t(512)*1024*1024));
         result["case"]=caseIndex;result["label"]=run.value("label",variant);result["variant"]=variant;result["workers"]=workers;
         result["sql_batch_rows"]=sqlRows;result["repetition"]=repeat;
         result["packed_export_options_applied"]=variant.starts_with("native_packed");

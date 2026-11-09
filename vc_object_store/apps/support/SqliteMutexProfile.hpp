@@ -29,6 +29,7 @@ inline std::array<std::atomic<sqlite3_mutex*>,14> staticMutexes{};
 inline thread_local std::array<Counters,14> counters{};
 inline bool installed=false;
 inline bool captureStacks=false;
+inline uint64_t stackInterval=65536;
 struct StackSample {
     std::array<void*,8> frames{};
     int depth=0;
@@ -75,7 +76,7 @@ inline void enter(sqlite3_mutex* mutex)
     // Capture before entering the lock, never while holding the shared PMEM
     // lock. Stack storage itself is fixed-size and thread-local. Symbol lookup
     // happens only in the much less frequent progress snapshot.
-    if(captureStacks && category==SQLITE_MUTEX_STATIC_PMEM && value.calls%65536==0)
+    if(captureStacks && category==SQLITE_MUTEX_STATIC_PMEM && value.calls%stackInterval==0)
         capturePmemStack();
     if((value.calls%1024)==0){
         const auto start=std::chrono::steady_clock::now();
@@ -90,8 +91,9 @@ inline void enter(sqlite3_mutex* mutex)
     original.xMutexEnter(mutex);
 }
 
-inline void install(bool withStacks=false)
+inline void install(bool withStacks=false,uint64_t interval=65536)
 {
+    if(!interval)throw std::invalid_argument("SQLite stack sample interval must be positive");
     if(installed)throw std::logic_error("SQLite mutex profiler already installed");
 #if !VC_SQLITE_PROFILE_STACKS
     if(withStacks)throw std::runtime_error("SQLite stack profiling is unsupported on this platform");
@@ -106,6 +108,7 @@ inline void install(bool withStacks=false)
         throw std::runtime_error("Cannot install SQLite mutex profiler");
     installed=true;
     captureStacks=withStacks;
+    stackInterval=interval;
 }
 
 // Read only the calling thread's counters. Safe while other workers run;

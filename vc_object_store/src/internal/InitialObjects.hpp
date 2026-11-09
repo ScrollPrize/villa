@@ -7,4 +7,6 @@ namespace vc::objects::detail {
 // for privately adding immutable reference endpoints during initial edge import.
 std::vector<std::pair<std::string,int64_t>> insertInitialObjects(
     ObjectStore&,WriteTxn&,std::span<const InitialObjectRecord>);
+std::vector<std::pair<std::string,int64_t>> insertInitialObjectRefs(
+    ObjectStore&,WriteTxn&,std::span<const InitialObjectRecord* const>);
 }

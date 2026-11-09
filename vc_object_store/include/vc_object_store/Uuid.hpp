@@ -69,5 +69,6 @@ inline std::string newUuid()
 std::string nameUuid(std::string_view name);
 // The same in another namespace (a UUID), e.g. one shared with other tools.
 std::string nameUuid(const std::string& namespaceUuid, std::string_view name);
+std::string nameUuid(const std::array<unsigned char,16>& namespaceUuid, std::string_view name);
 
 } // namespace vc::objects::util

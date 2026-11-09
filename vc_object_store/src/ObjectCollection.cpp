@@ -858,10 +858,17 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
 std::vector<InitialObjectIdentity> ObjectCollection::importInitialObjects(
     CollectionTxn& t,std::span<const InitialObjectRecord> records)
 {
+    std::vector<const InitialObjectRecord*> refs;refs.reserve(records.size());
+    for(const auto& record:records)refs.push_back(&record);
+    return importInitialObjectRefs(t,refs);
+}
+std::vector<InitialObjectIdentity> ObjectCollection::importInitialObjectRefs(
+    CollectionTxn& t,std::span<const InitialObjectRecord* const> records)
+{
     auto& w=impl_->writer(t);auto* db=impl_->db(t,0);
     if(historyEnabled(db))throw std::runtime_error("initial objects require history-off storage");
     Savepoint save(db);
-    const auto inserted=detail::insertInitialObjects(*impl_->nodes[0].store,w,records);
+    const auto inserted=detail::insertInitialObjectRefs(*impl_->nodes[0].store,w,records);
     std::vector<InitialObjectIdentity> result;result.reserve(inserted.size());
     for(const auto& [uuid,id]:inserted)result.push_back({{impl_->nodes[0].member.storeUuid,uuid},id});
     save.release();return result;
