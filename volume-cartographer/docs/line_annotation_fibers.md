@@ -124,8 +124,15 @@ OME pyramids, display coordinates refer to the finest declared grid. The GUI
 maps annotation coordinates into the prediction/normal manifest's base grid,
 so displaying the downscaled compound does not shift tracing to another location.
 
-Changing the project's normal source invalidates the annotation's normal samplers and cached
-alignment metrics; it is refused while a line solve is running. The recorded
+Dataset selection is available in read-only inspection panes as well as editable
+ones. Changes share one dependency-based invalidation path: switching a compound
+fiber dataset also invalidates normal-derived state when predicted normals are
+selected; switching an inactive Lasagna dataset does not. Normal changes clear
+cached/pending alignment metrics, reject late old-source metric results, and
+resample the existing line geometry to refresh open strips. Prediction changes
+also reset the trace-scale normal adapter, even with a separate Lasagna source.
+Historical segment solve metadata is preserved; affected sessions are marked as
+needing optimization. Input changes are refused while a line solve is running. The recorded
 segment `normal_manifest` identifies the actual source, including the compound
 Zarr when predicted normals were used.
 

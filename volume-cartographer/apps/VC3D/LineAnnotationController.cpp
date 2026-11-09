@@ -148,6 +148,7 @@ struct LineAnnotationController::LineAnnotationSession {
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
     bool usingFiberNormals = false;
+    bool normalSamplesStale = false;
     bool inspectionFrameOnly = false;
     bool modelOnly = false;
     // A stored fiber opens view only: the editing signals of its dialog are
@@ -2062,6 +2063,14 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     dialog->setFiberOptimizationMode(session->fiberOptimizationMode);
     dialog->setModelOnlySession(session->modelOnly);
     refreshLineAnnotationDatasetMenu(dialog);
+    // Input selection is project state, not a fiber edit: it must work for
+    // read-only inspection panes too, and must not be wired twice on edit-enable.
+    connect(dialog, &LineAnnotationDialog::lasagnaDatasetSelectionChanged,
+            this, &LineAnnotationController::handleLasagnaDatasetSelectionChanged);
+    connect(dialog, &LineAnnotationDialog::fiberInferenceDatasetSelectionChanged,
+            this, &LineAnnotationController::handleFiberInferenceDatasetSelectionChanged);
+    connect(dialog, &LineAnnotationDialog::normalSourceSelectionChanged,
+            this, &LineAnnotationController::handleNormalSourceSelectionChanged);
     if (!dialog->addPane(surfaceName, tr("Line Annotation Slice"), camera)) {
         dialog->deleteLater();
         _state->setSurface(surfaceName, nullptr);
@@ -2362,59 +2371,6 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
                 }
                 setFiberTag(pane->session->fiberId, tag, enabled);
             });
-    connect(dialog,
-            &LineAnnotationDialog::lasagnaDatasetSelectionChanged,
-            this,
-            [this](const std::string& location) {
-                handleLasagnaDatasetSelectionChanged(location);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::fiberInferenceDatasetSelectionChanged,
-            this,
-            [this](const std::string& location) {
-                handleFiberInferenceDatasetSelectionChanged(location);
-            });
-    connect(dialog, &LineAnnotationDialog::normalSourceSelectionChanged, this,
-            [this](const std::string& source) {
-        for (const auto& pane : _panes) {
-            if (pane.session && pane.session->taskState == LineAnnotationSession::TaskState::Running) {
-                showError(tr("Wait for the running line optimization before changing normals."),
-                          pane.session->suppressErrorDialogs);
-                refreshLineAnnotationDatasetMenus();
-                return;
-            }
-        }
-        if (!_state || !_state->vpkg()) return;
-        try {
-            _state->vpkg()->setAnnotationNormalSource(source);
-        } catch (const std::exception& ex) {
-            showError(tr("Could not save normal source: %1").arg(QString::fromUtf8(ex.what())),
-                      _errorDialogsSuppressed);
-            refreshLineAnnotationDatasetMenus();
-            return;
-        }
-        ++_fiberMetricsGeneration; // discard in-flight results for the previous field
-        _fiberAlignmentMetrics.clear();
-        _pendingFiberAlignmentMetrics.clear();
-        _pendingFiberAlignmentMetricTokens.clear();
-        _fiberMetricsPending = false;
-        for (const auto& pane : _panes) {
-            if (!pane.session || pane.session->modelOnly) continue;
-            auto& session = *pane.session;
-            session.dataset.reset();
-            session.normalSampler.reset();
-            session.traceNormalDataset.reset();
-            session.traceNormalSampler.reset();
-            session.usingFiberNormals = false;
-            session.selectedDatasetLocation.clear();
-            session.traceNormalDatasetLocation.clear();
-            if (!session.controlPoints.empty())
-                setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
-            updateGeneratedViewMetricsForFiber(session.fiberId);
-        }
-        refreshLineAnnotationDatasetMenus();
-        emit fibersChanged();
-    });
     connect(dialog,
             &LineAnnotationDialog::crossSectionDragFinished,
             this,
@@ -8244,6 +8200,33 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
                                                        bool required,
                                                        const std::function<bool()>& stillValid)
 {
+    if (!resolveDatasetForSession(session, required, stillValid)) return false;
+    if (session.normalSamplesStale && !session.modelOnly) {
+        try {
+            // Preserve the geometry and historical solve metadata; only the
+            // derived normal samples/display frame belong to the new source.
+            if (!session.optimizedLine.points.empty()) {
+                const auto points = linePointPositions(session.optimizedLine);
+                session.optimizedLine = session.normalSampler
+                    ? lineModelFromPoints(points, session.normalSampler.get())
+                    : vc::lasagna::lineModelForInspection(points);
+                ++session.lineRevision;
+            }
+            session.inspectionFrameOnly = !session.normalSampler;
+            session.normalSamplesStale = false;
+        } catch (const std::exception& ex) {
+            showError(tr("Could not refresh line normals: %1").arg(QString::fromUtf8(ex.what())),
+                      session.suppressErrorDialogs || _errorDialogsSuppressed);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& session,
+                                                        bool required,
+                                                        const std::function<bool()>& stillValid)
+{
     if (session.modelOnly) {
         try {
             if (!_state || !_state->currentVolume())
@@ -8492,90 +8475,106 @@ void LineAnnotationController::refreshLineAnnotationDatasetMenu(
         vpkg->selectedFiberInferenceDataset());
 }
 
-void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
-    const std::string& location)
+bool LineAnnotationController::canChangeAnnotationInputs()
 {
-    if (!_state || !_state->vpkg() || location.empty()) {
-        return;
-    }
+    if (!_state || !_state->vpkg()) return false;
     for (const auto& pane : _panes) {
         if (pane.session &&
             pane.session->taskState == LineAnnotationSession::TaskState::Running) {
             showError(tr("Line optimization is already running."),
                       pane.session->suppressErrorDialogs);
             refreshLineAnnotationDatasetMenus();
-            return;
+            return false;
         }
     }
+    return true;
+}
 
-    auto vpkg = _state->vpkg();
-    if (vpkg->selectedLasagnaDataset() == location) {
-        return;
+void LineAnnotationController::invalidateAnnotationInputs(bool predictionsChanged, bool normalsChanged)
+{
+    if (normalsChanged) {
+        // Includes fibers with no open pane and rejects both partial and final
+        // publications by metric workers that still hold the previous source.
+        ++_fiberMetricsGeneration;
+        _fiberAlignmentMetrics.clear();
+        _pendingFiberAlignmentMetrics.clear();
+        _pendingFiberAlignmentMetricTokens.clear();
+        _fiberMetricsPending = false;
+        ++_orientationEpoch;
     }
-    vpkg->setSelectedLasagnaDataset(location);
     for (const auto& pane : _panes) {
-        if (!pane.session) {
-            continue;
-        }
+        if (!pane.session || pane.session->modelOnly || (!predictionsChanged && !normalsChanged)) continue;
         auto& session = *pane.session;
-        if (session.modelOnly) continue;
-        if (session.usingFiberNormals) continue;
-        session.dataset.reset();
-        session.normalSampler.reset();
+        if (predictionsChanged) {
+            session.fiberInferenceDataset.reset();
+            session.fiberPredictionField.reset();
+            session.selectedFiberInferenceDatasetLocation.clear();
+            session.selectedFiberManifestIdentity.clear();
+            session.selectedFiberInferenceManifestPath.clear();
+            session.fiberTraceToBaseScale = 1.0;
+        }
+        // Trace-scale normals depend on BOTH the prediction grid and the
+        // normal source, even when Lasagna supplies the base normal field.
         session.traceNormalDataset.reset();
         session.traceNormalSampler.reset();
-        session.selectedDatasetLocation.clear();
         session.traceNormalDatasetLocation.clear();
-        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
-            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        if (normalsChanged) {
+            session.dataset.reset();
+            session.normalSampler.reset();
+            session.usingFiberNormals = false;
+            session.selectedDatasetLocation.clear();
+            session.selectedLasagnaManifestIdentity.clear();
+            session.selectedManifestPath.clear();
+            session.workingToBaseScale = 1.0;
+            session.normalSamplesStale = true;
         }
+        if (!session.controlPoints.empty())
+            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        if (normalsChanged) updateGeneratedViewMetricsForFiber(session.fiberId);
     }
+    if (normalsChanged) scheduleStaleViewRefresh();
     refreshLineAnnotationDatasetMenus();
+    if (predictionsChanged || normalsChanged) emit fibersChanged();
+}
+
+void LineAnnotationController::handleNormalSourceSelectionChanged(const std::string& source)
+{
+    if (!canChangeAnnotationInputs()) return;
+    auto vpkg = _state->vpkg();
+    const bool changed = vpkg->annotationNormalSource() != source;
+    try {
+        // Persist an explicit Lasagna choice even when it equals the unset
+        // project's fallback, so a later attachment cannot override it.
+        vpkg->setAnnotationNormalSource(source);
+    } catch (const std::exception& ex) {
+        showError(tr("Could not save normal source: %1").arg(QString::fromUtf8(ex.what())),
+                  _errorDialogsSuppressed);
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    invalidateAnnotationInputs(false, changed);
+}
+
+void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
+    const std::string& location)
+{
+    if (location.empty() || !canChangeAnnotationInputs()) return;
+    auto vpkg = _state->vpkg();
+    if (vpkg->selectedLasagnaDataset() == location) return;
+    vpkg->setSelectedLasagnaDataset(location);
+    invalidateAnnotationInputs(false, vpkg->annotationNormalSource() == "lasagna");
 }
 
 void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
     const std::string& location)
 {
-    if (!_state || !_state->vpkg() || location.empty()) {
-        return;
-    }
-    for (const auto& pane : _panes) {
-        if (pane.session &&
-            pane.session->taskState == LineAnnotationSession::TaskState::Running) {
-            showError(tr("Line optimization is already running."),
-                      pane.session->suppressErrorDialogs);
-            refreshLineAnnotationDatasetMenus();
-            return;
-        }
-    }
-
+    if (location.empty() || !canChangeAnnotationInputs()) return;
     auto vpkg = _state->vpkg();
     if (vpkg->selectedFiberInferenceDataset() == location) {
         return;
     }
     vpkg->setSelectedFiberInferenceDataset(location);
-    for (const auto& pane : _panes) {
-        if (!pane.session) {
-            continue;
-        }
-        auto& session = *pane.session;
-        session.fiberInferenceDataset.reset();
-        session.fiberPredictionField.reset();
-        session.selectedFiberInferenceDatasetLocation.clear();
-        if (session.usingFiberNormals) {
-            session.dataset.reset();
-            session.normalSampler.reset();
-            session.traceNormalDataset.reset();
-            session.traceNormalSampler.reset();
-            session.usingFiberNormals = false;
-            session.selectedDatasetLocation.clear();
-            session.traceNormalDatasetLocation.clear();
-        }
-        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
-            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
-        }
-    }
-    refreshLineAnnotationDatasetMenus();
+    invalidateAnnotationInputs(true, vpkg->annotationNormalSource() == "fiber");
 }
 
 bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
@@ -11342,13 +11341,13 @@ void LineAnnotationController::refreshStaleGeneratedViews()
             if (!materializeGeneratedViews(*target.session)) {
                 Logger()->warn(
                     "Line annotation: could not rebuild generated views for {} "
-                    "after the umbilicus changed; its orientation is unchanged",
+                    "after the normal/orientation inputs changed; its orientation is unchanged",
                     target.surfaceName);
             }
         } catch (const std::exception& e) {
             Logger()->warn(
                 "Line annotation: rebuilding generated views for {} after the "
-                "umbilicus changed threw: {}",
+                "normal/orientation inputs changed threw: {}",
                 target.surfaceName,
                 e.what());
         }
@@ -11364,7 +11363,7 @@ void LineAnnotationController::publishUmbilicusNotice()
             QString notice = _umbilicusNotice;
             if (pane.session && pane.session->inspectionFrameOnly) {
                 if (!notice.isEmpty()) notice += "\n";
-                notice += tr("No Lasagna normals: cut orientation follows the curve, not the sheet.");
+                notice += tr("No normal source: cut orientation follows the curve, not the sheet.");
             }
             pane.dialog->setUmbilicusNotice(notice);
         }
@@ -11477,6 +11476,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
                                                          const std::function<bool()>& stillValid)
 {
     const QPointer<LineAnnotationController> alive(this);
+    if (session.normalSamplesStale && !ensureDatasetForSession(session, false, stillValid))
+        return false;
     session.inspectionFrameOnly = std::any_of(
         session.optimizedLine.points.begin(), session.optimizedLine.points.end(),
         [](const auto& point) { return point.sampledNormal.reason == "display frame only"; });
