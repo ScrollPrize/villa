@@ -444,8 +444,12 @@ class TissueMap(NamedTuple):
 MAP_SLABS = 16
 
 
-def tissue_map(levels, low, high, want=PREFILTER_SCALE, slabs=MAP_SLABS):
-    """Read `low`..`high` of the coarse volume once, reduced, as an in-memory mask."""
+def tissue_map(levels, low, high, want=PREFILTER_SCALE, slabs=MAP_SLABS, within=None):
+    """Read `low`..`high` of the coarse volume once, reduced, as an in-memory mask.
+
+    With `within`, a map read before at the same level whose box holds this one, the same
+    voxels are cut out of it instead: a session draws several times, five stretches for a
+    hold-out set, and each read took the better part of half a minute."""
     level = coarsest_level(levels, want)
     if level is None:
         return None
@@ -455,6 +459,11 @@ def tissue_map(levels, low, high, want=PREFILTER_SCALE, slabs=MAP_SLABS):
                     np.asarray(array.shape))
     if (hi <= lo).any():
         return None
+    if within is not None and within.scale == scale:
+        start = np.rint(np.asarray(within.low, float) / scale).astype(int)
+        if (start <= lo).all() and (hi <= start + np.asarray(within.data.shape)).all():
+            cut = within.data[tuple(slice(a - s, b - s) for a, b, s in zip(lo, hi, start))]
+            return TissueMap(cut, scale, lo * scale)
 
     axis = int(np.argmax(hi - lo))
     edges = np.linspace(lo[axis], hi[axis], min(slabs, int(hi[axis] - lo[axis])) + 1)

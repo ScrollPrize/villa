@@ -241,6 +241,7 @@ class Session:
         self._coarse = {}
         self._fine = {}
         self._maps = {}
+        self._tissue = None
         self._as_read = (self._stamp(), json.loads(json.dumps(person_fields(state))))
 
     # ------------------------------------------------------------------ the directory
@@ -423,6 +424,22 @@ class Session:
             self._load_block(patch_id)
         return self._coarse[patch_id]
 
+    def tissue(self):
+        """The tissue map of the region blocks are drawn from (`region()`): read once, kept
+        with the blocks, and cut from by every draw inside it (`dense.tissue_map`)."""
+        if self._tissue is None:
+            path = self.directory / "blocks" / "tissue-map.npz"
+            if path.exists():
+                with np.load(path) as data:
+                    self._tissue = dense.TissueMap(data["data"], float(data["scale"]), data["low"])
+            else:
+                coarse_levels, _fine_array, _scale = self.open()
+                self._tissue = dense.tissue_map(coarse_levels, *self.region())
+                if self._tissue is not None:
+                    np.savez(path, data=self._tissue.data, scale=self._tissue.scale,
+                             low=np.asarray(self._tissue.low, float))
+        return self._tissue
+
     def _block_path(self, patch_id):
         return self.directory / "blocks" / f"{patch_id}.npz"
 
@@ -490,7 +507,7 @@ class Session:
         seed = len(rounds) if seed is None else int(seed)
         rng = np.random.default_rng(seed)
 
-        where = dense.tissue_map(coarse_levels, low, high)
+        where = dense.tissue_map(coarse_levels, low, high, within=self.tissue())
         taken = {tuple(patch["origin_zyx"]) for patch in self.state["patches"]}
         origins = [origin for origin in dense.chunk_grid_origins(
                        coarse_array.shape, (low, high), rng,
