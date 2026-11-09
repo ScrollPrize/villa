@@ -113,7 +113,8 @@ inline void bind(nb::module_& m)
         .def_prop_ro("scale", [](const Level& l) { return l.scale; })
         .def_prop_ro("offset", [](const Level& l) { return l.offset; })
         .def_prop_ro("linear", [](const Level& l) { return l.linear; })
-        .def_prop_ro("gpu", [](const Level& l) { return l.cuda != nullptr; });
+        .def_rw("channel", &Level::channel, "Scalar CZYX channel, or None for a ZYX array.")
+        .def_prop_ro("gpu", [](const Level& l) { return l.cuda != nullptr && !l.channel; });
 
     const auto withCuda = [](Level level, nb::handle cuda) {
         if (!cuda.is_none()) {
