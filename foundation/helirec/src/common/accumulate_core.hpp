@@ -7,6 +7,7 @@
 #include "hd_math.hpp"
 #include "helirec/accumulate.hpp"
 #include "sino_core.hpp"
+#include "sld_core.hpp"
 
 namespace helirec::accum_core {
 
@@ -18,7 +19,14 @@ HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
     const std::size_t pix = static_cast<std::size_t>(r) * s.det_cols + c;
     const std::size_t slot = s.raw_slot ? static_cast<std::size_t>(s.raw_slot[k]) : static_cast<std::size_t>(k);
     const float u = static_cast<float>(s.raw[(slot * s.win_rows + t) * s.det_cols + c]);
-    const float sig = div(sub(u, s.dark[pix]), s.current_div[k]);
+    float sig = div(sub(u, s.dark[pix]), s.current_div[k]);
+    if (s.glare) {   // scintillator light diffusion: minus the glare, interpolated between its sampled projections
+        const std::size_t cell = static_cast<std::size_t>(s.glare_rows) * s.glare_cols;
+        const float gf = s.glare_frac[k];
+        const float g0 = sld_core::glare_sample(s.glare + s.glare_i0[k] * cell, s.glare_rows, s.glare_cols, s.glare_inv_bin, r, c);
+        const float g1 = sld_core::glare_sample(s.glare + s.glare_i1[k] * cell, s.glare_rows, s.glare_cols, s.glare_inv_bin, r, c);
+        sig = sub(sig, add(mul(sub(1.0f, gf), g0), mul(gf, g1)));
+    }
     const std::size_t plane = static_cast<std::size_t>(s.det_rows) * s.det_cols;
     const float f = s.flat_frac[k];
     const float flat = add(mul(sub(1.0f, f), s.flats[s.flat_i0[k] * plane + pix]), mul(f, s.flats[s.flat_i1[k] * plane + pix]));

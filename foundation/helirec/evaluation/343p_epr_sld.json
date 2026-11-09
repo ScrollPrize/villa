@@ -1,0 +1,116 @@
+{
+  "projections": "/mnt/raid_nvme/343p_recon_work/projections",
+  "cache_dir": "/mnt/raid_nvme/343p_recon_work/output/baselines/_calibration",
+  "device": "cuda",
+  "params": {
+    "mode": "corrected",
+    "filters": []
+  },
+  "slices": {
+    "z": [
+      4497,
+      3598,
+      2698,
+      1798,
+      899
+    ]
+  },
+  "roi": null,
+  "window": "auto",
+  "tile": 1024,
+  "methods": [
+    {
+      "name": "fbp_epr_unsharp_v1",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "epr",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ]
+      },
+      "desc": "FBP, cubic B-spline, 2x oversampling; eikonal phase retrieval delta/beta 1000 (3 iterations) + unsharp 1.2/4"
+    },
+    {
+      "name": "sirt_epr_unsharp_v1",
+      "backprojector": "sirt(num_iter=20,init=gridrec,norm=rowsum,relax=1)",
+      "params": {
+        "filters": [
+          {
+            "type": "epr",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ]
+      },
+      "desc": "SIRT, 20 iterations from gridrec; eikonal phase retrieval delta/beta 1000 (3 iterations) + unsharp 1.2/4"
+    },
+    {
+      "name": "fbp_sld_paganin_unsharp_v1",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ],
+        "sld": "fraction=0.1,length=100"
+      },
+      "desc": "FBP; scintillator diffusion correction (fraction 0.1, length 100 px: uncalibrated defaults); Paganin 1000 + unsharp 1.2/4"
+    },
+    {
+      "name": "fbp_sld_epr_unsharp_v1",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "epr",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ],
+        "sld": "fraction=0.1,length=100"
+      },
+      "desc": "FBP; scintillator diffusion correction (fraction 0.1, length 100 px: uncalibrated defaults); eikonal phase retrieval 1000 + unsharp 1.2/4"
+    },
+    {
+      "name": "sirt_sld_epr_unsharp_v1",
+      "backprojector": "sirt(num_iter=20,init=gridrec,norm=rowsum,relax=1)",
+      "params": {
+        "filters": [
+          {
+            "type": "epr",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ],
+        "sld": "fraction=0.1,length=100"
+      },
+      "desc": "SIRT, 20 iterations from gridrec; scintillator diffusion correction (fraction 0.1, length 100 px: uncalibrated defaults); eikonal phase retrieval 1000 + unsharp 1.2/4"
+    }
+  ]
+}

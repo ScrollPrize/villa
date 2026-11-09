@@ -1,4 +1,4 @@
-"""Projection filter chains (C++ registry: paganin, unsharp, gaussian, median, python).
+"""Projection filter chains (C++ registry: paganin, epr, unsharp, gaussian, median, python).
 
 A chain is a list of dicts, applied in order to every gridded stack before (stage "intensity", default) or after
 (stage "log") -log:

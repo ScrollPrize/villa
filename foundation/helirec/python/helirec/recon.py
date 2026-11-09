@@ -36,7 +36,7 @@ DEFAULTS = dict(
     mode="corrected", filters=DEFAULT_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9,
+    axis_source_meters=1e9, sld="",
 )
 
 # mode "legacy_reference": every parameter pinned to the reference workflow
@@ -44,7 +44,7 @@ LEGACY_REFERENCE = dict(
     filters=REFERENCE_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9,
+    axis_source_meters=1e9, sld="",
 )
 assert set(LEGACY_REFERENCE) == set(DEFAULTS) - {"mode"}
 
@@ -95,10 +95,29 @@ def _same(key, a, b):
     return a == b
 
 
+def sld_config(spec):
+    """Scintillator light diffusion correction spec -> reconstructor config keys. '' / None: no correction; else text
+    or dict: fraction (tail weight relative to the direct image, e.g. 0.1), length (damping length in detector
+    pixels, default 100), bin (binning of the glare maps, default 8), stride (projections per glare map, default 10),
+    e.g. "fraction=0.1,length=100"."""
+    if not spec:
+        return {}
+    if isinstance(spec, dict):
+        d = dict(spec)
+    else:
+        d = dict(kv.split("=", 1) for kv in str(spec).replace(" ", "").split(",") if kv)
+    unknown = set(d) - {"fraction", "length", "bin", "stride"}
+    if unknown or "fraction" not in d:
+        raise ValueError(f"sld: expected fraction=F[,length=L,bin=B,stride=S], got {spec!r}")
+    out = dict(sld_fraction=float(d["fraction"]), sld_length=float(d.get("length", 100.0)),
+               sld_bin=int(float(d.get("bin", 8))), sld_stride=int(float(d.get("stride", 10))))
+    return out if out["sld_fraction"] > 0 else {}
+
+
 def legacy_reference_config():
     """SliceReconstructor config keys of mode legacy_reference (all but geometry / physics / device), for callers
     that build the reconstructor themselves"""
-    p = {k: v for k, v in LEGACY_REFERENCE.items() if k != "backprojector"}
+    p = {k: v for k, v in LEGACY_REFERENCE.items() if k not in ("backprojector", "sld")}
     p["filters"] = [dict(f) for f in LEGACY_REFERENCE["filters"]]
     return dict(p, legacy_reference=True, **backprojector_config(LEGACY_REFERENCE["backprojector"]))
 
@@ -190,6 +209,7 @@ class HelicalRecon:
                    pixel_size_m=m.pixel_size_m, rot_center=self.cal.rot_center,
                    legacy_reference=mode == "legacy_reference")
         cfg.update(backprojector_config(p["backprojector"]))
+        cfg.update(sld_config(cfg.pop("sld")))
         scans = [self._scan_data(self.main, "main"), self._scan_data(self.companion, "companion")]
         self.rec = _core.SliceReconstructor(scans, cfg)
         self.info = self.rec.info

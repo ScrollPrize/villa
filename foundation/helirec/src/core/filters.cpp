@@ -153,6 +153,38 @@ FilterStage stage_of(const FilterParams& p) {
     throw Error("filter stage must be 'intensity' or 'log', not '" + s + "'");
 }
 
+// The padded FFT filter of a fused Fourier step for stacks (H, W) with margin m: rows padded to roundfft(H),
+// columns to roundfft(W + 2 m), symmetric; coefficients = the product of the members' responses.
+FourierFilterSpec fourier_step_spec(const std::vector<ProjectionFilter*>& members, int H, int W, int m) {
+    if (H <= 2 * m) throw Error("filter: stack height must exceed 2 x margin");
+    const int N0 = roundfft(H), N1 = roundfft(W + 2 * m);
+    const int pos0 = -((N0 - H) / 2);
+    const int pos1 = -m - (N1 - (W + 2 * m)) / 2;
+    std::vector<cplx> K(static_cast<std::size_t>(N0) * N1, cplx(1.0, 0.0));
+    for (const auto* f : members) f->multiply_response(K, N0, N1, m);
+    FourierFilterSpec sp;
+    sp.ndim = 2;
+    sp.h = H;
+    sp.w = W;
+    sp.ph = N0;
+    sp.pw = N1;
+    sp.pad_top = -pos0;
+    sp.pad_left = -pos1;
+    sp.mode = PadMode::Symmetric;
+    static std::atomic<std::uint64_t> next_id{1};
+    sp.id = next_id++;
+    const int nc = N1 / 2 + 1;
+    sp.filter.resize(static_cast<std::size_t>(N0) * nc);
+    sp.filter_imag.resize(sp.filter.size());
+    for (int i = 0; i < N0; ++i)
+        for (int j = 0; j < nc; ++j) {
+            const cplx v = K[static_cast<std::size_t>(i) * N1 + j];
+            sp.filter[static_cast<std::size_t>(i) * nc + j] = static_cast<float>(v.real());
+            sp.filter_imag[static_cast<std::size_t>(i) * nc + j] = static_cast<float>(v.imag());
+        }
+    return sp;
+}
+
 // ------------------------------------------------------------------ paganin
 // nabuxx paganin_filter.cpp (pag_version 2): H = 1 / (1 + (2 - cos f0 - cos f1) pfact), pfact = 2 (l/px / 2 pi)^2,
 // l = sqrt(lambda D delta/beta pi); real-space kernel truncated vertically to dy in [-m, m-1] (m = step margin)
@@ -172,6 +204,8 @@ class Paganin final : public ProjectionFilter {
                                   static_cast<float>(M_PI));
         return l / static_cast<float>(ctx_.pixel_size_m * 1.0e6);
     }
+    // H = 1 / (1 + pfact (2 - cos f0 - cos f1)) = 1 / (1 - (pfact / 2) lap), lap: the 5-point Laplacian
+    double pfact() const { return 2.0 * std::pow(static_cast<double>(l_over_px()) / (2 * M_PI), 2); }
     // nabu PaganinPhaseRetrieval(shape, margin=None): padded = next_power(2n), float64 filter,
     // conv kernel = irfft2(filter); margin = first row with |k[r,0]| < k[0,0]/1000
     int margin_rows() const override {
@@ -206,7 +240,7 @@ class Paganin final : public ProjectionFilter {
     }
     void multiply_response(std::vector<cplx>& K, int N0, int N1, int margin) const override {
         if (db_ <= 0) return;
-        const double pfact = 2.0 * std::pow(static_cast<double>(l_over_px()) / (2 * M_PI), 2);
+        const double pfact = this->pfact();
         auto response = [&](int n0, int n1) {   // the untruncated discrete-Laplacian response on an n0 x n1 grid
             std::vector<cplx> P(static_cast<std::size_t>(n0) * n1);
             for (int i = 0; i < n0; ++i) {
@@ -254,6 +288,78 @@ class Paganin final : public ProjectionFilter {
     FilterContext ctx_;
     double db_;
     mutable int margin_ = -1;
+};
+
+// ------------------------------------------------------------------ eikonal phase retrieval
+// Local second-order closure (src/common/epr_core.hpp): the Paganin result, then `iters` iterations
+// I += relax Paganin[measured - F(I)]. The Paganin filter is the fixed (unit-DC) kernel in every mode.
+class Epr final : public ProjectionFilter {
+  public:
+    Epr(const FilterParams& p, const FilterContext& c)
+        : db_(p.num("delta_beta")), iters_(static_cast<int>(p.num("iters", 3))), relax_(p.num("relax", 0.75)),
+          max_shift_(p.num("max_shift", 12.5)), pag_(paganin_params(p), fixed_kernel(c)) {
+        if (db_ <= 0) throw Error("epr: delta_beta must be > 0");
+        if (iters_ < 0 || iters_ > 100) throw Error("epr: iters must be 0..100");
+        if (!(relax_ > 0 && relax_ <= 1)) throw Error("epr: relax must be in (0, 1]");
+        if (!(c.energy_kev > 0 && c.distance_m > 0 && c.pixel_size_m > 0))
+            throw Error("epr: needs the energy, the propagation distance and the pixel size");
+    }
+    int margin_rows() const override {
+        const int m = pag_.own_margin();
+        return iters_ > 0 ? 2 * m + 4 : m;   // the estimate's support + one more for the correction, + the stencils
+    }
+    void apply(float* frames, int n, int H, int W, Device device) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        EprParams ep;
+        ep.shift_px2 = 0.5 * pag_.pfact();
+        ep.delta_beta = db_;
+        ep.iters = iters_;
+        ep.relax = static_cast<float>(relax_);
+        ep.max_shift = static_cast<float>(max_shift_);
+        FourierFilter& f = paganin_for(H, W, device);
+        if (device == Device::CPU) { cpu::epr_frames(frames, n, H, W, ep, f); return; }
+#ifdef HELIREC_WITH_CUDA
+        cuda::epr_frames(frames, n, H, W, ep, f);
+#else
+        throw Error("built without CUDA");
+#endif
+    }
+
+  private:
+    static FilterParams paganin_params(const FilterParams& p) {
+        FilterParams q;
+        q.values["delta_beta"] = p.str("delta_beta", "");
+        return q;
+    }
+    static FilterContext fixed_kernel(FilterContext c) {
+        c.legacy = false;
+        return c;
+    }
+    FourierFilter& paganin_for(int H, int W, Device device) {
+        for (auto& e : filters_)
+            if (e.H == H && e.W == W && e.device == device) return *e.f;
+        if (filters_.size() >= 4) filters_.erase(filters_.begin());  // e.g. full chunks + the last one
+        const FourierFilterSpec spec = fourier_step_spec({&pag_}, H, W, pag_.own_margin());
+        Entry e{H, W, device, nullptr};
+#ifdef HELIREC_WITH_CUDA
+        if (device == Device::CUDA) e.f = cuda::make_fourier_filter(spec);
+        else
+#endif
+            e.f = cpu::make_fourier_filter(spec);
+        filters_.push_back(std::move(e));
+        return *filters_.back().f;
+    }
+    struct Entry {
+        int H, W;
+        Device device;
+        std::unique_ptr<FourierFilter> f;
+    };
+    double db_;
+    int iters_;
+    double relax_, max_shift_;
+    Paganin pag_;
+    std::vector<Entry> filters_;
+    std::mutex mutex_;
 };
 
 // ------------------------------------------------------------------ unsharp, gaussian
@@ -319,6 +425,11 @@ std::map<std::string, FilterFactory>& registry() {
         {"paganin", [](const FilterParams& p, const FilterContext& c) -> std::unique_ptr<ProjectionFilter> {
              check_keys("paganin", p, {"delta_beta"});
              return std::make_unique<Paganin>(p, c);
+         }},
+        {"epr", [](const FilterParams& p, const FilterContext& c) -> std::unique_ptr<ProjectionFilter> {
+             check_keys("epr", p, {"delta_beta", "iters", "relax", "max_shift"});
+             if (stage_of(p) != FilterStage::Intensity) throw Error("epr: runs at the intensity stage");
+             return std::make_unique<Epr>(p, c);
          }},
         {"unsharp", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
              check_keys("unsharp", p, {"sigma", "coeff", "method"});
@@ -406,33 +517,7 @@ const FourierFilterSpec& FilterPipeline::step_spec(std::size_t s, int H, int W, 
     const std::vector<int> key{static_cast<int>(s), H, W, m};
     auto it = spec_cache_.find(key);
     if (it != spec_cache_.end()) return it->second;
-    if (H <= 2 * m) throw Error("filter: stack height must exceed 2 x margin");
-    const int N0 = roundfft(H), N1 = roundfft(W + 2 * m);
-    const int pos0 = -((N0 - H) / 2);
-    const int pos1 = -m - (N1 - (W + 2 * m)) / 2;
-    std::vector<cplx> K(static_cast<std::size_t>(N0) * N1, cplx(1.0, 0.0));
-    for (const auto* f : steps_[s].members) f->multiply_response(K, N0, N1, m);
-    FourierFilterSpec sp;
-    sp.ndim = 2;
-    sp.h = H;
-    sp.w = W;
-    sp.ph = N0;
-    sp.pw = N1;
-    sp.pad_top = -pos0;
-    sp.pad_left = -pos1;
-    sp.mode = PadMode::Symmetric;
-    static std::atomic<std::uint64_t> next_id{1};
-    sp.id = next_id++;
-    const int nc = N1 / 2 + 1;
-    sp.filter.resize(static_cast<std::size_t>(N0) * nc);
-    sp.filter_imag.resize(sp.filter.size());
-    for (int i = 0; i < N0; ++i)
-        for (int j = 0; j < nc; ++j) {
-            const cplx v = K[static_cast<std::size_t>(i) * N1 + j];
-            sp.filter[static_cast<std::size_t>(i) * nc + j] = static_cast<float>(v.real());
-            sp.filter_imag[static_cast<std::size_t>(i) * nc + j] = static_cast<float>(v.imag());
-        }
-    return spec_cache_.emplace(key, std::move(sp)).first->second;
+    return spec_cache_.emplace(key, fourier_step_spec(steps_[s].members, H, W, m)).first->second;
 }
 
 std::string FilterPipeline::describe() const {

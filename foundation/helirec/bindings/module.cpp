@@ -520,6 +520,10 @@ class PySliceReconstructor {
         f("pixel_size_m", cfg.pixel_size_m);
         if (c.contains("filters")) cfg.filters = chain_from(c["filters"]);
         f("margin", cfg.margin);
+        f("sld_fraction", cfg.sld.fraction);
+        f("sld_length", cfg.sld.length);
+        f("sld_bin", cfg.sld.bin);
+        f("sld_stride", cfg.sld.stride);
         f("n_grid", cfg.n_grid);
         f("angular_tolerance_steps", cfg.angular_tolerance_steps);
         f("luminosity_repartition", cfg.luminosity_repartition);
@@ -871,6 +875,22 @@ NB_MODULE(_core, m) {
           "energy_kev"_a = 0.0, "distance_m"_a = 0.0, "pixel_size_m"_a = 0.0, "device"_a = "cpu", "legacy_reference"_a = false,
           "Apply a filter chain's steps of `stage` to a stack (n_frames, H, W) as the pipeline does (single-step "
           "chains use `margin`); keep rows [margin, H - margin) of the result");
+    m.def("sld_correct",
+          [](HostIn frames, double fraction, double length, int bin) {
+              require(frames.ndim() == 3, "frames must be (n, rows, cols)");
+              SldParams p;
+              p.fraction = fraction;
+              p.length = length;
+              p.bin = bin;
+              HostOut out = copy_of(frames);
+              nb::gil_scoped_release nogil;
+              ScintillatorGlare g(static_cast<int>(frames.shape(1)), static_cast<int>(frames.shape(2)), p);
+              g.correct(data(out), static_cast<int>(frames.shape(0)));
+              return out;
+          },
+          "frames"_a, "fraction"_a, "length"_a = 100.0, "bin"_a = 8,
+          "Scintillator light diffusion correction of detector frames (n, rows, cols): the frames minus their glare, "
+          "i.e. the deconvolved frames / (1 + fraction) (the factor cancels between projections and flats)");
     m.def("roundfft", &roundfft, "n"_a);
 
     m.def("delta3d_available", &delta3d_available, "True if built with the vc-delta3d codec");

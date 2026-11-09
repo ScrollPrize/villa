@@ -33,6 +33,14 @@ struct AccumScanView {
     const float* flat_frac = nullptr;
     const int32_t* flat_i0 = nullptr;
     const int32_t* flat_i1 = nullptr;
+    // optional scintillator glare (sld.hpp), subtracted from (raw - dark) / current: maps (n_maps, glare_rows,
+    // glare_cols) of the binned detector; projection k takes (1 - glare_frac) maps[glare_i0] + glare_frac maps[glare_i1]
+    const float* glare = nullptr;
+    int glare_rows = 0, glare_cols = 0;
+    float glare_inv_bin = 0;
+    const int32_t* glare_i0 = nullptr;
+    const int32_t* glare_i1 = nullptr;
+    const float* glare_frac = nullptr;
     // horizontal placement
     int sx = 0, ixs = 0;
     float fract_x = 0;

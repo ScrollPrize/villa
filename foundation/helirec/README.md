@@ -136,13 +136,34 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   is `filters.REFERENCE_CHAIN` (Paganin δ/β 1000 + unsharp σ 1.2, coefficient 4), also used by the standard
   Paganin baseline recipes. Explicit chains are literal: omit `unsharp` for Paganin alone, or set
   `unsharp.coeff=0` to disable sharpening. Built-in types: `paganin`,
-  `unsharp`, `gaussian`, `median`, `python`; register more in C++ (`register_filter`, `filters.hpp`) or Python
+  `epr`, `unsharp`, `gaussian`, `median`, `python`; register more in C++ (`register_filter`, `filters.hpp`) or Python
   (`helirec.filters.register`). Each filter runs at `stage=intensity` (before −log, default) or `stage=log` and
   declares the margin rows it needs. Consecutive linear shift-invariant filters of one stage fuse into one FFT
   filter. Command line: `--set "filters=paganin(delta_beta=2000)+median(radius=1,stage=log)"`, or override one
   parameter of the current chain with `--set paganin.delta_beta=500`. Sweeps take the same keys
   (`--sweep paganin.delta_beta=250,500`, or `filters=CHAIN1;CHAIN2`); a sweep of one intensity-stage FFT step shares
   the forward FFT.
+* **Eikonal phase retrieval** (`epr(delta_beta=…, iters=3, relax=0.75, max_shift=12.5)`, in place of `paganin`):
+  the local second-order closure of Mirone et al. (*J. Synchrotron Rad.* 32, 2025; arXiv:2601.22793, eq. 1) for a
+  homogeneous object. Paganin inverts the first-order (TIE) model `I_det = I − A ∇²I`, with
+  `A = δ/β · λL / (4π px²)` (px²; the ray shift in pixels is `A ∇ln I`); `epr` starts from that result and iterates
+  `I += relax · Paganin[I_det − F(I)]`, where `F` adds the terms of second order in the ray shift (and the small
+  diffraction term) of `src/common/epr_core.hpp`. `iters=0` is exactly `paganin`; `max_shift` limits the modelled
+  ray shift (pixels). It needs 2 × Paganin's margin + 4 rows and runs at the intensity stage on CPU and CUDA,
+  deterministically. It matters where the estimated ray shift approaches a pixel (`A` is 13.6 px² for the 8.64 µm
+  PHerc0343P pair at δ/β 1000, and ~290 px² for a 1.1 µm, 0.22 m, 59 keV scan); where the shift is a few hundredths
+  of a pixel the result is Paganin's. Not implemented: the non-local (ray-mapping) solver for shifts well beyond a
+  pixel, oversampling, and the polychromatic spectrum lines of the reference implementation.
+  Example: `--set "filters=epr(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)"`.
+* **Scintillator light diffusion** (`sld="fraction=0.1,length=100"`, default `""`: none; `bin=8`, `stride=10`):
+  the correction of the same paper (section 3.6) for the detector's long-range glare. The recorded frame is the
+  image convolved with `K = (δ + f·t) / (1 + f)`, `t(r) ∝ exp(−r/length) / r` (pixels); the glare `S ∗ M`,
+  `Ŝ = f t̂ / (1 + f t̂)`, is computed on frames binned by `bin`, subtracted from `(raw − dark) / current` before the
+  flat division, and the flats are corrected the same way (`include/helirec/sld.hpp`). Each chunk reads the whole
+  frame of every `stride`-th projection for its glare map (kept across consecutive chunks) and interpolates in
+  between. `fraction` and `length` are properties of the scintillator and optics and must be measured (e.g. from a
+  slit or an opaque edge); 0.1 / 100 are the Night Rail defaults, not a calibration of any particular scan. Not
+  available in `legacy_reference`. Example: `--set sld=fraction=0.1,length=100`.
 * **Gridding**: `luminosity_repartition`, `mend_threshold`, `n_grid`, `angular_tolerance_steps`, `block_angles`
   (memory/speed only).
 * **Geometry**: `--cor` / `--vector` override the calibration for one run (never cached; not allowed in
@@ -189,6 +210,20 @@ AGENTS_AGENT_MODE=1 .venv/bin/python -u evaluation/compare_methods.py evaluation
     --out /mnt/raid_nvme/343p_recon_work/output/baselines --run-name paganin_unsharp_v3 \
     --methods fbp_paganin_unsharp_v3 sirt_paganin_unsharp_v3
 ```
+
+`evaluation/343p_epr_sld.json` adds, next to those baselines and over the same five slices, eikonal phase retrieval
+in place of Paganin and the scintillator diffusion correction (uncalibrated Night Rail defaults), each with the
+reference unsharp mask:
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python -u evaluation/compare_methods.py evaluation/343p_epr_sld.json \
+    --out /mnt/raid_nvme/343p_recon_work/output/baselines --run-name epr_sld_v1
+```
+
+`tests/test_epr.py` checks `epr` against exact Fresnel propagation of a homogeneous object (about half of Paganin's
+error where ray shifts reach a fraction of a pixel, Paganin's result where they do not), CPU/CUDA parity and chunk
+independence; `tests/test_sld.py` checks the glare model against the exact point spread and through the
+reconstructor.
 
 Measured-support and interpolation regressions are in `tests/test_sirt_pipeline.py`: explicit-matrix SIRT
 updates, excluded-ray invariance, a fractional helical analytic phantom, chunk consistency and CPU/CUDA parity.

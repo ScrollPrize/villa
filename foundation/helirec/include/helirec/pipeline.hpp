@@ -14,6 +14,7 @@
 #include "helirec/filters.hpp"
 #include "helirec/kernels.hpp"
 #include "helirec/raw_reader.hpp"
+#include "helirec/sld.hpp"
 
 namespace helirec {
 
@@ -35,6 +36,8 @@ struct ReconConfig {
     FilterChain filters;
     double energy_kev = 0, distance_m = 0;
     int margin = -1;                    // <0: the chain's margin (filters' context rows)
+    // scintillator light diffusion correction of the raw frames (sld.hpp); fraction 0: none
+    SldParams sld;
     // gridding
     int n_grid = 0;                     // <=0: round(360 / mean step) of the main scan
     double angular_tolerance_steps = 5;

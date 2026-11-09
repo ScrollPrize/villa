@@ -19,6 +19,12 @@
 //   unsharp  sigma, coeff, method=gaussian   (1 + c) - c G   (method log: 1 + c Lap G)
 //   gaussian sigma                           Gaussian blur (periodic, as unsharp's G)
 //   median   radius (1..3)                   (2r+1)^2 median per frame, edges clamped
+//   epr      delta_beta, iters=3,            eikonal phase retrieval (local second-order closure, src/common/
+//            relax=0.75, max_shift=12.5      epr_core.hpp), in place of paganin: starts from the Paganin result
+//                                            and iterates I += relax Paganin[measured - F(I)] against the
+//                                            second-order model F of the propagated intensity. iters=0 is Paganin.
+//                                            max_shift: limit of the modelled ray shift (pixels; <= 0: none).
+//                                            Intensity stage only; margin 2 x Paganin's + 4 rows
 // Every filter accepts stage=intensity|log.
 #include <complex>
 #include <functional>
@@ -107,12 +113,26 @@ class FilterPipeline {
     mutable std::map<std::vector<int>, FourierFilterSpec> spec_cache_;
 };
 
+// Eikonal phase retrieval of frames (n_frames, H, W), in place: measured intensity -> contact-plane intensity.
+// `paganin`: the Paganin filter for (H, W) frames with the same delta_beta (initial estimate and preconditioner).
+struct EprParams {
+    double shift_px2 = 0;    // A = delta_beta lambda L / (4 pi px^2): ray shift (pixels) per unit grad ln I
+    double delta_beta = 0;
+    int iters = 3;
+    float relax = 0.75f;
+    float max_shift = 12.5f; // pixels; <= 0: no limit
+    float eps = 1e-8f;       // floor of intensities
+};
+
 namespace cpu {
 void median_frames(float* frames, int n_frames, int H, int W, int radius);
+void epr_frames(float* frames, int n_frames, int H, int W, const EprParams& p, FourierFilter& paganin);
 }
 #ifdef HELIREC_WITH_CUDA
 namespace cuda {
 void median_frames(float* frames, int n_frames, int H, int W, int radius, void* stream = nullptr);
+void epr_frames(float* frames, int n_frames, int H, int W, const EprParams& p, FourierFilter& paganin,
+                void* stream = nullptr);
 }
 #endif
 
