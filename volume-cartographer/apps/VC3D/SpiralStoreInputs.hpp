@@ -24,7 +24,7 @@ namespace vc3d::spiral {
 // comes from its input manifest (object_store_inputs.json, published by the
 // service as its input manifest artifact), compared by identities of the
 // store: geometry revision UUIDs, the metadata values the adapter read,
-// relationship record UUIDs, generations and approval states.
+// relationship record UUIDs, numbered versions and approval states.
 
 // How one fitted input stands in the attached store now.
 enum class InputState {
@@ -73,7 +73,7 @@ struct FitFiber {
 // How one relationship the fit consumed stands now, judged as the fit's
 // adapter would consume it from the current heads of the fitted objects.
 enum class LinkState {
-    Fitted,   // consumed at the same generation, approval and endpoint geometry
+    Fitted,   // consumed at the same version, approval and endpoint geometry
     Changed,  // still consumed, but any of those differ
     Dropped,  // no longer consumed: removed, rejected, inapplicable or an endpoint gone
     Added,    // consumed now among the fitted objects, but not by the fit

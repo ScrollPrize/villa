@@ -1,7 +1,7 @@
 // The Spiral workspace's reads of a fit's object-store inputs: they are read
 // as the store holds them now and converted to reference-volume voxels, and
 // each input and consumed relationship says whether it is what the fit read,
-// by geometry revision, the adapter's metadata values and link generations.
+// by geometry revision, the adapter's metadata values and relationship versions.
 #include "SpiralStoreInputs.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
@@ -181,9 +181,9 @@ struct Fixture {
                 const auto& version = selected.relationship;
                 const bool stored = version.record.aUuid == surface;
                 relationships.push_back(
-                    {{"uuid", version.record.uuid}, {"version", version.record.version.value_or(0)}, {"kind", version.record.kind},
+                    {{"uuid", version.record.uuid}, {"kind", version.record.kind},
                      {"family", "pcl_patch"}, {"approval_state", version.record.approvalState},
-                     {"generation", version.record.generation}, {"a", surface},
+                     {"version", version.version}, {"a", surface},
                      {"a_geometry_revision", *(stored ? version.aGeometryRevision : version.bGeometryRevision)},
                      {"b", pcl},
                      {"b_geometry_revision", *(stored ? version.bGeometryRevision : version.aGeometryRevision)}});

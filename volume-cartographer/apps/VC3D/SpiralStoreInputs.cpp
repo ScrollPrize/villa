@@ -92,8 +92,8 @@ std::string relationshipFamily(const std::string& edgeKind, const std::string& f
 
 // The identity fields of StoredRelationship.provenance() for a relationship
 // version the adapter would consume (filter_relationships); nullopt when it
-// would not be consumed. A content change bumps the generation, so the
-// generation stands for the anchors and metadata.
+// would not be consumed. The numbered relationship version detects changes
+// to its anchors and metadata without a second per-record generation counter.
 std::optional<Json> consumedIdentity(const vc::objects::SelectedRelationship& selected,
                                      const std::map<std::string, std::string>& kinds,
                                      bool approvedLinksOnly)
@@ -117,7 +117,7 @@ std::optional<Json> consumedIdentity(const vc::objects::SelectedRelationship& se
     if (approvedLinksOnly && record.approvalState != "approved") return std::nullopt;
     const auto geometry = [](const auto& revision) { return revision ? Json(*revision) : Json(nullptr); };
     return Json{{"uuid", record.uuid}, {"kind", record.kind}, {"family", family},
-                {"approval_state", record.approvalState}, {"generation", record.generation},
+                {"approval_state", record.approvalState}, {"version", version.version},
                 {"a", ends[0].uuid}, {"a_geometry_revision", geometry(ends[0].geometry)},
                 {"b", ends[1].uuid}, {"b_geometry_revision", geometry(ends[1].geometry)}};
 }
