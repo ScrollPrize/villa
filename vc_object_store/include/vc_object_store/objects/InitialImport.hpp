@@ -69,11 +69,11 @@ private:
 
 // Constructs, seals and atomically publishes one new collection. The API owns
 // independent worker connections, transactions, shared lineage/commit state, index finalization,
-// linking, VFS lifetime and failure cleanup. Producers only supply native data.
+// store_references, VFS lifetime and failure cleanup. Producers only supply native data.
 // One uncompressed shard produces an ordinary SQLite file; multiple uncompressed
 // shards produce a directory. Supplying packed produces one framed VFS file.
 // History-off/spatial-off initial construction only; editing uses other APIs.
-// Dependencies must already be sealed; sibling shards are not mutable links.
+// Dependencies must already be sealed; sibling shards are not mutable store_references.
 // A fresh logical UUID is allocated for every import; creationStoreUuid must be
 // unset. Producers must supply globally unique object and edge UUIDs across all
 // shards. Native uniqueness is enforced per shard. UUID-hash routing sends any

@@ -244,7 +244,7 @@ std::vector<std::string> detail::currentExtensionChunks(sqlite3* db)
           for (const auto& [name, descriptor] : descriptors.items()) {
             const auto table = versionedTable(db, name, ownerTable);
             // Validate before removing any historical chunks. These also work
-            // for chunks routed to an immutable linked store.
+            // for chunks routed to an immutable referenced store.
             (void)readSnapshot(db, table, formatUuid(owners.blob16(0)), descriptor);
             for (const auto& hash : descriptor.at("chunks")) hashes.insert(hash.get<std::string>());
           }

@@ -6,8 +6,8 @@ This is the implementation contract and progress record for integrating the immu
 
 - Use the next upstream SQLite schema version (21 if upstream remains at 20), not an independent “vcobj v2” schema family. An ordinary store remains an ordinary SQLite file. Optional packed-container framing has its own physical format version, independent of the logical SQLite schema.
 - Retain upstream functionality, including checked transactions, numbered object and relationship versions, lineage/generation UUIDs, receipts, hosted clients/server, discovery operations, and history queries where history is retained. Do not restore the obsolete hub/replica implementation that upstream removed.
-- Retain our history-off policy, sealing, direct-key linked-store overlays, independent sharding, binary UUIDs/hashes, direct geometry descriptors, optional spatial indexing, packed VFS, and fast shared-stream batch import. Retain the default of 32 import workers.
-- The object UUID is the complete logical key, including across shards and linked stores. Relationships store endpoint UUIDs directly; no proxy objects, aliases, per-object routing directories, endpoint directories, or duplicated endpoint rows. Fixed key-routing metadata determines the responsible database.
+- Retain our history-off policy, sealing, direct-key store_references and overlays, independent sharding, binary UUIDs/hashes, direct geometry descriptors, optional spatial indexing, packed VFS, and fast shared-stream batch import. Retain the default of 32 import workers.
+- The object UUID is the complete logical key, including across shards and referenced stores. Relationships store endpoint UUIDs directly; no proxy objects, aliases, per-object routing directories, endpoint directories, or duplicated endpoint rows. Fixed key-routing metadata determines the responsible database.
 - UUIDs use one 16-byte binary storage format. Chunk hashes remain binary content identifiers, not version counters.
 
 ## One commit clock and one record version
@@ -15,8 +15,8 @@ This is the implementation contract and progress record for integrating the immu
 - Rename our numeric store generation to `commitSequence`/`commit_sequence`. This is the sole store-wide logical change counter and is independent of history retention.
 - Retain upstream's generation UUID as a lineage identifier, not a number. Store identity, lineage identity, object identity, object version, and schema version have distinct meanings.
 - New objects and relationships start at version 1. A changed record advances from its current version once per transaction, even if several setters modify it. No-op updates do not advance it. Deletion retains the last version in a tombstone so recreating the same UUID cannot reuse an old state identifier.
-- Advance the store clock once for a committed logical change. Rollbacks, rolled-back savepoints, and no-op transactions do not advance it. Changes to linking, sealing and logical provisioning count; physical repacking and cache maintenance alone do not.
-- Preserve the dependency ordering rule: a derived store's commit sequence is greater than every sealed linked dependency. Allocate `max(current sequence, linked dependency sequences) + 1` when required. Sequence gaps are permitted; change feeds must handle them. Unrelated stores are not ordered by their sequence values alone.
+- Advance the store clock once for a committed logical change. Rollbacks, rolled-back savepoints, and no-op transactions do not advance it. Changes to store_references, sealing and logical provisioning count; physical repacking and cache maintenance alone do not.
+- Preserve the dependency ordering rule: a derived store's commit sequence is greater than every sealed referenced dependency. Allocate `max(current sequence, referenced dependency sequences) + 1` when required. Sequence gaps are permitted; change feeds must handle them. Unrelated stores are not ordered by their sequence values alone.
 - Current record versions must be stored/read without joining retained history. History-on archives use these same versions and commit sequences, not another incrementing counter. History-off does not create archival version rows merely to provide current-state freshness checks.
 - Remove the old per-record numeric `generation` and `data_generation` fields and their duplicate bookkeeping. Update approvals, geometry repair guards, serializers, Python bindings and VC3D consumers to use the appropriate record version or store-state token. Do not merely rename old numeric values: legacy mutation counts are not necessarily numbered versions.
 - History removal never resets current versions or the commit sequence. Enabling history archives the current state under its existing identities. The redesigned lazy/delta history scheme remains deferred.
@@ -29,9 +29,9 @@ Geometry caches may conservatively invalidate on any object-version change. Exis
 
 Approval metadata belongs to the version it approves. Migrate legacy approval-generation stamps to the numbered-version model, preserving approval provenance and invalidation behavior; changes within the same transaction must not accidentally approve later unreviewed edits.
 
-## Linked stores, sharding and history-off
+## Store references, sharding and history-off
 
-- Links target sealed stores and pin `(store UUID, lineage UUID, commitSequence)`. A mismatch fails explicitly. An immutable base can be shadowed by an ordinary same-UUID object/relationship in the writable overlay; deletion uses the existing state field, not a separate tombstone table.
+- Store references (`store_reference`) target sealed stores and pin `(store UUID, lineage UUID, commitSequence)`. A mismatch fails explicitly. An immutable base can be shadowed by an ordinary same-UUID object/relationship in the writable overlay; deletion uses the existing state field, not a separate tombstone table.
 - Retain `state` with Active/Retired/Deleted for objects and Active/Deleted for relationships. Retain location search APIs and fixed database/table routing metadata. All data tables follow the shard ownership plan; provisioning metadata remains small and store-local.
 - Retain the pre-integration lifecycle simplification: retiring an object tombstones its current incident relationships atomically; restoring does not resurrect them. History-on retains earlier observations through historical selections. Do not reintroduce per-edge lifecycle-binding tables or claim surviving current links need a separate lifecycle epoch check.
 - Independent shard writers construct one unpublished logical import state with known versions and a shared lineage/commit token. They directly write known UUID references without cross-shard joins or validation reads. Finalization must not reopen all shards to rediscover information the importer already owns.
@@ -50,7 +50,7 @@ Approval metadata belongs to the version it approves. Migrate legacy approval-ge
 
 1. Record this contract, fetch upstream, and preserve the pre-integration branch state in Git.
 2. Integrate upstream additions without reintroducing superseded hub/replica code or undoing the direct-key/slim-store changes.
-3. Implement schema 21/current version and commit tracking, history-off behavior, geometry descriptors, approvals and linked-state tokens.
+3. Implement schema 21/current version and commit tracking, history-off behavior, geometry descriptors, approvals and store_reference state tokens.
 4. Reconcile the offline upstream converters; remove the unpublished experimental-format conversion path.
 5. Update native/Python/hosted/VC3D consumers, documentation and tests.
 6. Run core, adapter, Python, conversion and import regression tests; benchmark matched prepared and AFV inputs with the existing fixed runner. Each import benchmark is limited to 30 seconds; estimate full-volume time instead of launching long imports.
@@ -72,7 +72,7 @@ Approval metadata belongs to the version it approves. Migrate legacy approval-ge
 ## Progress
 
 - Contract committed before integration as `e43271649`. Pre-integration branch head: `ef3442aeb`; fetched upstream head: `2144fdd3f` (schema 20).
-- Schema 21, ordinary record versions, direct geometry descriptors, linked lineage/commit pins and explicit upstream conversion are implemented. Final validation: 49 native tests pass (9.25 s; the external-credential SSH test is skipped), and all 126 Python tests pass (8.62 s), including hosted-server tests and importer readback. No deferred delta-history redesign was implemented.
+- Schema 21, ordinary record versions, direct geometry descriptors, store_reference lineage/commit pins and explicit upstream conversion are implemented. Final validation: 49 native tests pass (9.25 s; the external-credential SSH test is skipped), and all 126 Python tests pass (8.62 s), including hosted-server tests and importer readback. No deferred delta-history redesign was implemented.
 - History-off request retry receipts are operational state, not retained object history: create their existing standalone receipt table lazily only when an explicit request UUID is submitted. Slim initial imports never need this table. History-policy changes preserve already-issued receipts.
 - Conversion preserves logical identities, so hosted metadata-cache keys now include the schema-21 wire namespace. Existing raw geometry/artifact blocks remain reusable. Geometry-only and metadata-plus-geometry edits preserve explicitly recorded historical relationship pins; an unpublished relationship cannot claim a historical state that never existed.
 

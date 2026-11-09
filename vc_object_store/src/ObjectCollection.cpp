@@ -234,7 +234,7 @@ struct ObjectCollection::Impl {
                 if(nodes[i].member.partition&&(!routed||*routed==child)&&included.insert(i).second)order.push_back(i);
             }
             for(const auto& child:nodes[n].children){const auto i=byDatabase.at(child);
-                // Even an unselected shard can link to readonly dependencies.
+                // Even an unselected shard can hold store_references to readonly dependencies.
                 // Skip its rows, not the logical bases it references.
                 visit(i,!nodes[i].member.partition);
             }
@@ -267,7 +267,7 @@ struct ObjectCollection::Impl {
         pool->externalGeometryChunkSize=[locate](const auto& hash){return locate(hash).second;};
         pool->externalGeometryChunk=[locate](const auto& hash){
             const auto source=locate(hash).first;
-            if(!source)throw std::runtime_error("collection: chunk absent from linked readonly stores");
+            if(!source)throw std::runtime_error("collection: chunk absent from referenced readonly stores");
             return readGeometryPayload(source,hash);
         };
         auto endpoint=[this,n,get](const std::string& uuid){
@@ -389,8 +389,8 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
             catch(const std::exception& error){if(directError.empty())directError=error.what();return false;}
         };
         bool found=attempt(input);
-        for(const auto& candidate:options.linkedStoreFiles)if(!found)found=attempt(candidate);
-        for(const auto& directory:options.linkedStoreDirectories){
+        for(const auto& candidate:options.storeReferenceFiles)if(!found)found=attempt(candidate);
+        for(const auto& directory:options.storeReferenceDirectories){
             if(found)break;
             std::vector<std::filesystem::path> candidates;std::error_code error;
             for(std::filesystem::directory_iterator it(directory,error),end;!error&&it!=end;it.increment(error)){

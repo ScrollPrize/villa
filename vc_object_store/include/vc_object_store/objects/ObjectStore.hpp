@@ -257,14 +257,14 @@ struct OpenOptions {
     // geometryRegion or nearestSurfaces query reached whose geometry is not
     // local yet. Must only queue work; ObjectStoreSession sets it on writable attachments.
     std::function<void(const std::vector<std::string>&)> remoteGeometryReached;
-    // Collection dependency relocation only; never changes the root locator.
+    // Store_reference dependency relocation only; never changes the root locator.
     // After the recorded path, try these files in order, then regular files in
     // each nonrecursive directory in sorted filename order. Relative search
     // paths are relative to the process working directory. Candidates must
     // match the pinned database/store UUIDs, generation and readonly policy.
     // Packed container files are supported and select the pinned member UUID.
-    std::vector<std::filesystem::path> linkedStoreFiles;
-    std::vector<std::filesystem::path> linkedStoreDirectories;
+    std::vector<std::filesystem::path> storeReferenceFiles;
+    std::vector<std::filesystem::path> storeReferenceDirectories;
 };
 
 struct ObjectSelection {
@@ -460,7 +460,7 @@ public:
         const std::function<bool(const ExtensionRow&)>&) const;
     DatabaseIdentity databaseIdentity(const Txn&) const;
     // Irreversible publication: future writes (including through already-open
-    // handles) are rejected. Linked stores must have been sealed, not merely
+    // handles) are rejected. Referenced stores must have been sealed, not merely
     // opened using readOnly=true.
     void seal(WriteTxn&);
     static ObjectStore open(const std::filesystem::path&, const OpenOptions&);

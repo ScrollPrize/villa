@@ -622,7 +622,7 @@ void versionedHistoryPolicy()
     }
 }
 
-void linkedVersionedFields(HistoryMode history)
+void storeReferenceVersionedFields(HistoryMode history)
 {
     TemporaryDirectory dir;
     const auto basePath = dir.path / "base.vcobj";
@@ -667,7 +667,7 @@ void linkedVersionedFields(HistoryMode history)
         initialCommit = overlay.provisioning(txn).commitSequence;
         require(rows(overlay, txn, objectTable.name, firstPrefix) == first &&
                 rows(overlay, txn, edgeTable.name, edgePrefix) == edges,
-                "linked owner fields are visible before creating a local owner");
+                "referenced owner fields are visible before creating a local owner");
     }
     {
         auto txn = overlay.write();
@@ -720,7 +720,7 @@ void linkedVersionedFields(HistoryMode history)
     {
         auto txn = overlay.read();
         require(rows(overlay, txn, objectTable.name, firstPrefix) == changed,
-                "rolled-back linked clear restores owner visibility and values");
+                "rolled-back store_reference clear restores owner visibility and values");
     }
     {
         auto txn = overlay.write();
@@ -883,18 +883,18 @@ void shardedImport(bool packed)
     size_t first = 0;
     collection.scanExtensionRows(txn, objectTable.name, [&](const auto&) { ++first; return false; });
     require(first == 1, "early termination stops the composed scan, not only one shard");
-    auto linked = ObjectCollection::create(dir.path / "linked.vcobj", {result.path},
+    auto storeReference = ObjectCollection::create(dir.path / "store-reference.vcobj", {result.path},
                                           OpenOptions{.history = HistoryMode::Off, .author = "extension-test"});
-    auto linkedTxn = linked.read();
-    size_t linkedCount = 0;
-    linked.scanExtensionRows(linkedTxn, edgeTable.name, [&](const auto&) { ++linkedCount; return true; });
-    require(linkedCount == count, "linked collections expose extension rows without copying the source graph");
-    const std::vector<ExtensionValue> linkedPrefix{extensionUuid(objects.front())};
-    std::vector<ExtensionRow> linkedRows;
-    linked.scanExtensionRows(linkedTxn, objectTable.name,
-        [&](const auto& row) { linkedRows.push_back(row); return true; }, linkedPrefix);
-    require(linkedRows == std::vector<ExtensionRow>{sample(objects.front(), 1)},
-            "linked UUID-prefix lookup preserves typed results through plain and packed partitions");
+    auto referenceTxn = storeReference.read();
+    size_t referenceCount = 0;
+    storeReference.scanExtensionRows(referenceTxn, edgeTable.name, [&](const auto&) { ++referenceCount; return true; });
+    require(referenceCount == count, "store_references expose extension rows without copying the source graph");
+    const std::vector<ExtensionValue> referencePrefix{extensionUuid(objects.front())};
+    std::vector<ExtensionRow> referenceRows;
+    storeReference.scanExtensionRows(referenceTxn, objectTable.name,
+        [&](const auto& row) { referenceRows.push_back(row); return true; }, referencePrefix);
+    require(referenceRows == std::vector<ExtensionRow>{sample(objects.front(), 1)},
+            "store_reference UUID-prefix lookup preserves typed results through plain and packed partitions");
 }
 } // namespace
 
@@ -912,8 +912,8 @@ int main()
     versionedRelationship(HistoryMode::Off);
     versionedRelationship(HistoryMode::On);
     versionedHistoryPolicy();
-    linkedVersionedFields(HistoryMode::Off);
-    linkedVersionedFields(HistoryMode::On);
+    storeReferenceVersionedFields(HistoryMode::Off);
+    storeReferenceVersionedFields(HistoryMode::On);
     shardedImport(false);
     shardedImport(true);
 }

@@ -49,7 +49,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
                   const Json& coordinates,AfvSource& source,int64_t limit)
 {
     using namespace vc::objects::imports;
-    const bool linked=config.contains("geometry_collection"),hasEdges=config.contains("constraints");
+    const bool storeReference=config.contains("geometry_collection"),hasEdges=config.contains("constraints");
     const auto integerOption=[&](const char* key,uint64_t fallback,uint64_t maximum,bool allowZero=false){
         const auto it=config.find(key);if(it==config.end())return fallback;
         if(!it->is_number_integer()||(!it->is_number_unsigned()&&it->get<int64_t>()<0))
@@ -67,12 +67,12 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
     const size_t queueBytes=integerOption("queue_bytes",256*1024*1024,sizeLimit);
     const size_t sourceCacheBytes=integerOption("source_cache_bytes",128*1024*1024,sizeLimit);
     const size_t sourceMmapBytes=integerOption("source_mmap_bytes",0,sizeLimit,true);
-    if(linked&&!hasEdges)throw std::invalid_argument("geometry_collection requires constraints");
+    if(storeReference&&!hasEdges)throw std::invalid_argument("geometry_collection requires constraints");
     const auto start=Clock::now();const auto sourceUuid=source.uuid();
     source.setMmapBytes(sourceMmapBytes);
-    const auto fiberRanges=linked?std::vector<std::array<int64_t,2>>{}:source.workRanges(
+    const auto fiberRanges=storeReference?std::vector<std::array<int64_t,2>>{}:source.workRanges(
         integerOption("source_chunk_points",65536,sizeLimit),integerOption("source_chunk_fibers",1024,sizeLimit),limit);
-    const int64_t fiberEnd=!linked&&limit&&!fiberRanges.empty()?fiberRanges.back()[1]:INT64_MAX;
+    const int64_t fiberEnd=!storeReference&&limit&&!fiberRanges.empty()?fiberRanges.back()[1]:INT64_MAX;
     std::unique_ptr<AfcSource> edgeSource;
     std::vector<std::array<int64_t,2>> edgeRanges;
     if(hasEdges){
@@ -93,7 +93,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         options.packed->memoryFirst=config.value("memory_first",false);
         options.packed->backgroundFlush=config.value("background_flush",true);
     }
-    if(linked)options.dependencies={std::filesystem::absolute(config.at("geometry_collection").get<std::string>())};
+    if(storeReference)options.dependencies={std::filesystem::absolute(config.at("geometry_collection").get<std::string>())};
     options.shards.clear();
     const int64_t reservation=INT64_MAX/workers;
     for(int i=0;i<workers;++i)options.shards.push_back({{int64_t(i)*reservation+1,int64_t(i+1)*reservation},
@@ -107,14 +107,14 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
     std::vector<size_t> fiberMmap(readers),edgeMmap(readers);
     // Join/cancel readers before destroying the cursor/stat buffers they use.
     ParallelImportStream stream({size_t(readers),size_t(workers),batchSize,batchBytes,queueBytes});
-    if(!linked){
+    if(!storeReference){
         FiberSourceInfo info;info.uuid=sourceUuid;info.fiberCount=source.fiberCount();info.pointCount=source.pointCount();
         if(config.contains("source_sha256"))info.sha256=config.at("source_sha256").get<std::string>();
         options.extensions.push_back(fiberSourceExtension(info));
     }
     if(hasEdges){
         std::vector<ExtensionSource> pins;
-        if(linked){auto base=ObjectCollection::open(config.at("geometry_collection").get<std::string>(),readOptions(config));auto tx=base.read();
+        if(storeReference){auto base=ObjectCollection::open(config.at("geometry_collection").get<std::string>(),readOptions(config));auto tx=base.read();
             const auto state=base.provisioning(tx);pins.push_back({base.uuid(tx),state.generation,state.commitSequence});}
         FiberConstraintSourceInfo info;info.fiberSourceUuid=sourceUuid;info.constraintCount=edgeSource->constraintCount();
         if(config.contains("constraints_sha256"))info.sha256=config.at("constraints_sha256").get<std::string>();
@@ -168,7 +168,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         // All writers have joined. Check their existing counters while every
         // destination is still private; no source scan or store readback.
         for(const auto& c:counts){fibers+=c.fibers;points+=c.points;nedges+=c.edges;}
-        if(!linked&&(fibers!=(limit?std::min(limit,source.fiberCount()):source.fiberCount())||(!limit&&points!=source.pointCount())))
+        if(!storeReference&&(fibers!=(limit?std::min(limit,source.fiberCount()):source.fiberCount())||(!limit&&points!=source.pointCount())))
             throw std::runtime_error("initial fiber aggregate totals differ from source");
         if(hasEdges && fiberEnd==INT64_MAX && nedges!=(edgeLimit?std::min(edgeLimit,edgeSource->constraintCount()):edgeSource->constraintCount()))
             throw std::runtime_error("initial constraint aggregate totals differ from source");
@@ -226,7 +226,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
     const bool verify=config.value("verify_readback",false);double validationSeconds=0;
     if(verify){
         const auto vstart=Clock::now();auto joined=ObjectCollection::open(imported.path,readOptions(config));auto txn=joined.read();
-        if(!linked)for(const auto& range:fiberRanges){
+        if(!storeReference)for(const auto& range:fiberRanges){
             AfvSource part(input,range[0],range[1]);AfvFiber fiber;
             while(part.next(fiber)){
                 checkCancelled();
@@ -268,13 +268,13 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         {if(entry.is_regular_file())bytes+=entry.file_size();}
     else bytes=std::filesystem::file_size(output);
     Json result={{"source",input.string()},{"output",output.string()},{"store_uuid",imported.storeUuid},
-        {"stage","complete"},{"mode",linked?"relations":hasEdges?"combined":"geometry"},
+        {"stage","complete"},{"mode",storeReference?"relations":hasEdges?"combined":"geometry"},
         {"source_uuid",sourceUuid},{"initial_batch",true},{"uuid_hash_routing",true},{"shards",workers},{"readers",readers},
         {"batch_size",batchSize},{"batch_bytes",batchBytes},{"queue_bytes",queueBytes},{"packed",bool(options.packed)},
         {"fibers",fibers},{"points",points},{"constraints",nedges},{"constraints_imported",hasEdges},{"source_pipeline_seconds",sourceSeconds},
         {"geometry_bytes",points*24},{"metadata_json_bytes",metadataBytes},{"constraint_metadata_json_bytes",edgeMetadataBytes},
         {"fiber_source_extension_rows",fibers},{"constraint_extension_rows",nedges},
-        {"source_metadata_json_bytes",linked?edgeSource->metadataJson().size():source.metadataJson().size()},
+        {"source_metadata_json_bytes",storeReference?edgeSource->metadataJson().size():source.metadataJson().size()},
         {"source_read_seconds",fiberPreparation},{"constraint_source_read_seconds",edgePreparation},{"per_reader",perReader},
         {"source_read_timing","reader-worker preparation sum (decode/UUID/batching), excludes queue push time"},
         {"native_import_seconds",objectSeconds},{"constraint_import_seconds",edgeSeconds},{"seal_seconds",sealSeconds},
@@ -288,12 +288,12 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         {"ingestion_seconds",imported.ingestionSeconds},{"manifest_seconds",imported.manifestSeconds},
         {"persistence_seconds",imported.persistenceSeconds},{"validation_seconds",validationSeconds},{"readback_verified",verify},
         {"total_seconds",seconds(start)},{"output_bytes",bytes},{"peak_rss_bytes",benchmark::peakRssBytes()},{"per_shard",perShard}};
-    if(linked){result["geometry_collection"]=options.dependencies.front().string();result["geometry_copied"]=false;}
-    if(!linked&&hasEdges&&edgeLimit){
+    if(storeReference){result["geometry_collection"]=options.dependencies.front().string();result["geometry_copied"]=false;}
+    if(!storeReference&&hasEdges&&edgeLimit){
         result["estimated_full_import_seconds"]=nullptr;
         result["estimate_basis"]="unavailable for combined import with constraint_limit: fiber and relation sampling fractions differ; do not scale both phases by fiber count";
     }else{
-        result["estimated_full_import_seconds"]=linked?(nedges?pipelineSeconds*edgeSource->constraintCount()/nedges:0.):
+        result["estimated_full_import_seconds"]=storeReference?(nedges?pipelineSeconds*edgeSource->constraintCount()/nedges:0.):
             (fibers?pipelineSeconds*source.fiberCount()/fibers:0.);
         result["estimate_basis"]="linear record-count projection, source preparation included; not a full-volume measurement";
     }

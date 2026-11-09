@@ -26,7 +26,7 @@ void clearCurrentExtensionRows(sqlite3*, const char* ownerTable, const std::stri
 // Current snapshots, not discarded historical versions, survive history removal.
 std::vector<std::string> currentExtensionChunks(sqlite3*);
 // Localize manual fields with their owner into an overlay. Immutable result
-// tables remain in the linked store and need no copied rows.
+// tables remain in the referenced store and need no copied rows.
 void materializeExtensionOwner(sqlite3* sourceDb, ObjectStore& target, WriteTxn&,
                                const char* ownerTable, const std::string& ownerUuid,
                                const std::string& sourceMeta);

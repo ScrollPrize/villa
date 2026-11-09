@@ -78,7 +78,7 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
     Statement row(db, "SELECT id,kind FROM objects WHERE uuid=? AND state<>2", bytes);
     if (!row.row()) throw std::runtime_error("object store: object not found: " + uuid);
     const auto kind = row.text(1);
-    // UUID endpoints may live in linked stores; RESTRICT is checked by the API.
+    // UUID endpoints may live in referenced stores; RESTRICT is checked by the API.
     Statement incident(db, "SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1", bytes);
     if (incident.row()) throw std::runtime_error("object store: remove incident relationships before deletion");
     beforeCurrentObjectEdit(db,uuid);

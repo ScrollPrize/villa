@@ -6,7 +6,7 @@ The [schema integration contract](schema-integration.md) supersedes the old expe
 
 ## Identities and versions
 
-All SQL UUID fields use the same 16-byte SQLite BLOB representation; public APIs and JSON use canonical UUID strings. Object UUIDs are the complete logical keys across local records, shards and linked stores. SHA-256 payload keys and SQL references are 32-byte BLOBs. Public hashes and JSON descriptor references remain hexadecimal. Neither object keys nor payload hashes are counters.
+All SQL UUID fields use the same 16-byte SQLite BLOB representation; public APIs and JSON use canonical UUID strings. Object UUIDs are the complete logical keys across local records, shards and referenced stores. SHA-256 payload keys and SQL references are 32-byte BLOBs. Public hashes and JSON descriptor references remain hexadecimal. Neither object keys nor payload hashes are counters.
 
 | Table | Contents |
 | --- | --- |
@@ -50,11 +50,11 @@ Edit validation uses transaction-local C++ snapshots and savepoint rollback, not
 
 ### Lifecycle and relationships
 
-`objects.state` is Active=0, Retired=1 or Deleted=2. `edges.state` permits Active=0 or Deleted=2. Public `retired`/historical deletion indicators are projections, not independent current-state columns. A same-key deletion row blocks fallback to linked stores; only an absent UUID falls through. An explicit recreate can replace the deletion marker, but does not implicitly revive geometry or relationships.
+`objects.state` is Active=0, Retired=1 or Deleted=2. `edges.state` permits Active=0 or Deleted=2. Public `retired`/historical deletion indicators are projections, not independent current-state columns. A same-key deletion row blocks fallback to referenced stores; only an absent UUID falls through. An explicit recreate can replace the deletion marker, but does not implicitly revive geometry or relationships.
 
 Retiring an object removes its current incident relationships. Restoring it does not silently recreate them. Current relationships to retired/deleted endpoints are rejected. History-enabled stores retain earlier states; history-off cannot retain a historical-only relationship.
 
-Edges store endpoint UUIDs directly in `a_uuid`/`b_uuid`, identically for local, sibling-shard and linked objects. There are no proxy objects, endpoint directories, external-key aliases, negative handles or per-object routing rows. Native APIs resolve keys through fixed routing metadata when edit validation requires endpoints; batch construction writes supplied keys without cross-shard lookups.
+Edges store endpoint UUIDs directly in `a_uuid`/`b_uuid`, identically for local, sibling-shard and referenced-store objects. There are no proxy objects, endpoint directories, external-key aliases, negative handles or per-object routing rows. Native APIs resolve keys through fixed routing metadata when edit validation requires endpoints; batch construction writes supplied keys without cross-shard lookups.
 
 Each edge UUID identifies one observation. Different UUIDs may describe the same endpoint pair and kind; duplicate live UUIDs are rejected. There is no extra relation key or endpoint-pair uniqueness constraint. Relationship tags remain ordinary tags, not additional endpoint objects.
 
@@ -80,7 +80,7 @@ Spatial selection, region reads and nearest-surface queries fail explicitly when
 
 `seal(writeTxn)` persists immutability atomically. After commit, new writable opens and already-open handles cannot write. Merely opening read-only does not seal a store. This is API-level protection, not protection against arbitrary raw SQL or filesystem modification.
 
-Links pin a sealed dependency's store UUID, lineage UUID and commit sequence. A mismatch fails. A derived store's sequence is greater than all pinned dependencies; allocation uses the maximum relevant sequence plus one, so sequence gaps are valid. Physical repacking preserves these logical identities.
+Store references (`store_reference`) pin a sealed dependency's store UUID, lineage UUID and commit sequence. A mismatch fails. A derived store's sequence is greater than all pinned dependencies; allocation uses the maximum relevant sequence plus one, so sequence gaps are valid. Physical repacking preserves these logical identities.
 
 A shard import is one unpublished state with a shared lineage and commit token. Independent writers directly create object/edge keys and descriptors. The final coordinator writes known routing metadata, without reopening shards to rediscover or validate records. All data tables follow ownership; metadata remains small and local. No cross-database transaction is claimed.
 

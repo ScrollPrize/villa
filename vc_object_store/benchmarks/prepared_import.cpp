@@ -279,7 +279,7 @@ Json reduced(const Prepared& data,const fs::path& path,bool verifyReadback){
     result["verify_seconds"]=elapsed(verify);
     return result;
 }
-Json native(Prepared& data,const fs::path& path,bool linked,bool packed,size_t workers,size_t sqlRows,
+Json native(Prepared& data,const fs::path& path,bool storeReference,bool packed,size_t workers,size_t sqlRows,
     size_t exportWorkers,bool preSizeExport,size_t residentBytes,bool verifyReadback,size_t sqliteCacheBytes){
     using namespace vc::objects::imports;
     InitialImportOptions opt;opt.store.author="prepared-benchmark";opt.store.sqliteCacheBytes=sqliteCacheBytes;
@@ -339,10 +339,10 @@ Json native(Prepared& data,const fs::path& path,bool linked,bool packed,size_t w
         {"object_tasks",r.objectTasks},{"edge_tasks",r.edgeTasks},{"object_seconds",r.objectSeconds},{"edge_seconds",r.edgeSeconds},{"queue_wait_seconds",r.queueWaitSeconds}});}
       return result;
     };
-    if(linked){const auto base=path.string()+".base";const auto start=Clock::now();const auto result=runImport(base,true,false,false);
+    if(storeReference){const auto base=path.string()+".base";const auto start=Clock::now();const auto result=runImport(base,true,false,false);
         owner=result.storeUuid;dependency=elapsed(start);opt.dependencies={base};}
-    const auto result=runImport(path,!linked,true,true);
-    if(!linked)owner=result.storeUuid;
+    const auto result=runImport(path,!storeReference,true,true);
+    if(!storeReference)owner=result.storeUuid;
     InitialShardResult summed;
     for(const auto& shard:result.shards){summed.objectSeconds+=shard.objectSeconds;summed.edgeSeconds+=shard.edgeSeconds;
         summed.producerSeconds+=shard.producerSeconds;summed.creationSeconds+=shard.creationSeconds;summed.sealCommitSeconds+=shard.sealCommitSeconds;}
@@ -411,7 +411,7 @@ int main(int argc,char** argv){try{
             key=="export_workers"||key=="pre_size_export"||key=="resident_bytes"||key=="sqlite_cache_bytes",
             "cases may change only variant, workers, sql_batch_rows, repetitions, label, export_workers, pre_size_export, resident_bytes or sqlite_cache_bytes; input is shared");
         const std::string variant=run.at("variant");
-        require(variant=="prototype"||variant=="native"||variant=="linked"||variant=="native_packed"||
+        require(variant=="prototype"||variant=="native"||variant=="store_reference"||variant=="native_packed"||
             variant=="native_sharded"||variant=="native_packed_sharded","unknown variant");
         require(run.value("repetitions",config.value("repetitions",1))>0,"repetitions must be positive");
         needsPrototype|=variant=="prototype";
@@ -449,7 +449,7 @@ int main(int argc,char** argv){try{
         const auto path=root/("case"+std::to_string(caseIndex)+"-"+variant+std::to_string(repeat)+".sqlite");require(!fs::exists(path),"refusing overwrite");
         std::cout<<Json({{"stage","case_start"},{"case",caseIndex},{"variant",variant},{"workers",workers},{"repetition",repeat}}).dump()<<std::endl;
         const bool verifyReadback=config.value("verify_readback",false);
-        Json result=variant=="prototype"?reduced(data,path,verifyReadback):native(data,path,variant=="linked",variant.starts_with("native_packed"),workers,sqlRows,
+        Json result=variant=="prototype"?reduced(data,path,verifyReadback):native(data,path,variant=="store_reference",variant.starts_with("native_packed"),workers,sqlRows,
             exportWorkers,preSizeExport,residentBytes,verifyReadback,run.value("sqlite_cache_bytes",config.value("sqlite_cache_bytes",size_t(512)*1024*1024)));
         result["sqlite_cache_bytes"]=run.value("sqlite_cache_bytes",config.value("sqlite_cache_bytes",size_t(512)*1024*1024));
         result["case"]=caseIndex;result["label"]=run.value("label",variant);result["variant"]=variant;result["workers"]=workers;
@@ -460,7 +460,7 @@ int main(int argc,char** argv){try{
         if(result["inventory_scanned"].get<bool>()) {
             result["tables"]=inventory(path);
             require(result["tables"].value("edges",size_t(0))==data.edges.size(),"edge count mismatch");
-            require(result["tables"].value("objects",size_t(0))==(variant=="linked"?0:data.objects.size()),"objects must not be duplicated into relation shards");
+            require(result["tables"].value("objects",size_t(0))==(variant=="store_reference"?0:data.objects.size()),"objects must not be duplicated into relation shards");
         }
         uint64_t bytes=0;
         if(fs::is_directory(path)){for(const auto& member:fs::directory_iterator(path))if(member.path().extension()==".vcobj")bytes+=fs::file_size(member.path());}
@@ -469,7 +469,7 @@ int main(int argc,char** argv){try{
         // Outputs are private benchmark fixtures, not experiment deliverables.
         // Remove only successfully created paths; the runner handles aborts.
         if(config.value("remove_completed_outputs",true)) {
-            std::vector<fs::path> outputs{path};if(variant=="linked")outputs.emplace_back(path.string()+".base");
+            std::vector<fs::path> outputs{path};if(variant=="store_reference")outputs.emplace_back(path.string()+".base");
             for(const auto& output:outputs) {
                 fs::remove_all(output);
                 for(const auto* suffix:{"-wal","-shm","-journal"})fs::remove(output.string()+suffix);

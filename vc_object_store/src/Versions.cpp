@@ -534,7 +534,7 @@ ChangePage ObjectStore::changesSince(const Txn& txn, const FeedCursor& cursor, i
             break;
         }
     }
-    // Provisioning commits and linked-store ordering can leave sequence gaps
+    // Provisioning commits and store_reference ordering can leave sequence gaps
     // without record changes. A completely consumed feed advances over them.
     if (!page.more) page.next = head;
     return page;

@@ -167,7 +167,7 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
         for(size_t i=0;i<options.shards.size();++i)paths.push_back(packed->addDatabase(util::newUuid()));
         manifest=paths.size()==1?paths.front():packed->addDatabase(manifestId);
     }else if(options.shards.size()==1){
-        // A sibling filename retains the same external-relative-link base.
+        // A sibling filename retains the same external-relative-store_reference base.
         single=std::make_unique<detail::StagedDatabase>(destination,false);
         paths.push_back(single->path);manifest=paths.front();
     }else{

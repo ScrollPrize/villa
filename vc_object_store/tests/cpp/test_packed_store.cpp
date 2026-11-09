@@ -305,7 +305,7 @@ int main()
 
         // Collection repacking changes only physical locations and remains
         // self-contained after both the container and original bases move.
-        const auto basePath = temp.path / "linked-base.vcobj", derivedPath = temp.path / "derived.vcobj";
+        const auto basePath = temp.path / "referenced-base.vcobj", derivedPath = temp.path / "derived.vcobj";
         OpenOptions collectionOptions; collectionOptions.author = "packed-test";
         collectionOptions.history = HistoryMode::Off; collectionOptions.spatialIndex = false;
         ObjectKey key;
@@ -328,7 +328,7 @@ int main()
             auto read = derived.read(); generation = derived.provisioning(read).generation;
             commitSequence = derived.provisioning(read).commitSequence;
         }
-        packObjectCollection(derivedPath, temp.path / "linked-packed.vcobj", options);
+        packObjectCollection(derivedPath, temp.path / "store-reference-packed.vcobj", options);
         const auto branchPath = temp.path / "branch.vcobj", dagPath = temp.path / "dag.vcobj";
         auto deformed = originalGeometry;
         double changed = 123;
@@ -351,11 +351,11 @@ int main()
         {
             auto reversed = ObjectCollection::create(temp.path / "reversed-dag.vcobj", {branchPath, derivedPath}, collectionOptions);
             auto read = reversed.read();
-            require(reversed.readGeometryArray(read,key,"line_points")==deformed,"first linked same-key geometry override wins");
+            require(reversed.readGeometryArray(read,key,"line_points")==deformed,"first referenced same-key geometry override wins");
         }
         packObjectCollection(dagPath, temp.path / "dag-packed.vcobj", options);
-        std::filesystem::rename(basePath, temp.path / "old-linked-base.vcobj");
-        std::filesystem::rename(temp.path / "linked-packed.vcobj", temp.path / "relocated-packed.vcobj");
+        std::filesystem::rename(basePath, temp.path / "old-referenced-base.vcobj");
+        std::filesystem::rename(temp.path / "store-reference-packed.vcobj", temp.path / "relocated-packed.vcobj");
         {
             auto packed = ObjectCollection::open(temp.path / "relocated-packed.vcobj", OpenOptions{.readOnly=true});
             auto read = packed.read();

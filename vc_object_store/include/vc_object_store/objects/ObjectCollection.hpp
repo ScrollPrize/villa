@@ -90,7 +90,7 @@ public:
     // relevant partition in each layer. Unfiltered scans visit all partitions.
     void scanExtensionRows(const CollectionTxn&, const std::string&,
         const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {}) const;
-    // Flush the local writer's committed WAL; linked readonly stores are unchanged.
+    // Flush the local writer's committed WAL; referenced readonly stores are unchanged.
     void checkpoint();
     std::vector<CollectionMember> members() const;
     std::optional<CollectionObject> object(const CollectionTxn&, const ObjectKey&) const;

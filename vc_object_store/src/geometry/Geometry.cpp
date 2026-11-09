@@ -255,7 +255,7 @@ void writeArrays(sqlite3* db, const std::string& revisionUuid,
             if (geometryWork && inserted) geometryWork->writtenBytes[array.name] += bytes.size();
             // A successful new INSERT has stored exactly the supplied bytes.
             // Only reuse needs readback: never silently reuse corrupt data or
-            // a hash collision, including explicitly linked external chunks.
+            // a hash collision, including external chunks resolved via store_reference.
             if(!inserted) {
                 verify.reset(); verify.bind(1, digest);
                 if (!verify.row()) throw std::runtime_error("geometry: missing reused payload");

@@ -22,7 +22,7 @@ int64_t chunks(sqlite3* db){Statement q(db,"SELECT count(*) FROM geometry_chunks
 void borrowedChunks()
 {
     TemporaryDirectory dir;
-    const auto basePath=dir.path/"base",sourcePath=dir.path/"source",targetPath=dir.path/"linked-target";
+    const auto basePath=dir.path/"base",sourcePath=dir.path/"source",targetPath=dir.path/"store-reference-target";
     const auto owner=util::newUuid(),id=util::newUuid();
     const auto geometry=shape();
     {
@@ -46,7 +46,7 @@ void borrowedChunks()
         copied.arrays.front().bytes=GeometryReader(source.get(),revision).read("points",0);
         const auto selected=target.putGeometry(w,id,copied);
         require(target.readGeometryArray(w,selected,"points")==geometry.arrays.front().bytes,
-            "copy resolves absent local payloads through linked source");
+            "copy resolves absent local payloads through store_reference");
         require(chunks(sql)>0,"standalone destination owns copied payloads");
         w.commit();
     }
@@ -55,11 +55,11 @@ void borrowedChunks()
         const auto key=target.upsertObject(w,track(id));
         target.putGeometry(w,key,geometry);
         require(target.readGeometryArray(w,key,"points")==geometry.arrays.front().bytes,
-            "linked destination resolves shared geometry descriptors");
+            "referencing destination resolves shared geometry descriptors");
         w.commit();
     }
     Db target(openConnection(targetPath,SQLITE_OPEN_READONLY,{},true),sqlite3_close_v2);
-    require(chunks(target.get())==0,"linked geometry creation does not copy unchanged payloads");
+    require(chunks(target.get())==0,"store_reference geometry creation does not copy unchanged payloads");
 }
 
 void currentDescriptor(HistoryMode history)

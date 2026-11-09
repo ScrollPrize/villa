@@ -242,18 +242,18 @@ void uuidPrecedence()
         auto read=collection.read();
         require(a.active==b.active,"store hints must not split one logical object UUID");
         require(Json::parse(collection.object(read,a.active)->record.meta).at("quality")==1,
-                "first linked store has explicit precedence");
+                "first referenced store has explicit precedence");
         require(Json::parse(collection.object(read,b.active)->record.meta).at("quality")==1,
                 "store hint must not bypass overlay precedence");
         size_t count=0;
         collection.scanObjects(read,[&](const auto&){++count;return true;},"fiber");
-        require(count==1,"same UUID must enumerate once across linked stores");
+        require(count==1,"same UUID must enumerate once across referenced stores");
     }
     auto reverse=ObjectCollection::create(directory.path/"reversed",{b.path,a.path},directOptions());
     {
         auto read=reverse.read();
         require(Json::parse(reverse.object(read,a.active)->record.meta).at("quality")==2,
-                "linked-store ordering must define deterministic precedence");
+                "store_reference ordering must define deterministic precedence");
     }
     {
         auto write=collection.write();
@@ -281,7 +281,7 @@ void uuidPrecedence()
         auto write=collection.write();collection.deleteObject(write,a.active);collection.seal(write);write.commit();
         auto read=collection.read();
         require(!collection.object(read,a.active)&&!collection.object(read,b.active),
-                "deleted key must stop fallback to every linked store");
+                "deleted key must stop fallback to every referenced store");
     }
     {
         auto raw=ObjectStore::open(path,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
@@ -296,7 +296,7 @@ void uuidPrecedence()
     auto child=ObjectCollection::create(directory.path/"child",{path,b.path},directOptions());
     {
         auto read=child.read();
-        require(!child.object(read,a.active),"deeper link resurrected a shadowed deleted object");
+        require(!child.object(read,a.active),"deeper store_reference resurrected a shadowed deleted object");
     }
     for(const auto& base:{a,b}) {
         auto source=ObjectStore::open(base.path,OpenOptions{.readOnly=true});auto read=source.read();
@@ -401,7 +401,7 @@ void routedPartitionsPrecedeTheirBases()
         "local tombstones stop fallback to routed partitions and their bases");}
     auto child=ObjectCollection::create(directory.path/"child",{directory.path/"overlay",basePath},directOptions());
     {auto read=child.read();require(!child.object(read,{{},a})&&!child.edge(read,{{},edgeUuid}),
-        "routed-layer tombstones stay authoritative through a deeper linked overlay");}
+        "routed-layer tombstones stay authoritative through a deeper store_reference overlay");}
 }
 
 void siblingReferences()

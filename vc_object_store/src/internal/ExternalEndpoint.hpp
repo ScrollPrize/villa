@@ -33,7 +33,7 @@ inline std::optional<std::pair<std::string,std::string>> externalEndpointKey(sql
         return {};
     }
     // A standalone local endpoint does not become external merely because an
-    // edge references it. includeOverridden only probes an available linked
+    // edge references it. includeOverridden only probes an available referenced
     // source; absent a collection resolver, its own row is authoritative.
     if(owned)return {};
     Statement referenced(db,"SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",bytes);

@@ -3,7 +3,7 @@
 
 namespace vc::objects::detail {
 using SharedJson = nlohmann::json;
-// Raw content-addressed payload access, local or explicitly linked. Callers
+// Raw content-addressed payload access, local or via store_reference. Callers
 // account budgets and verify the appropriate content hash exactly once.
 int64_t geometryPayloadSize(sqlite3*, const std::string& hash);
 bool hasExternalGeometryPayload(sqlite3*, const std::string& hash);

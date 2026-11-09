@@ -36,7 +36,7 @@ void packObjectCollection(const std::filesystem::path& source,
             exec(db.get(), "UPDATE store_write_state SET dirty=0 WHERE singleton=1; COMMIT");
         } catch (...) { exec(db.get(), "ROLLBACK"); throw; }
     }
-    // Resolve all rewritten links and validate pins/ranges before publication.
+    // Resolve all rewritten store_references and validate pins/ranges before publication.
     { auto checked = ObjectCollection::open(builder.databasePath(members.front().databaseUuid), OpenOptions{.readOnly=true}); }
     builder.finalize(members.front().databaseUuid);
 }

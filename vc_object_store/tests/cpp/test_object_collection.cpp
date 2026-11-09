@@ -77,23 +77,23 @@ int main()try{
         GeometryArrayEdit change{"line_points",0,std::vector<uint8_t>(8)};double value=123;std::memcpy(change.bytes.data(),&value,8);
         {auto w=c.write();c.editGeometry(w,a,{change},initial);w.commit();}
         auto expected=geometry;std::memcpy(expected.data(),&value,8);
-        {auto r=c.read();require(c.readGeometryArray(r,a,"line_points")==expected,"linked sparse geometry edit exact");}
+        {auto r=c.read();require(c.readGeometryArray(r,a,"line_points")==expected,"store_reference sparse geometry edit exact");}
         {auto raw=ObjectStore::open(file,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});auto r=raw.read();
-            Statement bytes(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM geometry_chunks WHERE data IS NULL");bytes.row();require(bytes.i64(0)==0,"linked chunks create no placeholder rows");
+            Statement bytes(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM geometry_chunks WHERE data IS NULL");bytes.row();require(bytes.i64(0)==0,"referenced chunks create no placeholder rows");
             mustFail([&]{auto records=raw.objectsByKind(r,"fiber");auto rev=raw.currentGeometry(r,records[0].uuid);raw.readGeometryArray(r,rev->uuid,"line_points");});}
         {auto w=c.write();c.seal(w);w.commit();}
         auto deeper=ObjectCollection::create(dir.path/(history==HistoryMode::Off?"deeper-off.vcobj":"deeper-on.vcobj"),{file},opt);
-        {auto r=deeper.read();require(deeper.readGeometryArray(r,a,"line_points")==expected,"linked geometry resolves through deeper overlay");}
+        {auto r=deeper.read();require(deeper.readGeometryArray(r,a,"line_points")==expected,"referenced geometry resolves through deeper overlay");}
     }
     {
-        const auto file=dir.path/"linked-policy.vcobj";auto expected=geometry;double value=111;std::memcpy(expected.data(),&value,8);
+        const auto file=dir.path/"store-reference-policy.vcobj";auto expected=geometry;double value=111;std::memcpy(expected.data(),&value,8);
         {auto c=ObjectCollection::create(file,{basePath},options);std::string token;{auto r=c.read();token=c.currentGeometry(r,a)->uuid;}
             GeometryArrayEdit change{"line_points",0,std::vector<uint8_t>(8)};std::memcpy(change.bytes.data(),&value,8);
             auto w=c.write();c.editGeometry(w,a,{change},token);w.commit();}
         for(auto mode:{HistoryMode::On,HistoryMode::Off}){
             changeHistoryMode(file,mode);auto c=ObjectCollection::open(file,OpenOptions{.readOnly=true});auto r=c.read();
-            require(c.readGeometryArray(r,a,"line_points")==expected,"history policy preserves linked geometry");
-            require(c.provisioning(r).history==mode,"linked history policy persisted");
+            require(c.readGeometryArray(r,a,"line_points")==expected,"history policy preserves referenced geometry");
+            require(c.provisioning(r).history==mode,"store_reference history policy persisted");
         }
     }
     // Two independent workers reserve disjoint ranges under one publication.

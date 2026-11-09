@@ -240,24 +240,24 @@ void shardedResults(bool packed)
                 batch.push_back(std::move(row)); return true;
             });
         });
-    auto linked = ObjectCollection::create(dir.path / "linked.vcobj", {result.path},
+    auto storeReference = ObjectCollection::create(dir.path / "store-reference.vcobj", {result.path},
         OpenOptions{.history = HistoryMode::Off, .author = "fiber-graph-test"});
-    auto txn = linked.read();
+    auto txn = storeReference.read();
     for (size_t i = 0; i < count; ++i) for (size_t run = 0; run < runUuids.size(); ++run) {
         for (const auto& expected : fiberRows(fibers[i], edges[i], run)) {
             bool found = false;
             const std::vector<ExtensionValue> prefix{extensionUuid(fibers[i]), extensionUuid(runUuids[run])};
-            linked.scanExtensionRows(txn, expected.table, [&](const auto& actual) { if (actual == expected.values) found = true; return true; }, prefix);
-            require(found, "fiber result rows route with their owner through linked plain/packed shards");
+            storeReference.scanExtensionRows(txn, expected.table, [&](const auto& actual) { if (actual == expected.values) found = true; return true; }, prefix);
+            require(found, "fiber result rows route with their owner through store_references to plain/packed shards");
         }
         const auto expected = relationRow(edges[i], run);
         const std::vector<ExtensionValue> prefix{extensionUuid(edges[i]), extensionUuid(runUuids[run])};
         std::vector<ExtensionRow> found;
-        linked.scanExtensionRows(txn, expected.table, [&](const auto& actual) { found.push_back(actual); return true; }, prefix);
+        storeReference.scanExtensionRows(txn, expected.table, [&](const auto& actual) { found.push_back(actual); return true; }, prefix);
         require(found == std::vector<ExtensionRow>{expected.values}, "constraint result rows route with their cross-shard edge");
     }
     size_t runs = 0;
-    linked.scanExtensionRows(txn, fiberGraphSolveTable(Table::Runs).name, [&](const auto&) { ++runs; return true; });
+    storeReference.scanExtensionRows(txn, fiberGraphSolveTable(Table::Runs).name, [&](const auto&) { ++runs; return true; });
     require(runs == 2, "run descriptors are stored once and discovered without duplicating them per fiber");
 }
 } // namespace

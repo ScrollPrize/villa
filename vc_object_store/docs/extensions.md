@@ -97,7 +97,7 @@ Immutable computation results and editable extension data have different write p
 
 These are not separate numerical change clocks. The store's commit sequence describes committed writes; ordinary owner versions describe editable record states; input references describe the state a computation used. Enabling history retains the corresponding editable states, while history-off retains current state and freshness checks without pretending old versions can be reconstructed.
 
-For editable fields, set `versioned=true` and `keySpace="objects"` or `"edges"`. The first primary-key column must be the owner's binary UUID; additional key columns allow multiple rows per owner. `ObjectStore::replaceExtensionRows(write, tableName, ownerUuid, rows)` replaces that owner's complete row set, not the whole table. An empty row set removes those fields. The direct store operation requires a local owner; the collection operation described below handles localization from linked stores.
+For editable fields, set `versioned=true` and `keySpace="objects"` or `"edges"`. The first primary-key column must be the owner's binary UUID; additional key columns allow multiple rows per owner. `ObjectStore::replaceExtensionRows(write, tableName, ownerUuid, rows)` replaces that owner's complete row set, not the whole table. An empty row set removes those fields. The direct store operation requires a local owner; the collection operation described below handles localization from referenced stores.
 
 ```cpp
 // Create a separate manual table with its own immutable schema definition.
@@ -135,7 +135,7 @@ matches = store.extension_rows("ext_fiber_classification",
 
 `extension_rows` materializes its result; use `scan_extension_rows(table, visitor, key_prefix=...)` for streaming. A callback returning `False` stops the scan; `None` continues. `extension_rows_at_version` takes the ordinary version-reference dictionary with `store`, `generation`, `version` and exactly one of `object` or `relationship`.
 
-## Parallel construction and linked reads
+## Parallel construction and store_reference reads
 
 Extension payloads use the existing bounded object/edge import stream and are written beside their owning object or edge in the same transaction. They do not require another source scan, a per-object routing directory or cross-shard endpoint reads.
 
@@ -256,9 +256,9 @@ Use a new run UUID for another independently saved result/checkpoint. Metric pro
 
 ## Validation and historical matched import check
 
-Regression coverage includes typed values (including empty BLOB versus NULL), registration and transactional stamps, owner versions/checked writes, history on/off, restore, binary snapshots larger than one chunk, database-copy preservation, linked clears/deletions, and plain/packed multi-shard imports. Python uses the same native row/schema builders. Extension-specific hosted operations are not exposed yet; metadata-only JSON export and object-only copy explicitly reject extension-bearing stores rather than dropping their data.
+Regression coverage includes typed values (including empty BLOB versus NULL), registration and transactional stamps, owner versions/checked writes, history on/off, restore, binary snapshots larger than one chunk, database-copy preservation, store_reference clears/deletions, and plain/packed multi-shard imports. Python uses the same native row/schema builders. Extension-specific hosted operations are not exposed yet; metadata-only JSON export and object-only copy explicitly reject extension-bearing stores rather than dropping their data.
 
-The compact-provisioning cleanup and workflow-table additions passed 51 native tests and 136 Python tests; the optional SSH integration test was skipped. The no-adapter build also passed all 45 executed tests. The new `object_store_fiber_graph_extension` regression covers independent runs, typed values, input references, and linked plain/packed sharded storage. Python exercises the same definitions and rejects wholesale source/configuration dictionaries in the compact builders. The local argument-free verification command is `bash /home/hendrik/villa2/local/scripts/run_vcobj_tests`; portable build/test instructions remain in the project README.
+The compact-provisioning cleanup and workflow-table additions passed 51 native tests and 136 Python tests; the optional SSH integration test was skipped. The no-adapter build also passed all 45 executed tests. The new `object_store_fiber_graph_extension` regression covers independent runs, typed values, input references, and store_references to plain/packed sharded storage. Python exercises the same definitions and rejects wholesale source/configuration dictionaries in the compact builders. The local argument-free verification command is `bash /home/hendrik/villa2/local/scripts/run_vcobj_tests`; portable build/test instructions remain in the project README.
 
 The following numbers were measured **before** the compact-provisioning cleanup, extension-family rename and workflow-table additions. They are not current performance results; those changes have not been rebenchmarked here. The historical matched input contained 50,000 fibers, 15,486,987 XYZ points and 300,000 constraints. Build: GCC 13.3, RelWithDebInfo, SQLite 3.45.1, Linux amd64. Packed output used RAM-first storage, 512 MiB SQLite caches, a 4 GiB resident budget and one exporter to tmpfs. Prepared ingestion excluded source decoding; streaming ingestion included parallel decoding. Final persistence was separate. Each 32-worker result was three trials; the one-worker control was one trial. Every benchmark invocation had a 30-second hard limit. Use the shareable `vc_bench_prepared_import CONFIG.json` and `vc_object_import_afv CONFIG.json` workflows with matching input/settings for a new comparison.
 

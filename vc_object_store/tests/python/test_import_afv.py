@@ -197,7 +197,7 @@ def test_native_aggregate_mismatch_leaves_destination_retryable(tmp_path, shards
 
 
 @pytest.mark.parametrize('packed', [False, True])
-def test_native_uuid_dispatch_combined_and_linked(tmp_path, packed):
+def test_native_uuid_dispatch_combined_and_store_reference(tmp_path, packed):
     build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
     tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
     if not tool or not tool.exists():
@@ -209,12 +209,12 @@ def test_native_uuid_dispatch_combined_and_linked(tmp_path, packed):
                   shards=4, readers=2, batch_size=1, batch_bytes=256, queue_bytes=128,
                   packed=packed, verify_readback=True, memory_first=True, resident_bytes=128 * 1024**2)
     path = tmp_path / 'config.json'
-    for mode in ('combined', 'geometry', 'linked', 'limited', 'failure'):
+    for mode in ('combined', 'geometry', 'store_reference', 'limited', 'failure'):
         output, report = tmp_path / mode, tmp_path / (mode + '.json')
         current = dict(config, output=str(output), report=str(report))
         if mode == 'geometry':
             del current['constraints']
-        elif mode == 'linked':
+        elif mode == 'store_reference':
             current['geometry_collection'] = str(tmp_path / 'geometry' if packed else tmp_path / 'geometry' / 'collection.vcobj')
         elif mode == 'limited':
             current['constraint_limit'] = 5
@@ -231,7 +231,7 @@ def test_native_uuid_dispatch_combined_and_linked(tmp_path, packed):
         assert result.returncode == 0, result.stderr
         data = json.loads(report.read_text())
         assert data['uuid_hash_routing'] and data['readback_verified']
-        assert data['fibers'] == (0 if mode == 'linked' else 2)
+        assert data['fibers'] == (0 if mode == 'store_reference' else 2)
         assert data['constraints'] == (0 if mode == 'geometry' else 5 if mode == 'limited' else 17)
         if mode == 'limited':
             assert data['estimated_full_import_seconds'] is None
@@ -256,7 +256,7 @@ def test_native_uuid_dispatch_combined_and_linked(tmp_path, packed):
                             h = ((h ^ byte) * 1099511628211) & ((1 << 64) - 1)
                         assert h % 4 == int(shard.stem.split('-')[-1])
                         seen += 1
-            assert seen == (0 if mode == 'linked' else 2)
+            assert seen == (0 if mode == 'store_reference' else 2)
 
 
 @pytest.mark.parametrize('key,value', [

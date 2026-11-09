@@ -22,7 +22,7 @@ struct FiberConstraintSourceInfo {
 };
 // Ordinary optional extension, not part of the core fiber/edge schema. Source
 // AFV/AFC identity has no vcobj commit: record only the supplied identity and
-// counts, not the source report. Linked vcobj input pins may be supplied.
+// counts, not the source report. Referenced vcobj input pins may be supplied.
 ExtensionTable fiberSourceExtension(const FiberSourceInfo& source);
 ExtensionTable fiberConstraintExtension(const FiberConstraintSourceInfo& source,
     std::span<const ExtensionSource> basedOn = {});

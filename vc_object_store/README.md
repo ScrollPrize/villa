@@ -41,7 +41,7 @@ without copies.
 
 ## Immutable and large-scale stores
 
-Schema 21 supports current-only storage (`history_enabled=False`), optional spatial indexing, sealing, [linked overlays and independent shards](docs/collections.md), and optional [packed SQLite containers](docs/packed-stores.md). Current record versions and the store commit sequence remain available with history disabled; requests for unavailable history fail explicitly. A lineage UUID is not a numeric change counter. Spatial queries require the spatial index.
+Schema 21 supports current-only storage (`history_enabled=False`), optional spatial indexing, sealing, [store_references, overlays and independent shards](docs/collections.md), and optional [packed SQLite containers](docs/packed-stores.md). Current record versions and the store commit sequence remain available with history disabled; requests for unavailable history fail explicitly. A lineage UUID is not a numeric change counter. Spatial queries require the spatial index.
 
 For large immutable datasets, the C++ [initial batch construction API](docs/initial-import.md) accepts objects, geometry and relationships from a shared parallel streaming source. See the [format and policy reference](docs/store-format.md) and [schema integration contract](docs/schema-integration.md). The redesigned lazy/delta history layout remains deferred.
 
