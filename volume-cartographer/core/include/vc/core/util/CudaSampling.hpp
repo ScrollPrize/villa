@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace vcr {
 class Array;
@@ -17,9 +18,9 @@ namespace zarr { struct OpenedArray; }
 namespace vc::cuda {
 
 // A reader keeping up to `cacheBytes` of `array` on the device; null when the build or
-// machine has no CUDA device, or `array` is not 3-D uint8.
+// machine has no CUDA device, or `array` is not uint8 ZYX / a selected CZYX channel.
 std::shared_ptr<vcr::reader_cuda::Reader> makeReader(vcr::Array& array, const vcr::ElementType& type,
-                                                     std::size_t cacheBytes);
+                                                     std::size_t cacheBytes, std::optional<std::int64_t> channel = std::nullopt);
 // One device brick cache of `cacheBytes` for several readers (e.g. every level of the
 // volumes a viewer opens); null when the build or machine has no CUDA device.
 std::shared_ptr<vcr::reader_cuda::Pool> makePool(std::size_t cacheBytes);
@@ -27,7 +28,8 @@ std::shared_ptr<vcr::reader_cuda::Pool> makePool(std::size_t cacheBytes);
 // as makeReader, or when pool is null. Arrays whose bricks are larger than the pool's
 // slots (odd chunk edges over 32) get a cache of their own of the pool's budget.
 std::shared_ptr<vcr::reader_cuda::Reader> makeReader(vcr::Array& array, const vcr::ElementType& type,
-                                                     const std::shared_ptr<vcr::reader_cuda::Pool>& pool);
+                                                     const std::shared_ptr<vcr::reader_cuda::Pool>& pool,
+                                                     std::optional<std::int64_t> channel = std::nullopt);
 
 // Trilinear / nearest values at zyx index points, on `reader` when given. A GPU failure
 // frees the reader's bricks, logs once per process and samples on the CPU. Null samples on
@@ -52,9 +54,12 @@ void applyToolOptions(int& argc, char** argv);
 const char* toolOptionsHelp();
 
 // The tool's reader of `level`, made on first use and kept until the process exits; every
-// level's reader shares one device cache of the --cuda-cache-gb budget; null when --cuda is off or the level is not 3-D uint8 (noted in the log).
-vcr::reader_cuda::Reader* toolReader(const vcr::zarr::OpenedArray& level);
+// level/channel reader shares one device cache of the --cuda-cache-gb budget;
+// null when --cuda is off or the level/channel is not supported (noted in the log).
+vcr::reader_cuda::Reader* toolReader(const vcr::zarr::OpenedArray& level,
+                                  std::optional<std::int64_t> channel = std::nullopt);
 // The reader toolReader made for `array`, or null.
-vcr::reader_cuda::Reader* toolReaderOf(const vcr::Array& array);
+vcr::reader_cuda::Reader* toolReaderOf(const vcr::Array& array,
+                                    std::optional<std::int64_t> channel = std::nullopt);
 
 }  // namespace vc::cuda

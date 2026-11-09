@@ -10,6 +10,7 @@
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/objects/Project.hpp>
 #include "vc/core/types/Volume.hpp"
+#include "volume_viewers/ViewerSampling.hpp"
 #include "test/support/TestVolume.hpp"
 #include <nlohmann/json.hpp>
 #include <vc_reader/zarr.hpp>
@@ -107,6 +108,7 @@ int runObjectStoreControllerTests()
             require(state.storeFor("fiber") && state.vpkg()->document().data() == data, "reopening uses the upgraded store without another conversion");
             state.closeProject();
         }
+#include "LineAnnotationCompoundTest.inc"
 #include "LineAnnotationFiberCacheTest.inc"
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;

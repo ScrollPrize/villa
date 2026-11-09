@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 
 #include <memory>
 #include <string>
@@ -20,11 +21,7 @@ inline constexpr std::string_view kLasagnaVolumeGroupTagPrefix = "vc-lasagna-gro
     const LasagnaChannelGroup& group,
     std::string_view manifestLocation);
 
-struct PreparedLasagnaProjectVolume {
-    std::string location;
-    std::vector<std::string> tags;
-    std::shared_ptr<Volume> volume;
-};
+using PreparedLasagnaProjectVolume = VolumePkg::PreparedVolumeAttachment;
 
 [[nodiscard]] std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
     const LasagnaDataset& dataset,

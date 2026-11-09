@@ -87,6 +87,27 @@ struct RebasedCoordinates : Coordinates {
 };
 using FloatAffine = RebasedCoordinates<BasicAffineCoordinates<float>>;
 
+// A scalar view of CZYX coordinates. The integer channel never participates in
+// interpolation; spatial coordinates retain their original precision/origin.
+template<class Coordinates>
+struct ChannelCoordinates {
+    using value_type = typename Coordinates::value_type;
+    static constexpr std::size_t kDimensions = 4;
+    const Coordinates& spatial;
+    std::int64_t channel;
+    std::int64_t base(std::size_t axis) const {
+        return axis ? spatial.base(axis - 1) : channel;
+    }
+    const value_type* operator()(std::size_t p, value_type* out) const {
+        value_type scratch[3];
+        const auto* xyz = spatial(p, scratch);
+        out[0] = std::is_integral_v<value_type> ? value_type(channel) : value_type(0);
+        std::copy_n(xyz, 3, out + 1);
+        return out;
+    }
+    void prefetch(std::size_t p) const { spatial.prefetch(p); }
+};
+
 // An integer origin for (n, 3) points to be sampled in local float32 coordinates: the
 // floor of their low corner. nullopt when they span too far for that to keep local
 // rounding below 1/4096 voxel, independent of point order. Non-finite points do not count.
@@ -567,7 +588,11 @@ public:
     void sample_nearest_coordinates(const Coordinates& coords, std::size_t n, std::uint8_t* out,
                                     std::uint8_t* missing = nullptr)
     {
-        if (ndim() == 3)
+        if constexpr (requires { Coordinates::kDimensions; }) {
+            if (ndim() != Coordinates::kDimensions)
+                throw std::invalid_argument("coordinate provider rank does not match array");
+            read_points_as<Coordinates::kDimensions>(coords, n, out, missing);
+        } else if (ndim() == 3)
             read_points_as<3>(coords, n, out, missing);
         else
             read_points_as<0>(coords, n, out, missing);
@@ -603,7 +628,11 @@ public:
             throw std::invalid_argument("sample() supports at most 16 dimensions");
         // The element loads, chosen once: native-order numbers inline, the rest through `type`.
         const auto dispatch = [&](auto load) {
-            if (ndim() == 3)
+            if constexpr (requires { Coordinates::kDimensions; }) {
+                if (ndim() != Coordinates::kDimensions)
+                    throw std::invalid_argument("coordinate provider rank does not match array");
+                sample_linear_as<Coordinates::kDimensions>(coords, n, type, out64, out, load, missing);
+            } else if (ndim() == 3)
                 sample_linear_as<3>(coords, n, type, out64, out, load, missing);
             else
                 sample_linear_as<0>(coords, n, type, out64, out, load, missing);
@@ -616,9 +645,20 @@ public:
     // Float32 uint8 CT entry: select a dense workspace only when its volume is
     // bounded relative to the requested samples; otherwise plan direct chunks.
     template<class Coordinates>
-    void sample_u8_float32(const Coordinates& coords, std::size_t n, int order, void* out) {
-        if (ndim() != 3 || spec_.itemsize != 1)
-            throw std::invalid_argument("float32 sampling requires 3-D uint8 CT");
+    void sample_u8_float32(const Coordinates& coords, std::size_t n, int order, void* out,
+                          std::optional<std::int64_t> channel = std::nullopt) {
+        if (ndim() != (channel ? 4 : 3) || spec_.itemsize != 1 ||
+            (channel && (*channel < 0 || *channel >= spec_.shape[0])))
+            throw std::invalid_argument("float32 sampling requires uint8 ZYX or a valid CZYX channel");
+        if (channel) {
+            const ChannelCoordinates selected{coords, *channel};
+            if (order == 0) read_points_as<4>(selected,n,static_cast<std::uint8_t*>(out));
+            else if (order == 1)
+                sample_linear_as<4>(selected,n,ElementType{'u',1,false},false,out,
+                                   [](const std::uint8_t* at) { return float(*at); });
+            else throw std::invalid_argument("order must be 0 or 1");
+            return;
+        }
         if (order == 0) read_points_as<3>(coords,n,static_cast<std::uint8_t*>(out));
         else if (order == 1) {
             if constexpr (std::is_same_v<Coordinates,FloatAffine>) {
