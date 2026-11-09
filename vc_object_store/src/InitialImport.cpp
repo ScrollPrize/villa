@@ -217,6 +217,7 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
     } catch(...){failure.record(std::current_exception());}
     for(auto& job:jobs){try {result.shards.push_back(job.get());}catch(...){failure.record(std::current_exception());}}
     if(failure.error)std::rethrow_exception(failure.error);
+    if(options.beforePublish)options.beforePublish();
     result.ingestionSeconds=elapsed(start);
     const auto manifestStart=Clock::now();
     if(paths.size()>1)detail::InitialCollectionAccess::writeManifest(manifest,completedMembers,common,options.uuidHashRouting);

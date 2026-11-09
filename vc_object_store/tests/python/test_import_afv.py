@@ -155,6 +155,47 @@ def constraint_fixture(path, source_uuid):
                        (i * 3, 0, 9, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, .5, .5, 1, None, None, '{}'))
 
 
+@pytest.mark.parametrize('shards', [1, 2])
+@pytest.mark.parametrize('packed', [False, True])
+@pytest.mark.parametrize('bad_total', ['points', 'constraints'])
+def test_native_aggregate_mismatch_leaves_destination_retryable(tmp_path, shards, packed, bad_total):
+    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
+    tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
+    if not tool or not tool.exists():
+        pytest.skip('needs native importer')
+    source, constraints = tmp_path / 'source.afv', tmp_path / 'source.afc'
+    metadata, _ = fixture(source)
+    constraint_fixture(constraints, metadata['uuid'])
+    output, report = tmp_path / 'output', tmp_path / 'report.json'
+    config = dict(source=str(source), constraints=str(constraints), output=str(output),
+                  report=str(report), unbound=True, shards=shards, readers=2, packed=packed,
+                  source_chunk_fibers=1, source_chunk_edges=1, batch_size=1,
+                  memory_first=True, resident_bytes=128 * 1024**2)
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps(config))
+    damaged = source if bad_total == 'points' else constraints
+    key = 'point_count' if bad_total == 'points' else 'statistics'
+    with sqlite3.connect(damaged) as db:
+        original, = db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
+        incorrect = 263 if bad_total == 'points' else dict(constraints=18)
+        db.execute('UPDATE metadata SET value=? WHERE key=?', (json.dumps(incorrect), key))
+    rejected = subprocess.run([str(tool), str(path)], capture_output=True, text=True, timeout=30)
+    assert rejected.returncode != 0
+    expected = 'initial fiber aggregate totals' if bad_total == 'points' else 'initial constraint aggregate totals'
+    assert expected in rejected.stderr
+    assert not output.exists(), 'Aggregate mismatch must be rejected before publication'
+    assert not report.exists(), 'A rejected import must not report completion'
+    assert not list(tmp_path.glob('.output-*')), 'Failed staging must be removed'
+    assert not list(tmp_path.glob('output.building-*')), 'Failed packed staging must be removed'
+    with sqlite3.connect(damaged) as db:
+        db.execute('UPDATE metadata SET value=? WHERE key=?', (original, key))
+    retried = subprocess.run([str(tool), str(path)], capture_output=True, text=True, timeout=30)
+    assert retried.returncode == 0, retried.stderr
+    result = json.loads(report.read_text())
+    assert (result['fibers'], result['points'], result['constraints']) == (2, 262, 17)
+    assert output.exists()
+
+
 @pytest.mark.parametrize('packed', [False, True])
 def test_native_uuid_dispatch_combined_and_linked(tmp_path, packed):
     build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')

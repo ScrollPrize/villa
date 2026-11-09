@@ -161,6 +161,18 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         std::cout<<Json({{"stage","uuid_shard_import"},{"fibers",completedFibers.load()},
             {"constraints",completedEdges.load()},{"shards",workers},{"elapsed_seconds",seconds(start)}}).dump()<<std::endl;
     };
+    int64_t fibers=0,points=0,nedges=0;
+    options.beforePublish=[&]{
+        stream.finish();
+        checkCancelled();
+        // All writers have joined. Check their existing counters while every
+        // destination is still private; no source scan or store readback.
+        for(const auto& c:counts){fibers+=c.fibers;points+=c.points;nedges+=c.edges;}
+        if(!linked&&(fibers!=(limit?std::min(limit,source.fiberCount()):source.fiberCount())||(!limit&&points!=source.pointCount())))
+            throw std::runtime_error("initial fiber aggregate totals differ from source");
+        if(hasEdges && fiberEnd==INT64_MAX && nedges!=(edgeLimit?std::min(edgeLimit,edgeSource->constraintCount()):edgeSource->constraintCount()))
+            throw std::runtime_error("initial constraint aggregate totals differ from source");
+    };
     InitialImportResult imported;
     try {
         imported=importInitialCollection(output,options,[&](size_t i,InitialShardImport& shard){
@@ -191,7 +203,6 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
                 if(config.value("profile_sqlite_mutex",false))mutexProfiles[i]=benchmark::sqlite_profile::snapshot();
             }catch(...){stream.fail(std::current_exception());throw;}
         });
-        stream.finish();
     }catch(...){stream.fail(std::current_exception());try{stream.finish();}catch(...){}throw;}
     double sourceSeconds=0,fiberPreparation=0,edgePreparation=0;Json perReader=Json::array();
     for(size_t i=0;i<stream.readers.size();++i){const auto& s=stream.readers[i];fiberPreparation+=s.objectSeconds;edgePreparation+=s.edgeSeconds;
@@ -201,10 +212,9 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
             {"phase_nanoseconds",sourceProfiles[i].phaseNanoseconds},
             {"object_tasks",s.objectTasks},{"edge_tasks",s.edgeTasks},{"object_seconds",s.objectSeconds},{"edge_seconds",s.edgeSeconds},{"queue_wait_seconds",s.queueWaitSeconds}});
         if(config.value("profile_sqlite_mutex",false))perReader.back()["sqlite_mutex_profile"]=readerMutexProfiles[i];}
-    int64_t fibers=0,points=0,nedges=0,metadataBytes=0,edgeMetadataBytes=0;Json perShard=Json::array();
+    int64_t metadataBytes=0,edgeMetadataBytes=0;Json perShard=Json::array();
     double objectSeconds=0,edgeSeconds=0,sealSeconds=0;
     for(size_t i=0;i<counts.size();++i){const auto& c=counts[i];const auto& t=imported.shards[i];
-        fibers+=c.fibers;points+=c.points;nedges+=c.edges;
         metadataBytes+=c.metadata;edgeMetadataBytes+=c.edgeMetadata;
         objectSeconds+=t.objectSeconds;edgeSeconds+=t.edgeSeconds;sealSeconds+=t.sealCommitSeconds;
         perShard.push_back({{"shard",i},{"fibers",c.fibers},{"points",c.points},{"constraints",c.edges},
@@ -212,10 +222,6 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
             {"seal_commit_seconds",t.sealCommitSeconds},{"phase_nanoseconds",profiles[i].phaseNanoseconds}});
         if(config.value("profile_sqlite_mutex",false))perShard.back()["sqlite_mutex_profile"]=mutexProfiles[i];
     }
-    if(!linked&&(fibers!=(limit?std::min(limit,source.fiberCount()):source.fiberCount())||(!limit&&points!=source.pointCount())))
-        throw std::runtime_error("initial fiber aggregate totals differ from source");
-    if(hasEdges && fiberEnd==INT64_MAX && nedges!=(edgeLimit?std::min(edgeLimit,edgeSource->constraintCount()):edgeSource->constraintCount()))
-        throw std::runtime_error("initial constraint aggregate totals differ from source");
     const double pipelineSeconds=seconds(start);
     const bool verify=config.value("verify_readback",false);double validationSeconds=0;
     if(verify){

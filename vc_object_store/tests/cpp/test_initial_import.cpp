@@ -6,6 +6,7 @@
 #include <future>
 #include <iostream>
 #include <sqlite3.h>
+#include <thread>
 
 using namespace vc::objects;
 namespace {
@@ -233,6 +234,35 @@ void phaseFailures()
             });
     }
 }
+
+void sourceCompletion(size_t shards,bool packed)
+{
+    TemporaryDirectory dir;auto opt=options(shards,packed);
+    const auto output=dir.path/"output";
+    const auto coordinator=std::this_thread::get_id();
+    std::atomic<size_t> finished=0;
+    size_t completions=0;bool reject=true;
+    opt.beforePublish=[&]{
+        ++completions;
+        require(std::this_thread::get_id()==coordinator,"source completion runs on the caller thread");
+        require(finished==shards,"source completion follows every shard producer");
+        require(!std::filesystem::exists(output),"source completion precedes publication");
+        if(reject)throw std::runtime_error("source aggregate mismatch");
+    };
+    const auto produce=[&](size_t,auto& shard){
+        auto row=fiber(util::newUuid());shard.appendObjects(std::span(&row,1));++finished;
+    };
+    mustFail([&]{importInitialCollection(output,opt,produce);});
+    require(completions==1,"source completion runs exactly once per successful ingestion");
+    require(std::filesystem::is_empty(dir.path),"source completion rejection removes all private staging");
+    reject=false;finished=0;
+    const auto result=importInitialCollection(output,opt,produce);
+    require(completions==2&&std::filesystem::exists(result.path),"corrected source can retry the same destination");
+    // A producer failure must not be followed by a successful completion hook.
+    opt.beforePublish=[&]{++completions;};
+    mustFail([&]{importInitialCollection(dir.path/"failed",opt,[](size_t,auto&){throw std::runtime_error("producer failed");});});
+    require(completions==2&&!std::filesystem::exists(dir.path/"failed"),"producer failure skips completion and publication");
 }
-int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u})roundTrip(count,packed);phased(packed);directConnections(packed);}failures();phaseFailures();
+}
+int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u}){roundTrip(count,packed);sourceCompletion(count,packed);}phased(packed);directConnections(packed);}failures();phaseFailures();
     std::cout<<"initial import passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

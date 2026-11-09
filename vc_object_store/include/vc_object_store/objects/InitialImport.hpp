@@ -22,6 +22,11 @@ struct InitialImportOptions {
     // Optional extension definitions instantiated independently on each shard.
     // Payloads accompany owner records in the same parallel stream.
     std::vector<ExtensionTable> extensions;
+    // Optional source completion hook, on the caller thread after all shard
+    // producers have joined, before manifest construction/publication. Use it
+    // to join source readers and check aggregate counters, without reopening
+    // databases. Throwing discards private staging and leaves no destination.
+    std::function<void()> beforePublish;
 };
 struct InitialShardResult {
     int64_t objects=0,edges=0;
