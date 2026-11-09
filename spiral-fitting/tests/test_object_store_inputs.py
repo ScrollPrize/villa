@@ -29,6 +29,28 @@ def request(**selectors):
         volume, approved)
 
 
+@pytest.mark.parametrize('history_enabled', [False, True])
+def test_snapshot_uses_numbered_relationship_versions_without_record_generations(tmp_path, history_enabled):
+    from vc_object_store import ObjectStore
+
+    with ObjectStore.create(str(tmp_path / 'input.vcobj'), author='test',
+                            history_enabled=history_enabled) as store:
+        surface = put_patch(store, _grid())
+        collection = put_pcl(store, {3: ([20.0, 14.0, 14.0], None)})
+        edge = pcl_patch_edge(store, collection, 3, surface, (1.0, 1.0))
+        snapshot = osi.read_snapshot(store, request())
+        [relationship] = snapshot.relationships
+        assert relationship.uuid == edge
+        assert relationship.version == store.edge(edge)['version']
+        assert 'generation' not in relationship.provenance()
+        assert snapshot.manifest()['position']['generation'] == store.status()['generation']
+        # A pinned current snapshot works even without historical storage.
+        import dataclasses
+        again = osi.read_snapshot(store, dataclasses.replace(
+            request(), pins=snapshot.request.pins))
+        assert again.digest() == snapshot.digest()
+
+
 def test_default_selection_reads_every_active_object_in_uuid_order(db):
     patches = sorted(put_patch(db, _grid(z)) for z in (10.0, 20.0, 30.0))
     pcl = put_pcl(db, {3: ([20.0, 14.0, 14.0], None)})

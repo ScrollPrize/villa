@@ -73,20 +73,20 @@ def test_pairs_follow_the_stored_endpoint_order(db, first, second):
     _put(db, _plane(), uuid=first)
     _put(db, _plane(10.0), uuid=second)
     [edge] = _detect(db)
-    assert edge['a'] == first
+    assert (edge['a'], edge['b']) == (LOW, HIGH)
     inputs = materialize(db)
     snapshot_edge = inputs.snapshot.relationships_of('patch_overlap')[0]
     # The snapshot orders same-kind endpoints by UUID; pairs keep stored order.
     assert (snapshot_edge.a, snapshot_edge.b) == (LOW, HIGH)
     pairs = _pairs(inputs)
     assert len(pairs) > 1
-    assert all(pcl['points'][0]['on_patch']['id'] == first for pcl in pairs)
+    assert all(pcl['points'][0]['on_patch']['id'] == edge['a'] for pcl in pairs)
     assert_pairs_lie_on_their_patches(inputs)
     shift = {first: 0.0, second: 10.0}
     for pcl in pairs:
         a, b = pcl['points'][0]['on_patch'], pcl['points'][1]['on_patch']
         assert b['ij'][1] == pytest.approx(
-            a['ij'][1] + (shift[first] - shift[second]) / 2, abs=0.25)
+            a['ij'][1] + (shift[edge['a']] - shift[edge['b']]) / 2, abs=0.25)
 
 
 @pytest.mark.parametrize('scales,level', [((2, 0.5), 0), ((0.25, 4), 0), ((1, 1), 1)])

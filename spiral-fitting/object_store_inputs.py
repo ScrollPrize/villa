@@ -72,7 +72,7 @@ FIT_UNITS = 'reference-volume voxels (ZYX)'
 # or relationship's numbered version moves with every change to it, those
 # the adapter does not read included (a review note, a relationship of a
 # selected object), so versions resolve the inputs exactly but are left out
-# of the digest. Geometry revisions, record UUIDs, content generations and
+# of the digest. Geometry revisions, record UUIDs, consumed content and
 # approval states define them.
 VERSION_FIELDS = {'objects': ('version',), 'relationships': ('version',)}
 
@@ -358,7 +358,6 @@ class StoredRelationship:
     kind: str
     family: str
     approval_state: str
-    generation: int
     a: str
     b: str
     a_anchor: dict
@@ -375,7 +374,6 @@ class StoredRelationship:
         return {'uuid': self.uuid, 'version': self.version,
                 'kind': self.kind, 'family': self.family,
                 'approval_state': self.approval_state,
-                'generation': self.generation,
                 'a': self.a, 'a_geometry_revision': self.a_geometry_revision,
                 'b': self.b, 'b_geometry_revision': self.b_geometry_revision,
                 'content_sha256': content_sha256(
@@ -635,7 +633,7 @@ def filter_relationships(view_relationships, objects, approved_links_only):
         consumed.append(StoredRelationship(
             uuid=record['uuid'], version=int(entry['version']), kind=record['kind'],
             family=family, approval_state=state,
-            generation=record['generation'], a=a, b=b, a_anchor=a_anchor,
+            a=a, b=b, a_anchor=a_anchor,
             b_anchor=b_anchor, meta=record['meta'] or {},
             a_geometry_revision=a_geometry, b_geometry_revision=b_geometry,
             stored_order=(record['a'], record['b'])))
@@ -2893,10 +2891,17 @@ def _compared(manifest):
     manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
     manifest.pop('link_refresh', None)
     manifest.pop('position', None)
+    # Schema-20 checkpoints also recorded a relationship generation. Its
+    # content hash already identifies the consumed data; schema 21 has no
+    # equivalent counter. Do not discard it from older, hash-less manifests:
+    # those cannot establish unchanged relationships across the conversion.
     for section, fields in VERSION_FIELDS.items():
         if section in manifest:
             manifest[section] = [
-                {key: value for key, value in entry.items() if key not in fields}
+                {key: value for key, value in entry.items()
+                 if key not in fields and not (
+                     section == 'relationships' and key == 'generation'
+                     and 'content_sha256' in entry)}
                 for entry in manifest[section] or ()]
     return manifest
 

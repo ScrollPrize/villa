@@ -316,7 +316,19 @@ def test_digest_covers_the_metadata_the_adapter_reads(store_path):
     assert 'objects' in problem
 
 
-def test_a_checkpoint_before_content_identity_compares_geometry(store_path):
+def test_schema20_content_identity_does_not_require_obsolete_generations(store_path):
+    inputs = load(store_path)
+    recorded = json.loads(json.dumps(inputs.manifest))
+    assert recorded['relationships']
+    for entry in recorded['relationships']:
+        entry['generation'] = 7
+    assert osi.resume_problems({'object_store': recorded}, inputs) == []
+    recorded['relationships'][0]['content_sha256'] = 'different-content'
+    [problem] = osi.resume_problems({'object_store': recorded}, inputs)
+    assert 'relationships' in problem
+
+
+def test_a_checkpoint_without_relationship_content_requires_explicit_override(store_path):
     inputs = load(store_path)
     legacy = json.loads(json.dumps(inputs.manifest))
     # The manifest such a checkpoint recorded: no metadata hashes, no
@@ -326,13 +338,17 @@ def test_a_checkpoint_before_content_identity_compares_geometry(store_path):
         del entry['version']
         entry['object_revision'] = 'another-store'
     legacy['relationships'] = [
-        {key: entry[key] for key in ('uuid', 'kind', 'family', 'approval_state',
-                                     'generation')} | {'revision': 'another'}
+        {key: entry[key] for key in ('uuid', 'kind', 'family', 'approval_state')}
+        | {'generation': 1, 'revision': 'another'}
         for entry in legacy['relationships']]
     warnings = []
-    assert osi.resume_problems({'object_store': legacy}, inputs,
+    # The old numeric generation cannot be compared to a numbered version.
+    # Do not silently accept potentially changed relationship content.
+    [problem] = osi.resume_problems({'object_store': legacy}, inputs)
+    assert 'relationships' in problem
+    assert osi.resume_problems({'object_store': legacy}, inputs, allow_changed=True,
                                log=warnings.append) == []
-    assert 'compared on geometry revisions' in warnings[0]
+    assert 'resuming anyway' in warnings[0]
     legacy['objects'][0]['geometry_revision'] = 'older-geometry'
     [problem] = osi.resume_problems({'object_store': legacy}, inputs)
     assert 'objects' in problem
