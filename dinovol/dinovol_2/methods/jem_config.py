@@ -29,6 +29,16 @@ JEM_DEFAULTS: dict[str, Any] = {
     "global_view_weight": 0.2,
     "local_view_weight": 0.8,
     "entropy_rank_scope": "logical_batch",
+    # Marginal behind the global-collapse gradient d = log(mu) + 1.
+    # "exact": the current batch's mu (with several chunks per rank, a statistics pass over
+    # every chunk first: one extra student forward). "running": one pass for any chunk
+    # count, d from the previous updates' marginal
+    # (momentum 0 = the previous update only); the W/M coefficients and the logged loss stay exact.
+    # "mixed": the exact scheme with d = log(mu_hat) + 1, mu_hat = batch_weight * mu + (1 - batch_weight) * r:
+    # the current batch keeps the feedback immediate, the running marginal r (momentum) adds samples.
+    # "running" and "mixed" use the exact scheme for the first exact_updates successful updates
+    # (and always until r exists); r is updated from every training update in both.
+    "global_marginal": {"mode": "running", "momentum": 0.0, "batch_weight": 0.5, "exact_updates": 0},
     "entropy_view_scope": "crop_type",
     "structural_pair_weighting": "uniform",
     "structural_backend": "contraction",
@@ -38,8 +48,8 @@ JEM_DEFAULTS: dict[str, Any] = {
     "regularizer_warmup_steps": 12500,
     "global_collapse_schedule": {"start": 1.0, "end": 0.1},
     "structural_schedule": {"warm": 0.05, "final": 1.0},
-    "views": {"source_size": 512, "teacher_size": 256, "global_size": 256, "local_size": 144,
-              "locals_per_set": 4, "min_overlap_fraction": 0.10, "min_overlap_count": 2,
+    "views": {"source_size": 512, "teacher_size": 256, "global_size": 256, "local_size": 144, "orientations": "all",
+              "locals_per_set": 4, "min_overlap_fraction": 0.10, "min_overlap_count": 2, "student_scale": [1.0, 1.0],
               "max_student_attempts": 64, "max_teacher_attempts": 16, "max_source_attempts": 64},
     "masking": {},
     "batch_storage": "device",
@@ -115,6 +125,15 @@ def resolve_jem_method(method: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} must be positive")
     if recipe["entropy_rank_scope"] not in ("logical_batch", "rank"):
         raise ValueError("entropy_rank_scope must be 'logical_batch' or 'rank'")
+    marginal = recipe["global_marginal"]
+    if marginal["mode"] not in ("exact", "running", "mixed"):
+        raise ValueError("global_marginal.mode must be 'exact', 'running' or 'mixed'")
+    if not 0.0 <= float(marginal["momentum"]) < 1.0:
+        raise ValueError("global_marginal.momentum must be in [0, 1)")
+    if not 0.0 <= float(marginal["batch_weight"]) <= 1.0:
+        raise ValueError("global_marginal.batch_weight must be in [0, 1]")
+    if int(marginal["exact_updates"]) < 0:
+        raise ValueError("global_marginal.exact_updates must be nonnegative")
     if recipe["entropy_view_scope"] not in ("crop_type", "slot"):
         raise ValueError("entropy_view_scope must be 'crop_type' or 'slot'")
     if recipe["structural_pair_weighting"] not in ("uniform", "distance_stratified"):
@@ -169,8 +188,8 @@ def validate_jem_backbone(backbone: Mapping[str, Any]) -> None:
         raise ValueError("JEM disables CLS-only output norms: set untie_cls_and_patch_norms and "
                          "untie_global_and_local_cls_norm to false")
     patch = tuple(int(p) for p in backbone["patch_size"])
-    if len(set(patch)) != 1:
-        raise ValueError(f"JEM needs a cubic patch size, got {patch}")
+    if len(patch) != 3 or patch[1] != patch[2]:
+        raise ValueError(f"JEM needs a ZYX patch size with equal y and x (the y/x transpose keeps it), got {patch}")
     heads = int(backbone["num_heads"])
     dim = int(backbone["embed_dim"])
     if backbone.get("use_rot_pos_emb", True) and backbone.get("rope_type") == "axial" and (dim // heads) % 6:

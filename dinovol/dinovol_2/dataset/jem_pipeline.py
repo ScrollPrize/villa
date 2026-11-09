@@ -20,6 +20,7 @@ from typing import Any, Mapping
 import torch
 
 from dinovol_2.dataset.cuda_pipeline import BatchProcessor, normalization_transforms, spatial_transforms
+from dinovol_2.dataset.jem_views import zyx
 
 JEM_EXCLUDED_OPERATIONS = ("Defocus", "GaussianBlur", "LowResolution")
 
@@ -67,7 +68,7 @@ class JemBatchProcessor(BatchProcessor):
     def __init__(self, config, *, device, patch: int, masking=None, lattice: bool = False,
                  storage: str = "device", dtype: torch.dtype = torch.float32, group_size: int | None = None):
         super().__init__(config, None, device=device)
-        self.patch = int(patch)
+        self.patch = zyx(patch, "patch")
         self.masking = resolve_masking(masking)
         self.lattice = bool(lattice)
         if storage not in ("device", "host"):
@@ -93,19 +94,22 @@ class JemBatchProcessor(BatchProcessor):
         """Process CropViews; returns tensors in input order."""
         outputs = [None] * len(views)
         groups = defaultdict(list)
+        raws = {}
         for index, view in enumerate(views):
-            if tuple(view.raw.shape) != tuple(view.target):
-                raise ValueError("JEM crops are cut at their output shape (no resampling)")
-            groups[(tuple(view.raw.shape), view.augment)].append(index)
+            raw = view.raw
+            if tuple(raw.shape) != tuple(view.target):
+                # Scaled student crop: resize to the target shape, voxel centers aligned, in FP32.
+                raws[index] = self.resize(raw, tuple(view.target))
+            groups[(tuple(view.target), view.augment, index in raws)].append(index)
         oriented = defaultdict(list)
-        for (shape, augment), indices in groups.items():
+        for (shape, augment, _), indices in groups.items():
             scanner = augment and self.config.get("augmentation", "full") == "full"
             pipeline = self.pipeline(("jem-prepare", shape, scanner), lambda: [
                 *([self.A.RicianNoise(std=(1, 4), p=.10)] if scanner else []),
                 *normalization_transforms(self.config.get("normalization_scheme", "robust"),
                                           self.config.get("intensity_properties")),
                 *(self.scanner(shape) if scanner else [])])
-            raw = torch.stack([views[i].raw for i in indices]).unsqueeze(1)
+            raw = torch.stack([raws[i] if i in raws else views[i].raw for i in indices]).unsqueeze(1)
             images = self.run(pipeline, raw, [views[i].seed for i in indices])
             for i, image in zip(indices, images):
                 oriented[(shape, views[i].spatial, augment)].append((i, image))
@@ -127,10 +131,18 @@ class JemBatchProcessor(BatchProcessor):
                 outputs[i] = image
         return outputs
 
+    def resize(self, raw: torch.Tensor, shape) -> torch.Tensor:
+        """Trilinear resize of one crop to `shape` with voxel centers aligned (vc_reader Affine), FP32."""
+        source = tuple(raw.shape)
+        pipeline = self.pipeline(("jem-resize", source, shape), lambda: [self.A.Affine(
+            shape=list(shape), border=True, scale_factors=[t / r for t, r in zip(shape, source)])])
+        image = raw.to(self.device if self.backend == "cuda" else "cpu").float()[None, None]
+        return self.run(pipeline, image, [0])[0, 0]
+
     def _empty(self, rows, size):
         pin = self.storage == "host" and self.device.type == "cuda"
         device = "cpu" if self.storage == "host" else self.device
-        return torch.empty((rows, 1, size, size, size), dtype=self.dtype, device=device, pin_memory=pin)
+        return torch.empty((rows, 1, *size), dtype=self.dtype, device=device, pin_memory=pin)
 
     def __call__(self, samples):
         from vc_reader import views as native
@@ -141,9 +153,10 @@ class JemBatchProcessor(BatchProcessor):
         patch = self.patch
         slots = {"teacher": n_sets, "global": n_sets, "local": n_sets * L}
         field = {"teacher": "teacher_views", "global": "global_views", "local": "local_views"}
-        # Crops are cubic, so orientation leaves the token grid shape unchanged.
-        size = {kind: int(samples[0][field[kind]][0].target[0]) for kind in slots}
-        grid = {kind: (size[kind] // patch,) * 3 for kind in slots}
+        # Orientations keep every crop's shape (cubes, or z-preserving with equal y/x), so the
+        # token grid is the same before and after orientation.
+        size = {kind: tuple(int(v) for v in samples[0][field[kind]][0].target) for kind in slots}
+        grid = {kind: tuple(s // p for s, p in zip(size[kind], patch)) for kind in slots}
         device = self.device
 
         masks = {}
@@ -164,7 +177,7 @@ class JemBatchProcessor(BatchProcessor):
                 images = torch.stack([next(processed) for _ in rows[kind]])
                 if kind != "teacher":
                     cells = masks[kind]["device"][rows[kind]].view(len(images), *grid[kind])
-                    images = native.mask_patch_cells(images, cells, (patch,) * 3)
+                    images = native.mask_patch_cells(images, cells, patch)
                 outputs[kind][torch.tensor(rows[kind])] = images.to(outputs[kind].device, self.dtype)
 
         teacher_grid = grid["teacher"]
@@ -186,14 +199,21 @@ class JemBatchProcessor(BatchProcessor):
                                            for s, b in zip(teacher_set, source)])
             teacher_orient = torch.stack([plans[int(b)]["teacher_orientations"][int(s)]
                                           for s, b in zip(teacher_set, source)])
+            scaled = f"{kind}_boxes" in plans[0]
+            student_boxes = (torch.stack([plans[b][f"{kind}_boxes"][v] for v in range(slots) for b in range(B)])
+                             if scaled else None)
             corr = native.correspondence(
                 support, source, student_origins, grid[kind], student_orient,
-                teacher_origins, teacher_grid, teacher_orient, lattice=self.lattice)
+                teacher_origins, teacher_grid, teacher_orient, lattice=self.lattice,
+                student_boxes=student_boxes, patch=patch if scaled else None)
             batch[f"{kind}_crops"] = crops
             batch[f"{kind}_masks"] = mask_tensor
             batch[f"{kind}_mask_applied"] = masks[kind]["applied"]
             batch[f"{kind}_mask_counts"] = masks[kind]["counts"]
             batch[f"{kind}_targets"] = torch.as_tensor(corr["teacher_index"]).long()
+            # Host copy of the overlapping-token count per row: the step sizes its compacted
+            # overlap tensors from it without waiting for the GPU (prefetch runs this ahead).
+            batch[f"{kind}_overlap_count"] = (batch[f"{kind}_targets"] >= 0).sum(-1).cpu()
             batch[f"{kind}_valid"] = torch.as_tensor(corr["student_valid"]).bool()
             if self.lattice:
                 batch[f"{kind}_lattice"] = torch.as_tensor(corr["lattice"]).long()

@@ -5,10 +5,12 @@ import unittest
 import torch
 
 from dinovol_2.loss.jem_losses import (
-    EntropyStatistics, alignment_from_means, band_pair_weights, distance_metric, entropy, entropy_attribution,
-    entropy_groups, entropy_surrogate, global_collapse_weight, kl_divergence, nonaffine_target,
+    EntropyStatistics, accumulation_terms, alignment_from_means, band_pair_weights, distance_metric, entropy, entropy_attribution,
+    entropy_groups, entropy_surrogate, global_collapse_weight, kl_divergence, nonaffine_target, overlap_capacity,
+    overlap_order,
     structural_band_counts, structural_dense_reference, structural_distance_stratified,
-    structural_uniform_contraction, structural_uniform_tiled, structural_weight, subset_means,
+    structural_uniform_contraction, structural_uniform_contraction_rows, structural_uniform_tiled, structural_weight,
+    subset_means,
 )
 
 DEPTHS = [4, 8, 12]
@@ -215,6 +217,20 @@ class EntropyTests(unittest.TestCase):
         for value in pooled:
             torch.testing.assert_close(value, single.float(), atol=1e-6, rtol=1e-5)
 
+    def test_distinct_sources_per_position(self):
+        # Rows from repeated, interleaved sources; D counts sources with any valid vector per group.
+        g = torch.Generator().manual_seed(2)
+        log_q = torch.log_softmax(torch.randn(9, 6, 5, generator=g), -1)
+        valid = torch.rand(9, 6, generator=g) > 0.5
+        sources = torch.tensor([3, 0, 3, 1, 0, 3, 1, 1, 2])
+        group = torch.tensor([0, 1, 1, 0, 0, 1, 1, 0, 1])
+        *_, D = accumulation_terms(log_q, valid, group, 2, sources)
+        for index in range(2):
+            rows = group == index
+            unique = torch.unique(sources[rows])
+            expected = torch.stack([(valid[rows & (sources == u)].any(0)) for u in unique]).float().sum(0)
+            torch.testing.assert_close(D[index], expected)
+
     def test_entropy_underflow_is_zero_safe(self):
         log_q = torch.log_softmax(torch.tensor([[[[0., -200., 0.]]]]).repeat(2, 10, 1, 1), -1)
         valid = torch.ones(log_q.shape[:-1], dtype=torch.bool)
@@ -259,6 +275,38 @@ class StructuralTests(unittest.TestCase):
             value = structural_uniform_contraction(a.float(), b.float()).double()
             relative = float((value - reference).abs() / reference)
             self.assertLess(relative, 2e-3, f"scale={scale}: relative error {relative:.2e}")
+
+    def test_row_batched_contraction_matches_per_row(self):
+        # Rows with 0, 1, 2 and many kept tokens, unequal widths; values and gradients.
+        rows, n = 5, 23
+        a = self.unit(rows * n, 8).view(rows, n, 8).requires_grad_()
+        b = self.unit(rows * n, 6).view(rows, n, 6)
+        keep = torch.rand(rows, n, generator=self.g) > 0.4
+        keep[0] = False
+        keep[1] = False
+        keep[1, 3] = True
+        keep[2] = False
+        keep[2, [4, 9]] = True
+        value = structural_uniform_contraction_rows(a, b, keep)
+        value.sum().backward()
+        reference_input = a.detach().clone().requires_grad_()
+        reference = torch.stack([structural_uniform_contraction(reference_input[r, keep[r]], b[r, keep[r]])
+                                 for r in range(rows)])
+        reference.sum().backward()
+        torch.testing.assert_close(value, reference.detach(), atol=1e-12, rtol=1e-9)
+        torch.testing.assert_close(a.grad, reference_input.grad, atol=1e-12, rtol=1e-9)
+        self.assertEqual(value[:2].tolist(), [0.0, 0.0])
+
+    def test_overlap_compaction(self):
+        self.assertEqual([overlap_capacity(c, 1331) for c in (0, 1, 64, 65, 1300, 1331)], [64, 64, 64, 128, 1331, 1331])
+        overlap = torch.rand(4, 300, generator=self.g) > 0.6
+        overlap[1] = False
+        capacity = overlap_capacity(int(overlap.sum(-1).max()), 300)
+        order = overlap_order(overlap, capacity)
+        for row in range(4):
+            count = int(overlap[row].sum())
+            self.assertTrue(torch.equal(order[row, :count], overlap[row].nonzero().flatten()))  # token order kept
+            self.assertFalse(overlap[row, order[row, count:]].any())
 
     def test_fewer_than_two_tokens_give_connected_zero(self):
         for n in (0, 1):

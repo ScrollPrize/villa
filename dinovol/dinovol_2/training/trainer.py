@@ -149,6 +149,11 @@ class Trainer:
         self.lr_schedule, self.wd_schedule = self._build_schedulers()
 
         self.log_every = int(self.runtime_config.get("log_every", 20))
+        # Extra training metrics appended to each printed step line (names absent from a step are skipped).
+        self.log_metrics = [str(name) for name in self.runtime_config.get("log_metrics", ())]
+        # runtime.metrics_jsonl: every printed step's full training metrics, one JSON line each,
+        # in output_dir/metrics.jsonl (main process).
+        self.metrics_jsonl = bool(self.runtime_config.get("metrics_jsonl", False))
         self.val_every_n = int(self.runtime_config.get("val_every_n", 0))
         # Save a monitor image from the current training batch every N steps (0 disables).
         self.train_monitor_every_n = int(self.runtime_config.get("train_monitor_every_n", 0))
@@ -723,7 +728,11 @@ class Trainer:
                     self._log_wandb_metrics("train", metrics, step=step)
 
                 if self.is_main_process and step % self.log_every == 0:
-                    print(f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e}")
+                    extra = "".join(f" {name}={metrics[name]:.4g}" for name in self.log_metrics if name in metrics)
+                    if self.metrics_jsonl:
+                        with open(self.output_dir / "metrics.jsonl", "a") as handle:
+                            handle.write(json.dumps({"step": step, **metrics}) + "\n")
+                    print(f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e}{extra}")
                 if self.val_every_n and step > 0 and step % self.val_every_n == 0:
                     if val_dataloader_iter is None:
                         if self.is_main_process and not self._warned_missing_val_dataset:

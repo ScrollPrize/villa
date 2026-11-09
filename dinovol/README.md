@@ -1215,27 +1215,56 @@ adopted convention are in [plans/JEM_impl.md](plans/JEM_impl.md). The recipe is
 
 ```bash
 .venv/bin/python -m dinovol_2.pretrain dinovol_2/configs/pretrain_jem_3d.json
-torchrun --nproc_per_node=4 -m dinovol_2.pretrain dinovol_2/configs/pretrain_jem_3d.json --ddp  # set data.batch_size to 48/4
+torchrun --nproc_per_node=7 -m dinovol_2.pretrain dinovol_2/configs/pretrain_jem_3d.json --ddp  # set data.batch_size to 84/world size, e.g. 12 on 7 GPUs
 ```
 
-`method.global_batch_size` (48) must equal `data.batch_size` x world size; JEM uses
-no gradient accumulation. The peak LR is resolved once from the global batch by
-`optimizer.lr_scaling` (`3e-4 * sqrt(48/64)`).
+One optimizer step uses `method.global_batch_size` (84) sources, which must equal
+`data.batch_size` x world size. Each rank accumulates gradients over its sources in
+minibatches of `method.source_chunk_size` (6) sources (gradient accumulation when a
+rank has more sources than one minibatch); JEM does this itself rather than through the
+trainer's `grad_accumulation_steps` because the collapse term's per-position counts span
+the whole step. The peak LR is resolved once from the global batch by
+`optimizer.lr_scaling` (`3e-4 * sqrt(84/64)` = 3.4e-4), reached after a
+5,000-step linear warmup (`optimizer.warmup_steps`).
 
 **Views.** Each independent source yields two view sets of one teacher global,
-one student global and four student locals (160³ / 88³ voxels, 8³ token cells)
-at the level's native spacing, with no resizing, zoom or aspect change. vc_reader
-(`views.plan_view_sets`) places all crops on the 512³ window's patch lattice and
+one student global and four student locals (ZYX 128×224×224 / 64×128×128 voxels,
+16×8×8 token cells: 8×28×28 = 6,272 / 4×16×16 = 1,024 tokens) at the level's native spacing. vc_reader
+(`views.plan_view_sets`) places all crops on the 320³ window's patch lattice and
 accepts a student only when at least 10% of its tokens (and two) overlap its own
-teacher on valid support; contained and coincident crops are allowed. The union
-box is read once. Every crop then gets an independent uniform draw from the 48
-signed axis permutations, applied by exact Transpose/Flip reindexing, and its own
-intensity seed. `views.correspondence` gives each final student token its teacher
-token (or -1) through both orientations with integer arithmetic only. Masks are
+teacher on valid support; contained and coincident crops are allowed.
+`views.student_scale: [0.8, 1.25]` (recipe; default `[1, 1]`, no resizing) gives every
+student view an isotropic scale `s`, log-uniform in that range: the student covers
+`round(s * size)` voxels per axis, placed at a uniform voxel offset inside the token box the
+planner places for it (one planner call per set), and is resized to its size with
+vc_reader's Affine (trilinear, voxel centers aligned, FP32). Teachers are never resized.
+Without it, crops sit on one patch lattice and a visible student token holds exactly its
+teacher token's voxels: a run with the 0.2 visible weight drove visible KL to 0.23 while
+masked KL stayed flat (worse than predicting the marginal) and its features became a
+token-scale hash of voxel content (speckled PCA). Scaling alone is not enough with
+`visible_weight: 0`: resumed from that run at step 19k for 10k steps, the visible tokens,
+held by the collapse term alone, stayed one-hot hashes (teacher entropy 0.04 nats,
+visible argmax agreement 1%), so masked KL stayed within 0.3-0.8 nats of the trivial
+marginal predictor (`kl_masked_marginal_*`). The recipe keeps the paper's 0.2 / 0.8, so
+the visible term demands codes that survive the rescale. The union
+box is read once. Every crop then gets an independent uniform orientation, applied by
+exact Transpose/Flip reindexing, and its own intensity seed: `views.orientations:
+"z_preserving"` (recipe) draws from the 16 signed permutations that keep z in place
+(y/x transpose and flips), which anisotropic patches and crops require (equal y and x
+sizes keep every crop's shape); `"all"` draws from all 48 and needs cubic patches and
+crops. Sizes and the patch are one integer or three ZYX integers. `views.correspondence` gives each final student token its teacher
+token (or -1) through both orientations with integer arithmetic only; a resized student
+token maps to the teacher token containing its center (`student_boxes`), at most half a
+token from the student token's center along each axis. Masks are
 seeded per view (`views.patch_masks`): globals 3D multiblock with cyclic shift,
 locals uniform random, each applied with probability 0.7 to 55% / 40% of tokens;
-masked cells are zero-filled by `views.mask_patch_cells` before the CNN stem and
-replaced by the learned mask token after it. Teachers are never masked. The JEM
+masked cells are zero-filled by `views.mask_patch_cells` before the patch embedding
+and replaced by the learned mask token after it. The recipe embeds tokens DINOv3-style
+(`embedding_type: "default"`: one non-overlapping 16×8×8 convolution, no padding, so no
+token sees the crop border; the earlier residual CNN stem's zero padding marked edge
+tokens, and a collapsed run's features turned into a pure position map). RoPE
+coordinates use `normalize_coords: "max"`, which scales every axis of a crop by its
+largest token count, so global and local crops differ by one uniform scale. Teachers are never masked. The JEM
 intensity recipe drops Defocus, GaussianBlur and LowResolution (DINO keeps them).
 
 **Model.** A CLS-free backbone (four registers) feeds one categorical head per
@@ -1244,11 +1273,13 @@ linear layer to K=512, teacher copies by EMA 0.994 of the plain weights) and one
 structural head per target depth {0, 4, 8} on the final student features.
 Categorical inputs reuse the backbone patch LayerNorm per tap; structural targets
 are raw teacher taps after a non-affine LayerNorm and L2 normalization. RoPE
-coordinate augmentation is disabled for JEM.
+coordinate augmentation is disabled for JEM. The recipe has no LayerScale
+(`backbone.init_values: null`).
 
 **Objective.** `L = L_align + w_global(t) R_global + w_struct(t) R_struct` with
 FP32 reductions:
-- alignment: per view and depth, `0.2 * mean visible KL + 0.8 * mean masked KL`
+- alignment: per view and depth, `visible_weight * mean visible KL + masked_weight * mean
+  masked KL` (paper and recipe 0.2 / 0.8)
   over valid overlapping tokens (teacher and student temperatures 0.1), depth
   weights {0.25, 0.25, 1} unnormalized, the ten student views equally weighted;
 - global collapse: per depth, crop type (`entropy_view_scope: "crop_type"`, or
@@ -1262,7 +1293,7 @@ FP32 reductions:
 - schedules over successful updates: `w_global` 1 -> 0.1 over 12.5k updates;
   `w_struct` 0 -> 0.05 over 12.5k, then -> 1 at the final update.
 
-**Batches larger than memory.** `method.source_chunk_size` sources run per forward.
+**Gradient accumulation.** `method.source_chunk_size` sources run per forward (minibatch).
 With several chunks, a statistics pass runs the student without gradients on every
 chunk (saving each chunk's RNG state) and the marginal statistics are all-reduced;
 the gradient pass then replays each chunk with the same drop-path draws, adds the
@@ -1271,21 +1302,134 @@ average is the exact first-order gradient of the full-batch objective. Only the 
 chunk's backward synchronizes DDP. The logged `global_collapse_loss` is the true
 objective; `surrogate_value` only carries gradients. `batch_storage: "host"` keeps
 processed crops (in the autocast dtype) in pinned host memory between passes.
-Each loader worker assembles a whole 48-source batch (about 1 GB of raw crops in
-`/dev/shm` at 160³ / 88³), so the recipe uses 4 workers with `prefetch_factor: 1`.
 
-Measured on one RTX 5090 (real 8–9 µm volumes, BF16, three steps each):
+That is `method.global_marginal.mode: "exact"`. The recipe default, `"running"`, skips the
+statistics pass: each chunk runs once with `d = log r + 1` from the running marginal `r` of
+past updates (`momentum: 0` uses the previous update's marginal; `m > 0` an exponential
+average of its sufficient statistics `S`, `M`). This also holds when each rank runs its
+sources as a single chunk, which would otherwise use the current batch's marginal. The coefficients `W/M` come from this
+batch's validity masks (all-reduced before any forward) and stay exact, and the same pass
+accumulates this batch's statistics for the logged `global_collapse_loss` (still the true
+objective) and the next `r`. This is the gradient of the variational form
+`max_r [C/M + Σ mu log r]` at a stale `r`, not the exact gradient. The first update and
+evaluation use the exact scheme; `r` is saved in checkpoints. `marginal_lag_kl` logs the
+mean KL(mu ‖ r) over present positions, a staleness measure.
+
+Measured on a briefly trained model (1,200 updates of 8 sources with a 200-step warmup,
+then 48-source updates at LR 2.6e-4; `outputs/jem_marginal/`), the exact batch gradient
+was within a median 5% (in units of the collapse-term gradient) of the gradient with a
+population marginal from four further batches at the same parameters, while the
+previous-update marginal was off by a median 144% (EMA 0.9: 160%, 0.99: 181%): there, the
+marginal drifted more per update than batches differ. Whether that settles later in
+training is untested; `marginal_lag_kl` and the exact mode allow checking it.
+A run with 14 sources per step and `momentum: 0.9` collapsed at step ~1,800 (every token
+the same near-uniform distribution, MI 0), with the residual CNN stem.
+
+`mode: "mixed"` (recipe) keeps the exact scheme's current-batch statistics but takes
+`d = log mu_hat + 1` with `mu_hat = batch_weight * mu + (1 - batch_weight) * r`, `r` the
+running marginal (`momentum`). The current batch keeps the feedback immediate (as in exact
+mode); `r` adds samples from past updates, reducing the plug-in entropy's small-batch bias.
+`d` is not scaled by `batch_weight`: past vectors come from (nearly) the same model, so the
+batch's gradient stands for the whole pool, as with a population marginal. `batch_weight: 1`
+is the exact gradient and `0` the running one. `exact_updates` runs the exact scheme for that
+many successful updates first (`running` honors it too); `r` is updated from every training
+update, so it is ready at the switch. With one minibatch per rank neither exact nor mixed
+needs a statistics pass. The recipe runs `mode: "mixed"` (`batch_weight` 0.5, momentum 0.9,
+exact for the first 1,000 updates). The diagnostics, logged per depth and entropy group, show
+whether mixing is worth it:
+`marginal_entropy_ema` vs `marginal_entropy` (H(r) - H(mu): the small-batch entropy bias mixing
+reduces, plus drift), `marginal_lag_kl` KL(mu || r) vs `marginal_step_kl` KL(mu || previous
+update's mu) (sampling noise alone gives a lag about half the step value; a much larger lag means
+`r` trails the model's drift), and `mixed_d_rms` (how far mixing at `batch_weight` would move
+`d`). `runtime.metrics_jsonl: true` writes every logged step's metrics to
+`output_dir/metrics.jsonl`; `runtime.log_metrics` names metrics appended to the printed step line.
+`kl_masked_marginal_d{k}_{type}` is the masked KL of a trivial predictor, the source chunk's mean
+teacher distribution: masked prediction works only where `kl_masked` sits clearly below it.
+On the 28-source exact run (gpu-2, step 17.7k) these read H(r) - H(mu) = 0.49 nats and lag/step
+KL 0.56 / 1.0: a large small-batch bias and noise rather than drift, which is the case mixing
+addresses.
+Each loader worker assembles a whole batch, so the recipe uses 4 workers with
+`prefetch_factor: 1`.
+
+Measured on one RTX 5090 (real 8–9 µm volumes, BF16, eager, three steps each):
 
 | Crops (teacher/global / local) | Sources per chunk | Time per source, both passes | Peak allocated |
 | --- | --- | --- | --- |
-| 160³ / 88³ (recipe) | 1 | 0.49 s | 5.8 GiB |
+| 160³ / 88³ | 1 | 0.49 s | 5.8 GiB |
 | 160³ / 88³ | 4 | 0.54 s | 20.3 GiB |
 | 256³ / 144³ | 1 | 3.5 s (167–176 s per 48-source update) | 21.6 GiB |
 
-The 160³ recipe therefore needs about 24 s of model time per 48-source update on
-one 5090 (extrapolated from 4-source batches); 160³ placement in the 512³ window
-rejects about 35–40 student proposals per source (versus about 5 at 256³) with no
-source redraws. `pretrain_jem_3d_large.json` is the L-style preset (1024 wide,
+Per 48-source update of the 160³ recipe on one 5090 (steady state; `data` is the
+parent-side view processing the step waits for):
+
+| Configuration | Model step | Data wait | Update wall time |
+| --- | --- | --- | --- |
+| eager | 23.9 s | 4.1 s | 28.0 s |
+| `runtime.compile` | 16.5 s | 4.2 s | 20.7 s |
+| compile + `data.gpu_prefetch` | 15.4 s | 0 s | 15.4 s |
+| … + no gradient, head or loss checkpointing | 14.3 s | 0 s | 14.3 s |
+| … + compiled objective and statistics, unchunked CNN embedding | 13.1 s | 0 s | 13.1 s |
+| … + overlap-token compaction (`global_marginal.mode: "exact"`) | 13.0 s | 0 s | 13.0 s |
+| … running marginal, no statistics pass, no LayerScale | 10.4 s | 0 s | 10.4 s |
+
+The current recipe then shrank the crops and the step (one 5090, compiled,
+`data.gpu_prefetch`, steady-state medians over 5 or 14 steps; `outputs/jem_crop128/`):
+
+| Crops / source window / sources per step | Per optimizer step | Per 48 sources | Peak allocated |
+| --- | --- | --- | --- |
+| 160³ / 88³, 512³, 48 | 10.41 s | 10.41 s | 18.5 GiB |
+| 128³ / 72³, 512³, 48 | 5.18 s | 5.18 s | 10.4 GiB |
+| 128³ / 72³, 512³, 16 | 1.76 s | 5.29 s | 10.3 GiB |
+| 128³ / 72³, 320³, 16 (recipe) | 1.76 s | 5.27 s | 10.5 GiB |
+
+Data wait was 0 s in every row. 128³ crops have 4,096 tokens instead of 8,000, so
+full attention costs about a quarter as much; FLOPs per source fall about 2.6x and time 2x.
+
+`data.gpu_prefetch` processes the next batch on a side stream while the step runs
+(the JEM processor draws only from per-view seeds, so drop-path replay is unaffected).
+The third row also includes asynchronous chunk uploads from pinned storage and
+channels-last strides for the one-channel CNN input (cuDNN otherwise converted the
+first convolutions' full-resolution gradients every backward).
+
+The recipe turns off `backbone.grad_checkpointing`, `method.checkpoint_heads` and
+`method.checkpoint_losses`: one source per chunk then peaks at about 19 GiB allocated
+(20.5 GiB reserved) instead of 6.7 GiB. Measured on 8-source updates (s per update):
+
+| Checkpointing | Time | Peak allocated |
+| --- | --- | --- |
+| backbone, heads, losses | 2.57 | 6.7 GiB |
+| heads and losses off | 2.50 | 8.0 GiB |
+| … and transformer blocks off (CNN embedding still checkpointed) | 2.42 | 15.4 GiB |
+| … and CNN embedding off, blocks checkpointed | 2.44 | 10.9 GiB |
+| none | 2.36 | 18.3 GiB |
+| none, compiled objective and statistics | 2.22 | 17.8 GiB |
+| none, compiled objective, `deeper_embed_batch_chunk_size: null` | 2.18 | 18.0 GiB |
+| … and overlap-token compaction (recipe) | 2.16 | 17.9–19.0 GiB |
+| heads and losses off, `source_chunk_size: 2` | 2.46 | 14.0 GiB |
+
+Where memory is short, re-enable `grad_checkpointing` first (2.50 s at 8.0 GiB). A
+chunk size of 2 draws different drop-path masks per chunk, so it is not a pure speed
+setting. The objective and the marginal statistics have static shapes (masked dense
+gathers instead of per-row `nonzero` loops, so no host synchronization per chunk) and
+compile with the model (`compile.dynamic` key `objective`); the full-batch surrogate
+coefficients are formed once per update. Alignment KL and structural terms read only
+each row's teacher-overlapping tokens, compacted (stable sort) to the chunk's largest
+overlap count rounded up to 64; the processor counts overlaps per row on the host
+(`{kind}_overlap_count`), so sizing needs no GPU sync, and the compacted width is
+compiled as a dynamic dimension (`compile.dynamic.objective` cannot be false). On
+recipe batches this keeps 35–40% of global and 87–92% of local token positions (one
+high-overlap local per chunk sets the width). Running the CNN embedding over all views of a
+chunk at once (`deeper_embed_batch_chunk_size: null`) is about 1.5% faster without
+checkpointing (chunk sizes 2 and 4 are not). Also measured without gain: the Torch channel norm instead of the custom
+Triton op, cuDNN attention (slower backward than FlashAttention-2 at these shapes), a
+no-gradient statistics pass without structural heads (the cheaper forward is offset by
+a slower backward), and zero-padding the one-channel input for tensor-core
+convolutions. `compile.mode: "max-autotune-no-cudagraphs"` saves another 1% (2.34 s)
+for about five more minutes of compilation per launch.
+
+160³ placement in the 512³ window rejects about 35–40 student proposals per source
+(versus about 5 at 256³), and 128³ about 100; 128³ in the recipe's 320³ window rejects
+about 17, all without source redraws. `pretrain_jem_3d_large.json` is the L-style preset (1024 wide,
 24 blocks, 16 heads, GELU MLP 4096, LayerScale 1e-5, drop-path 0.3, Compass RoPE,
 alignment {8, 16, 24}, structural {0, 8, 16}, heads 2048 / 256 / 1024) at 256³ /
 144³; one source per chunk does not fit in 32 GB.
@@ -1295,11 +1439,25 @@ collapse, MI, marginal/conditional entropy, marginal perplexity, minimum valid
 vectors and distinct sources per position; structural loss per depth; overlap,
 validity and mask fractions; placement attempts/rejections; whole-view mask-status
 contributions (`contrib_*_masked/unmasked`, which add up to each weighted loss and
-use the full-batch marginal). Monitor images show oriented student/teacher slices
-with masks and correspondence support.
+use the full-batch marginal). Monitor images show, for two student globals and three
+locals of one source, the oriented student and teacher slices (masked tokens red,
+tokens without correspondence dimmed) next to their final patch features projected
+onto the top three principal components of that source's teacher tokens as RGB (one
+basis and color scale for all panels).
 
 Auxiliary object/ink/region/point objectives are not implemented for JEM; nonzero
-`method.auxiliaries` weights are rejected. `torch.compile` is not wired up for JEM.
+`method.auxiliaries` weights are rejected.
+
+**Compilation.** `runtime.compile` (the DINO settings; `compile.dynamic` may map
+`student` and `teacher`) compiles the student and teacher forwards, backbone and
+heads; the losses stay eager. Random ops fall back to ATen
+(`torch._inductor.config.fallback_random`), so compiled drop-path draws come from
+the CUDA generator exactly as in eager mode and the gradient pass replays them.
+Compiled, the statistics pass runs the gradient pass's graph with gradients on: the
+no-gradient graph fuses differently and its BF16 logits differ in the last bits,
+while the shared graph keeps `replay_max_abs_diff` exactly zero at no measured cost.
+The first update compiles for about two minutes.
+
 Tests: `tests/test_jem_losses.py` (fixed reduction fixtures, dense references) and
 `tests/test_jem_training.py` (exact correspondence through the processor on CPU and
 CUDA, masks and withheld voxels, view replay, chunked/single/dense gradients, EMA,

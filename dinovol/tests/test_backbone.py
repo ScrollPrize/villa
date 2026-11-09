@@ -26,3 +26,31 @@ class BackboneTests(unittest.TestCase):
                 b = wrapper.student.backbone(x,is_training=True,view_kind=kind)
             torch.testing.assert_close(a['x_norm_clstoken'],b['x_norm_clstoken'],rtol=0,atol=0)
             torch.testing.assert_close(a['x_norm_patchtokens'],b['x_norm_patchtokens'],rtol=0,atol=0)
+
+    def test_channels_last_stem_sees_channels_last_single_channel_input(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+        from dinovol_2.model.patch_encode_decode import PatchEmbedDeeper
+        torch.manual_seed(0)
+        stem = PatchEmbedDeeper(patch_size=(4, 4, 4), input_channels=1, embed_dim=16, stage_channels=(4, 8),
+                                stage_strides=((2, 2, 2), (2, 2, 2)), depth_per_level=(1, 1), use_stem=True,
+                                stem_type="residual", stem_channels=4, final_projection=True, channels_last=True)
+        stem.to(memory_format=stem.memory_format)
+        x = torch.randn(2, 1, 8, 8, 8)
+        seen = []
+
+        class Inputs(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func is torch.ops.aten.convolution.default and args[0].shape[1] == 1:
+                    seen.append(args[0].stride())
+                return func(*args, **(kwargs or {}))
+
+        with Inputs():
+            out = stem(x)
+        # One-channel inputs carry explicit channels-last strides (same bytes, no copy).
+        self.assertTrue(seen)
+        self.assertTrue(all(stride == (512, 1, 64, 8, 1) for stride in seen), seen)
+        self.assertEqual(stem(x).shape, out.shape)
+
+
+if __name__ == "__main__":
+    unittest.main()

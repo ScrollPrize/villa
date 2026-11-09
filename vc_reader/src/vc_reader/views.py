@@ -121,7 +121,8 @@ def plan_view_sets(support, teacher_shape, student_shapes, *, n_sets, min_overla
 
 
 def correspondence(support, support_index, student_origins, student_shape, student_orientations,
-                   teacher_origins, teacher_shape, teacher_orientations, *, lattice=False):
+                   teacher_origins, teacher_shape, teacher_orientations, *, lattice=False, student_boxes=None,
+                   patch=None):
     """Map each oriented student token to its oriented teacher token, for N pairs.
 
     support: (Sg,T0,T1,T2) token grids (a single (T0,T1,T2) grid is also
@@ -131,6 +132,14 @@ def correspondence(support, support_index, student_origins, student_shape, stude
     is unsupported; ``student_valid`` uint8 (N, prod(student_shape)); and with
     ``lattice=True``, ``lattice`` int32 (N, prod(student_shape), 3), ZYX token
     coordinates. Outputs are on the device of ``support``.
+
+    Resampled students: ``student_boxes`` (N,6) gives each student's voxel
+    origin ZYX (>= 0) and voxel extent ZYX in the support grid's voxel frame,
+    the region resized (voxel centers aligned) to ``student_shape * patch``; with
+    it ``patch`` is required and ``student_origins`` is not read. Each student
+    token then maps through the support token containing its center,
+    floor((o + (u + 1/2) * F / S) / P) per axis (exact integer arithmetic; a box
+    of origin * patch and student_shape * patch voxels gives the plain result).
     """
     support, torch = _native(support)
     if support.ndim == 3:
@@ -147,7 +156,8 @@ def correspondence(support, support_index, student_origins, student_shape, stude
                            _host(student_orientations, np.int64).reshape(-1), _host(teacher_origins, np.int64),
                            teacher_shape, _host(teacher_orientations, np.int64).reshape(-1),
                            result["teacher_index"], result["student_valid"], result.get("lattice"),
-                           _stream(support, torch))
+                           None if student_boxes is None else _host(student_boxes, np.int64),
+                           (0, 0, 0) if student_boxes is None else _triple(patch), _stream(support, torch))
     return result
 
 

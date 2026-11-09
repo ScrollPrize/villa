@@ -3,55 +3,22 @@
     "attention_type": "full",
     "attention_backend": "flash",
     "global_crops_size": [
-      160,
-      160,
-      160
+      128,
+      224,
+      224
     ],
     "local_crops_size": [
-      88,
-      88,
-      88
+      64,
+      128,
+      128
     ],
     "embed_dim": 512,
     "patch_size": [
-      8,
+      16,
       8,
       8
     ],
-    "embedding_type": "deeper",
-    "deeper_embed_use_stem": true,
-    "deeper_embed_stem_type": "residual",
-    "deeper_embed_stem_channels": 32,
-    "deeper_embed_stage_channels": [
-      32,
-      64,
-      128
-    ],
-    "deeper_embed_stage_strides": [
-      [
-        2,
-        2,
-        2
-      ],
-      [
-        2,
-        2,
-        2
-      ],
-      [
-        2,
-        2,
-        2
-      ]
-    ],
-    "deeper_embed_depth_per_level": [
-      1,
-      1,
-      1
-    ],
-    "deeper_embed_final_projection": true,
-    "deeper_embed_batch_chunk_size": 1,
-    "deeper_embed_channels_last": true,
+    "embedding_type": "default",
     "depth": 12,
     "num_heads": 8,
     "qkv_bias": false,
@@ -61,20 +28,23 @@
     "scale_mlp": false,
     "drop_path_rate": 0.1,
     "drop_path_uniform": false,
-    "init_values": 1e-05,
+    "init_values": null,
     "num_reg_tokens": 4,
     "class_token": false,
     "untie_cls_and_patch_norms": false,
     "untie_global_and_local_cls_norm": false,
     "use_rot_pos_emb": true,
     "rope_type": "compass",
-    "grad_checkpointing": true,
-    "block_chunks": 0
+    "grad_checkpointing": false,
+    "block_chunks": 0,
+    "rope_kwargs": {
+      "normalize_coords": "max"
+    }
   },
   "method": {
     "name": "jem",
-    "global_batch_size": 48,
-    "source_chunk_size": 1,
+    "global_batch_size": 84,
+    "source_chunk_size": 6,
     "categories": 512,
     "head_hidden_dim": 1024,
     "head_bottleneck_dim": 256,
@@ -99,19 +69,42 @@
     "teacher_temperature": 0.1,
     "student_temperature": 0.1,
     "entropy_rank_scope": "logical_batch",
+    "global_marginal": {
+      "mode": "mixed",
+      "momentum": 0.9,
+      "batch_weight": 0.5,
+      "exact_updates": 1000
+    },
     "entropy_view_scope": "crop_type",
     "structural_pair_weighting": "uniform",
     "structural_backend": "contraction",
     "momentum_teacher": 0.994,
     "regularizer_warmup_steps": 12500,
     "views": {
-      "source_size": 512,
-      "teacher_size": 160,
-      "global_size": 160,
-      "local_size": 88,
+      "source_size": 320,
+      "teacher_size": [
+        128,
+        224,
+        224
+      ],
+      "global_size": [
+        128,
+        224,
+        224
+      ],
+      "local_size": [
+        64,
+        128,
+        128
+      ],
       "locals_per_set": 4,
       "min_overlap_fraction": 0.1,
-      "min_overlap_count": 2
+      "min_overlap_count": 2,
+      "orientations": "z_preserving",
+      "student_scale": [
+        0.8,
+        1.25
+      ]
     },
     "masking": {
       "global": {
@@ -126,8 +119,10 @@
       }
     },
     "batch_storage": "host",
-    "checkpoint_heads": true,
-    "checkpoint_losses": true
+    "checkpoint_heads": false,
+    "checkpoint_losses": false,
+    "visible_weight": 0.2,
+    "masked_weight": 0.8
   },
   "optimizer": {
     "lr_scaling": {
@@ -136,7 +131,7 @@
       "rule": "sqrt"
     },
     "lr_schedule": "constant",
-    "warmup_steps": 50000,
+    "warmup_steps": 5000,
     "weight_decay": 0.04,
     "weight_decay_end": 0.04,
     "betas": [
@@ -149,10 +144,11 @@
     "fused_optimizer": true
   },
   "data": {
-    "batch_size": 48,
-    "num_workers": 4,
-    "prefetch_factor": 1,
+    "batch_size": 84,
+    "num_workers": 20,
+    "prefetch_factor": 4,
     "persistent_workers": true,
+    "gpu_prefetch": true,
     "dataset": {
       "occupancy_level": 5,
       "object_mask": {
@@ -161,7 +157,7 @@
         "z_trim_pct": 0.05
       },
       "augmentation": "full",
-      "normalization_scheme": "robust",
+      "normalization_scheme": "none",
       "s3_storage_options": {
         "anon": true
       },
@@ -448,14 +444,27 @@
     "max_iterations": 500000,
     "use_amp": true,
     "amp_dtype": "bfloat16",
-    "compile": false,
+    "compile": true,
     "cuda_expandable_segments": true,
     "cudnn_benchmark": true,
-    "save_every_n": 2500,
-    "keep_last_checkpoints": 3,
+    "save_every_n": 500,
+    "keep_last_checkpoints": 10,
     "train_monitor_every_n": 500,
     "log_every": 10,
     "resume": true,
-    "auto_resume": true
+    "auto_resume": true,
+    "log_metrics": [
+      "alignment_loss",
+      "global_collapse_loss",
+      "structural_loss",
+      "mi_d12_global",
+      "mi_d12_local",
+      "perplexity_d12_global",
+      "perplexity_d12_local",
+      "marginal_lag_kl_d12_global",
+      "marginal_step_kl_d12_global",
+      "mixed_d_rms_d12_global"
+    ],
+    "metrics_jsonl": true
   }
 }

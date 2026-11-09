@@ -56,12 +56,15 @@ inline Index3 cells(const Index3& shape, const Index3& patch)
 struct PairPlan {
     std::int64_t grid;
     std::int32_t studentOrigin[3], teacherOrigin[3];
+    std::int64_t boxOrigin[3], boxExtent[3];          // resampled student box (voxels), if sampled
     std::int8_t studentPerm[3], teacherPerm[3];
     std::int8_t studentFlip[3], teacherFlip[3];
 };
 struct PairGeometry {
     std::int32_t student[3], teacher[3];               // unoriented shapes
     std::int32_t tokens[3];                             // support grid shape
+    std::int32_t patch[3];                              // voxels per token, if sampled
+    bool sampled;                                       // students come from studentBoxes
     std::int64_t gridSize, studentTokens;
 };
 
@@ -80,6 +83,11 @@ inline PairGeometry pairGeometry(const Supports& support, const Pairs& pairs)
     }
     require(product(pairs.teacherShape) <= limit, "teacher token count must fit int32");
     require(product(pairs.studentShape) <= limit, "student token count must fit int32");
+    g.sampled = pairs.studentBoxes != nullptr;
+    for (int a = 0; a < 3; ++a) {
+        if (g.sampled) require(pairs.patch[a] > 0 && pairs.patch[a] <= limit, "patch must be positive with student boxes");
+        g.patch[a] = g.sampled ? std::int32_t(pairs.patch[a]) : 0;
+    }
     g.gridSize = product(support.shape);
     g.studentTokens = product(pairs.studentShape);
     return g;
@@ -95,8 +103,10 @@ inline std::vector<PairPlan> pairPlans(const Supports& support, const Pairs& pai
 {
     std::vector<PairPlan> plans(pairs.count);
     if (pairs.count)
-        require(pairs.supportIndex && pairs.studentOrigins && pairs.studentOrientations && pairs.teacherOrigins &&
-                pairs.teacherOrientations, "pair arrays are required");
+        require(pairs.supportIndex && (g.sampled || pairs.studentOrigins) && pairs.studentOrientations &&
+                pairs.teacherOrigins && pairs.teacherOrientations, "pair arrays are required");
+    // Box coordinates bound the exact center arithmetic 2 * o * S + (2u + 1) * F well inside int64.
+    const std::int64_t boxLimit = std::int64_t(1) << 30;
     // Lattice coordinates of every crop token must fit int32.
     const auto lo = std::int64_t(std::numeric_limits<std::int32_t>::min());
     const auto hi = std::int64_t(std::numeric_limits<std::int32_t>::max());
@@ -107,8 +117,14 @@ inline std::vector<PairPlan> pairPlans(const Supports& support, const Pairs& pai
         plan.grid = pairs.supportIndex[p];
         const auto s = resolve(pairs.studentOrientations[p]), t = resolve(pairs.teacherOrientations[p]);
         for (int a = 0; a < 3; ++a) {
-            const auto so = pairs.studentOrigins[3 * p + a], to = pairs.teacherOrigins[3 * p + a];
+            const auto so = g.sampled ? 0 : pairs.studentOrigins[3 * p + a], to = pairs.teacherOrigins[3 * p + a];
             require(so >= lo && so <= hi - g.student[a] + 1, "student origin out of int32 range");
+            plan.boxOrigin[a] = g.sampled ? pairs.studentBoxes[6 * p + a] : 0;
+            plan.boxExtent[a] = g.sampled ? pairs.studentBoxes[6 * p + 3 + a] : 0;
+            if (g.sampled)
+                require(plan.boxOrigin[a] >= 0 && plan.boxExtent[a] > 0 && plan.boxOrigin[a] < boxLimit &&
+                            plan.boxExtent[a] < boxLimit,
+                        "student box origin must be in [0, 2^30) and extent in (0, 2^30)");
             require(to >= lo && to <= hi - g.teacher[a] + 1, "teacher origin out of int32 range");
             plan.studentOrigin[a] = std::int32_t(so);
             plan.teacherOrigin[a] = std::int32_t(to);
@@ -139,7 +155,10 @@ VCR_VIEWS_HD void correspond(const PairGeometry& g, const PairPlan& p, const std
     for (int k = 0; k < 3; ++k) {
         const int axis = p.studentPerm[k];
         const std::int64_t u = p.studentFlip[k] ? g.student[axis] - 1 - at[k] : at[k];
-        lat[axis] = p.studentOrigin[axis] + u;
+        // Sampled: support token containing the center o + (u + 1/2) F / S (all terms >= 0).
+        lat[axis] = g.sampled ? (2 * p.boxOrigin[axis] * g.student[axis] + (2 * u + 1) * p.boxExtent[axis]) /
+                                    (std::int64_t(2) * g.student[axis] * g.patch[axis])
+                              : p.studentOrigin[axis] + u;
     }
     bool inGrid = true;
     for (int a = 0; a < 3; ++a) inGrid = inGrid && lat[a] >= 0 && lat[a] < g.tokens[a];

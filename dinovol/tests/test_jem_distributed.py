@@ -44,12 +44,19 @@ def _worker(rank, folder):
         method = JemMethod(config, device="cpu", is_distributed=True, rank=rank)
         method.successful_updates = 1
         dataset, samples = _samples(method, config)
-        local = samples[rank * 2:(rank + 1) * 2]
-        output, grads = _step(method, method.build_processor(dataset, "cpu")(local), distributed=True)
+        local = method.build_processor(dataset, "cpu")(samples[rank * 2:(rank + 1) * 2])
+        output, grads = _step(method, local, distributed=True)
         reference = torch.load(root / "reference.pt")
         # DDP averages gradients; the surrogate makes that the full-batch gradient.
         for name, grad in reference["grads"].items():
             torch.testing.assert_close(grads[name], grad, rtol=2e-4, atol=1e-6, msg=name)
+        # The second update takes the single-pass running-marginal path. With unchanged parameters
+        # its r is the all-reduced full-batch marginal and its counts are all-reduced from the
+        # validity masks, so it reproduces the full-batch gradient too.
+        self_check, running_grads = _step(method, local, distributed=True)
+        assert float(self_check.metrics["marginal_lag_kl"]) < 1e-6
+        for name, grad in reference["grads"].items():
+            torch.testing.assert_close(running_grads[name], grad, rtol=2e-4, atol=1e-6, msg=f"running {name}")
         # The global-collapse value is computed from all-reduced statistics on every rank.
         torch.testing.assert_close(output.metrics["global_collapse_loss"], reference["global"], rtol=1e-5, atol=1e-7)
         loss = output.loss.clone()

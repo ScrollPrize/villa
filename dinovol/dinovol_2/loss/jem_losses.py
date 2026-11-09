@@ -111,6 +111,45 @@ def entropy(log_probs: torch.Tensor) -> torch.Tensor:
     return -(log_probs.exp() * log_probs).sum(-1)
 
 
+def slot_group_index(groups: Sequence[EntropyGroup], view_type: str) -> list[int]:
+    """Index of each slot's group among the groups of `view_type` (the groups partition the slots)."""
+    members = [group for group in groups if group.view_type == view_type]
+    n_slots = max(slot for group in members for slot in group.slots) + 1
+    index = [-1] * n_slots
+    for position, group in enumerate(members):
+        for slot in group.slots:
+            if index[slot] != -1:
+                raise ValueError(f"slot {slot} of {view_type} views belongs to several entropy groups")
+            index[slot] = position
+    if -1 in index:
+        raise ValueError(f"every {view_type} slot must belong to one entropy group, got {index}")
+    return index
+
+
+def accumulation_terms(log_q: torch.Tensor, valid: torch.Tensor, group: torch.Tensor, n_groups: int,
+                       sources: torch.Tensor):
+    """Per-group increments of the marginal statistics, with static shapes (no host syncs).
+
+    log_q [R, N, K] FP32; valid [R, N] bool; group [R] (group index of each row); sources [R].
+    Returns S [G, N, K], C [G, N], M [G, N] and D [G, N]: the number of distinct sources
+    with at least one valid vector of the group at the position.
+    """
+    q = log_q.exp()
+    h = entropy(log_q)
+    member = group[None, :] == torch.arange(n_groups, device=group.device)[:, None]  # [G, R]
+    a = valid.to(q.dtype)[None] * member[..., None].to(q.dtype)  # [G, R, N]
+    S = torch.einsum("grn,rnk->gnk", a, q)
+    C = (a * h[None]).sum(1)
+    M = a.sum(1)
+    # Count each source once, at its first row: does any row of that source have a valid vector?
+    same = sources[:, None] == sources[None, :]  # [R, R]
+    order = torch.arange(len(sources), device=sources.device)
+    first = ~(same & (order[None, :] < order[:, None])).any(1)
+    reached = torch.einsum("rs,gsn->grn", same.to(q.dtype), a) > 0
+    D = (reached & first[None, :, None]).to(q.dtype).sum(1)
+    return S, C, M, D
+
+
 class EntropyStatistics:
     """Detached sufficient statistics of the logical-batch marginals.
 
@@ -124,6 +163,8 @@ class EntropyStatistics:
         self.depths = list(depths)
         self.categories = int(categories)
         self.S, self.C, self.M, self.D = {}, {}, {}, {}
+        self.slot_group = {view_type: torch.tensor(slot_group_index(self.groups, view_type), device=device)
+                           for view_type in sorted({group.view_type for group in self.groups})}
         for depth in self.depths:
             for group in self.groups:
                 n = int(positions[group.view_type])
@@ -140,23 +181,20 @@ class EntropyStatistics:
     def accumulate(self, depth: int, view_type: str, log_q: torch.Tensor, valid: torch.Tensor,
                    slots: torch.Tensor, sources: torch.Tensor) -> None:
         """log_q [rows, N, K] FP32; valid [rows, N] bool; slots/sources [rows] long."""
-        log_q = log_q.float()
-        q = log_q.exp()
-        h = entropy(log_q)
-        for group in self.groups_for(view_type):
-            rows = torch.isin(slots, slots.new_tensor(group.slots))
-            if not bool(rows.any()):
-                continue
-            a = valid[rows].float()
+        group = self.slot_group[view_type].to(slots.device)[slots]
+        self.add_terms(depth, view_type, accumulation_terms(log_q.float(), valid, group,
+                                                            len(self.groups_for(view_type)), sources))
+
+    @torch.no_grad()
+    def add_terms(self, depth: int, view_type: str, terms) -> None:
+        """Add accumulation_terms (stacked in groups_for(view_type) order)."""
+        S, C, M, D = terms
+        for index, group in enumerate(self.groups_for(view_type)):
             key = (depth, group.name)
-            self.S[key] += torch.einsum("rn,rnk->nk", a, q[rows])
-            self.C[key] += (a * h[rows]).sum(0)
-            self.M[key] += a.sum(0)
-            # Distinct sources: any valid vector of the source at this position.
-            source_ids = sources[rows]
-            unique, inverse = torch.unique(source_ids, return_inverse=True)
-            per_source = a.new_zeros(len(unique), a.shape[1]).index_add(0, inverse, a)
-            self.D[key] += (per_source > 0).float().sum(0)
+            self.S[key] += S[index]
+            self.C[key] += C[index]
+            self.M[key] += M[index]
+            self.D[key] += D[index]
 
     def all_reduce(self) -> None:
         if not (dist.is_available() and dist.is_initialized()):
@@ -198,18 +236,29 @@ class EntropyStatistics:
         return {"loss": zero, "marginal_entropy": zero, "conditional_entropy": zero,
                 "min_vectors": zero, "min_sources": zero, "positions": zero, "perplexity": zero}
 
-    def coefficients(self, key, scale: float):
-        """Per-position surrogate coefficient scale / (P_present * M) and d = log mu + 1.
+    def coefficients(self, key, scale: float, reference=None, batch_weight: float = 1.0):
+        """Per-position surrogate coefficient scale / (P_present * M), d = log mu_hat + 1, and log mu.
 
-        d is zero where mu underflowed to zero: every valid q is then zero too,
-        so its value and its contribution through the softmax are zero.
+        mu_hat is this batch's marginal mu, or with ``reference`` (r [N, K], present [N]) the
+        mixture batch_weight * mu + (1 - batch_weight) * r wherever r is present. d is zero
+        where mu_hat underflowed to zero. log mu is always the batch marginal's (for the
+        loss attribution of the batch objective).
         """
         present = self.present(key)
         n_present = present.float().sum().clamp_min(1)
         coef = torch.where(present, scale / (n_present * self.M[key].clamp_min(1)), torch.zeros_like(self.M[key]))
         mu = self.marginal(key)
-        log_mu = torch.where(mu > 0, mu.clamp_min(torch.finfo(mu.dtype).tiny).log(), torch.zeros_like(mu))
-        return coef, log_mu + 1.0, log_mu
+        log_mu = _safe_log(mu)
+        if reference is None:
+            return coef, log_mu + 1.0, log_mu
+        r, r_present = reference
+        mixed = torch.where(r_present[:, None], batch_weight * mu + (1.0 - batch_weight) * r, mu)
+        return coef, _safe_log(mixed) + 1.0, log_mu
+
+
+def _safe_log(p: torch.Tensor) -> torch.Tensor:
+    """log p, and zero where p is zero."""
+    return torch.where(p > 0, p.clamp_min(torch.finfo(p.dtype).tiny).log(), torch.zeros_like(p))
 
 
 def entropy_surrogate(log_q: torch.Tensor, valid: torch.Tensor, coef: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
@@ -254,6 +303,43 @@ def structural_uniform_contraction(a: torch.Tensor, b: torch.Tensor) -> torch.Te
     full = 0.5 * ((dd * ss).sum() + (sd * sd.T).sum())
     diagonal = (d * s).sum(-1).square().sum()
     return (full - diagonal) / (n * (n - 1))
+
+
+def overlap_capacity(count: int, n: int, multiple: int = 64) -> int:
+    """Compacted token capacity: `count` rounded up to `multiple` (at least one), at most n."""
+    return min(n, max(1, -(-int(count) // multiple)) * multiple)
+
+
+def overlap_order(overlap: torch.Tensor, capacity: int) -> torch.Tensor:
+    """Token positions [R, capacity]: each row's overlapping tokens first, in token order.
+
+    With capacity >= every row's overlap count, positions past a row's count are
+    non-overlapping tokens (masked out by gathering `overlap` with the same order).
+    """
+    # Contiguous for every capacity, so compiled graphs see one layout.
+    return torch.sort((~overlap).to(torch.uint8), dim=-1, stable=True).indices[:, :capacity].contiguous()
+
+
+def structural_uniform_contraction_rows(a: torch.Tensor, b: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+    """structural_uniform_contraction of every row over its kept tokens, with static shapes.
+
+    a [R, N, Ca], b [R, N, Cb], keep [R, N] bool -> [R]. Zeroing the dropped tokens in
+    D = A - B and S = A + B removes them from every Gram product and the diagonal; rows
+    with fewer than two kept tokens give zero.
+    """
+    width = max(a.shape[-1], b.shape[-1])
+    a = F.pad(a, (0, width - a.shape[-1]))
+    b = F.pad(b, (0, width - b.shape[-1]))
+    m = keep.unsqueeze(-1).to(a.dtype)
+    d = (a - b) * m
+    s = (a + b) * m
+    dd = d.mT @ d
+    ss = s.mT @ s
+    sd = s.mT @ d
+    full = 0.5 * ((dd * ss).sum((-2, -1)) + (sd * sd.mT).sum((-2, -1)))
+    diagonal = (d * s).sum(-1).square().sum(-1)
+    n = keep.sum(-1).to(a.dtype)
+    return torch.where(n >= 2, (full - diagonal) / (n * (n - 1)).clamp_min(1), torch.zeros_like(full))
 
 
 def distance_metric(spacing: Sequence[float], patch: Sequence[int]) -> tuple[torch.Tensor, float]:

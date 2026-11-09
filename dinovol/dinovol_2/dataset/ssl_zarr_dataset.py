@@ -393,7 +393,7 @@ class SSLZarrDataset(Dataset):
                 raise ValueError("JEM views need source_rotation='none' and no single-crop, object-point, "
                                  "point-supervision or Gram-teacher sampling")
             self.jem = JemViewSpec.from_config(jem, patch_size=jem.get("patch", 8))
-            if self.source_sampling_size != (self.jem.source_size,) * 3:
+            if tuple(self.source_sampling_size) != tuple(self.jem.source_size):
                 raise ValueError(f"JEM source_size {self.jem.source_size} must equal source_sampling_size "
                                  f"{self.source_sampling_size}")
         self._volume_spacing: dict[int, tuple[float, float, float]] = {}

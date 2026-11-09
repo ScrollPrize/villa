@@ -63,6 +63,22 @@ class LayerNormNd(nn.Module):
         return channel_norm.reference(x, self.weight, self.bias, self.eps, residual, relu)
 
 
+def _channels_last_view(x: torch.Tensor) -> torch.Tensor:
+    """Give a dense one-channel volume explicit channels-last strides (a view, no copy).
+
+    With one channel both layouts are the same bytes, so contiguous(memory_format=...)
+    keeps the NCDHW strides. cuDNN then runs the first convolutions in NCDHW and
+    converts their full-resolution gradients from channels-last in every backward.
+    """
+    if x.ndim not in (4, 5) or x.shape[1] != 1 or x.numel() == 0 or not x.is_contiguous():
+        return x
+    spatial = x.shape[2:]
+    strides = [1] * len(spatial)
+    for axis in range(len(spatial) - 2, -1, -1):
+        strides[axis] = strides[axis + 1] * spatial[axis + 1]
+    return x.as_strided(x.shape, (x[0].numel(), 1, *strides))
+
+
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 
@@ -746,7 +762,7 @@ class PatchEmbedDeeper(nn.Module):
 
     def forward(self, x: torch.Tensor, return_skips: bool = False):
         if self.memory_format is not torch.contiguous_format:
-            x = x.contiguous(memory_format=self.memory_format)
+            x = _channels_last_view(x.contiguous(memory_format=self.memory_format))
         x = self.stem(x)
         skips = []
         for stage in self.stages:

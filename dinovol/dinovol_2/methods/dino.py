@@ -20,6 +20,7 @@ from .dino_data import build_dino_ibot_collate_fn
 from dinovol_2.training.schedules import CosineScheduler
 from dinovol_2.training.config import dino_model_config
 from dinovol_2.training.checkpoint import method_state
+from dinovol_2.training.compilation import resolve_compile_settings
 from .base import TrainingMethod, StepOutput
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -206,69 +207,23 @@ class DinoMethod(TrainingMethod):
         self._configure_model_compilation()
 
     def _configure_model_compilation(self) -> None:
-        settings = self.compile_config
-        if isinstance(settings, bool):
-            settings = {"enabled": settings}
-        elif isinstance(settings, Mapping):
-            settings = dict(settings)
-        else:
-            raise ValueError("compile must be a boolean or a settings mapping")
-        unknown = set(settings) - {"enabled", "backend", "mode", "dynamic", "fullgraph", "optimize_ddp"}
-        if unknown:
-            raise ValueError(f"Unknown compile settings: {sorted(unknown)}")
-        enabled = settings.pop("enabled", False)
-        if not isinstance(enabled, bool):
-            raise ValueError("compile.enabled must be a boolean")
-        self.compile_enabled = enabled
-        if not enabled:
-            return
-        # Dynamo's DDP optimizer splits compiled graphs at gradient-bucket boundaries. The split
-        # graphs no longer honour the checkpoint save-attention policy: under DDP every student
-        # attention forward ran again in backward (g256 crops, 3x H100: 5.75 -> 4.47 s/step off).
-        # "python_reducer" instead traces DDP's reducer into a compiled-autograd backward.
-        optimize_ddp = settings.pop("optimize_ddp", False)
-        if not isinstance(optimize_ddp, bool) and optimize_ddp != "python_reducer":
-            raise ValueError('compile.optimize_ddp must be a boolean or "python_reducer"')
-        import torch._dynamo
-        torch._dynamo.config.optimize_ddp = optimize_ddp
-        if optimize_ddp == "python_reducer":
-            torch._dynamo.config.compiled_autograd = True
-        options = {"backend": "inductor", "mode": "default", "dynamic": None, "fullgraph": False, **settings}
-        # dynamic may also map module names (backbone, dino_head, ibot_head) to settings;
-        # unlisted modules use null. Backbones see fixed global/local crop shapes, while
-        # the iBOT head sees a different number of masked tokens every step.
-        dynamic = options.pop("dynamic")
         module_names = ("backbone", "dino_head", "ibot_head")
-        if isinstance(dynamic, Mapping):
-            unknown_modules = set(dynamic) - set(module_names)
-            if unknown_modules:
-                raise ValueError(f"Unknown compile.dynamic modules: {sorted(unknown_modules)}")
-            dynamic_by_module = {name: dynamic.get(name) for name in module_names}
-        else:
-            dynamic_by_module = {name: dynamic for name in module_names}
-        if any(value is not None and not isinstance(value, bool) for value in dynamic_by_module.values()):
-            raise ValueError("compile.dynamic must be a boolean, null, or a mapping of module names to those")
-        if not isinstance(options["fullgraph"], bool):
-            raise ValueError("compile.fullgraph must be a boolean")
-        if not isinstance(options["backend"], str) or not isinstance(options["mode"], str):
-            raise ValueError("compile.backend and compile.mode must be strings")
-        if options["backend"] == "inductor":
-            # Inductor's mix-order reduction (torch 2.10) fuses the mask-token gradient with
-            # LayerNormNd parameter gradients in the CNN backward and then returns it as [C]
-            # instead of [1, 1, C] (seen with 8+ masked 128^3 crops). Disabling it cost no
-            # measurable CNN throughput.
-            import torch._inductor.config as inductor_config
-            inductor_config.triton.mix_order_reduction = False
+        # dynamic may map module names to settings: backbones see fixed global/local crop
+        # shapes, while the iBOT head sees a different number of masked tokens every step.
+        settings = resolve_compile_settings(self.compile_config, module_names)
+        self.compile_enabled = settings is not None
+        if settings is None:
+            return
         # Compile inner modules rather than DDP or the variable masked-token selection.
         # In-place compilation preserves parameter identities and state_dict keys for
         # optimizer groups, EMA updates, checkpoint loading, and downstream inference.
         # The small point heads (object losses) stay eager.
         for branch in (self.model_module.student, self.model_module.teacher):
             for name in module_names:
-                branch[name].compile(**options, dynamic=dynamic_by_module[name])
+                branch[name].compile(**settings.for_module(name))
         if self.gram_teacher_backbone is not None:
-            self.gram_teacher_backbone.compile(**options, dynamic=dynamic_by_module["backbone"])
-        self.ibot_patch_loss.compile_kernels(**options)
+            self.gram_teacher_backbone.compile(**settings.for_module("backbone"))
+        self.ibot_patch_loss.compile_kernels(**settings.options)
 
     @property
     def is_main_process(self) -> bool:

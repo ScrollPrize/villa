@@ -107,7 +107,8 @@ void correspondenceInto(const Array& support, Host<std::int64_t> supportIndex, H
                         const std::array<std::int64_t, 3>& studentShape, Host<std::int64_t> studentOrientations,
                         Host<std::int64_t> teacherOrigins, const std::array<std::int64_t, 3>& teacherShape,
                         Host<std::int64_t> teacherOrientations, const Array& teacherIndex, const Array& studentValid,
-                        std::optional<Array> lattice, std::uintptr_t stream)
+                        std::optional<Array> lattice, std::optional<Host<std::int64_t>> studentBoxes,
+                        const std::array<std::int64_t, 3>& patch, std::uintptr_t stream)
 {
     if (support.ndim() != 4) throw nb::value_error("support must be (grids,T0,T1,T2)");
     if (!isByteMask(support)) throw nb::type_error("support must be bool or uint8");
@@ -122,6 +123,7 @@ void correspondenceInto(const Array& support, Host<std::int64_t> supportIndex, H
     pairsShape(teacherOrigins, {n, 3}, "teacher_origins");
     pairsShape(studentOrientations, {n}, "student_orientations");
     pairsShape(teacherOrientations, {n}, "teacher_orientations");
+    if (studentBoxes) pairsShape(*studentBoxes, {n, 6}, "student_boxes");
     const auto tokens = studentShape[0] * studentShape[1] * studentShape[2];
     if (!isCode(teacherIndex, Code::Int, 32)) throw nb::type_error("teacher_index must be int32");
     if (!isCode(studentValid, Code::UInt, 8)) throw nb::type_error("student_valid must be uint8");
@@ -138,7 +140,8 @@ void correspondenceInto(const Array& support, Host<std::int64_t> supportIndex, H
     const Supports grids{static_cast<const std::uint8_t*>(support.data()), support.shape(0),
                          {std::int64_t(support.shape(1)), std::int64_t(support.shape(2)), std::int64_t(support.shape(3))}};
     const Pairs pairs{std::size_t(n), index3(studentShape), index3(teacherShape), supportIndex.data(),
-                      studentOrigins.data(), studentOrientations.data(), teacherOrigins.data(), teacherOrientations.data()};
+                      studentOrigins.data(), studentOrientations.data(), teacherOrigins.data(), teacherOrientations.data(),
+                      studentBoxes ? studentBoxes->data() : nullptr, index3(patch)};
     auto* index = static_cast<std::int32_t*>(teacherIndex.data());
     auto* valid = static_cast<std::uint8_t*>(studentValid.data());
     dispatch(id, stream, [&] { correspondence(grids, pairs, index, valid, lat); },
@@ -236,7 +239,7 @@ NB_MODULE(_views, m)
     m.def("_correspondence", &correspondenceInto, "support"_a, "support_index"_a, "student_origins"_a,
           "student_shape"_a, "student_orientations"_a, "teacher_origins"_a, "teacher_shape"_a,
           "teacher_orientations"_a, "teacher_index"_a.noconvert(), "student_valid"_a.noconvert(),
-          "lattice"_a.noconvert().none(), "stream"_a);
+          "lattice"_a.noconvert().none(), "student_boxes"_a.none(), "patch"_a, "stream"_a);
     m.def("_patch_masks", [](const std::array<std::int64_t, 3>& shape, Host<std::uint64_t> seeds, const std::string& mode,
                              double probability, double fraction, double minBlock, std::optional<double> maxBlock,
                              double minAspect, std::optional<double> maxAspect, std::int64_t attempts, bool shift) {

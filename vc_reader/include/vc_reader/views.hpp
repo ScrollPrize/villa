@@ -93,9 +93,19 @@ struct Pairs {
     const std::int64_t* studentOrientations = nullptr;// (count)
     const std::int64_t* teacherOrigins = nullptr;     // (count, 3)
     const std::int64_t* teacherOrientations = nullptr;// (count)
+    // Optional resampled students: (count, 6) voxel origin ZYX (>= 0) then voxel
+    // extent ZYX (> 0) of the support-grid region each student was resampled from
+    // (studentShape * patch voxels, voxel centers aligned). studentOrigins is then
+    // not read. patch (voxels per token) is required with studentBoxes.
+    const std::int64_t* studentBoxes = nullptr;
+    Index3 patch{};
 };
 // For pair p and oriented student token i (C order over the oriented student
-// shape), g = student origin + its unoriented crop coordinates. studentValid =
+// shape), g = student origin + its unoriented crop coordinates u; with
+// studentBoxes, g is the support token containing the token's center,
+// g = floor((o + (u + 1/2) * F / S) / P) per axis for box origin o, extent F,
+// student shape S and patch P (exact integer arithmetic; equal to origin + u
+// when o = origin * P and F = S * P). studentValid =
 // 1 iff g is inside the grid and supported. teacherIndex is the C-order index of
 // g in the oriented teacher crop when g lies inside the teacher box and the
 // student token is valid, else -1. lattice (optional) receives g, ZYX.

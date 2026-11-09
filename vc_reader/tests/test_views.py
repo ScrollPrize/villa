@@ -120,6 +120,66 @@ def test_correspondence_identity_is_a_shift():
         assert out["student_valid"][0, i] == support[tuple(g)]
 
 
+def test_correspondence_student_boxes_reduce_to_lattice(fixture):
+    rng, grid, support, ids = fixture
+    ns, nt, count = (3, 2, 3), (4, 3, 4), 400
+    so = np.stack([rng.integers(0, np.subtract(grid, ns) + 1) for _ in range(count)])
+    to = np.stack([rng.integers(0, np.subtract(grid, nt) + 1) for _ in range(count)])
+    sr, tr = rng.integers(0, 48, count), rng.integers(0, 48, count)
+    args = (support, np.zeros(count, np.int64), so, ns, sr, to, nt, tr)
+    plain = V.correspondence(*args, lattice=True)
+    boxes = np.concatenate([so * PATCH, np.broadcast_to(np.multiply(ns, PATCH), so.shape)], 1)
+    boxed = V.correspondence(support, np.zeros(count, np.int64), np.full_like(so, -99), ns, sr, to, nt, tr,
+                             lattice=True, student_boxes=boxes, patch=PATCH)
+    for key in plain:
+        np.testing.assert_array_equal(boxed[key], plain[key])
+
+
+def scaled_reference(support, box, ns, sr, to, nt, tr, patch):
+    """Brute force: support token of each oriented student token center, exact rationals."""
+    from fractions import Fraction
+    unoriented = oriented(np.stack(np.meshgrid(*[np.arange(n) for n in ns], indexing="ij"), -1), sr).reshape(-1, 3)
+    labels = oriented(np.arange(np.prod(nt)).reshape(nt), tr).reshape(-1)
+    teacher_position = np.argsort(labels)  # unoriented C index -> oriented C index
+    index, valid, lattice = [], [], []
+    for u in unoriented:
+        g = [int((box[a] + (Fraction(int(u[a])) + Fraction(1, 2)) * box[3 + a] / ns[a]) // patch[a]) for a in range(3)]
+        ok = all(0 <= g[a] < support.shape[a] for a in range(3)) and bool(support[tuple(g)])
+        t = np.subtract(g, to)
+        inside = ok and (t >= 0).all() and (t < nt).all()
+        index.append(int(teacher_position[np.ravel_multi_index(t, nt)]) if inside else -1)
+        valid.append(int(ok))
+        lattice.append(g)
+    return np.array(index), np.array(valid), np.array(lattice)
+
+
+def test_correspondence_student_boxes_match_centers():
+    rng = np.random.default_rng(7)
+    patch, grid = (4, 2, 2), (6, 9, 9)
+    support = (rng.random(grid) > .15).astype(np.uint8)
+    ns, nt, count = (2, 3, 3), (3, 4, 4), 300
+    shape = np.multiply(ns, patch)
+    extent = np.stack([np.maximum(1, np.round(shape * s)).astype(np.int64) for s in rng.uniform(.6, 1.7, count)])
+    origin = np.stack([rng.integers(0, np.maximum(1, np.multiply(grid, patch) - e)) for e in extent])
+    boxes = np.concatenate([origin, extent], 1)
+    to = np.stack([rng.integers(0, np.subtract(grid, nt) + 1) for _ in range(count)])
+    sr, tr = rng.integers(0, 16, count), rng.integers(0, 16, count)  # z-preserving: anisotropic patch
+    out = V.correspondence(support, np.zeros(count, np.int64), np.zeros((count, 3), np.int64), ns, sr, to, nt, tr,
+                           lattice=True, student_boxes=boxes, patch=patch)
+    for p in range(count):
+        index, valid, lattice = scaled_reference(support, boxes[p], ns, sr[p], to[p], nt, tr[p], patch)
+        np.testing.assert_array_equal(out["teacher_index"][p], index)
+        np.testing.assert_array_equal(out["student_valid"][p], valid)
+        np.testing.assert_array_equal(out["lattice"][p], lattice)
+    assert (out["teacher_index"] >= 0).any() and (out["teacher_index"] < 0).any()
+    with pytest.raises(ValueError):
+        V.correspondence(support, [0], [(0, 0, 0)], ns, [0], [(0, 0, 0)], nt, [0], student_boxes=[(0, 0, 0, 0, 4, 4)],
+                         patch=patch)
+    with pytest.raises(ValueError):
+        V.correspondence(support, [0], [(0, 0, 0)], ns, [0], [(0, 0, 0)], nt, [0], student_boxes=[(-1, 0, 0, 4, 4, 4)],
+                         patch=patch)
+
+
 def test_correspondence_rejects_bad_pairs():
     support = np.ones((1, 4, 4, 4), np.uint8)
     with pytest.raises(ValueError):
@@ -302,6 +362,15 @@ def test_cuda_matches_cpu(torch_cuda, fixture):
     stream.synchronize()
     for key in cpu:
         assert gpu[key].is_cuda
+        np.testing.assert_array_equal(gpu[key].cpu().numpy(), cpu[key])
+
+    boxes = np.concatenate([rng.integers(0, 12, (count, 3)), rng.integers(1, 12, (count, 3))], 1)
+    cpu = V.correspondence(supports, *args, lattice=True, student_boxes=boxes, patch=(2, 2, 2))
+    with torch.cuda.stream(stream):
+        gpu = V.correspondence(torch.from_numpy(supports).cuda(), *device_args, lattice=True,
+                               student_boxes=torch.from_numpy(boxes).cuda(), patch=(2, 2, 2))
+    stream.synchronize()
+    for key in cpu:
         np.testing.assert_array_equal(gpu[key].cpu().numpy(), cpu[key])
 
     images = rng.random((2, 3, 8, 6, 10), dtype=np.float32)
