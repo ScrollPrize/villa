@@ -10,6 +10,16 @@ This is the implementation contract and progress record for integrating the immu
 - The object UUID is the complete logical key, including across shards and referenced stores. Relationships store endpoint UUIDs directly; no proxy objects, aliases, per-object routing directories, endpoint directories, or duplicated endpoint rows. Fixed key-routing metadata determines the responsible database.
 - UUIDs use one 16-byte binary storage format. Chunk hashes remain binary content identifiers, not version counters.
 
+### Spiral and relationship-detector consumers
+
+Spiral input snapshots retain the store lineage UUID and `commit_sequence` and pin objects and relationships by their numbered versions. They do not read a removed per-record `generation` or `data_generation`. Relationship content hashes still describe the consumed anchors and metadata; the VC3D input comparison uses the relationship version to detect an edited relationship.
+
+Schema-20 Spiral checkpoint manifests with relationship content hashes remain comparable: their redundant numeric relationship generation is ignored. Older manifests with only that counter cannot establish unchanged relationship content after conversion and require the existing explicit changed-input override to resume; the counter is not treated as a numbered version.
+
+Current input snapshots and overlap correspondence reads work with history enabled or disabled. A history-off store cannot reconstruct a superseded state: historical requests must fail rather than substitute current data. Incremental relationship discovery requires the optional spatial index; it must not create one implicitly. Full discovery remains available without that index.
+
+The local/hosted `open_store` convenience API and current Spiral consumer operate on individual stores. Collections still require `ObjectCollection`; a physical-store open rejects the collection feature rather than silently reading only a root or shard. Collection-wide Spiral input selection is not introduced by this integration.
+
 ## One commit clock and one record version
 
 - Rename our numeric store generation to `commitSequence`/`commit_sequence`. This is the sole store-wide logical change counter and is independent of history retention.

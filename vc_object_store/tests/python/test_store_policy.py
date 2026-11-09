@@ -1,6 +1,7 @@
 """The Python facade delegates schema-21 policy to the native store implementation."""
 import sqlite3
 import json
+import uuid
 
 import pytest
 
@@ -9,6 +10,28 @@ from vc_object_store import (
     enable_history, remove_history_and_disable,
 )
 from object_helpers import raw
+
+
+@pytest.mark.parametrize("history_enabled", [False, True])
+def test_same_object_write_guard_does_not_hide_a_stale_read(tmp_path, history_enabled):
+    from vc_object_store import TransactionConflict
+
+    with ObjectStore.create(str(tmp_path / "conflict.vcobj"), author="test",
+                            history_enabled=history_enabled) as store:
+        obj = store.upsert_object(dict(kind="note"))
+        state = store.status()
+        request = dict(command_version=1, request=str(uuid.uuid4()), store=state["store"],
+                       generation=state["generation"], author="test",
+                       expected_objects={obj: 1}, read_dependencies={obj: 2},
+                       expected_relationships={}, expected_commit_sequence=None,
+                       operations=[dict(op="set_meta", uuid=obj, key="derived", value=True)])
+        with pytest.raises(TransactionConflict):
+            store.submit(request)
+        assert store.status()["commit_sequence"] == state["commit_sequence"]
+        assert "derived" not in store.object(obj)["meta"]
+        request["read_dependencies"] = {obj: 1}
+        store.submit(request)
+        assert store.object(obj)["meta"]["derived"] is True
 
 
 def test_history_off_spatial_off_and_atomic_seal(tmp_path):
