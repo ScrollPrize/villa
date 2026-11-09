@@ -39,6 +39,7 @@
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"

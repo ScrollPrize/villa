@@ -117,8 +117,10 @@ trace-coordinate adapters. Existing normal sampling/interpolation is reused.
 
 Packed CZYX arrays attach as spatial volumes and display their first channel
 (presence for compound AFV). Display reads the shared packed chunk cache directly,
-without extracting or writing separate channel volumes. Channel views use CPU
-sampling; regular 3-D volumes retain their existing GPU display path. Sparse
+without extracting or writing separate channel volumes. Uint8 channel views use
+the existing CUDA display path when enabled: selected scalar bricks are uploaded
+from the shared decoded CZYX cache, with CPU fallback on GPU failure. Other dtypes
+remain CPU sampled, as for separate volumes. Sparse
 pyramids starting at `/2` do not require a physical `/0` array. As with other
 OME pyramids, display coordinates refer to the finest declared grid. The GUI
 maps annotation coordinates into the prediction/normal manifest's base grid,
@@ -152,6 +154,14 @@ build/bin/VC3D --test-object-store
 This creates a temporary project, attaches only the real compound prediction,
 checks both coordinate frames and interactive/headless source selection, and
 runs a short native trace. The source data is read-only.
+
+With a CUDA build and a GPU grant, add `VC3D_COMPOUND_TEST_CUDA=1` to also
+compare progressive GPU display and all packed channel samplers against CPU
+sampling. The reader's `test_native_grid_cuda` covers packed synthetic chunks,
+missing chunks, channel selection and CPU fallback. Setting
+`VC_READER_COMPOUND_CUDA_TEST_ARRAY` to the above volume's `/sd2/2` array adds
+real-data checks for all seven channels; the same variable enables
+`vc_reader/tests/test_cuda_channels.py`.
 
 ## CP direction annotations
 

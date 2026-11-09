@@ -61,10 +61,12 @@ OpenedVolumes::Level OpenedVolumes::level(const Volume& volume, int level)
     const int base = volume.baseScaleLevel();
     auto opened = open(volume, base + level);
     std::shared_ptr<vcr::reader_cuda::Reader> reader;
-    if (gpuCacheBytes_ && opened->meta.dtype == "|u1" && opened->meta.shape.size() == 3) {
+    if (gpuCacheBytes_ && opened->meta.dtype == "|u1" &&
+        (opened->meta.shape.size() == 3 || opened->meta.shape.size() == 4)) {
         auto& shared = readers_[opened->array.get()];
         if (!shared)
-            shared = vc::cuda::makeReader(*opened->array, opened->meta.type, gpuPool_);
+            shared = vc::cuda::makeReader(*opened->array, opened->meta.type, gpuPool_,
+                opened->meta.shape.size() == 4 ? std::optional<std::int64_t>(0) : std::nullopt);
         reader = shared;
     }
     // Level zero is a coordinate frame, not necessarily a stored array: compact

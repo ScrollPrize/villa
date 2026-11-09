@@ -134,12 +134,12 @@ struct Level {
     ElementType type;
     std::array<double, 3> scale{1, 1, 1}, offset{0, 0, 0};
     std::optional<std::array<double, 9>> linear;
-    // The level's CUDA reader (uint8 3-D CT), when a request may sample it on the GPU;
+    // The level's scalar uint8 CUDA reader, when a request may sample it on the GPU;
     // null samples on the CPU. Builds without CUDA have none.
     reader_cuda::Reader* cuda = nullptr;
     // Select a scalar channel of a CZYX array. Unset requires a ZYX array.
     // Packed chunks remain shared in the array cache; no extracted volume is made.
-    // Channel views currently sample on the CPU (CUDA readers are 3-D only).
+    // A CUDA reader must select this same array/channel.
     std::optional<std::int64_t> channel;
 };
 

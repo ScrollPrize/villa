@@ -672,12 +672,13 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
     checkRequest(request, width, height);
     if (readers.size() != request.levels.size())
         throw std::invalid_argument("one CUDA reader per request level");
-    for (const auto& level : request.levels)
-        if (level.channel)
-            throw std::invalid_argument("CZYX channel views use the CPU grid sampler");
     for (auto* r : readers)
         if (!r || r->device_id() != readers.front()->device_id())
             throw std::invalid_argument("CUDA readers must share one device");
+    for (std::size_t i = 0; i < readers.size(); ++i)
+        if (readers[i]->channel() != request.levels[i].channel ||
+            readers[i]->array().spec().identity != request.levels[i].array->spec().identity)
+            throw std::invalid_argument("CUDA reader must match the level's array and channel");
     const int deviceId = readers.front()->device_id();
     device::Guard guard(deviceId);
     const std::size_t pixels = std::size_t(width) * std::size_t(height);
@@ -862,7 +863,7 @@ Result dispatch(const Request& request, Host&& host, Device&& device)
 #ifdef VC_READER_CUDA
     std::vector<reader_cuda::Reader*> readers;
     for (const auto& L : request.levels)
-        if (L.cuda && !L.channel)
+        if (L.cuda)
             readers.push_back(L.cuda);
     if (!readers.empty() && readers.size() == request.levels.size()) {
         std::string failure;

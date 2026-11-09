@@ -22,7 +22,8 @@ if (const char* source = std::getenv("VC3D_COMPOUND_TEST_VOLUME")) {
     const cv::Vec3d direction{0.2243, 0.0238, -0.9740};
     // Exercise the same attachment + progressive scalar display as VC3D. There
     // is no physical level zero in this compound, and presence is packed CZYX.
-    OpenedVolumes openedVolumes(64 * 1024 * 1024);
+    const bool testCuda = std::getenv("VC3D_COMPOUND_TEST_CUDA") != nullptr;
+    OpenedVolumes openedVolumes(64 * 1024 * 1024, testCuda ? 64 * 1024 * 1024 : 0);
     const auto viewer = vc3d::openViewerLevels(openedVolumes, *volumes.front().volume);
     // This OME pyramid's display coordinate frame is its finest stored grid.
     const double displayScale = double(dataset.manifest().baseShapeZYX.value()[0]) / volumes.front().volume->shape()[0];
@@ -31,11 +32,31 @@ if (const char* source = std::getenv("VC3D_COMPOUND_TEST_VOLUME")) {
         {1,0,0}, {0,1,0}, {0,0,1}, 1, 1};
     auto request = viewer.request(2, 0);
     require(request.levels.size() == 1 && request.levels[0].channel == 0, "viewer selects packed presence");
+    require(!testCuda || request.levels[0].cuda, "compound viewer creates selected-channel CUDA reader");
     vcr::grid::Pending pending;
     vcr::grid::sampleCached(frame, request, &pending);
     vcr::grid::load(pending);
     const auto rendered = vcr::grid::sampleCached(frame, request, nullptr);
     require(rendered.level[0] == 0 && rendered.values[0] > 0, "progressive display reads real packed presence");
+    require(rendered.cudaFailure.empty(), "compound viewer did not fall back after CUDA failure");
+    if (testCuda) {
+        auto cpuRequest=request;
+        cpuRequest.levels[0].cuda=nullptr;
+        const auto cpu=vcr::grid::sample(frame,cpuRequest);
+        require(std::abs(cpu.values[0]-rendered.values[0])<1.e-3f,"real compound viewer CPU/CUDA parity");
+        std::cout << "compound_gui PASS: CUDA packed presence display" << std::endl;
+        vc::cuda::enableForTool(64 * 1024 * 1024);
+        vc::lasagna::LasagnaGroupArrays arrays(64 * 1024 * 1024);
+        for (const auto& channel : dataset.manifest().groups.front().channels) {
+            auto binding=vc::lasagna::bindLasagnaChannel(dataset.manifest(),channel,arrays);
+            require(binding.cuda != nullptr,"packed tool channel creates CUDA reader");
+            const auto gpuValue=vc::lasagna::sampleLasagnaChannel(binding,seed);
+            binding.cuda=nullptr;
+            const auto cpuValue=vc::lasagna::sampleLasagnaChannel(binding,seed);
+            require(gpuValue && cpuValue && std::abs(*gpuValue-*cpuValue)<1.e-3,
+                    "packed tool scalar CPU/CUDA parity");
+        }
+    }
     Controller::LineAnnotationSession session;
     session.suppressErrorDialogs = true;
     require(controller.ensureDatasetForSession(session), "GUI base normals resolve without Lasagna");
