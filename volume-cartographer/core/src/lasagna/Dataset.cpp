@@ -216,7 +216,8 @@ LasagnaDataset LasagnaDataset::open(const std::filesystem::path& manifestPath,
                                     LasagnaDatasetOpenOptions options)
 {
     validateOpenOptions(options);
-    auto manifest = LasagnaDatasetManifest::parseFile(manifestPath);
+    auto manifest = LasagnaDatasetManifest::parseFile(
+        std::filesystem::is_directory(manifestPath) ? manifestPath/".zattrs" : manifestPath);
     manifest.manifestLocation = manifest.manifestPath.string();
     manifest.manifestIsRemote = false;
     manifest.workingToBaseScale = options.workingToBaseScale;
@@ -282,6 +283,11 @@ vcr::zarr::OpenedArray openLasagnaGroupArray(
     options.memoryCache = std::move(cache);
     options.access = vcr::zarr::resolveAccess(location, group.discoverAwsCredentials ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
     return vcr::zarr::openArray(location, options);
+}
+
+LasagnaDataset fiberSheetNormalDataset(const LasagnaDataset& prediction)
+{
+    return LasagnaDataset(fiberNormalManifest(prediction.manifest()));
 }
 
 } // namespace vc::lasagna

@@ -123,6 +123,13 @@ int64_t InitialShardImport::importEdges(const std::function<bool(std::vector<Ini
     } catch(...){p.failure.record(std::current_exception());throw;}
 }
 
+void InitialShardImport::appendExtensionRows(const std::string& table,std::span<const ExtensionRow> rows)
+{
+    auto& p=*impl_;p.check();
+    try {p.store.appendExtensionRows(p.transaction,table,rows);}
+    catch(...){p.failure.record(std::current_exception());throw;}
+}
+
 InitialImportResult importInitialCollection(const std::filesystem::path& target,
     const InitialImportOptions& options,const std::function<void(size_t,InitialShardImport&)>& producer)
 {

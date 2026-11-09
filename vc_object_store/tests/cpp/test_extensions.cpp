@@ -809,6 +809,96 @@ void storeReferenceVersionedFields(HistoryMode history)
     }
 }
 
+void shardedOverlayScan(bool packed)
+{
+    TemporaryDirectory dir;
+    const auto basePath = dir.path / "base.vcobj";
+    auto uuidInShard = [](const std::string& prefix, size_t shard) {
+        for (size_t i = 0;; ++i) {
+            auto uuid = util::nameUuid(prefix + std::to_string(i));
+            if (uuidShardIndex(uuid, 2) == shard) return uuid;
+        }
+    };
+    // Deterministic UUIDs ensure every replacement is in the later shard.
+    // Loading shard 0 visits the shared base before loading shard 1, which
+    // must not make the base win a collection-wide scan.
+    const auto objectUuid = uuidInShard("extension-object-", 1);
+    const auto otherUuid = uuidInShard("extension-other-", 0);
+    const auto edgeUuid = uuidInShard("extension-edge-", 1);
+    const auto objectTable = definition();
+    auto edgeTable = definition();
+    edgeTable.name = "ext_test_edge_results"; edgeTable.keySpace = "edges";
+    auto unkeyedTable = definition();
+    unkeyedTable.name = "ext_test_unrouted_results"; unkeyedTable.keySpace.clear();
+    const std::vector<ExtensionTable> tables{objectTable, edgeTable, unkeyedTable};
+    auto changedObject = sample(objectUuid, 1); changedObject[2] = 8.5;
+    auto changedEdge = sample(edgeUuid, 1); changedEdge[2] = 9.5;
+    const std::vector<ExtensionRow> objectReplacement{changedObject}, edgeReplacement{changedEdge};
+    OpenOptions storeOptions; storeOptions.history = HistoryMode::Off; storeOptions.author = "extension-test";
+    {
+        auto base = ObjectStore::create(basePath, storeOptions);
+        auto txn = base.write();
+        for (const auto& table : tables) base.createExtensionTable(txn, table);
+        for (const auto& uuid : {objectUuid, otherUuid}) {
+            ObjectRecord object; object.uuid = uuid; object.kind = "fiber";
+            base.upsertObject(txn, object);
+        }
+        EdgeRecord edge; edge.uuid = edgeUuid; edge.kind = "perpendicular";
+        edge.aUuid = objectUuid; edge.bUuid = otherUuid;
+        edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
+        base.addEdge(txn, edge);
+        const std::vector<ExtensionRow> objectRows{sample(objectUuid, 1), sample(otherUuid, 1)};
+        const std::vector<ExtensionRow> edgeRows{sample(edgeUuid, 1)};
+        base.appendExtensionRows(txn, objectTable.name, objectRows);
+        base.appendExtensionRows(txn, edgeTable.name, edgeRows);
+        base.appendExtensionRows(txn, unkeyedTable.name, objectRows);
+        base.seal(txn); txn.commit();
+    }
+    InitialImportOptions options;
+    options.store.author = "extension-overlay-test";
+    options.dependencies = {basePath}; options.extensions = tables;
+    options.shards = {{{1, 100}, {1, 100}}, {{101, 200}, {101, 200}}};
+    if (packed) {
+        options.packed.emplace(); options.packed->memoryFirst = true;
+        options.packed->disposableBulk = true; options.packed->backgroundFlush = false;
+        options.packed->residentBytes = 64 * 1024 * 1024;
+    }
+    const auto result = importInitialCollection(dir.path / "derived", options,
+        [&](size_t i, InitialShardImport& shard) {
+            if (i != 1) return;
+            shard.appendExtensionRows(objectTable.name, objectReplacement);
+            shard.appendExtensionRows(edgeTable.name, edgeReplacement);
+            shard.appendExtensionRows(unkeyedTable.name, objectReplacement);
+        });
+    const auto verify = [&](ObjectCollection& collection) {
+        auto txn = collection.read();
+        for (const auto& table : tables) {
+            const bool isEdge = table.keySpace == "edges";
+            const auto& uuid = isEdge ? edgeUuid : objectUuid;
+            const auto& replacement = isEdge ? edgeReplacement : objectReplacement;
+            const std::vector<ExtensionValue> prefix{extensionUuid(uuid)};
+            require(rows(collection, txn, table.name, prefix) == replacement,
+                    "prefix scans resolve replacement rows from the later sibling shard");
+            auto all = rows(collection, txn, table.name);
+            auto expected = replacement;
+            if (!isEdge) expected.push_back(sample(otherUuid, 1));
+            std::sort(all.begin(), all.end()); std::sort(expected.begin(), expected.end());
+            require(all == expected,
+                    "full extension scans resolve all sibling replacements before shared dependencies");
+            size_t count = 0;
+            collection.scanExtensionRows(txn, table.name, [&](const auto& row) {
+                require(row == replacement.front(), "early scan termination must not return a stale base row");
+                ++count; return false;
+            });
+            require(count == 1, "early termination applies across all partitions and bases");
+        }
+    };
+    auto collection = ObjectCollection::open(result.path, OpenOptions{.readOnly = true});
+    verify(collection);
+    auto wrapper = ObjectCollection::create(dir.path / "wrapper.vcobj", {result.path}, storeOptions);
+    verify(wrapper);
+}
+
 void shardedImport(bool packed)
 {
     TemporaryDirectory dir;
@@ -914,6 +1004,8 @@ int main()
     versionedHistoryPolicy();
     storeReferenceVersionedFields(HistoryMode::Off);
     storeReferenceVersionedFields(HistoryMode::On);
+    shardedOverlayScan(false);
+    shardedOverlayScan(true);
     shardedImport(false);
     shardedImport(true);
 }

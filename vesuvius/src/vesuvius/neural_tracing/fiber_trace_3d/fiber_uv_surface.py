@@ -181,7 +181,8 @@ def run(settings):
         accepted=p[np.arange(len(p)),pick]>settings.get('joint_threshold',.5)
         del p
         print(f'{item["label"]}: loading {accepted.sum():,} selected piece curves',flush=True)
-        bank=CurveBank(cfg['fibers'],d['source_id'][accepted],settings['normal_curves'],normal)
+        from .fiber_graph_store import workflow_volume
+        bank=CurveBank(cfg['fibers'],d['source_id'][accepted],settings['normal_curves'],normal,volume=workflow_volume(cfg))
         xyz,valid,stats=construct(d,state,widths,cfg,bank,settings)
         if not valid.any():raise ValueError('No supported surface vertices')
         coordinate_space=settings.get('coordinate_space') or cfg.get('coordinate_space')

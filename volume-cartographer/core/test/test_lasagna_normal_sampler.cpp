@@ -77,15 +77,17 @@ void writeText(const fs::path& path, const std::string& text)
 
 } // namespace
 
-TEST_CASE("LasagnaNormalSampler rejects 4D channel groups")
+TEST_CASE("LasagnaNormalSampler selects packed 4D channel groups")
 {
     const auto dir = tmpDir("4d");
     const auto zarrPath = dir / "pred.zarr";
     std::vector<uint8_t> payload(3 * 2 * 2 * 2, 128);
+    std::fill(payload.begin(),payload.begin()+16,255);
     createU8Zarr(zarrPath, {3, 2, 2, 2}, {3, 2, 2, 2}, &payload);
     const auto manifestPath = dir / "dataset.lasagna.json";
     writeText(manifestPath, R"({
         "version": 2,
+        "packed_channel_view": true,
         "source_to_base": 1.0,
         "grad_mag_encode_scale": 255.0,
         "grad_mag_factor": 1.0,
@@ -99,10 +101,66 @@ TEST_CASE("LasagnaNormalSampler rejects 4D channel groups")
     })");
 
     const vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    CHECK_THROWS_WITH_AS(
-        vc::lasagna::LasagnaNormalSampler(dataset),
-        doctest::Contains("must reference a 3D (Z,Y,X) zarr"),
-        std::runtime_error);
+    const auto sample=vc::lasagna::LasagnaNormalSampler(dataset).sampleNormal({0.5,0.5,0.5});
+    CHECK(sample.valid);
+    CHECK(sample.normal[0]==doctest::Approx(1));
+    CHECK(sample.normal[1]==doctest::Approx(0));
+    CHECK(sample.normal[2]==doctest::Approx(0));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Packed prediction sheet normals preserve channel identity and odd base extents")
+{
+    const auto dir=tmpDir("sheet_packed");
+    // Channel chunking deliberately differs from total channels. Direction is
+    // +X, sheet normal +Y: reading the direction by mistake must fail this test.
+    auto packed=vcr::zarr::Writer::create(dir/"sd2/2",{
+        .shape={7,2,2,2},.chunks={4,2,2,2},.compressor="",.fillValue=0.});
+    const std::array<uint8_t,8> values{255,255,128,80,128,255,255,0};
+    for(size_t c=0;c<2;++c) {
+        std::vector<uint8_t> bytes(32);
+        for(size_t k=0;k<4;++k)
+            std::fill(bytes.begin()+8*k,bytes.begin()+8*(k+1),values[4*c+k]);
+        // Only one sheet-normal corner is valid. The other seven are blank,
+        // not diagonal normals, even though decoding (0,0) produces an axis.
+        if(c==1) for(size_t k=0;k<3;++k)
+            std::fill(bytes.begin()+8*k+1,bytes.begin()+8*(k+1),uint8_t{0});
+        packed.writeChunk({int64_t(c),0,0,0},bytes.data(),bytes.size());
+    }
+    writeText(dir/".zattrs",R"({"lasagna":{"version":3,"base_shape_zyx":[7,7,7],
+        "source_to_base":1.0,"groups":{"sd2":{"scaledown":2,"zarr":"sd2/2",
+        "channels":["presence","nx","ny","width","sheet_nx","sheet_ny","sheet_grad_mag"]}}}})");
+    auto prediction=vc::lasagna::LasagnaDataset::open(dir);
+    auto normals=vc::lasagna::fiberSheetNormalDataset(prediction);
+    CHECK_NOTHROW(vc::lasagna::validateLasagnaNormalDatasetStructure(normals));
+    vc::lasagna::LasagnaNormalSampler sampler(normals);
+    CHECK(sampler.masksInvalidCorners());
+    const auto n=sampler.sampleNormal({2,2,2});
+    REQUIRE(n.valid);
+    CHECK(n.normal[0]==doctest::Approx(0));
+    CHECK(n.normal[1]==doctest::Approx(1));
+    CHECK(n.normal[2]==doctest::Approx(0));
+    CHECK_FALSE(sampler.sampleNormal({4,4,4}).valid);
+    std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> sampled;
+    (void)sampler.sampleNormalBatch(std::vector<cv::Vec3f>{{2,2,2},{4,4,4}},2,sampled);
+    REQUIRE(sampled.size()==2);
+    CHECK(sampled[0].valid);
+    CHECK(sampled[0].normal[0]==doctest::Approx(0));
+    CHECK(sampled[0].normal[1]==doctest::Approx(1));
+    CHECK_FALSE(sampled[1].valid);
+    std::vector<vc::lasagna::NormalSampleWithDerivative> doubles;
+    (void)sampler.sampleNormalBatch(std::vector<cv::Vec3d>{{2,2,2},{4,4,4}},false,2,doubles);
+    REQUIRE(doubles.size()==2);
+    CHECK(doubles[0].sample.valid);
+    CHECK(doubles[0].sample.normal[1]==doctest::Approx(1));
+    CHECK_FALSE(doubles[1].sample.valid);
+    vc::lasagna::LasagnaGroupArrays arrays(0);
+    const auto direction=vc::lasagna::bindLasagnaChannel(prediction.manifest(),"nx",arrays);
+    CHECK(vc::lasagna::sampleLasagnaChannel(direction,cv::Vec3d{2,2,2}).value()==255);
+    CHECK(prediction.manifest().groupForChannel("sheet_nx")->channelIndex("sheet_nx")==4);
+    auto bad=prediction.manifest(); bad.groups[0].channels.pop_back();
+    CHECK_THROWS(vc::lasagna::bindLasagnaChannel(bad,"nx",arrays));
+    CHECK_THROWS(vc::lasagna::fiberSheetNormalDataset(vc::lasagna::LasagnaDataset(bad)));
     fs::remove_all(dir);
 }
 

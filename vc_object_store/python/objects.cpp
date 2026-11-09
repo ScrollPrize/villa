@@ -1,6 +1,7 @@
 #include "StorageBindings.hpp"
 #include "AfvBindings.hpp"
 #include "ExtensionBindings.hpp"
+#include "CollectionBindings.hpp"
 #include "ObjectReadBindings.hpp"
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
@@ -774,6 +775,7 @@ NB_MODULE(_native, m)
 {
     bindAfvSource(m);
     bindExtensionHelpers(m);
+    bindCollectionApi(m);
     m.def("artifact_manifest_json", [](const nb::list& files) {
         std::vector<vo::ArtifactFile> parsed;
         for (const auto& f : files) {

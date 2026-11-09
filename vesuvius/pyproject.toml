@@ -186,6 +186,8 @@ vesuvius = [
     "install/configs/cubes.yaml",
     "ink_detection/configs/*.json",
     "tifxyz_label_transfer/*.cpp",
+    "neural_tracing/fiber_trace_3d/fiber_lemon.cpp",
+    "neural_tracing/fiber_trace_3d/fiber_pns.cpp",
     "tifxyz_label_transfer/*.md",
     "tifxyz_label_transfer/docs/*.md",
     "fiber_spline_generator/extend/*.pt",

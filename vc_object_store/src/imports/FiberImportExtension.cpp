@@ -67,6 +67,11 @@ ExtensionTable fiberConstraintExtension(const FiberConstraintSourceInfo& source,
     spec.basedOn.assign(basedOn.begin(),basedOn.end());
     Json provisioning={{"length_units","base_voxels"},{"winding_units","turns"},{"endpoint_order","source"}};
     if(!source.fiberSourceUuid.empty())provisioning["fiber_source_uuid"]=util::canonicalUuid(source.fiberSourceUuid);
+    if(source.coordinateSpace){
+        if(source.coordinateSpace->empty())throw std::invalid_argument("fiber extension: empty measurement frame");
+        spec.formatVersion=2;provisioning["coordinate_space"]=*source.coordinateSpace;
+        provisioning["anchor_frame"]="object_geometry";
+    }
     checksum(provisioning,source.sha256);count(provisioning,"constraint_count",source.constraintCount);
     spec.provisioning=provisioning.dump();
     spec.columns={{"edge_uuid",ExtensionType::Blob},{"source_id",ExtensionType::Integer},
@@ -81,6 +86,8 @@ ExtensionTable fiberConstraintExtension(const FiberConstraintSourceInfo& source,
     }
     for(const auto& field:diagnostics)spec.columns.push_back({field.name,field.type,true});
     spec.columns.push_back({"extra",ExtensionType::Text,true});
+    if(source.coordinateSpace)for(const auto* endpoint:{"a","b"})for(const auto axis:{'x','y','z'})
+        spec.columns.push_back({std::string("point_")+endpoint+"_"+axis,ExtensionType::Real});
     spec.primaryKey={"edge_uuid"};spec.indexes={{{"source_id"},false},{{"las_winding"},false}};
     return spec;
 }
@@ -89,7 +96,8 @@ InitialExtensionRow fiberSourceRow(const std::string& uuid,int64_t sourceId,cons
     return {kFiberSourceTable,{extensionUuid(uuid),sourceId,annotation}};
 }
 InitialExtensionRow fiberConstraintRow(const std::string& uuid,int64_t id,int64_t a,int64_t b,bool reversed,
-    const std::array<std::optional<double>,7>& values,const Json& normalA,const Json& normalB,const Json& measurement){
+    const std::array<std::optional<double>,7>& values,const Json& normalA,const Json& normalB,const Json& measurement,
+    const std::optional<std::array<std::array<double,3>,2>>& measuredPoints){
     InitialExtensionRow out{kFiberConstraintTable,{extensionUuid(uuid),id,a,b,int64_t(reversed)}};
     auto& row=out.values;Json extra=Json::object();
     for(const auto& value:values)row.emplace_back(value?ExtensionValue(*value):ExtensionValue(std::monostate{}));
@@ -115,6 +123,11 @@ InitialExtensionRow fiberConstraintRow(const std::string& uuid,int64_t id,int64_
     // XYZ duplicates are removed by the source decoder after comparison with
     // native anchors; arbitrary extra fields remain losslessly available.
     if(!remaining.empty())extra["measurement"]=std::move(remaining);
-    row.emplace_back(extra.empty()?ExtensionValue(std::monostate{}):ExtensionValue(extra.dump()));return out;
+    row.emplace_back(extra.empty()?ExtensionValue(std::monostate{}):ExtensionValue(extra.dump()));
+    if(measuredPoints)for(const auto& point:*measuredPoints)for(double value:point){
+        if(!std::isfinite(value))throw std::invalid_argument("fiber extension: nonfinite measured position");
+        row.emplace_back(value);
+    }
+    return out;
 }
 } // namespace vc::objects

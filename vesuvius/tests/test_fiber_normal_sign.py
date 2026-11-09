@@ -1,11 +1,10 @@
 import torch
 import pytest
 import json
-import sqlite3
 import numpy as np
-from lasagna.inference_provenance import sha256_file
 
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign import losses, metrics, prepare
+from .fiber_graph_fixture import uid, measured_store
 
 
 def test_pair_agreement_and_break_suppression():
@@ -63,24 +62,15 @@ def test_synthetic_adam_recovers_opposite_sign():
 
 
 def test_cached_tensor_identity_and_invalid_edges(tmp_path):
-    path=tmp_path/'source.sqlite'
-    db=sqlite3.connect(path)
-    db.executescript('CREATE TABLE metadata(key,value); CREATE TABLE fibers(id,source_index,normal_sign);'
-                     'CREATE TABLE constraints(id,fiber_a,fiber_b,perpendicular_score,parallel_score,normal_a,normal_b);')
-    for key,value in dict(schema_version=2,complete=True,normal_orientation=dict(sample_spacing_base=16)).items():
-        db.execute('INSERT INTO metadata VALUES(?,?)',(key,json.dumps(value)))
-    a,b,c=ids=[f'00000000-0000-4000-8000-0000000000{k}' for k in (11,12,23)]
-    db.executemany('INSERT INTO fibers VALUES(?,?,?)',[(a,0,1),(b,1,1),(c,2,1)])
-    pos=json.dumps(dict(valid=True,xyz=[0,0,1],reason=''))
-    neg=json.dumps(dict(valid=True,xyz=[0,0,-1],reason=''))
-    invalid=json.dumps(dict(valid=False,xyz=None,reason='missing'))
-    db.executemany('INSERT INTO constraints VALUES(?,?,?,?,?,?,?)',[
-        (0,a,b,1.,0.,pos,neg),(1,a,c,1.,0.,pos,invalid),(2,b,c,0.,1.,pos,pos)])
-    db.commit();db.close()
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
+    path=measured_store(tmp_path,[(0,11,12,False,.5),(1,11,23,False,.5),(2,12,23,True,1.)],
+        field_overrides={0:dict(normal_b_x=-1.),1:dict(normal_b_valid=0)})
+    ids=list(map(uid,[11,12,23]))
+    graph=FiberGraph(path)
     prior=tmp_path/'prior.json'
-    prior.write_text(json.dumps(dict(format='fiber-outward-priors',source_database=str(path),
-        source_database_sha256=sha256_file(path),source_ids=ids,agreement=[1.,-1.,0.],
-        statistics=dict(sample_spacing_base=16))))
+    payload=dict(format='fiber-outward-priors',source_store=graph.source,source_ids=ids,agreement=[1.,-1.,0.],
+        statistics=dict(sample_spacing_base=16))
+    prior.write_text(json.dumps(payload))
     config=dict(database=str(path),priors=str(prior),tensor_cache=str(tmp_path/'tensor.npz'))
     cache=prepare(config)
     with np.load(cache) as data:
@@ -90,6 +80,6 @@ def test_cached_tensor_identity_and_invalid_edges(tmp_path):
     stats=json.loads(cache.with_suffix('.json').read_text())
     assert stats['invalid_events_skipped']==1 and stats['isolated_fibers']==1
     assert prepare(config)==cache
-    db=sqlite3.connect(path);db.execute('UPDATE constraints SET normal_b=? WHERE id=0',(pos,));db.commit();db.close()
-    with pytest.raises(ValueError,match='different database content'):
+    prior.write_text(json.dumps(dict(payload,source_store=dict(graph.source,commit_sequence=-1))))
+    with pytest.raises(ValueError,match='another store snapshot'):
         prepare(config)

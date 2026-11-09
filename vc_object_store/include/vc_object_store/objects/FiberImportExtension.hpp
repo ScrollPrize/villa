@@ -19,6 +19,10 @@ struct FiberConstraintSourceInfo {
     std::string fiberSourceUuid;
     std::optional<std::string> sha256;
     std::optional<int64_t> constraintCount;
+    // Native format 2: measured points/normals and arc lengths are expressed
+    // in this SAMPLE/VOLUME base-voxel frame, independently of object anchors.
+    // Absent retains legacy AFC format 1, whose anchors are measurement points.
+    std::optional<std::string> coordinateSpace;
 };
 // Ordinary optional extension, not part of the core fiber/edge schema. Source
 // AFV/AFC identity has no vcobj commit: record only the supplied identity and
@@ -35,5 +39,6 @@ InitialExtensionRow fiberConstraintRow(const std::string& edgeUuid,int64_t sourc
     int64_t sourceFiberA,int64_t sourceFiberB,bool sourceReversed,
     const std::array<std::optional<double>,7>& values, // arcA/B, scores, distances, evidence
     const nlohmann::json& normalA,const nlohmann::json& normalB,
-    const nlohmann::json& measurement);
+    const nlohmann::json& measurement,
+    const std::optional<std::array<std::array<double,3>,2>>& measuredPoints = {});
 } // namespace vc::objects

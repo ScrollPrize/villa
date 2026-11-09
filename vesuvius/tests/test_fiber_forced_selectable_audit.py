@@ -29,7 +29,11 @@ def test_transfer_preserves_all_hypotheses_not_just_map():
     labels=torch.tensor([[-2.,0.,1.,1.5,2.,4.,7.]],dtype=torch.float64).expand(4,-1)
     for key,plan in original.items():
         owner,arc=plan[:2]
+        # Straight curves consume the lightweight owner/arc plans directly;
+        # packed interpolation caches exist only for non-straight curves.
+        torch.testing.assert_close(target.curve.plans[key][0],owner,rtol=0,atol=0)
+        torch.testing.assert_close(target.curve.plans[key][1],arc+shift[owner],rtol=0,atol=0)
         expected=source.curve.hypothesis_queries(state,widths,(parent[owner],arc+shift[owner],None,None,None),labels)
         actual=target.curve.hypothesis_queries(state[parent],widths,target.curve.plans[key],labels)
         for a,b in zip(actual,expected):torch.testing.assert_close(a,b,rtol=0,atol=0)
-    torch.testing.assert_close(target.curve.pair_plan_values[:,0,0],torch.as_tensor(local)+shift)
+    assert target.curve.fixed_slices=={'_anchor':slice(0,4),'a':slice(4,8),'b':slice(8,12)}

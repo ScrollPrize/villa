@@ -53,7 +53,8 @@ class PhysicalFile {
     sqlite3_file* file_ = nullptr;
     std::mutex mutex_;
 public:
-    PhysicalFile(const std::filesystem::path& path, bool writable, bool create = false) : path_(path.string())
+    PhysicalFile(const std::filesystem::path& path, bool writable, bool create = false)
+        : path_((create ? std::filesystem::absolute(path) : std::filesystem::canonical(path)).string())
     {
         auto* vfs = sqlite3_vfs_find(nullptr);
         if (!vfs) throw std::runtime_error("no default SQLite VFS");
@@ -837,7 +838,7 @@ std::filesystem::path packedDatabasePath(const std::filesystem::path& container,
     auto directory = readDirectory(container);
     const auto uuid = databaseUuid.empty() ? directory.root : util::canonicalUuid(databaseUuid);
     if (!directory.members.contains(uuid)) throw std::runtime_error("database UUID missing from packed container");
-    return std::string(readPrefix) + hexEncode(std::filesystem::absolute(container).lexically_normal().string()) + "/" + uuid;
+    return std::string(readPrefix) + hexEncode(std::filesystem::canonical(container).string()) + "/" + uuid;
 }
 std::filesystem::path packedContainerPath(const std::filesystem::path& locator)
 {

@@ -16,7 +16,7 @@ import tempfile
 import uuid as uuidlib
 
 import numpy as np
-from vc_object_store import Fiber, ObjectStore, geometry_scale_to_volume
+from vc_object_store import Fiber, ObjectStore, CollectionReader, import_initial_records, geometry_scale_to_volume
 from vesuvius.neural_tracing.tracers.shared.annotations.repair import ANNOTATION_REPAIR, repair_kinks
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
 from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_ids
@@ -32,71 +32,101 @@ def open_store(path):
 
 
 def fiber_volume(path):
-    """The one volume every fiber of the store is bound to; raises when they are unbound or bound to several."""
-    with open_store(path) as store:
-        first = store.select_objects(object_kind='fiber', limit=1, fields=['meta'])
-        if not first:
-            raise ValueError(f'No fibers in {path}')
-        volume = (first[0]['meta'].get('coordinates') or {}).get('volume_uuid')
-        if volume is None:
-            raise ValueError(f'Fibers in {path} are not bound to a volume')
-        if store.unbound_object_count('fiber', volume):
-            raise ValueError(f'Fibers in {path} are bound to several volumes; name one')
-    return volume
+    """The one volume every fiber is bound to, across the complete collection."""
+    with CollectionReader(str(path)) as store:
+        records = store.objects('fiber')
+    if not records:
+        raise ValueError(f'No fibers in {path}')
+    volumes = {(r['meta'].get('coordinates') or {}).get('volume_uuid') for r in records}
+    if None in volumes or len(volumes) != 1:
+        raise ValueError(f'Fibers in {path} must be bound to one volume')
+    return volumes.pop()
 
 
 def fiber_catalog(path, volume):
-    """Catalog rows of the fibers bound to ``volume``, in UUID order, without geometry:
-    dict(id, name, family, length, point_count, bbox, scale); length and bbox (minx,miny,minz,maxx,maxy,maxz, or
-    None) are volume voxels."""
-    rows, after = [], None
-    with open_store(path) as store:
-        while True:
-            page = store.select_objects(object_kind='fiber', volume=volume, fields=['name', 'fiber', 'meta'],
-                                        limit=PAGE, after_uuid=after)
-            if not page:
-                return rows
-            for record in page:
+    """UUID-ordered catalog, including shards/references; geometry is not decoded."""
+    with CollectionReader(str(path)) as store:
+        records = store.objects('fiber')
+    rows = []
+    for record in records:
+        fiber = record.get('fiber') or {}
+        scale = geometry_scale_to_volume(record['meta'], volume)
+        if scale is None or fiber.get('line_point_count', 0) < 2:
+            continue
+        bbox = fiber.get('bbox')
+        rows.append(dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
+                         length=fiber['length']*scale, point_count=fiber['line_point_count'],
+                         bbox=None if bbox is None else [v*scale for v in bbox], scale=scale, meta=record['meta']))
+    return rows
+
+
+def iter_polylines(path, fiber_ids=None, *, volume=None):
+    """Raw UUID-ordered line points in volume voxels, without repair or resampling."""
+    volume = volume or fiber_volume(path)
+    selected = None if fiber_ids is None else sorted(set(map(str, fiber_ids)))
+    with CollectionReader(str(path)) as store:
+        if selected is None:
+            records = [r for r in store.objects('fiber')
+                       if geometry_scale_to_volume(r['meta'], volume) is not None
+                       and (r.get('fiber') or {}).get('line_point_count', 0) >= 2]
+        else:
+            records = [store.object(fid) for fid in selected]
+            if any(r is None or r['kind'] != 'fiber' for r in records):
+                raise ValueError('Unknown requested fiber')
+        # Bounded native geometry batches, not one Python/native call per sample.
+        for begin in range(0, len(records), PAGE):
+            batch = records[begin:begin+PAGE]
+            # Same-volume scalar conversion preserves the existing fast path;
+            # registered frames use the shared native double-precision affine.
+            mapped=any(geometry_scale_to_volume(r['meta'],volume) is None for r in batch)
+            arrays = store.geometry_arrays([r['uuid'] for r in batch], 'line_points',volume if mapped else None)
+            for record, array in zip(batch, arrays):
+                scale = 1. if mapped else geometry_scale_to_volume(record['meta'], volume)
+                xyz = np.frombuffer(array['data'], dtype=array['dtype']).reshape(array['shape']).astype(np.float64)
+                if scale is None or xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) < 2:
+                    raise ValueError(f'Fiber {record["uuid"]} is unbound or has no line')
+                xyz *= scale
                 fiber = record.get('fiber') or {}
-                scale = geometry_scale_to_volume(record['meta'], volume)
-                if fiber.get('line_point_count', 0) < 2:
-                    continue
-                bbox = fiber.get('bbox')
-                rows.append(dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
-                                 length=fiber['length']*scale, point_count=fiber['line_point_count'],
-                                 bbox=None if bbox is None else [v*scale for v in bbox], scale=scale))
-            after = page[-1]['uuid']
+                yield (dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
+                                    length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
+                                    point_count=len(xyz), meta=record['meta']), xyz)
+
 
 
 def read_polylines(path, fiber_ids=None, *, volume=None):
-    """[(row, xyz)] of the requested fibers (all bound ones when None), in UUID order; xyz are the raw line points in
-    volume voxels (no repair or densifying). row = dict(id, name, family, length, point_count, meta). ``volume``
-    defaults to the store's one volume (fiber_volume). Raises for an unknown, unbound or line-less requested fiber."""
-    volume = volume or fiber_volume(path)
-    selected = None if fiber_ids is None else sorted(set(map(str, fiber_ids)))
-    with open_store(path) as store:
-        if selected is None:
-            selected = [row['id'] for row in fiber_catalog(path, volume)]
-        if not selected:
-            return []
-        with store.graph_read(object_kind='fiber', object_uuids=selected) as view:
-            if sorted(view.object_uuids) != selected:
-                raise ValueError('Unknown requested fiber')
-            records = view.objects(['name', 'fiber', 'meta'])
-            packed = view.read_geometry_arrays('line_points')
-            values, offsets = packed.values, packed.offsets
-            out = {}
-            for node, record in enumerate(records):
-                scale = geometry_scale_to_volume(record['meta'], volume)
-                xyz = np.array(values[offsets[node]:offsets[node+1]], dtype=np.float64)
-                if scale is None or len(xyz) < 2:
-                    raise ValueError(f'Fiber {record["uuid"]} is not bound to volume {volume} or has no line')
-                xyz *= scale
-                fiber = record.get('fiber') or {}
-                out[record['uuid']] = (dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
-                                            length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
-                                            point_count=len(xyz), meta=record['meta']), xyz)
-    return [out[fid] for fid in selected]
+    """Materialize raw curves; use iter_polylines for bounded streaming."""
+    return list(iter_polylines(path, fiber_ids, volume=volume))
+
+
+class FiberBlockIndex:
+    """Ephemeral double-precision 256-segment bounds, including slim stores.
+
+    The same overlapping block bounds used by the former AFV spatial seed
+    query; no persistent spatial tables are required. The KD tree is only a
+    conservative broad phase; inclusive XYZ-box intersection is checked exactly.
+    """
+    def __init__(self, path, ids, *, volume=None):
+        from scipy.spatial import cKDTree
+        owners, bounds = [], []
+        for row, xyz in iter_polylines(path, ids, volume=volume):
+            for first in range(0, len(xyz)-1, 256):
+                block = xyz[first:first+257]
+                owners.append(row['id'])
+                bounds.append([block.min(0), block.max(0)])
+        self.ids = np.asarray(owners, dtype='U36')
+        self.bounds = np.asarray(bounds, dtype=np.float64).reshape(-1, 2, 3)
+        centers = self.bounds.mean(1)
+        self.radius = np.max((self.bounds[:,1]-self.bounds[:,0])/2) if len(bounds) else 0.
+        self.tree = cKDTree(centers)
+
+    def query(self, samples, radius):
+        selected = set()
+        for point, candidates in zip(samples, self.tree.query_ball_point(samples, float(np.max(radius))+self.radius, p=np.inf)):
+            indices = np.asarray(candidates, dtype=np.int64)
+            bounds = self.bounds[indices]
+            hit = np.all(bounds[:,1] >= point-radius, axis=1) & np.all(bounds[:,0] <= point+radius, axis=1)
+            selected.update(self.ids[indices[hit]])
+        return selected
 
 
 FIBERS_DIGEST_FORMAT = 'fibers_digest v2'
@@ -108,8 +138,10 @@ def fibers_digest(path, fiber_ids=None):
     bytes are not a stable identity (WAL). Format v2 (numbered versions) never equals a v1 digest (geometry
     revision UUIDs and record generations), so data derived under v1 is reported changed and must be regenerated."""
     selected = [] if fiber_ids is None else sorted(set(map(str, fiber_ids)))
-    with open_store(path) as store:
-        rows = store.select_objects(object_kind='fiber', object_uuids=selected, fields=['name'])
+    with CollectionReader(str(path)) as store:
+        rows = store.objects('fiber') if fiber_ids is None else [store.object(fid) for fid in selected]
+        if any(row is None for row in rows):
+            raise ValueError('Unknown requested fiber')
     if fiber_ids is not None and sorted(r['uuid'] for r in rows) != selected:
         raise ValueError('Unknown requested fiber')
     digest = hashlib.sha256(f'{FIBERS_DIGEST_FORMAT}\n'.encode())
@@ -166,6 +198,39 @@ def write_fibers(destination, fibers, *, volume, author=None):
             raise RuntimeError('Store was not checkpointed on close')
         os.link(staged, destination)
     return dict(fibers=len(ids), points=points_total, ids=ids)
+
+
+def write_initial_fibers(destination, fibers, *, volume, workers=32, packed=False):
+    """Immutable batch import of traced polylines; no invented control points.
+
+    Uses the same UUID-routed native queues as AFV and prepared imports. The
+    native importer owns staging, failure cleanup, sealing and atomic publication.
+    Returns the actual root locator (collection.vcobj for unpacked shards).
+    """
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    records, ids, points_total = [], [], 0
+    for row, points in fibers:
+        xyz = np.ascontiguousarray(points, dtype='<f8')
+        if xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) < 2 or not np.isfinite(xyz).all():
+            raise ValueError(f'Invalid polyline for fiber {row.get("id")}')
+        fid = str(uuidlib.UUID(str(row['id']))) if row.get('id') else str(uuidlib.uuid4())
+        ids.append(fid)
+        points_total += len(xyz)
+        record = dict(uuid=fid, kind='fiber', name=row.get('name', ''), format_version=4,
+                      fiber=dict(family=row.get('family', ''), control_point_count=0,
+                                 line_point_count=len(xyz),
+                                 length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
+                                 bbox=[*map(float, xyz.min(0)), *map(float, xyz.max(0))]),
+                      meta={**(row.get('meta') or {}), 'coordinates': dict(volume_uuid=str(volume), scale_factor=1)})
+        records.append(dict(record=record, geometry=dict(kind='fiber', format_version=1,
+                            arrays=[dict(name='control_points', dtype='<f8', shape=[0,3], data=b''),
+                                    dict(name='control_point_ids', dtype='<i8', shape=[0], data=b''),
+                                    dict(name='line_points', dtype='<f8', shape=list(xyz.shape), data=xyz.tobytes())])))
+    if len(set(ids)) != len(ids):
+        raise ValueError('Duplicate fiber UUID')
+    result = import_initial_records(str(destination), records, workers=workers, packed=packed)
+    return dict(result, fibers=len(ids), points=points_total, ids=ids)
 
 
 class FiberStore(Sequence):

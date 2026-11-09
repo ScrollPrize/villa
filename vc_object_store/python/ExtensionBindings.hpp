@@ -208,11 +208,13 @@ inline void bindExtensionHelpers(nb::module_& module)
     }, nb::arg("source_uuid"), nb::arg("sha256") = nb::none(),
        nb::arg("fiber_count") = nb::none(), nb::arg("point_count") = nb::none())
     .def("fiber_constraint_extension", [](const std::string& uuid, const std::optional<std::string>& sha256,
-                                         std::optional<int64_t> count, const nb::list& basedOn) {
-        return extensionTableToPy(vo::fiberConstraintExtension({uuid, sha256, count},
+                                         std::optional<int64_t> count, const nb::list& basedOn,
+                                         const std::optional<std::string>& coordinateSpace) {
+        return extensionTableToPy(vo::fiberConstraintExtension({uuid, sha256, count, coordinateSpace},
             vo::extensionSourcesFromJson(jsonDumps(basedOn))));
     }, nb::arg("fiber_source_uuid"), nb::arg("sha256") = nb::none(),
-       nb::arg("constraint_count") = nb::none(), nb::arg("based_on") = nb::list())
+       nb::arg("constraint_count") = nb::none(), nb::arg("based_on") = nb::list(),
+       nb::arg("coordinate_space") = nb::none())
     .def("fiber_graph_solve_table", [](const std::string& role) {
         return extensionTableToPy(vo::fiberGraphSolveTable(fiberGraphTableFromPy(role)));
     }, nb::arg("role"))

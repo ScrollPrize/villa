@@ -8,6 +8,9 @@ if(VC_BUILD_FIBERLETS OR VC_BUILD_APPS OR VC_BUILD_PYTHON)
     add_executable(vc_fiber_constraints src/vc_fiber_constraints.cpp
         src/FiberConstraintExtraction.cpp src/FiberConstraintDatabase.cpp)
     target_link_libraries(vc_fiber_constraints PRIVATE vc_fiber_tracer vc_lasagna vc_object_store::vc_objects)
+    add_executable(test_fiber_normal_publication EXCLUDE_FROM_ALL
+        src/test_fiber_normal_publication.cpp src/FiberConstraintDatabase.cpp)
+    target_link_libraries(test_fiber_normal_publication PRIVATE vc_fiber_tracer vc_lasagna vc_object_store::vc_objects)
     # Wheel libraries live at its root, immediately above bin/.
     if(VC_BUILD_PYTHON AND NOT VC_BUILD_APPS)
         if(APPLE)

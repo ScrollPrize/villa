@@ -57,4 +57,7 @@ private:
 [[nodiscard]] vcr::zarr::OpenedArray openLasagnaGroupArray(
     const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache);
 
+// Select predicted sheet normals while preserving the compound channel layout.
+[[nodiscard]] LasagnaDataset fiberSheetNormalDataset(const LasagnaDataset& prediction);
+
 } // namespace vc::lasagna

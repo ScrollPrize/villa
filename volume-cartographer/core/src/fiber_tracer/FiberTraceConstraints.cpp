@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -66,6 +67,47 @@ struct PairCandidate {
     double distance = std::numeric_limits<double>::infinity();
     double arcA = -1.0, arcB = -1.0;
 };
+
+void sortLocalCandidates(std::vector<PairCandidate>& candidates, std::size_t requestedThreads)
+{
+    // Initial local sample-pair keys are unique. Parallel chunk sorts/merges
+    // therefore reproduce the serial total ordering, including within each pair.
+    const auto less=[](const auto& a,const auto& b) {
+        return std::tie(a.pieces.a,a.pieces.b,a.sampleA,a.sampleB)<
+            std::tie(b.pieces.a,b.pieces.b,b.sampleA,b.sampleB);
+    };
+#ifdef _OPENMP
+    const auto chunks=std::min(requestedThreads,std::max<std::size_t>(1,candidates.size()/16384));
+#else
+    const std::size_t chunks=1;
+#endif
+    if(chunks==1) {std::sort(candidates.begin(),candidates.end(),less);return;}
+    const auto boundary=[&](std::size_t i){return candidates.size()/chunks*i+std::min(i,candidates.size()%chunks);};
+    std::vector<std::exception_ptr> failures(chunks);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(chunks))
+#endif
+    for(std::ptrdiff_t i=0;i<static_cast<std::ptrdiff_t>(chunks);++i) {
+        try {std::sort(candidates.begin()+boundary(i),candidates.begin()+boundary(i+1),less);}
+        catch(...) {failures[i]=std::current_exception();}
+    }
+    for(const auto& failure:failures)if(failure)std::rethrow_exception(failure);
+    for(std::size_t stride=1;stride<chunks;stride*=2) {
+        const auto jobs=(chunks+2*stride-1)/(2*stride);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(chunks))
+#endif
+        for(std::ptrdiff_t job=0;job<static_cast<std::ptrdiff_t>(jobs);++job) {
+            const auto first=static_cast<std::size_t>(job)*2*stride;
+            const auto middle=std::min(first+stride,chunks),last=std::min(first+2*stride,chunks);
+            try {
+                std::inplace_merge(candidates.begin()+boundary(first),candidates.begin()+boundary(middle),
+                    candidates.begin()+boundary(last),less);
+            } catch(...) {failures[job]=std::current_exception();}
+        }
+        for(const auto& failure:failures)if(failure)std::rethrow_exception(failure);
+    }
+}
 
 enum class RejectReason { None, Tangent, Winding, WindingCutoff, Consistency };
 
@@ -563,17 +605,26 @@ ScoredCandidate scoreLocalCandidate(
         missingTangent=false;
         bool parallel = true, orthogonal = true;
         int valid=0;
-        for (int sa : {-1,1}) for (int sb : {-1,1}) {
-            const auto ta = tangent(ga, aa, sa), tb = tangent(gb, bb, sb);
-            if (!ta || !tb) {
-                missingTangent=true;
-                if(config.preserveInputLinesAsPieces) continue;
-                return 0;
+        // Each side's tangent is identical in both comparisons. Cache lazily
+        // so endpoint failures keep their original evaluation/return order.
+        std::array<std::optional<cv::Vec3d>,2> bTangents;
+        std::array<bool,2> bReady{};
+        for (int sa : {-1,1}) {
+            const auto ta=tangent(ga,aa,sa);
+            for (int sb : {-1,1}) {
+                const auto slot=sb>0?1:0;
+                if(!bReady[slot]) {bTangents[slot]=tangent(gb,bb,sb);bReady[slot]=true;}
+                const auto& tb=bTangents[slot];
+                if (!ta || !tb) {
+                    missingTangent=true;
+                    if(config.preserveInputLinesAsPieces) continue;
+                    return 0;
+                }
+                ++valid;
+                const double dot = std::abs(ta->dot(*tb));
+                parallel = parallel && dot >= cosine;
+                orthogonal = orthogonal && dot <= sine;
             }
-            ++valid;
-            const double dot = std::abs(ta->dot(*tb));
-            parallel = parallel && dot >= cosine;
-            orthogonal = orthogonal && dot <= sine;
         }
         return valid==0 ? 0 : parallel ? 1 : orthogonal ? 2 : 0;
     };
@@ -612,8 +663,8 @@ ScoredCandidate scoreLocalCandidate(
             return failure("central_reciprocal");
         }
     }
-    const auto ta=tangent(ga,a,1).has_value()?tangent(ga,a,1):tangent(ga,a,-1);
-    const auto tb=tangent(gb,b,1).has_value()?tangent(gb,b,1):tangent(gb,b,-1);
+    auto ta=tangent(ga,a,1);if(!ta)ta=tangent(ga,a,-1);
+    auto tb=tangent(gb,b,1);if(!tb)tb=tangent(gb,b,-1);
     const int orientation = ta->dot(*tb) < 0. ? -1 : 1;
     FiberTraceConstraint c;
     c.pieceA=candidate.pieces.a; c.pieceB=candidate.pieces.b;
@@ -947,7 +998,8 @@ ScoredCandidate scoreCandidate(
     };
 }
 
-void deduplicateLocalEvents(std::vector<ScoredCandidate>& scored, FiberTraceConstraintReport& report)
+void deduplicateLocalEvents(std::vector<ScoredCandidate>& scored, FiberTraceConstraintReport& report,
+    const FiberTraceConstraintProgressCallback& progress = {})
 {
     // Projection can discover the same encounter from several nearby seeds.
     // Quantization is ONLY an index: test actual arc distances in adjacent bins.
@@ -955,7 +1007,11 @@ void deduplicateLocalEvents(std::vector<ScoredCandidate>& scored, FiberTraceCons
     std::map<Key,std::vector<std::size_t>> cells;
     constexpr double tolerance=8.;
     std::vector<ScoredCandidate> unique;
+    std::size_t processed=0;
+    if(progress)progress({"deduplicate",0,scored.size(),scored.size()});
     for (auto& s : scored) {
+        if(progress && ++processed%65536==0)
+            progress({"deduplicate",processed,scored.size(),unique.size()});
         if (!s.constraint) { unique.push_back(std::move(s)); continue; }
         const auto& c=*s.constraint;
         const auto a=static_cast<long long>(std::floor(c.arcABaseVoxels/tolerance));
@@ -978,6 +1034,7 @@ void deduplicateLocalEvents(std::vector<ScoredCandidate>& scored, FiberTraceCons
         cells[{c.pieceA,c.pieceB,a,b}].push_back(unique.size());
         unique.push_back(std::move(s));
     }
+    if(progress)progress({"deduplicate",scored.size(),scored.size(),unique.size()});
     scored=std::move(unique);
 }
 
@@ -1226,33 +1283,34 @@ void measureCandidates(
 
 // Evidence belongs to certified source-trace encounters, not their later
 // segmentation. Partition repeated parallel evidence before remapping IDs.
-void normalizeLocalParallelEvidence(FiberTraceConstraintReport& report,
+void normalizeLocalParallelEvidence(std::span<FiberTraceConstraint> constraints,
+    std::span<const FiberTraceConstraintPiece> pieces,
     const std::vector<std::optional<PolylineArcGeometry>>& geometries,
     const FiberTraceConstraintConfig& config)
 {
     std::map<PiecePair,std::vector<std::size_t>> repeats;
-    for(std::size_t i=0;i<report.constraints.size();++i)
-        if(report.constraints[i].parallelScore>.5)
-            repeats[{report.constraints[i].pieceA,report.constraints[i].pieceB}].push_back(i);
+    for(std::size_t i=0;i<constraints.size();++i)
+        if(constraints[i].parallelScore>.5)
+            repeats[{constraints[i].pieceA,constraints[i].pieceB}].push_back(i);
     for(auto& [pair,ids]:repeats) {
         std::stable_sort(ids.begin(),ids.end(),[&](auto a,auto b) {
-            return report.constraints[a].arcABaseVoxels<report.constraints[b].arcABaseVoxels;
+            return constraints[a].arcABaseVoxels<constraints[b].arcABaseVoxels;
         });
         for(std::size_t first=0;first<ids.size();) {
             std::size_t endGroup=first+1;
-            const double arc=report.constraints[ids[first]].arcABaseVoxels;
-            while(endGroup<ids.size() && report.constraints[ids[endGroup]].arcABaseVoxels==arc)
+            const double arc=constraints[ids[first]].arcABaseVoxels;
+            while(endGroup<ids.size() && constraints[ids[endGroup]].arcABaseVoxels==arc)
                 ++endGroup;
             for(std::size_t k=first;k<endGroup;++k) {
-                auto& c=report.constraints[ids[k]];
+                auto& c=constraints[ids[k]];
                 double begin=c.supportABegin,end=c.supportAEnd;
                 if(!config.preserveInputLinesAsPieces) {
                     const double margin=config.localParallelSpanBaseVoxels+config.localTangentSpanBaseVoxels;
                     begin=std::max(begin,margin);
-                    end=std::min(end,geometries[report.pieces[c.pieceA].traceIndex]->length()-margin);
+                    end=std::min(end,geometries[pieces[c.pieceA].traceIndex]->length()-margin);
                 }
-                if(first>0)begin=std::max(begin,.5*(report.constraints[ids[first-1]].arcABaseVoxels+arc));
-                if(endGroup<ids.size())end=std::min(end,.5*(report.constraints[ids[endGroup]].arcABaseVoxels+arc));
+                if(first>0)begin=std::max(begin,.5*(constraints[ids[first-1]].arcABaseVoxels+arc));
+                if(endGroup<ids.size())end=std::min(end,.5*(constraints[ids[endGroup]].arcABaseVoxels+arc));
                 if(!(end>begin))
                     throw std::logic_error("Certified parallel event has no represented source support");
                 c.evidenceWeight=(end-begin)/(128.*static_cast<double>(endGroup-first));
@@ -1268,11 +1326,14 @@ void splitLocalEvents(FiberTraceConstraintReport& report,
     const std::vector<std::optional<PolylineArcGeometry>>& geometries,
     const FiberTraceConstraintConfig& config)
 {
-    if(config.localNormalizeEvidence)normalizeLocalParallelEvidence(report,geometries,config);
+    if(config.localNormalizeEvidence)normalizeLocalParallelEvidence(report.constraints,report.pieces,geometries,config);
     report.localCertifiedEvents=report.constraints.size();
-    const auto originalPieces=report.pieces;
-    std::vector<std::vector<double>> orthogonal(geometries.size()), cuts(geometries.size());
-    for(std::size_t i=0;i<report.constraints.size();++i) {
+    const bool rebuild=!config.preserveInputLinesAsPieces && !config.localKeepWholeFibers;
+    std::vector<FiberTraceConstraintPiece> previousPieces;
+    if(rebuild)previousPieces=report.pieces;
+    const auto& originalPieces=rebuild?previousPieces:report.pieces;
+    std::vector<std::vector<double>> orthogonal(rebuild?geometries.size():0), cuts(orthogonal.size());
+    if(rebuild)for(std::size_t i=0;i<report.constraints.size();++i) {
         const auto& c=report.constraints[i];
         if(c.perpendicularScore>c.parallelScore) {
             orthogonal[originalPieces[c.pieceA].traceIndex].push_back(c.arcABaseVoxels);
@@ -1290,7 +1351,7 @@ void splitLocalEvents(FiberTraceConstraintReport& report,
         }
     }
     std::vector<std::vector<std::size_t>> piecesByTrace(geometries.size());
-    if(!config.preserveInputLinesAsPieces && !config.localKeepWholeFibers) {
+    if(rebuild) {
         report.pieces.clear(); report.resampledPoints=0;
         for(std::size_t t=0;t<geometries.size();++t) {
             if(!geometries[t]) continue;
@@ -1329,11 +1390,24 @@ void splitLocalEvents(FiberTraceConstraintReport& report,
             piecesByTrace[report.pieces[i].traceIndex].push_back(i);
         report.localMidpointCuts=report.localTransitionCuts=0;
     }
-    std::size_t missingOwners=0;
-    report.constraints=remapCertifiedFiberTraceEvents(report.constraints,originalPieces,report.pieces,missingOwners,
-        config.localReplicateOverlap);
-    if(missingOwners)
-        throw std::logic_error("Full subdivision lost certified event owners");
+    const bool identity=!rebuild && std::all_of(piecesByTrace.begin(),piecesByTrace.end(),
+        [](const auto& ids){return ids.size()<=1;});
+    if(identity) {
+        // Whole fibers already own their events. Preserve the remapper's bounds
+        // validation, without copying geometry/events or building owner maps.
+        for(const auto& c:report.constraints) {
+            if(c.hardContinuity)throw std::invalid_argument("Cannot remap a continuation as a certified event");
+            const auto& a=report.pieces.at(c.pieceA);const auto& b=report.pieces.at(c.pieceB);
+            if(c.arcABaseVoxels<a.beginArcBaseVoxels || c.arcABaseVoxels>a.endArcBaseVoxels ||
+               c.arcBBaseVoxels<b.beginArcBaseVoxels || c.arcBBaseVoxels>b.endArcBaseVoxels)
+                throw std::logic_error("Full subdivision lost certified event owners");
+        }
+    } else {
+        std::size_t missingOwners=0;
+        report.constraints=remapCertifiedFiberTraceEvents(report.constraints,originalPieces,report.pieces,missingOwners,
+            config.localReplicateOverlap);
+        if(missingOwners)throw std::logic_error("Full subdivision lost certified event owners");
+    }
     if(config.localOnePerPair) {
         std::map<PiecePair,FiberTraceConstraint> closest;
         for(const auto& c:report.constraints) {
@@ -1437,24 +1511,59 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     const FiberTraceWindingDistance& windingDistance,
     const FiberTraceWindingDistanceBatch& windingDistanceBatch,
     const FiberTraceConstraintTracePairFilter& tracePairFilter,
-    const LasagnaNormalAlignmentField* alignedNormals)
+    const LasagnaNormalAlignmentField* alignedNormals,
+    const FiberTraceConstraintProgressCallback& progress)
+{
+    return extractFiberTraceConstraints(lines,config,windingDistance,windingDistanceBatch,
+        tracePairFilter,alignedNormals,progress,{});
+}
+
+FiberTraceConstraintReport extractFiberTraceConstraints(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const FiberTraceConstraintConfig& config,
+    const FiberTraceWindingDistance& windingDistance,
+    const FiberTraceWindingDistanceBatch& windingDistanceBatch,
+    const FiberTraceConstraintTracePairFilter& tracePairFilter,
+    const LasagnaNormalAlignmentField* alignedNormals,
+    const FiberTraceConstraintProgressCallback& progress,
+    const FiberTraceConstraintStream& stream)
 {
     validateConfig(config);
+    if((stream.prepared || stream.batch) &&
+       (!stream.prepared || !stream.batch || !config.localEvents || !config.localKeepWholeFibers ||
+        config.legacyFinePieces || config.localOnePerPair || !config.localIncludeParallel ||
+        !config.extraPieceCutsBaseVoxels.empty() || alignedNormals))
+        throw std::invalid_argument("Streaming requires unfiltered whole-fiber local events and unsigned normals");
+    if(config.candidateBatchSize==0)throw std::invalid_argument("Candidate batch size must be positive");
     FiberTraceConstraintReport report;
     report.inputTraces = lines.size();
     std::vector<std::optional<PolylineArcGeometry>> geometries(lines.size());
     std::vector<std::vector<std::size_t>> piecesByTrace(lines.size());
+    const std::size_t requestedThreads = config.parallelThreads == 0
+        ? std::max<std::size_t>(1, std::thread::hardware_concurrency())
+        : config.parallelThreads;
 
     if (!config.extraPieceCutsBaseVoxels.empty() &&
         (config.extraPieceCutsBaseVoxels.size() != lines.size() || config.preserveInputLinesAsPieces))
         throw std::invalid_argument("Piece cut hints require one entry per trace and ordinary splitting");
     const auto prepareStarted = std::chrono::steady_clock::now();
-    for (std::size_t traceIndex = 0; traceIndex < lines.size(); ++traceIndex) {
+    if(progress)progress({"prepare",0,lines.size()});
+    {
+    std::vector<std::vector<FiberTraceConstraintPiece>> preparedPieces(lines.size());
+    std::vector<std::exception_ptr> prepareFailures(lines.size());
+    std::vector<unsigned char> skipped(lines.size());
+    const int prepareWorkers=static_cast<int>(std::min(requestedThreads,std::max<std::size_t>(1,lines.size())));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(guided,16) num_threads(prepareWorkers)
+#endif
+    for (std::ptrdiff_t index = 0; index < static_cast<std::ptrdiff_t>(lines.size()); ++index) {
+        const auto traceIndex=static_cast<std::size_t>(index);
+        try {
         try {
             geometries[traceIndex] = makePolylineArcGeometry(
                 lines[traceIndex].pointsBaseXYZ);
         } catch (const std::invalid_argument&) {
-            ++report.skippedDegenerateTraces;
+            skipped[traceIndex]=1;
             continue;
         }
         auto intervals = (config.preserveInputLinesAsPieces || config.localEvents) ? std::vector<std::pair<double, double>>{{0.0, geometries[traceIndex]->length()}}
@@ -1477,27 +1586,47 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
                 begin = end;
             }
         }
-        piecesByTrace[traceIndex].reserve(intervals.size());
+        auto& output=preparedPieces[traceIndex];
+        output.reserve(intervals.size());
         for (std::size_t pieceIndex = 0; pieceIndex < intervals.size(); ++pieceIndex) {
             const auto [begin, end] = intervals[pieceIndex];
-            piecesByTrace[traceIndex].push_back(report.pieces.size());
-            report.pieces.push_back(makePiece(
+            output.push_back(makePiece(
                 traceIndex,
                 pieceIndex,
                 *geometries[traceIndex],
                 begin,
                 end,
                 config.localEvents ? config.localSpacingBaseVoxels : config.resampleSpacingBaseVoxels));
-            report.resampledPoints +=
-                report.pieces.back().samplePointsBaseXYZ.size();
         }
+        } catch(...) {prepareFailures[traceIndex]=std::current_exception();}
+    }
+    // IDs, sample order and failure precedence are independent of scheduling.
+    for(const auto& failure:prepareFailures)if(failure)std::rethrow_exception(failure);
+    std::size_t totalPieces=0;
+    for(const auto& pieces:preparedPieces)totalPieces+=pieces.size();
+    report.pieces.reserve(totalPieces);
+    for(std::size_t traceIndex=0;traceIndex<lines.size();++traceIndex) {
+        report.skippedDegenerateTraces+=skipped[traceIndex];
+        auto& ids=piecesByTrace[traceIndex];
+        ids.reserve(preparedPieces[traceIndex].size());
+        for(auto& piece:preparedPieces[traceIndex]) {
+            ids.push_back(report.pieces.size());
+            report.resampledPoints+=piece.samplePointsBaseXYZ.size();
+            report.pieces.push_back(std::move(piece));
+        }
+    }
     }
 
     appendContinuity(report, piecesByTrace, geometries);
     report.prepareSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prepareStarted).count();
+    if(progress)progress({"prepare",lines.size(),lines.size()});
 
     const auto searchStarted = std::chrono::steady_clock::now();
+    if(progress)progress({"spatial_index",0,report.resampledPoints});
+    std::vector<PairCandidate> candidates;
+    // The spatial index and query scratch are not needed by scoring.
+    {
     std::vector<SampleRecord> samples;
     samples.reserve(report.resampledPoints);
     std::vector<RTreeValue> values;
@@ -1514,17 +1643,49 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         }
     }
     const PointTree tree(values.begin(), values.end());
-    std::map<PiecePair, PairCandidate> bestByPair;
-    // Arc-pair cells preserve separate encounters of the same two source traces.
-    using LocalKey = std::tuple<std::size_t,std::size_t,std::size_t,std::size_t>;
-    std::map<LocalKey, PairCandidate> localCandidates;
-    std::vector<RTreeValue> hits;
+    if(progress)progress({"spatial_index",report.resampledPoints,report.resampledPoints});
+    // Local sample-pair keys are unique: globalB>globalA visits each pair once.
+    // Use contiguous worker buffers rather than one tree allocation per pair.
+    // Legacy nearest-pair reduction uses an epsilon comparator, so preserve its
+    // serial visitation order. Arbitrary caller filters retain serial callbacks.
+    const int queryWorkers=static_cast<int>(std::min<std::size_t>(
+        config.localEvents && !tracePairFilter ? requestedThreads : 1,
+        std::max<std::size_t>(1,samples.size())));
+    struct alignas(64) QueryScratch {
+        std::vector<RTreeValue> hits;
+        std::vector<PairCandidate> candidates;
+        std::map<PiecePair,PairCandidate> best;
+        std::size_t spatialHits=0;
+        std::exception_ptr failure;
+    };
+    std::vector<QueryScratch> scratch(queryWorkers);
+    std::atomic<std::size_t> completedQueries{0},discovered{0};
+    std::atomic<bool> queryFailed{false};
     const double maximumDistanceSquared =
         config.maximumDistanceBaseVoxels * config.maximumDistanceBaseVoxels;
-    for (std::size_t globalA = 0; globalA < samples.size(); ++globalA) {
+    if(progress)progress({"search",0,samples.size()});
+    constexpr std::size_t queryBlock=1024;
+    const auto blocks=(samples.size()+queryBlock-1)/queryBlock;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(guided, 1) num_threads(queryWorkers)
+#endif
+    for(std::ptrdiff_t block=0;block<static_cast<std::ptrdiff_t>(blocks);++block) {
+#ifdef _OPENMP
+        auto& local=scratch[omp_get_thread_num()];
+#else
+        auto& local=scratch[0];
+#endif
+        if(queryFailed.load(std::memory_order_relaxed))continue;
+        const auto first=static_cast<std::size_t>(block)*queryBlock;
+        const auto end=std::min(first+queryBlock,samples.size());
+        const auto before=local.spatialHits;
+        try {
+        for(std::size_t globalA=first;globalA<end;++globalA) {
         const auto& sampleA = samples[globalA];
         const auto& pieceA = report.pieces[sampleA.piece];
+        if(config.crossQueryPrefix && pieceA.traceIndex>=config.crossQueryPrefix)continue;
         const cv::Vec3d pointA = pieceA.samplePointsBaseXYZ[sampleA.sample];
+        auto& hits=local.hits;
         hits.clear();
         tree.query(
             bgi::intersects(queryBox(
@@ -1538,6 +1699,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             if (sampleA.piece == sampleB.piece)
                 continue;
             const auto& pieceB = report.pieces[sampleB.piece];
+            if(config.crossQueryPrefix && pieceB.traceIndex<config.crossQueryPrefix)continue;
             if (pieceA.traceIndex == pieceB.traceIndex)
                 continue;
             if (tracePairFilter && !tracePairFilter(pieceA.traceIndex, pieceB.traceIndex)) {
@@ -1550,7 +1712,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
                 distanceSquared > maximumDistanceSquared + kEpsilon) {
                 continue;
             }
-            ++report.spatialHits;
+            ++local.spatialHits;
             PairCandidate candidate;
             if (sampleA.piece < sampleB.piece) {
                 candidate.pieces = {sampleA.piece, sampleB.piece};
@@ -1567,23 +1729,41 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             }
             candidate.distance = std::sqrt(std::max(0.0, distanceSquared));
             if (config.localEvents) {
-                const LocalKey key{candidate.pieces.a,candidate.pieces.b,candidate.sampleA,candidate.sampleB};
-                localCandidates.emplace(key,candidate);
+                local.candidates.push_back(candidate);
                 continue;
             }
-            const auto found = bestByPair.find(candidate.pieces);
-            if (found == bestByPair.end())
-                bestByPair.emplace(candidate.pieces, candidate);
+            const auto found = local.best.find(candidate.pieces);
+            if (found == local.best.end())
+                local.best.emplace(candidate.pieces, candidate);
             else if (betterCandidate(candidate, found->second))
                 found->second = candidate;
         }
+        }
+        const auto count=discovered.fetch_add(local.spatialHits-before,std::memory_order_relaxed)+local.spatialHits-before;
+        const auto done=completedQueries.fetch_add(end-first,std::memory_order_relaxed)+end-first;
+        if(progress)progress({"search",done,samples.size(),count});
+        } catch(...) {
+            local.failure=std::current_exception();
+            queryFailed.store(true,std::memory_order_relaxed);
+        }
     }
-    std::vector<PairCandidate> candidates;
-    for (const auto& [key,candidate] : localCandidates) candidates.push_back(candidate);
-    candidates.reserve(bestByPair.size());
-    for (const auto& [key, candidate] : bestByPair) {
-        (void)key;
-        candidates.push_back(candidate);
+    std::size_t count=0;
+    for(const auto& local:scratch) {
+        if(local.failure)std::rethrow_exception(local.failure);
+        count+=local.candidates.size()+local.best.size();
+        report.spatialHits+=local.spatialHits;
+    }
+    if(progress)progress({"search",samples.size(),samples.size(),count});
+    if(progress)progress({"candidate_order",0,count,count});
+    candidates.reserve(count);
+    for(auto& local:scratch) {
+        candidates.insert(candidates.end(),std::make_move_iterator(local.candidates.begin()),
+            std::make_move_iterator(local.candidates.end()));
+        std::vector<PairCandidate>().swap(local.candidates);
+        for(const auto& [key,candidate]:local.best)candidates.push_back(candidate);
+    }
+    if(config.localEvents)sortLocalCandidates(candidates,requestedThreads);
+    if(progress)progress({"candidate_order",count,count,count});
     }
     report.measuredCandidates = candidates.size();
     report.searchSeconds = std::chrono::duration<double>(
@@ -1592,16 +1772,25 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     if (!candidates.empty() && !windingDistance && !windingDistanceBatch)
         throw std::invalid_argument("Fiber trace constraint winding sampler is missing");
     const auto scoreStarted = std::chrono::steady_clock::now();
-    const std::size_t requestedThreads = config.parallelThreads == 0
-        ? std::max<std::size_t>(1, std::thread::hardware_concurrency())
-        : config.parallelThreads;
-    const int workers = static_cast<int>(std::min<std::size_t>(
+    const int poolWorkers = static_cast<int>(std::min<std::size_t>(
         requestedThreads,
         std::max<std::size_t>(1, candidates.size())));
+    const auto& pieces=report.pieces;
+    const auto consumeBatch=[&](std::span<const PairCandidate> candidates,
+                               FiberTraceConstraintReport& report, int workers,
+                               const FiberTraceConstraintProgressCallback& progress) {
+    const auto batchScoreStarted=std::chrono::steady_clock::now();
+    if(progress)progress({"score",0,candidates.size(),candidates.size()});
     std::vector<ScoredCandidate> scored(candidates.size());
     std::vector<std::exception_ptr> failures(candidates.size());
+    std::atomic<std::size_t> completedScores{0};
 #ifdef _OPENMP
-#pragma omp parallel for schedule(guided, 16) num_threads(workers)
+#pragma omp parallel num_threads(workers) if(workers>1)
+#endif
+    {
+    std::size_t localCompleted=0;
+#ifdef _OPENMP
+#pragma omp for schedule(guided, 16)
 #endif
     for (std::ptrdiff_t index = 0;
          index < static_cast<std::ptrdiff_t>(candidates.size());
@@ -1609,13 +1798,24 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         try {
             scored[static_cast<std::size_t>(index)] = scoreCandidate(
                 candidates[static_cast<std::size_t>(index)],
-                report.pieces,
+                pieces,
                 geometries,
                 config);
         } catch (...) {
             failures[static_cast<std::size_t>(index)] = std::current_exception();
         }
+        if(progress && ++localCompleted==256) {
+            const auto done=completedScores.fetch_add(localCompleted,std::memory_order_relaxed)+localCompleted;
+            localCompleted=0;
+            progress({"score",done,candidates.size(),candidates.size()});
+        }
     }
+    if(progress && localCompleted) {
+        const auto done=completedScores.fetch_add(localCompleted,std::memory_order_relaxed)+localCompleted;
+        progress({"score",done,candidates.size(),candidates.size()});
+    }
+    }
+    if(progress)progress({"score",candidates.size(),candidates.size(),candidates.size()});
     for (const auto& failure : failures) {
         if (failure)
             std::rethrow_exception(failure);
@@ -1633,8 +1833,8 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     if(config.orthogonalProbeSpan>0. && alignedNormals)for(auto& s:scored)if(s.constraint) {
         const auto& c=*s.constraint;
         if(c.parallelScore>=c.perpendicularScore)continue;
-        const auto& a=*geometries[report.pieces[c.pieceA].traceIndex];
-        const auto& b=*geometries[report.pieces[c.pieceB].traceIndex];
+        const auto& a=*geometries[pieces[c.pieceA].traceIndex];
+        const auto& b=*geometries[pieces[c.pieceB].traceIndex];
         const double h=config.orthogonalProbeSpan;
         if(c.arcABaseVoxels<h || c.arcABaseVoxels+h>a.length() ||
            c.arcBBaseVoxels<h || c.arcBBaseVoxels+h>b.length())continue;
@@ -1642,15 +1842,17 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         for(bool moveA:{true,false})for(double offset:{-h,h})
             s.parallelConnectors.push_back(orthogonalProbeConnector(a,b,c.arcABaseVoxels+(moveA?offset:0.),c.arcBBaseVoxels+(moveA?0.:offset)));
     }
-    report.orientationScoreSeconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - scoreStarted).count();
+    report.orientationScoreSeconds += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - batchScoreStarted).count();
 
     const auto windingStarted = std::chrono::steady_clock::now();
     if(config.localEvents) {
-        const auto before=scored.size();deduplicateLocalEvents(scored,report);
+        const auto before=scored.size();deduplicateLocalEvents(scored,report,progress);
         report.localDeduplicatedCandidates+=before-scored.size();
     }
+    if(progress)progress({"winding",0,scored.size(),scored.size()});
     measureCandidates(scored, config, windingDistance, windingDistanceBatch, alignedNormals, workers, &report);
+    if(progress)progress({"winding",scored.size(),scored.size(),scored.size()});
     if(config.localEvents) {
         for(std::size_t round=0;round<config.localRefinementRounds;++round) {
             std::map<PiecePair,std::vector<std::size_t>> groups;
@@ -1688,10 +1890,10 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             std::vector<ScoredCandidate> refined(extra.size());
             std::vector<std::exception_ptr> errors(extra.size());
 #ifdef _OPENMP
-#pragma omp parallel for schedule(guided, 16) num_threads(workers)
+#pragma omp parallel for schedule(guided, 16) num_threads(workers) if(workers>1)
 #endif
             for(std::ptrdiff_t i=0;i<static_cast<std::ptrdiff_t>(extra.size());++i) {
-                try { refined[i]=scoreLocalCandidate(extra[i],report.pieces,geometries,config); }
+                try { refined[i]=scoreLocalCandidate(extra[i],pieces,geometries,config); }
                 catch(...) { errors[i]=std::current_exception(); }
             }
             for(const auto& e:errors)if(e)std::rethrow_exception(e);
@@ -1703,12 +1905,13 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             measureCandidates(refined,config,windingDistance,windingDistanceBatch,alignedNormals,workers,&report);
             report.localRefinedCandidates+=refined.size();
             scored.insert(scored.end(),std::make_move_iterator(refined.begin()),std::make_move_iterator(refined.end()));
-            const auto before=scored.size();deduplicateLocalEvents(scored,report);
+            const auto before=scored.size();deduplicateLocalEvents(scored,report,progress);
             report.localDeduplicatedCandidates+=before-scored.size();
         }
     }
-    report.windingScoreSeconds = std::chrono::duration<double>(
+    report.windingScoreSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - windingStarted).count();
+    if(progress)progress({"finalize",0,scored.size(),scored.size()});
 
     for (auto& result : scored) {
         if(config.localEvents)
@@ -1734,8 +1937,88 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         else if (result.rejection == RejectReason::Consistency)
             ++report.localRejectedConsistency;
     }
+    };
+    if(progress)progress({"score_batches",0,candidates.size(),0});
+    std::vector<std::pair<std::size_t,std::size_t>> jobs;
+    // Small independent jobs, consumed dynamically by one persistent pool.
+    // No barrier between scoring, deduplication, measurement and refinement.
+    const auto jobSize=std::min<std::size_t>(config.candidateBatchSize,1024);
+    for(std::size_t begin=0;begin<candidates.size();) {
+        std::size_t end=begin+std::min(jobSize,candidates.size()-begin);
+        // Deduplication/refinement never compares different fiber pairs. Keep
+        // each pair's complete initial event sequence in the same batch.
+        while(end<candidates.size() &&
+              candidates[end-1].pieces.a==candidates[end].pieces.a &&
+              candidates[end-1].pieces.b==candidates[end].pieces.b)++end;
+        report.maximumBatchCandidates=std::max(report.maximumBatchCandidates,end-begin);
+        ++report.scoringBatches;
+        jobs.emplace_back(begin,end);
+        begin=end;
+    }
+    if(stream.prepared)stream.prepared(report.pieces);
+    const auto streamKey=[](const auto& c) {
+        return std::tie(c.pieceA,c.pieceB,c.hardContinuity,c.arcABaseVoxels,c.arcBBaseVoxels);
+    };
+    std::vector<FiberTraceConstraintReport> workerReports(poolWorkers);
+    std::vector<std::vector<FiberTraceConstraint>> jobConstraints(jobs.size());
+    std::vector<std::exception_ptr> jobFailures(jobs.size());
+    std::atomic<std::size_t> completedCandidates{0},acceptedConstraints{0};
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1) num_threads(poolWorkers)
+#endif
+    for(std::ptrdiff_t job=0;job<static_cast<std::ptrdiff_t>(jobs.size());++job) {
+        int worker=0;
+#ifdef _OPENMP
+        worker=omp_get_thread_num();
+#endif
+        auto& local=workerReports[worker];
+        const auto [begin,end]=jobs[job];
+        try {
+            consumeBatch(std::span<const PairCandidate>(candidates).subspan(begin,end-begin),local,1,{});
+            if(stream.batch) {
+                // Jobs contain complete pair groups, so evidence normalization
+                // is identical to the global pass and final for these events.
+                if(config.localNormalizeEvidence)
+                    normalizeLocalParallelEvidence(local.constraints,report.pieces,geometries,config);
+                std::sort(local.constraints.begin(),local.constraints.end(),
+                    [&](const auto& a,const auto& b){return streamKey(a)<streamKey(b);});
+                for(std::size_t i=1;i<local.constraints.size();++i)
+                    if(streamKey(local.constraints[i-1])==streamKey(local.constraints[i]))
+                        throw std::logic_error("Streaming cannot preserve ambiguous duplicate event ordering");
+                stream.batch(static_cast<std::size_t>(job),local.constraints);
+            }
+            jobConstraints[job].swap(local.constraints);
+            const auto accepted=acceptedConstraints.fetch_add(jobConstraints[job].size(),std::memory_order_relaxed)+jobConstraints[job].size();
+            const auto done=completedCandidates.fetch_add(end-begin,std::memory_order_relaxed)+end-begin;
+            if(progress)progress({"score_batches",done,candidates.size(),accepted});
+        } catch(...) {
+            jobFailures[job]=std::current_exception();
+            if(stream.failed)stream.failed(jobFailures[job]);
+        }
+    }
+    for(const auto& failure:jobFailures)if(failure)std::rethrow_exception(failure);
+    // Deterministic assembly: completion order never affects event ordering.
+    report.constraints.reserve(report.constraints.size()+acceptedConstraints.load());
+    for(auto& events:jobConstraints)
+        report.constraints.insert(report.constraints.end(),std::make_move_iterator(events.begin()),std::make_move_iterator(events.end()));
+    for(const auto& local:workerReports) {
+        for(const auto& [key,value]:local.localFailureChecks)report.localFailureChecks[key]+=value;
+        for(const auto& [key,values]:local.localOutcomesByRelation)
+            for(const auto& [name,value]:values)report.localOutcomesByRelation[key][name]+=value;
+        for(const auto& [key,value]:local.localWindingFailureOverlap)report.localWindingFailureOverlap[key]+=value;
+#define MERGE(field) report.field+=local.field
+        MERGE(localWindingChecksEvaluated); MERGE(localDeduplicatedCandidates);
+        MERGE(localPerpendicularReciprocalEvaluated); MERGE(localPerpendicularReciprocalWindowFailures);
+        MERGE(localPerpendicularReciprocalEndpointFailures); MERGE(localRejectedConsistency);
+        MERGE(localRefinedCandidates); MERGE(signedWindingConstraints); MERGE(skippedSignedWindingConstraints);
+        MERGE(rejectedTangents); MERGE(rejectedWinding); MERGE(rejectedWindingCutoff);
+        MERGE(orientationScoreSeconds); MERGE(windingScoreSeconds);
+#undef MERGE
+    }
+    if(progress)progress({"finalize",0,report.constraints.size(),report.constraints.size()});
     if(config.localEvents || config.legacyFinePieces) {
         auto splitConfig=config;
+        if(stream.batch)splitConfig.localNormalizeEvidence=false; // Already finalized per complete pair.
         if(config.legacyFinePieces) {
             std::erase_if(report.constraints,[](const auto& c){return c.hardContinuity;});
             report.hardConstraints=0;
@@ -1765,6 +2048,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         std::sort(report.constraints.begin(),report.constraints.end(),constraintOrder);
     report.scoreSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - scoreStarted).count();
+    if(progress)progress({"finalize",report.constraints.size(),report.constraints.size(),report.constraints.size()});
     if (alignedNormals != nullptr) {
         for (auto& constraint : report.constraints) {
             if (!constraint.hardContinuity)

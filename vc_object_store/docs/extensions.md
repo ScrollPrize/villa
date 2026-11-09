@@ -139,7 +139,7 @@ matches = store.extension_rows("ext_fiber_classification",
 
 Extension payloads use the existing bounded object/edge import stream and are written beside their owning object or edge in the same transaction. They do not require another source scan, a per-object routing directory or cross-shard endpoint reads.
 
-For colocated tables, the entity's binary UUID follows the existing object or edge shard rule. Table descriptors are per-table metadata; physical table UUIDs differ across shards even though they implement the same logical extension. Extension-aware collection reads use the declared routing and dependency order.
+For colocated tables, the entity's binary UUID follows the existing object or edge shard rule. Table descriptors are per-table metadata; physical table UUIDs differ across shards even though they implement the same logical extension. Extension-aware collection reads use the declared routing and dependency order. Sibling shards form one overlay layer: their local rows take precedence over every shard's referenced stores. Full scans and UUID-prefix lookups apply the same precedence; physical database discovery order does not determine which row wins. A collection scan is not globally sorted across shards.
 
 `ObjectCollection::replaceExtensionRows(write, tableName, ownerKey, rows)` localizes an inherited owner and its manual fields before editing. Ordinary metadata localization also preserves those fields. Versioned table scans use the winning owner, not a union of individual row keys: a replacement hides all older rows for that owner, an explicit clear stays empty, and a deletion marker prevents fallback to inherited fields. Immutable result tables instead merge by their own primary keys and keep their original input provenance independently of current owner edits. Historical version reads remain the direct `ObjectStore` API, not a cross-collection history query.
 
@@ -155,9 +155,11 @@ Operations that preserve complete databases retain optional tables. `exportJson`
 
 Generic extension read/write methods are currently local C++/Python APIs. `HostedStore`, server transaction operations and hosted extension-row queries have not been added. Hosting a store does not make its optional rows remotely queryable through core object listings. Existing core reads remain usable, but remote consumers must not treat those listings or object-copy operations as a complete extension export.
 
-## Fiber graph solve extension, format 1
+## Fiber graph solve extension
 
 The shared extension family is `ext_fiber_graph_solve`. Import definitions and row builders are in [`objects/FiberImportExtension.hpp`](../include/vc_object_store/objects/FiberImportExtension.hpp); workflow-result definitions are in [`objects/FiberGraphSolveExtension.hpp`](../include/vc_object_store/objects/FiberGraphSolveExtension.hpp). These are optional typed tables, not additional core-schema columns. Importers create only the applicable source/constraint tables; merely requesting a solver-table definition creates nothing. This supplies storage for workflows without changing or rerunning any solver algorithm.
+
+Formats are table-specific. Source and workflow-result tables use format 1. The constraint table uses format 2 for native extraction and retains format 1 for external legacy AFC import. Both use core schema 21; format 2 does not change the result-table schemas or introduce another storage backend.
 
 ### Imported observations
 
@@ -174,6 +176,7 @@ Fiber line geometry, names, family, length/bounds and coordinate bindings stay i
 | --- | --- |
 | Source identity/order | `source_id`, `source_fiber_a`, `source_fiber_b`, `source_reversed` |
 | Base-point arc positions | `arc_a`, `arc_b` |
+| Exact measured endpoint XYZ, format 2 only | `point_a_x`, `point_a_y`, `point_a_z`, `point_b_x`, `point_b_y`, `point_b_z` |
 | Classification/evidence | `parallel_score`, `perpendicular_score`, `evidence_weight` |
 | Lasagna measurements | `las_winding`, `parallel_las_winding` |
 | Endpoint sheet normals | For each of `normal_a` and `normal_b`: `_valid`, `_x`, `_y`, `_z`, `_reason` |
@@ -182,15 +185,38 @@ Fiber line geometry, names, family, length/bounds and coordinate bindings stay i
 | Signed/orientation evidence | `signed_winding_delta`, `perpendicular_normal_alignment`, `winding_normal_component`, `signed_parallel_winding_delta`, `parallel_normal_alignment` |
 | Unrecognized or inconsistent source extras | Nullable `extra` JSON text, not the ordinary measurement payload |
 
-Arc/length values use base voxels; winding distances use turns. Supported numerical fields are nullable typed scalars, not zero-filled for absent measurements. Normals remain sheet normals; they are not inserted into the core anchor's fiber-tangent direction field. Source normal validity and reason are retained separately from coordinates.
+Arc/length values use base voxels; winding distances use turns. Optional numerical fields are nullable typed scalars, not zero-filled for absent measurements. The six format-2 measured XYZ columns are required finite REAL values. Normals remain sheet normals; they are not inserted into the core anchor's fiber-tangent direction field. Source normal validity and reason are retained separately from coordinates.
 
 Core edges canonicalize their endpoint UUID order. Measurement fields deliberately retain the source A/B convention: `source_reversed=1` means source A/B is opposite to core edge A/B. Consumers map endpoint fields accordingly. The importer does not guess sign inversions for measured scalars merely because UUID ordering changed.
 
-The source's `measurement` JSON repeats some scalar and XYZ data. Equal duplicate copies are omitted from the extension payload; differing copies are retained in `extra`, together with genuinely unknown fields. Supported diagnostics and normals are typed columns. The fiber's original free-form annotation remains opaque JSON text because this importer does not impose a schema on arbitrary source annotations.
+For external legacy import, the source's `measurement` JSON repeats some scalar and XYZ data. Equal duplicate copies are omitted from the extension payload; differing copies are retained in `extra`, together with genuinely unknown fields. Supported diagnostics and normals are typed columns. The fiber's original free-form annotation remains opaque JSON text because this importer does not impose a schema on arbitrary source annotations. Native extraction also writes the typed columns directly; legacy JSON is not an internal graph representation.
 
-Provisioning is explicitly constructed from compact typed inputs, not copied or filtered out of a source metadata/configuration tree. `FiberSourceInfo` supplies the source UUID when known, optional SHA-256 and optional fiber/point counts. `FiberConstraintSourceInfo` supplies the input fiber-source UUID when known, optional constraint-file SHA-256 and optional constraint count, plus fixed units/order conventions. AFC has no independent file UUID: its AFV UUID identifies the input fibers, not the constraint file. Unknown identity is omitted, never guessed. Filesystem paths, reports, selection-ID lists and nested source configuration are not stored in provisioning. Per-fiber source annotations are a separate opaque source field, not provisioning.
+Provisioning is explicitly constructed from compact typed inputs, not copied or filtered out of a source metadata/configuration tree. `FiberSourceInfo` supplies the source UUID when known, optional SHA-256 and optional fiber/point counts. `FiberConstraintSourceInfo` supplies the input fiber-source UUID when known, optional constraint-file SHA-256 and optional constraint count, plus fixed units/order conventions. Supplying its `coordinateSpace` selects the native format-2 definition below; leaving it absent preserves the legacy format-1 interpretation. AFC has no independent file UUID: its AFV UUID identifies the input fibers, not the constraint file. Unknown identity is omitted, never guessed. Filesystem paths, reports, selection-ID lists and nested source configuration are not stored in provisioning. Per-fiber source annotations are a separate opaque source field, not provisioning.
 
 The source table indexes `source_id`; the constraint table indexes `source_id` and `las_winding` in addition to its edge UUID primary key. Existing core adjacency indexes still find relationships from a fiber; the extension row is then looked up by edge UUID.
+
+### Native extraction measurement format 2
+
+The native extractor records measured endpoints before converting them into source-object anchors. These are distinct coordinate representations, not interchangeable copies:
+
+| Representation | Frame and purpose |
+| --- | --- |
+| Constraint `point_a_*` / `point_b_*` | Exact extracted XYZ in the named volume's base-voxel frame; used for numerical graph evaluation and normal sampling |
+| Constraint `arc_a` / `arc_b` | Distance along the corresponding source fiber in base voxels |
+| Constraint `normal_a_*` / `normal_b_*` | Sheet-normal axes in the same measurement frame, with separate validity/reason |
+| Core edge anchor `position` | Position transformed into that endpoint object's stored geometry frame; used by ordinary object/geometry consumers |
+
+The extension's compact provisioning declares `coordinate_space` as `SAMPLE/VOLUME_ID`, `anchor_frame` as `object_geometry`, `length_units` as `base_voxels`, `winding_units` as `turns`, and `endpoint_order` as `source`. Numerical consumers must read the explicit measured XYZ columns instead of treating core anchor coordinates as base voxels or reconstructing measurements by a transform round trip. For example, geometry stored at a four-base-voxel scale has different anchor and measurement coordinates even though they identify the same physical point. There is no rounding, nearest-point substitution or change to measured winding distances in this representation.
+
+Native `source_id` is the event's numeric extraction-order identifier; `source_fiber_a/b` are source-catalog ordinals. Neither identifies a fiber across stores. Persistent fiber/relationship identity comes from the core UUIDs. `source_reversed` maps source-ordered arc positions, normals and measured XYZ to the canonical core edge endpoints; signed measurements remain in their recorded source convention.
+
+[`readFiberConstraintGraph`](../include/vc_object_store/objects/FiberConstraintGraph.hpp) joins the typed measurement rows with core parallel/perpendicular edges and returns source-ordered endpoint UUIDs and numerical columns. It supports plain, sharded and packed collections through `ObjectCollection`, sorts by event `source_id`, and rejects duplicate event identifiers instead of silently combining independently extracted graphs. Format 1 reads endpoint XYZ from the original core anchors; format 2 reads the six explicit measurement columns. This format-1 support is for the external legacy adapter, not permission to write AFC databases or reuse the removed JSON/SQLite graph backend.
+
+Native extraction records the selected cohort in `_fibers` rows under a `constraint_extraction` run, including fibers with no events. These are participant rows referring to existing core objects, not copied geometry. `_inputs` and table `basedOn` pin the source snapshot. `normal_source_sha256` is a compact identity check for the normal inputs; manifests, input paths and source metadata trees are not stored in provisioning.
+
+Normal orientation creates a sealed derived store referencing the input graph. It writes only changed measurement rows, retaining the same edge UUIDs, source ordering, exact measurement positions, validity and all non-normal fields; unchanged rows and geometry remain referenced. The new `normal_orientation` run records `sample_spacing_base`. Subsequent normal-curve/prior export requires that orientation run, matching normal-source identity and matching sampling spacing; it must not infer spacing or silently resample an incompatible gauge. Collection full scans and keyed reads must therefore resolve the same winning measurement rows across all partitions.
+
+Python `vc_object_store.CollectionReader` exposes the same composed graph through `fiber_constraints()` and typed extension discovery/reads. The winding workflows use the shared `fiber_graph_store.FiberGraph` adapter and UUID-indexed source geometry rather than opening SQLite files themselves. See [fiber storage and extraction](../../vesuvius/docs/fiber_layout.md#storage-and-identities) for workflow inputs and cache invalidation.
 
 ### Run results
 
@@ -258,7 +284,7 @@ Use a new run UUID for another independently saved result/checkpoint. Metric pro
 
 Regression coverage includes typed values (including empty BLOB versus NULL), registration and transactional stamps, owner versions/checked writes, history on/off, restore, binary snapshots larger than one chunk, database-copy preservation, store_reference clears/deletions, and plain/packed multi-shard imports. Python uses the same native row/schema builders. Extension-specific hosted operations are not exposed yet; metadata-only JSON export and object-only copy explicitly reject extension-bearing stores rather than dropping their data.
 
-The compact-provisioning cleanup and workflow-table additions passed 51 native tests and 136 Python tests; the optional SSH integration test was skipped. The no-adapter build also passed all 45 executed tests. The new `object_store_fiber_graph_extension` regression covers independent runs, typed values, input references, and store_references to plain/packed sharded storage. Python exercises the same definitions and rejects wholesale source/configuration dictionaries in the compact builders. The local argument-free verification command is `bash /home/hendrik/villa2/local/scripts/run_vcobj_tests`; portable build/test instructions remain in the project README.
+The compact-provisioning cleanup and workflow-table additions passed 51 native tests and 136 Python tests; the optional SSH integration test was skipped. The no-adapter build also passed all 45 executed tests. The `object_store_fiber_graph_extension` regression covers independent runs, typed values, input references, and store_references to plain/packed sharded storage. Python exercises the same definitions and rejects wholesale source/configuration dictionaries in the compact builders. See the [project README](../README.md) for portable build/test instructions. Collection extension tests also cover later-shard replacements over shared bases, including full/prefix scans and nested references; native normal-publication tests exercise the measurement-frame and orientation invariants.
 
 The following numbers were measured **before** the compact-provisioning cleanup, extension-family rename and workflow-table additions. They are not current performance results; those changes have not been rebenchmarked here. The historical matched input contained 50,000 fibers, 15,486,987 XYZ points and 300,000 constraints. Build: GCC 13.3, RelWithDebInfo, SQLite 3.45.1, Linux amd64. Packed output used RAM-first storage, 512 MiB SQLite caches, a 4 GiB resident budget and one exporter to tmpfs. Prepared ingestion excluded source decoding; streaming ingestion included parallel decoding. Final persistence was separate. Each 32-worker result was three trials; the one-worker control was one trial. Every benchmark invocation had a 30-second hard limit. Use the shareable `vc_bench_prepared_import CONFIG.json` and `vc_object_import_afv CONFIG.json` workflows with matching input/settings for a new comparison.
 

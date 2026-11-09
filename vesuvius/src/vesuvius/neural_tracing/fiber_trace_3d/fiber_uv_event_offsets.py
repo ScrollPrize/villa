@@ -43,21 +43,18 @@ def adjacency(source,arc,family,tie_distance=0.):
 
 
 def prepare(d,config):
-    from .fiber_uv_layout import _ro
+    from .fiber_graph_store import FiberGraph
     ids=np.asarray(d['event_ids'],dtype=np.int64)
-    records={}
-    with _ro(config['database']) as db:
-        for a in range(0,len(ids),500):
-            batch=ids[a:a+500].tolist()
-            query='SELECT id,fiber_a,fiber_b,arc_a,arc_b FROM constraints WHERE id IN ('+','.join('?' for _ in batch)+')'
-            records.update({int(r[0]):r[1:] for r in db.execute(query,batch)})
-    if len(records)!=len(ids):raise ValueError('Missing/duplicate constraint endpoint IDs')
-    ends=np.asarray([records[int(i)][:2] for i in ids],dtype=str).reshape(-1,2)
+    graph=FiberGraph(config['database'])
+    at=np.searchsorted(graph.event_ids,ids)
+    if np.any(at>=len(graph.event_ids)) or not np.array_equal(graph.event_ids[at],ids):
+        raise ValueError('Missing constraint endpoint IDs')
+    ends=np.column_stack((graph.fiber_a[at],graph.fiber_b[at]))
     owners=np.r_[d['i'],d['j']]
     source=d['source_id'][owners]
     if not np.array_equal(ends.T.reshape(-1),source):
         raise ValueError('Endpoint source order does not match cached constraints')
-    arcs=np.asarray([records[int(i)][2:] for i in ids],dtype=float).reshape(-1,2).T.reshape(-1)
+    arcs=np.r_[graph.arc_a[at],graph.arc_b[at]]
     if np.any(arcs<d['start'][owners]-1e-5) or np.any(arcs>d['end'][owners]+1e-5):
         raise ValueError('Endpoint arc outside owning piece')
     event_nodes=len(owners)

@@ -55,6 +55,9 @@ public:
     void checkCancelled() const;
     std::vector<InitialObjectIdentity> appendObjects(std::span<const InitialObjectRecord>);
     std::vector<InitialObjectIdentity> appendObjectRefs(std::span<const InitialObjectRecord* const>);
+    // Extension-only derived rows may reference owners in sealed dependencies;
+    // no copied objects, endpoint directories or extra ownership tables.
+    void appendExtensionRows(const std::string&,std::span<const ExtensionRow>);
     int64_t importEdges(const std::function<bool(std::vector<InitialCollectionEdge>&)>&);
 private:
     struct Impl;

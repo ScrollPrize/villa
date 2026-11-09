@@ -1,4 +1,5 @@
 #include "vc_object_store/objects/ObjectCollection.hpp"
+#include "vc_object_store/objects/VolumeTransforms.hpp"
 #include "internal/InitialEdges.hpp"
 #include "internal/InitialObjects.hpp"
 #include "internal/ImmutableImport.hpp"
@@ -79,7 +80,10 @@ INSERT INTO store_required_features VALUES('collection-v1');
 std::filesystem::path normalized(const std::filesystem::path& path) {
     if(isPackedDatabasePath(path)) return path;
     if(isPackedStore(path)) return packedDatabasePath(path);
-    return std::filesystem::absolute(path).lexically_normal();
+    // Resolve references relative to the actual manifest, not to a symlink
+    // used by a workflow's staging directory.
+    return std::filesystem::exists(path) ? std::filesystem::canonical(path)
+        : std::filesystem::absolute(path).lexically_normal();
 }
 std::filesystem::path resolve(const std::filesystem::path& parent,const std::string& ref) {
     if(ref.starts_with("@packed:")) return resolvePackedDatabasePath(parent,ref);
@@ -210,24 +214,26 @@ struct ObjectCollection::Impl {
     struct Node { std::unique_ptr<ObjectStore> store; CollectionMember member; bool collection=false; std::vector<KeyRoute> routes; std::vector<std::string> children; };
     std::vector<Node> nodes;
     OpenOptions options;
-    // DFS insertion order is explicit precedence: local, then bases in manifest order.
-    // Originals are resolved only after considering all overrides/tombstones.
+    // Physical nodes are loaded by DFS, but reads must resolve all sibling
+    // partitions before their bases. Never use physical insertion order as
+    // overlay precedence.
     std::map<std::string,size_t> byDatabase;
     std::map<std::string,std::pair<std::string,int64_t>> pinned;
-    std::vector<size_t> uuidReadOrder(const std::string& uuid,const char* space)const{
+    std::vector<size_t> readOrder(const std::string* uuid=nullptr,const char* space=nullptr)const{
         std::vector<size_t> order;std::set<size_t> included;std::set<std::pair<size_t,bool>> visited;
-        const std::string keySpace=std::string(space)+".uuid";
+        const std::string keySpace=space?std::string(space)+".uuid":std::string{};
         std::function<void(size_t,bool)> visit=[&](size_t n,bool local){
             if(!visited.emplace(n,local).second)return;
             if(local&&included.insert(n).second)order.push_back(n);
             std::optional<std::string> routed;
             std::optional<size_t> remainder;
-            for(const auto& r:nodes[n].routes)if(r.keySpace==keySpace){
-                if(!remainder)remainder=uuidShardIndex(uuid,r.divisor);
+            for(const auto& r:nodes[n].routes)if(uuid&&r.keySpace==keySpace){
+                if(!remainder)remainder=uuidShardIndex(*uuid,r.divisor);
                 if(*remainder==r.remainder)routed=r.databaseUuid;
             }
             // Sibling partitions are one overlay layer, not ordered bases.
-            // Query its selected local row before ANY partition's dependencies;
+            // Query its local rows (only the routed partition for a UUID
+            // lookup, all partitions for a scan) before ANY dependencies;
             // otherwise an earlier unselected shard can expose a base record
             // that incorrectly shadows the selected shard's replacement.
             for(const auto& child:nodes[n].children){const auto i=byDatabase.at(child);
@@ -240,6 +246,9 @@ struct ObjectCollection::Impl {
             }
         };
         visit(0,true);return order;
+    }
+    std::vector<size_t> uuidReadOrder(const std::string& uuid,const char* space)const{
+        return readOrder(&uuid,space);
     }
     void load(const std::filesystem::path&,bool,const std::optional<CollectionMember>&,std::set<std::string>&,sqlite3* existingRoot=nullptr);
     bool depends(size_t n,size_t target)const{
@@ -650,6 +659,21 @@ StoreProvisioning ObjectCollection::provisioning(const CollectionTxn& t)const{re
 void ObjectCollection::createExtensionTable(CollectionTxn& t,const ExtensionTable& table){
     auto& w=impl_->writer(t);impl_->nodes[0].store->createExtensionTable(w,table);
 }
+VolumeTransforms ObjectCollection::volumeTransforms(const CollectionTxn& t)const{
+    std::vector<std::pair<ObjectRecord,std::string>> registrations;
+    std::vector<ObjectRecord> choices;
+    scanObjects(t,[&](const auto& row){
+        const auto source=impl_->locate(t,row.key);
+        const auto head=impl_->nodes[source->node].store->currentObjectRevision(impl_->txn(t,source->node),row.record.uuid);
+        if(!head)throw std::runtime_error("commit new volume registrations before resolving views");
+        registrations.emplace_back(row.record,head->uuid);return true;
+    },"volume_transform");
+    scanObjects(t,[&](const auto& row){choices.push_back(row.record);return true;},"volume_transform_choice");
+    return volumeTransformsFrom(registrations,choices,impl_->options.catalogTransforms.get());
+}
+void ObjectCollection::appendExtensionRows(CollectionTxn& t,const std::string& table,std::span<const ExtensionRow> rows){
+    auto& w=impl_->writer(t);impl_->nodes[0].store->appendExtensionRows(w,table,rows);
+}
 void ObjectCollection::replaceExtensionRows(CollectionTxn& t,const std::string& table,const ObjectKey& input,
                                              std::span<const ExtensionRow> rows){
     const auto owner=canonical(input);auto& w=impl_->writer(t);auto* target=impl_->db(t,0);Savepoint save(target);
@@ -698,7 +722,7 @@ void ObjectCollection::scanExtensionRows(const CollectionTxn& t,const std::strin
     if(!schema)throw std::invalid_argument("collection: extension table not found: "+name);
     std::vector<size_t> order;
     if(!schema->keySpace.empty()&&!prefix.empty())order=impl_->uuidReadOrder(extensionUuid(prefix.front()),schema->keySpace.c_str());
-    else for(size_t n=0;n<impl_->nodes.size();++n)order.push_back(n);
+    else order=impl_->readOrder();
     std::vector<size_t> keys;
     for(const auto& key:schema->primaryKey){const auto col=std::find_if(schema->columns.begin(),schema->columns.end(),[&](const auto& c){return c.name==key;});keys.push_back(size_t(col-schema->columns.begin()));}
     if(!visitor||prefix.size()>schema->primaryKey.size())throw std::invalid_argument("collection: invalid extension scan");

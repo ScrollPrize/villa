@@ -268,6 +268,12 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
     if (!root.is_object()) {
         throw std::runtime_error("Lasagna manifest root must be a JSON object");
     }
+    if (root.contains("lasagna")) {
+        auto embedded=root.at("lasagna");
+        if (!embedded.is_object() || embedded.value("version",0)!=3)
+            throw std::invalid_argument("embedded Lasagna manifest must be version 3");
+        root=std::move(embedded);
+    }
 
     LasagnaDatasetManifest manifest;
     manifest.manifestPath = manifestPath.empty()
@@ -346,6 +352,10 @@ LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest& source)
     }
     result.raw["grad_mag_encode_scale"]=1.0;
     result.raw["grad_mag_factor"]=1.0;
+    result.raw["normal_source"]="fiber_sheet";
+    // Mask before projective/tensor interpolation: zero validity encodes no
+    // normal, not a direction obtained by decoding the blank nx/ny bytes.
+    result.raw["mask_invalid_normal_corners"]=true;
     return result;
 }
 

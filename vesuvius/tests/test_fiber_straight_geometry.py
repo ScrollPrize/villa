@@ -50,3 +50,16 @@ def test_inverse_geometry_gradients_and_boundary_continuity():
     x=b[2].detach()+torch.tensor([-1e-7,1e-7],dtype=torch.float64)
     q=soft.uv.u_to_q(x,w,b)
     assert float((q[1]-q[0]).detach())<1e-6
+
+
+def test_straight_queries_skip_unused_interpolation(monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_shared_curve as module
+    def forbidden(*args):raise AssertionError('Straight curves must not interpolate knots')
+    monkeypatch.setattr(module,'interpolation_plan',forbidden)
+    _,c,s,w=setup()
+    c.add_plan('probe',np.array([0,1]),np.array([12.,-8.]))
+    assert not hasattr(c,'fixed_plan')
+    assert c.plans['probe'][2].untyped_storage().nbytes()==8
+    actual=c.evaluate_fixed(s,w)
+    expected=torch.cat([torch.stack(c.evaluate(s,w,key),-1) for key in c.plans])
+    torch.testing.assert_close(actual,expected)

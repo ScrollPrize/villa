@@ -2,7 +2,7 @@
 import argparse
 import json
 from pathlib import Path
-import sqlite3
+from .fiber_graph_store import FiberGraph, store_digest
 import time
 
 import numpy as np
@@ -51,7 +51,6 @@ def direction_prior(points, axis, spacing=16., axis_half=8., family='H'):
     return float(np.dot(weights[ok],agreement)/den),float(den/length.sum())
 
 
-def _ro(path):return sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True)
 
 
 def inherit_h_labels(ids,labels,inherited):
@@ -70,15 +69,17 @@ def inherit_h_labels(ids,labels,inherited):
 def prepare(config):
     from .fiber_hv_stage import verify_feature_source
     from .fiber_normal_sign_visualization import load_umbilicus_frame
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
+    from .fiber_graph_store import workflow_volume
     from vesuvius.neural_tracing.tracers.shared.geometry import arclength,tangents_at
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
     start=time.monotonic();cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
     family,label,_=family_settings(config)
-    signature={k:(fibers_digest if k=='fibers' else sha256_file)(config[k]) for k in ('database','fibers','features','stage1','hv_solution','umbilicus')}
+    signature={k:(fibers_digest if k=='fibers' else store_digest if k=='database' else sha256_file)(config[k]) for k in ('database','fibers','features','stage1','hv_solution','umbilicus')}
     signature.update(version=1,tangent_half=config.get('tangent_half',16.),prior_spacing=config.get('prior_spacing',16.),
                      axis_half=config.get('axis_half',8.),convention='axis_increasing_z_cross_outward_radius_ccw')
+    signature['working_volume']=workflow_volume(config)
     if family=='V':signature.update(family='V',convention='local_umbilicus_axis_increasing_z_up')
     if config.get('inherited_h_solution'):
         if family!='V':raise ValueError('H inheritance is only for the V pass')
@@ -107,9 +108,9 @@ def prepare(config):
             inherited={f'inherited_h_direction_sign_{g}':h[f'direction_sign_{g}'].copy() for g in ('ccw','cw')}
     active=np.flatnonzero(labels==label)
     if not len(active):raise ValueError('No retained family fibers')
-    axis=load_umbilicus_frame(config['umbilicus'],fiber_volume(config['fibers']))
-    with _ro(config['database']) as db:
-        records=db.execute('SELECT id,fiber_a,fiber_b,arc_a,arc_b FROM constraints WHERE parallel_score>perpendicular_score ORDER BY id').fetchall()
+    graph=FiberGraph(config['database'])
+    axis=load_umbilicus_frame(config['umbilicus'],graph.volume)
+    records=[r[:5] for r in graph.endpoint_rows() if r[11]>r[12]]
     rows=np.asarray([(r[0],r[3],r[4]) for r in records],dtype=float).reshape(-1,3)
     ends=np.asarray([r[1:3] for r in records],dtype=str).reshape(-1,2)
     idx=np.searchsorted(ids,ends)
@@ -121,7 +122,7 @@ def prepare(config):
     starts=np.searchsorted(sorted_ids,np.arange(len(active)));stops=np.searchsorted(sorted_ids,np.arange(len(active)),side='right')
     tangents=np.empty((2*count,3),np.float32);prior=np.zeros(len(active),np.float32)
     support=np.zeros(len(active),np.float32);lengths=np.zeros(len(active))
-    geometry=read_polylines(config['fibers'],ids[active])
+    geometry=read_polylines(config['fibers'],ids[active],volume=graph.volume)
     print(f'{family}-direction prepare: {len(active):,} fibers; {count:,} parallel events',flush=True)
     for n,(row,xyz) in enumerate(geometry):
         if row['id']!=ids[active[n]]:raise ValueError('Geometry order mismatch')
@@ -336,7 +337,8 @@ def report(config):
     with np.load(cfg['tensor_cache']) as archive:d={k:archive[k] for k in archive.files}
     with np.load(root/'solution.npz') as archive:s={k:archive[k] for k in archive.files}
     for key in ('database','fibers','features','stage1','hv_solution','umbilicus'):
-        if (fibers_digest if key=='fibers' else sha256_file)(cfg[key])!=summary['input']['signature'][key]:raise ValueError('Changed source: '+key)
+        fingerprint=fibers_digest if key=='fibers' else store_digest if key=='database' else sha256_file
+        if fingerprint(cfg[key])!=summary['input']['signature'][key]:raise ValueError('Changed source: '+key)
     if not np.array_equal(s['ids'],d['ids']) or not np.array_equal(s['active'],d['active']):raise ValueError('Saved source identity mismatch')
     if not np.all(np.isfinite(s['sign_logit_ccw'])):raise ValueError('Nonfinite solution')
     if not np.array_equal(s['direction_sign_cw'],-s['direction_sign_ccw']):raise ValueError('Bad CW gauge')

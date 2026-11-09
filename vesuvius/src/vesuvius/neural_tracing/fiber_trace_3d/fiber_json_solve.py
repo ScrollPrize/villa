@@ -1,7 +1,6 @@
 """Reviewed-JSON adapter with caller-configured extraction and solver stages."""
 import json
 import uuid
-import sqlite3
 from pathlib import Path
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
@@ -10,7 +9,7 @@ from lasagna.inference_provenance import atomic_write, sha256_file
 def convert(source_dir, destination, *, volume, shape_zyx, expected_manifest_tokens):
     """Reviewed VC3D fiber JSON -> a store of fibers bound to ``volume`` (base voxels, shape ``shape_zyx``); each
     fiber keeps its document's own ``uuid``."""
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers, read_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_initial_fibers, read_polylines
     if not expected_manifest_tokens or any(not str(token) for token in expected_manifest_tokens):
         raise ValueError('Provide expected_manifest_tokens to verify the source scan')
     shape=list(shape_zyx)
@@ -45,7 +44,7 @@ def convert(source_dir, destination, *, volume, shape_zyx, expected_manifest_tok
     if Path(destination).exists():
         if json.loads(manifest.read_text())!=records: raise ValueError('Changed source fibers')
     else:
-        write_fibers(destination,fibers,volume=volume)
+        write_initial_fibers(destination,fibers,volume=volume,packed=True)
         atomic_write(manifest,records,durable=False)
     actual=read_polylines(destination,volume=str(volume))
     if len(actual)!=len(fibers): raise ValueError('Roundtrip fiber count')
@@ -118,9 +117,12 @@ def report(root,uv_name='uv'):
                  retained=bool(keep[i]),bucket=int(pick[i]),anchor_q=float(q[i]),end_q=float(q_end[i]),
                  u=float(u[i]),v=float(v[i]),broken_probability=float(p[i,-1]),
                  chosen_joint_probability=float(p[i,pick[i]])) for i in range(len(keep))]
-    with sqlite3.connect(Path(cfg['database']).resolve().as_uri()+'?mode=ro',uri=True) as db:
-        pairs=[dict(a=a,b=b,events=int(n),winding_mean=mean,winding_min=lo,winding_max=hi)
-               for a,b,n,mean,lo,hi in db.execute('SELECT fiber_a,fiber_b,count(*),avg(winding_distance),min(winding_distance),max(winding_distance) FROM constraints GROUP BY fiber_a,fiber_b')]
+    from .fiber_graph_store import FiberGraph
+    graph=FiberGraph(cfg['database']);grouped={}
+    for a,b,value in zip(graph.fiber_a,graph.fiber_b,graph.distance):
+        grouped.setdefault((str(a),str(b)),[]).append(float(value))
+    pairs=[dict(a=a,b=b,events=len(values),winding_mean=float(np.mean(values)),
+                winding_min=min(values),winding_max=max(values)) for (a,b),values in sorted(grouped.items())]
     e=np.arange(len(d['i']));qa,qb,delta,active=uv.edge_readout(d,geometry,widths,e,cfg,state)
     positional=qb-qa-d['phase_delta']+.5*(d['family'][d['j']]-d['family'][d['i']])
     constraints=[dict(event_id=int(d['event_ids'][n]),a=str(d['source_id'][d['i'][n]]),

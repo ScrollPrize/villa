@@ -4,6 +4,42 @@ import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_scaled_lbfgs import scaled_joint
 
 
+@pytest.mark.parametrize('edge_batch,prior_batch',[(1,1),(2,3),(20,20)])
+def test_disjoint_pair_prior_global_parts_match_full(edge_batch,prior_batch):
+    from .test_fiber_bucket_uv import fixture
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_soft_winding as soft
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_implicit_winding as imp
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_bucket_uv import BucketUV
+    d,cfg,_,s,w=fixture()
+    d['links']=np.array([[0.,1.,50.,70.]])
+    cfg.update(cavity_winding_sigma=False,predicted_only_geometry=True,
+        straight_fixed_length_geometry=True,shared_curve_geometry=True,
+        shared_curve_integer_geometry=True,shared_curve_hypothesis_mapping=True,
+        reuse_constraint_work=True)
+    owners=np.array([1,0,1,0,1,0,1])
+    samples=dict(owner=owners,ds=np.linspace(1,290,7),phase=np.linspace(.1,.9,7),
+        z=np.arange(7.),weight=np.full(7,.25),v_owner=owners[::-1].copy(),
+        v_ds=np.linspace(2,270,7),v_z=np.arange(7.)*20,v_weight=np.full(7,.25))
+    data,nodes=soft.tensor_inputs(d,samples,cfg,'cpu')
+    state=s.detach().double().requires_grad_();initial=w.detach().double()
+    raw=soft.encode_widths(initial,cfg).requires_grad_()
+    ext=BucketUV(d,cfg,'cpu').double();ext.prepare_fields(d,samples)
+    ext.curve.initialize(state,initial)
+    params=[state,raw,*ext.parameters()]
+    loss,expected=soft.objective(state,raw,initial,data,nodes,cfg,pair_cost=imp.pair_cost,extension=ext)
+    gradients=torch.autograd.grad(loss,params,allow_unused=True)
+    actual={};accum=[torch.zeros_like(p) for p in params]
+    for value,terms in soft.full_objective_parts(state,raw,initial,data,nodes,cfg,imp.pair_cost,ext,edge_batch,prior_batch):
+        for key,v in terms.items():actual[key]=actual.get(key,0)+v.detach()
+        gs=torch.autograd.grad(value,params,allow_unused=True)
+        for total,g in zip(accum,gs):
+            if g is not None:total.add_(g)
+    assert actual.keys()==expected.keys()
+    for key in actual:torch.testing.assert_close(actual[key],expected[key],rtol=1e-6,atol=1e-8)
+    for got,want,p in zip(accum,gradients,params):
+        torch.testing.assert_close(got,torch.zeros_like(p) if want is None else want,rtol=1e-6,atol=1e-8)
+
+
 def test_fixed_length_vram_estimate():
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_scaled_lbfgs import estimated_fixed_length_vram
     gib=1024**3

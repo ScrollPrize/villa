@@ -30,7 +30,7 @@ def test_inconsistent_signs_return_concrete_cycle():
     assert {e['event_id'] for e in result['contradictory_cycle']} == {50, 51}
 
 import json
-import sqlite3
+from .fiber_graph_fixture import uid, measured_store
 import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_audit import (
     objective_cost, compare_targets, internal_details, gt_details, audit_measurements,
@@ -106,35 +106,30 @@ def test_detail_exports_keep_fractional_residual_and_empty_gt():
 
 
 def test_measurement_audit_verifies_sources_and_detects_wrong_cache(tmp_path):
-    db = tmp_path/'constraints.afc'
-    normal = json.dumps(dict(xyz=[1,0,0],valid=True))
-    with sqlite3.connect(db) as con:
-        con.execute('CREATE TABLE constraints (id INTEGER, fiber_a TEXT, fiber_b TEXT, ax REAL, ay REAL, az REAL, bx REAL, by REAL, bz REAL, parallel_score REAL, perpendicular_score REAL, winding_distance REAL, parallel_winding_distance REAL, normal_a TEXT, normal_b TEXT)')
-        con.execute('INSERT INTO constraints VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (8,U(10),U(20),0,0,0,1,0,0,.9,.1,9.,2.,normal,normal))
+    db = measured_store(tmp_path, [(8,10,20,True,2.)])
     stage = tmp_path/'normals.npz'
-    np.savez(stage, ids=np.array([U(10),U(20)]), normal_sign=np.ones(2), normal_convention=np.array('inward'))
+    np.savez(stage, ids=np.array([uid(10),uid(20)]), normal_sign=np.ones(2), normal_convention=np.array('inward'))
     cache = tmp_path/'cache.npz'
     np.savez(cache, unused=np.zeros(1))
-    d = dict(event_ids=np.array([8]),source_id=np.array([U(10),U(20)]),i=np.array([0]),j=np.array([1]),
+    d = dict(event_ids=np.array([8]),source_id=np.array([uid(10),uid(20)]),i=np.array([0]),j=np.array([1]),
              parallel=np.ones(1,bool),sign=np.array([-1]),distance=np.array([2.]))
     sources=dict(database=str(db),stage1=str(stage))
     r = audit_measurements(dict(tensor_cache=str(cache)), d, sources)
     assert r['rows_verified'] == 1
-    assert r['source_afc_recomputation'] == 'verified'
+    assert r['source_graph_recomputation'] == 'verified'
     with pytest.raises(ValueError, match='measurements'):
         audit_measurements(dict(tensor_cache=str(cache)), dict(d,sign=np.array([1])), sources)
     with pytest.raises(ValueError, match='identity'):
-        audit_measurements(dict(tensor_cache=str(cache)), dict(d,source_id=np.array([U(11),U(20)])), sources)
+        audit_measurements(dict(tensor_cache=str(cache)), dict(d,source_id=np.array([uid(11),uid(20)])), sources)
     r = audit_measurements(dict(tensor_cache=str(cache)), d, dict(sources,database=str(tmp_path/'missing')))
-    assert r['source_afc_recomputation'] == 'unavailable'
+    assert r['source_graph_recomputation'] == 'unavailable'
 
 
 def test_audit_config_resolves_optional_sources_and_rejects_flags(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_experiment import load_config
     case = dict(name='trial', dataset=dict(fibers='fibers.vcobj',umbilicus='axis.json',tensor_cache='cache.npz'),
                 audit=dict(details=True,sign_analysis=False,rounded_baseline='rounded/solution.npz',
-                           measurements=dict(database='missing.afc',stage1='normals.npz')))
+                           measurements=dict(database='missing.vcobj',stage1='normals.npz')))
     (tmp_path/'normals.npz').touch()
     config = tmp_path/'config.json'
     config.write_text(json.dumps(dict(output_root='results',cases=[case])))
@@ -142,7 +137,7 @@ def test_audit_config_resolves_optional_sources_and_rejects_flags(tmp_path):
     audit = settings['cases'][0]['audit']
     assert audit['rounded_baseline'] == str(tmp_path/'rounded/solution.npz')
     assert str(tmp_path/'normals.npz') in dependencies
-    assert str(tmp_path/'missing.afc') not in dependencies
+    assert str(tmp_path/'missing.vcobj') not in dependencies
     case['audit']['details'] = 'false'
     config.write_text(json.dumps(dict(output_root='results',cases=[case])))
     with pytest.raises(ValueError,match='boolean'):

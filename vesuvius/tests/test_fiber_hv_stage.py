@@ -3,28 +3,22 @@ import numpy as np
 import pytest
 import torch
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_hv_stage import losses, probabilities, hard_metrics
+from .fiber_graph_fixture import uid, measured_store
 
 
 def test_preparation_freezes_stage1_and_active_degree(tmp_path):
-    import json,sqlite3
-    from lasagna.inference_provenance import sha256_file
+    import json
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_hv_stage import prepare
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, write_fibers
-    ids=[f'00000000-0000-4000-8000-0000000000{k}' for k in (10,20,30,40)]
-    store=tmp_path/'source.vcobj'
-    write_fibers(store,[(dict(id=f),np.array([[0.,0,k],[100.,0,k]])) for k,f in enumerate(ids)],volume='123')
-    dbpath=tmp_path/'input.sqlite';db=sqlite3.connect(dbpath)
-    db.executescript('CREATE TABLE metadata(key,value);CREATE TABLE fibers(id,source_index,length_base);'
-        'CREATE TABLE constraints(id,fiber_a,fiber_b,parallel_score,perpendicular_score);')
-    db.executemany('INSERT INTO metadata VALUES(?,?)',[(k,json.dumps(v)) for k,v in
-        dict(complete=True,provenance=dict(fibers_store_uuid='test',config=dict(fibers=str(store),coordinate_space='scroll/123'))).items()])
-    db.executemany('INSERT INTO fibers VALUES(?,?,?)',[(f,k,100) for k,f in enumerate(ids)])
-    db.executemany('INSERT INTO constraints VALUES(?,?,?,?,?)',[(0,ids[0],ids[1],1,0),(1,ids[0],ids[2],0,1)])
-    db.commit();db.close()
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import store_digest
+    ids=list(map(uid,[10,20,30,40]))
+    dbpath=measured_store(tmp_path,[(0,10,20,True,1.),(1,10,30,False,.5)],isolated_ids=[40])
     solution=tmp_path/'solution.npz';np.savez(solution,ids=ids,broken=[False,True,False,False])
-    (tmp_path/'summary.json').write_text(json.dumps(dict(input=dict(signature=dict(database_sha256=sha256_file(dbpath))))))
-    feature=tmp_path/'features.json';feature.write_text(json.dumps(dict(format='fiber-axial-priors',version=1,
-        fibers_store_uuid='test',source_ids=ids,agreement=[1,1,-1,0],fibers_digest=fibers_digest(store),umbilicus_sha256='b')))
+    (tmp_path/'summary.json').write_text(json.dumps(dict(input=dict(signature=dict(database_sha256=store_digest(dbpath))))))
+    feature=tmp_path/'features.json'
+    payload=dict(format='fiber-axial-priors',version=1,source_ids=ids,agreement=[1,1,-1,0],
+                 fibers_digest=fibers_digest(dbpath),umbilicus_sha256='b')
+    feature.write_text(json.dumps(payload))
     cache=tmp_path/'tensors.npz';config=dict(database=str(dbpath),features=str(feature),stage1=str(solution),tensor_cache=str(cache))
     prepare(config)
     with np.load(cache) as data:
@@ -33,8 +27,10 @@ def test_preparation_freezes_stage1_and_active_degree(tmp_path):
         np.testing.assert_array_equal(data['inherited'],[False,True,False,False])
         assert data['ids'].dtype.kind=='U' and list(data['ids'])==ids
     before=cache.stat().st_mtime_ns;prepare(config);assert cache.stat().st_mtime_ns==before
-    db=sqlite3.connect(dbpath);db.execute('UPDATE fibers SET length_base=99 WHERE source_index=3');db.commit();db.close()
-    with pytest.raises(ValueError,match='lengths differ'):prepare(config)
+    feature.write_text(json.dumps(dict(payload,fibers_digest='wrong snapshot')))
+    with pytest.raises(ValueError,match='content mismatch'):prepare(config)
+    feature.write_text(json.dumps(dict(payload,source_ids=ids[::-1])))
+    with pytest.raises(ValueError,match='IDs differ'):prepare(config)
 
 
 def test_feature_export_records_store_identity(tmp_path,monkeypatch):

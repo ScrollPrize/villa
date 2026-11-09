@@ -6,9 +6,11 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <exception>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -65,6 +67,9 @@ struct FiberTraceConstraintConfig {
     bool localOnePerPair = false;
     bool localReplicateOverlap = false;
     bool localIncludeParallel = true;
+    // Whole input prefix queried only against the suffix. Zero disables this
+    // native bipartite mode; unlike arbitrary callbacks it stays parallel.
+    std::size_t crossQueryPrefix = 0;
     double localMinimumPieceLengthBaseVoxels = 0.0;
     double localSpacingBaseVoxels = 64.0;
     double localTangentSpanBaseVoxels = 16.0;
@@ -81,6 +86,10 @@ struct FiberTraceConstraintConfig {
     // Optional arc boundaries per input trace; geometry/continuity is preserved.
     std::vector<std::vector<double>> extraPieceCutsBaseVoxels;
     std::size_t parallelThreads = 0;
+    // Scratch ceiling target only. Dynamically scheduled jobs target at most
+    // 1024 candidates; whole fiber-pair groups stay together to preserve
+    // greedy encounter deduplication and adaptive refinement exactly.
+    std::size_t candidateBatchSize = 262144;
 };
 
 struct FiberTraceConstraintPiece {
@@ -158,6 +167,8 @@ struct FiberTraceConstraintReport {
     std::size_t resampledPoints = 0;
     std::size_t spatialHits = 0;
     std::size_t measuredCandidates = 0;
+    std::size_t scoringBatches = 0;
+    std::size_t maximumBatchCandidates = 0;
     std::size_t rejectedTangents = 0;
     std::size_t rejectedWinding = 0;
     std::size_t rejectedWindingCutoff = 0;
@@ -166,6 +177,7 @@ struct FiberTraceConstraintReport {
     std::size_t skippedSignedWindingConstraints = 0;
     double prepareSeconds = 0.0;
     double searchSeconds = 0.0;
+    // Sum of worker durations for overlapping sub-stages, not elapsed wall time.
     double orientationScoreSeconds = 0.0;
     double windingScoreSeconds = 0.0;
     double scoreSeconds = 0.0;
@@ -232,6 +244,8 @@ using FiberTraceWindingDistance = std::function<double(
     const cv::Vec3d& bBaseXYZ,
     double stepBaseVoxels)>;
 
+// Winding callbacks can be invoked concurrently by independent pair workers.
+// Batch callbacks receive the requested inner parallelism (one in the pool).
 using FiberTraceWindingDistanceBatch = std::function<std::vector<double>(
     const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectorsBaseXYZ,
     double stepBaseVoxels,
@@ -254,13 +268,47 @@ struct FiberTraceConstraintObjReport {
     std::size_t parallelSeparateWinding = 0;
 };
 
+// Observational only. Callbacks may arrive from query workers and must be
+// thread-safe; they must not throw or modify extraction inputs.
+struct FiberTraceConstraintProgress {
+    std::string_view phase;
+    std::size_t completed = 0;
+    std::size_t total = 0;
+    std::size_t candidates = 0;
+};
+using FiberTraceConstraintProgressCallback =
+    std::function<void(const FiberTraceConstraintProgress&)>;
+
+// Optional whole-fiber export hooks. Prepared is called once before scoring;
+// finalized batches have deterministic job IDs but may arrive concurrently and
+// out of order. Spans are borrowed only for the call. A blocking consumer applies
+// backpressure; exceptions abort extraction. Unsupported splitting/filtering
+// modes reject before invoking either hook, rather than exporting provisional data.
+struct FiberTraceConstraintStream {
+    std::function<void(std::span<const FiberTraceConstraintPiece>)> prepared;
+    std::function<void(std::size_t,std::span<const FiberTraceConstraint>)> batch;
+    // Must not throw; unblock all consumers/producers immediately on failure.
+    std::function<void(std::exception_ptr)> failed;
+};
+
 [[nodiscard]] FiberTraceConstraintReport extractFiberTraceConstraints(
     const std::vector<FiberletCropTraceLine>& lines,
     const FiberTraceConstraintConfig& config,
     const FiberTraceWindingDistance& windingDistance,
     const FiberTraceWindingDistanceBatch& windingDistanceBatch = {},
     const FiberTraceConstraintTracePairFilter& tracePairFilter = {},
-    const LasagnaNormalAlignmentField* alignedNormals = nullptr);
+    const LasagnaNormalAlignmentField* alignedNormals = nullptr,
+    const FiberTraceConstraintProgressCallback& progress = {});
+
+[[nodiscard]] FiberTraceConstraintReport extractFiberTraceConstraints(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const FiberTraceConstraintConfig& config,
+    const FiberTraceWindingDistance& windingDistance,
+    const FiberTraceWindingDistanceBatch& windingDistanceBatch,
+    const FiberTraceConstraintTracePairFilter& tracePairFilter,
+    const LasagnaNormalAlignmentField* alignedNormals,
+    const FiberTraceConstraintProgressCallback& progress,
+    const FiberTraceConstraintStream& stream);
 
 [[nodiscard]] double dominantFiberTraceConstraintWindingDistance(
     const FiberTraceConstraint& constraint) noexcept;

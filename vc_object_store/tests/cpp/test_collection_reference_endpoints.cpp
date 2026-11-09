@@ -391,6 +391,20 @@ void routedPartitionsPrecedeTheirBases()
         require(Json::parse(collection.edge(read,{{},edgeUuid})->record.meta).at("quality")==9,
             "selected later shard edge must precede inherited edge with same UUID");
         require(collection.object(read,{{},b}).has_value(),"unselected shard dependencies remain visible");
+        size_t objectCount=0;
+        collection.scanObjects(read,[&](const CollectionObject& row){
+            ++objectCount;
+            if(row.key.objectUuid==a)require(Json::parse(row.record.meta).at("quality")==9,
+                "object scans resolve later-shard replacements like keyed reads");
+            return true;
+        });
+        require(objectCount==2,"object scans deduplicate base and partition records");
+        const auto byKind=collection.edgesByKind(read,"routing");
+        const auto adjacent=collection.edgesOf(read,{{},a});
+        require(byKind.size()==1&&adjacent.size()==1&&
+            Json::parse(byKind.front().record.meta).at("quality")==9&&
+            Json::parse(adjacent.front().record.meta).at("quality")==9,
+            "edge kind and adjacency scans resolve later-shard replacements like keyed reads");
     }
     auto overlay=ObjectCollection::create(directory.path/"overlay",{result.path},directOptions());
     {auto write=overlay.write();overlay.setMeta(write,{{},a},"quality","11");write.commit();}
@@ -401,7 +415,12 @@ void routedPartitionsPrecedeTheirBases()
         "local tombstones stop fallback to routed partitions and their bases");}
     auto child=ObjectCollection::create(directory.path/"child",{directory.path/"overlay",basePath},directOptions());
     {auto read=child.read();require(!child.object(read,{{},a})&&!child.edge(read,{{},edgeUuid}),
-        "routed-layer tombstones stay authoritative through a deeper store_reference overlay");}
+        "routed-layer tombstones stay authoritative through a deeper store_reference overlay");
+        size_t count=0;child.scanObjects(read,[&](const auto& row){
+            require(row.key.objectUuid==b,"object scans must not resurrect a shadowed tombstone");++count;return true;
+        });
+        require(count==1&&child.edgesByKind(read,"routing").empty()&&child.edgesOf(read,{{},b}).empty(),
+            "full object and edge scans honor nested overlay tombstones");}
 }
 
 void siblingReferences()

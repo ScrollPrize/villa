@@ -81,7 +81,11 @@ public:
     CollectionTxn write();
     std::string uuid(const CollectionTxn&) const;
     StoreProvisioning provisioning(const CollectionTxn&) const;
+    VolumeTransforms volumeTransforms(const CollectionTxn&) const;
     void createExtensionTable(CollectionTxn&, const ExtensionTable&);
+    // Append immutable result rows in the writable overlay. Input objects/edges
+    // stay in sealed dependencies; results do not require copied owner records.
+    void appendExtensionRows(CollectionTxn&, const std::string&, std::span<const ExtensionRow>);
     void replaceExtensionRows(CollectionTxn&, const std::string&, const ObjectKey&,
                               std::span<const ExtensionRow>);
     std::vector<ExtensionTableInfo> extensionTables(const CollectionTxn&) const;

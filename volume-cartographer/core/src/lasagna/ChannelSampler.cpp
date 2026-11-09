@@ -364,7 +364,7 @@ LasagnaChannelBinding bindLasagnaChannel(
     binding.packed = meta.shape.size() == 4 && meta.chunks.size() == 4;
     if ((binding.packed && manifest.version != 3 && !manifest.raw.value("packed_channel_view", false)) ||
         (!binding.packed && (meta.shape.size() != 3 || meta.chunks.size() != 3)) ||
-        (binding.packed && (size_t(meta.shape[0]) != group->channels.size() || meta.chunks[0] != meta.shape[0]))) {
+        (binding.packed && size_t(meta.shape[0]) != group->channels.size())) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) +
                                  "' must reference a 3D (Z,Y,X) zarr");
     }

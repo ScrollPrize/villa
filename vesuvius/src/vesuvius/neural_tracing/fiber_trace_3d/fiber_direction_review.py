@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
+from .fiber_graph_store import store_digest
 from .fiber_direction import breakage_readout, family_settings,label_metrics
 from .fiber_normal_sign_visualization import catalog_rows, export, spatial_subset, obj_fiber, arrow_mesh
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, read_polylines
@@ -120,7 +121,7 @@ def run(config):
     keys=['database','fibers','features','stage1','hv_solution','umbilicus']
     if cfg.get('inherited_h_solution'):keys.append('inherited_h_solution')
     for key in keys:
-        if (fibers_digest if key=='fibers' else sha256_file)(cfg[key])!=stamp['signature'][key]:raise ValueError('Changed input '+key)
+        if (fibers_digest if key=='fibers' else store_digest if key=='database' else sha256_file)(cfg[key])!=stamp['signature'][key]:raise ValueError('Changed input '+key)
     with np.load(cfg['tensor_cache']) as f:d={k:f[k] for k in f.files}
     rows=[];chosen=None;chosen_root=Path(sweep['selected']['output_root'])
     for row in sweep['results']:

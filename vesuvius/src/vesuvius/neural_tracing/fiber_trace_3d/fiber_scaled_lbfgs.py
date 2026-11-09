@@ -33,7 +33,8 @@ def scaled_joint(objective, state, raw, extension, steps, callback=None,
                  plateau_window=0, plateau_rtol=1e-6, plateau_atol=1e-9,
                  square_match_initial_scale=False, closure_cache=True, soft_minimum_width=False,
                  lbfgs_lr=1., winding_coordinate_scale=1., rejection_coordinate_scale=1.,
-                 vertical_coordinate_scale=100., frozen_fiber_mask=None, freeze_widths=False):
+                 vertical_coordinate_scale=100., frozen_fiber_mask=None, freeze_widths=False,
+                 freeze_winding=False):
     """Exact GT-probe scales, line search, tolerances and full objective.
 
     SciPy owns the optimizer/history; tensors may reside on CPU or CUDA.
@@ -73,6 +74,7 @@ def scaled_joint(objective, state, raw, extension, steps, callback=None,
     masks=[torch.zeros_like(state,dtype=torch.bool),torch.ones_like(raw,dtype=torch.bool)]+[
         torch.ones_like(p,dtype=torch.bool) for _,p in named]
     masks[0][:,0]=True
+    if freeze_winding:masks[0][:,0]=False
     curve=getattr(extension,'curve',None)
     if curve is not None and hasattr(curve,'owner'):
         if len(torch.unique(curve.owner))!=len(state):
@@ -111,8 +113,8 @@ def scaled_joint(objective, state, raw, extension, steps, callback=None,
     def evaluate():
         value=state.new_zeros(())
         gradients=[torch.zeros_like(p) for p in targets]
-        # Each weighted part includes its share of global regularizers; sum of
-        # shares is one. Release its graph before constructing the next part.
+        # Parts sum to the exact full objective. Release each graph before
+        # constructing the next; globals need not be repeated in each part.
         parts=objective_parts() if objective_parts is not None else (objective(),)
         for part,_ in parts:
             if not torch.isfinite(part):raise FloatingPointError('Nonfinite L-BFGS objective')
@@ -342,24 +344,34 @@ def managed_solve(config,state,raw,widths,data,nodes,d,extension,pair_cost,diagn
     edge_count=len(data.get('i',[]))
     batch=int(config.get('lbfgs_edge_batch_size',max(1,edge_count)))
     if batch<1:raise ValueError('lbfgs_edge_batch_size must be positive')
+    prior_batch=int(config.get('lbfgs_prior_batch_size',batch))
+    if prior_batch<1:raise ValueError('lbfgs_prior_batch_size must be positive')
+    parts_calls=0
     def parts():
-        count=len(data['i'])
-        for start in range(0,count,batch):
-            edges=torch.arange(start,min(start+batch,count),device=state.device)
-            value,terms=soft.objective(state,raw,widths,data,nodes,config,edges=edges,pair_cost=pair_cost,extension=extension)
-            weight=len(edges)/count
-            yield value*weight,{k:v*weight for k,v in terms.items()}
+        nonlocal parts_calls
+        parts_calls+=1
+        progress=int(config.get('lbfgs_objective_progress_every',0)) if parts_calls==1 else 0
+        part_started=time.monotonic()
+        if not edge_count:
+            yield soft.objective(state,raw,widths,data,nodes,config,pair_cost=pair_cost,extension=extension)
+            return
+        for index,part in enumerate(soft.full_objective_parts(state,raw,widths,data,nodes,config,pair_cost,extension,batch,prior_batch),1):
+            yield part
+            if progress and index%progress==0:
+                print(json.dumps(dict(stage='initial_objective',parts_completed=index,
+                    terms=list(part[1]),seconds=time.monotonic()-part_started)),flush=True)
     def objective():
-        if batch<edge_count:
-            terms={}
-            for _,piece in parts():
-                for k,v in piece.items():terms[k]=terms.get(k,0)+v
-            return sum(terms.values()),terms
-        return soft.objective(state,raw,widths,data,nodes,config,pair_cost=pair_cost,extension=extension)
+        terms={}
+        for _,piece in parts():
+            for k,v in piece.items():terms[k]=terms.get(k,0)+v
+        return sum(terms.values()),terms
     def save(path):
         np.savez(path,state=state.detach().cpu().numpy(),widths=soft.decode_widths(raw,config).detach().cpu().numpy(),
             **extension.arrays(),**{k:d[k] for k in ('source_id','start','end','family')})
+    diagnostic_seconds=0.
     def record(iteration):
+        nonlocal diagnostic_seconds
+        diagnostic_started=time.monotonic()
         with torch.no_grad():
             value,terms=objective();p=state[:,3].sigmoid()
             row=dict(iteration=iteration,loss=float(value),seconds=time.monotonic()-started,
@@ -368,6 +380,11 @@ def managed_solve(config,state,raw,widths,data,nodes,d,extension,pair_cost,diagn
                 terms={k:float(v) for k,v in terms.items()})
             if diagnostics is not None:row.update(diagnostics(state,config))
             row.update(extension.diagnostics())
+        diagnostic_duration=time.monotonic()-diagnostic_started
+        diagnostic_seconds+=diagnostic_duration
+        row.update(diagnostic_seconds=diagnostic_duration,
+            cumulative_diagnostic_seconds=diagnostic_seconds,
+            optimizer_seconds=time.monotonic()-started-diagnostic_seconds)
         history.append(row);atomic_write(root/'history.json',history,durable=False)
         print(json.dumps(row),flush=True)
         if config.get('save_diagnostic_checkpoints'):
@@ -379,7 +396,7 @@ def managed_solve(config,state,raw,widths,data,nodes,d,extension,pair_cost,diagn
                         optimize_rejection=not config.get('force_keep_fibers',False),
                         local_gap_scaling=config.get('lbfgs_local_gap_scaling',False),
                         direct_rejection=config.get('lbfgs_direct_rejection',False),fixed_enabled_mask=fixed,
-                        objective_parts=parts if batch<edge_count else None,
+                        objective_parts=parts,
                         frozen_fiber_mask=(np.isin(d['source_id'],config['freeze_source_ids'])
                             if config.get('freeze_source_ids') else None),
                         freeze_widths=bool(config.get('freeze_widths',False)))

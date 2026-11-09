@@ -56,6 +56,7 @@ add_library(vc_objects ${_vc_store_library_type}
     StoreConversion.cpp
     imports/AfvSource.cpp
     imports/FiberImportExtension.cpp
+    imports/FiberConstraintGraph.cpp
     imports/FiberGraphSolveExtension.cpp
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
