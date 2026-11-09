@@ -281,10 +281,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 121
-            and coverage.get("registered") == 121
+            and coverage.get("described") == 140
+            and coverage.get("registered") == 140
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 121
+            and len(snapshot["methods"]) == 140
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -989,6 +989,57 @@ def check_workspaces(client: BridgeClient, results: Results) -> None:
     except Exception as error:  # noqa: BLE001
         results.record(
             "viewers_every_manager", False, f"{type(error).__name__}: {error}")
+
+
+def check_ink_labels_without_segment(client: BridgeClient,
+                                     results: Results) -> None:
+    """With a project open but no active segment: state reports no session,
+    open names the missing segment, and paint asks for an open session."""
+
+    def expect_kind(method: str, params: dict, code: int,
+                    kind: str) -> tuple[bool, str]:
+        try:
+            result, _ = client.call(method, params, timeout=RPC_TIMEOUT)
+            return False, f"expected {code}, got result keys={list(result)[:6]}"
+        except BridgeError as e:
+            got = e.data.get("kind")
+            return (e.code == code and got == kind,
+                    f"code={e.code} kind={got!r}")
+        except Exception as e:  # noqa: BLE001
+            return False, f"unexpected {type(e).__name__}: {e}"
+
+    try:
+        state, _ = client.call("ink_labels.state", {}, timeout=RPC_TIMEOUT)
+        results.record(
+            "ink_labels_state_closed",
+            state.get("open") is False and state.get("canvas") is None,
+            f"open={state.get('open')} tool={state.get('tool')}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "ink_labels_state_closed",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+    ok, detail = expect_kind("ink_labels.open", {}, -32007, "segment")
+    results.record("ink_labels_open_needs_segment", ok, detail)
+    ok, detail = expect_kind(
+        "ink_labels.paint",
+        {"class": "ink", "stroke": {"points": [{"x": 1, "y": 1}], "radius": 2}},
+        -32007,
+        "ink_label_session",
+    )
+    results.record("ink_labels_paint_needs_session", ok, detail)
+    for method, params in (("ink_labels.fill", {"point": {"x": 1, "y": 1}}),
+                           ("ink_labels.versions", {}),
+                           ("ink_labels.import", {"path": "/nonexistent.png"})):
+        ok, detail = expect_kind(method, params, -32007, "ink_label_session")
+        results.record(f"{method.replace('.', '_')}_needs_session", ok, detail)
+    try:
+        closed, _ = client.call("ink_labels.close", {}, timeout=RPC_TIMEOUT)
+        results.record("ink_labels_close_without_session", closed.get("closed") is False, str(closed))
+    except Exception as error:  # noqa: BLE001
+        results.record("ink_labels_close_without_session", False, f"{type(error).__name__}: {error}")
 
 
 def check_project_create(
@@ -2020,6 +2071,7 @@ def main() -> int:
             check_state_changes(sock_path, client, results)
             check_ui_inspect(client, results)
             check_screenshot_targets(client, results)
+            check_ink_labels_without_segment(client, results)
 
             check_volume_attach(client, results, tmp_path, project)
             check_project_workspace(client, results, tmp_path)

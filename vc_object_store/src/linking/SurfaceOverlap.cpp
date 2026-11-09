@@ -1,3 +1,4 @@
+#include "linking/Detectors.hpp"
 #include "linking/StoredGeometry.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
@@ -637,17 +638,19 @@ void validateParams(const SurfaceOverlapParams& params)
 
 }  // namespace
 
-DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
-                                 const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
+detail::Detection detail::detectSurfaceOverlaps(StoredGeometry& inputs,
+                                                const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
 {
     validateParams(params);
     Profile profile;
     const auto& progress = params.progress;
     objects::util::reportProgress(progress, "selecting stored surfaces");
-    DetectorReport report;
+    Detection detection;
+    detection.detector = kSurfaceOverlapDetector; detection.version = 1;
+    detection.replaceStalePending = params.replaceStalePending;
+    DetectorReport& report = detection.report;
     auto cancelled = [&] { return cancel && cancel->load(); };
 
-    detail::StoredGeometry inputs(db);
     const auto objects = inputs.select("surface", params.surfaceUuids);
 
     std::vector<LoadedSurface> surfaces;
@@ -656,7 +659,8 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
         objects::util::reportProgress(progress, "loading surfaces", loadedCount++, objects.size(), object.uuid);
         if (cancelled()) {
             report.problems.push_back("surface-overlap: cancelled during loading");
-            return report;
+            detection.publish = false;
+            return detection;
         }
         PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
         if (auto loaded = loadSurface(inputs, object, params, report))
@@ -700,13 +704,15 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
         }();
         if (cancelled()) {
             report.problems.push_back("surface-overlap: cancelled");
-            return report;
+            detection.publish = false;
+            return detection;
         }
         objects::util::reportProgress(surfaceProgress, "fitting overlaps");
         for (auto& [ti, collector] : matches) {
             if (cancelled()) {
                 report.problems.push_back("surface-overlap: cancelled");
-                return report;
+                detection.publish = false;
+                return detection;
             }
             const LoadedSurface& target = surfaces[ti];
             const auto correspondences = collector.take();
@@ -774,18 +780,18 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
     for (const auto& [reason, count] : rejections)
         report.problems.push_back("surface-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason);
 
-    StaleEdgeScope scope{{params.edgeKind}, {}};
-    for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
-    auto txn = db.write();
-    DetectorReport committed = detail::commitStoredCandidates(db, inputs, txn, kSurfaceOverlapDetector, 1, candidates, params.replaceStalePending, &scope, progress);
-    if (cancelled()) throw std::runtime_error("surface-overlap: cancelled before commit");
-    txn.commit();
-    report.candidatesFound = committed.candidatesFound;
-    report.edgesCreated = committed.edgesCreated;
-    report.edgesUpdated = committed.edgesUpdated;
-    report.edgesSkippedExisting = committed.edgesSkippedExisting;
-    report.staleRemoved = committed.staleRemoved;
-    return report;
+    detection.scope = StaleEdgeScope{{params.edgeKind}, {}};
+    for (const auto& surface : surfaces) detection.scope.objectUuids.push_back(surface.uuid);
+    detection.candidates = std::move(candidates);
+    return detection;
+}
+
+DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
+                                 const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
+{
+    detail::StoredGeometry inputs(db);
+    const auto detection = detail::detectSurfaceOverlaps(inputs, params, cancel);
+    return detail::publishDetection(db, inputs, detection, params.progress, cancel);
 }
 
 }  // namespace vc::object_links

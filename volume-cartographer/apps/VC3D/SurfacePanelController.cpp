@@ -278,9 +278,13 @@ void SurfacePanelController::activate(const std::string& id, bool preserveEditin
             fetchThenActivate(id, preserveEditing);
             return;
         }
-        emit statusMessageRequested(tr("Cannot open surface %1: it has no geometry").arg(idQString), 8000);
+        const QString reason = tr("Cannot open surface %1: it has no geometry").arg(idQString);
+        qWarning().noquote() << reason;
+        emit statusMessageRequested(reason, 8000);
     } catch (const std::exception& error) {
-        emit statusMessageRequested(tr("Cannot open surface %1: %2").arg(idQString, QString::fromUtf8(error.what())), 8000);
+        const QString reason = tr("Cannot open surface %1: %2").arg(idQString, QString::fromUtf8(error.what()));
+        qWarning().noquote() << reason;
+        emit statusMessageRequested(reason, 8000);
     }
     _currentSurfaceId = id;
     updateTagCheckboxStates(_catalog->row(id));

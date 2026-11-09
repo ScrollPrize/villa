@@ -18,6 +18,7 @@ constexpr const char* kSectionPushPull = "Push/Pull";
 constexpr const char* kSectionPointCollection = "Point Collection";
 constexpr const char* kSectionMouseControls = "Mouse Controls";
 constexpr const char* kSectionSliceStep = "Z-Scroll Sensitivity";
+constexpr const char* kSectionInkLabels = "Ink Labels";
 // The line annotation workspace owns its panes' keyboard handling, so these
 // keys shadow the global bindings above while that workspace has focus. They
 // are listed as literals because the dialog binds them directly rather than
@@ -182,6 +183,104 @@ const ShortcutDef CycleViewers{
     ShortcutKind::Text,
     "Ctrl+Tab",
     QKeySequence::Open
+};
+// Ink label keys are QShortcuts scoped to the segment workspace. Every key
+// but I and H is enabled only in ink label mode.
+const ShortcutDef InkLabelMode{
+    "ink_label_mode",
+    kSectionInkLabels,
+    "Toggle ink label mode (segment view)",
+    ShortcutKind::Text,
+    "I",
+    QKeySequence::Open
+};
+const ShortcutDef InkLabelInk{
+    "ink_label_ink",
+    kSectionInkLabels,
+    "Paint ink",
+    ShortcutKind::Text,
+    "W",
+    QKeySequence::Open
+};
+const ShortcutDef InkLabelBackground{
+    "ink_label_background",
+    kSectionInkLabels,
+    "Paint background (supervised, not ink)",
+    ShortcutKind::Text,
+    "F",
+    QKeySequence::Open
+};
+const ShortcutDef InkLabelValidation{
+    "ink_label_validation",
+    kSectionInkLabels,
+    "Paint validation area",
+    ShortcutKind::Text,
+    "V",
+    QKeySequence::Open
+};
+const ShortcutDef InkLabelEraser{
+    "ink_label_eraser",
+    kSectionInkLabels,
+    "Toggle eraser (back to unknown)",
+    ShortcutKind::Text,
+    "Z",
+    QKeySequence::Open
+};
+const ShortcutDef InkLabelTool{
+    "ink_label_tool",
+    kSectionInkLabels,
+    "Switch brush, polygon and fill",
+    ShortcutKind::Text,
+    "L",
+    QKeySequence::Open
+};
+const ShortcutDef InkLabelSuggest{
+    "ink_label_suggest",
+    kSectionInkLabels,
+    "Suggest ink from the prediction (click to pick, Enter to accept)",
+    ShortcutKind::Text,
+    "U",
+    QKeySequence::Open
+};
+const ShortcutDef InkLabelPickAll{
+    "ink_label_pick_all",
+    kSectionInkLabels,
+    "Pick every ink suggestion (while suggestions are shown)",
+    ShortcutKind::Text,
+    "Shift+U",
+    QKeySequence::Open
+};
+const ShortcutDef InkLabelShow{
+    "ink_label_show",
+    kSectionInkLabels,
+    "Show or hide ink labels",
+    ShortcutKind::Text,
+    "H",
+    QKeySequence::Open
+};
+const ShortcutDef InkLabelUndo{
+    "ink_label_undo",
+    kSectionInkLabels,
+    "Undo last ink label edit (in label mode)",
+    ShortcutKind::Standard,
+    nullptr,
+    QKeySequence::Undo
+};
+const ShortcutDef InkLabelRedo{
+    "ink_label_redo",
+    kSectionInkLabels,
+    "Redo ink label edit (in label mode)",
+    ShortcutKind::Standard,
+    nullptr,
+    QKeySequence::Redo
+};
+const ShortcutDef InkLabelSave{
+    "ink_label_save",
+    kSectionInkLabels,
+    "Save ink labels as training TIFFs (in label mode)",
+    ShortcutKind::Standard,
+    nullptr,
+    QKeySequence::Save
 };
 } // namespace shortcuts
 
@@ -457,6 +556,14 @@ QKeySequence sequenceFor(const ShortcutDef& def)
     return QKeySequence(QString::fromUtf8(def.sequenceText));
 }
 
+QList<QKeySequence> sequencesFor(const ShortcutDef& def)
+{
+    if (def.kind == ShortcutKind::Standard) {
+        return QKeySequence::keyBindings(def.standardKey);
+    }
+    return {sequenceFor(def)};
+}
+
 QKeySequence sequenceFor(const KeyPressDef& def)
 {
     return QKeySequence(def.key | def.modifiers);
@@ -548,6 +655,26 @@ QString buildKeybindsHelpText()
 
         { kSectionSliceStep, keypress::SliceStepDecrease.description, HelpKeyType::KeyPress, nullptr, &keypress::SliceStepDecrease, nullptr },
         { kSectionSliceStep, keypress::SliceStepIncrease.description, HelpKeyType::KeyPress, nullptr, &keypress::SliceStepIncrease, nullptr },
+
+        { kSectionInkLabels, shortcuts::InkLabelMode.description, HelpKeyType::Shortcut, &shortcuts::InkLabelMode, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelInk.description, HelpKeyType::Shortcut, &shortcuts::InkLabelInk, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelBackground.description, HelpKeyType::Shortcut, &shortcuts::InkLabelBackground, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelValidation.description, HelpKeyType::Shortcut, &shortcuts::InkLabelValidation, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelEraser.description, HelpKeyType::Shortcut, &shortcuts::InkLabelEraser, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelTool.description, HelpKeyType::Shortcut, &shortcuts::InkLabelTool, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelSuggest.description, HelpKeyType::Shortcut, &shortcuts::InkLabelSuggest, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelPickAll.description, HelpKeyType::Shortcut, &shortcuts::InkLabelPickAll, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelShow.description, HelpKeyType::Shortcut, &shortcuts::InkLabelShow, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelUndo.description, HelpKeyType::Shortcut, &shortcuts::InkLabelUndo, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelRedo.description, HelpKeyType::Shortcut, &shortcuts::InkLabelRedo, nullptr, nullptr },
+        { kSectionInkLabels, shortcuts::InkLabelSave.description, HelpKeyType::Shortcut, &shortcuts::InkLabelSave, nullptr, nullptr },
+        { kSectionInkLabels, "Paint, or add a polygon point", HelpKeyType::Literal, nullptr, nullptr, "Left Click / Left Drag" },
+        { kSectionInkLabels, "Straight stroke from the last point", HelpKeyType::Literal, nullptr, nullptr, "Shift+Click" },
+        { kSectionInkLabels, "Brush radius", HelpKeyType::Literal, nullptr, nullptr, "Ctrl+Mouse Wheel" },
+        { kSectionInkLabels, "Close polygon", HelpKeyType::Literal, nullptr, nullptr, "Enter or Double-click" },
+        { kSectionInkLabels, "Remove last polygon point", HelpKeyType::Literal, nullptr, nullptr, "Backspace" },
+        { kSectionInkLabels, "Cancel polygon, fill or suggestions", HelpKeyType::Literal, nullptr, nullptr, "Esc" },
+        { kSectionInkLabels, "Accept the picked suggestions", HelpKeyType::Literal, nullptr, nullptr, "Enter" },
 
         { kSectionLineAnnotation, "Rotate the current cut about the horizontal axis", HelpKeyType::Literal, nullptr, nullptr, "W / S" },
         { kSectionLineAnnotation, "Rotate the current cut about the vertical axis", HelpKeyType::Literal, nullptr, nullptr, "A / D" },

@@ -9,6 +9,9 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#if VC_OBJECT_SERVER_LINKING
+#include "vc_object_store/object_links/LinkObjects.hpp"
+#endif
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -356,10 +359,21 @@ std::string utcNow()
     return text;
 }
 
+// A link_objects request being prepared or committed (submitPrepared).
+struct InFlightLink {
+    std::string digest;
+    std::vector<std::function<void(Reply)>> waiters; // every connection awaiting its answer
+};
+
 struct ServerState {
     ServerOptions options;
     std::optional<ObjectStore> store;
     Staging staging;
+    struct {
+        std::mutex mutex;
+        std::map<std::string, std::shared_ptr<InFlightLink>> inFlight; // by request UUID
+        uint64_t detections = 0; // link requests whose detection this service ran (a replay runs none)
+    } links;
     // Before io: connections still queued in io decrement them as io is destroyed.
     std::atomic<std::size_t> connections{0}, responseBytes{0};
     WalUpkeep wal;
@@ -383,8 +397,16 @@ struct ServerState {
         return ObjectStore::open(path, open);
     }
 
+    static ObjectStore openWithLinking(const std::filesystem::path& path, const ServerOptions& options)
+    {
+#if VC_OBJECT_SERVER_LINKING
+        object_links::enableLinkObjects();
+#endif
+        return openOwned(path, options);
+    }
+
     ServerState(const std::filesystem::path& path, ServerOptions o)
-        : options(std::move(o)), store(openOwned(path, options)),
+        : options(std::move(o)), store(openWithLinking(path, options)),
           staging(stagingDirectory(path, options), options.maxStagedBytes, options.stagingLifetime), acceptor(io)
     {
         const tcp::endpoint endpoint(net::ip::make_address(options.listenAddress), options.port);
@@ -429,7 +451,16 @@ struct ServerState {
             {"queues", {{"writer", writer->queued()}, {"read", readers->queued()}, {"control", control->queued()},
                         {"transfer", transfers->queued()}}},
             {"response_bytes_in_flight", responseBytes.load()},
+            {"link_requests", linkReport()},
             {"staging", staging.report()}, {"wal", walJson}}.dump());
+    }
+
+    Json linkReport()
+    {
+        std::lock_guard lock(links.mutex);
+        std::size_t waiting = 0;
+        for (const auto& [uuid, entry] : links.inFlight) waiting += entry->waiters.size();
+        return {{"in_flight", links.inFlight.size()}, {"waiting_connections", waiting}, {"detections", links.detections}};
     }
 
     // Writer lane: one scheduled checkpoint between transactions.
@@ -462,6 +493,83 @@ struct ServerState {
     {
         const auto receipt = store->submit(body, [this](const std::string& hash) { return staging.get(hash); });
         return jsonReply(transactionReceiptToJson(receipt));
+    }
+
+    // A request with a prepared operation (link_objects): its preparation
+    // (the detection) runs here, on a read worker; the checked write is then
+    // queued to the writer like any transaction, which holds the writer lane
+    // only for the commit. A request whose payloads are not all staged takes
+    // the ordinary path (a saved receipt or the missing hashes answer it).
+    //
+    // A link request in flight is remembered by its request UUID until it is
+    // answered: a retry of it (a client whose stall timeout elapsed before
+    // the detection was done, or a second client sending the same request)
+    // waits for the running detection and gets its answer, instead of
+    // starting the detection again; a same-UUID request with other contents
+    // is refused, as submit refuses it once the receipt is saved.
+    void submitPrepared(const std::shared_ptr<std::string>& body, const std::function<void(Reply)>& done)
+    {
+        auto request = std::make_shared<TransactionRequest>();
+        bool parsed = false, unstaged = false;
+        const auto parse = guarded([&] {
+            TransactionPayloads payloads;
+            for (const auto& hash : transactionJsonPayloadHashes(*body)) {
+                auto bytes = staging.get(hash);
+                if (!bytes) { unstaged = true; return Reply{}; }
+                payloads.emplace(hash, std::move(*bytes));
+            }
+            *request = transactionRequestFromJson(*body, payloads);
+            parsed = true;
+            return Reply{};
+        });
+        if (unstaged) {
+            if (!writer->tryPost([this, body, done] { done(guarded([&] { return submit(*body); })); }))
+                done(errorReply(http::status::service_unavailable, "server busy; retry"));
+            return;
+        }
+        if (!parsed) { done(parse); return; }
+        const auto uuid = request->requestUuid;
+        const auto digest = transactionRequestDigest(*request);
+        {
+            std::lock_guard lock(links.mutex);
+            if (const auto running = links.inFlight.find(uuid); running != links.inFlight.end()) {
+                if (running->second->digest != digest)
+                    done(errorReply(http::status::bad_request, "request " + uuid + " is in flight with different contents"));
+                else running->second->waiters.push_back(done);
+                return;
+            }
+            auto entry = std::make_shared<InFlightLink>();
+            entry->digest = digest;
+            entry->waiters.push_back(done);
+            links.inFlight.emplace(uuid, std::move(entry));
+        }
+        // Answers everyone waiting on this request and forgets it.
+        auto finish = [this, uuid](const Reply& reply) {
+            std::vector<std::function<void(Reply)>> waiters;
+            {
+                std::lock_guard lock(links.mutex);
+                const auto running = links.inFlight.find(uuid);
+                waiters.swap(running->second->waiters);
+                links.inFlight.erase(running);
+            }
+            for (const auto& waiter : waiters) waiter(reply);
+        };
+        auto prepared = std::make_shared<PreparedOperations>();
+        bool ready = false;
+        const auto reply = guarded([&] {
+            PrepareOptions prepare;
+            prepare.localPaths = false;
+            prepare.scratchDirectory = options.linkScratchDirectory;
+            *prepared = store->prepare(*request, prepare);
+            ready = true;
+            return Reply{};
+        });
+        if (ready && !prepared->empty()) { std::lock_guard lock(links.mutex); ++links.detections; }
+        if (!ready) { finish(reply); return; }
+        const auto commit = [this, request, prepared, finish] {
+            finish(guarded([&] { return jsonReply(transactionReceiptToJson(store->submit(*request, *prepared))); }));
+        };
+        if (!writer->tryPost(commit)) finish(errorReply(http::status::service_unavailable, "server busy; retry"));
     }
 
     Reply changes(const Target& target)
@@ -666,6 +774,9 @@ struct ServerState {
         Lane* lane = nullptr;
         std::function<Reply()> work;
         bool busy = false;
+        // Set instead of `work` for a request that answers from another lane
+        // (submitPrepared): runs on `lane` and calls done when it has a reply.
+        std::function<void(std::function<void(Reply)>)> continued;
     };
 
     Route route(const Request& request)
@@ -688,8 +799,15 @@ struct ServerState {
         if (method == http::verb::get && is({"v1", "service"})) return {control.get(), [this] { return service(); }};
         if (method == http::verb::get && is({"v1", "receipts", "*"}))
             return {control.get(), [this, target] { return receipt(target->path[2]); }};
-        if (method == http::verb::post && is({"v1", "transactions"}))
+        if (method == http::verb::post && is({"v1", "transactions"})) {
+            if (transactionJsonHasPreparedOperations(*body)) {
+                Route route;
+                route.lane = readers.get();
+                route.continued = [this, body](std::function<void(Reply)> done) { submitPrepared(body, done); };
+                return route;
+            }
             return {writer.get(), [this, body] { return submit(*body); }};
+        }
         if (method == http::verb::get && is({"v1", "changes"}))
             return {readers.get(), [this, target] { return changes(*target); }};
         if (method == http::verb::get && is({"v1", "objects", "*"}))
@@ -744,6 +862,10 @@ struct ServerState {
         } catch (const MissingPayloads& missing) {
             return jsonReply(Json{{"error", missing.what()}, {"missing", missing.hashes()}}.dump(),
                              http::status::unprocessable_entity);
+        } catch (const PreparationFailed& failed) {
+            // Not the service's fault and not transient: no retry.
+            return jsonReply(Json{{"error", failed.what()}, {"preparation_failed", true}}.dump(),
+                             http::status::unprocessable_entity);
         } catch (const std::invalid_argument& e) {
             return errorReply(http::status::bad_request, e.what());
         } catch (const std::out_of_range& e) {
@@ -774,7 +896,9 @@ struct ServerState {
             done(errorReply(http::status::not_found, "unknown endpoint"));
             return;
         }
-        auto job = [work = std::move(r.work), done]() mutable { done(guarded(work)); };
+        std::function<void()> job;
+        if (r.continued) job = [continued = std::move(r.continued), done] { continued(done); };
+        else job = [work = std::move(r.work), done] { done(guarded(work)); };
         if (!r.lane->tryPost(job)) done(errorReply(http::status::service_unavailable, "server busy; retry"));
     }
 

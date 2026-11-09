@@ -1,6 +1,7 @@
 // Host one object store for clients without filesystem access to it.
 #include "vc_object_store/server/Server.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <string>
 
@@ -9,10 +10,14 @@ int usage()
 {
     std::cerr << "usage: vc_object_server STORE.vcobj [--listen ADDRESS] [--port N] [--read-workers N]\n"
                  "    [--max-payload-mib N] [--max-staged-mib N] [--staging-dir DIR]\n"
+                 "    [--request-deadline SECONDS] [--strip-cache DIR]\n"
                  "Serves STORE over HTTP until SIGINT/SIGTERM. There is no authentication: the\n"
                  "default listen address is 127.0.0.1 (reach it through an SSH tunnel); use a\n"
                  "trusted private network address only. Standalone writers must be closed first.\n"
-                 "Uploads are staged in DIR (default STORE.vcobj.staging); staged payloads are dropped at startup.\n";
+                 "Uploads are staged in DIR (default STORE.vcobj.staging); staged payloads are dropped at startup.\n"
+                 "--request-deadline bounds one request on a connection (default 300); a link_objects request\n"
+                 "answers only when its detection is done, so set it above the longest link. --strip-cache keeps\n"
+                 "the fiber strips of link_objects requests between runs.\n";
     return 2;
 }
 } // namespace
@@ -33,6 +38,8 @@ int main(int argc, char** argv)
             else if (flag == "--max-payload-mib") options.maxPayloadBytes = std::stoull(value) << 20;
             else if (flag == "--max-staged-mib") options.maxStagedBytes = std::stoull(value) << 20;
             else if (flag == "--staging-dir") options.stagingDirectory = value;
+            else if (flag == "--request-deadline") options.requestDeadline = std::chrono::seconds(std::stol(value));
+            else if (flag == "--strip-cache") options.linkScratchDirectory = value;
             else return usage();
         }
         vc::objects::server::Server server(argv[1], options);

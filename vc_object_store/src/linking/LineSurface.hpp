@@ -18,6 +18,13 @@ struct LineData {
 using LineLoader = std::function<std::optional<LineData>(size_t, DetectorReport&)>;
 void validateLineSurfaceParams(const LineSurfaceParams& params, double sourceScale);
 // Load one line at a time so track coordinates need not all be copied into RAM.
+// A cancellation during detection is reported in the detection's problems
+// (publish = false); other failures throw.
+Detection detectLinesToSurfaces(StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+    const std::filesystem::path& ctVolume,
+    const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
+    const std::atomic_bool* cancel);
+// detectLinesToSurfaces published in a write of its own.
 DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
     const LineSurfaceParams& params, double sourceScale, const char* detector, int version,

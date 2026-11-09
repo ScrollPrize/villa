@@ -77,7 +77,7 @@ vc_object_ingest --db objects.vcobj --author "$USER" \
   --surface-channel SURFACE_UUID ink /data/ink_prediction.tif
 vc_object_links --db objects.vcobj --author "$USER" --link-surface-overlaps
 vc_object_links --db objects.vcobj --author "$USER" \
-  --link-fiber-surfaces --ct /data/ct.zarr
+  --link-fiber-surfaces --ct /data/ct.zarr        # or --normal-x/--normal-y, --normal-pool, or none
 vc_object_export --db objects.vcobj --uuid SURFACE_UUID --output /data/out
 vc_object_server objects.vcobj --port 8750   # serve to clients (see docs/hosted.md)
 ```

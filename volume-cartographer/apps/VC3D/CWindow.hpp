@@ -96,6 +96,8 @@ class ProjectWorkspace;
 class FiberMapWorkspace;
 namespace vc3d::fibers3d { class Fiber3DPanel; }
 
+class InkLabelController;
+
 class CWindow : public QMainWindow
 {
 
@@ -362,6 +364,7 @@ private:
     std::unique_ptr<BBoxOverlayController> _bboxOverlay;
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
     std::unique_ptr<InkDetectionOverlayController> _inkDetectionOverlay;
+    std::unique_ptr<InkLabelController> _inkLabelController;
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
     std::unique_ptr<StoreSurfaceOverlayController> _storeSurfaceOverlay;
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;

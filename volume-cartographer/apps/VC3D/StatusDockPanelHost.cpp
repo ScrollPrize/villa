@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <utility>
 
 namespace {
 constexpr int kResizeHitWidth = 10;
@@ -333,6 +334,45 @@ void StatusDockPanelHost::showDock(QDockWidget* dock)
     }
 }
 
+QWidget* StatusDockPanelHost::contentForDock(QDockWidget* dock) const
+{
+    const Item* item = itemForDock(dock);
+    return item ? item->content.data() : nullptr;
+}
+
+QWidget* StatusDockPanelHost::panelWidgetForDock(QDockWidget* dock) const
+{
+    const Item* item = itemForDock(dock);
+    if (!item)
+        return nullptr;
+    if (item->detached)
+        return item->dock.data();
+    // Never capture another dock's page, or reveal a collapsed panel by grab().
+    if (_currentIndex != itemIndex(*item) || !item->page || _stack->currentWidget() != item->page)
+        return nullptr;
+    return item->page.data();
+}
+
+bool StatusDockPanelHost::isDockDetached(QDockWidget* dock) const
+{
+    const Item* item = itemForDock(dock);
+    return item && item->detached;
+}
+
+bool StatusDockPanelHost::setDockDetached(QDockWidget* dock, bool detached)
+{
+    Item* item = itemForDock(dock);
+    if (!item || !item->dock || !item->content || !item->page)
+        return false;
+    setItemVisibleInBar(*item, true);
+    if (detached)
+        detachItem(*item);
+    else
+        attachItem(*item, true);
+    showDock(dock);
+    return item->detached == detached;
+}
+
 bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
 {
     if (auto* button = qobject_cast<QPushButton*>(watched)) {
@@ -484,6 +524,11 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
 }
 
 StatusDockPanelHost::Item* StatusDockPanelHost::itemForDock(QDockWidget* dock)
+{
+    return const_cast<Item*>(std::as_const(*this).itemForDock(dock));
+}
+
+const StatusDockPanelHost::Item* StatusDockPanelHost::itemForDock(QDockWidget* dock) const
 {
     auto it = std::find_if(_items.begin(), _items.end(), [dock](const Item& item) {
         return item.dock == dock;

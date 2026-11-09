@@ -44,6 +44,9 @@ class QWidget;
 class CChunkedVolumeViewer;
 class CWindow;
 class ViewerManager;
+class InkDetectionOverlayController;
+class InkLabelController;
+class InkLabelPanel;
 class VolumeViewerBase;
 struct CommandLaunchError;
 struct StoreImportOutcome;
@@ -102,6 +105,7 @@ private:
     void registerViewerDisplayHandlers();
     void registerEditSettingsHandlers();
     void registerStoresHandlers();
+    void registerInkLabelHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
@@ -203,6 +207,31 @@ private:
     void connectStateSignals();
 
     // --- Handlers ---
+    // Ink labels (AgentBridgeHandlers_inklabels.cpp).
+    InkLabelController* inkLabelController() const;
+    InkLabelPanel* inkLabelPanel() const;
+    QWidget* inkLabelCaptureWidget() const;
+    const InkDetectionOverlayController* inkDetectionOverlay() const;
+    void requireInkLabelProject() const;
+    QJsonObject handleInkLabelsState(const QJsonValue& params);
+    QJsonObject handleInkLabelsPanel(const QJsonValue& params);
+    QJsonObject handleInkLabelsControl(const QJsonValue& params);
+    QJsonObject handleInkLabelsViewportStroke(const QJsonValue& params);
+    QJsonObject handleInkLabelsOpen(const QJsonValue& params);
+    QJsonObject handleInkLabelsPaint(const QJsonValue& params);
+    QJsonObject handleInkLabelsRead(const QJsonValue& params);
+    QJsonObject handleInkLabelsHistory(const QJsonValue& params);
+    QJsonObject handleInkLabelsSave(const QJsonValue& params);
+    QJsonObject handleInkLabelsVersions(const QJsonValue& params);
+    QJsonObject handleInkLabelsDatasetEntry(const QJsonValue& params);
+    QJsonObject handleInkLabelsSetToolState(const QJsonValue& params);
+    QJsonObject handleInkLabelsClose(const QJsonValue& params);
+    QJsonObject handleInkLabelsFill(const QJsonValue& params);
+    QJsonObject handleInkLabelsSuggest(const QJsonValue& params);
+    QJsonObject handleInkLabelsAcceptSuggestions(const QJsonValue& params);
+    QJsonObject handleInkLabelsDiscardSuggestions(const QJsonValue& params);
+    QJsonObject handleInkLabelsCleanup(const QJsonValue& params);
+    QJsonObject handleInkLabelsImport(const QJsonValue& params);
     QJsonObject handlePing(const QJsonValue& params);
     QJsonObject handleRpcDescribe(const QJsonValue& params);
     QJsonObject handleStateGet(const QJsonValue& params);

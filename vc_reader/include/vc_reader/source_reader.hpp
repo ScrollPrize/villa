@@ -331,8 +331,10 @@ private:
 };
 
 // A plain image file as a source: its first series and level, and a page stack's anonymous axis named z.
-// TIFF and PNG/JPEG, by suffix. Opens the file once to learn its axes.
-[[nodiscard]] Source imageSource(const std::string& location, const OptionsFor& options = {});
+// TIFF and PNG/JPEG, by suffix unless format is supplied (e.g. TIFF checkpoints
+// without an image extension). Opens the file once to learn its axes.
+[[nodiscard]] Source imageSource(const std::string& location, const OptionsFor& options = {},
+                                 const std::optional<std::string>& format = std::nullopt);
 // The whole of such a file, retaining nothing, with no decode budget. `axes` skips learning them.
 [[nodiscard]] Block readImage(const std::string& location, const OptionsFor& options = {}, const std::optional<std::vector<std::string>>& axes = std::nullopt);
 // One page of such a file: of a page stack, that page; of anything else, the whole image.

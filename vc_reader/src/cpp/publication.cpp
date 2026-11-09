@@ -1,5 +1,6 @@
 #include "vc_reader/publication.hpp"
 #include <algorithm>
+#include <exception>
 #include <fstream>
 #include <set>
 #include <vector>

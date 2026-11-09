@@ -993,3 +993,102 @@ volume-package fixtures and is intentionally separate from hermetic CI.
 - While `canvas.key` delivers a key, any modal dialog that opens is answered
   as Escape would, including one raised by unrelated application code at
   that moment, and native dialogs are off application-wide for the call.
+
+### Ink labels
+
+Ink labels are the ink, background and validation pixels drawn on a segment's
+flattened view for the ink detection trainer. The methods drive the same
+`InkLabelController` as the label section of the Ink Detection dock, so the
+GUI shows every bridge edit live, and the GUI and the bridge share one undo
+history.
+
+- A session belongs to the active segment and is stored in
+  `<project dir>/ink_labels/<segment folder>/`. `ink_labels.open` opens it
+  (or reuses the open one); `ink_labels.state` reports it. Switching segment
+  closes the session and keeps unsaved edits as an autosave checkpoint.
+- Label space is the `vc_render_tifxyz` canvas of the segment at full
+  resolution: label pixel `(c, r)` covers `[c, c+1) x [r, r+1)`, and a grid
+  position `g` maps to `canvas.centerX + (renderScale / scaleX) *
+  (g.x - gridCols / 2)`, likewise in y. `state.canvas` carries the constants.
+  Volume-space points go through the segmentation viewer's `volumeToScene`,
+  round-tripped within 2 voxels as in `canvas.click`, then scene to surface to
+  grid to label pixels; a point off the labeled segment is -32003.
+- `open` never prompts. `recover` decides what happens to an autosave newer
+  than the last save (`fail` by default, with `data.kind:"autosave_pending"`
+  and `data.autosaveAtUtc`); `readOnlyIfLocked` decides whether a store held
+  by another VC3D opens read-only. A store saved for a different grid,
+  scale or segment uuid is locked (-32009 `label_layer_locked`, with
+  `data.expected` and `data.got`) and is never painted over. `version`
+  opens `<seg>_inklabels_vN.tif`; omitted, the newest version opens.
+  `startNewVersion` starts empty labels as the next version instead, which is
+  also the way past a locked store. An open that arrives while the dock's
+  restore question is showing is -32009 `open_pending`.
+- `paint` applies exactly one of `stroke`, `polygon` or `mask` as one undo
+  entry recorded with actor `agent`. Classes and the eraser follow the GUI:
+  ink sets ink and supervision, background sets supervision and clears ink
+  (unless `backgroundKeepsInk`), validation sets the validation bit, and the
+  eraser returns ink or background to unknown. A mask is an absolute
+  single-channel 8-bit PNG or TIFF of at most 8192 x 8192 px, painted where
+  nonzero; with `mask.format: "values"` it holds label values 0 to 7 as
+  `read` writes them, every pixel of its rectangle is set to its value, and
+  `class` is not needed. A point farther than 2^22 label px from the origin
+  is -32602. A brush stroke the user is drawing is -32009 `stroke_open`.
+  `expect: {segment, serial}` refuses the paint (-32602 `expect_mismatch`
+  with `data.current`) when the session moved on.
+- `read` writes the current label values of a rectangle, saved or not, to a
+  PNG or TIFF, so callers inspect unsaved work without touching the trainer
+  files. It is limited to 4096 x 4096 px because the wire limit is 1 MiB.
+- `history` undoes or redoes label edits, separately from segmentation undo.
+  Undo stops at an entry another actor made unless `force` is true; when the
+  first entry is the user's the call fails with -32009 `other_actor_entry`
+  (the refusal is a policy, not a busy job).
+- `save` writes the trainer files (`<seg>_inklabels.tif`,
+  `<seg>_supervision_mask.tif`, and `<seg>_validation_mask.tif` when used)
+  and the JSON sidecar, keeping the replaced files as `.prev`. It is a
+  deferred response completed by the save's own completion (300 s cap); a
+  clean session answers `saved:false` at once. A trainer file changed outside
+  VC3D since it was loaded is -32602 `external_edit` with `data.files` unless
+  `overwriteExternalEdits` is true. `asNewVersion` writes all three files as
+  the next version and moves the session to it.
+- `fill`, `suggest` and `cleanup` run the dock's assist tools to completion
+  before answering (they are bounded to 4096 x 4096, or 8192 x 8192 for
+  cleanup, label px; `bound` defaults to the visible part of the segment
+  view). Settings given in the call (threshold, guide, median and so on)
+  become the dock's settings. Fill and suggestions need the single-channel
+  ink prediction selected in the Ink Detection dock (-32009 `no_prediction`);
+  an assist started from the dock and still running is -32004
+  `ink_label_assist`. Suggestions leave out pixels already labeled ink or
+  background, and `accept_suggestions` never changes them; it takes `ids`,
+  `all`, or the user's picks. Results are one undo entry with actor `agent`;
+  `fill` reports `reachedBound` when the bound cut the region.
+- `import` reads a label TIFF, PNG or label zarr into one bit (by default
+  from the file name) on a worker and answers when it lands (deferred, 300
+  s). A half or quarter resolution render needs `allowResample` (-32602
+  `resample_needed`), a legacy PNG pair needs `legacyMaskAs` (-32602
+  `legacy_mask`).
+- `set_tool_state` sets what the dock shows (label mode, class, eraser, tool,
+  radius, display, assist settings). Label mode needs an open session and is
+  -32009 `label_mode_refused` while segmentation editing is on. `versions`,
+  `dataset_entry` (the trainer's dataset entry as JSON) and `close` (unsaved
+  edits kept as an autosave) complete the set, so every label control of the
+  dock has a method.
+
+| `vc3d_ink_labels_accept_suggestions` | `ink_labels.accept_suggestions` | Paint ink suggestions (given ids, all, or the user's picks) as one undo entry, never over labeled pixels. |
+| `vc3d_ink_labels_cleanup` | `ink_labels.cleanup` | Remove specks, fill holes, grow, shrink or ring ink labels with background in a region. |
+| `vc3d_ink_labels_close` | `ink_labels.close` | Close the ink label session, keeping unsaved edits as an autosave. |
+| `vc3d_ink_labels_dataset_entry` | `ink_labels.dataset_entry` | The ink detection trainer's dataset entry for the open labels. |
+| `vc3d_ink_labels_discard_suggestions` | `ink_labels.discard_suggestions` | Drop the shown ink suggestions and any running assist. |
+| `vc3d_ink_labels_fill` | `ink_labels.fill` | Flood-fill a region from a point, guided by the ink prediction or by equal labels, as one undo entry. |
+| `vc3d_ink_labels_history` | `ink_labels.history` | Undo or redo ink label edits; undo stops at the user's entries unless forced. |
+| `vc3d_ink_labels_import` | `ink_labels.import` | Import a label TIFF, PNG or label zarr into one label bit and wait for it. |
+| `vc3d_ink_labels_open` | `ink_labels.open` | Open the active segment's ink labels with an explicit autosave policy (never prompts). |
+| `vc3d_ink_labels_paint` | `ink_labels.paint` | Paint ink, background or validation labels from a stroke, polygon or mask in label or volume space, as one undo entry. |
+| `vc3d_ink_labels_read` | `ink_labels.read` | Write the current (also unsaved) label pixels of a rectangle to a PNG or TIFF. |
+| `vc3d_ink_labels_save` | `ink_labels.save` | Save the labels as the trainer's TIFFs (optionally as a new version) and wait for the write. |
+| `vc3d_ink_labels_set_tool_state` | `ink_labels.set_tool_state` | Set label mode, class, eraser, tool, radius, display and assist settings. |
+| `vc3d_ink_labels_panel` | `ink_labels.panel` | Show a named section of the native Ink Labels dock; optional floating window. |
+| `vc3d_ink_labels_control` | `ink_labels.control` | Operate an allowlisted, visible label control through its Qt signal, guarded by expected state. |
+| `vc3d_ink_labels_viewport_stroke` | `ink_labels.viewport_stroke` | Send 1..256 logical viewport positions through the label event filter, with per-event consumption and agent attribution. |
+| `vc3d_ink_labels_state` | `ink_labels.state` | Report the ink label session: store, canvas mapping, versions, tool, history, counts, assist, prediction and last save. |
+| `vc3d_ink_labels_suggest` | `ink_labels.suggest` | Find ink suggestions from the prediction, leaving labeled pixels out. |
+| `vc3d_ink_labels_versions` | `ink_labels.versions` | List the label versions in the store. |

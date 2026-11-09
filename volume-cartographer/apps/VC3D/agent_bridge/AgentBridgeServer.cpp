@@ -848,6 +848,8 @@ void AgentBridgeServer::registerHandlers()
     registerSegmentOpsHandlers();
     registerViewerDisplayHandlers();
     registerEditSettingsHandlers();
+
+    registerInkLabelHandlers();
 }
 
 

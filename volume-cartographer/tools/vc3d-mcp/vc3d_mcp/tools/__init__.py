@@ -12,6 +12,7 @@ from . import (  # noqa: F401  (imported for their registration side effects)
     editing_settings,
     fiber,
     flatten,
+    ink_labels,
     jobs,
     lasagna,
     manual_add,
