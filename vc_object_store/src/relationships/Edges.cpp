@@ -5,6 +5,7 @@
 #include "geometry/GeometryInternal.hpp"
 #include "internal/History.hpp"
 #include "internal/ExtensionHistory.hpp"
+#include "internal/RecordResolver.hpp"
 #include <nlohmann/json.hpp>
 #include <variant>
 
@@ -106,10 +107,7 @@ std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& 
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     const auto key=parseUuid(objectUuid);
-    if(!objectIdByUuid(db,key)) {
-        Statement present(db,"SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
-        if(!present.row())throw std::runtime_error("object store: object not found: "+objectUuid);
-    }
+    if(!resolveObject(db,objectUuid))throw std::runtime_error("object store: object not found: "+objectUuid);
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE state=0 AND (a_uuid=? OR b_uuid=?)" +
         (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id", key, key);
     return readEdgeRows(db, s);

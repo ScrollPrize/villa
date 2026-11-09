@@ -638,6 +638,8 @@ void storeReferenceVersionedFields(HistoryMode history)
     const std::vector<ExtensionRow> immutable{sample(firstUuid, 9)};
     OpenOptions options; options.history = history; options.author = "extension-test";
     std::string baseUuid;
+    ObjectVersion baseObjectVersion;
+    RelationshipVersion baseEdgeVersion;
     {
         auto base = ObjectStore::create(basePath, options);
         auto txn = base.write();
@@ -656,15 +658,28 @@ void storeReferenceVersionedFields(HistoryMode history)
         base.replaceExtensionRows(txn, edgeTable.name, edgeUuid, edges);
         base.appendExtensionRows(txn, immutableTable.name, immutable);
         base.seal(txn); txn.commit();
+        auto read=base.read();
+        baseObjectVersion=base.versionReference(read,*base.currentObjectRevision(read,firstUuid));
+        const auto sourceEdge=*base.edgeByUuid(read,edgeUuid);
+        baseEdgeVersion={baseUuid,sourceEdge.versionGeneration,edgeUuid,*sourceEdge.version};
     }
     const ObjectKey firstKey{baseUuid, firstUuid}, secondKey{baseUuid, secondUuid}, edgeKey{baseUuid, edgeUuid};
     const std::vector<ExtensionValue> firstPrefix{extensionUuid(firstUuid)};
     const std::vector<ExtensionValue> edgePrefix{extensionUuid(edgeUuid)};
     auto overlay = ObjectCollection::create(overlayPath, {basePath}, options);
     int64_t initialCommit = 0;
+    ObjectVersion borrowedSnapshotVersion;
     {
         auto txn = overlay.read();
         initialCommit = overlay.provisioning(txn).commitSequence;
+        require(overlay.objectAtVersion(txn,baseObjectVersion).has_value()&&
+            overlay.relationshipAtVersion(txn,baseEdgeVersion).has_value(),"exact object and edge versions resolve in referenced stores");
+        std::vector<ExtensionRow> oldObject,oldEdge;
+        overlay.scanExtensionRowsAtVersion(txn,objectTable.name,baseObjectVersion,[&](const auto& row){oldObject.push_back(row);return true;});
+        overlay.scanExtensionRowsAtVersion(txn,edgeTable.name,baseEdgeVersion,[&](const auto& row){oldEdge.push_back(row);return true;});
+        require(oldObject==first&&oldEdge==edges,"historical extension reads follow referenced versions before any local schema or owner exists");
+        auto missing=baseObjectVersion;++missing.version;
+        require(!overlay.objectAtVersion(txn,missing),"missing exact versions must not fall back to current state");
         require(rows(overlay, txn, objectTable.name, firstPrefix) == first &&
                 rows(overlay, txn, edgeTable.name, edgePrefix) == edges,
                 "referenced owner fields are visible before creating a local owner");
@@ -696,7 +711,19 @@ void storeReferenceVersionedFields(HistoryMode history)
     {
         auto txn = overlay.read();
         require(rows(overlay, txn, objectTable.name, firstPrefix) == first,
-                "localizing an owner for ordinary metadata preserves its typed manual fields");
+                "metadata override preserves borrowed typed manual fields");
+        const auto record=overlay.object(txn,firstKey)->record;
+        borrowedSnapshotVersion={overlay.uuid(txn),record.versionGeneration,firstUuid,*record.version};
+        auto local = ObjectStore::open(overlayPath, OpenOptions{.physicalPartitionOnly = true, .readOnly = true});
+        auto localTxn = local.read();
+        detail::Statement physical(ObjectStoreImplAccess::conn(localTxn),"SELECT count(*) FROM "+objectTable.name);
+        require(physical.row()&&physical.i64(0)==0, "metadata-only override copies no typed owner rows");
+        detail::Statement chunks(ObjectStoreImplAccess::conn(localTxn), "SELECT count(*) FROM geometry_chunks"); chunks.row();
+        require(chunks.i64(0) == 0, "metadata-only override copies no extension snapshot chunks");
+        if (history == HistoryMode::On) {
+            const auto versions = local.objectHistory(localTxn, firstUuid);
+            require(versions.size() == 1, "metadata override has only its actual edit in history");
+        }
     }
     std::vector<ExtensionRow> changed{first.front()};
     changed.front()[3] = std::string("local replacement");
@@ -766,6 +793,15 @@ void storeReferenceVersionedFields(HistoryMode history)
                 "owner tombstones also suppress inherited versioned rows in routed scans");
         require(rows(overlay, txn, immutableTable.name) == immutable,
                 "historical immutable computation results are not mistaken for editable current owner fields");
+        std::vector<ExtensionRow> oldObject,oldEdge;
+        overlay.scanExtensionRowsAtVersion(txn,objectTable.name,baseObjectVersion,[&](const auto& row){oldObject.push_back(row);return true;});
+        overlay.scanExtensionRowsAtVersion(txn,edgeTable.name,baseEdgeVersion,[&](const auto& row){oldEdge.push_back(row);return true;});
+        require(oldObject==first&&oldEdge==edges,"exact referenced versions survive overlay edits, clears and tombstones");
+        if(history==HistoryMode::On) {
+            oldObject.clear();
+            overlay.scanExtensionRowsAtVersion(txn,objectTable.name,borrowedSnapshotVersion,[&](const auto& row){oldObject.push_back(row);return true;});
+            require(oldObject==first,"historical overlay version follows its original borrowed snapshot, not current typed rows");
+        }
     }
     {
         auto base = ObjectStore::open(basePath, OpenOptions{.readOnly = true});

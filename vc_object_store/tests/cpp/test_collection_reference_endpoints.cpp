@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/InitialImport.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/CollectionReads.hpp"
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <atomic>
@@ -91,14 +92,15 @@ void noEndpointCopies(const std::filesystem::path& path)
         "('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones',"
         "'collection_external_chunks','current_geometry','current_geometry_chunks','current_shared_payloads')");
     require(redundant.row()&&redundant.i64(0)==0,"relations must not provision alias, proxy or chunk registration structures");
+    auto references=attachCollectionReferenceResolver(sql,path);
     const auto edges=db.edgesByKind(read,"perpendicular",true);
     if(!edges.empty()){
         const auto& first=edges.front();
         require(!db.neighbours(read,first.aUuid,{}, {},true).empty(),"physical neighbour traversal dropped an external endpoint");
         require(db.componentOf(read,first.aUuid,{},nullptr,true).size()==2,"physical component traversal lost direct endpoint keys");
-        mustFail([&]{db.neighbours(read,first.aUuid);});
-        mustFail([&]{db.componentOf(read,first.aUuid);});
-        mustFail([&]{db.neighbours(read,first.aUuid,{},"fiber",true);});
+        require(db.neighbours(read,first.aUuid).size()==1,"ordinary traversal resolves referenced lifecycle");
+        require(db.componentOf(read,first.aUuid).size()==2,"ordinary component traversal resolves referenced endpoints");
+        require(db.neighbours(read,first.aUuid,{},"fiber",true).size()==1,"ordinary traversal resolves referenced kind");
     }
 }
 

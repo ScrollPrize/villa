@@ -1,4 +1,5 @@
 #include "internal/RecordSql.hpp"
+#include "internal/RecordResolver.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "geometry/GeometryDelta.hpp"
 
@@ -19,10 +20,8 @@ std::string ObjectStore::insertObjectWithId(WriteTxn& txn, const ObjectRecord& r
 
 std::optional<ObjectRecord> ObjectStore::objectByUuid(const Txn& txn, const std::string& uuid) const
 {
-    sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=? AND state<>2", parseUuid(uuid));
-    if (!s.row()) return std::nullopt;
-    return readObjectRow(db, s);
+    const auto object=resolveObject(static_cast<sqlite3*>(connection(txn)),uuid);
+    return object?std::optional(object->record):std::nullopt;
 }
 
 std::vector<ObjectRecord> ObjectStore::objectsByKind(const Txn& txn, const std::string& kind,

@@ -18,14 +18,14 @@ inline void requireBinaryUuidStorage(const vc::objects::ObjectStore& store,const
             if(column!="uuid"&&!column.ends_with("_uuid")&&!reference&&
                 !(table=="hub_leases"&&column=="holder")&&!(table=="hub_upstream"&&column=="hub_replica"))continue;
             if(columns.text(1)!="BLOB")throw std::runtime_error("UUID column must declare BLOB: "+table+"."+column);
-            const bool tagged=reference||(table=="history_expected"&&column=="revision_uuid");
+            const bool versioned=(table=="relationship_revisions"&&(column=="a_revision"||column=="b_revision"))||(table=="history_expected"&&column=="revision_uuid");
             // All names originate from our schema. Quote anyway so the audit
             // remains valid for an extension containing punctuation.
             const auto quote=[](const std::string& s){std::string q="\"";for(char c:s){q+=c;if(c=='\"')q+=c;}return q+'\"';};
             const auto name=quote(column);
             Statement invalid(db,"SELECT count(*) FROM "+quote(table)+" WHERE "+name+" IS NOT NULL AND NOT "
                 "(typeof("+name+")='blob' AND length("+name+")=16"+
-                (tagged?" OR (typeof("+name+")='text' AND ("+name+" GLOB 'external:*' OR "+name+" GLOB 'current:*'))":"")+")");
+                (versioned?" OR (typeof("+name+")='blob' AND length("+name+")=56)":"")+")");
             if(!invalid.row()||invalid.i64(0)!=0)throw std::runtime_error("UUID must use BLOB16 storage: "+table+"."+column);
         }
     }

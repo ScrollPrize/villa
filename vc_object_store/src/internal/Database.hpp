@@ -45,14 +45,10 @@ struct CurrentWriteState {
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
     // Installed only by a collection transaction with pinned dependencies.
-    // Hashes resolve directly through pinned readonly dependencies, without
-    // per-reference registration. Size returns zero when no dependency owns it.
-    std::function<std::vector<uint8_t>(const std::string&)> externalGeometryChunk;
-    std::function<int64_t(const std::string&)> externalGeometryChunkSize;
-    std::function<ObjectRecord(const std::string&)> externalEndpointRecord;
-    std::function<std::string(const std::string&)> externalEndpointVersion;
-    std::function<std::optional<std::string>(const std::string&)> externalEndpointOwner;
-    std::function<void(const std::string&,const Anchor&)> externalEndpointValidateAnchor;
+    // Shared lookup for immutable records and payloads. Owns no data, aliases
+    // or per-record directories; returned connections live for the transaction.
+    std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> referenceSource;
+    std::function<sqlite3*(const std::string&,bool)> objectSource;
     std::shared_ptr<CurrentWriteState> currentWrite;
     bool historyEnabled = true;
     bool spatialEnabled = true;

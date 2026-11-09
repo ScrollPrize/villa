@@ -4,7 +4,7 @@
 #include "internal/SqlValues.hpp"
 #include "geometry/GeometryDelta.hpp"
 #include "internal/ImmutableImport.hpp"
-#include "internal/ExternalEndpoint.hpp"
+#include "internal/RecordResolver.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -36,10 +36,9 @@ std::string detail::activeEdgeSql()
 namespace {
 ObjectRecord endpointLifecycle(sqlite3* db,const std::string& uuid)
 {
-    Statement row(db,"SELECT id,state FROM objects WHERE uuid=?",parseUuid(uuid));
-    if(!row.row())return externalEndpointRecord(db,uuid);
-    ObjectRecord record;readLifecycle(db,row.i64(0),record);
-    record.retired=record.retired||row.i64(1)!=0;return record;
+    const auto object=resolveObject(db,uuid);
+    if(!object)throw std::runtime_error("relationship endpoint is missing or deleted");
+    return object->record;
 }
 }
 

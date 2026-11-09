@@ -42,6 +42,7 @@ add_library(vc_objects ${_vc_store_library_type}
     internal/InitialEdges.cpp
     internal/InitialObjects.cpp
     internal/RecordJson.cpp
+    geometry/GeometryReference.cpp
     Uuid.cpp
     internal/JsonFields.cpp
     formats/FiberJson.cpp

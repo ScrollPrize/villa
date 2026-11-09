@@ -5,6 +5,8 @@
 #include "internal/Versions.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "geometry/GeometryToken.hpp"
+#include "internal/RecordResolver.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 
 namespace vc::objects::detail {
 const char* kObjectCols =
@@ -398,7 +400,12 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         rec.version = managed.i64(0);
         rec.dataChecksum = managed.text(1);
     } else if (rec.storageKind == "sqlite") {
-        throw std::invalid_argument("object store: managed geometry requires putGeometry, not a storage_kind override");
+        // A metadata override may retain, never invent/change, an existing
+        // managed reference. No geometry payload or descriptor is copied.
+        const auto original=resolveObject(db,rec.uuid);
+        if(!original||original->record.storageKind!=rec.storageKind||original->record.storageRef!=rec.storageRef||
+           original->record.dataChecksum!=rec.dataChecksum)
+            throw std::invalid_argument("object store: managed geometry requires putGeometry, not a storage_kind override");
     }
 
     int64_t id = 0;
@@ -419,6 +426,8 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
             version, rec.dataChecksum, rec.meta, id);
     } else {
         if (!restoringExtensions) rejectInitialExtensionMetadata(rec.meta);
+        if(!historyEnabled(db)&&nlohmann::json::parse(rec.meta).contains(kArtifactsMetaKey))
+            beforeCurrentObjectEdit(db,rec.uuid);
         id = allocateRecordId(db, "objects");
         insertObjectRow(db,rec,id,commit_sequence,author,host,now,preserveRecord);
     }
@@ -466,6 +475,8 @@ std::string jsonPathForKey(const std::string& key)
 
 std::optional<std::string> geometryHead(sqlite3* db, const std::string& objectUuid)
 {
+    db=objectSource(db,objectUuid);
+    if(!db)return std::nullopt;
     Statement s(db,"SELECT storage_ref FROM objects WHERE uuid=? AND state<>2 AND geometry_manifest IS NOT NULL",parseUuid(objectUuid));
     return s.row()?std::optional(s.text(0)):std::nullopt;
 }

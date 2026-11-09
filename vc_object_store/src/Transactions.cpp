@@ -33,17 +33,16 @@ void Txn::commit()
 void Txn::release(bool commit)
 {
     auto* conn = static_cast<sqlite3*>(handle_);
-    handle_ = nullptr;
     auto releaseConnection = [&] {
+        handle_ = nullptr;
         // Collection resolvers capture the transaction's pinned dependencies;
         // pooled connections must never retain those captures after release.
         if (const auto pool = activeStatementPools.find(conn); pool != activeStatementPools.end()) {
-            pool->second->externalGeometryChunk = {};
-            pool->second->externalGeometryChunkSize = {};
-            pool->second->externalEndpointRecord = {};
-            pool->second->externalEndpointVersion = {};
-            pool->second->externalEndpointOwner = {};
-            pool->second->externalEndpointValidateAnchor = {};
+            // Readers can hold a pinned dependency connection. Never retain
+            // such readers after releasing this collection transaction.
+            if (pool->second->referenceSource) pool->second->geometryCache.reset();
+            pool->second->referenceSource = {};
+            pool->second->objectSource = {};
             pool->second->currentWrite.reset();
         }
         activeStatementPools.erase(conn);
@@ -87,7 +86,7 @@ void* ObjectStore::connection(const Txn& txn) const {
     return ObjectStoreImplAccess::conn(txn);
 }
 
-ReadTxn ObjectStore::read()
+ReadTxn ObjectStore::read() const
 {
     sqlite3* conn = impl_->checkoutReader();
     try {

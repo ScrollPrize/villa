@@ -86,15 +86,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
         std::vector<int64_t> originalIds;
         if(!idsName.empty()) {
             originalIds=idsOf(reader,idsName,oldCount);
-            // Restoration must not allow a previously allocated ID to be reused.
-            Statement latest(db,historyEnabled(db) ? "SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY rowid DESC LIMIT 1" :
-                "SELECT geometry_manifest FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
-                parseUuid(uuid));
-            if(latest.row()) {
-                const auto tip=Json::parse(latest.text(0));
-                if(tip.at("sequences").at(edit.array).at("allocated")!=state.at("allocated"))
-                    allocated.mergeAllocated(MetadataSnapshot(db,tip.at("sequences").at(edit.array).at("allocated")));
-            }
+            mergeRetainedAllocations(db,uuid,edit.array,allocated);
         }
         const auto tail=edit.start+edit.eraseCount;
         std::set<int64_t> liveIds;

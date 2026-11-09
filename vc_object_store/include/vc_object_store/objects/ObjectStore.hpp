@@ -381,13 +381,13 @@ public:
     const std::optional<TransactionReceipt>& receipt() const { return receipt_; }
 
 protected:
-    Txn(ObjectStore* db, void* handle, bool write) : db_(db), handle_(handle), write_(write) {}
+    Txn(const ObjectStore* db, void* handle, bool write) : db_(db), handle_(handle), write_(write) {}
     void release(bool commit);
 
 private:
     friend class ObjectStore;
     friend struct ObjectStoreImplAccess;
-    ObjectStore* db_ = nullptr;
+    const ObjectStore* db_ = nullptr;
     void* handle_ = nullptr;  // sqlite3*
     bool write_ = false;
     RevisionSelection expectedRevisions_;
@@ -397,7 +397,7 @@ private:
 
 class ReadTxn : public Txn {
 public:
-    ReadTxn(ObjectStore* db, void* handle) : Txn(db, handle, false) {}
+    ReadTxn(const ObjectStore* db, void* handle) : Txn(db, handle, false) {}
 };
 
 class WriteTxn : public Txn {
@@ -469,7 +469,7 @@ public:
     ObjectStore(const ObjectStore&) = delete;
     ObjectStore& operator=(const ObjectStore&) = delete;
     ~ObjectStore();
-    ReadTxn read();
+    ReadTxn read() const;
     VolumeTransforms volumeTransforms(const Txn&) const;
     std::vector<vcr::catalog::TransformResolution> availableTransforms(const Txn&, const std::string& objectUuid) const;
     // Exact polyline length after mapping to target voxels; reads bounded chunks.

@@ -1,5 +1,6 @@
 #include "internal/Extensions.hpp"
 #include "internal/Database.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include <cctype>
 #include <cmath>
 #include <set>
@@ -263,6 +264,18 @@ void ObjectStore::createExtensionTable(WriteTxn& t,const ExtensionTable& spec){d
 std::vector<ExtensionTableInfo> ObjectStore::extensionTables(const Txn& t) const{return detail::extensionTables(static_cast<sqlite3*>(connection(t)));}
 void ObjectStore::appendExtensionRows(WriteTxn& t,const std::string& name,std::span<const ExtensionRow> rows){detail::appendExtensionRows(static_cast<sqlite3*>(connection(t)),name,rows);}
 void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix) const {
-    detail::scanExtensionRows(static_cast<sqlite3*>(connection(t)),name,visitor,prefix);
+    auto* db=static_cast<sqlite3*>(connection(t));
+    const auto table=extensionTable(db,name);
+    if(!table)throw std::invalid_argument("extension: unregistered table "+name);
+    if(!visitor||prefix.size()>table->primaryKey.size())throw std::invalid_argument("extension: invalid scan");
+    if(!table->versioned){detail::scanExtensionRows(db,name,visitor,prefix);return;}
+    scanExtensionOwnerKeys(db,*table,prefix,[&](const std::string& owner){
+        if(table->keySpace=="objects") {
+            const auto record=objectByUuid(t,owner);
+            return !record||scanExtensionSnapshot(db,*table,owner,record->meta,visitor,prefix);
+        }
+        const auto record=edgeByUuid(t,owner);
+        return !record||scanExtensionSnapshot(db,*table,owner,record->meta,visitor,prefix);
+    });
 }
 } // namespace vc::objects

@@ -35,7 +35,6 @@ struct GeometryViewState {
     std::optional<std::map<int64_t, int64_t>> pointIndex;
     void requireCurrent() const {
         read->require();
-        if (!parseCurrentGeometryToken(revision.uuid)) return;
         const auto* local = dynamic_cast<const LocalStoreReader*>(read->reader);
         if (!local || sqlite3_txn_state(ObjectStoreImplAccess::conn(local->txn()), "main") != SQLITE_TXN_WRITE) return;
         const auto current = local->geometryRevision(revision.uuid);

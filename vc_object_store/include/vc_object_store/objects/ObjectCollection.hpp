@@ -90,6 +90,15 @@ public:
     // relevant partition in each layer. Unfiltered scans visit all partitions.
     void scanExtensionRows(const CollectionTxn&, const std::string&,
         const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {}) const;
+    // Exact version references retain their meaning across overlays. No
+    // substitution of a newer local owner or dependency version is allowed.
+    std::optional<ObjectRevision> objectAtVersion(const CollectionTxn&, const ObjectVersion&) const;
+    std::optional<RelationshipRevision> relationshipAtVersion(const CollectionTxn&, const RelationshipVersion&) const;
+    void scanExtensionRowsAtVersion(const CollectionTxn&, const std::string&, const ObjectVersion&,
+        const std::function<bool(const ExtensionRow&)>&) const;
+    void scanExtensionRowsAtVersion(const CollectionTxn&, const std::string&, const RelationshipVersion&,
+        const std::function<bool(const ExtensionRow&)>&) const;
+    std::vector<uint8_t> readGeometryArrayAtVersion(const CollectionTxn&, const ObjectVersion&, const std::string& array) const;
     // Flush the local writer's committed WAL; referenced readonly stores are unchanged.
     void checkpoint();
     std::vector<CollectionMember> members() const;
@@ -103,6 +112,9 @@ public:
     void scanObjects(const CollectionTxn&, const std::function<bool(const CollectionObject&)>&, const std::optional<std::string>& kind = {}) const;
     std::optional<GeometryRevision> currentGeometry(const CollectionTxn&, const ObjectKey&) const;
     std::vector<uint8_t> readGeometryArray(const CollectionTxn&, const ObjectKey&, const std::string& array) const;
+    std::optional<uint64_t> artifactLength(const CollectionTxn&,const std::string& hash) const;
+    std::vector<uint8_t> readArtifact(const CollectionTxn&,const std::string& hash,uint64_t offset=0,
+                                    const std::optional<uint64_t>& count=std::nullopt) const;
     std::string putGeometry(CollectionTxn&, const ObjectKey&, const GeometryData&);
     // Same sparse-edit rules as ObjectStore. Inherited incident edges must be
     // explicitly removed/recreated locally before changing their geometry.
@@ -113,6 +125,10 @@ public:
     std::optional<CollectionEdge> edge(const CollectionTxn&, const ObjectKey&) const;
     std::optional<CollectionEdge> edgeById(const CollectionTxn&, const std::string& owner, int64_t id) const;
     ObjectKey upsertObject(CollectionTxn&, const ObjectRecord&);
+    // Metadata writes create a same-key record override, not a local dataset.
+    // The geometry descriptor is copied; payloads/archives and extension
+    // snapshots remain borrowed from pinned bases;
+    // file references are rebased if their owning directory changes.
     void replaceObject(CollectionTxn&, const ObjectKey&, const ObjectRecord&);
     void setMeta(CollectionTxn&, const ObjectKey&, const std::string&, const std::string& json);
     void deleteObject(CollectionTxn&, const ObjectKey&);

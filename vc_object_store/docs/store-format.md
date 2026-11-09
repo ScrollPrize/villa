@@ -30,6 +30,8 @@ Graph snapshots expose these ordinary object versions as C++ `GraphReadView::ver
 
 A historical reference is `(store UUID, lineage UUID, object UUID, version)`. Existing upstream archives use these same versions and commit sequences. Geometry descriptors are ordinary object state: changing the descriptor changes the object's version. Chunk hashes identify payload content, not another geometry-change counter.
 
+History's `object_revisions.geometry_uuid` and geometry's `geometry_revisions.parent_uuid` store exact geometry references, not local-only foreign keys. A reference is the same geometry UUID in both history modes. The descriptor may be current object state or a retained archive, locally or in a sealed dependency. The shared resolver validates and reads that record in the transaction's pinned scope. Metadata history retains the original descriptor/reference unchanged; a geometry edit can directly reference its inherited parent without creating a duplicate base revision. This adds no tables, counters or payload-registration records.
+
 ## History-off current storage
 
 `OpenOptions::history = HistoryMode::Off` selects a new store's persistent policy. Opens honor the stored policy, not the creation-option default. This does not disable SQLite rollback/WAL transaction safety.
@@ -39,12 +41,12 @@ History-off retains typed current objects, relationships, lifecycle state, tags 
 | Current storage | Contents |
 | --- | --- |
 | `objects.geometry_manifest` | Geometry descriptor with ordered chunk hashes and shared metadata references |
-| `objects.storage_ref`, `data_checksum` | Current geometry token and content checksum |
+| `objects.storage_ref`, `data_checksum` | Current geometry UUID and content checksum |
 | `geometry_chunks` | Binary content hash and non-null payload |
 
 There are no separate current-geometry, current-chunk-map, shared-payload-reference or geometry-head tables. Both history policies use the object's current descriptor. History-enabled stores additionally retain the existing archives until the later history redesign.
 
-History-off geometry tokens are `current:<32 object UUID hex digits>:<version at geometry write>`. Metadata-only edits need not change this token; the view's `version()` reports the current object version. Repeated geometry writes in one transaction may share a token and eventual version. Borrowed writer views therefore also check descriptor content, rejecting stale in-transaction geometry. Read snapshots retain SQLite isolation.
+Each new geometry state receives an ordinary UUID, including repeated writes in one transaction and independent overlay branches. Metadata-only edits retain that UUID; the view's `version()` reports the selected object version. History-off retains only the current descriptor, while history-on also retains previous geometry states. Both use the same descriptor/payload resolver, and stale history-off writer views are rejected once their UUID is replaced. Read snapshots retain SQLite isolation. The existing generic `storage_ref` column holds the canonical UUID text; geometry/archive reference columns use binary UUIDs. An index on current `storage_ref` supports direct UUID lookup without scanning objects.
 
 Edit validation uses transaction-local C++ snapshots and savepoint rollback, not temporary SQL tables. Immutable batch construction does not create interactive-edit snapshots. Superseded payloads are not scanned/reclaimed on every write; explicit reclamation is a separate maintenance concern.
 
@@ -58,13 +60,13 @@ Edges store endpoint UUIDs directly in `a_uuid`/`b_uuid`, identically for local,
 
 Each edge UUID identifies one observation. Different UUIDs may describe the same endpoint pair and kind; duplicate live UUIDs are rejected. There is no extra relation key or endpoint-pair uniqueness constraint. Relationship tags remain ordinary tags, not additional endpoint objects.
 
-No persistent current edge-geometry/lifecycle bindings duplicate endpoint state. Geometry/dependency changes require an explicit relationship decision before commit. Transaction-local decisions cannot approve a later unreviewed endpoint change. Archived relationships may retain exact historical endpoint selections when history exists.
+No persistent current edge-geometry/lifecycle bindings duplicate endpoint state. Geometry/dependency changes require an explicit relationship decision before commit. Transaction-local decisions cannot approve a later unreviewed endpoint change. Archived relationships retain exact endpoint versions when history exists. An archived object revision is referenced directly by its binary UUID; otherwise an exact current-only version is encoded as `(store UUID, lineage UUID, object UUID, version)`—three binary 16-byte UUIDs and a little-endian 64-bit version (56 bytes). Both forms use the shared exact-version reader, whether local or referenced; there is no special external-endpoint encoding or relaxed dependency check. A missing version is never silently substituted by a current one.
 
 ### History maintenance and sessions
 
 `changeHistoryMode(path, HistoryMode::On)` enables retained history. `changeHistoryMode(path, HistoryMode::Off)` explicitly removes it and disables further retention. The CLI forms are `vc_object_convert --enable-history STORE` and `vc_object_convert --remove-history-and-disable STORE`. Close every other handle first. These offline operations stage and validate a sibling replacement, atomically replacing the original only after success; sealed sources require a new export. Current record versions and commit sequence never reset. Enabling history archives existing current state under its existing identities.
 
-Geometry tokens may change between archival UUIDs and current tokens during maintenance; reopen handles and reload views afterward. Compatible extensions survive; incompatible dependencies fail conversion without replacing the source.
+Geometry UUIDs are preserved during history-policy maintenance; reopen handles and reload views afterward. Compatible extensions survive; incompatible dependencies fail conversion without replacing the source.
 
 Current native export/copy, typed snapshots, projects/documents/umbilici and catalog fetching work with either policy. Checked edits always use ordinary numbered versions and typed transaction requests; no separate store-generation-only write API is needed. `StoreStatus.historyEnabled` describes feed availability. A history-off session detects lineage/commit changes and emits `StoreSessionEvent.revalidate=true` with no fabricated journal entries. Clients must re-read cached state. Hosted snapshots similarly validate a stable commit sequence instead of replaying absent history.
 

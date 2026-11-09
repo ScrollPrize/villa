@@ -1,8 +1,30 @@
 #include "geometry/SequenceMetadata.hpp"
+#include "internal/ReferenceResolver.hpp"
 #include "geometry/SequenceIdentity.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 
 namespace vc::objects::detail {
+void mergeRetainedAllocations(sqlite3* db,const std::string& object,const std::string& array,MetadataSnapshot& into)
+{
+    std::set<std::string> seen;
+    const auto merge=[&](sqlite3* source,const std::string& text){
+        const auto manifest=SharedJson::parse(text);
+        if(!manifest.contains("sequences")||!manifest.at("sequences").contains(array))return;
+        const auto& sequence=manifest.at("sequences").at(array);
+        if(!sequence.contains("allocated"))return;
+        const auto& allocated=sequence.at("allocated");
+        if(seen.insert(allocated.dump()).second)into.mergeAllocated(MetadataSnapshot(source,allocated));
+    };
+    resolveReference(db,[&](sqlite3* source){
+        Statement current(source,"SELECT geometry_manifest FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",parseUuid(object));
+        if(current.row())merge(source,current.text(0));
+        if(historyEnabled(source)){
+            Statement rows(source,"SELECT DISTINCT json_extract(manifest,'$.sequences') FROM geometry_revisions WHERE object_uuid=?",parseUuid(object));
+            while(rows.row())if(!rows.isNull(0))merge(source,SharedJson{{"sequences",SharedJson::parse(rows.text(0))}}.dump());
+        }
+        return false;
+    });
+}
 namespace {
 using Json=nlohmann::json;
 struct Cached {Json value;size_t bytes;};

@@ -51,11 +51,11 @@ int main() try
         const auto previous=borrowed.fiber(fiber);
         require(previous.load().linePoints.back()[0]==21,"writer view reads current geometry");
         require(store.geometryLengthInVolume(txn,fiber,"b")==42,"writer transformed length before replacement");
-        require(store.editGeometry(txn,fiber,{change(22)},token)==token,
-                "current geometry identity is object plus object version");
+        require(store.editGeometry(txn,fiber,{change(22)},token)!=token,
+                "each geometry write has its own UUID even within one object version");
         mustFail([&]{previous.load();});
         require(borrowed.fiber(fiber).load().linePoints.back()[0]==22,"new writer view sees replacement at same version");
-        require(store.geometryLengthInVolume(txn,fiber,"b")==44,"writer transformed length does not cache same-token old geometry");
+        require(store.geometryLengthInVolume(txn,fiber,"b")==44,"writer transformed length does not cache replaced-geometry old geometry");
         // Roll back to preserve the fixture used by the session checks below.
     }
     ObjectStoreSession session;

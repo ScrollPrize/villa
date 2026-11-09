@@ -1,7 +1,7 @@
 #include "internal/EdgeSql.hpp"
 #include "internal/History.hpp"
 #include "geometry/GeometryToken.hpp"
-#include "internal/ExternalEndpoint.hpp"
+#include "internal/RecordResolver.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -12,12 +12,8 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto key=parseUuid(objectUuid);
-    Statement own(db,"SELECT state FROM objects WHERE uuid=?",key);
-    if(own.row()) {if(own.i64(0)==2)return {};}
-    else {Statement known(db,"SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
-        if(!known.row())throw std::runtime_error("object store: object not found: "+objectUuid);
-        if(!includeRetired&&externalEndpointRecord(db,objectUuid).retired)return {};
-    }
+    const auto own=resolveObject(db,objectUuid);
+    if(!own||(!includeRetired&&own->record.retired))return {};
     if (applicableOnly) requirePublishedGraphRead(txn);
     const std::string filter = " AND state=0" + fiberAdjacencySql(adjacentFilter) +
         (edgeKind ? std::string(" AND kind=?2") : " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'") +
@@ -35,10 +31,9 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
     while (rows.row()) {
         const auto next = formatUuid(rows.blob16(0));
         if (seen.contains(next)) continue;
-        if(rows.isNull(2)&&(!includeRetired||neighbourKind)){
-            const auto endpoint=externalEndpointRecord(db,next);
-            if((!includeRetired&&endpoint.retired)||(neighbourKind&&endpoint.kind!=*neighbourKind))continue;
-        }else if(neighbourKind&&rows.text(3)!=*neighbourKind)continue;
+        const auto endpoint=resolveObject(db,next);
+        if(!endpoint||(!includeRetired&&endpoint->record.retired)||
+           (neighbourKind&&endpoint->record.kind!=*neighbourKind))continue;
         if (applicableOnly && !currentRelationshipApplicable(*this, txn, formatUuid(rows.blob16(1)))) continue;
         seen.insert(next); out.push_back(next);
     }
@@ -92,12 +87,10 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
             const_cast<std::atomic_bool*>(cancel));
     const auto startBytes = parseUuid(startUuid);
     auto active=[&](const std::string& uuid) {
-        Statement local(db,"SELECT state FROM objects WHERE uuid=?",parseUuid(uuid));
-        if(local.row())return local.i64(0)!=2&&(includeRetired||local.i64(0)==0);
-        return includeRetired||!externalEndpointRecord(db,uuid).retired;
+        const auto object=resolveObject(db,uuid);
+        return object&&(includeRetired||!object->record.retired);
     };
-    Statement known(db,"SELECT 1 FROM objects WHERE uuid=?1 UNION ALL SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",startBytes);
-    if(!known.row())throw std::runtime_error("object store: object not found: "+startUuid);
+    if(!resolveObject(db,startUuid))throw std::runtime_error("object store: object not found: "+startUuid);
     if(!active(startUuid))return {};
     // Probe the endpoint indexes only for nodes reached by this traversal.
     // Visit neighbours in stable internal-ID order.

@@ -77,13 +77,13 @@ int main() try {
         Statement counts(ObjectStoreImplAccess::conn(r),"SELECT (SELECT count(*) FROM objects),"
             "(SELECT count(*) FROM sqlite_schema WHERE name IN ('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones')),"
             "(SELECT count(*) FROM objects WHERE geometry_manifest IS NOT NULL),(SELECT count(*) FROM geometry_chunks)");
-        // The metadata override for a retains its existing geometry descriptor
-        // in the ordinary object row, but all payload bytes remain inherited.
+        // Metadata overrides copy their small descriptor, not payloads.
+        // Adding an edge must not copy any additional endpoint records.
         require(counts.row()&&counts.i64(0)==3&&counts.i64(1)==0&&counts.i64(2)==1&&counts.i64(3)==0,
             "adding indexed edge must not copy endpoints beyond two existing overrides and the owned object");
         Statement descriptor(ObjectStoreImplAccess::conn(r),"SELECT uuid FROM objects WHERE geometry_manifest IS NOT NULL");
         require(descriptor.row()&&formatUuid(descriptor.blob16(0))==a.objectUuid&&!descriptor.row(),
-            "only the explicit metadata override retains its inherited geometry descriptor");
+            "only the metadata override copies its geometry descriptor");
     }
     const auto boundGeneration=generation(overlay);
     {

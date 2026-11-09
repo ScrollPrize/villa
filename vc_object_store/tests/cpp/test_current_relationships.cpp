@@ -118,9 +118,11 @@ void currentGeometryTokens(){
         id=db.upsertObject(w,record);token=db.putGeometry(w,id,shape());
         require(x(db.readGeometryArray(w,token,"line_points"))==1,"first current payload read");
         const auto second=db.editGeometry(w,id,{edit(0,8)},token);
-        require(second==token,"multiple geometry writes share publication token");
-        require(x(db.readGeometryArray(w,token,"line_points"))==8,"same-token current read sees latest bytes");
-        require(x(db.readGeometryArrays(w,{token,token},"line_points").data)==8,"same-token batched read sees latest bytes");
+        require(second!=token,"each geometry write gets an independent UUID");
+        mustFail([&]{db.readGeometryArray(w,token,"line_points");});
+        token=second;
+        require(x(db.readGeometryArray(w,token,"line_points"))==8,"replaced-geometry current read sees latest bytes");
+        require(x(db.readGeometryArrays(w,{token,token},"line_points").data)==8,"replaced-geometry batched read sees latest bytes");
         db.registerVolumeTransform(w,"a","b",VolumeAffine::scale(2),"test");w.commit();}
     {auto r=db.read();ObjectSelection selected;selected.kind="fiber";
         const auto graph=db.graphReadView(r,selected,{});
@@ -136,7 +138,7 @@ void currentGeometryTokens(){
         require(next!=token,"next publication changes geometry token");
         const auto beforeLength=db.geometryLengthInVolume(w,id,"b");
         db.editGeometry(w,id,{edit(0,12)},next);
-        require(db.geometryLengthInVolume(w,id,"b")>beforeLength,"same-token edit invalidates transformed length cache");
+        require(db.geometryLengthInVolume(w,id,"b")>beforeLength,"replaced-geometry edit invalidates transformed length cache");
         w.commit();}
     {auto r=db.read();require(!db.geometryRevision(r,token),"superseded current token is unavailable");}
     std::string sheet,revision;
@@ -149,10 +151,11 @@ void currentGeometryTokens(){
         std::vector<GeometryArrayEdit> edits;
         for(int64_t index=0;index<4;++index){const float z=20;std::vector<uint8_t> bytes(sizeof z);
             std::memcpy(bytes.data(),&z,sizeof z);edits.push_back({"points",3*index+2,std::move(bytes)});}
-        require(db.editGeometry(w,sheet,edits,revision)==revision,"surface edit shares the current object version");
+        const auto changed=db.editGeometry(w,sheet,edits,revision);
+        require(changed!=revision,"surface edit gets a distinct geometry UUID");revision=changed;
         {GeometryReader reader(w,revision);
             require(surfaceTile(o.surfaceTiles.get(),revision,reader,0,0,2,2)->points.front()[2]==20,
-                "shared tile cache cannot return stale same-token geometry");}
+                "shared tile cache cannot return stale replaced-geometry geometry");}
         w.commit();}
     {auto r=db.read();SurfaceProximityQuery query;query.point={.5,.5,21};query.tolerance=2;
         const auto hits=db.nearestSurfaces(r,query);

@@ -4,6 +4,7 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 
 #include <fstream>
@@ -23,10 +24,57 @@ void writeFile(const std::filesystem::path& path, const std::string& bytes)
 {
     std::ofstream(path, std::ios::binary) << bytes;
 }
+
+void referencedArtifacts()
+{
+    for(const auto baseHistory:{HistoryMode::Off,HistoryMode::On})
+    for(const auto overlayHistory:{HistoryMode::Off,HistoryMode::On}) {
+        TemporaryDirectory directory;
+        const auto basePath=directory.path/"base",middlePath=directory.path/"middle",overlayPath=directory.path/"overlay";
+        const auto id=util::newUuid();std::string hash;
+        OpenOptions options;options.author="artifact-references";options.history=baseHistory;
+        writeFile(directory.path/"bytes","reference artifact bytes");
+        {
+            auto base=ObjectStore::create(basePath,options);
+            hash=base.putArtifact(directory.path/"bytes");
+            auto w=base.write();base.upsertObject(w,trackRecord(id));
+            base.setMeta(w,id,kArtifactsMetaKey,artifactManifestJson({{"bytes",hash,24}}));
+            base.seal(w);w.commit();
+        }
+        options.history=overlayHistory;
+        {
+            auto middle=ObjectCollection::create(middlePath,{basePath},options);
+            auto w=middle.write();middle.setMeta(w,{{},id},"note","true");middle.seal(w);w.commit();
+        }
+        auto overlay=ObjectCollection::create(overlayPath,{middlePath},options);
+        {
+            auto w=overlay.write();overlay.setMeta(w,{{},id},"label","3");w.commit();
+            auto r=overlay.read();
+            require(overlay.artifactLength(r,hash)==24,"artifact size resolves through nested references");
+            const auto bytes=overlay.readArtifact(r,hash,10,8);
+            require(std::string(bytes.begin(),bytes.end())=="artifact","artifact range resolves through nested references");
+        }
+        require(!std::filesystem::exists(artifactBlobDirectory(overlayPath))&&!std::filesystem::exists(artifactBlobDirectory(middlePath)),
+            "metadata overrides never copy artifact payloads");
+        mustFail([&]{auto w=overlay.write();overlay.setMeta(w,{{},id},kArtifactsMetaKey,
+            artifactManifestJson({{"missing",std::string(64,'e'),5}}));w.commit();});
+        {
+            auto r=overlay.read();require(artifactManifest(overlay.object(r,{{},id})->record).front().sha256==hash,
+                "invalid artifact replacement rolls back");
+        }
+        // Direct history-off creates are checked too, not only edits.
+        options.history=HistoryMode::Off;
+        auto plain=ObjectStore::create(directory.path/"plain",options);
+        mustFail([&]{auto w=plain.write();auto record=trackRecord(util::newUuid());
+            record.meta=nlohmann::json{{kArtifactsMetaKey,nlohmann::json::parse(artifactManifestJson({{"missing",hash,24}}))}}.dump();
+            plain.upsertObject(w,record);w.commit();});
+    }
+}
 } // namespace
 
 int main()
 try {
+    referencedArtifacts();
     TemporaryDirectory directory;
     const auto path = directory.path / "artifacts.vcobj";
     OpenOptions options; options.author = "artifacts-test";

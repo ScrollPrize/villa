@@ -1,6 +1,7 @@
 #include "internal/Versions.hpp"
 #include "internal/History.hpp"
 #include "internal/Extensions.hpp"
+#include "internal/RecordResolver.hpp"
 
 #include <limits>
 
@@ -436,7 +437,8 @@ std::optional<TransactionReceipt> ObjectStore::receipt(const Txn& txn, const std
 
 std::optional<int64_t> ObjectStore::currentVersion(const Txn& txn, const std::string& objectUuid) const
 {
-    return headVersion(static_cast<sqlite3*>(connection(txn)), canonical(objectUuid));
+    auto* source=objectSource(static_cast<sqlite3*>(connection(txn)),canonical(objectUuid));
+    return source?headVersion(source,canonical(objectUuid)):std::nullopt;
 }
 
 std::optional<int64_t> ObjectStore::currentRelationshipVersion(const Txn& txn, const std::string& uuid) const
@@ -452,7 +454,15 @@ std::optional<ObjectRevision> ObjectStore::objectAtVersion(const Txn& txn, const
 ObjectVersion ObjectStore::versionReference(const Txn& txn, const ObjectRevision& revision) const
 {
     if (revision.version <= 0) throw std::invalid_argument("object history: revision has no numbered version");
-    return {storeUuidText(static_cast<sqlite3*>(connection(txn))), revision.generation, revision.objectUuid, revision.version};
+    if(revision.uuid.empty()) {
+        const auto current=resolveObject(static_cast<sqlite3*>(connection(txn)),revision.objectUuid);
+        if(!current||current->record.version!=revision.version||current->record.versionGeneration!=revision.generation)
+            throw std::invalid_argument("object history: current-only version is unavailable");
+        return objectVersion(*current);
+    }
+    const auto resolved=resolveObjectRevision(static_cast<sqlite3*>(connection(txn)),revision.uuid);
+    if(!resolved)throw std::invalid_argument("object history: revision is unavailable");
+    return {storeUuidText(resolved->source), resolved->revision.generation, resolved->revision.objectUuid, resolved->revision.version};
 }
 
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectVersion>& versions) const
@@ -478,7 +488,7 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, c
         if (!revision)
             throw std::invalid_argument("object history: version " + std::to_string(reference.version) + " of " +
                                         reference.objectUuid + " is not recorded in this store and generation");
-        if (!selection.emplace(revision->objectUuid, revision->uuid).second)
+        if (!selection.emplace(revision->objectUuid, versionReferenceText(reference)).second)
             throw std::invalid_argument("object history: object selected twice: " + revision->objectUuid);
     }
     return relationshipsAt(txn, selection);

@@ -1,4 +1,5 @@
 #include "geometry/GeometryDelta.hpp"
+#include "internal/ReferenceResolver.hpp"
 #include <zstd.h>
 
 namespace vc::objects::detail {
@@ -82,6 +83,12 @@ EncodedGeometryDelta encodeGeometryDelta(const std::vector<GeometryChunkChange>&
 }
 std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::string& revision,
                                                     const nlohmann::json& manifest) {
+    db=resolveReference(db,[&](sqlite3* source) {
+        if(!historyEnabled(source))return false;
+        Statement row(source,"SELECT 1 FROM geometry_deltas WHERE revision_uuid=?",parseUuid(revision));
+        return row.row();
+    });
+    if(!db)throw std::runtime_error("geometry delta: missing payload reference");
     const auto& d = manifest.at("delta");
     const auto rawSize = d.at("raw_size").get<int64_t>();
     if (d.at("version") != 1 || rawSize <= 0 || uint64_t(rawSize) > maxDeltaBytes)
@@ -161,13 +168,13 @@ void clearGeometryMaterialization(sqlite3* db, const std::string& object) {
     }
 }
 void materializeGeometry(sqlite3* db, const std::string& object, const std::string& revision) {
-    Statement row(db, "SELECT manifest,content_hash FROM geometry_revisions WHERE uuid=?", parseUuid(revision));
-    if (!row.row()) throw std::runtime_error("geometry: missing revision");
-    const auto descriptor = loadGeometryManifest(db, revision, row.text(0), readDigest(row,1));
+    const auto record=resolveGeometryRecord(db,revision);
+    if (!record||record->revision.objectUuid!=object) throw std::runtime_error("geometry: missing or mismatched revision");
+    const auto& descriptor = record->descriptor;
     clearGeometryMaterialization(db, object);
     if (!descriptor.contains("delta")) {
         execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=? WHERE uuid=?",
-            revision,descriptor.dump(),readDigest(row,1),parseUuid(object));
+            revision,descriptor.dump(),record->revision.contentHash,parseUuid(object));
         return;
     }
     GeometryReader reader(db, revision, false);
@@ -184,6 +191,6 @@ void materializeGeometry(sqlite3* db, const std::string& object, const std::stri
     execute(db, "INSERT INTO geometry_materializations VALUES(?,?,?)", parseUuid(object), parseUuid(revision),
         manifest.dump());
     execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=? WHERE uuid=?",
-        revision,manifest.dump(),readDigest(row,1),parseUuid(object));
+        revision,manifest.dump(),record->revision.contentHash,parseUuid(object));
 }
 }

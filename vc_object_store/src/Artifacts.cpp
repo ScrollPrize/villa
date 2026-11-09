@@ -5,6 +5,8 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "internal/Artifacts.hpp"
 #include "internal/Database.hpp"
+#include "internal/ReferenceResolver.hpp"
+#include "vc_object_store/objects/PackedStore.hpp"
 
 #include <vc_reader/native/atomic_file.hpp>
 #include <vc_reader/native/platform_io.hpp>
@@ -126,7 +128,8 @@ bool isArtifactHash(const std::string& text)
 
 std::filesystem::path artifactBlobDirectory(const std::filesystem::path& storePath)
 {
-    return std::filesystem::path(storePath.string() + ".artifacts") / "sha256";
+    const auto path=isPackedDatabasePath(storePath)?packedContainerPath(storePath):storePath;
+    return std::filesystem::path(path.string() + ".artifacts") / "sha256";
 }
 
 std::filesystem::path artifactBlobPath(const std::filesystem::path& storePath, const std::string& sha256)
@@ -155,13 +158,32 @@ std::vector<ArtifactFile> artifactManifest(const ObjectRecord& record)
     return parseManifest(meta.at(kArtifactsMetaKey));
 }
 
-void detail::checkArtifactReferences(const std::filesystem::path& storePath, const std::string& objectUuid,
+namespace {
+struct ResolvedArtifact {std::filesystem::path path;uint64_t length;};
+std::optional<ResolvedArtifact> resolveArtifact(sqlite3* db,const std::string& hash)
+{
+    if(!isArtifactHash(hash))throw std::invalid_argument("artifact: invalid SHA-256");
+    std::optional<ResolvedArtifact> result;
+    detail::resolveReference(db,[&](sqlite3* source){
+        const auto path=artifactBlobPath(sqlite3_db_filename(source,"main"),hash);
+        std::error_code error;const auto size=std::filesystem::file_size(path,error);
+        if(error)return false;
+        result=ResolvedArtifact{path,size};return true;
+    });
+    return result;
+}
+}
+std::optional<uint64_t> detail::resolvedArtifactLength(sqlite3* db,const std::string& hash)
+{
+    const auto artifact=resolveArtifact(db,hash);
+    return artifact?std::optional(artifact->length):std::nullopt;
+}
+void detail::checkArtifactReferences(sqlite3* db, const std::string& objectUuid,
                                      const Json& manifest)
 {
     for (const auto& file : parseManifest(manifest)) {
-        std::error_code ec;
-        const auto size = std::filesystem::file_size(artifactBlobPath(storePath, file.sha256), ec);
-        if (ec || size != file.length)
+        const auto size = resolvedArtifactLength(db,file.sha256);
+        if (!size || *size != file.length)
             throw std::invalid_argument("artifact: " + objectUuid + " names '" + file.name + "' (" + file.sha256 +
                                         ") which this store does not hold; put its bytes first");
     }
@@ -217,24 +239,27 @@ std::string ObjectStore::putArtifact(const std::filesystem::path& file, bool mov
 
 std::optional<uint64_t> ObjectStore::artifactLength(const std::string& sha256) const
 {
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(artifactBlobPath(impl_->path, sha256), ec);
-    if (ec) return std::nullopt;
-    return size;
+    auto txn=read();
+    return detail::resolvedArtifactLength(ObjectStoreImplAccess::conn(txn),sha256);
 }
 
 std::vector<uint8_t> ObjectStore::readArtifact(const std::string& sha256, uint64_t offset,
                                                const std::optional<uint64_t>& count) const
 {
-    const auto path = artifactBlobPath(impl_->path, sha256);
-    const auto length = artifactLength(sha256);
-    if (!length) throw std::invalid_argument("artifact: this store does not hold " + sha256);
-    if (offset > *length) throw std::out_of_range("artifact: invalid byte offset");
-    const auto size = count.value_or(*length - offset);
-    if (size > *length - offset) throw std::out_of_range("artifact: invalid byte count");
+    auto txn=read();
+    return detail::readResolvedArtifact(ObjectStoreImplAccess::conn(txn),sha256,offset,count);
+}
+std::vector<uint8_t> detail::readResolvedArtifact(sqlite3* db,const std::string& sha256,uint64_t offset,
+                                               const std::optional<uint64_t>& count)
+{
+    const auto artifact=resolveArtifact(db,sha256);
+    if (!artifact) throw std::invalid_argument("artifact: unavailable hash " + sha256);
+    if (offset > artifact->length) throw std::out_of_range("artifact: invalid byte offset");
+    const auto size = count.value_or(artifact->length - offset);
+    if (size > artifact->length - offset) throw std::out_of_range("artifact: invalid byte count");
     std::vector<uint8_t> result;
     result.reserve(std::size_t(size));
-    Descriptor in(path, O_RDONLY);
+    Descriptor in(artifact->path, O_RDONLY);
     readBlocks(in.fd, offset, size, [&](const uint8_t* data, std::size_t n) { result.insert(result.end(), data, data + n); });
     return result;
 }
