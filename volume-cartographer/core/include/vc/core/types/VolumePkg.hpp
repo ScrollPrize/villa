@@ -23,12 +23,16 @@ class Volume;
 namespace vc::project {
 
 inline constexpr std::string_view kFiberLasagnaTag = "vc-lasagna-fiber";
+inline constexpr std::string_view kPredictedFiberNormalsTag = "vc-fiber-normal-channels";
 inline constexpr std::string_view kAnonymousRemoteAuthTag =
     "vc-remote-auth:anonymous";
 
 struct Entry {
     std::string location;
     std::vector<std::string> tags;
+    // Optional named CZYX scalar display views, in storage channel order.
+    // The source is persisted once; all views share its caches and coordinates.
+    std::vector<std::string> channels;
     bool operator==(const Entry&) const = default;
 };
 
@@ -90,6 +94,7 @@ public:
         std::string location;
         std::vector<std::string> tags;
         std::shared_ptr<Volume> volume;
+        std::vector<std::string> channels;
     };
 
     static std::shared_ptr<VolumePkg> open(const std::filesystem::path& path,
@@ -149,6 +154,11 @@ public:
     void setSelectedFiberInferenceDataset(std::string location);
     void clearSelectedFiberInferenceDataset();
 
+    // Project-scoped explicit choice. Unset legacy projects use Lasagna;
+    // attaching a dataset initializes the choice once, never at sampling time.
+    [[nodiscard]] std::string annotationNormalSource() const;
+    void setAnnotationNormalSource(std::string source);
+
     // Viewer bbox in volume coordinates; disabling retains the saved limits.
     [[nodiscard]] std::optional<Rect3D> focusBounds() const { return focusBounds_; }
     [[nodiscard]] bool focusBoundsEnabled() const { return focusBoundsEnabled_; }
@@ -199,6 +209,7 @@ private:
     std::vector<vc::project::Entry> lasagnaDatasets_;
     std::optional<std::string> selectedLasagnaDataset_;
     std::optional<std::string> selectedFiberInferenceDataset_;
+    std::optional<std::string> annotationNormalSource_;
     std::optional<Rect3D> focusBounds_;
     bool focusBoundsEnabled_ = false;
     std::string currentVolumeId_;
@@ -209,6 +220,8 @@ private:
 
     void resolveAll();
     void resolveVolumeEntry(const vc::project::Entry& e);
+    bool registerVolumeViews(const std::shared_ptr<Volume>& volume, const vc::project::Entry& entry,
+                             bool replace = false);
     void resolveNormalGridEntry(const vc::project::Entry& e);
 
     // Read resources and view state from the document.

@@ -79,11 +79,12 @@ int fallbackLevels(const std::vector<Level>& levels, int start, int width, int h
         // A representative chunk edge in working voxels: the mean over the axes.
         const auto extent = voxelExtent(L);
         const auto& chunks = L.array->spec().chunks;
-        if (chunks.size() != 3)
-            throw std::invalid_argument("view levels must be 3-D arrays");
+        const std::size_t first = L.channel ? 1 : 0;
+        if (chunks.size() != first + 3)
+            throw std::invalid_argument("view levels must be ZYX arrays or selected CZYX channels");
         double chunkExtent = 0.0;
         for (std::size_t axis = 0; axis < 3; ++axis)
-            chunkExtent += double(chunks[axis]) * extent[axis];
+            chunkExtent += double(chunks[first + axis]) * extent[axis];
         if (chunkExtent / 3.0 >= viewExtent)
             return level - start;
     }
@@ -196,9 +197,14 @@ void readChunks(Array& array, const std::vector<std::int64_t>& keys, const std::
     const auto& grid = array.chunk_grid();
     const auto& shape = array.spec().chunks;
     std::vector<Index> starts, sizes(keys.size(), Index(shape.begin(), shape.end()));
-    for (const auto key : keys)
-        starts.push_back(Index{key / (grid[1] * grid[2]) * shape[0], key / grid[2] % grid[1] * shape[1],
-                               key % grid[2] * shape[2]});
+    for (auto key : keys) {
+        Index start(grid.size());
+        for (std::size_t axis = grid.size(); axis-- > 0;) {
+            start[axis] = key % grid[axis] * shape[axis];
+            key /= grid[axis];
+        }
+        starts.push_back(std::move(start));
+    }
     array.read_many(starts, sizes, std::vector<std::uint8_t*>(keys.size(), nullptr), nullptr, false, cancel);
 }
 

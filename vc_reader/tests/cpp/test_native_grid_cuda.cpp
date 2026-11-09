@@ -4,11 +4,13 @@
 #include <vc_reader/array.hpp>
 #include <vc_reader/native/reader_cuda/reader.hpp>
 #include <vc_reader/grid.hpp>
+#include <vc_reader/zarr.hpp>
 #include <vc_reader/native/cuda_available.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -62,6 +64,137 @@ void compare(const vcr::grid::Result& cpu, const vcr::grid::Result& gpu, float t
     }
 }
 
+void packedChannels(const std::filesystem::path& root)
+{
+    namespace fs = std::filesystem;
+    fs::create_directories(root);
+    // Two channels per compressed chunk, including a nonzero channel-chunk
+    // index, an array edge and a missing chunk with nonzero fill.
+    vcr::ArraySpec spec;
+    spec.shape = {4, 29, 30, 31}; spec.chunks = {2, 16, 16, 16};
+    spec.fill = {17}; spec.identity = root.string();
+    spec.layers.push_back({"array", root.string(), "zstd", "", false});
+    for (int cc=0; cc<2; ++cc) for (int z=0; z<2; ++z)
+        for (int y=0; y<2; ++y) for (int x=0; x<2; ++x) {
+            if (z==1 && y==1 && x==1) continue;
+            std::vector<std::uint8_t> raw(2*16*16*16);
+            for (int c=0; c<2; ++c) for (int k=0; k<16*16*16; ++k)
+                raw[c*16*16*16+k] = std::uint8_t((19*(2*cc+c)+7*z+11*y+13*x+k)%251);
+            const auto compressed = vcr::encode(vcr::Codec::Zstd, {}, raw.data(), raw.size(), 1, spec.chunks);
+            std::ofstream file(root/(std::to_string(cc)+"."+std::to_string(z)+"."+std::to_string(y)+"."+std::to_string(x)),std::ios::binary);
+            file.write(reinterpret_cast<const char*>(compressed.data()),compressed.size());
+        }
+    auto cache = std::make_shared<vcr::MemoryCache>(8<<20);
+    vcr::Array array(spec,cache);
+    auto pool = std::make_shared<vcr::reader_cuda::Pool>(8<<20,0);
+    vcr::grid::Plane plane{{-1.25f, -0.5f, 15.4f},{1,0,0},{0,1,0},{0,0,1},34,34};
+    std::uint64_t firstChannelReads=0;
+    for (int c=0; c<4; ++c) {
+        vcr::reader_cuda::Reader reader(array,pool,c);
+        require(vcr::reader_cuda::Reader::brick_bytes(array,c)==16*16*16,"scalar brick size excludes channels");
+        vcr::grid::Level level{&array,{'u',1,false}}; level.channel=c;
+        vcr::grid::Request request; request.levels={level}; request.offsets={-1,0,1};
+        for (int order : {0,1}) {
+            request.order=order;
+            auto cpu=vcr::grid::sample(plane,request);
+            request.levels[0].cuda=&reader;
+            const auto gpu=vcr::grid::sample(plane,request);
+            require(gpu.cudaFailure.empty() && reader.stats()[3]>0,"packed dispatch must use CUDA");
+            compare(cpu,gpu,1e-3f,"packed plane channel "+std::to_string(c));
+            request.levels[0].cuda=nullptr;
+        }
+        // Channel 1 reuses channel 0's *whole* decoded storage chunks.
+        if (c==0) firstChannelReads=array.stats().disk_hits.load();
+        if (c==1) require(array.stats().disk_hits==firstChannelReads,"channels share decoded packed cache entries");
+        // Both GPU and CPU routes of the generic reader consume XYZ-independent
+        // ZYX triples. Include a chunk boundary, volume edge and missing chunk.
+        const double points[]{15.2,15.3,15.4, 16.7,17.1,18.8, -0.4,2,3, 28.5,29.5,30.5};
+        for (int order : {0,1}) {
+            auto cpu=reader.points(points,4,64,{0,0,0},2,order,"cpu");
+            auto gpu=reader.points(points,4,64,{0,0,0},2,order,"chunks");
+            const auto bytes=4*(order ? sizeof(float) : 1);
+            std::vector<std::uint8_t> a(bytes),b(bytes);
+            vcr::device::check(cudaMemcpy(a.data(),cpu.storage->ptr,bytes,cudaMemcpyDeviceToHost));
+            vcr::device::check(cudaMemcpy(b.data(),gpu.storage->ptr,bytes,cudaMemcpyDeviceToHost));
+            if (!order) require(a==b,"packed nearest CPU route");
+            else for (int i=0;i<4;++i) {
+                float x,y; std::memcpy(&x,a.data()+4*i,4); std::memcpy(&y,b.data()+4*i,4);
+                require(std::abs(x-y)<1e-3f,"packed linear CPU route");
+            }
+        }
+        // Region and affine CPU routes use the same channel selection as brick
+        // uploads, including the one-channel leading extent of read_many.
+        for (int kind : {0,1}) for (int order : {0,1}) {
+            vcr::reader_cuda::Grid g;
+            for (int a=0;a<3;++a) { g.shape[a]=3; g.base[a]=14; g.axes[a*3+a]=1; g.origin[a]=0.25f; }
+            auto cpu=reader.grids({g},kind,order,true,"cpu");
+            auto gpu=reader.grids({g},kind,order,true,"chunks");
+            std::vector<float> a(27),b(27);
+            vcr::device::check(cudaMemcpy(a.data(),cpu.storage->ptr,108,cudaMemcpyDeviceToHost));
+            vcr::device::check(cudaMemcpy(b.data(),gpu.storage->ptr,108,cudaMemcpyDeviceToHost));
+            for (int i=0;i<27;++i) require(std::abs(a[i]-b[i])<1e-3f,"packed region/affine CPU route");
+        }
+        const std::int64_t voxels[]{0,1,2,16,17,18};
+        auto cpuVoxels=reader.points(voxels,2,64,{0,0,0},3,0,"cpu");
+        auto gpuVoxels=reader.points(voxels,2,64,{0,0,0},3,0,"chunks");
+        std::uint8_t a[2],b[2];
+        vcr::device::check(cudaMemcpy(a,cpuVoxels.storage->ptr,2,cudaMemcpyDeviceToHost));
+        vcr::device::check(cudaMemcpy(b,gpuVoxels.storage->ptr,2,cudaMemcpyDeviceToHost));
+        require(std::equal(a,a+2,b),"packed integer point CPU route");
+        vcr::reader_cuda::Reader small(array,1,0,c);
+        request.levels[0].cuda=&small;
+        const auto fallback=vcr::grid::sample(plane,request);
+        require(!fallback.cudaFailure.empty(),"packed budget failure is reported");
+        request.levels[0].cuda=nullptr;
+        compare(vcr::grid::sample(plane,request),fallback,0,"packed budget fallback");
+        request.levels[0].cuda=&reader;
+        request.levels[0].channel=(c+1)%4;
+        bool rejected=false;
+        try { vcr::grid::cuda::sample(plane,request,{&reader}); }
+        catch (const std::invalid_argument&) { rejected=true; }
+        require(rejected,"mismatched GPU channel rejected");
+    }
+    for (int channel : {-1,4}) {
+        bool rejected=false;
+        try { vcr::reader_cuda::Reader invalid(array,pool,channel); }
+        catch (const std::invalid_argument&) { rejected=true; }
+        require(rejected,"invalid GPU channel rejected");
+    }
+    std::cout << "Packed CUDA channels: shared decoded cache, channel chunks, fill, edges, CPU fallback passed\n";
+}
+
+void realPackedChannels(const char* location)
+{
+    vcr::zarr::OpenOptions options;
+    options.memoryCache=std::make_shared<vcr::MemoryCache>(64<<20);
+    auto opened=vcr::zarr::openArray(location,options);
+    require(opened.meta.dtype=="|u1" && opened.meta.shape.size()==4,"real test needs uint8 CZYX");
+    auto pool=std::make_shared<vcr::reader_cuda::Pool>(64<<20,0);
+    // PHerc0332 real annotated fiber seed, base coordinates / 4 at level 2.
+    const vcr::grid::Plane plane{{6160.293945f/4-32,8019.695801f/4-32,26137.808594f/4},
+        {1,0,0},{0,1,0},{0,0,1},64,64};
+    for (std::int64_t c=0;c<opened.meta.shape[0];++c) {
+        vcr::reader_cuda::Reader reader(*opened.array,pool,c);
+        vcr::grid::Request request;
+        vcr::grid::Level level{opened.array.get(),opened.meta.type}; level.channel=c;
+        request.levels={level}; request.offsets={-0.5f,0,0.5f};
+        for (int order : {0,1}) {
+            request.order=order;
+            const auto cpu=vcr::grid::sample(plane,request);
+            request.levels[0].cuda=&reader;
+            vcr::grid::Frame frame; frame.plane=plane;
+            vcr::grid::Pending pending;
+            vcr::grid::sampleCached(frame,request,&pending);
+            require(vcr::grid::load(pending).empty(),"real progressive CUDA load");
+            const auto gpu=vcr::grid::sampleCached(frame,request,nullptr);
+            require(gpu.cudaFailure.empty() && reader.stats()[3]>0,"real channel must sample on GPU");
+            compare(cpu,gpu,1e-3f,"real compound channel "+std::to_string(c));
+            request.levels[0].cuda=nullptr;
+        }
+    }
+    std::cout << "Real PHerc0332 CUDA parity/progressive loading passed for " << opened.meta.shape[0] << " channels: " << location << '\n';
+}
+
 }  // namespace
 
 int main()
@@ -76,7 +209,17 @@ int main()
         cudaStream_t stream;
         vcr::device::check(cudaStreamCreate(&stream));
         vcr::device::StreamScope scope(stream);
+        packedChannels(path / "packed");
+        if (const char* real=std::getenv("VC_READER_COMPOUND_CUDA_TEST_ARRAY")) realPackedChannels(real);
         auto fine = store(path / "0", 128, 64), coarse = store(path / "1", 64, 64, 200);
+        {
+            const std::int64_t p[]{1,2,3}; std::uint8_t output;
+            const vcr::PointCoordinates spatial{p,std::size_t(3)};
+            bool rejected=false;
+            try { fine->sample_nearest_coordinates(vcr::ChannelCoordinates{spatial,0},1,&output); }
+            catch (const std::invalid_argument&) { rejected=true; }
+            require(rejected,"channel coordinates cannot enter a three-dimensional sampler");
+        }
         vcr::reader_cuda::Reader fineGpu(*fine, 64 << 20, 0), coarseGpu(*coarse, 64 << 20, 0);
         const vcr::ElementType u8{'u', 1, false};
         const vcr::grid::Level L0{fine.get(), u8, {1, 1, 1}, {0, 0, 0}};
