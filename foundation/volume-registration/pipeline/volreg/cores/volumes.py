@@ -111,11 +111,61 @@ def open_volume_levels(path: str) -> list:
 
 
 
+def by_z_range(array):
+    """Whether a box of `array` can be read as byte ranges: a zarr v2 array behind fsspec
+    whose chunks are stored raw (no compressor, no filter) in C order. Then the planes
+    z0..z1 of a chunk are one contiguous run of bytes."""
+    store = getattr(array, "store", None)
+    return (isinstance(store, zarr.storage.FSStore) and array._compressor is None
+            and not array._filters and array.order == "C")
+
+
+def read_z_ranges(array, lo, hi):
+    """A voxel box read with one ranged request per chunk it touches, for only the planes
+    the box needs from that chunk. A patch's fine box spans about ten 128^3 chunks, so a
+    whole-chunk read fetches four to seven times the box; this fetches about half of
+    that. A missing chunk reads as the fill value, as zarr reads it."""
+    lo, hi = np.asarray(lo, int), np.asarray(hi, int)
+    chunk = np.asarray(array.chunks)
+    plane = int(np.prod(chunk[1:])) * array.dtype.itemsize
+    store = array.store
+    first, last = lo // chunk, -(-hi // chunk)
+    out = np.full(tuple(hi - lo), array.fill_value, array.dtype)
+    places, urls, starts, ends = [], [], [], []
+    for index in np.ndindex(*(last - first)):
+        index = first + np.asarray(index)
+        corner = index * chunk
+        a, b = np.maximum(lo, corner), np.minimum(hi, corner + chunk)
+        key = store._normalize_key(array._chunk_key(tuple(int(i) for i in index)))
+        urls.append(f"{store.path.rstrip('/')}/{key}")
+        starts.append(int(a[0] - corner[0]) * plane)
+        ends.append(int(b[0] - corner[0]) * plane)
+        places.append((a, b, corner))
+    found = store.fs.cat_ranges(urls, starts, ends, on_error="return")
+    for (a, b, corner), data, start, end in zip(places, found, starts, ends):
+        if isinstance(data, FileNotFoundError):
+            continue
+        if isinstance(data, BaseException):
+            raise data
+        if len(data) != end - start:
+            raise IOError(f"asked for {end - start} bytes, got {len(data)}")
+        planes = np.frombuffer(data, array.dtype).reshape(-1, *chunk[1:])
+        out[tuple(slice(p - q, r - q) for p, q, r in zip(a, lo, b))] = \
+            planes[:, a[1] - corner[1]:b[1] - corner[1], a[2] - corner[2]:b[2] - corner[2]]
+    return out
+
+
 def read_patch(array, lo, hi, attempts: int = PATCH_READ_ATTEMPTS) -> np.ndarray:
-    """Read a voxel box, retrying the transient failures the remote stores produce."""
+    """Read a voxel box, retrying the transient failures the remote stores produce. A box
+    inside an array stored raw is read by z-range (`read_z_ranges`); anything else, and a
+    box reaching past the array, through zarr."""
+    ranged = (by_z_range(array) and (np.asarray(lo) >= 0).all()
+              and (np.asarray(hi) <= np.asarray(array.shape)).all())
     last_error = None
     for attempt in range(attempts):
         try:
+            if ranged:
+                return read_z_ranges(array, lo, hi)
             return np.asarray(array[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]])
         except Exception as e:  # noqa: BLE001 - any read failure is worth one more try
             last_error = e
