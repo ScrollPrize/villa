@@ -1057,7 +1057,8 @@ int main(int argc, char** argv) {
   // setenv("OMP_NUM_THREADS") here would be too late, because the OpenMP
   // runtime OpenBLAS loads has already read it, so change the runtime's
   // default instead. flatboi has no OpenMP of its own on Clang, so the call is
-  // looked up at run time. An OMP_NUM_THREADS set by the user still wins.
+  // looked up at run time. An OMP_NUM_THREADS set by the user still wins and
+  // skips this; the threading line in the log warns when it is not 1.
   if (!std::getenv("OMP_NUM_THREADS")) {
     using SetDefaults = void (*)(const char*);
     if (auto set_defaults = reinterpret_cast<SetDefaults>(dlsym(RTLD_DEFAULT, "kmp_set_defaults"))) {
@@ -1162,6 +1163,15 @@ int main(int argc, char** argv) {
               << (on ? on : blas_omp_single ? "<unset, 1 per BLAS call on macOS>" : "<unset>")
               << ", hardware_concurrency=" << std::thread::hardware_concurrency()
               << std::endl;
+#if defined(__APPLE__)
+    // A user's OMP_NUM_THREADS bypasses the workaround at the top of main, so
+    // say so where the thread settings are logged when it is not 1.
+    if (on && std::atoi(on) != 1) {
+      std::cerr << "warning: OMP_NUM_THREADS=" << on << " is set, so flatboi's macOS OpenBLAS "
+                   "workaround is off; with OpenBLAS before 0.3.34, any value other than 1 can "
+                   "crash the solve (\"Negative diagonal term\"); unset it or set it to 1\n";
+    }
+#endif
   }
 
   std::ios::sync_with_stdio(false);
