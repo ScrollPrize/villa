@@ -2,6 +2,8 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/PackedTrackStore.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryInput.hpp"
@@ -9,6 +11,7 @@
 #include "formats/RemoteSource.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <set>
 
@@ -22,13 +25,13 @@ using formats::surface;
 using formats::collections;
 using formats::track;
 using formats::readJson;
-// One committed write transaction; a session serializes it with its actions.
-using Commit = ObjectStoreSession::Commit;
-struct Expected { std::optional<int64_t> generation; };
+// One committed write transaction (placeholder ingestion).
+using Commit = std::function<void(const std::function<void(ObjectStore&, WriteTxn&)>&)>;
+struct Expected { std::optional<int64_t> version; };
 Expected expectedAt(ObjectStore& db, const Txn& read, const std::string& id)
 {
     Expected e;
-    if (const auto object = db.objectByUuid(read, id)) e.generation = object->generation;
+    if (const auto object = db.objectByUuid(read, id)) e.version = object->version;
     return e;
 }
 Commit directCommit(ObjectStore& db)
@@ -41,25 +44,21 @@ void ingestBatch(const Commit& commit, std::vector<Prepared> batch,
 {
     const auto count = batch.size();
     int64_t edges = 0;
+    std::vector<std::string> created;
     commit([&](ObjectStore& db, WriteTxn& write) {
+        created.clear();
         for (const auto& p : batch) {
             const auto existing = db.objectByUuid(write, p.object.uuid);
             const auto& e = expectations.at(p.object.uuid);
-            if ((existing ? std::optional(existing->generation) : std::nullopt) != e.generation)
-                throw std::runtime_error("object changed while reading source; retry ingestion");
-            if (existing && existing->kind != p.object.kind) throw std::runtime_error("source UUID belongs to another object kind");
+            if ((existing ? existing->version : std::nullopt) != e.version)
+                throw GeometrySourceRejected("object changed while reading source; retry ingestion");
+            if (existing && existing->kind != p.object.kind) throw GeometrySourceRejected("source UUID belongs to another object kind");
         }
+        for (const auto& p : batch) created.push_back(detail::sourceUuid(p.object.uuid));
         edges = detail::ingestGeometryBatch(db, write, std::move(batch), coordinateContext, registeredInitial);
     });
     report.ingested += count; report.edgesImported += edges;
-}
-void ingestOne(const Commit& commit, Prepared p, const Expected& expected, GeometryIngestReport& report,
-    const std::string& coordinateContext)
-{
-    std::map<std::string, Expected> expectations{{p.object.uuid, expected}};
-    std::vector<Prepared> batch;
-    batch.push_back(std::move(p));
-    ingestBatch(commit, std::move(batch), expectations, report, coordinateContext);
+    report.uuids.insert(report.uuids.end(), created.begin(), created.end());
 }
 // A tifxyz surface directory itself, or a folder of them (each with its meta.json).
 std::vector<fs::path> surfaceDirectories(const fs::path& source)
@@ -178,39 +177,107 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
 }
 
 namespace {
-// Stops before the next surface or track once `cancelled` is set.
-GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const std::string& kind,
-    const fs::path& source, const util::ProgressCallback& progress, const std::string& coordinateContext,
-    const std::vector<std::string>& tags, const SourceIngestOptions& options, const std::atomic_bool& cancelled)
+// Where ingestion reads and commits: one checked request per commit.
+struct IngestTarget {
+    std::function<void(const std::function<void(const StoreReader&)>&)> read;
+    std::function<TransactionRequest()> newRequest;
+    std::function<TransactionReceipt(const TransactionRequest&)> submit;
+    // Stops before the next surface or track, or before a batch commits.
+    std::function<bool()> cancelled;
+    // Relative track dataset references resolve here (the store's directory).
+    std::optional<fs::path> storeDirectory;
+};
+
+// Ends ingestion at a failure that is not the source's (stopOnInfrastructureError).
+struct Stopped {};
+// Reports the failure of the step `label`. A rejected source is a problem of
+// that source. Any other failure is the store's: a problem as well, unless the
+// options stop ingestion at it.
+void failed(GeometryIngestReport& report, const SourceIngestOptions& options, const std::string& label,
+    const std::exception& error)
 {
-    GeometryIngestReport report;
+    if (const auto* exists = dynamic_cast<const GeometryIdentitiesExist*>(&error))
+        report.existing.insert(report.existing.end(), exists->uuids.begin(), exists->uuids.end());
+    if (dynamic_cast<const GeometrySourceRejected*>(&error) || !options.stopOnInfrastructureError) {
+        problem(report, label, error);
+        return;
+    }
+    report.fatalError = label + ": " + error.what();
+    throw Stopped{};
+}
+// A step that only reads and decodes source files or the caller's request:
+// whatever fails there rejects the source.
+template <class Step> auto fromSource(Step&& step)
+{
+    try { return step(); }
+    catch (const GeometrySourceRejected&) { throw; }
+    catch (const std::exception& error) { throw GeometrySourceRejected(error.what()); }
+}
+
+void commitBatch(const IngestTarget& target, std::vector<Prepared> batch, GeometryIngestReport& report,
+    const std::string& coordinateContext)
+{
+    const auto count = int64_t(batch.size());
+    std::vector<std::string> created;
+    for (const auto& p : batch) created.push_back(detail::sourceUuid(p.object.uuid));
+    auto request = target.newRequest();
+    target.read([&](const StoreReader& reader) {
+        // Identities the store already has (including retired and deleted
+        // objects) reject the whole batch, listing every clash.
+        std::vector<std::string> clashes;
+        for (const auto& uuid : created)
+            if (reader.currentObject(uuid)) clashes.push_back(uuid);
+        if (!clashes.empty()) throw GeometryIdentitiesExist(std::move(clashes));
+        addIngestOperation(request, reader, std::move(batch), coordinateContext);
+    });
+    TransactionReceipt receipt;
+    // The request expects every new object absent and every existing endpoint
+    // at the version read: a conflict is the store changing under the source.
+    try { receipt = target.submit(request); }
+    catch (const TransactionConflict& conflict) { throw GeometrySourceRejected(conflict.what()); }
+    // The new objects, then the relationships their sources declare.
+    report.ingested += count; report.edgesImported += int64_t(receipt.created.size()) - count;
+    report.uuids.insert(report.uuids.end(), created.begin(), created.end());
+}
+
+void ingestSource(GeometryIngestReport& report, const IngestTarget& target, const std::string& kind,
+    const fs::path& source, const util::ProgressCallback& progress, const std::string& coordinateContext,
+    const std::vector<std::string>& tags, const SourceIngestOptions& options)
+try {
+    auto one = [&](Prepared p) {
+        std::vector<Prepared> batch;
+        batch.push_back(std::move(p));
+        commitBatch(target, std::move(batch), report, coordinateContext);
+    };
     try {
-        geometryCoordinates(Json::parse(coordinateContext));
-        if (options.uuidNamespace) util::canonicalUuid(*options.uuidNamespace);
+        fromSource([&] {
+            geometryCoordinates(Json::parse(coordinateContext));
+            if (options.uuidNamespace) util::canonicalUuid(*options.uuidNamespace);
+            return 0;
+        });
         if (kind == "track") {
-            const auto packed = resolvePackedTrackStore(source);
-            PackedTrackStore store(packed);
+            const auto packed = fromSource([&] { return resolvePackedTrackStore(source); });
+            const auto store = fromSource([&] { return std::make_unique<PackedTrackStore>(packed); });
             std::map<std::string, ObjectRecord> existing;
-            std::map<std::string, Expected> expectations;
             std::set<std::string> refs;
-            {
-                auto read = db.read();
-                for (const auto& object : db.objectsByKind(read, "track", std::nullopt, true)) {
+            target.read([&](const StoreReader& reader) {
+                ObjectSelection tracks; tracks.kind = "track"; tracks.includeRetired = true;
+                for (const auto& object : reader.selectObjects(tracks)) {
                     if (!object.track) continue;
                     fs::path path(object.track->datasetRef);
-                    if (path.is_relative()) path = db.path().parent_path() / path;
+                    if (path.is_relative() && target.storeDirectory) path = *target.storeDirectory / path;
                     std::error_code error;
                     if (fs::weakly_canonical(path, error) == packed && !error) {
                         refs.insert(object.track->datasetRef); existing.emplace(object.track->externalKey, object);
-                        expectations[object.uuid] = expectedAt(db, read, object.uuid);
                     }
                 }
-            }
-            if (refs.size() > 1) throw std::runtime_error("track dataset registered under multiple aliases");
+            });
+            if (refs.size() > 1) throw GeometrySourceRejected("track dataset registered under multiple aliases");
             const auto ref = refs.empty() ? packed.string() : *refs.begin();
-            for (size_t row = 0; row < store.sourceIds().size() && !cancelled; ++row) {
-                const auto key = std::to_string(store.sourceIds()[row]);
-                util::reportProgress(progress, "ingesting tracks", row, store.sourceIds().size(), key);
+            size_t row = 0;
+            for (; row < store->sourceIds().size() && !target.cancelled(); ++row) {
+                const auto key = std::to_string(store->sourceIds()[row]);
+                util::reportProgress(progress, "ingesting tracks", row, store->sourceIds().size(), key);
                 try {
                     ObjectRecord object;
                     if (existing.contains(key)) object = existing.at(key);
@@ -219,65 +286,94 @@ GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const s
                         object.storageKind = "dataset"; object.storageRef = ref;
                         object.track = TrackDetail{}; object.track->datasetRef = ref; object.track->externalKey = key;
                     }
-                    const auto e = expectations.contains(object.uuid) ? expectations.at(object.uuid) : Expected{};
-                    auto prepared = track(store, row, object);
-                    if (fs::exists(packed / "metadata.json")) prepared.source = readJson(packed / "metadata.json");
+                    auto prepared = fromSource([&] {
+                        auto p = track(*store, row, object);
+                        if (fs::exists(packed / "metadata.json")) p.source = readJson(packed / "metadata.json");
+                        return p;
+                    });
                     addTags(prepared, tags);
-                    ingestOne(commit, std::move(prepared), e, report, coordinateContext);
-                } catch (const std::exception& error) { problem(report, key, error); }
+                    one(std::move(prepared));
+                } catch (const std::exception& error) { failed(report, options, key, error); }
             }
+            report.cancelled = row < store->sourceIds().size();
         } else if (kind == "surface") {
             // Surfaces have no native relationships among themselves: each commits on its own.
-            const auto directories = surfaceDirectories(source);
-            for (size_t i = 0; i < directories.size() && !cancelled; ++i) {
+            const auto directories = fromSource([&] { return surfaceDirectories(source); });
+            size_t i = 0;
+            for (; i < directories.size() && !target.cancelled(); ++i) {
                 const auto& directory = directories[i];
                 util::reportProgress(progress, "ingesting surfaces", i, directories.size(), directory.filename().string());
                 try {
-                    Expected expected;
-                    auto prepared = surface(directory, options.uuidNamespace);
+                    auto prepared = fromSource([&] { return surface(directory, options.uuidNamespace); });
                     addTags(prepared, tags);
-                    { auto read = db.read(); expected = expectedAt(db, read, prepared.object.uuid); }
-                    ingestOne(commit, std::move(prepared), expected, report, coordinateContext);
-                } catch (const std::exception& error) { problem(report, directory.string(), error); }
+                    one(std::move(prepared));
+                } catch (const std::exception& error) { failed(report, options, directory.string(), error); }
             }
+            report.cancelled = i < directories.size();
             util::reportProgress(progress, "ingesting surfaces", directories.size(), directories.size());
         } else {
-            std::vector<Prepared> batch;
-            std::map<std::string, Expected> expectations;
-            {
-                // Pin registration expectations while reading files. Ingestion
-                // rechecks duplicate identities under the writer lock.
-                auto read = db.read();
-                std::vector<std::string> available;
-                for (const auto& object : db.objectsByKind(read, kind)) available.push_back(object.uuid);
-                batch = prepareGeometrySource(kind, source, available, options);
-                for (auto& p : batch) { expectations[p.object.uuid] = expectedAt(db, read, p.object.uuid); addTags(p, tags); }
-            }
-            ingestBatch(commit, std::move(batch), expectations, report, coordinateContext);
+            std::vector<std::string> available;
+            target.read([&](const StoreReader& reader) {
+                ObjectSelection objects; objects.kind = kind;
+                for (const auto& object : reader.selectObjects(objects, std::vector<std::string>{"uuid"}))
+                    available.push_back(object.uuid);
+            });
+            auto batch = fromSource([&] { return prepareGeometrySource(kind, source, available, options); });
+            for (auto& p : batch) addTags(p, tags);
+            // The batch commits whole or not at all.
+            if (target.cancelled()) { report.cancelled = true; return; }
+            commitBatch(target, std::move(batch), report, coordinateContext);
         }
-    } catch (const std::exception& error) { problem(report, source.string(), error); }
-    return report;
-}
+    } catch (const std::exception& error) { failed(report, options, source.string(), error); }
+} catch (const Stopped&) {}
 }
 
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind, const fs::path& source,
     const util::ProgressCallback& progress, const std::string& coordinateContext, const std::vector<std::string>& tags,
     const SourceIngestOptions& options)
 {
-    static const std::atomic_bool never{false};
-    return ingestSource(db, directCommit(db), kind, source, progress, coordinateContext, tags, options, never);
+    IngestTarget target;
+    target.read = [&](const auto& fn) { auto txn = db.read(); fn(LocalStoreReader(db, txn)); };
+    target.newRequest = [&] {
+        TransactionRequest request;
+        StoreStatus current;
+        { auto txn = db.read(); current = db.status(txn); }
+        request.requestUuid = util::newUuid(); request.storeUuid = current.storeUuid;
+        request.generation = current.generation; request.author = db.author();
+        return request;
+    };
+    target.submit = [&](const TransactionRequest& request) { return db.submit(request); };
+    target.cancelled = [] { return false; };
+    target.storeDirectory = db.path().parent_path();
+    GeometryIngestReport report;
+    ingestSource(report, target, kind, source, progress, coordinateContext, tags, options);
+    return report;
 }
 
 GeometryIngestReport ingestGeometrySource(ObjectStoreSession& session, const AttachmentIdentity& attachment,
     const std::string& kind, const fs::path& source, const util::ProgressCallback& progress,
-    const std::string& coordinateContext, const std::vector<std::string>& tags, const SourceIngestOptions& options)
+    const std::string& coordinateContext, const std::vector<std::string>& tags, const SourceIngestOptions& options,
+    const std::atomic_bool* cancel)
 {
     GeometryIngestReport report;
-    session.writeJob(attachment, [&](ObjectStore& db, const Commit& commit, const std::atomic_bool& cancelled) {
-        report = ingestSource(db, commit, kind, source, progress, coordinateContext, tags, options, cancelled);
-    });
+    if (!session.writable(attachment)) {
+        const std::string error = "object store: ingestion needs a writable attachment";
+        if (!options.stopOnInfrastructureError) throw std::invalid_argument(error);
+        report.fatalError = error;
+        return report;
+    }
+    IngestTarget target;
+    target.read = [&](const auto& fn) {
+        session.readStore(attachment, [&](const StoreReader& reader, const auto&) { fn(reader); });
+    };
+    target.newRequest = [&] { return session.newRequest(attachment); };
+    target.submit = [&](const TransactionRequest& request) { return session.submit(attachment, request); };
+    target.cancelled = [&] { return !session.current(attachment) || (cancel && cancel->load()); };
+    if (!session.hosted(attachment)) target.storeDirectory = fs::path(session.location(attachment)).parent_path();
+    ingestSource(report, target, kind, source, progress, coordinateContext, tags, options);
     return report;
 }
+
 std::string importSurfaceChannel(ObjectStore& db, WriteTxn& txn, const std::string& objectUuid,
     const std::string& name, const fs::path& tiff)
 {

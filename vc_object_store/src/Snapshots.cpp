@@ -14,8 +14,8 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
     const std::set<std::string> fields(options.fields.begin(), options.fields.end());
     if (!fields.empty()) out["projected"] = true;
     const std::set<std::string> commonFields{
-        "uuid", "kind", "generation", "created_by", "created_at", "created_host", "changed_by", "changed_at", "changed_host",
-        "approval_state", "approved_by", "approved_at", "approved_host", "approved_generation", "tags", "meta"};
+        "uuid", "kind", "commit_sequence", "created_by", "created_at", "created_host", "changed_by", "changed_at", "changed_host",
+        "approval_state", "approved_by", "approved_at", "approved_host", "approved_version", "tags", "meta"};
     auto projection = [&](std::set<std::string> valid) -> std::optional<std::vector<std::string>> {
         if (fields.empty()) return std::nullopt;
         valid.insert(commonFields.begin(), commonFields.end());
@@ -23,7 +23,7 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
         for (const auto& field : fields) if (valid.contains(field)) selected.push_back(field);
         return selected;
     };
-    const auto objectProjection = projection({"name", "format_version", "storage_kind", "storage_ref", "data_generation", "data_checksum", "fiber", "surface", "track"});
+    const auto objectProjection = projection({"name", "format_version", "storage_kind", "storage_ref", "version", "data_checksum", "fiber", "surface", "track"});
     const auto edgeProjection = projection({"a", "b", "a_anchor", "b_anchor"});
     ObjectFields edgeFields = edgeProjection ? ObjectFields(std::in_place, edgeProjection->begin(), edgeProjection->end()) : std::nullopt;
     // Export canonicalizes endpoint order, including self-link dependency order.
@@ -106,7 +106,7 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
             if (recordContent(objectToJson(*existing)) == recordContent(objectToJson(object))) continue;
             throw std::runtime_error("object store: snapshot conflicts with existing object: " + object.uuid);
         }
-        upsertObjectImpl(db, impl_->options.author, impl_->hostname, object, true);
+        upsertObjectImpl(db, author(), impl_->hostname, object, true);
     }
     for (const auto& j : root.at("edges")) {
         auto e = edgeFromJson(j);

@@ -10,7 +10,7 @@ using namespace vc::objects::detail;
 namespace {
 int64_t scalar(sqlite3* db,const std::string& sql){Statement s(db,sql);require(s.row(),"scalar row");return s.i64(0);}
 ObjectRecord record(std::string kind="note") {ObjectRecord r;r.uuid=util::newUuid();r.kind=std::move(kind);r.name="native";r.tags={"b","a","b",""};return r;}
-nlohmann::json comparable(const ObjectRecord& r){auto j=objectToJson(r);for(const auto* k:{"created_at","changed_at"})j.erase(k);return j;}
+nlohmann::json comparable(const ObjectRecord& r){auto j=objectToJson(r);for(const auto* k:{"created_at","changed_at","version_generation"})j.erase(k);return j;}
 void parity(bool spatial){
     TemporaryDirectory dir;OpenOptions o;o.author="test";o.history=HistoryMode::Off;o.spatialIndex=spatial;
     auto normal=ObjectStore::create(dir.path/"normal",o),initial=ObjectStore::create(dir.path/"initial",o);
@@ -43,7 +43,7 @@ void geometry(){
     require(ga&&gb,"both geometry heads present");
     for(const auto& array:encoded.arrays)require(normal.readGeometryArray(a,ga->uuid,array.name)==initial.readGeometryArray(b,gb->uuid,array.name),"exact geometry bytes");
     const auto ra=*normal.objectByUuid(a,fiber.uuid),rb=*initial.objectByUuid(b,fiber.uuid);
-    require(ra.storageKind==rb.storageKind&&ra.dataChecksum==rb.dataChecksum&&ra.dataGeneration==rb.dataGeneration,"managed geometry identity and generation");
+    require(ra.storageKind==rb.storageKind&&ra.dataChecksum==rb.dataChecksum&&ra.version==rb.version,"managed geometry identity and object version");
     require(nlohmann::json::parse(ra.meta)==nlohmann::json::parse(rb.meta),"source annotation ownership and coordinates preserved");
     require(initial.readGeometryArray(b,gb->uuid,"control_points").empty(),"no invented control points");
 }

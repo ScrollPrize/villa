@@ -19,11 +19,10 @@ ObjectRecord object(const std::string& kind="note")
 {
     ObjectRecord record;record.kind=kind;record.uuid=util::newUuid();return record;
 }
-WriteTxn editObject(ObjectStore& store,HistoryMode history,const std::string& object)
+WriteTxn editObject(ObjectStore& store,const std::string& object)
 {
-    if(history==HistoryMode::Off)return store.write();
-    std::string revision;{auto read=store.read();revision=store.currentObjectRevision(read,object)->uuid;}
-    return store.write({{object,revision}});
+    std::optional<int64_t> version;{auto read=store.read();version=store.currentVersion(read,object);}
+    return store.write(VersionSelection{{object,version}});
 }
 void sourceIndex(HistoryMode history)
 {
@@ -56,7 +55,7 @@ void sourceIndex(HistoryMode history)
         require(std::any_of(tables.begin(),tables.end(),[](const auto& t){return t.name=="source_points";}),"lazy table has native directory identity");
     }
     {
-        auto txn=editObject(store,history,points.uuid);
+        auto txn=editObject(store,points.uuid);
         store.setMeta(txn,points.uuid,"source",R"({"origin":"renamed","source_collection_id":"points"})");
         refreshSourceIdentityIndex(ObjectStoreImplAccess::conn(txn));
         updateGeometryArrays(store,txn,points.uuid,vc::geometry::encode(vc::geometry::PointCollection{{9,11},{{4,5,6},{7,8,9}}}),
@@ -84,7 +83,7 @@ void sourcePolicyTransitions()
             require(!hasTable(txn,"source_points"),"history policy cannot provision unused source accelerator");}
         auto store=ObjectStore::open(path,options);
         {auto txn=store.read();require(sourcePoint(ObjectStoreImplAccess::conn(txn),"document",7)->object==points.uuid,"history transition retains source identities");}
-        auto txn=editObject(store,mode,points.uuid);
+        auto txn=editObject(store,points.uuid);
         updateGeometryArrays(store,txn,points.uuid,vc::geometry::encode(vc::geometry::PointCollection{{7},{{2,3,4}}}),
             store.currentGeometry(txn,points.uuid)->uuid);
         refreshSourceIdentityIndex(ObjectStoreImplAccess::conn(txn));
@@ -125,23 +124,23 @@ void lifecycle(HistoryMode history)
     auto store=ObjectStore::create(dir.path/"lifecycle",options);auto a=object(),b=object();std::string relation;
     auto edge=[&]{EdgeRecord e;e.kind="test";e.aUuid=a.uuid;e.bUuid=b.uuid;e.aAnchor.wholeGeometry=true;e.bAnchor.wholeGeometry=true;return e;};
     {auto txn=store.write();store.upsertObject(txn,a);store.upsertObject(txn,b);relation=store.addEdge(txn,edge());txn.commit();}
-    std::optional<std::string> original;
-    if(history==HistoryMode::On){auto read=store.read();original=store.currentObjectRevision(read,a.uuid)->uuid;}
+    std::optional<ObjectVersion> original;
+    if(history==HistoryMode::On){auto read=store.read();original=store.versionReference(read,*store.currentObjectRevision(read,a.uuid));}
     auto write=[&]{
-        RevisionSelection selected;if(history==HistoryMode::On){auto read=store.read();for(const auto& r:{a,b})selected[r.uuid]=store.currentObjectRevision(read,r.uuid)->uuid;}
+        VersionSelection selected;if(history==HistoryMode::On){auto read=store.read();for(const auto& r:{a,b})selected[r.uuid]=store.currentVersion(read,r.uuid);}
         return history==HistoryMode::On?store.write(selected):store.write();
     };
     {auto txn=write();store.retireObject(txn,a.uuid);require(!store.edgeByUuid(txn,relation),"retire removes current edge");}
     {auto read=store.read();require(store.edgeByUuid(read,relation).has_value()&&!store.objectByUuid(read,a.uuid)->retired,"retire rollback restores relationships and state");}
     {auto txn=write();store.retireObject(txn,a.uuid);txn.commit();}
-    {auto read=store.read();require(store.objectByUuid(read,a.uuid)->lifecycleEpoch==std::to_string(store.provisioning(read).generation),"retire token is publication generation");}
+    {auto read=store.read();require(store.objectByUuid(read,a.uuid)->lifecycleEpoch==std::to_string(store.provisioning(read).commitSequence),"retire token is publication commit sequence");}
     {auto txn=write();auto retired=*store.objectByUuid(txn,a.uuid);retired.name="still-retired";store.upsertObject(txn,retired);
         require(store.objectByUuid(txn,a.uuid)->retired,"ordinary upsert must not activate a retired object");
         Statement state(ObjectStoreImplAccess::conn(txn),"SELECT state FROM objects WHERE uuid=?",parseUuid(a.uuid));
         require(state.row()&&state.i64(0)==1,"retirement has the single state value one");txn.commit();}
     {auto txn=write();store.restoreObject(txn,a.uuid);txn.commit();}
     {auto read=store.read();require(!store.edgeByUuid(read,relation),"restore never revives retired relationships");
-        require(store.objectByUuid(read,a.uuid)->lifecycleEpoch==std::to_string(store.provisioning(read).generation),"restore token is publication generation");}
+        require(store.objectByUuid(read,a.uuid)->lifecycleEpoch==std::to_string(store.provisioning(read).commitSequence),"restore token is publication commit sequence");}
     {
         auto txn=write();const auto created=store.addEdge(txn,edge());store.retireObject(txn,a.uuid);
         require(!store.edgeByUuid(txn,created),"retire removes edges created in same transaction");

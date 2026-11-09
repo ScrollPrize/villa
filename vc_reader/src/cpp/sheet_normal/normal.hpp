@@ -33,7 +33,8 @@ inline void region(const double* xyz,const std::int64_t* shape,std::int64_t* sta
         if(!std::isfinite(xyz[axis]) || std::abs(xyz[axis])>=0x1p52) throw std::invalid_argument("invalid sheet-normal point");
         const double lattice=std::floor(xyz[axis]/3)*3;
         start[2-axis]=std::int64_t(lattice)-54;
-        offset[axis]=float(xyz[axis]-lattice);
+        // float32 can round a difference just below 3 up to 3: keep the open bound.
+        offset[axis]=std::min(float(xyz[axis]-lattice),std::nextafter(3.f,0.f));
         *valid&=start[2-axis]>=0 && start[2-axis]+width<=shape[2-axis];
     }
 }

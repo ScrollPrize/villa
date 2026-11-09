@@ -161,13 +161,13 @@ void clearGeometryMaterialization(sqlite3* db, const std::string& object) {
     }
 }
 void materializeGeometry(sqlite3* db, const std::string& object, const std::string& revision) {
-    Statement row(db, "SELECT manifest,content_hash,object_generation FROM geometry_revisions WHERE uuid=?", parseUuid(revision));
+    Statement row(db, "SELECT manifest,content_hash FROM geometry_revisions WHERE uuid=?", parseUuid(revision));
     if (!row.row()) throw std::runtime_error("geometry: missing revision");
     const auto descriptor = loadGeometryManifest(db, revision, row.text(0), readDigest(row,1));
     clearGeometryMaterialization(db, object);
     if (!descriptor.contains("delta")) {
-        execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=?,data_generation=? WHERE uuid=?",
-            revision,descriptor.dump(),readDigest(row,1),row.i64(2),parseUuid(object));
+        execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=? WHERE uuid=?",
+            revision,descriptor.dump(),readDigest(row,1),parseUuid(object));
         return;
     }
     GeometryReader reader(db, revision, false);
@@ -183,7 +183,7 @@ void materializeGeometry(sqlite3* db, const std::string& object, const std::stri
         }
     execute(db, "INSERT INTO geometry_materializations VALUES(?,?,?)", parseUuid(object), parseUuid(revision),
         manifest.dump());
-    execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=?,data_generation=? WHERE uuid=?",
-        revision,manifest.dump(),readDigest(row,1),row.i64(2),parseUuid(object));
+    execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=? WHERE uuid=?",
+        revision,manifest.dump(),readDigest(row,1),parseUuid(object));
 }
 }

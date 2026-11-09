@@ -138,7 +138,8 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
     if(options.store.history!=HistoryMode::Off || options.store.spatialIndex || options.store.readOnly)
         throw std::invalid_argument("initial import requires writable history-off, spatial-off provisioning");
     if(options.store.author.empty())throw std::invalid_argument("initial import requires an author");
-    if(options.store.creationStoreUuid)throw std::invalid_argument("initial import owns its fresh store UUID");
+    if(options.store.creationStoreUuid||options.store.creationGeneration)
+        throw std::invalid_argument("initial import owns its fresh store and lineage UUIDs");
     if(!options.edges.sqlBatchRows)
         throw std::invalid_argument("initial import SQL batch size must be positive");
     validateRanges(options.shards,true);validateRanges(options.shards,false);
@@ -152,6 +153,7 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
     result.path=!options.packed && options.shards.size()>1?destination/"collection.vcobj":destination;
     result.storeUuid=util::newUuid();
     auto common=options.store;common.creationStoreUuid=result.storeUuid;
+    common.creationGeneration=util::newUuid();
     std::unique_ptr<PrivateDirectory> directory;
     std::unique_ptr<detail::StagedDatabase> single;
     std::unique_ptr<PackedStoreBuilder> packed;

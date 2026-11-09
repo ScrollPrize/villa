@@ -27,7 +27,7 @@ int main()try{
     mustFail([&]{ObjectStore::open(overlayPath,OpenOptions{.readOnly=true});});
     {
         auto r=overlay.read();require(overlay.readGeometryArray(r,a,"line_points")==geometry,"inherited geometry exact");
-        require(overlay.provisioning(r).generation>overlay.members()[1].generation,"derived generation above parent");
+        require(overlay.provisioning(r).commitSequence>overlay.members()[1].commitSequence,"derived commit sequence above parent");
         require(overlay.objectById(r,a.storeUuid,1)->key==a,"numeric base routing");
     }
     ObjectKey newFiber,edge;
@@ -97,13 +97,13 @@ int main()try{
         }
     }
     // Two independent workers reserve disjoint ranges under one publication.
-    const auto logical=util::newUuid();std::vector<std::filesystem::path> shards;std::vector<ObjectKey> keys;
+    const auto logical=util::newUuid(),lineage=util::newUuid();std::vector<std::filesystem::path> shards;std::vector<ObjectKey> keys;
     for(int i=0;i<2;++i){auto path=dir.path/("shard"+std::to_string(i)+".vcobj");shards.push_back(path);
-        auto opt=options;opt.creationStoreUuid=logical;opt.initialGeneration=9;opt.objectIdRange={1+i*100,100+i*100};opt.edgeIdRange=opt.objectIdRange;
+        auto opt=options;opt.creationStoreUuid=logical;opt.creationGeneration=lineage;opt.initialCommitSequence=9;opt.objectIdRange={1+i*100,100+i*100};opt.edgeIdRange=opt.objectIdRange;
         auto db=ObjectStore::create(path,opt);auto w=db.write();keys.push_back({logical,db.upsertObject(w,fiber())});db.seal(w);w.commit();}
     auto collection=ObjectCollection::publishShards(dir.path/"sharded.vcobj",shards,options);
     {
-        auto r=collection.read();require(collection.provisioning(r).generation==10,"common reserved publication generation");
+        auto r=collection.read();require(collection.provisioning(r).commitSequence==10&&collection.provisioning(r).generation==lineage,"common reserved publication lineage and commit sequence");
         require(collection.objectById(r,logical,101)->key==keys[1],"numeric range routes to second shard");
         require(!collection.objectById(r,logical,99),"reserved unpopulated ID remains absent");
         size_t count=0;collection.scanObjects(r,[&](auto&){++count;return true;});require(count==2,"all partitions enumerated");
@@ -111,9 +111,9 @@ int main()try{
     mustFail([&]{ObjectCollection::publishShards(dir.path/"overlap.vcobj",{shards[0],shards[0]},options);});
     require(!std::filesystem::exists(dir.path/"overlap.vcobj"),"invalid shard publication invisible");
     for(auto mode:{RoutingKind::Modulo,RoutingKind::Bits,RoutingKind::HashV1}){
-        const auto owner=util::newUuid();std::vector<std::filesystem::path> parts;std::vector<KeyRoute> rules;std::map<int64_t,ObjectKey> ids,edgeIds;
+        const auto owner=util::newUuid(),generation=util::newUuid();std::vector<std::filesystem::path> parts;std::vector<KeyRoute> rules;std::map<int64_t,ObjectKey> ids,edgeIds;
         for(int partition=0;partition<2;++partition){auto p=dir.path/("route-"+std::to_string(int(mode))+"-"+std::to_string(partition));parts.push_back(p);
-            auto opt=options;opt.creationStoreUuid=owner;opt.objectIdRange={1,100};opt.edgeIdRange={1,100};
+            auto opt=options;opt.creationStoreUuid=owner;opt.creationGeneration=generation;opt.objectIdRange={1,100};opt.edgeIdRange={1,100};
             auto db=ObjectStore::create(p,opt);auto w=db.write();const auto physical=db.databaseIdentity(w).uuid;
             KeyRoute rule{"objects",mode,1,100,2,uint64_t(partition),mode==RoutingKind::Bits?1u:0u,physical};
             std::vector<std::string> endpoints;
@@ -130,10 +130,10 @@ int main()try{
         for(auto& [id,key]:edgeIds)require(c.edgeById(r,owner,id)->key==key,"custom edge routing exact");
     }
     // Same manifest/routing API inside the packed VFS; no absolute staging refs.
-    const auto packedPath=dir.path/"packed.vcobj";const auto packedOwner=util::newUuid();
+    const auto packedPath=dir.path/"packed.vcobj";const auto packedOwner=util::newUuid(),packedLineage=util::newUuid();
     {
         PackedStoreBuilder builder(packedPath);std::vector<std::filesystem::path> paths;
-        for(int i=0;i<2;++i){auto p=builder.addDatabase(util::newUuid());paths.push_back(p);auto opt=options;opt.creationStoreUuid=packedOwner;
+        for(int i=0;i<2;++i){auto p=builder.addDatabase(util::newUuid());paths.push_back(p);auto opt=options;opt.creationStoreUuid=packedOwner;opt.creationGeneration=packedLineage;
             opt.objectIdRange={1+i*100,100+i*100};opt.edgeIdRange=opt.objectIdRange;
             auto db=ObjectStore::create(p,opt);auto w=db.write();db.upsertObject(w,fiber());db.seal(w);w.commit();}
         const auto root=util::newUuid();auto rootPath=builder.addDatabase(root);
@@ -151,7 +151,12 @@ int main()try{
     const auto brokenPath=dir.path/"broken.vcobj";
     {auto c=ObjectCollection::create(brokenPath,{basePath},options);}
     {auto db=ObjectStore::open(brokenPath,OpenOptions{.physicalPartitionOnly=true,.author="test"});auto w=db.write();
-        execute(ObjectStoreImplAccess::conn(w),"UPDATE collection_members SET generation=generation+1");w.commit();}
+        execute(ObjectStoreImplAccess::conn(w),"UPDATE collection_members SET commit_sequence=commit_sequence+1");w.commit();}
     mustFail([&]{ObjectCollection::open(brokenPath,OpenOptions{.readOnly=true});});
+    const auto brokenLineage=dir.path/"broken-lineage.vcobj";
+    {auto c=ObjectCollection::create(brokenLineage,{basePath},options);}
+    {auto db=ObjectStore::open(brokenLineage,OpenOptions{.physicalPartitionOnly=true,.author="test"});auto w=db.write();
+        execute(ObjectStoreImplAccess::conn(w),"UPDATE collection_members SET generation=?",parseUuid(util::newUuid()));w.commit();}
+    mustFail([&]{ObjectCollection::open(brokenLineage,OpenOptions{.readOnly=true});});
     std::cout<<"collections passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

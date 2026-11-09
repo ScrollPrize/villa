@@ -12,7 +12,7 @@ int main() try {
     TemporaryDirectory directory;
     OpenOptions options;options.author="external-history";
     auto store=ObjectStore::create(directory.path/"store",options);
-    const auto owner=util::newUuid(),a=util::newUuid(),b=util::newUuid();
+    const auto owner=util::newUuid(),lineage=util::newUuid(),a=util::newUuid(),b=util::newUuid();
     auto install=[&](const Txn& txn){
         auto& pool=*activeStatementPools.at(ObjectStoreImplAccess::conn(txn));
         pool.externalEndpointOwner=[&](const std::string& id)->std::optional<std::string>{
@@ -20,10 +20,10 @@ int main() try {
         };
         pool.externalEndpointRecord=[&](const std::string& id){
             if(id!=a&&id!=b)throw std::runtime_error("unknown external key");
-            ObjectRecord record;record.uuid=id;record.kind="fiber";record.generation=3;
+            ObjectRecord record;record.uuid=id;record.kind="fiber";record.version=3;record.versionGeneration=lineage;
             record.meta=R"({"quality":7})";return record;
         };
-        pool.externalEndpointVersion=[&](const std::string& id){return externalEndpointToken(owner,id,7);};
+        pool.externalEndpointVersion=[&](const std::string& id){return externalEndpointToken(owner,id,lineage,7);};
     };
     std::string edge,oldVersion;
     {
@@ -38,13 +38,12 @@ int main() try {
         auto txn=store.read();install(txn);auto* db=ObjectStoreImplAccess::conn(txn);requireBinaryUuidStorage(store,txn);
         Statement objects(db,"SELECT (SELECT count(*) FROM objects),(SELECT count(*) FROM object_revisions),(SELECT count(*) FROM object_head_records)");objects.row();
         require(objects.i64(0)==0&&objects.i64(1)==0&&objects.i64(2)==0,"external edges never fabricate objects or histories");
-        const auto pinned=store.currentObjectRevision(txn,a);require(pinned&&pinned->uuid==externalEndpointToken(owner,a,7),"external endpoint has sealed version token");
-        const auto relationships=store.recordedRelationships(txn,pinned->uuid);
-        require(relationships.size()==1&&relationships[0].record.uuid==edge,"external-only relationship history remains discoverable");
-        oldVersion=relationships[0].uuid;
-        require(relationships[0].aRevision.starts_with("external:")&&relationships[0].bRevision.starts_with("external:"),"relationship pins external versions");
-        const auto selected=store.relationshipsAt(txn,{{a,pinned->uuid},{b,externalEndpointToken(owner,b,7)}});
-        require(selected.size()==1&&selected[0].applicable,"external sealed endpoints apply to historical graph");
+        const auto pinned=store.currentObjectRevision(txn,a);require(pinned&&pinned->uuid==externalEndpointToken(owner,a,lineage,7),"external endpoint has sealed version token");
+        const auto selected=ObjectStoreImplAccess::relationshipsAt(store,txn,{{a,pinned->uuid},{b,externalEndpointToken(owner,b,lineage,7)}});
+        require(selected.size()==1&&selected[0].relationship.record.uuid==edge,"external-only relationship history remains discoverable");
+        oldVersion=selected[0].relationship.uuid;
+        require(selected[0].relationship.aRevision.starts_with("external:")&&selected[0].relationship.bRevision.starts_with("external:"),"relationship pins external versions");
+        require(selected[0].applicable,"external sealed endpoints apply to historical graph");
     }
     {
         auto txn=store.read();mustFail([&]{store.currentObjectRevision(txn,a);});
@@ -54,11 +53,14 @@ int main() try {
         store.updateEdge(txn,record);txn.commit();
     }
     {
-        auto txn=store.read();install(txn);const auto history=store.recordedRelationships(txn,externalEndpointToken(owner,a,7));
-        require(history.size()==1&&history[0].uuid!=oldVersion,"editing local relationship publishes a new relation, not an external object");
+        auto txn=store.read();install(txn);const auto history=ObjectStoreImplAccess::relationshipsAt(store,txn,
+            {{a,externalEndpointToken(owner,a,lineage,7)},{b,externalEndpointToken(owner,b,lineage,7)}});
+        require(history.size()==1&&history[0].relationship.uuid!=oldVersion,"editing local relationship publishes a new relation, not an external object");
         auto& pool=*activeStatementPools.at(ObjectStoreImplAccess::conn(txn));
-        pool.externalEndpointVersion=[&](const auto& id){return externalEndpointToken(owner,id,8);};
-        mustFail([&]{store.objectRevision(txn,externalEndpointToken(owner,a,7));});
+        pool.externalEndpointVersion=[&](const auto& id){return externalEndpointToken(owner,id,lineage,8);};
+        mustFail([&]{ObjectStoreImplAccess::objectRevision(store,txn,externalEndpointToken(owner,a,lineage,7));});
+        pool.externalEndpointVersion=[&](const auto& id){return externalEndpointToken(owner,id,util::newUuid(),7);};
+        mustFail([&]{ObjectStoreImplAccess::objectRevision(store,txn,externalEndpointToken(owner,a,lineage,7));});
     }
     std::cout<<"external endpoint history tests passed\n";
     return 0;

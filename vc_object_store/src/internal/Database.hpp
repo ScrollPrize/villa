@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 #include "internal/Sqlite.hpp"
+#include "internal/Ownership.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -37,6 +38,8 @@ namespace detail { class GeometryReadCache; class SpatialReadCache; }
 struct CurrentWriteState {
     std::map<std::string,nlohmann::json> before;
     std::map<std::string,std::pair<nlohmann::json,nlohmann::json>> validated;
+    // Savepoint-aware receipt changes, never persisted as per-record history.
+    std::set<std::string> changedObjects, changedRelationships, created;
 };
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
@@ -58,13 +61,23 @@ struct StatementPool {
     std::map<std::string,double> transformedLengths;
     bool readSnapshot = false;
     bool checkedAction = false, actionConflict = false;
-    // Hosted-store bookkeeping for the active write (see hub/HubRules.hpp):
-    // cursors at BEGIN, and whether this write applies hub state verbatim.
-    bool hubApply = false;
-    std::optional<std::string> actingHolder;
-    int64_t startJournal = 0, startGeometry = 0;
-    std::map<std::string, std::vector<int64_t>> components;
+    VersionSelection checkedObjects;
+    // Attribution and request identity of the active write (see
+    // TransactionContext). actingAuthor overrides the open author for
+    // mutation stamps; commit* attribute the store commit.
+    std::optional<std::string> actingAuthor, requestUuid, requestDigest;
+    std::string commitAuthor, commitHost;
+    std::optional<int64_t> publishedSequence; // set by publishHistory
+    // Components read on this connection, filed under every member's id (one
+    // shared list per component; see detail::componentIds). Kept across read
+    // snapshots while the connection's data_version is unchanged.
+    struct Component {
+        std::vector<int64_t> ids;
+        std::optional<std::vector<std::string>> uuids; // filled on first ask
+    };
+    std::unordered_map<std::string, std::shared_ptr<Component>> components;
     size_t componentNodes = 0;
+    std::optional<int> componentsVersion;
     std::shared_ptr<detail::GeometryReadCache> geometryCache;
     std::shared_ptr<detail::SpatialReadCache> spatialCache;
     std::unordered_multimap<std::string, sqlite3_stmt*> idle;
@@ -76,10 +89,11 @@ extern thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatement
 namespace detail {
 bool historyEnabled(sqlite3*);
 void requireHistory(sqlite3*);
-void requireSyncReplica(sqlite3*);
 bool spatialEnabled(sqlite3*);
 void requireSpatial(sqlite3*);
-int64_t writeGeneration(sqlite3*);
+int64_t writeCommitSequence(sqlite3*);
+int64_t writeObjectVersion(sqlite3*, const std::string& uuid);
+int64_t writeRecordVersion(sqlite3*, const char* table, const std::string& uuid);
 int64_t allocateRecordId(sqlite3*, const char* keySpace);
 void createProvisioning(sqlite3*, bool history, bool spatial = true);
 void createChangeTracking(sqlite3*);
@@ -91,14 +105,18 @@ void validateCurrentRelationships(sqlite3*);
 void beginReadCaches(sqlite3*, StatementPool&, size_t geometryBudget, size_t spatialBudget);
 void beginSpatialRead(StatementPool&, size_t budget, int version);
 void beforeCurrentObjectEdit(sqlite3*, const std::string& uuid);
+// The current schema version and the whole schema of a new store (one
+// history generation), inside the caller's transaction. The offline
+// converter builds its destination with the same function.
+inline constexpr int kSchemaVersion = 21;
+void createStoreSchema(sqlite3*, const std::string& generation);
 }
-// Hosting role, fixed at open by the presence of the hub_* tables.
-enum class HubRole { None, Hub, Replica };
 struct ObjectStore::Impl {
+    // Declared first: released only after every connection has closed.
+    std::unique_ptr<detail::OwnershipGuard> ownership;
     std::filesystem::path path;
     OpenOptions options;
     std::string hostname;
-    HubRole hubRole = HubRole::None;
     bool immutableInitial = false;
     sqlite3* writer = nullptr;
     std::mutex writerMutex;
@@ -143,6 +161,21 @@ struct ObjectStoreImplAccess {
         if (!txn.active())
             throw std::runtime_error("object store: use of finished transaction");
         return static_cast<sqlite3*>(txn.handle_);
+    }
+    // Internal revision-UUID lookups (storage keys; see ObjectStore's private section).
+    static std::optional<ObjectRevision> objectRevision(const ObjectStore& store, const Txn& txn, const std::string& revision)
+    {
+        return store.objectRevision(txn, revision);
+    }
+    static RevisionSelection revisionSelectionAt(const ObjectStore& store, const Txn& txn, int64_t publishedAtUs,
+                                                 bool includeRetired)
+    {
+        return store.revisionSelectionAt(txn, publishedAtUs, includeRetired);
+    }
+    static std::vector<SelectedRelationship> relationshipsAt(const ObjectStore& store, const Txn& txn,
+                                                             const RevisionSelection& selection)
+    {
+        return store.relationshipsAt(txn, selection);
     }
 };
 

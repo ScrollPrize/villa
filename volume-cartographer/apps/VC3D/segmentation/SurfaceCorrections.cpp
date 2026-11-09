@@ -3,6 +3,8 @@
 #include "vc/core/StoredCollection.hpp"
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
@@ -69,21 +71,23 @@ std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session
                                              {"bounds", {{"min", annotation.boundsMin}, {"max", annotation.boundsMax}}}}},
                       {"point_attributes", std::move(pointAttributes)}};
     const auto uuid = util::newUuid();
-    std::optional<std::string> surface;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        if (const auto head = db.currentObjectRevision(txn, annotation.surfaceUuid)) surface = head->uuid;
+    ObjectRecord record;
+    record.uuid = uuid;
+    record.kind = "point_collection";
+    record.name = "growth corrections";
+    record.tags = {"growth_annotation"};
+    record.meta = meta.dump();
+    auto edge = attachmentEdge(uuid, annotation.surfaceUuid, "growth_annotation");
+    edge.uuid = util::newUuid();
+    auto request = session.newRequest(attachment);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        const auto surface = reader.currentObject(annotation.surfaceUuid);
+        if (!surface) throw std::runtime_error("surface not found: " + annotation.surfaceUuid);
+        request.expectedObjects[surface->objectUuid] = surface->version;
     });
-    if (!surface) throw std::runtime_error("surface not found: " + annotation.surfaceUuid);
-    session.act(attachment, {{uuid, std::nullopt}, {annotation.surfaceUuid, surface}}, [&](auto& db, auto& txn) {
-        ObjectRecord record;
-        record.uuid = uuid;
-        record.kind = "point_collection";
-        record.name = "growth corrections";
-        record.tags = {"growth_annotation"};
-        record.meta = meta.dump();
-        db.upsertObject(txn, record);
-        db.putGeometry(txn, uuid, vc::geometry::encode(geometry));
-        db.attach(txn, uuid, annotation.surfaceUuid, "growth_annotation");
-    });
+    request.expectedObjects[uuid] = std::nullopt;
+    request.operations = {CreateObjectOp{objectRecordJson(record)}, PutGeometryOp{uuid, vc::geometry::encode(geometry), {}},
+                          AddEdgeOp{edgeRecordJson(edge)}};
+    (void)session.submit(attachment, request);
     return uuid;
 }

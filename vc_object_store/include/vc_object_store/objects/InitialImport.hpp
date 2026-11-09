@@ -60,7 +60,7 @@ private:
 };
 
 // Constructs, seals and atomically publishes one new collection. The API owns
-// independent worker connections, transactions, generations, index finalization,
+// independent worker connections, transactions, shared lineage/commit state, index finalization,
 // linking, VFS lifetime and failure cleanup. Producers only supply native data.
 // One uncompressed shard produces an ordinary SQLite file; multiple uncompressed
 // shards produce a directory. Supplying packed produces one framed VFS file.

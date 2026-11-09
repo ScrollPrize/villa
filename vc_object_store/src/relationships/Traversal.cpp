@@ -139,24 +139,42 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
 
 }  // namespace
 
-std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
-                                        const std::vector<std::string>& kinds, bool includeRetired, std::optional<bool> adjacentFilter)
+namespace {
+// The component of `start`, cached on read connections (nullptr elsewhere,
+// with the walk in `walked`).
+std::shared_ptr<StatementPool::Component> cachedComponent(
+    sqlite3* db, const std::string& start, const std::vector<std::string>& kinds, bool includeRetired,
+    std::optional<bool> adjacentFilter, const std::atomic_bool* cancel, std::vector<int64_t>& walked)
 {
     StatementPool* pool = nullptr;
     if (auto it = activeStatementPools.find(db); it != activeStatementPools.end() && it->second->readSnapshot)
         pool = it->second;
-    const auto key = nlohmann::json({formatUuid(parseUuid(start)), kinds, includeRetired, adjacentFilter ? nlohmann::json(*adjacentFilter) : nlohmann::json(nullptr)}).dump();
+    const auto prefix = nlohmann::json({kinds, includeRetired, adjacentFilter ? nlohmann::json(*adjacentFilter) : nlohmann::json(nullptr)}).dump() + "/";
+    const auto key = prefix + formatUuid(parseUuid(start));
     if (pool) if (auto it = pool->components.find(key); it != pool->components.end()) return it->second;
-    const auto keys=traverse(db,start,INT_MAX,kinds,nullptr,includeRetired,adjacentFilter);
+    const auto keys=traverse(db,start,INT_MAX,kinds,cancel,includeRetired,adjacentFilter);
     std::vector<int64_t> ids;ids.reserve(keys.size());
     for(const auto& uuid:keys)if(const auto id=objectIdByUuid(db,parseUuid(uuid)))ids.push_back(*id);
     // Bound the transaction-local membership cache; never reuse across snapshots.
     if (pool && ids.size() <= 262144) {
         if (pool->componentNodes + ids.size() > 262144) { pool->components.clear(); pool->componentNodes = 0; }
         pool->componentNodes += ids.size();
-        pool->components.emplace(key, ids);
+        const auto shared = std::make_shared<StatementPool::Component>(StatementPool::Component{std::move(ids), std::nullopt});
+        for (const auto& uuid : keys) pool->components.emplace(prefix + uuid, shared);
+        return shared;
     }
-    return ids;
+    walked = std::move(ids);
+    return nullptr;
+}
+}  // namespace
+
+std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
+                                        const std::vector<std::string>& kinds, bool includeRetired, std::optional<bool> adjacentFilter,
+                                        const std::atomic_bool* cancel)
+{
+    std::vector<int64_t> walked;
+    const auto component = cachedComponent(db, start, kinds, includeRetired, adjacentFilter, cancel, walked);
+    return component ? component->ids : walked;
 }
 
 std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::string& objectUuid,
@@ -213,13 +231,13 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     std::unordered_map<std::string, uint64_t> nodes;
     std::vector<int64_t> ids;
     auto objectsQuery = objectSelectionQuery(db, objects,
-        "o.id,o.uuid,o.generation,CASE WHEN o.geometry_manifest IS NOT NULL THEN o.storage_ref END");
+        "o.id,o.uuid,o.version,CASE WHEN o.geometry_manifest IS NOT NULL THEN o.storage_ref END");
     while (objectsQuery->row()) {
         const auto node = result.objectUuids.size();
         const auto id = objectsQuery->i64(0);
         nodes.emplace(formatUuid(objectsQuery->blob16(1)), node); ids.push_back(id);
         result.objectUuids.push_back(formatUuid(objectsQuery->blob16(1)));
-        result.generations.push_back(objectsQuery->i64(2));
+        result.versions.push_back(objectsQuery->i64(2));
         result.geometryRevisions.push_back(objectsQuery->isNull(3) ? std::nullopt :
             std::optional(readGeometryTokenColumn(*objectsQuery,3)));
     }
@@ -245,6 +263,21 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     return result;
 }
 
+GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<ObjectVersion>& versions,
+                                         const EdgeSelection& edges) const
+{
+    RevisionSelection selection;
+    const auto revisions = objectsAtVersions(txn, versions);
+    for (size_t i = 0; i < versions.size(); ++i) {
+        if (!revisions[i])
+            throw std::invalid_argument("object history: version " + std::to_string(versions[i].version) + " of " +
+                                        versions[i].objectUuid + " is not recorded in this store and generation");
+        if (!selection.emplace(revisions[i]->objectUuid, revisions[i]->uuid).second)
+            throw std::invalid_argument("duplicate object in version selection");
+    }
+    return graphReadViewAt(txn, selection, edges);
+}
+
 GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelection& selection,
                                          const EdgeSelection& edges) const
 {
@@ -252,7 +285,7 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
     requirePublishedGraphRead(txn);
     validateEdgeSelection(edges);
     if (edges.endpointUuids)
-        throw std::invalid_argument("graph endpoint scope is specified by its revision selection");
+        throw std::invalid_argument("graph endpoint scope is specified by its version selection");
     GraphReadView result;
     result.selectedObjects.emplace(); result.selectedRelationships.emplace();
     RevisionSelection resolved;
@@ -268,7 +301,7 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
     for (const auto& [object, revision] : resolved) {
         auto value = *objectRevision(txn, *revision);
         nodes.emplace(object, result.objectUuids.size());
-        result.objectUuids.push_back(object); result.generations.push_back(value.record.generation);
+        result.objectUuids.push_back(object); result.versions.push_back(value.record.version.value_or(0));
         result.geometryRevisions.push_back(value.geometryRevision);
         result.selectedObjects->push_back(std::move(value));
     }

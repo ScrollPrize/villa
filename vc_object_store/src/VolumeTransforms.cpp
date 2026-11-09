@@ -1,3 +1,5 @@
+#include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/VolumeTransforms.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
@@ -10,6 +12,19 @@
 #include <limits>
 #include <string_view>
 namespace vc::objects {
+void checkVolumeMapping(const ObjectStore& store, const Txn& txn, const std::string& objectUuid,
+                        const std::string& target, double targetScale, const VolumeAffine& expected)
+{
+    const auto object = store.objectByUuid(txn, objectUuid);
+    const auto mapping = object
+        ? store.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->meta), target, targetScale)
+        : std::nullopt;
+    if (!mapping || *mapping != expected)
+        throw TransactionConflict(TransactionConflict::Reason::ReadDependency,
+            {{"object", objectUuid, std::nullopt, std::nullopt}},
+            "volume registration changed; reopen its transformed view");
+}
+
 std::optional<VolumeAffine> VolumeTransforms::toVolume(const nlohmann::json& metadata,const std::string& target,double targetScale) const {
     if(target.empty() || !std::isfinite(targetScale) || targetScale<=0)throw std::invalid_argument("invalid target volume or scale");
     const auto coordinates=geometryCoordinates(metadata.value("coordinates",nlohmann::json::object()));
@@ -56,32 +71,59 @@ std::optional<ObjectRecord> volumeTransformChoice(const ObjectStore& store,const
     }
     return std::nullopt;
 }
+std::optional<ObjectRecord> volumeTransformChoice(const StoreReader& reader,const std::string& source,const std::string& target) {
+    ObjectSelection choices;choices.kind="volume_transform_choice";
+    for(const auto& existing:reader.selectObjects(choices)) {
+        const auto c=nlohmann::json::parse(existing.meta).at("choice");
+        if(c.at("source_volume")==source&&c.at("target_volume")==target)return existing;
+    }
+    return std::nullopt;
+}
+ObjectRecord volumeTransformRecord(ObjectRecord record,const std::string& source,const std::string& target,
+    const VolumeAffine& matrix,const std::string& name) {
+    vcr::catalog::RegistrationGraph validate;validate.add({"validate","",source,target,matrix,name});
+    if(!record.kind.empty()&&record.kind!="volume_transform")throw std::invalid_argument("not a volume registration");
+    record.kind="volume_transform";record.name=name;
+    auto meta=nlohmann::json::parse(record.meta);
+    meta["registration"]={{"source_volume",source},{"target_volume",target},{"matrix",matrix.json()},{"description",name}};
+    record.meta=meta.dump();
+    return record;
+}
+ObjectRecord volumeTransformChoiceRecord(ObjectRecord record,const std::string& source,const std::string& target,
+    const std::vector<std::string>& path) {
+    record.kind="volume_transform_choice";record.name=source+" -> "+target;
+    record.meta=nlohmann::json{{"choice",{{"source_volume",source},{"target_volume",target},{"path",path}}}}.dump();
+    return record;
+}
 std::string registerVolumeTransform(ObjectStoreSession& session,const AttachmentIdentity& attachment,const std::string& source,
     const std::string& target,const VolumeAffine& matrix,const std::string& name) {
-    const auto uuid=util::newUuid();
-    StoreProvisioning policy;
-    session.read(attachment,[&](const auto& store,const auto& txn,const auto&){policy=store.provisioning(txn);});
-    const ObjectStoreSession::Action action=[&](auto& store,auto& txn){store.registerVolumeTransform(txn,source,target,matrix,name,uuid);};
-    if(policy.history==HistoryMode::Off)session.actAtGeneration(attachment,policy.generation,action);
-    else session.act(attachment,{{uuid,std::nullopt}},action);
-    return uuid;
+    ObjectRecord base;base.uuid=util::newUuid();
+    auto request=session.newRequest(attachment);
+    request.expectedObjects[base.uuid]=std::nullopt;
+    request.operations.push_back(CreateObjectOp{objectRecordJson(volumeTransformRecord(base,source,target,matrix,name))});
+    (void)session.submit(attachment,request);
+    return base.uuid;
 }
 std::string chooseVolumeTransform(ObjectStoreSession& session,const AttachmentIdentity& attachment,const std::string& source,
     const std::string& target,const std::vector<std::string>& path) {
-    std::string uuid=util::newUuid();
-    std::optional<std::string> revision;
-    StoreProvisioning policy;
-    session.read(attachment,[&](const auto& store,const auto& txn,const auto&) {
-        policy=store.provisioning(txn);
-        if(const auto existing=volumeTransformChoice(store,txn,source,target)) {
-            uuid=existing->uuid;
-            if(policy.history==HistoryMode::On)revision=store.currentObjectRevision(txn,uuid)->uuid;
+    auto request=session.newRequest(attachment);
+    ObjectRecord record;
+    session.readStore(attachment,[&](const StoreReader& reader,const auto&) {
+        (void)reader.volumeTransforms().graph.resolve(source,target,path).resolved();
+        request.readDependencies=transformDependencies(reader);
+        if(const auto existing=volumeTransformChoice(reader,source,target)) {
+            record=*existing;
+            request.readDependencies.erase(record.uuid);
+            request.expectedObjects[record.uuid]=record.version;
+            request.operations.push_back(UpdateObjectOp{objectRecordJson(volumeTransformChoiceRecord(record,source,target,path))});
+        } else {
+            record.uuid=util::newUuid();
+            request.expectedObjects[record.uuid]=std::nullopt;
+            request.operations.push_back(CreateObjectOp{objectRecordJson(volumeTransformChoiceRecord(record,source,target,path))});
         }
     });
-    const ObjectStoreSession::Action action=[&](auto& store,auto& txn){store.chooseVolumeTransform(txn,source,target,path,uuid);};
-    if(policy.history==HistoryMode::Off)session.actAtGeneration(attachment,policy.generation,action);
-    else session.act(attachment,{{uuid,revision}},action);
-    return uuid;
+    (void)session.submit(attachment,request);
+    return record.uuid;
 }
 std::array<double,6> transformBounds(const std::array<double,6>& b,const VolumeAffine& m) {
     std::array<double,6> out;
@@ -97,29 +139,42 @@ std::array<double,6> transformBounds(const std::array<double,6>& b,const VolumeA
     }
     return out;
 }
-VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
+std::string catalogTransformUuid(const std::string& registrationId) {
+    if(registrationId.empty())throw std::invalid_argument("catalog registration id is empty");
+    return util::nameUuid("vc_object_store/catalog-registration/"+registrationId);
+}
+VolumeTransforms volumeTransformsFrom(const std::vector<std::pair<ObjectRecord,std::string>>& registrations,
+                                      const std::vector<ObjectRecord>& choices,
+                                      const vcr::catalog::RegistrationGraph* catalog) {
     VolumeTransforms result;
-    if(impl_->options.catalogTransforms)result.graph=*impl_->options.catalogTransforms;
-    for(const auto& object:objectsByKind(txn,"volume_transform")) {
+    std::vector<vcr::catalog::Registration> recorded;
+    std::set<std::string> recordedIds;
+    for(const auto& [object,headRevision]:registrations) {
         const auto meta=nlohmann::json::parse(object.meta);
         const auto& value=meta.at("registration");
-        const auto policy=provisioning(txn);
-        std::string version;
-        if(policy.history==HistoryMode::On) {
-            const auto head=currentObjectRevision(txn,object.uuid);
-            if(!head)throw std::runtime_error("commit new volume registrations before resolving views");
-            version=head->uuid;
-        } else {
-            if(object.generation>policy.generation)throw std::runtime_error("commit new volume registrations before resolving views");
-            // The transform graph uses an opaque cache/freshness token, not a
-            // historical revision reference. No history rows are synthesized.
-            version="generation:"+std::to_string(object.generation);
+        // A recorded catalog registration keeps its catalog id as its route key.
+        std::string id=object.uuid;
+        if(meta.contains("catalog_registration")) {
+            id=meta.at("catalog_registration").at("id").get<std::string>();
+            recordedIds.insert(id);
         }
-        result.graph.add({object.uuid,version,
+        // A current-only store has no archival revision UUID. Its ordinary
+        // lineage/version pair still identifies the registration for route
+        // choices, without fabricating a retained object-history entry.
+        const auto revision = headRevision.empty()
+            ? object.versionGeneration + ":" + std::to_string(object.version.value())
+            : headRevision;
+        recorded.push_back({id,revision,
             value.at("source_volume").get<std::string>(),value.at("target_volume").get<std::string>(),
             VolumeAffine::fromJson(value.at("matrix")),value.value("description",std::string{})});
     }
-    for(const auto& object:objectsByKind(txn,"volume_transform_choice")) {
+    // Client catalog registrations not recorded in the store still apply
+    // locally; recorded ones always resolve from the store.
+    if(catalog)
+        for(const auto& registration:catalog->registrations())
+            if(!recordedIds.contains(registration.id))result.graph.add(registration);
+    for(auto& registration:recorded)result.graph.add(std::move(registration));
+    for(const auto& object:choices) {
         const auto value=nlohmann::json::parse(object.meta).at("choice");
         const auto key=std::pair(value.at("source_volume").get<std::string>(),value.at("target_volume").get<std::string>());
         if(!result.choices.emplace(key,value.at("path").get<std::vector<std::string>>()).second)
@@ -127,16 +182,19 @@ VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
     }
     return result;
 }
+
+VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
+    std::vector<std::pair<ObjectRecord,std::string>> registrations;
+    for(auto& object:objectsByKind(txn,"volume_transform")) {
+        const auto head=currentObjectRevision(txn,object.uuid);
+        if(!head)throw std::runtime_error("commit new volume registrations before resolving views");
+        registrations.emplace_back(std::move(object),head->uuid);
+    }
+    return volumeTransformsFrom(registrations,objectsByKind(txn,"volume_transform_choice"),
+                                impl_->options.catalogTransforms.get());
+}
 std::vector<vcr::catalog::TransformResolution> ObjectStore::availableTransforms(const Txn& txn,const std::string& uuid) const {
-    const auto object=objectByUuid(txn,uuid);
-    if(!object)throw std::invalid_argument("object not found");
-    const auto coordinates=geometryCoordinates(nlohmann::json::parse(object->meta).value("coordinates",nlohmann::json::object()));
-    if(coordinates["volume_uuid"].is_null()||coordinates["scale_factor"].is_null())return {};
-    const auto source=coordinates["volume_uuid"].get<std::string>();
-    const auto context=volumeTransforms(txn);
-    auto result=context.graph.available(source);
-    for(auto& resolution:result)resolution=context.resolve(source,resolution.target);
-    return result;
+    return LocalStoreReader(*this,txn).availableTransforms(uuid);
 }
 double ObjectStore::geometryLengthInVolume(const Txn& txn,const std::string& uuid,const std::string& target,double scale) const {
     const auto object=objectByUuid(txn,uuid);
@@ -149,22 +207,42 @@ double ObjectStore::geometryLengthInVolume(const Txn& txn,const std::string& uui
 }
 std::string ObjectStore::registerVolumeTransform(WriteTxn& txn,const std::string& source,const std::string& target,
     const VolumeAffine& matrix,const std::string& name,const std::optional<std::string>& uuid) {
-    vcr::catalog::RegistrationGraph validate;validate.add({"validate","",source,target,matrix,name});
     ObjectRecord record;
-    if(uuid) {if(auto existing=objectByUuid(txn,*uuid)){record=*existing;if(record.kind!="volume_transform")throw std::invalid_argument("not a volume registration");}else record.uuid=*uuid;}
-    record.kind="volume_transform";record.name=name;
-    auto meta=nlohmann::json::parse(record.meta);
-    meta["registration"]={{"source_volume",source},{"target_volume",target},{"matrix",matrix.json()},{"description",name}};
-    record.meta=meta.dump();return upsertObject(txn,record);
+    if(uuid) {if(auto existing=objectByUuid(txn,*uuid))record=*existing;else record.uuid=*uuid;}
+    return upsertObject(txn,volumeTransformRecord(record,source,target,matrix,name));
+}
+std::vector<std::string> ObjectStore::recordCatalogTransforms(WriteTxn& txn,const std::vector<vcr::catalog::Registration>& registrations) {
+    std::vector<std::string> changed;
+    std::set<std::string> seen;
+    for(const auto& registration:registrations) {
+        if(!seen.insert(registration.id).second)throw std::invalid_argument("duplicate catalog registration "+registration.id);
+        vcr::catalog::RegistrationGraph validate;validate.add(registration);
+        const auto uuid=catalogTransformUuid(registration.id);
+        ObjectRecord record;
+        if(auto existing=objectByUuid(txn,uuid)) {
+            record=*existing;
+            if(record.kind!="volume_transform")throw std::invalid_argument("not a volume registration: "+uuid);
+        } else record.uuid=uuid;
+        record.kind="volume_transform";
+        record.name=registration.provenance.empty()?registration.id:registration.provenance;
+        auto meta=nlohmann::json::parse(record.meta);
+        const nlohmann::json value={{"source_volume",registration.source},{"target_volume",registration.target},
+                                    {"matrix",registration.matrix.json()},{"description",registration.provenance}};
+        const nlohmann::json source={{"id",registration.id},{"revision",registration.revision}};
+        if(meta.value("registration",nlohmann::json())==value&&meta.value("catalog_registration",nlohmann::json())==source)continue;
+        meta["registration"]=value;meta["catalog_registration"]=source;
+        record.meta=meta.dump();
+        changed.push_back(upsertObject(txn,record));
+    }
+    return changed;
 }
 std::string ObjectStore::chooseVolumeTransform(WriteTxn& txn,const std::string& source,const std::string& target,const std::vector<std::string>& path,
     const std::optional<std::string>& uuid) {
     auto transforms=volumeTransforms(txn);
     (void)transforms.graph.resolve(source,target,path).resolved();
-    ObjectRecord record;record.kind="volume_transform_choice";record.name=source+" -> "+target;
+    ObjectRecord record;
     if(uuid)record.uuid=*uuid;
     if(auto existing=volumeTransformChoice(*this,txn,source,target))record=std::move(*existing);
-    record.meta=nlohmann::json{{"choice",{{"source_volume",source},{"target_volume",target},{"path",path}}}}.dump();
-    return upsertObject(txn,record);
+    return upsertObject(txn,volumeTransformChoiceRecord(record,source,target,path));
 }
 }

@@ -24,14 +24,15 @@ class QNetworkReply;
  *
  * Supports two modes:
  *   - Internal: launches fit_service.py as a subprocess on the attached
- *     object store's file (--store --shared-store; this process's session
- *     syncs it)
+ *     object store (--store with its file or, for a hosted store, its
+ *     vc_object_server endpoint; --shared-store)
  *   - External: connects to a pre-started service on a known host:port; it
- *     must work on the same store (a replica of the same hub)
+ *     must work on the same store (on another machine: started with
+ *     --store <endpoint> of the vc_object_server VC3D attached)
  *
  * Jobs read stored surfaces by UUID and create their results as new surfaces
- * in the store (results attached to them, the model checkpoint in their
- * artifact directory); nothing travels as files.
+ * in the store (results attached to them, the model checkpoint among their
+ * artifacts); nothing travels as files.
  *
  * The service is kept alive so repeated optimizations avoid
  * Python/torch startup overhead.
@@ -76,8 +77,8 @@ public:
     /** The store jobs read and write (the surface catalog's attachment). */
     void setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
                         std::optional<vc::objects::AttachmentIdentity> attachment);
-    /** The model checkpoint a fit left with a stored surface, if any. */
-    std::optional<std::filesystem::path> surfaceModel(const std::string& surfaceUuid) const;
+    /** Whether a fit published a model checkpoint (the model.pt artifact) with a stored surface. */
+    bool surfaceHasModel(const std::string& surfaceUuid) const;
 
     [[nodiscard]] bool isRunning() const;
     [[nodiscard]] QString lastError() const { return _lastError; }
@@ -164,9 +165,6 @@ private:
     void handleOptimizeReply(QNetworkReply* reply);
     bool validateApiVersion(QNetworkReply* reply, const QString& context);
     void postOptimizationRequest(const QJsonObject& requestConfig);
-    /** Run `then` once the store's hub has this replica's edits (an external
-     *  service reads the hub); right away for the internal service. */
-    void afterStoreSync(std::function<void()> then);
     QString storeError() const;
     void updateCachedJobFromStatus(const QJsonObject& status);
 
@@ -189,8 +187,8 @@ private:
     // it (this manager is a process-lifetime singleton).
     std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
     std::optional<vc::objects::AttachmentIdentity> _storeAttachment;
-    QString _storePath;         // the attached store's file
-    QString _serviceStorePath;  // the file the internal service was started on
+    QString _storeLocation;         // the attached store: its file or endpoint
+    QString _serviceStoreLocation;  // the store the internal service was started on
     QString _serviceStoreUuid;  // the store the connected service writes to
     bool _serviceReady{false};
     bool _optimizationRunning{false};

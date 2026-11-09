@@ -1,8 +1,10 @@
 #include "TestSupport.hpp"
 #include "internal/RecordSql.hpp"
+#include "geometry/GeometryReader.hpp"
 #include "vc_object_store/objects/InitialImport.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/VolumeTransforms.hpp"
+#include "vc_object_store/objects/SurfaceTileCache.hpp"
 #include <nlohmann/json.hpp>
 #include <cstring>
 #include <iostream>
@@ -34,6 +36,9 @@ struct Fixture {
     }
     int quality(){auto r=db.read();return Json::parse(db.objectByUuid(r,a)->meta).at("quality");}
     bool hasEdge(){auto r=db.read();return db.edgeByUuid(r,e).has_value();}
+    WriteTxn checkedWrite(){VersionSelection expected;
+        {auto r=db.read();for(const auto& id:{a,b})expected[id]=db.objectByUuid(r,id)->version;}
+        return db.write(expected);}
 };
 void metadataAndSavepoints(){
     TemporaryDirectory dir;Fixture f(dir.path/"current");
@@ -73,19 +78,19 @@ void geometryAndLifecycle(){
     std::string changed;
     {auto w=f.db.write();changed=f.db.editGeometry(w,f.a,{edit(0,9)},before,[&](const auto& affected){
         std::vector<GeometryEdgeEdit> choices;for(const auto& edge:affected){GeometryEdgeEdit c;
-            c.edgeUuid=edge.uuid;c.expectedGeneration=edge.generation;c.action="retain";
+            c.edgeUuid=edge.uuid;c.expectedVersion=edge.version.value_or(0);c.action="retain";
             c.aRevision=f.db.currentGeometry(w,edge.aUuid)->uuid;c.bRevision=f.db.currentGeometry(w,edge.bUuid)->uuid;
             choices.push_back(c);}return choices;});w.commit();}
     require(f.hasEdge(),"explicit geometry retain leaves current edge");
     {auto w=f.db.write();f.db.editGeometry(w,f.a,{edit(3,12)},changed);w.commit();}
     require(f.hasEdge(),"unanchored point edit does not require review");
-    {auto w=f.db.write();{Savepoint nested(ObjectStoreImplAccess::conn(w));f.db.retireObject(w,f.a);}
+    {auto w=f.checkedWrite();{Savepoint nested(ObjectStoreImplAccess::conn(w));f.db.retireObject(w,f.a);}
         w.commit();}
     require(f.hasEdge(),"retirement savepoint rollback restores incident relationship");
-    {auto w=f.db.write();f.db.retireObject(w,f.a);w.commit();}
+    {auto w=f.checkedWrite();f.db.retireObject(w,f.a);w.commit();}
     require(!f.hasEdge(),"retirement transactionally removes current incident edges");
     {auto w=f.db.write();mustFail([&]{f.db.addEdge(w,relation(f.a,f.b));});w.commit();}
-    {auto w=f.db.write();f.db.restoreObject(w,f.a);w.commit();}
+    {auto w=f.checkedWrite();f.db.restoreObject(w,f.a);w.commit();}
     require(!f.hasEdge(),"restoration never revives removed relationships");
     {auto w=f.db.write();f.e=f.db.addEdge(w,relation(f.a,f.b));w.commit();}
     require(f.hasEdge(),"explicit relation construction after restoration works");
@@ -106,6 +111,7 @@ void immutableInitial(){
 }
 void currentGeometryTokens(){
     TemporaryDirectory dir;auto o=options();o.spatialIndex=true;
+    o.surfaceTiles=std::make_shared<SurfaceTileCache>(1024*1024);
     auto db=ObjectStore::create(dir.path/"tokens",o);std::string id,token;
     auto x=[](const std::vector<uint8_t>& bytes){double value;std::memcpy(&value,bytes.data(),sizeof value);return value;};
     {auto w=db.write();auto record=fiber();record.meta=R"({"coordinates":{"volume_uuid":"a","scale_factor":1}})";
@@ -121,6 +127,11 @@ void currentGeometryTokens(){
         require(graph.geometryRevisions.size()==1&&graph.geometryRevisions[0]==token,"graph preserves current token");
         selected.volume="b";selected.orderBy="length_desc";
         require(db.selectObjects(r,selected).size()==1,"registered length query accepts current token");}
+    {auto w=db.write();db.setMeta(w,id,"note","true");w.commit();}
+    {auto r=db.read();const auto geometry=db.geometryRevision(r,token);const auto object=db.objectByUuid(r,id);
+        require(geometry&&geometry->uuid==token&&geometry->objectVersion==object->version.value_or(0),
+            "metadata-only version advance preserves geometry reference without an extra geometry counter");
+        require(x(db.readGeometryArray(r,token,"line_points"))==8,"geometry remains readable after metadata-only edit");}
     {auto w=db.write();const auto next=db.editGeometry(w,id,{edit(0,1)},token);
         require(next!=token,"next publication changes geometry token");
         const auto beforeLength=db.geometryLengthInVolume(w,id,"b");
@@ -131,8 +142,19 @@ void currentGeometryTokens(){
     std::string sheet,revision;
     {auto w=db.write();ObjectRecord record;record.kind="surface";sheet=db.upsertObject(w,record);
         vc::geometry::Surface surface{2,2,{1,1},{{0,0,10},{1,0,10},{0,1,10},{1,1,10}}};
-        revision=db.putGeometry(w,sheet,vc::geometry::encode(surface));w.commit();}
-    {auto r=db.read();SurfaceProximityQuery query;query.point={.5,.5,11};query.tolerance=2;
+        revision=db.putGeometry(w,sheet,vc::geometry::encode(surface));
+        {GeometryReader reader(w,revision);
+            require(surfaceTile(o.surfaceTiles.get(),revision,reader,0,0,2,2)->points.front()[2]==10,
+                "initial writer query populates shared tile cache");}
+        std::vector<GeometryArrayEdit> edits;
+        for(int64_t index=0;index<4;++index){const float z=20;std::vector<uint8_t> bytes(sizeof z);
+            std::memcpy(bytes.data(),&z,sizeof z);edits.push_back({"points",3*index+2,std::move(bytes)});}
+        require(db.editGeometry(w,sheet,edits,revision)==revision,"surface edit shares the current object version");
+        {GeometryReader reader(w,revision);
+            require(surfaceTile(o.surfaceTiles.get(),revision,reader,0,0,2,2)->points.front()[2]==20,
+                "shared tile cache cannot return stale same-token geometry");}
+        w.commit();}
+    {auto r=db.read();SurfaceProximityQuery query;query.point={.5,.5,21};query.tolerance=2;
         const auto hits=db.nearestSurfaces(r,query);
         require(hits.size()==1&&hits[0].objectUuid==sheet,"surface proximity accepts current geometry token");}
 }
@@ -153,7 +175,7 @@ void overlay(HistoryMode history){
     std::string before;{auto r=db.read();before=db.currentGeometry(r,a)->uuid;require(!db.edge(r,old)&&db.edge(r,edge),"inherited edge replaced locally");}
     mustFail([&]{auto w=db.write();db.editGeometry(w,a,{edit(0,9)},before);w.commit();});
     {auto w=db.write();const auto current=*db.edge(w,edge);GeometryEdgeEdit c;c.edgeUuid=edge.objectUuid;
-        c.expectedGeneration=current.record.generation;c.action="retain";
+        c.expectedVersion=current.record.version.value_or(0);c.action="retain";
         c.aRevision=db.currentGeometry(w,current.a)->uuid;c.bRevision=db.currentGeometry(w,current.b)->uuid;
         db.editGeometry(w,a,{edit(0,9)},before,{c});w.commit();}
     // The second endpoint is still a compact external key. Its promotion
@@ -161,7 +183,7 @@ void overlay(HistoryMode history){
     {auto r=db.read();before=db.currentGeometry(r,b)->uuid;}
     mustFail([&]{auto w=db.write();db.editGeometry(w,b,{edit(0,10)},before);w.commit();});
     {auto w=db.write();const auto current=*db.edge(w,edge);GeometryEdgeEdit c;c.edgeUuid=edge.objectUuid;
-        c.expectedGeneration=current.record.generation;c.action="retain";
+        c.expectedVersion=current.record.version.value_or(0);c.action="retain";
         c.aRevision=db.currentGeometry(w,current.a)->uuid;c.bRevision=db.currentGeometry(w,current.b)->uuid;
         db.editGeometry(w,b,{edit(0,10)},before,{c});
         const auto promoted=*db.edge(w,edge);

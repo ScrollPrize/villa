@@ -6,12 +6,14 @@ namespace vc::objects::detail {
 template<class Record, class Visit>
 void commonFields(Record& r, Visit visit)
 {
-    visit("generation", r.generation);
+    visit("commit_sequence", r.commitSequence);
+    visit("version", r.version);
+    visit("version_generation", r.versionGeneration);
     visit("created_by", r.createdBy); visit("created_at", r.createdAt); visit("created_host", r.createdHost);
     visit("changed_by", r.changedBy); visit("changed_at", r.changedAt); visit("changed_host", r.changedHost);
     visit("approval_state", r.approvalState);
     visit("approved_by", r.approvedBy); visit("approved_at", r.approvedAt); visit("approved_host", r.approvedHost);
-    visit("approved_generation", r.approvedGeneration);
+    visit("approved_version", r.approvedVersion);
     visit("tags", r.tags);
 }
 
@@ -21,7 +23,6 @@ void objectFields(Record& r, Visit visit)
     visit("name", r.name);
     visit("format_version", r.formatVersion);
     visit("storage_kind", r.storageKind); visit("storage_ref", r.storageRef);
-    visit("data_generation", r.dataGeneration);
 }
 
 template<class Detail, class Visit>

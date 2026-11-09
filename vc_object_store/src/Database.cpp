@@ -3,7 +3,7 @@
 #include "imports/SourceIdentityIndex.hpp"
 #include "internal/History.hpp"
 #include "internal/RecordSql.hpp"
-#include "hub/HubRules.hpp"
+#include "internal/Versions.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "internal/ImmutableImport.hpp"
 
@@ -15,13 +15,30 @@ ObjectStore::~ObjectStore() = default;
 ObjectStore::ObjectStore(ObjectStore&&) noexcept = default;
 ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 
+void detail::createStoreSchema(sqlite3* db, const std::string& generation)
+{
+    createProvisioning(db, true, true);
+    createSchema(db, true, std::nullopt, false);
+    execute(db, "UPDATE store_manifest SET generation=?,initial_generation=?", parseUuid(generation), parseUuid(generation));
+    Statement owner(db, "SELECT uuid FROM store_identity"); owner.row();
+    for (const char* name : {"objects", "edges"})
+        execute(db, "INSERT INTO key_allocators VALUES(?,?,1,?,1)", std::string(name), owner.blob16(0), int64_t(INT64_MAX));
+    createHistorySchema(db);
+    createVersionSchema(db, generation);
+    createGeometryHistoryIndex(db);
+    createSourceIdentityIndex(db);
+    createStorageDirectory(db);
+    execute(db, "UPDATE database_identity SET schema_version=?", int64_t(kSchemaVersion));
+    registerStorageTables(db);
+    createChangeTracking(db);
+}
+
 std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create, bool immutable)
 {
     const int kApplicationId = 0x56434f42;
-    const int kSchemaVersion = 18;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
-    if (create && options.sharedFile) throw std::invalid_argument("object store: create a store locally, then initialize it as a hub");
-    if (create && (options.initialGeneration<1 || options.initialGeneration==INT64_MAX))
+    if (options.serviceOwner && options.readOnly) throw std::invalid_argument("hosting service requires writable access");
+    if (create && (options.initialCommitSequence<0 || options.initialCommitSequence==INT64_MAX))
         throw std::invalid_argument("object store: invalid initial generation");
     if (create) for (const auto& range : {options.objectIdRange,options.edgeIdRange})
         if(range[0]<1 || range[1]<range[0]) throw std::invalid_argument("object store: invalid reserved ID range");
@@ -38,18 +55,17 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
     impl->immutableInitial=immutable;
     if(immutable && (!create || options.history!=HistoryMode::Off || options.spatialIndex))
         throw std::invalid_argument("immutable construction requires a new history-off spatial-off database");
-    impl->options.readerPoolSize = immutable ? 0 : options.sharedFile ? 1 : std::max(1, options.readerPoolSize);
-    if (options.sharedFile) impl->options.geometryCacheBytes = impl->options.spatialCacheBytes = 0;
+    impl->options.readerPoolSize = immutable ? 0 : std::max(1, options.readerPoolSize);
     impl->hostname = options.hostnameOverride.value_or(detectHostname());
 
     auto validate = [&](sqlite3* db) {
         if (pragmaInt(db, "application_id") != kApplicationId)
             throw std::runtime_error("object store: unsupported database format: " + path.string());
         if (pragmaInt(db, "user_version") != kSchemaVersion)
-            throw std::runtime_error("object store: unsupported database schema (convert legacy stores with the separate v2 conversion tool): " + path.string());
-        Statement manifest(db, "SELECT format_version,history_enabled,sealed,spatial_enabled FROM store_manifest WHERE singleton=1");
-        if (!manifest.row() || manifest.i64(0) != 2)
-            throw std::runtime_error("object store: invalid v2 manifest");
+            throw std::runtime_error("object store: unsupported database schema (convert upstream stores with vc_object_convert): " + path.string());
+        Statement manifest(db, "SELECT schema_version,history_enabled,sealed,spatial_enabled FROM store_manifest WHERE singleton=1");
+        if (!manifest.row() || manifest.i64(0) != kSchemaVersion)
+            throw std::runtime_error("object store: invalid store manifest");
         impl->options.history = manifest.i64(1) ? HistoryMode::On : HistoryMode::Off;
         impl->options.spatialIndex = manifest.i64(3) != 0;
         if (manifest.i64(2) && !options.readOnly)
@@ -71,21 +87,17 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             }
             throw std::runtime_error("object store: unsupported required feature (use ObjectCollection for collections): " + features.text(0));
         }
-        if(!currentState) throw std::runtime_error("object store: legacy current-state layout requires separate conversion; refusing mixed v2 semantics");
-        if(!binaryHashes||!endpointKeys||!stateLayout||!binaryUuids) throw std::runtime_error("object store: earlier experimental v2 layout requires rebuilding (binary hashes/direct endpoint UUIDs/single state/binary UUIDs absent)");
+        if(!currentState||!binaryHashes||!endpointKeys||!stateLayout||!binaryUuids)
+            throw std::runtime_error("object store: required current-schema features are absent (direct geometry, binary hashes, direct endpoint keys, state or binary UUIDs)");
         Statement physical(db, "SELECT schema_version FROM database_identity WHERE singleton=1");
         if (!physical.row() || physical.i64(0) != kSchemaVersion)
             throw std::runtime_error("object store: invalid database identity/schema");
-        // A hub must keep its rollback journal: opening it with WAL from a
-        // network mount would break locking for every other client.
-        impl->hubRole = detectHubRole(db);
-        if (impl->hubRole == HubRole::Hub && !options.sharedFile)
-            throw std::runtime_error("object store: " + path.string() + " is a hosted hub; clone it to a local replica");
-        if (impl->hubRole != HubRole::Hub && options.sharedFile)
-            throw std::runtime_error("object store: " + path.string() + " is not a hosted hub");
     };
     const bool buildingPacked = isBuildingPackedDatabasePath(path);
-    const char* journalMode = options.sharedFile || buildingPacked ? "PRAGMA journal_mode=DELETE;" : "PRAGMA journal_mode=WAL;";
+    const char* journalMode = buildingPacked ? "PRAGMA journal_mode=DELETE;" : "PRAGMA journal_mode=WAL;";
+    if (!options.readOnly && !buildingPacked && !immutable)
+        impl->ownership = std::make_unique<OwnershipGuard>(path,
+            options.serviceOwner ? OwnershipGuard::Mode::Service : OwnershipGuard::Mode::Standalone);
 
     if (create) {
         std::error_code ec;
@@ -110,11 +122,16 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             createProvisioning(impl->writer, options.history == HistoryMode::On, options.spatialIndex);
             createSchema(impl->writer, options.history == HistoryMode::On, options.creationStoreUuid,immutable);
             if(immutable)execute(impl->writer,"INSERT INTO store_required_features VALUES(?)",std::string(immutableImportFeature));
-            execute(impl->writer,"UPDATE store_manifest SET generation=?",options.initialGeneration);
+            const auto lineage = parseUuid(options.creationGeneration.value_or(util::newUuid()));
+            execute(impl->writer,"UPDATE store_manifest SET commit_sequence=?,generation=?,initial_generation=?",
+                options.initialCommitSequence,lineage,lineage);
             Statement owner(impl->writer,"SELECT uuid FROM store_identity"); owner.row();
             for (const auto& [name,range] : {std::pair{"objects",options.objectIdRange},std::pair{"edges",options.edgeIdRange}})
                 execute(impl->writer,"INSERT INTO key_allocators VALUES(?,?,?,?,?)",std::string(name),owner.blob16(0),range[0],range[1],range[0]);
-            if (options.history == HistoryMode::On) createHistorySchema(impl->writer);
+            if (options.history == HistoryMode::On) {
+                createHistorySchema(impl->writer);
+                createVersionSchema(impl->writer, formatUuid(lineage));
+            }
             if(!immutable)createGeometryHistoryIndex(impl->writer);
             createStorageDirectory(impl->writer, buildingPacked ? packedDatabaseUuid(path) : std::string{});
             exec(impl->writer, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
@@ -129,7 +146,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
     } else if (!options.readOnly) {
         impl->writer = openConnection(path, SQLITE_OPEN_READWRITE, options, false);
         validate(impl->writer);
-        exec(impl->writer, journalMode);
+        exec(impl->writer, "PRAGMA journal_mode=WAL;");
         exec(impl->writer, "PRAGMA synchronous=FULL;");
     }
 
@@ -159,7 +176,6 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
 
 const std::filesystem::path& ObjectStore::path() const { return impl_->path; }
 std::string ObjectStore::hostname() const { return impl_->hostname; }
-std::string ObjectStore::author() const { return impl_->options.author; }
 
 ObjectStore ObjectStore::create(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,true)); }
 ObjectStore ObjectStore::open(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,false)); }

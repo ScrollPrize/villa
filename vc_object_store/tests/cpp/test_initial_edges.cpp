@@ -36,7 +36,7 @@ EdgeRecord edge(bool points=false) {
 }
 nlohmann::json snapshot(sqlite3* db) {
     nlohmann::json rows=nlohmann::json::array();
-    Statement s(db,"SELECT e.uuid,e.a_uuid,e.b_uuid,e.kind,e.generation,e.approval_state,e.meta,e.a_dependencies,e.b_dependencies "
+    Statement s(db,"SELECT e.uuid,e.a_uuid,e.b_uuid,e.kind,e.version,e.approval_state,e.meta,e.a_dependencies,e.b_dependencies "
         "FROM edges e "
         "ORDER BY e.id");
     while(s.row()) {nlohmann::json row=nlohmann::json::array();
@@ -65,7 +65,7 @@ void parity(bool geometry,bool defer,size_t sqlRows=1,size_t rowCount=2,int vari
         auto txn=store->write();auto* db=ObjectStoreImplAccess::conn(txn);objects(*store,txn,geometry);
         if(store==&ordinary) for(const auto& e:input) store->addEdge(txn,e);
         else {
-            exec(db,"CREATE INDEX custom_edge_index ON edges(generation)");
+            exec(db,"CREATE INDEX custom_edge_index ON edges(version)");
             if(variables)sqlite3_limit(db,SQLITE_LIMIT_VARIABLE_NUMBER,variables);
             Savepoint whole(db);InitialEdgeInserter initial(*store,txn,defer,sqlRows);
             const auto first=rowCount>2?size_t(65):size_t(1);
@@ -86,7 +86,7 @@ void parity(bool geometry,bool defer,size_t sqlRows=1,size_t rowCount=2,int vari
         require(actual->createdBy=="test"&&actual->changedBy=="test"&&
             actual->createdHost==actual->changedHost&&actual->createdAt==actual->changedAt&&
             actual->approvalState=="pending"&&!actual->approvedBy&&!actual->approvedAt&&
-            !actual->approvedHost&&!actual->approvedGeneration,
+            !actual->approvedHost&&!actual->approvedVersion,
             "shared batch provenance and SQL approval defaults preserved");
         require(currentRelationshipApplicable(ordinary,x,e.uuid)&&currentRelationshipApplicable(bulk,y,e.uuid),
             "ordinary and bulk relationships are valid against current endpoints");

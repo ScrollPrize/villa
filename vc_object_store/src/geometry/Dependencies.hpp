@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include <functional>
@@ -84,6 +85,18 @@ inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& t
         if (activeDependencies->size() == 8) activeDependencies->erase(activeDependencies->begin());
         activeDependencies->emplace(key, result);
     }
+    return result;
+}
+
+// Over a reader (any backend): arrays read through it; point identities are
+// resolved from the ids arrays.
+inline DependencyGeometry dependencyGeometry(const StoreReader& reader, const GeometryRevision& revision)
+{
+    DependencyGeometry result; result.kind = revision.kind; result.attributes = revision.attributes; result.gridOrigin = revision.gridOrigin;
+    for (const auto& array : revision.arrays) result.arrays.emplace(array.name, array);
+    result.read = [&reader, uuid = revision.uuid](const std::string& name, int64_t offset, int64_t count) {
+        return reader.readGeometryArray(uuid, name, offset, count);
+    };
     return result;
 }
 

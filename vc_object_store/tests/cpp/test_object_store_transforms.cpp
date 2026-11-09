@@ -1,6 +1,9 @@
 #include "TestSupport.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/SurfaceGrid.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/objects/UmbilicusFile.hpp"
@@ -41,6 +44,11 @@ int main() try {
         const auto ordered=db.selectObjects(txn,select);
         require(ordered.size()==1&&ordered.front().volumeLength==db.geometryLengthInVolume(txn,fiber,"b"),
                 "registered rows carry the target length they were ordered by");
+        // A reader measures the same lengths from the array bytes it reads.
+        const LocalStoreReader reader(db,txn);
+        require(reader.geometryLengthInVolume(fiber,"b")==db.geometryLengthInVolume(txn,fiber,"b")&&
+                reader.geometryLengthInVolume(track,"b",.5)==db.geometryLengthInVolume(txn,track,"b",.5),"reader lengths");
+        mustFail([&]{(void)reader.geometryLengthInVolume(surface,"b");});
         SurfaceProximityQuery query;query.volume="b";query.point={12.5,1,21.5};query.tolerance=.51;
         const auto hits=db.nearestSurfaces(txn,query);require(hits.size()==1,"registered nearest surface");
         require(std::abs(hits.front().distance-.5)<1e-10,"target-space Euclidean distance");
@@ -71,7 +79,7 @@ int main() try {
         surfaces.targetScale=.5;cut.origin={6.5,.5,10.5};cut.localBounds={-.25,-.5,-.5,.25,.5,.5};
         clippedEnds(.5);
     }
-    std::string objectRevision,geometryRevision;
+    std::optional<int64_t> objectVersion;std::string geometryRevision;
     std::vector<GeometryArrayEdit> changes;
     {
         GeometrySnapshot snapshot(db);const auto view=snapshot.track(track).viewTransformedAt("b");
@@ -118,13 +126,13 @@ int main() try {
         require(surfaceChanges.size()==1,"surface inverse edits supplied by store");
         const auto changedPoint=vc::objects::xyzFromBytes<float>(surfaceChanges.front().bytes).front();
         require(changedPoint==std::array<float,3>{1,0,1},"surface inverse uses registration");
-        changes=surfaceChanges;objectRevision=surfaceView.objectRevision();geometryRevision=surfaceView.revision().uuid;
+        changes=surfaceChanges;objectVersion=surfaceView.version();geometryRevision=surfaceView.revision().uuid;
         snapshot.close();
         bool closed=false;try{view.points("points",0,1);}catch(const std::exception&){closed=true;}require(closed,"snapshot lifetime retained");
     }
     {
         GeometrySnapshot snapshot(db);const auto view=snapshot.surface(surface).viewTransformedAt("b");
-        auto txn=db.write({{surface,objectRevision}});view.validateForWrite(db,txn);
+        auto txn=db.write({{surface,objectVersion}});view.validateForWrite(db,txn);
         db.editGeometry(txn,surface,changes,geometryRevision);txn.commit();
     }
     GeometrySnapshot pinned(db);const auto stale=pinned.surface(surface).viewTransformedAt("b");
@@ -150,7 +158,7 @@ int main() try {
         const auto choice=vc::objects::util::newUuid();
         {auto txn=db.write({{choice,std::nullopt}});require(db.chooseVolumeTransform(txn,"a","b",paths[1],choice)==choice,"choice takes the given uuid");txn.commit();}
         {auto read=db.read();require(db.volumeTransforms(read).resolve("a","b").status==vcr::catalog::TransformStatus::Resolved,"a choice resolves the pair");}
-        {auto read=db.read();const auto head=db.currentObjectRevision(read,choice)->uuid;
+        {auto read=db.read();const auto head=db.currentVersion(read,choice);
          auto txn=db.write({{choice,head}});require(db.chooseVolumeTransform(txn,"a","b",paths[0])==choice,"choosing again updates the choice");txn.commit();}
         auto read=db.read();
         require(db.volumeTransforms(read).resolve("a","b").resolved().path==paths[0],"the latest choice wins");
@@ -180,7 +188,7 @@ int main() try {
         require(context.resolve("a","b").resolved().path!=other,"the forward choice is unchanged");
         const auto choice=volumeTransformChoice(db,read,"b","a");
         require(choice.has_value(),"the explicit reverse choice is stored");
-        {auto txn=db.write({{choice->uuid,db.currentObjectRevision(read,choice->uuid)->uuid}});db.retireObject(txn,choice->uuid);txn.commit();}
+        {auto txn=db.write({{choice->uuid,db.currentVersion(read,choice->uuid)}});db.retireObject(txn,choice->uuid);txn.commit();}
         {auto after=db.read();require(db.volumeTransforms(after).resolve("b","a").resolved().path==implied,"retiring it restores the implied choice");}
         // A b -> a registration equal to the chosen route's inverse folds the
         // implied route into it; the related listing names the listed route.
@@ -201,19 +209,24 @@ int main() try {
         vc::geometry::Umbilicus u;u.points={{2,4,6},{4,6,8}};
         {auto txn=db.write({{first.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",first,u);txn.commit();}
         {
-            auto read=db.read();const auto found=volumeUmbilicus(db,read,{"c"});
+            auto read=db.read();const auto found=volumeUmbilicus(LocalStoreReader(db,read),{"c"});
             require(found&&found->uuid==first.uuid&&found->points.front()==std::array<double,3>{1,2,3},
                     "the volume's umbilicus in its voxels");
-            require(!volumeUmbilicus(db,read,{"d"}),"a volume without one has none");
+            require(found->version.version==db.currentVersion(read,first.uuid)&&found->version.objectUuid==first.uuid&&
+                    found->version.generation==db.status(read).generation,"the umbilicus carries the version read");
+            require(!volumeUmbilicus(LocalStoreReader(db,read),{"d"}),"a volume without one has none");
         }
         auto second=first;second.uuid=vc::objects::util::newUuid();second.name="second";
-        RevisionSelection pins;{auto read=db.read();pins=volumeUmbilicusRevisions(db,read,"c");}
-        require(pins.size()==1&&pins.contains(first.uuid),"the replacement pins the umbilicus it replaces");
-        pins[second.uuid]=std::nullopt;
+        TransactionContext pins;
+        {
+            auto read=db.read();const auto replaced=volumeUmbilici(LocalStoreReader(db,read),"c");
+            require(replaced.size()==1&&replaced[0].uuid==first.uuid,"the replacement expects the umbilicus it replaces");
+            pins.expectedObjects={{first.uuid,db.currentVersion(read,first.uuid)},{second.uuid,std::nullopt}};
+        }
         {auto txn=db.write(pins);setVolumeUmbilicus(db,txn,"c",second,u);txn.commit();}
         {
             auto read=db.read();
-            require(volumeUmbilicus(db,read,{"c"})->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
+            require(volumeUmbilicus(LocalStoreReader(db,read),{"c"})->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
                     "importing replaces the volume's umbilicus");
         }
         auto elsewhere=first;elsewhere.uuid=vc::objects::util::newUuid();
@@ -225,7 +238,7 @@ int main() try {
         auto extra=first;extra.uuid=vc::objects::util::newUuid();
         {auto txn=db.write();db.upsertObject(txn,extra);db.putGeometry(txn,extra.uuid,vc::geometry::encode(u));txn.commit();}
         bool several=false;
-        try{auto read=db.read();(void)volumeUmbilicus(db,read,{"c"});}catch(const std::runtime_error&){several=true;}
+        try{auto read=db.read();(void)volumeUmbilicus(LocalStoreReader(db,read),{"c"});}catch(const std::runtime_error&){several=true;}
         require(several,"several umbilici for one volume are refused");
     }
     {
@@ -288,7 +301,8 @@ int main() try {
         require(!binding.refusal&&!binding.confirm&&binding.storedUnitsPerVoxel==2.0,"a stamped grid binds as stated");
         importVolumeUmbilicus(session,attachment,"v",stamped,*binding.storedUnitsPerVoxel,"stamped",{{"tool","test"}});
         auto found=volumeUmbilicus(session,attachment,{"v"});
-        require(found && found->objectRevision.empty()==(policy==HistoryMode::Off),"history-off umbilicus has no invented revision");
+        require(found && found->version.version > 0 && !found->version.generation.empty(),
+                "umbilici carry ordinary numbered versions with or without retained history");
         require(found&&found->name=="stamped"&&found->points.front()==std::array<double,3>{10,5,0},"imported in the volume's voxels");
         require(volumeUmbilicus(session,attachment,{"v",0.5})->points.front()==std::array<double,3>{5,2.5,0},
                 "an umbilicus is read at a scale of the volume's voxels");
@@ -331,9 +345,8 @@ int main() try {
         // Attached data (a surface's corrections) is no volume collection.
         ObjectRecord surface;surface.kind="surface";surface.uuid=vc::objects::util::newUuid();
         surface.meta=R"({"coordinates":{"volume_uuid":"w","scale_factor":1}})";
-        int64_t generation=0;
-        session.read(attachment,[&](const auto& db,const auto& txn,const auto&){generation=db.provisioning(txn).generation;});
-        session.actAtGeneration(attachment,generation,[&](auto& db,auto& txn){db.upsertObject(txn,surface);});
+        auto create=session.newRequest(attachment);create.expectedObjects[surface.uuid]=std::nullopt;
+        create.operations.push_back(CreateObjectOp{objectRecordJson(surface)});session.submit(attachment,create);
         AttachedCollection corrections=collection;corrections.uuid=vc::objects::util::newUuid();
         replaceAttachedCollections(session,attachment,surface.uuid,"corrections",{corrections},volumeCoordinates("w",1));
         require(volumeCollections(session,attachment,{"w"}).size()==1,"attached collections are not the volume's");
@@ -347,6 +360,50 @@ int main() try {
                 "a collection written at a scale is bound at that scale");
         const auto again=volumeCollections(session,attachment,{"w",0.25});
         require(again.size()==1&&again[0].points.points[0]==std::array<double,3>{7,8,9},"and reads back at it");
+    }
+    // Several numbered object versions can share one geometry payload. Each
+    // historical read must use the coordinate metadata of the selected version.
+    {
+        auto history = ObjectStore::create(directory.path / "surface-history.vcobj", options);
+        std::string uuid;
+        vc::geometry::Surface grid{1, 2, {1, 1}, {{2, 4, 6}, {8, 10, 12}}};
+        {
+            auto txn = history.write();
+            ObjectRecord record; record.kind = "surface";
+            record.meta = R"({"coordinates":{"volume_uuid":"a","scale_factor":1}})";
+            uuid = history.upsertObject(txn, record);
+            history.putGeometry(txn, uuid, vc::geometry::encode(grid));
+            txn.commit();
+        }
+        {
+            auto txn = history.write();
+            history.setMeta(txn, uuid, "coordinates", R"({"volume_uuid":"c","scale_factor":2})");
+            txn.commit();
+        }
+        auto check = [&] {
+            auto txn = history.read();
+            LocalStoreReader reader(history, txn);
+            const auto first = readSurfaceGrid(reader, uuid, "a", 1, 1);
+            const auto second = readSurfaceGrid(reader, uuid, "c", 1, 2);
+            require(first.points == std::vector<float>{2, 4, 6, 8, 10, 12} &&
+                    second.points == std::vector<float>{1, 2, 3, 4, 5, 6}, "historical coordinate metadata");
+            require(first.scale == std::array<double, 2>{1, 1} && second.scale == std::array<double, 2>{2, 2},
+                    "historical grid scale");
+            require(first.geometryRevision == second.geometryRevision && first.version == 1 && second.version == 2,
+                    "metadata-only versions share geometry");
+            require(nlohmann::json::parse(first.record.meta).at("coordinates").at("volume_uuid") == "a",
+                    "record and geometry use the same numbered version");
+            const auto scaled = readSurfaceGrid(reader, uuid, "a", .5, 1);
+            require(scaled.points == second.points, "historical reads respect target scale");
+        };
+        check();
+        {
+            auto txn = history.write();
+            grid.points[0][0] = 20;
+            history.putGeometry(txn, uuid, vc::geometry::encode(grid), history.currentGeometry(txn, uuid)->uuid);
+            txn.commit();
+        }
+        check(); // The historical payload is no longer the current geometry.
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

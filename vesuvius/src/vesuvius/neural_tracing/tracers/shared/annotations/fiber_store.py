@@ -99,17 +99,22 @@ def read_polylines(path, fiber_ids=None, *, volume=None):
     return [out[fid] for fid in selected]
 
 
+FIBERS_DIGEST_FORMAT = 'fibers_digest v2'
+
+
 def fibers_digest(path, fiber_ids=None):
-    """Content digest of a store's fibers (all, or the given ones): SHA-256 over each fiber's UUID, current geometry
-    revision and generation, in UUID order. A store file's bytes are not a stable identity (WAL)."""
+    """Content digest of a store's live fibers (all, or the given ones): SHA-256 over a format tag and each fiber's
+    UUID and numbered version (with its history generation), in UUID order, read in one snapshot. A store file's
+    bytes are not a stable identity (WAL). Format v2 (numbered versions) never equals a v1 digest (geometry
+    revision UUIDs and record generations), so data derived under v1 is reported changed and must be regenerated."""
     selected = [] if fiber_ids is None else sorted(set(map(str, fiber_ids)))
-    with open_store(path) as store, store.graph_read(object_kind='fiber', object_uuids=selected) as view:
-        if fiber_ids is not None and sorted(view.object_uuids) != selected:
-            raise ValueError('Unknown requested fiber')
-        rows = sorted(zip(view.object_uuids, view.geometry_revisions, view.generations))
-    digest = hashlib.sha256()
-    for fid, revision, generation in rows:
-        digest.update(f'{fid} {revision} {generation}\n'.encode())
+    with open_store(path) as store:
+        rows = store.select_objects(object_kind='fiber', object_uuids=selected, fields=['name'])
+    if fiber_ids is not None and sorted(r['uuid'] for r in rows) != selected:
+        raise ValueError('Unknown requested fiber')
+    digest = hashlib.sha256(f'{FIBERS_DIGEST_FORMAT}\n'.encode())
+    for row in sorted(rows, key=lambda r: r['uuid']):
+        digest.update(f"{row['uuid']} {row['version_generation']} {row['version']}\n".encode())
     return digest.hexdigest()
 
 
@@ -132,7 +137,7 @@ def write_fibers(destination, fibers, *, volume, author=None):
 
             def flush():
                 if pending:
-                    with store.write(expected_revisions={r['uuid']: None for r, _ in pending}) as tx:
+                    with store.write(expected_versions={r['uuid']: None for r, _ in pending}) as tx:
                         for record, geometry in pending:
                             tx.upsert_object(record)
                             tx.put_geometry(record['uuid'], geometry)
@@ -210,7 +215,7 @@ class FiberStore(Sequence):
         ids = [r['id'] for r in self.catalog]
         # A compact collection manifest avoids hashing/expanding all polylines
         # each time a replay cache is opened by a loader worker.
-        return [dict(kind='fiber_store_catalog_v1', digest=fibers_digest(self.path, ids), volume=self.volume,
+        return [dict(kind='fiber_store_catalog_v2', digest=fibers_digest(self.path, ids), volume=self.volume,
                      grid_scale=self.grid_scale, fiber_count=len(self),
                      fiber_ids_sha256=hashlib.sha256('\n'.join(ids).encode()).hexdigest(),
                      annotation_repair=ANNOTATION_REPAIR)]

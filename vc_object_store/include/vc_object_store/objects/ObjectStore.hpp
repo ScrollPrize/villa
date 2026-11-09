@@ -6,8 +6,11 @@
 
 #include "vc_object_store/objects/Geometry.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
+#include "vc_object_store/objects/Transactions.hpp"
+#include <nlohmann/json_fwd.hpp>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -54,18 +57,22 @@ struct TrackDetail {
     std::optional<std::array<double, 6>> bbox;
 };
 
-// Generation, stamps and approval are library-managed and ignored on write.
+// Versions, commit stamps and approval are library-managed and ignored on write.
 struct RecordCommon {
     std::string uuid;  // canonical text; empty on create = mint a new one
     std::string kind;  // required, non-empty
-    int64_t generation = 0; // Last local store publication, not a per-object edit counter.
+    int64_t commitSequence = 0; // Store commit which last changed this record.
     std::string createdBy, createdAt, createdHost;
     std::string changedBy, changedAt, changedHost;
     std::string approvalState = "pending";  // pending | approved | rejected
     std::optional<std::string> approvedBy, approvedAt, approvedHost;
-    std::optional<int64_t> approvedGeneration;
+    std::optional<int64_t> approvedVersion;
     std::vector<std::string> tags;
     std::string meta = "{}";  // JSON object text
+    // Current numbered version; present for every persisted record, including
+    // history-off stores and records edited in the current transaction.
+    std::optional<int64_t> version;
+    std::string versionGeneration;
 };
 
 struct ObjectRecord : RecordCommon {
@@ -76,7 +83,6 @@ struct ObjectRecord : RecordCommon {
     int64_t formatVersion = 0;
     std::string storageKind;  // e.g. "file", "dataset", "" (db-only)
     std::string storageRef;   // location hint relative to DB directory, or dataset URI; uuid is identity
-    int64_t dataGeneration = 0;
     std::optional<std::string> dataChecksum;
     std::optional<FiberDetail> fiber;
     std::optional<SurfaceDetail> surface;
@@ -114,21 +120,28 @@ struct EdgeRecord : RecordCommon {
     Anchor aAnchor, bAnchor;
 };
 
-// Object UUID -> immutable object revision UUID. null means expect no object.
-// These are object revisions, not geometry payload revisions.
+// Object UUID -> internal object revision UUID (storage keys; public history
+// references are numbered ObjectVersions). null means no object.
 using RevisionSelection = std::map<std::string, std::optional<std::string>>;
 
 struct ObjectRevision {
     std::string uuid, objectUuid;
     std::optional<std::string> parentUuid, geometryRevision;
     int64_t sequence = 0;
-    int64_t generation = 0; // Store publication generation, not the sequence cursor.
-    // False for baselines a hub pull installed without their original metadata history.
+    // False for baselines imported without their original metadata history
+    // (recorded by stores converted from hub replicas).
     bool metadataComplete = true;
     // UTC Unix microseconds assigned once per atomic publication, monotonically
     // increasing within this store. Missing only for those untimed baselines.
     std::optional<int64_t> publishedAtUs;
     bool deleted = false;
+    // Numbered history: (store, generation, objectUuid, version) is this
+    // revision's public reference. The generation is the lineage it was
+    // published in. commitSequence is absent for history converted without a
+    // recorded publication (e.g. untimed imported baselines).
+    int64_t version = 0;
+    std::string generation;
+    std::optional<int64_t> commitSequence;
     ObjectRecord record;
 };
 
@@ -139,15 +152,20 @@ struct ObjectRevision {
 // and exports include them. Point collections attached this way carry a record
 // meta "role" and are never linked to surfaces by the point-collection linker.
 inline constexpr const char* kAttachmentEdgeKind = "attachment";
+// The relationship attaching object `data` to `owner` in `role` (ObjectStore::attach); no UUID.
+EdgeRecord attachmentEdge(const std::string& dataUuid, const std::string& ownerUuid, const std::string& role);
 
 // Edge changes revise both endpoints atomically; unchanged membership is inherited.
-// Pins are immutable objectRevision() UUIDs, never moving heads.
+// Endpoint pins are immutable object revisions (aVersion/bVersion), never moving heads.
 struct RelationshipRevision {
     std::string uuid;
-    int64_t generation = 0;
     EdgeRecord record;
     std::string aRevision, bRevision;
     std::optional<std::string> aGeometryRevision, bGeometryRevision;
+    // Numbered history of the relationship and of its pinned endpoint states.
+    int64_t version = 0;
+    std::string generation;
+    int64_t aVersion = 0, bVersion = 0;
 };
 
 struct SelectedRelationship {
@@ -160,18 +178,19 @@ struct JournalEntry {
     int64_t seq = 0;
     std::string recordUuid;
     std::string kind; // the object or edge kind, recorded at the change
-    int64_t generation = 0;
+    int64_t commitSequence = 0;
     std::string author, hostname, timestamp, changeKind;
     // Approval snapshot after this change; absent for deletion events.
     std::optional<std::string> approvalState, approvedBy, approvedAt, approvedHost;
-    std::optional<int64_t> approvedGeneration;
+    std::optional<int64_t> approvedVersion;
 };
 
 enum class HistoryMode { Off, On };
 
 struct StoreProvisioning {
-    int formatVersion = 2;
-    int64_t generation = 1;
+    int schemaVersion = 21;
+    int64_t commitSequence = 0;
+    std::string generation; // Publication lineage UUID.
     HistoryMode history = HistoryMode::On;
     bool sealed = false;
     bool spatialIndex = true;
@@ -199,7 +218,8 @@ struct OpenOptions {
     // Creation-only provisioning for independently built shards. Integer key
     // ranges are reservations, not counts of currently populated records.
     std::optional<std::string> creationStoreUuid;
-    int64_t initialGeneration = 1;
+    int64_t initialCommitSequence = 0;
+    std::optional<std::string> creationGeneration;
     std::array<int64_t,2> objectIdRange{1,INT64_MAX};
     std::array<int64_t,2> edgeIdRange{1,INT64_MAX};
     // Explicit low-level access to one physical partition. Ordinary opens of
@@ -228,11 +248,10 @@ struct OpenOptions {
     // as a full revision instead (unchanged chunks are shared by hash). Capped
     // at 256 MiB, the largest delta read back.
     std::size_t maxGeometryDeltaBytes = 256 * 1024 * 1024;
-    // A hosted hub on a network filesystem (sshfs, NFS, SMB): rollback journal
-    // and SQLite's unix-dotfile locking instead of WAL, one reader, no caches.
-    // Only the hub functions in objects/Hub.hpp open stores this way; ordinary
-    // opens of a hub are rejected so they cannot switch it back to WAL.
-    bool sharedFile = false;
+    // Open as the store's hosting service: exclusive host-local ownership.
+    // Fails while any standalone writable handle is open, and standalone
+    // writable opens fail while the service holds it (see ObjectStore).
+    bool serviceOwner = false;
     // Called (on the reading thread, inside the read) with the surfaces a
     // geometryRegion or nearestSurfaces query reached whose geometry is not
     // local yet. Must only queue work; ObjectStoreSession sets it on writable attachments.
@@ -307,7 +326,7 @@ struct EdgeSelection {
 struct GraphReadView {
     std::vector<std::string> objectUuids, edgeUuids;
     std::vector<std::optional<std::string>> geometryRevisions;
-    std::vector<int64_t> generations;
+    std::vector<int64_t> versions;
     std::vector<uint64_t> offsets, neighbours, edgeIndices;
     std::vector<std::array<uint64_t, 2>> endpoints;
     int64_t journalSequence = 0;
@@ -356,9 +375,9 @@ public:
     ~Txn();
     void commit();
     bool active() const { return handle_ != nullptr; }
-    // Exact heads captured inside a successful checked commit, before releasing
-    // the writer. A later external commit cannot change this receipt.
-    const RevisionSelection& committedRevisions() const { return committedRevisions_; }
+    // Numbered receipt of a committed write: commit sequence and versions,
+    // captured before releasing the writer (a later commit cannot change it).
+    const std::optional<TransactionReceipt>& receipt() const { return receipt_; }
 
 protected:
     Txn(ObjectStore* db, void* handle, bool write) : db_(db), handle_(handle), write_(write) {}
@@ -370,7 +389,9 @@ private:
     ObjectStore* db_ = nullptr;
     void* handle_ = nullptr;  // sqlite3*
     bool write_ = false;
-    RevisionSelection expectedRevisions_, committedRevisions_;
+    RevisionSelection expectedRevisions_;
+    std::optional<TransactionReceipt> receipt_;
+    VersionSelection expectedObjectVersions_, expectedRelationshipVersions_;
 };
 
 class ReadTxn : public Txn {
@@ -391,14 +412,18 @@ struct EdgeGeometryState {
 // Snapshot repair in edgeByUuid() endpoint order. Null revisions mean no geometry.
 struct EdgeGeometryRepair {
     std::string edgeUuid;
-    int64_t expectedGeneration = 0;
+    int64_t expectedVersion = 0;
     std::optional<std::string> aRevision, bRevision;
     Anchor aAnchor, bAnchor;
 };
 
+// A GeometryEdgeEdit with this edgeUuid and action "keep_recorded" decides
+// every affected relationship without its own decision: each is kept as
+// recorded (from the edit's checked state).
+inline constexpr const char* kKeepAffectedRecorded = "*";
 struct GeometryEdgeEdit {
     std::string edgeUuid;
-    int64_t expectedGeneration = 0;
+    int64_t expectedVersion = 0;
     // "retain", "update", "remove", or "keep_recorded". Retain keeps the same
     // relationship and anchors; update supplies both complete anchors in
     // stored a/b order. Revisions are the heads observed BEFORE the edit.
@@ -440,29 +465,81 @@ public:
     // (as `uuid` when given).
     std::string chooseVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
         const std::vector<std::string>& path, const std::optional<std::string>& uuid = std::nullopt);
+    // Record external catalog registrations as versioned store records
+    // (catalogTransformUuid(id), exact coefficients, catalog id and revision
+    // evidence). Unchanged registrations are left untouched; others need
+    // their expected versions in a checked write. Once recorded, a
+    // registration resolves from the store for every client: a client's own
+    // catalog copy of that id is ignored by volumeTransforms(). Returns the
+    // records created or changed.
+    std::vector<std::string> recordCatalogTransforms(WriteTxn&, const std::vector<vcr::catalog::Registration>&);
     WriteTxn write();
-    // Check supplied heads before editing; require every changed object/endpoint.
-    // Commit publishes one revision per changed object. Missing expectations or
-    // conflicts abort the whole transaction, even if caught.
-    WriteTxn write(const RevisionSelection& expected);
+    // Checked write expecting these object versions (null: absent); the same as
+    // write(TransactionContext) with only expectedObjects. Every changed
+    // object/endpoint must be expected. Commit publishes one revision per changed
+    // object. Missing expectations or conflicts abort the whole transaction, even if caught.
+    WriteTxn write(const VersionSelection& expectedObjects);
+    // Numbered checked write (see TransactionContext). A request UUID already
+    // committed is rejected here; use receipt() or submit() to recover it.
+    WriteTxn write(const TransactionContext&);
+    // Execute typed operations atomically. An identical retry of a committed
+    // request returns its saved receipt without re-executing; the same request
+    // UUID with different contents fails. Conflicts throw TransactionConflict.
+    // Prepared operations (link_objects) are prepared first, outside the
+    // writer lock, as prepare() then submit(request, prepared) do.
+    TransactionReceipt submit(const TransactionRequest&);
+    // The preparation of the request's prepared operations (see
+    // Transactions.hpp): each runs under its own read snapshot through its
+    // registered preparer. Empty when the request has none, or when its
+    // receipt is already saved (submit then replays it). Throws
+    // std::invalid_argument for a prepared operation with no preparer
+    // registered.
+    PreparedOperations prepare(const TransactionRequest&, const PrepareOptions& = {});
+    // submit() with the preparation already made: the prepared versions join
+    // the request's expectations and read dependencies, and each prepared
+    // operation publishes through its `apply`.
+    TransactionReceipt submit(const TransactionRequest&, const PreparedOperations&);
+    // The same, from the canonical JSON form (transactionRequestToJson). A
+    // saved receipt of the identical request answers before any payload is
+    // needed, so a retry recovers a committed result even after its staged
+    // bytes expired. Otherwise every payload must be available or
+    // MissingPayloads names those that are not.
+    TransactionReceipt submit(const std::string& requestJson, const PayloadLookup&);
+    std::optional<TransactionReceipt> receipt(const Txn&, const std::string& requestUuid) const;
+    StoreStatus status(const Txn&) const;
+    // Changes after the cursor, whole commits in sequence order, at most
+    // maxChanges records unless one commit alone exceeds it (then continued).
+    ChangePage changesSince(const Txn&, const FeedCursor&, int64_t maxChanges = 4096) const;
+    std::optional<int64_t> currentVersion(const Txn&, const std::string& objectUuid) const;
+    std::optional<int64_t> currentRelationshipVersion(const Txn&, const std::string& relationshipUuid) const;
+    // Exact numbered reference; nullopt when this store never published it in
+    // that generation (never another generation's same-numbered version).
+    std::optional<ObjectRevision> objectAtVersion(const Txn&, const ObjectVersion&) const;
+    std::optional<RelationshipRevision> relationshipAtVersion(const Txn&, const RelationshipVersion&) const;
+    // objectAtVersion for many references in one snapshot, in order (nullopt
+    // where a reference is not recorded). Versions that are still the head
+    // read the materialized head record without replaying history.
+    std::vector<std::optional<ObjectRevision>> objectsAtVersions(const Txn&, const std::vector<ObjectVersion>&) const;
+    ObjectVersion versionReference(const Txn&, const ObjectRevision&) const;
+    // Restore tooling: start a fresh, never reused history generation for new
+    // writes. Recorded versions keep their publication generations.
+    std::string startHistoryGeneration(const std::string& reason);
     std::optional<ObjectRevision> currentObjectRevision(const Txn&, const std::string& objectUuid) const;
-    std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
     std::vector<ObjectRevision> objectHistory(const Txn&, const std::string& objectUuid) const;
-    // Latest live revisions at/before this time; actions are indivisible.
+    // The version of every object live at/before this publication time
+    // (UTC Unix microseconds), ordered by object UUID; actions are indivisible.
     // Empty before the first publication; excludes deletions.
-    RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired = false) const;
-    // The current revisions of the selected objects (a pin for each), without a
-    // query per object.
-    RevisionSelection currentRevisions(const Txn&, const ObjectSelection&) const;
-    std::vector<RelationshipRevision> recordedRelationships(const Txn&, const std::string& objectRevisionUuid) const;
-    // Explicit, closed selection: omitted endpoints are not selected. null
-    // selects the latest head (unlike write(), where null expects absence).
-    std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
+    std::vector<ObjectVersion> versionsAt(const Txn&, int64_t publishedAtUs, bool includeRetired = false) const;
+    // Relationships recorded between the selected objects, each at an exact
+    // recorded version of this store (one per object; omitted endpoints are
+    // not selected; deleted versions and unknown references fail).
+    std::vector<SelectedRelationship> relationshipsAt(const Txn&, const std::vector<ObjectVersion>&) const;
     // After endpoint edits, validate anchors/metadataKeys and retain the relationship.
     // The caller decides domain meaning.
     void retainRelationship(WriteTxn&, const std::string& edgeUuid);
-    // Keep historical pins after an endpoint edit and remove the current edge,
-    // without asserting applicability to the edited endpoint. Requires history.
+    // Keep the relationship and its historical pins after an endpoint edit,
+    // without asserting applicability to the edited endpoint. Current queries
+    // can filter out the now-inapplicable relationship. Requires history.
     void keepRecordedRelationship(WriteTxn&, const std::string& edgeUuid);
     // keepRecordedRelationship for every current relationship of the object
     // (e.g. after a record-only edit of it).
@@ -474,13 +551,9 @@ public:
     // Stable store identity, independent of its filesystem location.
     std::string uuid(const Txn&) const;
 
-    std::string replicaUuid(const Txn&) const;
-    // Assign a copied database its own replica, physical database and table
-    // identities. The hub-family logical store identity remains unchanged.
-    std::string forkReplica();
-
-    // Create/update by UUID (mint one if empty). Updates bump generation, stamp
-    // changed_*, reset approval and journal. Returns the UUID.
+    // Create/update by UUID (mint one if empty). Content changes advance the
+    // ordinary record version once per transaction, stamp changed_*, reset
+    // approval and journal when history is retained. Returns the UUID.
     std::string upsertObject(WriteTxn& txn, const ObjectRecord& record);
     // Import-only explicit local row ID, within this store's reserved range.
     // UUID remains the portable identity. Existing UUIDs cannot be renumbered.
@@ -502,7 +575,7 @@ public:
     // omitted source selects the last active revision. Links need explicit validation.
     void retireObject(WriteTxn&, const std::string& uuid);
     void restoreObject(WriteTxn&, const std::string& uuid,
-                       const std::optional<std::string>& sourceRevision = std::nullopt);
+                       const std::optional<ObjectVersion>& source = std::nullopt);
     void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
     // Create geometry, or replace a surface; sequences use structural/sparse edits.
@@ -534,6 +607,11 @@ public:
                              const std::vector<GeometryArrayEdit>&,
                              const std::string& expectedRevision) const;
     std::optional<GeometryRevision> currentGeometry(const Txn& txn, const std::string& objectUuid) const;
+    // The current geometry revision (payload identity; nullopt without
+    // geometry) of an object checked to be at `expectedVersion`: the
+    // expectation the geometry mutations take. Any other version is a history
+    // conflict, which aborts a checked write.
+    std::optional<std::string> geometryAtVersion(const Txn&, const std::string& objectUuid, int64_t expectedVersion) const;
     std::optional<GeometryRevision> geometryRevision(const Txn& txn, const std::string& revisionUuid) const;
     std::vector<GeometryRevision> geometryHistory(const Txn& txn, const std::string& objectUuid) const;
     // Byte ranges allow bounded loading without materializing a whole array.
@@ -577,8 +655,9 @@ public:
     std::string resizeSurface(WriteTxn&, const std::string& objectUuid,
         const GeometrySurfaceResize&, const std::string& expectedRevision,
         const std::vector<GeometryEdgeEdit>& edgeEdits = {});
-    // Aligned annotations for a geometry revision, derived from stable IDs.
-    std::string geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
+    // Aligned annotations for a geometry revision, derived from stable IDs: a
+    // JSON array with one value per point.
+    nlohmann::json geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName) const;
 
     // Dense row-major rectangle from any aligned surface array. Exact
@@ -592,7 +671,8 @@ public:
     std::vector<std::vector<uint8_t>> readGeometryRectangles(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName, const std::vector<std::array<int64_t, 4>>& rectangles) const;
 
-    // Stamp current generation without bumping it: pending, approved or rejected.
+    // Set pending, approved or rejected; a changed decision advances the
+    // ordinary record version once per transaction and stamps approved_version.
     void setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state);
 
     // Open-ended metadata: single-key atomic updates via SQLite JSON1.
@@ -601,7 +681,7 @@ public:
     // null), with stored XYZ = volume-voxel XYZ * scale_factor. Metadata only:
     // neither writes nor import transform geometry. Omission means unknown.
     // jsonValue is JSON text (e.g. "\"reviewed\"", "3", "true").
-    // Both bump generation and reset approval, like any content change.
+    // Changed values advance the ordinary version and reset approval; no-ops do neither.
     void setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue);
     void removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key);
     // Declare an object's coordinate frame: stored at `storedUnitsPerVoxel`
@@ -614,8 +694,9 @@ public:
     int64_t journalPosition(const Txn& txn) const;
 
     EdgeGeometryState edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const;
-    // Atomically repair anchors/bindings, checking edge generation and endpoint heads.
-    // Preserves other metadata, resets approval and journals. Identical input is a no-op.
+    // Atomically repair anchors/bindings, checking edge version and endpoint heads.
+    // Preserves other metadata, resets approval and journals when history is retained.
+    // Identical input is a no-op.
     void repairEdgeGeometry(WriteTxn&, const EdgeGeometryRepair&);
 
 
@@ -643,13 +724,14 @@ public:
     std::vector<EdgeRecord> attachments(const Txn&, const std::string& ownerUuid,
                                         const std::optional<std::string>& role = std::nullopt) const;
     // Both endpoints must belong to the selected objects. Reads topology,
-    // generations and geometry heads from the caller's consistent snapshot.
+    // object versions and geometry heads from the caller's consistent snapshot.
     GraphReadView graphReadView(const Txn&, const ObjectSelection& = {},
                                const EdgeSelection& = {}) const;
-    // Requires a ReadTxn. Closed selection, null revisions resolve to latest in this snapshot.
+    // Requires a ReadTxn. Closed selection of exact recorded versions (one per
+    // object; deleted versions and unknown references fail).
     // Always includes only applicable relationships. Retains isolated objects,
     // including explicitly selected retired objects (which have no applicable edges).
-    GraphReadView graphReadViewAt(const Txn&, const RevisionSelection&,
+    GraphReadView graphReadViewAt(const Txn&, const std::vector<ObjectVersion>&,
                                  const EdgeSelection& = {}) const;
     // Neighbour object UUIDs, optionally filtered by edge kind and/or
     // neighbour object kind.
@@ -702,7 +784,40 @@ public:
     // called while a WriteTxn is live on this handle.
     void checkpoint();
 
+    // One WAL checkpoint, for services that schedule their own (SQLite's
+    // automatic passive checkpoints still run on commit). Passive never
+    // waits; Truncate waits up to `wait` for readers, then empties the WAL
+    // file only if every frame was copied. Same restriction as checkpoint().
+    // Artifact bytes (objects/Artifacts.hpp). putArtifact copies `file` (or
+    // moves it, when `move` and it is on the same filesystem) into the
+    // store's content-addressed directory and syncs it to disk before
+    // returning its SHA-256, so a transaction may then reference it. Content
+    // already held is kept. Writable handles only (under service ownership,
+    // the service). Reads work on any handle; ranges past the end throw.
+    std::string putArtifact(const std::filesystem::path& file, bool move = false);
+    std::optional<uint64_t> artifactLength(const std::string& sha256) const;
+    std::vector<uint8_t> readArtifact(const std::string& sha256, uint64_t offset = 0,
+                                      const std::optional<uint64_t>& count = std::nullopt) const;
+
+    enum class WalCheckpointMode { Passive, Truncate };
+    struct WalCheckpoint {
+        int64_t logFrames = 0;           // frames in the WAL after the call
+        int64_t checkpointedFrames = 0;  // of those, copied into the database
+        bool busy = false;               // readers or a writer prevented completion
+        uint64_t walBytes = 0;           // WAL file size after the call
+        bool complete() const { return !busy && checkpointedFrames == logFrames; }
+    };
+    WalCheckpoint checkpointWal(WalCheckpointMode, std::chrono::milliseconds wait = std::chrono::milliseconds(0));
+
 private:
+    // Lookups by internal revision UUID (storage keys, not public history
+    // references); src/ reaches them through ObjectStoreImplAccess.
+    std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
+    RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired) const;
+    // Explicit, closed selection: omitted endpoints are not selected. null
+    // selects the latest head (unlike write(), where null expects absence).
+    std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
+    GraphReadView graphReadViewAt(const Txn&, const RevisionSelection&, const EdgeSelection&) const;
     struct Impl;
     static std::unique_ptr<Impl> openImpl(const std::filesystem::path&, const OpenOptions&, bool create, bool immutableInitial = false);
     explicit ObjectStore(std::unique_ptr<Impl>);

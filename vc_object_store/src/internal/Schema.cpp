@@ -20,14 +20,16 @@ void createSchema(sqlite3* db, bool history, const std::optional<std::string>& s
   lifecycle_epoch TEXT NOT NULL DEFAULT '',
   kind TEXT NOT NULL CHECK(length(kind)>0),
   name TEXT NOT NULL DEFAULT '',
-  generation INTEGER NOT NULL DEFAULT 1,
+  commit_sequence INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+  version_generation BLOB CHECK(version_generation IS NULL OR length(version_generation)=16),
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
   changed_by TEXT NOT NULL, changed_at TEXT NOT NULL, changed_host TEXT NOT NULL,
   approval_state TEXT NOT NULL DEFAULT 'pending' CHECK(approval_state='pending' OR approval_state='approved' OR approval_state='rejected'),
-  approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER,
+  approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_version INTEGER,
   format_version INTEGER NOT NULL DEFAULT 0,
   storage_kind TEXT NOT NULL DEFAULT '', storage_ref TEXT NOT NULL DEFAULT '',
-  data_generation INTEGER NOT NULL DEFAULT 0, data_checksum TEXT,
+  data_checksum TEXT,
   geometry_manifest TEXT,
   meta TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(meta) AND json_type(meta)='object'),
   -- The geometry coordinate binding, exactly as json_extract reads it (no
@@ -65,10 +67,10 @@ CREATE INDEX object_tags_tag ON object_tags(tag);
 )SQL");
     if (history) exec(db, R"SQL(CREATE TABLE journal(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  record_uuid BLOB NOT NULL, record_kind TEXT NOT NULL, generation INTEGER NOT NULL,
+  record_uuid BLOB NOT NULL, record_kind TEXT NOT NULL, commit_sequence INTEGER NOT NULL,
   author TEXT NOT NULL, hostname TEXT NOT NULL, timestamp TEXT NOT NULL,
   change_kind TEXT NOT NULL,
-  approval_state TEXT, approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER
+  approval_state TEXT, approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_version INTEGER
 );
 CREATE INDEX journal_record ON journal(record_uuid, seq);
 )SQL");
@@ -79,11 +81,13 @@ CREATE INDEX journal_record ON journal(record_uuid, seq);
   a_uuid BLOB NOT NULL CHECK(length(a_uuid)=16),
   b_uuid BLOB NOT NULL CHECK(length(b_uuid)=16),
   kind TEXT NOT NULL CHECK(length(kind)>0),
-  generation INTEGER NOT NULL DEFAULT 1,
+  commit_sequence INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+  version_generation BLOB CHECK(version_generation IS NULL OR length(version_generation)=16),
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
   changed_by TEXT NOT NULL, changed_at TEXT NOT NULL, changed_host TEXT NOT NULL,
   approval_state TEXT NOT NULL DEFAULT 'pending' CHECK(approval_state='pending' OR approval_state='approved' OR approval_state='rejected'),
-  approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER,
+  approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_version INTEGER,
   a_anchor_x REAL, a_anchor_y REAL, a_anchor_z REAL,
   a_dir_x REAL, a_dir_y REAL, a_dir_z REAL,
   b_anchor_x REAL, b_anchor_y REAL, b_anchor_z REAL,
@@ -121,12 +125,12 @@ CREATE INDEX tracks_length ON tracks(length DESC,object_id);
   parent_uuid BLOB,
   content_hash BLOB NOT NULL CHECK(typeof(content_hash)='blob' AND length(content_hash)=32),
   manifest TEXT NOT NULL CHECK(json_valid(manifest) AND json_type(manifest)='object'),
-  object_generation INTEGER NOT NULL,
+  object_version INTEGER NOT NULL,
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
   UNIQUE(object_uuid,uuid),
   FOREIGN KEY(object_uuid,parent_uuid) REFERENCES geometry_revisions(object_uuid,uuid)
 );
-CREATE INDEX geometry_history ON geometry_revisions(object_uuid,object_generation);
+CREATE INDEX geometry_history ON geometry_revisions(object_uuid,object_version);
 CREATE TABLE geometry_revision_chunks(
   revision_uuid BLOB NOT NULL REFERENCES geometry_revisions(uuid),
   array_name TEXT NOT NULL, chunk_index INTEGER NOT NULL CHECK(chunk_index>=0),
@@ -168,10 +172,6 @@ CREATE TABLE geometry_current_chunks(
 );
 
 )SQL");
-    if(!immutable){
-        exec(db, "CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL CHECK(typeof(uuid)='blob' AND length(uuid)=16));");
-        execute(db, "INSERT INTO sync_replica VALUES(1,?)", parseUuid(util::newUuid()));
-    }
     exec(db, "CREATE INDEX objects_kind_uuid ON objects(kind,uuid);");
     if (spatialEnabled(db)) detail::createSpatialSchema(db);
     exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");

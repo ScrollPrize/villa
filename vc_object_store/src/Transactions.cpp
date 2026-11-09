@@ -1,13 +1,14 @@
 #include "internal/Database.hpp"
 #include "internal/History.hpp"
+#include "internal/Versions.hpp"
 #include "imports/SourceIdentityIndex.hpp"
-#include "hub/HubRules.hpp"
-#include "internal/ExternalEndpoint.hpp"
 
 namespace vc::objects {
 using namespace detail;
 Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_),
-    expectedRevisions_(std::move(other.expectedRevisions_)), committedRevisions_(std::move(other.committedRevisions_))
+    expectedRevisions_(std::move(other.expectedRevisions_)),
+    receipt_(std::move(other.receipt_)), expectedObjectVersions_(std::move(other.expectedObjectVersions_)),
+    expectedRelationshipVersions_(std::move(other.expectedRelationshipVersions_))
 {
     other.handle_ = nullptr;
 }
@@ -51,32 +52,31 @@ void Txn::release(bool commit)
     };
     try {
         if (commit && write_) {
-            if (pragmaInt(conn, "schema_version") != activeStatementPools.at(conn)->startSchemaVersion) {
+            auto& pool = *activeStatementPools.at(conn);
+            if(pool.actionConflict) throw std::runtime_error("object store: checked action failed; all changes rolled back");
+            if (pragmaInt(conn, "schema_version") != pool.startSchemaVersion) {
                 registerStorageTables(conn);
                 exec(conn, "UPDATE store_write_state SET dirty=1 WHERE singleton=1;");
             }
-            const bool immutable=activeStatementPools.at(conn)->immutableInitial;
-            if(!immutable) {
-                refreshSourceIdentityIndex(conn);
-                if (historyEnabled(conn)) publishHistory(conn);
-                else validateCurrentRelationships(conn);
-            } else {refreshSourceIdentityIndex(conn);exec(conn,"UPDATE store_write_state SET dirty=1 WHERE singleton=1;");}
-            exec(conn, "UPDATE store_manifest SET generation=generation+1 WHERE singleton=1 AND "
-                       "(SELECT dirty FROM store_write_state WHERE singleton=1)=1;"
-                       "UPDATE store_write_state SET dirty=0 WHERE singleton=1 AND dirty=1;");
-            enforceHubRules(conn, *activeStatementPools.at(conn), db_->impl_->hubRole);
-            for (const auto& [uuid, expected] : expectedRevisions_) {
-                Statement head(conn, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?",
-                               parseUuid(uuid));
-                if(head.row())committedRevisions_[uuid]=formatUuid(head.blob16(0));
-                else committedRevisions_[uuid]=externalEndpointKey(conn,uuid)?std::optional(externalEndpointVersion(conn,uuid)):std::nullopt;
+            refreshSourceIdentityIndex(conn);
+            if (historyEnabled(conn)) publishHistory(conn);
+            else if (!pool.immutableInitial) validateCurrentRelationships(conn);
+            if (pool.immutableInitial) exec(conn, "UPDATE store_write_state SET dirty=1 WHERE singleton=1;");
+            Statement dirty(conn, "SELECT dirty FROM store_write_state WHERE singleton=1");
+            if (dirty.row() && dirty.i64(0)) {
+                pool.publishedSequence = writeCommitSequence(conn);
+                execute(conn, "UPDATE store_manifest SET commit_sequence=? WHERE singleton=1", *pool.publishedSequence);
+                exec(conn, "UPDATE store_write_state SET dirty=0 WHERE singleton=1;");
             }
+            auto expectedObjects = expectedObjectVersions_;
+            for (const auto& [uuid, expected] : expectedRevisions_) expectedObjects.emplace(uuid, std::nullopt);
+            receipt_ = finishReceipt(conn, *activeStatementPools.at(conn), expectedObjects, expectedRelationshipVersions_);
         }
         exec(conn, commit ? "COMMIT;" : "ROLLBACK;");
     }
     catch (...) {
         sqlite3_exec(conn, "ROLLBACK;", nullptr, nullptr, nullptr);
-        committedRevisions_.clear();
+        receipt_.reset();
         releaseConnection(); throw;
     }
     releaseConnection();
@@ -94,7 +94,6 @@ ReadTxn ObjectStore::read()
         activeStatementPools[conn] = impl_->statementPools.at(conn).get();
         auto& pool = *impl_->statementPools.at(conn);
         pool.readSnapshot = true;
-        pool.components.clear(); pool.componentNodes = 0;
         exec(conn, "BEGIN;");
         // Establish the snapshot now, so all reads in this transaction
         // see one consistent state even before the first real query.
@@ -120,28 +119,65 @@ WriteTxn ObjectStore::write()
     impl_->statementPools.at(impl_->writer)->readSnapshot = false;
     impl_->statementPools.at(impl_->writer)->checkedAction = false;
     impl_->statementPools.at(impl_->writer)->actionConflict = false;
+    {
+        auto& pool = *impl_->statementPools.at(impl_->writer);
+        pool.actingAuthor.reset(); pool.requestUuid.reset(); pool.requestDigest.reset();
+        pool.checkedObjects.clear();
+        pool.publishedSequence.reset();
+        pool.commitAuthor = impl_->options.author; pool.commitHost = impl_->hostname;
+    }
     try {
         exec(impl_->writer, "BEGIN IMMEDIATE;");
-        impl_->statementPools.at(impl_->writer)->startSchemaVersion = pragmaInt(impl_->writer, "schema_version");
-        Statement manifest(impl_->writer, "SELECT sealed,generation,history_enabled FROM store_manifest WHERE singleton=1");
+        auto& pool = *impl_->statementPools.at(impl_->writer);
+        pool.startSchemaVersion = pragmaInt(impl_->writer, "schema_version");
+        Statement manifest(impl_->writer, "SELECT sealed,commit_sequence,history_enabled FROM store_manifest WHERE singleton=1");
         if (!manifest.row() || manifest.i64(0)) throw std::runtime_error("object store: store is sealed");
-        if (manifest.i64(1) == INT64_MAX) throw std::runtime_error("object store: generation exhausted");
-        impl_->statementPools.at(impl_->writer)->historyEnabled = manifest.i64(2) != 0;
+        if (manifest.i64(1)==INT64_MAX) throw std::overflow_error("object store: commit sequence exhausted");
+        pool.historyEnabled = manifest.i64(2)!=0;
         beginCurrentWrite(impl_->writer);
-        if (impl_->hubRole != HubRole::None) beginHubWrite(impl_->writer, *impl_->statementPools.at(impl_->writer));
     }
     catch (...) { sqlite3_exec(impl_->writer, "ROLLBACK;", nullptr, nullptr, nullptr); activeStatementPools.erase(impl_->writer); throw; }
     lock.release(); // WriteTxn releases the mutex on commit or rollback.
     return WriteTxn(this, impl_->writer);
 }
 
-WriteTxn ObjectStore::write(const RevisionSelection& expected)
+WriteTxn ObjectStore::write(const VersionSelection& expectedObjects)
 {
+    TransactionContext context;
+    context.expectedObjects = expectedObjects;
+    return write(context);
+}
+
+WriteTxn ObjectStore::write(const TransactionContext& context)
+{
+    if (context.author && context.author->empty()) throw std::invalid_argument("object store: empty transaction author");
     auto txn = write();
-    requireHistory(static_cast<sqlite3*>(connection(txn)));
-    expectHistory(static_cast<sqlite3*>(connection(txn)), expected);
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    auto& pool = *activeStatementPools.at(db);
+    if (context.requestUuid) {
+        const auto request = util::canonicalUuid(*context.requestUuid);
+        if (savedReceipt(db, request))
+            throw std::invalid_argument("object store: request " + request + " already committed; recover its receipt");
+        pool.requestUuid = request;
+        pool.requestDigest = context.requestDigest;
+    }
+    if (context.author) pool.actingAuthor = *context.author;
+    RevisionSelection expected;
+    prepareCheckedWrite(db, context, expected);
     txn.expectedRevisions_ = expected;
+    txn.expectedObjectVersions_ = context.expectedObjects;
+    txn.expectedRelationshipVersions_ = context.expectedRelationships;
     return txn;
+}
+
+std::string ObjectStore::author() const
+{
+    // A write's transaction context attributes every stamp it makes, without
+    // changing the handle's options for other threads/requests.
+    if (impl_->writer)
+        if (const auto pool = activeStatementPools.find(impl_->writer); pool != activeStatementPools.end() &&
+            pool->second->actingAuthor) return *pool->second->actingAuthor;
+    return impl_->options.author;
 }
 
 void ObjectStore::checkpoint()
@@ -154,6 +190,32 @@ void ObjectStore::checkpoint()
     // statistics here, outside their atomic write transaction.
     exec(impl_->writer, "PRAGMA optimize;");
     check(sqlite3_wal_checkpoint_v2(impl_->writer, nullptr, SQLITE_CHECKPOINT_FULL, nullptr, nullptr), impl_->writer, "checkpoint");
+}
+
+ObjectStore::WalCheckpoint ObjectStore::checkpointWal(WalCheckpointMode mode, std::chrono::milliseconds wait)
+{
+    if (!impl_->writer)
+        throw std::runtime_error("object store: checkpoint on read-only handle");
+    std::lock_guard<std::mutex> lock(impl_->writerMutex);
+    WalCheckpoint result;
+    int log = 0, copied = 0;
+    int rc = SQLITE_OK;
+    if (mode == WalCheckpointMode::Passive) {
+        rc = sqlite3_wal_checkpoint_v2(impl_->writer, nullptr, SQLITE_CHECKPOINT_PASSIVE, &log, &copied);
+    } else {
+        // Truncate waits through the busy handler: bound it to `wait`.
+        sqlite3_busy_timeout(impl_->writer, static_cast<int>(std::clamp<int64_t>(wait.count(), 0, INT32_MAX)));
+        rc = sqlite3_wal_checkpoint_v2(impl_->writer, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &copied);
+        sqlite3_busy_timeout(impl_->writer, impl_->options.busyTimeoutMs);
+    }
+    if (rc == SQLITE_BUSY) result.busy = true;
+    else check(rc, impl_->writer, "checkpoint");
+    result.logFrames = log < 0 ? 0 : log;
+    result.checkpointedFrames = copied < 0 ? 0 : copied;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(impl_->path.string() + "-wal", ec);
+    result.walBytes = ec ? 0 : size;
+    return result;
 }
 
 } // namespace vc::objects

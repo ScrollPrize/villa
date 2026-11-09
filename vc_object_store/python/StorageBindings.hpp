@@ -122,6 +122,8 @@ void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::stri
         if (include(key)) d[key] = value;
     });
     if (include("meta")) d["meta"] = jsonLoads(r.meta);
+    // Inline numbered version (including pending edits inside a write).
+    if (r.version) { d["version"] = *r.version; d["version_generation"] = r.versionGeneration; }
 }
 
 nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fields = nullptr)
@@ -245,7 +247,7 @@ nb::dict geometryToPy(const vo::GeometryRevision& r)
     result["kind"] = r.kind; result["format_version"] = r.formatVersion;
     result["coordinate_system"] = r.coordinateSystem; result["attributes"] = jsonLoads(r.attributes);
     result["grid_origin"] = r.gridOrigin;
-    result["object_generation"] = r.objectGeneration;
+    result["object_version"] = r.objectVersion;
     result["created_by"] = r.createdBy; result["created_at"] = r.createdAt; result["created_host"] = r.createdHost;
     nb::list arrays;
     for (const auto& a : r.arrays) {
@@ -260,6 +262,11 @@ nb::dict geometryReportToPy(const vo::GeometryIngestReport& r)
 {
     nb::dict result;
     result["edges_imported"] = r.edgesImported; result["ingested"] = r.ingested; result["problems"] = r.problems;
+    result["uuids"] = r.uuids; result["existing"] = r.existing; result["cancelled"] = r.cancelled;
+    if (r.fatalError) {
+        nb::dict fatal; fatal["message"] = *r.fatalError;
+        result["fatal_error"] = fatal;
+    } else result["fatal_error"] = nb::none();
     return result;
 }
 
@@ -270,7 +277,7 @@ std::vector<vo::GeometryEdgeEdit> edgeEditsFromPy(const nb::list& edits)
         const auto d = nb::cast<nb::dict>(item);
         vo::GeometryEdgeEdit edit;
         edit.edgeUuid = nb::cast<std::string>(d["edge_uuid"]);
-        edit.expectedGeneration = nb::cast<int64_t>(d["expected_generation"]);
+        edit.expectedVersion = nb::cast<int64_t>(d["expected_version"]);
         edit.action = nb::cast<std::string>(d["action"]);
         edit.aRevision = nb::cast<std::optional<std::string>>(d["a_revision"]);
         edit.bRevision = nb::cast<std::optional<std::string>>(d["b_revision"]);
@@ -389,7 +396,8 @@ struct PyObjectWriteTxn {
     PyObjectStore* owner = nullptr;
     std::shared_ptr<vo::ObjectStore> lease;
     std::unique_ptr<vo::WriteTxn> txn;
-    std::optional<vo::RevisionSelection> expected;
+    std::optional<vo::TransactionContext> context;
+    std::optional<vo::TransactionReceipt> receipt;
 
     vo::WriteTxn& require()
     {
@@ -401,14 +409,15 @@ struct PyObjectWriteTxn {
         if (txn) throw std::runtime_error("transaction is already active");
         owner->require();
         lease = owner->db;
-        try { txn = std::make_unique<vo::WriteTxn>(expected ? lease->write(*expected) : lease->write()); }
+        receipt.reset();
+        try { txn = std::make_unique<vo::WriteTxn>(context ? lease->write(*context) : lease->write()); }
         catch (...) { lease.reset(); throw; }
         return *this;
     }
     void exit(bool failed)
     {
         if (txn) {
-            try { if (!failed) txn->commit(); }
+            try { if (!failed) { txn->commit(); receipt = txn->receipt(); } }
             catch (...) { txn.reset(); lease.reset(); throw; }
             txn.reset();  // RAII rolls back when not committed
             lease.reset();

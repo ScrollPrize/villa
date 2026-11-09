@@ -29,7 +29,7 @@ struct StagedDatabase {
     StagedDatabase(const StagedDatabase&) = delete;
     ~StagedDatabase()
     {
-        if (cleanup) for (const auto* suffix : {"", "-wal", "-shm", "-journal"}) {
+        if (cleanup) for (const auto* suffix : {"", "-wal", "-shm", "-journal", "-owner"}) {
             std::error_code error; std::filesystem::remove(path.string() + suffix, error);
         }
     }

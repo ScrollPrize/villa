@@ -36,11 +36,11 @@ InitialObjectRecord fiber(const std::string& uuid)
 void roundTrip(size_t shards,bool packed)
 {
     TemporaryDirectory dir;auto opt=options(shards,packed);
-    const auto base=dir.path/"base.vcobj";ObjectKey reference;int64_t baseGeneration=0;
+    const auto base=dir.path/"base.vcobj";ObjectKey reference;int64_t baseSequence=0;
     {
         auto store=ObjectStore::create(base,opt.store);auto w=store.write();auto row=fiber(util::newUuid());
         reference={store.uuid(w),store.upsertObject(w,row.record)};store.putGeometry(w,reference.objectUuid,*row.geometry);
-        store.seal(w);w.commit();auto r=store.read();baseGeneration=store.provisioning(r).generation;
+        store.seal(w);w.commit();auto r=store.read();baseSequence=store.provisioning(r).commitSequence;
     }
     opt.dependencies={base};std::vector<std::string> uuids(shards),edges(shards);
     for(size_t i=0;i<shards;++i){uuids[i]=util::newUuid();edges[i]=util::newUuid();}
@@ -61,8 +61,12 @@ void roundTrip(size_t shards,bool packed)
     require(result.totalSeconds>=result.ingestionSeconds && result.persistenceSeconds>=0,"timings reported");
     auto store=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto r=store.read();
     require(store.uuid(r)==result.storeUuid,"published logical owner");
-    require(store.provisioning(r).sealed && store.provisioning(r).generation>baseGeneration,
-        "sealed generation follows dependencies");
+    require(store.provisioning(r).sealed && store.provisioning(r).commitSequence>baseSequence,
+        "sealed commit sequence follows dependencies");
+    const auto pin=store.provisioning(r);
+    for(const auto& member:store.members())if(member.storeUuid==result.storeUuid)
+        require(member.generation==pin.generation&&member.commitSequence==pin.commitSequence,
+            "parallel shards share the manifest lineage and commit sequence");
     require(store.provisioning(r).history==HistoryMode::Off && !store.provisioning(r).spatialIndex,
         "initial provisioning omits history and spatial structures");
     for(size_t i=0;i<shards;++i){
@@ -105,6 +109,7 @@ void failures()
     opt=options(2);failed([](size_t i,auto& part){if(i==0)throw std::runtime_error("peer failure");
         auto row=fiber(util::newUuid());part.appendObjects(std::span(&row,1));});
     opt=options();opt.store.creationStoreUuid=util::newUuid();failed([](size_t,auto&){});
+    opt=options();opt.store.creationGeneration=util::newUuid();failed([](size_t,auto&){});
     opt=options(2);opt.shards[1]=opt.shards[0];failed([](size_t,auto&){});
     opt=options();opt.store.history=HistoryMode::On;failed([](size_t,auto&){});
     opt=options();opt.store.spatialIndex=true;failed([](size_t,auto&){});
@@ -176,10 +181,11 @@ void directConnections(bool packed) {
         }
         // Validation is deliberately outside construction, like a consumer.
         auto collection=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto read=collection.read();
-        const auto generation=collection.provisioning(read).generation;
+        const auto pin=collection.provisioning(read);
         require(collection.provisioning(read).sealed,"direct output sealed");
         for(const auto& member:collection.members())if(member.storeUuid==result.storeUuid)
-            require(member.generation==generation,"direct manifest pins committed shard generation");
+            require(member.generation==pin.generation&&member.commitSequence==pin.commitSequence,
+                "direct manifest pins committed shard lineage and sequence");
         for(size_t i=0;i<count;++i) {
             const auto object=collection.objectById(read,result.storeUuid,opt.shards[i].objectIds[0]);
             require(object&&object->key.objectUuid==ids[i],"direct range routing");

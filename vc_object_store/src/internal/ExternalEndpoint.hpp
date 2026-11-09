@@ -3,19 +3,22 @@
 #include "geometry/GeometryToken.hpp"
 
 namespace vc::objects::detail {
-struct ExternalEndpointToken {std::string ownerUuid,objectUuid;int64_t generation;};
-inline std::string externalEndpointToken(const std::string& owner,const std::string& object,int64_t generation)
+struct ExternalEndpointToken {std::string ownerUuid,objectUuid,generation;int64_t commitSequence;};
+inline std::string externalEndpointToken(const std::string& owner,const std::string& object,
+                                         const std::string& generation,int64_t commitSequence)
 {
     auto ownerHex=formatUuid(parseUuid(owner));ownerHex.erase(std::remove(ownerHex.begin(),ownerHex.end(),'-'),ownerHex.end());
-    return "external:"+ownerHex+":"+currentGeometryToken(object,generation).substr(8);
+    auto lineageHex=formatUuid(parseUuid(generation));lineageHex.erase(std::remove(lineageHex.begin(),lineageHex.end(),'-'),lineageHex.end());
+    return "external:"+ownerHex+":"+lineageHex+":"+currentGeometryToken(object,commitSequence).substr(8);
 }
 inline std::optional<ExternalEndpointToken> parseExternalEndpointToken(const std::string& token)
 {
     if(!token.starts_with("external:"))return {};
-    if(token.size()<9+32+1||token[41]!=':')throw std::invalid_argument("invalid external endpoint token");
+    if(token.size()<9+32+1+32+1||token[41]!=':'||token[74]!=':')throw std::invalid_argument("invalid external endpoint token");
     const auto owner=parseCurrentGeometryToken("current:"+token.substr(9,32)+":1");
-    const auto object=parseCurrentGeometryToken("current:"+token.substr(42));
-    return ExternalEndpointToken{owner->objectUuid,object->objectUuid,object->generation};
+    const auto lineage=parseCurrentGeometryToken("current:"+token.substr(42,32)+":1");
+    const auto object=parseCurrentGeometryToken("current:"+token.substr(75));
+    return ExternalEndpointToken{owner->objectUuid,object->objectUuid,lineage->objectUuid,object->version};
 }
 inline std::optional<std::pair<std::string,std::string>> externalEndpointKey(sqlite3* db,const std::string& input,bool includeOverridden=false)
 {
@@ -52,7 +55,7 @@ inline std::string externalEndpointVersion(sqlite3* db,const std::string& endpoi
     const auto parsed=parseExternalEndpointToken(version);
     if(!parsed||parsed->ownerUuid!=key->first||parsed->objectUuid!=key->second)
         throw std::runtime_error("external endpoint resolver identity mismatch");
-    return externalEndpointToken(parsed->ownerUuid,parsed->objectUuid,parsed->generation);
+    return externalEndpointToken(parsed->ownerUuid,parsed->objectUuid,parsed->generation,parsed->commitSequence);
 }
 inline ObjectRecord externalEndpointRecord(sqlite3* db,const std::string& endpoint)
 {
@@ -65,8 +68,8 @@ inline std::optional<std::string> externalEndpointObject(sqlite3* db,const std::
 {
     const auto parsed=parseExternalEndpointToken(token);if(!parsed)return {};
     const auto endpoint=parsed->objectUuid;
-    if(externalEndpointVersion(db,endpoint)!=externalEndpointToken(parsed->ownerUuid,parsed->objectUuid,parsed->generation))
-        throw std::runtime_error("external endpoint generation changed");
+    if(externalEndpointVersion(db,endpoint)!=externalEndpointToken(parsed->ownerUuid,parsed->objectUuid,parsed->generation,parsed->commitSequence))
+        throw std::runtime_error("external endpoint lineage or commit sequence changed");
     return endpoint;
 }
 }

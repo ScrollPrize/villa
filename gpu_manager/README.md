@@ -136,14 +136,23 @@ compute fraction, CUDA partition, or speed guarantee.
 
 The service journals ownership beside the socket (`.json`), protected by a
 separate `.lock`. Never delete these files while clients might still hold GPUs.
-Restart with the same inventory; surviving clients must release before receiving
-a fresh grant, except declared non-pausable clients whose grants remain intact.
+On restart, verified-dead process trees are retired. A changed hardware inventory
+is adopted automatically only when no recorded job remains alive. Task history
+and retired UUIDs are retained; stale manual splits are cleared on that inventory
+change, and the current constraints config is applied. A recorded Linux boot ID
+detects reboot without inspecting reused PIDs. For journals without that ID, a
+write time before the current boot also proves the recorded jobs are gone.
+Surviving clients must release before receiving a fresh grant, except declared
+non-pausable clients whose grants remain intact.
 Tasks whose journal already records both granted and held allocations as empty
 recover directly to waiting, preserving pause flags; they need no additional
 release acknowledgement. This also repairs empty tasks left in release by the
 older recovery implementation.
 Missing/corrupt recovery state fails closed rather than assuming
-the GPUs are free. Unknown/inaccessible process state remains reserved.
+the GPUs are free. A matching PID whose ownership cannot be verified makes
+startup fail with the process identity and journal path. Live jobs block a hardware
+inventory change; neither failure overwrites the journal. Auto-start propagates
+the startup error and recent server diagnostics to the calling command.
 
 The first Ctrl-C drains the pool and waits for release acknowledgements. A second
 Ctrl-C forces shutdown, retaining reservations in the journal. Pausable clients

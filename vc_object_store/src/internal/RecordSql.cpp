@@ -1,13 +1,15 @@
 #include "internal/RecordSql.hpp"
 #include "internal/RecordFields.hpp"
+#include "internal/ImmutableImport.hpp"
+#include "internal/Versions.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "geometry/GeometryToken.hpp"
 
 namespace vc::objects::detail {
 const char* kObjectCols =
-    "id,uuid,kind,name,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
-    "approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,storage_kind,"
-    "storage_ref,data_generation,data_checksum,meta";
+    "id,uuid,kind,name,commit_sequence,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
+    "approval_state,approved_by,approved_at,approved_host,approved_version,format_version,storage_kind,"
+    "storage_ref,version,data_checksum,meta,version_generation";
 
 ExplicitRecordId::ExplicitRecordId(sqlite3* db,const char* keySpace,const std::string& uuid,int64_t id)
     :db_(db),keySpace_(keySpace),id_(id),save_(db)
@@ -38,13 +40,13 @@ std::string projectedObjectColumns(const ObjectFields& fields)
 {
     if (!fields) return kObjectCols;
     const std::vector<std::pair<std::string, std::string>> columns{
-        {"uuid", "NULL"}, {"kind", "''"}, {"name", "''"}, {"generation", "0"},
+        {"uuid", "NULL"}, {"kind", "''"}, {"name", "''"}, {"commit_sequence", "0"},
         {"created_by", "''"}, {"created_at", "''"}, {"created_host", "''"},
         {"changed_by", "''"}, {"changed_at", "''"}, {"changed_host", "''"},
         {"approval_state", "''"}, {"approved_by", "NULL"}, {"approved_at", "NULL"},
-        {"approved_host", "NULL"}, {"approved_generation", "NULL"}, {"format_version", "0"},
-        {"storage_kind", "''"}, {"storage_ref", "''"}, {"data_generation", "0"},
-        {"data_checksum", "NULL"}, {"meta", "'{}'"}};
+        {"approved_host", "NULL"}, {"approved_version", "NULL"}, {"format_version", "0"},
+        {"storage_kind", "''"}, {"storage_ref", "''"}, {"version", "0"},
+        {"data_checksum", "NULL"}, {"meta", "'{}'"}, {"version_generation", "NULL"}};
     std::set<std::string> valid{"tags", "fiber", "surface", "track", "retired", "lifecycle_epoch"};
     std::string sql = "id";
     for (const auto& [name, fallback] : columns) {
@@ -57,22 +59,25 @@ std::string projectedObjectColumns(const ObjectFields& fields)
 }
 
 void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
-                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind,
+                   const std::array<unsigned char, 16>& uuid, int64_t commit_sequence, const char* changeKind,
                    const std::string& deletedKind)
 {
-    if (!historyEnabled(db)) return;
-    generation = writeGeneration(db);
-    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? AND state<>2 "
-        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=? AND state=0",
+    if (!historyEnabled(db)) {
+        recordCurrentChange(db, uuid, changeKind);
+        return;
+    }
+    commit_sequence = writeCommitSequence(db);
+    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_version FROM objects WHERE uuid=? AND state<>2 "
+        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_version FROM edges WHERE uuid=? AND state=0",
         uuid, uuid);
     const bool hasState = state.row();
     // Deleted entries have no current approval state. Their caller supplies
     // the record kind even though the UUID row remains as a tombstone.
     const std::string kind = hasState ? state.text(0) : deletedKind;
     if (kind.empty()) throw std::logic_error("object store: journal entry without record kind");
-    Statement s(db, "INSERT INTO journal(record_uuid,record_kind,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        uuid, kind, generation, author, hostname, nowIsoUtc(), std::string(changeKind));
+    Statement s(db, "INSERT INTO journal(record_uuid,record_kind,commit_sequence,author,hostname,timestamp,change_kind,"
+                    "approval_state,approved_by,approved_at,approved_host,approved_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        uuid, kind, commit_sequence, author, hostname, nowIsoUtc(), std::string(changeKind));
     for (int i = 0; i < 4; ++i) {
         if (hasState && !state.isNull(1 + i)) s.bind(8 + i, state.text(1 + i));
         else s.bindNull(8 + i);
@@ -86,7 +91,7 @@ void readCommon(RecordCommon& rec, const Statement& s, int uuidCol, int kindCol,
 {
     rec.uuid = formatUuid(s.blob16(uuidCol));
     rec.kind = s.text(kindCol);
-    rec.generation = s.i64(genCol);
+    rec.commitSequence = s.i64(genCol);
     rec.createdBy = s.text(genCol + 1);
     rec.createdAt = s.text(genCol + 2);
     rec.createdHost = s.text(genCol + 3);
@@ -98,7 +103,7 @@ void readCommon(RecordCommon& rec, const Statement& s, int uuidCol, int kindCol,
     rec.approvedAt = s.optText(genCol + 9);
     rec.approvedHost = s.optText(genCol + 10);
     if (!s.isNull(genCol + 11))
-        rec.approvedGeneration = s.i64(genCol + 11);
+        rec.approvedVersion = s.i64(genCol + 11);
 }
 
 std::optional<std::array<double, 6>> readBbox(const Statement& s, int firstCol)
@@ -161,9 +166,14 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details)
     rec.formatVersion = s.i64(16);
     rec.storageKind = s.text(17);
     rec.storageRef = s.text(18);
-    rec.dataGeneration = s.i64(19);
+    rec.version = s.i64(19);
     rec.dataChecksum = s.optText(20);
     rec.meta = s.text(21);
+    if (!s.isNull(22)) rec.versionGeneration = s.uuid(22);
+    else {
+        Statement lineage(db, "SELECT initial_generation FROM store_manifest WHERE singleton=1");
+        if (lineage.row()) rec.versionGeneration = lineage.uuid(0);
+    }
     readLifecycle(db, id, rec);
 
     if (!details) return rec;
@@ -293,12 +303,13 @@ void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
 {
     // Preserve authorship/approval evidence, not another database's version
     // counter. The imported state is published here by this transaction.
-    const auto generation = writeGeneration(db);
-    execute(db, std::string("UPDATE ") + table + " SET generation=?,created_by=?,created_at=?,created_host=?,"
-        "changed_by=?,changed_at=?,changed_host=?,approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE uuid=?",
-        generation, rec.createdBy, rec.createdAt, rec.createdHost, rec.changedBy, rec.changedAt,
+    const auto commit_sequence = writeCommitSequence(db);
+    const auto version = writeRecordVersion(db, table, rec.uuid);
+    execute(db, std::string("UPDATE ") + table + " SET commit_sequence=?,created_by=?,created_at=?,created_host=?,"
+        "changed_by=?,changed_at=?,changed_host=?,approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=? WHERE uuid=?",
+        commit_sequence, rec.createdBy, rec.createdAt, rec.createdHost, rec.changedBy, rec.changedAt,
         rec.changedHost, rec.approvalState, rec.approvedBy, rec.approvedAt, rec.approvedHost,
-        rec.approvedGeneration ? std::optional<int64_t>(generation) : std::nullopt, parseUuid(rec.uuid));
+        rec.approvedVersion ? std::optional<int64_t>(version) : std::nullopt, parseUuid(rec.uuid));
 }
 
 void validateGeometrySourceMetadata(sqlite3* db, const std::string& uuid, const nlohmann::json& source)
@@ -344,24 +355,26 @@ void normalizeObjectCoordinates(nlohmann::json& meta,const std::string& kind,boo
     else if(defaults)meta["coordinates"]=geometryCoordinates(nlohmann::json::object());
 }
 
-void insertObjectRow(sqlite3* db,const ObjectRecord& rec,int64_t id,int64_t generation,
+void insertObjectRow(sqlite3* db,const ObjectRecord& rec,int64_t id,int64_t commit_sequence,
                      const std::string& author,const std::string& host,const std::string& now,bool preserveRecord,
                      const std::string* geometryManifest)
 {
-    Statement s(db, "INSERT INTO objects(uuid,kind,name,generation,created_by,created_at,created_host,changed_by,changed_at,"
-                    "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,"
-                    "storage_kind,storage_ref,data_generation,data_checksum,meta,id,geometry_manifest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        parseUuid(rec.uuid), rec.kind, rec.name, generation, author, now, host, author, now, host);
+    Statement s(db, "INSERT INTO objects(uuid,kind,name,commit_sequence,created_by,created_at,created_host,changed_by,changed_at,"
+                    "changed_host,approval_state,approved_by,approved_at,approved_host,approved_version,format_version,"
+                    "storage_kind,storage_ref,version,data_checksum,meta,id,geometry_manifest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        parseUuid(rec.uuid), rec.kind, rec.name, commit_sequence, author, now, host, author, now, host);
     const std::string state = preserveRecord ? rec.approvalState : "pending";
     s.bind(11, state.empty() ? std::string("pending") : state);
     if (preserveRecord && rec.approvedBy) s.bind(12, *rec.approvedBy); else s.bindNull(12);
     if (preserveRecord && rec.approvedAt) s.bind(13, *rec.approvedAt); else s.bindNull(13);
     if (preserveRecord && rec.approvedHost) s.bind(14, *rec.approvedHost); else s.bindNull(14);
-    if (preserveRecord && rec.approvedGeneration) s.bind(15, *rec.approvedGeneration); else s.bindNull(15);
-    s.bind(16, rec.formatVersion); s.bind(17, rec.storageKind); s.bind(18, rec.storageRef); s.bind(19, rec.dataGeneration);
+    if (preserveRecord && rec.approvedVersion) s.bind(15, *rec.approvedVersion); else s.bindNull(15);
+    s.bind(16, rec.formatVersion); s.bind(17, rec.storageKind); s.bind(18, rec.storageRef); s.bind(19, int64_t(1));
     s.bind(20, rec.dataChecksum);s.bind(21, rec.meta);s.bind(22, id);
     if(geometryManifest)s.bindBorrowedText(23,*geometryManifest);else s.bindNull(23);
     s.stepDone();
+    if (!immutableInitial(db)) execute(db,
+        "UPDATE objects SET version_generation=NULLIF((SELECT generation FROM store_manifest),(SELECT initial_generation FROM store_manifest)) WHERE id=?", id);
 }
 
 std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
@@ -375,35 +388,36 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?", uuid);
     if (collision.row()) throw std::runtime_error("object store: UUID already belongs to an edge");
     const std::string now = nowIsoUtc();
-    Statement managed(db, "SELECT data_generation,data_checksum,storage_ref FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
+    Statement managed(db, "SELECT version,data_checksum,storage_ref FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
         uuid);
     const bool hasGeometry = managed.row();
     if (hasGeometry) {
         rec.storageKind = "sqlite";
         rec.storageRef = managed.text(2);
-        rec.dataGeneration = managed.i64(0);
+        rec.version = managed.i64(0);
         rec.dataChecksum = managed.text(1);
     } else if (rec.storageKind == "sqlite") {
         throw std::invalid_argument("object store: managed geometry requires putGeometry, not a storage_kind override");
     }
 
     int64_t id = 0;
-    const int64_t generation = writeGeneration(db);
+    const int64_t commit_sequence = writeCommitSequence(db);
     if (auto existing = objectIdByUuid(db, uuid)) {
         id = *existing;
-        Statement cur(db, "SELECT kind,generation FROM objects WHERE id=?", id);
+        Statement cur(db, "SELECT kind,commit_sequence FROM objects WHERE id=?", id);
         (void)cur.row();
         if (cur.text(0) != rec.kind)
             throw std::runtime_error("object store: object kind cannot change (" + cur.text(0) + " -> " + rec.kind + ")");
         beforeCurrentObjectEdit(db,rec.uuid);
-        execute(db, "UPDATE objects SET state=CASE WHEN state=2 THEN 0 ELSE state END,name=?,generation=?,changed_by=?,changed_at=?,changed_host=?,"
-                        "approval_state='pending',approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_generation=NULL,"
-                        "format_version=?,storage_kind=?,storage_ref=?,data_generation=?,data_checksum=?,meta=? WHERE id=?",
-            rec.name, generation, author, now, host, rec.formatVersion, rec.storageKind, rec.storageRef,
-            rec.dataGeneration, rec.dataChecksum, rec.meta, id);
+        const auto version = writeObjectVersion(db, rec.uuid);
+        execute(db, "UPDATE objects SET state=CASE WHEN state=2 THEN 0 ELSE state END,name=?,commit_sequence=?,changed_by=?,changed_at=?,changed_host=?,"
+                        "approval_state='pending',approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_version=NULL,"
+                        "format_version=?,storage_kind=?,storage_ref=?,version=?,data_checksum=?,meta=? WHERE id=?",
+            rec.name, commit_sequence, author, now, host, rec.formatVersion, rec.storageKind, rec.storageRef,
+            version, rec.dataChecksum, rec.meta, id);
     } else {
         id = allocateRecordId(db, "objects");
-        insertObjectRow(db,rec,id,generation,author,host,now,preserveRecord);
+        insertObjectRow(db,rec,id,commit_sequence,author,host,now,preserveRecord);
     }
     writeObjectDetail(db, id, rec);
     if (!hasGeometry) detail::setSpatialBounds(db, id, bounds);
@@ -412,7 +426,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         restoreCommon(db, "objects", rec);
         writeLifecycle(db, id, rec);
     }
-    appendJournal(db, author, host, uuid, preserveRecord ? rec.generation : generation, preserveRecord ? importOperation : "upsert");
+    appendJournal(db, author, host, uuid, preserveRecord ? rec.commitSequence : commit_sequence, preserveRecord ? importOperation : "upsert");
     savepoint.release();
     return rec.uuid;
 }
@@ -427,12 +441,13 @@ std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char,
 void stampContentChange(sqlite3* db, const std::string& author, const std::string& host, const char* table,
                         int64_t id, const std::array<unsigned char, 16>& uuid, const char* changeKind)
 {
-    const int64_t generation = writeGeneration(db);
+    writeRecordVersion(db, table, formatUuid(uuid));
+    const int64_t commit_sequence = writeCommitSequence(db);
     execute(db, std::string("UPDATE ") + table +
-                        " SET generation=?,changed_by=?,changed_at=?,changed_host=?,approval_state='pending',"
-                        "approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_generation=NULL WHERE id=?",
-        generation, author, nowIsoUtc(), host, id);
-    appendJournal(db, author, host, uuid, generation, changeKind);
+                        " SET commit_sequence=?,changed_by=?,changed_at=?,changed_host=?,approval_state='pending',"
+                        "approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_version=NULL WHERE id=?",
+        commit_sequence, author, nowIsoUtc(), host, id);
+    appendJournal(db, author, host, uuid, commit_sequence, changeKind);
 }
 
 std::string jsonPathForKey(const std::string& key)

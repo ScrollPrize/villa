@@ -111,7 +111,7 @@ def import_afv(source, destination, *, volume_id=None, volume=None, scale_factor
             collection = dict(uuid=collection_uuid, kind='collection', name=source.stem,
                 meta=dict(coordinates=coordinates, afv=dict(metadata=metadata, source=str(source),
                     volume=str(Path(volume).absolute()) if volume else None)))
-            with store.write(expected_revisions={collection_uuid: None}) as tx:
+            with store.write(expected_versions={collection_uuid: None}) as tx:
                 tx.upsert_object(collection)
             pending, pending_bytes = [], 0
             last_report = started
@@ -120,7 +120,7 @@ def import_afv(source, destination, *, volume_id=None, volume=None, scale_factor
                 nonlocal pending_bytes, last_report
                 if not pending:
                     return
-                with store.write(expected_revisions={r['uuid']: None for r, _ in pending}) as tx:
+                with store.write(expected_versions={r['uuid']: None for r, _ in pending}) as tx:
                     for record, geometry in pending:
                         tx.upsert_object(record)
                         tx.put_geometry(record['uuid'], geometry)
@@ -145,7 +145,7 @@ def import_afv(source, destination, *, volume_id=None, volume=None, scale_factor
             flush()
             if count != metadata['fiber_count'] or points != metadata['point_count']:
                 raise ValueError('AFV catalog totals do not match collection metadata')
-            with store.write(expected_revisions={collection_uuid: store.current_object_revision(collection_uuid)['uuid']}) as tx:
+            with store.write(expected_versions={collection_uuid: store.current_version(collection_uuid)}) as tx:
                 tx.set_meta(collection_uuid, 'import', dict(fibers=count, points=points))
         # A closed store has checkpointed its WAL. Link publishes atomically
         # without a check/replace race; staging is on the destination filesystem.

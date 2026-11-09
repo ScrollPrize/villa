@@ -1,4 +1,5 @@
 #include <iostream>
+#include <vc_reader/http.hpp>
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QThread>
@@ -7,11 +8,13 @@
 #include "SpiralServiceManager.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/AttachedDocument.hpp>
+#include <vc_object_store/objects/Project.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "test/support/TestVolume.hpp"
 #include <nlohmann/json.hpp>
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
+#include <vc_reader/sftp.hpp>
 #include <filesystem>
 #include <fstream>
 #include "fibers3d/Fiber3DCanvas.hpp"
@@ -40,44 +43,70 @@ int runObjectStoreControllerTests()
     using namespace vc::objects;
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::objects::util::newUuid()+".vcobj");
-    auto checkHubStatus = [&](CState& state, Controller& controller,
-                              FiberCollectionController& collection,
-                              const std::function<bool()>& catalogReady) {
-        const auto generation = controller._fiberDataGeneration;
-        const auto snapshots = controller._sideStripStoredSnapshotCache.size();
-        int catalogUpdates = 0, fiberUpdates = 0, selectionResets = 0;
-        QObject observer;
-        QObject::connect(&collection, &FiberCollectionController::catalogChanged, &observer,
-            [&](const auto&, bool) { ++catalogUpdates; });
-        QObject::connect(&collection, &FiberCollectionController::selectionChanged, &observer,
-            [&](const auto& selection) { if (selection.id == 0) ++selectionResets; });
-        QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
-        std::vector<double> elapsedMs;
-        for (int i = 0; i < 20; ++i) {
-            QElapsedTimer timer; timer.start();
-            state.objectStoreChanged({StoreSessionEvent::Kind::Hub,
-                *state.storeFor("fiber"), 0, {}});
-            QApplication::processEvents();
-            while (!catalogReady() && timer.elapsed() < 10000) {
-                QApplication::processEvents(); QThread::msleep(1);
-            }
-            require(catalogReady(), "hub status test catalog settles");
-            elapsedMs.push_back(timer.nsecsElapsed() / 1.e6);
-        }
-        std::sort(elapsedMs.begin(), elapsedMs.end());
-        double total = 0;
-        for (const auto ms : elapsedMs) total += ms;
-        std::cout << "hub status events=20 mean_ms=" << total / elapsedMs.size()
-                  << " median_ms=" << (elapsedMs[9] + elapsedMs[10]) / 2
-                  << " p95_ms=" << elapsedMs[18] << " catalog_updates=" << catalogUpdates
-                  << " fiber_updates=" << fiberUpdates << " selection_resets=" << selectionResets << std::endl;
-        require(catalogUpdates == 0 && fiberUpdates == 0 && selectionResets == 0,
-                "hub status does not reload the catalog, redraw fibers or clear selection");
-        require(controller._fiberDataGeneration == generation &&
-                controller._sideStripStoredSnapshotCache.size() == snapshots,
-                "hub status preserves fiber generation and warm snapshots");
-    };
     try {
+#include "LineAnnotationNearbyBenchmark.inc"
+        if (const char* endpoint = std::getenv("VC3D_SSH_STORE_TEST")) {
+            QTemporaryDir directory;
+            const auto local = fs::path(directory.path().toStdString()) / "local.vcobj";
+            OpenOptions options; options.author = "ssh-gui-test";
+            { auto store = ObjectStore::create(local, options); }
+            CState state;
+            openStoreAsProject(state, QString::fromStdString(local.string()), options.author.c_str());
+            int prompts = 0, heartbeats = 0;
+            vcr::sftp::setAuthenticator([&](const vcr::sftp::Prompt& prompt) -> std::optional<std::string> {
+                if (!prompt.confirmation) return std::nullopt;
+                QMetaObject::invokeMethod(qApp, [&] { ++prompts; }, Qt::BlockingQueuedConnection);
+                return "yes"; // disposable local sshd from run_ssh_test.py
+            });
+            const auto resetAuth = qScopeGuard([] { vcr::sftp::setAuthenticator({}); });
+            QTimer heartbeat; heartbeat.setInterval(5);
+            QObject::connect(&heartbeat, &QTimer::timeout, [&] {
+                ++heartbeats;
+                state.objectStoreSession()->finalize();
+            });
+            heartbeat.start();
+            const auto hosted = state.attachHostedStore(endpoint, options.author.c_str());
+            state.setStoreFor("fiber", hosted);
+            const auto project = state.vpkg()->document().path();
+            require(prompts == 1 && heartbeats > 0, "SSH prompts and GUI events run during attachment");
+            require(state.objectStoreSession()->location(hosted) == endpoint, "project retains pasted SSH endpoint");
+            state.closeProject();
+            state.setVpkg(VolumePkg::open(project));
+            require(state.storeFor("fiber") && state.objectStoreSession()->location(*state.storeFor("fiber")) == endpoint,
+                    "project reopening reestablishes its SSH hosted store");
+            auto invalid = state.vpkg()->document().data();
+            invalid["stores"][1]["location"] = "sftp://host:8750/file.vcobj";
+            bool refused = false;
+            try { state.vpkg()->document().replace(invalid); } catch (...) { refused = true; }
+            require(refused, "hosted endpoints reject SFTP file paths");
+            state.closeProject();
+        }
+        if (const char* legacy = std::getenv("VC3D_UPGRADE_STORE_TEST")) {
+            QTemporaryDir directory;
+            const auto source = fs::path(directory.path().toStdString()) / "legacy.vcobj";
+            fs::copy_file(legacy, source);
+            if (fs::exists(std::string(legacy) + ".artifacts"))
+                fs::copy(std::string(legacy) + ".artifacts", source.string() + ".artifacts", fs::copy_options::recursive);
+            CState state;
+            openStoreAsProject(state, QString::fromStdString(source.string()), "test", true);
+            const auto original = state.vpkg()->document().data();
+            require(!state.storeFor("fiber"), "read-only legacy store is not upgraded");
+            state.closeProject();
+            openStoreAsProject(state, QString::fromStdString(source.string()), "test");
+            require(state.storeFor("fiber").has_value(), "writable legacy store upgrades and attaches automatically");
+            const auto project = state.vpkg()->document().path();
+            const auto data = state.vpkg()->document().data();
+            const auto upgraded = state.vpkg()->document().resolve(data["stores"][0]["location"]);
+            require(upgraded != source && fs::exists(source), "upgrade keeps the original database");
+            require(data["selections"] == original["selections"], "upgrade preserves store routes");
+            std::ifstream reportFile(upgraded.string() + ".report.json");
+            const auto report = nlohmann::json::parse(reportFile);
+            require(report["validation"] == "ok" && fs::exists(upgraded.string() + ".mapping.json"), "upgrade retains conversion report and revision mapping");
+            state.closeProject();
+            state.setVpkg(VolumePkg::open(project));
+            require(state.storeFor("fiber") && state.vpkg()->document().data() == data, "reopening uses the upgraded store without another conversion");
+            state.closeProject();
+        }
 #include "LineAnnotationFiberCacheTest.inc"
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;
@@ -110,7 +139,6 @@ int runObjectStoreControllerTests()
                       << " selected_ms=" << timer.elapsed()-pageMs << " heartbeats=" << heartbeats << std::endl;
             require(!controller.fiberSnapshotsForSideStripQuery({*selected}).empty(), "warm real fiber snapshot");
             collection.selectFiber(id, false, false);
-            checkHubStatus(state, controller, collection, [&] { return !page.empty(); });
             state.closeProject();
             require(controller.fiberUuidForId(id).empty() && !controller.readStoredFiber(id), "detach clears runtime identities");
             return 0;
@@ -207,12 +235,14 @@ int runObjectStoreControllerTests()
                     "a volume without a stored umbilicus has none");
             auto add = [&](const std::string& name) {
                 const auto uuid = vc::objects::util::newUuid();
-                state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-                    ObjectRecord record; record.uuid = uuid; record.kind = "umbilicus"; record.name = name;
-                    record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}}.dump();
-                    db.upsertObject(txn, record);
-                    db.putGeometry(txn, uuid, vc::geometry::encode(vc::geometry::Umbilicus{{{8, 6, 0}, {8, 6, 30}}}));
-                });
+                ObjectRecord record; record.uuid = uuid; record.kind = "umbilicus"; record.name = name;
+                record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}}.dump();
+                auto request = state.objectStoreSession()->newRequest(attachment);
+                request.expectedObjects = {{uuid, std::nullopt}};
+                request.operations.push_back(vc::objects::CreateObjectOp{vc::objects::objectRecordJson(record)});
+                request.operations.push_back(vc::objects::PutGeometryOp{uuid,
+                    vc::geometry::encode(vc::geometry::Umbilicus{{{8, 6, 0}, {8, 6, 30}}}), {}});
+                state.objectStoreSession()->submit(attachment, request);
                 state.pollObjectStoreChanges();
                 return uuid;
             };
@@ -341,8 +371,8 @@ int runObjectStoreControllerTests()
             };
             auto stored = [&](const std::string& uuid) {
                 vc::geometry::Fiber fiber;
-                state.objectStoreSession()->read(*state.storeFor("fiber"), [&](const auto& db, const auto& txn, const auto&) {
-                    fiber = GeometrySnapshot(db, txn).fiber(uuid).load();
+                state.objectStoreSession()->readStore(*state.storeFor("fiber"), [&](const StoreReader& reader, const auto&) {
+                    fiber = GeometrySnapshot(reader).fiber(uuid).load();
                 });
                 return fiber;
             };
@@ -447,8 +477,8 @@ int runObjectStoreControllerTests()
         openStoreAsProject(state, QString::fromStdString(path.string()),"vc3d-controller-test");
         auto transferJson = [&](const Controller::StoredFiber& fiber) {
             nlohmann::json result;
-            state.objectStoreSession()->read(fiber.storePin->attachment, [&](const auto& db, const auto& txn, const auto&) {
-                result = nlohmann::json::parse(fiberRevisionJson(db, txn, fiber.storePin->objectRevision));
+            state.objectStoreSession()->readStore(fiber.storePin->attachment, [&](const StoreReader& reader, const auto&) {
+                result = nlohmann::json::parse(fiberVersionJson(reader, fiber.storePin->reference()));
             });
             return result;
         };
@@ -476,6 +506,30 @@ int runObjectStoreControllerTests()
             return fibers.front();
         };
         a=resolve(a.uuid);b=resolve(b.uuid);
+        {
+            auto beforeReset = std::vector<Controller::FiberSaveSnapshot>{controller.makeFiberSaveSnapshot(a)};
+            { auto db = ObjectStore::open(path, options); db.startHistoryGeneration("restored backup"); }
+            bool rejected = false;
+            try { controller.commitFiberStoreAction(beforeReset); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "fiber opened before reset rejects edits");
+            a = resolve(a.uuid); b = resolve(b.uuid);
+            require(a.storePin->generation != a.storePin->writeGeneration,
+                    "reopened fiber retains its publication generation");
+            const auto publication = a.storePin->reference();
+            a.tags.push_back("after-reset");
+            batch = {controller.makeFiberSaveSnapshot(a)};
+            controller.commitFiberStoreAction(batch);
+            a = batch.front().fiber;
+            require(a.storePin->version == publication.version + 1 &&
+                    a.storePin->generation == a.storePin->writeGeneration,
+                    "reopened fiber saves in the active generation");
+            a.tags.push_back("second-save");
+            batch = {controller.makeFiberSaveSnapshot(a)};
+            controller.commitFiberStoreAction(batch);
+            a = batch.front().fiber;
+            require(a.storePin->version == publication.version + 2, "subsequent fiber saves use the new pin");
+        }
         Controller::FiberBranchRef link;
         link.controlPointIndex=0;link.branchControlPointIndex=0;link.branchFiberId=b.id;link.branchFileName=b.fileName;
         link.controlPointPosition=a.controlPoints[0];link.branchControlPointPosition=b.controlPoints[0];
@@ -506,8 +560,13 @@ int runObjectStoreControllerTests()
                     "fibers without a binding list without a volume length");
         }
         require(controller.fiberSnapshotsForSideStripQuery({a, b}).size() == 2, "warm linked fiber snapshots");
+        {
+            const auto retained = controller._sideStripStoredSnapshotCache.at(b.id).snapshot.polyline;
+            (void)controller.fiberSnapshotsForSideStripQuery({a});
+            require(controller._sideStripStoredSnapshotCache.at(b.id).snapshot.polyline == retained,
+                    "visiting a different candidate set retains immutable stored snapshots");
+        }
         collection.selectFiber(a.id, false, false);
-        checkHubStatus(state, controller, collection, [&] { return catalog.size() == 2; });
         {
             const auto generation = controller._fiberDataGeneration;
             const auto snapshots = controller._sideStripStoredSnapshotCache.size();
@@ -521,10 +580,13 @@ int runObjectStoreControllerTests()
             const auto connection = state.objectStoreSession();
             const auto attachment = *state.storeFor("fiber");
             const auto unrelated = vc::objects::util::newUuid();
-            connection->act(attachment, {{unrelated, std::nullopt}}, [&](auto& db, auto& txn) {
+            {
                 ObjectRecord record; record.uuid = unrelated; record.kind = "point_collection";
-                db.upsertObject(txn, record);
-            });
+                auto request = connection->newRequest(attachment);
+                request.expectedObjects = {{unrelated, std::nullopt}};
+                request.operations.push_back(vc::objects::CreateObjectOp{vc::objects::objectRecordJson(record)});
+                connection->submit(attachment, request);
+            }
             state.pollObjectStoreChanges();
             // Old/foreign attachments must not invalidate this store's fibers.
             StoreSessionEvent foreign{StoreSessionEvent::Kind::Committed,
@@ -584,7 +646,7 @@ int runObjectStoreControllerTests()
             controller.commitFibers({&approved});
             state.pollObjectStoreChanges();
             require(controller._fiberDataGeneration > generation && controller._sideStripStoredSnapshotCache.empty(),
-                    "real commits still invalidate fiber geometry snapshots after hub status events");
+                    "real commits invalidate fiber geometry snapshots");
             QElapsedTimer timer; timer.start();
             const auto approvedCatalog = [&] {
                 return catalog.size() == 2 && std::all_of(catalog.begin(), catalog.end(),
@@ -684,7 +746,7 @@ int runObjectStoreControllerTests()
             changedPane.surfaceName = "changed-test-pane"; changedPane.session = changedSession;
             keptPane.surfaceName = "kept-test-pane"; keptPane.session = untouched;
             controller._panes.push_back(changedPane); controller._panes.push_back(keptPane);
-            { auto db = ObjectStore::open(path, options); auto txn = db.write({{a.uuid, a.storePin->objectRevision}});
+            { auto db = ObjectStore::open(path, options); auto txn = db.write({{a.uuid, a.storePin->version}});
               db.setMeta(txn, a.uuid, "external_note", "true"); txn.commit(); }
             controller.refreshChangedStoreFibers();
             require(controller._panes.size() == 1 && controller._panes.front().session == untouched,
@@ -706,9 +768,9 @@ int runObjectStoreControllerTests()
             bool rejected = false;
             try { controller.commitFiberStoreAction(failed); } catch (...) { rejected = true; }
             require(rejected, "invalid relationship rejects after geometry edits start");
-            require(failed.front().fiber.storePin->objectRevision == invalid.storePin->objectRevision, "failed transaction leaves working pins unchanged");
+            require(failed.front().fiber.storePin->version == invalid.storePin->version, "failed transaction leaves working pins unchanged");
             auto db = ObjectStore::open(path, options); auto txn = db.read();
-            require(db.currentObjectRevision(txn, a.uuid)->uuid == a.storePin->objectRevision,
+            require(db.currentObjectRevision(txn, a.uuid)->version == a.storePin->version,
                     "failed relationship rolls back geometry and metadata");
         }
         const auto edge=a.branches.front().edgeUuid;
@@ -736,7 +798,7 @@ int runObjectStoreControllerTests()
         batch={controller.makeFiberSaveSnapshot(a)};
         const auto stale=batch;
         a=resolve(a.uuid);
-        { auto db=ObjectStore::open(path,options);auto txn=db.write({{a.uuid,a.storePin->objectRevision}});db.setMeta(txn,a.uuid,"external","true");txn.commit(); }
+        { auto db=ObjectStore::open(path,options);auto txn=db.write({{a.uuid,a.storePin->version}});db.setMeta(txn,a.uuid,"external","true");txn.commit(); }
         bool conflict=false;try { auto old=stale;controller.commitFiberStoreAction(old); } catch(...) { conflict=true; }
         require(conflict,"stale controller edits reject");
         a=resolve(a.uuid);
@@ -745,7 +807,7 @@ int runObjectStoreControllerTests()
         {
         auto db=ObjectStore::open(path,options);auto txn=db.read();
         require(db.objectByUuid(txn,a.uuid)->retired,"retirement persisted");
-        require(db.objectRevision(txn,first->objectRevision).has_value(),"historical revision retained");
+        require(db.objectAtVersion(txn,first->reference()).has_value(),"historical revision retained");
         require(db.edgesByKind(txn,"fiber_branch").empty(),"retirement and branch removal atomic");
         }
 
@@ -815,7 +877,7 @@ int runObjectStoreControllerTests()
             const auto failures=controller._fiberSaveFailureCount;
             controller.saveSessionAsFiber(*live,false);
             require(controller._fiberSaveFailureCount==failures,"completed manual interaction commits without solver");
-            require(live->storePin->objectRevision!=merged.storePin->objectRevision,"interaction advances pin immediately");
+            require(live->storePin->version!=merged.storePin->version,"interaction advances pin immediately");
             const auto savedPin=live->storePin;
             controller.saveOpenFibers();
             require(live->storePin==savedPin,"Save barrier does not create another revision");
@@ -940,7 +1002,7 @@ int runObjectStoreControllerTests()
             require(controller.readStoredFibers(std::nullopt).size()==count,"real database reopens");
             const auto restored=resolve(fiber.uuid);
             require(std::find(restored.tags.begin(),restored.tags.end(),"vc3d_smoke")!=restored.tags.end(),"real database edit persists");
-            require(restored.storePin->objectRevision!=originalPin->objectRevision,"real database revision advances");
+            require(restored.storePin->version!=originalPin->version,"real database revision advances");
             auto realSplit=la::planFiberSplit(restored,restored.controlPoints.size()/2,
                 identity("real-prefix.json"),identity("real-suffix.json"),true,&error);
             if(!realSplit) throw std::runtime_error("real split plan: "+error);

@@ -26,8 +26,8 @@ struct InitialEdgeImportOptions {
     std::size_t sqlBatchRows = 1;
 };
 struct CollectionMember {
-    std::string databaseUuid, storeUuid;
-    int64_t generation = 0;
+    std::string databaseUuid, storeUuid, generation;
+    int64_t commitSequence = 0;
     std::filesystem::path locator;
     bool partition = false;
     std::array<int64_t,2> objectIds{}, edgeIds{};
@@ -65,14 +65,14 @@ private:
 
 // Composed vcobj API over independent SQLite connections, without ATTACH's
 // database limit. The local ObjectStore is one atomic writable overlay; every
-// dependency/partition is sealed and verified by UUID+generation on open.
+// dependency/partition is sealed and verified by store/lineage UUID and commit sequence on open.
 class ObjectCollection {
 public:
     static ObjectCollection create(const std::filesystem::path&, const std::vector<std::filesystem::path>& bases, const OpenOptions&);
     static ObjectCollection open(const std::filesystem::path&, const OpenOptions&);
     // Publish independently imported, sealed physical partitions of one logical
-    // store. Each must have the same store UUID/generation and disjoint reserved
-    // object/edge ID ranges. The manifest is sealed in that same generation.
+    // store. Each must have the same store/lineage UUID and commit sequence and
+    // disjoint reserved object/edge ID ranges. The manifest has the same state pin.
     static ObjectCollection publishShards(const std::filesystem::path&, const std::vector<std::filesystem::path>&, const OpenOptions&, const std::vector<KeyRoute>& routes = {});
     ObjectCollection(ObjectCollection&&) noexcept;
     ~ObjectCollection();

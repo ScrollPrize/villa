@@ -28,7 +28,8 @@ def test_grown_patches_are_stored_surfaces_found_by_seed(tmp_path):
     assert valid.sum() == 12 and not valid[0].any() and scale == (0.05, 0.05)
     np.testing.assert_array_equal(points[1:-1, 1:-1], grid.astype(np.float32))
     assert record["tags"] == ["paths"] and record["meta"]["provenance"]["tool"] == "grow_track_graph"
-    assert record["meta"]["area_cm2"] == meta["area_cm2"]
+    # The store keeps the area itself (record["surface"]["area"]), not the tifxyz meta key.
+    assert "area_cm2" not in record["meta"] and record["surface"]["area"] > 0
 
     assert ggt.stored_seed_surfaces(store, tracks) == {7: [uid]}
     assert ggt.stored_seed_surfaces(store, tmp_path / "other.vctracks") == {}

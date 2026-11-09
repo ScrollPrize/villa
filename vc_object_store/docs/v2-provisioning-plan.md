@@ -1,6 +1,9 @@
 # Draft vcobj v2 provisioning plan
 
-Status: implementation specification, based on `origin/main` at `3fbb3bbad`. See [v2-store-format.md](v2-store-format.md), [collections.md](collections.md) and [packed-stores.md](packed-stores.md) for the implemented schema/APIs. The redesigned history representation and lazy history sections below remain explicitly deferred; they are not claims about current history-on storage. This plan covers the intended infrastructure, not the abandoned experimental importer.
+> Historical design notes: the implemented schema 21 integration is specified in [schema-integration.md](schema-integration.md) and [store format](store-format.md). Numeric store generations below became `commitSequence`; lineage uses upstream generation UUIDs and current objects use numbered versions. The proposed lazy/delta history remains deferred. Do not implement superseded counters or APIs from this document.
+
+
+Status: historical implementation specification, based on `origin/main` at `3fbb3bbad`. See [store-format.md](store-format.md), [collections.md](collections.md) and [packed-stores.md](packed-stores.md) for the implemented schema/APIs. The redesigned history representation and lazy history sections below remain explicitly deferred; they are not claims about current history-on storage. This plan covers the intended infrastructure, not the abandoned experimental importer.
 
 The goal is a versioned logical store manifest that separates object identity and routing from physical storage. The same model should support ordinary SQLite files, independent database shards, linked derived stores, and an optional packed VFS container.
 

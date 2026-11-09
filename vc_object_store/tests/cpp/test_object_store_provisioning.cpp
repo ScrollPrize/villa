@@ -33,9 +33,9 @@ void directStore(bool spatial)
     {
         auto t = store.read();
         require(scalar(store,t,"PRAGMA cache_size")==-131072,"configured SQLite reader page cache");
-        require(store.provisioning(t).generation == 1, "initial generation");
+        require(store.provisioning(t).commitSequence == 0, "initial commit sequence");
         physical = store.databaseIdentity(t);
-        require(physical.uuid != store.uuid(t) && physical.schemaVersion == 18, "physical database and logical store identities are separate");
+        require(physical.uuid != store.uuid(t) && physical.schemaVersion == 21, "physical database and logical store identities are separate");
         std::set<std::string> tableIds;
         for (const auto& table : physical.tables) {
             require(tableIds.insert(table.uuid).second, "table UUIDs are unique");
@@ -68,10 +68,10 @@ void directStore(bool spatial)
     }
     {
         auto t = store.read();
-        require(store.provisioning(t).generation == 2, "one generation per committed write");
-        require(store.objectByUuid(t, a)->generation == 2 && store.objectByUuid(t, b)->generation == 2 &&
-                store.edgeByUuid(t, edgeId)->generation == 2 && store.currentGeometry(t,a)->objectGeneration == 2,
-                "objects, geometry and relationships share publication generation");
+        require(store.provisioning(t).commitSequence == 1, "one sequence per committed write");
+        require(store.objectByUuid(t, a)->version == 1 && store.objectByUuid(t, b)->version == 1 &&
+                store.edgeByUuid(t, edgeId)->version == 1 && store.currentGeometry(t,a)->objectVersion == 1,
+                "new objects, geometry and relationships begin at version one");
         const auto expected = std::find_if(data.arrays.begin(), data.arrays.end(), [](const auto& a) { return a.name == "line_points"; });
         require(store.readGeometryArray(t, original, "line_points") == expected->bytes, "current geometry reads");
         require(!store.edgeGeometryState(t, edgeId).stale, "initial relationship valid");
@@ -101,7 +101,7 @@ void directStore(bool spatial)
     { auto w = store.write(); store.setMeta(w, a, "rolled_back", "true"); }
     {
         auto t = store.read();
-        require(store.provisioning(t).generation == 2, "no-op and rollback preserve generation");
+        require(store.provisioning(t).commitSequence == 1, "no-op and rollback preserve commit sequence");
     }
     std::string replacement;
     {
@@ -228,7 +228,7 @@ int main()
         const auto directory = independent.databaseIdentity(r);
         const auto extra = std::find_if(directory.tables.begin(), directory.tables.end(), [](const auto& t) { return t.name == "extension_data"; });
         require(extra != directory.tables.end() && extra->primaryKey == std::vector<std::string>{"key"}, "schema changes register extension tables atomically");
-        require(independent.provisioning(r).generation == 2, "provisioning change advances store generation");
+        require(independent.provisioning(r).commitSequence == 1, "provisioning change advances store commit sequence");
     }
     {
         auto w = independent.write();

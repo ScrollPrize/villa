@@ -142,13 +142,13 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
             if (validateGeometry) {
                 const auto updated = *db.edgeByUuid(txn, e.uuid);
                 objects::EdgeGeometryRepair repair;
-                repair.edgeUuid = updated.uuid; repair.expectedGeneration = updated.generation;
+                repair.edgeUuid = updated.uuid; repair.expectedVersion = updated.version.value();
                 if (const auto revision = db.currentGeometry(txn, updated.aUuid)) repair.aRevision = revision->uuid;
                 if (const auto revision = db.currentGeometry(txn, updated.bUuid)) repair.bRevision = revision->uuid;
                 repair.aAnchor = updated.aAnchor; repair.bAnchor = updated.bAnchor;
                 db.repairEdgeGeometry(txn, repair);
             }
-            if (db.edgeByUuid(txn, e.uuid)->generation == old.generation) ++report.edgesSkippedExisting;
+            if (db.edgeByUuid(txn, e.uuid)->version == old.version) ++report.edgesSkippedExisting;
             else ++report.edgesUpdated;
         } else {
             db.addEdge(txn, e);  // starts 'pending' until reviewed
@@ -188,6 +188,37 @@ DetectorReport detail::commitStoredCandidates(objects::ObjectStore& db, const St
     inputs.validate(txn);
     return commitCandidatesImpl(db, txn, detectorName, detectorVersion, candidates,
         replaceStalePending, staleScope, progress, true);
+}
+
+DetectorReport detail::commitDetection(objects::ObjectStore& db, const StoredGeometry& inputs, objects::WriteTxn& txn,
+    const Detection& detection, const objects::util::ProgressCallback& progress)
+{
+    auto report = detection.report;
+    if (!detection.publish) return report;
+    const auto committed = commitStoredCandidates(db, inputs, txn, detection.detector, detection.version,
+        detection.candidates, detection.replaceStalePending, &detection.scope, progress);
+    report.candidatesFound = committed.candidatesFound;
+    report.edgesCreated = committed.edgesCreated;
+    report.edgesUpdated = committed.edgesUpdated;
+    report.edgesSkippedExisting = committed.edgesSkippedExisting;
+    report.staleRemoved = committed.staleRemoved;
+    report.problems.insert(report.problems.end(), committed.problems.begin(), committed.problems.end());
+    return report;
+}
+
+DetectorReport detail::publishDetection(objects::ObjectStore& db, const StoredGeometry& inputs, const Detection& detection,
+    const objects::util::ProgressCallback& progress, const std::atomic_bool* cancel)
+{
+    if (!detection.publish) return detection.report;
+    auto cancelled = [&] { if (cancel && cancel->load()) throw std::runtime_error(detection.detector + ": cancelled before commit"); };
+    cancelled();
+    auto txn = db.write();
+    cancelled();
+    auto report = commitDetection(db, inputs, txn, detection, progress);
+    cancelled();
+    objects::util::reportProgress(progress, "committing links");
+    txn.commit();
+    return report;
 }
 
 }  // namespace vc::object_links

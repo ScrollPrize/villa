@@ -10,7 +10,7 @@ using namespace vc::objects;
 using namespace vc::objects::detail;
 namespace {
 ObjectRecord fiber() { ObjectRecord r; r.kind="fiber"; r.fiber.emplace(); r.meta=R"({"foo":1})"; return r; }
-int64_t generation(ObjectCollection& collection) { auto r=collection.read(); return collection.provisioning(r).generation; }
+int64_t generation(ObjectCollection& collection) { auto r=collection.read(); return collection.provisioning(r).commitSequence; }
 }
 int main() try {
     TemporaryDirectory dir;
@@ -149,16 +149,16 @@ int main() try {
             auto sameUuid=edge;sameUuid.uuid=high;mustFail([&]{db.insertEdgeWithId(w,sameUuid,102);});
             mustFail([&]{db.addEdge(w,edge);});w.commit();
         }
-        int64_t before;{auto r=db.read();before=db.provisioning(r).generation;}
+        int64_t before;{auto r=db.read();before=db.provisioning(r).commitSequence;}
         {auto rollback=db.write();db.insertEdgeWithId(rollback,edge,102);}
-        {auto r=db.read();require(db.provisioning(r).generation==before&&db.edgesByKind(r,"explicit").size()==3,"explicit edge rollback leaked state");}
+        {auto r=db.read();require(db.provisioning(r).commitSequence==before&&db.edgesByKind(r,"explicit").size()==3,"explicit edge rollback leaked state");}
         {
             auto w=db.write();const auto final=db.insertEdgeWithId(w,edge,102);
             require(edgeIdByUuid(ObjectStoreImplAccess::conn(w),parseUuid(final))==102,"rolled-back edge ID was not reusable");
             mustFail([&]{db.addEdge(w,edge);});w.commit();
         }
         auto r=db.read();require(db.edgesByKind(r,"explicit").size()==4,"explicit edges not published");
-        require(db.provisioning(r).generation==before+1,"explicit edge publication generation changed incorrectly");
+        require(db.provisioning(r).commitSequence==before+1,"explicit edge publication commit sequence changed incorrectly");
     }
     std::cout<<"collection audit passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

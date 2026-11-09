@@ -1,20 +1,17 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
-#include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
 #include "internal/Digest.hpp"
-#include "sync/Apply.hpp"
-#include "sync/GeometryTransfer.hpp"
 #include <bit>
 
 using namespace vc::objects;
 
 namespace {
-int64_t generation(ObjectStore& store)
+int64_t commitSequence(ObjectStore& store)
 {
     auto txn = store.read();
-    return store.provisioning(txn).generation;
+    return store.provisioning(txn).commitSequence;
 }
 
 GeometryArrayEdit moveX(double value)
@@ -45,7 +42,6 @@ void nativeChanges(HistoryMode history)
         require(columns.row()&&columns.i64(0)==2,"lifecycle state is directly on objects");
         detail::Statement oldColumns(sql,"SELECT count(*) FROM pragma_table_info('objects') WHERE name IN ('retired','deleted')");
         require(oldColumns.row()&&oldColumns.i64(0)==0,"one state replaces independent lifecycle flags");
-        require(!store.replicaUuid(txn).empty(),"ordinary editable store retains its sync identity");
     }
     const auto a = util::newUuid(), b = util::newUuid();
     std::vector<std::string> revisions;
@@ -68,30 +64,32 @@ void nativeChanges(HistoryMode history)
     }
     {
         auto txn = store.read();
-        require(store.provisioning(txn).generation == 2, "multiple operations commit one global generation");
-        require(store.objectByUuid(txn, a)->generation == 2 && store.objectByUuid(txn, b)->generation == 2,
-                "every changed object uses committed generation");
-        require(store.edgeByUuid(txn, edge)->generation == 2, "edge uses committed generation");
-        require(store.objectByUuid(txn, a)->approvedGeneration == 2 && store.edgeByUuid(txn, edge)->approvedGeneration == 2,
-                "approval covers the local publication generation");
-        require(store.currentGeometry(txn, a)->objectGeneration == 2 && store.objectByUuid(txn, a)->dataGeneration == 2,
-                "geometry and current data generation agree");
+        require(store.provisioning(txn).commitSequence == 1, "multiple operations commit one global generation");
+        require(store.objectByUuid(txn, a)->version == 1 && store.objectByUuid(txn, b)->version == 1,
+                "new objects start at version one despite repeated edits");
+        require(store.edgeByUuid(txn, edge)->version == 1, "new edge starts at version one");
+        require(store.objectByUuid(txn, a)->approvedVersion == 1 && store.edgeByUuid(txn, edge)->approvedVersion == 1,
+                "approval covers the current record version");
+        require(store.currentGeometry(txn, a)->objectVersion == 1,
+                "geometry descriptor belongs to the object version");
         if (history == HistoryMode::On) {
             const auto geometries = store.geometryHistory(txn, a);
             require(geometries.size() == 3, "retain multiple geometry edits within one transaction");
             for (size_t i = 0; i < revisions.size(); ++i) {
-                require(geometries[i].uuid == revisions[i] && geometries[i].objectGeneration == 2,
-                        "same-generation geometry ancestry remains chronological");
+                require(geometries[i].uuid == revisions[i] && geometries[i].objectVersion == 1,
+                        "same-version geometry ancestry remains chronological");
                 require(!store.readGeometryArray(txn, revisions[i], "line_points").empty(), "read intermediate geometry");
             }
-            for (const auto& event : store.journalSince(txn, 0)) require(event.generation == 2, "journal global stamp");
-            for (const auto& version : store.objectHistory(txn, a)) require(version.generation == 2, "history global stamp");
+            for (const auto& event : store.journalSince(txn, 0)) require(event.commitSequence == 1, "journal global stamp");
+            for (const auto& version : store.objectHistory(txn, a))
+                require(version.version == 1 && version.commitSequence == 1 &&
+                        version.generation == store.status(txn).generation, "history shares record version and store identity");
         }
     }
     { auto txn = store.write(); store.setMeta(txn, b, "value", "7"); txn.commit(); }
-    require(generation(store) == 2, "same metadata no-op preserves generation");
+    require(commitSequence(store) == 1, "same metadata no-op preserves generation");
     { auto txn = store.write(); store.setMeta(txn, b, "value", "8"); }
-    require(generation(store) == 2, "rollback preserves generation");
+    require(commitSequence(store) == 1, "rollback preserves generation");
     {
         auto txn = store.write();
         // Failure rolls back the API savepoint, including any allocated ID.
@@ -99,39 +97,39 @@ void nativeChanges(HistoryMode history)
         mustFail([&] { store.addEdge(txn, relation); });
         txn.commit();
     }
-    require(generation(store) == 2, "failed operation and empty commit preserve generation");
+    require(commitSequence(store) == 1, "failed operation and empty commit preserve generation");
     {
         auto txn = store.write();
         mustFail([&] { detail::execute(ObjectStoreImplAccess::conn(txn),
             "INSERT INTO geometry_chunks VALUES(?,NULL)",detail::parseDigest(std::string(64,'0'))); });
         txn.commit();
     }
-    require(generation(store) == 2, "plain stores cannot silently acquire missing/external chunk payloads");
+    require(commitSequence(store) == 1, "plain stores cannot silently acquire missing/external chunk payloads");
     {
         auto txn = store.write(); store.setApproval(txn, b, "approved"); txn.commit();
     }
     {
         auto txn = store.read();
-        require(store.objectByUuid(txn, b)->generation == 3 && store.objectByUuid(txn, b)->approvedGeneration == 3,
+        require(store.objectByUuid(txn, b)->version == 2 && store.objectByUuid(txn, b)->approvedVersion == 2,
                 "approval alone advances object publication");
-        require(store.objectByUuid(txn, a)->generation == 2, "unchanged object retains original generation");
+        require(store.objectByUuid(txn, a)->version == 1, "unchanged object retains original version");
     }
     int64_t cursor = 0;
     if (history == HistoryMode::On) { auto txn = store.read(); cursor = store.journalPosition(txn); }
     {
         auto txn = store.write(); store.removeEdge(txn, edge); store.deleteObject(txn, b); txn.commit();
     }
-    require(generation(store) == 4, "deletion advances generation");
+    require(commitSequence(store) == 3, "deletion advances generation");
     {
         auto txn=store.read();auto* sql=ObjectStoreImplAccess::conn(txn);
         require(!store.objectByUuid(txn,b)&&!store.edgeByUuid(txn,edge),
                 "deleted objects and relations are absent from current UUID lookups");
         require(store.objectCount(txn,"fiber",true)==1&&store.edgesOf(txn,a,true).empty(),
                 "include-retired queries do not expose deleted records");
-        detail::Statement object(sql,"SELECT state,generation FROM objects WHERE uuid=?",detail::parseUuid(b));
-        require(object.row()&&object.i64(0)==2&&object.i64(1)==4,"object deletion is an ordinary stamped tombstone");
-        detail::Statement relation(sql,"SELECT state,generation,a_uuid,b_uuid FROM edges WHERE uuid=?",detail::parseUuid(edge));
-        require(relation.row()&&relation.i64(0)==2&&relation.i64(1)==4,"edge deletion is an ordinary stamped tombstone");
+        detail::Statement object(sql,"SELECT state,version FROM objects WHERE uuid=?",detail::parseUuid(b));
+        require(object.row()&&object.i64(0)==2&&object.i64(1)==3,"object deletion is an ordinary stamped tombstone");
+        detail::Statement relation(sql,"SELECT state,version,a_uuid,b_uuid FROM edges WHERE uuid=?",detail::parseUuid(edge));
+        require(relation.row()&&relation.i64(0)==2&&relation.i64(1)==2,"edge deletion is an ordinary stamped tombstone");
         const auto first=detail::formatUuid(relation.blob16(2)),second=detail::formatUuid(relation.blob16(3));
         require((first==a&&second==b)||(first==b&&second==a),"tombstones retain original endpoint UUIDs");
     }
@@ -139,9 +137,9 @@ void nativeChanges(HistoryMode history)
         auto txn = store.read();
         const auto events = store.journalSince(txn, cursor);
         require(events.size() == 2, "edge and object deletions recorded");
-        for (const auto& event : events) require(event.generation == 4, "deletions use committing generation, not zero");
+        for (const auto& event : events) require(event.commitSequence == 3, "deletions use committing generation, not zero");
         const auto versions = store.objectHistory(txn, b);
-        require(versions.back().deleted && versions.back().generation == 4, "deleted history version global generation");
+        require(versions.back().deleted && versions.back().version == 3 && versions.back().commitSequence == 3, "deleted history version global generation");
     }
     {
         auto txn=store.write();
@@ -153,7 +151,7 @@ void nativeChanges(HistoryMode history)
         mustFail([&]{store.putGeometry(txn,b,vc::geometry::encode(vc::geometry::Fiber{{},{{0,0,0},{1,0,0}},{}}));});
         txn.commit();
     }
-    require(generation(store)==4,"rejected tombstone edits do not publish a generation");
+    require(commitSequence(store)==3,"rejected tombstone edits do not publish a generation");
     {
         auto txn=store.write();store.upsertObject(txn,fiber(b));txn.commit();
     }
@@ -162,30 +160,8 @@ void nativeChanges(HistoryMode history)
         require(store.objectByUuid(txn,b).has_value()&&store.objectCount(txn,"fiber",true)==2,
                 "explicit object upsert revives a tombstone at the same UUID");
         require(!store.edgeByUuid(txn,edge),"object revival does not revive deleted relationships");
+        require(store.objectByUuid(txn,b)->version == 4, "revival advances beyond the deletion version");
     }
-}
-
-void immutableSyncCapability()
-{
-    TemporaryDirectory dir;OpenOptions options;
-    options.author="immutable-sync";options.history=HistoryMode::Off;options.spatialIndex=false;
-    const auto path=dir.path/"immutable.vcobj";
-    {
-        auto store=ObjectStoreImplAccess::createInitial(path,options);
-        auto txn=store.write();store.seal(txn);txn.commit();
-    }
-    auto store=ObjectStore::open(path,OpenOptions{.readOnly=true});
-    auto txn=store.read();
-    detail::Statement absent(ObjectStoreImplAccess::conn(txn),"SELECT count(*) FROM sqlite_schema WHERE name IN ('sync_replica','object_lifecycle')");
-    require(absent.row()&&absent.i64(0)==0,"immutable batch store omits replica identity and separate lifecycle");
-    auto unsupported=[&](auto&& call){
-        try{call();throw std::runtime_error("sync unexpectedly available");}
-        catch(const std::runtime_error& error){require(std::string(error.what()).find("sync is unavailable for immutable batch stores")!=std::string::npos,
-            "immutable sync APIs report explicit capability error");}
-    };
-    unsupported([&]{store.replicaUuid(txn);});
-    txn.commit();
-    unsupported([&]{store.forkReplica();});
 }
 
 void deletedTrackIdentity(HistoryMode history)
@@ -219,9 +195,9 @@ void deletedGeometryRevival(HistoryMode history)
     const auto uuid=util::newUuid();std::string geometry;
     {auto txn=store.write();store.upsertObject(txn,fiber(uuid));
         geometry=store.putGeometry(txn,uuid,vc::geometry::encode(vc::geometry::Fiber{{},{{0,0,0},{1,0,0}},{}}));txn.commit();}
-    RevisionSelection selected;
-    if(history==HistoryMode::On){auto txn=store.read();selected[uuid]=store.currentObjectRevision(txn,uuid)->uuid;}
-    {auto txn=history==HistoryMode::On?store.write(selected):store.write();store.retireObject(txn,uuid);txn.commit();}
+    VersionSelection selected;
+    {auto txn=store.read();selected[uuid]=store.currentVersion(txn,uuid);}
+    {auto txn=store.write(selected);store.retireObject(txn,uuid);txn.commit();}
     {auto txn=store.write();store.deleteObject(txn,uuid);txn.commit();}
     {auto txn=store.write();store.upsertObject(txn,fiber(uuid));txn.commit();}
     auto txn=store.read();const auto revived=store.objectByUuid(txn,uuid);
@@ -242,23 +218,24 @@ void deletedEdgeRevival(HistoryMode history)
     edge.tags={"old"};edge.meta=R"({"version":1})";
     {auto txn=store.write();store.upsertObject(txn,fiber(a));store.upsertObject(txn,fiber(b));
         store.addEdge(txn,edge);txn.commit();}
-    std::string original;
-    if(history==HistoryMode::On){auto txn=store.read();original=store.currentObjectRevision(txn,a)->uuid;}
+    std::vector<ObjectVersion> original;
+    if(history==HistoryMode::On){auto txn=store.read();const auto state=store.status(txn);
+        for(const auto& uuid:{a,b})original.push_back({state.storeUuid,state.generation,uuid,*store.currentVersion(txn,uuid)});}
     {auto txn=store.write();store.removeEdge(txn,edge.uuid);txn.commit();}
     {auto txn=store.read();require(!store.edgeByUuid(txn,edge.uuid),"removed edge remains absent until explicit add");}
     edge.tags={"new"};edge.meta=R"({"version":2})";
     {auto txn=store.write();require(store.addEdge(txn,edge)==edge.uuid,"explicit recreation keeps edge UUID");txn.commit();}
     {auto txn=store.read();const auto current=store.edgeByUuid(txn,edge.uuid);
-        require(current&&current->tags==edge.tags&&current->meta==edge.meta&&current->generation==4,
+        require(current&&current->tags==edge.tags&&current->meta==edge.meta&&current->version==3,
                 "explicit recreation replaces the deletion marker and old current tags");
         require(store.edgesOf(txn,a).size()==1&&store.edgesOf(txn,b).size()==1,"recreated edge is visible at both UUID endpoints");
         if(history==HistoryMode::On){
-            const auto historical=store.recordedRelationships(txn,original);
-            require(historical.size()==1&&historical.front().record.meta==R"({"version":1})",
+            const auto historical=store.relationshipsAt(txn,original);
+            require(historical.size()==1&&historical.front().relationship.record.meta==R"({"version":1})",
                     "recreation retains original historical relationship");
         }}
     {auto txn=store.write();mustFail([&]{store.addEdge(txn,edge);});txn.commit();}
-    require(generation(store)==4,"explicit insertion still rejects a duplicate live edge UUID");
+    require(commitSequence(store)==3,"explicit insertion still rejects a duplicate live edge UUID");
 }
 
 void metadataImport(HistoryMode history)
@@ -271,7 +248,6 @@ void metadataImport(HistoryMode history)
     {
         auto txn = source.write(); source.upsertObject(txn, fiber(a));
         auto external = fiber(b); external.storageKind = "file"; external.storageRef = "external.fiber";
-        external.dataGeneration = 123;
         source.upsertObject(txn, external);
         EdgeRecord relation; relation.kind = "perpendicular"; relation.aUuid = a; relation.bUuid = b;
         edge = source.addEdge(txn, relation); txn.commit();
@@ -288,143 +264,33 @@ void metadataImport(HistoryMode history)
     {
         auto txn = target.read();
         const auto record = target.objectByUuid(txn, a);
-        require(generation(source) == 7 && target.provisioning(txn).generation == 2, "source and destination counters intentionally differ");
-        require(record->generation == 2 && record->approvedGeneration == 2 && record->createdBy == "source",
-                "import stamps local generation while retaining authorship and approval provenance");
-        require(target.edgeByUuid(txn, edge)->generation == 2 && target.edgeByUuid(txn, edge)->approvedGeneration == 2,
+        require(commitSequence(source) == 6 && target.provisioning(txn).commitSequence == 1, "source and destination counters intentionally differ");
+        require(record->version == 1 && record->approvedVersion == 1 && record->createdBy == "source",
+                "import starts a local record version while retaining authorship and approval provenance");
+        require(target.edgeByUuid(txn, edge)->version == 1 && target.edgeByUuid(txn, edge)->approvedVersion == 1,
                 "imported relationship approval uses destination generation");
-        require(target.objectByUuid(txn, b)->dataGeneration == 123, "external data version remains content, not a local counter");
+        require(target.objectByUuid(txn, b)->storageRef == "external.fiber", "external geometry reference remains content");
     }
     { auto txn = target.write(); target.importJson(txn, snapshot); txn.commit(); }
-    require(generation(target) == 2, "reimport remains idempotent despite differing publication generations");
+    require(commitSequence(target) == 1, "reimport remains idempotent despite differing publication generations");
     {
         auto changed = nlohmann::json::parse(snapshot);
-        for (auto& record : changed["objects"]) if (record["uuid"] == b) record["data_generation"] = 124;
+        for (auto& record : changed["objects"]) if (record["uuid"] == b) record["storage_ref"] = "changed.fiber";
         auto txn = target.write(); mustFail([&] { target.importJson(txn, changed.dump()); }); txn.commit();
     }
-    require(generation(target) == 2, "external data version mismatch remains a conflict");
+    require(commitSequence(target) == 1, "external geometry reference mismatch remains a conflict");
     { auto txn = target.write(); target.setMeta(txn, a, "revision", "99"); txn.commit(); }
     { auto txn = target.write(); mustFail([&] { target.importJson(txn, snapshot); }); txn.commit(); }
-    require(generation(target) == 3, "real content conflict remains an error and changes nothing");
+    require(commitSequence(target) == 2, "real content conflict remains an error and changes nothing");
 }
 
-void transferredGeometry()
-{
-    TemporaryDirectory dir;
-    OpenOptions options; options.author = "source";
-    auto source = ObjectStore::create(dir.path / "source.vcobj", options);
-    auto target = ObjectStore::create(dir.path / "target.vcobj", options);
-    const auto a = util::newUuid();
-    std::string head;
-    {
-        auto txn = source.write(); source.upsertObject(txn, fiber(a));
-        head = source.putGeometry(txn, a, vc::geometry::encode(vc::geometry::Fiber{{}, {{0,0,0}, {10,0,0}}, {}}));
-        txn.commit();
-    }
-    for (int i = 0; i < 3; ++i) {
-        auto txn = source.write(); head = source.editGeometry(txn, a, {moveX(i + 1)}, head); txn.commit();
-    }
-    {
-        auto txn = source.write(); source.setApproval(txn, a, "approved"); txn.commit();
-    }
-    const auto transfer = [&] {
-        auto from = source.read(); auto to = target.write();
-        const auto record = detail::syncRecord(source, from, a);
-        nlohmann::json before = nlohmann::json::object(), merged = {{a, record}};
-        const auto current = detail::syncRecord(target, to, a);
-        if (!current.is_null()) before[a] = current;
-        detail::applyObjects(target, to, before, merged);
-        detail::transferGeometry(ObjectStoreImplAccess::conn(from), ObjectStoreImplAccess::conn(to), a, 0);
-        detail::applyHeadsAndEdges(target, to, before, merged);
-        require(detail::syncRecord(target, to, a) == record, "content identity excludes database-local counters");
-        to.commit();
-    };
-    transfer();
-    {
-        auto txn = target.read();
-        require(target.objectByUuid(txn, a)->generation == 2 && target.objectByUuid(txn, a)->dataGeneration == 2,
-                "transferred records and current geometry publish locally");
-        for (const auto& revision : target.geometryHistory(txn, a)) {
-            require(revision.objectGeneration == 2, "transferred historical geometry installed in local generation");
-            require(!target.readGeometryArray(txn, revision.uuid, "line_points").empty(), "transferred ancestry remains readable");
-        }
-    }
-    transfer();
-    require(generation(target) == 2, "repeat transfer is a no-op despite source geometry generation differences");
-}
 
-void hostedPolicy()
-{
-    TemporaryDirectory dir;
-    OpenOptions options; options.author = "curator";
-    const auto directPath = dir.path / "direct.vcobj", sealedPath = dir.path / "sealed.vcobj";
-    {
-        options.history = HistoryMode::Off;
-        auto direct = ObjectStore::create(directPath, options);
-        direct.checkpoint();
-    }
-    mustFail([&] { initHub(directPath, "curator"); });
-    {
-        auto direct = ObjectStore::open(directPath, options);
-        require(!hubStatus(direct) && generation(direct) == 1, "history-off hub setup rejected without logical changes");
-    }
-    options.history = HistoryMode::On;
-    {
-        auto sealed = ObjectStore::create(sealedPath, options);
-        auto txn = sealed.write(); sealed.seal(txn); txn.commit(); sealed.checkpoint();
-    }
-    mustFail([&] { initHub(sealedPath, "curator"); });
-    const auto hubPath = dir.path / "hub.vcobj", replicaPath = dir.path / "replica.vcobj";
-    { auto initial = ObjectStore::create(hubPath, options); initial.checkpoint(); }
-    initHub(hubPath, "curator");
-    DatabaseIdentity hubIdentity;
-    {
-        auto shared = options; shared.sharedFile = true;
-        auto hub = ObjectStore::open(hubPath, shared);
-        auto txn = hub.read();
-        require(hub.provisioning(txn).generation == 2, "hub provisioning publishes a generation");
-        hubIdentity = hub.databaseIdentity(txn);
-        bool found = false;
-        for (const auto& table : hub.databaseIdentity(txn).tables) found |= table.name == "hub_leases";
-        require(found, "hub provisioning registers added tables");
-    }
-    cloneHub(hubPath, replicaPath, options);
-    int64_t beforeDetach;
-    {
-        auto replica = ObjectStore::open(replicaPath, options); beforeDetach = generation(replica);
-        auto txn = replica.read();
-        const auto identity = replica.databaseIdentity(txn);
-        require(identity.uuid != hubIdentity.uuid, "replica gets its own physical database UUID");
-        for (const auto& table : identity.tables) for (const auto& original : hubIdentity.tables)
-            require(table.uuid != original.uuid, "copied table instances get independent UUIDs");
-    }
-    detachHub(replicaPath, "curator");
-    {
-        auto detached = ObjectStore::open(replicaPath, options);
-        auto txn = detached.read();
-        require(!hubStatus(detached) && detached.provisioning(txn).generation == beforeDetach + 1,
-                "hub detachment publishes a generation");
-        for (const auto& table : detached.databaseIdentity(txn).tables)
-            require(!table.name.starts_with("hub_"), "hub detachment removes directory entries");
-    }
-    {
-        auto extended = ObjectStore::create(dir.path / "extension.vcobj", options);
-        auto txn = extended.write();
-        detail::exec(ObjectStoreImplAccess::conn(txn),
-            "CREATE TABLE custom_reference(table_uuid BLOB REFERENCES table_directory(uuid));");
-        txn.commit();
-        const auto before = generation(extended);
-        mustFail([&] { extended.forkReplica(); });
-        require(generation(extended) == before, "unknown physical identity references refuse fork atomically");
-    }
-}
 }
 
 int main()
 {
     nativeChanges(HistoryMode::On);
     nativeChanges(HistoryMode::Off);
-    immutableSyncCapability();
     deletedTrackIdentity(HistoryMode::On);
     deletedTrackIdentity(HistoryMode::Off);
     deletedGeometryRevival(HistoryMode::On);
@@ -433,6 +299,4 @@ int main()
     deletedEdgeRevival(HistoryMode::Off);
     metadataImport(HistoryMode::On);
     metadataImport(HistoryMode::Off);
-    transferredGeometry();
-    hostedPolicy();
 }

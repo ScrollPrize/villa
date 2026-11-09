@@ -87,7 +87,7 @@ void compactPackedStore(const std::filesystem::path& source,
 
 // Package a sealed collection and its complete dependency closure. Rewrites
 // physical locators only, preserving store/database/table identities and every
-// logical generation. All links become portable internal @packed references.
+// logical lineage or commit sequence. All links become portable internal @packed references.
 void packObjectCollection(const std::filesystem::path& source,
                           const std::filesystem::path& destination,
                           const PackedStoreOptions& options = {});

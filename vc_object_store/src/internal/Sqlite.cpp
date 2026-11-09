@@ -1,6 +1,5 @@
 #include "internal/Database.hpp"
 #include "internal/ReadRequest.hpp"
-#include "sftp/SftpVfs.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include <limits>
 
@@ -41,6 +40,27 @@ std::array<unsigned char, 16> parseUuid(const std::string& uuid)
         out[size_t(nibble / 2)] = static_cast<unsigned char>((out[size_t(nibble / 2)] << 4) | v);
         ++nibble;
     }
+    return out;
+}
+
+HashKey parseHash(const std::string& hex)
+{
+    auto digit = [&](char ch) {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        throw std::runtime_error("object store: not a lowercase SHA-256 hex digest: " + hex);
+    };
+    if (hex.size() != 64) throw std::runtime_error("object store: not a lowercase SHA-256 hex digest: " + hex);
+    HashKey out{};
+    for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<unsigned char>(digit(hex[2 * i]) << 4 | digit(hex[2 * i + 1]));
+    return out;
+}
+
+std::string formatHash(const unsigned char* bytes)
+{
+    constexpr char digits[] = "0123456789abcdef";
+    std::string out(64, '0');
+    for (size_t i = 0; i < 32; ++i) { out[2 * i] = digits[bytes[i] >> 4]; out[2 * i + 1] = digits[bytes[i] & 15]; }
     return out;
 }
 
@@ -102,29 +122,20 @@ void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly)
 sqlite3* openConnection(const std::filesystem::path& path, int flags, const OpenOptions& options, bool queryOnly)
 {
     sqlite3* db = nullptr;
-    const bool remote = isRemotePath(path);
     const bool packedLocator = isPackedDatabasePath(path);
-    const bool packedFile = !remote && !packedLocator && isPackedStore(path);
+    const bool packedFile = !packedLocator && isPackedStore(path);
     const bool packed = packedLocator || packedFile;
-    if (remote && !options.sharedFile)
-        throw std::invalid_argument("object store: only hosted hubs open from sftp:// or ssh:// locations; clone one to a local replica");
-    if (packed && options.sharedFile)
-        throw std::invalid_argument("object store: packed databases are not shared mutable hubs");
-    const auto name = remote ? canonicalRemotePath(path) : packedFile ? packedDatabasePath(path).string() : path.string();
-    if (!remote && !packed && options.sharedFile && std::filesystem::exists(path.string() + ".lock/" + kProcessLockName))
-        throw std::runtime_error("hub: this hub uses SSH process locking; access it through its sftp:// address");
-    // Network filesystems lack the shared memory and byte-range locks WAL needs.
-    const char* vfs = packed ? packedStoreVfs() : remote ? sftpVfs() : options.sharedFile ? "unix-dotfile" : nullptr;
+    const auto name = packedFile ? packedDatabasePath(path).string() : path.string();
+    const char* vfs = packed ? packedStoreVfs() : nullptr;
     if (vfs && !sqlite3_vfs_find(vfs))
         throw std::runtime_error("object store: this SQLite build lacks the unix-dotfile VFS needed for shared files");
-    const int rc = sqlite3_open_v2(remote || packed ? name.c_str() : reinterpret_cast<const char*>(path.u8string().c_str()), &db,
+    const int rc = sqlite3_open_v2(packed ? name.c_str() : reinterpret_cast<const char*>(path.u8string().c_str()), &db,
                                    flags & SQLITE_OPEN_NOMUTEX ? flags : flags | SQLITE_OPEN_FULLMUTEX, vfs);
     if (rc != SQLITE_OK) {
         std::string msg = db ? sqlite3_errmsg(db) : "open failed";
-        if (remote && !sftpLastError().empty()) msg += " (" + sftpLastError() + ")";
         if (packed && !packedStoreLastError().empty()) msg += " (" + packedStoreLastError() + ")";
         if (db) sqlite3_close(db);
-        throw std::runtime_error("object store: cannot open " + name + ": " + msg);
+        throw std::runtime_error("object store: cannot open " + path.string() + ": " + msg);
     }
     try {
         applyPragmas(db, options, queryOnly);
@@ -191,6 +202,18 @@ void Statement::bind(int i, const std::array<unsigned char, 16>& v)
     check(sqlite3_bind_blob(value, i, v.data(), 16, SQLITE_TRANSIENT), db_, "bind");
 }
 
+void Statement::bind(int i, const HashKey& v)
+{
+    check(sqlite3_bind_blob(value, i, v.data(), int(v.size()), SQLITE_TRANSIENT), db_, "bind");
+}
+
+std::string Statement::hash(int c) const
+{
+    if (sqlite3_column_bytes(value, c) != 32)
+        throw std::runtime_error("object store: hash column is not 32 bytes");
+    return formatHash(static_cast<const unsigned char*>(sqlite3_column_blob(value, c)));
+}
+
 bool Statement::row()
 {
     requestPoll();
@@ -234,6 +257,18 @@ std::string Statement::text(int c) const
 std::optional<std::string> Statement::optText(int c) const
 {
     return isNull(c) ? std::nullopt : std::optional(text(c));
+}
+
+std::string Statement::uuid(int c) const { return formatUuid(blob16(c)); }
+
+std::optional<std::string> Statement::optUuid(int c) const
+{
+    return isNull(c) ? std::nullopt : std::optional(uuid(c));
+}
+
+std::optional<std::array<unsigned char, 16>> parseOptionalUuid(const std::optional<std::string>& uuid)
+{
+    return uuid ? std::optional(parseUuid(*uuid)) : std::nullopt;
 }
 
 std::array<unsigned char, 16> Statement::blob16(int c) const

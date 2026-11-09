@@ -5,7 +5,7 @@ void createGeometryHistoryIndex(sqlite3* db) {
     // Revision allocation and latest-ledger queries must not sort full history.
     // Relationship dependencies themselves are already native edge fields;
     // do not duplicate every edge in a trigger-maintained materialization.
-    if (historyEnabled(db)) exec(db,"CREATE INDEX geometry_revision_generation ON geometry_revisions(object_uuid,object_generation DESC);");
+    if (historyEnabled(db)) exec(db,"CREATE INDEX geometry_revision_version ON geometry_revisions(object_uuid,object_version DESC);");
 }
 std::vector<EdgeRecord> structuralEdgeCandidates(sqlite3* db,const std::string& uuid,const std::string& array,const std::vector<int64_t>& ids) {
     const auto canonical=formatUuid(parseUuid(uuid));

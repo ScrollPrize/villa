@@ -58,7 +58,11 @@ private:
 
 void beginReadCaches(sqlite3* db, StatementPool& pool, size_t geometryBudget, size_t spatialBudget)
 {
-    const int version = geometryBudget || spatialBudget ? pragmaInt(db, "data_version") : 0;
+    const int version = pragmaInt(db, "data_version");
+    // Components stay valid while no connection has committed since.
+    if (pool.componentsVersion != version) {
+        pool.components.clear(); pool.componentNodes = 0; pool.componentsVersion = version;
+    }
     if (!geometryBudget) pool.geometryCache.reset();
     else {
         if (!pool.geometryCache) pool.geometryCache = std::make_shared<GeometryReadCache>(geometryBudget);
@@ -108,15 +112,16 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
     if(currentOnly_==historyEnabled(db_))throw std::invalid_argument("geometry: revision belongs to a different history layout");
     revision_=parseUuid(current ? current->objectUuid : revision);
     Statement row(db_, current ?
-        "SELECT data_checksum,geometry_manifest,uuid,NULL FROM objects WHERE uuid=? AND data_generation=? AND state<>2 AND geometry_manifest IS NOT NULL" :
+        "SELECT data_checksum,geometry_manifest,uuid,NULL FROM objects WHERE uuid=? AND storage_ref=? AND state<>2 AND geometry_manifest IS NOT NULL" :
         "SELECT content_hash,manifest,object_uuid,parent_uuid FROM geometry_revisions WHERE uuid=?");
-    row.bind(1,revision_);if(current)row.bind(2,current->generation);
+    row.bind(1,revision_);if(current)row.bind(2,canonicalGeometryToken(revision));
     if (!row.row()) throw std::invalid_argument("geometry: revision not found");
     const auto text = row.text(1);
     // Charge JSON nodes/strings, layouts and cache bookkeeping conservatively,
     // in addition to the separately accounted retained payload bytes.
     metadataCharge_ = text.size() * 32 + 4096;
-    manifest_ = loadGeometryManifest(db_, revision, text, current ? row.text(0) : readDigest(row,0));
+    contentHash_ = current ? row.text(0) : readDigest(row,0);
+    manifest_ = loadGeometryManifest(db_, revision, text, contentHash_);
     std::optional<nlohmann::json> currentDescriptor;
     if(!current) {
         Statement object(db_,"SELECT geometry_manifest,data_checksum FROM objects WHERE uuid=? AND storage_ref=? AND state<>2 AND geometry_manifest IS NOT NULL",
@@ -497,7 +502,7 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
     constexpr size_t window = 256;
     const bool currentOnly=!historyEnabled(db);
     auto request = [currentOnly](size_t count) {
-        std::string sql = currentOnly ? "WITH requested(pos,uuid,generation) AS (VALUES " : "WITH requested(pos,uuid) AS (VALUES ";
+        std::string sql = currentOnly ? "WITH requested(pos,uuid,token) AS (VALUES " : "WITH requested(pos,uuid) AS (VALUES ";
         for (size_t i = 0; i < count; ++i)
             sql += (i ? "," : "") + std::string("(") + std::to_string(i) + ",?" + std::to_string(i*(currentOnly?2:1)+1) +
                 (currentOnly ? ",?"+std::to_string(i*2+2) : "") + ")";
@@ -508,13 +513,13 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
             const auto token=parseCurrentGeometryToken(revisions[begin+i]);
             if(token.has_value()!=currentOnly)throw std::invalid_argument("geometry: revision belongs to a different history layout");
             query.bind(int(i*(currentOnly?2:1)+1),parseUuid(token?token->objectUuid:revisions[begin+i]));
-            if(token)query.bind(int(i*2+2),token->generation);
+            if(token)query.bind(int(i*2+2),canonicalGeometryToken(revisions[begin+i]));
         }
     };
     for (size_t begin = 0; begin < revisions.size(); begin += window) {
         const auto count = std::min(window, revisions.size() - begin);
         Statement manifests(db, request(count) + (currentOnly ? "SELECT q.pos,r.data_checksum,r.geometry_manifest FROM requested q " : "SELECT q.pos,r.content_hash,r.manifest FROM requested q ") +
-            (currentOnly ? "LEFT JOIN objects r ON r.uuid=q.uuid AND r.data_generation=q.generation ORDER BY q.pos" :
+            (currentOnly ? "LEFT JOIN objects r ON r.uuid=q.uuid AND r.storage_ref=q.token AND r.state<>2 ORDER BY q.pos" :
              "LEFT JOIN geometry_revisions r ON r.uuid=q.uuid ORDER BY q.pos"));
         bind(manifests, begin, count);
         while (manifests.row()) {
@@ -671,10 +676,14 @@ std::shared_ptr<const detail::SurfaceTile> detail::surfaceTile(SurfaceTileCache*
                                                                GeometryReader& reader, int64_t row, int64_t column,
                                                                int64_t rows, int64_t columns)
 {
+    // Current history-off references keep the same object version throughout
+    // one transaction. Distinct edits therefore need distinct cache keys even
+    // while the reference is unchanged; use the existing descriptor checksum.
+    const auto key=parseCurrentGeometryToken(revision)?revision+":"+reader.contentHash():revision;
     if (cache)
-        if (auto tile = cache->find(revision, row, column, rows, columns)) return tile;
+        if (auto tile = cache->find(key, row, column, rows, columns)) return tile;
     auto tile = std::make_shared<const SurfaceTile>(surfaceTile(reader, row, column, rows, columns));
-    if (cache) cache->insert(revision, row, column, rows, columns, tile);
+    if (cache) cache->insert(key, row, column, rows, columns, tile);
     return tile;
 }
 

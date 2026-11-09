@@ -14,7 +14,7 @@ std::vector<uint8_t> readSharedPayload(sqlite3*, const std::string& name, const 
 std::string storeSharedPayload(sqlite3*, const std::string&, std::span<const uint8_t>);
 // Install an initial full descriptor whose chunks are already registered
 // locally (payloads may be pinned external references). Uses the ordinary
-// publication, generation, geometry indexing and dependency machinery.
+// publication, object versioning, geometry indexing and dependency machinery.
 std::string publishReferencedGeometry(ObjectStore&, WriteTxn&, const std::string&, const SharedJson&);
 // Structural operations materialize a regular chunk snapshot; subsequent
 // coordinate edits use the same delta path as newly imported geometry.

@@ -320,11 +320,13 @@ int main()
             base.seal(write); write.commit();
             auto read = base.read(); originalGeometry = base.readGeometryArray(read, revision, "line_points");
         }
-        std::int64_t generation = 0;
+        std::int64_t commitSequence = 0;
+        std::string generation;
         {
             auto derived = ObjectCollection::create(derivedPath, {basePath}, collectionOptions);
             auto write = derived.write(); derived.setMeta(write, key, "family", "\"H\""); derived.seal(write); write.commit();
             auto read = derived.read(); generation = derived.provisioning(read).generation;
+            commitSequence = derived.provisioning(read).commitSequence;
         }
         packObjectCollection(derivedPath, temp.path / "linked-packed.vcobj", options);
         const auto branchPath = temp.path / "branch.vcobj", dagPath = temp.path / "dag.vcobj";
@@ -358,6 +360,7 @@ int main()
             auto packed = ObjectCollection::open(temp.path / "relocated-packed.vcobj", OpenOptions{.readOnly=true});
             auto read = packed.read();
             require(packed.provisioning(read).generation == generation, "physical repacking changed logical generation");
+            require(packed.provisioning(read).commitSequence == commitSequence, "physical repacking changed logical commit sequence");
             require(packed.object(read, key)->record.meta.find("H") != std::string::npos, "packed overlay or dependency lost");
             require(packed.readGeometryArray(read, key, "line_points") == originalGeometry, "packed inherited geometry changed");
         }

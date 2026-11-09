@@ -63,10 +63,10 @@ bool matchesEdgeSelection(const EdgeRecord& edge, const EdgeSelection& selection
 }
 
 const char* kEdgeCols =
-    "id,uuid,a_uuid,b_uuid,kind,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
-    "approval_state,approved_by,approved_at,approved_host,approved_generation,"
+    "id,uuid,a_uuid,b_uuid,kind,commit_sequence,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
+    "approval_state,approved_by,approved_at,approved_host,approved_version,"
     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies";
+    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,version,version_generation";
 
 std::string projectedEdgeColumns(const ObjectFields& fields)
 {
@@ -124,6 +124,12 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const Obje
         dependenciesFromJson(rec.bAnchor, nlohmann::json::parse(s.text(31)));
     }
     rec.meta = s.text(29);
+    rec.version = s.i64(32);
+    if (!s.isNull(33)) rec.versionGeneration = s.uuid(33);
+    else {
+        Statement lineage(db, "SELECT initial_generation FROM store_manifest WHERE singleton=1");
+        if (lineage.row()) rec.versionGeneration = lineage.uuid(0);
+    }
     if (!details) return rec;
     Statement tags(db, "SELECT tag FROM edge_tags WHERE edge_id=? ORDER BY tag", id);
     while (tags.row()) rec.tags.push_back(tags.text(0));
@@ -171,11 +177,11 @@ std::array<unsigned char,16> normalizeNewEdge(EdgeRecord& rec,bool* swapped)
 }
 
 void insertEdgeRow(sqlite3* db,const EdgeRecord& rec,int64_t id,
-                   int64_t generation,const std::string& author,const std::string& host,
+                   int64_t commit_sequence,const std::string& author,const std::string& host,
                    const std::string& now,bool preserveRecord)
 {
     const EdgeInsertRow row{&rec,id,parseUuid(rec.aUuid),parseUuid(rec.bUuid)};
-    insertEdgeRows(db,std::span(&row,1),generation,author,host,now,preserveRecord);
+    insertEdgeRows(db,std::span(&row,1),commit_sequence,author,host,now,preserveRecord);
 }
 
 void requireUnusedObjectUuids(sqlite3* db,std::span<const EdgeInsertRow> rows,size_t sqlBatchRows)
@@ -196,14 +202,14 @@ void requireUnusedObjectUuids(sqlite3* db,std::span<const EdgeInsertRow> rows,si
     }
 }
 
-void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t generation,
+void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t commit_sequence,
                    const std::string& author,const std::string& host,const std::string& now,
                    bool preserveRecord,size_t sqlBatchRows)
 {
     if(!preserveRecord){
         // New records share provenance. Approval defaults are the same as the
         // ordinary insert; avoid rebinding shared/default values per row.
-        writeSqlValuesShared(db,"INSERT INTO edges(uuid,a_uuid,b_uuid,kind,generation,created_by,created_at,created_host,"
+        writeSqlValuesShared(db,"INSERT INTO edges(uuid,a_uuid,b_uuid,kind,commit_sequence,created_by,created_at,created_host,"
             "changed_by,changed_at,changed_host,a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
             "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id)",
             4,20,rows.size(),sqlBatchRows,[](size_t offset){
@@ -214,7 +220,7 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
                     if(i==4)pattern+=",?1,?2,?3,?4,?2,?3,?4";
                 }
                 return pattern+')';
-            },[&](Statement& s){s.bind(1,generation);s.bindBorrowedText(2,author);s.bindBorrowedText(3,now);s.bindBorrowedText(4,host);},
+            },[&](Statement& s){s.bind(1,commit_sequence);s.bindBorrowedText(2,author);s.bindBorrowedText(3,now);s.bindBorrowedText(4,host);},
             [&](Statement& s,size_t index,int offset){
                 const auto& row=rows[index];const auto& rec=*row.record;
                 s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aUuid);s.bind(offset+3,row.bUuid);s.bindBorrowedText(offset+4,rec.kind);
@@ -223,14 +229,14 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
                 bindDependencies(s,offset+19,rec.bAnchor);s.bind(offset+20,row.id);
             });
     }else{
-    writeSqlValues(db,"INSERT INTO edges(uuid,a_uuid,b_uuid,kind,generation,created_by,created_at,created_host,changed_by,changed_at,"
-                    "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,"
+    writeSqlValues(db,"INSERT INTO edges(uuid,a_uuid,b_uuid,kind,commit_sequence,created_by,created_at,created_host,changed_by,changed_at,"
+                    "changed_host,approval_state,approved_by,approved_at,approved_host,approved_version,"
                     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
                     "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id)",
         "",32,rows.size(),sqlBatchRows,[&](Statement& s,size_t index,int offset){
     const auto& row=rows[index];const auto& rec=*row.record;
     s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aUuid);s.bind(offset+3,row.bUuid);
-    s.bind(offset+4,rec.kind);s.bind(offset+5,generation);
+    s.bind(offset+4,rec.kind);s.bind(offset+5,commit_sequence);
     s.bind(offset+6,author);s.bind(offset+7,now);s.bind(offset+8,host);
     s.bind(offset+9,author);s.bind(offset+10,now);s.bind(offset+11,host);
     const std::string state = preserveRecord ? rec.approvalState : "pending";
@@ -238,7 +244,7 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
     if (preserveRecord && rec.approvedBy) s.bind(offset+13, *rec.approvedBy); else s.bindNull(offset+13);
     if (preserveRecord && rec.approvedAt) s.bind(offset+14, *rec.approvedAt); else s.bindNull(offset+14);
     if (preserveRecord && rec.approvedHost) s.bind(offset+15, *rec.approvedHost); else s.bindNull(offset+15);
-    if (preserveRecord && rec.approvedGeneration) s.bind(offset+16, *rec.approvedGeneration); else s.bindNull(offset+16);
+    if (preserveRecord && rec.approvedVersion) s.bind(offset+16, *rec.approvedVersion); else s.bindNull(offset+16);
     bindAnchor(s, offset+17, rec.aAnchor);
     bindAnchor(s, offset+23, rec.bAnchor);
     s.bind(offset+29, rec.meta);
@@ -262,11 +268,21 @@ EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string
     // A caller explicitly inserting this UUID may replace its deletion marker.
     // Merely reviving an endpoint never reactivates relationships. Historical
     // relationship revisions retain the earlier state independently.
+    int64_t nextVersion = 1;
+    {
+        Statement previous(db, "SELECT version FROM edges WHERE uuid=? AND state=2", parseUuid(rec.uuid));
+        if (previous.row()) {
+            if (previous.i64(0) == INT64_MAX) throw std::overflow_error("relationship version exhausted");
+            nextVersion = previous.i64(0) + 1;
+        }
+    }
     execute(db,"DELETE FROM edges WHERE uuid=? AND state=2",parseUuid(rec.uuid));
     const auto id=allocateRecordId(db,"edges");
-    insertEdgeRow(db,rec,id,writeGeneration(db),author,host,nowIsoUtc(),preserveRecord);
+    insertEdgeRow(db,rec,id,writeCommitSequence(db),author,host,nowIsoUtc(),preserveRecord);
+    execute(db, "UPDATE edges SET version=?,version_generation=NULLIF((SELECT generation FROM store_manifest),(SELECT initial_generation FROM store_manifest)) WHERE id=?",
+        nextVersion, id);
     if (preserveRecord) restoreCommon(db, "edges", rec);
-    appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : writeGeneration(db), preserveRecord ? importOperation : "add_edge");
+    appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.commitSequence : writeCommitSequence(db), preserveRecord ? importOperation : "add_edge");
     savepoint.release();
     return rec;
 }

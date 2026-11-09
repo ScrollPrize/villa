@@ -6,7 +6,7 @@
 
 namespace vc::objects::detail {
 using Json = nlohmann::json;
-Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object, const GeometryRevision& revision, const std::optional<RevisionSelection>& selection)
+Json nativeMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& object, const GeometryRevision& revision, const std::optional<RevisionSelection>& selection)
 {
     const auto metadata = Json::parse(object.meta);
     auto result = geometryTransferMetadata(metadata);
@@ -16,7 +16,7 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
     if (structure.manifest().contains("sequences"))
         for (const auto& [name,state]:structure.manifest().at("sequences").items())
             result[object.kind=="point_collection" ? "point_attributes" : name+"_attributes"] =
-                Json::parse(db.geometryPointAnnotations(txn,revision.uuid,name));
+                db.geometryPointAnnotations(txn,revision.uuid,name);
     result["name"] = object.name;
     if (object.kind == "point_collection" && metadata.contains("source") && result.contains("tags") && result.at("tags").is_object()) {
         auto tags = Json::object();
@@ -39,7 +39,7 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
         result["windings_linked"] = Json::array();
         std::vector<EdgeRecord> edges;
         if (selection) {
-            for (const auto& selected : db.relationshipsAt(txn,*selection))
+            for (const auto& selected : ObjectStoreImplAccess::relationshipsAt(db,txn,*selection))
                 if(selected.applicable) edges.push_back(selected.relationship.record);
         } else {
             for(const auto& edge:db.edgesOf(txn,object.uuid))
@@ -59,7 +59,7 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
                 link(edge.aUuid, edge.aAnchor, edge.bAnchor); link(edge.bUuid, edge.bAnchor, edge.aAnchor);
             } else {
                 const auto targetId=edge.aUuid == object.uuid ? edge.bUuid : edge.aUuid;
-                const auto target = selection ? std::optional(db.objectRevision(txn,*selection->at(targetId))->record)
+                const auto target = selection ? std::optional(ObjectStoreImplAccess::objectRevision(db,txn,*selection->at(targetId))->record)
                                               : db.objectByUuid(txn,targetId);
                 if (!target) throw std::runtime_error("native winding link target is missing");
                 const auto targetMeta = Json::parse(target->meta).at("source");

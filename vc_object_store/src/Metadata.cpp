@@ -1,3 +1,4 @@
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "internal/RecordSql.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 
@@ -24,21 +25,26 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
         throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
     const auto [table, id] = recordLocation(db, bytes, recordUuid);
-    const int64_t generation = writeGeneration(db);
+    {
+        Statement current(db, std::string("SELECT approval_state FROM ") + table + " WHERE id=?", id);
+        if (current.row() && current.text(0) == state) { savepoint.release(); return; }
+    }
+    const auto version = writeRecordVersion(db, table, recordUuid);
+    const int64_t commit_sequence = writeCommitSequence(db);
     Statement s(db, std::string("UPDATE ") + table +
-                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=?,generation=? WHERE id=?",
+                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=?,commit_sequence=? WHERE id=?",
         state);
     if (state == "pending") {
         s.bindNull(2); s.bindNull(3); s.bindNull(4); s.bindNull(5);
     } else {
-        s.bind(2, impl_->options.author);
+        s.bind(2, author());
         s.bind(3, nowIsoUtc());
         s.bind(4, impl_->hostname);
-        s.bind(5, generation);
+        s.bind(5, version);
     }
-    s.bind(6, generation); s.bind(7, id);
+    s.bind(6, commit_sequence); s.bind(7, id);
     s.stepDone();
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, generation, "approval");
+    appendJournal(db, author(), impl_->hostname, bytes, commit_sequence, "approval");
     savepoint.release();
 }
 
@@ -87,11 +93,21 @@ void ObjectStore::setMeta(WriteTxn& txn, const std::string& recordUuid, const st
         const auto object = objectByUuid(txn, recordUuid);
         if (object && hasGeometryCoordinates(object->kind)) {
             const auto value = geometryCoordinates(nlohmann::json::parse(jsonValue));
-            mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, value.dump());
+            mutateMeta(static_cast<sqlite3*>(connection(txn)), author(), impl_->hostname, recordUuid, key, value.dump());
             return;
         }
     }
-    mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, jsonValue);
+    mutateMeta(static_cast<sqlite3*>(connection(txn)), author(), impl_->hostname, recordUuid, key, jsonValue);
+}
+
+SetMetaOp bindCoordinatesOperation(const ObjectRecord& object, const std::string& volume, double storedUnitsPerVoxel)
+{
+    if (!hasGeometryCoordinates(object.kind))
+        throw std::invalid_argument("objects of kind " + object.kind + " have no coordinate frame");
+    const auto meta = nlohmann::json::parse(object.meta);
+    const auto merged = mergeGeometryCoordinates(meta.value("coordinates", nlohmann::json::object()),
+                                                 volumeCoordinates(volume, storedUnitsPerVoxel));
+    return {object.uuid, "coordinates", merged.dump()};
 }
 
 void ObjectStore::bindGeometryCoordinates(WriteTxn& txn, const std::string& objectUuid, const std::string& volume,
@@ -99,17 +115,13 @@ void ObjectStore::bindGeometryCoordinates(WriteTxn& txn, const std::string& obje
 {
     const auto object = objectByUuid(txn, objectUuid);
     if (!object) throw std::invalid_argument("object not found: " + objectUuid);
-    if (!hasGeometryCoordinates(object->kind))
-        throw std::invalid_argument("objects of kind " + object->kind + " have no coordinate frame");
-    const auto meta = nlohmann::json::parse(object->meta);
-    const auto merged = mergeGeometryCoordinates(meta.value("coordinates", nlohmann::json::object()),
-                                                 volumeCoordinates(volume, storedUnitsPerVoxel));
-    setMeta(txn, objectUuid, "coordinates", merged.dump());
+    const auto operation = bindCoordinatesOperation(*object, volume, storedUnitsPerVoxel);
+    setMeta(txn, objectUuid, operation.key, operation.jsonValue);
 }
 
 void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key)
 {
-    mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, std::nullopt);
+    mutateMeta(static_cast<sqlite3*>(connection(txn)), author(), impl_->hostname, recordUuid, key, std::nullopt);
 }
 
 int64_t ObjectStore::journalPosition(const Txn& txn) const
@@ -124,15 +136,15 @@ std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afte
 {
     requireHistory(static_cast<sqlite3*>(connection(txn)));
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation,record_kind FROM journal WHERE seq>? ORDER BY seq",
+    Statement s(db, "SELECT seq,record_uuid,commit_sequence,author,hostname,timestamp,change_kind,"
+                    "approval_state,approved_by,approved_at,approved_host,approved_version,record_kind FROM journal WHERE seq>? ORDER BY seq",
         afterSeq);
     std::vector<JournalEntry> out;
     while (s.row()) {
         JournalEntry e;
         e.seq = s.i64(0);
         e.recordUuid = formatUuid(s.blob16(1));
-        e.generation = s.i64(2);
+        e.commitSequence = s.i64(2);
         e.author = s.text(3);
         e.hostname = s.text(4);
         e.timestamp = s.text(5);
@@ -141,7 +153,7 @@ std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afte
         e.approvedBy = s.optText(8);
         e.approvedAt = s.optText(9);
         e.approvedHost = s.optText(10);
-        if (!s.isNull(11)) e.approvedGeneration = s.i64(11);
+        if (!s.isNull(11)) e.approvedVersion = s.i64(11);
         e.kind = s.text(12);
         out.push_back(std::move(e));
     }

@@ -1,6 +1,7 @@
 #include "internal/Database.hpp"
 #include "geometry/SharedGeometry.hpp"
 #include "internal/ImmutableImport.hpp"
+#include "internal/Versions.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -12,11 +13,36 @@ void protectDatabaseIdentity(sqlite3* db)
 }
 }
 
-int64_t detail::writeGeneration(sqlite3* db)
+int64_t detail::writeCommitSequence(sqlite3* db)
 {
-    Statement s(db, "SELECT generation FROM store_manifest WHERE singleton=1");
-    if (!s.row() || s.i64(0) == INT64_MAX) throw std::runtime_error("object store: generation exhausted or absent");
+    Statement s(db, "SELECT commit_sequence FROM store_manifest WHERE singleton=1");
+    if (!s.row() || s.i64(0) == INT64_MAX) throw std::runtime_error("object store: commit sequence exhausted or absent");
     return s.i64(0) + 1;
+}
+
+int64_t detail::writeRecordVersion(sqlite3* db, const char* table, const std::string& uuid)
+{
+    const std::string name(table);
+    if (name != "objects" && name != "edges") throw std::invalid_argument("invalid versioned record table");
+    const auto key = parseUuid(uuid);
+    const auto sequence = writeCommitSequence(db);
+    Statement current(db, "SELECT version,commit_sequence FROM " + name + " WHERE uuid=?", key);
+    if (!current.row()) throw std::runtime_error("cannot version missing record: " + uuid);
+    const auto version = current.i64(0);
+    if (current.i64(1) == sequence) return version;
+    if (version == INT64_MAX) throw std::overflow_error("object store: record version exhausted");
+    // A graph-only publication keeps existing approval evidence. Actual
+    // content edits clear it in stampContentChange, as do metadata/geometry
+    // edits made later in this same transaction.
+    execute(db, "UPDATE " + name + " SET approved_version=CASE WHEN approved_version=version THEN version+1 ELSE approved_version END,"
+        "version=?,commit_sequence=?,version_generation=? WHERE uuid=?",
+        version + 1, sequence, parseUuid(activeGeneration(db)), key);
+    return version + 1;
+}
+
+int64_t detail::writeObjectVersion(sqlite3* db, const std::string& uuid)
+{
+    return writeRecordVersion(db, "objects", uuid);
 }
 
 bool detail::immutableInitial(sqlite3* db) {
@@ -39,7 +65,7 @@ bool detail::historyEnabled(sqlite3* db)
     const auto pool = activeStatementPools.find(db);
     if (pool != activeStatementPools.end()) return pool->second->historyEnabled;
     Statement s(db, "SELECT history_enabled FROM store_manifest WHERE singleton=1");
-    if (!s.row()) throw std::runtime_error("object store: missing v2 manifest");
+    if (!s.row()) throw std::runtime_error("object store: missing store manifest");
     return s.i64(0) != 0;
 }
 
@@ -48,18 +74,12 @@ void detail::requireHistory(sqlite3* db)
     if (!historyEnabled(db)) throw std::runtime_error("object store: history is disabled for this store");
 }
 
-void detail::requireSyncReplica(sqlite3* db)
-{
-    Statement capability(db,"SELECT 1 FROM sqlite_schema WHERE type='table' AND name='sync_replica'");
-    if(!capability.row())throw std::runtime_error("object store: sync is unavailable for immutable batch stores; create an editable linked store");
-}
-
 bool detail::spatialEnabled(sqlite3* db)
 {
     const auto pool = activeStatementPools.find(db);
     if (pool != activeStatementPools.end()) return pool->second->spatialEnabled;
     Statement s(db, "SELECT spatial_enabled FROM store_manifest WHERE singleton=1");
-    if (!s.row()) throw std::runtime_error("object store: missing v2 manifest");
+    if (!s.row()) throw std::runtime_error("object store: missing store manifest");
     return s.i64(0) != 0;
 }
 
@@ -73,8 +93,11 @@ void detail::createProvisioning(sqlite3* db, bool history, bool spatial)
     exec(db, R"SQL(
 CREATE TABLE store_manifest(
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
- format_version INTEGER NOT NULL CHECK(format_version=2),
- generation INTEGER NOT NULL CHECK(generation>0),
+ schema_version INTEGER NOT NULL CHECK(schema_version=21),
+ commit_sequence INTEGER NOT NULL CHECK(commit_sequence>=0),
+ generation BLOB NOT NULL CHECK(length(generation)=16),
+ initial_generation BLOB NOT NULL CHECK(length(initial_generation)=16),
+ feed_start INTEGER NOT NULL DEFAULT 0 CHECK(feed_start>=0),
  history_enabled INTEGER NOT NULL CHECK(history_enabled IN (0,1)),
  sealed INTEGER NOT NULL CHECK(sealed IN (0,1)),
  spatial_enabled INTEGER NOT NULL CHECK(spatial_enabled IN (0,1))
@@ -90,7 +113,8 @@ CREATE TABLE key_allocators(
  next_id INTEGER CHECK(next_id>=lower_bound AND next_id<=upper_bound)
 );
 )SQL");
-    execute(db, "INSERT INTO store_manifest VALUES(1,2,1,?,0,?)", int64_t(history), int64_t(spatial));
+    const auto lineage = parseUuid(util::newUuid());
+    execute(db, "INSERT INTO store_manifest VALUES(1,21,0,?,?,0,?,0,?)", lineage, lineage, int64_t(history), int64_t(spatial));
 }
 
 void detail::createChangeTracking(sqlite3* db)
@@ -99,7 +123,7 @@ void detail::createChangeTracking(sqlite3* db)
     // sqlite3_total_changes(): that also counts changes rolled back to a savepoint.
     for (const auto* table : {"objects", "fibers", "surfaces", "tracks", "object_tags", "edges", "edge_tags", "table_directory", "table_key_columns", "store_required_features"}) {
         for (const auto* op : {"INSERT", "UPDATE", "DELETE"}) {
-            const auto sql = std::string("CREATE TRIGGER ") + table + "_v2_" + op + " AFTER " + op + " ON " + table +
+            const auto sql = std::string("CREATE TRIGGER ") + table + "_changed_" + op + " AFTER " + op + " ON " + table +
                 " BEGIN UPDATE store_write_state SET dirty=1 WHERE singleton=1 AND dirty=0; END;";
             exec(db, sql.c_str());
         }
@@ -112,9 +136,9 @@ void detail::createChangeTracking(sqlite3* db)
 StoreProvisioning ObjectStore::provisioning(const Txn& txn) const
 {
     Statement s(static_cast<sqlite3*>(connection(txn)),
-        "SELECT format_version,generation,history_enabled,sealed,spatial_enabled FROM store_manifest WHERE singleton=1");
-    if (!s.row()) throw std::runtime_error("object store: missing v2 manifest");
-    return {int(s.i64(0)), s.i64(1), s.i64(2) ? HistoryMode::On : HistoryMode::Off, s.i64(3) != 0, s.i64(4) != 0};
+        "SELECT schema_version,commit_sequence,generation,history_enabled,sealed,spatial_enabled FROM store_manifest WHERE singleton=1");
+    if (!s.row()) throw std::runtime_error("object store: missing store manifest");
+    return {int(s.i64(0)), s.i64(1), s.uuid(2), s.i64(3) ? HistoryMode::On : HistoryMode::Off, s.i64(4) != 0, s.i64(5) != 0};
 }
 
 void ObjectStore::seal(WriteTxn& txn)

@@ -29,15 +29,16 @@ struct EdgeInsertRow {
     std::optional<std::array<unsigned char,16>> binaryUuid;
 };
 void requireUnusedObjectUuids(sqlite3*,std::span<const EdgeInsertRow>,size_t sqlBatchRows=1);
-void insertEdgeRows(sqlite3*, std::span<const EdgeInsertRow>,int64_t generation,
+void insertEdgeRows(sqlite3*, std::span<const EdgeInsertRow>,int64_t commitSequence,
     const std::string& author,const std::string& host,const std::string& time,
     bool preserveRecord=false,size_t sqlBatchRows=1);
 void insertEdgeRow(sqlite3*, const EdgeRecord&, int64_t id,
-    int64_t generation, const std::string& author, const std::string& host,
+    int64_t commitSequence, const std::string& author, const std::string& host,
     const std::string& time, bool preserveRecord = false);
 std::vector<int64_t> componentIds(sqlite3* db, const std::string& start,
                                  const std::vector<std::string>& kinds, bool includeRetired = false,
-                                 std::optional<bool> adjacent = std::nullopt);
+                                 std::optional<bool> adjacent = std::nullopt,
+                                 const std::atomic_bool* cancel = nullptr);
 
 // Return the normalized identity/endpoints/anchors used for insertion, so
 // dependency validation need not hydrate the just-written edge from SQL.

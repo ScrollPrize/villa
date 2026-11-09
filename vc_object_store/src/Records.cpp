@@ -5,7 +5,7 @@ namespace vc::objects {
 using namespace detail;
 std::string ObjectStore::upsertObject(WriteTxn& txn, const ObjectRecord& record)
 {
-    return upsertObjectImpl(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, record, false);
+    return upsertObjectImpl(static_cast<sqlite3*>(connection(txn)), author(), impl_->hostname, record, false);
 }
 
 std::string ObjectStore::insertObjectWithId(WriteTxn& txn, const ObjectRecord& record, int64_t id)
@@ -50,9 +50,9 @@ std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::s
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     // Column names are ambiguous under the join only for id; qualify by selecting explicit object columns.
-    Statement s(db, "SELECT o.id,o.uuid,o.kind,o.name,o.generation,o.created_by,o.created_at,o.created_host,o.changed_by,o.changed_at,"
-                    "o.changed_host,o.approval_state,o.approved_by,o.approved_at,o.approved_host,o.approved_generation,o.format_version,"
-                    "o.storage_kind,o.storage_ref,o.data_generation,o.data_checksum,o.meta FROM objects o "
+    Statement s(db, "SELECT o.id,o.uuid,o.kind,o.name,o.commit_sequence,o.created_by,o.created_at,o.created_host,o.changed_by,o.changed_at,"
+                    "o.changed_host,o.approval_state,o.approved_by,o.approved_at,o.approved_host,o.approved_version,o.format_version,"
+                    "o.storage_kind,o.storage_ref,o.version,o.data_checksum,o.meta,o.version_generation FROM objects o "
                     "JOIN object_tags t INDEXED BY object_tags_tag ON t.object_id=o.id WHERE t.tag=? AND o.state<>2" +
                     (includeRetired ? std::string() : " AND " + activeObjectSql("o.id")) + " ORDER BY o.id", tag);
     return readObjectRows(db, s);
@@ -81,14 +81,15 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
     Statement incident(db, "SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1", bytes);
     if (incident.row()) throw std::runtime_error("object store: remove incident relationships before deletion");
     beforeCurrentObjectEdit(db,uuid);
+    writeObjectVersion(db,uuid);
     // Keep only the same-key deletion marker, not live subtype identities or
     // tags. In particular a deleted track must release its source identity.
     for(const auto* table:{"fibers","surfaces","tracks","object_tags"})
         execute(db,std::string("DELETE FROM ")+table+" WHERE object_id=?",row.i64(0));
     clearGeometryMaterialization(db,uuid);
-    execute(db,"UPDATE objects SET state=2,lifecycle_epoch='',geometry_manifest=NULL,storage_kind='',storage_ref='',data_generation=0,data_checksum=NULL,"
-        "generation=?,changed_by=?,changed_host=?,changed_at=? WHERE id=?",
-        writeGeneration(db),impl_->options.author,impl_->hostname,nowIsoUtc(),row.i64(0));
+    execute(db,"UPDATE objects SET state=2,lifecycle_epoch='',geometry_manifest=NULL,storage_kind='',storage_ref='',data_checksum=NULL,"
+        "commit_sequence=?,changed_by=?,changed_host=?,changed_at=? WHERE id=?",
+        writeCommitSequence(db),impl_->options.author,impl_->hostname,nowIsoUtc(),row.i64(0));
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete", kind);
     savepoint.release();
 }

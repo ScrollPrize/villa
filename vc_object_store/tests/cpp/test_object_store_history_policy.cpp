@@ -1,6 +1,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/StoreConversion.hpp"
 #include "vc_object_store/objects/ObjectCopy.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
 #include "internal/History.hpp"
@@ -33,7 +34,8 @@ void exercise(bool spatial)
     OpenOptions options; options.author = "test"; options.spatialIndex = spatial;
     options.maxGeometryDeltaBytes = 1024;
     const auto a = util::newUuid(), b = util::newUuid();
-    std::string edge, annotations;
+    std::string edge;
+    nlohmann::json annotations;
     std::map<std::string, std::vector<uint8_t>> expected;
     {
         auto store = ObjectStore::create(path, options);
@@ -96,7 +98,7 @@ void exercise(bool spatial)
         require(scalar(txn, "SELECT count(*) FROM geometry_deltas") == 2, "fixture has delta after large shared-array revision");
         for (const auto& array : encoded.arrays) expected[array.name] = store.readGeometryArray(txn, head, array.name);
         annotations = store.geometryPointAnnotations(txn, head, "control_points");
-        require(annotations.find("kept") != std::string::npos, "fixture has sequence annotations");
+        require(annotations.dump().find("kept") != std::string::npos, "fixture has sequence annotations");
         require(!store.edgeGeometryState(txn, edge).stale, "unaffected dependency rebinding before transition");
     }
     int64_t iteration = 0;
@@ -110,7 +112,7 @@ void exercise(bool spatial)
             head = store.currentGeometry(txn, a)->uuid;
             for (const auto& [name, bytes] : expected)
                 require(store.readGeometryArray(txn, head, name) == bytes, "transition preserves exact geometry bytes");
-            const auto copy=readObjectCopy(store,txn,a);
+            const auto copy=readObjectCopy(LocalStoreReader(store,txn),a);
             require(copy.geometry.has_value(),"current object copy works under either history policy");
             for(const auto& array:copy.geometry->arrays)
                 require(array.bytes==expected.at(array.name),"current copy preserves geometry bytes without synthetic history");
@@ -154,7 +156,7 @@ void rejectsUnavailableHistory()
     mustFail([&] { changeHistoryMode(path,HistoryMode::Off); });
     auto store=ObjectStore::open(path,OpenOptions{.readOnly=true});
     auto txn=store.read();
-    require(store.provisioning(txn).history==HistoryMode::On && store.provisioning(txn).generation==2,
+    require(store.provisioning(txn).history==HistoryMode::On && store.provisioning(txn).commitSequence==1,
             "incompatible extension rejects history removal without touching original");
     require(scalar(txn,"SELECT count(*) FROM extension_history")==0,"original extension still readable after refusal");
 }
@@ -203,11 +205,11 @@ void leanDependencies(HistoryMode history)
     mustFail([&]{auto txn=store.write();store.setMeta(txn,a,"important",R"({"nested":[4]})");txn.commit();});
     {auto txn=store.write();store.setMeta(txn,a,"important",R"({"nested":[4]})");store.retainRelationship(txn,anchored);txn.commit();}
     const auto checked=[&] {
-        RevisionSelection pins;
-        if(history==HistoryMode::On){auto txn=store.read();for(const auto& id:{a,b})pins[id]=store.currentObjectRevision(txn,id)->uuid;}
+        VersionSelection pins;
+        {auto txn=store.read();for(const auto& id:{a,b})pins[id]=store.currentVersion(txn,id);}
         return pins;
     };
-    const auto write=[&]{return history==HistoryMode::On ? store.write(checked()) : store.write();};
+    const auto write=[&]{return store.write(checked());};
     {auto txn=write();store.retireObject(txn,a);txn.commit();}
     {auto txn=store.read();const auto full=objectToJson(*store.objectByUuid(txn,a));
      require(currentDependencyMetadata(ObjectStoreImplAccess::conn(txn),a,Anchor{})==dependencyMetadata(full,Anchor{}),"retired state and lifecycle epoch retained even without metadata keys");}

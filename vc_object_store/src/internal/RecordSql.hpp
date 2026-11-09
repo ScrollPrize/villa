@@ -44,7 +44,7 @@ bool wants(const ObjectFields& fields, const std::string& name);
 std::string projectedObjectColumns(const ObjectFields& fields);
 
 void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
-                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind,
+                   const std::array<unsigned char, 16>& uuid, int64_t commitSequence, const char* changeKind,
                    const std::string& deletedKind = {});
 
 void readCommon(RecordCommon& rec, const Statement& s, int uuidCol, int kindCol, int genCol);
@@ -58,15 +58,13 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details = true)
 std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
 
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
-// Endpoint handles are positive for owned objects and negative for compact
-// qualified external keys. They never imply a copied object/detail record.
 
 void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
 void insertObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
 ObjectRecord prepareObjectRecord(const ObjectRecord&);
 void normalizeObjectCoordinates(ObjectRecord&,bool addDefaultCoordinates,sqlite3* existingStore=nullptr);
 void normalizeObjectCoordinates(nlohmann::json& meta,const std::string& kind,bool addDefaultCoordinates);
-void insertObjectRow(sqlite3*,const ObjectRecord&,int64_t id,int64_t generation,
+void insertObjectRow(sqlite3*,const ObjectRecord&,int64_t id,int64_t commitSequence,
     const std::string& author,const std::string& host,const std::string& time,bool preserveRecord=false,
     const std::string* geometryManifest=nullptr);
 
@@ -80,7 +78,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
 
 std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 
-// Shared content-mutation stamp: uses the transaction publication generation,
+// Shared content-mutation stamp: advances the ordinary record version once per transaction,
 // restamps changed_*, resets approval and journals.
 void stampContentChange(sqlite3* db, const std::string& author, const std::string& host, const char* table,
                         int64_t id, const std::array<unsigned char, 16>& uuid, const char* changeKind);

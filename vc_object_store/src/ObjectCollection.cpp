@@ -7,6 +7,7 @@
 #include "internal/EdgeSql.hpp"
 #include "internal/RecordJson.hpp"
 #include "internal/History.hpp"
+#include "internal/Versions.hpp"
 #include "internal/CollectionReads.hpp"
 #include "geometry/SharedGeometry.hpp"
 #include "geometry/Dependencies.hpp"
@@ -46,7 +47,8 @@ void collectionSchema(sqlite3* db) {
     exec(db,R"SQL(
 CREATE TABLE collection_members(
  ordinal INTEGER PRIMARY KEY, database_uuid BLOB NOT NULL UNIQUE CHECK(length(database_uuid)=16),
- store_uuid BLOB NOT NULL CHECK(length(store_uuid)=16), generation INTEGER NOT NULL CHECK(generation>0),
+ store_uuid BLOB NOT NULL CHECK(length(store_uuid)=16), generation BLOB NOT NULL CHECK(length(generation)=16),
+ commit_sequence INTEGER NOT NULL CHECK(commit_sequence>0),
  locator TEXT NOT NULL, partition INTEGER NOT NULL CHECK(partition IN (0,1)),
  object_low INTEGER NOT NULL, object_high INTEGER NOT NULL, edge_low INTEGER NOT NULL, edge_high INTEGER NOT NULL
 );
@@ -105,8 +107,8 @@ std::array<int64_t,2> reservation(sqlite3* db,const char* name) {
 void insertMember(sqlite3* db,int64_t ordinal,const CollectionMember& m,const std::string& ref) {
     const auto objects=m.partition?m.objectIds:std::array<int64_t,2>{0,0};
     const auto edges=m.partition?m.edgeIds:std::array<int64_t,2>{0,0};
-    execute(db,"INSERT INTO collection_members VALUES(?,?,?,?,?,?,?,?,?,?)",ordinal,parseUuid(m.databaseUuid),
-        parseUuid(m.storeUuid),m.generation,ref,int64_t(m.partition),objects[0],objects[1],edges[0],edges[1]);
+    execute(db,"INSERT INTO collection_members VALUES(?,?,?,?,?,?,?,?,?,?,?)",ordinal,parseUuid(m.databaseUuid),
+        parseUuid(m.storeUuid),parseUuid(m.generation),m.commitSequence,ref,int64_t(m.partition),objects[0],objects[1],edges[0],edges[1]);
 }
 std::vector<KeyRoute> rangeRoutes(const std::vector<CollectionMember>& members) {
     std::vector<KeyRoute> routes;routes.reserve(2*members.size());
@@ -142,7 +144,7 @@ nlohmann::json editableObject(ObjectRecord record) {
     // Reuse the record serializer so detail schemas stay shared with native
     // reads/writes. Caller-controlled content excludes provenance and approval.
     static const std::set<std::string> fields{"name","format_version","storage_kind","storage_ref",
-        "data_generation","data_checksum","meta","tags","fiber","surface","track"};
+        "data_checksum","meta","tags","fiber","surface","track"};
     std::sort(record.tags.begin(),record.tags.end());record.tags.erase(std::unique(record.tags.begin(),record.tags.end()),record.tags.end());
     if(record.meta.empty())record.meta="{}";
     return objectToJson(record,&fields);
@@ -203,7 +205,7 @@ struct ObjectCollection::Impl {
     // DFS insertion order is explicit precedence: local, then bases in manifest order.
     // Originals are resolved only after considering all overrides/tombstones.
     std::map<std::string,size_t> byDatabase;
-    std::map<std::string,int64_t> pinned;
+    std::map<std::string,std::pair<std::string,int64_t>> pinned;
     std::vector<size_t> uuidReadOrder(const std::string& uuid,const char* space)const{
         std::vector<size_t> order;std::set<size_t> included;std::set<std::pair<size_t,bool>> visited;
         const std::string keySpace=std::string(space)+".uuid";
@@ -277,9 +279,8 @@ struct ObjectCollection::Impl {
         pool->externalEndpointVersion=[this,endpoint,get](const std::string& uuid){
             const auto found=endpoint(uuid);
             if(!found)throw std::runtime_error("collection: missing external endpoint");
-            Statement generation(get(found->node),"SELECT generation FROM store_manifest WHERE singleton=1");
-            if(!generation.row())throw std::runtime_error("collection: missing endpoint generation");
-            return externalEndpointToken(nodes[found->node].member.storeUuid,uuid,generation.i64(0));
+            const auto& pin=nodes[found->node].member;
+            return externalEndpointToken(pin.storeUuid,uuid,pin.generation,pin.commitSequence);
         };
         pool->externalEndpointValidateAnchor=[endpoint,get](const std::string& uuid,const Anchor& anchor){
             const auto found=endpoint(uuid);
@@ -370,11 +371,11 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
                 if(!attempted.insert(selected).second)return false;
                 auto opened=std::make_unique<ObjectStore>(ObjectStore::open(selected,opt));
                 auto snapshot=std::make_unique<ReadTxn>(opened->read());auto* candidateSql=ObjectStoreImplAccess::conn(*snapshot);
-                Statement pin(candidateSql,"SELECT s.uuid,d.uuid,m.generation,m.sealed FROM store_identity s,database_identity d,store_manifest m");
+                Statement pin(candidateSql,"SELECT s.uuid,d.uuid,m.generation,m.commit_sequence,m.sealed FROM store_identity s,database_identity d,store_manifest m");
                 if(!pin.row()||formatUuid(pin.blob16(0))!=expected->storeUuid||formatUuid(pin.blob16(1))!=expected->databaseUuid||
-                   pin.i64(2)!=expected->generation||pin.i64(3)==0||
+                   formatUuid(pin.blob16(2))!=expected->generation||pin.i64(3)!=expected->commitSequence||pin.i64(4)==0||
                    (expected->partition&&(reservation(candidateSql,"objects")!=expected->objectIds||reservation(candidateSql,"edges")!=expected->edgeIds)))
-                    throw std::runtime_error("dependency identity/generation/sealed policy/reservation mismatch");
+                    throw std::runtime_error("dependency identity/lineage/commit sequence/sealed policy/reservation mismatch");
                 path=std::move(selected);store=std::move(opened);read=std::move(snapshot);return true;
             }catch(const std::bad_alloc&){throw;}
             catch(const std::exception& error){if(directError.empty())directError=error.what();return false;}
@@ -397,30 +398,30 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
         if(!existingRoot){store=std::make_unique<ObjectStore>(ObjectStore::open(path,opt));read=std::make_unique<ReadTxn>(store->read());}
     }
     auto* sql=existingRoot?existingRoot:ObjectStoreImplAccess::conn(*read);
-    Statement header(sql,"SELECT s.uuid,d.uuid,m.generation,m.sealed FROM store_identity s,database_identity d,store_manifest m");
+    Statement header(sql,"SELECT s.uuid,d.uuid,m.generation,m.commit_sequence,m.sealed FROM store_identity s,database_identity d,store_manifest m");
     if(!header.row())throw std::runtime_error("collection: absent manifest identity");
-    StoreProvisioning p;p.generation=header.i64(2);p.sealed=header.i64(3)!=0;
     DatabaseIdentity id;id.uuid=formatUuid(header.blob16(1));
-    CollectionMember member{id.uuid,formatUuid(header.blob16(0)),p.generation,path,expected?expected->partition:false,reservation(sql,"objects"),reservation(sql,"edges")};
-    if(!root&&!p.sealed)throw std::runtime_error("collection: dependency is not sealed: "+path.string());
-    if(expected&&(member.databaseUuid!=expected->databaseUuid||member.storeUuid!=expected->storeUuid||member.generation!=expected->generation||
+    CollectionMember member{id.uuid,formatUuid(header.blob16(0)),formatUuid(header.blob16(2)),header.i64(3),path,expected?expected->partition:false,reservation(sql,"objects"),reservation(sql,"edges")};
+    if(!root&&header.i64(4)==0)throw std::runtime_error("collection: dependency is not sealed: "+path.string());
+    if(expected&&(member.databaseUuid!=expected->databaseUuid||member.storeUuid!=expected->storeUuid||member.generation!=expected->generation||member.commitSequence!=expected->commitSequence||
                   (expected->partition&&(member.objectIds!=expected->objectIds||member.edgeIds!=expected->edgeIds))))
-        throw std::runtime_error("collection: dependency identity/generation/reservation mismatch: "+path.string());
+        throw std::runtime_error("collection: dependency identity/lineage/commit sequence/reservation mismatch: "+path.string());
     if(visiting.contains(id.uuid))throw std::runtime_error("collection: cyclic database dependency");
     if(byDatabase.contains(id.uuid))return;
-    if(auto it=pinned.find(member.storeUuid);it!=pinned.end()&&it->second!=member.generation)
-        throw std::runtime_error("collection: inconsistent repeated store generation");
-    pinned[member.storeUuid]=member.generation;
+    const auto statePin=std::pair{member.generation,member.commitSequence};
+    if(auto it=pinned.find(member.storeUuid);it!=pinned.end()&&it->second!=statePin)
+        throw std::runtime_error("collection: inconsistent repeated store lineage or commit sequence");
+    pinned[member.storeUuid]=statePin;
     bool composed=hasCollection(sql);std::vector<CollectionMember> children;std::vector<KeyRoute> routes;
     if(composed){
-        Statement s(sql,"SELECT database_uuid,store_uuid,generation,locator,partition,object_low,object_high,edge_low,edge_high FROM collection_members ORDER BY ordinal");
+        Statement s(sql,"SELECT database_uuid,store_uuid,generation,commit_sequence,locator,partition,object_low,object_high,edge_low,edge_high FROM collection_members ORDER BY ordinal");
         while(s.row()){
-            CollectionMember child{formatUuid(s.blob16(0)),formatUuid(s.blob16(1)),s.i64(2),resolve(path,s.text(3)),s.i64(4)!=0,{s.i64(5),s.i64(6)},{s.i64(7),s.i64(8)}};
+            CollectionMember child{formatUuid(s.blob16(0)),formatUuid(s.blob16(1)),formatUuid(s.blob16(2)),s.i64(3),resolve(path,s.text(4)),s.i64(5)!=0,{s.i64(6),s.i64(7)},{s.i64(8),s.i64(9)}};
             // load() identifies external packed files and selects the pinned
             // physical member while trying the recorded/search locators.
-            if(child.partition?(child.storeUuid!=member.storeUuid||child.generation!=member.generation):
-                               (child.storeUuid==member.storeUuid||child.generation>=member.generation))
-                throw std::runtime_error("collection: invalid dependency generation/ownership ordering");
+            if(child.partition?(child.storeUuid!=member.storeUuid||child.generation!=member.generation||child.commitSequence!=member.commitSequence):
+                               (child.storeUuid==member.storeUuid||child.commitSequence>=member.commitSequence))
+                throw std::runtime_error("collection: invalid dependency lineage/commit sequence/ownership ordering");
             children.push_back(std::move(child));
         }
         Statement routing(sql,"SELECT key_space,kind,lower_bound,upper_bound,divisor,remainder,shift,database_uuid FROM collection_routes ORDER BY key_space,lower_bound,remainder");
@@ -491,7 +492,7 @@ std::string ObjectCollection::Impl::ensureLocal(CollectionTxn& t,const ObjectKey
     if(source->node==0)return key.objectUuid;
     const auto inherited=geometry(t,key);
     auto record=source->record;
-    record.storageKind.clear();record.storageRef.clear();record.dataChecksum.reset();record.dataGeneration=0;
+    record.storageKind.clear();record.storageRef.clear();record.dataChecksum.reset();
     nodes[0].store->upsertObject(w,record);
     if(record.retired||!record.lifecycleEpoch.empty())
         writeLifecycle(db(t,0),*objectIdByUuid(db(t,0),parseUuid(key.objectUuid)),record);
@@ -528,14 +529,14 @@ ObjectCollection ObjectCollection::open(const std::filesystem::path& path,const 
     auto p=std::make_unique<Impl>();p->options=options;std::set<std::string> visiting;p->load(path,true,{},visiting);return ObjectCollection(std::move(p));
 }
 ObjectCollection ObjectCollection::create(const std::filesystem::path& path,const std::vector<std::filesystem::path>& bases,const OpenOptions& options){
-    std::vector<CollectionMember> members;int64_t generation=1;
+    std::vector<CollectionMember> members;int64_t commitSequence=options.initialCommitSequence;
     auto readOptions=options;readOptions.readOnly=true;
     for(const auto& base:bases){auto c=open(base,readOptions);auto t=c.read();auto p=c.provisioning(t);
         if(!p.sealed)throw std::runtime_error("collection: base must be sealed");
-        if(p.generation>=INT64_MAX-1)throw std::runtime_error("collection: dependency generation exhausted");
-        generation=std::max(generation,p.generation);members.push_back(c.impl_->nodes[0].member);
+        if(p.commitSequence>=INT64_MAX-1)throw std::runtime_error("collection: dependency commit sequence exhausted");
+        commitSequence=std::max(commitSequence,p.commitSequence);members.push_back(c.impl_->nodes[0].member);
     }
-    auto opt=options;opt.initialGeneration=std::max(opt.initialGeneration,generation);opt.physicalPartitionOnly=true;
+    auto opt=options;opt.initialCommitSequence=std::max(opt.initialCommitSequence,commitSequence);opt.physicalPartitionOnly=true;
     StagedDatabase staged(path,isBuildingPackedDatabasePath(path));
     {auto store=ObjectStore::create(staged.path,opt);auto w=store.write();auto* db=ObjectStoreImplAccess::conn(w);collectionSchema(db);
      int64_t i=0;for(const auto& m:members){if(m.storeUuid==store.uuid(w))throw std::runtime_error("collection: overlay needs an independent store UUID");
@@ -550,22 +551,22 @@ ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::
 {
     // This path is private to the initial builder, which owns staging and
     // publication. No intermediate writable store is published or reopened.
-    std::vector<CollectionMember> members;int64_t generation=options.initialGeneration;
+    std::vector<CollectionMember> members;int64_t commitSequence=options.initialCommitSequence;
     auto readOptions=options;readOptions.readOnly=true;
     for(const auto& base:bases){auto c=ObjectCollection::open(base,readOptions);auto r=c.read();
-        const auto p=c.provisioning(r);if(!p.sealed||p.generation>=INT64_MAX-1)
+        const auto p=c.provisioning(r);if(!p.sealed||p.commitSequence>=INT64_MAX-1)
             throw std::runtime_error("initial collection needs sealed, non-exhausted dependencies");
-        generation=std::max(generation,p.generation);members.push_back(c.impl_->nodes[0].member);}
-    auto opt=options;opt.initialGeneration=generation;opt.physicalPartitionOnly=true;
+        commitSequence=std::max(commitSequence,p.commitSequence);members.push_back(c.impl_->nodes[0].member);}
+    auto opt=options;opt.initialCommitSequence=commitSequence;opt.physicalPartitionOnly=true;
     auto store=std::make_unique<ObjectStore>(ObjectStoreImplAccess::createInitial(path,opt));
     auto p=std::make_unique<ObjectCollection::Impl>();p->options=opt;
     {auto w=store->write();auto* db=ObjectStoreImplAccess::conn(w);collectionSchema(db);
      int64_t ordinal=0;for(const auto& m:members){
         if(m.storeUuid==store->uuid(w))throw std::runtime_error("initial collection needs independent dependency ownership");
         insertMember(db,ordinal++,m,locator(normalized(path),m.locator));}
-     CollectionMember root{store->databaseIdentity(w).uuid,store->uuid(w),writeGeneration(db),path,false,opt.objectIdRange,opt.edgeIdRange};
+     CollectionMember root{store->databaseIdentity(w).uuid,store->uuid(w),activeGeneration(db),writeCommitSequence(db),path,false,opt.objectIdRange,opt.edgeIdRange};
      std::vector<std::string> children;for(const auto& m:members)children.push_back(m.databaseUuid);
-     p->byDatabase.emplace(root.databaseUuid,0);p->pinned.emplace(root.storeUuid,root.generation);
+     p->byDatabase.emplace(root.databaseUuid,0);p->pinned.emplace(root.storeUuid,std::pair{root.generation,root.commitSequence});
      p->nodes.push_back({nullptr,std::move(root),true,{},std::move(children)});
      w.commit();}
     // No reader pool or collection loading for the database just constructed.
@@ -577,7 +578,7 @@ ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::
 CollectionMember detail::InitialCollectionAccess::sealShard(ObjectCollection& collection,CollectionTxn& transaction) {
     collection.seal(transaction);
     auto member=collection.impl_->nodes[0].member;
-    member.generation=writeGeneration(collection.impl_->db(transaction,0));
+    member.commitSequence=writeCommitSequence(collection.impl_->db(transaction,0));
     member.partition=true;
     transaction.commit();collection.checkpoint();
     return member;
@@ -586,7 +587,8 @@ void detail::InitialCollectionAccess::writeManifest(const std::filesystem::path&
     const std::vector<CollectionMember>& members,const OpenOptions& options,bool uuidHashRouting) {
     const auto& first=members.at(0);
     auto opt=options;opt.history=HistoryMode::Off;opt.spatialIndex=false;
-    opt.creationStoreUuid=first.storeUuid;opt.initialGeneration=first.generation-1;opt.physicalPartitionOnly=true;
+    opt.creationStoreUuid=first.storeUuid;opt.creationGeneration=first.generation;
+    opt.initialCommitSequence=first.commitSequence-1;opt.physicalPartitionOnly=true;
     auto store=ObjectStoreImplAccess::createInitial(path,opt);
     writeShardManifest(store,path,members,initialRoutes(members,uuidHashRouting));
 }
@@ -600,8 +602,9 @@ ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& pa
         // Its own content still resides in one independent SQLite database.
         auto m=c.impl_->nodes[0].member;m.partition=true;members.push_back(m);
     }
-    const auto& first=members.front();if(first.generation<2)throw std::runtime_error("collection: invalid shard generation");
-    for(auto& m:members)if(m.storeUuid!=first.storeUuid||m.generation!=first.generation)throw std::runtime_error("collection: shards disagree on ownership/generation");
+    const auto& first=members.front();if(first.commitSequence<1)throw std::runtime_error("collection: invalid shard commit sequence");
+    for(auto& m:members)if(m.storeUuid!=first.storeUuid||m.generation!=first.generation||m.commitSequence!=first.commitSequence)
+        throw std::runtime_error("collection: shards disagree on ownership/lineage/commit sequence");
     auto routes=requestedRoutes.empty()?rangeRoutes(members):requestedRoutes;
     validateRoutes(routes,members);
     // Custom routing is verified once at publication. Readers only trust the
@@ -618,7 +621,8 @@ ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& pa
                     if(matches!=1)throw std::runtime_error("collection: shard UUID not uniquely routed");}
             }
         }}
-    auto opt=options;opt.history=HistoryMode::Off;opt.spatialIndex=false;opt.creationStoreUuid=first.storeUuid;opt.initialGeneration=first.generation-1;opt.physicalPartitionOnly=true;
+    auto opt=options;opt.history=HistoryMode::Off;opt.spatialIndex=false;opt.creationStoreUuid=first.storeUuid;
+    opt.creationGeneration=first.generation;opt.initialCommitSequence=first.commitSequence-1;opt.physicalPartitionOnly=true;
     const bool packed=isBuildingPackedDatabasePath(path);
     StagedDatabase staged(path,packed);const auto& stage=staged.path;
     {auto store=ObjectStore::create(stage,opt);writeShardManifest(store,normalized(path),members,routes);}
@@ -679,7 +683,7 @@ std::string ObjectCollection::editGeometry(CollectionTxn& t,const ObjectKey& inp
     std::map<std::string,CollectionEdge> observed;
     for(const auto& decision:decisions){
         const auto before=edge(t,{uuid(t),decision.edgeUuid});
-        if(!before||before->record.generation!=decision.expectedGeneration)throw std::runtime_error("collection: geometry decision edge changed");
+        if(!before||before->record.version.value_or(0)!=decision.expectedVersion)throw std::runtime_error("collection: geometry decision edge changed");
         const auto ga=currentGeometry(t,before->a),gb=currentGeometry(t,before->b);
         if(decision.aRevision!=(ga?std::optional(ga->uuid):std::nullopt)||decision.bRevision!=(gb?std::optional(gb->uuid):std::nullopt))
             throw std::runtime_error("collection: geometry decision endpoint changed");
@@ -689,7 +693,7 @@ std::string ObjectCollection::editGeometry(CollectionTxn& t,const ObjectKey& inp
     auto adapted=decisions;for(auto& d:adapted){
         const auto after=*impl_->nodes[0].store->edgeByUuid(w,d.edgeUuid);
         if(impl_->decode(t,0,after.aUuid)!=observed.at(d.edgeUuid).a){std::swap(d.aAnchor,d.bAnchor);std::swap(d.aRevision,d.bRevision);}
-        d.expectedGeneration=after.generation;
+        d.expectedVersion=after.version.value_or(0);
         d.aRevision=geometryHead(impl_->db(t,0),after.aUuid);d.bRevision=geometryHead(impl_->db(t,0),after.bUuid);
     }
     const auto result=impl_->nodes[0].store->editGeometry(w,local,edits,localExpected,adapted);save.release();return result;

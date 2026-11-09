@@ -62,7 +62,7 @@ void InitialEdgeInserter::append(std::span<EdgeRecord> input) {
     try {
         if(input.empty())return;
         GeometryPhase phase("native.initial_edges.append");
-        const auto first=p.reserve(input.size()),generation=writeGeneration(p.db);
+        const auto first=p.reserve(input.size()),commit_sequence=writeCommitSequence(p.db);
         std::vector<EdgeInsertRow> rows;rows.reserve(input.size());
         {GeometryPhase preparation("initial_edges.prepare");
         for(size_t i=0;i<input.size();++i){
@@ -71,7 +71,7 @@ void InitialEdgeInserter::append(std::span<EdgeRecord> input) {
             rows.push_back({&rec,first+int64_t(i),parseUuid(rec.aUuid),parseUuid(rec.bUuid),binaryUuid});
         }}
         {GeometryPhase insertion("initial_edges.edge_rows");
-            insertEdgeRows(p.db,rows,generation,p.author,p.host,nowIsoUtc(),false,p.sqlBatchRows);}
+            insertEdgeRows(p.db,rows,commit_sequence,p.author,p.host,nowIsoUtc(),false,p.sqlBatchRows);}
     }catch(...){p.failed=true;throw;}
 }
 }

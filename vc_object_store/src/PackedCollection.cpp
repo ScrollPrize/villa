@@ -24,7 +24,7 @@ void packObjectCollection(const std::filesystem::path& source,
         exec(db.get(), "BEGIN IMMEDIATE");
         try {
             // This is physical relocation of a private snapshot, not an object
-            // edit. UUIDs, generation pins and retained history remain intact.
+            // edit. UUIDs, lineage/commit pins and retained history remain intact.
             Statement refs(db.get(), "SELECT database_uuid FROM collection_members ORDER BY ordinal");
             std::vector<std::string> targets;
             while (refs.row()) targets.push_back(formatUuid(refs.blob16(0)));

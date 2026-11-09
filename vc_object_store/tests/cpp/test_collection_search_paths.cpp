@@ -36,7 +36,7 @@ void plainAndNested(){
     const auto unrelated=temp.path/"moved"/"unrelated";base(unrelated);
     const auto stale=temp.path/"moved"/"stale";fs::copy_file(moved,stale);
     {std::unique_ptr<sqlite3,decltype(&sqlite3_close_v2)> sql(openConnection(stale,SQLITE_OPEN_READWRITE,{},false),sqlite3_close_v2);
-        exec(sql.get(),"UPDATE store_manifest SET generation=generation+1;");}
+        exec(sql.get(),"UPDATE store_manifest SET commit_sequence=commit_sequence+1;");}
     options.linkedStoreFiles={unrelated,stale,moved};found(root,options,uuid,moved);
     options.linkedStoreFiles={unrelated,stale};mustFail([&]{ObjectCollection::open(root,options);});
     // Directory discovery is not filename-based and ignores non-store files.

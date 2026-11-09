@@ -271,3 +271,133 @@ own format marker. Here it only opens the cached copy as a local folder.
   (the decoded cache of its URL). Before this, they read the cached copy as a
   local folder, so compare such results only with runs that read the same way.
 - The branch links vc_reader as `libvc_reader_native.so` (`VC_READER_SHARED_READER`).
+
+## Hosted nearby annotations
+
+`bench_hosted_annotations.py` drives VC3D's nearby-annotation controller against a
+read-only hosted store. It compares synchronous preparation with the background
+scheduler, checks exact candidate geometry and intersection-marker hashes, and
+records cold, repeated (memory-warm), and new-process disk-warm requests. Its
+counting proxy permits only reads and selection queries; projects and caches are
+isolated below a new output directory. The input volume supplies metadata; this
+benchmark does not sample CT or measure opening-time normals/rendering.
+
+From the repository root, using an existing localhost SSH forward:
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D vc_object_server_app -j 4
+python volume-cartographer/benchmarks/bench_hosted_annotations.py \
+  --binary "$PWD/volume-cartographer/build/bin/VC3D" \
+  --upstream http://127.0.0.1:18750 \
+  --volume /path/to/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr \
+  --output /tmp/nearby-annotations --runs 5
+```
+
+Use a Release build with `VC_TESTING` enabled (the existing viewer regression
+configuration). Each repetition uses a new object cache; the already-open source
+fiber and setup are outside the timed region. The 1000-voxel strip is centered on
+the first bound fiber's midpoint, normal to its tangent. The reference measures
+the old synchronous preparation phase separately from the unchanged numerical
+intersection routine. Results contain elapsed time, maximum 5 ms timer callback
+gap, requests, response bytes, payload bytes, candidate/marker counts, and exact
+hashes. Freshness polling is counted separately from nearby queries.
+`results.json` reports mean, p50 and nearest-rank p95 over repetitions.
+
+`--delay-ms 20` injects latency into every hosted response, including selection,
+revision validation, and geometry loading, to exercise event processing. The
+script rejects changed candidate/marker hashes, nearby store reads on an unchanged
+request, and geometry/artifact payload downloads after a disk-warm restart.
+Add `--stress` to exercise overlapping surfaces, latest-pending deduplication,
+invalidation followed by replacement, and destruction during loading. These checks
+run outside the timed samples and do not modify the hosted store.
+
+The disposable real-surface cache regression is `object_store_hosted_cache`; it
+covers restart reuse across different forwarded ports, corruption, overlapping
+interactive reads, pinned revisions during remote edits, cancellation/resumption,
+detachment, a surface larger than the memory budget, eviction and low free space.
+`test_native_cache_adoption` in `vc_reader` covers persistent budget accounting for
+non-Zarr cache files.
+
+Validation commands (the hosted tests need loopback socket access):
+
+```bash
+AGENTS_AGENT_MODE=1 ctest --test-dir volume-cartographer/build \
+  -R '^(object_store_|viewer_regressions|test_fiber_side_strip_intersections|test_line_annotation_generated_views|test_viewer_overlay_surface_primitives)' \
+  -E object_store_ssh --output-on-failure -j 4
+AGENTS_AGENT_MODE=1 CCACHE_DIR=/tmp/villa-ccache cmake --build vc_reader/build-native-cuda \
+  --target test_native_cache_adoption -j 4
+ctest --test-dir vc_reader/build-native-cuda -R '^test_native_cache_adoption$' --output-on-failure
+```
+
+`object_store_ssh` has a separate disposable-sshd harness; it is not part of this
+cache/controller validation. The live benchmark can use an existing SSH forward.
+
+### PHerc0139 measurements, 2026-11-06
+
+Release, Linux x86_64, Intel Core Ultra 7 270K Plus, five repetitions per case.
+The baseline is synchronous preparation using the shared decoder and intersection
+implementation. Cold means an empty client object cache, without resetting the
+server's caches or the OS page cache. The counting proxy opens one upstream HTTP
+connection per request; network elapsed times include that overhead.
+
+Input service: `ssh://sean@dl.ash2txt.org:8750`, store
+`652e5919-fe5b-485b-8fd3-dff6cbafaa0e`, history generation
+`cae68190-d8ec-5c92-963c-93961384d1da`, commit 50. The read-only workload uses source
+fiber `00122f40-4a74-5d1f-84fd-23f3236152f9` and this exact cached volume:
+
+```
+/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr
+```
+
+Commands, from the repository root (the forward runs in a separate terminal):
+
+```bash
+ssh -F /dev/null -o BatchMode=yes -o ExitOnForwardFailure=yes -o ConnectTimeout=10 \
+  -N -L 127.0.0.1:18750:127.0.0.1:8750 sean@dl.ash2txt.org
+AGENTS_AGENT_MODE=1 python volume-cartographer/benchmarks/bench_hosted_annotations.py \
+  --binary "$PWD/volume-cartographer/build/bin/VC3D" \
+  --upstream http://127.0.0.1:18750 \
+  --volume /mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr \
+  --output /tmp/villa-nearby-final --runs 5
+```
+
+All times below are milliseconds. UI gap is the maximum gap in each run, summarized
+across runs; the synchronous reference reports its blocking preparation duration.
+Repeated requests finish before the 5 ms timer can fire.
+
+| Case | Elapsed mean / p50 / p95 | UI gap mean / p50 / p95 | Requests | Geometry/artifact payload requests / bytes |
+| --- | --- | --- | --- | --- |
+| Synchronous, cold | 21782.600 / 21741.998 / 22060.334 | 21754.259 / 21713.252 / 22031.867 | 261 | 86 / 2385984 |
+| Async, cold | 21553.827 / 21549.280 / 22003.714 | 5.890 / 5.889 / 5.972 | 261 | 86 / 2385984 |
+| Async, memory warm | 0.024577 / 0.024459 / 0.029785 | — | 0 | 0 / 0 |
+| Async, disk warm after restart | 7310.968 / 7337.276 / 7372.948 | 5.846 / 5.862 / 5.924 | 94 | 0 / 0 |
+
+Counts and byte totals were identical in all five repetitions of each case. Total
+response bytes were 4936842 cold, 0 memory warm, and 121930 disk warm. Freshness
+polling contributed 13 cold and 7 disk-warm requests. All 20 runs produced exactly
+15 candidate geometries and one intersection marker, with these SHA-256 hashes of
+the UUID-keyed coordinates and ordered marker values:
+
+```
+geometry a4c5791de7ecc3e06b9fa604b70f234b20a2e3e788837e1f8527a25ef4f69614
+markers  290331206043793f27d626f42111af9eeb4e55ceaea97e6a3fe6d424b3b63100
+```
+
+The proxy's latency profile attributes mean cold upstream time to geometry array
+reads (7419 ms), point annotations (3565 ms), current heads (2928 ms), and geometry
+descriptors (2621 ms). After restart, the largest remaining categories are current
+heads (2954 ms), change queries (1289 ms), edge queries (1091 ms), and graph queries
+(1045 ms). These are sums of request durations and can overlap with freshness
+polling. They identify authoritative validation round trips as the remaining
+loading cost; the UI thread continues processing events during those waits.
+
+Raw measurements and individual VC3D logs are emitted under the output directory.
+The additional `--runs 1 --delay-ms 20 --stress` check passed, including pending
+requests, invalidation/replacement, and destruction during loading. Its async cold
+load took 27647 ms with a maximum timer gap of 10.90 ms; geometry and marker hashes
+still matched. CPU-event profiling was unavailable (`perf_event_paranoid=4`);
+the endpoint latency profile above is the recorded evidence for remaining waits.
+The live workload checks nearby loading only: it does not benchmark full-store
+prefetch, CT sampling, opening-time normals, or rendering. Cache/prefetch mutation
+and failure cases are tested against disposable copies of the real surface fixture
+`volume-cartographer/core/test/data/segments/20241113070770`.

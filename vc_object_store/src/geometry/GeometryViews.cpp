@@ -1,4 +1,5 @@
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include "geometry/GeometryToken.hpp"
@@ -12,28 +13,32 @@ namespace vc::objects {
 namespace detail {
 struct GeometryReadState {
     std::shared_ptr<ObjectStore> lease;
-    const ObjectStore* db;
-    // The snapshot's own transaction, or none when it borrows the caller's.
+    // The snapshot's own transaction and reader, or none when it borrows the
+    // caller's transaction or reader.
     std::unique_ptr<ReadTxn> owned;
-    const Txn* txn;
+    std::unique_ptr<LocalStoreReader> local;
+    const StoreReader* reader = nullptr;
     explicit GeometryReadState(ObjectStore& store)
-        : db(&store), owned(std::make_unique<ReadTxn>(store.read())), txn(owned.get()) {}
-    GeometryReadState(const ObjectStore& store, const Txn& borrowed) : db(&store), txn(&borrowed) {}
+        : owned(std::make_unique<ReadTxn>(store.read())),
+          local(std::make_unique<LocalStoreReader>(store, *owned)), reader(local.get()) {}
+    GeometryReadState(const ObjectStore& store, const Txn& borrowed)
+        : local(std::make_unique<LocalStoreReader>(store, borrowed)), reader(local.get()) {}
+    explicit GeometryReadState(const StoreReader& borrowed) : reader(&borrowed) {}
     void require() const {
-        if (!txn || !txn->active()) throw std::runtime_error("geometry snapshot is closed");
+        if (!reader || !reader->active()) throw std::runtime_error("geometry snapshot is closed");
     }
 };
 struct GeometryViewState {
     std::shared_ptr<GeometryReadState> read;
     GeometryRevision revision;
-    std::string objectRevision;
-    int64_t objectGeneration = 0;
+    std::optional<int64_t> version;
     std::optional<std::map<int64_t, int64_t>> pointIndex;
     void requireCurrent() const {
         read->require();
         if (!parseCurrentGeometryToken(revision.uuid)) return;
-        if(sqlite3_txn_state(ObjectStoreImplAccess::conn(*read->txn),"main")!=SQLITE_TXN_WRITE)return;
-        const auto current=read->db->geometryRevision(*read->txn,revision.uuid);
+        const auto* local = dynamic_cast<const LocalStoreReader*>(read->reader);
+        if (!local || sqlite3_txn_state(ObjectStoreImplAccess::conn(local->txn()), "main") != SQLITE_TXN_WRITE) return;
+        const auto current = local->geometryRevision(revision.uuid);
         if(!current||current->contentHash!=revision.contentHash)
             throw std::runtime_error("current geometry view changed; reload the view");
     }
@@ -53,7 +58,7 @@ struct GeometryViewState {
         if (start < 0 || count < 0 || start > size || count > size - start)
             throw std::out_of_range("geometry point range out of bounds");
         const int64_t stride = (a.dtype == "<f8" || a.dtype == "<i8" ? 8 : 4) * (a.shape.size() > 1 ? 3 : 1);
-        return read->db->readGeometryArray(*read->txn, revision.uuid, name, start * stride, count * stride);
+        return read->reader->readGeometryArray(revision.uuid, name, start * stride, count * stride);
     }
     std::optional<int64_t> indexOf(int64_t id) {
         requireCurrent();
@@ -94,14 +99,16 @@ GeometrySnapshot::GeometrySnapshot(std::shared_ptr<ObjectStore> db)
 }
 GeometrySnapshot::GeometrySnapshot(const ObjectStore& db, const Txn& txn)
     : state_(std::make_shared<detail::GeometryReadState>(db, txn)) {}
+GeometrySnapshot::GeometrySnapshot(const StoreReader& reader)
+    : state_(std::make_shared<detail::GeometryReadState>(reader)) {}
 TransformedGeometryView GeometrySnapshot::viewTransformedAt(const std::string& uuid,const std::string& target,
     double targetScale,const VolumeTransforms* context) const
 {
     state_->require();
-    const auto record=state_->db->objectByUuid(*state_->txn,uuid);
-    if(!record)throw std::invalid_argument("object not found");
-    const auto local=context?VolumeTransforms{}:state_->db->volumeTransforms(*state_->txn);
-    const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(record->meta),target,targetScale);
+    const auto object=state_->reader->currentObject(uuid);
+    if(!object)throw std::invalid_argument("object not found");
+    const auto local=context?VolumeTransforms{}:state_->reader->volumeTransforms();
+    const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(object->record.meta),target,targetScale);
     if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
     return TransformedGeometryView(geometry(uuid),*mapping,target,targetScale);
 }
@@ -114,51 +121,58 @@ TransformedGeometryView GeometrySnapshot::viewStored(const std::string& uuid,
 
 TransformedGeometryView GeometryView::viewTransformedAt(const std::string& target,double scale) const {
     state_->read->require();
-    const auto& db=*state_->read->db;
-    const auto& txn=*state_->read->txn;
+    const auto& reader=*state_->read->reader;
     const auto& id=state_->revision.objectUuid;
-    const GeometrySnapshot snapshot(db,txn);
-    const auto current=db.currentGeometry(txn,id);
+    const GeometrySnapshot snapshot(state_->read);
+    const auto current=reader.currentGeometry(id);
     if(current&&current->uuid==state_->revision.uuid)return snapshot.viewTransformedAt(id,target,scale);
     // Older geometry is in the frame of the latest object revision that held it.
-    std::optional<ObjectRecord> record;
-    for(const auto& revision:db.objectHistory(txn,id))
-        if(revision.geometryRevision==state_->revision.uuid&&revision.metadataComplete)record=revision.record;
+    std::optional<ObjectRevision> record;
+    for(const auto& revision:reader.objectHistory(id))
+        if(revision.geometryRevision==state_->revision.uuid&&revision.metadataComplete)record=revision;
     if(!record)throw std::invalid_argument("geometry revision has no recorded coordinate metadata");
-    const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(record->meta),target,scale);
+    return viewTransformedAt(*record,target,scale);
+}
+
+TransformedGeometryView GeometryView::viewTransformedAt(const ObjectRevision& object,const std::string& target,double scale) const {
+    state_->read->require();
+    if(object.objectUuid!=state_->revision.objectUuid||object.geometryRevision!=state_->revision.uuid||!object.metadataComplete)
+        throw std::invalid_argument("object revision does not name this geometry and its coordinate metadata");
+    const auto mapping=state_->read->reader->volumeTransforms().toVolume(nlohmann::json::parse(object.record.meta),target,scale);
     if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
-    return TransformedGeometryView(snapshot.geometry(id,state_->revision.uuid),*mapping,target,scale);
+    return TransformedGeometryView(GeometrySnapshot(state_->read).geometry(object.objectUuid,state_->revision.uuid),*mapping,target,scale);
 }
 
 std::vector<vcr::catalog::TransformResolution> GeometryView::availableTransforms() const {
     state_->read->require();
-    return state_->read->db->availableTransforms(*state_->read->txn,state_->revision.objectUuid);
+    return state_->read->reader->availableTransforms(state_->revision.objectUuid);
 }
 
-void GeometrySnapshot::close() { state_->txn = nullptr; state_->owned.reset(); state_->lease.reset(); }
-bool GeometrySnapshot::active() const { return state_->txn && state_->txn->active(); }
+void GeometrySnapshot::close()
+{
+    state_->reader = nullptr;
+    state_->local.reset();
+    state_->owned.reset();
+    state_->lease.reset();
+}
+bool GeometrySnapshot::active() const { return state_->reader && state_->reader->active(); }
 std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::string& kind,
                                               const std::optional<std::string>& geometryRevision) const
 {
     state_->require();
-    const auto object = state_->db->objectByUuid(*state_->txn, id);
+    const auto object = state_->reader->currentObject(id);
     if (!object) throw std::invalid_argument("object not found");
-    const auto revision = geometryRevision ? state_->db->geometryRevision(*state_->txn, *geometryRevision)
-                                           : state_->db->currentGeometry(*state_->txn, id);
+    const auto revision = geometryRevision ? state_->reader->geometryRevision(*geometryRevision)
+                                           : state_->reader->currentGeometry(id);
     if (!revision) throw std::invalid_argument("object has no stored geometry");
-    if (revision->objectUuid != object->uuid)
+    if (revision->objectUuid != object->objectUuid)
         throw std::invalid_argument("geometry revision belongs to another object");
     if (!kind.empty() && revision->kind != kind) throw std::invalid_argument("geometry kind mismatch: expected " + kind);
     if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
         throw std::invalid_argument("unsupported geometry version or coordinate system");
     auto result = std::make_shared<State>();
     result->read = state_; result->revision = *revision;
-    result->objectGeneration = object->generation;
-    if (!geometryRevision && state_->db->provisioning(*state_->txn).history == HistoryMode::On) {
-        const auto historical = state_->db->currentObjectRevision(*state_->txn, id);
-        if (!historical || historical->deleted) throw std::invalid_argument("object has no published revision");
-        result->objectRevision = historical->uuid;
-    }
+    if (!geometryRevision) result->version = object->version;
     if (revision->kind == "point_collection") {
         result->require("points", "<f8", 2);
         result->require("point_ids", "<i8", 1);
@@ -190,8 +204,7 @@ TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::o
 
 GeometryView::GeometryView(std::shared_ptr<State> state) : state_(std::move(state)) {}
 const GeometryRevision& GeometryView::revision() const { state_->requireCurrent(); return state_->revision; }
-const std::string& GeometryView::objectRevision() const { state_->read->require(); return state_->objectRevision; }
-int64_t GeometryView::objectGeneration() const { state_->read->require(); return state_->objectGeneration; }
+std::optional<int64_t> GeometryView::version() const { state_->read->require(); return state_->version; }
 geometry::Geometry GeometryView::loadGeometry() const
 {
     state_->requireCurrent();
@@ -202,7 +215,7 @@ geometry::Geometry GeometryView::loadGeometry() const
     data.attributes = state_->revision.attributes;
     for (const auto& a : state_->revision.arrays)
         data.arrays.push_back({a.name, a.dtype, a.shape,
-            state_->read->db->readGeometryArray(*state_->read->txn, state_->revision.uuid, a.name)});
+            state_->read->reader->readGeometryArray(state_->revision.uuid, a.name)});
     return geometry::decode(data);
 }
 int64_t PointCollectionView::size() const { return state_->array("points").shape[0]; }
@@ -249,7 +262,7 @@ bool SurfaceView::valid(int64_t row, int64_t column) const { return readTile(row
 geometry::Surface SurfaceView::readTile(int64_t row, int64_t column, int64_t rows, int64_t columns) const
 {
     state_->requireCurrent();
-    const auto bytes = state_->read->db->readGeometryRectangle(*state_->read->txn,
+    const auto bytes = state_->read->reader->readGeometryRectangle(
         state_->revision.uuid, "points", row, column, rows, columns);
     geometry::Surface result{rows, columns, scale(), detail::xyzValues<float>(bytes)};
     // Vertices without coordinates read as the sentinel; exact stored bits stay
@@ -258,7 +271,7 @@ geometry::Surface SurfaceView::readTile(int64_t row, int64_t column, int64_t row
         if (!geometry::validSurfacePoint(p)) p = {-1, -1, -1};
     const auto& arrays = state_->revision.arrays;
     if (std::any_of(arrays.begin(), arrays.end(), [](const auto& a) { return a.name == detail::surfaceValidChannel; }))
-        result.validity = state_->read->db->readGeometryRectangle(*state_->read->txn,
+        result.validity = state_->read->reader->readGeometryRectangle(
             state_->revision.uuid, detail::surfaceValidChannel, row, column, rows, columns);
     result.validate();
     return result;
@@ -269,8 +282,8 @@ geometry::Surface SurfaceView::load() const { return std::get<geometry::Surface>
 const GeometryRevision& TransformedGeometryView::revision() const {
     return std::visit([](const auto& v)->const GeometryRevision&{return v.revision();},source_);
 }
-const std::string& TransformedGeometryView::objectRevision() const {
-    return std::visit([](const auto& v)->const std::string&{return v.objectRevision();},source_);
+std::optional<int64_t> TransformedGeometryView::version() const {
+    return std::visit([](const auto& v){return v.version();},source_);
 }
 std::vector<geometry::Point> TransformedGeometryView::points(const std::string& array,int64_t start,int64_t count) const {
     auto result=std::visit([&](const auto& v)->std::vector<geometry::Point>{
@@ -336,16 +349,14 @@ std::vector<GeometryArrayEdit> TransformedGeometryView::coordinateEdits(const st
 void TransformedGeometryView::validateForWrite(const ObjectStore& db,const Txn& txn) const {
     const auto& pinned=revision();
     const auto head=db.currentGeometry(txn,pinned.objectUuid);
-    const auto object=db.objectByUuid(txn,pinned.objectUuid);
-    const auto generation=std::visit([](const auto& v){return v.objectGeneration();},source_);
-    if(!head||head->uuid!=pinned.uuid||head->contentHash!=pinned.contentHash||!object||object->generation!=generation)
+    const auto object=db.currentObjectRevision(txn,pinned.objectUuid);
+    const auto read=version();
+    if(!head||head->uuid!=pinned.uuid||head->contentHash!=pinned.contentHash||!object||!read||object->version!=*read)
         throw std::runtime_error("object changed; reopen its transformed view");
-    if(db.provisioning(txn).history==HistoryMode::On){
-        const auto historical=db.currentObjectRevision(txn,pinned.objectUuid);
-        if(!historical||historical->uuid!=objectRevision())throw std::runtime_error("object changed; reopen its transformed view");
-    }
-    const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->meta),target_,targetScale_);
-    if(!mapping||*mapping!=mapping_)throw std::runtime_error("volume registration changed; reopen its transformed view");
+    checkVolumeMapping(db,txn,pinned.objectUuid,target_,targetScale_,mapping_);
+}
+CheckVolumeMappingOp TransformedGeometryView::checkMappingOperation() const {
+    return {revision().objectUuid,target_,targetScale_,mapping_};
 }
 std::string TransformedGeometryView::writeCoordinates(ObjectStore& db,WriteTxn& txn,const std::string& array,int64_t start,
     const std::vector<geometry::Point>& desired,const std::vector<GeometryEdgeEdit>& edges) const {
@@ -444,10 +455,17 @@ geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surf
     result.validate();return result;
 }
 std::vector<GeometryArrayEdit> TransformedGeometryView::surfaceEdits(int64_t row,int64_t column,int64_t rows,int64_t columns,
-    const std::vector<geometry::SurfacePoint>& desired) const {
+    const std::vector<geometry::SurfacePoint>& desired,const std::vector<uint8_t>* validity) const {
     const auto* surface=std::get_if<SurfaceView>(&source_);
     if(!surface)throw std::invalid_argument("not a surface");
-    const auto stored=surface->readTile(row,column,rows,columns);
+    auto stored=surface->readTile(row,column,rows,columns);
+    if(validity) {
+        const auto gridColumns=surface->columns();
+        if(int64_t(validity->size())!=surface->rows()*gridColumns)throw std::invalid_argument("surface validity shape mismatch");
+        stored.validity.resize(size_t(rows*columns));
+        for(int64_t r=0;r<rows;++r)for(int64_t c=0;c<columns;++c)
+            stored.validity[size_t(r*columns+c)]=(*validity)[size_t((row+r)*gridColumns+column+c)];
+    }
     if(desired.size()!=stored.points.size())throw std::invalid_argument("surface edit shape mismatch");
     const auto inverse=mapping_.inverse();
     std::vector<GeometryArrayEdit> edits;

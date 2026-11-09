@@ -1,6 +1,7 @@
 // Open Data samples as catalog stores: placeholders from the catalog, geometry
 // fetched by reads that reach it (once, through the session), failures not
 // cached, imports shadowing catalog surfaces, published files and refresh.
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "TestSupport.hpp"
 #include "vc_object_store/Tiff.hpp"
 #include "vc_object_store/objects/CatalogStore.hpp"
@@ -153,9 +154,7 @@ RegionResult regionAt(ObjectStoreSession& session, const AttachmentIdentity& att
     RegionOptions options;
     options.kind = "surface";
     options.volume = "vol";
-    RegionResult result;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) { result = db.geometryRegion(txn, slice, options); });
-    return result;
+    return session.geometryRegion({attachment}, slice, options).front().result;
 }
 } // namespace
 
@@ -184,8 +183,8 @@ int main() try
         const auto attachment=current.attach(directPath,direct);
         require(addCatalogSample(current,attachment,directSample).added==2,"current-only catalog import");
         current.ensureGeometry(attachment,uuid);
-        current.read(attachment,[&](const auto& db,const auto& txn,const auto&){
-            require(GeometrySnapshot(db,txn).surface(uuid).rows()==6,"current-only catalog fetched geometry");
+        current.readStore(attachment,[&](const StoreReader& reader,const auto&){
+            require(GeometrySnapshot(reader).surface(uuid).rows()==6,"current-only catalog fetched geometry");
         });
         require(refreshCatalog(current,attachment,directSample).updated==0,"current-only unchanged catalog refresh");
         mustFail([&]{restoreCatalogVersion(current,attachment,uuid);});
@@ -208,7 +207,7 @@ int main() try
 
     // Placeholder metadata comes from the catalog, never the published meta.json.
     std::optional<ObjectRecord> record;
-    session.read(catalog, [&](const auto& db, const auto& txn, const auto&) { record = db.objectByUuid(txn, uuid); });
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) { record = reader.currentObject(uuid)->record; });
     require(record && record->name == "w001", "name from the catalog");
     const auto meta = nlohmann::json::parse(record->meta);
     require(meta.at("coordinates").at("volume_uuid") == "vol" && meta.at("provenance").at("tool") == "surface_mesh_generation",
@@ -226,7 +225,7 @@ int main() try
     require(session.selectObjects({catalog}, near).size() == 1, "placeholder found by its bounds");
     const auto local = [&](const std::string& object) {
         bool found = false;
-        session.read(catalog, [&](const auto& db, const auto& txn, const auto&) { found = db.currentGeometry(txn, object).has_value(); });
+        session.readStore(catalog, [&](const StoreReader& reader, const auto&) { found = reader.currentGeometry(object).has_value(); });
         return found;
     };
     require(!local(uuid), "no geometry before a read reaches it");
@@ -246,12 +245,12 @@ int main() try
     for (const auto& event : events)
         sawCommit |= event.kind == StoreSessionEvent::Kind::Committed && event.attachment == catalog;
     require(sawCommit, "the fetched geometry is a commit event");
-    session.read(catalog, [&](const auto& db, const auto& txn, const auto&) {
-        const auto geometry = db.currentGeometry(txn, uuid);
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+        const auto geometry = reader.currentGeometry(uuid);
         require(geometry && nlohmann::json::parse(geometry->attributes).at("source_url") == server.url("seg-a.tifxyz"),
                 "revision records its source");
-        require(db.objectByUuid(txn, uuid)->name == "w001", "record not replaced by meta.json");
-        require(db.objectByUuid(txn, uuid)->surface->gridWidth == 8, "grid filled at fetch");
+        require(reader.currentObject(uuid)->record.name == "w001", "record not replaced by meta.json");
+        require(reader.currentObject(uuid)->record.surface->gridWidth == 8, "grid filled at fetch");
     });
     regionAt(session, catalog, 900);  // reaches the offline placeholder
     // A failed fetch reports unavailable, caches nothing, and is retried.
@@ -262,18 +261,30 @@ int main() try
     session.ensureGeometry(catalog, offline);
     require(local(offline), "retried on the next read");
 
-    // Published files land in the artifact directory.
-    const auto ink = publishedFile(session, catalog, uuid, "ink-detection.jpg");
-    require(fs::is_regular_file(ink) && ink.parent_path() == session.artifactDirectory(catalog, uuid, false),
-            "published image fetched");
+    // Published files are fetched to where the caller keeps them; the store is not written.
+    std::optional<CatalogFile> published;
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+        // Keep the optional alive while iterating its vector. In C++20 the
+        // temporary behind optional::operator-> does not survive this range-for.
+        const auto reference = catalogReference(reader.currentObject(uuid)->record);
+        require(reference.has_value(), "fetched surface retains catalog reference");
+        for (const auto& file : reference->files)
+            if (file.name == "ink-detection.jpg") published = file;
+    });
+    const auto target = directory.path / "published" / "ink-detection.jpg";
+    require(published.has_value(), "published image remains in catalog metadata");
+    require(fetchPublishedFile(*published, target) == target && fs::is_regular_file(target), "published image fetched");
+    require(!fs::exists(session.path(catalog).string() + ".artifacts"), "published image stays outside store artifacts");
+    const auto written = fs::last_write_time(target);
+    require(fetchPublishedFile(*published, target) == target && fs::last_write_time(target) == written, "fetched once");
 
     // Editing a fetched surface edits it in place; resetting restores the fetched version.
-    std::string firstRevision;
-    session.read(catalog, [&](const auto& db, const auto& txn, const auto&) { firstRevision = db.currentObjectRevision(txn, uuid)->uuid; });
-    session.act(catalog, {{uuid, firstRevision}}, [&](auto& db, auto& txn) { db.setMeta(txn, uuid, "review", "\"edited\""); });
+    (void)session.editRecords(catalog, {uuid}, [](ObjectRecord& record) {
+        auto meta = nlohmann::json::parse(record.meta); meta["review"] = "edited"; record.meta = meta.dump();
+    });
     restoreCatalogVersion(session, catalog, uuid);
-    session.read(catalog, [&](const auto& db, const auto& txn, const auto&) {
-        require(!nlohmann::json::parse(db.objectByUuid(txn, uuid)->meta).contains("review"), "reset to the catalog version");
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+        require(!nlohmann::json::parse(reader.currentObject(uuid)->record.meta).contains("review"), "reset to the catalog version");
     });
     // Other objects have no catalog version.
     mustFail([&] { restoreCatalogVersion(session, catalog, util::newUuid()); });
@@ -294,25 +305,24 @@ int main() try
     waitFor([&] { return server.requests("seg-a-v2.tifxyz/x.tif") == 1; }, "stale surface fetched again");
     waitFor([&] {
         bool fresh = false;
-        session.read(catalog, [&](const auto& db, const auto& txn, const auto&) {
-            fresh = nlohmann::json::parse(db.currentGeometry(txn, uuid)->attributes).at("source_url") ==
+        session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+            fresh = nlohmann::json::parse(reader.currentGeometry(uuid)->attributes).at("source_url") ==
                     server.url("seg-a-v2.tifxyz");
         });
         return fresh;
     }, "new revision");
-    session.read(mine, [&](const auto& db, const auto& txn, const auto&) {
-        require(nlohmann::json::parse(db.currentGeometry(txn, uuid)->attributes).at("source_url") == server.url("seg-a.tifxyz"),
+    session.readStore(mine, [&](const StoreReader& reader, const auto&) {
+        require(nlohmann::json::parse(reader.currentGeometry(uuid)->attributes).at("source_url") == server.url("seg-a.tifxyz"),
                 "other stores untouched by refresh");
     });
     // Local edits survive refresh and reopening.
-    session.editCurrent(catalog, {uuid}, [&](auto& db, auto& txn, const auto& id) {
-        auto geometry = db.currentGeometry(txn, id);
-        const auto view = GeometrySnapshot(db, txn).viewStored(id);
-        db.editGeometry(txn, id, view.surfaceEdits(0, 0, 1, 1, {{42, 43, 44}}), geometry->uuid);
+    (void)session.editCurrent(catalog, {uuid}, [&](const StoreReader& reader, const std::string& id) {
+        const auto view = GeometrySnapshot(reader).viewStored(id);
+        return std::vector<TransactionOperation>{EditGeometryOp{id, view.surfaceEdits(0, 0, 1, 1, {{42, 43, 44}}), {}}};
     });
     std::string editedGeometry;
-    session.read(catalog, [&](const auto& db, const auto& txn, const auto&) {
-        editedGeometry = db.currentGeometry(txn, uuid)->uuid;
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+        editedGeometry = reader.currentGeometry(uuid)->uuid;
     });
     const auto kept = refreshCatalog(session, catalog, sample);
     require(kept.preserved == 1 && kept.stale == 0, "refresh preserves locally edited geometry");
@@ -320,15 +330,15 @@ int main() try
     const auto edited = editedGeometry;
     session.detach(catalog);
     const auto reopened = session.attach(projectPath, user);
-    session.read(reopened, [&](const auto& db, const auto& txn, const auto&) {
-        require(db.currentGeometry(txn, uuid)->uuid == edited, "edits survive reopening the project");
-        require(GeometrySnapshot(db, txn).surface(uuid).vertex(0, 0) == vc::geometry::SurfacePoint{42, 43, 44},
+    session.readStore(reopened, [&](const StoreReader& reader, const auto&) {
+        require(reader.currentGeometry(uuid)->uuid == edited, "edits survive reopening the project");
+        require(GeometrySnapshot(reader).surface(uuid).vertex(0, 0) == vc::geometry::SurfacePoint{42, 43, 44},
                 "saved coordinates survive refresh and reopening");
     });
     restoreCatalogVersion(session, reopened, uuid);
-    session.read(reopened, [&](const auto& db, const auto& txn, const auto&) {
-        const auto record = db.objectByUuid(txn, uuid);
-        require(nlohmann::json(db.currentGeometry(txn, uuid)->uuid) == nlohmann::json::parse(record->meta).at("catalog_geometry_revision"),
+    session.readStore(reopened, [&](const StoreReader& reader, const auto&) {
+        const auto record = reader.currentObject(uuid)->record;
+        require(nlohmann::json(reader.currentGeometry(uuid)->uuid) == nlohmann::json::parse(record.meta).at("catalog_geometry_revision"),
                 "reset restores the fetched geometry");
     });
     session.detach(reopened);
@@ -362,8 +372,8 @@ int main() try
         addCatalogSample(session, attached, reduced);
         session.ensureGeometry(attached, reducedUuid);
         std::vector<float> xyz;
-        session.read(attached, [&](const auto& db, const auto& txn, const auto&) {
-            const auto stored = db.readGeometryData(txn, db.currentGeometry(txn, reducedUuid)->uuid);
+        session.readStore(attached, [&](const StoreReader& reader, const auto&) {
+            const auto stored = reader.readGeometryData(reader.currentGeometry(reducedUuid)->uuid);
             for (const auto& array : stored.arrays)
                 if (array.name == "points") {
                     xyz.resize(array.bytes.size() / sizeof(float));

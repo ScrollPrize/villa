@@ -66,7 +66,7 @@ void requireCheckedLifecycle(sqlite3* db)
 {
     if (!historyEnabled(db)) return;
     Statement checked(db, "SELECT 1 FROM history_checked");
-    if (!checked.row()) throw std::runtime_error("object lifecycle requires write(expected_revisions)");
+    if (!checked.row()) throw std::runtime_error("object lifecycle requires a checked write (expected versions)");
 }
 }
 
@@ -82,7 +82,7 @@ void ObjectStore::retireObject(WriteTxn& txn, const std::string& uuid)
     // Removing current relationships also prevents restore from silently
     // reviving observations whose endpoint was deliberately retired.
     for (const auto& edge : edgesOf(txn,uuid,true)) removeEdge(txn,edge.uuid);
-    record->retired = true; record->lifecycleEpoch = std::to_string(writeGeneration(db));
+    record->retired = true; record->lifecycleEpoch = std::to_string(writeCommitSequence(db));
     const auto id = *objectIdByUuid(db, parseUuid(uuid));
     writeLifecycle(db, id, *record);
     stampContentChange(db, author(), hostname(), "objects", id, parseUuid(uuid), "retire");
@@ -90,18 +90,18 @@ void ObjectStore::retireObject(WriteTxn& txn, const std::string& uuid)
 }
 
 void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
-                               const std::optional<std::string>& sourceRevision)
+                               const std::optional<ObjectVersion>& sourceVersion)
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     requireCheckedLifecycle(db);
     const auto current = objectByUuid(txn, uuid);
     if (!current) throw std::invalid_argument("object lifecycle: unknown object");
-    if (!current->retired && !sourceRevision) return;
+    if (!current->retired && !sourceVersion) return;
     if (!historyEnabled(db)) {
-        if (sourceRevision) requireHistory(db);
+        if (sourceVersion) requireHistory(db);
         Savepoint savepoint(db);
         auto restored = *current;
-        restored.retired = false; restored.lifecycleEpoch = std::to_string(writeGeneration(db));
+        restored.retired = false; restored.lifecycleEpoch = std::to_string(writeCommitSequence(db));
         const auto id = *objectIdByUuid(db, parseUuid(uuid));
         writeLifecycle(db, id, restored);
         stampContentChange(db, author(), hostname(), "objects", id, parseUuid(uuid), "restore");
@@ -109,8 +109,10 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
         return;
     }
     std::optional<ObjectRevision> source;
-    if (sourceRevision) source = objectRevision(txn, *sourceRevision);
-    else {
+    if (sourceVersion) {
+        source = objectAtVersion(txn, *sourceVersion);
+        if (!source) throw std::invalid_argument("object lifecycle: restore source version is not recorded in this store");
+    } else {
         auto history = objectHistory(txn, uuid);
         for (auto it = history.rbegin(); it != history.rend(); ++it)
             if (it->publishedAtUs && !it->deleted && !it->record.retired) { source = *it; break; }
@@ -140,10 +142,10 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
     auto restored = source->record;
     // upsert preserves identity/creation stamps and resets approval normally.
     upsertObjectImpl(db, author(), hostname(), restored);
-    restored.retired = false; restored.lifecycleEpoch = std::to_string(writeGeneration(db));
+    restored.retired = false; restored.lifecycleEpoch = std::to_string(writeCommitSequence(db));
     writeLifecycle(db, id, restored);
     if (oldGeometry != source->geometryRevision) refreshGeometryBounds(db, uuid);
-    appendJournal(db, author(), hostname(), parseUuid(uuid), objectByUuid(txn, uuid)->generation, "restore");
+    appendJournal(db, author(), hostname(), parseUuid(uuid), objectByUuid(txn, uuid)->commitSequence, "restore");
     savepoint.release();
 }
 } // namespace vc::objects
