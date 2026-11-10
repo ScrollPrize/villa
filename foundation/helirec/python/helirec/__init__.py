@@ -5,11 +5,12 @@ C++ core with CPU and CUDA kernels; this package exposes them through nanobind.
 from . import _core
 from ._core import (cuda_available, built_with_cuda, release_pinned_memory, flatfield, backproject, FourierFilter, ghbp, ghbp_plan_info,
                     filter_types, filter_margin, filter_describe, apply_filters, roundfft, minus_log, rebalance, ramp_filter, ramp_geometry,
-                    RawReader, ScanData, make_scan_data, SliceReconstructor, span_info)
+                    RawReader, ScanData, make_scan_data, SliceReconstructor, span_info, ProgressBar, OutputMask, ReferenceMask)
+from .omezarr import to_uint8
 
 __all__ = ["cuda_available", "built_with_cuda", "release_pinned_memory", "flatfield", "backproject", "FourierFilter", "ghbp", "ghbp_plan_info", "filter_types", "filter_margin", "filter_describe", "apply_filters",
            "roundfft", "minus_log", "rebalance", "ramp_filter", "ramp_geometry", "RawReader", "ScanData", "make_scan_data",
-           "SliceReconstructor", "devices"]
+           "SliceReconstructor", "ProgressBar", "OutputMask", "ReferenceMask", "to_uint8", "devices"]
 __version__ = "0.1.0"
 
 

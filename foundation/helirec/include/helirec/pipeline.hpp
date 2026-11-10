@@ -6,6 +6,7 @@
 // Every stage is a separate kernel call with a CPU and a CUDA implementation.
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,7 @@
 #include "helirec/helical.hpp"
 #include "helirec/filters.hpp"
 #include "helirec/kernels.hpp"
+#include "helirec/progress.hpp"
 #include "helirec/raw_reader.hpp"
 #include "helirec/sld.hpp"
 
@@ -109,6 +111,33 @@ struct SliceRoi {   // [x0, x1) x [y0, y1) of the (N, N) slice
     int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
 };
 
+// A mask of a chunk's uint8 slices, possibly coarser than them (e.g. a pyramid level of a masked reference volume,
+// reference.hpp): output voxel (s, y, x) (slice of the chunk, row and column of the ROI) is 0 where
+// data[(s + oz) / fz, (y + oy) / fy, (x + ox) / fx] is 0, indices clamped to the mask.
+struct OutputMask {
+    const std::uint8_t* data = nullptr;   // (nz, ny, nx), host
+    int nz = 0, ny = 0, nx = 0;
+    int fz = 1, fy = 1, fx = 1;
+    int oz = 0, oy = 0, ox = 0;
+};
+
+// Where the slices of a chunk go: host arrays (n, y1 - y0, x1 - x0), either or both. The uint8 version is
+// to_uint8 (kernels.hpp) of each slice with the window [u8_lo, u8_hi], 0 outside the reconstruction disk with
+// u8_zero_outside and where u8_mask is 0; on CUDA it is converted on the device, so a uint8-only chunk downloads
+// one byte per pixel.
+// Only the pixels that are needed are backprojected: those of `region` (slice coordinates; the rest of the output is
+// 0), and with uint8 slices alone, those within the bounds of what u8_mask keeps (the others are 0 either way). The
+// exact backprojector computes each pixel on its own, so the pixels computed are those of a whole-slice run; a chunk
+// with none is not reconstructed at all.
+struct SliceOutput {
+    float* f32 = nullptr;
+    std::uint8_t* u8 = nullptr;
+    double u8_lo = 0.0, u8_hi = 1.0;
+    bool u8_zero_outside = false;
+    OutputMask u8_mask;
+    std::optional<SliceRoi> region;
+};
+
 // A backprojector outside the library (bindings: Python functions). Per slice it gets the rows on the
 // reconstructor's device: ramp-filtered x balanced weights (filtered() == true), or the -log rows and the balanced
 // weights (filtered() == false, for methods that filter / model the data themselves); measured_only() instead
@@ -147,8 +176,15 @@ class SliceReconstructor {
     // slices for view heights h_lo .. h_hi-1 -> out (h_hi - h_lo, N, N), or (n, y1 - y0, x1 - x0) with an ROI
     // (GHBP computes whole slices and crops; FBP computes only the ROI)
     // [next_lo, next_hi): the chunk that will follow; its raw windows are read in the background (CUDA)
+    // progress: advanced by one per slice, with the step in hand ("read", "grid", "backproject") as its postfix
+    void reconstruct(int h_lo, int h_hi, const SliceOutput& out, ChunkDebug* debug = nullptr, const SliceRoi* roi = nullptr,
+                     int next_lo = 0, int next_hi = 0, ProgressBar* progress = nullptr);
     void reconstruct(int h_lo, int h_hi, float* out, ChunkDebug* debug = nullptr, const SliceRoi* roi = nullptr,
-                     int next_lo = 0, int next_hi = 0);
+                     int next_lo = 0, int next_hi = 0) {
+        SliceOutput o;
+        o.f32 = out;
+        reconstruct(h_lo, h_hi, o, debug, roi, next_lo, next_hi);
+    }
     // same chunk, but only the band of pixels the sampler's points need, with the exact backprojector; the
     // sampler accumulates its point samples (call with contiguous, increasing chunks)
     // `sweep`: several filter chains (CUDA): everything before the filters is computed once per chunk and the

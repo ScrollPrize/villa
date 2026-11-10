@@ -9,10 +9,12 @@ Heavy kernels are C++ (helirec._core); the bookkeeping is numpy.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import time
+import types
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -43,8 +45,9 @@ class FrameSource:
                                      np.ascontiguousarray(row0, np.int32), int(nrows))
 
 
-def _mean_frames(src: FrameSource, transform=None, batch=40) -> np.ndarray:
-    """numpy.mean(stack.astype(float32), axis=0) semantics: sequential float32 sum, then / n."""
+def _mean_frames(src: FrameSource, transform=None, batch=40, progress=None) -> np.ndarray:
+    """numpy.mean(stack.astype(float32), axis=0) semantics: sequential float32 sum, then / n.
+    progress(k): called as k more frames are done."""
     n = len(src.refs)
     acc = None
     for s in range(0, n, batch):
@@ -56,19 +59,29 @@ def _mean_frames(src: FrameSource, transform=None, batch=40) -> np.ndarray:
                 acc = np.array(f, np.float32, copy=True)
             else:
                 acc += f
+        if progress:
+            progress(e - s)
     return acc / n
 
 
-def reduce_darks_flats(scan: BlissScan):
-    """dark (rows, cols) and flats (n_series, rows, cols) exactly as nx2etf stores them."""
-    dark = _mean_frames(FrameSource(scan.darks, scan.frame_shape))
+def _bar(show, total, desc, unit):
+    """a helirec.ProgressBar, or a stand-in that shows nothing"""
+    if show:
+        return _core.ProgressBar(int(total), desc, unit)
+    return contextlib.nullcontext(types.SimpleNamespace(update=lambda n=1: None))
+
+
+def reduce_darks_flats(scan: BlissScan, progress=None):
+    """dark (rows, cols) and flats (n_series, rows, cols) exactly as nx2etf stores them.
+    progress(k): called as k more of the len(scan.darks) + sum(len(series)) frames are done."""
+    dark = _mean_frames(FrameSource(scan.darks, scan.frame_shape), progress=progress)
     flats = []
     for refs, ctl in zip(scan.flats, scan.flats_control_A):
         scale = np.float32(NOMINAL_CURRENT_A) / np.asarray(ctl, np.float32)
 
         def tr(F, i, scale=scale):
             return dark + (F - dark) * scale[i]
-        flats.append(_mean_frames(FrameSource(refs, scan.frame_shape), tr))
+        flats.append(_mean_frames(FrameSource(refs, scan.frame_shape), tr, progress=progress))
     return dark.astype(np.float32), np.stack(flats).astype(np.float32)
 
 
@@ -164,7 +177,8 @@ class Extractor:
         f = (ang - self.fa[i1 - 1]) / (self.fa[i1] - self.fa[i1 - 1])
         return (np.float32(1) - f) * self.F[i1 - 1] + f * self.F[i1]
 
-    def extract(self, p0, p1, f, zs0, zs1, zf0, zf1, S):
+    def extract(self, p0, p1, f, zs0, zs1, zf0, zf1, S, progress=None):
+        """progress(1): called after each of the len(p0) requests"""
         n = len(p0)
         rows, cols = self.scan.frame_shape
         out_s = np.zeros((n, S, cols), np.float32)
@@ -209,6 +223,8 @@ class Extractor:
                     w[k] = (np.float32(1) - frac) * wt[zl[k]] + frac * wt[zl[k] + 1]
                 out_s[i, j] = (np.float32(1) - fi) * v[0] + fi * v[1]
                 out_w[i, j] = (np.float32(1) - fi) * w[0] + fi * w[1]
+            if progress:
+                progress(1)
         return out_s, out_w
 
 
@@ -265,7 +281,7 @@ def line_error_map(merits, z):
 
 
 def find_cor(ext: Extractor, span: Span, near_pos, near_width=40, n_slices=20, step_deg=5.0, ovs=4,
-             sigma_wide=10.0, sigma_narrow=0.4, log=print):
+             sigma_wide=10.0, sigma_narrow=0.4, log=print, progress=False):
     """Rotation axis of a half-acquisition scan (detector frame of that scan)."""
     scan = ext.scan
     W = scan.frame_shape[1]
@@ -294,9 +310,11 @@ def find_cor(ext: Extractor, span: Span, near_pos, near_width=40, n_slices=20, s
         zl.extend(((zz[0] + zz[1]) * 0.5).tolist())
     zl = np.asarray(zl)
     sig, wgt = [], []
-    for r in (req, req180):
-        s, w = ext.extract(*[np.asarray(r[k]) for k in ("p0", "p1", "f", "zs0", "zs1", "zf0", "zf1")], S=1)
-        sig.append(s[:, 0]); wgt.append(w[:, 0])
+    with _bar(progress, len(req["p0"]) + len(req180["p0"]), "rotation axis", "line") as bar:
+        for r in (req, req180):
+            s, w = ext.extract(*[np.asarray(r[k]) for k in ("p0", "p1", "f", "zs0", "zs1", "zf0", "zf1")], S=1,
+                               progress=bar.update)
+            sig.append(s[:, 0]); wgt.append(w[:, 0])
     sig = np.ascontiguousarray(np.stack(sig), np.float32)
     wgt = np.ascontiguousarray(np.stack(wgt), np.float32)
     ovl_min = int(round(max(4, W - 2 * (near_pos + near_width))))
@@ -355,7 +373,7 @@ def overlap_cross_check(img0, w0, img1, w1, res, sigma=2.0, tolerance=0.375, log
 
 
 def find_overlap(ext_main: Extractor, span_main: Span, ext_comp: Extractor, span_comp: Span, init_dx,
-                 radius_x=40, radius_z=10, n_slices=80, low_pass=0.4, high_pass=10.0, log=print):
+                 radius_x=40, radius_z=10, n_slices=80, low_pass=0.4, high_pass=10.0, log=print, progress=False):
     """(dy, dx): main[y, x] == companion[y - dy, x - dx] at equal angle and view height."""
     zm, zc = ext_main.scan.z_translation_m, ext_comp.scan.z_translation_m
     same_dir = (zm[-1] >= zm[0]) == (zc[-1] >= zc[0])
@@ -385,8 +403,10 @@ def find_overlap(ext_main: Extractor, span_main: Span, ext_comp: Extractor, span
             r["zs0"].append(base - span.ishift[P0]); r["zs1"].append(base - span.ishift[P1])
             r["zf0"].append(span.fract[P0]); r["zf1"].append(span.fract[P1])
     stripes = []
-    for ext, r in zip((ext_main, ext_comp), reqs):
-        stripes.append(ext.extract(*[np.asarray(r[k]) for k in ("p0", "p1", "f", "zs0", "zs1", "zf0", "zf1")], S=S))
+    with _bar(progress, 2 * len(slices), "HA -> TA overlap", "stripe") as bar:
+        for ext, r in zip((ext_main, ext_comp), reqs):
+            stripes.append(ext.extract(*[np.asarray(r[k]) for k in ("p0", "p1", "f", "zs0", "zs1", "zf0", "zf1")], S=S,
+                                       progress=bar.update))
     (img0, w0), (img1, w1) = _filter_overlap([stripes[0][0], stripes[1][0]], [stripes[0][1], stripes[1][1]],
                                              low_pass, high_pass)
     res = _core.find_offset(img0, w0, img1, w1, 0, int(init_dx), radius_z, radius_x)
@@ -516,13 +536,15 @@ def _load_cache(cache_dir, fp, log):
 
 
 def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, cor_override=None,
-              vector_override=None):
+              vector_override=None, progress=None):
     """Full calibration from raw data. Returns (Calibration, arrays dict).
 
     cache_dir: the darks/flats reduction and the *measured* calibration are cached there, keyed by
     acquisition_fingerprint(); a cache of another acquisition or calibration version is ignored and replaced.
     cor_override / vector_override replace the measured values for this call only (Calibration.source =
     "override"); they are never written to the cache, so a later run without overrides gets the measured values."""
+    if progress is None:   # progress bars for the long steps: whenever the log is shown
+        progress = log is print
     fp = acquisition_fingerprint(main, companion)
     override = cor_override is not None or vector_override is not None
     cached_cal, arrays = _load_cache(cache_dir, fp, log) if cache_dir else (None, None)
@@ -541,7 +563,8 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
         arrays = {}
         for tag, sc in (("main", main), ("companion", companion)):
             log(f"[{tag}] reducing darks/flats of {sc.name} ...")
-            dark, flats = reduce_darks_flats(sc)
+            with _bar(progress, len(sc.darks) + sum(len(refs) for refs in sc.flats), f"darks/flats ({tag})", "frame") as bar:
+                dark, flats = reduce_darks_flats(sc, bar.update)
             arrays[f"{tag}_dark"], arrays[f"{tag}_flats"] = dark, flats
         # weight map from all flats (companion first, as the reference --scan_files order)
         arrays["weight_map"] = weight_map([arrays["companion_flats"], arrays["main_flats"]])
@@ -564,7 +587,7 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
     if cor_override is None:
         log("rotation axis ...")
         e = extractors()
-        cr = find_cor(e["m"], e["sm"], main.estimated_cor_from_motor_pix, log=log)
+        cr = find_cor(e["m"], e["sm"], main.estimated_cor_from_motor_pix, log=log, progress=progress)
         check_cor_drift(cr["cor_begin_end"], log=log)
         cor_main = float(cr["cor0"])
         details["cor"] = dict(cor_begin_end=cr["cor_begin_end"], z_begin_end=cr["z_begin_end"],
@@ -576,7 +599,7 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
         log("HA -> TA overlap ...")
         e = extractors()
         init_dx = round(main.estimated_cor_from_motor_pix - companion.estimated_cor_from_motor_pix)
-        ov = find_overlap(e["m"], e["sm"], e["c"], e["sc"], init_dx, log=log)
+        ov = find_overlap(e["m"], e["sm"], e["c"], e["sc"], init_dx, log=log, progress=progress)
         vector = tuple(float(v) for v in ov["best_sub"])
         details["overlap"] = dict(best_int=ov["best_int"], best_int_loss=ov["best_int_loss"],
                                   best_sub_loss=ov["best_sub_loss"], smoothed_sub=ov["cross_check"]["sub"],

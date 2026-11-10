@@ -175,7 +175,9 @@ class OmeZarrWriter:
                 self._store_slab(0, iz, arr)
                 del self.buf[iz]
 
-    def close(self):
+    def close(self, progress=None):
+        """progress(level, n_slabs): called before a pyramid level is built; its return value, when not None, is
+        called after each of the level's slabs."""
         for iz, (arr, filled) in sorted(self.buf.items()):
             self._store_slab(0, iz, arr)  # unfilled slices stay at the fill value
         self.buf.clear()
@@ -184,6 +186,7 @@ class OmeZarrWriter:
         for l in range(1, self.levels):
             Zp = self.level_shapes[l - 1][0]
             Z, Y, X = self.level_shapes[l]
+            step = progress(l, (Z + cz - 1) // cz) if progress else None
             for iz in range((Z + cz - 1) // cz):
                 a, b = iz * cz * 2, min(Zp, (iz + 1) * cz * 2)
                 src = self.read(l - 1, a, b).astype(np.float64)
@@ -192,24 +195,19 @@ class OmeZarrWriter:
                 if self.dtype.kind in "ui":
                     ds = np.rint(ds)
                 self._store_slab(l, iz, ds.astype(self.dtype)[:, :Y, :X])
+                if step:
+                    step()
             self._drain()
         self.pool.shutdown()
 
 
-def to_uint8(img, lo=-0.03, hi=0.145, outside=None):
-    """float slice(s) -> uint8 with the window [lo, hi] (default: the reference uint8 window).
-    `outside`: optional boolean (y, x) mask of pixels without data (outside the reconstruction disk),
-    set to 0 (so empty chunks stay empty)."""
-    u8 = np.rint(np.clip((np.asarray(img, np.float32) - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
-    if outside is not None:
-        u8[..., outside] = 0
-    return u8
-
-
-def outside_disk(n, roi=None):
-    """Pixels of an n x n slice (cropped to roi = (x0, x1, y0, y1)) outside GHBP's reconstruction
-    disk (x-c)^2 + (y-c)^2 > (n//2)^2, c = (n-1)/2."""
-    x0, x1, y0, y1 = roi if roi else (0, n, 0, n)
-    c = (n - 1) / 2
-    yy, xx = np.mgrid[y0:y1, x0:x1]
-    return (xx - c) ** 2 + (yy - c) ** 2 > (n // 2) ** 2
+def to_uint8(img, lo=-0.03, hi=0.145, disk=None, mask=None):
+    """float slice(s) (..., ny, nx) -> uint8 with the window [lo, hi] (default: the reference uint8 window).
+    disk = (n, x0, y0): the slices are the ROI at (x0, y0) of n x n slices; the pixels outside their reconstruction
+    disk are set to 0 (so empty chunks stay empty). mask: the result is 0 where it is 0: a uint8 array of img's
+    shape, or a helirec OutputMask over the slices (possibly coarser).
+    The kernel behind SliceReconstructor.reconstruct(uint8=...)."""
+    from . import _core
+    if mask is not None and not isinstance(mask, _core.OutputMask):
+        mask = np.ascontiguousarray(mask, np.uint8)
+    return _core.to_uint8(np.ascontiguousarray(img, np.float32), lo, hi, disk, mask=mask)

@@ -183,6 +183,8 @@ struct SliceReconstructor::Impl {
     }
     cuda::DeviceBuffer<float> R, RW, Wp, Aha, Bha, Atot, Btot, S, W, row, wrow, pad, slice, arc_d;
     cuda::PinnedBuffer<float> slice_host;   // staging of the slices' download
+    cuda::DeviceBuffer<std::uint8_t> slice_u8, slice_mask;
+    cuda::PinnedBuffer<std::uint8_t> slice_u8_host;
     std::unique_ptr<cuda::Ghbp> ghbp;
     std::unique_ptr<cuda::Stream> copy;
 #endif
@@ -197,6 +199,10 @@ struct SliceReconstructor::Impl {
     void run(int h_lo, int h_hi, ChunkDebug* dbg, const std::vector<const FilterPipeline*>& sets, int margin_rows,
              int filter_rows, const std::function<void(int, int, float*, float*)>& sink, int next_lo = 0, int next_hi = 0);
     bool raw_rows = false;  // sinks get the unfiltered rows (external backprojectors that filter themselves)
+    ProgressBar* progress = nullptr;   // of the chunk in hand: run() names its steps
+    void step(const char* name) {
+        if (progress) progress->set_postfix(name);
+    }
     std::vector<float> up_h;
 #ifdef HELIREC_WITH_CUDA
     cuda::DeviceBuffer<float> up_d;
@@ -676,6 +682,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     };
     setup_invariants();
     tick("setup");
+    step("read");
 
     // ---------------------------------------------------------------- per-scan chunk geometry
     const bool measured_only = cfg.external && cfg.external->measured_only();
@@ -746,6 +753,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                  n, ch.win_rows, ch.raw.data());
         }
         tick("read_raw");
+        step("grid");
         std::vector<float> S(sino_n), Wc(sino_n);
         std::vector<float> R(blk), RW(blk), Wp, Aha, Bha, Atot, Btot;
         for (int g0 = 0; g0 < NG; g0 += BL) {
@@ -810,6 +818,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         tick("rebalance");
         std::vector<float> row(static_cast<std::size_t>(NG) * NX), wrow(row.size());
         std::vector<float> padded(static_cast<std::size_t>(NG) * rg.npad);
+        step("backproject");
         for (int y = 0; y < DY; ++y) {
             for (int i = 0; i < NG; ++i) {
                 std::memcpy(&row[static_cast<std::size_t>(i) * NX], &S[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
@@ -846,6 +855,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         for (int r = 0; r < 2; ++r) { d_raw[r].resize(nsc); d_slot[r].resize(nsc); }
     const bool prefetched = take_prefetch(h_lo, h_hi, m);
     tick("read_wait");
+    if (prefetched) step("grid");
     struct DevChunk {
         cuda::DeviceBuffer<int32_t> row0, fi0, fi1, gi0, gi1, grow0;
         cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac, z_w;
@@ -1087,6 +1097,13 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         raw_read.t.join();
         if (want_next) start_prefetch(next_lo, next_hi, m);
     }
+    if (progress) {
+        // the gridding and filtering queued above finish here rather than inside the first slice's download, so
+        // that the step shown is the one running
+        step("grid");
+        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+        step("backproject");
+    }
     const std::size_t rown = static_cast<std::size_t>(NG) * NX;
     row.ensure(rown); wrow.ensure(rown); pad.ensure(static_cast<std::size_t>(NG) * rg.npad);
     auto slices = [&](int k) {  // ramp filter x balanced weights per slice -> sink
@@ -1170,15 +1187,117 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
 #endif
 }
 
-void SliceReconstructor::reconstruct(int h_lo, int h_hi, float* out, ChunkDebug* dbg, const SliceRoi* roi_in, int next_lo,
-                                     int next_hi) {
+namespace {
+
+// A block of an (ry, rx) slice: [x0, x0 + w) x [y0, y0 + h)
+struct Block {
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+};
+
+// zeros everywhere in the slice but the block
+template <class T>
+void clear_outside(T* slice, int ry, int rx, const Block& b) {
+#pragma omp parallel for schedule(static)
+    for (int y = 0; y < ry; ++y) {
+        T* r = slice + static_cast<std::size_t>(y) * rx;
+        if (y < b.y0 || y >= b.y0 + b.h) {
+            std::memset(r, 0, static_cast<std::size_t>(rx) * sizeof(T));
+        } else {
+            std::memset(r, 0, static_cast<std::size_t>(b.x0) * sizeof(T));
+            std::memset(r + b.x0 + b.w, 0, static_cast<std::size_t>(rx - b.x0 - b.w) * sizeof(T));
+        }
+    }
+}
+
+// the block's (h, w) packed rows into the slice
+template <class T>
+void place(T* slice, int rx, const Block& b, const T* rows) {
+    for (int y = 0; y < b.h; ++y)
+        std::memcpy(slice + static_cast<std::size_t>(b.y0 + y) * rx + b.x0, rows + static_cast<std::size_t>(y) * b.w,
+                    static_cast<std::size_t>(b.w) * sizeof(T));
+}
+
+// The smallest block of an (ry, rx) slice holding every pixel the mask keeps in a chunk of n slices (w = 0: none).
+Block mask_bounds(const OutputMask& m, int n, int ry, int rx) {
+    auto index = [](int v, int o, int f, int size) { return std::min(std::max(v + o, 0) / f, size - 1); };
+    // the mask elements the chunk reads
+    const int k0 = index(0, m.oz, m.fz, m.nz), k1 = index(n - 1, m.oz, m.fz, m.nz);
+    const int i0 = index(0, m.oy, m.fy, m.ny), i1 = index(ry - 1, m.oy, m.fy, m.ny);
+    const int j0 = index(0, m.ox, m.fx, m.nx), j1 = index(rx - 1, m.ox, m.fx, m.nx);
+    int ia = i1 + 1, ib = i0 - 1, ja = j1 + 1, jb = j0 - 1;
+    for (int k = k0; k <= k1; ++k)
+        for (int i = i0; i <= i1; ++i) {
+            const std::uint8_t* row = m.data + (static_cast<std::size_t>(k) * m.ny + i) * m.nx;
+            for (int j = j0; j <= j1; ++j)
+                if (row[j]) {
+                    ia = std::min(ia, i); ib = std::max(ib, i);
+                    ja = std::min(ja, j); jb = std::max(jb, j);
+                }
+        }
+    if (ib < ia) return {};
+    // the pixels reading elements [a, b] of an axis: from the first one of a to the last one of b
+    auto span = [](int a, int b, int first, int last, int o, int f, int size) {
+        const int lo = a <= first ? 0 : a * f - o, hi = b >= last ? size : (b + 1) * f - o;
+        return std::pair<int, int>(lo, hi);
+    };
+    const auto [y0, y1] = span(ia, ib, i0, i1, m.oy, m.fy, ry);
+    const auto [x0, x1] = span(ja, jb, j0, j1, m.ox, m.fx, rx);
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+
+}  // namespace
+
+void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out, ChunkDebug* dbg, const SliceRoi* roi_in,
+                                     int next_lo, int next_hi, ProgressBar* progress) {
     auto& I = *impl_;
     const int N = I.grid_size;
     const SliceRoi roi = roi_in ? *roi_in : SliceRoi{0, N, 0, N};
     if (!(0 <= roi.x0 && roi.x0 < roi.x1 && roi.x1 <= N && 0 <= roi.y0 && roi.y0 < roi.y1 && roi.y1 <= N))
         throw Error("reconstruct: ROI outside the slice");
-    const int rx = roi.x1 - roi.x0, ry = roi.y1 - roi.y0;
+    if (!out.f32 && !out.u8) throw Error("reconstruct: no output");
+    if (h_hi <= h_lo) throw Error("reconstruct: empty height range");
+    const int n = h_hi - h_lo, rx = roi.x1 - roi.x0, ry = roi.y1 - roi.y0;
     const std::size_t plane = static_cast<std::size_t>(rx) * ry, N2 = static_cast<std::size_t>(N) * N;
+    const OutputMask& mask = out.u8_mask;
+    if (mask.data && (mask.nz < 1 || mask.ny < 1 || mask.nx < 1 || mask.fz < 1 || mask.fy < 1 || mask.fx < 1))
+        throw Error("reconstruct: empty mask");
+    // the block of the ROI that is computed (the rest is 0)
+    Block B{0, 0, rx, ry};
+    auto cut = [&](int x0, int x1, int y0, int y1) {   // to [x0, x1) x [y0, y1) of the ROI
+        const int a = std::max(B.x0, x0), b = std::min(B.x0 + B.w, x1), c = std::max(B.y0, y0), d = std::min(B.y0 + B.h, y1);
+        B = b > a && d > c ? Block{a, c, b - a, d - c} : Block{};
+    };
+    if (out.region) cut(out.region->x0 - roi.x0, out.region->x1 - roi.x0, out.region->y0 - roi.y0, out.region->y1 - roi.y0);
+    if (mask.data && !out.f32 && B.w) {
+        const Block kept = mask_bounds(mask, n, ry, rx);
+        cut(kept.x0, kept.x0 + kept.w, kept.y0, kept.y0 + kept.h);
+    }
+    const bool partial = B.w != rx || B.h != ry;
+    if (!B.w) {   // nothing to compute
+        if (out.f32) clear_outside(out.f32, n * ry, rx, Block{});
+        if (out.u8) clear_outside(out.u8, n * ry, rx, Block{});
+        if (progress) progress->update(static_cast<std::uint64_t>(n));
+        return;
+    }
+    const int bw = B.w, bh = B.h;
+    const std::size_t block_plane = static_cast<std::size_t>(bw) * bh;
+    const SliceRoi computed{roi.x0 + B.x0, roi.x0 + B.x0 + bw, roi.y0 + B.y0, roi.y0 + B.y0 + bh};   // in the slice
+    // uint8 conversion of the block; `mask_data`: the mask slice (host or device copy)
+    const std::size_t mask_plane = static_cast<std::size_t>(mask.ny) * mask.nx;
+    auto mask_slice = [&](int y) { return std::min(std::max(y + mask.oz, 0) / mask.fz, mask.nz - 1); };
+    auto window = [&](const std::uint8_t* mask_data) {
+        Uint8Window w;
+        w.lo = out.u8_lo;
+        w.hi = out.u8_hi;
+        if (out.u8_zero_outside) { w.disk_n = N; w.x0 = computed.x0; w.y0 = computed.y0; }
+        if (mask_data) {
+            w.mask = mask_data;
+            w.mask_ny = mask.ny; w.mask_nx = mask.nx;
+            w.mask_fy = mask.fy; w.mask_fx = mask.fx;
+            w.mask_oy = mask.oy + B.y0; w.mask_ox = mask.ox + B.x0;
+        }
+        return w;
+    };
     I.setup_invariants();
     const bool use_ghbp = I.cfg.backprojector == "ghbp";
     if (use_ghbp && !I.have_plan) {
@@ -1186,47 +1305,104 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, float* out, ChunkDebug*
         I.have_plan = true;
     }
     BackprojectParams bp = I.bp;
-    bp.x0 = roi.x0;
-    bp.y0 = roi.y0;
+    bp.x0 = computed.x0;
+    bp.y0 = computed.y0;
     const bool external = I.cfg.backprojector == "external";
     I.raw_rows = external && !I.cfg.external->filtered();
     const int nd = I.NX * I.cfg.bp_oversample;
+    // (run() names the chunk's steps on the bar; cleared on every way out)
+    struct Scope {
+        Impl& I;
+        Scope(Impl& impl, ProgressBar* p) : I(impl) { I.progress = p; }
+        ~Scope() { I.progress = nullptr; I.raw_rows = false; }
+    } scope(I, progress);
+    auto f32_of = [&](int y) { return out.f32 + static_cast<std::size_t>(y) * plane; };
+    auto u8_of = [&](int y) { return out.u8 + static_cast<std::size_t>(y) * plane; };
+    // a block computed on the host (CPU kernels, external backprojectors): `compute` fills its (bh, bw) floats
+    std::vector<float> host_block(out.f32 && !partial ? 0 : block_plane);
+    std::vector<std::uint8_t> host_u8(out.u8 && partial ? block_plane : 0);
+    auto host_sink = [&](int y, const std::function<void(float*)>& compute) {
+        float* blk = out.f32 && !partial ? f32_of(y) : host_block.data();
+        compute(blk);
+        const Uint8Window w = window(mask.data ? mask.data + mask_slice(y) * mask_plane : nullptr);
+        if (!partial) {
+            if (out.u8) cpu::to_uint8(blk, bw, u8_of(y), bh, bw, w);
+        } else {
+            if (out.f32) {
+                clear_outside(f32_of(y), ry, rx, B);
+                place(f32_of(y), rx, B, blk);
+            }
+            if (out.u8) {
+                cpu::to_uint8(blk, bw, host_u8.data(), bh, bw, w);
+                clear_outside(u8_of(y), ry, rx, B);
+                place(u8_of(y), rx, B, host_u8.data());
+            }
+        }
+        if (progress) progress->update(1);
+    };
     if (I.cfg.device == Device::CPU) {
         std::vector<float> full(use_ghbp ? N2 : 0);
         const auto P = I.pipeline(I.cfg.filters);
         I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
-            float* dst = out + static_cast<std::size_t>(y) * plane;
-            if (external) {
-                I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles_of(y), bp, N, roi, Device::CPU, dst);
-            } else if (use_ghbp) {
-                cpu::ghbp(I.plan, row, full.data());
-                for (int r = 0; r < ry; ++r)
-                    std::memcpy(dst + static_cast<std::size_t>(r) * rx, full.data() + static_cast<std::size_t>(roi.y0 + r) * N + roi.x0,
-                                rx * sizeof(float));
-            } else {
-                cpu::backproject(I.fbp_rows(row), I.fbp_angles_of(y), dst, I.n_grid, nd, ry, rx, bp);
-            }
+            host_sink(y, [&](float* dst) {
+                if (external) {
+                    I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles_of(y), bp, N, computed, Device::CPU, dst);
+                } else if (use_ghbp) {
+                    cpu::ghbp(I.plan, row, full.data());
+                    for (int r = 0; r < bh; ++r)
+                        std::memcpy(dst + static_cast<std::size_t>(r) * bw,
+                                    full.data() + static_cast<std::size_t>(computed.y0 + r) * N + computed.x0, bw * sizeof(float));
+                } else {
+                    cpu::backproject(I.fbp_rows(row), I.fbp_angles_of(y), dst, I.n_grid, nd, bh, bw, bp);
+                }
+            });
         });
-        I.raw_rows = false;
         return;
     }
 #ifdef HELIREC_WITH_CUDA
     if (use_ghbp && !I.ghbp) I.ghbp = std::make_unique<cuda::Ghbp>(I.plan);
-    if (!external) I.slice.ensure(use_ghbp ? N2 : plane);
+    if (!external) I.slice.ensure(use_ghbp ? N2 : block_plane);
+    if (!external && out.u8) I.slice_u8.ensure(block_plane);
+    if (!external && out.u8 && mask.data) I.slice_mask.ensure(mask_plane);
+    int mask_loaded = -1;   // the mask slice on the device
+    const std::size_t at = static_cast<std::size_t>(B.y0) * rx + B.x0;   // the block in an output slice
     const auto P = I.pipeline(I.cfg.filters);
     I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
-        float* dst = out + static_cast<std::size_t>(y) * plane;
         if (external) {
-            I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles_of(y), bp, N, roi, Device::CUDA, dst);
-        } else if (use_ghbp) {
-            I.ghbp->run(row, I.slice.data());
-            cuda::download_rows(dst, I.slice.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0, N, rx, ry, I.slice_host);
-        } else {
-            cuda::backproject(I.fbp_rows(row), I.fbp_angles_of(y), I.slice.data(), I.n_grid, nd, ry, rx, bp);
-            cuda::download_rows(dst, I.slice.data(), rx, rx, ry, I.slice_host);
+            host_sink(y, [&](float* dst) {
+                I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles_of(y), bp, N, computed, Device::CUDA, dst);
+            });
+            return;
         }
+        // the block on the device: (bh, bw) rows at a pitch of `pitch` floats
+        const float* dev = I.slice.data();
+        std::size_t pitch = static_cast<std::size_t>(bw);
+        if (use_ghbp) {
+            I.ghbp->run(row, I.slice.data());
+            dev += static_cast<std::size_t>(computed.y0) * N + computed.x0;
+            pitch = static_cast<std::size_t>(N);
+        } else {
+            cuda::backproject(I.fbp_rows(row), I.fbp_angles_of(y), I.slice.data(), I.n_grid, nd, bh, bw, bp);
+        }
+        if (out.u8) {   // converted before the float download, which then overlaps it
+            if (mask.data && mask_slice(y) != mask_loaded) {
+                mask_loaded = mask_slice(y);
+                HELIREC_CUDA_CHECK(cudaMemcpyAsync(I.slice_mask.data(), mask.data + mask_loaded * mask_plane, mask_plane,
+                                                   cudaMemcpyHostToDevice));
+            }
+            cuda::to_uint8(dev, pitch, I.slice_u8.data(), bh, bw, window(mask.data ? I.slice_mask.data() : nullptr));
+        }
+        if (out.f32) {
+            if (partial) clear_outside(f32_of(y), ry, rx, B);
+            cuda::download_rows(f32_of(y) + at, dev, pitch, bw, bh, I.slice_host, rx);
+        }
+        if (out.u8) {
+            if (partial) clear_outside(u8_of(y), ry, rx, B);
+            cuda::download_rows(u8_of(y) + at, static_cast<const std::uint8_t*>(I.slice_u8.data()), bw, bw, bh,
+                                I.slice_u8_host, rx);
+        }
+        if (progress) progress->update(1);
     }, next_lo, next_hi);
-    I.raw_rows = false;
 #endif
 }
 

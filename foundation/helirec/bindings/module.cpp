@@ -19,8 +19,11 @@
 #include "helirec/band.hpp"
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/array.h>
+#include <nanobind/stl/tuple.h>
 #include "helirec/helical.hpp"
 #include "helirec/kernels.hpp"
+#include "helirec/progress.hpp"
+#include "helirec/reference.hpp"
 #include "ndarray_utils.hpp"
 
 #ifdef HELIREC_WITH_CUDA
@@ -35,6 +38,71 @@ using namespace helirec;
 using namespace helirec::py;
 
 namespace {
+
+// (..., ny, nx) float32 -> uint8 (a 1-D array is one row); disk = (n, x0, y0): the frames are the ROI at (x0, y0)
+// of (n, n) slices
+using MaskIn = nb::ndarray<const std::uint8_t, nb::c_contig, nb::device::cpu>;
+
+// A mask for SliceReconstructor.reconstruct(mask=...) with the object owning its memory: a NumPy array, or the
+// ReferenceMask whose buffer it is.
+struct PyOutputMask {
+    OutputMask m;
+    nb::object keep;
+};
+
+nb::ndarray<nb::numpy, std::uint8_t> to_uint8_py(HostIn img, double lo, double hi,
+                                                 std::optional<std::array<int, 3>> disk, const std::string& device,
+                                                 nb::object mask) {
+    require(img.ndim() >= (disk ? 2 : 1), "img must be (..., ny, nx)");
+    require(hi > lo, "the window needs hi > lo");
+    const std::size_t ny = img.ndim() >= 2 ? img.shape(img.ndim() - 2) : 1, nx = img.shape(img.ndim() - 1), plane = ny * nx;
+    const std::size_t frames = plane ? img.size() / plane : 0;
+    Uint8Window w;
+    w.lo = lo;
+    w.hi = hi;
+    if (disk) { w.disk_n = (*disk)[0]; w.x0 = (*disk)[1]; w.y0 = (*disk)[2]; }
+    // the mask: an array of img's shape, or an OutputMask over the frames (possibly coarser)
+    OutputMask k;
+    std::optional<MaskIn> mask_array;
+    if (nb::isinstance<PyOutputMask>(mask)) {
+        k = nb::cast<PyOutputMask&>(mask).m;
+    } else if (!mask.is_none()) {
+        mask_array = nb::cast<MaskIn>(mask);
+        require(mask_array->size() == img.size(), "a mask array must have the shape of img (an OutputMask may be coarser)");
+        k.data = mask_array->data();
+        k.nz = static_cast<int>(frames); k.ny = static_cast<int>(ny); k.nx = static_cast<int>(nx);
+    }
+    const std::size_t mask_plane = static_cast<std::size_t>(k.ny) * k.nx;
+    auto mask_slice = [&](std::size_t f) { return std::min(std::max(static_cast<int>(f) + k.oz, 0) / k.fz, k.nz - 1); };
+    w.mask_ny = k.ny; w.mask_nx = k.nx;
+    w.mask_fy = k.fy; w.mask_fx = k.fx;
+    w.mask_oy = k.oy; w.mask_ox = k.ox;
+    auto out = new_array_t<std::uint8_t>(shape_of(img));
+    auto* o = static_cast<std::uint8_t*>(out.data());
+    const Device dev = parse_device(device);
+    nb::gil_scoped_release nogil;
+    if (dev == Device::CPU) {
+        for (std::size_t f = 0; f < frames; ++f) {
+            w.mask = k.data ? k.data + mask_slice(f) * mask_plane : nullptr;
+            cpu::to_uint8(img.data() + f * plane, nx, o + f * plane, static_cast<int>(ny), static_cast<int>(nx), w);
+        }
+        return out;
+    }
+#ifdef HELIREC_WITH_CUDA
+    cuda::DeviceBuffer<float> d_in(plane);
+    cuda::DeviceBuffer<std::uint8_t> d_out(plane), d_mask(k.data ? mask_plane : 0);
+    for (std::size_t f = 0; f < frames; ++f) {
+        HELIREC_CUDA_CHECK(cudaMemcpy(d_in.data(), img.data() + f * plane, plane * sizeof(float), cudaMemcpyHostToDevice));
+        if (k.data) {
+            HELIREC_CUDA_CHECK(cudaMemcpy(d_mask.data(), k.data + mask_slice(f) * mask_plane, mask_plane, cudaMemcpyHostToDevice));
+            w.mask = d_mask.data();
+        }
+        cuda::to_uint8(d_in.data(), nx, d_out.data(), static_cast<int>(ny), static_cast<int>(nx), w);
+        HELIREC_CUDA_CHECK(cudaMemcpy(o + f * plane, d_out.data(), plane, cudaMemcpyDeviceToHost));
+    }
+#endif
+    return out;
+}
 
 HostOut flatfield_py(HostIn raw, HostIn dark, HostIn flat, float threshold, bool take_log,
                      const std::string& device) {
@@ -608,47 +676,84 @@ class PySliceReconstructor {
         return d;
     }
     nb::object reconstruct(int h_lo, int h_hi, bool debug, bool timing, std::optional<std::array<int, 4>> roi,
-                           std::optional<std::array<int, 2>> next) {
+                           std::optional<std::array<int, 2>> next, std::optional<std::tuple<double, double, bool>> uint8,
+                           bool float32, ProgressBar* progress, nb::object mask,
+                           std::optional<std::array<int, 4>> region) {
         const int N = impl_->grid_size();
         SliceRoi r{0, N, 0, N};
         if (roi) r = SliceRoi{(*roi)[0], (*roi)[1], (*roi)[2], (*roi)[3]};
         require(0 <= r.x0 && r.x0 < r.x1 && r.x1 <= N && 0 <= r.y0 && r.y0 < r.y1 && r.y1 <= N,
                 "roi (x0, x1, y0, y1) must lie within the slice");
         require(h_hi > h_lo, "empty height range");
-        HostOut out = new_array({static_cast<std::size_t>(h_hi - h_lo), static_cast<std::size_t>(r.y1 - r.y0),
-                                 static_cast<std::size_t>(r.x1 - r.x0)});
+        require(float32 || uint8, "no output: float32=False needs uint8=(lo, hi, zero_outside)");
+        require(float32 || !debug, "debug=True returns the float32 slices");
+        const std::vector<std::size_t> shape{static_cast<std::size_t>(h_hi - h_lo), static_cast<std::size_t>(r.y1 - r.y0),
+                                             static_cast<std::size_t>(r.x1 - r.x0)};
+        SliceOutput o;
+        nb::object f32 = nb::none(), u8 = nb::none();
+        if (float32) {
+            HostOut a = new_array(shape);
+            o.f32 = data(a);
+            f32 = nb::cast(a);
+        }
+        if (uint8) {
+            require(std::get<1>(*uint8) > std::get<0>(*uint8), "uint8=(lo, hi, zero_outside) needs hi > lo");
+            auto a = new_array_t<std::uint8_t>(shape);
+            o.u8 = static_cast<std::uint8_t*>(a.data());
+            o.u8_lo = std::get<0>(*uint8);
+            o.u8_hi = std::get<1>(*uint8);
+            o.u8_zero_outside = std::get<2>(*uint8);
+            u8 = nb::cast(a);
+        }
+        if (region) {
+            require((*region)[0] < (*region)[1] && (*region)[2] < (*region)[3], "region (x0, x1, y0, y1) is empty");
+            o.region = SliceRoi{(*region)[0], (*region)[1], (*region)[2], (*region)[3]};
+        }
+        require(mask.is_none() || uint8, "mask applies to the uint8 output: pass uint8=(lo, hi, zero_outside)");
+        std::optional<MaskIn> mask_array;   // (kept alive through the call)
+        if (nb::isinstance<PyOutputMask>(mask)) {
+            o.u8_mask = nb::cast<PyOutputMask&>(mask).m;
+        } else if (!mask.is_none()) {
+            mask_array = nb::cast<MaskIn>(mask);
+            require(mask_array->ndim() == 3 && mask_array->shape(0) == shape[0] && mask_array->shape(1) == shape[1] &&
+                    mask_array->shape(2) == shape[2],
+                    "a mask array must be (n, y1 - y0, x1 - x0), the shape of the output (an OutputMask may be coarser)");
+            o.u8_mask.data = mask_array->data();
+            o.u8_mask.nz = static_cast<int>(shape[0]);
+            o.u8_mask.ny = static_cast<int>(shape[1]);
+            o.u8_mask.nx = static_cast<int>(shape[2]);
+        }
         ChunkDebug dbg;
         dbg.keep = debug;
         dbg.timing = timing;
         {
             nb::gil_scoped_release nogil;
-            impl_->reconstruct(h_lo, h_hi, data(out), &dbg, &r, next ? (*next)[0] : 0, next ? (*next)[1] : 0);
+            impl_->reconstruct(h_lo, h_hi, o, &dbg, &r, next ? (*next)[0] : 0, next ? (*next)[1] : 0, progress);
+        }
+        if (!debug && !timing) {
+            if (float32 && uint8) return nb::make_tuple(f32, u8);
+            return float32 ? f32 : u8;
         }
         nb::dict sec;
         for (const auto& [k, v] : dbg.seconds) sec[k.c_str()] = v;
         for (const auto& [k, v] : dbg.stats) sec[("stat_" + k).c_str()] = v;
-        if (!debug && !timing) return nb::cast(out);
-        if (!debug) {
-            nb::dict d;
-            d["slices"] = out;
-            d["seconds"] = sec;
-            return d;
-        }
+        nb::dict d;
+        if (float32) d["slices"] = f32;
+        if (uint8) d["uint8"] = u8;
+        if (timing) d["seconds"] = sec;
+        if (!debug) return d;
         const std::size_t DY = h_hi - h_lo, NG = impl_->n_grid(), NX = impl_->merged_width();
         auto mk = [&](const std::vector<float>& v, std::vector<std::size_t> shape) {
             HostOut a = new_array(shape);
             std::memcpy(data(a), v.data(), v.size() * sizeof(float));
             return a;
         };
-        nb::dict d;
-        d["slices"] = out;
         d["sino"] = mk(dbg.sino, {NG, DY, NX});
         d["weights"] = mk(dbg.weights, {NG, DY, NX});
         d["wbal"] = mk(dbg.wbal, {NG, DY, NX});
         d["filtered"] = mk(dbg.filtered, {DY, NG, NX});
         // the angles each slice is backprojected at (radians, GHBP / nabu sign: -the exact backprojector's)
         d["angles"] = mk(dbg.angles, {DY, NG});
-        if (timing) d["seconds"] = sec;
         return d;
     }
     static std::vector<FilterChain> chains_from(const nb::object& sweep) {
@@ -1021,11 +1126,19 @@ NB_MODULE(_core, m) {
         .def(nb::init<std::vector<ScanData>, const nb::dict&>(), "scans"_a, "config"_a)
         .def_prop_ro("info", &PySliceReconstructor::info)
         .def("reconstruct", &PySliceReconstructor::reconstruct, "h_lo"_a, "h_hi"_a, "debug"_a = false,
-             "timing"_a = false, "roi"_a = nb::none(), "next"_a = nb::none(),
+             "timing"_a = false, "roi"_a = nb::none(), "next"_a = nb::none(), "uint8"_a = nb::none(), "float32"_a = true,
+             nb::arg("progress").none() = nb::none(), "mask"_a = nb::none(), "region"_a = nb::none(),
              "slices for view heights [h_lo, h_hi) -> (n, N, N), or (n, y1 - y0, x1 - x0) with roi=(x0, x1, y0, y1); "
-             "debug=True returns a dict with intermediates; timing=True returns a dict with 'slices' and per-stage "
-             "'seconds' (GPU synchronised per stage); next=(h_lo, h_hi): the chunk that will follow, read in the "
-             "background (CUDA)")
+             "uint8=(lo, hi, zero_outside): also the uint8 slices of that window (to_uint8; 0 outside the "
+             "reconstruction disk with zero_outside), converted on the device with CUDA -> (float32, uint8), or the "
+             "uint8 slices alone with float32=False; "
+             "debug=True returns a dict with intermediates; timing=True returns a dict with 'slices' / 'uint8' and "
+             "per-stage 'seconds' (GPU synchronised per stage); next=(h_lo, h_hi): the chunk that will follow, read "
+             "in the background (CUDA); progress: a ProgressBar advanced by one per slice; mask: the uint8 slices are 0 "
+             "where it is 0: a uint8 array of the output's shape, or an OutputMask (possibly coarser, e.g. "
+             "ReferenceMask.read); region=(x0, x1, y0, y1): only these pixels of the slice are computed, the rest of "
+             "the output is 0. With uint8 slices alone, only the pixels within the bounds of what the mask keeps are "
+             "computed (the others are 0 either way); the pixels computed are those of a whole-slice run")
         .def("reconstruct_band", &PySliceReconstructor::reconstruct_band, "h_lo"_a, "h_hi"_a, "band"_a,
              "timing"_a = false, "sweep"_a = nb::none(), "next"_a = nb::none(),
              "reconstruct the chunk [h_lo, h_hi) only at the band pixels `band` needs (exact backprojector) and "
@@ -1109,6 +1222,87 @@ NB_MODULE(_core, m) {
              },
              "file_index"_a, "frame_index"_a, "n_threads"_a = 0);
     m.def("minus_log", &minus_log_py, "x"_a, "clip_min"_a = 1e-6f, "clip_max"_a = 10.f, "device"_a = "cpu");
+    m.def("to_uint8", &to_uint8_py, "img"_a, "lo"_a, "hi"_a, "disk"_a = nb::none(), "device"_a = "cpu", "mask"_a = nb::none(),
+          "(..., ny, nx) float32 -> uint8: rint(clip((img - lo) / (hi - lo), 0, 1) * 255) in float32, NaN -> 0. "
+          "disk=(n, x0, y0): the frames are the ROI at (x0, y0) of (n, n) slices, 0 outside their reconstruction disk "
+          "(x - c)^2 + (y - c)^2 > (n // 2)^2, c = (n - 1) / 2; mask: the result is 0 where it is 0: a uint8 array of "
+          "img's shape, or an OutputMask over the frames (possibly coarser)");
+
+    nb::class_<PyOutputMask>(m, "OutputMask",
+                             "A mask of a chunk's uint8 slices, possibly coarser than them: output voxel (s, y, x) is 0 "
+                             "where array[(s + oz) // fz, (y + oy) // fy, (x + ox) // fx] is 0 (indices clamped)")
+        .def("__init__", [](PyOutputMask* self, nb::ndarray<const std::uint8_t, nb::ndim<3>, nb::c_contig, nb::device::cpu> a,
+                            std::array<int, 3> scale, std::array<int, 3> offset) {
+                 require(a.size() > 0 && scale[0] >= 1 && scale[1] >= 1 && scale[2] >= 1, "empty mask or scale < 1");
+                 new (self) PyOutputMask();
+                 self->m.data = a.data();
+                 self->m.nz = static_cast<int>(a.shape(0)); self->m.ny = static_cast<int>(a.shape(1)); self->m.nx = static_cast<int>(a.shape(2));
+                 self->m.fz = scale[0]; self->m.fy = scale[1]; self->m.fx = scale[2];
+                 self->m.oz = offset[0]; self->m.oy = offset[1]; self->m.ox = offset[2];
+                 self->keep = nb::cast(a);
+             }, "array"_a, "scale"_a = std::array<int, 3>{1, 1, 1}, "offset"_a = std::array<int, 3>{0, 0, 0})
+        .def_prop_ro("shape", [](const PyOutputMask& p) { return nb::make_tuple(p.m.nz, p.m.ny, p.m.nx); })
+        .def_prop_ro("scale", [](const PyOutputMask& p) { return nb::make_tuple(p.m.fz, p.m.fy, p.m.fx); })
+        .def_prop_ro("offset", [](const PyOutputMask& p) { return nb::make_tuple(p.m.oz, p.m.oy, p.m.ox); });
+
+    nb::class_<ReferenceMask>(m, "ReferenceMask",
+                              "The mask of a masked uint8 reference volume on the reconstruction's grid, read with "
+                              "vc_reader from any of its pyramid levels (`scale`; 0: full resolution). shape: the "
+                              "reconstruction's whole volume (z, y, x), which the reference's level 0 must have.")
+        .def("__init__", [](ReferenceMask* self, const std::string& location, int scale, std::array<std::int64_t, 3> shape,
+                            const std::string& cache_dir) {
+                 nb::gil_scoped_release nogil;
+                 new (self) ReferenceMask(location, scale, shape, cache_dir);
+             }, "location"_a, "scale"_a, "shape"_a, "cache_dir"_a = "")
+        .def_prop_ro("location", &ReferenceMask::location)
+        .def_prop_ro("scale", &ReferenceMask::scale)
+        .def_prop_ro("factors", &ReferenceMask::factors, "volume voxels per mask voxel (z, y, x)")
+        .def_prop_ro("level_shape", &ReferenceMask::level_shape)
+        .def("read", [](nb::object self, int z0, int z1, std::array<int, 4> roi, int slot) {
+                 auto& ref = nb::cast<ReferenceMask&>(self);
+                 PyOutputMask out;
+                 {
+                     nb::gil_scoped_release nogil;
+                     out.m = ref.read(z0, z1, SliceRoi{roi[0], roi[1], roi[2], roi[3]}, slot);
+                 }
+                 out.keep = self;
+                 return out;
+             }, "z0"_a, "z1"_a, "roi"_a, "slot"_a = 0,
+             "the OutputMask of volume slices [z0, z1) of roi = (x0, x1, y0, y1); its data is this object's buffer "
+             "`slot`, valid until the next read into that slot");
+
+    nb::class_<ProgressBar>(m, "ProgressBar",
+                            "tqdm-style terminal progress bar: redrawn in place on a terminal, one line every "
+                            "log_interval seconds otherwise. Thread-safe; usable as a context manager.")
+        .def("__init__", [](ProgressBar* self, std::uint64_t total, const std::string& desc, const std::string& unit,
+                            int fd, double min_interval, double log_interval, int width, std::optional<bool> terminal,
+                            bool leave) {
+                 ProgressBar::Options o;
+                 o.desc = desc;
+                 o.unit = unit;
+                 o.fd = fd;
+                 o.min_interval = min_interval;
+                 o.log_interval = log_interval;
+                 o.width = width;
+                 o.terminal = terminal ? (*terminal ? 1 : 0) : -1;
+                 o.leave = leave;
+                 new (self) ProgressBar(total, o);
+             }, "total"_a, "desc"_a = "", "unit"_a = "it", "fd"_a = 2, "min_interval"_a = 0.1, "log_interval"_a = 10.0,
+             "width"_a = 0, "terminal"_a = nb::none(), "leave"_a = true)
+        .def("update", [](ProgressBar& b, std::uint64_t n) { nb::gil_scoped_release nogil; b.update(n); }, "n"_a = 1)
+        .def("set_postfix", [](ProgressBar& b, const std::string& t) { nb::gil_scoped_release nogil; b.set_postfix(t); }, "text"_a)
+        .def("set_description", [](ProgressBar& b, const std::string& t) { nb::gil_scoped_release nogil; b.set_description(t); }, "desc"_a)
+        .def("write", [](ProgressBar& b, const std::string& t) { nb::gil_scoped_release nogil; b.write(t); }, "line"_a,
+             "print a line above the bar")
+        .def("refresh", [](ProgressBar& b) { nb::gil_scoped_release nogil; b.refresh(); })
+        .def("close", [](ProgressBar& b) { nb::gil_scoped_release nogil; b.close(); })
+        .def_prop_ro("count", &ProgressBar::count)
+        .def_prop_ro("total", &ProgressBar::total)
+        .def("__enter__", [](nb::object self) { return self; })
+        .def("__exit__", [](ProgressBar& b, nb::handle, nb::handle, nb::handle) { nb::gil_scoped_release nogil; b.close(); },
+             "type"_a.none(), "value"_a.none(), "traceback"_a.none())
+        .def_static("format", &ProgressBar::format, "n"_a, "total"_a, "elapsed"_a, "rate"_a, "desc"_a = "", "unit"_a = "it",
+                    "postfix"_a = "", "width"_a = 80, "unicode"_a = true, "the meter text");
     m.def("arc_deblur_taps", &arc_deblur_taps, "arc"_a, "radius"_a = 4,
           "Taps g[0..radius] of the inverse of an exposure arc of `arc` grid angles (1 / sinc(arc f), unit sum)");
     m.def("angular_fir", &angular_fir_py, "sino"_a, "taps"_a, "support"_a = nb::none(), "device"_a = "cpu",

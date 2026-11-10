@@ -67,4 +67,31 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
 }  // namespace cuda
 #endif
 
+// ------------------------------------------------------------ uint8 output
+// out[y, x] = rint(clamp((src[y, x] - lo) / (hi - lo), 0, 1) * 255) in float32 (ties to even), NaN -> 0.
+// With disk_n > 0 the rows are the ROI [x0, x0 + nx) x [y0, y0 + ny) of a (disk_n, disk_n) slice and the pixels
+// outside its reconstruction disk, (X - c)^2 + (Y - c)^2 > (disk_n / 2)^2 with c = (disk_n - 1) / 2, are 0.
+// With a mask the pixels whose mask element is 0 are 0: pixel (y, x) reads mask[(y + mask_oy) / mask_fy,
+// (x + mask_ox) / mask_fx], indices clamped to the (mask_ny, mask_nx) mask, so a mask coarser than the slice serves.
+// src: (ny, nx) rows at a pitch of src_pitch elements; out: (ny, nx) packed.
+struct Uint8Window {
+    // double: the kernels divide by float(hi - lo), the correctly rounded width of the window
+    double lo = 0.0, hi = 1.0;
+    int disk_n = 0, x0 = 0, y0 = 0;
+    const std::uint8_t* mask = nullptr;   // (mask_ny, mask_nx) packed, on the kernel's device
+    int mask_ny = 0, mask_nx = 0, mask_fy = 1, mask_fx = 1, mask_oy = 0, mask_ox = 0;
+};
+
+namespace cpu {
+void to_uint8(const float* src, std::size_t src_pitch, std::uint8_t* out, int ny, int nx, const Uint8Window& w);
+}  // namespace cpu
+
+#ifdef HELIREC_WITH_CUDA
+namespace cuda {
+// device pointers
+void to_uint8(const float* src, std::size_t src_pitch, std::uint8_t* out, int ny, int nx, const Uint8Window& w,
+              void* stream = nullptr);
+}  // namespace cuda
+#endif
+
 }  // namespace helirec

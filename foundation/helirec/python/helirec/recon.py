@@ -171,6 +171,8 @@ class HelicalRecon:
         scans = bliss.discover_scans(self.projections_dir)
         pair = bliss.pair_companions(scans)
         self.main, self.companion = pair["main"], pair["companion"]
+        self.log(f"scans: {self.main.name} ({len(self.main.unwrapped_angles_deg)} projections) + "
+                 f"{self.companion.name} ({len(self.companion.unwrapped_angles_deg)})")
         for s in (self.main, self.companion):
             s.check_files()
         given = dict(self.params)
@@ -296,12 +298,24 @@ class HelicalRecon:
         height = px_mm * ((rows - 1) / 2 - h) - z0 * 1e3
         return SliceInfo(fraction, h, 999999 - (self.hi - h), height)
 
-    def reconstruct_heights(self, h_lo: int, h_hi: int, debug=False, timing=False, roi=None, next=None):
+    def reconstruct_heights(self, h_lo: int, h_hi: int, debug=False, timing=False, roi=None, next=None, uint8=None,
+                            float32=True, progress=None, mask=None, region=None):
         """Slices [h_lo, h_hi) -> (n, N, N), or (n, y1 - y0, x1 - x0) with roi = (x0, x1, y0, y1).
         next = (h_lo, h_hi): the chunk the caller will ask for next; its raw data is read while this one computes
-        (CUDA)."""
+        (CUDA).
+        uint8 = (lo, hi): also the uint8 slices of that window (0 outside the reconstruction disk when the outer
+        circle is clipped), converted on the device -> (float32, uint8), or the uint8 slices alone with float32=False.
+        progress: a helirec.ProgressBar advanced by one per slice, its postfix the step in hand.
+        mask: the uint8 slices are 0 where it is 0: a uint8 array of the output's shape, or a helirec OutputMask
+        (possibly coarser: ReferenceMask.read, the mask of a masked reference volume).
+        region = (x0, x1, y0, y1): only these pixels of the slice are computed; the rest of the output is 0. With
+        uint8 slices alone and a mask, only the pixels within the bounds of what the mask keeps are computed."""
+        if uint8 is not None:   # (lo, hi), or (lo, hi, zero_outside) to say it outright
+            uint8 = (float(uint8[0]), float(uint8[1]),
+                     bool(uint8[2] if len(uint8) > 2 else self.params["clip_outer_circle"]))
         return self.rec.reconstruct(int(h_lo), int(h_hi), debug, timing, None if roi is None else tuple(map(int, roi)),
-                                    None if next is None else (int(next[0]), int(next[1])))
+                                    None if next is None else (int(next[0]), int(next[1])), uint8, float32, progress, mask,
+                                    None if region is None else tuple(map(int, region)))
 
     def reconstruct_fractions(self, fractions):
         out = []

@@ -45,21 +45,27 @@ pkg_check_modules(FFTW3 REQUIRED IMPORTED_TARGET fftw3)   # double precision: fi
 find_library(FFTW3F_OMP_LIB NAMES fftw3f_omp HINTS ${FFTW3F_LIBRARY_DIRS} REQUIRED)
 find_package(HDF5 REQUIRED COMPONENTS C)
 
-# vc-delta3d (lossless uint8 chunk codec of vc_reader / VC3D), pinned to the revision vc_reader uses
-# so that everything helirec writes is readable there. Offline builds: -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>
-option(HELIREC_DELTA3D "Build the vc-delta3d chunk codec (uint8 OME-Zarr output)" ON)
-if(HELIREC_DELTA3D)
-  include(FetchContent)
-  set(VC_DELTA3D_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
-  set(VC_DELTA3D_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  set(VC_DELTA3D_INSTALL_CPP OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(vc_delta3d
-    GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-    GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d)  # = vc_reader cmake/NativeReader.cmake pin
-  set(CMAKE_AUTOMOC OFF)
-  FetchContent_MakeAvailable(vc_delta3d)
-  set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# vc_reader's native library: Zarr reading and writing (codecs, pyramids, remote stores and their disk caches). An
+# installed package, or the sibling checkout built statically into helirec (the Python module then carries no shared
+# library of its own; its install rules stay out of helirec's).
+if(NOT TARGET vc_reader::reader)
+  find_package(vc_reader CONFIG QUIET)
 endif()
+if(NOT TARGET vc_reader::reader)
+  set(VC_READER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../vc_reader" CACHE PATH "vc_reader source checkout")
+  if(NOT EXISTS "${VC_READER_SOURCE}/CMakeLists.txt")
+    message(FATAL_ERROR "Install vc_reader or set VC_READER_SOURCE to its checkout")
+  endif()
+  set(VC_READER_BUILD_PYTHON OFF)
+  set(VC_READER_BUILD_READER ON)
+  set(VC_READER_BUILD_C_API OFF)
+  set(VC_READER_SHARED_READER OFF)
+  set(VC_READER_ENABLE_CUDA OFF)   # helirec reads and writes host arrays through it
+  add_subdirectory("${VC_READER_SOURCE}" "${CMAKE_BINARY_DIR}/vc_reader" EXCLUDE_FROM_ALL)
+endif()
+
+# vc-delta3d (lossless uint8 chunk codec of vc_reader / VC3D): the revision vc_reader builds with
+option(HELIREC_DELTA3D "Build the vc-delta3d chunk codec (uint8 OME-Zarr output)" ON)
 
 # ---------------------------------------------------------------- core library
 file(GLOB HELIREC_CPU_SOURCES CONFIGURE_DEPENDS src/core/*.cpp src/cpu/*.cpp src/io/*.cpp)
@@ -71,7 +77,9 @@ if(HELIREC_CPU_ARCH)
 endif()
 target_link_libraries(helirec
   PUBLIC OpenMP::OpenMP_CXX
-  PRIVATE PkgConfig::FFTW3F PkgConfig::FFTW3 ${FFTW3F_OMP_LIB} HDF5::HDF5)
+  PRIVATE PkgConfig::FFTW3F PkgConfig::FFTW3 ${FFTW3F_OMP_LIB} HDF5::HDF5 vc_reader::reader)
+# (vc_reader's headers are not written for -Wextra)
+set_source_files_properties(src/io/reference.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
 if(HELIREC_DELTA3D)
   target_link_libraries(helirec PRIVATE vc_delta3d::vc_delta3d)
   target_compile_definitions(helirec PRIVATE HELIREC_WITH_DELTA3D=1)

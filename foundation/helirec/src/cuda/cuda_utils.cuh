@@ -165,16 +165,23 @@ class PinnedBuffer {
 };
 
 // Device rows -> pageable host memory (e.g. a new NumPy array) through a pinned staging buffer: `rows` rows of
-// `width` elements at device pitch `src_pitch` elements, packed at `dst`. The host copy runs on several threads
-// (first-touch page faults of a fresh destination dominate a direct pageable copy).
+// `width` elements at device pitch `src_pitch` elements, to `dst` at a pitch of `dst_pitch` elements (0: packed). The
+// host copy runs on several threads (first-touch page faults of a fresh destination dominate a direct pageable copy).
 template <class T>
-void download_rows(T* dst, const T* src, std::size_t src_pitch, std::size_t width, std::size_t rows, PinnedBuffer<T>& stage) {
+void download_rows(T* dst, const T* src, std::size_t src_pitch, std::size_t width, std::size_t rows, PinnedBuffer<T>& stage,
+                   std::size_t dst_pitch = 0) {
     const std::size_t n = width * rows;
     stage.ensure(n);
     HELIREC_CUDA_CHECK(cudaMemcpy2D(stage.data(), width * sizeof(T), src, src_pitch * sizeof(T), width * sizeof(T), rows,
                                     cudaMemcpyDeviceToHost));
     const std::size_t step = std::size_t(1) << 20;
     const T* s = stage.data();
+    if (dst_pitch && dst_pitch != width) {
+#pragma omp parallel for schedule(static) num_threads(8)
+        for (std::ptrdiff_t r = 0; r < static_cast<std::ptrdiff_t>(rows); ++r)
+            std::copy(s + r * width, s + (r + 1) * width, dst + r * dst_pitch);
+        return;
+    }
 #pragma omp parallel for schedule(static) num_threads(8)
     for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>((n + step - 1) / step); ++i) {
         const std::size_t a = static_cast<std::size_t>(i) * step;

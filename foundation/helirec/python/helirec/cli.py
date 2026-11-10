@@ -58,8 +58,28 @@ def write_png_gray(path, img_u8):
 
 
 def to_u8(img, window=PREVIEW_WINDOW):
-    from .omezarr import to_uint8
-    return to_uint8(img, *window)
+    from . import to_uint8
+    return to_uint8(np.ascontiguousarray(img, np.float32), *window)
+
+
+def reference_mask(a, r):
+    """the --reference_volume mask on the reconstruction's grid (helirec.ReferenceMask), or None"""
+    if not a.reference_volume:
+        return None
+    from ._core import ReferenceMask
+    N = r.info["grid_size"]
+    try:
+        ref = ReferenceMask(a.reference_volume, a.reference_scale, (r.hi - r.lo, N, N), a.reference_cache or "")
+    except RuntimeError as e:
+        sys.exit(f"--reference_volume: {e}")
+    print(f"reference volume {a.reference_volume}: uint8 output masked where its level {ref.scale} "
+          f"({'x'.join(map(str, ref.level_shape))}, {'x'.join(map(str, ref.factors))} voxels each) is 0")
+    return ref
+
+
+def describe_reference(ref):
+    return dict(location=ref.location, scale=ref.scale, factors=list(ref.factors), level_shape=list(ref.level_shape))
+
 
 
 def downsample(img, size):
@@ -112,6 +132,7 @@ def contact_sheet(path, previews):
 # ------------------------------------------------------------------------------------------ modes
 def run_fractions(a, r, out, manifest):
     import tifffile
+    from . import ProgressBar
     if a.fractions:
         fractions = list(a.fractions)
     else:
@@ -122,44 +143,44 @@ def run_fractions(a, r, out, manifest):
     if not a.no_preview:
         os.makedirs(os.path.join(out, "preview"), exist_ok=True)
     previews = []
-    for i, f in enumerate(fractions):
-        si = r.slice_info(f)
-        t = time.time()
-        img = crop(r.reconstruct_heights(si.view_height, si.view_height + 1)[0], a.roi)
-        dt = time.time() - t
-        name = f"slice_f{f:.4f}"
-        entry = dict(name=name, fraction=f, view_height=si.view_height, z=si.view_height - r.lo,
-                     nabu_index=si.nabu_index, height_mm=si.height_mm, seconds=round(dt, 2))
-        if not a.uint8_only:
-            entry["tiff"] = os.path.join(out, name + ".tiff")
-            tifffile.imwrite(entry["tiff"], img)
-        u8 = to_u8(img, a.u8_window)
-        if a.uint8:
-            entry["tiff_uint8"] = os.path.join(out, name + "_uint8.tif")
-            tifffile.imwrite(entry["tiff_uint8"], u8)
-        path = entry.get("tiff", entry.get("tiff_uint8"))
-        if not a.no_preview:
-            entry["preview"] = os.path.join(out, "preview", name + ".png")
-            write_png_gray(entry["preview"], u8)
-            previews.append(to_u8(downsample(img, 512), a.u8_window))
-        manifest["slices"].append(entry)
-        print(f"[{i + 1}/{len(fractions)}] f={f:.4f} h={si.view_height} z={entry['z']} ({si.height_mm:.2f} mm) "
-              f"{dt:.1f}s -> {path}")
-        save_manifest(out, manifest)
+    with ProgressBar(len(fractions), "slices", "slice") as bar:
+        for f in fractions:
+            si = r.slice_info(f)
+            t = time.time()
+            N = r.info["grid_size"]
+            z = si.view_height - r.lo
+            mask = a.reference.read(z, z + 1, a.roi or (0, N, 0, N)) if a.reference else None
+            # (single slices keep their values outside the reconstruction disk)
+            img, u8 = r.reconstruct_heights(si.view_height, si.view_height + 1, roi=a.roi, progress=bar,
+                                            uint8=(*a.u8_window, False), mask=mask, region=a.bbox)
+            img, u8 = img[0], u8[0]
+            dt = time.time() - t
+            bar.set_postfix("write")
+            name = f"slice_f{f:.4f}"
+            entry = dict(name=name, fraction=f, view_height=si.view_height, z=si.view_height - r.lo,
+                         nabu_index=si.nabu_index, height_mm=si.height_mm, seconds=round(dt, 2))
+            if not a.uint8_only:
+                entry["tiff"] = os.path.join(out, name + ".tiff")
+                tifffile.imwrite(entry["tiff"], img)
+            if a.uint8:
+                entry["tiff_uint8"] = os.path.join(out, name + "_uint8.tif")
+                tifffile.imwrite(entry["tiff_uint8"], u8)
+            path = entry.get("tiff", entry.get("tiff_uint8"))
+            if not a.no_preview:
+                entry["preview"] = os.path.join(out, "preview", name + ".png")
+                write_png_gray(entry["preview"], u8)
+                previews.append(to_u8(downsample(img, 512), a.u8_window))
+            manifest["slices"].append(entry)
+            bar.write(f"f={f:.4f} h={si.view_height} z={entry['z']} ({si.height_mm:.2f} mm) {dt:.1f}s -> {path}")
+            save_manifest(out, manifest)
     if previews:
         contact_sheet(os.path.join(out, "contact_sheet.png"), previews)
 
 
-def crop(img, roi):
-    if roi is None:
-        return img
-    x0, x1, y0, y1 = roi
-    return np.ascontiguousarray(img[..., y0:y1, x0:x1])
-
-
 def run_range(a, r, out, manifest):
     import tifffile
-    from .omezarr import OmeZarrWriter, outside_disk, to_uint8
+    from . import ProgressBar
+    from .omezarr import OmeZarrWriter
     if a.z is not None:
         h0, h1 = a.z[0] + r.lo, a.z[1] + r.lo
     else:
@@ -173,13 +194,18 @@ def run_range(a, r, out, manifest):
     n = h1 - h0
     shape = (n, y1 - y0, x1 - x0)
     z0 = h0 - r.lo
-    outside = outside_disk(N, (x0, x1, y0, y1)) if r.params["clip_outer_circle"] else None
     manifest.update(view_heights=[h0, h1], z=[z0, z0 + n], roi_xyxy=[x0, x1, y0, y1], shape_zyx=list(shape),
                     chunk=a.chunk, format=a.format)
+    if a.reference:
+        manifest["reference_volume"] = describe_reference(a.reference)
+    if a.bbox:
+        manifest["bbox_xyxy"] = list(a.bbox)
     writers = []
     provenance = {"helirec": {k: manifest[k] for k in ("created", "projections", "mode", "params", "provenance",
                                                      "view_heights", "z", "roi_xyxy", "chunk")},
                   "helirec_calibration": manifest["calibration"]}
+    u8_attrs = {"helirec_uint8_window": list(a.u8_window),
+                **({"helirec_reference_volume": describe_reference(a.reference)} if a.reference else {})}
     vox = r.main.pixel_size_m * 1e6
     if a.format == "zarr":
         chunks = tuple(a.zarr_chunks) if a.zarr_chunks else (128, 128, 128)  # 32-aligned for vc-delta3d presets
@@ -191,8 +217,7 @@ def run_range(a, r, out, manifest):
             writers.append(("uint8", OmeZarrWriter(os.path.join(out, "volume_uint8.zarr"), shape, np.uint8, chunks,
                                                    vox, (z0, y0, x0), a.levels, a.u8_compression,
                                                    delta3d_preset=a.u8_delta3d_preset,
-                                                   name=f"{a.tag} uint8", attrs={**provenance,
-                                                   "helirec_uint8_window": list(a.u8_window)},
+                                                   name=f"{a.tag} uint8", attrs={**provenance, **u8_attrs},
                                                    overwrite=a.overwrite)))
         manifest["outputs"] = {k: w.path for k, w in writers}
     else:
@@ -202,36 +227,61 @@ def run_range(a, r, out, manifest):
             os.makedirs(d, exist_ok=True)
     save_manifest(out, manifest)
     t_all = time.time()
-    done = 0
     mid_preview = None
-    for c0 in range(h0, h1, a.chunk):
-        c1 = min(h1, c0 + a.chunk)
-        t = time.time()
-        vol = crop(r.reconstruct_heights(c0, c1, next=(c1, min(h1, c1 + a.chunk)) if c1 < h1 else None), (x0, x1, y0, y1))
-        t_rec = time.time() - t
-        zc = c0 - h0  # index inside the output
-        if a.format == "zarr":
-            for kind, w in writers:
-                w.write(zc, vol if kind == "float32" else to_uint8(vol, *a.u8_window, outside=outside))
-        else:
-            for k in range(vol.shape[0]):
-                zz = c0 + k - r.lo
-                if not a.uint8_only:
-                    tifffile.imwrite(os.path.join(out, "float32", f"z{zz:05d}.tiff"), vol[k])
-                if a.uint8:
-                    tifffile.imwrite(os.path.join(out, "uint8", f"z{zz:05d}.tif"),
-                                     to_uint8(vol[k], *a.u8_window, outside=outside))
-        if mid_preview is None and c0 <= (h0 + h1) // 2 < c1:
-            mid_preview = vol[(h0 + h1) // 2 - c0]
-        done += c1 - c0
-        el = time.time() - t_all
-        print(f"  z {c0 - r.lo}..{c1 - r.lo - 1} (h {c0}..{c1 - 1}): recon {t_rec:.1f}s, total {el:.0f}s, "
-              f"{done}/{n} slices, ETA {el / done * (n - done):.0f}s", flush=True)
+    roi = (x0, x1, y0, y1) if a.roi else None
+    # the reference volume's mask of a chunk is read while the chunk before it reconstructs (two buffers in turn)
+    from concurrent.futures import ThreadPoolExecutor
+    chunks = [(c0, min(h1, c0 + a.chunk)) for c0 in range(h0, h1, a.chunk)]
+    reader = ThreadPoolExecutor(1) if a.reference else None
+
+    def read_mask(i):
+        c0, c1 = chunks[i]
+        return reader.submit(a.reference.read, c0 - r.lo, c1 - r.lo, (x0, x1, y0, y1), i % 2)
+
+    pending = read_mask(0) if reader else None
+    with ProgressBar(n, "reconstruct", "slice") as bar:
+        for i, (c0, c1) in enumerate(chunks):
+            mask = None
+            if reader:
+                mask = pending.result()
+                pending = read_mask(i + 1) if i + 1 < len(chunks) else None
+            # float32 and / or uint8 slices: the uint8 ones are converted on the device
+            res = r.reconstruct_heights(c0, c1, roi=roi, next=chunks[i + 1] if i + 1 < len(chunks) else None,
+                                        uint8=a.u8_window if a.uint8 else None, float32=not a.uint8_only, progress=bar,
+                                        mask=mask, region=a.bbox)
+            vol, vol8 = res if a.uint8 and not a.uint8_only else (None, res) if a.uint8 else (res, None)
+            bar.set_postfix("write")
+            zc = c0 - h0  # index inside the output
+            if a.format == "zarr":
+                for kind, w in writers:
+                    w.write(zc, vol if kind == "float32" else vol8)
+            else:
+                for k in range(c1 - c0):
+                    zz = c0 + k - r.lo
+                    if not a.uint8_only:
+                        tifffile.imwrite(os.path.join(out, "float32", f"z{zz:05d}.tiff"), vol[k])
+                    if a.uint8:
+                        tifffile.imwrite(os.path.join(out, "uint8", f"z{zz:05d}.tif"), vol8[k])
+            if mid_preview is None and c0 <= (h0 + h1) // 2 < c1 and not a.no_preview:
+                k = (h0 + h1) // 2 - c0
+                mid_preview = vol8[k] if a.uint8_only else to_u8(vol[k], a.u8_window)
+    if reader:
+        reader.shutdown()
     for kind, w in writers:
-        w.close()
+        bars = []   # one bar per pyramid level
+
+        def level(l, slabs, kind=kind, bars=bars):
+            for b in bars:
+                b.close()
+            bars.append(ProgressBar(slabs, f"{kind} level {l}", "slab"))
+            return bars[-1].update
+
+        w.close(progress=level)
+        for b in bars:
+            b.close()
         manifest.setdefault("chunks_written", {})[kind] = dict(written=w.n_written, skipped_empty=w.n_skipped)
-    if mid_preview is not None and not a.no_preview:
-        write_png_gray(os.path.join(out, "preview_mid.png"), to_u8(mid_preview, a.u8_window))
+    if mid_preview is not None:
+        write_png_gray(os.path.join(out, "preview_mid.png"), mid_preview)
     manifest["seconds"] = round(time.time() - t_all, 1)
     save_manifest(out, manifest)
 
@@ -265,6 +315,18 @@ def main(argv=None):
     out.add_argument("--u8_window", nargs=2, type=float, default=None, metavar=("LO", "HI"),
                      help="float window mapped to 0..255 (default: the reference window, in the run's "
                           "units: [-0.06, 0.29] cm^-1, or [-0.03, 0.145] in mode legacy_reference)")
+    sel.add_argument("--bbox", nargs=4, type=int, metavar=("X0", "X1", "Y0", "Y1"),
+                     help="reconstruct only the pixels [X0, X1) x [Y0, Y1) of each slice; the output keeps its shape "
+                          "(--roi crops it) and is 0 elsewhere")
+    out.add_argument("--reference_volume", default=None, metavar="ZARR",
+                     help="a masked uint8 volume on the reconstruction's grid (a local or http(s):// / s3:// Zarr array "
+                          "or OME-Zarr, read with vc_reader): the uint8 output is 0 where it is 0, so its mask need "
+                          "not be redone")
+    out.add_argument("--reference_scale", type=int, default=0, metavar="LEVEL",
+                     help="pyramid level of --reference_volume that decides the mask (default 0, full resolution): a "
+                          "coarser level is a much smaller read and marks the same area to within its voxel size")
+    out.add_argument("--reference_cache", default=None, metavar="DIR",
+                     help="vc_reader disk cache for a remote --reference_volume")
     out.add_argument("--chunk", type=int, default=32, help="range mode: slices reconstructed together (default 32)")
     out.add_argument("--zarr_chunks", nargs=3, type=int, metavar=("CZ", "CY", "CX"),
                      help="OME-Zarr chunk shape (default 128 128 128; keep multiples of 32 for vc-delta3d presets)")
@@ -316,6 +378,8 @@ def main(argv=None):
     if a.chunk < 1:
         sys.exit("--chunk must be >= 1")
     a.uint8 = a.uint8 or a.uint8_only
+    if a.reference_volume and not a.uint8:
+        sys.exit("--reference_volume masks the uint8 output: add --uint8 or --uint8_only")
 
     from .recon import HelicalRecon
     a.tag = a.tag or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -337,6 +401,10 @@ def main(argv=None):
         a.u8_window = display_window(r.params["mode"])
     print(f"setup {time.time() - t0:.1f}s: doable view heights [{r.lo}, {r.hi}) (z 0..{r.hi - r.lo - 1}), "
           f"rotation axis {r.cal.rot_center}, grid {r.info['grid_size']}, margin {r.info['margin']}")
+    a.reference = reference_mask(a, r)
+    N = r.info["grid_size"]
+    if a.bbox and not (0 <= a.bbox[0] < a.bbox[1] <= N and 0 <= a.bbox[2] < a.bbox[3] <= N):
+        sys.exit(f"--bbox must lie within [0, {N}]")
     manifest = dict(created=datetime.datetime.now().isoformat(timespec="seconds"),
                     projections=os.path.abspath(a.projections), device=a.device, mode=r.params["mode"], params=r.params,
                     provenance=r.provenance(), calibration=json.loads(r.cal.to_json()),

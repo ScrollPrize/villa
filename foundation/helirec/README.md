@@ -50,6 +50,17 @@ helirec-slices PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif       
   cm⁻¹; [−0.03, 0.145] in `legacy_reference`), 0 outside the reconstruction disk, compressed losslessly with
   vc-delta3d (`{"id": "vc-delta3d", "quant": 1}`, preset `fast`; `--u8_delta3d_preset delta` writes D3D1 frames
   for older readers). Chunks default to 128³ (keep multiples of 32). All-fill chunks are not written.
+* The uint8 slices are converted on the device (`to_uint8`, `SliceReconstructor.reconstruct(uint8=...)`): a
+  `--uint8_only` run downloads one byte per voxel and keeps no float32 volume on the host.
+* `--reference_volume ZARR` reuses the mask of a masked uint8 volume on the same grid (e.g. the published volume of
+  the scan): the uint8 output is 0 wherever the reference is 0; the float32 output is not masked. The reference's
+  level 0 must have the reconstruction's full shape (z, y, x). `--reference_scale LEVEL` takes the mask from a coarser
+  pyramid level instead (each of its voxels decides the block of output voxels it covers), which is a far smaller
+  read: an 8x level is 1/512 of the data. The reference is read in C++ with vc_reader (`helirec::ReferenceMask`: a
+  local path, or an `http(s)://` / `s3://` location with `--reference_cache DIR` as its disk cache).
+* Progress is a bar per multi-part step (calibration reductions and searches, slices, pyramid levels) with the step
+  in hand after the rate; when the output is not a terminal it is one line every 10 s (`helirec.ProgressBar`, the
+  C++ `helirec::ProgressBar`).
 * In `legacy_reference`, chunked slices inherit the reference Paganin kernel's chunk-height dependence (a small
   uniform offset compared with single-slice runs) and the luminosity window clipped to the chunk; the default mode
   has neither (it reads the window's 12 context rows either side of a chunk).
@@ -444,8 +455,10 @@ whole-slice methods, and regression checks of the corrected conventions (`tests/
 
 ## Build
 
-Requirements: CMake ≥ 3.24, a C++17 compiler, FFTW3 (float + double), HDF5 (C), Python ≥ 3.10, and optionally
-the CUDA toolkit. CUDA code is compiled for the build machine's GPU (`native`); override with
+Requirements: CMake ≥ 3.24, a C++20 compiler, FFTW3 (float + double), HDF5 (C), Python ≥ 3.10, the libraries
+vc_reader's native library needs (libcurl, blosc, zstd, lz4, SQLite3, nlohmann-json, zlib, libtiff, libpng, libjpeg),
+and optionally the CUDA toolkit. vc_reader's native library is built from `../../vc_reader` into helirec (or an
+installed `vc_reader` CMake package is used). CUDA code is compiled for the build machine's GPU (`native`); override with
 `-DCMAKE_CUDA_ARCHITECTURES=...`. `HELIREC_CUDA=AUTO` (default) builds CUDA only if `nvcc` is found, so put it on
 `PATH` (or pass `-C cmake.define.HELIREC_CUDA=ON`); check with `helirec.devices()`.
 
