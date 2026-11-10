@@ -2,7 +2,6 @@
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
-#include "internal/Database.hpp"
 #include <algorithm>
 #include <tuple>
 
@@ -78,15 +77,22 @@ ResourceWrite prepareResourceWrite(const StoreReader& reader, ObjectRecord recor
 
 // Write `record` over the object's current version `version` (created when
 // it is not in the store; restored first when `restore`), in one checked request.
-void writeRecord(ObjectStoreSession& session, const AttachmentIdentity& attachment, const ObjectRecord& record,
-                 const std::optional<int64_t>& version, const std::optional<ObjectRecord>& existing, bool restore = false)
+void appendRecordWrite(TransactionRequest& request, const ObjectRecord& record,
+                       const std::optional<int64_t>& version, const std::optional<ObjectRecord>& existing,
+                       bool restore)
 {
-    auto request = session.newRequest(attachment);
     request.expectedObjects[util::canonicalUuid(record.uuid)] = version;
     if (existing) expectObject(request, existing->reference());
     if (restore) request.operations.push_back(RestoreObjectOp{record.uuid, std::nullopt});
     if (existing) request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
     else request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
+}
+
+void writeRecord(ObjectStoreSession& session, const AttachmentIdentity& attachment, const ObjectRecord& record,
+                 const std::optional<int64_t>& version, const std::optional<ObjectRecord>& existing, bool restore = false)
+{
+    auto request = session.newRequest(attachment);
+    appendRecordWrite(request, record, version, existing, restore);
     session.submit(attachment, request);
 }
 } // namespace
@@ -215,14 +221,25 @@ ObjectRecord resolveProjectResourceIdentity(const StoreReader& reader, ObjectRec
     return record;
 }
 
-std::string addProjectResource(ObjectStore& db, WriteTxn& txn, ObjectRecord record)
+std::string addProjectResource(ObjectStore& db, ObjectRecord record)
 {
-    auto write = prepareResourceWrite(LocalStoreReader(db, txn), std::move(record));
-    if (write.unchanged()) return write.record.uuid;
-    detail::Savepoint operation(ObjectStoreImplAccess::conn(txn));
-    if (write.restore()) db.restoreObject(txn, write.record.uuid);
-    auto uuid = db.upsertObject(txn, write.record);
-    operation.release();
+    TransactionRequest request;
+    std::string uuid;
+    {
+        auto txn = db.read();
+        LocalStoreReader reader(db, txn);
+        auto write = prepareResourceWrite(reader, std::move(record));
+        uuid = write.record.uuid;
+        if (write.unchanged()) return uuid;
+        const auto status = reader.status();
+        request.requestUuid = util::newUuid();
+        request.storeUuid = status.storeUuid;
+        request.generation = status.generation;
+        request.author = db.author();
+        appendRecordWrite(request, write.record, write.existing ? write.existing->version :
+                          currentVersionOf(reader, uuid), write.existing, write.restore());
+    }
+    db.submit(request);
     return uuid;
 }
 

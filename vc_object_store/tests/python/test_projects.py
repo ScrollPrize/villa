@@ -43,7 +43,7 @@ def test_resource_identity_distinguishes_location_and_owner(db):
 
 def test_readding_retired_resource_restores_visibility(db):
     uuid = db.add_project_resource("volume", "/scan", owner="alice")
-    with db.write() as writer:
+    with db.write(expected_versions={uuid: db.current_version(uuid)}) as writer:
         writer.retire_object(uuid)
     assert db.project_resources("volume") == []
     assert db.add_project_resource("volume", "/scan", owner="alice", meta={"checked": True}) == uuid

@@ -75,7 +75,7 @@ ObjectRecord projectResourceRecord(const std::string& kind, const std::string& l
 ObjectRecord resolveProjectResourceIdentity(const StoreReader&, ObjectRecord);
 // Direct-store counterpart of the checked session helper, with the same
 // identity and retirement rules. Returns the actual stored UUID.
-std::string addProjectResource(ObjectStore&, WriteTxn&, ObjectRecord);
+std::string addProjectResource(ObjectStore&, ObjectRecord);
 // Add a resource (or bring back a removed one) with these tags and meta, shared
 // or `owner`'s; false when it is already there, unchanged.
 bool addProjectResource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& kind,
