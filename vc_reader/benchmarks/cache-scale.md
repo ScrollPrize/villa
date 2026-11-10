@@ -16,6 +16,8 @@ For one uint8 channel in 16³ chunks:
 
 `MAINTENANCE=0` selects synchronous eviction. Positive values select background workers with foreground assistance. `SCAN=0` uses full-directory oldest-16 cohorts; positive values select the oldest available tail from a bounded randomized-start scan, with age-dependent batch size. `PROFILE=1` enables lock wait/hold instrumentation; use separate diagnostic runs because profiling changes throughput.
 
+With sampled maintenance enabled, the writer tries one inline batch at the eviction watermark before waking background maintenance. It uses the same victim selection and byte accounting as background maintenance. A busy inline reclaimer or a batch that cannot get below the watermark falls back to background maintenance. No worker-count cutoff is involved. The stderr log counts completed inline batches by case and window.
+
 `WINDOWS` defaults to six and accepts 1–15. Use fifteen 2-second windows for larger capacities that have not stabilized after twelve seconds; this gives thirty seconds per pressure workload.
 
 Parallel prefill is outside measurement, reports progress and peak RSS, and aborts at 60 seconds if the requested entry count cannot be constructed. An incomplete prefill is not a result for that capacity. Keys retain the synthetic volume/chunk/channel string format. There is no giant additional key vector or payload array.
@@ -33,6 +35,8 @@ Aggregate last-window throughput with mean, median and range; inspect p99, hit r
 ```bash
 python benchmarks/run_cache_suite.py --virtual --binary build/bench_cache_scale --output /path/to/new/results
 ```
+
+Use `--capacities 512 --workers 1 64 192` to run only selected worker counts on the largest fixture.
 
 This runs all thirteen workload types at 0.25, 64 and 512 GiB equivalent capacity, with foreground worker counts 1, 8, 32, 64, available CPU count, twice CPU count and ten times CPU count. `--workers` can override that matrix. Shards remain fixed at the CPU count, with four maintenance workers and an eight-tail candidate scan: only foreground concurrency varies. Each ordinary case runs six consecutive two-second windows; the compact and per-capacity scaling tables use the median of the last three and retain every window, latency, hit count and sampled excess. These windows show whether the workload has stabilized; they are not independent repetitions. The suite allows up to 300 seconds for setup (`--prefill-seconds`), because constructing 134 million entries on one worker can exceed the standalone native default of sixty seconds. The total timeout adds 180 seconds for measurements. Failures remain explicit while the other combinations continue. Optional headroom draining is never awaited.
 

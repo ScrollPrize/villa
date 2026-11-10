@@ -27,6 +27,18 @@ public:
         order_.splice(order_.begin(), order_, it->second);
         return &it->second->value;
     }
+    // Leave accounting and node allocation unchanged on equal-cost updates.
+    struct Replacement { const T* existing; std::size_t cost; bool replaced; };
+    template<class Replace>
+    Replacement replace_same_cost(const Key& key, std::size_t cost, Replace&& replace)
+    {
+        const auto it = index_.find(key);
+        if (it == index_.end()) return {nullptr, 0, false};
+        if (it->second->cost != cost) return {&it->second->value, it->second->cost, false};
+        replace(it->second->value);
+        order_.splice(order_.begin(), order_, it->second);
+        return {nullptr, cost, true};
+    }
     void put(const Key& key, T value, std::size_t cost)
     {
         if (cost > limit_) return;
@@ -71,10 +83,6 @@ public:
     std::size_t limit() const { return limit_; }
     std::size_t oldest_cost() const { return order_.empty() ? 0 : order_.back().cost; }
     const T* oldest() const { return order_.empty() ? nullptr : &order_.back().value; }
-    std::size_t cost(const Key& key) const {
-        const auto it=index_.find(key);
-        return it==index_.end()?0:it->second->cost;
-    }
     T take_oldest() {
         T result=std::move(order_.back().value);
         pop_oldest();

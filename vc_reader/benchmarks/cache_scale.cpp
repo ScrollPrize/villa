@@ -59,7 +59,15 @@ int main(int argc,char** argv) {
         const auto resident=cache_ptr?cache_ptr->nbytes():0;
         return 2*target_budget.load()-std::min(2*target_budget.load(),resident);
     };
-    auto owner=full?std::make_unique<vcr::MemoryCache>(options,shards):std::make_unique<vcr::MemoryCache>(full_budget,shards);
+    // Measure identical synchronous prefill before enabling the chosen policy.
+    auto make_cache=[&](auto&& setting) {
+#ifdef VCR_BENCH_PRE_READER
+        return std::make_unique<vcr::MemoryCache>(setting,shards);
+#else
+        return std::make_unique<vcr::MemoryCache>(setting,shards,false);
+#endif
+    };
+    auto owner=full?make_cache(options):make_cache(full_budget);
     auto& cache=*owner;cache_ptr=&cache;
     // One reference-count block per producer, not a single contended shared_ptr.
     std::vector<vcr::ChunkPtr> payloads;
@@ -193,6 +201,10 @@ int main(int argc,char** argv) {
         std::cout<<entries<<','<<workers<<','<<shards<<','<<maintenance<<','<<mode<<','<<repeat<<','<<elapsed<<','<<sum.ops/elapsed<<','<<sum.reads<<','<<sum.hits<<','<<sum.puts<<','<<q(.5)<<','<<q(.95)<<','<<q(.99)<<','<<after.evicted_entries-before.evicted_entries<<','<<after.batches-before.batches<<','<<after.selection_scans-before.selection_scans<<','<<after.reclaim_claims-before.reclaim_claims<<','<<after.assist_puts-before.assist_puts<<','<<after.headroom_bytes<<','<<cache.nbytes()<<','<<drain_seconds<<','<<prof_after.get.wait_ns-prof_before.get.wait_ns<<','<<prof_after.put.wait_ns-prof_before.put.wait_ns<<','<<prof_after.get.hold_ns-prof_before.get.hold_ns<<','<<prof_after.put.hold_ns-prof_before.put.hold_ns<<','<<end_resident<<','<<end_reclaiming<<','<<overshoot.load()<<std::endl;
         if(maintenance && overshoot.load()) {std::cerr<<"hard capacity violation"<<std::endl;std::_Exit(5);}
         std::cerr<<"peak_rss_bytes,"<<mode<<','<<peak_rss_bytes()<<std::endl;
+#ifndef VCR_BENCH_PRE_READER
+        if(after.inline_batches!=before.inline_batches)
+            std::cerr<<"inline_batches,"<<mode<<','<<repeat<<','<<after.inline_batches-before.inline_batches<<std::endl;
+#endif
     }
     // This standalone, memory-only benchmark can hold 134 million entries.
     // Let the OS reclaim the large fixture instead of timing serial destructors.

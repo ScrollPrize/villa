@@ -11,7 +11,7 @@ int main() {
             options.available=[&]{return available.load();};
             options.smoothing_seconds=0;
             options.refresh_interval=std::chrono::hours(24);
-            vcr::MemoryCache cache(options,32);
+            vcr::MemoryCache cache(options,32,false);
             cache.enable_maintenance(workers,scan);
             std::vector<std::thread> producers;
             for(int t=0;t<8;++t)producers.emplace_back([&,t]{
@@ -43,7 +43,7 @@ int main() {
             options.refresh_interval=std::chrono::hours(24);
             // Sampling is not a global-LRU guarantee. Verify its chosen-shard
             // ordering here; multi-shard hit retention is a benchmark metric.
-            vcr::MemoryCache cache(options,scan?1:32);
+            vcr::MemoryCache cache(options,scan?1:32,false);
             for(int i=0;i<800;++i)cache.put(std::to_string(i),std::make_shared<vcr::Chunk>(256));
             cache.enable_maintenance(4,scan);
             std::this_thread::sleep_for(std::chrono::milliseconds(4));
@@ -54,11 +54,13 @@ int main() {
         }
         // An outstanding reader retains a payload after its cache entry leaves.
         vcr::MemoryCache cache(4096,8);
-        cache.enable_maintenance(2);
         auto held=std::make_shared<vcr::Chunk>(256,93);
         cache.put("held",held);
         auto retained=cache.get("held").second;
         require(retained!=nullptr,"initial admission failed");
+        cache.put("held",std::make_shared<vcr::Chunk>(256,17));
+        require(cache.nbytes()==256 && cache.size()==1 && cache.get("held").second->at(0)==17,
+                "equal-cost replacement changed accounting or failed to update the entry");
         for(int i=0;i<10000;++i)cache.put(std::to_string(i),std::make_shared<vcr::Chunk>(256));
         require(cache.wait_for_maintenance() && retained->at(0)==93,"eviction invalidated reader payload");
         cache.put("large",std::make_shared<vcr::Chunk>(4096,19));
