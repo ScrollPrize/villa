@@ -29,6 +29,33 @@ def load(path, log=None, **overrides):
     return osi.load_fit_inputs(fit_config(path, **overrides), log=lines.append)
 
 
+def test_umbilicus_owner_survives_request_manifest_and_commit(tmp_path):
+    import threading
+    import uuid
+    from fit_session import SpiralProject
+    from spiral_service import ServiceState
+    from service_project import project, UMBILICUS
+
+    manifests = []
+    for owner in (str(uuid.uuid4()), str(uuid.uuid4())):
+        selected = dict(UMBILICUS, store=owner)
+        parsed = SpiralProject.from_mapping(project(umbilicus=selected))
+        assert parsed.to_mapping()['volumes'][VOLUME]['umbilicus'] == selected
+        manifest = parsed.record(VOLUME)
+        assert manifest['umbilicus']['store'] == owner
+        manifests.append(manifest)
+        input_path = tmp_path / 'inputs.json'
+        input_path.write_text(json.dumps({'manifest': {'volume_uuid': VOLUME}}))
+        state = SimpleNamespace(lock=threading.RLock(), session_id='s',
+                                session=SimpleNamespace(status=lambda: dict(
+                                    input_manifest_path=str(input_path), input_digest='digest')),
+                                session_request={'project': dict(umbilicus=selected)},
+                                object_store=SimpleNamespace(author='test'))
+        context = ServiceState._commit_context(state, 's', 1, 'hash')
+        assert context.umbilicus == {key: selected[key] for key in ('store', 'uuid', 'generation', 'version')}
+    assert manifests[0] != manifests[1]
+
+
 def test_default_refresh_writes_links_and_freezes_the_inputs(store_path):
     log = []
     inputs = load(store_path, log)

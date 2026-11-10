@@ -984,20 +984,21 @@ PROJECT_INPUT_KEYS = (*PROJECT_LASAGNA_INPUTS, *VOLUME_INPUT_KEYS)
 @dataclass(frozen=True)
 class ProjectUmbilicus:
     """A volume's umbilicus in the project's umbilicus store: its object,
-    the numbered version (and history generation) VC3D read and its points
+    its owning store, numbered version and history generation, and its points
     in the volume's own voxels (ZYX)."""
 
     uuid: str
     generation: str
     version: int
     points_zyx: tuple[tuple[float, float, float], ...]
+    store: str = ""  # absent only in legacy requests; never infer the attachment owner
 
     def manifest(self) -> dict[str, Any]:
-        return {"uuid": self.uuid, "generation": self.generation, "version": self.version,
+        return {"store": self.store, "uuid": self.uuid, "generation": self.generation, "version": self.version,
                 "points": len(self.points_zyx)}
 
     def to_mapping(self) -> dict[str, Any]:
-        return {"uuid": self.uuid, "generation": self.generation, "version": self.version,
+        return {"store": self.store, "uuid": self.uuid, "generation": self.generation, "version": self.version,
                 "points_zyx": [list(point) for point in self.points_zyx]}
 
 
@@ -1252,7 +1253,8 @@ def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
                               for point in points):
         raise ScrollSpecError(
             f"{source}: umbilicus points_zyx must be two or more finite ZYX points")
-    return ProjectUmbilicus(uuid=uuid, generation=generation, version=int(version), points_zyx=points)
+    return ProjectUmbilicus(uuid=uuid, generation=generation, version=int(version), points_zyx=points,
+                            store=str(value.get("store") or "").strip())
 
 
 @dataclass(frozen=True)

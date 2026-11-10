@@ -313,6 +313,11 @@ def adapter_metadata(kind, meta, fiber=None, track=None):
     everything materialization reads, so its hash identifies the object's
     input content in any copy of the store. Other metadata (review notes, ingest
     diagnostics) does not reach the fit and does not change the digest.
+
+    This fit-protocol projection is mirrored by VC3D's ``adapterMetadata``;
+    ``test_spiral_store_inputs`` checks parity for coordinates, source tuning,
+    sampling group and fiber/track family fields. These are Spiral semantics,
+    not store identity/placement rules, so they do not belong in vcobj's schema.
     """
     meta = meta or {}
     source = meta.get('source') or {}
@@ -1099,14 +1104,11 @@ def _surface_zyxs(store, obj, what):
     points = arrays['points']
     if points.ndim != 3 or points.shape[-1] != 3:
         raise ObjectStoreInputError([f'{what} {obj.uuid} points have shape {points.shape}'])
-    invalid = np.all(points == -1, axis=-1)
-    if 'valid' in arrays:
-        # The store's per-vertex validity channel (ingested from mask.tif):
-        # zero marks a hole even where coordinates remain.
-        if arrays['valid'].shape != invalid.shape:
-            raise ObjectStoreInputError(
-                [f'{what} {obj.uuid} validity has shape {arrays["valid"].shape}'])
-        invalid |= arrays['valid'] == 0
+    from vc_object_store import Surface
+    validity = arrays.get('valid')
+    surface = Surface.from_arrays(np.ascontiguousarray(points, dtype='<f4'), attributes['scale'],
+                                  None if validity is None else np.ascontiguousarray(validity, dtype='u1'))
+    invalid = ~surface.valid_mask()
     return (obj.frame.xyz_to_fit_zyx(points, invalid), invalid,
             obj.frame.grid_scale_to_fit(attributes['scale']))
 
@@ -1517,14 +1519,12 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
     def pinned(rel):
         a, b = rel.stored_order or (rel.a, rel.b)
         anchors = {rel.a: rel.a_anchor, rel.b: rel.b_anchor}
-        return {'uuid': rel.uuid, 'a': a, 'b': b,
+        return {'uuid': rel.uuid,
                 'whole_geometry': all(bool((anchors[end] or {}).get('whole_geometry'))
                                       for end in (a, b)),
                 'meta': json.dumps(rel.meta),
-                'a_object_meta': json.dumps(snapshot.objects[a].meta),
-                'b_object_meta': json.dumps(snapshot.objects[b].meta),
-                'a_geometry_revision': snapshot.objects[a].geometry_revision,
-                'b_geometry_revision': snapshot.objects[b].geometry_revision}
+                'a_reference': snapshot.objects[a].reference,
+                'b_reference': snapshot.objects[b].reference}
     fit_scale = snapshot.request.fit_scale
     results = store.overlap_correspondences_at(
         [pinned(rel) for rel in edges.values()], snapshot.volume_uuid,

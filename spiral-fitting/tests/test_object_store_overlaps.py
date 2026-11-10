@@ -162,15 +162,15 @@ def test_materialization_errors_and_stale_geometry_are_reported(db):
         osi.materialize(db, snapshot, z_begin=0, z_end=64, z_margin=0,
                         erode_cells_default=1)
     assert error.value.problems == [f'patch overlap {plain}: edge has no overlap pose']
-    # The pairs are computed from the geometry the snapshot froze: one this
-    # store does not hold is that edge's error.
+    # Complete references select the frozen geometry. A conflicting geometry
+    # field in the consumer snapshot must be rejected rather than used instead.
     snapshot = osi.read_snapshot(db, osi.InputRequest())
     snapshot.relationships = [rel for rel in snapshot.relationships
                               if rel.uuid == edge['uuid']]
     patches, _ = osi.materialize_patches(
         db, snapshot, z_begin=0, z_end=64, z_margin=0, erode_cells_default=1)
     snapshot.objects[b].geometry_revision = '00000000-0000-4000-8000-0000000000aa'
-    with pytest.raises(osi.ObjectStoreInputError, match='has no geometry revision'):
+    with pytest.raises(osi.ObjectStoreInputError, match="other than the snapshot's"):
         osi.materialize_patch_overlaps(db, snapshot, patches, pair_spacing=8.0,
                                        max_pairs=16)
 

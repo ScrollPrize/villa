@@ -3532,7 +3532,7 @@ class ServiceState:
                         if checkpoint.get("model_state_sha256") == model_state_sha256
                         else None),
             base_shape_zyx=project.get("base_shape_zyx"),
-            umbilicus=({"uuid": umbilicus.get("uuid"), "generation": umbilicus.get("generation"),
+            umbilicus=({"store": umbilicus.get("store", ""), "uuid": umbilicus.get("uuid"), "generation": umbilicus.get("generation"),
                         "version": umbilicus.get("version")}
                        if umbilicus else None),
             api_version=API_VERSION)

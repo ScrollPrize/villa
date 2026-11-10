@@ -4,7 +4,7 @@ umbilicus."""
 
 from object_store_fixture import VOLUME
 
-UMBILICUS = {"uuid": "6c1f0e4e-6d7a-4d55-9d0c-2b8f9a0c1e11",
+UMBILICUS = {"store": "6c1f0e4e-6d7a-4d55-9d0c-2b8f9a0c1e12", "uuid": "6c1f0e4e-6d7a-4d55-9d0c-2b8f9a0c1e11",
              "generation": "a7d5c3e0-1b2c-4d3e-8f90-0a1b2c3d4e5f", "version": 3,
              "points_zyx": [[0.0, 32.0, 32.0], [64.0, 32.0, 32.0]]}
 
