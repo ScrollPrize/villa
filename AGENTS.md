@@ -236,6 +236,8 @@ document how to use them and how they’re validated.
 
 Read `vc_object_store/docs/reading.md` and the contract in `vc_object_store/docs/coherent-store-api-cleanup.md` before changing vcobj handling. Physical placement (local, referenced, sharded or packed) is resolved by the store layer, never by consumer-specific SQL or fallback branches.
 
+For reviews, use the [vcobj review contract](vc_object_store/docs/review-contract.md): trace each invariant through all sibling entry points and test the same case at their boundaries. Python bindings adapt Python types; the shared native implementation owns schema interpretation and validation.
+
 - Resolve once, then carry the complete `ObjectRevision`/`ObjectVersion` through geometry, transforms, adapters and caches. Never replace its metadata with a fresh current-object lookup or infer its owner from the attachment. Exact reads must not require a live current object. Compare complete identities, not just version numbers.
 - Use shared identity, endpoint and tombstone resolution for writes as well as reads. Local SQL uniqueness checks do not enforce collection-wide identity. Canonicalize UUIDs through the shared API, not ad-hoc string comparisons.
 - For edits of loaded data, use `expectObject(request, selected.reference())`, not a freshly read numeric version. Retain the loaded coordinate-mapping guard with editable points; an unchanged object reference does not imply unchanged volume registrations.
