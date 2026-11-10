@@ -20,37 +20,9 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
         historyConflict(db, "geometry repair: endpoint revision changed; recompute repair");
     if (edge->version != repair.expectedVersion)
         historyConflict(db, "geometry repair: edge version changed; recompute repair");
-    auto a = repair.aAnchor, b = repair.bAnchor;
-    for (const auto& [uuid, anchor] : {std::pair{edge->aUuid, a}, std::pair{edge->bUuid, b}})
-        if (const auto revision = currentGeometry(txn, uuid))
-            detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
     auto normalized = *edge;
-    normalized.aAnchor = a; normalized.bAnchor = b;
-    canonicalizeEdge(normalized);
-    if (normalized.aUuid != edge->aUuid) swapEndpoints(normalized);
-    a = normalized.aAnchor; b = normalized.bAnchor;
-    const auto state = edgeGeometryState(txn, repair.edgeUuid);
-    Savepoint savepoint(db);
-    createRecordOverride(db,"edges",repair.edgeUuid);
-    if (state.aRevision == aRevision && state.bRevision == bRevision && a == edge->aAnchor && b == edge->bAnchor) {
-        Statement changedGeometry(db,"SELECT 1 FROM objects WHERE uuid IN (?,?) AND commit_sequence=? LIMIT 1",
-            parseUuid(edge->aUuid),parseUuid(edge->bUuid),writeCommitSequence(db));
-        if (edge->commitSequence!=writeCommitSequence(db)&&changedGeometry.row())
-            stampContentChange(db, author(), hostname(), "edges", *edgeIdByUuid(db, parseUuid(edge->uuid)),
-                               parseUuid(edge->uuid), "geometry_revalidated");
-        recordRelationshipValidation(db, *edge);
-        savepoint.release();
-        return;
-    }
-    const auto id = *edgeIdByUuid(db, parseUuid(repair.edgeUuid));
-    Statement anchors(db, "UPDATE edges SET a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
-        "b_anchor_x=?,b_anchor_y=?,b_anchor_z=?,b_dir_x=?,b_dir_y=?,b_dir_z=?,a_dependencies=?,b_dependencies=? WHERE id=?");
-    bindAnchor(anchors, 1, a); bindAnchor(anchors, 7, b);
-    anchors.bind(13, dependenciesToJson(a).dump()); anchors.bind(14, dependenciesToJson(b).dump());
-    anchors.bind(15, id); anchors.stepDone();
-    stampContentChange(db, author(), hostname(), "edges", id, parseUuid(repair.edgeUuid), "geometry_repaired");
-    recordRelationshipValidation(db, normalized);
-    savepoint.release();
+    normalized.aAnchor = repair.aAnchor; normalized.bAnchor = repair.bAnchor;
+    updateEdge(txn,normalized);
 }
 
 EdgeGeometryState ObjectStore::edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const

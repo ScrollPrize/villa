@@ -59,16 +59,15 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     std::sort(rec.tags.begin(), rec.tags.end());
     rec.tags.erase(std::unique(rec.tags.begin(), rec.tags.end()), rec.tags.end());
     Savepoint savepoint(db);
-    createRecordOverride(db, "edges", rec.uuid);
     if (rec.aAnchor == existing->aAnchor && rec.bAnchor == existing->bAnchor &&
         rec.tags == existing->tags && nlohmann::json::parse(rec.meta) == nlohmann::json::parse(existing->meta)) {
-        if (!lifecycleBindingMatches(db, rec))
-            stampContentChange(db, author(), hostname(), "edges", *edgeIdByUuid(db, parseUuid(rec.uuid)),
-                               parseUuid(rec.uuid), "lifecycle_revalidated");
-        recordRelationshipValidation(db, rec);
-        savepoint.release();
-        return;
+        // An unchanged record can still explicitly revalidate edited endpoints.
+        // Otherwise keep the original owner, version and transaction sequence.
+        Statement changed(db,"SELECT 1 FROM objects WHERE uuid IN (?,?) AND commit_sequence=? LIMIT 1",
+            parseUuid(rec.aUuid),parseUuid(rec.bUuid),writeCommitSequence(db));
+        if(!changed.row()&&currentRelationshipApplicable(*this,txn,rec.uuid))return;
     }
+    createRecordOverride(db, "edges", rec.uuid);
     const auto id = *edgeIdByUuid(db, parseUuid(rec.uuid));
     Statement s(db, "UPDATE edges SET a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
         "b_anchor_x=?,b_anchor_y=?,b_anchor_z=?,b_dir_x=?,b_dir_y=?,b_dir_z=?,meta=?,a_dependencies=?,b_dependencies=? WHERE id=?");

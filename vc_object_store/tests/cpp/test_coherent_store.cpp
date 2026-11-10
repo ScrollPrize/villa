@@ -77,6 +77,15 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
     }
     // A no-op must not materialize an override or advance the store sequence.
     int64_t sequence;{auto r=store.read();sequence=store.status(r).commitSequence;}
+    EdgeRecord unchanged;EdgeGeometryRepair repair;
+    {auto r=store.read();unchanged=*store.edgeByUuid(r,f.edge);
+        repair.edgeUuid=f.edge;repair.expectedVersion=*unchanged.version;
+        repair.aRevision=store.currentGeometry(r,unchanged.aUuid)->uuid;repair.bRevision=store.currentGeometry(r,unchanged.bUuid)->uuid;
+        repair.aAnchor=unchanged.aAnchor;repair.bAnchor=unchanged.bAnchor;}
+    {auto w=store.write();store.updateEdge(w,unchanged);store.repairEdgeGeometry(w,repair);w.commit();}
+    {auto r=store.read();require(store.edgeByUuid(r,f.edge)->versionStoreUuid==unchanged.versionStoreUuid,
+        "unchanged edge update/repair preserves inherited ownership");
+        require(store.status(r).commitSequence==sequence,"unchanged edge update/repair does not publish");}
     {auto w=store.write();const std::array<ExtensionRow,1> rows{ExtensionRow{extensionUuid(f.edge),int64_t(4)}};
         store.replaceExtensionRows(w,extension().name,f.edge,rows);w.commit();}
     {auto r=store.read();require(store.status(r).commitSequence==sequence,"inherited no-op remains a no-op");}
