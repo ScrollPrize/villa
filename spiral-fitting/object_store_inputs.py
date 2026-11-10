@@ -160,10 +160,8 @@ class InputPins:
     """What a fit reads exactly: the selected objects (and the outer shell)
     at the numbered versions they had when the links were made, and the
     position (the links' commit) that state belongs to. Reads at pins use
-    the store's numbered history (objects_at_versions,
-    relationships_at_versions: the relationships between pinned versions are
-    exact, since a relationship change versions both endpoints), so they do
-    not depend on the store's head.
+    the store's numbered history. Inherited endpoints do not pin overlay
+    membership; such selections cannot replay after an overlay commit.
 
     ``objects`` may be empty (a position alone, e.g. a configuration's
     object_store_input_position): the versions are then those at the
@@ -862,7 +860,7 @@ def read_snapshot(store, request, selected=None):
     earlier, so one startup reads exactly the objects it refreshed. Every
     object is read at the version the selection resolved it at
     (objects_at_versions), and the relationships between those versions
-    (relationships_at_versions) are exact whatever the store's head.
+    (relationships_at_versions) are guarded against moving overlay membership.
     Every selected object must declare a frame in the fit volume; all frame
     problems are reported together. The outer shell (resolve_outer_shell) is
     read alongside, in the same volume, but is not among ``objects``.
@@ -883,7 +881,12 @@ def read_snapshot(store, request, selected=None):
             raise ObjectStoreInputError([
                 f'selected object {ref["object"]} is not at version {ref["version"]} of this store'])
         revisions[revision['object_uuid']] = revision
+    inherited = any(ref['store'] != position.store for ref in refs)
+    if inherited and InputPosition.of_status(store.status()) != position:
+        raise ObjectStoreInputError(['Cannot replay inherited relationship membership after the store changed'])
     relationships_read = store.relationships_at_versions(refs)
+    if inherited and InputPosition.of_status(store.status()) != position:
+        raise ObjectStoreInputError(['The store changed while inherited relationships were read; retry'])
 
     notes, problems = [], []
     usable = []

@@ -3975,6 +3975,12 @@ void CWindow::closeEvent(QCloseEvent* event)
         });
         return;
     }
+    try { _state->savePointCollections(); }
+    catch (const std::exception& error) {
+        QMessageBox::warning(this, tr("Close blocked"), QString::fromUtf8(error.what()));
+        event->ignore();
+        return;
+    }
     _destroyingWindow = true;
     if (_lineAnnotationController) {
         _lineAnnotationController->saveOpenFibers();
@@ -4318,7 +4324,7 @@ bool CWindow::OpenVolume(const QString& path,
         return false;
     }
 
-    CloseVolume();
+    if (!CloseVolume()) return false;
     // Without a choice, the volume the user last viewed in the project.
     const auto ids = package->volumeIDs();
     const auto remembered = QString::fromStdString(package->currentVolumeId());
@@ -4775,24 +4781,26 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 }
 
-void CWindow::CloseVolume(void)
+bool CWindow::CloseVolume()
 {
-
-
     // Tear down active segmentation editing before surfaces disappear to avoid
     // dangling pointers inside the edit manager when the underlying surfaces
     // are unloaded (reloading with editing enabled previously triggered a
     // use-after-free crash).
-    if (_segmentationModule) {
-        if (_segmentationModule->editingEnabled()) {
-            _segmentationModule->setEditingEnabled(false);
-        } else if (_segmentationModule->hasActiveSession()) {
-            _segmentationModule->endEditingSession();
-        }
+    try {
+        _state->closeAll([this] {
+            if (!_segmentationModule) return;
+            if (_segmentationModule->editingEnabled())
+                _segmentationModule->setEditingEnabled(false);
+            else if (_segmentationModule->hasActiveSession())
+                _segmentationModule->endEditingSession();
+        });
+    } catch (const std::exception& error) {
+        if (!_destroyingWindow)
+            QMessageBox::warning(this, tr("Close blocked"), QString::fromUtf8(error.what()));
+        return false;
     }
 
-    // CState::closeAll emits volumeClosing, clears surfaces, vpkg, volume, points
-    _state->closeAll();
     if (_spiralWorkspace) {
         _spiralWorkspace->synchronizeVolume(nullptr);
     }
@@ -4828,7 +4836,7 @@ void CWindow::CloseVolume(void)
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->setOverlayVolume(nullptr, {});
     }
-
+    return true;
 }
 
 // Handle open request

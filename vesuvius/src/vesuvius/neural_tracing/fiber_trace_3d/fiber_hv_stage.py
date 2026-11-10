@@ -70,7 +70,8 @@ def verify_feature_source(database,feature):
         if [r[0] for r in rows]!=[r[0] for r in source_rows]:raise ValueError('Constraint/store IDs differ')
         if not np.allclose([r[1] for r in rows],[r[1] for r in source_rows],rtol=1e-10,atol=1e-6):
             raise ValueError('Constraint/store geometry lengths differ')
-    return dict(fibers_digest=feature['fibers_digest'],fiber_lengths_checked=len(rows))
+    return dict(fibers_digest=feature['fibers_digest'],fiber_lengths_checked=len(rows),
+                fiber_source=provenance['fiber_source'])
 
 
 def prepare(config):

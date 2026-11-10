@@ -363,6 +363,13 @@ void checkReferencedSurfaceSelections(const fs::path& directory)
     { auto collection = ObjectCollection::create(overlay, {base}, options); }
     auto session = std::make_shared<ObjectStoreSession>();
     const auto attachment = session->attach(overlay, options);
+    VolumeAffine shifted;
+    shifted(0,3)=-3; shifted(2,3)=-7;
+    registerVolumeTransform(*session,attachment,"vol","negative",shifted,"negative target coordinates");
+    const auto translated = SurfaceCatalog::open(session,attachment,{"negative",1},original.objectUuid,original);
+    require((*translated.surface->rawPointsPtr())(0,0)==cv::Vec3f(-1,4,-1) &&
+            translated.surface->validMask()(0,0),
+            "native materialization preserves valid negative target coordinates");
     const auto open = [&](const ObjectVersion& ref) { return SurfaceCatalog::open(session, attachment, {"vol", 1}, original.objectUuid, ref); };
     require(open(original).editable, "exact current inherited surface remains editable");
     bool rejected = false;

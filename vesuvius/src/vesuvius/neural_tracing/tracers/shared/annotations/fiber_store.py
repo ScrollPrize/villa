@@ -127,17 +127,27 @@ def read_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
 FIBERS_DIGEST_FORMAT = 'fibers_digest v3'
 
 
-def fibers_digest(path, fiber_ids=None):
+def fibers_digest(path, fiber_ids=None, *, source_version=None):
     """Content digest of a store's live fibers (all, or the given ones): SHA-256 over a format tag and each fiber's
     complete owning-store/generation/object/version identity, in UUID order, read in one snapshot.
     Format v3 includes source ownership, so divergent branches cannot collide at equal version counters."""
     selected = [] if fiber_ids is None else sorted({canonical_uuid(str(fid)) for fid in fiber_ids})
     with open_store(path) as store:
+        _require_source_version(store, source_version)
         rows = (store.select_objects(object_kind='fiber', object_uuids=selected, fields=['name'])
                 if selected or fiber_ids is None else [])
+        _require_source_version(store, source_version)
     if fiber_ids is not None and sorted(r['uuid'] for r in rows) != selected:
         raise ValueError('Unknown requested fiber')
     return _references_digest(object_reference(row) for row in rows)
+
+
+def verify_fiber_source(path, digest, source_version=None):
+    """Validate saved evidence and return the snapshot to use for subsequent reads."""
+    version = source_version if source_version is not None else fiber_source_version(path)
+    if fibers_digest(path, source_version=version) != digest:
+        raise ValueError('Saved fiber source differs; regenerate frozen evidence')
+    return version
 
 
 def _references_digest(references):
@@ -147,15 +157,15 @@ def _references_digest(references):
     return digest.hexdigest()
 
 
-def write_fibers(destination, fibers, *, volume, author=None, metadata_policy='portable'):
+def write_fibers(destination, fibers, *, volume, author=None, metadata_policy='portable', replace=False):
     """A new store holding ``fibers``: (row, xyz) pairs, xyz in voxels of ``volume`` (bound with scale 1). row keys:
     id (a UUID to keep, or absent/None for a new one), name, family, optional meta (its coordinates are replaced).
     Each fiber gets end-point controls 0,1 and every sample as line points. Written to a sibling staging file and
-    renamed into place; an existing destination is refused. Managed extension/artifact descriptors are rejected
+    published into place; an existing destination is refused unless replace=True. Managed extension/artifact descriptors are rejected
     unless metadata_policy='geometry_only' explicitly requests new geometry without those payloads.
     This is a derived-data writer, not a store/relationship/history copy. Returns dict(fibers, points, ids)."""
     destination = Path(destination)
-    if destination.exists():
+    if destination.exists() and not replace:
         raise FileExistsError(f'{destination} exists')
     destination.parent.mkdir(parents=True, exist_ok=True)
     coordinates = dict(volume_uuid=str(volume), scale_factor=1)
@@ -196,7 +206,10 @@ def write_fibers(destination, fibers, *, volume, author=None, metadata_policy='p
             raise ValueError('Duplicate fiber UUID')
         if any(Path(str(staged)+suffix).exists() for suffix in ('-wal', '-shm')):
             raise RuntimeError('Store was not checkpointed on close')
-        os.link(staged, destination)
+        if replace:
+            staged.replace(destination)
+        else:
+            os.link(staged, destination)
     return dict(fibers=len(ids), points=points_total, ids=ids)
 
 

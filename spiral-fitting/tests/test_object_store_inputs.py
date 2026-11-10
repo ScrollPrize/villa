@@ -110,6 +110,9 @@ def test_selection_preserves_inherited_source_identity_and_manifest_pins(db):
     assert osi.InputPins.from_provenance(pins.provenance()).refs() == [source]
     again = osi.read_snapshot(attachment, dataclasses.replace(request(), pins=pins))
     assert again.digest() == snapshot.digest()
+    db.upsert_object(dict(kind='note', name='new overlay commit'))
+    with pytest.raises(osi.ObjectStoreInputError, match='Cannot replay inherited relationship membership'):
+        osi.read_snapshot(attachment, dataclasses.replace(request(), pins=pins))
     # Legacy same-store pins remain supported; they must not affect new captures.
     legacy = osi.InputPins(osi.InputPosition.of_status(db.status()), {fiber: source['version']})
     assert legacy.refs() == [source]

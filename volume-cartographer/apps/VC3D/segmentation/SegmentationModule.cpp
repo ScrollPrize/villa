@@ -229,7 +229,9 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_state) {
         connect(_state, &CState::surfaceChanged,
                 this, &SegmentationModule::onSurfaceCollectionChanged);
-        connect(_state, &CState::pointCollectionsSaveRequested, this, &SegmentationModule::saveCorrections);
+        _state->saveSurfaceCorrections = [editor = QPointer<SegmentationModule>(this)] {
+            return !editor || editor->saveCorrections();
+        };
         connect(_state, &CState::recoveredDraftFound, this, &SegmentationModule::offerRecoveredDraft);
     }
 

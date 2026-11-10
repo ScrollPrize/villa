@@ -7,7 +7,6 @@
 #include <vc_object_store/objects/SurfaceGrid.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/Uuid.hpp>
-#include <vc_reader/tifxyz.hpp>
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -20,7 +19,6 @@ static_assert(std::endian::native == std::endian::little, "stored geometry array
 
 namespace {
 using vc::objects::GeometryArray;
-const cv::Vec3f kInvalid{-1.f, -1.f, -1.f};
 
 int cvDepth(const std::string& dtype)
 {
@@ -98,8 +96,6 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader
     auto grid=vc::objects::readSurfaceGrid(reader,selected,transformed,applyValidity);
     auto points=std::make_unique<cv::Mat_<cv::Vec3f>>(int(grid.rows),int(grid.columns));
     std::memcpy(points->data,grid.points.data(),grid.points.size()*sizeof(float));
-    // Negative transformed coordinates use QuadSurface's missing-vertex sentinel.
-    for(auto& p:*points)if(!vcr::tifxyz::vertexValid(p.val))p=kInvalid;
     auto surface=std::make_unique<QuadSurface>(points.release(),cv::Vec2f(float(grid.scale[0]),float(grid.scale[1])));
     surface->id = grid.record.uuid;
     surface->meta = nlohmann::json::parse(grid.record.meta);
