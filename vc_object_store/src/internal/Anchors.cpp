@@ -4,6 +4,15 @@
 #include <cmath>
 #include <stdexcept>
 
+namespace vc::objects {
+std::string EdgeRecord::otherEndpoint(const std::string& endpoint) const
+{
+    const auto key=util::canonicalUuid(endpoint);
+    if(key==util::canonicalUuid(aUuid))return util::canonicalUuid(bUuid);
+    if(key==util::canonicalUuid(bUuid))return util::canonicalUuid(aUuid);
+    throw std::invalid_argument("object is not an endpoint of this edge");
+}
+}
 namespace vc::objects::detail {
 void validateAnchor(const Anchor& anchor)
 {

@@ -63,6 +63,11 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
         require(store.objectCount(r,"track")==2,"collection counts use visible records");
         require(store.objectsByTag(r,"base").size()==2,"tag queries include inherited objects");
         require(store.componentOf(r,f.a).size()==2,"traversal resolves inherited endpoints");
+        auto uppercase=f.a;std::transform(uppercase.begin(),uppercase.end(),uppercase.begin(),[](unsigned char c){return std::toupper(c);});
+        require(store.neighbours(r,uppercase)==std::vector{f.b},"neighbours canonicalize endpoint UUID spelling");
+        const auto e=*store.edgeByUuid(r,f.edge);
+        require(e.otherEndpoint(uppercase)==f.b&&e.otherEndpoint(f.b)==f.a,"opposite endpoint is shared and symmetric");
+        mustFail([&]{e.otherEndpoint(f.file);});
         require(store.graphReadView(r).objectUuids.size()==3,"ordinary graph includes inherited objects");
         const auto graph=store.graphReadViewAt(r,std::vector<ObjectVersion>{f.av,f.bv});
         require(graph.objectUuids.size()==2&&graph.edgeUuids.size()==1,"exact graphs work for current-only and archived sources");

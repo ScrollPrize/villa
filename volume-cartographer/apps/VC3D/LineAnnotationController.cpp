@@ -15210,7 +15210,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                 edges.endpointUuids = std::vector<std::string>{uuid};
                 for (const auto& edge : reader.selectEdges(edges)) {
                     dependency.relationships.insert(edge.uuid);
-                    const auto peer = edge.aUuid == uuid ? edge.bUuid : edge.aUuid;
+                    const auto peer = edge.otherEndpoint(uuid);
                     const auto object = reader.currentObject(peer);
                     dependency.peers[peer] = object ? std::optional<uint64_t>(object->version) : std::nullopt;
                 }

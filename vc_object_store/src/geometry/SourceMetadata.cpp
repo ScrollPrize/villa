@@ -58,7 +58,7 @@ Json nativeMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& o
                 };
                 link(edge.aUuid, edge.aAnchor, edge.bAnchor); link(edge.bUuid, edge.bAnchor, edge.aAnchor);
             } else {
-                const auto targetId=edge.aUuid == object.uuid ? edge.bUuid : edge.aUuid;
+                const auto targetId=edge.otherEndpoint(object.uuid);
                 const auto target = selection ? std::optional(ObjectStoreImplAccess::objectRevision(db,txn,*selection->at(targetId))->record)
                                               : db.objectByUuid(txn,targetId);
                 if (!target) throw std::runtime_error("native winding link target is missing");

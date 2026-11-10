@@ -5,7 +5,7 @@
 Baseline: `3812cb17b`. C++ store plus VC3D adapters; existing CMake/approved PR runner, Linux and macOS portability, unchanged schema 21 and binary identifiers. These fixes must remove duplicated resolution, not introduce more placement-specific branches. Each fix is committed separately with regressions; the final run uses `bash local/scripts/run_vcobj_pr_tests`.
 
 - [x] S. Reject inherited live edge UUID insertion; continue inherited deleted-edge versions through shared tombstone resolution. `test_coherent_store` passes for history on/off insertion rejection and inherited resurrection.
-- [ ] T. Centralize canonical opposite-endpoint lookup for traversal and attached documents.
+- [x] T. Centralize canonical opposite-endpoint lookup for traversal and attached documents. Coherent-store and transform tests pass, including uppercase attachment removal without retiring the owner; VC3D and source metadata use the same helper.
 - [ ] U. Preserve ownership on no-op edge update/repair; share actual mutation/revalidation handling.
 - [ ] V. Route geometry history to the owning record instead of the attachment database.
 - [ ] W. Carry selected metadata through historical geometry transforms and transform listings.

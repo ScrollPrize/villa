@@ -25,7 +25,7 @@ std::map<std::string, EdgeRecord> attachedEdges(const StoreReader& reader, const
 {
     std::map<std::string, EdgeRecord> edges;
     for (auto& edge : attachments(reader, objectUuid, role)) {
-        const auto collection = edge.aUuid == objectUuid ? edge.bUuid : edge.aUuid;
+        const auto collection = edge.otherEndpoint(objectUuid);
         edges.emplace(collection, std::move(edge));
     }
     return edges;
@@ -140,7 +140,7 @@ std::optional<nlohmann::json> attachedDocument(const StoreReader& reader, const 
                                                const std::string& role)
 {
     for (const auto& edge : attachments(reader, objectUuid, role)) {
-        const auto uuid = edge.aUuid == objectUuid ? edge.bUuid : edge.aUuid;
+        const auto uuid = edge.otherEndpoint(objectUuid);
         const auto object = reader.currentObject(uuid);
         if (!object || object->record.retired || !object->geometryRevision) continue;
         const auto source = nlohmann::json::parse(object->record.meta).value("source", nlohmann::json::object());

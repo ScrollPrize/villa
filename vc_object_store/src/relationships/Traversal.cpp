@@ -21,7 +21,7 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
         selection.applicableOnly=applicableOnly;selection.attachments=bool(edgeKind);
         std::vector<std::string> result;std::set<std::string> seen;
         for(const auto& edge:selectEdges(txn,selection)){
-            const auto next=edge.aUuid==objectUuid?edge.bUuid:edge.aUuid;
+            const auto next=edge.otherEndpoint(objectUuid);
             const auto endpoint=resolveObject(db,next);
             if(endpoint&&(!neighbourKind||endpoint->record.kind==*neighbourKind)&&seen.insert(next).second)result.push_back(next);
         }
@@ -210,7 +210,7 @@ std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std:
             selection.adjacent=adjacentFilter;selection.applicableOnly=applicableOnly;selection.attachments=!edgeKindFilter.empty();
             for(const auto& edge:selectEdges(txn,selection)){
                 if(!edgeKindFilter.empty()&&std::find(edgeKindFilter.begin(),edgeKindFilter.end(),edge.kind)==edgeKindFilter.end())continue;
-                visit(edge.aUuid==uuid?edge.bUuid:edge.aUuid,[]{return true;});
+                visit(edge.otherEndpoint(uuid),[]{return true;});
             }
         });
     }

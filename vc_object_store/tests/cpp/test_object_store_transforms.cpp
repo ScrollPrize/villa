@@ -349,6 +349,13 @@ int main() try {
         create.operations.push_back(CreateObjectOp{objectRecordJson(surface)});session.submit(attachment,create);
         AttachedCollection corrections=collection;corrections.uuid=vc::objects::util::newUuid();
         replaceAttachedCollections(session,attachment,surface.uuid,"corrections",{corrections},volumeCoordinates("w",1));
+        auto uppercase=surface.uuid;std::transform(uppercase.begin(),uppercase.end(),uppercase.begin(),[](unsigned char c){return std::toupper(c);});
+        require(attachedCollections(session,attachment,uppercase,"corrections").front().uuid==corrections.uuid,
+                "attachment readers use canonical opposite endpoints");
+        replaceAttachedCollections(session,attachment,uppercase,"corrections",{},volumeCoordinates("w",1));
+        session.readStore(attachment,[&](const StoreReader& reader,const auto&){
+            require(!reader.currentObject(surface.uuid)->record.retired,"removing attachments never retires their owner");
+        });
         require(volumeCollections(session,attachment,{"w"}).size()==1,"attached collections are not the volume's");
         writeVolumeCollections(session,attachment,{"w"},{},{collection.uuid});
         require(volumeCollections(session,attachment,{"w"}).empty(),"a removed collection is retired");

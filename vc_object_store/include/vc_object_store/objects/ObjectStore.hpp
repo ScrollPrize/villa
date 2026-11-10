@@ -122,6 +122,8 @@ struct Anchor {
 struct EdgeRecord : RecordCommon {
     std::string aUuid, bUuid;  // endpoint order is normalised by addEdge
     Anchor aAnchor, bAnchor;
+    // Canonical opposite endpoint; rejects UUIDs not incident to this edge.
+    std::string otherEndpoint(const std::string& endpoint) const;
 };
 
 // Object UUID -> internal object revision UUID (storage keys; public history
