@@ -165,6 +165,7 @@ void PointCollectionSync::reload()
     auto* points = state_->pointCollection();
     installing_ = true;
     points->replaceUnanchoredCollections(collections);
+    for (const auto& collection : stored) points->reservePointIds(uint64_t(collection.nextPointId));
     uuids_.clear();
     std::map<std::string, uint64_t> ids;
     for (const auto& [id, collection] : points->getAllCollections())

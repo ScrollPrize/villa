@@ -47,6 +47,7 @@ public:
         std::string uuid;
         std::vector<std::array<double, 3>> points;
         std::vector<std::array<double, 2>> grid;
+        std::optional<vc::objects::ObjectVersion> reference;
     };
 
 protected:
@@ -81,6 +82,9 @@ private:
         std::vector<std::string> drafted;
         std::vector<std::uint64_t> draftRevisions;
         std::vector<Run> draftRuns;
+        std::map<std::string, std::shared_ptr<QuadSurface>> displayedSurfaces;
+        std::vector<Run> residentRuns;
+        std::optional<vc3d::store::Region> residentSlab;
         struct Drawn {
             std::uint64_t runsVersion{0}, styleVersion{0};
             std::vector<std::uint64_t> draftRevisions;
@@ -104,7 +108,8 @@ private:
         bool cutsStale{false};
     };
     void request(VolumeViewerBase* viewer, const vc3d::store::Region& region, const std::vector<std::string>& uuids);
-    void requestCuts(VolumeViewerBase* viewer, const std::string& uuid, const std::vector<PlaneCut>& cuts);
+    using ResidentSurfaces = std::map<std::string, std::shared_ptr<const vc::objects::ResidentSurface>>;
+    void requestCuts(VolumeViewerBase* viewer, const ResidentSurfaces& surfaces, const std::vector<PlaneCut>& cuts, bool planeViewer = false);
     // Fetch placeholders' geometry (not already fetching or failed); each
     // arrival is a commit, which reads the views again.
     void fetch(const std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>>& remote);
@@ -134,6 +139,7 @@ private:
     std::vector<Run> draftRuns(const std::vector<std::string>& uuids, const vc3d::store::Region& slab) const;
     void drawPlaneViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder);
     void drawSurfaceViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder);
+    std::shared_ptr<vc::objects::ResidentSurface> residentSurface(QuadSurface& surface);
 
     CState* _state;
     std::vector<std::string> _surfaces;
@@ -143,4 +149,5 @@ private:
     std::map<std::string, QString> _fetchFailures;
     std::shared_ptr<std::atomic_bool> _fetchCancel = std::make_shared<std::atomic_bool>(false);
     std::unordered_map<VolumeViewerBase*, std::unique_ptr<View>> _views;
+    std::map<std::string, std::pair<const QuadSurface*, std::shared_ptr<vc::objects::ResidentSurface>>> _residentSurfaces;
 };

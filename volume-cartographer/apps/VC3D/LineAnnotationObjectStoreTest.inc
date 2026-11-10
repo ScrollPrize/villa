@@ -6,6 +6,7 @@
 #include "FiberCollectionController.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/AttachedDocument.hpp>
+#include <vc_object_store/objects/ObjectCollection.hpp>
 #include <vc_object_store/objects/Project.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "volume_viewers/ViewerSampling.hpp"
@@ -423,7 +424,7 @@ int runObjectStoreControllerTests()
                 live->surfaceName = "frame-test-session"; live->fiberId = opened.id; live->fiberUuid = opened.uuid;
                 live->fiberFileName = opened.fileName; live->fiberUsername = opened.username;
                 live->fiberStartedAt = opened.startedAt; live->fiberSequence = opened.sequence;
-                live->storePin = opened.storePin; live->coordinateIdentity = opened.coordinateIdentity; live->frame = opened.frame;
+                live->storePin = opened.storePin; live->graphCommit = opened.graphCommit; live->coordinateIdentity = opened.coordinateIdentity; live->frame = opened.frame;
                 live->fiberOptimizationMode = opened.optimizationMode; live->suppressGeneratedViews = true; live->suppressErrorDialogs = true;
                 for (size_t i = 0; i < opened.controlPoints.size(); ++i) {
                     la::LineControlPoint control(double(i), opened.controlPoints[i], i == 0, int(i));
@@ -438,6 +439,7 @@ int runObjectStoreControllerTests()
                 controller.commitFiberStoreAction(save);
                 require(stored(scaledLong).controlPoints[3] == vc::geometry::Point{16,4,6}, "a session save maps back to the stored frame");
                 live->storePin = save.front().fiber.storePin;
+                live->graphCommit = save.front().fiber.graphCommit;
                 const auto parent = controller.makeStoredFiberSessionSnapshot(*live).fiber;
                 const auto identity = [&](const char* name) {
                     la::NewFiberIdentity result; result.id = controller.nextFiberId(); result.username = "test";
@@ -637,6 +639,20 @@ int runObjectStoreControllerTests()
                 require(fiber.branches.front().edgeUuid == a.branches.front().edgeUuid, "edge UUID survives transfer");
                 require(fiber.branches.front().autoLink, "automatic mark survives transfer");
             }
+            destination.closeProject();
+            { auto db = ObjectStore::open(target, options); auto txn = db.write(); db.seal(txn); txn.commit(); }
+            const auto overlay = fs::path(transfers.path().toStdString()) / "overlay.vcobj";
+            { auto collection = ObjectCollection::create(overlay, {target}, options); }
+            openStoreAsProject(destination, QString::fromStdString(overlay.string()), "inherited-graph-test");
+            auto stale = imported.readStoredFibers(std::nullopt).front();
+            const auto loaded = stale.storePin->reference();
+            { auto db = ObjectStore::open(overlay, options); auto txn = db.write();
+              db.setApproval(txn, stale.branches.front().edgeUuid, "approved"); txn.commit(); }
+            require(destination.objectStoreSession()->currentObject(stale.storePin->attachment, stale.uuid)->reference() == loaded,
+                    "overlay relationship changes leave inherited endpoint identity unchanged");
+            bool rejected = false;
+            try { imported.commitFibers({&stale}); } catch (const TransactionConflict&) { rejected = true; }
+            require(rejected, "loaded graph baseline rejects unseen overlay relationship changes");
         }
         {
             // Approval clears the mark on the shared edge.
@@ -656,6 +672,10 @@ int runObjectStoreControllerTests()
             require(approvedCatalog(), "real commits still refresh catalog link state");
             const auto again = resolve(a.uuid);
             require(!again.branches[0].pending && !again.branches[0].autoLink, "approval clears the automatic mark");
+            auto stale = a;
+            bool staleRejected = false;
+            try { controller.commitFibers({&stale}); } catch (const TransactionConflict&) { staleRejected = true; }
+            require(staleRejected, "a loaded graph cannot overwrite a later branch approval even with unchanged geometry");
             auto pending = again;
             pending.branches[0].pending = true;
             controller.commitFibers({&pending});
@@ -708,9 +728,9 @@ int runObjectStoreControllerTests()
         require(controller.generatedBranchLinkMarkers(a.branches).empty(), "unbound peers have no branch markers");
         {
             auto changedSession = std::make_shared<Controller::LineAnnotationSession>();
-            changedSession->fiberId = a.id; changedSession->fiberUuid = a.uuid; changedSession->storePin = a.storePin;
+            changedSession->fiberId = a.id; changedSession->fiberUuid = a.uuid; changedSession->storePin = a.storePin; changedSession->graphCommit = a.graphCommit;
             auto untouched = std::make_shared<Controller::LineAnnotationSession>();
-            untouched->fiberId = b.id; untouched->fiberUuid = b.uuid; untouched->storePin = b.storePin;
+            untouched->fiberId = b.id; untouched->fiberUuid = b.uuid; untouched->storePin = b.storePin; untouched->graphCommit = b.graphCommit;
             untouched->fiberTags = {"unsaved-work"};
             untouched->runningSolveCancel = std::make_shared<std::atomic_bool>(false);
             Controller::PaneRecord changedPane, keptPane;
@@ -745,6 +765,10 @@ int runObjectStoreControllerTests()
                     "failed relationship rolls back geometry and metadata");
         }
         const auto edge=a.branches.front().edgeUuid;
+        const auto graphBaseline = a.graphCommit;
+        controller.commitFibers({&a});
+        controller.commitFibers({&a});
+        require(a.graphCommit == graphBaseline, "repeated no-op saves preserve the loaded graph baseline");
         a.controlPoints[0][0]=-1; a.linePoints[0][0]=-1;
         batch={controller.makeFiberSaveSnapshot(a)};
         vc3d::line_annotation::canonicalizeFiberSaveSnapshots(batch);controller.commitFiberStoreAction(batch);
@@ -835,6 +859,7 @@ int runObjectStoreControllerTests()
             live->fiberFileName=merged.fileName;live->fiberUsername=merged.username;
             live->fiberStartedAt=merged.startedAt;live->fiberSequence=merged.sequence;
             live->storePin=merged.storePin;
+            live->graphCommit=merged.graphCommit;
             live->coordinateIdentity=merged.coordinateIdentity;live->frame=merged.frame;
             live->fiberOptimizationMode=merged.optimizationMode;live->suppressGeneratedViews=true;live->suppressErrorDialogs=true;
             for(size_t i=0;i<merged.controlPoints.size();++i) {

@@ -1,4 +1,5 @@
 #include "segmentation/SurfaceCorrections.hpp"
+#include "segmentation/SurfaceStoreEdit.hpp"
 
 #include "vc/core/StoredCollection.hpp"
 #include <vc_object_store/objects/AttachedDocument.hpp>
@@ -40,16 +41,21 @@ vc3d::corrections::Snapshot vc3d::corrections::read(ObjectStoreSession& session,
 }
 
 void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdentity& attachment, Snapshot& snapshot,
-                              const std::map<uint64_t, nlohmann::json>& collections, const vc::objects::VolumeVoxels& volume)
+                              const std::map<uint64_t, nlohmann::json>& collections, const vc::objects::VolumeVoxels& volume,
+                              SurfaceStoreEdit* editor)
 {
+    // No UI edit requests no write; keep the original optimistic baseline.
+    if (collections == snapshot.collections) return;
     std::vector<AttachedCollection> stored;
     for (const auto& [id, json] : collections) stored.push_back(toStore(id, json));
-    replaceAttachedCollections(session, attachment, snapshot.baseline, stored, vc::objects::volumeCoordinates(volume));
+    if (editor) editor->saveAttachedCollections(snapshot.baseline, stored, vc::objects::volumeCoordinates(volume));
+    else replaceAttachedCollections(session, attachment, snapshot.baseline, stored, vc::objects::volumeCoordinates(volume));
     snapshot.collections = collections;
 }
 
 std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session, const AttachmentIdentity& attachment,
-                                                     const GrowthAnnotation& annotation, const vc::objects::VolumeVoxels& volume)
+                                                     const GrowthAnnotation& annotation, const vc::objects::VolumeVoxels& volume,
+                                                     SurfaceStoreEdit* editor)
 {
     auto points = annotation.points;
     std::stable_sort(points.begin(), points.end(), [](const auto& a, const auto& b) { return a.creationTime < b.creationTime; });
@@ -88,6 +94,7 @@ std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session
     request.expectedObjects[uuid] = std::nullopt;
     request.operations = {CreateObjectOp{objectRecordJson(record)}, PutGeometryOp{uuid, vc::geometry::encode(geometry), {}},
                           AddEdgeOp{edgeRecordJson(edge)}};
-    (void)session.submit(attachment, request);
+    if (editor) (void)editor->submitAttached(std::move(request));
+    else (void)session.submit(attachment, request);
     return uuid;
 }

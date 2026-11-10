@@ -14,6 +14,7 @@
 #include <vector>
 #include <string>
 
+class SurfaceStoreEdit;
 
 namespace vc3d::corrections {
 
@@ -35,7 +36,7 @@ Snapshot read(vc::objects::ObjectStoreSession& session,
 // retired. One checked action.
 void write(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
            Snapshot&, const std::map<uint64_t, nlohmann::json>& collections,
-           const vc::objects::VolumeVoxels& volume);
+           const vc::objects::VolumeVoxels& volume, SurfaceStoreEdit* editor = nullptr);
 
 // A growth that used corrections, kept for training: the surface's geometry
 // revisions before and after, the grid region and volume bounds the
@@ -56,6 +57,7 @@ struct GrowthAnnotation {
 // Store it as a point_collection attached to the surface (role
 // "growth_annotation"). Returns the new object's UUID.
 std::string writeGrowthAnnotation(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
-                                  const GrowthAnnotation& annotation, const vc::objects::VolumeVoxels& volume);
+                                  const GrowthAnnotation& annotation, const vc::objects::VolumeVoxels& volume,
+                                  SurfaceStoreEdit* editor = nullptr);
 
 } // namespace vc3d::corrections

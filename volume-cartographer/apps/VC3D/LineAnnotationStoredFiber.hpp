@@ -78,6 +78,9 @@ struct FiberVolumeFrame {
 
 struct StoredFiber {
     std::optional<vc::objects::PinnedObject> storePin;
+    // Loaded graph membership, including overlay-only branch changes whose
+    // immutable endpoint object references do not advance.
+    std::optional<int64_t> graphCommit;
     // Set when read in the open volume (bound to it by scale or through a
     // registration); unset for a fiber in its stored frame, which is unbound.
     std::optional<FiberVolumeFrame> frame;

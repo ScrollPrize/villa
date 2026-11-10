@@ -251,6 +251,7 @@ struct LineAnnotationController::LineAnnotationSession {
     uint64_t fiberId = 0;
     std::string fiberUuid = vc::objects::util::newUuid();
     std::optional<vc::objects::PinnedObject> storePin;
+    std::optional<int64_t> graphCommit;
     std::optional<vc::objects::PinnedObject> runningStorePin;
     std::string fiberUsername;
     std::string fiberStartedAt;
@@ -2974,6 +2975,7 @@ std::optional<QString> LineAnnotationController::placePreparedControl(
             return context.changedMessage;
         }
         session.storePin = current->storePin;
+        session.graphCommit = current->graphCommit;
     }
     const size_t countBefore = session.controlPoints.size();
     const std::vector<cv::Vec3d> currentLinePoints = linePointPositions(session.optimizedLine);
@@ -3952,6 +3954,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberId = fiber.id;
     session->fiberUuid = fiber.uuid;
     session->storePin = fiber.storePin;
+    session->graphCommit = fiber.graphCommit;
     session->fiberUsername = fiber.username;
     session->fiberStartedAt = fiber.startedAt;
     session->fiberSequence = fiber.sequence;
@@ -14420,6 +14423,7 @@ LineAnnotationController::makeIntersectionLineSession(
     session->fiberId = fiber.id;
     session->fiberUuid = fiber.uuid;
     session->storePin = fiber.storePin;
+    session->graphCommit = fiber.graphCommit;
     session->readOnly = fiber.readOnly;
     session->suppressFiberSave = fiber.readOnly;
     session->fiberUsername = fiber.username;
@@ -14556,6 +14560,7 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     fiber.uuid = session.fiberUuid;
     registerFiberId(fiber.uuid, fiber.id);
     fiber.storePin = session.storePin;
+    fiber.graphCommit = session.graphCommit;
     fiber.coordinateIdentity = session.coordinateIdentity;
     fiber.frame = session.frame;
     if ((!session.storePin || !session.storePin->stored()) && !(_state && _state->currentVolume()))
@@ -14944,6 +14949,7 @@ void LineAnnotationController::applyCommittedFibers(const std::vector<FiberSaveS
         const StoredFiber* saved = &snapshot->fiber;
         if (session.watcher && session.storePin != saved->storePin) session.solveQueue.noteSessionMutated();
         session.storePin = saved->storePin;
+        session.graphCommit = saved->graphCommit;
         session.coordinateIdentity = saved->coordinateIdentity;
         session.frame = saved->frame;
         const auto ordering = storedIndexMapForSessionControls(session.controlPoints);
@@ -15071,7 +15077,8 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     if (!attachment || (uuids && uuids->empty())) return result;
     const bool readOnly = !connection->writable(*attachment);
     connection->readStore(*attachment, [&](const StoreReader& reader, const auto& cancel) {
-        const auto activeGeneration = reader.status().generation;
+        const auto loadedStatus = reader.status();
+        const auto activeGeneration = loadedStatus.generation;
         // Fibers bound to the open volume (by scale or a registration) are read in its voxels.
         const auto transforms = context.hasVolume ? std::optional(reader.volumeTransforms()) : std::nullopt;
         auto decode = [&](const ObjectRecord& object, const ObjectRevision& head, bool withLines) {
@@ -15083,6 +15090,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             fiber.generation = object.version.value();
             fiber.tags = object.tags;
             fiber.storePin = pinOf(*attachment, head, activeGeneration);
+            fiber.graphCommit = loadedStatus.commitSequence;
             fiber.id = context.idForUuid(object.uuid);
             try {
                 if (!head.geometryRevision) throw std::runtime_error("Fiber has no geometry");
@@ -15260,6 +15268,10 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             }
         }
         for (auto& fiber : decoded) if (requested.contains(fiber.uuid)) result.push_back(std::move(fiber));
+        const auto after = reader.status();
+        if (after.storeUuid != loadedStatus.storeUuid || after.generation != loadedStatus.generation ||
+            after.commitSequence != loadedStatus.commitSequence)
+            throw std::runtime_error("Fiber graph changed while loading; reload it");
     });
     return result;
 }
@@ -15379,9 +15391,7 @@ std::vector<LineAnnotationController::StoredFiberPtr> LineAnnotationController::
         const vc::objects::FeedCursor position{status.storeUuid, status.generation, status.commitSequence};
         if (context.position && !context.cache.empty() &&
             (context.position->generation != position.generation ||
-             context.position->sequence != position.sequence) &&
-            vc::objects::changesTouchKinds(reader, *context.position,
-                                           {"volume_transform", "volume_transform_choice", vc::objects::kAttachmentEdgeKind})) {
+             context.position->sequence != position.sequence)) {
             context.cache.clear();
             context.dependencies.clear();
             context.snapshotsInvalidated = true;
@@ -15483,6 +15493,10 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 throw std::runtime_error("The fiber's pinned version is not in its object store's current history; reopen it");
             version = fiber.storePin->version;
             expectObject(request, fiber.storePin->reference());
+            if (!fiber.graphCommit) throw std::runtime_error("The fiber has no loaded graph baseline; reopen it");
+            if (request.expectedCommitSequence && request.expectedCommitSequence != fiber.graphCommit)
+                throw std::runtime_error("The edited fibers have different graph baselines; reopen them together");
+            request.expectedCommitSequence = fiber.graphCommit;
         }
         const auto [it, inserted] = expected.emplace(fiber.uuid, version);
         if (!inserted && it->second != version) throw std::runtime_error("Conflicting fiber version expectations");
@@ -15731,6 +15745,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         if (!saved[i]) throw std::logic_error("A saved fiber version is not in its object store");
         fiber.generation = saved[i]->version;
         fiber.storePin = pinOf(*attachment, *saved[i], receipt.generation);
+        if (receipt.commitSequence) fiber.graphCommit = receipt.commitSequence;
         registerFiberId(fiber.uuid, fiber.id);
     }
     // Shared links also revise the other endpoint: keep its open sessions
@@ -15740,6 +15755,8 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         auto& session = *pane.session;
         if (std::any_of(edits.begin(), edits.end(), [&](const auto& edit) { return edit.fiber.uuid == session.fiberUuid; })) continue;
         const auto reference = receipt.objectReference(session.fiberUuid);
+        // A receipt is not a replacement for the other pane's loaded graph.
+        // Keep its membership baseline until that pane reloads its branches.
         if (!reference || session.storePin->reference() == *reference) continue;
         const auto committed = connection->objectsAtVersions(*attachment, {*reference}).front();
         if (!committed) throw std::runtime_error("The saved endpoint version cannot be read back");
@@ -15763,10 +15780,13 @@ bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
     const auto& fiber=*stored; const auto pin=*fiber.storePin;
     using Json=nlohmann::json;
     Json metadata;
+    vc::objects::ObjectRecord selected;
+    const auto target = *_state->annotationVolume();
     const auto connection=_state->objectStoreSession();
     connection->readStore(pin.attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
         const auto record=reader.objectsAtVersions({pin.reference()}).front();
         if (!record) throw std::runtime_error("Fiber revision missing");
+        selected = record->record;
         metadata=Json::parse(record->record.meta);
     });
     const Json known=metadata.value("coordinates",Json::object());
@@ -15777,12 +15797,13 @@ bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
     const auto scale=vc3d::promptStoredUnitsPerVoxel(_parentWidget.data(),tr("Bind Fiber Coordinates"),tr("fiber"),*volume,known,
         tr("Fiber bounds XYZ: (%1, %2, %3) – (%4, %5, %6)").arg(lower[0]).arg(lower[1]).arg(lower[2]).arg(upper[0]).arg(upper[1]).arg(upper[2]));
     if (!scale) return false;
-    (void)connection->editCurrent(pin.attachment,{fiber.uuid},[&](const vc::objects::StoreReader& reader,const std::string& uuid){
-        // Units per voxel of the open volume: per voxel of its store volume at its scale.
-        const auto& target=*_state->annotationVolume();
-        return std::vector<vc::objects::TransactionOperation>{
-            vc::objects::bindCoordinatesOperation(reader.currentObject(uuid)->record,target.volume,*scale*target.scale)};
+    auto request = connection->newRequest(pin.attachment);
+    connection->readStore(pin.attachment,[&](const vc::objects::StoreReader& reader,const auto&) {
+        vc::objects::editCurrentRequest(reader, request, {fiber.uuid},
+            {vc::objects::bindCoordinatesOperation(selected,target.volume,*scale*target.scale)});
     });
+    vc::objects::expectObject(request, pin.reference());
+    (void)connection->submit(pin.attachment,request);
     return true;
 }
 

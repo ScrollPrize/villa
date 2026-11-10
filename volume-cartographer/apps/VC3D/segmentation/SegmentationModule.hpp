@@ -136,7 +136,8 @@ public:
     void applyCorrectionAnchorOffset(float offsetX, float offsetY);
     // The active surface's correction point collections in the store.
     void loadCorrections(QuadSurface* surface);
-    void saveCorrections();
+    bool saveCorrections();
+    void saveGrowthAnnotation(const vc3d::corrections::GrowthAnnotation&);
 
     void attachViewer(VolumeViewerBase* viewer);
     void detachViewer(VolumeViewerBase* viewer);

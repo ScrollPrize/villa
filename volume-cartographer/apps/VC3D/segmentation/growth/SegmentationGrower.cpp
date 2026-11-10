@@ -1141,6 +1141,7 @@ void SegmentationGrower::onFutureFinished()
 
     refreshSegmentationViewers(_context.viewerManager);
 
+    bool correctionsSaved = true;
     // Keep the growth's corrections with the revisions before and after it.
     auto* annotated = primarySurface ? primarySurface : request.segmentationSurface.get();
     if (request.usingCorrections && request.beforePin && request.correctionsBounds && _context.module && annotated &&
@@ -1160,9 +1161,9 @@ void SegmentationGrower::onFutureFinished()
                     annotation.points.push_back({collection.id, point.id, collection.name,
                                                  {point.p[0], point.p[1], point.p[2]}, int64_t(point.creation_time)});
             try {
-                vc3d::corrections::writeGrowthAnnotation(*_context.state->objectStoreSession(), afterPin->attachment, annotation,
-                                                         _context.state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
+                _context.module->saveGrowthAnnotation(annotation);
             } catch (const std::exception& ex) {
+                correctionsSaved = false;
                 qCWarning(lcSegGrowth) << "Failed to save the corrections annotation:" << ex.what();
             }
         }
@@ -1179,12 +1180,12 @@ void SegmentationGrower::onFutureFinished()
             if (offsetX != 0.0f || offsetY != 0.0f) {
                 _context.module->applyCorrectionAnchorOffset(offsetX, offsetY);
                 // The anchors moved with the grown grid.
-                _context.module->saveCorrections();
+                correctionsSaved = _context.module->saveCorrections() && correctionsSaved;
             }
         }
     }
 
-    if (request.usingCorrections && _context.module) {
+    if (request.usingCorrections && _context.module && correctionsSaved) {
         _context.module->clearPendingCorrections();
     }
 
@@ -1192,7 +1193,9 @@ void SegmentationGrower::onFutureFinished()
     delete result.surface;
 
     QString message;
-    if (!result.statusMessage.isEmpty()) {
+    if (!correctionsSaved) {
+        message = tr("Growth completed, but corrections were not saved; pending corrections were kept.");
+    } else if (!result.statusMessage.isEmpty()) {
         message = result.statusMessage;
     } else if (request.usingCorrections) {
         message = tr("Corrections applied; tracer growth complete.");

@@ -128,6 +128,10 @@ int runSurfacePanelStoreTests()
                 "activation hands out the stored geometry");
         require(panel.opened() && panel.opened()->editable && panel.opened()->pin.object.objectUuid == plain,
                 "the opened surface is pinned and editable");
+        panel.setSelectionChangeGuard([] { return false; });
+        require(!panel.activateSurfaceById(approved, &error) && panel.opened()->pin.object.objectUuid == plain && activated.size() == 1,
+                "failed pending saves veto selection before replacing the displayed surface");
+        panel.setSelectionChangeGuard({});
         require(!panel.activateSurfaceById(unbound, &error), "unbound surfaces do not open");
 
         require(panel.setTagChecked(SurfacePanelController::Tag::Approved, true), "tag checkboxes are enabled for the selection");
@@ -421,6 +425,28 @@ int runViewerRegressionTests()
             const auto crossings = overlay.draftRuns({scaled->id}, *slab);
             require(!crossings.empty() && std::abs(crossings.front().points.front()[2] - 8) < 1e-5,
                     "the selected surface has plane intersections");
+            state.objectStoreSession()->clearDraft(scaled->id);
+            state.setSurface("test plane", std::make_shared<PlaneSurface>(cv::Vec3f(8, 8, 8), cv::Vec3f(1, 0, 0)));
+            overlay.setSurfaces({scaled->id});
+            StoreSurfaceOverlayController::OverlayBuilder selectedLines(idle);
+            overlay.collectPrimitives(idle, selectedLines);
+            const auto& selectedView = *overlay._views.at(idle);
+            pump([&] { return !selectedView.cutRequests.busy && !selectedView.residentRuns.empty(); },
+                 "displayed plane intersections complete asynchronously");
+            require(selectedView.targets.empty() && !selectedView.residentRuns.empty() &&
+                    std::abs(selectedView.residentRuns.front().points.front()[2] - 8) < 1e-5,
+                    "plane overlays use the displayed grid rather than querying the UUID's current head");
+            auto anotherSelection = std::make_shared<QuadSurface>(scaled->rawPoints().clone(), scaled->scale());
+            anotherSelection->id = scaled->id;
+            for (auto& p : *anotherSelection->rawPointsPtr()) p[2] = 6;
+            state.setSurface("segmentation", anotherSelection, false, true);
+            StoreSurfaceOverlayController::OverlayBuilder switchedLines(idle);
+            overlay.collectPrimitives(idle, switchedLines);
+            pump([&] { return !selectedView.cutRequests.busy && !selectedView.residentRuns.empty(); },
+                 "changed displayed plane intersections complete asynchronously");
+            require(!selectedView.residentRuns.empty() &&
+                    std::abs(selectedView.residentRuns.front().points.front()[2] - 6) < 1e-5,
+                    "same-UUID selection changes replace orthogonal-plane intersections");
             viewer->quiesceForClose();
         }
         std::cerr << "viewer regression tests passed\n";

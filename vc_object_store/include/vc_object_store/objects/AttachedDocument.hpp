@@ -31,9 +31,13 @@ std::string attachDocument(ObjectStoreSession&, const AttachmentIdentity&, const
 // with geometry); nullopt when there is none.
 std::optional<nlohmann::json> attachedDocument(const StoreReader&, const std::string& objectUuid,
                                                const std::string& role);
+// Exact owner selection; attached evidence must be applicable to that state.
+std::optional<nlohmann::json> attachedDocument(const StoreReader&, const ObjectVersion&, const std::string& role);
 // The same, read from a session's attachment.
 std::optional<nlohmann::json> attachedDocument(ObjectStoreSession&, const AttachmentIdentity&,
                                                const std::string& objectUuid, const std::string& role);
+std::optional<nlohmann::json> attachedDocument(ObjectStoreSession&, const AttachmentIdentity&,
+                                               const ObjectVersion&, const std::string& role);
 
 // Editable point collections attached to an object in a role (e.g. a surface's
 // corrections): each its points with stable ids, one annotation per point, and
@@ -46,6 +50,8 @@ struct AttachedCollection {
     std::optional<ObjectVersion> reference;
     // Mapping used when loading editable coordinates; checked under the write lock.
     std::optional<CheckVolumeMappingOp> mapping;
+    // Runtime allocation floor, including IDs removed from retained revisions.
+    int64_t nextPointId = 0;
 };
 // The live collections attached to `objectUuid` in `role`, with their points in
 // `frame` when given (else as stored).
@@ -68,7 +74,7 @@ AttachedCollectionsSnapshot attachedCollections(ObjectStoreSession&, const Attac
 // from the receipt, ready for another edit; on conflict it stays unchanged.
 // Membership uses the store's commit sequence, so unrelated commits also
 // require reloading. An inherited owner's unchanged version is not sufficient.
-void replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, AttachedCollectionsSnapshot&,
+TransactionReceipt replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, AttachedCollectionsSnapshot&,
                                 const std::vector<AttachedCollection>& collections, const nlohmann::json& coordinates);
 
 // A volume's point collections: the live point_collection objects whose

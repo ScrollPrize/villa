@@ -39,6 +39,7 @@ AttachedCollection readCollection(const StoreReader& reader, const ObjectRevisio
     const auto& head = *selected.geometryRevision;
     AttachedCollection collection;
     collection.reference = selected.reference();
+    collection.nextPointId = reader.nextGeometryPointId(object.uuid, "points");
     collection.uuid = object.uuid;
     collection.name = object.name;
     collection.points = std::get<geometry::PointCollection>(geometry::decode(reader.readGeometryData(head)));
@@ -50,6 +51,15 @@ AttachedCollection readCollection(const StoreReader& reader, const ObjectRevisio
     collection.annotations = reader.geometryPointAnnotations(head, "points");
     collection.source = nlohmann::json::parse(object.meta).value("source", nlohmann::json::object());
     return collection;
+}
+
+std::optional<nlohmann::json> documentOf(const StoreReader& reader, const ObjectRevision& object)
+{
+    if (object.deleted || object.record.retired || !object.geometryRevision) return std::nullopt;
+    const auto source = nlohmann::json::parse(object.record.meta).value("source", nlohmann::json::object());
+    auto document = source.value("document", nlohmann::json::object());
+    document[source.value("list_key", std::string("records"))] = reader.geometryPointAnnotations(*object.geometryRevision, "points");
+    return document;
 }
 
 // Operations making collection `uuid` hold `wanted`, read through `reader`:
@@ -100,17 +110,15 @@ void writeCollection(const StoreReader& reader, TransactionRequest& request, con
     operations.push_back(UpdateObjectOp{objectRecordJson(record)});
     const auto previous = std::get<geometry::PointCollection>(geometry::decode(reader.readGeometryData(head->uuid)));
     const auto previousAnnotations = reader.geometryPointAnnotations(head->uuid, "points");
-    if (previous.ids == points.ids && previous.points == points.points && previousAnnotations == wanted.annotations) {
-        // Only the record changed: its relationships still apply.
-        EdgeSelection edges;
-        edges.endpointUuids = std::vector<std::string>{uuid};
-        for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{}))
-            operations.push_back(RetainRelationshipOp{edge.uuid});
-        return;
-    }
     // Points that stay keep their identity (stable ids); relationships apply
-    // to the edited geometry as before.
-    operations.push_back(UpdateGeometryArraysOp{uuid, geometry::encode(points), {{"points", wanted.annotations.dump()}}, "retain"});
+    // to the edited document, including annotation-only changes which do not
+    // affect spatial dependencies but still publish new attached evidence.
+    if (previous.ids != points.ids || previous.points != points.points || previousAnnotations != wanted.annotations)
+        operations.push_back(UpdateGeometryArraysOp{uuid, geometry::encode(points), {{"points", wanted.annotations.dump()}}, "retain"});
+    EdgeSelection edges;
+    edges.endpointUuids = std::vector<std::string>{uuid};
+    for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{}))
+        operations.push_back(RetainRelationshipOp{edge.uuid});
 }
 }
 
@@ -149,15 +157,27 @@ std::string attachDocument(ObjectStoreSession& session, const AttachmentIdentity
 std::optional<nlohmann::json> attachedDocument(const StoreReader& reader, const std::string& objectUuid,
                                                const std::string& role)
 {
-    for (const auto& edge : attachments(reader, objectUuid, role)) {
-        const auto uuid = edge.otherEndpoint(objectUuid);
-        const auto object = reader.currentObject(uuid);
-        if (!object || object->record.retired || !object->geometryRevision) continue;
-        const auto source = nlohmann::json::parse(object->record.meta).value("source", nlohmann::json::object());
-        auto document = source.value("document", nlohmann::json::object());
-        document[source.value("list_key", std::string("records"))] =
-            reader.geometryPointAnnotations(*object->geometryRevision, "points");
-        return document;
+    for (const auto& edge : attachments(reader, objectUuid, role))
+        if (const auto object = reader.currentObject(edge.otherEndpoint(objectUuid)))
+            if (auto document = documentOf(reader, *object)) return document;
+    return std::nullopt;
+}
+
+std::optional<nlohmann::json> attachedDocument(const StoreReader& reader, const ObjectVersion& owner,
+                                               const std::string& role)
+{
+    EdgeSelection selection;
+    selection.kind = kAttachmentEdgeKind;
+    selection.applicableOnly = true;
+    const auto graph = reader.graphReadViewAround({owner}, selection);
+    const auto ownerUuid = util::canonicalUuid(owner.objectUuid);
+    for (size_t i = 0; i < graph.edgeUuids.size(); ++i) {
+        const auto& edge = graph.selectedRelationships->at(i).record;
+        if (edge.aUuid != ownerUuid && edge.bUuid != ownerUuid) continue;
+        if (nlohmann::json::parse(edge.meta).value("role", std::string{}) != role) continue;
+        const auto uuid = edge.otherEndpoint(ownerUuid);
+        const auto index = graph.objectUuids.at(graph.endpoints[i][0]) == uuid ? graph.endpoints[i][0] : graph.endpoints[i][1];
+        if (auto document = documentOf(reader, graph.selectedObjects->at(index))) return document;
     }
     return std::nullopt;
 }
@@ -169,6 +189,14 @@ std::optional<nlohmann::json> attachedDocument(ObjectStoreSession& session, cons
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         document = attachedDocument(reader, objectUuid, role);
     });
+    return document;
+}
+
+std::optional<nlohmann::json> attachedDocument(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+                                               const ObjectVersion& owner, const std::string& role)
+{
+    std::optional<nlohmann::json> document;
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) { document = attachedDocument(reader, owner, role); });
     return document;
 }
 
@@ -197,7 +225,7 @@ AttachedCollectionsSnapshot attachedCollections(ObjectStoreSession& session, con
     return result;
 }
 
-void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment, AttachedCollectionsSnapshot& baseline,
+TransactionReceipt replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment, AttachedCollectionsSnapshot& baseline,
                                 const std::vector<AttachedCollection>& collections, const nlohmann::json& coordinates)
 {
     auto next = baseline;
@@ -264,6 +292,7 @@ void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIde
             collection.mapping = CheckVolumeMappingOp{collection.uuid, frame->volume, frame->scale, VolumeAffine::identity()};
     }
     baseline = std::move(next);
+    return receipt;
 }
 
 std::vector<AttachedCollection> volumeCollections(const StoreReader& reader, const VolumeVoxels& volume)

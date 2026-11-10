@@ -402,30 +402,44 @@ void SegmentationModule::loadCorrections(QuadSurface* surface)
             _correctionsSnapshot = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid(),
                                              storeEdit->view());
             stored = _correctionsSnapshot->collections;
+            storeEdit->watchAttachedCollections(_correctionsSnapshot->baseline);
             _correctionsSurfaceId = storeEdit->uuid();
         } catch (const std::exception& error) {
             emit statusMessageRequested(tr("Cannot read correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
         }
     }
     _pointCollection->replaceAnchoredCollections(stored);
+    if (_correctionsSnapshot)
+        for (const auto& collection : _correctionsSnapshot->baseline.collections)
+            _pointCollection->reservePointIds(uint64_t(collection.nextPointId));
 }
 
-void SegmentationModule::saveCorrections()
+bool SegmentationModule::saveCorrections()
 {
     if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
         _correctionsSaveTimer->stop();
     }
     if (!_pointCollection || !_correctionsSnapshot || _correctionsSurfaceId.empty() || !_storeEdit || _storeEdit->uuid() != _correctionsSurfaceId ||
         !_state || !_state->annotationVolume()) {
-        return;
+        return true;
     }
     try {
         vc3d::corrections::write(*_state->objectStoreSession(), _storeEdit->pin().attachment, *_correctionsSnapshot,
-                                 _pointCollection->anchoredCollections(), *_state->annotationVolume());
+                                 _pointCollection->anchoredCollections(), *_state->annotationVolume(), _storeEdit.get());
+        return true;
     } catch (const std::exception& error) {
         qCWarning(lcSegModule) << "Saving correction points failed:" << error.what();
         emit statusMessageRequested(tr("Failed to save correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
+        return false;
     }
+}
+
+void SegmentationModule::saveGrowthAnnotation(const vc3d::corrections::GrowthAnnotation& annotation)
+{
+    if (!_storeEdit || _storeEdit->uuid() != annotation.surfaceUuid || !_state || !_state->annotationVolume())
+        throw std::runtime_error("Growth annotation has no active surface editor");
+    vc3d::corrections::writeGrowthAnnotation(*_state->objectStoreSession(), _storeEdit->pin().attachment,
+        annotation, *_state->annotationVolume(), _storeEdit.get());
 }
 
 vc::objects::CoordinateJson SegmentationModule::editCoordinates(const SurfaceStoreEdit& storeEdit) const

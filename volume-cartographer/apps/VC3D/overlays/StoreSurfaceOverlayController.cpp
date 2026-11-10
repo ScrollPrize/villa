@@ -37,7 +37,7 @@ std::vector<Run> runsOf(std::vector<vc::objects::VisibleRun>&& visible)
 {
     std::vector<Run> runs;
     runs.reserve(visible.size());
-    for (auto& run : visible) runs.push_back({std::move(run.objectUuid), std::move(run.points), std::move(run.grid)});
+    for (auto& run : visible) runs.push_back({std::move(run.objectUuid), std::move(run.points), std::move(run.grid), std::move(run.objectReference)});
     return runs;
 }
 
@@ -81,8 +81,15 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
     // Edits update their drafts before announcing the surface; intersect
     // targets and planes are named surfaces.
     connect(_state, &CState::surfaceChanged, this, [this](std::string, std::shared_ptr<Surface> surface, bool) {
+        // Do not retain indices for selections which have left the workspace.
+        // Plane navigation alone leaves the displayed-grid cache intact.
+        if (!surface || dynamic_cast<QuadSurface*>(surface.get())) _residentSurfaces.clear();
         for (auto& [viewer, view] : _views) {
             view->dirty = true;
+            // In-place edits retain the pointer; the displayed grid is still new.
+            if (!surface || std::any_of(view->displayedSurfaces.begin(), view->displayedSurfaces.end(),
+                    [&](const auto& entry) { return entry.second.get() == surface.get(); }))
+                view->residentSlab.reset();
             if (!surface || view->cutDisplayed == surface.get()) {
                 view->cutSurface.reset();
                 view->cutRequests.refresh();
@@ -154,6 +161,7 @@ void StoreSurfaceOverlayController::fetch(const std::vector<std::pair<vc::object
 
 void StoreSurfaceOverlayController::invalidate()
 {
+    _residentSurfaces.clear();
     _fetchCancel->store(true);
     _fetchCancel = std::make_shared<std::atomic_bool>(false);
     _fetching.clear();
@@ -171,6 +179,9 @@ void StoreSurfaceOverlayController::invalidate()
         view->planeRuns.clear();
         view->draftSlab.reset();
         view->draftRuns.clear();
+        view->residentRuns.clear();
+        view->displayedSurfaces.clear();
+        view->residentSlab.reset();
         view->draftRevisions.clear();
         view->drawn.reset();
         ++view->runsVersion;
@@ -328,8 +339,8 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
         });
 }
 
-void StoreSurfaceOverlayController::requestCuts(VolumeViewerBase* viewer, const std::string& uuid,
-                                                const std::vector<PlaneCut>& cuts)
+void StoreSurfaceOverlayController::requestCuts(VolumeViewerBase* viewer, const ResidentSurfaces& surfaces,
+                                                const std::vector<PlaneCut>& cuts, bool planeViewer)
 {
     auto& v = *_views.at(viewer);
     v.cutRequests.refresh();
@@ -344,26 +355,30 @@ void StoreSurfaceOverlayController::requestCuts(VolumeViewerBase* viewer, const 
     v.cutsStale = false;
     using Cut = std::map<std::string, std::vector<Run>>;
     vc3d::store::background<Cut>(this,
-        [surface = v.cutSurface,
-         uuid, cuts, token] {
+        [surfaces, cuts, token] {
             Cut result;
-            for (const auto& cut : cuts) {
+            for (const auto& cut : cuts) for (const auto& [uuid, surface] : surfaces) {
                 auto crossings = surface->region(uuid, vc3d::store::regionSlice(cut.slab),
                                                  [token](const auto&) { return token->load(); });
                 if (!crossings.complete() && !token->load())
                     throw std::runtime_error("Displayed surface cut exceeds its output budget");
-                result[cut.plane] = runsOf(std::move(crossings.runs));
+                auto runs = runsOf(std::move(crossings.runs));
+                auto& destination = result[cut.plane];
+                destination.insert(destination.end(), std::make_move_iterator(runs.begin()), std::make_move_iterator(runs.end()));
             }
             return result;
         },
-        [this, viewer, token, view = cuts.front().slab, query = *query](vc3d::store::Outcome<Cut> outcome) {
+        [this, viewer, token, planeViewer, view = cuts.front().slab, query = *query](vc3d::store::Outcome<Cut> outcome) {
             const auto found = _views.find(viewer);
             if (found == _views.end()) return;
             auto& v = *found->second;
             using Finished = vc3d::store::RegionRequests::Finished;
             const auto finished = v.cutRequests.finish(token, view, query, true, outcome.error);
             if (finished == Finished::Stale) return;
-            if (finished == Finished::Install && outcome.error.isEmpty()) v.planeRuns = std::move(outcome.value);
+            if (finished == Finished::Install && outcome.error.isEmpty()) {
+                if (planeViewer) { v.residentRuns = std::move(outcome.value[""]); ++v.runsVersion; }
+                else v.planeRuns = std::move(outcome.value);
+            }
             if (finished == Finished::Retry) v.cutsStale = true;
             v.dirty = true;
             refreshViewer(viewer);
@@ -390,7 +405,16 @@ void StoreSurfaceOverlayController::drawPlaneViewer(VolumeViewerBase* viewer, Vi
     if (!current) return;
     const auto session = _state->objectStoreSession();
     std::vector<std::string> drafted, stored;
-    for (const auto& uuid : targets(viewer)) (session->hasDraft(uuid) ? drafted : stored).push_back(uuid);
+    std::map<std::string, std::shared_ptr<QuadSurface>> displayed;
+    for (const auto& name : viewer->intersects())
+        if (auto surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name))) displayed[surface->id] = surface;
+    if (auto surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"))) displayed[surface->id] = surface;
+    const auto selected = targets(viewer);
+    std::erase_if(displayed, [&](const auto& entry) {
+        return !std::binary_search(selected.begin(), selected.end(), entry.first) || session->hasDraft(entry.first);
+    });
+    for (const auto& uuid : selected)
+        if (!displayed.contains(uuid)) (session->hasDraft(uuid) ? drafted : stored).push_back(uuid);
     if (v.targets != stored) {
         v.targets = stored;
         v.region.reset();
@@ -399,7 +423,9 @@ void StoreSurfaceOverlayController::drawPlaneViewer(VolumeViewerBase* viewer, Vi
     }
     if (!stored.empty()) request(viewer, *current, stored);
 
-    const auto notice = !v.region.error.isEmpty() ? tr("Surfaces: %1").arg(v.region.error)
+    const auto notice = !v.cutRequests.error.isEmpty() ? tr("Displayed surfaces: %1").arg(v.cutRequests.error)
+                        : v.cutRequests.busy ? tr("Reading displayed surface intersections…")
+                        : !v.region.error.isEmpty() ? tr("Surfaces: %1").arg(v.region.error)
                         : !_fetching.empty() ? tr("Fetching %n surface(s)…", nullptr, int(_fetching.size()))
                         : !_fetchFailures.empty()
                             ? tr("%n surface(s) could not be fetched: %1", nullptr, int(_fetchFailures.size()))
@@ -420,6 +446,19 @@ void StoreSurfaceOverlayController::drawPlaneViewer(VolumeViewerBase* viewer, Vi
     std::vector<std::uint64_t> revisions;
     for (const auto& uuid : drafted) revisions.push_back(session->draftRevision(uuid));
     const auto slab = planeSlab(*plane);
+    if (v.displayedSurfaces != displayed || v.residentSlab != slab) {
+        v.residentRuns.clear();
+        v.displayedSurfaces = std::move(displayed);
+        v.residentSlab = slab;
+        v.cutRequests.reset();
+        v.cutsStale = true;
+        ++v.runsVersion;
+    }
+    if (v.cutsStale && slab) {
+        ResidentSurfaces surfaces;
+        for (const auto& [uuid, surface] : v.displayedSurfaces) surfaces.emplace(uuid, residentSurface(*surface));
+        requestCuts(viewer, surfaces, {{"", *slab}}, true);
+    }
     if (v.draftSlab != slab || v.drafted != drafted || v.draftRevisions != revisions) {
         v.draftRuns = slab ? draftRuns(drafted, *slab) : std::vector<Run>{};
         v.draftSlab = slab;
@@ -451,8 +490,9 @@ void StoreSurfaceOverlayController::drawPlaneViewer(VolumeViewerBase* viewer, Vi
         }
     }
     std::vector<Run> runs = v.draftRuns;
+    runs.insert(runs.end(), v.residentRuns.begin(), v.residentRuns.end());
     for (const auto& run : v.runs)
-        if (!std::binary_search(drafted.begin(), drafted.end(), run.uuid)) runs.push_back(run);
+        if (!v.displayedSurfaces.contains(run.uuid) && !std::binary_search(drafted.begin(), drafted.end(), run.uuid)) runs.push_back(run);
     OverlayBuilder lines(viewer);
     addLines(viewer, runs, style, lines);
     applyPrimitives(viewer, kStoredLinesGroup, lines.takePrimitives());
@@ -571,6 +611,14 @@ void StoreSurfaceOverlayController::addLines(VolumeViewerBase* viewer, const std
     }
 }
 
+std::shared_ptr<vc::objects::ResidentSurface> StoreSurfaceOverlayController::residentSurface(QuadSurface& surface)
+{
+    auto& cached = _residentSurfaces[surface.id];
+    if (!cached.second || cached.first != &surface)
+        cached = {&surface, std::make_shared<vc::objects::ResidentSurface>(quad_surface_grid(surface))};
+    return cached.second;
+}
+
 void StoreSurfaceOverlayController::drawSurfaceViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder)
 {
     auto* surface = dynamic_cast<QuadSurface*>(viewer->currentSurface());
@@ -582,13 +630,13 @@ void StoreSurfaceOverlayController::drawSurfaceViewer(VolumeViewerBase* viewer, 
     v.cuts = cuts;
     v.cutObject = surface->id;
     if (!v.cutSurface || v.cutDisplayed != surface) {
-        v.cutSurface = std::make_shared<vc::objects::ResidentSurface>(quad_surface_grid(*surface));
+        v.cutSurface = residentSurface(*surface);
         v.cutDisplayed = surface;
         v.cutsStale = true;
         v.planeRuns.clear();
     }
     if (cutsChanged || v.cutsStale) {
-        requestCuts(viewer, surface->id, cuts);
+        requestCuts(viewer, {{surface->id, v.cutSurface}}, cuts);
     }
 
     const float opacity = std::clamp(viewer->intersectionOpacity() * vc3d::kActiveIntersectionOpacityScale, 0.0f, 1.0f);
