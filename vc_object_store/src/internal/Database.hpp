@@ -48,7 +48,7 @@ struct StatementPool {
     // Shared lookup for immutable records and payloads. Owns no data, aliases
     // or per-record directories; returned connections live for the transaction.
     std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> referenceSource;
-    std::function<sqlite3*(const std::string&,bool)> objectSource;
+    std::function<sqlite3*(const std::string&,bool,bool)> objectSource;
     std::function<sqlite3*(const std::string&,bool)> edgeSource;
     // Physical query sources in this pinned logical scope; visibility is
     // checked by key resolution before filtering/pagination is finalized.

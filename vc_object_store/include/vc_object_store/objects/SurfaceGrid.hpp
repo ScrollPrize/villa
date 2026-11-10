@@ -26,10 +26,13 @@ struct SurfaceGrid {
 };
 
 // The surface's current version, or numbered `version` in `generation` (default
-// the active one), in voxels of `volume` at `targetScale`, through the store's
+// the current owner's lineage), in voxels of `volume` at `targetScale`, through the store's
 // mapping to it (its binding or a registration). Throws std::invalid_argument
 // when the surface (version) does not exist or does not map to `volume`.
 SurfaceGrid readSurfaceGrid(const StoreReader&, const std::string& surfaceUuid, const std::string& volume,
                             double targetScale = 1.0, std::optional<int64_t> version = std::nullopt,
                             const std::optional<std::string>& generation = std::nullopt);
+// Exact selection is independent of the object's current owner or visibility.
+SurfaceGrid readSurfaceGrid(const StoreReader&, const ObjectVersion&, const std::string& volume,
+                            double targetScale = 1.0);
 }

@@ -4,6 +4,7 @@
 #include "geometry/ArrayLayout.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/Database.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include <map>
 #include <nlohmann/json.hpp>
 #include <cmath>
@@ -159,12 +160,12 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
                                               const std::optional<std::string>& geometryRevision) const
 {
     state_->require();
-    const auto object = state_->reader->currentObject(id);
-    if (!object) throw std::invalid_argument("object not found");
+    const auto object = geometryRevision ? std::optional<ObjectRevision>{} : state_->reader->currentObject(id);
+    if (!geometryRevision && !object) throw std::invalid_argument("object not found");
     const auto revision = geometryRevision ? state_->reader->geometryRevision(*geometryRevision)
                                            : state_->reader->currentGeometry(id);
     if (!revision) throw std::invalid_argument("object has no stored geometry");
-    if (revision->objectUuid != object->objectUuid)
+    if (revision->objectUuid != util::canonicalUuid(id))
         throw std::invalid_argument("geometry revision belongs to another object");
     if (!kind.empty() && revision->kind != kind) throw std::invalid_argument("geometry kind mismatch: expected " + kind);
     if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")

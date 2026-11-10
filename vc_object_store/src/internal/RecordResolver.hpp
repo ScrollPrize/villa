@@ -11,13 +11,14 @@ struct ResolvedObject {
 };
 // Inherited lookup is for an overlay's before-state only; ordinary consumers
 // use visible lookup, where a tombstone stops fallback.
-inline sqlite3* objectSource(sqlite3* db,const std::string& uuid,bool inherited=false)
+// includeDeleted returns the winning tombstone's owner, never an older live row.
+inline sqlite3* objectSource(sqlite3* db,const std::string& uuid,bool inherited=false,bool includeDeleted=false)
 {
     if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end()&&pool->second->objectSource)
-        return pool->second->objectSource(uuid,inherited);
+        return pool->second->objectSource(uuid,inherited,includeDeleted);
     if(inherited)return nullptr;
     Statement row(db,"SELECT state FROM objects WHERE uuid=?",parseUuid(uuid));
-    return row.row()&&row.i64(0)!=2?db:nullptr;
+    return row.row()&&(includeDeleted||row.i64(0)!=2)?db:nullptr;
 }
 inline std::optional<ResolvedObject> resolveObject(sqlite3* db,const std::string& uuid,bool inherited=false)
 {

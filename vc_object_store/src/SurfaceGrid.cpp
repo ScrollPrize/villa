@@ -3,6 +3,9 @@
 #include <stdexcept>
 
 namespace vc::objects {
+namespace {
+SurfaceGrid surfaceGrid(const StoreReader& reader, const ObjectRevision& selected, const std::string& volume, double targetScale);
+}
 SurfaceGrid readSurfaceGrid(const StoreReader& reader, const std::string& surfaceUuid, const std::string& volume,
                             double targetScale, std::optional<int64_t> version, const std::optional<std::string>& generation)
 {
@@ -16,6 +19,22 @@ SurfaceGrid readSurfaceGrid(const StoreReader& reader, const std::string& surfac
         revision = reader.currentObject(surfaceUuid);
         if (!revision || revision->record.kind != "surface") throw std::invalid_argument("no surface " + surfaceUuid);
     }
+    return surfaceGrid(reader,*revision,volume,targetScale);
+}
+
+SurfaceGrid readSurfaceGrid(const StoreReader& reader, const ObjectVersion& reference, const std::string& volume, double targetScale)
+{
+    const auto revision=reader.objectsAtVersions({reference}).front();
+    if(!revision||revision->deleted||revision->record.kind!="surface")
+        throw std::invalid_argument("no surface at the selected exact version");
+    return surfaceGrid(reader,*revision,volume,targetScale);
+}
+
+namespace {
+SurfaceGrid surfaceGrid(const StoreReader& reader, const ObjectRevision& selected, const std::string& volume, double targetScale)
+{
+    const auto* revision=&selected;
+    const auto& surfaceUuid=revision->objectUuid;
     if (!revision->geometryRevision)
         throw std::invalid_argument("surface " + surfaceUuid + " version " + std::to_string(revision->version) +
                                     " has no geometry");
@@ -46,5 +65,6 @@ SurfaceGrid readSurfaceGrid(const StoreReader& reader, const std::string& surfac
     for (const auto& array : canonical.revision().arrays)
         if (array.name != "points" && array.name != "valid") grid.channels.push_back(array.name);
     return grid;
+}
 }
 }

@@ -57,3 +57,23 @@ Implemented: H shares override preparation for restored metadata (including rela
 Permanent regressions cover active/retired/default inherited restores, relative file references, mixed local/inherited selections over paged hosted transport, version-1 selection artifact compatibility, inherited historical geometry export, both cross-kind UUID collision directions, source collection/point duplicates across stores, override/deletion precedence, and repeated On→Off→On→Off history transitions retaining borrowed delta geometry with zero local geometry chunks.
 
 Follow-up verification: `bash local/scripts/run_vcobj_pr_tests` completed successfully on Linux with 52 native tests passed (one optional SSH skip), 199 Python tests passed, and 117 Spiral integration tests passed (one optional real-data skip). `git diff --check` passed. The pre-existing Spiral nanobind shutdown leak diagnostic remains unchanged. No macOS or full-volume performance validation was run. Selection artifacts now encode version 2 while decoding existing version 1; database schema remains 21, with unchanged binary persistent identifiers.
+
+## Consumer and deleted-state audit
+
+Baseline: `9b756e7d3`. Fix the six findings through shared reference and routing APIs, preserving the schema and binary identifiers. Do not add per-object directories or copy referenced payloads.
+
+- [x] M. Preserve complete source/version references in VC3D fiber loading/export, surface history, Spiral relationship comparison and Python Spiral input pins.
+- [x] N. Repin edited inherited surfaces using the committed owner from the transaction receipt, not the old source owner.
+- [x] O. Reject geometry re-import of deleted inherited identities through shared tombstone-aware lookup.
+- [x] P. Resolve history of deleted inherited objects through the same owning-record lookup, without local-store fallback assumptions.
+- [x] Q. Read explicitly selected retained geometry independently of whether its object is currently visible.
+- [x] R. Add complete exact-reference surface reads and preserve source identity in Lasagna surface references, keeping existing reference syntax readable.
+- [x] Add regressions, validate native/Python/consumer tests, inspect the diff and commit.
+
+Audit probes reproduced incorrect owner references, failed repinning, a deleted inherited UUID being re-imported, two base history entries becoming zero through an overlay, and readable raw historical geometry being rejected by typed views. GUI call sites were code-traced; no GUI execution was claimed.
+
+Implemented M–R: shared object-source resolution can return the winning tombstone's owner for history and identity checks, without falling through deletion. Typed views resolve explicit geometry independently of current visibility. Exact surface reads accept the ordinary complete object reference and share the same grid materialization as current reads. Consumers use record references, and changed pins use receipt ownership. Spiral selections/manifests preserve mixed-source references without changing content digests; legacy single-store pins and Lasagna's two-field surface version syntax remain readable. Database schema 21 and binary identifiers are unchanged; no tables, proxy records, directories or geometry payload copies were introduced.
+
+Regressions exercise all four source/overlay history-policy combinations, inherited deletion/re-import, metadata overrides, retained typed geometry after deletion, wrong-object geometry rejection, exact surface reads, consumer pin/manifest round-trips and legacy reference compatibility.
+
+M–R verification: `bash local/scripts/run_vcobj_pr_tests` passed on Linux (RelWithDebInfo, Python 3.14): 52 native tests, 200 Python store tests, 118 Spiral integration tests and 12 Lasagna stored-surface tests. Optional SSH and real-data tests skipped. Lasagna used the existing reader native build with this checkout's Python reader package; no dependencies were installed. All four modified production VC3D translation units passed `c++ -std=c++20 -fPIC -fsyntax-only` using the existing Qt6/OpenCV/dependency includes. `git diff --check` passed. The pre-existing Spiral nanobind shutdown leak diagnostic remains; no GUI runtime, macOS or full-volume performance result is claimed. Changes are committed in separate core-store, VC3D, Spiral and Lasagna blocks.

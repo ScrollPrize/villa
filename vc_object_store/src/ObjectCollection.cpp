@@ -261,10 +261,10 @@ struct ObjectCollection::Impl {
             }
             return nullptr;
         };
-        pool->objectSource=[this,n,get,scope](const std::string& uuid,bool inherited)->sqlite3*{
+        pool->objectSource=[this,n,get,scope](const std::string& uuid,bool inherited,bool includeDeleted)->sqlite3*{
             const auto found=locateSourceSql({{},uuid},get,0,[&](size_t i){
                 return scope.contains(i)&&(!inherited||i!=n);
-            });
+            },includeDeleted);
             return found?get(*found):nullptr;
         };
         // Edges and objects have the same UUID/tombstone routing semantics.
@@ -287,7 +287,7 @@ struct ObjectCollection::Impl {
         return {nodes[n].member.storeUuid,uuid};
     }
     std::optional<size_t> locateSourceSql(const ObjectKey&,const std::function<sqlite3*(size_t)>&,size_t start=0,
-                                         const std::function<bool(size_t)>& eligible={}) const;
+                                         const std::function<bool(size_t)>& eligible={},bool includeDeleted=false) const;
     ObjectKey insertEdge(CollectionTxn&,const ObjectKey&,const ObjectKey&,const EdgeRecord&,std::optional<int64_t>);
 };
 struct CollectionTxn::Impl {
@@ -417,7 +417,7 @@ struct detail::CollectionReadContext {
     std::unique_ptr<StatementPool> rootPool;
     StatementPool* borrowedPool=nullptr;
     std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> previousReferences;
-    std::function<sqlite3*(const std::string&,bool)> previousObjects;
+    std::function<sqlite3*(const std::string&,bool,bool)> previousObjects;
     std::function<sqlite3*(const std::string&,bool)> previousEdges;
     std::function<std::vector<sqlite3*>()> previousQueries;
     std::map<size_t,std::unique_ptr<ReadTxn>> readers;
@@ -465,13 +465,13 @@ std::shared_ptr<void> detail::attachCollectionReferenceResolver(sqlite3* db,cons
     return hasCollection(db)?std::make_shared<CollectionReadContext>(db,path,options):std::shared_ptr<void>{};
 }
 std::optional<size_t> ObjectCollection::Impl::locateSourceSql(const ObjectKey& key,
-    const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible)const{
+    const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible,bool includeDeleted)const{
     // UUID is the complete key. The first present row wins, including deletion.
     for(const auto n:uuidReadOrder(key.objectUuid,"objects"))if(n>=start&&(!eligible||eligible(n))){
         auto* sql=get(n);
         Statement state(sql,"SELECT state FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
         if(!state.row())continue;
-        if(state.i64(0)==2)return {};
+        if(state.i64(0)==2&&!includeDeleted)return {};
         return n;
     }
     return {};

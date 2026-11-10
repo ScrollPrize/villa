@@ -809,10 +809,9 @@ std::optional<ObjectRevision> ObjectStore::currentObjectRevision(const Txn& txn,
 std::vector<ObjectRevision> ObjectStore::objectHistory(const Txn& txn, const std::string& object) const
 {
     auto* db=static_cast<sqlite3*>(connection(txn));
-    // History follows the visible owner, just like current reads. A deleted
-    // local object has no visible owner but still retains its local history.
-    auto* source=objectSource(db,object);
-    if(!source)source=db;
+    // History belongs to the winning record, including an inherited tombstone.
+    auto* source=objectSource(db,object,false,true);
+    if(!source)return {};
     requireHistory(source);
     Statement s(source, "SELECT uuid FROM object_revisions WHERE object_uuid=? ORDER BY seq",
         parseUuid(object));

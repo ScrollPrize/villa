@@ -27,14 +27,16 @@ class SurfaceGrid(NamedTuple):
     channels: frozenset  # names of the per-vertex channels (not points or valid)
 
 
-def read_surface(store, surface_uuid, *, volume, version=None, generation=None, target_scale=1.0) -> SurfaceGrid:
-    """The surface (its current version, or numbered ``version`` in ``generation``, default the store's active
+def read_surface(store, surface_uuid, *, volume, version=None, generation=None, reference=None, target_scale=1.0) -> SurfaceGrid:
+    """The surface (its current version, or numbered ``version`` in ``generation``, default the current owner's
     one) in voxels of ``volume`` at ``target_scale``, through the store's mapping to it (its binding, or a
     registration). ``store`` is a store file or a vc_object_server endpoint (``locations``). Raises ValueError when
-    the surface (version) does not exist or does not map to ``volume``."""
+    the surface (version) does not exist or does not map to ``volume``. ``reference`` is a complete
+    {store, generation, object, version} reference, independent of the current owner; it is exclusive
+    with version/generation selectors, which select within the current owner's history."""
     with attached(store, read_only=True) as (session, attachment):
         grid = session.read_surface_grid(attachment, str(surface_uuid), str(volume), float(target_scale),
-                                         None if version is None else int(version), generation)
+                                         None if version is None else int(version), generation, reference)
     return surface_grid(grid)
 
 

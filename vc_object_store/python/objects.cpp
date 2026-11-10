@@ -649,12 +649,19 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
            "(HostedSessionOptions::cacheDirectory), within disk_cache_bytes and keeping min_free_bytes free.")
         .def("read_surface_grid", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                      const std::string& volume, double targetScale, std::optional<int64_t> version,
-                                     const std::optional<std::string>& generation) {
+                                     const std::optional<std::string>& generation, const nb::object& reference) {
+            std::optional<vo::ObjectVersion> exact;
+            if(!reference.is_none()) {
+                nb::list refs;refs.append(reference);exact=objectVersionsFromPy(refs).front();
+                if(exact->objectUuid!=vo::util::canonicalUuid(uuid)||version||generation)
+                    throw std::invalid_argument("reference must name this surface and cannot be combined with version/generation");
+            }
             vo::SurfaceGrid grid;
             {
                 nb::gil_scoped_release release;
                 self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
-                    grid = vo::readSurfaceGrid(reader, uuid, volume, targetScale, version, generation);
+                    grid = exact ? vo::readSurfaceGrid(reader, *exact, volume, targetScale)
+                                 : vo::readSurfaceGrid(reader, uuid, volume, targetScale, version, generation);
                 });
             }
             nb::dict d;
@@ -667,7 +674,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             d["geometry_revision"] = grid.geometryRevision; d["channels"] = grid.channels;
             return d;
         }, nb::arg("attachment"), nb::arg("surface_uuid"), nb::arg("volume"), nb::arg("target_scale") = 1.0,
-           nb::arg("version") = nb::none(), nb::arg("generation") = nb::none(),
+           nb::arg("version") = nb::none(), nb::arg("generation") = nb::none(), nb::arg("reference") = nb::none(),
            "A surface (current, or numbered version) as a whole grid in volume's voxels (objects/SurfaceGrid.hpp): "
            "points (rows, columns, 3) float32 with -1 at invalid vertices, valid (uint8), scale, record, version, "
            "generation, geometry_revision, channels.")
@@ -953,6 +960,14 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
 
 NB_MODULE(_native, m)
 {
+    m.def("object_reference", [](const nb::dict& record) {
+        vo::ObjectRecord value;
+        value.uuid=nb::cast<std::string>(record["uuid"]);
+        value.version=nb::cast<int64_t>(record["version"]);
+        value.versionGeneration=nb::cast<std::string>(record["version_generation"]);
+        value.versionStoreUuid=nb::cast<std::string>(record["version_store"]);
+        return nb::cast<nb::dict>(objectVersionsToPy({value.reference()})[0]);
+    }, nb::arg("record"), "Complete exact-version reference of a listed or revision record; never infer its owner from an attachment.");
     m.def("geometry_coordinates", [](const nb::dict& value) {
         return jsonLoads(vo::geometryCoordinates(nlohmann::json::parse(jsonDumps(value))).dump());
     }, nb::arg("coordinates"));

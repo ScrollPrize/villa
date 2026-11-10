@@ -7,6 +7,9 @@
 #include "vc_object_store/objects/Selections.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
 #include "vc_object_store/objects/StoreConversion.hpp"
+#include "vc_object_store/objects/GeometryIngest.hpp"
+#include "vc_object_store/objects/SurfaceGrid.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
 #include "internal/Database.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include <fstream>
@@ -269,10 +272,45 @@ void restoreFileReference(){
     auto r=store.read();require(store.resolveStoragePath(r,f.file)==f.base.parent_path()/"fiber.json",
         "restore rebases metadata file references through the ordinary override helper");
 }
+
+void deletedAndExactReads(HistoryMode baseMode,HistoryMode overlayMode){
+    TemporaryDirectory dir;const auto base=dir.path/"base.vcobj",overlay=dir.path/"overlay.vcobj";
+    const auto live=util::newUuid(),deleted=util::newUuid();ObjectVersion original;std::string geometry;
+    vc::geometry::Surface shape;shape.rows=shape.columns=2;shape.points={{1,1,1},{2,1,1},{1,2,1},{2,2,1}};
+    {
+        auto store=ObjectStore::create(base,options(baseMode));
+        {auto w=store.write();for(const auto& id:{live,deleted}){ObjectRecord r;r.uuid=id;r.kind="surface";
+            r.meta=R"({"coordinates":{"volume_uuid":"test-volume","scale_factor":1}})";
+            store.upsertObject(w,r);const auto g=store.putGeometry(w,id,vc::geometry::encode(shape));if(id==live)geometry=g;}w.commit();}
+        {auto r=store.read();original=store.currentObjectRevision(r,live)->reference();}
+        {auto w=store.write();store.deleteObject(w,deleted);store.seal(w);w.commit();}
+    }
+    {auto collection=ObjectCollection::create(overlay,{base},options(overlayMode));}
+    auto store=ObjectStore::open(overlay,options(overlayMode));
+    if(baseMode==HistoryMode::On){auto r=store.read();const auto history=store.objectHistory(r,deleted);
+        require(history.size()==2&&history.back().deleted,"deleted inherited record retains its own history");}
+    else mustFail([&]{auto r=store.read();(void)store.objectHistory(r,deleted);});
+    mustFail([&]{auto w=store.write();GeometrySource p;p.object.uuid=deleted;p.object.kind="surface";
+        p.geometry=vc::geometry::encode(shape);p.source=nlohmann::json::object();ingestGeometryBatch(store,w,{p});w.commit();});
+    {auto r=store.read();require(!store.objectByUuid(r,deleted),"rejected import must not resurrect inherited tombstone");}
+    {auto w=store.write();store.setMeta(w,live,"changed","true");w.commit();}
+    {auto r=store.read();LocalStoreReader reader(store,r);const auto current=reader.currentObject(live)->reference();
+        require(current.storeUuid!=original.storeUuid,"override has new owning store");
+        require(bool(reader.objectsAtVersions({current}).front()),"new owner reference resolves after edit");
+        const auto grid=readSurfaceGrid(reader,original,"test-volume");
+        require(grid.record.reference().storeUuid==original.storeUuid&&!nlohmann::json::parse(grid.record.meta).contains("changed"),
+            "exact grid reads original metadata and geometry despite newer overlay");}
+    {auto w=store.write();store.deleteObject(w,live);w.commit();}
+    {auto r=store.read();LocalStoreReader reader(store,r);GeometrySnapshot snapshot(reader);
+        require(snapshot.surface(live,geometry).rows()==2,"exact typed geometry survives current deletion");
+        require(readSurfaceGrid(reader,original,"test-volume").rows==2,"exact grid survives current deletion");
+        mustFail([&]{snapshot.surface(deleted,geometry);});}
+}
 }
 int main()try{
     for(const auto base:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On}){
         readsAndOverrides(base,overlay);geometryEdit(base,overlay,"retain");
+        deletedAndExactReads(base,overlay);
         if(overlay==HistoryMode::On)geometryEdit(base,overlay,"keep_recorded");
     }
     queries();packing();spatialQueries();followupRegressions();restoreFileReference();std::cout<<"coherent store API tests passed\n";

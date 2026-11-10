@@ -45,12 +45,16 @@ rows = store.select_objects(object_kind="track", fields=["name", "track"])
 `select_objects` is the general query: kind, tag, bounding box, length
 filters, coordinate declaration, volume target, connection, limits and
 cursors, with optional `fields` projection. Each row carries `uuid`, `kind`,
-and the `version` and `version_generation` it was read at, so a listing pins
+and the `version`, `version_generation` and `version_store` it was read at, so a listing pins
 exactly what it returned (read snapshots only). `select_edges` does the same
 for relationships. On `HostedStore` these are paged; `select_all_objects` /
 `select_all_edges` return the complete result exact as of one commit and can
 raise `StoreBusy` under sustained concurrent writes. In C++ the same queries
 take an `ObjectSelection` / `EdgeSelection` in a read transaction.
+
+Use `ObjectRecord::reference()` or `ObjectRevision::reference()` in C++, and `vc_object_store.object_reference(record)` in Python, to preserve the complete `(store, generation, object, version)` identity. The attached store is a lookup scope, not necessarily the owner of a returned record. After an overlay edit, the new version belongs to the committing store; use the transaction receipt's store/generation for changed versions. Unchanged inputs retain their original references.
+
+`object_history(uuid)` follows the winning record even when it is a deletion marker in a referenced store. It does not fall through that deletion to older live records. Ingestion also reserves deleted identities across the same scope: re-import is not a restore operation.
 
 Volume-target listings (`volume=...`, the volume's `id`) match every frame
 declared in that volume, and their bbox, length filters, and length ordering
@@ -87,6 +91,7 @@ with store.geometry_snapshot() as snapshot:
 - Views keep their snapshot alive; closing the snapshot invalidates them.
   Snapshots are thread-confined and hold one reader slot — close them
   promptly. `load()` results stay valid after closure.
+- Explicit geometry revisions can be read even if their object is no longer visible. The revision must still belong to the requested object. For exact surface metadata and geometry together, use `readSurfaceGrid(reader, ObjectVersion, volume)` or Python `surfaces.read_surface(location, uuid, volume=..., reference=ref)`. This works through overlays and after current deletion as long as the selected source version remains retained. The older `version`/`generation` selectors remain available and select the current owner's history; they cannot identify a different source owner.
 - Any view can be read in another volume's frame with
   `view.view_transformed_at(target_volume)` — see
   [transforms](transforms.md#transformed-views).

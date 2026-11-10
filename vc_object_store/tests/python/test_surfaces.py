@@ -4,6 +4,20 @@ from vc_object_store import ObjectStore, Surface
 from vc_object_store.surfaces import create_surface, read_surface
 
 
+def test_exact_surface_reference_survives_deletion(db, db_path):
+    from vc_object_store import Surface, object_reference
+    uid = db.upsert_object(dict(kind='surface', meta={'coordinates': {'volume_uuid': 'a', 'scale_factor': 1}}))
+    points = np.full((2, 2, 3), 4, dtype='<f4')
+    db.put_geometry(uid, Surface.from_arrays(points, [1, 1]))
+    reference = object_reference(db.object(uid))
+    db.delete_object(uid)
+    grid = read_surface(db_path, uid, volume='a', reference=reference)
+    np.testing.assert_array_equal(grid.points, points)
+    assert object_reference(grid.record) == reference
+    with pytest.raises(ValueError, match='cannot be combined'):
+        read_surface(db_path, uid, volume='a', version=reference['version'], reference=reference)
+
+
 def test_created_surface_reads_back_through_registrations(db_path):
     ObjectStore.create(db_path, author="pytest").close()
     xyz = np.array([[[1, 2, 3], [4, 5, 6]], [[-1, -1, -1], [np.nan, 0, 0]]], dtype=np.float32)
