@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <nlohmann/json.hpp>
 #include <future>
@@ -12,10 +13,47 @@
 #include <tuple>
 #include <cctype>
 #include <sqlite3.h>
+#include <fstream>
 
 using namespace vc::objects;
 
 namespace {
+void referencedArtifacts(HistoryMode sourceMode, HistoryMode overlayMode)
+{
+    TemporaryDirectory directory;
+    OpenOptions options; options.author="artifact-test";options.history=sourceMode;
+    const auto base=directory.path/"base.vcobj", overlay=directory.path/"overlay.vcobj";
+    const auto oldFile=directory.path/"old.pt", newFile=directory.path/"new.pt";
+    std::ofstream(oldFile)<<"old checkpoint"; std::ofstream(newFile)<<"new checkpoint";
+    const auto uuid=util::newUuid();
+    {auto db=ObjectStore::create(base,options);auto txn=db.write();ObjectRecord record;
+        record.uuid=uuid;record.kind="note";db.upsertObject(txn,record);txn.commit();}
+    ObjectVersion original;
+    {ObjectStoreSession session;const auto attachment=session.attach(base,options);
+        session.publishArtifacts(attachment,uuid,1,{{"model.pt",oldFile}});
+        original=session.currentObject(attachment,uuid)->reference();}
+    {auto db=ObjectStore::open(base,options);auto txn=db.write();db.seal(txn);txn.commit();}
+    options.history=overlayMode;
+    {auto collection=ObjectCollection::create(overlay,{base},options);}
+    ObjectStoreSession session;const auto attachment=session.attach(overlay,options);
+    session.publishArtifacts(attachment,uuid,original.version,{{"model.pt",newFile}});
+    const auto latest=session.currentObject(attachment,uuid)->reference();
+    require(latest.storeUuid!=original.storeUuid,"artifact edit creates an overlay-owned version");
+    const auto expected=session.artifacts(attachment,uuid,{}, {},original);
+    require(expected.size()==1,"source artifact manifest survives shadowing");
+    session.materializeArtifacts(attachment,uuid,directory.path/"historical",{}, {},original);
+    const auto bytes=[](const std::filesystem::path& path){std::ifstream in(path);return std::string(std::istreambuf_iterator<char>(in),{});};
+    require(bytes(directory.path/"historical"/"model.pt")=="old checkpoint","exact materialization uses old bytes");
+    require(bytes(*session.artifactFile(attachment,uuid,"model.pt",directory.path/"cache"))=="new checkpoint","current artifact uses new bytes");
+    session.editCurrent(attachment,{uuid},[&](const StoreReader&,const std::string&){return std::vector<TransactionOperation>{DeleteObjectOp{uuid}};});
+    require(bytes(*session.artifactFile(attachment,uuid,"model.pt",directory.path/"cache",{}, {},original))=="old checkpoint",
+        "source artifacts remain readable after overlay deletion with either history policy");
+    mustFail([&]{session.artifacts(attachment,uuid);});
+    mustFail([&]{session.artifacts(attachment,util::newUuid(),{}, {},original);});
+    mustFail([&]{session.artifacts(attachment,uuid,original.version,{},original);});
+    auto wrong=original;wrong.storeUuid=util::newUuid();mustFail([&]{session.artifacts(attachment,uuid,{}, {},wrong);});
+}
+
 void editCurrentLifecycle(HistoryMode history)
 {
     TemporaryDirectory directory;
@@ -108,6 +146,8 @@ void editCurrentLifecycle(HistoryMode history)
 
 int main() try
 {
+    for(const auto source:{HistoryMode::On,HistoryMode::Off})for(const auto overlay:{HistoryMode::On,HistoryMode::Off})
+        referencedArtifacts(source,overlay);
     editCurrentLifecycle(HistoryMode::On);
     editCurrentLifecycle(HistoryMode::Off);
     TemporaryDirectory directory;

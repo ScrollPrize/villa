@@ -7,6 +7,7 @@ import uuid
 import http.client
 import http.server
 import threading
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -159,6 +160,17 @@ def test_session_typed_operations_on_hosted_and_local(hosted, tmp_path):
             assert events and not events[-1]["revalidate"] and events[-1]["changes"][-1]["kind"] == "note"
         files = session.materialize_artifacts(attachment, obj, str(tmp_path / f"out-{attachment.store_uuid}"))
         assert files[0]["length"] == 100 and (tmp_path / f"out-{attachment.store_uuid}" / "w.bin").read_bytes() == b"w" * 100
+        historical = vos.object_reference(session.current_object(attachment, obj)["record"])
+        source.write_bytes(b"replacement")
+        session.publish_artifacts(attachment, obj, historical["version"], {"w.bin": str(source)}, "pytest")
+        session.submit(attachment, request(session.status(attachment), [dict(op="delete_object", uuid=obj)],
+                                           {obj: historical["version"] + 1}))
+        assert session.artifacts(attachment, obj, reference=historical) == files
+        selected = session.artifact_file(attachment, obj, "w.bin", str(tmp_path / "exact-cache"), reference=historical)
+        assert Path(selected).read_bytes() == b"w" * 100
+        output = tmp_path / f"exact-{attachment.store_uuid}"
+        session.materialize_artifacts(attachment, obj, str(output), reference=historical)
+        assert (output / "w.bin").read_bytes() == b"w" * 100
     with pytest.raises(ValueError):
         session.path(remote)  # hosted attachments have no local database
 

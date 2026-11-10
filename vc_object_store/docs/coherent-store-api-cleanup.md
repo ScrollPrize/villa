@@ -4,13 +4,19 @@
 
 Baseline: `8c8a8ea00`. Resolve these six findings through shared APIs; keep schema 21, binary identities and history-off storage unchanged. Add regression tests, run the approved test runner and record any validation limitations.
 
-- [ ] AB. Compare complete selected object identities before transformed geometry writes; reject sibling-overlay versions with equal numeric counters.
-- [ ] AC. Make project copying preserve the resolved collection and its dependencies/artifacts rather than backing up only the root SQLite file.
-- [ ] AD. Resolve record-owned history policy centrally; project resource discovery and current-version helpers must not infer it from the attachment's policy.
-- [ ] AE. Resolve artifacts by complete object reference and carry historical Lasagna model references unchanged.
-- [ ] AF. Repin fiber edits and related endpoints through shared receipt-aware identity handling, preserving unchanged inherited ownership.
-- [ ] AG. Allocate structural control-point IDs through retained allocation history, not a GUI-only counter that can rewind after restore.
-- [ ] Run regressions and consumer checks, review the diff and record results.
+- [x] AB. Compare complete selected object identities before transformed geometry writes; reject sibling-overlay versions with equal numeric counters.
+- [x] AC. Make project copying preserve the resolved collection and its dependencies/artifacts rather than backing up only the root SQLite file.
+- [x] AD. Resolve record-owned history policy centrally; project resource discovery and current-version helpers must not infer it from the attachment's policy.
+- [x] AE. Resolve artifacts by complete object reference and carry historical Lasagna model references unchanged.
+- [x] AF. Repin fiber edits and related endpoints through shared receipt-aware identity handling, preserving unchanged inherited ownership.
+- [x] AG. Allocate structural control-point IDs through retained allocation history, not a GUI-only counter that can rewind after restore.
+- [x] Run regressions and consumer checks, review the diff and record results.
+
+Implementation: transformed writes compare the complete retained identity; artifacts and surfaces share `StoreReader::selectedObject`; receipts retain full references (including unchanged inputs) and consumers repin through that contract. Structural IDs use the same retained allocation data as validation, including restored metadata-only versions. Optional history follows the winning record's retention policy. Project copies use the collection snapshot/closure API, with common backup, locator relocation and publication cleanup shared with packing. A copied sharded base remains sealed behind a mutable overlay; an unpartitioned copy retains the existing direct-fork semantics. No persistent tables, proxy records or edit-time payload copies are added.
+
+Validation: `bash local/scripts/run_vcobj_pr_tests` passed on Linux (RelWithDebInfo, Python 3.14): 52 native tests, 200 Python store tests, 118 Spiral tests and 13 Lasagna tests. Optional SSH and real-data tests skipped. `bash local/scripts/check_vcobj_consumers` passed syntax checks of the changed VC3D translation units; `bash local/scripts/run_vcobj_consumer_checks` passed both focused native consumer regressions. `git diff --check` passed. The first native run hit two timeouts and the hosted concurrent-listing scheduling assertion under eight-way test concurrency; two-way runs passed unchanged assertions. The new hosted Python fixture initially omitted its required author; correcting that fixture cleared its failure. The existing Spiral nanobind shutdown leak warning remains. No full GUI, macOS or full-volume performance validation is claimed.
+
+Diff versus `8c8a8ea00`: production adds 452 lines and removes 191 (net +261); regression tests add 311 lines. This pass centralizes missing capabilities rather than reducing total code: collection copying/publication, complete receipts, retained-ID allocation and owner-aware optional history require new shared APIs, while consumer-specific SQL/selection/ID logic is removed. No new persistent tables, schema changes or payload copies during ordinary edits are introduced. Export intentionally copies its dependency closure and artifacts; unrelated external dataset files remain external.
 
 ## Current review fixes
 

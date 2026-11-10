@@ -203,6 +203,7 @@ TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::o
 GeometryView::GeometryView(std::shared_ptr<State> state) : state_(std::move(state)) {}
 const GeometryRevision& GeometryView::revision() const { state_->requireCurrent(); return state_->revision; }
 std::optional<int64_t> GeometryView::version() const { state_->read->require(); return state_->reference?std::optional(state_->reference->version):std::nullopt; }
+std::optional<ObjectVersion> GeometryView::reference() const { state_->read->require(); return state_->reference; }
 geometry::Geometry GeometryView::loadGeometry() const
 {
     state_->requireCurrent();
@@ -348,8 +349,8 @@ void TransformedGeometryView::validateForWrite(const ObjectStore& db,const Txn& 
     const auto& pinned=revision();
     const auto head=db.currentGeometry(txn,pinned.objectUuid);
     const auto object=db.currentObjectRevision(txn,pinned.objectUuid);
-    const auto read=version();
-    if(!head||head->uuid!=pinned.uuid||head->contentHash!=pinned.contentHash||!object||!read||object->version!=*read)
+    const auto read=std::visit([](const auto& view){return view.reference();},source_);
+    if(!head||head->uuid!=pinned.uuid||head->contentHash!=pinned.contentHash||!object||!read||object->reference()!=*read)
         throw std::runtime_error("object changed; reopen its transformed view");
     checkVolumeMapping(db,txn,pinned.objectUuid,target_,targetScale_,mapping_);
 }

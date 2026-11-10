@@ -245,11 +245,13 @@ std::string canonical(const std::string& uuid) { return formatUuid(parseUuid(uui
 
 Json detail::receiptToJson(const TransactionReceipt& r)
 {
+    Json references=Json::object();
+    for(const auto& [uuid,ref]:r.objectReferences)references[uuid]=Json::parse(versionReferenceText(ref));
     return Json{{"request_uuid", r.requestUuid ? Json(*r.requestUuid) : Json(nullptr)},
                 {"store_uuid", r.storeUuid}, {"generation", r.generation},
                 {"commit_sequence", r.commitSequence ? Json(*r.commitSequence) : Json(nullptr)},
                 {"objects", selectionToJson(r.objects)}, {"relationships", selectionToJson(r.relationships)},
-                {"created", r.created}};
+                {"created", r.created}, {"object_references",references}};
 }
 
 TransactionReceipt detail::receiptFromJson(const Json& j)
@@ -262,7 +264,29 @@ TransactionReceipt detail::receiptFromJson(const Json& j)
     r.objects = selectionFromJson(j.at("objects"));
     r.relationships = selectionFromJson(j.at("relationships"));
     r.created = j.at("created").get<std::vector<std::string>>();
+    if(j.contains("object_references")){
+        if(!j.at("object_references").is_object())throw std::invalid_argument("receipt object references must be a map");
+        for(const auto& [uuid,value]:j.at("object_references").items()){
+            const auto ref=parseVersionReference(value.dump());
+            if(!ref)throw std::invalid_argument("invalid receipt object reference");
+            r.objectReferences.emplace(canonical(uuid),*ref);
+            (void)r.objectReference(uuid);
+        }
+    }
     return r;
+}
+
+std::optional<ObjectVersion> TransactionReceipt::objectReference(const std::string& objectUuid) const
+{
+    const auto uuid=canonical(objectUuid);
+    const auto number=objects.find(uuid);
+    if(number==objects.end()||!number->second)return {};
+    const auto found=objectReferences.find(uuid);
+    if(found==objectReferences.end())
+        throw std::runtime_error("transaction receipt lacks complete object identities; reload before editing");
+    if(found->second.objectUuid!=uuid||found->second.version!=*number->second)
+        throw std::runtime_error("transaction receipt has inconsistent object identity");
+    return found->second;
 }
 
 void detail::recordCurrentChange(sqlite3* db, const std::array<unsigned char,16>& key, const char* changeKind)
@@ -339,6 +363,13 @@ TransactionReceipt detail::finishReceipt(sqlite3* db, const StatementPool& pool,
         for(const auto& uuid:pool.currentWrite->changedRelationships) receipt.relationships[uuid]=relationshipHeadVersion(db,uuid);
         for(const auto& uuid:pool.currentWrite->created)
             if(headVersion(db,uuid) || relationshipHeadVersion(db,uuid)) receipt.created.push_back(uuid);
+    }
+    for(const auto& [uuid,version]:receipt.objects)if(version){
+        auto* source=objectSource(db,uuid);
+        if(!source)throw std::logic_error("receipt object no longer resolves");
+        Statement row(source,"SELECT coalesce(version_generation,(SELECT initial_generation FROM store_manifest)) FROM objects WHERE uuid=?",parseUuid(uuid));
+        if(!row.row())throw std::logic_error("receipt object no longer resolves");
+        receipt.objectReferences.emplace(uuid,ObjectVersion{storeUuidText(source),row.uuid(0),uuid,*version});
     }
     if (pool.requestUuid) {
         execute(db, "INSERT INTO transaction_receipts VALUES(?,?,?,?,?)", parseUuid(*pool.requestUuid),

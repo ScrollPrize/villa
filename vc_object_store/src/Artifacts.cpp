@@ -6,6 +6,7 @@
 #include "internal/Artifacts.hpp"
 #include "internal/Database.hpp"
 #include "internal/ReferenceResolver.hpp"
+#include "internal/RecordResolver.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 
 #include <vc_reader/native/atomic_file.hpp>
@@ -139,7 +140,8 @@ std::filesystem::path artifactBlobPath(const std::filesystem::path& storePath, c
 }
 
 detail::ArtifactExport::ArtifactExport(const std::vector<std::filesystem::path>& sources,
-                                      const std::filesystem::path& destination)
+                                      const std::filesystem::path& destination,
+                                      const std::vector<std::filesystem::path>& snapshots)
 {
     std::set<std::filesystem::path> roots;
     for(const auto& source:sources)roots.insert(artifactBlobDirectory(source));
@@ -170,6 +172,35 @@ detail::ArtifactExport::ArtifactExport(const std::vector<std::filesystem::path>&
                     readBlocks(input.fd,offset,count,[&](const uint8_t* data,size_t size){bytes.insert(bytes.end(),data,data+size);});
                     return bytes;
                 });
+            }
+        }
+        // Copying present files cannot detect a missing referenced blob. Check
+        // the copied state, including manifests retained only in history. The
+        // bytes above are already hash-verified; here only presence/length remain.
+        const auto check=[&](const ObjectRecord& record){
+            for(const auto& file:artifactManifest(record)){
+                std::error_code error;
+                const auto size=std::filesystem::file_size(artifactBlobPath(destination,file.sha256),error);
+                if(error||size!=file.length)throw std::runtime_error("artifact export: missing or wrong-length retained payload "+file.sha256);
+            }
+        };
+        for(const auto& snapshot:snapshots){
+            std::unique_ptr<sqlite3,decltype(&sqlite3_close_v2)> db(
+                detail::openConnection(snapshot,SQLITE_OPEN_READONLY,{},true),sqlite3_close_v2);
+            const auto hasTable=[&](const char* name){detail::Statement table(db.get(),"SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?",name);return table.row();};
+            if(!hasTable("store_manifest")||!hasTable("objects"))continue; // Other SQLite members have no vcobj manifests.
+            detail::Statement current(db.get(),"SELECT meta FROM objects WHERE json_type(meta,'$.artifacts') IS NOT NULL");
+            while(current.row()){ObjectRecord record;record.meta=current.text(0);check(record);}
+            if(!hasTable("object_revisions"))continue;
+            // Only revisions introducing/changing an artifact manifest can add
+            // a required hash. Reuse the history resolver, not a second delta codec.
+            detail::Statement history(db.get(),"SELECT uuid FROM object_revisions WHERE EXISTS ("
+                "SELECT 1 FROM json_tree(metadata_delta) WHERE key='artifacts' OR "
+                "(key='path' AND (value='/meta' OR value LIKE '/meta/artifacts%')))");
+            while(history.row()){
+                const auto revision=detail::resolveObjectRevision(db.get(),history.uuid(0));
+                if(!revision)throw std::runtime_error("artifact export: unavailable retained revision");
+                check(revision->revision.record);
             }
         }
     }catch(...){

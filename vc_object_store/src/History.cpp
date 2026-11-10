@@ -828,12 +828,12 @@ std::optional<ObjectRevision> ObjectStore::objectAtGeometry(const Txn& txn,const
     return result;
 }
 
-std::vector<ObjectRevision> ObjectStore::objectHistory(const Txn& txn, const std::string& object) const
+std::vector<ObjectRevision> ObjectStore::objectHistory(const Txn& txn, const std::string& object, bool ifRetained) const
 {
     auto* db=static_cast<sqlite3*>(connection(txn));
     // History belongs to the winning record, including an inherited tombstone.
     auto* source=objectSource(db,object,false,true);
-    if(!source)return {};
+    if(!source || (ifRetained && !historyEnabled(source)))return {};
     requireHistory(source);
     Statement s(source, "SELECT uuid FROM object_revisions WHERE object_uuid=? ORDER BY seq",
         parseUuid(object));

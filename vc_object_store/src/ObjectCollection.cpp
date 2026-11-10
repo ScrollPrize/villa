@@ -18,6 +18,7 @@
 #include "internal/Publication.hpp"
 #include "internal/Extensions.hpp"
 #include "internal/ExtensionHistory.hpp"
+#include "internal/DatabaseCopy.hpp"
 #include <variant>
 #include <limits>
 
@@ -606,6 +607,78 @@ void ObjectCollection::scanExtensionRows(const CollectionTxn& t,const std::strin
     impl_->nodes[0].store->scanExtensionRows(impl_->txn(t,0),name,visitor,prefix);
 }
 std::vector<CollectionMember> ObjectCollection::members()const{std::vector<CollectionMember> r;for(const auto& n:impl_->nodes)r.push_back(n.member);return r;}
+
+void copyObjectCollection(const std::filesystem::path& source, const std::filesystem::path& destination,
+                          const OpenOptions& options)
+{
+    namespace fs=std::filesystem;
+    const auto target=fs::absolute(destination).lexically_normal(), sidecar=fs::path(target.string()+".stores");
+    if(fs::exists(target)||fs::exists(sidecar)||fs::exists(target.string()+".artifacts"))
+        throw std::invalid_argument("collection copy destination or sidecar already exists");
+    auto collection=ObjectCollection::open(source,readonlyOptions(options));
+    auto snapshot=collection.read();
+    const auto members=collection.members();
+    const auto provisioning=collection.provisioning(snapshot);
+    const auto before=provisioning.commitSequence;
+    const bool partitioned=std::any_of(members.begin(),members.end(),[&](const auto& m){
+        return m.partition && m.storeUuid==members.front().storeUuid;
+    });
+    if(partitioned&&!provisioning.sealed)throw std::runtime_error("partitioned collection root must be sealed");
+    if(before==std::numeric_limits<int64_t>::max())throw std::overflow_error("copied store commit sequence exhausted");
+    StagedDatabase staged(target,false);
+    bool ownsSidecar=false;
+    try {
+        if(members.size()>1||partitioned){
+            if(!fs::create_directory(sidecar))throw std::runtime_error("cannot create collection copy sidecar");
+            ownsSidecar=true;
+        }
+        std::map<std::string,fs::path> paths;
+        std::vector<fs::path> artifactSources;
+        std::vector<fs::path> artifactSnapshots;
+        for(size_t i=0;i<members.size();++i){
+            const auto& member=members[i];
+            paths[member.databaseUuid]=i==0&&!partitioned?staged.path:sidecar/(member.databaseUuid+".vcobj");
+            copySqliteSnapshot(ObjectStoreImplAccess::conn(collection.impl_->txn(snapshot,i)),paths.at(member.databaseUuid));
+            artifactSources.push_back(member.locator);
+            artifactSnapshots.push_back(paths.at(member.databaseUuid));
+        }
+        ArtifactExport artifacts(artifactSources,target,artifactSnapshots);
+        for(size_t i=0;i<members.size();++i){
+            const auto& member=members[i];const auto& path=paths.at(member.databaseUuid);
+            std::unique_ptr<sqlite3,decltype(&sqlite3_close_v2)> db(
+                openConnection(path,SQLITE_OPEN_READWRITE,options,false),sqlite3_close_v2);
+            exec(db.get(),"BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON;");
+            try {
+                relocateCollectionMembers(db.get(),[&](const std::string& id){
+                    return fs::relative(paths.at(id),path.parent_path()).generic_string();
+                });
+                if(i==0&&!partitioned){
+                    forkStorageIdentity(db.get());
+                    const auto newStore=util::newUuid();
+                    exec(db.get(),"DROP TRIGGER store_identity_immutable_update; DROP TRIGGER store_identity_immutable_delete;");
+                    execute(db.get(),"UPDATE store_identity SET uuid=?",parseUuid(newStore));
+                    execute(db.get(),"UPDATE key_allocators SET namespace_uuid=?",parseUuid(newStore));
+                    clearTransactionReceipts(db.get());
+                    exec(db.get(),"CREATE TRIGGER store_identity_immutable_update BEFORE UPDATE ON store_identity "
+                        "BEGIN SELECT RAISE(ABORT,'store identity is immutable'); END;"
+                        "CREATE TRIGGER store_identity_immutable_delete BEFORE DELETE ON store_identity "
+                        "BEGIN SELECT RAISE(ABORT,'store identity is retained'); END;");
+                    execute(db.get(),"UPDATE store_manifest SET commit_sequence=?,sealed=0 WHERE singleton=1",before+1);
+                }
+                exec(db.get(),"UPDATE store_write_state SET dirty=0 WHERE singleton=1; COMMIT;");
+            } catch(...) {sqlite3_exec(db.get(),"ROLLBACK",nullptr,nullptr,nullptr);throw;}
+        }
+        if(partitioned){
+            auto writable=options;writable.history=provisioning.history;writable.readOnly=false;writable.serviceOwner=false;
+            auto overlay=ObjectCollection::create(staged.path,{paths.at(members.front().databaseUuid)},writable);
+        }
+        {auto verified=ObjectCollection::open(staged.path,readonlyOptions(options));}
+        staged.publish();artifacts.commit();
+    } catch(...) {
+        if(ownsSidecar){std::error_code ignored;fs::remove_all(sidecar,ignored);}
+        throw;
+    }
+}
 std::optional<ObjectRevision> ObjectCollection::objectAtVersion(const CollectionTxn& t,const ObjectVersion& version)const{
     return impl_->nodes[0].store->objectAtVersion(impl_->txn(t,0),version);
 }

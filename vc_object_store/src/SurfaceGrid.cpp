@@ -20,18 +20,14 @@ SurfaceGrid surfaceGrid(const StoreReader& reader, const ObjectRevision& selecte
 SurfaceGrid readSurfaceGrid(const StoreReader& reader, const std::string& surfaceUuid, const std::string& volume,
                             double targetScale, std::optional<int64_t> version, const std::optional<std::string>& generation)
 {
-    std::optional<ObjectRevision> revision;
-    if (version) {
-        const auto current=reader.currentObject(surfaceUuid);
-        if(current)revision=reader.objectsAtVersions({current->reference(version,generation)}).front();
-    } else revision = reader.currentObject(surfaceUuid);
+    const auto revision=reader.selectedObject(surfaceUuid,version,generation);
     if (!revision) throw std::invalid_argument("no surface " + surfaceUuid + (version ? " version " + std::to_string(*version) : ""));
     return surfaceGrid(reader,*revision,volume,targetScale);
 }
 
 SurfaceGrid readSurfaceGrid(const StoreReader& reader, const ObjectVersion& reference, const std::string& volume, double targetScale)
 {
-    const auto revision=reader.objectsAtVersions({reference}).front();
+    const auto revision=reader.selectedObject(reference.objectUuid,std::nullopt,std::nullopt,reference);
     if(!revision)throw std::invalid_argument("no surface at the selected exact version");
     return surfaceGrid(reader,*revision,volume,targetScale);
 }

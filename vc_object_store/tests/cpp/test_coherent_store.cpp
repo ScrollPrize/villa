@@ -10,6 +10,8 @@
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/objects/SurfaceGrid.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/GeometryEdits.hpp"
 #include "internal/Database.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include <fstream>
@@ -348,7 +350,88 @@ void deletedAndExactReads(HistoryMode baseMode,HistoryMode overlayMode){
         mustFail([&]{snapshot.surface(deleted,geometry);});}
 }
 }
+void siblingViewWrites(HistoryMode mode){
+    TemporaryDirectory dir;
+    const auto base=dir.path/"base.vcobj",left=dir.path/"left.vcobj",right=dir.path/"right.vcobj";
+    const auto id=util::newUuid();
+    {auto store=ObjectStore::create(base,options(mode));auto w=store.write();auto r=track(id);
+        r.meta=R"({"coordinates":{"volume_uuid":"source","scale_factor":1}})";
+        store.upsertObject(w,r);store.putGeometry(w,id,shape());w.commit();
+        auto seal=store.write();store.seal(seal);seal.commit();}
+    {auto c=ObjectCollection::create(left,{base},options(mode));}
+    {auto c=ObjectCollection::create(right,{base},options(mode));}
+    auto a=ObjectStore::open(left,options(mode)),b=ObjectStore::open(right,options(mode));
+    {auto w=a.write();a.setMeta(w,id,"branch",R"("left")");w.commit();}
+    {auto w=b.write();b.setMeta(w,id,"branch",R"("right")");w.commit();}
+    GeometrySnapshot snapshot(a);const auto view=snapshot.viewTransformedAt(id,"source");
+    {auto r=b.read();require(view.version()==b.currentVersion(r,id),"sibling counters collide");}
+    mustFail([&]{auto w=b.write();view.writeCoordinates(b,w,"points",0,{{9,9,9}});w.commit();});
+    {GeometrySnapshot result(b);require(result.track(id).points(0,1).front()==vc::geometry::TrackPoint{1,2,3},
+        "rejected sibling write preserves geometry");}
+    {auto w=a.write();view.writeCoordinates(a,w,"points",0,{{9,9,9}});w.commit();}
+}
+void completeReceipts(HistoryMode mode){
+    Fixture f(mode,mode);
+    auto store=ObjectStore::open(f.overlay,options(mode));
+    TransactionRequest request;request.requestUuid=util::newUuid();request.author="receipt-test";
+    {auto r=store.read();const auto status=store.status(r);request.storeUuid=status.storeUuid;request.generation=status.generation;}
+    request.expectedObjects={{f.a,f.av.version},{f.b,f.bv.version}};
+    request.operations.push_back(SetMetaOp{f.a,"note","true"});
+    const auto receipt=store.submit(request);
+    require(receipt.objectReference(f.b)==f.bv,"unchanged inherited receipt identity stays source-owned");
+    require(receipt.objectReference(f.a)->storeUuid==receipt.storeUuid,"changed receipt identity belongs to writer");
+    {auto r=store.read();require(store.objectAtVersion(r,*receipt.objectReference(f.a)).has_value(),"committed reference resolves");}
+    const auto decoded=transactionReceiptFromJson(transactionReceiptToJson(receipt));
+    require(decoded.objectReferences==receipt.objectReferences,"receipt transport preserves complete identities");
+    auto invalid=nlohmann::json::parse(transactionReceiptToJson(receipt));
+    invalid["object_references"][f.a]=nlohmann::json::object();
+    mustFail([&]{transactionReceiptFromJson(invalid.dump());});
+    invalid.erase("object_references");
+    const auto legacy=transactionReceiptFromJson(invalid.dump());
+    require(legacy.objects==receipt.objects,"legacy receipts remain readable");
+    mustFail([&]{legacy.objectReference(f.a);});
+    const auto replay=store.submit(request);
+    require(replay.replayed&&replay.objectReferences==receipt.objectReferences,"durable replay preserves reference identities");
+    request.requestUuid=util::newUuid();request.expectedObjects=receipt.objects;
+    const auto noop=store.submit(request);
+    require(!noop.commitSequence&&noop.objectReferences==receipt.objectReferences,"no-op receipt retains both owners");
+    {auto w=store.write();store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
+    require(store.submit(request).objectReferences==noop.objectReferences,"later deletion cannot change a saved receipt");
+}
+void retainedPointAllocation(HistoryMode overlayMode){
+    TemporaryDirectory dir;const auto base=dir.path/"base.vcobj",overlay=dir.path/"overlay.vcobj";
+    const auto id=util::newUuid();ObjectVersion initial;
+    vc::geometry::Fiber shape{{{0,0,0},{1,0,0}},{},{0,1}};
+    {auto store=ObjectStore::create(base,options(HistoryMode::On));
+        {auto w=store.write();ObjectRecord r;r.uuid=id;r.kind="fiber";store.upsertObject(w,r);store.putGeometry(w,id,vc::geometry::encode(shape));w.commit();}
+        {auto r=store.read();initial=store.currentObjectRevision(r,id)->reference();}
+        {auto w=store.write(VersionSelection{{id,initial.version}});auto extended=shape;extended.controlPointIds.push_back(2);extended.controlPoints.push_back({2,0,0});
+            updateGeometryArrays(store,w,id,vc::geometry::encode(extended),store.currentGeometry(w,id)->uuid);w.commit();}
+        {auto w=store.write(VersionSelection{{id,initial.version+1}});store.restoreObject(w,id,initial);store.seal(w);w.commit();}}
+    {auto c=ObjectCollection::create(overlay,{base},options(overlayMode));}
+    auto store=ObjectStore::open(overlay,options(overlayMode));int64_t version;
+    {auto r=store.read();LocalStoreReader reader(store,r);version=*store.currentVersion(r,id);
+        require(reader.assignGeometryPointIds(id,"control_points",{0,1,-1,1})==std::vector<int64_t>{0,1,3,4},
+            "restored-away IDs stay allocated across store policies");
+        require(reader.assignGeometryPointIds(id,"control_points",{1,0})==std::vector<int64_t>{1,0},"reordering preserves IDs");}
+    {auto w=store.write(VersionSelection{{id,version}});LocalStoreReader reader(store,w);
+        shape.controlPointIds=reader.assignGeometryPointIds(id,"control_points",{0,1,-1});shape.controlPoints.push_back({2,0,0});
+        updateGeometryArrays(store,w,id,vc::geometry::encode(shape),store.currentGeometry(w,id)->uuid);w.commit();}
+    {auto r=store.read();require(store.nextGeometryPointId(r,id,"control_points")==4,"accepted allocation advances retained high-water mark");}
+}
+void allocationWithoutCurrentGeometry(){
+    TemporaryDirectory dir;auto store=ObjectStore::create(dir.path/"metadata.vcobj",options(HistoryMode::On));
+    const auto id=util::newUuid();ObjectVersion first;
+    {auto w=store.write();ObjectRecord object;object.uuid=id;object.kind="fiber";store.upsertObject(w,object);w.commit();}
+    {auto r=store.read();first=store.currentObjectRevision(r,id)->reference();}
+    {auto w=store.write();store.putGeometry(w,id,vc::geometry::encode(vc::geometry::Fiber{{{0,0,0}},{},{7}}));w.commit();}
+    {auto w=store.write(VersionSelection{{id,first.version+1}});store.restoreObject(w,id,first);w.commit();}
+    {auto r=store.read();require(!store.currentGeometry(r,id),"restored version predates geometry");
+        require(store.nextGeometryPointId(r,id,"control_points")==8,"absent current geometry does not erase retained allocations");}
+}
 int main()try{
+    allocationWithoutCurrentGeometry();
+    for(const auto mode:{HistoryMode::Off,HistoryMode::On}){siblingViewWrites(mode);completeReceipts(mode);retainedPointAllocation(mode);}
     for(const auto mode:{HistoryMode::Off,HistoryMode::On})edgeIdentity(mode);
     for(const auto base:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On}){
         readsAndOverrides(base,overlay);geometryEdit(base,overlay,"retain");

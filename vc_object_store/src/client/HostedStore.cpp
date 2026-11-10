@@ -557,9 +557,10 @@ SelectionRecord HostedStore::recordSelection(const ObjectSelection& selection, i
     throw StoreBusy("hosted store: transforms kept changing while recording a selection; retry later");
 }
 
-std::vector<ObjectRevision> HostedStore::objectHistory(const std::string& objectUuid, StoreStatus* asOf)
+std::vector<ObjectRevision> HostedStore::objectHistory(const std::string& objectUuid, StoreStatus* asOf, bool ifRetained)
 {
-    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/objects/" + objectUuid + "/history");
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/objects/" + objectUuid + "/history" +
+                                            (ifRetained ? "?if_retained=1" : ""));
     if (response.status == 404) {
         if (asOf) *asOf = status();
         return {};
@@ -590,6 +591,12 @@ nlohmann::json HostedStore::geometryPointAnnotations(const std::string& revision
     const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/geometry/" + revisionUuid + "/annotations/" + arrayPathSegment(arrayName));
     if (response.status == 404) throw std::invalid_argument("geometry revision not found: " + revisionUuid);
     return Json::parse(expectOk(response, "point annotations").body);
+}
+
+int64_t HostedStore::nextGeometryPointId(const std::string& objectUuid,const std::string& arrayName)
+{
+    const auto response=impl_->http.request("GET",requestEndpoint_+"/v1/objects/"+objectUuid+"/next-point-id/"+arrayPathSegment(arrayName));
+    return Json::parse(expectOk(response,"next point ID").body).get<int64_t>();
 }
 
 std::vector<std::string> HostedStore::traverse(const GraphQuery& query, StoreStatus* asOf)

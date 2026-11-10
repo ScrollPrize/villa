@@ -339,25 +339,22 @@ VolumeTransforms ObjectStoreSession::volumeTransforms(const AttachmentIdentity& 
 }
 
 std::vector<ArtifactFile> ObjectStoreSession::artifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
-                                                       const std::optional<int64_t>& version, const std::optional<std::string>& generation)
+                                                       const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                                                       const std::optional<ObjectVersion>& reference)
 {
     const auto uuid = util::canonicalUuid(objectUuid);
     std::optional<ObjectRevision> revision;
-    if (version) {
-        const auto current=currentObject(identity,uuid);
-        if(current)revision=objectsAtVersions(identity,{current->reference(version,generation)}).front();
-    } else {
-        revision = currentObject(identity, uuid);
-    }
+    readStore(identity,[&](const StoreReader& reader,const auto&){revision=reader.selectedObject(uuid,version,generation,reference);});
     if (!revision || revision->deleted) throw std::invalid_argument("object version not found: " + uuid);
     return artifactManifest(revision->record);
 }
 
 std::vector<ArtifactFile> ObjectStoreSession::materializeArtifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
                                                                   const std::filesystem::path& destination,
-                                                                  const std::optional<int64_t>& version, const std::optional<std::string>& generation)
+                                                                  const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                                                                  const std::optional<ObjectVersion>& reference)
 {
-    const auto files = artifacts(identity, objectUuid, version, generation);
+    const auto files = artifacts(identity, objectUuid, version, generation, reference);
     for (const auto& file : files) writeArtifact(identity, file, destination / std::filesystem::path(file.name));
     return files;
 }
@@ -378,9 +375,10 @@ void ObjectStoreSession::writeArtifact(const AttachmentIdentity& identity, const
 std::optional<std::filesystem::path> ObjectStoreSession::artifactFile(const AttachmentIdentity& identity,
                                                                       const std::string& objectUuid, const std::string& name,
                                                                       const std::filesystem::path& cacheDirectory,
-                                                                      const std::optional<int64_t>& version, const std::optional<std::string>& generation)
+                                                                      const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                                                                      const std::optional<ObjectVersion>& reference)
 {
-    const auto files = artifacts(identity, objectUuid, version, generation);
+    const auto files = artifacts(identity, objectUuid, version, generation, reference);
     const auto file = std::find_if(files.begin(), files.end(), [&](const auto& f) { return f.name == name; });
     if (file == files.end()) return std::nullopt;
     // Content-addressed: a complete file at its path is that content (writes are atomic and verified).
@@ -1115,9 +1113,15 @@ void ObjectStoreSession::conclude(const std::string& requestUuid, const Transact
                 draftChanged(uuid, attachment);
                 continue;
             }
-            if (const auto version = receipt->objects.find(uuid); version != receipt->objects.end() && version->second) {
-                meta->second.base = ObjectVersion{receipt->storeUuid, receipt->generation, uuid, *version->second};
-                meta->second.conflict.clear();
+            try {
+                if (const auto reference = receipt->objectReference(uuid)) {
+                    meta->second.base = *reference;
+                    meta->second.conflict.clear();
+                }
+            } catch (const std::exception& error) {
+                // Older durable receipts lack owning identities. The commit
+                // succeeded, but this draft must reload instead of inventing a pin.
+                meta->second.conflict = error.what();
             }
             if (unchanged) meta->second.savedRevision = submitted;
         }

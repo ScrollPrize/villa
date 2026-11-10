@@ -555,7 +555,9 @@ public:
     // writes. Recorded versions keep their publication generations.
     std::string startHistoryGeneration(const std::string& reason);
     std::optional<ObjectRevision> currentObjectRevision(const Txn&, const std::string& objectUuid) const;
-    std::vector<ObjectRevision> objectHistory(const Txn&, const std::string& objectUuid) const;
+    // ifRetained returns no entries when the winning record's owner has history
+    // disabled. The default explicit history request still rejects that case.
+    std::vector<ObjectRevision> objectHistory(const Txn&, const std::string& objectUuid, bool ifRetained = false) const;
     // The version of every object live at/before this publication time
     // (UTC Unix microseconds), ordered by object UUID; actions are indivisible.
     // Empty before the first publication; excludes deletions.
@@ -692,6 +694,10 @@ public:
     // JSON array with one value per point.
     nlohmann::json geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName) const;
+    // First unused ID above all retained allocations, including restored-away
+    // points and referenced versions. A proposal, not a reservation: commit
+    // under an expected object version and ordinary structural validation.
+    int64_t nextGeometryPointId(const Txn&, const std::string& objectUuid, const std::string& arrayName) const;
 
     // Dense row-major rectangle from any aligned surface array. Exact
     // bytes; handles tiled and linear layouts. Coordinates/counts are vertices.

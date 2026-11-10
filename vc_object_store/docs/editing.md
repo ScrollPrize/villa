@@ -84,6 +84,8 @@ surface is the same edit: `vc_object_ingest --surface-channel UUID NAME TIFF`
 
 ## Structural sequence edits
 
+C++ editors use `StoreReader::assignGeometryPointIds(uuid, array, ids)` to fill negative or duplicate IDs, or `ObjectStore::nextGeometryPointId(txn, uuid, array)` for the next available value. Both account for retained allocations across referenced stores and restored-away revisions, even when the selected current revision predates its geometry. IDs are proposals, not reservations: submit them under the expected object version. Do not keep a separate high-water counter in restorable object metadata.
+
 `edit_geometry_sequence` splices rows of `points` (point collections, tracks),
 `control_points`, or `line_points` (fibers). `start` and `erase_count` select
 the span removed; `parts` supplies the replacement, in order — new rows

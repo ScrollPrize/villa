@@ -154,6 +154,7 @@ public:
     void removeEdge(CollectionTxn&, const ObjectKey&);
     void seal(CollectionTxn&);
 private:
+    friend void copyObjectCollection(const std::filesystem::path&, const std::filesystem::path&, const OpenOptions&);
     friend class CollectionTxn;
     friend struct detail::CollectionReadContext;
     friend struct detail::InitialCollectionAccess;
@@ -161,4 +162,13 @@ private:
     explicit ObjectCollection(std::unique_ptr<Impl>);
     std::unique_ptr<Impl> impl_;
 };
+// Independent mutable copy of a resolved collection snapshot. The root is a
+// normal SQLite database; dependencies/partitions live in <destination>.stores
+// and artifacts in its ordinary sidecar. Relative locators make this bundle
+// movable together. Referenced immutable stores retain their logical identity.
+// A partitioned root stays sealed behind a new writable overlay; an ordinary
+// root is forked directly, preserving its retained versions under the new ID.
+// The destination and both sidecars must be absent. Failure cleans owned files.
+void copyObjectCollection(const std::filesystem::path& source, const std::filesystem::path& destination,
+                          const OpenOptions&);
 }

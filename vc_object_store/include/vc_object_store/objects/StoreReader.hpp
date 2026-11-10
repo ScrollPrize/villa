@@ -28,7 +28,13 @@ public:
     virtual ChangePage changesSince(const FeedCursor& cursor, int64_t maxChanges = 4096) const = 0;
     // The live (or retired) current revision; nullopt when absent or deleted.
     virtual std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const = 0;
-    virtual std::vector<ObjectRevision> objectHistory(const std::string& objectUuid) const = 0;
+    // One selector for geometry, artifacts and other versioned payloads. Number
+    // selectors use the current owner; complete references need no current row.
+    std::optional<ObjectRevision> selectedObject(const std::string& objectUuid,
+        std::optional<int64_t> version = std::nullopt,
+        const std::optional<std::string>& generation = std::nullopt,
+        const std::optional<ObjectVersion>& reference = std::nullopt) const;
+    virtual std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, bool ifRetained = false) const = 0;
     virtual std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&) const = 0;
     // The relationships among objects at these versions (ObjectStore::relationshipsAt).
     virtual std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const = 0;
@@ -52,6 +58,11 @@ public:
                                                        int64_t columns) const = 0;
     // Per-point annotations of a sequence array (ObjectStore::geometryPointAnnotations).
     virtual nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const = 0;
+    virtual int64_t nextGeometryPointId(const std::string& objectUuid, const std::string& arrayName) const = 0;
+    // Keep existing unique IDs; replace negative/duplicate entries with fresh
+    // IDs respecting retained history. Call under a checked edit's read snapshot.
+    std::vector<int64_t> assignGeometryPointIds(const std::string& objectUuid, const std::string& arrayName,
+                                               std::vector<int64_t> ids) const;
     virtual VolumeTransforms volumeTransforms() const = 0;
     // Complete listings (every page when the selection has no limit), with
     // the projections of ObjectStore::selectObjects/selectEdges.
@@ -90,7 +101,8 @@ std::vector<EdgeRecord> attachments(const StoreReader&, const std::string& owner
                                     const std::optional<std::string>& role = std::nullopt);
 
 // The current head version, or the latest retained deletion version when
-// history is enabled. Missing/deleted objects return nullopt without history.
+// the winning record's owner retains history. Missing/deleted objects return
+// nullopt without retained history, independent of the attachment's policy.
 std::optional<int64_t> currentVersionOf(const StoreReader&, const std::string& objectUuid);
 
 // Request expectations read through a reader (objects/Transactions.hpp).
@@ -140,7 +152,7 @@ public:
     StoreStatus status() const override;
     ChangePage changesSince(const FeedCursor& cursor, int64_t maxChanges = 4096) const override;
     std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const override;
-    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid) const override;
+    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, bool ifRetained = false) const override;
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&) const override;
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const override;
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
@@ -155,6 +167,7 @@ public:
                                                int64_t row, int64_t column, int64_t rows,
                                                int64_t columns) const override;
     nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override;
+    int64_t nextGeometryPointId(const std::string& objectUuid, const std::string& arrayName) const override;
     VolumeTransforms volumeTransforms() const override;
     std::vector<ObjectRecord> selectObjects(
         const ObjectSelection&, const std::optional<std::vector<std::string>>& fields = std::nullopt) const override;

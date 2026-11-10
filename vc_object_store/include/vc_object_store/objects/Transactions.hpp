@@ -97,6 +97,11 @@ struct TransactionReceipt {
     // Versions after commit of every expected and every changed record;
     // nullopt for a record that is absent (deleted).
     VersionSelection objects, relationships;
+    // Complete identities at commit, including unchanged inherited inputs.
+    // Absent/deleted objects have no reference. Never reconstruct these from
+    // the receipt's committing store/generation and a numeric object version.
+    std::map<std::string, ObjectVersion> objectReferences;
+    std::optional<ObjectVersion> objectReference(const std::string& uuid) const;
     // Objects/relationships this transaction created, in creation order.
     std::vector<std::string> created;
     // True when submit() returned the receipt saved by an earlier identical

@@ -250,6 +250,11 @@ try {
     const auto before = session.status(hosted);
     const auto receipt = session.submit(hosted, request(session, hosted, {{track, 1}}, {SetMetaOp{track, "note", "\"one\""}}));
     require(receipt.objects.at(track) == 2 && session.currentObject(hosted, track)->version == 2, "own edit visible");
+    require(receipt.objectReference(track)==session.currentObject(hosted,track)->reference(),"hosted receipts retain exact identity");
+    session.readStore(hosted,[&](const StoreReader& reader,const auto&){
+        require(reader.assignGeometryPointIds(fiber,"control_points",{0,1,2,-1})==std::vector<int64_t>{0,1,2,3},
+            "hosted point allocation uses the shared retained-ID query");
+    });
     session.readStore(hosted, [&](const StoreReader& reader, const auto&) {
         const FeedCursor since{before.storeUuid, before.generation, before.commitSequence};
         require(changesTouchKinds(reader, since, {"track"}) && !changesTouchKinds(reader, since, {"surface", "fiber"}) &&

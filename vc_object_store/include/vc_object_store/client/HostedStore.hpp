@@ -125,13 +125,14 @@ public:
     SelectionRecord recordSelection(const ObjectSelection&, int64_t pageSize = 1000, int maxRestarts = 3);
     // ObjectStore::geometryPointAnnotations.
     nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName);
+    int64_t nextGeometryPointId(const std::string& objectUuid, const std::string& arrayName);
     // ObjectStore::componentOf / neighbours on the host (GraphQuery).
     std::vector<std::string> traverse(const GraphQuery&, StoreStatus* asOf = nullptr);
     int64_t objectCount(const std::string& kind, bool includeRetired = false, StoreStatus* asOf = nullptr);
     int64_t unboundObjectCount(const std::string& kind, const std::string& volume, StoreStatus* asOf = nullptr);
     std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt, StoreStatus* asOf = nullptr);
     // Every recorded revision of an object (empty when it never existed).
-    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr);
+    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr, bool ifRetained = false);
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&, StoreStatus* asOf = nullptr);
     // Budgets above the server's limits are clamped; the result's stop reason
     // reports a budget stop (complete() is false).

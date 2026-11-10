@@ -7,6 +7,7 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
@@ -69,10 +70,33 @@ server::ServerOptions serverOptions()
     o.stagingLifetime = std::chrono::seconds(3600);
     return o;
 }
+
+void retainedHistoryOverReferences(HistoryMode sourceMode)
+{
+    TemporaryDirectory directory;const auto base=directory.path/"base.vcobj",overlay=directory.path/"overlay.vcobj";
+    OpenOptions options;options.author="history-policy";options.history=sourceMode;
+    const auto id=util::newUuid();
+    {auto store=ObjectStore::create(base,options);auto w=store.write();store.upsertObject(w,trackRecord(id));w.commit();
+        auto remove=store.write();store.deleteObject(remove,id);store.seal(remove);remove.commit();}
+    options.history=sourceMode==HistoryMode::On?HistoryMode::Off:HistoryMode::On;
+    {auto collection=ObjectCollection::create(overlay,{base},options);}
+    server::Server service(overlay,serverOptions());service.start();
+    const auto endpoint="http://127.0.0.1:"+std::to_string(service.port());HostedStore client(endpoint);
+    require(client.objectHistory(id,nullptr,true).size()==(sourceMode==HistoryMode::On?2:0),
+        "hosted optional history follows source policy, not root policy");
+    if(sourceMode==HistoryMode::Off)mustFail([&]{client.objectHistory(id);});
+    ObjectStoreSession session;const auto attachment=session.attachHosted(endpoint);
+    session.readStore(attachment,[&](const StoreReader& reader,const auto&){
+        require(currentVersionOf(reader,id)==(sourceMode==HistoryMode::On?std::optional<int64_t>(2):std::nullopt),
+            "hosted retained version helper follows tombstone owner");
+    });
+}
 } // namespace
 
 int main()
 try {
+    retainedHistoryOverReferences(HistoryMode::Off);
+    retainedHistoryOverReferences(HistoryMode::On);
     TemporaryDirectory directory;
     OpenOptions options; options.author = "hosted-test";
     auto local = ObjectStore::create(directory.path / "local.vcobj", options);

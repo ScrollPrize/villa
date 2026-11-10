@@ -629,6 +629,12 @@ struct ServerState {
         return jsonReply(std::move(text));
     }
 
+    Reply nextPointId(const std::string& objectUuid,const std::string& array)
+    {
+        auto txn=store->read();
+        return jsonReply(Json(store->nextGeometryPointId(txn,uuidSegment(objectUuid),array)).dump());
+    }
+
     Reply geometryArray(const std::string& revisionUuid, const std::string& array, const Target& target)
     {
         const auto offset = target.integer("offset", 0);
@@ -732,10 +738,10 @@ struct ServerState {
         return jsonReply(uuidListResultToJson(store->status(txn), uuids));
     }
 
-    Reply objectHistory(const std::string& uuid)
+    Reply objectHistory(const std::string& uuid, const Target& target)
     {
         auto txn = store->read();
-        const auto history = store->objectHistory(txn, uuidSegment(uuid));
+        const auto history = store->objectHistory(txn, uuidSegment(uuid), target.integer("if_retained", 0) != 0);
         if (history.empty()) return errorReply(http::status::not_found, "no object " + uuid);
         return jsonReply(objectHistoryToJson(store->status(txn), history));
     }
@@ -822,7 +828,7 @@ struct ServerState {
         if (method == http::verb::get && is({"v1", "objects", "*", "versions", "*"}))
             return {readers.get(), [this, target] { return objectVersion(target->path[2], target->path[4], *target); }};
         if (method == http::verb::get && is({"v1", "objects", "*", "history"}))
-            return {readers.get(), [this, target] { return objectHistory(target->path[2]); }};
+            return {readers.get(), [this, target] { return objectHistory(target->path[2], *target); }};
         if (method == http::verb::post && is({"v1", "query", "objects"}))
             return {readers.get(), [this, body] { return queryObjects(*body); }};
         if (method == http::verb::post && is({"v1", "query", "edges"}))
@@ -853,6 +859,8 @@ struct ServerState {
         }
         if (method == http::verb::get && is({"v1", "geometry", "*", "annotations", "*"}))
             return {readers.get(), [this, target] { return geometryAnnotations(target->path[2], target->path[4]); }};
+        if (method == http::verb::get && is({"v1", "objects", "*", "next-point-id", "*"}))
+            return {readers.get(), [this, target] { return nextPointId(target->path[2], target->path[4]); }};
         if (method == http::verb::get && is({"v1", "geometry", "*", "arrays", "*"})) {
             // Bounded download memory: unsent replies stay below the limit
             // (plus the replies being produced, each maxResponseBytes at most).

@@ -273,23 +273,28 @@ public:
     // (and, locally, the client catalog's unrecorded registrations).
     VolumeTransforms volumeTransforms(const AttachmentIdentity&);
     // Artifacts (objects/Artifacts.hpp) on any attachment: the manifest of an
-    // object's current version (or `version` in `generation`, default active).
+    // object's current version, a numbered version of its current owner, or a
+    // complete reference (exclusive with version/generation). Complete refs
+    // remain readable after overrides/deletion while their source is retained.
     std::vector<ArtifactFile> artifacts(const AttachmentIdentity&, const std::string& objectUuid,
                                         const std::optional<int64_t>& version = std::nullopt,
-                                         const std::optional<std::string>& generation = std::nullopt);
+                                         const std::optional<std::string>& generation = std::nullopt,
+                                         const std::optional<ObjectVersion>& reference = std::nullopt);
     // Writes those files under `destination` (local to this process; names
     // are relative paths), each atomically and verified against the manifest.
     std::vector<ArtifactFile> materializeArtifacts(const AttachmentIdentity&, const std::string& objectUuid,
                                                    const std::filesystem::path& destination,
                                                    const std::optional<int64_t>& version = std::nullopt,
-                                                   const std::optional<std::string>& generation = std::nullopt);
+                                                   const std::optional<std::string>& generation = std::nullopt,
+                                                   const std::optional<ObjectVersion>& reference = std::nullopt);
     // One artifact as a local file, kept by content: <cacheDirectory>/<sha256>/
     // <file name of `name`>, written (verified) unless it is there. nullopt
     // when that version of the object has no artifact of that name.
     std::optional<std::filesystem::path> artifactFile(const AttachmentIdentity&, const std::string& objectUuid,
                                                       const std::string& name, const std::filesystem::path& cacheDirectory,
                                                       const std::optional<int64_t>& version = std::nullopt,
-                                                      const std::optional<std::string>& generation = std::nullopt);
+                                                      const std::optional<std::string>& generation = std::nullopt,
+                                                      const std::optional<ObjectVersion>& reference = std::nullopt);
     // Stores each (name, local file) durably, then names them in the object's
     // manifest (replacing entries of the same names) in one checked request
     // that expects `expectedVersion` of the object; returns its receipt. An

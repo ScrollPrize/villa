@@ -771,9 +771,9 @@ std::optional<ObjectRevision> HostedStoreReader::currentObject(const std::string
     return revision;
 }
 
-std::vector<ObjectRevision> HostedStoreReader::objectHistory(const std::string& objectUuid) const
+std::vector<ObjectRevision> HostedStoreReader::objectHistory(const std::string& objectUuid, bool ifRetained) const
 {
-    return attachment_->client().objectHistory(objectUuid);
+    return attachment_->client().objectHistory(objectUuid, nullptr, ifRetained);
 }
 
 std::optional<GeometryRevision> HostedStoreReader::currentGeometry(const std::string& objectUuid) const

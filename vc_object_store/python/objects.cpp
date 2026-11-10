@@ -75,6 +75,13 @@ std::vector<vo::ObjectVersion> objectVersionsFromPy(const nb::handle& refs)
     return vo::objectVersionsRequestFromJson(jsonDumps(request));
 }
 
+std::optional<vo::ObjectVersion> optionalObjectVersionFromPy(const nb::object& reference)
+{
+    if (reference.is_none()) return std::nullopt;
+    nb::list refs; refs.append(reference);
+    return objectVersionsFromPy(refs).front();
+}
+
 nb::list objectVersionsToPy(const std::vector<vo::ObjectVersion>& refs)
 {
     return nb::cast<nb::list>(jsonLoads(vo::objectVersionsRequestToJson(refs))["versions"]);
@@ -537,11 +544,11 @@ void bindHostedStore(nb::module_& m)
             { nb::gil_scoped_release release; record = self.recordSelection(selection, pageSize, maxRestarts); }
             return selectionRecordToPy(record);
         }, nb::arg("query"), nb::arg("page_size") = 1000, nb::arg("max_restarts") = 3)
-        .def("object_history", [](Hosted& self, const std::string& uuid) {
+        .def("object_history", [](Hosted& self, const std::string& uuid, bool ifRetained) {
             std::vector<vo::ObjectRevision> history;
-            { nb::gil_scoped_release release; history = self.objectHistory(uuid); }
+            { nb::gil_scoped_release release; history = self.objectHistory(uuid, nullptr, ifRetained); }
             return toPy(history);
-        }, nb::arg("object_uuid"))
+        }, nb::arg("object_uuid"), nb::arg("if_retained") = false)
         .def("relationships_at_versions", [](Hosted& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             std::vector<vo::SelectedRelationship> revisions;
@@ -650,9 +657,8 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         .def("read_surface_grid", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                      const std::string& volume, double targetScale, std::optional<int64_t> version,
                                      const std::optional<std::string>& generation, const nb::object& reference) {
-            std::optional<vo::ObjectVersion> exact;
-            if(!reference.is_none()) {
-                nb::list refs;refs.append(reference);exact=objectVersionsFromPy(refs).front();
+            const auto exact = optionalObjectVersionFromPy(reference);
+            if(exact) {
                 if(exact->objectUuid!=vo::util::canonicalUuid(uuid)||version||generation)
                     throw std::invalid_argument("reference must name this surface and cannot be combined with version/generation");
             }
@@ -887,25 +893,33 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             return toPy(revisions);
         }, nb::arg("attachment"), nb::arg("refs"))
         .def("artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
-                              const std::optional<int64_t>& version, const std::optional<std::string>& generation) {
+                              const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                              const nb::object& reference) {
+            const auto exact = optionalObjectVersionFromPy(reference);
             std::vector<vo::ArtifactFile> files;
-            { nb::gil_scoped_release release; files = self.artifacts(attachment, uuid, version, generation); }
+            { nb::gil_scoped_release release; files = self.artifacts(attachment, uuid, version, generation, exact); }
             return filesPy(files);
-        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt)
+        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt,
+           nb::arg("reference") = nb::none())
         .def("materialize_artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
-                                          const std::filesystem::path& destination, const std::optional<int64_t>& version, const std::optional<std::string>& generation) {
+                                          const std::filesystem::path& destination, const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                                          const nb::object& reference) {
+            const auto exact = optionalObjectVersionFromPy(reference);
             std::vector<vo::ArtifactFile> files;
-            { nb::gil_scoped_release release; files = self.materializeArtifacts(attachment, uuid, destination, version, generation); }
+            { nb::gil_scoped_release release; files = self.materializeArtifacts(attachment, uuid, destination, version, generation, exact); }
             return filesPy(files);
-        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("destination"), nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt)
+        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("destination"), nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt,
+           nb::arg("reference") = nb::none())
         .def("artifact_file", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                   const std::string& name, const std::filesystem::path& cacheDirectory,
-                                  const std::optional<int64_t>& version, const std::optional<std::string>& generation) -> nb::object {
+                                  const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                                  const nb::object& reference) -> nb::object {
+            const auto exact = optionalObjectVersionFromPy(reference);
             std::optional<std::filesystem::path> path;
-            { nb::gil_scoped_release release; path = self.artifactFile(attachment, uuid, name, cacheDirectory, version, generation); }
+            { nb::gil_scoped_release release; path = self.artifactFile(attachment, uuid, name, cacheDirectory, version, generation, exact); }
             return path ? nb::cast(*path) : nb::none();
         }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("name"), nb::arg("cache_directory"),
-           nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt,
+           nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt, nb::arg("reference") = nb::none(),
            "One artifact as a local file under cache_directory/<sha256>/ (written unless there); None without it.")
         .def("publish_artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                       int64_t expectedVersion, const std::map<std::string, std::filesystem::path>& files,
@@ -960,6 +974,10 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
 
 NB_MODULE(_native, m)
 {
+    m.def("receipt_object_reference", [](const nb::dict& receipt,const std::string& uuid) -> nb::object {
+        const auto ref=vo::transactionReceiptFromJson(jsonDumps(receipt)).objectReference(uuid);
+        return ref?nb::object(objectVersionsToPy({*ref})[0]):nb::none();
+    },nb::arg("receipt"),nb::arg("object_uuid"),"Exact committed reference, including unchanged inherited inputs.");
     m.def("object_reference", [](const nb::dict& record) {
         vo::ObjectRecord value;
         value.uuid=nb::cast<std::string>(record["uuid"]);
@@ -1495,7 +1513,7 @@ NB_MODULE(_native, m)
         .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),
              nb::arg("object_uuid"))
         .def("object_history", readMethod<&vo::ObjectStore::objectHistory>(),
-             nb::arg("object_uuid"))
+             nb::arg("object_uuid"), nb::arg("if_retained") = false)
         .def("status", [](PyObjectStore& self) {
             return jsonLoads(vo::storeStatusToJson(self.withRead([](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.status(txn); })));
         }, "Store UUID, lineage generation, commit sequence, feed start and history_enabled policy.")

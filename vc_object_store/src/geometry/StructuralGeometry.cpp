@@ -64,6 +64,20 @@ nlohmann::json ObjectStore::geometryPointAnnotations(const Txn& txn,const std::s
     GeometryReader reader(txn,revision);
     return annotations(txn,*r,reader,name);
 }
+int64_t ObjectStore::nextGeometryPointId(const Txn& txn,const std::string& object,const std::string& array) const {
+    const auto current=objectByUuid(txn,object);
+    if(current&&sequenceIdArray(current->kind,array).empty())throw std::invalid_argument("sequence has no stable point IDs");
+    MetadataCacheScope cache;
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    MetadataSnapshot allocated(db);
+    mergeRetainedAllocations(db,object,array,allocated);
+    int64_t next=0;
+    allocated.entries([&](int64_t id,const auto&){
+        if(id==INT64_MAX)throw std::overflow_error("geometry point IDs exhausted");
+        next=std::max(next,id+1);
+    });
+    return next;
+}
 std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& objectId,const GeometrySequenceEdit& edit,
     const std::string& expected,const std::vector<GeometryEdgeEdit>& edges)
 {

@@ -54,7 +54,11 @@ take an `ObjectSelection` / `EdgeSelection` in a read transaction.
 
 Use `ObjectRecord::reference()` or `ObjectRevision::reference()` in C++, and `vc_object_store.object_reference(record)` in Python, to preserve the complete `(store, generation, object, version)` identity. The attached store is a lookup scope, not necessarily the owner of a returned record. After an overlay edit, the new version belongs to the committing store; use the transaction receipt's store/generation for changed versions. Unchanged inputs retain their original references.
 
+For repinning after a write, use `TransactionReceipt::objectReference(uuid)` or Python `receipt_object_reference(receipt, uuid)`. Receipts retain complete identities for every live expected/changed object, including unchanged inherited inputs. Do not combine the receipt's store/generation with its numeric `objects` entries: those entries also include unchanged referenced objects. Saved receipts retain their original references on replay. Older receipts without `object_references` remain readable but cannot safely repin an editor; the helper requires reloading rather than guessing ownership. Durable drafts preserve their data and record that reload requirement.
+
 `object_history(uuid)` follows the winning record even when it is a deletion marker in a referenced store. It does not fall through that deletion to older live records. Ingestion also reserves deleted identities across the same scope: re-import is not a restore operation.
+
+Consumers that use history only when it is retained can request `object_history(uuid, if_retained=True)` (C++ `objectHistory(uuid, true)` on `StoreReader`). This returns no entries when that record's owner has history disabled; explicit history reads still reject unavailable history. Do not infer a referenced record's retention policy from the attached root's `history_enabled` setting.
 
 Volume-target listings (`volume=...`, the volume's `id`) match every frame
 declared in that volume, and their bbox, length filters, and length ordering

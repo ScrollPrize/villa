@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/Project.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "vc_object_store/objects/ObjectCopy.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -35,10 +36,114 @@ Json view(ObjectStoreSession& session, const AttachmentIdentity& attachment, con
     session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) { result = projectView(reader, author); });
     return result;
 }
+
+void ownerHistoryPolicy(HistoryMode sourceMode,HistoryMode overlayMode)
+{
+    TemporaryDirectory dir;auto sourceOptions=as("test");sourceOptions.history=sourceMode;
+    const auto base=dir.path/"base.vcobj",overlay=dir.path/"overlay.vcobj";
+    const auto deleted=util::newUuid();
+    const auto resource=projectResourceRecord(kVolumeResource,"/volumes/test");
+    {auto store=ObjectStore::create(base,sourceOptions);auto w=store.write();
+        store.upsertObject(w,resource);
+        for(int i=0;i<2;++i){ObjectRecord r;r.kind=kProjectKind;store.upsertObject(w,r);}
+        ObjectRecord r;r.uuid=deleted;r.kind="note";store.upsertObject(w,r);w.commit();
+        auto remove=store.write();store.deleteObject(remove,deleted);store.seal(remove);remove.commit();}
+    auto overlayOptions=as("test");overlayOptions.history=overlayMode;
+    {auto collection=ObjectCollection::create(overlay,{base},overlayOptions);}
+    auto store=ObjectStore::open(overlay,overlayOptions);auto txn=store.read();LocalStoreReader reader(store,txn);
+    require(projectResources(reader,kVolumeResource).size()==1,"resource discovery uses owner history policy");
+    require(projectRecord(reader).has_value(),"project ordering uses owner history policy");
+    require(reader.objectHistory(deleted,true).size()==(sourceMode==HistoryMode::On?2:0),"optional history follows winning tombstone owner");
+    require(currentVersionOf(reader,deleted)==(sourceMode==HistoryMode::On?std::optional<int64_t>(2):std::nullopt),
+        "retained tombstone version does not depend on overlay history policy");
+    if(sourceMode==HistoryMode::Off)mustFail([&]{reader.objectHistory(resource.uuid);});
+}
+
+void copyCollectionProject(bool packed,bool sharded)
+{
+    TemporaryDirectory dir;const auto sourceDir=dir.path/"source",destinationDir=dir.path/"destination";
+    std::filesystem::create_directories(sourceDir);std::filesystem::create_directories(destinationDir);
+    auto options=as("copy-test");options.history=HistoryMode::Off;options.spatialIndex=false;
+    std::filesystem::path source=sourceDir/"root.vcobj";
+    std::string artifactOwner;const auto payload=sourceDir/"payload.txt";std::ofstream(payload)<<"retained payload";
+    if(sharded){
+        const auto owner=util::newUuid(),lineage=util::newUuid();std::vector<std::filesystem::path> shards;
+        for(int i=0;i<2;++i){
+            auto opt=options;opt.creationStoreUuid=owner;opt.creationGeneration=lineage;
+            opt.objectIdRange={1+i*100,100+i*100};opt.edgeIdRange=opt.objectIdRange;
+            const auto path=sourceDir/("shard"+std::to_string(i)+".vcobj");shards.push_back(path);
+            auto store=ObjectStore::create(path,opt);auto w=store.write();
+            store.upsertObject(w,projectResourceRecord(kVolumeResource,"/volume/"+std::to_string(i)));w.commit();
+            auto seal=store.write();store.seal(seal);seal.commit();
+        }
+        auto collection=ObjectCollection::publishShards(source,shards,options);
+    }else{
+        const auto base=sourceDir/"base.vcobj";createProject(base,"source project",Json::object(),options);
+        {ObjectStoreSession session;const auto attachment=session.attach(base,options);
+            addProjectResource(session,attachment,kVolumeResource,"/volume/base");
+            session.readStore(attachment,[&](const StoreReader& reader,const auto&){artifactOwner=projectRecord(reader)->uuid;});
+            session.publishArtifacts(attachment,artifactOwner,session.currentObject(attachment,artifactOwner)->version,{{"note.txt",payload}},"copy-test");}
+        {auto store=ObjectStore::open(base,options);auto w=store.write();store.seal(w);w.commit();}
+        {auto collection=ObjectCollection::create(source,{base},options);}
+        {ObjectStoreSession session;const auto attachment=session.attach(source,options);
+            addProjectResource(session,attachment,kVolumeResource,"/volume/overlay");}
+    }
+    if(packed){
+        if(!sharded){auto store=ObjectStore::open(source,options);auto w=store.write();store.seal(w);w.commit();}
+        const auto output=sourceDir/"packed.vcobj";packObjectCollection(source,output);source=output;
+    }
+    const auto destination=destinationDir/"copy.vcobj";
+    {ObjectStoreSession session;auto readOptions=options;readOptions.readOnly=true;
+        const auto attachment=session.attach(source,readOptions);copyProject(session,attachment,destination,"independent",options);}
+    // The copied closure must no longer rely on either original paths or a
+    // source packed container. Renaming the temporary source tree makes that explicit.
+    std::filesystem::rename(sourceDir,dir.path/"source-unavailable");
+    {ObjectStoreSession session;const auto attachment=session.attach(destination,options);
+        require(resources(session,attachment,kVolumeResource).size()==2,"copied collection retains both resources");
+        session.readStore(attachment,[&](const StoreReader& reader,const auto&){
+            require(projectRecord(reader)->name=="independent","copied collection has a mutable independent project");});
+        if(!artifactOwner.empty()){
+            const auto files=session.artifacts(attachment,artifactOwner);
+            require(files.size()==1,"inherited artifact manifest survives copy");
+            const auto local=session.artifactFile(attachment,artifactOwner,"note.txt",dir.path/"cache");
+            require(local&&std::filesystem::file_size(*local)==16,"inherited artifact content survives copy");
+        }
+        setProjectName(session,attachment,"renamed again");}
+    {ObjectStoreSession session;const auto attachment=session.attach(destination,options);
+        require(resources(session,attachment,kVolumeResource).size()==2,"copy remains readable after another root commit");}
+}
+
+void missingArtifactExport(HistoryMode history)
+{
+    TemporaryDirectory dir;const auto source=dir.path/"source.vcobj",payload=dir.path/"payload";
+    std::ofstream(payload)<<"retained bytes";
+    auto options=as("artifact-copy");options.history=history;
+    std::string hash;
+    {auto store=ObjectStore::create(source,options);hash=store.putArtifact(payload);
+        auto w=store.write();ObjectRecord record;record.uuid=util::newUuid();record.kind="note";
+        record.meta=Json{{kArtifactsMetaKey,Json::parse(artifactManifestJson({{"note.txt",hash,14}}))}}.dump();
+        store.upsertObject(w,record);w.commit();
+        auto finish=store.write();
+        if(history==HistoryMode::On)store.removeMeta(finish,record.uuid,kArtifactsMetaKey);
+        store.seal(finish);finish.commit();}
+    // History-on: only an older revision still needs the blob. History-off:
+    // the current manifest does. Neither export may silently drop the bytes.
+    std::filesystem::remove(artifactBlobPath(source,hash));
+    for(const bool packed:{false,true}){
+        const auto target=dir.path/(packed?"packed.vcobj":"copy.vcobj");
+        mustFail([&]{if(packed)packObjectCollection(source,target);else copyObjectCollection(source,target,options);});
+        for(const auto* suffix:{"",".artifacts",".stores"})
+            require(!std::filesystem::exists(target.string()+suffix),"failed artifact export removes owned output and sidecars");
+    }
+}
 } // namespace
 
 int main() try
 {
+    for(const auto history:{HistoryMode::Off,HistoryMode::On})missingArtifactExport(history);
+    for(const auto source:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On})
+        ownerHistoryPolicy(source,overlay);
+    for(const bool packed:{false,true})for(const bool sharded:{false,true})copyCollectionProject(packed,sharded);
     TemporaryDirectory directory;
     const auto path = directory.path / "project.vcobj";
 

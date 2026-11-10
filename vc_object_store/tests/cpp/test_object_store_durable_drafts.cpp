@@ -8,6 +8,7 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/server/Server.hpp"
 
 #include <iostream>
@@ -77,6 +78,28 @@ try {
     const auto surface = createSurface(storePath, options);
     const auto coordinates = volumeCoordinates(volume, 1);
     ObjectVersion base;
+
+    // No-op saves keep the inherited owner even though the receipt is issued
+    // by a different writable attachment. Kept drafts use that exact base.
+    for(const auto mode:{HistoryMode::Off,HistoryMode::On}){
+        const auto root=directory.path/(mode==HistoryMode::Off?"off":"on");
+        std::filesystem::create_directories(root);
+        auto opt=options;opt.history=mode;
+        const auto original=root/"base.vcobj",overlay=root/"overlay.vcobj";
+        const auto uuid=createSurface(original,opt);
+        {auto db=ObjectStore::open(original,opt);auto w=db.write();db.seal(w);w.commit();}
+        {auto collection=ObjectCollection::create(overlay,{original},opt);}
+        ObjectStoreSession session;const auto attachment=session.attach(overlay,opt);
+        session.useDraftDirectory(root/"drafts");
+        const auto ref=session.currentObject(attachment,uuid)->reference();
+        session.setDraft(uuid,flat(1),coordinates,attachment,ref);
+        auto request=session.newRequest(attachment);request.expectedObjects={{uuid,ref.version}};
+        const DurableSave keep{{{uuid,session.draftRevision(uuid)}},true};
+        const auto receipt=session.submitDurably(attachment,request,keep);
+        require(!receipt.commitSequence&&receipt.objectReference(uuid)==ref,"no-op receipt keeps referenced owner");
+        require(session.draftState(uuid)->base==ref&&session.draftState(uuid)->conflict.empty(),
+            "durable no-op repinning does not fabricate a local base");
+    }
 
     // Checkpoint, edit afterwards, "crash": the checkpoint comes back.
     {

@@ -5,18 +5,25 @@
 
 namespace vc::objects::detail {
 // The caller must close/checkpoint and sync the staging file first. Atomic
-// no-replace publication avoids an exists()+rename race. A directory-sync error
-// after linking means the complete destination may exist but durability is not
-// confirmed; never treat that as permission to overwrite an existing file.
+// no-replace publication avoids an exists()+rename race. Keep the staging link
+// as an ownership witness until publication is durable, so an error can remove
+// only this attempt's destination (never another publisher's file).
 inline void publishNewFile(const std::filesystem::path& staging,
                            const std::filesystem::path& destination)
 {
     const auto from = std::filesystem::absolute(staging).lexically_normal();
     const auto to = std::filesystem::absolute(destination).lexically_normal();
     std::filesystem::create_hard_link(from, to);
-    vcr::platform::sync_directory(to.parent_path(), "publish vcobj store");
-    std::filesystem::remove(from);
-    vcr::platform::sync_directory(from.parent_path(), "remove vcobj staging name");
+    try {
+        vcr::platform::sync_directory(to.parent_path(), "publish vcobj store");
+        std::filesystem::remove(from);
+        // No fallible work after unlinking the ownership witness. The output
+        // is durable; a crash may retain its harmless private staging name.
+    } catch (...) {
+        std::error_code ignored;
+        if (std::filesystem::equivalent(from, to, ignored)) std::filesystem::remove(to, ignored);
+        throw;
+    }
 }
 
 // SQLite sibling staging, including any sidecars left after an interrupted

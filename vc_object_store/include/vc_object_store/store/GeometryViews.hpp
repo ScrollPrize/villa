@@ -24,6 +24,8 @@ public:
     // The numbered version of the object this view read (its current one);
     // nullopt for a view of a pinned geometry revision.
     std::optional<int64_t> version() const;
+    // Complete identity retained by current/selected views, not just its counter.
+    std::optional<ObjectVersion> reference() const;
 protected:
     explicit GeometryView(std::shared_ptr<detail::GeometryViewState>);
     geometry::Geometry loadGeometry() const;

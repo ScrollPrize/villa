@@ -27,7 +27,10 @@ bool artifactFileMatches(const ArtifactFileRef&, const std::filesystem::path&);
 // its own destination on failure. Used by every packed database-copy path.
 class ArtifactExport {
 public:
-    ArtifactExport(const std::vector<std::filesystem::path>& sources,const std::filesystem::path& destination);
+    // `snapshots` are the copied databases, not mutable source heads: validation
+    // checks exactly the current and retained manifests being exported.
+    ArtifactExport(const std::vector<std::filesystem::path>& sources,const std::filesystem::path& destination,
+                   const std::vector<std::filesystem::path>& snapshots);
     ~ArtifactExport();
     ArtifactExport(const ArtifactExport&)=delete;
     ArtifactExport& operator=(const ArtifactExport&)=delete;

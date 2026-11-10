@@ -10,6 +10,44 @@
 
 namespace vc::objects {
 
+std::optional<ObjectRevision> StoreReader::selectedObject(const std::string& objectUuid,std::optional<int64_t> version,
+    const std::optional<std::string>& generation,const std::optional<ObjectVersion>& reference) const
+{
+    const auto uuid=util::canonicalUuid(objectUuid);
+    if(reference){
+        if(util::canonicalUuid(reference->objectUuid)!=uuid||version||generation)
+            throw std::invalid_argument("reference must name this object and cannot be combined with version/generation");
+        return objectsAtVersions({*reference}).front();
+    }
+    const auto current=currentObject(uuid);
+    return version&&current?objectsAtVersions({current->reference(version,generation)}).front():current;
+}
+
+std::vector<int64_t> StoreReader::assignGeometryPointIds(const std::string& objectUuid,const std::string& array,
+                                                       std::vector<int64_t> ids) const
+{
+    std::set<int64_t> used;
+    std::vector<size_t> unassigned;
+    for(size_t i=0;i<ids.size();++i)
+        if(ids[i]<0||!used.insert(ids[i]).second)unassigned.push_back(i);
+    if(unassigned.empty())return ids;
+    auto next=nextGeometryPointId(objectUuid,array);
+    if(!used.empty()){
+        if(*used.rbegin()==INT64_MAX)throw std::overflow_error("geometry point IDs exhausted");
+        next=std::max(next,*used.rbegin()+1);
+    }
+    for(const auto i:unassigned){
+        if(next==INT64_MAX)throw std::overflow_error("geometry point IDs exhausted");
+        ids[i]=next++;
+    }
+    return ids;
+}
+
+int64_t LocalStoreReader::nextGeometryPointId(const std::string& objectUuid,const std::string& array) const
+{
+    return store_->nextGeometryPointId(*txn_,objectUuid,array);
+}
+
 std::vector<vcr::catalog::TransformResolution> StoreReader::availableTransforms(const std::string& objectUuid) const
 {
     const auto object = currentObject(objectUuid);
@@ -178,8 +216,7 @@ VersionSelection transformDependencies(const StoreReader& reader)
 std::optional<int64_t> currentVersionOf(const StoreReader& reader, const std::string& objectUuid)
 {
     if (const auto head = reader.currentObject(objectUuid)) return head->version;
-    if (!reader.status().historyEnabled) return std::nullopt;
-    const auto history = reader.objectHistory(objectUuid);
+    const auto history = reader.objectHistory(objectUuid, true);
     return history.empty() ? std::nullopt : std::optional(history.back().version);
 }
 
@@ -243,9 +280,9 @@ std::optional<ObjectRevision> LocalStoreReader::currentObject(const std::string&
     return revision;
 }
 
-std::vector<ObjectRevision> LocalStoreReader::objectHistory(const std::string& objectUuid) const
+std::vector<ObjectRevision> LocalStoreReader::objectHistory(const std::string& objectUuid, bool ifRetained) const
 {
-    return store_->objectHistory(*txn_, objectUuid);
+    return store_->objectHistory(*txn_, objectUuid, ifRetained);
 }
 
 std::vector<std::optional<ObjectRevision>> LocalStoreReader::objectsAtVersions(

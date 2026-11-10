@@ -131,7 +131,7 @@ public:
     bool active() const override { return true; }
     StoreStatus status() const override { return attachment_->status(); }
     std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const override;
-    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid) const override;
+    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, bool ifRetained = false) const override;
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>& references) const override
     {
         return attachment_->objectsAtVersions(references);
@@ -169,6 +169,10 @@ public:
     nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override
     {
         return *attachment_->geometryPointAnnotations(revisionUuid, arrayName);
+    }
+    int64_t nextGeometryPointId(const std::string& objectUuid,const std::string& arrayName) const override
+    {
+        return attachment_->client().nextGeometryPointId(objectUuid,arrayName);
     }
     std::vector<std::string> componentOf(const std::string& objectUuid, const std::vector<std::string>& edgeKinds = {},
                                          const std::atomic_bool* = nullptr) const override

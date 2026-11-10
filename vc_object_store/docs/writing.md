@@ -227,6 +227,8 @@ the version they read. Hosted clients get `putArtifact` / `fetchArtifact`
 (verified, atomic). The older mutable per-object artifact directories are no
 longer read or written, and their contents are not migrated.
 
+All three session artifact readers accept `reference={store, generation, object, version}` (C++: the optional `ObjectVersion` argument). This selects the exact manifest through the shared version resolver, including a retained referenced version after an overlay edit or deletion. It cannot be combined with `version`/`generation` and must name the requested object. The older number-only selectors use the current owner's history; they do not identify a different source owner. Geometry and model-checkpoint consumers must carry the same complete reference to both reads.
+
 ## Projects
 
 A store is also a project ([objects/Project.hpp](../include/vc_object_store/objects/Project.hpp)):
@@ -254,4 +256,4 @@ corrections) go through `documents.attach_document(location, ...)` /
 `attached_document` / `point_collections` — one checked request each, on a
 file or endpoint alike; their edges are `attachment` edges, not graph links
 (see [graph edges](graph-edges.md#attachments-are-not-graph-links)).
-`copyProject` copies the artifact directory with the database.
+`copyProject` uses the shared [collection copy](collections.md#independent-import-shards) API: the mutable root, referenced/sharded databases and artifact payloads are copied as one portable bundle, not just the attached physical file.
