@@ -26,7 +26,8 @@ public:
     // The tool read `pin`: in stored coordinates (`volume` unset), or through
     // the view of it in `volume`, where `identity` says whether that view maps
     // stored coordinates unchanged.
-    void noteRead(const PinnedObject& pin, const std::optional<VolumeVoxels>& volume, bool identity);
+    void noteRead(const PinnedObject& pin, const std::optional<VolumeVoxels>& volume, bool identity,
+                  const std::optional<CheckVolumeMappingOp>& mapping = std::nullopt);
     // The coordinates of a new object made from `sources`: bound to `volume`
     // when given, else to the frame the sources were read in (the voxels they
     // were read through, else the first source's binding). Sources read in
@@ -35,7 +36,9 @@ public:
     // The pin (version and geometry) of writing back `uuid`: one this tool
     // read in stored units (writing a mapped grid back would rewrite every
     // stored coordinate). Throws otherwise.
-    PinnedObject writable(const std::string& uuid);
+    // Prepare the request from that same loaded state, including the coordinate
+    // mapping guard; callers append their edits afterwards.
+    PinnedObject writable(const std::string& uuid, TransactionRequest& request);
     // Publish local files (name, path) as artifacts of `uuid`
     // (ObjectStoreSession::publishArtifacts), expecting the version this tool
     // read it at, else its current version (an object the tool created).
@@ -49,6 +52,7 @@ private:
         PinnedObject pin;
         std::optional<VolumeVoxels> volume;
         bool identity = true;
+        std::optional<CheckVolumeMappingOp> mapping;
     };
     std::string tool_;
     std::shared_ptr<ObjectStoreSession> session_;

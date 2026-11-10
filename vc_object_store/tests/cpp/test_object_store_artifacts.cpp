@@ -6,6 +6,7 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/ToolObjects.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -187,8 +188,13 @@ try {
         const auto attachment = session.attach(path, options);
         const auto before = session.currentObject(attachment, object);
         const auto oldPin = pinOf(attachment, *before, session.status(attachment).generation);
+        ToolObjects tool(path, "loaded-artifact-test");
+        tool.noteRead(pinOf(tool.attachment(), *tool.session()->currentObject(tool.attachment(), object),
+                          tool.session()->status(tool.attachment()).generation), {}, true);
         const auto generation = db.startHistoryGeneration("restored backup");
         mustFail([&] { session.requireCurrent(oldPin); });
+        mustFail([&] { session.publishArtifacts(oldPin, {}); });
+        mustFail([&] { tool.publishArtifacts(object, {}); });
         const auto reopened = pinOf(attachment, *session.currentObject(attachment, object), generation);
         require(reopened.reference() == oldPin.reference() && reopened.writeGeneration != oldPin.writeGeneration,
                 "reopening preserves the historical reference and observes the new write generation");

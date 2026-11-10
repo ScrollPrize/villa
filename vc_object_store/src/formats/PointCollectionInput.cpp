@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <cmath>
+#include <limits>
 namespace vc::objects::formats {
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -44,9 +45,8 @@ std::vector<Prepared> collections(const fs::path& source, const SourceIngestOpti
     const auto root = readJson(source);
     if (root.value("vc_pointcollections_json_version", "") != "1" || !root.at("collections").is_object())
         throw std::runtime_error("expected vc_pointcollections JSON version 1");
-    int64_t nextId = -1;
-    const auto colliding = collidingCollections(root.at("collections"), nextId);
-    ++nextId;
+    int64_t largestId = -1;
+    const auto colliding = collidingCollections(root.at("collections"), largestId);
     if (!colliding.empty()) {
         if (!options.renumberCollidingPointIds) {
             std::string named;
@@ -94,7 +94,9 @@ std::vector<Prepared> collections(const fs::path& source, const SourceIngestOpti
             for (double value : xyz) if (!std::isfinite(value)) throw std::runtime_error("non-finite point");
             auto extra = entry; extra.erase("p");
             if (renumber) extra["source_point_id"] = id;
-            ids.push_back(renumber ? nextId++ : id); coordinates.push_back(xyz);
+            if (renumber && largestId == std::numeric_limits<int64_t>::max())
+                throw std::runtime_error("cannot renumber point IDs: numeric ID range exhausted");
+            ids.push_back(renumber ? ++largestId : id); coordinates.push_back(xyz);
             attributes["point_attributes"].push_back(std::move(extra));
         }
         p.geometry = vc::geometry::encode(vc::geometry::PointCollection{std::move(ids), std::move(coordinates)});

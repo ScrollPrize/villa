@@ -39,6 +39,9 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
         return false;
     }
 
+    // A previous stop may have failed to save. Do not replace its loaded
+    // correction state until that write succeeds, even for the same surface.
+    if (!saveCorrections()) return false;
     if (!prepareEditingDestination(surface)) return false;
     // Editing starts from the revision on screen and holds the object until it ends.
     const auto storeEdit = storeEditFor(surface.get());

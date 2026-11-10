@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/ToolObjects.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 
 #include <cstdlib>
 #include <set>
@@ -18,23 +19,28 @@ ToolObjects::ToolObjects(const std::filesystem::path& store, const std::string& 
 TransactionReceipt ToolObjects::publishArtifacts(const std::string& uuid,
                                                 const std::vector<std::pair<std::string, std::filesystem::path>>& files)
 {
-    std::optional<int64_t> version;
+    std::optional<PinnedObject> pin;
+    std::optional<CheckVolumeMappingOp> mapping;
     {
         std::lock_guard lock(mutex_);
-        if (const auto read = read_.find(util::canonicalUuid(uuid)); read != read_.end()) version = read->second.pin.version;
+        if (const auto read = read_.find(util::canonicalUuid(uuid)); read != read_.end()) {
+            pin = read->second.pin; mapping = read->second.mapping;
+        }
     }
-    if (!version) {
+    if (!pin) {
         const auto current = session_->currentObject(attachment_, uuid);
         if (!current) throw std::runtime_error("no object " + uuid + " to publish artifacts of");
-        version = current->version;
+        return session_->publishArtifacts(attachment_, uuid, current->version, files);
     }
-    return session_->publishArtifacts(attachment_, uuid, *version, files);
+    return session_->publishArtifacts(*pin, files, {}, mapping);
 }
 
-void ToolObjects::noteRead(const PinnedObject& pin, const std::optional<VolumeVoxels>& volume, bool identity)
+void ToolObjects::noteRead(const PinnedObject& pin, const std::optional<VolumeVoxels>& volume, bool identity,
+                           const std::optional<CheckVolumeMappingOp>& mapping)
 {
     std::lock_guard lock(mutex_);
-    read_[pin.object.objectUuid] = {pin, volume, !volume || identity};
+    if (volume && !mapping) throw std::invalid_argument("a loaded volume view requires its mapping guard");
+    read_[util::canonicalUuid(pin.object.objectUuid)] = {pin, volume, !volume || identity, mapping};
 }
 
 CoordinateJson ToolObjects::coordinatesFor(const std::vector<std::string>& sources, const std::optional<VolumeVoxels>& volume)
@@ -63,13 +69,16 @@ CoordinateJson ToolObjects::coordinatesFor(const std::vector<std::string>& sourc
     return coordinates;
 }
 
-PinnedObject ToolObjects::writable(const std::string& uuid)
+PinnedObject ToolObjects::writable(const std::string& uuid, TransactionRequest& request)
 {
     std::lock_guard lock(mutex_);
-    const auto found = read_.find(uuid);
+    const auto found = read_.find(util::canonicalUuid(uuid));
     if (found == read_.end()) throw std::runtime_error("update a surface this tool loaded: " + uuid);
     if (!found->second.identity)
         throw std::runtime_error("surface " + uuid + " was loaded through a volume mapping other than the identity");
+    request.generation = found->second.pin.writeGeneration;
+    expectObject(request, found->second.pin.reference());
+    if (found->second.mapping) request.operations.push_back(*found->second.mapping);
     return found->second.pin;
 }
 

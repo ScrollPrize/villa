@@ -141,11 +141,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             sub.candidateWorkBudget=options.candidateWorkBudget-std::min(options.candidateWorkBudget,merged.stats.candidateWork);
             sub.sqlStepBudget=options.sqlStepBudget-std::min(options.sqlStepBudget,merged.stats.sqlSteps);
             auto part = geometryRegion(txn, view, sub, cancel);
-            for (auto field : {&RegionStats::outputBytes, &RegionStats::processingBytes, &RegionStats::payloadBytes,
-                               &RegionStats::verifiedBytes, &RegionStats::metadataBytes, &RegionStats::reconstructedBytes,
-                               &RegionStats::cacheBytes, &RegionStats::candidateWork, &RegionStats::candidateVisits,
-                               &RegionStats::segmentTests, &RegionStats::sqlSteps})
-                merged.stats.*field += part.stats.*field;
+            addRegionStats(merged.stats, part.stats);
             for (auto& run : part.runs) {
                 merged.runs.push_back(std::move(run));
             }
@@ -312,6 +308,12 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
     };
     try {
         request.poll();
+        std::set<std::string> excluded;
+        for (const auto& uuid : options.excludedUuids) {
+            request.work(&RegionStats::candidateVisits);
+            request.bytes(64, &RegionStats::metadataBytes);
+            excluded.insert(formatUuid(parseUuid(uuid)));
+        }
         std::optional<std::string> includedIds;
         if (options.uuids) {
             if (options.uuids->empty()) return result;
@@ -356,6 +358,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             while(candidates.row()) {
                 requestWork(&RegionStats::candidateVisits);
                 auto& row=candidates.values();
+                if(excluded.contains(row.uuid(0))) continue;
                 process(candidates.source(),row.uuid(0),row.i64(1),readGeometryTokenColumn(row,2),row.text(3));
             }
         };
@@ -363,6 +366,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         query(false);
         if (kind.surface) {
             result.remote = remoteSurfacesIn(db, bounds, includedIds, options.coordinates);
+            std::erase_if(result.remote, [&](const auto& uuid) { return excluded.contains(uuid); });
             if (!result.remote.empty() && impl_->options.remoteGeometryReached)
                 impl_->options.remoteGeometryReached(result.remote);
         }

@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/ObjectCopy.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "internal/Database.hpp"
 #include <nlohmann/json.hpp>
 #include <limits>
 
@@ -55,8 +56,10 @@ std::vector<TransactionOperation> objectCopyOperations(const ObjectCopy& copy)
 
 std::string writeObjectCopy(ObjectStore& store, WriteTxn& txn, const ObjectCopy& copy)
 {
+    detail::Savepoint operation(ObjectStoreImplAccess::conn(txn));
     const auto uuid = store.upsertObject(txn, copy.record);
     if (copy.geometry) store.putGeometry(txn, uuid, *copy.geometry);
+    operation.release();
     return uuid;
 }
 }

@@ -140,6 +140,19 @@ void missingArtifactExport(HistoryMode history)
 
 int main() try
 {
+    for (auto history : {HistoryMode::On, HistoryMode::Off}) {
+        TemporaryDirectory dir;
+        auto options = as("copy-test"); options.history = history;
+        auto store = ObjectStore::create(dir.path / "copy.vcobj", options);
+        ObjectCopy copy;
+        copy.record.uuid = util::newUuid(); copy.record.kind = "fiber";
+        copy.geometry.emplace(); copy.geometry->kind = "surface"; // invalid for this target
+        auto write = store.write();
+        mustFail([&] { writeObjectCopy(store, write, copy); });
+        write.commit(); // catching a failure must not publish partial metadata
+        auto read = store.read();
+        require(!store.objectByUuid(read, copy.record.uuid), "failed composite copy rolled back");
+    }
     for(const auto history:{HistoryMode::Off,HistoryMode::On})missingArtifactExport(history);
     for(const auto source:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On})
         ownerHistoryPolicy(source,overlay);

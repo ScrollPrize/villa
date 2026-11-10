@@ -302,6 +302,11 @@ public:
     TransactionReceipt publishArtifacts(const AttachmentIdentity&, const std::string& objectUuid, int64_t expectedVersion,
                                         const std::vector<std::pair<std::string, std::filesystem::path>>& files,
                                         const std::string& author = {});
+    // Loaded tools retain both the selected source reference and active write lineage.
+    TransactionReceipt publishArtifacts(const PinnedObject&,
+                                        const std::vector<std::pair<std::string, std::filesystem::path>>& files,
+                                        const std::string& author = {},
+                                        const std::optional<CheckVolumeMappingOp>& mapping = {});
     // Writes by a geometry fetcher (setGeometryFetcher) on a writable attachment.
     using FetchWrite = std::function<TransactionReceipt(const VersionSelection& expected, const Action&)>;
     // Fetches one object's geometry and writes it with `write`; throws when it
@@ -445,6 +450,8 @@ public:
     void requireCurrent(const PinnedObject&);
 
 private:
+    TransactionReceipt publishArtifactManifest(const AttachmentIdentity&, TransactionRequest,
+        const ObjectRevision&, const std::vector<std::pair<std::string, std::filesystem::path>>&);
     void submitCopy(const AttachmentIdentity& from, const AttachmentIdentity& to, const ObjectCopy&);
     struct Attachment;
     std::shared_ptr<Attachment> open(const std::filesystem::path&, const OpenOptions&);

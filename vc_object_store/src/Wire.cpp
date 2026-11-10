@@ -583,7 +583,7 @@ std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::str
 std::string regionQueryRequestToJson(const RegionSlice& slice, const RegionOptions& o)
 {
     refuseTransforms(o.transforms || o.toTarget, "region query");
-    return Json{{"slice", {{"origin", slice.origin}, {"u", slice.u}, {"v", slice.v}, {"normal", slice.normal},
+    auto result = Json{{"slice", {{"origin", slice.origin}, {"u", slice.u}, {"v", slice.v}, {"normal", slice.normal},
                            {"local_bounds", slice.localBounds}}},
                 {"options", {{"kind", o.kind}, {"maximum_objects", o.maximumObjects}, {"selected", opt(o.selected)},
                              {"family", opt(o.family)}, {"min_length", o.minLength}, {"min_points", o.minPoints},
@@ -592,8 +592,9 @@ std::string regionQueryRequestToJson(const RegionSlice& slice, const RegionOptio
                              {"candidate_work_budget", o.candidateWorkBudget}, {"sql_step_budget", o.sqlStepBudget},
                              {"max_unit_bytes", o.maxUnitBytes}, {"uuids", opt(o.uuids)},
                              {"coordinates", opt(o.coordinates)}, {"volume", opt(o.volume)},
-                             {"target_scale", o.targetScale}}}}
-        .dump();
+                             {"target_scale", o.targetScale}}}};
+    if (!o.excludedUuids.empty()) result["options"]["excluded_uuids"] = o.excludedUuids;
+    return result.dump();
 }
 
 std::pair<RegionSlice, RegionOptions> regionQueryRequestFromJson(const std::string& text)
@@ -610,12 +611,13 @@ std::pair<RegionSlice, RegionOptions> regionQueryRequestFromJson(const std::stri
         const auto& p = j.at("options");
         requireKeys(p, {"kind", "maximum_objects", "selected", "family", "min_length", "min_points",
                         "output_byte_budget", "processing_byte_budget", "candidate_work_budget", "sql_step_budget",
-                        "max_unit_bytes", "uuids", "coordinates", "volume", "target_scale"}, "region options");
+                        "max_unit_bytes", "uuids", "excluded_uuids", "coordinates", "volume", "target_scale"}, "region options");
         read(p, "kind", o.kind); read(p, "maximum_objects", o.maximumObjects); read(p, "selected", o.selected);
         read(p, "family", o.family); read(p, "min_length", o.minLength); read(p, "min_points", o.minPoints);
         read(p, "output_byte_budget", o.outputByteBudget); read(p, "processing_byte_budget", o.processingByteBudget);
         read(p, "candidate_work_budget", o.candidateWorkBudget); read(p, "sql_step_budget", o.sqlStepBudget);
         read(p, "max_unit_bytes", o.maxUnitBytes); read(p, "uuids", o.uuids); read(p, "coordinates", o.coordinates);
+        read(p, "excluded_uuids", o.excludedUuids);
         read(p, "volume", o.volume); read(p, "target_scale", o.targetScale);
     }
     return {slice, o};

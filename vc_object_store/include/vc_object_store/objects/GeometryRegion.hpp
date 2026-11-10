@@ -36,6 +36,8 @@ struct RegionOptions {
     // Applied before selected priority and maximumObjects. nullopt is unrestricted;
     // an explicitly empty set matches nothing. UUIDs are canonicalized by the store.
     std::optional<std::vector<std::string>> uuids;
+    // Session precedence/refill: skip these candidates before object admission.
+    std::vector<std::string> excludedUuids;
     // Exact coordinate declaration, using the same JSON filter as ObjectSelection.
     std::optional<std::string> coordinates;
     // Volume target, exclusive with coordinates: the slice, minLength and the
@@ -57,6 +59,13 @@ struct RegionStats {
     uint64_t reconstructedBytes = 0, cacheBytes = 0;
     uint64_t candidateWork = 0, candidateVisits = 0, segmentTests = 0, sqlSteps = 0;
 };
+inline void addRegionStats(RegionStats& into, const RegionStats& from)
+{
+    for (auto field : {&RegionStats::outputBytes, &RegionStats::processingBytes, &RegionStats::payloadBytes,
+                       &RegionStats::verifiedBytes, &RegionStats::metadataBytes, &RegionStats::reconstructedBytes,
+                       &RegionStats::cacheBytes, &RegionStats::candidateWork, &RegionStats::candidateVisits,
+                       &RegionStats::segmentTests, &RegionStats::sqlSteps}) into.*field += from.*field;
+}
 struct VisibleRun {
     std::string objectUuid, revisionUuid, arrayName, family;
     int64_t firstSegment = 0;

@@ -752,7 +752,76 @@ void measuredLengths(HistoryMode mode){
     check();{auto w=store.write();store.registerVolumeTransform(w,"unrelated-x","unrelated-y",VolumeAffine{},"unrelated");w.commit();}check();
 }
 
+void regionPrecedenceRefill()
+{
+    TemporaryDirectory dir;auto opts=options(HistoryMode::On);opts.spatialIndex=true;
+    const auto path=dir.path/"region";const std::string a="00000000-0000-4000-8000-000000000001",b="00000000-0000-4000-8000-000000000002";
+    vc::geometry::Surface grid{2,2,{1,1},{{0,0,1},{2,0,3},{0,2,1},{2,2,3}}};
+    {auto store=ObjectStore::create(path,opts);auto w=store.write();for(const auto& id:{a,b}){ObjectRecord record;record.uuid=id;record.kind="surface";
+        record.meta=R"({"coordinates":{"volume_uuid":"region","scale_factor":1}})";store.upsertObject(w,record);store.putGeometry(w,id,vc::geometry::encode(grid));}w.commit();}
+    ObjectStoreSession session;const auto attachment=session.attach(path,opts);
+    for(auto& point:grid.points)point[2]+=100;
+    session.setDraft(a,grid,volumeCoordinates("region",1),attachment);
+    RegionSlice slice;slice.origin={0,0,2};slice.localBounds={-10,-10,-0.1,10,10,0.1};
+    RegionOptions query;query.kind="surface";query.volume="region";query.maximumObjects=1;
+    {auto excluded=query;excluded.excludedUuids={a};
+        excluded=regionQueryRequestFromJson(regionQueryRequestToJson(slice,excluded)).second;
+        auto reader=ObjectStore::open(path,opts);auto txn=reader.read();
+        const auto result=reader.geometryRegion(txn,slice,excluded);
+        require(result.intersectingObjects==1&&result.runs[0].objectUuid==b,"wire exclusions precede backend admission");}
+    const auto rows=session.geometryRegion({attachment},slice,query);
+    require(!rows.empty()&&rows[0].result.intersectingObjects==1,"hidden draft cannot consume a visible object slot");
+    require(!rows[0].result.runs.empty()&&rows[0].result.runs[0].objectUuid==b,"bounded refill reaches next visible surface");
+    require(rows[0].result.stats.outputBytes>rows[0].result.runs[0].points.size()*sizeof(std::array<double,3>),"discarded output remains charged");
+    query.processingByteBudget=1;
+    const auto bounded=session.geometryRegion({attachment},slice,query);
+    require(bounded[0].result.stop==RegionStop::ProcessingBudget&&bounded[0].result.stats.processingBytes<=1,"refill never resets processing budget");
+    session.clearDraft(a);
+    const auto firstPath=dir.path/"earlier";
+    {auto first=ObjectStore::create(firstPath,opts);auto w=first.write();ObjectRecord record;record.uuid=a;record.kind="surface";
+        record.meta=R"({"coordinates":{"volume_uuid":"region","scale_factor":1}})";first.upsertObject(w,record);first.putGeometry(w,a,vc::geometry::encode(grid));w.commit();}
+    const auto first=session.attach(firstPath,opts);query.processingByteBudget=RegionOptions{}.processingByteBudget;
+    const auto stacked=session.geometryRegion({first,attachment},slice,query);
+    require(stacked.size()>=2&&stacked[1].result.intersectingObjects==1&&stacked[1].result.runs[0].objectUuid==b,
+            "earlier off-screen owner cannot starve later visible results");
+}
+
+void duplicateStatementLease()
+{
+    sqlite3* db=nullptr; require(sqlite3_open(":memory:",&db)==SQLITE_OK,"open statement lease fixture");
+    {
+        StatementPool pool; activeStatementPools.emplace(db,&pool);
+        { Statement first(db,"SELECT 1"); { Statement second(db,"SELECT 1"); require(second.row(),"overlapping statement runs"); } }
+        int count=0;for(auto* statement=sqlite3_next_stmt(db,nullptr);statement;statement=sqlite3_next_stmt(db,statement))++count;
+        require(count==2&&pool.idle.size()==2,"multimap retains both duplicate SQL handles");
+        activeStatementPools.erase(db);
+    }
+    require(sqlite3_close(db)==SQLITE_OK,"all leased statements released");
+}
+
+void foreignPointIdentity(HistoryMode mode, bool referenced)
+{
+    TemporaryDirectory dir;const auto path=dir.path/"points",base=referenced?dir.path/"base":path;
+    const auto target=util::newUuid(),foreign=util::newUuid();std::string original,source;
+    {auto store=ObjectStore::create(base,options(mode));auto w=store.write();for(const auto& id:{target,foreign}){ObjectRecord record;record.uuid=id;record.kind="point_collection";
+        store.upsertObject(w,record);const auto revision=store.putGeometry(w,id,vc::geometry::encode(vc::geometry::PointCollection{{42},{{1,2,3}}}));
+        if(id==target)original=revision;else source=revision;}if(referenced)store.seal(w);w.commit();}
+    if(referenced){auto collection=ObjectCollection::create(path,{base},options(mode));}
+    auto store=ObjectStore::open(path,options(mode));
+    const auto checked=[&]{auto r=store.read();return store.write({{target,store.currentVersion(r,target)},{foreign,store.currentVersion(r,foreign)}});};
+    std::string empty;{auto w=checked();GeometrySequenceEdit edit;edit.array="points";edit.eraseCount=1;
+        empty=store.editGeometrySequence(w,target,edit,original);w.commit();}
+    {auto w=checked();GeometrySequenceEdit edit;edit.array="points";GeometrySequencePart part;part.revision=source;part.count=1;edit.parts={part};
+        mustFail([&]{store.editGeometrySequence(w,target,edit,empty);});mustFail([&]{w.commit();});}
+    {auto r=store.read();require(store.currentGeometry(r,target)->uuid==empty,"foreign identity rejection is atomic");}
+    if(mode==HistoryMode::On||referenced){auto w=checked();GeometrySequenceEdit edit;edit.array="points";
+        GeometrySequencePart part;part.revision=original;part.count=1;edit.parts={part};store.editGeometrySequence(w,target,edit,empty);w.commit();}
+}
+
 int main()try{
+    duplicateStatementLease();
+    regionPrecedenceRefill();
+    for(const auto mode:{HistoryMode::Off,HistoryMode::On})for(bool referenced:{false,true})foreignPointIdentity(mode,referenced);
     for(const auto mode:{HistoryMode::Off,HistoryMode::On}){atomicCompositeWrites(mode);measuredLengths(mode);}
     followupAtomicityAndPolicy();
     inventoryIdentityAndSources();

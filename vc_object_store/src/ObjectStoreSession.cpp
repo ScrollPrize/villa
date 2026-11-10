@@ -412,8 +412,29 @@ TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity
     if (actual != expectedVersion)
         throw TransactionConflict(TransactionConflict::Reason::Version, {{"object", uuid, expectedVersion, actual}},
                                   "artifact publication: expected version changed for " + uuid);
+    request.expectedObjects = {{uuid, expectedVersion}};
+    return publishArtifactManifest(identity, std::move(request), *head, files);
+}
+
+TransactionReceipt ObjectStoreSession::publishArtifacts(const PinnedObject& pin,
+    const std::vector<std::pair<std::string, std::filesystem::path>>& files, const std::string& author,
+    const std::optional<CheckVolumeMappingOp>& mapping)
+{
+    auto request = newRequest(pin.attachment);
+    if (!author.empty()) request.author = author;
+    request.generation = pin.writeGeneration;
+    expectObject(request, pin.reference());
+    if (mapping) request.operations.push_back(*mapping);
+    const auto selected = objectsAtVersions(pin.attachment, {pin.reference()}).front();
+    if (!selected) throw std::runtime_error("artifact source revision is unavailable");
+    return publishArtifactManifest(pin.attachment, std::move(request), *selected, files);
+}
+
+TransactionReceipt ObjectStoreSession::publishArtifactManifest(const AttachmentIdentity& identity, TransactionRequest request,
+    const ObjectRevision& head, const std::vector<std::pair<std::string, std::filesystem::path>>& files)
+{
     std::map<std::string, ArtifactFile> manifest;
-    for (auto& file : artifactManifest(head->record)) manifest[file.name] = std::move(file);
+    for (auto& file : artifactManifest(head.record)) manifest[file.name] = std::move(file);
     // Bytes first: the request may only name what the store holds.
     withAttachment(identity, true, [&](Attachment& attachment) {
         for (const auto& [name, path] : files) {
@@ -424,8 +445,7 @@ TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity
     });
     std::vector<ArtifactFile> listed;
     for (auto& [name, file] : manifest) listed.push_back(std::move(file));
-    request.expectedObjects = {{uuid, expectedVersion}};
-    request.operations = {SetMetaOp{uuid, kArtifactsMetaKey, artifactManifestJson(std::move(listed))}};
+    request.operations.push_back(SetMetaOp{head.objectUuid, kArtifactsMetaKey, artifactManifestJson(std::move(listed))});
     return submit(identity, request);
 }
 
@@ -1180,22 +1200,49 @@ std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector
     const RegionSlice& slice, const RegionOptions& options, const RegionCancel& cancel)
 {
     const auto drafts = options.kind == "surface" ? this->drafts() : Drafts{};
+    std::set<std::string> excluded;
+    for (const auto& uuid : options.excludedUuids) excluded.insert(util::canonicalUuid(uuid));
     std::vector<AttachedRegion> result;
     std::vector<AttachmentIdentity> earlier;
     const bool stored = !(options.kind == "surface" && onlyDrafts(options.uuids, drafts));
     for (const auto& attachment : stored ? order : std::vector<AttachmentIdentity>{}) {
         // A hosted store answers the whole query on the host (no cancellation).
-        auto region = withAttachment(attachment, false, [&](Attachment& held) {
-            if (held.remote) return held.remote->client().geometryRegion(slice, options);
-            auto txn = held.store().read();
-            return held.store().geometryRegion(txn, slice, options, cancel);
-        });
-        std::set<std::string> uuids(region.remote.begin(), region.remote.end());
-        for (const auto& run : region.runs) uuids.insert(run.objectUuid);
-        const auto hidden = heldBy(earlier, uuids);
-        const auto replaced = [&](const std::string& uuid) { return hidden.contains(uuid) || drafts.contains(uuid); };
-        std::erase_if(region.runs, [&](const VisibleRun& run) { return replaced(run.objectUuid); });
-        std::erase_if(region.remote, replaced);
+        RegionResult region;
+        auto page = options;
+        std::set<std::string> visible, remote;
+        for (;;) {
+            const auto remaining = [](uint64_t budget, uint64_t used) { return budget - std::min(budget, used); };
+            page.outputByteBudget = remaining(options.outputByteBudget, region.stats.outputBytes);
+            page.processingByteBudget = remaining(options.processingByteBudget, region.stats.processingBytes);
+            page.candidateWorkBudget = remaining(options.candidateWorkBudget, region.stats.candidateWork);
+            page.sqlStepBudget = remaining(options.sqlStepBudget, region.stats.sqlSteps);
+            if (options.maximumObjects) page.maximumObjects = options.maximumObjects - visible.size();
+            const RegionCancel cumulativeCancel = cancel ? RegionCancel([&](const RegionStats& current) {
+                auto spent = region.stats; addRegionStats(spent, current); return cancel(spent);
+            }) : RegionCancel{};
+            auto part = withAttachment(attachment, false, [&](Attachment& held) {
+                if (held.remote) return held.remote->client().geometryRegion(slice, page);
+                auto txn = held.store().read();
+                return held.store().geometryRegion(txn, slice, page, cumulativeCancel);
+            });
+            addRegionStats(region.stats, part.stats);
+            std::set<std::string> uuids(part.remote.begin(), part.remote.end());
+            for (const auto& run : part.runs) uuids.insert(run.objectUuid);
+            const auto hidden = heldBy(earlier, uuids);
+            const auto replaced = [&](const std::string& uuid) { return hidden.contains(uuid) || drafts.contains(uuid); };
+            for (auto& run : part.runs) if (!replaced(run.objectUuid)) {
+                visible.insert(run.objectUuid); region.runs.push_back(std::move(run));
+            }
+            for (auto& uuid : part.remote) if (!replaced(uuid)) remote.insert(std::move(uuid));
+            region.intersectingObjects = visible.size();
+            region.stop = part.stop;
+            if (part.stop != RegionStop::ObjectLimit || !options.maximumObjects ||
+                visible.size() == options.maximumObjects || uuids.empty()) break;
+            // Refill only the bounded page lost to precedence. Already returned
+            // candidates cannot consume another slot; all spent work stays charged.
+            page.excludedUuids.insert(page.excludedUuids.end(), uuids.begin(), uuids.end());
+        }
+        region.remote.assign(remote.begin(), remote.end());
         result.push_back({attachment, std::move(region)});
         earlier.push_back(attachment);
     }
@@ -1210,7 +1257,7 @@ std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector
     std::vector<AttachedRegion> drafted;
     for (const auto* entry : ordered) {
         const auto& [uuid, draft] = *entry;
-        if (!admits(options.uuids, uuid)) continue;
+        if (!admits(options.uuids, uuid) || excluded.contains(uuid)) continue;
         const auto placement = detail::placeDraft(*draft, options.coordinates, options.volume, options.targetScale,
                                                   options.toTarget,
                                                   needsTransforms(*draft, options.volume) ? transforms(*draft) : nullptr);

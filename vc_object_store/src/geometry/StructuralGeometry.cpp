@@ -128,6 +128,9 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
                 partCoords=source.read(edit.array,part.start*stride,part.count*stride);
                 if(!idsName.empty()) {
                     pointIds.resize(part.count);copyScalars<int64_t>(source.read(idsName,part.start*8,part.count*8),pointIds);
+                    if(sourceRevision->objectUuid!=uuid)
+                        for(auto id:pointIds)if(!allocated.get(id).is_null())
+                            throw std::invalid_argument("foreign point ID already allocated by target; reference target history to restore it");
                 }
                 const auto all=annotations(txn,*sourceRevision,source,edit.array);
                 pointAttrs=Json::array();for(auto i=part.start;i<part.start+part.count;++i)pointAttrs.push_back(all.at(i));

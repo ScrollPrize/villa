@@ -103,6 +103,17 @@ void checkCorrectionSnapshots(const fs::path& directory)
         vc3d::corrections::write(session, attachment, first, first.collections, {"volume"});
         require(first.baseline.owner == unchangedOwner && first.baseline.snapshot.commitSequence == unchangedCommit,
                 "no-op correction save preserves ownership and the loaded commit baseline");
+        auto pending = first.collections;
+        pending.at(1)["points"]["7"]["p"] = {2., 3., 4.};
+        bool failedSave = false;
+        try { vc3d::corrections::write(session, attachment, first, pending, {"volume", 0}); }
+        catch (const std::exception&) { failedSave = true; }
+        require(failedSave && first.baseline.owner == unchangedOwner && first.collections != pending,
+                "failed correction persistence retains the loaded baseline for retry");
+        // Editing restart must save successfully before reloading this data.
+        vc3d::corrections::write(session, attachment, first, pending, {"volume"});
+        first = vc3d::corrections::read(session, attachment, surface.uuid);
+        require(first.collections == pending, "successful retry then reload preserves previously unsaved correction edits");
         auto stale = vc3d::corrections::read(session, attachment, surface.uuid);
         data.at(1)["points"]["7"]["p"] = {4., 5., 6.};
         vc3d::corrections::write(session, attachment, first, data, {"volume"});
@@ -281,6 +292,54 @@ void checkHistoryGenerationSaves(const fs::path& directory)
             "reloaded tool input saves in the active generation");
 }
 
+void checkToolMappingGuards(const fs::path& directory)
+{
+    for (bool history : {false, true}) for (bool referenced : {false, true}) {
+        OpenOptions options; options.author = "tool-mapping"; options.history = history ? HistoryMode::On : HistoryMode::Off;
+        const auto base = directory / ("tool-mapping-" + std::to_string(history) + std::to_string(referenced) + ".vcobj");
+        ObjectRecord surface; surface.uuid = util::newUuid(); surface.kind = "surface";
+        surface.meta = nlohmann::json{{"coordinates", volumeCoordinates("source", 1)}}.dump();
+        {
+            auto source = ObjectStore::create(base, options);
+            auto transaction = source.write();
+            source.upsertObject(transaction, surface);
+            source.putGeometry(transaction, surface.uuid, vc::geometry::encode(vc::geometry::Surface{2, 2, {1, 1},
+                {{1,1,1},{2,1,1},{1,2,1},{2,2,1}}}));
+            if (referenced) source.seal(transaction);
+            transaction.commit();
+        }
+        auto path = base;
+        if (referenced) {
+            path = directory / (base.filename().string() + ".overlay");
+            auto overlay = ObjectCollection::create(path, {base}, options);
+        }
+        StoreSurfaces tool(path, "mapping-test");
+        const auto attachment = tool.objects().attachment();
+        const auto registration = registerVolumeTransform(*tool.objects().session(), attachment,
+            "source", "target", VolumeAffine::identity(), "identity");
+        auto loaded = tool.load(surface.uuid, true, VolumeVoxels{"target", 1});
+        (*loaded->rawPointsPtr())(0,0)[2] += 1;
+        tool.update(surface.uuid, *loaded);
+        loaded = tool.load(surface.uuid, true, VolumeVoxels{"target", 1});
+        (*loaded->rawPointsPtr())(0,0)[2] += 1;
+        VolumeAffine moved; moved(0,3) = 10;
+        tool.objects().session()->editCurrent(attachment, {registration}, [&](const StoreReader& reader, const std::string& uuid) {
+            return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(
+                volumeTransformRecord(reader.currentObject(uuid)->record, "source", "target", moved, "moved"))}};
+        });
+        bool rejected = false;
+        try { tool.update(surface.uuid, *loaded); } catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "tool edits check the mapping actually used to load the grid");
+        rejected = false;
+        try { tool.objects().publishArtifacts(surface.uuid, {}); } catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "artifact results retain the same loaded mapping guard as geometry edits");
+        loaded = tool.load(surface.uuid, true, VolumeVoxels{"target", 1});
+        tool.objects().publishArtifacts(surface.uuid, {});
+        auto stored = tool.load(surface.uuid);
+        require((*stored->rawPointsPtr())(0,0)[2] == 2, "mapping conflict leaves surface geometry unchanged");
+    }
+}
+
 void checkReferencedSurfaceSelections(const fs::path& directory)
 {
     OpenOptions options; options.author = "surface-reference-test"; options.history = HistoryMode::Off;
@@ -392,6 +451,7 @@ int main(int argc, char** argv)
         checkHistoryGenerationSaves(fs::path(dir.path().toStdString()));
         checkReferencedSurfaceSelections(fs::path(dir.path().toStdString()));
         checkCorrectionSnapshots(fs::path(dir.path().toStdString()));
+        checkToolMappingGuards(fs::path(dir.path().toStdString()));
         if (argc > 1) checkDraftRecovery(argv[1], fs::path(dir.path().toStdString()));
         const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
         const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
