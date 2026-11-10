@@ -162,10 +162,10 @@ QString metricTooltip(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
                       bool showMetrics)
 {
     if (!showMetrics) {
-        return QObject::tr("Enable Calc metrics to sample Lasagna normal alignment errors.");
+        return QObject::tr("Enable Calc metrics to sample alignment errors using the annotation normal source.");
     }
     if (metric.pending) {
-        return QObject::tr("Sampling Lasagna normals.");
+        return QObject::tr("Sampling annotation normals.");
     }
     if (!metric.error.empty()) {
         return QString::fromStdString(metric.error);
@@ -372,7 +372,7 @@ void CFiberWidget::setupUi()
     _calcMetricsCheckBox = new QCheckBox(tr("Calc metrics"), mainWidget);
     _calcMetricsCheckBox->setObjectName(QStringLiteral("fiberCalcMetricsCheckBox"));
     _calcMetricsCheckBox->setToolTip(
-        tr("Sample Lasagna normal alignment errors for the listed fibers."));
+        tr("Sample normal alignment errors for the listed fibers using the annotation normal source."));
     layout->addWidget(_calcMetricsCheckBox);
     connect(_calcMetricsCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
         refreshMetricDisplays();

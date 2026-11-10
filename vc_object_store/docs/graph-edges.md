@@ -203,6 +203,8 @@ report = store.link_surface_overlaps()
 report = store.link_point_collections_to_surfaces()          # tolerance=..., absolute_winding=...
 report = store.link_tracks_to_tracks()                       # dataset_ref=..., track_uuids=[...]
 report = store.link_fibers_to_surfaces("/data/ct.zarr")      # ct_level=..., strip cache, scales
+report = store.link_fibers_to_surfaces(normal_pool="/cache/normals_g4", ct_to_base_scale=4)  # lasagna pack
+report = store.link_fibers_to_surfaces()                     # no normals: centerline-only
 report = store.link_tracks_to_surfaces("/data/ct.zarr")
 # report: {objects_considered, candidates_found, edges_created, edges_updated,
 #          edges_skipped_existing, stale_removed, problems}
@@ -215,6 +217,98 @@ vc_object_links --db objects.vcobj --author "$USER" --link-track-tracks
 vc_object_links --db objects.vcobj --author "$USER" --link-fiber-surfaces --ct /data/ct.zarr
 vc_object_links --db objects.vcobj --author "$USER" --link-track-surfaces --ct /data/ct.zarr
 ```
+
+#### Normal sources of the line–surface detectors
+
+Fiber- and track-surface linking widens each centerline into a strip that
+follows the sheet normal. The normal source is at most one of:
+
+- CT (`--ct`, `ct_volume`): structure-tensor normals from uint8 Zarr data with
+  complete 109³ support.
+- Lasagna normals (`--normal-x/--normal-y`, `normal_x_volume`/`normal_y_volume`):
+  paired uint8 nx/ny stores, read at `<store>/<ct_level>` and decoded as the
+  spiral fitter does: `(v - 128) / 127`, `nz = sqrt(1 - nx² - ny²)`, with
+  `nx = ny = 0` meaning no data. Nearest-voxel lookup; `ct_to_base_scale` is the
+  store's downsampling (the spiral's `lasagna_scale`).
+- Packed lasagna normals (`--normal-pool`, `normal_pool`): the same normals from
+  a resident-pool pack (spiral-fitting's `pack_resident_pools.py`: `meta.json`,
+  `table.npy`, `channel_0.u8`/`channel_1.u8`), sampled and decoded identically,
+  bricks read on demand; a brick the pack dropped reads as no data. `ct_level`
+  does not apply. The fiber strip cache keys it by the pack's recorded dataset
+  identity and CT mask rather than its path. A pack is a specific directory,
+  not a cache root: the detector reads only the pack named.
+- None: no strip is built. Anchors compare the centerline points themselves
+  with each surface, by distance only (same sheet within `same_sheet`, adjacent
+  within `adjacent_low..adjacent_high`), under the same strip gate ratio/margin.
+
+Naming several sources is a parameter error (`ValueError`), before any work.
+A source that cannot be opened fails the run (standalone: `RuntimeError`; in
+`link_objects`: a preparation failure, nothing written). No source is ever
+substituted for an unavailable one. Edges record the choice in
+`meta.normal_method` (`ct-…`, `lasagna-…` or `centerline`) and
+`meta.normal_source` (the CT location, `{normal_x, normal_y}`,
+`{normal_pool}`, or null). Native CT opening supports local and anonymous
+HTTP/S3 arrays and pyramid levels; credentials and disk-cache configuration
+are not exposed by this adapter. Codec support follows vc_reader.
+
+### Linking as a checked request: `link_objects`
+
+A `link_objects` operation ([object_links/LinkObjects.hpp](../include/vc_object_store/object_links/LinkObjects.hpp))
+runs an ordered plan of detectors and publishes every link they found,
+together with the store's **link marker**, in one commit — on a local store
+and through `vc_object_server` alike, so a client of a served store never
+runs a detector itself. The request is *prepared* before the writer lock is
+taken (`ObjectStore::prepare`: the detection, over one read snapshot) and
+committed by `submit` expecting every object the detectors read at the
+version they read: a commit touching one of them in between is an ordinary
+`TransactionConflict` and nothing is written; an unrelated commit does not
+interfere. The writer is held only for the publication, as with the
+standalone detectors. An identical retry replays the saved receipt.
+
+```python
+plan = {"detectors": [
+            {"detector": "point-collection-surface", "params": {"tolerance": 2.5}},
+            {"detector": "fiber-surface", "ct_volume": "/data/ct.zarr",
+             "params": {"fiber_uuids": [...], "surface_uuids": [...], "ct_level": 1}},
+            {"detector": "surface-overlap", "params": {}}],
+        "marker": {"key": "..."}}                       # kept in the marker's metadata
+request = {..., "operations": [{"op": vos.LINK_OBJECTS_OPERATION, "plan": plan}]}
+receipt = store.submit(request, progress=lambda stage, done, total, detail: ...)   # local: detectors run here
+receipt = hosted.submit(request)                                                  # served: they run on the service
+marker = store.object_by_uuid(vos.link_marker_uuid())    # kind LINK_MARKER_KIND
+```
+
+`params` take the keyword names of the Python detector calls below; the
+line–surface detectors name a CT normal source as the step's `ct_volume`,
+and a lasagna source as the params `normal_x_volume`/`normal_y_volume` or
+`normal_pool` (none of them: centerline-only linking). The link
+marker is one object per store: its metadata is the plan's `marker` content
+plus `commit_sequence` (the links' commit) and `detectors` (each step with
+its `report`), so a client reads it like any object to decide whether the
+links are current. Two link runs prepared over the same state conflict on
+the marker. A detector that cannot run (an unreadable normal source, missing
+inputs) fails the whole request, whether the detector reports the failure
+or throws it: no step's links are published, the marker does not move, and
+the error names the detector; candidates a detector
+rejected are not failures and stay in its report's `problems`. A
+preparation is bound to its request's digest and to the store it ran on:
+`submit` refuses it for any other request or store.
+
+On a served store the detectors read their CT or Lasagna normals where the
+service runs: a `ct_volume`, `normal_x_volume`/`normal_y_volume` or
+`normal_pool` must be a URL or a path readable on the service's host (a
+client-local path fails the request as an unreadable source; nothing is
+uploaded). The strip cache is the service's own
+(`vc_object_server --strip-cache`), and a request naming a `cache_directory`
+is refused. The reply comes when the detection is done, so two timeouts are
+set together: the service's `--request-deadline` and the client's link
+timeout (`HostedStoreOptions::linkTimeoutS`, Python `link_timeout_s`; both
+default to 300 s) must exceed the longest link. A client that gives up
+earlier retries with the same request UUID; the service keeps every link
+request in flight by its UUID, so the retry waits for the detection already
+running (or replays its receipt) instead of starting another, and a
+same-UUID request with other contents is refused. `GET /v1/service` reports
+`link_requests` (`in_flight`, `waiting_connections`, `detections`).
 
 | Detector (`meta.detector.name`) | Pairs | Default edge kind | Notes |
 | --- | --- | --- | --- |

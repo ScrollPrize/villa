@@ -27,6 +27,14 @@ struct SourceIngestOptions {
     // identities; surfaces keep the pre-rename kind "patch" here. Canonical source
     // UUIDs are kept.
     std::optional<std::string> uuidNamespace;
+    // Drop fiber branch declarations whose target file is absent, recording each in
+    // the declaring fiber's meta.source.dropped_branches. Otherwise the import fails.
+    bool dropDanglingBranches = false;
+    // Renumber every PCL collection that shares a point ID with another collection
+    // of its document, above the document's largest ID and in point-ID order. Each
+    // renumbered point keeps its file ID as the point attribute "source_point_id".
+    // Documents with point links are refused. Otherwise the import fails.
+    bool renumberCollidingPointIds = false;
     // Without a namespace, a fiber file without a UUID (including a branch's peer
     // file) is a problem rather than named from its file name.
     bool requireSourceUuids = false;
@@ -75,6 +83,8 @@ void addIngestOperation(TransactionRequest&, const StoreReader&, std::vector<Geo
 struct GeometryIngestReport {
     int64_t ingested = 0, edgesImported = 0;
     std::vector<std::string> problems;
+    // Repairs applied by SourceIngestOptions; informational, not failures.
+    std::vector<std::string> notices;
     // The objects created, in commit order.
     std::vector<std::string> uuids;
     // Identities rejected because the store already has them (including retired
@@ -92,9 +102,11 @@ struct GeometryIngestReport {
 // never had geometry are eligible. Existing/retired imports are errors, even if
 // unchanged. Source data must be stable during ingestion; edit imported objects
 // through the store APIs. There is no file refresh or reconciliation.
+// coordinateContext is applied as for ingestGeometrySource.
 GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
     const std::optional<std::filesystem::path>& datasetRoot = std::nullopt,
-    const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {});
+    const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {},
+    const std::string& coordinateContext = "{}");
 
 // Create new objects and ingest one source: a tifxyz surface directory or a
 // folder of them, vc3d_fiber JSON, collection or directory, vc_pointcollections

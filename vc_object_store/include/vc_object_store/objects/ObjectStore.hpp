@@ -432,7 +432,20 @@ public:
     // Execute typed operations atomically. An identical retry of a committed
     // request returns its saved receipt without re-executing; the same request
     // UUID with different contents fails. Conflicts throw TransactionConflict.
+    // Prepared operations (link_objects) are prepared first, outside the
+    // writer lock, as prepare() then submit(request, prepared) do.
     TransactionReceipt submit(const TransactionRequest&);
+    // The preparation of the request's prepared operations (see
+    // Transactions.hpp): each runs under its own read snapshot through its
+    // registered preparer. Empty when the request has none, or when its
+    // receipt is already saved (submit then replays it). Throws
+    // std::invalid_argument for a prepared operation with no preparer
+    // registered.
+    PreparedOperations prepare(const TransactionRequest&, const PrepareOptions& = {});
+    // submit() with the preparation already made: the prepared versions join
+    // the request's expectations and read dependencies, and each prepared
+    // operation publishes through its `apply`.
+    TransactionReceipt submit(const TransactionRequest&, const PreparedOperations&);
     // The same, from the canonical JSON form (transactionRequestToJson). A
     // saved receipt of the identical request answers before any payload is
     // needed, so a retry recovers a committed result even after its staged

@@ -98,15 +98,15 @@ class ZarrReader:
 
     # -- construction -----------------------------------------------------------
 
-    def cuda(self, *, cache_bytes=512 << 20, device=0, pool=None):
-        """Optional CUDA adapter for 3-D uint8 CT; outputs remain on device.
+    def cuda(self, *, cache_bytes=512 << 20, device=0, pool=None, channel=None):
+        """CUDA adapter for uint8 ZYX or one CZYX channel; outputs remain on device.
 
         Owns a bounded device chunk cache, or shares ``pool`` (a ``CudaPool``, e.g.
         with the other levels of a pyramid). Create one per worker/device and reuse
         it across reads; close it or use it as a context manager.
         """
         from .cuda import CudaReader
-        return CudaReader(self, cache_bytes=cache_bytes, device=device, pool=pool)
+        return CudaReader(self, cache_bytes=cache_bytes, device=device, pool=pool, channel=channel)
 
     def grid_level(self, *, working_scale=(1, 1, 1), working_offset=(0, 0, 0), cuda=None, map=None):
         """This array as a :mod:`vc_reader.grid` level.

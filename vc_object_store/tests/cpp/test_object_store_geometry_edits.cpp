@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <sqlite3.h>
 using namespace vc::objects;

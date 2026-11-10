@@ -12,6 +12,7 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <mutex>
 
 namespace vc::objects {
 using namespace detail;
@@ -153,6 +154,12 @@ public:
             registrations.push_back({{"id", r.id}, {"revision", r.revision}, {"source", r.source}, {"target", r.target},
                                      {"matrix", r.matrix.json()}, {"provenance", r.provenance}});
         return {{"op", "record_catalog_transforms"}, {"registrations", registrations}};
+    }
+    Json operator()(const LinkObjectsOp& op)
+    {
+        auto plan = Json::parse(op.planJson);
+        if (!plan.is_object()) throw std::invalid_argument("transaction: link_objects plan is a JSON object");
+        return {{"op", kLinkObjectsOperation}, {"plan", std::move(plan)}};
     }
 private:
     Json data(const GeometryData& data)
@@ -320,6 +327,11 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
                 vcr::catalog::Affine::fromJson(r.at("matrix")), r.at("provenance").get<std::string>()});
         return result;
     }
+    if (op == kLinkObjectsOperation) {
+        const auto& plan = j.at("plan");
+        if (!plan.is_object()) throw std::invalid_argument("transaction: link_objects plan is a JSON object");
+        return LinkObjectsOp{plan.dump()};
+    }
     throw std::invalid_argument("transaction: unknown operation " + op);
 }
 
@@ -469,6 +481,8 @@ EdgeRecord edgeInput(const Json& j)
 struct Executor {
     ObjectStore& store;
     WriteTxn& txn;
+    const std::map<std::size_t, PreparedOperation>& prepared;
+    std::size_t index = 0; // of the operation being applied
 
     template <class Op> std::vector<GeometryEdgeEdit> edgeEdits(const Op& op)
     {
@@ -588,6 +602,13 @@ struct Executor {
     {
         store.updateSurfaceChannels(txn, op.objectUuid, op.channels, op.remove, geometryHead(op.objectUuid), edgeEdits(op));
     }
+    void operator()(const LinkObjectsOp&)
+    {
+        const auto found = prepared.find(index);
+        if (found == prepared.end() || !found->second.apply)
+            throw std::invalid_argument("transaction: link_objects was not prepared (ObjectStore::prepare)");
+        found->second.apply(store, txn);
+    }
     void operator()(const UpdateGeometryArraysOp& op)
     {
         if (op.affected != "retain" && op.affected != "keep_recorded")
@@ -603,12 +624,97 @@ struct Executor {
 };
 }
 
-TransactionReceipt ObjectStore::submit(const TransactionRequest& request)
+namespace {
+std::mutex& preparerMutex() { static std::mutex m; return m; }
+std::map<std::string, OperationPreparer>& preparers() { static std::map<std::string, OperationPreparer> p; return p; }
+
+std::optional<std::string> preparedOperationName(const TransactionOperation& op)
+{
+    if (std::holds_alternative<LinkObjectsOp>(op)) return kLinkObjectsOperation;
+    return std::nullopt;
+}
+
+void validateRequest(const TransactionRequest& request)
 {
     if (!util::isUuid(request.requestUuid)) throw std::invalid_argument("transaction: request UUID required");
     if (request.author.empty()) throw std::invalid_argument("transaction: author required");
     if (!util::isUuid(request.storeUuid) || !util::isUuid(request.generation))
         throw std::invalid_argument("transaction: store UUID and generation required");
+}
+
+// Merge a preparation's versions into the request's: the same record with
+// another version is the request contradicting what its preparation read.
+void mergeVersions(VersionSelection& into, const VersionSelection& from, const char* what)
+{
+    for (const auto& [uuid, version] : from) {
+        const auto id = canonical(uuid);
+        const auto [found, inserted] = into.emplace(id, version);
+        if (!inserted && found->second != version)
+            throw std::invalid_argument(std::string("transaction: ") + what + " of " + id + " differ between the request and its preparation");
+    }
+}
+} // namespace
+
+void registerOperationPreparer(const std::string& operationName, OperationPreparer preparer)
+{
+    std::lock_guard lock(preparerMutex());
+    preparers()[operationName] = std::move(preparer);
+}
+
+VersionSelection PreparedOperations::expectedObjects() const
+{
+    VersionSelection result;
+    for (const auto& [index, preparation] : operations_) mergeVersions(result, preparation.expectedObjects, "expected versions");
+    return result;
+}
+
+VersionSelection PreparedOperations::readDependencies() const
+{
+    VersionSelection result;
+    for (const auto& [index, preparation] : operations_) mergeVersions(result, preparation.readDependencies, "read dependencies");
+    return result;
+}
+
+PreparedOperations ObjectStore::prepare(const TransactionRequest& request, const PrepareOptions& options)
+{
+    validateRequest(request);
+    PreparedOperations result;
+    bool any = false;
+    for (const auto& op : request.operations) any = any || preparedOperationName(op).has_value();
+    if (!any) return result;
+    {
+        // Already committed: submit() replays the receipt, so nothing to prepare.
+        auto txn = read();
+        if (savedReceipt(static_cast<sqlite3*>(connection(txn)), canonical(request.requestUuid), nullptr)) return result;
+        const auto current = status(txn);
+        result.storeUuid_ = current.storeUuid;
+        result.generation_ = current.generation;
+    }
+    result.requestUuid_ = canonical(request.requestUuid);
+    result.requestDigest_ = transactionRequestDigest(request);
+    for (std::size_t i = 0; i < request.operations.size(); ++i) {
+        const auto name = preparedOperationName(request.operations[i]);
+        if (!name) continue;
+        OperationPreparer preparer;
+        {
+            std::lock_guard lock(preparerMutex());
+            if (const auto found = preparers().find(*name); found != preparers().end()) preparer = found->second;
+        }
+        if (!preparer)
+            throw std::invalid_argument("transaction: " + *name + " is not available here (its library is not linked)");
+        result.operations_.emplace(i, preparer(*this, request.operations[i], options));
+    }
+    return result;
+}
+
+TransactionReceipt ObjectStore::submit(const TransactionRequest& request)
+{
+    return submit(request, prepare(request));
+}
+
+TransactionReceipt ObjectStore::submit(const TransactionRequest& request, const PreparedOperations& prepared)
+{
+    validateRequest(request);
     const auto requestUuid = canonical(request.requestUuid);
     const auto digest = transactionRequestDigest(request);
     auto txn = write();
@@ -628,14 +734,38 @@ TransactionReceipt ObjectStore::submit(const TransactionRequest& request)
     context.storeUuid = request.storeUuid; context.generation = request.generation;
     context.expectedObjects = request.expectedObjects; context.expectedRelationships = request.expectedRelationships;
     context.readDependencies = request.readDependencies; context.expectedCommitSequence = request.expectedCommitSequence;
+    if (!prepared.empty()) {
+        // A preparation publishes only for the request whose detection it
+        // ran, on the store it read.
+        if (prepared.requestUuid_ != requestUuid || prepared.requestDigest_ != digest)
+            throw std::invalid_argument("transaction: the preparation belongs to another request");
+        const auto current = status(txn);
+        if (prepared.storeUuid_ != current.storeUuid || prepared.generation_ != current.generation)
+            throw std::invalid_argument("transaction: the preparation was made on another store");
+    }
+    for (const auto& [index, preparation] : prepared.operations_) {
+        if (index >= request.operations.size() || !preparedOperationName(request.operations[index]))
+            throw std::invalid_argument("transaction: preparation " + std::to_string(index) + " names no prepared operation");
+        mergeVersions(context.expectedObjects, preparation.expectedObjects, "expected versions");
+        mergeVersions(context.readDependencies, preparation.readDependencies, "read dependencies");
+    }
+    // A record both written and read-guarded at the same version is just
+    // expected; a read dependency at another version is a stale read the
+    // check below reports (a preparation that read the record later than
+    // the request's own read).
+    for (const auto& [uuid, version] : context.expectedObjects)
+        if (const auto guard = context.readDependencies.find(uuid);
+            guard != context.readDependencies.end() && guard->second == version)
+            context.readDependencies.erase(guard);
     RevisionSelection expected;
     checkTransactionContext(db, context, expected);
     expectHistory(db, expected);
     txn.expectedRevisions_ = expected;
-    txn.expectedObjectVersions_ = request.expectedObjects;
+    txn.expectedObjectVersions_ = context.expectedObjects;
     txn.expectedRelationshipVersions_ = request.expectedRelationships;
-    Executor apply{*this, txn};
-    for (const auto& op : request.operations) std::visit(apply, op);
+    Executor apply{*this, txn, prepared.operations_};
+    for (apply.index = 0; apply.index < request.operations.size(); ++apply.index)
+        std::visit(apply, request.operations[apply.index]);
     txn.commit();
     return *txn.receipt();
 }
@@ -672,6 +802,14 @@ std::vector<std::string> payloadHashesIn(const Json& request)
 } // namespace
 
 std::vector<std::string> transactionJsonPayloadHashes(const std::string& text) { return payloadHashesIn(Json::parse(text)); }
+
+bool transactionJsonHasPreparedOperations(const std::string& text)
+{
+    const auto request = Json::parse(text); // the loop reads into it
+    for (const auto& op : request.at("operations"))
+        if (op.at("op").get<std::string>() == kLinkObjectsOperation) return true;
+    return false;
+}
 
 TransactionReceipt ObjectStore::submit(const std::string& text, const PayloadLookup& lookup)
 {

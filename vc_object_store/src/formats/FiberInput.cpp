@@ -1,10 +1,8 @@
 #include "formats/GeometryInput.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
 #include "vc_object_store/Uuid.hpp"
-#include <cmath>
 #include <map>
 #include <set>
-#include <tuple>
 namespace vc::objects::formats {
 namespace {
 // A fiber file without a UUID (as VC3D wrote before fibers had identities) is
@@ -46,6 +44,7 @@ Prepared fiber(const std::filesystem::path& path) { return fiberDocument(readJso
 std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vector<std::string>& available,
     const SourceIngestOptions& options)
 {
+    const auto& uuidNamespace = options.uuidNamespace;
     namespace fs = std::filesystem;
     using Json = nlohmann::json;
     std::set<std::string> existing, incoming;
@@ -77,24 +76,16 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
         }
     } else read(path);
     if (batch.empty()) throw std::runtime_error("no fibers were found");
-    // Versions 1 and 3 name branch targets only by file, and declare each link from both ends with
-    // separately computed directions. So do version-4 branches that VC3D saved with a branch_file
-    // but no target_uuid, as in the published fiber annotations. Targets resolve through the peer
-    // file's UUID; the second declaration of a link must match the first and is dropped.
+    // Versions 1 and 3 name branch targets only by file; they resolve through the peer file's UUID.
+    // So do version-4 branches that VC3D saved with a branch_file but no target_uuid, as in the
+    // published fiber annotations. Reciprocal declarations are reconciled by the relationship importer.
     std::map<fs::path, std::string> fileUuids;
-    std::map<std::tuple<std::string, int64_t, std::string, int64_t>, Json> fileLinks;
-    const auto sameDirection = [](const Json& left, const Json& right) {
-        if (left.is_null() || right.is_null()) return left.is_null() && right.is_null();
-        for (size_t axis = 0; axis < 3; ++axis)
-            if (std::abs(left.at(axis).get<double>() - right.at(axis).get<double>()) > 1e-9) return false;
-        return true;
-    };
     for (size_t i = 0; i < batch.size(); ++i) {
         const auto source = fs::path(batch[i].object.storageRef);
-        const auto self = batch[i].object.uuid;
         // Copy before appending peers, which can reallocate the batch.
         const auto metadata = batch[i].source;
         const bool legacy = metadata.value("version", 0) < 4;
+        auto dropped = Json::array();
         for (const auto* key : {"branches", "adjacent_branches"}) {
             auto kept = Json::array();
             bool rewrite = legacy;
@@ -104,6 +95,18 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                 const auto peerPath = [&] {
                     return source.parent_path() / fs::path(branch.at("branch_file").get<std::string>()).filename();
                 };
+                // Only a declaration that must be resolved from an absent file can dangle.
+                const bool known = !byFile && branch.contains("target_uuid") &&
+                    (existing.contains(util::canonicalUuid(branch.at("target_uuid").get<std::string>())) ||
+                     incoming.contains(util::canonicalUuid(branch.at("target_uuid").get<std::string>())));
+                if (!known && branch.contains("branch_file") && !fs::exists(peerPath())) {
+                    if (!options.dropDanglingBranches)
+                        throw std::runtime_error("branch target file is absent: " + peerPath().string());
+                    auto record = branch;
+                    record["declaration"] = key;
+                    dropped.push_back(std::move(record));
+                    continue;
+                }
                 if (byFile) {
                     const auto peer = peerPath();
                     if (!fileUuids.contains(peer))
@@ -111,17 +114,6 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                     branch["target_uuid"] = fileUuids.at(peer);
                 }
                 const auto target = util::canonicalUuid(branch.at("target_uuid").get<std::string>());
-                if (byFile) {
-                    const auto own = branch.at("control_point_index").get<int64_t>();
-                    const auto other = branch.at("branch_control_point_index").get<int64_t>();
-                    if (const auto first = fileLinks.find({target, other, self, own}); first != fileLinks.end()) {
-                        if (!sameDirection(first->second.value("control_point_direction", Json()), branch.value("branch_control_point_direction", Json())) ||
-                            !sameDirection(first->second.value("branch_control_point_direction", Json()), branch.value("control_point_direction", Json())))
-                            throw std::runtime_error("conflicting reciprocal fiber branch declarations: " + self + " <-> " + target);
-                        continue;
-                    }
-                    fileLinks.emplace(std::tuple{self, own, target, other}, branch);
-                }
                 kept.push_back(branch);
                 if (existing.contains(target) || incoming.contains(target)) continue;
                 const auto peer = readJson(peerPath());
@@ -129,8 +121,9 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                     throw std::runtime_error("branch target UUID does not match its artifact");
                 add(peer, peerPath());
             }
-            if (rewrite && metadata.contains(key)) batch[i].source[key] = std::move(kept);
+            if ((rewrite || !dropped.empty()) && metadata.contains(key)) batch[i].source[key] = std::move(kept);
         }
+        if (!dropped.empty()) batch[i].source["dropped_branches"] = std::move(dropped);
     }
     return batch;
 }

@@ -81,6 +81,25 @@ void problem(GeometryIngestReport& report, const std::string& label, const std::
 {
     report.problems.push_back(label + ": " + error.what());
 }
+// Describe the SourceIngestOptions repairs recorded in a prepared batch's metadata.
+std::vector<std::string> repairNotices(const std::vector<Prepared>& batch, const fs::path& source)
+{
+    std::vector<std::string> result;
+    size_t renumbered = 0;
+    for (const auto& p : batch) {
+        if (p.source.value("point_ids_renumbered", false)) ++renumbered;
+        if (!p.source.contains("dropped_branches")) continue;
+        std::string targets;
+        for (const auto& branch : p.source.at("dropped_branches"))
+            targets += (targets.empty() ? "" : ", ") + branch.at("branch_file").get<std::string>();
+        result.push_back("fiber " + p.object.uuid + " (" + p.object.name + "): dropped " +
+            std::to_string(p.source.at("dropped_branches").size()) + " branch declarations to absent files: " + targets);
+    }
+    if (renumbered)
+        result.push_back(source.string() + ": renumbered point IDs of " + std::to_string(renumbered) +
+            " collections sharing IDs; file IDs kept as source_point_id");
+    return result;
+}
 }
 
 std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const fs::path& source,
@@ -95,8 +114,10 @@ std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const
 }
 
 GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::optional<fs::path>& datasetRoot,
-    const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress)
+    const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress,
+    const std::string& coordinateContext)
 {
+    geometryCoordinates(Json::parse(coordinateContext));
     GeometryIngestReport report;
     std::vector<ObjectRecord> objects;
     std::map<std::string, Expected> expectations;
@@ -169,7 +190,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
         } catch (const std::exception& error) { problem(report, object.uuid, error); }
     }
     if (report.problems.empty()) {
-        try { ingestBatch(directCommit(db), std::move(prepared), expectations, report, "{}", true); }
+        try { ingestBatch(directCommit(db), std::move(prepared), expectations, report, coordinateContext, true); }
         catch (const std::exception& error) { problem(report, "batch", error); }
     }
     util::reportProgress(progress, "ingesting geometry", objects.size(), objects.size());
@@ -320,9 +341,11 @@ try {
             });
             auto batch = fromSource([&] { return prepareGeometrySource(kind, source, available, options); });
             for (auto& p : batch) addTags(p, tags);
+            const auto notices = repairNotices(batch, source);
             // The batch commits whole or not at all.
             if (target.cancelled()) { report.cancelled = true; return; }
             commitBatch(target, std::move(batch), report, coordinateContext);
+            report.notices.insert(report.notices.end(), notices.begin(), notices.end());
         }
     } catch (const std::exception& error) { failed(report, options, source.string(), error); }
 } catch (const Stopped&) {}

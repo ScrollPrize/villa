@@ -245,8 +245,9 @@ std::vector<AttachedCollection> volumeCollections(ObjectStoreSession& session, c
     return result;
 }
 
-void writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment, const VolumeVoxels& volume,
-                            const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed)
+TransactionReceipt writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+                                          const VolumeVoxels& volume, const std::vector<AttachedCollection>& changed,
+                                          const std::vector<std::string>& removed, const VersionSelection& expected)
 {
     auto request = session.newRequest(attachment);
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
@@ -259,8 +260,10 @@ void writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentit
             if (const auto object = reader.currentObject(uuid); object && !object->record.retired)
                 request.operations.push_back(RetireObjectOp{uuid});
         }
+        // The caller's pins win over the current versions read here.
+        for (const auto& [uuid, version] : expected) request.expectedObjects[util::canonicalUuid(uuid)] = version;
         expectRelationshipEndpoints(reader, request.expectedObjects);
     });
-    session.submit(attachment, request);
+    return session.submit(attachment, request);
 }
 }

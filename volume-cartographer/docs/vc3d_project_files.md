@@ -52,6 +52,12 @@ The version 1 document contains:
 - Optional `open_data`: catalog `sample` and populated `store` reference ID.
 
 Store references and resources within the project directory use relative paths.
+Volume resources can additionally declare `channels`, a list of named scalar
+views in CZYX storage order. Manifest attachment fills this list for compound
+volumes. Each channel appears separately in the volume dropdown, but the source
+location, decoded cache, and annotation coordinate frame remain shared. No
+channel files are generated. Older entries without this list remain unchanged.
+
 External resources may use absolute paths. Relative local paths resolve against
 the project-file directory. Remote URLs
 remain URLs. Resource entries and view settings belong to the project file;
@@ -107,40 +113,35 @@ Both remote-origin forms remain valid:
 Absolute remote group URLs are also supported. Plain local relative groups
 continue to resolve from the manifest directory.
 
-## Ordinary 3D Volumes
+## Channel display volumes
 
-Every manifest group is exposed in the project as one ordinary 3D volume. The
-group must name exactly one channel and reference a ZYX array. VC3D does not
-support channel-first CZYX Lasagna arrays or acquire generic 4D volume handling.
-
-The original Lasagna preprocessing and fitting pipeline used flat CZYX arrays
-as an intermediate representation before conversion to separate per-channel
-3D OME-Zarr volumes. Those older Lasagna intermediates are not VC3D project
-volumes and must be converted before their manifest is attached.
-
-Derived entries use the resolved Zarr source directly as their location. For
-example, a relative group in the manifest above is stored as:
+Separate ZYX sources appear as ordinary scalar volumes, as before. A packed
+CZYX source exposes one scalar view per channel listed in its manifest. Those
+views appear in the same volume dropdown, labeled `source / channel`, and are
+also available for overlays. They retain one source entry rather than copying
+or extracting channel files. For example:
 
 ```json
 {
-  "location": "s3://bucket/path/presence.zarr",
+  "location": "s3://bucket/path/compound.zarr/sd2",
+  "channels": ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny", "sheet_grad_mag"],
   "tags": [
-    "vc-lasagna-derived:s3://bucket/path/predictions.lasagna.json"
+    "vc-lasagna-manifest:s3://bucket/path/predictions.lasagna.json",
+    "vc-lasagna-group:sd2"
   ]
 }
 ```
 
-The path-bearing `vc-lasagna-derived:<manifest location>` tag records ownership
-only. Group, channel, spacing, dtype, and shape are read from the authoritative
-manifest and Zarr descriptor and are not duplicated in project tags. Reload
-uses the ownership tag to rebuild the exact-byte Lasagna runtime volume rather
-than opening a remote group through the generic volume cache. Repeated
-references to the same source share one project volume and add one ownership
-tag per manifest. Detach removes one ownership tag and only removes the volume
-after the last owner is gone. If the source was already an independent primary
-project volume, attachment reuses it without adding an ownership tag, so
-manifest detach cannot remove it.
+Project reopening restores the named views directly from the volume entry.
+Channel zero keeps the original volume ID; other display IDs add a channel
+suffix. Annotation coordinates continue to use the original source ID, so
+switching channels does not switch the coordinate frame or hide annotations.
+The saved current-volume ID restores the selected channel. Channel names must
+match the array's C dimension; spacing, dtype and shapes remain Zarr metadata.
 
-Project load reconciliation is in-memory until the caller explicitly saves;
-opening a project does not rewrite it solely because runtime derived-volume
-objects were reconstructed.
+All views share the opened arrays and decoded packed RAM cache. With CUDA
+enabled, uint8 views upload selected scalar bricks into the common GPU cache;
+other dtypes and CPU fallback use the same selected channel. No preprocessing
+or additional disk cache is needed. Reattach a manifest to expose its channels
+in projects saved before channel views were supported. A bare packed source
+without a channel declaration continues to display channel zero.

@@ -442,3 +442,24 @@ def test_cuda_unset_potential_raises_at_assert_boundary():
     assert crossing_map.winding_potentials(
         torch.tensor([0], device='cuda')).tolist() == [0]
     crossing_map.assert_no_pending_potential_errors()
+
+
+@pytest.mark.parametrize('device', [
+    'cpu',
+    pytest.param('cuda', marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason='needs CUDA')),
+])
+def test_compact_source_potentials_stream_in_chunks(device):
+    # Preorder tree: 0 -> 1 -> 2, 0 -> 3, and a second root 4; exits are interior.
+    nodes = torch.arange(5).numpy()
+    parents = torch.tensor([0, 0, 1, 0, 4]).numpy()
+    exits = torch.tensor([4, 3, 3, 4, 5]).numpy()
+    points = _points_for_theta([0.1, 6.2, 0.2, 6.1, 3.0])  # theta in [0, 2pi)
+    crossing_map = ThetaCrossingMap(device, chunk_size=2)
+    start = crossing_map.register_nodes(5, lambda lo, hi: points[lo:hi].to(device))
+    crossing_map.register_potential_source(
+        start, 5, lambda lo, hi: (nodes[lo:hi], parents[lo:hi], exits[lo:hi]),
+        lambda cursor, limit: (cursor, torch.empty((0, 2), dtype=torch.int64).numpy()))
+    crossing_map.force_refresh(_identity)
+    assert crossing_map.node_winding_potential.tolist() == [0, 1, 0, 1, 0]
+    assert crossing_map.node_winding_potential.device.type == device

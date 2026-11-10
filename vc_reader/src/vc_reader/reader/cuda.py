@@ -1,4 +1,4 @@
-"""Optional CUDA backend for 3-D uint8 CT readers."""
+"""CUDA scalar uint8 sampling of ZYX arrays and selected CZYX channels."""
 import operator
 import os
 import numpy as np
@@ -71,11 +71,15 @@ class CudaReader:
     The cache is private to this reader adapter and device, unless ``pool`` (a
     :class:`CudaPool`) shares one with other readers; clear_cache() drops this reader's
     resident source chunks. Arrays retain independent ownership after close().
+    ``channel`` selects one CZYX channel; requests remain spatial ZYX triples.
+    Channels reuse the original array's decoded RAM cache, not extracted arrays.
     """
-    def __init__(self, reader, *, cache_bytes=512 << 20, device=0, pool=None):
+    def __init__(self, reader, *, cache_bytes=512 << 20, device=0, pool=None, channel=None):
         reader._ready()
-        if reader.ndim != 3 or reader.dtype != np.uint8:
-            raise TypeError("CUDA sampling supports 3-D uint8 CT")
+        if channel is not None:
+            channel = operator.index(channel)
+        if reader.ndim != (4 if channel is not None else 3) or reader.dtype != np.uint8:
+            raise TypeError("CUDA sampling supports uint8 ZYX or a selected CZYX channel")
         cache_bytes, device = operator.index(cache_bytes), operator.index(device)
         if cache_bytes < 0 or device < 0:
             raise ValueError("cache_bytes and device must be nonnegative")
@@ -84,8 +88,9 @@ class CudaReader:
         if pool is not None:
             device = pool.device
         self.reader, self.device, self._pid, self.pool = reader, device, os.getpid(), pool
-        self._engine = (_reader.CudaReader(reader._array, cache_bytes, device) if pool is None
-                        else _reader.CudaReader(reader._array, pool._engine))
+        self.shape = reader.shape[-3:]
+        self._engine = (_reader.CudaReader(reader._array, cache_bytes, device, channel) if pool is None
+                        else _reader.CudaReader(reader._array, pool._engine, channel))
 
     def _ready(self):
         if self._pid != os.getpid():
@@ -165,7 +170,7 @@ class CudaReader:
     def read_many(self, selections, *, dtype=None, source="auto", valid=False):
         """Read slice selections as one batch with shared chunk uploads."""
         self._ready()
-        plans = [parse_index(selection, self.reader.shape) for selection in selections]
+        plans = [parse_index(selection, self.shape) for selection in selections]
         if not plans:
             return ([], []) if valid else []
         output = self.read_regions([(start, size) for start, size, _ in plans],

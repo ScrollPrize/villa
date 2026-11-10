@@ -39,6 +39,14 @@ struct HostedStoreOptions {
     long stallTimeoutS = 60;
     int retries = 5;
     long requestTimeoutMs = 0;
+    // A link_objects request answers only when its detection is done, so it
+    // is sent with this stall timeout instead of stallTimeoutS (and no
+    // whole-request limit). Set it with the service's --request-deadline
+    // (default 300 s): below the detection's duration the client gives up
+    // and retries; the service then has the retry wait for the detection
+    // already running rather than start another, and the outcome is still
+    // known only once a retry is answered.
+    long linkTimeoutS = 300;
     // Geometry array reads larger than this are fetched as several ranges
     // (the server refuses single responses above its own limit).
     int64_t rangeBytes = 32 << 20;
