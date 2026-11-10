@@ -2,6 +2,8 @@
 
 #include "LineAnnotationController.hpp"
 #include "SpiralPclRole.hpp"
+#include "SpiralPreviewWindings.hpp"
+#include "overlays/SpiralFiberOverlayController.hpp"
 
 #include <QMainWindow>
 #include <QFutureWatcher>
@@ -11,6 +13,8 @@
 #include <QColor>
 #include <QSet>
 #include <QStringList>
+#include <QTemporaryDir>
+#include <nlohmann/json_fwd.hpp>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
 #include <vc_reader/affine.hpp>
@@ -19,11 +23,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 #include <functional>
+
+namespace vc3d::spiral {
+struct FitInputs;
+struct FitInputChanges;
+struct FitSurface;
+}
 
 class AxisAlignedSliceController;
 class CState;
@@ -39,6 +50,7 @@ class ViewerSplitGrid;
 class VolumePkg;
 class Volume;
 class SpiralOverlayController;
+class QTimer;
 class StoreSurfaceOverlayController;
 class SpiralMinimap;
 class SpiralBrushController;
@@ -65,10 +77,6 @@ public:
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds);
-    bool stageFiberInputs(const std::vector<uint64_t>& fiberIds);
-    void refreshTrackedFibers();
-    void noteFiberRetired(const QString& objectUuid);
-    bool prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
     void setLineAnnotationController(LineAnnotationController* controller);
@@ -77,22 +85,24 @@ public:
     // offers to create or attach.
     [[nodiscard]] QString lineAnnotationDraftUnavailableReason() const;
     void startLineAnnotationDraft();
+    // The object kinds Spiral fits, reads and edits. They share one store:
+    // the service's store (a file or a served store), or the store a local service binds.
+    static const std::vector<std::string>& inputKinds();
 
 signals:
     void spiralSessionActiveChanged(bool active);
     void patchEditorRequested(const QString& id, const QString& path);
 
 protected:
+    void showEvent(QShowEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
 
 private:
-    struct PreviewComponent {
-        int rowBegin = 0;
-        int rowEnd = 0;
-        int columnBegin = 0;
-        int columnEnd = 0;
-        int winding = 0;
-    };
+    // The store the project routes every input kind to; none when the
+    // routes differ or are unset.
+    std::optional<vc::objects::AttachmentIdentity> inputStore() const;
+    void bindInputStore();
+    using PreviewComponent = vc3d::spiral::PreviewComponent;
     struct PreviewLoadResult {
         std::shared_ptr<QuadSurface> surface;
         QString surfaceId;
@@ -117,6 +127,11 @@ private:
         };
         std::vector<LossMap> lossMaps;
         QString runDiffImagePath;
+        // A committed fit read from the object store (its UUID and name),
+        // rather than a published preview artifact: it is held whole and
+        // carries no overlays.
+        QString storedFitUuid;
+        QString storedFitName;
     };
     struct PreviewDisplaySelection {
         cv::Rect region;
@@ -131,27 +146,57 @@ private:
         std::shared_ptr<QuadSurface> surface;
     };
     struct InputSurfaceLoadResult {
+        // The surface categories this result replaces; others are kept. With
+        // none, the surfaces are added or replaced by ID and `removedIds`
+        // removed, leaving every other surface as it is.
+        QStringList categories;
+        QStringList removedIds;
         std::vector<InputSurfaceEntry> surfaces;
         QStringList warnings;
     };
 
-    QString mapServicePath(const QString& servicePath) const;
     // Loss-map entries of one manifest, resolved against the artifact
     // directory holding them. Shared by the surface manifest (older services
     // still carry the overlays there) and the diagnostics manifest.
     static std::vector<PreviewLoadResult::LossMap> parseLossMaps(
         const QJsonObject& manifest, const QString& artifactRoot);
     void loadPreview(const QString& manifestPath, qint64 generation);
+    // Show a committed fit (SpiralStoredFits) from the attached input store in
+    // place of the current preview, until the next one is published. An
+    // empty `uuid` offers the store's committed fits to choose from.
+    void openStoredFit(const QString& uuid);
     void installPreview(const PreviewLoadResult& result, qint64 generation);
     // Adopt the loss overlays published for the installed preview. They are a
     // separate artifact that lands after the surface, so this only extends
     // what is already displayed - it never reloads the surface.
     void installPreviewDiagnostics(const QString& manifestPath,
                                    qint64 generation);
-    void installPclArtifact(vc3d::spiral::PclRole role, const QString& manifestPath,
-                            const QJsonObject& artifactRef);
+    // The fit's inputs as the attached store holds them now, with how they
+    // differ from what the session's input manifest says the fit read
+    // (vc3d::spiral::readFitInputs).
+    void loadFitInputs();
+    void installFitInputs(const std::shared_ptr<vc3d::spiral::FitInputs>& inputs,
+                             quint64 generation);
+    void clearFitInputs(const QString& reason);
+    // Re-read only the fitted objects and links store commits changed, and
+    // replace only their overlays (vc3d::spiral::readFitInputChanges).
+    void loadFitInputChanges();
+    void installFitInputChanges(vc3d::spiral::FitInputChanges changes);
+    InputSurfaceEntry fitSurfaceEntry(const vc3d::spiral::FitSurface& entry,
+                                      const QString& category = QStringLiteral("verified")) const;
+    void rebuildFitPclDocuments();
+    void rebuildFitFibers();
+    void showFitInputProblems(const vc3d::spiral::FitInputs& inputs);
+    // Queue the fitted objects and links a store commit changed for
+    // loadFitInputChanges; count other inputs a rebuild's selection may include.
+    void noteStoreChanges(const vc::objects::StoreSessionEvent& event);
+    void updateInputFreshness();
     void refreshPclOverlay(vc3d::spiral::PclRole role);
-    void refreshPclOverlays();
+    void refreshFiberOverlay();
+    void refreshFitOverlays();
+    // Reference-volume voxels -> the preview's volume frame; nullopt (with
+    // the reason) when either side lacks or disagrees on a coordinate domain.
+    std::optional<double> fitInputScale(QString* error) const;
     void applyPreviewWindingRange(bool preserveFocus);
     void loadRunDiff();
     void updateRunDiffOverlay();
@@ -165,11 +210,8 @@ private:
     void clearSurfaceDrafts();
     void installPreviewAlias(const std::shared_ptr<QuadSurface>& preview, const QString& registrationId,
                              qint64 generation, quint64 revision, bool preserveFocus);
-    void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
+    void resetSessionSurfaces(quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
-    void registerPendingPatchSurface(const QString& inputId,
-                                     const std::shared_ptr<QuadSurface>& surface,
-                                     const std::optional<QColor>& color = std::nullopt);
     void finalizeBrushPaint();
     void finalizeLineAnnotationDraft();
     void cancelLineAnnotationDraft();
@@ -178,19 +220,33 @@ private:
                                         Qt::KeyboardModifiers modifiers);
     [[nodiscard]] std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
         resolveLineAnnotationInputs(QString* errorMessage) const;
-    [[nodiscard]] QStringList fallbackFiberManifests() const;
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         resolveFiberBaseShape(QString* errorMessage) const;
     void updatePreviewCoordinateScale();
-    void submitReadyDrafts(bool commitAfterAdd);
-    void maybeCommitForPendingExit();
-    QString provisionalBrushRoot() const;
+    // Save the brush's ready drafts into the attached store (store-backed
+    // edits); ``updateAfter`` then runs Update Fit Inputs.
+    void submitReadyDrafts(bool updateAfter);
     void discardBrushWork();
     void setSurfaceCategoryVisible(const QString& category, bool visible);
-    void updatePendingPatchIds(const QJsonObject& status);
     void pruneBrushPreviewSurfaces();
     QSet<QString> _retainedBrushPreviewIds;
-    void inputDraftPrepared(const QString& alias, const QString& error = {});
+    // Brush patches and new point collections saved to the store, by
+    // gesture id (their object and the version the save wrote, which their
+    // next edit starts from), and drafts saved but not yet part of the fit
+    // (dropped once an input update includes them).
+    struct SavedObject {
+        std::string uuid;
+        int64_t version = 0;
+    };
+    QHash<QString, SavedObject> _brushPatches;
+    QHash<QString, SavedObject> _savedCollections;
+    int _savesInFlight = 0;  // submitReadyDrafts writing on a worker thread
+    QStringList _savedDraftIds;
+    QStringList _savedPatchIds;
+    // Those saved when the input update in flight began, with the version
+    // saved: one saved again or edited since stays a local drawing.
+    QHash<QString, int64_t> _updatingDrafts;
+    QHash<QString, int64_t> _updatingPatches;
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();
@@ -202,20 +258,22 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _slices;
     std::unique_ptr<SpiralOverlayController> _overlay;
     std::unique_ptr<StoreSurfaceOverlayController> _storeSurfaceOverlay;
-    // Spiral's surfaces are files, not stored objects: each shown one is a
-    // draft of the store session under its (UUID) id, so store queries
-    // (intersections, lookups, overlaps) see it.
+    // Service previews, shells and local brush surfaces are session-only
+    // drafts for store queries. Fitted surfaces retain their stored UUIDs
+    // and are queried directly, without overriding another editor's draft.
     std::map<std::string, std::weak_ptr<QuadSurface>> _surfaceDrafts;
     std::unique_ptr<SpiralBrushController> _brush;
     std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
-    // The display-only overlay of one editable PCL role (same-winding or
-    // relative-winding), fed by the service's snapshot artifact of that
-    // role's dataset file.
+    // The display-only overlay of the fit's point collections of one role
+    // (same-winding, or relative-winding with the absolute ones), read from
+    // the attached store as it is now.
     struct PclOverlayState {
         std::unique_ptr<VCCollection> collection;
         std::unique_ptr<PointsOverlayController> overlay;
-        std::optional<std::array<std::size_t, 3>> baseShapeZYX;
-        QString manifestPath;
+        // The fit's collections as a point-collections document, and that
+        // document on disk for VCCollection::loadFromJSON; empty when none.
+        QJsonObject document;
+        QString documentPath;
         bool visible = false;
     };
     std::array<PclOverlayState, vc3d::spiral::kEditablePclRoles.size()> _pclOverlays;
@@ -223,6 +281,10 @@ private:
     {
         return _pclOverlays[vc3d::spiral::pclRoleIndex(role)];
     }
+    // The fit's fibers as the store holds them now, in reference-volume voxels.
+    std::unique_ptr<SpiralFiberOverlayController> _fiberOverlay;
+    std::vector<SpiralFiberOverlayController::Fiber> _fitFibers;
+    bool _fiberOverlayVisible = false;
     LineAnnotationController* _lineAnnotationController = nullptr;
     std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
     SpiralServiceManager* _service = nullptr;
@@ -233,9 +295,12 @@ private:
     VolumeViewerBase* _flattenedViewer = nullptr;
     SpiralMinimap* _windingMinimap = nullptr;
     qint64 _requestedPreviewGeneration = -1;
-    QJsonObject _sessionPaths;
+    // Every preview load (an artifact or a committed fit) takes the next
+    // serial; only the latest one installs.
+    quint64 _previewLoadSerial = 0;
     QJsonObject _sessionRunConfig;
-    QHash<QString, QString> _trackedFiberPaths;
+    // The scroll the session fits (its request's "scroll").
+    QJsonObject _sessionScroll;
     struct LineAnnotationDraft {
         std::shared_ptr<QuadSurface> surface;
         std::vector<QPointF> surfacePoints;
@@ -246,14 +311,35 @@ private:
     QHash<QString, QStringList> _surfaceCategoryIds;
     QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;
-    QSet<QString> _pendingPatchIds;
-    QSet<QString> _visibleUncommittedPointCollectionIds;
     std::map<std::string, std::size_t> _surfaceOverlayColorAssignments;
     std::map<std::string, cv::Vec3b> _surfaceOverlayColors;
     std::size_t _nextSurfaceOverlayColorIndex = 0;
     quint64 _inputSurfaceGeneration = 0;
+    // The session's input manifest and what the attached store holds of it.
+    QString _inputManifestPath;
+    QString _inputDigest;
+    quint64 _fitInputGeneration = 0;
+    // The store binding the fit inputs were last read against.
+    QStringList _fitInputBinding;
+    std::shared_ptr<vc3d::spiral::FitInputs> _fitInputs;
+    // Record UUIDs of the fitted objects and relationships, and of the other
+    // surfaces, collections and fibers changed since the fit's inputs loaded.
+    QSet<QString> _fitRecords;
+    QSet<QString> _changedOtherInputs;
+    QTimer* _fitInputReload = nullptr;
+    // The manifest being displayed, and the fitted objects and links changed
+    // by commits not yet read.
+    std::shared_ptr<const nlohmann::json> _fitDocument;
+    std::set<std::string> _pendingObjectChanges;
+    std::set<std::string> _pendingLinkChanges;
+    bool _fitChangesReading = false;
+    // The generation of the full read _fitInputs holds.
+    quint64 _installedFitInputGeneration = 0;
+    QTemporaryDir _fitPclDocuments;
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
+    // The UUID of the committed fit _previewSource is; empty for an artifact.
+    QString _previewStoredFit;
     std::optional<std::array<std::size_t, 3>> _previewBaseShapeZYX;
     std::optional<std::array<std::size_t, 3>> _fiberBaseShapeZYX;
     std::optional<double> _previewToFiberBaseScale;
@@ -277,31 +363,10 @@ private:
     bool _outputVisible = true;
     bool _showSurfaceIntersections = true;
     bool _showSurfaceOverlap = true;
-    bool _pendingPatchesOnly = false;
     bool _runDiffVisible = false;
     bool _windingTransitionsVisible = true;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;
     bool _shuttingDown = false;
-    struct PendingBrushPatch {
-        QString path;
-        QColor color;
-        std::shared_ptr<QuadSurface> surface;
-        QString operation;
-    };
-    QHash<QString, PendingBrushPatch> _pendingBrushPatches;
-    QHash<QString, QString> _brushProvisionalPaths;
-    QSet<QString> _uncommittedBrushPatchIds;
-    QHash<QString, QString> _pendingPointCollectionPaths;
-    QHash<QString, QString> _pointCollectionProvisionalPaths;
-    QSet<QString> _uncommittedPointCollectionIds;
-    // Role of each staged collection replacement, for user-facing messages.
-    std::function<void()> _pendingExitAction;
-    bool _commitAfterBrushUploads = false;
-    QHash<QString, QString> _managedPatchCopies;
-    int _draftPreparationRemaining = 0;
-    bool _draftPreparationFailed = false;
-    // Keyed by Spiral input id (the fiber file stem), never by runtime
-    // fiber id: runtime ids are reassigned whenever the fiber list reloads.
 };

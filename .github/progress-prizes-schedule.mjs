@@ -26,13 +26,12 @@ export const NONTERMINAL_RUN_STATUSES = Object.freeze([
 
 const NONTERMINAL_STATUS_SET = new Set(NONTERMINAL_RUN_STATUSES);
 const RUN_STATUS_SET = new Set([...NONTERMINAL_RUN_STATUSES, 'completed']);
-// `validate` is used only by the manual staging rehearsal proxy. The scheduler
-// itself still produces only dry-run, prepare, or activate plans.
+// The scheduler itself produces only dry-run, prepare, or ready plans.
 const OPERATIONS = new Set([
   'validate',
   'dry-run',
   'prepare',
-  'activate',
+  'ready',
 ]);
 const DEDUPE_REASONS = new Set([
   'production-idle',
@@ -510,7 +509,6 @@ export function buildProductionDispatch({
       operation: selectedOperation,
       'source-cycle': cycles.sourceCycle,
       'target-cycle': cycles.targetCycle,
-      'verify-mode': 'prepared',
       'request-id': numericRequestId,
     }),
     return_run_details: true,

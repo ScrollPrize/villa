@@ -4,12 +4,11 @@
 #include <QElapsedTimer>
 #include <QThread>
 #include "FiberCollectionController.hpp"
-#include "SpiralWorkspace.hpp"
-#include "SpiralServiceManager.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/objects/Project.hpp>
 #include "vc/core/types/Volume.hpp"
+#include "volume_viewers/ViewerSampling.hpp"
 #include "test/support/TestVolume.hpp"
 #include <nlohmann/json.hpp>
 #include <vc_reader/zarr.hpp>
@@ -107,6 +106,7 @@ int runObjectStoreControllerTests()
             require(state.storeFor("fiber") && state.vpkg()->document().data() == data, "reopening uses the upgraded store without another conversion");
             state.closeProject();
         }
+#include "LineAnnotationCompoundTest.inc"
 #include "LineAnnotationFiberCacheTest.inc"
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;
@@ -671,13 +671,11 @@ int runObjectStoreControllerTests()
             Controller imported(&destination, nullptr, nullptr, nullptr);
             imported._errorDialogsSuppressed = true;
             openStoreAsProject(destination, QString::fromStdString(target.string()), "service-import-test");
-            SpiralWorkspace workspace(&destination);
-            workspace.setLineAnnotationController(&imported);
-            auto* service = workspace.findChild<SpiralServiceManager*>();
-            service->inputEditorRequested(QJsonObject{{"kind", "fiber"}, {"id", QString::fromStdString(a.uuid)}},
-                QString::fromStdString(transferPaths.at(a.uuid).string()));
-            require(imported.readStoredFibers(std::nullopt).size() == 2 && service->inputDraftStatus().size() == 2,
-                    "service-only component is imported into attached store before editing");
+            QString error;
+            if (!imported.importFibersFromPath(transferPaths.at(a.uuid), &error))
+                throw std::runtime_error(error.toStdString());
+            require(imported.readStoredFibers(std::nullopt).size() == 2,
+                    "a transported component is imported into the attached store");
             auto document = aWire;
             const auto uuid = vc::objects::util::newUuid(); document["uuid"] = uuid;
             document["branches"] = nlohmann::json::array(); document["adjacent_branches"] = nlohmann::json::array();
@@ -685,7 +683,6 @@ int runObjectStoreControllerTests()
             const auto volumeUuid = vc::objects::util::newUuid();
             document["coordinates"] = {{"volume_uuid", volumeUuid}, {"scale_factor", 4}};
             document["coordinate_binding"] = {{"active_volume_id", "display"}};
-            QString error;
             const auto single = fs::path(directory.path().toStdString()) / "optional-mode.json";
             { std::ofstream out(single); out << document.dump(); }
             if (!imported.importFibersFromPath(single, &error)) throw std::runtime_error(error.toStdString());
@@ -706,32 +703,6 @@ int runObjectStoreControllerTests()
             const auto paths = imported.fiberTransportPaths({id});
             require(readDocument(paths.at(uuid)).at("custom_annotation") == document.at("custom_annotation"),
                     "editing preserves unknown source annotations");
-        }
-        {
-            SpiralWorkspace workspace(&state);
-            workspace.setLineAnnotationController(&controller);
-            auto* service = workspace.findChild<SpiralServiceManager*>();
-            require(service, "Spiral service exists");
-            require(workspace.stageFiberInputs({a.id}), "stage a newly saved fiber");
-            auto rows = service->inputDraftStatus();
-            require(rows.size() == 2, "staging includes linked fibers");
-            for (const auto& row : rows)
-                require(row.toObject()["applied_revision"].toInteger() == 0, "staging does not apply to fit");
-            workspace.refreshTrackedFibers();
-            require(service->inputDraftStatus() == rows, "unchanged fibers are not restaged");
-            // Reopening a service input registers it even in a fresh workspace.
-            SpiralWorkspace reopened(&state);
-            reopened.setLineAnnotationController(&controller);
-            auto* reopenedService = reopened.findChild<SpiralServiceManager*>();
-            reopenedService->inputEditorRequested(QJsonObject{{"kind", "fiber"}, {"id", QString::fromStdString(a.uuid)}},
-                QString::fromStdString(transferPaths.at(a.uuid).string()));
-            require(reopenedService->inputDraftStatus().size() == 2, "reopened service fibers are tracked");
-            auto changed = a; changed.tags.push_back("spiral-draft-edit");
-            controller.commitFibers({&changed});
-            workspace.refreshTrackedFibers(); reopened.refreshTrackedFibers();
-            require(service->inputDraftStatus() != rows, "saved edits refresh tracked drafts");
-            for (const auto& row : service->inputDraftStatus())
-                require(row.toObject()["applied_revision"].toInteger() == 0, "refresh does not auto-apply");
         }
         a = resolve(a.uuid); b = resolve(b.uuid);
         require(controller.generatedBranchLinkMarkers(a.branches).empty(), "unbound peers have no branch markers");

@@ -4,6 +4,83 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## Running the object-store workflow
+
+Use VC3D and the Spiral service from the same checkout: the store-location
+protocol is API **47**. Update the existing Spiral environment with `uv sync`
+from this directory when deploying this checkout (native prerequisites must
+already be installed). This builds the Python bindings, not the standalone
+`vc_object_ingest`, `vc_object_server` and `vc_object_convert` tools; use
+those from a matching native object-store build.
+
+| Input | Command-line fit | Service fit |
+| --- | --- | --- |
+| Patches, PCLs, fibers, tracks and their relationships | `--object-store` | Service's bound store |
+| Outer shell | Store surface tagged `spiral-outer-shell` | Same |
+| Scroll facts and umbilicus | `--inputs` manifest's `scroll` and `umbilicus` | VC3D project |
+| Lasagna fields | Manifest's `lasagna.manifest` and the cache; missing packs may be built | Project-selected dataset; packs must already be cached |
+| Fiber directions | Manifest's `fiber_directions` | Project-selected fiber-inference dataset's cached artifact |
+| Winding inference | Manifest's `winding_inference` | Service's `--winding-inference` binding |
+
+1. Ingest geometry once as described under **One-time dataset ingest**. For
+   tracks, first run `python convert_track_store.py /data/scroll/tracks/input.dbm`,
+   then ingest that DBM with its packed mirror using `vc_object_ingest --tracks`.
+   Existing stores need only the track ingest, not another import of their
+   patches/PCLs/fibers. Frames declare stored coordinates per reference-volume
+   voxel; use the real scale for each source. Fits do not read DBMs,
+   `.vctracks` directories or `.crossings.npz` sidecars after ingest.
+2. For CLI use, write an input manifest naming the fit volume, its facts
+   (preferably with `base_shape_zyx`) and every input file; see **Input
+   manifest**. Lasagna scale is derived where possible; otherwise an explicit
+   `scroll.lasagna_scale` is required. See **Input manifest** for the
+   `source_to_base == 1` restriction and cross-checks.
+3. For service use, select the project volume, import its umbilicus, and
+   select the Lasagna dataset in VC3D. Pack its fields into the service's
+   cache first; see **Lasagna inputs must be packed first**. A local copy of
+   a remote dataset must be packed with `--as` naming the same URL VC3D uses.
+   Prepare the fiber-direction cache too if enabling that loss, and bind
+   the winding-inference artifact with `--winding-inference` if enabling
+   winding-model supervision.
+4. Run either command below from `spiral-fitting/`. The example enables
+   tracks explicitly: `input_use_tracks` defaults to false. Choose a real
+   fit window and input paths for your scroll.
+
+```sh
+FIT_SPIRAL_OUT_DIR=/data/spiral-output \
+FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin":9000,"z_end":9100,"input_use_tracks":true}' \
+  .venv/bin/python fit_spiral.py \
+  --inputs /data/spiral-inputs.json --object-store /data/scroll.vcobj \
+  --object-store-author "$USER" --cache /data/spiral-cache
+
+.venv/bin/python spiral_service.py \
+  --port 8765 --object-store /data/scroll.vcobj \
+  --winding-inference /data/winding_inference \
+  --output /data/spiral-output --cache /data/spiral-cache \
+  --gpus 0 --session-name scroll-fit
+```
+
+For the service, enable tracks and choose the z window in VC3D before
+Initialize Fit. Localhost mode can launch the service itself. A service on
+another host that VC3D should edit against needs its store served by
+`vc_object_server` and bound by endpoint; see **Object store, positions and
+input updates**.
+
+Startup normally writes refreshed relationships, including track crossings.
+`object_store_refresh_links: false` consumes existing relationships instead;
+there is no fallback crossing scan in the fitter. Track selection uses
+`object_store_track_uuids` / `object_store_track_tags`, like the other kinds.
+Remove the retired `track_scale_factor` config setting; each stored track
+now declares its frame. Track databases are never input paths.
+
+Save drafts into the store, then **Update Fit Inputs** to adopt eligible
+geometry changes without resetting optimization. Changes to tracks, their
+crossings, the outer shell, the volume or prepared-input settings require
+**Rebuild with Current Inputs**. With tracks enabled and
+`track_exclusion_radius > 0` (default 16), input replacement also requires a
+rebuild because the exclusion masks depend on the trusted geometry. Saved
+checkpoints remain subject to input-manifest validation; a pre-migration
+track fit is not automatically equivalent to a new store-backed fit.
+
 ## CPU surface-track extraction
 
 `extract_surface_tracks.py --backend cpu` labels 6-connected components with
@@ -77,78 +154,91 @@ allocate the graph path's persistent LR buffer.
 `FIT_SPIRAL_GRAPH_RK4_MAX` caps the graphs kept for the forward and the backward
 pass each (default 256, oldest evicted first).
 
-## Editing input snapshots
+## Input manifest
 
-The service snapshots patch directories, fiber JSON files and point collections
-when claiming a dataset editing workspace. `input_snapshot.py` tries Linux
-`FICLONE` or macOS `clonefile` for independent copy-on-write files. Unsupported
-filesystems and cross-filesystem copies fall back to a streamed copy; other I/O
-errors propagate. Hard links are never used.
+`fit_spiral.py --inputs MANIFEST` names every input a command-line fit reads
+by path; nothing is discovered in a dataset directory and no filename is
+inferred. Relative paths resolve against the manifest's own directory, so a
+fit runs the same from any working directory; files may have any names and
+live anywhere. Geometry (patches, PCLs, fibers, tracks and the outer shell)
+is read from `--object-store` only and has no manifest entry. A service
+session takes the scroll's facts and inputs from the VC3D project and its own
+launch bindings instead; see
+[The VC3D project's inputs](#the-vc3d-projects-inputs). This is not covered
+by scrollprize.org/tutorial_spiral.
 
-The fallback hashes bytes while copying, verifies the destination, and compares
-the final source fingerprint with the captured tree. Clones are hashed once and
-compared with the final source. This reduces full content reads from four to
-three for ordinary copies and two for clones. Snapshots retain the existing
-SHA-256 format, sorted tree membership, empty directories and symlink rejection.
-Changes during capture that leave the source different from the captured bytes
-are rejected. No model inputs, precision or numerical algorithms change.
+`runners/run_single.py --resume` records the object store's persistent UUID
+in its run state and checks it even when the fit stage is already complete.
+Moving the store or serving it with `vc_object_server` preserves this identity;
+switching to a different store is refused. Older runner state files without
+the UUID cannot establish which store was used and are refused too; use a new
+output directory. This check identifies the store, not its current contents;
+the fitter's checkpoint input-manifest checks still apply when fitting resumes.
 
-Run the focused tests using the existing environment, from the repository root:
-
-```sh
-PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
-  spiral-fitting/tests/test_input_snapshot.py \
-  spiral-fitting/tests/test_service_editing.py \
-  spiral-fitting/tests/test_service_editing_http.py
+```json
+{
+  "schema_version": 1,
+  "volume_uuid": "reference-volume-id",
+  "scroll": {
+    "name": "PHerc0826",
+    "voxel_size_um": 9.362,
+    "base_shape_zyx": [12000, 8000, 8000],
+    "spiral_outward_sense": "CW"
+  },
+  "umbilicus": {"path": "umbilicus.json", "coordinate_scale": 1},
+  "lasagna": {
+    "manifest": "lasagna/predictions.lasagna.json",
+    "original_url": "https://example.org/predictions.lasagna.json"
+  },
+  "fiber_directions": "fiber_directions.npz",
+  "winding_inference": "winding_inference",
+  "scroll_zarr": "scroll.ome.zarr/0"
+}
 ```
 
-Benchmark real patches (temporary copies are removed; sources stay unchanged):
-
-```sh
-PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python \
-  spiral-fitting/tests/benchmark_input_snapshots.py \
-  /home/sean/Desktop/spiral_dataset/verified_patches --iterations 5 --profile
-```
-
-Use `--destination PATH` to test another filesystem. The default is `/tmp`.
-`--count` selects the first N sorted patch directories (default 32).
-
-Measured on Linux arm64, CPython 3.14, without Python optimization flags, with
-`cProfile` enabled for both versions: 32 real verified patches, 55,302,864 bytes,
-five iterations, ordinary-copy fallback on the local ext-family filesystem.
-These are cache-warm measurements, not end-to-end fit initialization times.
-
-| Snapshot implementation | Mean | Min | Median | Max |
-| --- | ---: | ---: | ---: | ---: |
-| Previous copy plus three hash passes | 166.8 ms | 160.8 ms | 162.2 ms | 181.0 ms |
-| Streamed copy/hash plus verification | 152.3 ms | 148.9 ms | 153.2 ms | 154.0 ms |
-
-Mean time decreased 8.7%. Before the change, fingerprint calls accounted for
-0.649 s of 0.834 s total across all five iterations; file copying accounted for
-0.177 s. Afterwards, hashing remains the largest cost (0.336 s in SHA-256 updates),
-but the separate source pre-read is eliminated. Reflink throughput and actual
-macOS cloning require validation on supporting filesystems; unit tests cover
-the platform dispatch and fallback/error paths.
-
-Filesystem API references: [Linux FICLONE](https://man7.org/linux/man-pages/man2/FICLONE.2const.html)
-and [Apple file cloning support](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumesupportsfilecloning).
-
-## Scroll specification (spiral-scroll.json)
-
-`fit_spiral.py` requires a `spiral-scroll.json` file in the dataset root.
-This is not covered by scrollprize.org/tutorial_spiral. Required keys:
+Required:
 
 - `schema_version` — must equal `1`.
-- `name`, `voxel_size_um` — required, no validation beyond presence.
+- `volume_uuid` — the reference volume the inputs are in: the volume the
+  selected store objects declare (`vc_object_ingest --volume-uuid`). A fit
+  whose objects are in another volume is refused, and checkpoints record it.
+- `scroll` — the scroll's physical facts (below).
+- `umbilicus` — `path` to its control-point JSON, and optionally
+  `coordinate_scale` (its coordinates per fit-volume voxel, default 1).
+
+Optional, but required when the configuration's losses read them (checked,
+all at once, before the fit starts):
+
+- `lasagna.manifest` — the local `*.lasagna.json` manifest (see "Lasagna
+  inputs must be packed first"). `lasagna.original_url` says the local
+  manifest is a copy of the remote dataset at that URL: the fit reads it as
+  that dataset, sharing its packs with a service fitting the URL. Nothing is
+  downloaded.
+- `fiber_directions` — the samples file (see "Fiber direction samples").
+- `winding_inference` — the crossing artifact directory (see "Neural
+  winding-inference losses").
+- `scroll_zarr` — the CT volume, a path or a URL; used for visualization and
+  the Lasagna shape check only.
+
+Unknown keys are refused, with guidance for a former `spiral-scroll.json`'s
+(`spiral-scroll.json` is not read: move its facts into `scroll` and name each
+input; its `paths` overrides are retired) and for geometry keys.
+
+### Scroll facts
+
+- `name`, `voxel_size_um` — required.
 - `z_direction_is_top_to_bottom`, `left_handed_coordinates` — the fitted
-  volume's two properties from the open-data catalog (`metadata.json`), copied 
-- verbatim as `true`/`false`. Together they fix the spiral's sense under the catalog convention that every scroll
-  shows the same spiral seen from its top: `"CW"` when they are equal, `"ACW"`
-  when they differ. The z direction also orients exported surfaces (below).
+  volume's two properties from the open-data catalog (`metadata.json`), copied
+  verbatim as `true`/`false`. Together they fix the spiral's sense under the
+  catalog convention that every scroll shows the same spiral seen from its
+  top: `"CW"` when they are equal, `"ACW"` when they differ. The z direction
+  also orients exported surfaces (below).
 - `spiral_outward_sense` — `"CW"` or `"ACW"` (case-insensitive). Derived from
   the two catalog properties when both are present, and then only needed as a
   cross-check (a mismatch is an error). Without them it is required and is
   read off the CT data by a person in VC3D, or from an already-fitted spiral.
+  The fit setting `spiral_outward_sense` (`FIT_SPIRAL_CONFIG_OVERRIDES`) may
+  give it instead, and must agree with the manifest where both do.
 
 Exported surfaces (the per-winding `meshes/`, the combined preview and
 `flatten_spiral_checkpoint.py`'s source surface) read like the scroll: column 0
@@ -162,20 +252,40 @@ are in the written grid, outermost winding first. `left_handed_coordinates` does
 direction of its cross-product normal, which renders correct with
 `flip-normals = not left_handed_coordinates`.
 
-Optional `paths` object for per-input overrides when a dataset's file names
-don't match the catalog's conventional defaults (e.g. `tracks_dbm`).
+Optional `base_shape_zyx`: the fit volume's shape in its own voxels, a ZYX
+list of three positive integers (the catalog `metadata.json` shape of a
+full-resolution volume). Exports record it, and the fit derives the Lasagna
+scale from it.
 
-Also optional, and easy to get wrong silently: `normal_zarr_group`
-(default `"4"`) and `lasagna_scale` (default `4`) select which OME-Zarr
-pyramid level the `normal_x`/`normal_y` lasagna stores are read at.
-**`lasagna_scale` must equal the actual downsample factor of whichever
-group you pick for this specific scroll's lasagna store** — read it from
-the store's own `.zattrs` multiscales metadata, do not assume it from
-another scroll's example or from a generic recommendation. A mismatched
-value either silently reads the wrong-resolution normal maps (no error) or
-throws `RuntimeError: lasagna z-ROI [...] is empty` if the mismatch is
-large enough to push the requested z-range outside the (wrongly-scaled)
-store bounds.
+The Lasagna arrays' downsampling relative to the fit volume (`lasagna_scale`)
+is derived for command-line fits when a fit reads the
+Lasagna dataset (see "Lasagna inputs must be packed first") and both shapes
+are known: `scroll.base_shape_zyx` and the Lasagna manifest's `base_shape_zyx`. The two shapes
+must be power-of-two levels of one grid (ceil or floor halving; at one level
+they may differ by one voxel, the voxel-count and inclusive conventions), and
+the scale is then the manifest's base voxels per array voxel (2^`scaledown`)
+over its base voxels per fit-volume voxel, which must be a whole number. The
+manifest's `base_shape_zyx` is level 0 of the finest real scan, and
+`scaledown` counts from it even when the Lasagna was computed from a
+downsampled level: PHercParis4's, inferred on level 2 of its 2.4 µm volume,
+states that volume's full shape and normals at `scaledown` 4 (16
+full-resolution voxels). A manifest with `source_to_base` other than 1
+(levels counted from a pre-downsampled volume) has no agreed convention
+between VC3D and the Lasagna writer yet, so the CLI requires an explicit
+scale for it. VC3D's service request still computes
+`source_to_base * 2^scaledown` before converting to fit voxels; the CLI
+restriction is not currently enforced there. **The derivation assumes the two grids cover
+the same aligned volume extent** (one origin, one extent): shapes cannot show
+a cropped or offset Lasagna dataset, or another volume of the same shape.
+
+An explicit `scroll.lasagna_scale` (a positive integer) is then a cross-check, and a
+fit whose value disagrees with the derived one is refused. Where the scale
+cannot be derived (either shape missing, shapes that are not levels of one
+grid, a fractional result) `lasagna_scale` is required: there is no default.
+Read it from the arrays' own `.zattrs` multiscales metadata, not from another
+scroll's example. Whatever its source, a fit that opens the scroll zarr
+refuses Lasagna packs whose shape is not that volume's downsampling by the
+scale.
 
 Optional `num_windings`: the scroll's winding count, where someone has
 estimated it (an integer of at least 2). It replaces the generic default of
@@ -183,47 +293,338 @@ both `shell_outer_winding_idx` and `model_gap_expander_num_windings`, which is
 Scroll 1's count (130). The exporter writes windings up to
 `shell_outer_winding_idx`, so on a scroll with fewer windings the generic
 value exports windings that lie outside the papyrus. It is a default rather
-than a fact the scroll owns: `FIT_SPIRAL_CONFIG_OVERRIDES` and the Spiral panel
-still override it, and `model_gap_expander_capacity_windings` is raised to
-`num_windings + 3` only when the count would not otherwise fit.
+than a fact the scroll owns: `FIT_SPIRAL_CONFIG_OVERRIDES` still overrides it,
+and `model_gap_expander_capacity_windings` is raised to `num_windings + 3`
+only when the count would not otherwise fit. A service reads no manifest: set
+the winding count in the fit configuration (the Spiral panel, or the
+service's `--config`).
 
-Example (PHerc0826, where group `"2"` is a 4x downsample for this scroll
-specifically):
+Migrating a dataset directory: write a manifest beside it naming its
+`umbilicus.json`, `lasagna_inputs/*.lasagna.json`, `fiber_directions.npz` and
+`winding_inference/` explicitly, move `spiral-scroll.json`'s facts into
+`scroll` (its `umbilicus.coordinate_scale` into `umbilicus`), and set
+`volume_uuid` to the `--volume-uuid` its store objects were ingested with.
 
-```json
-{
-  "schema_version": 1,
-  "name": "PHerc0826",
-  "voxel_size_um": 9.362,
-  "spiral_outward_sense": "CW",
-  "normal_zarr_group": "2",
-  "lasagna_scale": 4,
-  "paths": {
-    "tracks_dbm": "tracks/PHerc0826_20250821151701_surface_m7_L0_th0.2.dbm"
-  }
-}
+## Object-store inputs
+
+`fit_spiral.py` reads patches, fibers, point collections (PCLs) and tracks,
+and the relationships between them, from a `vc_object_store` database
+(`object_store_inputs.py`). It never reads patch directories, fiber JSONs,
+PCL documents or track databases, and never links points to patches or finds
+track crossings itself: the store's detectors do. The other inputs (umbilicus,
+lasagna normal/gradient stores, fiber directions, winding inference) are
+named by the input manifest (`--inputs`; see "Input manifest").
+
+### One-time dataset ingest
+
+Ingest the dataset's files into a store once, with the store's
+`vc_object_ingest` (built with `vc_object_store`; see its `docs/README.md`).
+Every object needs a coordinate frame (`--volume-uuid`, `--scale-factor`: stored
+coordinates = reference-volume voxels × the scale factor), and VC3D-era files
+need identities derived from one UUID namespace per dataset
+(`--derive-uuids`; generate it once, record it with the dataset, and reuse
+it, so the same files always map to the same objects). For the conventional
+Spiral layout, where patches and PCLs are in fit-volume voxels and version-3
+fibers without `coordinate_base_shape_zyx` are at 4× that scale, that is two
+runs, one per frame:
+
+```sh
+NS=<dataset uuid namespace>   # e.g. python3 -c 'import uuid; print(uuid.uuid4())', once
+ingest="vc_object_ingest --db dataset.vcobj --author $USER --derive-uuids $NS --volume-uuid VOLUME"
+patches=(); for p in dataset/verified_patches/*/; do patches+=(--surface "$p"); done
+$ingest --scale-factor 1 --renumber-point-ids "${patches[@]}" \
+    --point-collections dataset/abs_winding.json \
+    --point-collections dataset/relative_windings.json \
+    --point-collections dataset/same_windings.json
+$ingest --scale-factor 4 --drop-dangling-branches --fiber dataset/fibers
+$ingest --scale-factor 1 --tag spiral-outer-shell --surface dataset/outer_shell
+python convert_track_store.py dataset/tracks/2um_ds2_ps256_surf_v2.dbm
+$ingest --scale-factor S --tracks dataset/tracks/2um_ds2_ps256_surf_v2.dbm
+```
+
+`VOLUME` names the reference volume (its catalog `metadata.json` id, or any
+stable name such as `s1-reference`); the fit infers it from the objects, and
+the input manifest's `volume_uuid` must name the same one. Fibers
+declaring `coordinate_base_shape_zyx` need the scale that domain implies
+instead of 4. Tracks are read from the DBM's packed `.vctracks` mirror (see
+"Packing large track databases"); `S` is their stored voxels per fit-volume
+voxel (1 when they were extracted from the fit volume itself). The two repair
+flags handle the 2026-10 Spiral dataset's defects
+(branches to fiber files that do not exist; `same_windings.json` collections
+that each number their points from 0) and are recorded on the objects.
+
+What the ingest covers: tifxyz patches (`--surface`, one directory each,
+stored as kind `surface`), the outer shell (a tifxyz surface tagged
+`spiral-outer-shell`), the PCL role documents, and the fiber directory with
+its same-winding and adjacent-winding branches
+(which become `fiber_branch` relationships; the fit ties an adjacent branch's
+V fiber one winding inside its H fiber, and leaves out one whose fibers are
+not one H and one V), and tracks (`--tracks`, one object per track, keyed by
+its packed store and source ID). A collection is absolute-winding when its
+`meta.source.winding_is_absolute` is true, which the ingest sets for a
+document named `abs_winding.json`; otherwise its points' `wind_a` annotations
+make it relative, and none make it same-winding. `patch-overlap-pcls.json` is
+not ingested: the store's overlap detector replaces it. Ingest is not repeated
+to update a store; edit objects through the store's API instead.
+
+### Running a fit
+
+The command-line fit reads its inputs from the store named by `--object-store`
+(required: a store file, or the endpoint of the `vc_object_server` serving one,
+`http://host:port` or `ssh://host:port`; the config keys `object_store_location`,
+`object_store_author` and `object_store_link_timeout_s` are set from the command
+line, and `FIT_SPIRAL_CONFIG_OVERRIDES` cannot name them). A served store links
+on its server, so `--object-store-link-timeout` must cover the longest link
+refresh (the server's `--request-deadline`):
+
+```sh
+FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 9000, "z_end": 9100}' \
+  python fit_spiral.py --inputs spiral-inputs.json --object-store dataset.vcobj \
+  --object-store-author me
+```
+
+`--object-store-author` is optional: it defaults to `$USER`, then `$USERNAME`,
+then `spiral-fit` if neither is set to a nonempty value. Pass it explicitly to
+override that identity. The service keeps its `spiral-service@<host>` default.
+
+At startup rank 0 resolves the selection (`object_store_{patch,pcl,fiber,track}_{uuids,tags}`;
+unset selects every active object, an empty list none; `input_use_*` toggles
+off select none), validates every selected object's frame, then refreshes the
+PCL-patch, fiber-patch, patch-overlap and track-crossing links as
+`--object-store-author`,
+writing them back to the store. Detectors whose object kinds are not all
+selected are skipped. `input_use_patch_overlaps: false` skips the
+patch-overlap detector and adds no overlap pairs to the fit (a rebuild
+setting). The refresh is one `link_objects` request of the store: every
+detector runs under one read snapshot and their links commit together with
+the link marker, so a detector failure stops the fit before training and
+writes nothing. `object_store_refresh_links: false` reads the store's
+current relationships read-only.
+
+The link marker is one `link_marker` record of the store, updated in the
+links' own commit (two concurrent refreshes conflict): the position, the fit
+volume, the link parameters, normal source and detector versions, and the
+selection. The next refresh skips the detectors when the marker's inputs
+match, the selection is the same or smaller, and nothing since its position
+touched a selected object, a detector relationship (point-surface,
+same-surface, crossing) or a volume registration. A service input update
+links only objects added since (pairs with a new object, partners found by
+stored bounds); those links are approximate (an existing PCL keeps its old
+surface link alongside one to a new surface), and the next startup refreshes
+in full. `object_store_full_link_refresh: true` always runs every detector.
+Each detector's mode and duration are logged, and its progress shows in the
+service's `input_preparation.progress` (stderr for a CLI fit).
+
+Pending and approved relationships are used
+and rejected ones never; `object_store_approved_links_only` uses approved ones
+only (refresh still runs, so new links stay pending and unused).
+
+The outer shell is the one active surface tagged `spiral-outer-shell` (two are
+an error). It is never a patch: the default and tag selections leave it out,
+and naming it in `object_store_patch_uuids` is refused, so no detector links
+it. It is read with the selection, in the same fit volume, and it is part
+of the input manifest (at its version) and digest; a fit with shell losses or
+winding-model supervision refuses a store without one, and with
+`input_use_outer_shell` off it is not read. An input update that changes the
+shell is refused (the fit consumed it at build): rebuild instead.
+
+Fiber-patch refresh uses the fit's lasagna normals when `input_use_normals` is
+on and the normal stores exist (whatever the dense-normal loss weight), else
+`object_store_normal_ct_*` structure-tensor normals, else the fiber centerline
+alone (with a warning). The log names the source.
+
+After refresh every rank reads the same frozen snapshot and materializes it:
+patch grids, PCL points by stable ID with their `wind_a`, fibers trimmed and
+decimated with every patch contact and branch endpoint kept, branch links,
+patch overlaps as same-surface point pairs (`pcl_patch_overlap_*`, sampling
+group `patch_overlaps`), and the tracks lying entirely inside the z window
+with the crossing CSR of their `crossing` relationships, from which the fit
+builds its track crossing graph. Track-surface relationships are not used. Attachments on patch quads the losses do not sample
+are dropped and reported. The ranks' input digests must agree. The log prints
+the selection, consumed relationships and constraint counts; `python
+object_store_inputs.py dataset.vcobj --z-begin Z0 --z-end Z1` prints the same
+report without training.
+
+The inputs are a **position** of the store, `{store, generation,
+commit_sequence}` (its UUID, its history generation and one of its commits,
+as `status()` reports them), the same whether the store is a file or served
+by `vc_object_server`. Startup reads the head, refreshes the links over the
+selection as one checked request that expects every object the detectors
+read, and pins the links' commit: the selected objects at the numbered
+versions it left them, which later commits never change. A commit touching
+one of those objects (or the marker) between the snapshot and the write
+conflicts, and startup reads the new head and relinks (bounded; unrelated
+commits do not interfere). `object_store_input_position` reads a position
+exactly, without linking (a served store needs the pinned versions with
+it). The manifest records the position (outside the digest: equal inputs
+at two positions are equal) and the link parameters and normal source, so a
+later change of either shows the fit's links as stale.
+
+The inputs are frozen for the fit: settings that would relink or re-derive
+them (`config.OBJECT_STORE_PCL_KEYS`, the PCL role toggles, selection and
+frame settings) need a new fit. Each run writes `object_store_inputs.json`
+(store, selection, the version and scale of every object and the version of
+every consumed relationship, the fit volume, external-input frames,
+materialization settings, and the refresh mode with its fiber-patch normal
+source) and checkpoints carry the same manifest and digest; a resume whose
+inputs differ is refused unless `object_store_allow_changed_inputs`.
+
+The digest identifies inputs by content, not by store history: an object by
+its geometry revision and a hash of the metadata the adapter reads
+(`metadata_sha256`: its frame, erosion, PCL role and sampling group, fiber
+classification), a relationship by its record, approval, generation,
+endpoint geometry revisions and a hash of its anchors and metadata
+(`content_sha256`). The manifest keeps each object's and relationship's
+numbered `version`, outside the digest, to read the inputs back exactly. A
+checkpoint written before these identities is compared on geometry
+revisions and relationship generations, with a warning.
+
+### Frames and units
+
+The fit's unit is the reference-volume voxel (ZYX), whatever the stored
+scale: each object's stored XYZ is divided by its own scale factor once, at
+materialization, and patch grid indices are unchanged. Loss thresholds, ROI
+bounds, spacings and radial offsets are all in reference-volume voxels. An
+object without a declared frame, or frames naming different volumes, is an
+error; nothing is assumed to be at scale 1. The umbilicus keeps its
+input-manifest coordinate scale and lasagna stores their
+`lasagna_scale`; the outer shell, fiber directions and winding inference are
+in fit-volume voxels. Tracks declare their frames like every other object;
+their crossings are found on the stored integer voxels and their arclength
+positions and clearances converted to fit voxels.
+
+`fit_volume_level` (default 0) fits at a pyramid level of the reference
+volume instead: a fit voxel is 2^level reference voxels, so the z range and
+every setting above are in that level's voxels. Object frames, the scroll's
+facts (shape, voxel size, umbilicus and Lasagna scales), the store's overlap
+pairs and the fiber directions a service extracts are converted to it; link
+refresh still works in the reference volume's own voxels, and exported
+surfaces and previews are written back in them. The winding-inference
+artifact and a `scroll_zarr` array are read as they are, so they must already
+be at that level. A checkpoint resumes only at the level it was written at.
+
+### Tests and smoke checks
+
+From the repository root, with `vc_object_store`'s Python module on the path
+(its build directory's `python/`):
+
+```sh
+PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_object_store_inputs.py \
+  spiral-fitting/tests/test_object_store_materialize.py \
+  spiral-fitting/tests/test_object_store_fibers.py \
+  spiral-fitting/tests/test_object_store_overlaps.py \
+  spiral-fitting/tests/test_object_store_tracks.py \
+  spiral-fitting/tests/test_object_store_startup.py \
+  spiral-fitting/tests/test_object_store_positions.py \
+  spiral-fitting/tests/test_object_store_lazy_relink.py \
+  spiral-fitting/tests/test_object_store_hosted.py
+```
+
+These build small stores (`tests/object_store_fixture.py`; shared fixtures in
+`tests/conftest.py`) and cover selection, frames and scales, refresh and its
+idempotency, aggregated failures, read-only and approved-only modes, two-rank
+startup (a rank-local failure, manifest mismatch), resume refusal, positions
+linked and pinned (including edits racing the link refresh), lazy and
+incremental relinking, the same links, pins, service binding and commits
+through a `vc_object_server` endpoint (`test_object_store_hosted.py` runs a
+server subprocess when `VC_OBJECT_SERVER` names the binary and is skipped
+otherwise), tracks and
+their crossings (equal to the ones Spiral's own exact-crossing builder
+finds), and the runtime constraints against
+`tests/data/object_store_reference.json`, which the removed file loader
+produced from the same fixture. An opt-in startup test refreshes and
+materializes a real store (give it a scratch copy: it writes links):
+
+```sh
+OBJECT_STORE_SMOKE_STORE=/scratch/dataset.vcobj OBJECT_STORE_SMOKE_Z=9000:9100 \
+  PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin/python \
+  -m pytest -s -q spiral-fitting/tests/test_object_store_startup.py -k real_data
 ```
 
 ## Lasagna inputs must be packed first
 
-`fit_spiral.py` reads `normal_x`, `normal_y` and `gradient_magnitude` only
-through the resident-pool sidecars that `pack_resident_pools.py` writes
-(`lasagna_data.py`: there is no other loading path). Before the first fit on a
-dataset, pack the stores at the group named by `normal_zarr_group` in
-`spiral-scroll.json`:
+A fit's Lasagna dataset is a `*.lasagna.json` manifest: the command-line
+fit's input manifest names it (`lasagna.manifest`), a service's project
+selects it. The fit reads its `nx`, `ny` and `grad_mag` channels, which must be single-channel
+arrays sharing one array name (the manifest's `zarr` paths name it, e.g.
+`las_008_nx.ome.zarr/4`), only through resident pools (`lasagna_data.py`:
+there is no other loading path). Pools are derived data in the fit's cache
+(`--cache`, default `~/.cache/vc3d/spiral`), keyed by the dataset's identity:
+
+```
+<cache>/lasagna/<identity>/normals_g<array>/   nx and ny
+<cache>/lasagna/<identity>/grad_mag_g<array>/  grad_mag
+```
+
+A remote dataset (an `s3://`, `http(s)://` or `sftp://` manifest URL) is
+identified by its URL: `url-` and a digest of the manifest URL, with the scheme
+and host lower-cased and any fragment or trailing slash dropped. Data at a URL
+is taken never to change; re-publishing different arrays at the same URL
+leaves stale packs. Another spelling of the same bucket (an `https://` S3
+endpoint for an `s3://` URL, a mirror) is another dataset.
+
+A local dataset's identity is the `run_uuid` of the manifest's provenance
+record (its `"provenance"` file, e.g. `inference.json`, as published datasets
+carry), else `sha256-` and the SHA-256 of the manifest file; a manifest whose
+named provenance record is missing is refused rather than identified
+differently. A local copy of a remote dataset is a different dataset unless
+you name the URL it was copied from: `pack_resident_pools.py --as <URL>` packs
+it, and an input manifest's `lasagna.original_url` fits it, under that URL's
+identity, so a service fitting the URL finds its packs. Either way a host
+needs only the packs, not the arrays; the packer writes the dataset's source
+document (`lasagna-<identity>.json`, recording its location and, where the
+manifest states it, its frame: `base_shape_zyx`, `source_to_base` and the
+channels' `scaledown`) beside them. The command-line fit derives `lasagna_scale` from that
+frame (see "Input manifest").
+
+The command-line fit builds a missing pool from the arrays (reporting chunk
+progress; in DDP only rank 0 builds). So does a service, by default. A
+shared host whose cache is curated (for example packs built with `--ct`
+masking, which a service's build does not apply) can refuse to build them
+instead, requiring prepared packs:
 
 ```sh
-python pack_resident_pools.py <dataset>/lasagna_inputs \
-    --what normals,grad_mag --normal-group 2
+python spiral_service.py --object-store /path/to/store --output /path/to/output \
+    --cache ~/.cache/vc3d/spiral --require-prepared-lasagna-packs
 ```
 
-The packer looks for `*_nx.ome.zarr`, `*_ny.ome.zarr` and `*_grad_mag.ome.zarr`
-in that folder and writes `<store>.respool_g<group>_pair` (normals) and
-`<store>.respool_g<group>` (grad_mag) next to them. Without the sidecars the fit
-stops at input loading with
+The project supplies the dataset identity, array paths and scale. Missing packs
+are built from accessible local arrays, or from HTTP(S) ones, with shared
+packing locks and progress reporting, before link refresh or replacement of the
+resident fit. Checkpoint resumes prepare missing packs too, retaining their
+recorded input position. Existing packs are reused without needing the source
+arrays. A packing failure leaves the resident session intact. The same default
+extracts missing fiber-direction samples (see "Fiber direction samples"). A fit
+request cannot change it.
 
-```
-lasagna normals: resident-pool sidecar '.../PHercXXXX_nx.ome.zarr.respool_g2_pair' not found; build it with pack_resident_pools.py ...
+A remote Lasagna dataset (an open-data one, or any whose arrays are on S3)
+reaches a service on VC3D's host as its arrays' directories in VC3D's remote
+cache. Before a build, VC3D fetches every object of the arrays whose packs the
+service's cache lacks into those directories (logging its progress), so the
+service packs them like local arrays; once packed, the cached arrays are no
+longer read.
+
+A service on another host is given the arrays' URLs. It fetches each array
+whole, through vc_reader (`download_prefix`), into its cache beside the pack
+it builds (`<pack>.arrays/`, in vc_reader's cache layout), packs it, and
+removes the copy; an interrupted fetch resumes from the objects already
+there. Only arrays whose objects S3 lists can be fetched: `s3://` locations
+(anonymous for open data; otherwise with the AWS credentials of the
+service's environment) and virtual-hosted Amazon S3 URLs
+(`https://<bucket>.s3[.<region>].amazonaws.com/...`, read anonymously). The
+copy needs the arrays' full size on the service host's disk while the pack
+is built.
+
+For a service launched with `--require-prepared-lasagna-packs`, or arrays it
+cannot fetch (plain HTTP servers, which do not list), pack where the arrays
+are and copy the packs over:
+
+```sh
+python pack_resident_pools.py /path/to/dataset.lasagna.json \
+    --as https://example/dataset.lasagna.json \
+    --cache ~/.cache/vc3d/spiral --what normals,grad_mag
+rsync -a ~/.cache/vc3d/spiral/lasagna/<identity>/ service-host:<cache>/lasagna/<identity>/
 ```
 
 The packer only iterates over chunk files that exist, so a store that holds only
@@ -394,10 +795,15 @@ VC3D connects to a Spiral service in one of three modes, all speaking the same
 authenticated HTTP protocol:
 
 - **Localhost** — VC3D launches and owns the service on loopback. Nothing to
-  set up beyond the Python environment; the dataset (plus optional output and
-  cache roots) is chosen in the connection panel and VC3D launches the bound
-  service with those values. Selecting a different dataset restarts the owned
-  service — one service instance is bound to one dataset.
+  set up beyond the Python environment; the optional output, cache and
+  winding-inference paths are chosen in the connection panel and VC3D
+  launches the service bound to the project's store with those values: local
+  Lasagna arrays, and remote ones VC3D first caches in full, are packed
+  automatically on first use. Changing a
+  binding restarts the owned service.
+  Automatic service startup waits until you first open the Spiral workspace.
+  If no project is open then, it waits for the project's store. Disconnect
+  cancels that wait; revisiting the workspace does not reconnect it.
 - **Remote (SSH)** — the supported internet flow. SSH access to the host is
   the only client-side prerequisite: VC3D opens and manages its own SSH
   tunnel, reads the service's auto-generated API key over SSH, and attaches to
@@ -407,14 +813,181 @@ authenticated HTTP protocol:
   service's auto-generated API key. No reverse proxies, VPNs, or manual
   tunnels are ever required.
 
-In every mode the service — not the client — owns the base inputs: it is
-launched with `--dataset` (inputs) and `--output` (all generated state),
-resolves the dataset once at startup, and advertises the result through
-`/dataset`. `--output` must resolve outside the dataset root; the optional
-`--cache` (derived host caches) defaults to the documented user cache,
-`$XDG_CACHE_HOME/vc3d/spiral` (`~/.cache/vc3d/spiral`). Clients can add
-ephemeral inputs, commit them, and change run parameters, but cannot repoint
-the session at different host paths.
+In every mode the service — not the client — owns the host paths: it is
+launched with `--object-store` (patches, point collections, fibers, tracks and
+their links; see [Object-store inputs](#object-store-inputs)), `--output` (all
+generated state), the optional `--cache` (derived host caches; default
+`$XDG_CACHE_HOME/vc3d/spiral`, i.e. `~/.cache/vc3d/spiral`) and the optional
+`--winding-inference` (below), resolves them once at startup, and advertises
+them through `/bindings`. There is no dataset: the scroll's facts, the
+umbilicus, the Lasagna dataset and the fiber-inference dataset come from the
+client's project with each session request (below); the outer shell is the
+store's surface tagged `spiral-outer-shell`. Clients change run parameters
+but cannot repoint the session at other host paths or another object store;
+a request naming any input path other than a checkpoint is refused.
+
+`--winding-inference PATH` binds the winding-inference artifact (the crossing
+directory holding its `manifest.json`; see "Neural winding-inference
+losses") that winding-model supervision reads directly from that host path.
+It is a supervision input, not a cache and not a VC3D project asset: VC3D
+never downloads or interprets it, and no client can override it. `/bindings`
+reports whether it is bound and usable (`bindings.winding_inference`:
+`bound`, `path`, `available`, `error`; `capabilities.winding_inference`), so
+VC3D can say whether winding-model supervision can run. A fit enabling it
+without a usable binding fails preparation, leaving any resident fit as it
+was. Changing the binding means restarting the service and preparing a new
+fit. A named path that is not a directory refuses the launch.
+
+### The VC3D project's inputs
+
+A service session fits the VC3D project that asks for it. The project file
+is VC3D's and need not be readable on the service's host, so every initialize
+and rebuild carries a `project` block (`fit_session.SpiralProject`):
+
+- the project's name;
+- its selected Lasagna dataset as VC3D's manifest reader resolves it: its
+  identity (see "Lasagna inputs must be packed first"), the OME-Zarr stores
+  of the `nx`, `ny` and `grad_mag` channels (one-channel arrays sharing one
+  array name, e.g. `s_nx.ome.zarr/4`; local paths or remote locations), or
+  why the fit cannot read it (an unreadable dataset, multichannel arrays).
+  The fit and its startup link refresh read the identity's pools from the
+  service's cache, never the stores;
+- for each store volume its volumes' annotations are kept in (a catalog
+  volume once, whatever its working level): the facts the project knows
+  exactly (`voxel_size_um`; a catalog volume's `z_direction_is_top_to_bottom`,
+  `left_handed_coordinates` and full-resolution `base_shape_zyx`), the
+  Lasagna arrays' downsampling relative to its voxels (`lasagna_scale`, from
+  the manifest's `source_to_base`, scaledown and base shape and the volume's
+  shape) and its umbilicus from the project's umbilicus store (`uuid`,
+  `generation`, `version`, `points_zyx` in the volume's own voxels).
+
+The fit volume is the one the selection's objects name (a checkpoint resume:
+the one its inputs were read in). The build fits that project volume:
+
+- **Scroll.** The volume's facts and the project's name. Where the volume's
+  orientation is unknown (a volume outside the catalog) the fit setting
+  `spiral_outward_sense` (the Spiral panel's *Outward sense*) gives the
+  sense; where it is known, a setting that disagrees is refused.
+- **Lasagna.** The project's selected dataset, local or remote, by its
+  identity: the service writes it as `project-inputs/lasagna-<identity>.json`
+  (the file the fit reads) and loads its pools from its cache at the volume's
+  `lasagna_scale` (see "Lasagna inputs must be packed first"). A fit whose
+  losses need normals or gradient magnitudes the project cannot give, or
+  whose pools the cache lacks, is refused before anything is linked. The
+  startup link refresh reads the normals pack too (`normal_pool`); without
+  one in the cache it refreshes fiber links centerline-only, with a warning.
+  The command-line fit builds its normals pack before refreshing.
+- **Umbilicus.** The project's, written under the output directory
+  (`project-inputs/umbilicus-<uuid>-v<version>.json`) as the file the fit reads, at
+  coordinate scale 1.
+
+The service reads no scroll specification or input manifest (those are the
+command-line fit's); winding counts come from the fit configuration. A fit
+volume that is not a project volume, or has no umbilicus, fails the
+preparation and leaves any resident fit as it was. The session's
+`session_request` records `project` (name, volume, its facts, the Lasagna
+dataset, the umbilicus's identity), the resolved `scroll` and `paths` (the
+inputs read by path, the fit volume as `volume_uuid`, and their
+`provenance`: the project and the service's bindings), which checkpoints
+record too. A
+rebuild after the project's volume changed (another umbilicus version, a
+renamed project, another Lasagna dataset) rereads everything.
+
+### Object store, positions and input updates
+
+`--object-store STORE` binds the service to one store location for its lifetime:
+a store file on its host, or the endpoint of the `vc_object_server` serving one
+(a file a server holds is refused; bind its endpoint). `--object-store-author
+NAME` names the author of the links it writes (default `spiral-service@<host>`)
+and `--object-store-link-timeout SECONDS` how long a served store's link refresh
+may take (its server's `--request-deadline`). `object_store_location`,
+`object_store_author`, `object_store_link_timeout_s` and
+`object_store_input_position` are service-owned configuration: `/configuration`
+lists them under `service_owned`, a request that leaves them out or repeats
+the bound values is accepted, and a request naming another value is refused.
+VC3D removes them from saved profiles before sending a request.
+
+**A store file** is shared in place with the clients on the service's host
+(VC3D's project store): there is no copy and no sync, VC3D's saves are in
+the file the service reads, and the store's lock serializes the writers.
+Keep the file on a local disk (SQLite's WAL does not work over network
+filesystems). A client on another host cannot attach it: it drives and
+watches the service over HTTP (builds, runs, previews, diagnostics, the
+input manifest), but has no edits, input overlays or opened commits, and
+VC3D says so once: *"This service's store is local to its host: edits and
+commits need it served (vc_object_server) and attached here."*
+
+**A served store** (`vc_object_server STORE --port PORT`, bound by the
+service as `http://127.0.0.1:PORT` when both run on one host) is attached by
+clients anywhere: VC3D attaches `ssh://host:PORT` (or `http(s)://`), routes
+the Spiral kinds to it, and the whole editing workflow works as on a shared
+file. The link refresh then runs on the server: its `--request-deadline`
+and the service's `--object-store-link-timeout` must both cover the longest
+refresh (minutes for a scroll-sized store), its fiber-patch normal source (a
+Lasagna pack under the service's cache, or a CT path) must be readable by
+the server, and the input summary's `fiber_patch_normals` names the source
+used. A file a server holds refuses the service's writable open: bind the
+endpoint. Read-only opens of such a file still work. See the store's
+[serving instructions](../vc_object_store/docs/hosted.md#serving-a-store).
+
+The service writes only detector links and its commits, only during a
+build, an update or a commit, and is the only detector writer for its
+selection (a command-line refresh of the same store would conflict with it).
+
+```sh
+vc_object_server /data/scroll.vcobj --port 9800 --request-deadline 1800
+python spiral_service.py --output OUT --object-store http://127.0.0.1:9800 \
+    --object-store-link-timeout 1800
+```
+
+Each build (Initialize Fit, a full Rebuild Fit) links and pins a position,
+including at least the request's `inputs_position` (the position a client's
+saved edits reached: `{store, generation, commit_sequence}`, with the
+`request_uuid` of the last save's receipt, which the service's store must
+hold; a position of another store or generation, past the head, or whose
+receipt the store lacks is refused), before tearing anything down: a failure there leaves
+the resident fit untouched and is reported in `input_preparation_error`. A
+checkpoint resumes at the position it recorded. A model-only rebuild keeps the
+position. `POST /session/update-inputs {"inputs_position", "expected_input_generation"}`
+updates a resident fit in place: the service links and pins a position, then
+every rank reads it, prepares its inputs without touching resident state,
+releases the old inputs' device state and installs the new ones at an
+iteration boundary. The model, optimiser, scheduler and iteration are kept;
+status reports `input_update` while one runs and `input_generation`
+afterwards. A refusal (while linking or preparing, on any rank) leaves the fit
+as it was; a failure after the release fails the session
+(`input_preparation_error.recovery_required`): rebuild it or load a
+checkpoint.
+
+Tracks and their crossings are consumed at build. If either changes, an
+input update is refused: use **Rebuild with Current Inputs**. The same
+applies to outer-shell changes and to input updates while tracks use
+trusted-geometry exclusion (`track_exclusion_radius > 0`).
+
+Between builds and updates the inputs are frozen: runs, pauses, checkpoint
+loads and model-only rebuilds keep them, and `POST /session/rebuild {"inputs":
+"reload"}` (VC3D: *Rebuild Fit* → *Rebuild with Current Inputs*) rereads the
+store. Without `"inputs"` a rebuild that changes only model configuration
+keeps the inputs and one that changes anything else rereads them; the
+response's `inputs` says which happened.
+
+Status carries `input_digest` (the content digest of the fit's selection),
+`input_summary` (counts per kind and relationship, the volume, whether links
+were refreshed and which fiber-patch normal source they used) and
+`input_position` (store, generation, commit_sequence, the requested position,
+the head it was linked at, and where it came from). Every build and update
+publishes the selection, with each object's and relationship's version pins,
+as an `input_manifest` artifact
+(`object_store_inputs.json`). Previews, the preview index and autosave
+metadata record the digest and position of the inputs they were made from. A
+checkpoint whose recorded inputs differ from the session's is refused with the
+differences, the `{"inputs": "reload"}` remedy and the
+`object_store_allow_changed_inputs` override.
+
+Only one client changes a session at a time: mutating requests carry the
+`X-Spiral-Session-Token` of the client holding the session lease
+(`/session/lease/claim`, `/session/lease/release`), and one service holds the
+lease file under its output directory. Uploads accept resume checkpoints only.
 
 ### Creating the Spiral Python environment
 
@@ -427,8 +1000,7 @@ uv sync            # creates .venv from pyproject.toml
 ```
 
 This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
-`vc_spiral.track_crossings`, `vc_spiral.track_store`, and
-`vc_spiral.surface_index`. OpenMP is used when the toolchain provides it; the
+`vc_spiral.track_crossings` and `vc_spiral.track_store`. OpenMP is used when the toolchain provides it; the
 same modules build with serial kernels when it does not.
 
 or with conda/pip, install `torch` for your CUDA version and then
@@ -460,40 +1032,41 @@ or `uv run` would reinstall the CUDA build of torch and the `cuda` group.
 ### Resident sparse field pools
 
 Normals and gradient magnitude samples are served by fully
-resident device brick pools. Each store's occupied bricks are packed once
-into a flat sidecar next to the source zarr by `pack_resident_pools.py`:
+resident device brick pools. Each pack's occupied bricks are packed once
+into the fit's cache by `pack_resident_pools.py` (see "Lasagna inputs must be
+packed first" for the layout):
 
 ```sh
-python pack_resident_pools.py /path/to/lasagna_inputs \
+python pack_resident_pools.py /path/to/dataset.lasagna.json --cache <cache> \
     --ct /path/to/<scroll>_ds2.zarr --ct-group 2 --verify 2000
 ```
 
 `--ct` zeroes every voxel whose CT voxel reads 0 (the mask region around the
 scroll) so those bricks drop out of the pool and sample as no-data. The
-fitter loads the sidecars restricted to the configured z-ROI in one
+fitter loads the pools restricted to the configured z-ROI in one
 sequential read per channel (for the full s1 ROI: ~10 GiB normals); after
 that every gather is pure device indexing with no I/O and no
-eviction. When a required sidecar is missing, the fitter builds it before GPU
-loading and reports chunk progress. In DDP runs only rank 0 builds it. Manual
-prepacking with `--ct` remains useful because the CT mask can substantially
-reduce the resident pool size.
+eviction. When a required pool is missing, the command-line fitter builds it
+before GPU loading and reports chunk progress. In DDP runs only rank 0 builds
+it. Manual prepacking with `--ct` remains useful because the CT mask can
+substantially reduce the resident pool size.
 Set `FIT_SPIRAL_RESIDENT_BOUNDS_CHECK=1` to enable per-gather bounds
 assertions when debugging new sampling code.
 
 ### Internet flow (SSH attach)
 
-Start a persistent loopback service on the GPU host with its dataset. Give
+Start a persistent loopback service on the GPU host with its store. Give
 each independently operated service a stable session name, port, and GPU.
 Nothing is exposed on the network; VC3D tunnels to it over SSH:
 
 ```sh
 tmux new -s spiral-alice 'python spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
-    --gpus 0 --session-name alice'
+    --object-store /data/scrolls/s1.vcobj \
+    --output /data/spiral-output/s1 --gpus 0 --session-name alice'
 
 tmux new -s spiral-bob 'python spiral_service.py --port 8766 \
-    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
-    --gpus 1 --session-name bob'
+    --object-store /data/scrolls/s1.vcobj \
+    --output /data/spiral-output/s1 --gpus 1 --session-name bob'
 ```
 
 The service uses only physical CUDA device `0` by default. Select a different
@@ -502,19 +1075,20 @@ host-side list:
 
 ```sh
 python spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 --gpus 0,1,2,3
+    --object-store /data/scrolls/s1.vcobj \
+    --output /data/spiral-output/s1 --gpus 0,1,2,3
 ```
 
 Multi-GPU sessions run one fitter rank per listed device and split the configured
 per-step sample counts across those ranks by default. The device list is fixed for
 the lifetime of the service; restart it to change the selection.
 
-A named service writes autosaves, previews, artifacts, uploaded checkpoints,
-Lasagna output, and ephemeral inputs beneath `<output>/<session-name>/`, held
+A named service writes autosaves, previews, artifacts, uploaded checkpoints
+and Lasagna output beneath `<output>/<session-name>/`, held
 under an exclusive lease: two live services cannot own the same
 output/session-name pair. Launches without `--session-name` use `<output>/`
-directly. Permanent dataset inputs and the shared user cache stay untouched —
-nothing generated is ever written under the dataset root.
+directly. Bound inputs (the winding-inference artifact) and the shared user
+cache stay untouched.
 
 Every completed Spiral preview is flattened by the host's Lasagna service
 before it becomes downloadable in VC3D. The published grid uses a fixed
@@ -567,7 +1141,8 @@ attached terminal is not disconnected.
 
 ```sh
 python spiral_service.py --bind 0.0.0.0 --port 8765 \
-    --dataset /data/scrolls/s1 --output /data/spiral-output/s1
+    --object-store /data/scrolls/s1.vcobj \
+    --output /data/spiral-output/s1
 ```
 
 Copy the API key printed at startup into the *Remote (LAN)* profile's API key
@@ -590,50 +1165,103 @@ validation and never ignores certificate errors.
   ready line — the console print at startup is the intended way to obtain it.
 - `--nonce` is only for processes launched and owned by VC3D.
 
-### Datasets, output, and cache
+### Bindings, output, and cache
 
-`--dataset` must point at a dataset root containing at least `umbilicus.json`
-and `spiral-scroll.json`; the service refuses to start when either is missing.
-Verified patches are required when their default-on input toggle is active,
-but a patch-free fit can initialize with that source disabled. The dataset
-holds inputs only.
+A service has no dataset. `--dataset` is refused with migration guidance:
+geometry comes from `--object-store`, the scroll's facts, umbilicus, Lasagna
+and fiber-inference datasets from the VC3D project, and winding inference
+from `--winding-inference`. `GET /bindings` advertises the host bindings
+(`bindings.output_directory`, `cache_directory`, `winding_inference`), the
+capabilities, the bound store and its selection, and the checkpoints under
+the output directory that a load may name. Reading a large store's selection
+can take minutes, so `/bindings` never waits for it: until the background read
+for the store as it stands finishes, `inputs` is `{"pending": true}`; ask again
+for the summary.
 
-`--output` is required and must resolve outside the dataset root. Every piece
+`--output` is required. Every piece
 of generated state — run directories, autosaves, previews, published
-artifacts, ephemeral inputs, upload staging, and uploaded checkpoints — lives
+artifacts, upload staging, and uploaded checkpoints — lives
 under it (under `<output>/<session-name>` for a named service). Make sure its
 filesystem has room for checkpoints and previews.
 
 `--cache` holds derived host caches (content-addressed, shareable between
-datasets). It defaults to `$XDG_CACHE_HOME/vc3d/spiral`
-(`~/.cache/vc3d/spiral`) and must also resolve outside the dataset root. The
-headless `fit_spiral.py` CLI accepts the same `--cache` with the same default
+scrolls): prepared Lasagna packs and fiber directions, selected by the
+project's datasets' identities. It defaults to `$XDG_CACHE_HOME/vc3d/spiral`
+(`~/.cache/vc3d/spiral`). The winding-inference artifact is never read
+through it. The headless `fit_spiral.py` CLI accepts the same `--cache` with the same default
 (`FIT_SPIRAL_CACHE_DIR` still overrides it for the CLI).
 
-If the dataset root is read-only the fit still works, but *Commit current
-inputs* is unavailable (committing writes inputs into the dataset).
+The service never writes its bound inputs; its only store writes are the
+link refreshes, as `--object-store-author`.
 
 ### Connecting from VC3D
 
 Open the Spiral workspace and pick the profile in the *Spiral Service*
-section. For the local profile, set the dataset root (and optionally output
-and cache roots) there — VC3D launches its owned service bound to those
-values. Connection must succeed (an authenticated `/health` handshake and an
-API-version check) before session controls enable. The base-input rows always
-populate read-only from the service's advertised dataset resolution; run
-parameters (z range, iterations, advanced config) stay editable and persist
-per profile. Generated previews, geometry, and
-checkpoints transfer through the artifact API into a local cache — no shared
-filesystem is needed. Optional: set the profile's **Local dataset path** if
-this machine mounts the same dataset, so input surface overlays
-(verified patches/shell) can be displayed locally. It is assumed to
-correspond to the dataset root the service advertises, which is the prefix
-service paths are translated from; without it those overlays are simply marked
-unavailable.
+section. For the local profile, optionally set output, cache and
+winding-inference paths there — VC3D launches its owned service bound to the
+project's store and those values (an empty output defaults to a directory per
+store under VC3D's data directory). A remote service's bindings are set on
+its host. Connection must succeed (an authenticated `/health` handshake and
+an API-version check) before session controls enable. The output and cache
+rows populate read-only from the service's `/bindings`, and the panel says
+whether winding-model supervision can run there; run parameters (z range,
+iterations, advanced config) stay editable and persist per profile.
+Generated previews, geometry, and checkpoints transfer through the artifact
+API into a local cache — no shared filesystem is needed.
 
-`spiral-scroll.json` in the dataset root is the only source of the scroll's
-name and voxel resolution and of the Lasagna store layout (zarr groups,
-coordinate scale). None of them are panel settings: the panel reports them
+The fit's patches, point collections and fibers are displayed from an
+object store attached to the VC3D project, never from service files: the
+store the project routes surfaces, fibers and point collections to (*File >
+Stores > Show Surfaces From*, and so on). Spiral needs all three routed to
+one store; when the routes differ or are unset it has none. A local profile
+launches its service with `--object-store` set to that store; for a remote
+profile, attach the store the service was started with (served by
+`vc_object_server`, as `ssh://host:port`) and route the three kinds to it.
+The panel's *Object store* row compares the store UUIDs and history
+generations: when they differ, or there is no such store, the fit's inputs
+are not displayed. When they match, VC3D downloads
+the session's input manifest and shows each fitted surface, collection and
+fiber as the attached store holds it now: the store is edited live, and a
+commit that touches a fitted input or link updates just that input's overlay
+and the notes, so they agree with the rest of VC3D. The resident fit does not follow. *Fit
+inputs* lists the digest, the counts per kind and the links, and notes what
+differs from what the fit read: inputs no longer in the store, inputs edited
+or with other metadata, fitted links that changed or would no longer be
+consumed, links among the fitted inputs that were not fitted, and other store
+changes a rebuild's selection may include; *Rebuild Fit* reads them.
+*Show fitted fibers* in Display draws the fit's fibers on the plane views,
+within the point view tolerance of the slice.
+
+A local profile launches its service on the project's store, a file shared
+in place or the endpoint of the `vc_object_server` the project attached, so
+saved edits are already where the service reads them and *Update Fit
+Inputs* names the store's head. A remote profile attaches the service's
+store over `ssh://host:port` (the service advertises its location and
+whether it is served). When the service's store is a file on its host, the
+panel says so once (edits and commits need it served and attached here);
+*Update Fit Inputs* still runs there, without a position: it reads the
+service host's current head, and the edits saved here are not in it.
+
+Edits are saved into the store, not into the fit. *Save Drafts to Store*
+(Shift+E) writes the ready brush patches (new surfaces tagged
+`spiral-brush`, in the preview's frame of the fit volume, or new versions of
+ones saved earlier) and point-collection edits (fitted collections keep their
+objects and point ids) as checked writes, each expecting the version its
+edit started from. *Update Fit Inputs* updates an idle fit in place at a
+position including those edits (initializing one when there is none,
+rebuilding a failed one): the position the last save's receipt reached,
+which the service verifies is in its own store. A receipt the store lacks
+is refused (edits saved into a copy of the store with the same UUID and
+generation); the check does not catch a copy that shares the receipt, or
+a client that reopened without saving and so sends none. It reports the
+commits that position includes beyond
+the request and those after it, which show as stale. *Save and Update Fit
+Inputs* does both. The run panel's position summary shows unsaved drawings,
+a position being linked, and the position the fit reads.
+
+The VC3D project is the only source of the scroll's name and voxel
+resolution and of the Lasagna dataset (its arrays and scale). None of them
+are panel settings: the panel reports them
 read-only, and the service rejects a session request that carries
 `scroll_name`, `voxel_size_um`, `lasagna_group` or `lasagna_scale`.
 
@@ -653,133 +1281,64 @@ the outer shell. For example:
 }
 ```
 
-Most role switches require a whole-fit rebuild; same-winding and relative PCL
-switches apply at the next Run. Disabled roles retain their accepted workspace
-content, and enabling a role restores that desired content. Disabling a
-prerequisite also disables its dependent supervision: winding inference
-needs the outer shell.
+Every role switch requires a whole-fit rebuild: the switches select the
+fit's frozen object-store inputs, and a disabled role's store content is
+simply not selected. Disabling a prerequisite also disables its dependent
+supervision: winding inference needs the outer shell.
 
-The API 33 client and service use one revisioned input workspace per dataset.
-One service holds the dataset editing lease and one client owns that workspace;
-other connections can observe. Disconnecting retains ownership, drafts and
-command receipts. Reconnect with the same client resumes them. A fit rebuild
-replays desired inputs without replacing the editing workspace. Reconnect and
-rebuild also discover newly added dataset inputs, preserving their collection
-IDs and any existing workspace edits. A restarted service replaces a clean
-client catalog; pending edits or commands stay tied to their original workspace.
-
-**Add/Apply changes** captures the selected local revisions and applies the
-whole validated batch at a worker boundary, including while idle or after the
-final step. **Commit current inputs** first applies the selected revisions,
-then persists those exact revisions. Editing can continue during either action;
-a response for an older revision leaves newer edits dirty. Failed transfers or
-publication can be retried with the retained command and bytes.
+Patches, point collections and fibers cannot be added to or edited in a
+resident fit from VC3D: *Add* and *Commit* stay disabled and say why. Edit
+them in the store and rebuild with current inputs. The drawing tools below
+still work and keep their drawings in VC3D, listed as local drafts in the
+input list (Remove discards one), for store-backed editing to submit; leaving
+the workspace with drawings asks before discarding them.
 
 In the flattened Spiral preview, tap `Ctrl` to toggle patch painting: left-drag
 paints, right-drag erases, and `Escape` exits. Ctrl+wheel changes brush size
 without toggling the mode; Shift+right-drag draws control-point lines. Starting
 a stroke on a session-drawn selection extends that patch in its original color.
-Drawn selections remain brush-editable after Apply and Commit, including across
-preview updates when their original surface can be projected onto the new one.
-Finalization keeps the largest edge-connected component of complete quads;
-selections with no complete quad remain editable and report an error.
-
-Drawn patches use the same editing workspace as other inputs. Add/Apply and
-Commit capture their current selections; an edit made while an older snapshot
-is being saved stays dirty. Erasing a previously staged patch completely stages
-a deletion on the next Add/Apply. The input list shows local brush errors and
-colors; Remove on a local brush edit discards that edit. Dataset patches use
-the existing managed patch editor.
+Drawn selections remain brush-editable across preview updates when their
+original surface can be projected onto the new one. Finalization keeps the
+largest edge-connected component of complete quads; selections with no
+complete quad remain editable and report an error.
 
 Brush regression checks use the existing build and Python environment:
 
 ```bash
-AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D test_spiral_brush_patch test_spiral_input_workflow test_spiral_input_draft test_spiral_point_placement_mode test_spiral_point_collection_edit -j 4
-AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_(brush_patch|input_workflow|input_draft|point_placement_mode|point_collection_edit)$' --output-on-failure
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D test_spiral_brush_patch test_spiral_point_placement_mode test_spiral_point_collection_edit -j 4
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen ctest --test-dir volume-cartographer/build -R '^spiral_(brush_patch|point_placement_mode|point_collection_edit)$' --output-on-failure
 ```
 
 Set `SPIRAL_PATCH_REAL_INPUT` to a real tifxyz patch directory to include the
-read-only selection check and draft-copy validation. `SPIRAL_PATCH_EVIDENCE_DIR`
+read-only selection check. `SPIRAL_PATCH_EVIDENCE_DIR`
 optionally receives before/after selection-mask images. These checks cover CPU
 geometry and the editing workflow; they do not run GPU fitting.
 
 In the Spiral workspace, `Q` and `E` place same-winding and relative-winding
 points. Relative annotations count 0, 1, 2, ... in placement order; `F` reverses
-the chain and mirrors annotations. Existing collections remain editable after
-Apply. Shift+E prepares local drafts. Managed patch and fiber editors save to
-session working copies; successful saves update drafts and do not apply or
-commit automatically. Linked-fiber saves use working copies for their peers.
+the chain and mirrors annotations. Shift+E marks local drafts ready.
 
-The input list includes baseline dataset entries and additions, with a filter
-and selection checkboxes. Edit, Remove, Restore, Retry and Discard Local Changes
-operate on individual drafts. Applying Remove stops future supervision;
-Commit deletes the managed dataset entry. Restore remains available before
-committing a deletion. Baseline restores reference the retained service revision
-and do not require access to the service filesystem. Removal cannot reverse
-completed optimizer steps.
-Invalid selected drafts keep the batch unapplied and remain editable. Scoped
-external-source conflicts offer Use Current, Apply Local After Review, or Save
-Local as New; unrelated PCL collection changes are merged during publication.
-
-Editing workspaces are disposable session storage. **Discard and Exit** drops
-local drafts and releases the workspace directly. **Commit** exits only after
-publication succeeds, then releases temporary copies. Release and service
-shutdown stop file users and remove the entire `editing-workspaces/<id>`
-directory, including baseline snapshots, revisions and uploads. Reconnect,
-Stop, and Rebuild keep the workspace and its drafts. The next claim snapshots
-only committed dataset inputs.
-
-New workspaces carry versioned ownership metadata and a lifetime advisory lock.
-Startup reclaims marked directories whose owner has exited, including after a
-crash or forced termination. Live owners, symlinks, unrecognized markers and
-legacy folders without markers are left untouched; legacy storage requires
-manual cleanup. Dataset inputs, saved fit outputs, exports and shared caches
-are preserved. Interrupted Commit recovery directories (`.spiral-publication-*`
-beside dataset targets) are retained and their paths logged. Cleanup errors are
-reported with the workspace path; when a reader or worker cannot stop, files
-and ownership remain intact for a release retry or later startup reclamation.
-
-Cleanup regression checks (no installation needed):
+Protocol and acceptance checks for the store-backed service (from the
+repository root; `vc_object_store`'s Python module on `PYTHONPATH`):
 
 ```bash
-AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting:<store-build>/python spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_service_object_store.py \
+  spiral-fitting/tests/test_runtime_object_store.py \
+  spiral-fitting/tests/test_service_commits.py \
+  spiral-fitting/tests/test_object_store_hosted.py \
+  spiral-fitting/tests/test_service_mutations.py \
   spiral-fitting/tests/test_workspace_cleanup.py \
-  spiral-fitting/tests/test_service_editing.py \
-  spiral-fitting/tests/test_service_editing_http.py \
   spiral-fitting/tests/test_spiral_service_v2.py
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target test_spiral_store_inputs test_spiral_service_protocol -j 4
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" \
+  PYTHONPATH=<store-build>/python ctest --test-dir volume-cartographer/build -R '^spiral_' --output-on-failure
 ```
 
-Set `SPIRAL_REAL_PCL=/path/to/real/abs_winding.json` for the real-scroll
-close/reopen check. It edits a temporary dataset copy and verifies that both the
-source bytes and committed copy remain unchanged; it uses a resident test double
-and does not run GPU fitting.
-
-Regression checks for this workflow (using existing environments/builds):
-
-```bash
-# From the repository root:
-AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python -m pytest -q \
-  spiral-fitting/tests/test_service_editing.py spiral-fitting/tests/test_service_editing_http.py \
-  spiral-fitting/tests/test_revisioned_runtime.py spiral-fitting/tests/test_revisioned_geometry.py
-AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build test_spiral_input_draft test_spiral_input_workflow -j 2
-AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_input_(draft|workflow)$' --output-on-failure
-```
-
-The workflow tests start a loopback HTTP service and cover remote baseline
-restore, service restart, and edits made while a submission is running.
-The service suite includes transfer, revision, conflict, and publication recovery
-checks; runtime and geometry tests cover worker boundaries and supervision.
-For the retained CUDA check on temporary copies of a real dataset patch:
-
-```bash
-AGENTS_AGENT_MODE=1 SPIRAL_REVISION_LIVE_DATASET=/path/to/dataset \
-  SPIRAL_REVISION_PATCH=patch-directory-name \
-  spiral-fitting/.venv/bin/python -m pytest -q spiral-fitting/tests/test_revisioned_live_fit.py
-```
-
-Input uploads only transfer immutable bytes. The editing workspace owns
-acceptance, application, and persistence; there is no separate ephemeral-input
-ledger or automatic commit on editor save. Checkpoint uploads remain service-scoped.
+`spiral_service_protocol` starts `spiral_service.py` on a real store (its
+runtime faked by `tests/protocol_client_service.py`) and drives
+`SpiralServiceManager` through the lease, store binding, input manifest and
+reload rebuild; it is skipped without `SPIRAL_TEST_PYTHON`.
 
 Directional DT timing is an independent control on every interactive Run.
 When **Restrict DT losses to final** is unchecked, the Run adds no DT gate.
@@ -793,17 +1352,9 @@ does not recalculate the original window. The schedule is transient Run state,
 not advanced configuration or checkpoint state, and is cleared before the
 Run's autosave.
 
-Input-local validation failures reject the entire selected candidate without
-changing active supervision. Distributed ranks prepare the same candidate and
-must all agree before installation. Unexpected worker/device failures retain
-fail-stop behavior. Publication prepares all outputs before changing targets;
-a failure after publication starts retains the transaction and queues later
-mutations behind recovery. Recovery covers the running service, not crashes,
-and does not promise atomic visibility across multiple dataset files.
-
 **Checkpoints** are one panel section, and loading one is one button. It lists
-what the service advertises (checkpoints at the dataset root, and those under
-the output directory such as the autosave) plus any **client-local `.ckpt`**
+what the service advertises (checkpoints under its output directory, such as
+the autosave) plus any **client-local `.ckpt`**
 you browse for; a local file is uploaded to the service's
 `<output>/uploaded-checkpoints/` directory on the way (the panel shows
 progress and the transfer restarts if interrupted). Checkpoints are identified
@@ -820,10 +1371,10 @@ from-scratch action.
 With an existing fit, *Load* replaces the resident model's weights, optimiser
 and RNG state in place. When the checkpoint does not match the live model the service refuses
 it and says what a rebuild would have to replace: rebuilding the **model only**
-keeps the loaded dataset inputs and everything already added to the fit, while
-a **whole-fit** rebuild re-reads the dataset and replays the workspace's desired
-revisions, including uncommitted additions. The panel reports the reasons and asks; a checkpoint no
-rebuild can accept — one written against another dataset, or whose stored
+keeps the frozen inputs, while a **whole-fit** rebuild re-reads the project's
+inputs and the object store. A checkpoint fitted to other store inputs is refused with
+the differences and the reload rebuild as the remedy. The panel reports the reasons and asks; a checkpoint no
+rebuild can accept — one whose inputs are in another volume, or whose stored
 configuration holds a value the schema cannot interpret — is reported and
 nothing is offered. A checkpoint-backed session takes its durable configuration
 from the checkpoint, so the local advanced-config profile does not override it.
@@ -870,7 +1421,8 @@ Description=VC3D Spiral fitting service
 WorkingDirectory=%h/villa/spiral-fitting
 ExecStart=%h/villa/spiral-fitting/.venv/bin/python \
     %h/villa/spiral-fitting/spiral_service.py \
-    --port 8765 --dataset /data/scrolls/s1 \
+    --port 8765 \
+    --object-store /data/scrolls/s1.vcobj \
     --output /data/spiral-output/s1 --gpus 0
 Restart=on-failure
 
@@ -1009,21 +1561,19 @@ python convert_track_store.py \
 
 This writes `2um_ds2_ps256_surf_v2.dbm.vctracks/` atomically. The directory
 contains contiguous coordinates, ragged offsets, source IDs, family codes,
-Z bounds, arclengths, and tortuosities. `fit_spiral.py` automatically prefers
-a current adjacent packed store while retaining the DBM as the authoritative
-source and compatibility fallback. A source-file fingerprint prevents a stale
+Z bounds, arclengths, and tortuosities. It is what `vc_object_ingest --tracks`
+imports into an object store (fits read tracks only from there), while the DBM
+stays the authoritative source. A source-file fingerprint prevents a stale
 store from being used after the DBM changes; rerun with `--force` to replace it.
-
-The native `vc_spiral.track_store` loader memory-maps the packed files, applies the Z
-ROI from per-track metadata, and emits one compact float32 ragged array without
-constructing per-track Python objects. The crossing builder also stages
-directly from a current packed store, bypassing DBM and pickle decoding.
+The crossing builder below also stages directly from a current packed store,
+bypassing DBM and pickle decoding.
 
 ## Caching exact track crossings
 
-Crossing-connected track sampling needs the exact shared voxels between the
-horizontal and vertical track families. Build that index once as a CSR
-sidecar instead of sorting every track point whenever a fit session loads:
+A fit takes its track crossings from the object store (its link refresh runs
+the store's track-crossing detector, which uses the same exact-crossing
+kernel). `grow_track_graph.py` instead reads them from a CSR sidecar beside
+the DBM; build it once:
 
 ```sh
 python build_track_crossings.py \
@@ -1052,15 +1602,10 @@ the temporary workspace is created beside the tracks DBM rather than under the
 system temporary directory.
 
 The script writes
-`/data/tracks/2um_ds2_ps256_surf_v2.dbm.crossings.npz` atomically.
-`fit_spiral.py` finds it automatically from the configured tracks path. The
-sidecar includes a fingerprint of every DBM backing file; a stale or malformed
-file is ignored and the fitter falls back to its in-memory exact crossing
-scan. Re-run the builder after changing the DBM (`--force` replaces a current
-cache). A range-limited sidecar can serve the same or a narrower fitting Z
-range; building another range replaces it. Point-level track exclusion also
-uses the fallback because clipping a
-track changes its crossing-local indices.
+`/data/tracks/2um_ds2_ps256_surf_v2.dbm.crossings.npz` atomically. The
+sidecar includes a fingerprint of every DBM backing file, so a stale one is
+rebuilt rather than reused. Re-run the builder after changing the DBM
+(`--force` replaces a current cache); building another range replaces it.
 
 ## Converting track DBMs to OME-Zarr
 
@@ -1091,8 +1636,9 @@ commands.
 ## Neural winding-inference losses
 
 Set `dense_spacing_mode` to `winding_model` and provide the compact exported
-crossing directory at the conventional `<dataset>/winding_inference` path or
-override `paths.winding_inference` in `spiral-scroll.json`. Two vocabularies
+crossing directory: the input manifest's `winding_inference` for a
+command-line fit, the service's `--winding-inference` binding for a service
+fit (read directly from that host path; never through the cache). Two vocabularies
 deliberately coexist: `winding_model` names the fitting mode and its tunables
 (`sample_count_winding_model_*`, `winding_model_relative_pair_delta`,
 `winding_model_huber_delta`, the `dense_spacing_winding_model_*` losses),
@@ -1112,10 +1658,11 @@ The compact store is created by the Vesuvius winding-model
 `export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
 exact export command and format.
 
-For a headless fit, pass the dataset root with `--dataset` and select inference
-mode (plus any independently disabled losses) through
-`FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the
-declarative input catalog determine which conventional inputs are resolved.
+For a headless fit, name the artifact in the input manifest (`--inputs`) and
+select inference mode (plus any independently disabled losses) through
+`FIT_SPIRAL_CONFIG_OVERRIDES`. The declarative input catalog decides which
+named inputs the configuration requires; a required one the manifest does
+not name, or that is missing, is reported before the fit starts.
 
 To follow a headless fit while it runs, set `FIT_SPIRAL_METRICS_HISTORY` to a
 file path: every 200 iterations the fit appends one JSON line,
@@ -1125,21 +1672,23 @@ file path: every 200 iterations the fit appends one JSON line,
 
 ```bash
 FIT_SPIRAL_METRICS_HISTORY=/tmp/fit_metrics.jsonl \
-  ./.venv/bin/python fit_spiral.py --dataset /path/to/dataset > fit.log 2>&1 &
+  ./.venv/bin/python fit_spiral.py --inputs spiral-inputs.json --object-store dataset.vcobj > fit.log 2>&1 &
 tail -f /tmp/fit_metrics.jsonl
 ```
 
 ## Fiber direction samples
 
 The optional fiber-direction loss consumes one packed artifact extracted from a
-remote Lasagna fiber prediction. Extraction downloads only chunks intersecting
-the requested z ROI and keeps the highest-presence voxel in each fixed
-prediction-space cell:
+Lasagna fiber prediction: a remote manifest URL, or a local manifest whose
+arrays are Zarr v2 directories (VC3D's local copy of an open-data manifest,
+beside its `lasagna-remote.json` marker, reads its remote arrays). Extraction
+reads only chunks intersecting the requested z ROI and keeps the
+highest-presence voxel in each fixed prediction-space cell:
 
 ```bash
 ./.venv/bin/python fiber_direction_samples.py \
   https://example/fibers.lasagna.json \
-  /path/to/dataset/fiber_directions.npz \
+  /path/to/fiber_directions.npz \
   --z-roi 10000,11000 --output-scale 4 \
   --presence-threshold 160 --cell-size 2
 ```
@@ -1148,10 +1697,35 @@ The z ROI is half-open and expressed in the output/fitter coordinate system;
 `--output-scale 4` means one fitter `/2` coordinate is four base `/0` voxels. The
 extractor always covers the fiber volume's complete XY extent.
 
+A fit refuses a z window outside the range an artifact was extracted over
+(its recorded `z_roi`).
+
+A service reads no `fiber_directions.npz` path: it reads the samples of the
+project's selected fiber-inference dataset, by that dataset's identity (see
+"Lasagna inputs must be packed first") and the fit volume's scale, from its
+cache: `<cache>/fiber-directions/<identity>/scale<output scale>.npz`. A service
+extracts missing ones there itself during input preparation, over the
+prediction's whole height, logging its progress (from the remote manifest a
+VC3D copy of an open-data dataset came from, when VC3D names one). For a
+service launched with `--require-prepared-lasagna-packs`,
+extract them over the whole height (no `--z-roi`), or place an existing
+artifact there, and copy the file to the service's cache:
+
+```bash
+./.venv/bin/python fiber_direction_samples.py \
+  https://example/fibers.lasagna.json --cache ~/.cache/vc3d/spiral --output-scale 4
+./.venv/bin/python fiber_direction_samples.py \
+  --adopt /path/to/fiber_directions.npz --cache ~/.cache/vc3d/spiral
+```
+
+A build whose loss needs them, on a service that does not extract them,
+refuses a cache without them before linking.
+
 Both `input_use_fiber_directions` and `loss_weight_fiber_directions` default
 to off/zero; set the toggle true and the weight above zero to enable the
-loss. The fitter then loads the conventional `fiber_directions.npz` artifact
-and samples `sample_count_fiber_direction_points` observations per step.
+loss. The command-line fitter then loads the artifact its input manifest
+names as `fiber_directions` (a service, the cached one) and samples
+`sample_count_fiber_direction_points` observations per step.
 Positions and directions constrain only local fitted-sheet orientation; they
 do not attach a sample to a particular winding.
 
@@ -1210,51 +1784,3 @@ Run-scoped: a Run that changes them refills every retained strip's offsets from
 its stored vertical/horizontal tag and rebuilds the strip bundle and DT target
 caches, so no fit rebuild is needed. VC3D's spiral panel exposes them as a
 checkbox and a voxel distance next to the fibers path.
-
-## Point-to-patch linking
-
-Every point of every point collection (regular PCLs and fibers) is attached to
-the patch surface it lies on when the inputs load, and again for inputs added
-to a running session. A point attaches when a patch surface is within
-`pcl_link_distance_tolerance` scroll voxels (default 2.5). General collections
-take the largest-area patch within tolerance, then the nearest;
-`between_patches__A__B` collections take the nearest of their named pair.
-Every linking setting applies at a Run boundary. The tolerance and window
-settings re-link every resident collection, regular and fiber, from the
-retained catalogs against the resident patches and re-derive all the
-point-collection views (cross-patch groups and unattached strips); the fiber
-side-rule settings below only affect fibers, so they re-link and
-re-materialise the fibers alone.
-
-`pcl_link_window_points` and `pcl_link_window_min_points` (both default 1)
-gate candidates on their neighbours: a patch the point itself lies within
-tolerance of is eligible only when at least `pcl_link_window_min_points` of the
-centred window of `pcl_link_window_points` consecutive points (id order, the
-point included) also lie within tolerance of it. Eligible candidates are ranked
-as usual, largest area then nearest, so a fiber stays on the big patch its
-neighbours share instead of hopping onto a patch only one point touches. Even
-window counts round up to the next odd count, and at a collection's ends the
-requirement is clipped to the window members available. Points already
-attached to a patch count as window members when a session relinks.
-
-`pcl_fiber_link_side_filter` keeps fibers off patches on the wrong side of the
-sheet, which is how a fiber ends up on an adjacent winding when windings touch.
-The front of a sheet faces inward, toward the umbilicus and the neighbouring
-winding with the lower winding number; horizontal fibers lie on that front
-face and vertical fibers on the back. A vertical fiber (classified as described above) therefore only attaches to a patch whose surface is
-in front of it, a horizontal fiber only to one behind it, and untagged fibers
-and regular collections are unrestricted. A hit is rejected when the projection
-foot lies more than `pcl_fiber_link_side_margin_voxels` (default 0.5) on the
-wrong side of the point along the inward direction; the margin absorbs points
-lying on the traced surface itself.
-
-No fitted transform exists when the inputs load, so the inward direction starts
-as the line to the umbilicus at the point's z, which local deformation can turn
-away from the true sheet normal. Once `pcl_fiber_link_model_direction_step`
-steps (default 10000) have completed, whether run in the session or restored
-from a checkpoint, every fiber is relinked once with the inward direction taken
-from the fitted spiral's decreasing-winding direction (the negative scan-space
-gradient of the fitted winding, `fit_spiral.inward_winding_direction`), and the
-fiber training views are re-materialised. A checkpoint from before that step
-loaded after the switch relinks back under the umbilicus direction at its first
-step.

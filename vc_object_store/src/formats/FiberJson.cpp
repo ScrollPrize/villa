@@ -46,7 +46,8 @@ void version3Coordinates(Json& root)
             throw std::runtime_error("invalid version 3 coordinate space: " + space);
         if (space.substr(level) != "@L0" || root.value("vc_open_data_source_coordinate_scale_factor", 1.0) != 1.0)
             throw std::runtime_error("version 3 fiber coordinates are supported only at level 0: " + space);
-        root["coordinates"] = {{"volume_uuid", space.substr(slash + 1, level - slash - 1)}, {"scale_factor", 1}};
+        root["coordinates"] = mergeGeometryCoordinates(root.value("coordinates", Json::object()),
+            {{"volume_uuid", space.substr(slash + 1, level - slash - 1)}, {"scale_factor", 1}});
     }
     std::vector<std::string> openData;
     for (const auto& [key, value] : root.items())
@@ -182,6 +183,13 @@ std::string fiberVersionJson(const StoreReader& reader, const ObjectVersion& ver
     return revisionJson(reader, fiberAt(reader, version), byteBudget);
 }
 
+Json fiberHvClassification(Json sourceClassification, const std::string& family, bool manualFamily)
+{
+    sourceClassification["manual_tag"] = manualFamily ? family : "";
+    if (!manualFamily) sourceClassification["automatic_tag"] = family;
+    return sourceClassification;
+}
+
 namespace detail {
 Json fiberMetadata(const StoreReader& reader, const ObjectRecord& record, const GeometryRevision& geometry)
 {
@@ -202,8 +210,8 @@ Json fiberMetadata(const StoreReader& reader, const ObjectRecord& record, const 
         source["width"] = fiber.width; source["width_gap_fraction"] = fiber.widthGapFraction;
         if (!fiber.optimizationMode.empty()) source["optimization_mode"] = fiber.optimizationMode;
         else source.erase("optimization_mode");
-        source["hv_classification"]["manual_tag"] = fiber.manualFamily ? fiber.family : "";
-        if (!fiber.manualFamily) source["hv_classification"]["automatic_tag"] = fiber.family;
+        source["hv_classification"] = fiberHvClassification(
+            source.value("hv_classification", Json()), fiber.family, fiber.manualFamily);
     }
     return source;
 }

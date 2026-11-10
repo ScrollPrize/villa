@@ -112,8 +112,11 @@ inline void bind(nb::module_& m) {
         .def_prop_ro("slot_bytes",&Pool::slot_bytes)
         .def_prop_ro("resident_bytes",&Pool::resident_bytes);
     nb::class_<Reader>(m,"CudaReader")
-        .def(nb::init<Array&,std::size_t,int>(),nb::keep_alive<1,2>())
-        .def(nb::init<Array&,std::shared_ptr<Pool>>(),nb::keep_alive<1,2>())
+        .def(nb::init<Array&,std::size_t,int,std::optional<std::int64_t>>(),
+             "array"_a,"budget"_a,"device"_a,"channel"_a=nb::none(),nb::keep_alive<1,2>())
+        .def(nb::init<Array&,std::shared_ptr<Pool>,std::optional<std::int64_t>>(),
+             "array"_a,"pool"_a,"channel"_a=nb::none(),nb::keep_alive<1,2>())
+        .def_prop_ro("channel",&Reader::channel)
         .def("clear",&Reader::clear,nb::call_guard<nb::gil_scoped_release>())
         .def("stats",&Reader::stats,nb::call_guard<nb::gil_scoped_release>())
         .def("grids",[](Reader& r,const std::vector<std::array<std::int64_t,3>>& shapes,

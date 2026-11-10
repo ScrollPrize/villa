@@ -269,6 +269,45 @@ int main()
         };
         auto a0 = open(fine, 16), a1 = open(coarse, 8);
         const vcr::ElementType u8{'u', 1, false};
+        // Scalar views into CZYX chunks, including a nonzero channel chunk.
+        // Progressive loads must retain the channel axis in missing-chunk keys.
+        {
+            const auto packed = path / "packed";
+            fs::create_directories(packed);
+            for (int c = 0; c < 2; ++c) {
+                std::vector<std::uint8_t> bytes(2 * 512);
+                for (int channel = 0; channel < 2; ++channel)
+                    for (int z = 0; z < 8; ++z)
+                        for (int y = 0; y < 8; ++y)
+                            for (int x = 0; x < 8; ++x)
+                                bytes[channel * 512 + (z * 8 + y) * 8 + x] =
+                                    std::uint8_t(50 * (c * 2 + channel) + x + 2 * y + 3 * z);
+                std::ofstream out(packed / (std::to_string(c) + ".0.0.0"), std::ios::binary);
+                out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            }
+            vcr::ArraySpec spec;
+            spec.shape = {4, 8, 8, 8}; spec.chunks = {2, 8, 8, 8};
+            spec.fill = {0}; spec.identity = packed.string();
+            spec.layers.push_back({"array", packed.string(), "", "", false});
+            vcr::Array array(spec, std::make_shared<vcr::MemoryCache>(1 << 20));
+            vcr::grid::Level level{&array, u8}; level.channel = 3;
+            vcr::grid::Frame frame;
+            frame.plane = vcr::grid::Plane{{2.5f, 3, 4}, {1,0,0}, {0,1,0}, {0,0,1}, 1, 1};
+            vcr::grid::Request request; request.levels = {level};
+            vcr::grid::Pending pending;
+            require(vcr::grid::sampleCached(frame, request, &pending).level[0] == vcr::grid::Result::kMissing,
+                    "packed channel initially missing");
+            vcr::grid::load(pending);
+            require(near(vcr::grid::sampleCached(frame, request, nullptr).values[0], 170.5f),
+                    "packed nonzero channel after progressive load");
+            request.levels[0].channel = 0;
+            require(near(vcr::grid::sample(frame, request).values[0], 20.5f), "packed first channel");
+            require(vcr::grid::fallbackLevels({level}, 0, 10, 10, 1) == 0, "packed fallback extent");
+            request.levels[0].channel = 4;
+            bool rejected = false;
+            try { vcr::grid::sample(frame, request); } catch (const std::invalid_argument&) { rejected = true; }
+            require(rejected, "invalid channel rejected");
+        }
         const vcr::grid::Level L0{a0.get(), u8, {1, 1, 1}, {0, 0, 0}};
         // Level-1 voxel i is centred on level-0 voxel 2i + 0.5.
         const vcr::grid::Level L1{a1.get(), u8, {0.5, 0.5, 0.5}, {-0.25, -0.25, -0.25}};

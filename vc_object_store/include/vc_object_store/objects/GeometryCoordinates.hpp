@@ -121,4 +121,23 @@ inline std::optional<double> geometryScaleToVolume(const CoordinateJson& metadat
     if (!std::isfinite(scale) || scale <= 0) throw std::invalid_argument("geometry coordinate conversion is not representable");
     return scale;
 }
+// Strict form of geometryScaleToVolume: the object's declared frame, which must be
+// complete and match the target. Frames are declared at ingest or with setMeta.
+inline CoordinateJson resolveGeometryCoordinates(const CoordinateJson& metadata, const std::string& volumeId)
+{
+    if (volumeId.empty()) throw std::invalid_argument("target volume_uuid must be nonempty");
+    const auto coordinates = geometryCoordinates(metadata.value("coordinates", CoordinateJson::object()));
+    if (coordinates["volume_uuid"].is_null() || coordinates["scale_factor"].is_null())
+        throw std::invalid_argument("unknown geometry coordinate frame");
+    if (coordinates["volume_uuid"] != volumeId)
+        throw std::invalid_argument("geometry volume_uuid does not match target volume");
+    return coordinates;
+}
+
+// Multiplier from stored XYZ to volume voxels, for a frame that must match.
+inline double geometryScaleToFrame(const CoordinateJson& metadata, const std::string& volumeId)
+{
+    const auto coordinates = resolveGeometryCoordinates(metadata, volumeId);
+    return *geometryScaleToVolume(CoordinateJson{{"coordinates", coordinates}}, volumeId);
+}
 } // namespace vc::objects

@@ -18,6 +18,9 @@
 #include "vc_object_store/object_links/LinkObjects.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/FiberJson.hpp"
+#include <mutex>
 using namespace vc::python;
 namespace {
 nb::list collectionsToPy(const std::vector<vo::AttachedCollection>& collections)
@@ -173,6 +176,27 @@ vo::EdgeGeometryRepair repairFromPy(const nb::dict& d)
     return repair;
 }
 
+nb::list overlapCorrespondencesToPy(const std::vector<vc::object_links::OverlapCorrespondences>& results)
+{
+    nb::list out;
+    for (const auto& r : results) {
+        nb::dict item;
+        item["edge_uuid"] = r.edgeUuid; item["a"] = r.aUuid; item["b"] = r.bUuid;
+        item["a_geometry_revision"] = r.aGeometryRevision; item["b_geometry_revision"] = r.bGeometryRevision;
+        item["error"] = r.error.empty() ? nb::none() : nb::cast(r.error);
+        nb::list pairs;
+        for (const auto& pair : r.pairs) {
+            nb::dict q;
+            q["a_grid"] = pair.aGrid; q["b_grid"] = pair.bGrid;
+            q["a_xyz"] = pair.aXyz; q["b_xyz"] = pair.bXyz; q["distance"] = pair.distance;
+            pairs.append(q);
+        }
+        item["pairs"] = pairs;
+        out.append(item);
+    }
+    return out;
+}
+
 nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
 {
     nb::dict d;
@@ -186,6 +210,31 @@ nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
     return d;
 }
 
+// A Python progress callable as a detector's ProgressCallback:
+// progress(stage, completed, total, detail), total 0 when unknown. Detectors
+// report with the GIL released, sometimes from worker threads; calls are
+// serialized and take the GIL. An exception it raises is reported as
+// unraisable and does not stop the detector. The callable is borrowed: the
+// detector call's kwargs keep it alive.
+vc::objects::util::ProgressCallback pythonProgress(nb::handle callable)
+{
+    if (callable.is_none()) return {};
+    if (!PyCallable_Check(callable.ptr())) throw nb::type_error("progress must be callable or None");
+    auto serial = std::make_shared<std::mutex>();
+    PyObject* raw = callable.ptr();
+    return [serial, raw](const vc::objects::util::ProgressUpdate& update) {
+        const std::string stage(update.stage), detail(update.detail);
+        std::lock_guard lock(*serial);
+        nb::gil_scoped_acquire gil;
+        try {
+            const nb::handle report(raw);
+            report(stage, update.completed, update.total, detail);
+        } catch (nb::python_error& error) {
+            error.discard_as_unraisable(nb::handle(raw));
+        }
+    };
+}
+
 // Detector keyword arguments as the JSON the detectors' parameter parsers take
 // (object_links/LinkObjects.hpp), so Python and link_objects plans agree.
 nlohmann::json kwargsJson(const nb::kwargs& kwargs)
@@ -193,6 +242,22 @@ nlohmann::json kwargsJson(const nb::kwargs& kwargs)
     nb::dict d;
     for (auto item : kwargs) d[item.first] = item.second;
     return nlohmann::json::parse(jsonDumps(d));
+}
+
+// A detector's parameters from its keyword arguments: `progress` (a Python
+// callable, which a plan cannot carry) and the rest through the plan parser.
+template <class Params>
+Params detectorParams(const nb::kwargs& kwargs, Params (*fromJson)(const nlohmann::json&))
+{
+    nb::dict rest;
+    nb::object progress = nb::none();
+    for (auto item : kwargs) {
+        if (nb::cast<std::string>(item.first) == "progress") progress = nb::borrow(item.second);
+        else rest[item.first] = item.second;
+    }
+    auto params = fromJson(nlohmann::json::parse(jsonDumps(rest)));
+    params.progress = pythonProgress(progress);
+    return params;
 }
 
 template<class T>
@@ -425,6 +490,11 @@ void bindHostedStore(nb::module_& m)
             { nb::gil_scoped_release release; bytes = self.readGeometryArray(revision, array, offset, count); }
             return bytesToPy(bytes);
         }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
+        .def("geometry_point_annotations", [](Hosted& self, const std::string& revision, const std::string& array) {
+            nlohmann::json annotations;
+            { nb::gil_scoped_release release; annotations = self.geometryPointAnnotations(revision, array); }
+            return jsonLoads(annotations.dump());
+        }, nb::arg("revision_uuid"), nb::arg("array_name"), "Per-point annotations of a sequence array, as ObjectStore's.")
         .def("select_objects", [=](Hosted& self, const nb::object& query, bool withStatus) {
             std::optional<std::vector<std::string>> fields;
             const auto selection = objectQuery(query, fields);
@@ -517,6 +587,7 @@ void bindHostedStore(nb::module_& m)
         }, nb::arg("file"), nb::arg("destination"), "Write one manifest entry {name, sha256, length} atomically, verified.");
     nb::exception<vo::StoreBusy>(m, "StoreBusy", PyExc_RuntimeError);
     nb::exception<vo::PreparationFailed>(m, "PreparationFailed", PyExc_RuntimeError);
+    nb::exception<vo::TransactionConflict>(m, "TransactionConflict", PyExc_RuntimeError);
 }
 
 // ObjectStoreSession operations that take requests, numbered references and
@@ -548,7 +619,9 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         }, nb::arg("location"), nb::arg("author") = std::string(), nb::arg("read_only") = false,
            "Attach a store location: a vc_object_server endpoint (http:// or https://; always writable) or a store file.")
         .def("attach_hosted", [](Session& self, const std::string& endpoint, int64_t pollIntervalMs, size_t cacheBytes,
-                                 int retries, long connectTimeoutMs, const std::string& author, long linkTimeoutS) {
+                                 int retries, long connectTimeoutMs, const std::string& author, long linkTimeoutS,
+                                 const std::optional<std::filesystem::path>& cacheDirectory,
+                                 const std::optional<int64_t>& diskCacheBytes, int64_t minFreeBytes) {
             vo::HostedSessionOptions options;
             options.author = author;
             options.pollInterval = std::chrono::milliseconds(pollIntervalMs);
@@ -556,12 +629,19 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             options.client.retries = retries;
             options.client.connectTimeoutMs = connectTimeoutMs;
             options.client.linkTimeoutS = linkTimeoutS;
+            if (cacheDirectory) options.cacheDirectory = *cacheDirectory;
+            options.diskCacheBytes = diskCacheBytes;
+            options.minFreeBytes = minFreeBytes;
             nb::gil_scoped_release release;
             return self.attachHosted(endpoint, options);
         }, nb::arg("endpoint"), nb::arg("poll_interval_ms") = 2000, nb::arg("cache_bytes") = vo::HostedSessionOptions{}.cacheBytes,
            nb::arg("retries") = 5, nb::arg("connect_timeout_ms") = 10000, nb::arg("author") = std::string(),
-           nb::arg("link_timeout_s") = 300,
-           "Attach a store served by vc_object_server; use the typed operations (no local callbacks).")
+           nb::arg("link_timeout_s") = 300, nb::arg("cache_directory") = std::nullopt,
+           nb::arg("disk_cache_bytes") = std::nullopt, nb::arg("min_free_bytes") = 0,
+           "Attach a store served by vc_object_server; use the typed operations (no local callbacks). "
+           "link_timeout_s: how long a link_objects request may take (the service's --request-deadline). "
+           "cache_directory: persistent cache of numbered records, geometry and annotations across processes "
+           "(HostedSessionOptions::cacheDirectory), within disk_cache_bytes and keeping min_free_bytes free.")
         .def("read_surface_grid", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                      const std::string& volume, double targetScale, std::optional<int64_t> version,
                                      const std::optional<std::string>& generation) {
@@ -613,6 +693,106 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             return PyPackedGeometryArray{std::move(packed)};
         }, nb::arg("attachment"), nb::arg("revision_uuids"), nb::arg("array_name"),
            "Read homogeneous arrays into one verified packed buffer with row offsets (as ObjectStore.read_geometry_arrays).")
+        .def("location", &Session::location, nb::arg("attachment"), "The store file of a local attachment, or a hosted one's endpoint.")
+        .def("geometry_revision", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& revision) {
+            std::optional<vo::GeometryRevision> geometry;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { geometry = reader.geometryRevision(revision); });
+            }
+            return toPy(geometry);
+        }, nb::arg("attachment"), nb::arg("revision_uuid"), "A geometry revision's descriptor (as ObjectStore.geometry_revision), or None.")
+        .def("read_geometry_array", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& revision,
+                                       const std::string& array, int64_t offset, const std::optional<int64_t>& count) {
+            std::vector<uint8_t> bytes;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    bytes = reader.readGeometryArray(revision, array, offset, count);
+                });
+            }
+            return bytesToPy(bytes);
+        }, nb::arg("attachment"), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0,
+           nb::arg("byte_count") = std::nullopt, "Exact logical bytes of one array (as ObjectStore.read_geometry_array).")
+        .def("geometry_point_annotations", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& revision,
+                                              const std::string& array) {
+            nlohmann::json annotations;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    annotations = reader.geometryPointAnnotations(revision, array);
+                });
+            }
+            return jsonLoads(annotations.dump());
+        }, nb::arg("attachment"), nb::arg("revision_uuid"), nb::arg("array_name"),
+           "Per-point annotations of a sequence array (as ObjectStore.geometry_point_annotations).")
+        .def("relationships_at_versions", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs) {
+            const auto versions = objectVersionsFromPy(refs);
+            std::vector<vo::SelectedRelationship> revisions;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { revisions = reader.relationshipsAt(versions); });
+            }
+            nb::list result;
+            for (const auto& revision : revisions) {
+                auto d = relationshipRevisionToPy(revision.relationship);
+                d["applicable"] = revision.applicable;
+                result.append(d);
+            }
+            return result;
+        }, nb::arg("attachment"), nb::arg("refs"), "Relationships recorded between these numbered object versions.")
+        .def("changes_since", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::dict& cursor, int64_t maxChanges) {
+            const vo::FeedCursor c{nb::cast<std::string>(cursor["store"]), nb::cast<std::string>(cursor["generation"]),
+                                   nb::cast<int64_t>(cursor["sequence"]),
+                                   cursor.contains("offset") ? nb::cast<int64_t>(cursor["offset"]) : 0};
+            vo::ChangePage page;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { page = reader.changesSince(c, maxChanges); });
+            }
+            return jsonLoads(vo::changePageToJson(page));
+        }, nb::arg("attachment"), nb::arg("cursor"), nb::arg("max_changes") = 4096, "The change feed after cursor (as ObjectStore.changes_since).")
+        .def("select_edges", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::object& query) {
+            std::optional<std::vector<std::string>> fields;
+            const auto selection = vo::edgeQueryRequestFromJson(
+                nb::isinstance<nb::str>(query) ? nb::cast<std::string>(query) : jsonDumps(query), &fields);
+            std::vector<vo::EdgeRecord> records;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { records = reader.selectEdges(selection, fields); });
+            }
+            const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
+            nb::list result;
+            for (const auto& record : records) result.append(edgeToPy(record, fields ? &selected : nullptr));
+            return result;
+        }, nb::arg("attachment"), nb::arg("query"),
+           "Every edge the query (wire form, as HostedStore.select_edges; complete without a limit) selects in one read.")
+        .def("overlap_correspondences_at", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& edges,
+                                              const std::string& volume, double spacing, std::size_t maxPairs) {
+            std::vector<vc::object_links::OverlapEdgeAt> pinned;
+            for (auto item : edges) {
+                const auto edge = nb::cast<nb::dict>(item);
+                auto text = [&](const char* key) { return nb::cast<std::string>(edge[key]); };
+                vc::object_links::OverlapEdgeAt at;
+                at.uuid = text("uuid"); at.aUuid = text("a"); at.bUuid = text("b");
+                at.wholeGeometry = nb::cast<bool>(edge["whole_geometry"]);
+                at.meta = text("meta");
+                at.aObjectMeta = text("a_object_meta"); at.bObjectMeta = text("b_object_meta");
+                at.aGeometryRevision = text("a_geometry_revision");
+                at.bGeometryRevision = text("b_geometry_revision");
+                pinned.push_back(std::move(at));
+            }
+            const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, maxPairs};
+            std::vector<vc::object_links::OverlapCorrespondences> results;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    results = vc::object_links::materializeOverlapCorrespondences(reader, pinned, p);
+                });
+            }
+            return overlapCorrespondencesToPy(results);
+        }, nb::arg("attachment"), nb::arg("edges"), nb::arg("volume_uuid"), nb::arg("spacing") = 8.0, nb::arg("max_pairs") = 256,
+           "ObjectStore.overlap_correspondences_at over any attachment: the pinned geometry revisions are read through it.")
         .def("create_surface", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& name,
                                   const std::vector<std::string>& tags, const nb::object& coordinates, const std::string& tool,
                                   const nb::object& parameters, const std::vector<std::string>& sources, const nb::object& meta,
@@ -768,6 +948,31 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
 
 NB_MODULE(_native, m)
 {
+    m.def("geometry_coordinates", [](const nb::dict& value) {
+        return jsonLoads(vo::geometryCoordinates(nlohmann::json::parse(jsonDumps(value))).dump());
+    }, nb::arg("coordinates"));
+    m.def("merge_geometry_coordinates", [](const nb::dict& a, const nb::dict& b) {
+        return jsonLoads(vo::mergeGeometryCoordinates(nlohmann::json::parse(jsonDumps(a)),
+            nlohmann::json::parse(jsonDumps(b))).dump());
+    }, nb::arg("a"), nb::arg("b"));
+    m.def("resolve_geometry_coordinates", [](const nb::dict& metadata, const std::string& volume) {
+        return jsonLoads(vo::resolveGeometryCoordinates(nlohmann::json::parse(jsonDumps(metadata)), volume).dump());
+    }, nb::arg("metadata"), nb::arg("volume_uuid"));
+    m.def("geometry_scale_to_frame", [](const nb::dict& metadata, const std::string& volume) {
+        return vo::geometryScaleToFrame(nlohmann::json::parse(jsonDumps(metadata)), volume);
+    }, nb::arg("metadata"), nb::arg("volume_uuid"));
+
+    m.def("fiber_hv_classification", [](const nb::dict& source, const std::string& family, bool manualFamily) {
+        return jsonLoads(vo::fiberHvClassification(
+            nlohmann::json::parse(jsonDumps(source)), family, manualFamily).dump());
+    }, nb::arg("source_classification"), nb::arg("family"), nb::arg("manual_family"));
+
+    m.def("fiber_branch_control_index", [](const std::vector<int64_t>& controlIds, const nb::dict& anchor) {
+        return vo::fiberBranchControlIndex(controlIds, anchorFromPy(anchor));
+    }, nb::arg("control_point_ids"), nb::arg("anchor"),
+       "Index into control_point_ids of a fiber_branch endpoint anchor's stable control-point ID; "
+       "raises when the anchor names no single control point of this geometry.");
+
     m.def("artifact_manifest_json", [](const nb::list& files) {
         std::vector<vo::ArtifactFile> parsed;
         for (const auto& f : files) {
@@ -815,6 +1020,8 @@ NB_MODULE(_native, m)
         return vo::geometryScaleToVolume(nlohmann::json::parse(jsonDumps(meta)), volume);
     }, nb::arg("meta"), nb::arg("volume"),
        "Volume voxels per stored unit for an object whose meta binds it to volume; None when it is not.");
+    m.def("detector_versions", [] { return vc::object_links::detectorVersions(); },
+          "{detector name: version} of the link detectors, as recorded in their edges' meta.detector.");
     m.def("create_project", [](const std::filesystem::path& path, const std::string& name, const nb::object& meta,
                                const std::string& author) {
         vo::OpenOptions options;
@@ -921,6 +1128,8 @@ NB_MODULE(_native, m)
                 return out;
             },
             nb::arg("after_seq") = 0)
+        .def("journal_position", readMethod<&vo::ObjectStore::journalPosition>(),
+             "The journal's highest sequence (0 when empty): the store's head.")
         .def("geometry_point_annotations", [](PyObjectStore& self,const std::string& revision,const std::string& array) {
             return jsonLoads(self.withRead([&](vo::ObjectStore& db,vo::ReadTxn& txn) { return db.geometryPointAnnotations(txn,revision,array).dump(); }));
         },nb::arg("revision_uuid"),nb::arg("array_name"))
@@ -946,20 +1155,24 @@ NB_MODULE(_native, m)
         .def("read_geometry_ranges", readMethod<&vo::ObjectStore::readGeometryRanges, true>(), nb::arg("revision_uuid"), nb::arg("array_name"),
              nb::arg("ranges"))
         .def("ingest_registered_geometry", [](PyObjectStore& self, const std::optional<std::filesystem::path>& root,
-                                             const std::vector<std::string>& uuids) {
-            return geometryReportToPy(self.withStore<true>([&](auto& db) {
-                return vo::ingestRegisteredGeometry(db, root, uuids, {});
-            }));
-        }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{})
-        .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source,
-                                         const nb::dict& context, const std::optional<std::string>& uuidNamespace) {
+                                             const std::vector<std::string>& uuids, const nb::dict& context) {
             const auto declarations = jsonDumps(context);
-            const vo::SourceIngestOptions options{uuidNamespace};
+            return geometryReportToPy(self.withStore<true>([&](auto& db) {
+                return vo::ingestRegisteredGeometry(db, root, uuids, {}, declarations);
+            }));
+        }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{},
+           nb::arg("coordinate_context") = nb::dict())
+        .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source,
+                                         const nb::dict& context, const std::optional<std::string>& uuidNamespace,
+                                         bool dropDanglingBranches, bool renumberPointIds) {
+            const auto declarations = jsonDumps(context);
+            const vo::SourceIngestOptions options{uuidNamespace, dropDanglingBranches, renumberPointIds};
             return geometryReportToPy(self.withStore<true>([&](auto& db) {
                 return vo::ingestGeometrySource(db, kind, source, {}, declarations, {}, options);
             }));
         }, nb::arg("kind"), nb::arg("source"), nb::arg("coordinate_context") = nb::dict(),
-           nb::arg("uuid_namespace") = std::nullopt)
+           nb::arg("uuid_namespace") = std::nullopt, nb::arg("drop_dangling_branches") = false,
+           nb::arg("renumber_point_ids") = false)
         .def("export_geometry", [](PyObjectStore& self, const std::string& object,
                                    const std::filesystem::path& destination,
                                    const std::optional<int64_t>& version, const std::optional<std::string>& generation,
@@ -1120,7 +1333,7 @@ NB_MODULE(_native, m)
         .def(
             "link_point_collections_to_surfaces",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                const auto p = vc::object_links::pointCollectionSurfaceParamsFromJson(kwargsJson(kwargs));
+                const auto p = detectorParams(kwargs, &vc::object_links::pointCollectionSurfaceParamsFromJson);
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkPointCollectionsToSurfaces(db, p);
                 }));
@@ -1128,21 +1341,66 @@ NB_MODULE(_native, m)
             nb::arg("kwargs"),
             "Link regular PCL points to surfaces using Spiral's largest-area/nearest-named-pair rules. "
             "Point IDs anchor the edges; winding annotations and surface grid coordinates are retained. "
-            "Defaults: tolerance=2.5, window_points=1, window_min_points=1; no CT required.")
+            "Defaults: tolerance=2.5, window_points=1, window_min_points=1; no CT required. "
+            "progress(stage, completed, total, detail) reports progress. new_uuids (selected collections and "
+            "surfaces) runs incrementally: a new collection is linked as in a full run, an existing one near a "
+            "new surface to the new surfaces alone; stale removal touches edges of new objects only.")
         .def(
             "link_surface_overlaps",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                const auto p = vc::object_links::surfaceOverlapParamsFromJson(kwargsJson(kwargs));
+                const auto p = detectorParams(kwargs, &vc::object_links::surfaceOverlapParamsFromJson);
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkSurfaceOverlaps(db, p);
                 }));
             },
             "Run surface-overlap discovery using stored geometry; surface_uuids optionally selects objects. "
-            "kwargs mirror SurfaceOverlapParams (tolerance, min_minor_spread, ...).")
+            "kwargs mirror SurfaceOverlapParams (tolerance, min_minor_spread, ...). "
+            "progress(stage, completed, total, detail) reports progress. new_uuids (selected surfaces) examines "
+            "only pairs with a new surface, loading the surfaces near them; stale removal touches their edges only.")
+        .def(
+            "overlap_correspondences",
+            [](PyObjectStore& self, const std::vector<std::string>& edges, const std::string& volume,
+               double spacing, std::size_t maxPairs) {
+                const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, maxPairs};
+                return overlapCorrespondencesToPy(self.withStore<true>([&](auto& db) {
+                    return vc::object_links::materializeOverlapCorrespondences(db, edges, p);
+                }));
+            },
+            nb::arg("edge_uuids"), nb::arg("volume_uuid"), nb::arg("spacing") = 8.0,
+            nb::arg("max_pairs") = 256,
+            "Point pairs for accepted surface-overlap edges from their stored poses; grids are (row, column), "
+            "XYZ in volume voxels, in stored edge endpoint order. A non-null error means the edge failed.")
+        .def(
+            "overlap_correspondences_at",
+            [](PyObjectStore& self, const nb::list& edges, const std::string& volume, double spacing,
+               std::size_t maxPairs) {
+                std::vector<vc::object_links::OverlapEdgeAt> pinned;
+                for (auto item : edges) {
+                    const auto edge = nb::cast<nb::dict>(item);
+                    auto text = [&](const char* key) { return nb::cast<std::string>(edge[key]); };
+                    vc::object_links::OverlapEdgeAt at;
+                    at.uuid = text("uuid"); at.aUuid = text("a"); at.bUuid = text("b");
+                    at.wholeGeometry = nb::cast<bool>(edge["whole_geometry"]);
+                    at.meta = text("meta");
+                    at.aObjectMeta = text("a_object_meta"); at.bObjectMeta = text("b_object_meta");
+                    at.aGeometryRevision = text("a_geometry_revision");
+                    at.bGeometryRevision = text("b_geometry_revision");
+                    pinned.push_back(std::move(at));
+                }
+                const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, maxPairs};
+                return overlapCorrespondencesToPy(self.withStore<true>([&](auto& db) {
+                    return vc::object_links::materializeOverlapCorrespondences(db, pinned, p);
+                }));
+            },
+            nb::arg("edges"), nb::arg("volume_uuid"), nb::arg("spacing") = 8.0, nb::arg("max_pairs") = 256,
+            "overlap_correspondences from overlap edges as read at an earlier state, e.g. a pinned input position: dicts "
+            "with uuid, a and b (stored order), whole_geometry, meta (the edge's metadata JSON), a_object_meta and "
+            "b_object_meta (the endpoints' metadata JSON) and a_geometry_revision and b_geometry_revision (which "
+            "this store must hold). Not checked against the store's current state.")
         .def(
             "link_tracks_to_tracks",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                const auto p = vc::object_links::trackTrackParamsFromJson(kwargsJson(kwargs));
+                const auto p = detectorParams(kwargs, &vc::object_links::trackTrackParamsFromJson);
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkTracksToTracks(db, p);
                 }));
@@ -1153,7 +1411,7 @@ NB_MODULE(_native, m)
         .def(
             "link_tracks_to_surfaces",
             [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
-                const auto p = vc::object_links::trackSurfaceParamsFromJson(kwargsJson(kwargs));
+                const auto p = detectorParams(kwargs, &vc::object_links::trackSurfaceParamsFromJson);
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkTracksToSurfaces(db, ctVolume, p);
                 }));
@@ -1166,7 +1424,7 @@ NB_MODULE(_native, m)
         .def(
             "link_fibers_to_surfaces",
             [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
-                const auto p = vc::object_links::fiberSurfaceParamsFromJson(kwargsJson(kwargs));
+                const auto p = detectorParams(kwargs, &vc::object_links::fiberSurfaceParamsFromJson);
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkFibersToSurfaces(db, ctVolume, p);
                 }));
@@ -1175,7 +1433,10 @@ NB_MODULE(_native, m)
             "Link stored fibers to stored surfaces; select with fiber_uuids and surface_uuids. "
             "Strip normals come from ct_volume, lasagna normal_x_volume/normal_y_volume, or a "
             "normal_pool pack; with none, the centerline alone gates anchors. "
-            "Optional cache_directory stores disposable strips.")
+            "Optional cache_directory stores disposable strips. "
+            "progress(stage, completed, total, detail) reports progress. new_uuids (selected fibers and surfaces) "
+            "runs incrementally: a new fiber is linked as in a full run, an existing one near a new surface to "
+            "the new surfaces alone; stale removal touches edges of new objects only.")
         .def_prop_ro("uuid", readMethod<&vo::ObjectStore::uuid>())
         .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),
              nb::arg("object_uuid"))

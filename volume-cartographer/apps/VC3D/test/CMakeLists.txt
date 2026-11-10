@@ -79,16 +79,6 @@ vc_register_ctest(status_message_history test_status_message_history)
 set_tests_properties(status_message_history PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-add_executable(test_spiral_input_draft test_spiral_input_draft.cpp)
-set_target_properties(test_spiral_input_draft PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_spiral_input_draft PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_spiral_input_draft PRIVATE Qt6::Core Qt6::Test)
-add_test(NAME spiral_input_draft COMMAND test_spiral_input_draft)
-vc_register_test_target(test_spiral_input_draft)
-vc_register_ctest(spiral_input_draft test_spiral_input_draft)
-
 add_executable(test_line_annotation_coordinate_scale
     test_line_annotation_coordinate_scale.cpp)
 
@@ -331,6 +321,48 @@ vc_register_ctest(segmentation_undo_history test_segmentation_undo_history)
 set_tests_properties(segmentation_undo_history PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+add_executable(test_spiral_store_inputs
+    test_spiral_store_inputs.cpp
+    ../SpiralStoreInputs.cpp ../SpiralStoreInputs.hpp)
+target_include_directories(test_spiral_store_inputs PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_spiral_store_inputs PRIVATE vc_core Qt6::Core)
+add_test(NAME spiral_store_inputs COMMAND test_spiral_store_inputs)
+vc_register_test_target(test_spiral_store_inputs)
+vc_register_ctest(spiral_store_inputs test_spiral_store_inputs)
+
+add_executable(test_spiral_stored_fits
+    test_spiral_stored_fits.cpp
+    ../SpiralStoredFits.cpp ../SpiralStoredFits.hpp
+    ../SpiralPreviewWindings.cpp ../SpiralPreviewWindings.hpp)
+target_include_directories(test_spiral_stored_fits PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_spiral_stored_fits PRIVATE vc_core Qt6::Core opencv_core opencv_imgcodecs)
+add_test(NAME spiral_stored_fits COMMAND test_spiral_stored_fits)
+vc_register_test_target(test_spiral_stored_fits)
+vc_register_ctest(spiral_stored_fits test_spiral_stored_fits)
+
+add_executable(test_spiral_project_inputs
+    test_spiral_project_inputs.cpp
+    ../SpiralProjectInputs.cpp ../SpiralProjectInputs.hpp)
+target_include_directories(test_spiral_project_inputs PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_spiral_project_inputs PRIVATE vc_core vc_lasagna Qt6::Core)
+add_test(NAME spiral_project_inputs COMMAND test_spiral_project_inputs)
+vc_register_test_target(test_spiral_project_inputs)
+vc_register_ctest(spiral_project_inputs test_spiral_project_inputs)
+
+add_executable(test_spiral_store_edits
+    test_spiral_store_edits.cpp
+    ../SpiralStoreEdits.cpp ../SpiralStoreEdits.hpp
+    ../SpiralPointCollectionEdit.cpp ../SpiralPointCollectionEdit.hpp)
+target_include_directories(test_spiral_store_edits PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_spiral_store_edits PRIVATE vc_core Qt6::Core Qt6::Gui Qt6::Test opencv_core)
+add_test(NAME spiral_store_edits COMMAND test_spiral_store_edits)
+vc_register_test_target(test_spiral_store_edits)
+vc_register_ctest(spiral_store_edits test_spiral_store_edits)
+
 add_executable(test_spiral_preview_provenance
     test_spiral_preview_provenance.cpp)
 
@@ -347,6 +379,23 @@ target_link_libraries(test_spiral_preview_provenance PRIVATE
 add_test(NAME spiral_preview_provenance COMMAND test_spiral_preview_provenance)
 vc_register_test_target(test_spiral_preview_provenance)
 vc_register_ctest(spiral_preview_provenance test_spiral_preview_provenance)
+
+add_executable(test_spiral_updated_drafts
+    test_spiral_updated_drafts.cpp)
+
+set_target_properties(test_spiral_updated_drafts PROPERTIES
+    AUTOMOC ON)
+
+target_include_directories(test_spiral_updated_drafts PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_spiral_updated_drafts PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME spiral_updated_drafts COMMAND test_spiral_updated_drafts)
+vc_register_test_target(test_spiral_updated_drafts)
+vc_register_ctest(spiral_updated_drafts test_spiral_updated_drafts)
 
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp
@@ -700,21 +749,25 @@ vc_register_test_target(test_line_annotation_optimization_queue)
 vc_register_ctest(line_annotation_optimization_queue
     test_line_annotation_optimization_queue)
 
-add_executable(test_spiral_input_workflow
-    test_spiral_input_workflow.cpp
+add_executable(test_spiral_service_protocol
+    test_spiral_service_protocol.cpp
     ../SpiralServiceManager.cpp ../SpiralServiceManager.hpp
     ../SpiralServiceManagerInputs.cpp
     ../SpiralArtifactCache.cpp ../SpiralArtifactCache.hpp
-    ../SpiralSshTunnel.cpp ../SpiralSshTunnel.hpp)
-set_target_properties(test_spiral_input_workflow PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_spiral_input_workflow PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_compile_definitions(test_spiral_input_workflow PRIVATE
-    SPIRAL_CLIENT_SERVICE_FIXTURE="${PROJECT_SOURCE_DIR}/../spiral-fitting/tests/revisioned_client_service.py")
-target_link_libraries(test_spiral_input_workflow PRIVATE vc_core Qt6::Core Qt6::Concurrent Qt6::Network Qt6::Widgets Qt6::Test)
-add_test(NAME spiral_input_workflow COMMAND test_spiral_input_workflow)
-vc_register_test_target(test_spiral_input_workflow)
-vc_register_ctest(spiral_input_workflow test_spiral_input_workflow)
-set_tests_properties(spiral_input_workflow PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    ../SpiralSshTunnel.cpp ../SpiralSshTunnel.hpp
+    ../SpiralStoreInputs.cpp ../SpiralStoreInputs.hpp
+    ../SpiralStoredFits.cpp ../SpiralStoredFits.hpp
+    ../SpiralPreviewWindings.cpp ../SpiralPreviewWindings.hpp
+    ../SpiralProjectInputs.cpp ../SpiralProjectInputs.hpp)
+set_target_properties(test_spiral_service_protocol PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_spiral_service_protocol PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_compile_definitions(test_spiral_service_protocol PRIVATE
+    SPIRAL_PROTOCOL_SERVICE_FIXTURE="${PROJECT_SOURCE_DIR}/../spiral-fitting/tests/protocol_client_service.py")
+target_link_libraries(test_spiral_service_protocol PRIVATE vc_core vc_lasagna Qt6::Core Qt6::Concurrent Qt6::Network Qt6::Widgets Qt6::Test)
+add_test(NAME spiral_service_protocol COMMAND test_spiral_service_protocol)
+vc_register_test_target(test_spiral_service_protocol)
+vc_register_ctest(spiral_service_protocol test_spiral_service_protocol)
+set_tests_properties(spiral_service_protocol PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 add_executable(test_spiral_brush_patch test_spiral_brush_patch.cpp)
 set_target_properties(test_spiral_brush_patch PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_spiral_brush_patch PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)

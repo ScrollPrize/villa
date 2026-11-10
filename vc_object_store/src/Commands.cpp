@@ -749,8 +749,14 @@ TransactionReceipt ObjectStore::submit(const TransactionRequest& request, const 
         mergeVersions(context.expectedObjects, preparation.expectedObjects, "expected versions");
         mergeVersions(context.readDependencies, preparation.readDependencies, "read dependencies");
     }
-    // A record both written and read-guarded is just expected.
-    for (const auto& [uuid, version] : context.expectedObjects) context.readDependencies.erase(uuid);
+    // A record both written and read-guarded at the same version is just
+    // expected; a read dependency at another version is a stale read the
+    // check below reports (a preparation that read the record later than
+    // the request's own read).
+    for (const auto& [uuid, version] : context.expectedObjects)
+        if (const auto guard = context.readDependencies.find(uuid);
+            guard != context.readDependencies.end() && guard->second == version)
+            context.readDependencies.erase(guard);
     RevisionSelection expected;
     checkTransactionContext(db, context, expected);
     expectHistory(db, expected);

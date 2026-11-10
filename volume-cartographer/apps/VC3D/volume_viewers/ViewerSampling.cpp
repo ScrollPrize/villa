@@ -32,7 +32,9 @@ std::array<float, 3> ViewerLevels::vertexSpacing() const
 vcr::grid::Level ViewerLevels::gridLevel(int level) const
 {
     const auto& l = levels[std::size_t(level)];
-    return vcr::zarr::gridLevel(*l.array, l.working, gpuFailed->load() ? nullptr : l.cuda.get());
+    auto result = vcr::zarr::gridLevel(*l.array, l.working, gpuFailed->load() ? nullptr : l.cuda.get());
+    result.channel = l.channel;
+    return result;
 }
 
 std::vector<vcr::grid::Level> ViewerLevels::gridLevels() const

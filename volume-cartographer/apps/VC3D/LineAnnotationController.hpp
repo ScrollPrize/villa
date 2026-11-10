@@ -924,6 +924,8 @@ private:
     // package; false makes the helper return false at once.
     bool ensureDatasetForSession(LineAnnotationSession& session, bool required = true,
                                  const std::function<bool()>& stillValid = {});
+    bool resolveDatasetForSession(LineAnnotationSession& session, bool required,
+                                  const std::function<bool()>& stillValid);
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session,
                                                const std::function<bool()>& stillValid = {});
     // Every backend a fiber-mode solve of the session needs (dataset, and
@@ -955,6 +957,9 @@ private:
     void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
     void handleLasagnaDatasetSelectionChanged(const std::string& location);
     void handleFiberInferenceDatasetSelectionChanged(const std::string& location);
+    void handleNormalSourceSelectionChanged(const std::string& source);
+    bool canChangeAnnotationInputs();
+    void invalidateAnnotationInputs(bool predictionsChanged, bool normalsChanged);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     // stillValid (optional): forwarded to the backend helpers and checked
     // once more after the solve, before the result is applied.

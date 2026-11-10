@@ -1,5 +1,5 @@
 """Headless fit driver: one short headless fit, executed the same way the
-fit_spiral CLI drives it, with dataset locations supplied by a JSON spec
+fit_spiral CLI drives it, with its input manifest named by a JSON spec
 instead of edits to fit_spiral module globals.
 
     python tests/headless_fit_driver.py <spec.json> <result.json> <out_dir>
@@ -179,14 +179,13 @@ def run(spec_path, result_path, out_dir):
 
     import fit_spiral as fs
     from config import Config, FitConfig
-    from fit_session import conventional_input_paths, load_scroll_spec
+    from fit_session import load_input_manifest
     from spiral_helpers import scale_counts_for_z_range
 
-    # The dataset's spiral-scroll.json supplies the physical scroll facts;
-    # inputs follow the conventional layout it describes.
-    dataset = spec['dataset_path']
-    scroll = load_scroll_spec(dataset)
-    paths = conventional_input_paths(dataset, scroll)
+    # The input manifest supplies the physical scroll facts and names every
+    # input read by path, as fit_spiral.py --inputs reads it.
+    scroll, paths = load_input_manifest(
+        spec['inputs'], cache_directory=spec.get('cache_path') or '../cache')
 
     # Mirror fit_spiral.__main__ (single process, no DDP): resolve config
     # (the z window is the Config's z_begin/z_end now), scale per-step counts

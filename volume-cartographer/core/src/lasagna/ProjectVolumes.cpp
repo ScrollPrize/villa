@@ -81,17 +81,28 @@ std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
             });
 
         auto tags = lasagnaProjectVolumeTags(group, manifestLocation);
+        // Dataset-wide capability: the normal heads may be in separate groups.
+        if (manifest.groupForChannel("sheet_nx") && manifest.groupForChannel("sheet_ny") &&
+            manifest.groupForChannel("sheet_grad_mag"))
+            addUniqueTag(tags, std::string(vc::project::kPredictedFiberNormalsTag));
 
         if (existing != prepared.end()) {
+            if (existing->volume->channelCount() && existing->channels != group.channels)
+                throw std::runtime_error("conflicting display channel names for " + location);
             for (auto& tag : tags)
                 addUniqueTag(existing->tags, std::move(tag));
             continue;
         }
 
+        auto volume = openRegularVolumeForGroup(group);
+        const auto channels = volume->channelCount() ? group.channels : std::vector<std::string>{};
+        if (volume->channelCount() && *volume->channelCount() != static_cast<std::int64_t>(channels.size()))
+            throw std::runtime_error("manifest channel count does not match " + location);
         prepared.push_back({
             location,
             std::move(tags),
-            openRegularVolumeForGroup(group),
+            std::move(volume),
+            channels,
         });
     }
     return prepared;

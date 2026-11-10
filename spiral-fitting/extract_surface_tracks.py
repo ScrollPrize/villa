@@ -47,7 +47,6 @@ import importlib.util
 import os
 import pickle
 import re
-import sys
 
 import numpy as np
 
@@ -76,12 +75,14 @@ _PLACEHOLDER = re.compile(r'<[^<>/]+>')
 
 
 def open_predictions(path):
-    """Open the predictions array read-only with vesuvius's ``open_zarr`` (local path or URL)."""
-    vesuvius_src = f'{os.path.dirname(os.path.abspath(__file__))}/../vesuvius/src'
-    if vesuvius_src not in sys.path:
-        sys.path.insert(0, vesuvius_src)
-    from vesuvius.data.utils import open_zarr
-    return open_zarr(path, mode='r')
+    """Open the predictions array read-only with zarr: a local path, an http(s) URL, or an
+    s3:// URL read with the environment's AWS credentials."""
+    import zarr
+    if path.startswith('s3://'):
+        return zarr.open_array(path, mode='r', storage_options={'anon': False})
+    if path.startswith(('http://', 'https://')):
+        return zarr.open_array(path, mode='r', storage_options={})
+    return zarr.open_array(path, mode='r')
 
 
 def downsample_maxpool(x, factor):

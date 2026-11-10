@@ -161,10 +161,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _removeUmbilicusAct = new QAction(QObject::tr("Remove Um&bilicus"), this);
     connect(_removeUmbilicusAct, &QAction::triggered, this, &MenuActionController::removeUmbilicus);
 
-    _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna Manifest..."), this);
+    _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna / Compound Dataset..."), this);
     connect(_attachLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachLasagnaManifest);
 
-    _attachRemoteLasagnaManifestAct = new QAction(QObject::tr("Attach Remote Lasagna Manifest..."), this);
+    _attachRemoteLasagnaManifestAct = new QAction(QObject::tr("Attach Remote Lasagna / Compound Dataset..."), this);
     connect(_attachRemoteLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachRemoteLasagnaManifest);
 
     _detachEntryAct = new QAction(QObject::tr("&Detach..."), this);
@@ -1880,7 +1880,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
     QString location;
     if (remote) {
         location =
-            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, false, false);
+            promptLocation(QObject::tr("Attach Remote Lasagna / Compound Dataset"), QObject::tr("Pick a remote .lasagna.json manifest or compound .zarr directory."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, true, false);
         if (location.isEmpty())
             return;
         if (!vcr::zarr::isRemote(location.toStdString())) {
@@ -1888,12 +1888,16 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             return;
         }
     } else {
-        location = QFileDialog::
-            getOpenFileName(_window, QObject::tr("Attach Lasagna Manifest"), settings.value(vc3d::settings::project::DEFAULT_PATH).toString(), QObject::tr("Lasagna manifests (*.lasagna.json);;JSON files (*.json)"));
+        location = promptLocation(QObject::tr("Attach Lasagna / Compound Dataset"),
+            QObject::tr("Select a .lasagna.json manifest or compound .zarr directory; use Fiber inference for AFV predictions."),
+            settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+            {QStringLiteral("*.json")}, true, true, false);
         if (location.isEmpty())
             return;
-        location = QFileInfo(location).absoluteFilePath();
-        settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(location).absolutePath());
+        if (!vcr::zarr::isRemote(location.toStdString())) {
+            location = QFileInfo(location).absoluteFilePath();
+            settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(location).absolutePath());
+        }
     }
 
     bool roleAccepted = false;
@@ -2000,7 +2004,7 @@ bool MenuActionController::startLasagnaManifestAttachment(const QString& locatio
                 throw std::runtime_error("regular Lasagna data requires grad_mag, nx, and ny normal channels");
             for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(
                      dataset, persistedLocation)) {
-                result.volumes.push_back({std::move(prepared.location), std::move(prepared.tags), std::move(prepared.volume)});
+                result.volumes.push_back(std::move(prepared));
             }
         } catch (const std::exception& error) {
             result.error = QString::fromUtf8(error.what());

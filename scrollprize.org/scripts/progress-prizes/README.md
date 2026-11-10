@@ -1,9 +1,11 @@
 # Progress Prize form rollover
 
 This automation prepares the next monthly Google Form, changes only the managed
-deadline and responder link in `docs/34_prizes.md`, gates activation on tests and
-the exact Vercel preview commit, then closes the old form before opening the new
-one. The cutoff is midnight immediately after the last calendar day in
+deadline and responder link in `docs/34_prizes.md`, opens that change as a
+draft pull request, and marks the pull request ready once the month's deadline
+has passed and its checks are green. The cutoff itself is manual: a human
+closes the old form, opens the new one, and merges the pull request. The
+cutoff is midnight immediately after the last calendar day in
 `America/Los_Angeles` (the published deadline remains 11:59pm Pacific).
 
 Responses live only in Google Forms; the automation never reads or copies them.
@@ -12,14 +14,9 @@ tab. A linked Sheet is ignored by every check, and the automation never reads
 its cells, changes its link, moves it, or deletes it.
 
 A fresh copy is closed at the first possible Forms API call, before title, ACL,
-or capability reconciliation. At cutoff, the fingerprint-bound target records
-durable activation intent before the source is closed. Activation refetches and
-revalidates both forms after the preview gate, so a post-gate ACL, metadata, or
-target publishing change cannot be mistaken for a recoverable transition.
-
+or capability reconciliation, so a prepared form never accepts responses early.
 The source form only has to stay published. If someone closes it by hand at or
-before the deadline, `prepare`, `verify prepared`, and `activate` still proceed;
-activation records the source as closed and opens the target.
+before the deadline, `prepare` and `verify` still proceed.
 
 The repository is public. Google authentication is therefore keyless: GitHub's
 short-lived OIDC token is exchanged through Google Workload Identity Federation
@@ -40,8 +37,8 @@ repository secret, file, log, cache, or artifact.
   on a Vercel `repository_dispatch`. It never checks out or executes deployed
   branch code.
 - `progress-prizes-production.yml` provides guarded `validate`, `dry-run`,
-  `prepare`, `activate`, `reconcile-active`, and `verify`
-  operations. Every authenticated job is literal in that top-level workflow.
+  `prepare`, `ready`, and `verify` operations. Every authenticated job is
+  literal in that top-level workflow; `ready` touches only GitHub.
 - `progress-prizes-schedule.yml` is the secret-free scheduler added only after
   production `validate` and `dry-run` passed. Reaching `main` enables its
   Pacific-time schedules; a manual dispatch is permanently restricted to a
@@ -74,14 +71,11 @@ the approved secrets.
 
 ## GitHub Environments
 
-Create these environments before merging the workflows. Restrict all three to
-the protected `main` branch. Require an authorized Vesuvius Challenge reviewer
-only on `progress-prizes-production-activation`; this is the human gate for the
-real close/open transition. The approval job receives no Google configuration,
-OIDC permission, or repository write permission. Preview and
-`progress-prizes-production` itself must not require a reviewer, so a queued
-daily preparation cannot hold the production concurrency lock and block the
-cutoff or its recovery run.
+Create these environments before merging the workflows. Restrict both to the
+protected `main` branch. Neither may require a reviewer: a queued daily
+preparation must never hold the production concurrency lock, and the human
+decision point is the manual merge of the rollover pull request, not an
+Environment approval.
 
 ### `progress-prizes-production`
 
@@ -131,21 +125,10 @@ the production identity access to staging. Later validation cycles receive an
 empty staging-identity input.
 `PROGRESS_PRIZE_SOURCE_FORM_ID` is a one-time, explicit fallback. The July form
 never receives managed environment/role/cycle markers and is never moved or
-renamed. At activation it is closed first and receives only the private recovery
-state marker. The August copy is created in the production Shared Drive and is
-cryptographically bound to that exact source ID. After its activation, managed
+renamed. The August copy is created in the production Shared Drive and is
+cryptographically bound to that exact source ID. From then on, managed
 `appProperties` discovery always selects the prior managed target, so the
 fallback secret does not need a monthly edit and is ignored for later cycles.
-
-### `progress-prizes-production-activation`
-
-This Environment contains no secrets or variables. Require one authorized
-Vesuvius Challenge reviewer, disallow self-review if the organization supports
-it, and restrict deployment branches to protected `main`. The workflow first
-freezes and verifies the exact Progress Prize PR, public test, and Vercel
-preview; then this Environment records the human approval. The following
-Google job rechecks the immutable lease immediately before mutation, so a PR or
-`main` change while approval is pending fails closed.
 
 ### `progress-prizes-preview`
 
@@ -206,7 +189,7 @@ Bind only that provider principal to its matching service account with
 constructing the `principalSet` member. Do not grant one provider impersonation
 rights on both accounts. The workflow asks for a 1200-second access token.
 `validate`, `verify`, and dry runs use read-only Forms body and Drive scopes.
-Mutations use `forms.body` and `drive`: this headless workflow must find
+The form copy uses `forms.body` and `drive`: this headless workflow must find
 pre-existing forms and app-property-managed files in a Shared Drive, which
 `drive.file` cannot reliably authorize without an interactive picker. No
 response or Sheets scope is requested. The separate service accounts, the two
@@ -228,8 +211,8 @@ Before enabling the production automation, an administrator must:
    `Public no-secret tests` check. Keep squash merge enabled.
 2. In **Settings → Actions → General**, allow the workflow token the requested
    write permissions and enable **Allow GitHub Actions to create and approve pull
-   requests**. Without this, draft creation and ready/merge transitions fail
-   closed. GitHub places `pull_request` checks triggered by a PR created with
+   requests**. Without this, draft creation and the draft-to-ready transition
+   fail closed. GitHub places `pull_request` checks triggered by a PR created with
    `GITHUB_TOKEN` into an approval-required state; approve the no-secret test run
    on each automation PR before the exact-commit gate expires.
 3. Configure Vercel to send the `repository_dispatch` event
@@ -261,7 +244,7 @@ managed source in any later cycle fails instead of reusing July:
 1. Put the private form ID only in the production protected Environment. Do not
    put it in a repository file or ordinary GitHub variable.
 2. Give the production service account a direct Forms Editor/Drive `writer`
-   permission through activation, recovery, and active verification.
+   permission until the August copy is prepared and verified.
 3. Share July with the production editor group as Editor, remove the internal
    editors' direct ACLs after verification, and keep the one external editor as
    a direct production writer.
@@ -281,8 +264,8 @@ managed source in any later cycle fails instead of reusing July:
    role source, inheritance, uniqueness, and lack of expiration are verified.
    Any other service account at any role, inherited editor, domain writer,
    Manager, or Content manager fails closed.
-5. After the August form is active and verified, the owner may remove the direct
-   service-account ACL from July. Later cycles resolve only managed forms in the
+5. After the August form is prepared and verified, the owner may remove the
+   direct service-account ACL from July. Later cycles resolve only managed forms in the
    production Shared Drive, even if the stale fallback secret remains.
 
 If Workspace policy refuses direct sharing to a service-account principal, move
@@ -292,9 +275,9 @@ credentials.
 
 ## Production operations and recovery
 
-Use **Progress Prize production rollover** on `main`. For July to August, keep
-`source-cycle=2026-07` and `target-cycle=2026-08`; later targets must always be
-the immediately following month. Leave `request-id` empty for every manual run.
+Use **Progress Prize production rollover** on `main`. The source cycle is the
+month that is ending and the target cycle must always be the immediately
+following month. Leave `request-id` empty for every manual run.
 
 - `validate` performs the read-only live-form, capability, publishing, ACL, and
   copy preflight. It never writes Google or GitHub state.
@@ -309,60 +292,48 @@ the immediately following month. Leave `request-id` empty for every manual run.
   target for the cycle, keeps the new form published but closed, and
   reconstructs the one marker-only draft page PR. The source may be open or
   already closed.
-- `verify` with `prepared` requires that exact page-only PR on current `main`;
-  `active` requires the completed website and Google close/open state.
-- `activate` should be dispatched near 23:40 Pacific on the final day. The exact
-  PR tests and Vercel preview pass first. Approval is offered only when the real
-  cutoff is at most one hour away (or has passed), through the secret-free
-  `progress-prizes-production-activation` Environment. The job waits without a
-  Google token, authenticates at cutoff, reacquires a zero-wait GitHub lease,
-  closes the source, opens and reload-verifies the target, then merges only the activated commit.
-- `reconcile-active` is a manual break-glass repair for a rollover that humans
-  already completed. Run `verify active` first. Reconciliation proceeds only if
-  the old form is published and closed, the new form is published and open, the
-  website points exactly to the new responder URL, and titles, structure,
-  capabilities, ACLs, and copy fingerprint all match. It
-  requires the same secret-free activation Environment approval and may update
-  only the source `CLOSED` and target `ACTIVE` Drive `appProperties`. It never
-  changes a form, response, permission, folder, publishing state, or website
-  file. A second run is read-only and succeeds idempotently.
+- `ready` is the cutoff step. It finds the one open rollover PR, checks that its
+  head is a single page-only commit with the exact deterministic deadline and
+  link change, waits up to 30 minutes for the `Public no-secret tests` check and
+  the exact Vercel preview status on that commit, then marks the draft ready for
+  review and posts the manual cutoff checklist as a PR comment. It never
+  merges, never authenticates to Google, and other repository workflows on the
+  same commit cannot block it. If the PR is already ready it changes nothing;
+  if the page is already on `main` it exits green.
+- `verify` is read-only. It requires the one open rollover PR and checks that
+  the prepared form and the PR's page agree on cycle, link, titles, structure,
+  capabilities, ACLs, and copy fingerprint.
 
-If preparation, activation, or merge stops, rerun the same operation and cycle.
-Managed Drive markers make Google copy and close/open recovery idempotent. A
-rerun after a completed merge performs read-only active verification. If `main`
-moved before mutation, activation reconstructs and rechecks a stale-parent page
-commit; any multi-file, merge, wrong-path, or query-bearing change fails closed.
-Never use simulated time, fault controls, alternate branches, or staging folders
-for production; those inputs are absent and the shared action rejects them
-before authentication.
+The manual cutoff, once the PR is ready:
 
-Manual recovery uses public controls only; Google configuration stays inside the
-protected Environment:
+1. In Google Forms, stop the previous month's form accepting responses.
+2. Open the new month's form; it is already published and closed.
+3. Merge the pull request (squash). Order relative to the form switch does not
+   matter to the automation.
+
+If preparation stops, rerun `prepare` for the same cycles; managed Drive
+markers make the copy idempotent. If `ready` stops, rerun it; it is idempotent
+too. Manual recovery uses public controls only:
 
 ```bash
 gh workflow run progress-prizes-production.yml --ref main \
-  -f operation=activate -f source-cycle=2026-07 -f target-cycle=2026-08 \
-  -f verify-mode=active
+  -f operation=prepare -f source-cycle=2026-11 -f target-cycle=2026-12
 gh workflow run progress-prizes-production.yml --ref main \
-  -f operation=verify -f source-cycle=2026-07 -f target-cycle=2026-08 \
-  -f verify-mode=active
+  -f operation=ready -f source-cycle=2026-11 -f target-cycle=2026-12
 gh workflow run progress-prizes-production.yml --ref main \
-  -f operation=reconcile-active -f source-cycle=2026-07 -f target-cycle=2026-08 \
-  -f verify-mode=active
+  -f operation=verify -f source-cycle=2026-11 -f target-cycle=2026-12
 ```
 
 The trusted GitHub coordinator prints only these diagnostic codes:
-`main-ref-moved`, `ambiguous-pr`, `invalid-page-head`,
-`invalid-pr-association`, `invalid-main-ref`, `completed-state-missing`, and
-`unexpected-error`. The code is safe to include in an incident report; API
-bodies and private identifiers are never printed.
+`ambiguous-pr`, `invalid-pr-association`, `invalid-main-ref`,
+`completed-state-missing`, and `unexpected-error`. The code is safe to include
+in an incident report; API bodies and private identifiers are never printed.
 
 Generated `codex/progress-prize-YYYY-MM` branches and their PRs are strictly
 marker-only. Never push a human guideline, copy, or formatting commit to a
 generated rollover branch. Put editorial changes on a separate branch and PR;
-otherwise the exact one-commit/one-file activation gate will reject the
-rollover. Production never deletes an old form or any response. Cleanup is not
-exposed by the production workflow.
+otherwise the one-commit/one-file check will refuse to mark the rollover ready.
+Production never deletes an old form or any response.
 
 ## Automated schedule and immediate verification
 
@@ -377,32 +348,28 @@ bound to the exact child run ID and public Actions URL.
   seven-day window and after cutoff. Once an exact page-only draft PR already
   sits directly above current `main`, it skips repeated preparation instead of
   force-pushing a new commit and restarting checks.
-- `23:40` Pacific on candidate final days dispatches activation only when the
+- `23:40` Pacific on candidate final days dispatches `ready` only when the
   observed date is the actual last calendar day. The production workflow—not
-  the scheduler—runs tests and the Vercel gate, requests human approval, waits
-  for cutoff without a Google token, then authenticates.
-- `00:17` Pacific remains a first-day recovery probe. `06:47` Pacific retries
-  on days 1–7, always targeting the previous month's incomplete rollover. A
-  delayed day-7 event may cross local midnight before the day-8 slot; a true
-  day-8 event no-ops. If an exact production run is already nonterminal, the
-  scheduler does not enqueue a stale duplicate. A completed rollover reaches
-  read-only active verification and never creates another form or repeats
-  publishing mutations.
+  the scheduler—waits for the tests and the Vercel preview and flips the draft.
+- `00:17` Pacific remains a first-day retry. `06:47` Pacific retries on days
+  1–7, always targeting the previous month's rollover. A delayed day-7 event
+  may cross local midnight before the day-8 slot; a true day-8 event no-ops. If
+  an exact production run is already nonterminal, the scheduler does not
+  enqueue a stale duplicate. A PR that is already ready, or already merged,
+  makes every retry a green no-op.
 
 Production and scheduler concurrency groups never cancel an in-progress run and
 use GitHub's queued concurrency mode so a manual race cannot silently replace a
 pending cutoff run. The scheduler itself never sleeps. GitHub may delay or drop
 a scheduled event, and public-repository schedules can be disabled after 60 days
 without repository activity, so the production workflow keeps its manual
-`prepare` and `activate` recovery path.
+`prepare` and `ready` recovery path.
 
 Immediately after the scheduler reaches `main`, manually dispatch **Progress
 Prize production schedule** once. Manual scheduler runs have no inputs and can
-only dispatch the real-clock production `dry-run`; they cannot prepare, close,
-open, share, publish, merge, or update the website. Verify that the scheduler's
-recorded child run is the exact successful read-only production run. Scheduled
-preparation must remain reviewer-free; the reviewer gate belongs only to the
-secret-free `progress-prizes-production-activation` Environment.
+only dispatch the real-clock production `dry-run`; they cannot prepare, mark
+ready, close, open, share, publish, or update the website. Verify that the
+scheduler's recorded child run is the exact successful read-only production run.
 
 ## Local verification
 
@@ -429,8 +396,8 @@ schema-lag diagnostic; every other workflow finding remains fatal. Remove the
 ignore once a released actionlint understands queued concurrency.
 
 The workflow contract test checks immutable action pins, OIDC isolation,
-repository IDs, retired staging controls, exact-commit Vercel
-association, and trusted GitHub check provenance. The gated production and
+repository IDs, the absence of retired staging and activation controls,
+exact-commit Vercel association, and trusted GitHub check provenance. The gated production and
 scheduler have separate executable contract tests for the clock boundaries,
 minimal permissions, deduplication, fixed dispatch endpoint, child-run binding,
 redacted failures, and absence of Google configuration.

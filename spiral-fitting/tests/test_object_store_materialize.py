@@ -1,0 +1,238 @@
+"""Runtime patches and point constraints materialized from an object store."""
+import math
+
+import numpy as np
+import pytest
+
+pytest.importorskip('vc_object_store')
+
+import object_store_inputs as osi  # noqa: E402
+import object_store_reference as reference  # noqa: E402
+from object_store_fixture import (  # noqa: E402
+    frame, pcl_patch_edge, put_patch, put_pcl, write_reference_store)
+
+
+pytestmark = pytest.mark.usefixtures('cpu')
+
+
+def materialize(db, fiber_min_point_spacing=0.0, **request):
+    snapshot = osi.read_snapshot(db, osi.InputRequest(**request))
+    config = reference.fit_config()
+    return osi.materialize(db, snapshot, z_begin=config['z_begin'],
+                           z_end=config['z_end'],
+                           z_margin=config['patch_loss_z_margin'],
+                           erode_cells_default=config['patch_erode_patches'],
+                           fiber_min_point_spacing=fiber_min_point_spacing)
+
+
+def adapter_context(db, tmp_path):
+    """A FitContext loaded from the store instead of files."""
+    from config import FitConfig
+    from fit_session import SpiralInputPaths
+    from fit_spiral import FitContext
+    umbilicus = str(tmp_path / 'umbilicus.json')
+    reference.write_umbilicus(umbilicus)
+    context = FitContext(
+        FitConfig(reference.fit_config()), scroll=reference.scroll_spec(),
+        paths=SpiralInputPaths(umbilicus=umbilicus),
+        cache_dir=str(tmp_path / 'cache'), object_store_inputs=materialize(db))
+    context.load_host_inputs()
+    return context
+
+
+def _without_fibers(constraints):
+    """The patch and regular-PCL constraints of a summary."""
+    def regular(entries):
+        return [entry for entry in entries if entry[0] != 'fibers']
+    return {
+        'patches': constraints['patches'],
+        'cross_patch': [pcl for pcl in constraints['cross_patch']
+                        if pcl['group'] != 'fibers'],
+        'strips': [strip for strip in constraints['strips']
+                   if strip['group'] != 'fibers'],
+        'cross_patch_strata': regular(constraints['cross_patch_strata']),
+    }
+
+
+def test_identical_attachments_reproduce_the_reference_patches_and_pcls(db, tmp_path):
+    expected = reference.load_reference()
+    uuids = write_reference_store(db, expected, fibers=False)
+    context = adapter_context(db, tmp_path)
+    names = {uuid: name for name, uuid in uuids.items()}
+    summary = reference.constraint_summary(context, names)
+    assert _without_fibers(summary) == _without_fibers(expected['constraints'])
+    point = context.cross_patch_pcls[0]['points'][2]
+    assert point['on_patch']['edge_uuid'] in {
+        rel.uuid for rel in context.object_store_inputs.snapshot.relationships}
+
+
+def _grid(z0=4.0, size=8, step=4.0):
+    rows, cols = np.mgrid[:size, :size]
+    return np.stack([z0 + rows * step, np.full(rows.shape, 100.0),
+                     40.0 + cols * step], axis=-1)
+
+
+@pytest.mark.parametrize('scale', [0.5, 1, 4])
+def test_patch_frames_invalid_vertices_and_erosion(db, scale):
+    import torch
+    from spiral_helpers import prepare_patch_for_fit
+    from tifxyz import Patch
+    grid = _grid()
+    grid[3, 3] = -1
+    a = put_patch(db, grid, (0.25, 0.25), coordinates=frame(scale), name='a')
+    b = put_patch(db, _grid(), (0.25, 0.25), coordinates=frame(1), name='b',
+                  meta={'source': {'spiral_patch_erode_cells': 0}})
+    inputs = materialize(db)
+    patch = inputs.patches[a]
+    # The file loader's erosion of the same grid, with the hole kept at -1.
+    expected = Patch(torch.from_numpy(grid.astype(np.float32)),
+                     torch.tensor([0.25, 0.25]), None, None)
+    assert prepare_patch_for_fit(expected, 0, 64, 1) is None
+    valid = patch.valid_vertex_mask.numpy()
+    np.testing.assert_array_equal(valid, expected.valid_vertex_mask.numpy())
+    assert not valid[3, 3] and (patch.zyxs.numpy()[3, 3] == -1).all()
+    np.testing.assert_allclose(patch.zyxs.numpy(), expected.zyxs.numpy(), atol=1e-4)
+    np.testing.assert_allclose(patch.scale.numpy(), [0.25, 0.25])
+    # Its own erosion request keeps the other patch whole.
+    assert inputs.patches[b].valid_vertex_mask.all()
+
+
+def test_surface_validity_channel_marks_holes(db):
+    # Ingested mask.tif: a masked vertex keeps its coordinates but is a hole.
+    valid = np.ones(_grid().shape[:2], dtype=bool)
+    valid[2, 5] = False
+    uid = put_patch(db, _grid(), (0.25, 0.25), valid=valid,
+                    meta={'source': {'spiral_patch_erode_cells': 0}})
+    patch = materialize(db).patches[uid]
+    np.testing.assert_array_equal(patch.valid_vertex_mask.numpy(), valid)
+    assert (patch.zyxs.numpy()[2, 5] == -1).all()
+
+
+def test_patches_outside_the_z_window_are_dropped(db):
+    put_patch(db, _grid(z0=200.0))
+    inputs = materialize(db)
+    assert inputs.patches == {}
+    assert inputs.counts['patches outside z ROI'] == 1
+
+
+def _point(point_id, wind=None):
+    return [10.0 + point_id, 100.0, 40.0 + 4 * point_id], wind
+
+
+def test_points_keep_stable_ids_and_aligned_annotations(db):
+    patch = put_patch(db, _grid())
+    # Stored out of order, with noncontiguous IDs.
+    pcl = put_pcl(db, {9: _point(9, 2.0), 3: _point(3, 1.0), 5: _point(5, 1.5)})
+    pcl_patch_edge(db, pcl, 5, patch, (1.5, 2.25))
+    inputs = materialize(db)
+    [collection] = inputs.point_collections.values()
+    assert list(collection['points']) == [3, 5, 9]
+    assert [p['winding_annotation'] for p in collection['points'].values()] == [1.0, 1.5, 2.0]
+    assert collection['points'][5]['on_patch']['ij'] == [1.5, 2.25]
+    assert collection['points'][5]['on_patch']['id'] == patch
+    np.testing.assert_allclose(collection['points'][9]['zyx'], _point(9)[0])
+    assert collection['sampling_group'] == osi.RELATIVE_PCL_GROUP
+    assert inputs.counts['pcl attachments'] == 1
+
+
+def test_absolute_role_comes_from_metadata_not_names(db):
+    patch = put_patch(db, _grid())
+    absolute = put_pcl(db, {0: _point(0, 3.0)}, absolute=True, name='same_windings')
+    relative = put_pcl(db, {0: _point(0, 3.0)}, name='abs_winding')
+    unannotated = put_pcl(db, {0: _point(0)})
+    edges = {uid: pcl_patch_edge(db, uid, 0, patch, (1.0, 1.0))
+             for uid in (absolute, relative, unannotated)}
+    inputs = materialize(db)
+    by_uuid = {pcl['metadata']['object_uuid']: pcl
+               for pcl in inputs.point_collections.values()}
+    assert by_uuid[absolute]['metadata']['winding_is_absolute']
+    assert by_uuid[absolute]['sampling_group'] == osi.ABSOLUTE_PCL_GROUP
+    assert not by_uuid[relative]['metadata']['winding_is_absolute']
+    assert by_uuid[unannotated]['sampling_group'] == osi.SAME_WINDING_PCL_GROUP
+    # A role the detector found otherwise is refused, as is a malformed one.
+    record = db.edge(edges[absolute])
+    record['meta']['point_collection_surface']['winding_is_absolute'] = False
+    with db.write() as tx:
+        tx.update_edge(record)
+    with pytest.raises(osi.ObjectStoreInputError, match='detected as relative'):
+        materialize(db)
+    record['meta']['point_collection_surface']['winding_is_absolute'] = True
+    with db.write() as tx:
+        tx.update_edge(db.edge(edges[absolute]) | {'meta': record['meta']})
+    materialize(db)
+    put_pcl(db, {0: _point(0, 3.0)}, source={'winding_is_absolute': 'yes'})
+    with pytest.raises(osi.ObjectStoreInputError, match='non-boolean'):
+        materialize(db)
+
+
+def test_absolute_points_need_explicit_positive_windings(db, tmp_path):
+    from pcl_views import regular_pcl_views
+    patch = put_patch(db, _grid())
+    pcl = put_pcl(db, {0: _point(0), 1: _point(1, 4.0)}, absolute=True)
+    pcl_patch_edge(db, pcl, 0, patch, (1.0, 1.0))
+    inputs = materialize(db)
+    # A missing annotation is never treated as winding zero.
+    assert math.isnan(inputs.point_collections[0]['points'][0]['winding_annotation'])
+    with pytest.raises(ValueError, match='without a winding annotation'):
+        regular_pcl_views(inputs.point_collections, inputs.patches, z_begin=0,
+                          z_end=64, z_margin=0, min_point_spacing=0)
+
+
+def test_attachments_on_eroded_quads_are_dropped_and_reported(db, tmp_path):
+    from object_store_fixture import fiber_patch_edge, put_fiber
+    patch = put_patch(db, _grid())
+    pcl = put_pcl(db, {0: _point(0, 1.0), 1: _point(1, 2.0)})
+    eroded = pcl_patch_edge(db, pcl, 0, patch, (0.25, 0.25))
+    kept = pcl_patch_edge(db, pcl, 1, patch, (3.5, 3.5))
+    fiber = put_fiber(db, [[10.0, 104.0, 40.0 + i] for i in range(12)], [0, 11])
+    contact = fiber_patch_edge(db, fiber, 2, patch, (0.5, 6.5))
+    inputs = materialize(db)
+    points = inputs.point_collections[0]['points']
+    assert 'on_patch' not in points[0] and points[1]['on_patch']['edge_uuid'] == kept
+    assert 'attachments' not in inputs.fibers[fiber]['points'][2]
+    assert sorted(edge for edge, _ in inputs.dropped_attachments) == sorted([eroded, contact])
+    assert inputs.counts['pcl attachments off sampled quads'] == 1
+    assert inputs.counts['fiber contacts off sampled quads'] == 1
+    warning = [line for line in inputs.report() if line.startswith('WARNING')]
+    assert len(warning) == 1 and eroded in warning[0] and contact in warning[0]
+
+
+def test_attachments_on_detached_islands_are_dropped_like_the_losses_do(db):
+    """The losses sample only a patch's largest connected piece."""
+    from types import SimpleNamespace
+    from fit_spiral import FitContext
+    rows, cols = np.mgrid[:16, :20]
+    grid = np.stack([4.0 + rows * 3, np.full(rows.shape, 100.0), 40.0 + cols * 4],
+                    axis=-1)
+    grid[:, 6:9] = -1  # columns 0-5 become a smaller island than 9-19
+    patch = put_patch(db, grid, (0.25, 0.25))
+    pcl = put_pcl(db, {0: ([13.0, 100.0, 52.0], 3.0)}, absolute=True)
+    island = pcl_patch_edge(db, pcl, 0, patch, (3.0, 3.0))
+    inputs = materialize(db)
+    assert inputs.dropped_attachments == [(island, 'quad not sampled')]
+    assert 'on_patch' not in inputs.point_collections[0]['points'][0]
+    # The fit computes the same mask the materializer checked.
+    materialized = inputs.patches[patch]._sampling_valid_quad_mask_np
+    context = SimpleNamespace(
+        _patch_sampling_probabilities=lambda patches: None, progress=None,
+        z_begin=0, z_end=64, config=reference.fit_config())
+    FitContext._prepare_patch_sampling_cache(context, [inputs.patches[patch]])
+    np.testing.assert_array_equal(
+        inputs.patches[patch]._sampling_valid_quad_mask_np, materialized)
+    assert not materialized[3, 3]
+
+
+def test_report_derives_the_runtime_views(db, capsys):
+    patch = put_patch(db, _grid())
+    pcl = put_pcl(db, {0: _point(0, 1.0), 1: _point(1, 2.0), 2: _point(2, 2.5)})
+    pcl_patch_edge(db, pcl, 0, patch, (1.0, 1.0))
+    pcl_patch_edge(db, pcl, 1, patch, (2.0, 2.0))
+    assert osi.main([db.path, '--z-begin', '0', '--z-end', '64']) == 0
+    report = capsys.readouterr().out
+    assert 'pcl attachments 2' in report
+    assert 'views: 1 cross-patch (relative_windings 1), 1 strips (relative_windings 1)' in report
+    # It fails where a fit would.
+    absolute = put_pcl(db, {0: _point(0)}, absolute=True)
+    pcl_patch_edge(db, absolute, 0, patch, (1.0, 1.0))
+    assert osi.main([db.path, '--z-begin', '0', '--z-end', '64']) == 1
+    assert 'without a winding annotation' in capsys.readouterr().err

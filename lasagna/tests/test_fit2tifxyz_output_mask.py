@@ -728,6 +728,7 @@ class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
 		np.testing.assert_allclose(x_out, x * 0.5)
 		self.assertEqual(meta["base_shape_zyx"], [50, 50, 50])
 		self.assertEqual(meta["lasagna_base_shape_zyx"], [100, 100, 100])
+		self.assertEqual(meta["export_coordinate_scale"], 0.5)
 		self.assertEqual(meta["scale"], [1.0, 1.0])
 		self.assertEqual(meta["bbox"], [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
 		self.assertEqual(meta["area_vx2"], 4.0)
