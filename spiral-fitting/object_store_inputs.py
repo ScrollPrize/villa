@@ -1399,8 +1399,8 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
             obj.frame.xyz_to_fit_zyx(arrays['line_points'])[:, ::-1])
         controls = np.ascontiguousarray(
             obj.frame.xyz_to_fit_zyx(arrays['control_points'])[:, ::-1])
-        if len(controls) < 1:
-            raise ObjectStoreInputError([f'fiber {obj.uuid} has no control points'])
+        if not len(controls) and not len(line):
+            raise ObjectStoreInputError([f'fiber {obj.uuid} has no points'])
         own_contacts = contacts[obj.uuid]
         polyline, span_begin, control_line = fiber_control_span(controls, line)
         if polyline is controls:

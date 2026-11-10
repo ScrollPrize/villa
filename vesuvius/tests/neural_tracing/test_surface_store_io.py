@@ -101,6 +101,17 @@ def test_copy_store_mode_reads_the_pinned_version_and_creates_sourced_outputs(tm
         assert 'area_vx2' not in meta
         assert record['surface']['area'] > 0
 
+    # The next copy must cite its actual preceding output, not the first ancestor.
+    _, next_grid, next_valid = surfaces.load(created, 1)
+    previous = surfaces.loaded_version
+    following = surfaces.save(next_grid, next_valid, 'second', step_size=2, voxel_size_um=8.0,
+                              source='ckpt', metadata={}, apply_mesh_cleanup=False)
+    with ObjectStore.open(str(store), read_only=True) as db:
+        provenance = db.object(following)['meta']['provenance']
+        assert provenance['sources'] == [created]
+        assert provenance['parameters']['input'] == {'surface': created, **previous}
+        assert previous['object'] != exact['object']
+
 
 def test_copy_cli_takes_exactly_one_input_mode():
     base = ['--volume-path', 'v.zarr', '--checkpoint-path', 'c.pt']

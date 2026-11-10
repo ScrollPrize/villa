@@ -6,7 +6,7 @@ import pytest
 from vc_object_store import ObjectStore, extension_uuid, remove_history_and_disable
 
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
-    FiberStore, _references_digest, fiber_catalog, fibers_digest, read_polylines, write_fibers,
+    FiberStore, _references_digest, fiber_catalog, fibers_digest, fiber_source_version, read_polylines, write_fibers,
 )
 
 
@@ -30,6 +30,70 @@ def test_uuid_normalization_and_digest_owner(tmp_path):
             operation(path, ['invalid'])
     ref = fiber_catalog(path, 'vol')[0]['reference']
     assert _references_digest([ref]) != _references_digest([dict(ref, store=str(uuid.uuid4()))])
+
+
+def test_catalog_measures_selected_geometry_not_ingestion_summary(tmp_path):
+    path, ids = source(tmp_path)
+    xyz = np.array([[10., 20., 30.], [10., 24., 30.], [13., 24., 30.]])
+    with ObjectStore.open(str(path), author='editor') as store:
+        version = store.current_version(ids[0])
+        with store.write(expected_versions={ids[0]: version}) as tx:
+            tx.edit_geometry_sequence(ids[0], dict(array='line_points', start=0, erase_count=32,
+                                      parts=[dict(count=3, data=xyz.tobytes())]), version)
+    row = next(r for r in fiber_catalog(path, 'vol') if r['id'] == ids[0])
+    assert row['point_count'] == 3
+    assert row['length'] == 7
+    assert row['bbox'] == [10, 20, 30, 13, 24, 30]
+    np.testing.assert_array_equal(read_polylines(path, [ids[0]])[0][1], xyz)
+
+
+def test_strip_index_rejects_changed_ordinal_source(tmp_path):
+    from types import SimpleNamespace
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.data import RunFibers
+    path, ids = source(tmp_path)
+    index = SimpleNamespace(meta=dict(fibers_digest=fibers_digest(path)), unit_length=np.array([10.]))
+    RunFibers(path, index, 1)
+    with ObjectStore.open(str(path), author='editor') as store:
+        store.delete_object(min(ids))
+    with pytest.raises(ValueError, match='source changed'):
+        RunFibers(path, index, 1)
+    index.meta.clear()
+    with pytest.raises(ValueError, match='missing source digest'):
+        RunFibers(path, index, 1)
+
+
+def test_strip_resume_requires_complete_input_identity(tmp_path):
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all import pending_fibers
+    path, _ = source(tmp_path)
+    catalog = fiber_catalog(path, 'vol')
+    completed = {r['id']: r['reference'] for r in catalog}
+    assert pending_fibers(catalog, [0, 1], completed) == []
+    completed[catalog[0]['id']] = None  # legacy UUID-only completion
+    completed[catalog[1]['id']] = dict(catalog[1]['reference'], generation=str(uuid.uuid4()))
+    assert pending_fibers(catalog, [0, 1], completed) == [0, 1]
+
+
+@pytest.mark.parametrize('change_during_read', [False, True])
+def test_frozen_evidence_rejects_source_edits(tmp_path, monkeypatch, change_during_read):
+    from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
+    path, ids = source(tmp_path)
+    expected = fiber_source_version(path)
+    assert len(read_polylines(path, source_version=expected)) == 2
+    def edit():
+        with ObjectStore.open(str(path), author='editor') as store:
+            store.set_meta(ids[0], 'coordinates', dict(volume_uuid='vol', scale_factor=2))
+    if change_during_read:
+        original = fiber_store._read_rows
+        def interleaved(*args, **kwargs):
+            yield from original(*args, **kwargs)
+            edit()
+        monkeypatch.setattr(fiber_store, '_read_rows', interleaved)
+    else:
+        edit()
+    with pytest.raises(ValueError, match='source changed'):
+        read_polylines(path, source_version=expected)
+    with pytest.raises(ValueError, match='missing source version'):
+        read_polylines(path, source_version={})
 
 
 @pytest.mark.parametrize('change', ['metadata', 'geometry'])

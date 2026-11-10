@@ -152,6 +152,8 @@ def fiber_control_span(control_xyz, line_xyz):
     degenerate fiber) the control points themselves are the polyline.
     """
     num_control_points = len(control_xyz)
+    if not num_control_points:
+        return line_xyz, 0, np.empty(0, dtype=np.int64)
     if len(line_xyz) >= num_control_points and num_control_points >= 1:
         squared_distances = (
             (line_xyz[None, :, :] - control_xyz[:, None, :]) ** 2).sum(axis=-1)

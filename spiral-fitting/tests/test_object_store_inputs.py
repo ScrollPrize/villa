@@ -29,6 +29,16 @@ def request(**selectors):
         volume, approved)
 
 
+def test_dense_fiber_without_synthetic_controls_materializes_whole_line(db):
+    fid = put_fiber(db, _line(), [])
+    snapshot = osi.read_snapshot(db, request())
+    fibers, links, counts = osi.materialize_fibers(db, snapshot, {}, min_point_spacing=0)
+    assert counts['fibers'] == 1 and links == []
+    assert fibers[fid]['metadata']['fiber_num_control_points'] == 0
+    assert list(fibers[fid]['points']) == list(range(6))
+    np.testing.assert_allclose([p['zyx'] for p in fibers[fid]['points'].values()], _line())
+
+
 @pytest.mark.parametrize('history_enabled', [False, True])
 def test_snapshot_uses_numbered_relationship_versions_without_record_generations(tmp_path, history_enabled):
     from vc_object_store import ObjectStore

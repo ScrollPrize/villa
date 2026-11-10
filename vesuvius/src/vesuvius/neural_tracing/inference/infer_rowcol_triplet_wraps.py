@@ -2000,6 +2000,8 @@ class _StoredSurfaces:
         self.generation = generation
         self.reference = reference
         self.source_version = None  # complete source identity once loaded
+        self.loaded_source = None
+        self.loaded_version = None
 
     def load(self, ref, retarget_factor):
         pinned = ref == self.source
@@ -2008,11 +2010,13 @@ class _StoredSurfaces:
                                reference=self.reference if pinned else None)
         if pinned:
             self.source_version = surface.extra['store_version']
+        self.loaded_source = ref
+        self.loaded_version = surface.extra['store_version']
         return _surface_grid(surface, retarget_factor)
 
     def name(self, ref):
         with ObjectStore.open(str(self.store), read_only=True, reader_pool_size=1) as store:
-            pin = (self.source_version or self.reference) if ref == self.source else None
+            pin = self.loaded_version if ref == self.loaded_source else (self.source_version or self.reference) if ref == self.source else None
             if pin:
                 selected = store.objects_at_versions([pin])[0]
                 if selected is None:
@@ -2026,6 +2030,8 @@ class _StoredSurfaces:
         return False
 
     def save(self, grid, valid, name, step_size, voxel_size_um, source, metadata, apply_mesh_cleanup=True):
+        if self.loaded_version is None:
+            raise ValueError('Load the input surface before saving its derived result')
         save_grid, metadata_out = _prepare_surface_for_save(grid, valid, step_size, metadata, apply_mesh_cleanup)
         area_vx2, area_cm2 = get_area(save_grid, step_size, voxel_size_um)
         return create_surface(
@@ -2036,8 +2042,8 @@ class _StoredSurfaces:
             volume=self.volume,
             tool="vesuvius-displacement-copy",
             parameters={"checkpoint": str(source),
-                        "input": {"surface": self.source, **(self.source_version or {})}},
-            sources=[self.source],
+                        "input": {"surface": self.loaded_source, **self.loaded_version}},
+            sources=[self.loaded_source],
             meta={"area_vx2": area_vx2, "area_cm2": area_cm2, **metadata_out},
         )
 
