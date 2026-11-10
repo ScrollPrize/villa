@@ -179,3 +179,20 @@ def test_satisfied_fractions_are_compared_in_float64(monkeypatch, device):
         assert strict(1 + 1e-9) == (False, False)
     finally:
         devices.max_precision_bits.cache_clear()
+
+
+def test_out_of_memory_reruns_with_host_quads(monkeypatch):
+    import satisfaction_metrics
+    calls = []
+
+    def fake(*args, quad_device, **kwargs):
+        calls.append(quad_device.type)
+        if quad_device.type != 'cpu':
+            raise torch.OutOfMemoryError('out of memory')
+        return 'evaluation'
+
+    monkeypatch.setattr(satisfaction_metrics, '_evaluate_patch_satisfaction_packed', fake)
+    result = evaluate_patch_satisfaction_packed(
+        None, torch.tensor(1.0, device='meta'), [], None, 0, 1)
+    assert result == 'evaluation'
+    assert calls == ['meta', 'cpu']
