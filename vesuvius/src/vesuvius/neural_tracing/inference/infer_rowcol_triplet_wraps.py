@@ -59,6 +59,7 @@ _COPY_ARG_TO_CLI = {
     "surface_uuid": "--surface",
     "surface_version": "--surface-version",
     "surface_generation": "--surface-generation",
+    "surface_reference": "--surface-reference",
     "volume_uuid": "--volume-uuid",
     "volume_path": "--volume-path",
     "checkpoint_path": "--checkpoint-path",
@@ -584,6 +585,8 @@ def parse_args(argv=None):
                         help="Read this numbered version of --surface instead of its current one.")
     parser.add_argument("--surface-generation", type=str, default=None,
                         help="History generation of --surface-version (default: the store's active one).")
+    parser.add_argument("--surface-reference", type=json.loads, default=None,
+                        help="Complete source-owned {store,generation,object,version} JSON reference.")
     parser.add_argument("--volume-uuid", type=str, default=None)
     parser.add_argument("--volume-path", type=str, required=True)
     parser.add_argument("--checkpoint-path", type=str, required=True)
@@ -754,13 +757,15 @@ def parse_args(argv=None):
         parser.error("give exactly one of --tifxyz-path and --store.")
     if args.store is not None and (args.surface_uuid is None or args.volume_uuid is None):
         parser.error("--store needs --surface and --volume-uuid.")
-    if args.store is None and (args.surface_uuid or args.surface_version is not None or args.surface_generation
+    if args.store is None and (args.surface_uuid or args.surface_version is not None or args.surface_generation or args.surface_reference is not None
                                or args.volume_uuid):
         parser.error("--surface, --surface-version, --surface-generation and --volume-uuid need --store.")
     if args.surface_generation and args.surface_version is None:
         parser.error("--surface-generation needs --surface-version.")
     if args.surface_version is not None and args.surface_version < 1:
         parser.error("--surface-version must be at least 1.")
+    if args.surface_reference is not None and (args.surface_version is not None or args.surface_generation):
+        parser.error("--surface-reference is exclusive with --surface-version/--surface-generation.")
     if args.store is not None and args.out_dir is not None:
         parser.error("--out-dir is for tifxyz outputs; stored outputs go to --store.")
     if args.iterations is not None and args.iterations < 1:
@@ -790,6 +795,8 @@ def normalize_copy_args(copy_args):
 def _append_cli_arg(argv, flag, value):
     if isinstance(value, np.ndarray):
         value = value.tolist()
+    if isinstance(value, dict):
+        value = json.dumps(value)
     if isinstance(value, (list, tuple)):
         argv.append(flag)
         argv.extend(str(v) for v in value)
@@ -1981,29 +1988,38 @@ class _TifxyzSurfaces:
 
 
 class _StoredSurfaces:
-    """Input and outputs as surface objects of a store: ``source`` (read at numbered ``version`` in ``generation``
-    when given, else its current version) is the input, outputs are new surfaces bound to ``volume`` with
+    """Input and outputs as surface objects of a store: ``source`` (read at a complete ``reference``, legacy
+    version/generation selector, or current version) is the input, outputs are new surfaces bound to ``volume`` with
     ``source`` as their source and the version read in their parameters (``input``)."""
 
-    def __init__(self, store, volume, source, version=None, generation=None):
+    def __init__(self, store, volume, source, version=None, generation=None, reference=None):
         self.store = store
         self.volume = volume
         self.source = source
         self.version = version
         self.generation = generation
-        self.source_version = None  # {generation, version} of the source once loaded
+        self.reference = reference
+        self.source_version = None  # complete source identity once loaded
 
     def load(self, ref, retarget_factor):
         pinned = ref == self.source
         surface = read_surface(self.store, ref, volume=self.volume, version=self.version if pinned else None,
-                               generation=self.generation if pinned else None)
+                               generation=self.generation if pinned else None,
+                               reference=self.reference if pinned else None)
         if pinned:
             self.source_version = surface.extra['store_version']
         return _surface_grid(surface, retarget_factor)
 
     def name(self, ref):
         with ObjectStore.open(str(self.store), read_only=True, reader_pool_size=1) as store:
-            record = store.object(ref)
+            pin = (self.source_version or self.reference) if ref == self.source else None
+            if pin:
+                selected = store.objects_at_versions([pin])[0]
+                if selected is None:
+                    raise ValueError('Selected source surface is no longer retained')
+                record = selected['record']
+            else:
+                record = store.object(ref)
         return (record or {}).get("name") or ref
 
     def is_input(self, ref, name):
@@ -2609,7 +2625,7 @@ def run(args):
     if args.store is not None:
         input_ref = str(args.surface_uuid)
         surfaces = _StoredSurfaces(args.store, args.volume_uuid, input_ref, args.surface_version,
-                                   args.surface_generation)
+                                   args.surface_generation, args.surface_reference)
     else:
         out_dir = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.tifxyz_path).resolve().parent)
         surfaces = _TifxyzSurfaces(out_dir)

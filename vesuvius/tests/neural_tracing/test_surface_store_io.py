@@ -2,7 +2,7 @@
 mode built on them."""
 import numpy as np
 import pytest
-from vc_object_store import ObjectStore
+from vc_object_store import ObjectStore, object_reference
 
 from vesuvius.neural_tracing.inference import infer_rowcol_triplet_wraps as copy
 from vesuvius.neural_tracing.inference.surface_store import create_surface, read_surface
@@ -79,6 +79,7 @@ def test_copy_store_mode_reads_the_pinned_version_and_creates_sourced_outputs(tm
     with ObjectStore.open(str(store), author='test') as db:  # a later version must not be read
         pinned = db.current_version(source)
         generation = db.status()['generation']
+        exact = object_reference(db.object(source))
         edited = np.zeros((6, 8, 3), '<f4')
         db.put_geometry(source, dict(kind='surface', attributes=dict(scale=[0.5, 0.5]),
                                      arrays=[dict(name='points', dtype='<f4', shape=[6, 8, 3], data=edited.tobytes())]),
@@ -86,7 +87,7 @@ def test_copy_store_mode_reads_the_pinned_version_and_creates_sourced_outputs(tm
     surfaces = copy._StoredSurfaces(str(store), 'vol', source, pinned)
     _, grid, valid = surfaces.load(source, 1)
     assert grid[1, 1, 2] == pytest.approx(12.0)  # zyx of the pinned version (x = 1*2 + 10)
-    assert surfaces.source_version == {'generation': generation, 'version': pinned}
+    assert surfaces.source_version == exact
     assert not valid[0, 0]
     assert surfaces.name(source) == 'source'
     created = surfaces.save(grid, valid, 'source_front', step_size=2, voxel_size_um=8.0, source='ckpt',
@@ -95,8 +96,7 @@ def test_copy_store_mode_reads_the_pinned_version_and_creates_sourced_outputs(tm
         record = db.object(created)
         meta = record['meta']
         assert meta['provenance']['sources'] == [source]
-        assert meta['provenance']['parameters']['input'] == {'surface': source, 'generation': generation,
-                                                              'version': pinned}
+        assert meta['provenance']['parameters']['input'] == {'surface': source, **exact}
         assert meta['surface_role'] == 'front'
         assert 'area_vx2' not in meta
         assert record['surface']['area'] > 0
@@ -121,3 +121,27 @@ def test_copy_cli_takes_exactly_one_input_mode():
                     '--volume-uuid', 'vol']
     with pytest.raises(RuntimeError, match='geometry_revision'):
         copy._copy_args_to_argv({'store': 's.vcobj', 'surface_uuid': 'u', 'geometry_revision': 'r'})
+
+
+@pytest.mark.parametrize('deleted', [False, True])
+def test_queued_copy_carries_complete_selected_reference(tmp_path, deleted):
+    path = tmp_path / 'objects.vcobj'
+    source, _, points = _store_with_surface(path)
+    with ObjectStore.open(str(path), author='test') as db:
+        exact = object_reference(db.object(source))
+        db.set_meta(source, 'coordinates', dict(volume_uuid='vol', scale_factor=2))
+        if deleted:
+            db.delete_object(source)
+    argv = copy._copy_args_to_argv(dict(store=str(path), surface_uuid=source, volume_uuid='vol',
+                                      surface_reference=exact, volume_path='v', checkpoint_path='c'))
+    args = copy.parse_args(argv)
+    assert args.surface_reference == exact
+    selected = copy._StoredSurfaces(args.store, args.volume_uuid, args.surface_uuid,
+                                     reference=args.surface_reference)
+    selected.load(source, 1)
+    assert selected.source_version == exact
+    assert selected.name(source) == 'source'
+    surface = read_surface(path, source, volume='vol', reference=exact)
+    np.testing.assert_allclose(surface.xyz[1, 1], points[1, 1])
+    with pytest.raises(SystemExit):
+        copy.parse_args(argv + ['--surface-version', str(exact['version'])])
