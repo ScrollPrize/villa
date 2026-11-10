@@ -209,6 +209,11 @@ NB_MODULE(_reader, m)
 
     nb::class_<vcr::MemoryCache>(m, "MemoryCache", "Byte-bounded LRU of decoded chunks, shareable between arrays.")
         .def(nb::init<std::size_t>(), "max_bytes"_a)
+        .def_static("automatic", &vcr::MemoryCache::automatic, "fraction"_a = 0.5, "smoothing_seconds"_a = 10.)
+        .def_prop_ro("is_auto", &vcr::MemoryCache::is_auto)
+        .def_prop_ro("fraction", &vcr::MemoryCache::fraction)
+        .def_prop_ro("smoothing_seconds", &vcr::MemoryCache::smoothing_seconds)
+        .def("refresh_budget", &vcr::MemoryCache::refresh_budget)
         .def_prop_ro("max_bytes", &vcr::MemoryCache::max_bytes)
         .def_prop_ro("nbytes", &vcr::MemoryCache::nbytes)
         .def_prop_ro("hits", &vcr::MemoryCache::hits)
@@ -921,6 +926,10 @@ NB_MODULE(_reader, m)
         }, "path"_a, "location"_a, "access"_a);
 
     nb::class_<vcr::Array>(m, "Array")
+        .def("request_channel_cache", &vcr::Array::request_channel_cache, "channels"_a,
+             "Enable channel caching for every reader of this array; accumulate relevant leading-axis channels.")
+        .def_prop_ro("cache_channels", &vcr::Array::cache_channels)
+        .def_prop_ro("channel_cache_enabled", &vcr::Array::channel_cache_enabled)
         .def(
             "read_many",
             [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,
@@ -1093,6 +1102,8 @@ NB_MODULE(_reader, m)
             d["remote_fetches"] = s.remote_fetches.load();
             d["remote_missing"] = s.remote_missing.load();
             d["remote_bytes"] = s.remote_bytes.load();
+            d["channel_read_bytes"] = s.channel_read_bytes.load();
+            d["channel_decoded_bytes"] = s.channel_decoded_bytes.load();
             d["write_errors"] = s.write_errors.load();
             d["last_write_error"] = a.last_write_error();
             d["corrupt"] = s.corrupt.load();
