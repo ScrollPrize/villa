@@ -1,5 +1,7 @@
 # Coherent store follow-up fixes
 
+Subsequent review of `cf8406afc`: [R3 findings, fixes and validation](review-r3-summary.md). Its 16 findings have a separate implementation/validation record; the historical completion statement below applies only to the prior pass.
+
 Baseline: `3df5b7783`. All 21 findings in [the full review](coherent-store-review-3df5b7783.md) are implemented and validated as described below. The review's descriptions are frozen evidence; this file records current progress. The earlier 88 was a file count, not a defect count.
 
 ## Constraints and shared fixes

@@ -1,6 +1,6 @@
 # Coherent store API cleanup
 
-Latest completed follow-up: [21-finding fix tracker and validation](coherent-store-fix-tasks.md). The dated review sections below retain their historical evidence.
+Latest follow-up: [R3 16-finding fixes and validation](review-r3-summary.md); previous [21-finding fix tracker](coherent-store-fix-tasks.md). The dated review sections below retain their historical evidence.
 
 ## Open findings from review of `557a6f925`
 
@@ -106,6 +106,13 @@ Production diff versus `3812cb17b`: 204 lines added, 205 removed (net −1); reg
 ## Contract
 
 Current and exact-version reads, graph queries, edits, geometry, extension data and artifacts must use shared resolution and validation. Physical placement (local, partitioned, referenced, packed) belongs in storage routing, not consumer-specific branches. History policy changes retention, not identity. Preserve binary identifiers, slim history-off storage, checked writes, tombstone precedence and immutable dependencies; do not introduce proxy records or per-object routing directories.
+
+Additional regression-backed rules from [R3](review-r3-summary.md):
+
+- An immutable endpoint reference does not make graph membership immutable. Guard loaded membership and key graph caches by observed store freshness; successful receipts advance freshness without consuming change-feed events. A no-op receipt must not erase the loaded guard.
+- Editors sharing one selected surface coordinate their own guarded receipts through the shared edit state. Advance only state actually committed or reloaded: an unchanged endpoint in a receipt does not authorize advancing another editor's relationship-membership baseline. External changes require reload; failed saves preserve pending edits and veto navigation. Same UUID does not imply the same selected version.
+- Evidence producers record the version actually used, and consumers validate it before interpreting results. Never stamp old results with a freshly read source identity. Current attachment reads and explicitly selected historical attachment reads have distinct semantics, implemented by shared document/graph APIs.
+- Physical locator relocation belongs at the common database-copy boundary, including compaction. Source grouping uses the resolved owner's locator. Composite public writes use operation-wide savepoints, even inside a caller's transaction; tests catch failures and commit the outer transaction to verify atomicity.
 
 ## Tasks
 
