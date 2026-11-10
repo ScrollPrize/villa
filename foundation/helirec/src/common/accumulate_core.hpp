@@ -48,6 +48,14 @@ HR_HD void row_position(const AccumScanView& s, int k, int t, int c, int& tt, fl
     }
 }
 
+// What the row of projection k at stack row t is delayed by, beyond fract_x, for the frame's lateral registration
+// (AccumScanView::col_offset, col_slope): the cached value at column c is then the value at source position
+// c - fract_x + col_offset + col_slope (row - slope_row).
+HR_HD float column_delay(const AccumScanView& s, int k, int t) {
+    const float row = add(static_cast<float>(s.row0[k] + t), s.fract_v[k]);
+    return -add(s.col_offset[k], mul(s.col_slope[k], sub(row, s.slope_row)));
+}
+
 // the vertical kernel's weights for projection k at fraction a (per projection, or with a roll from the table)
 HR_HD const float* z_weights(const AccumScanView& s, int k, float a) {
     if (s.row_slope && s.z_lut)

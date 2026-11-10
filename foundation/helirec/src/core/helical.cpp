@@ -11,8 +11,10 @@ SpanInfo make_span_info(const ScanTrajectory& t, double tol_steps) {
     if (n < 2 || static_cast<int>(t.z_translation_m.size()) != n) throw Error("make_span_info: bad trajectory");
     if (!(t.z_translation_scale > 0)) throw Error("make_span_info: z_translation_scale must be positive");
     if ((!t.row_offset.empty() && static_cast<int>(t.row_offset.size()) != n) ||
-        (!t.row_slope.empty() && static_cast<int>(t.row_slope.size()) != n))
-        throw Error("make_span_info: row_offset / row_slope must have one value per projection");
+        (!t.row_slope.empty() && static_cast<int>(t.row_slope.size()) != n) ||
+        (!t.col_offset.empty() && static_cast<int>(t.col_offset.size()) != n) ||
+        (!t.col_slope.empty() && static_cast<int>(t.col_slope.size()) != n))
+        throw Error("make_span_info: row_offset / row_slope / col_offset / col_slope must have one value per projection");
     SpanInfo s;
     s.z_pix_per_proj.resize(n);
     s.x_pix_per_proj.resize(n);
@@ -204,6 +206,10 @@ ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const s
         c.row0[k] = h_lo - margin - s.integer_shift_v[p];
         c.fract_v[k] = s.fract_complement[p];
         if (!t.row_slope.empty()) c.row_slope.push_back(t.row_slope[p]);
+        if (!t.col_offset.empty() || !t.col_slope.empty()) {
+            c.col_offset.push_back(t.col_offset.empty() ? 0.f : t.col_offset[p]);
+            c.col_slope.push_back(t.col_slope.empty() ? 0.f : t.col_slope[p]);
+        }
         // angular splat (InterpInfo::setup_for_iproj)
         double a = t.angles_deg[p] * (2 * M_PI / 360.0);
         a = std::fmod(a, 2 * M_PI);

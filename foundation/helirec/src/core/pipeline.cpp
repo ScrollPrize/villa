@@ -75,6 +75,16 @@ void set_roll(AccumScanView& v, const ScanData& sd, const float* slope, const fl
     v.z_lut_n = lut_n;
 }
 
+// the lateral registration of a scan's frames (ScanTrajectory::col_offset, col_slope; host or device copies)
+// exact: the pipeline shifts columns exactly (x_interp = sinc); otherwise the lateral registration is not applied
+void set_lateral(AccumScanView& v, const ScanData& sd, const ChunkScan& c, const float* offset, const float* slope, bool exact) {
+    if (c.col_offset.empty() || !exact) return;
+    v.col_offset = offset;
+    v.col_slope = slope;
+    v.slope_row = sd.traj.slope_row;
+    v.x_exact = 1;   // (set_x_kernel leaves it off for a scan at a whole column offset)
+}
+
 AccumScanView make_view(const ScanData& sd, const ScanChunk& ch, const uint16_t* raw, const float* dark,
                         const float* flats, const float* weight, const int32_t* row0, const float* fract_v,
                         const float* alpha, const float* cdiv, const float* wfac, const float* ffrac,
@@ -284,7 +294,9 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             s.traj.n() != s.traj.z_translation_m.size() ||
             (!s.traj.lateral_correction_m.empty() && s.traj.lateral_correction_m.size() != s.traj.n()) ||
             (!s.traj.row_offset.empty() && s.traj.row_offset.size() != s.traj.n()) ||
-            (!s.traj.row_slope.empty() && s.traj.row_slope.size() != s.traj.n()))
+            (!s.traj.row_slope.empty() && s.traj.row_slope.size() != s.traj.n()) ||
+            (!s.traj.col_offset.empty() && s.traj.col_offset.size() != s.traj.n()) ||
+            (!s.traj.col_slope.empty() && s.traj.col_slope.size() != s.traj.n()))
             throw Error("ScanData: per-projection arrays have inconsistent lengths");
     if (I.scans.empty() || I.scans[0].traj.n() < 2) throw Error("SliceReconstructor: no scan");
     {   // the step between consecutive recorded projections: the median, which skipped projections do not stretch
@@ -318,6 +330,8 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             take(s.traj.lateral_correction_m);
             take(s.traj.row_offset);
             take(s.traj.row_slope);
+            take(s.traj.col_offset);
+            take(s.traj.col_slope);
             take(s.control_A);
             take(s.file_index);
             take(s.frame_index);
@@ -357,7 +371,8 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     {   // rolled frames: rows of context for the largest row offset on the detector, and the kernel's table
         float reach = 0.f;
         for (const auto& s : I.scans) {
-            if (I.cfg.legacy_reference && !s.traj.row_slope.empty()) throw Error("legacy reference mode has no frame registration");
+            if (I.cfg.legacy_reference && (!s.traj.row_slope.empty() || !s.traj.col_offset.empty() || !s.traj.col_slope.empty()))
+                throw Error("legacy reference mode has no frame registration");
             const float span = std::max(std::fabs(s.traj.slope_col), std::fabs(static_cast<float>(s.traj.det_cols - 1) - s.traj.slope_col));
             for (float v : s.traj.row_slope) reach = std::max(reach, std::fabs(v) * span);
         }
@@ -923,6 +938,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                       I.x_kernel, I.x_exact);
                 set_z_kernel(view, I.z_pad, I.z_ctx, ch.z_w.data());
                 set_roll(view, sd, c.row_slope.data(), I.z_lut.data(), Impl::z_lut_n);
+                set_lateral(view, sd, c, c.col_offset.data(), c.col_slope.data(), I.x_exact);
                 if (cfg.sld.enabled())
                     set_glare(view, *I.glare[s], cg[s].maps.data(), cg[s].i0.data(), cg[s].i1.data(), cg[s].frac.data(),
                               cg[s].rows, cg[s].row0.empty() ? nullptr : cg[s].row0.data());
@@ -1043,7 +1059,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     if (prefetched) step("grid");
     struct DevChunk {
         cuda::DeviceBuffer<int32_t> row0, fi0, fi1, gi0, gi1, grow0;
-        cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac, z_w, slope;
+        cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac, z_w, slope, col_offset, col_slope;
     };
     std::vector<DevChunk> dc(nsc);
     std::vector<std::size_t> per(nsc);
@@ -1059,6 +1075,10 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         dc[s].fi1.upload(c.flat_i1.data(), c.flat_i1.size());
         dc[s].fract_v.upload(c.fract_v.data(), c.fract_v.size());
         if (!c.row_slope.empty()) dc[s].slope.upload(c.row_slope.data(), c.row_slope.size());
+        if (!c.col_offset.empty()) {
+            dc[s].col_offset.upload(c.col_offset.data(), c.col_offset.size());
+            dc[s].col_slope.upload(c.col_slope.data(), c.col_slope.size());
+        }
         dc[s].alpha.upload(c.alpha.data(), c.alpha.size());
         dc[s].cdiv.upload(c.current_div.data(), c.current_div.size());
         dc[s].wfac.upload(c.weight_factor.data(), c.weight_factor.size());
@@ -1240,6 +1260,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             view.raw_slot = d_slot[r][s].data();
             set_z_kernel(view, I.z_pad, I.z_ctx, dc[s].z_w.data());
             set_roll(view, sd, dc[s].slope.data(), I.d_z_lut.data(), Impl::z_lut_n);
+            set_lateral(view, sd, chunks[s].cs, dc[s].col_offset.data(), dc[s].col_slope.data(), I.x_exact);
             if (cfg.sld.enabled())
                 set_glare(view, *I.glare[s], dc[s].glare.data(), dc[s].gi0.data(), dc[s].gi1.data(), dc[s].gfrac.data(),
                           cg[s].rows, cg[s].row0.empty() ? nullptr : dc[s].grow0.data());

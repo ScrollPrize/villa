@@ -70,10 +70,13 @@ __global__ void shift_bridge_kernel(float* rows, int n_rows, int n, int L, int S
         a[i] = sino_core::shift_bridge(a[n - 1], a[0], i, n, L);
     }
 }
-__global__ void shift_phase_kernel(cufftComplex* A, int n_rows, int nc, int L, float shift) {
+// shifts (n_shifts, or null): row r < n_shifts is delayed by shift + shifts[r]
+__global__ void shift_phase_kernel(cufftComplex* A, int n_rows, int nc, int L, float shift, const float* shifts, int n_shifts) {
     const size_t total = static_cast<size_t>(n_rows) * nc;
-    for (size_t q = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; q < total; q += static_cast<size_t>(gridDim.x) * blockDim.x)
-        sino_core::shift_bin(A[q].x, A[q].y, static_cast<int>(q % nc), L, shift);
+    for (size_t q = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; q < total; q += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int r = static_cast<int>(q / nc);
+        sino_core::shift_bin(A[q].x, A[q].y, static_cast<int>(q % nc), L, shifts && r < n_shifts ? shift + shifts[r] : shift);
+    }
 }
 
 // In-place transforms of batches of `batch` rows (a plan is tied to its batch size: the rows are taken `batch` at a
@@ -99,7 +102,7 @@ struct RowShifter {
 };
 }  // namespace
 
-void shift_rows(float* rows, int n_rows, int n, float shift, void* stream) {
+void shift_rows(float* rows, int n_rows, int n, float shift, void* stream, const float* shifts) {
     if (n_rows <= 0 || n <= 1) return;
     cudaStream_t s = as_stream(stream);
     thread_local RowShifter U;
@@ -118,7 +121,8 @@ void shift_rows(float* rows, int n_rows, int n, float shift, void* stream) {
         }
         check(cufftExecR2C(U.fwd, w, reinterpret_cast<cufftComplex*>(w)), "R2C (shift)");
         const int np = w == a ? nr : U.batch;   // (every row of `tail`: its spare rows must stay bounded)
-        shift_phase_kernel<<<grid_for(static_cast<size_t>(np) * nc), 256, 0, s>>>(reinterpret_cast<cufftComplex*>(w), np, nc, L, shift);
+        shift_phase_kernel<<<grid_for(static_cast<size_t>(np) * nc), 256, 0, s>>>(reinterpret_cast<cufftComplex*>(w), np, nc, L, shift,
+                                                                                    shifts ? shifts + r0 : nullptr, nr);
         check(cufftExecC2R(U.inv, reinterpret_cast<cufftComplex*>(w), w), "C2R (shift)");
         if (w != a)
             HELIREC_CUDA_CHECK(cudaMemcpyAsync(a, w, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));

@@ -571,8 +571,9 @@ class Calibration:
     # flats. []: measured, nothing significant. None: not measured yet (an older cache: measured on loading).
     detector_smear: list | None = None
     # Registration of the companion's frames on the main scan's (measure_registration; details["registration"]):
-    # dict(projection, row_offset, row_slope: knots along the companion's projections, segments: the stretches they
-    # are interpolated within, slope_col). {}: measured, nothing usable. None: not measured yet (an older cache).
+    # dict(projection, row_offset, row_slope, col_slope: knots along the companion's projections, segments: the
+    # stretches they are interpolated within, slope_col, slope_row). {}: measured, nothing usable.
+    # None: not measured yet (an older cache; one without the lateral knots is measured again).
     companion_registration: dict | None = None
     source: str = "measured"          # measured | override (cor and / or vector given by the caller; never cached)
     fingerprint: str = ""             # acquisition_fingerprint() of the scan pair it was computed from
@@ -680,7 +681,8 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
         if cal.detector_smear is None:        # (a cache from before the smear measurement)
             _add_smear(cal, main, arrays, log)
             _save_calibration(cache_dir, cal)
-        if cal.companion_registration is None:   # (a cache from before the frame registration)
+        if cal.companion_registration is None or (cal.companion_registration and "col_slope" not in cal.companion_registration):
+            # (a cache from before the frame registration, or from before its lateral part)
             _add_registration(cal, main, companion, arrays, log, progress)
             _save_calibration(cache_dir, cal)
         return cal, {**arrays, **_scan_weights(arrays["weight_map"], main, cal)}
@@ -798,20 +800,25 @@ def _smooth_knots(y, median, mean):
 
 
 def registration_arrays(reg, n_proj):
-    """Calibration.companion_registration -> per-projection (row_offset, row_slope, slope_col) of the companion
-    (float32 arrays; None when there is no registration)"""
+    """Calibration.companion_registration -> the companion's registration per projection, as make_scan_data takes
+    it: dict(row_offset, row_slope, slope_col[, col_slope, slope_row][, col_offset]) (float32 arrays; None when
+    there is no registration)"""
     if not reg:
         return None
     p = np.asarray(reg["projection"], np.float64)
-    off, slope = np.zeros(n_proj, np.float32), np.zeros(n_proj, np.float32)
+    keys = [k for k in ("row_offset", "row_slope", "col_offset", "col_slope") if k in reg]
+    out = {k: np.zeros(n_proj, np.float32) for k in keys}
     for s0, s1 in reg["segments"]:
         m = (p >= s0) & (p < s1)
         if not m.any():
             continue
         x = np.arange(s0, min(s1, n_proj))
-        off[x] = np.interp(x, p[m], np.asarray(reg["row_offset"])[m])
-        slope[x] = np.interp(x, p[m], np.asarray(reg["row_slope"])[m])
-    return off, slope, float(reg["slope_col"])
+        for k in keys:
+            out[k][x] = np.interp(x, p[m], np.asarray(reg[k])[m])
+    out["slope_col"] = float(reg["slope_col"])
+    if "col_slope" in reg or "col_offset" in reg:
+        out["slope_row"] = float(reg["slope_row"])
+    return out
 
 
 def measure_registration(main, companion, arrays, cal, n_pairs=240, tile=240, log=print, progress=False):
@@ -820,17 +827,23 @@ def measure_registration(main, companion, arrays, cal, n_pairs=240, tile=240, lo
     The calibrated vector places the companion by one (dy, dx) for the whole scan, found where the two detectors
     overlap. For n_pairs projections spread over the scan, the main frame and the companion frame of the same angle
     are compared where they see the same rays: their high-passed line integrals are registered on tiles
-    (_core.tile_shifts), and per pair  dv = a + phi u  is fitted (u: columns from the rotation axis): the row
-    displacement at the axis and its slope along the columns, a roll of the companion's frames against the main
-    scan's about the rotation axis. With a roll the one dy is right only at the middle of the overlap.
-    Against what the geometry assumes (the recorded z of both scans, the pitch scale, dy) the residual offset at the
-    axis and the slope are smoothed along the scan (running median, then mean), within the stretches where the
-    recorded difference of the two scans' z is continuous, and returned as knots for registration_arrays().
+    (_core.tile_shifts), and per pair  dv = a + phi u,  du = b + psi v  are fitted (u: columns from the rotation
+    axis, v: rows from the detector's centre): the row displacement at the axis and its slope along the columns, the
+    column displacement at the axis and its slope along the rows. phi and -psi are a roll of the companion's frames
+    against the main scan's about the rotation axis. With a roll the one dy is right only at the middle of the
+    overlap.
+    b is measured and kept with the pairs but not applied: where the detector's blur is lopsided and differs between
+    the two places a ray is recorded at, the frames' features are displaced by the blur itself, and b is that as much
+    as a misplacement (PHerc0343P: applying it moved the companion's content 0.3-0.4 voxel radially off the main
+    scan's and lowered the correlation with a finer scan; the slopes are free of it).
+    Against what the geometry assumes (the recorded z of both scans, the pitch scale, dy) the residual row offset at
+    the axis and the two slopes are smoothed along the scan (running median, then mean), within the
+    stretches where the recorded difference of the two scans' z is continuous, and returned as knots for
+    registration_arrays().
 
     Returns a dict: registration ({} when too few pairs register or they scatter by more than
     REGISTRATION_MAX_SCATTER rows), pairs [[main projection, companion projection, tiles, a, phi (rows per 1000
-    columns), b, psi (columns per 1000 rows), residual], ...] (b, psi: the lateral displacement at the axis and its
-    slope along the rows, measured but not applied), scatter, reason."""
+    columns), b, psi (columns per 1000 rows), residual], ...], scatter, reason."""
     t0 = time.time()
     rows, cols = main.frame_shape
     out = dict(registration={}, pairs=[], scatter=None, reason=None)
@@ -883,6 +896,9 @@ def measure_registration(main, companion, arrays, cal, n_pairs=240, tile=240, lo
                     keep = np.abs(t[:, 2] - M @ cv) <= 3 * 1.4826 * np.median(np.abs(t[:, 2] - M @ cv)) + 0.05
                     if keep.sum() >= REGISTRATION_MIN_TILES:
                         cv = np.linalg.lstsq(M[keep], t[keep, 2], rcond=None)[0]
+                    keep = np.abs(t[:, 3] - M @ cu) <= 3 * 1.4826 * np.median(np.abs(t[:, 3] - M @ cu)) + 0.05
+                    if keep.sum() >= REGISTRATION_MIN_TILES:
+                        cu = np.linalg.lstsq(M[keep], t[keep, 3], rcond=None)[0]
                     # what the geometry assumes: a row of the companion = the main scan's - (z difference) - dy
                     residual = cv[0] + dy + (zc[q] - zm[p])
                     pairs.append([int(p), q, int(len(t)), float(cv[0]), float(cv[1]), float(cu[0]), float(cu[2]), float(residual)])
@@ -905,6 +921,7 @@ def measure_registration(main, companion, arrays, cal, n_pairs=240, tile=240, lo
     cuts.append(len(ac))
     segments = [[int(a), int(b)] for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
     row_offset, row_slope, dev = np.zeros(len(P)), np.zeros(len(P)), np.zeros(len(P))
+    col_offset, col_slope = np.zeros(len(P)), np.zeros(len(P))
     for s0, s1 in segments:
         m = (q >= s0) & (q < s1)
         if m.any():
@@ -912,19 +929,24 @@ def measure_registration(main, companion, arrays, cal, n_pairs=240, tile=240, lo
             row_offset[m] = -smooth
             dev[m] = P[m, 7] - smooth
             row_slope[m] = _smooth_knots(P[m, 4], 21, 11) / 1000.0
+            col_offset[m] = _smooth_knots(P[m, 5], 9, 5)
+            col_slope[m] = _smooth_knots(P[m, 6], 21, 11) / 1000.0
     scatter = float(1.4826 * np.median(np.abs(dev)))
     out["scatter"] = scatter
     summary = (f"frame registration of {companion.name} on {main.name} ({len(pairs)} projection pairs): rows at the "
                f"rotation axis {(-row_offset).min():+.2f} .. {(-row_offset).max():+.2f} from the calibrated vector, roll "
                f"{np.median(row_slope) * 1e3:+.2f} mrad ({row_slope.min() * 1e3:+.2f} .. {row_slope.max() * 1e3:+.2f}), "
-               f"scatter {scatter:.2f} rows  [{time.time() - t0:.0f}s]")
+               f"scatter {scatter:.2f} rows; columns {np.median(col_slope) * 1e3:+.2f} per 1000 rows (and "
+               f"{col_offset.min():+.2f} .. {col_offset.max():+.2f} at the axis, not applied)  [{time.time() - t0:.0f}s]")
     if scatter > REGISTRATION_MAX_SCATTER:
         log(summary + ": too scattered, none applied")
         return dict(out, reason="the pairs scatter too much")
     log(summary)
     out["registration"] = dict(projection=[int(v) for v in q], row_offset=[float(v) for v in row_offset],
-                               row_slope=[float(v) for v in row_slope], segments=segments,
-                               slope_col=float(cal.rot_center - (pb.shift_x - pb.x_readjustment)))
+                               row_slope=[float(v) for v in row_slope], col_slope=[float(v) for v in col_slope],
+                               segments=segments,
+                               slope_col=float(cal.rot_center - (pb.shift_x - pb.x_readjustment)),
+                               slope_row=0.5 * (rows - 1))
     return out
 
 

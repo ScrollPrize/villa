@@ -42,8 +42,8 @@ DEFAULTS = dict(
     companion_registration="auto",
 )
 # companion_registration: "auto" (the companion's frames are placed on the main scan's as the calibration registered
-#   them: a row offset and a roll per projection, calibration.measure_registration) | "off" (the calibrated vector
-#   alone)
+#   them: a row offset and a roll (rows by the column, columns by the row), per projection:
+#   calibration.measure_registration) | "off" (the calibrated vector alone)
 # detector_smear: "auto" (the field the calibration measured from the flats' noise; none if nothing significant) |
 #   "" or "off" | "a11:a12:a21:a22:c1:c2": the detector's smear field for the band-dependent redundancy weights
 #   (pipeline.hpp); sharp_f, sharp_band = "f1:f2": the frequency the weights are taken at, and the crossover band.
@@ -254,7 +254,7 @@ class HelicalRecon:
         if arr is None:
             return {}
         self._registered = True
-        return dict(row_offset=arr[0].tolist(), row_slope=arr[1].tolist(), slope_col=arr[2])
+        return {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in arr.items()}
 
     def _build(self):
         p = dict(self.params)

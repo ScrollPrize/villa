@@ -589,12 +589,16 @@ ScanData make_scan_data(DIn angles_deg, DIn z_translation_m, double pixel_size_m
                         int shift_x, float x_readjustment, float z_readjustment, DIn control_A, HostIn flat_angles_deg,
                         HostIn dark, HostIn flats, HostIn weight, std::shared_ptr<RawReader> reader, IntIn file_index,
                         IntIn frame_index, double z_translation_scale, std::vector<float> row_offset,
-                        std::vector<float> row_slope, float slope_col) {
+                        std::vector<float> row_slope, float slope_col, std::vector<float> col_offset,
+                        std::vector<float> col_slope, float slope_row) {
     ScanData d;
     d.traj.z_translation_scale = z_translation_scale;
     d.traj.row_offset = std::move(row_offset);
     d.traj.row_slope = std::move(row_slope);
     d.traj.slope_col = slope_col;
+    d.traj.col_offset = std::move(col_offset);
+    d.traj.col_slope = std::move(col_slope);
+    d.traj.slope_row = slope_row;
     d.traj.angles_deg = vec<double>(angles_deg);
     d.traj.z_translation_m = vec<double>(z_translation_m);
     d.traj.pixel_size_m = pixel_size_m;
@@ -1200,8 +1204,11 @@ NB_MODULE(_core, m) {
           "det_cols"_a, "shift_x"_a, "x_readjustment"_a, "z_readjustment"_a, "control_A"_a, "flat_angles_deg"_a,
           "dark"_a, "flats"_a, "weight"_a, "reader"_a, "file_index"_a, "frame_index"_a, "z_translation_scale"_a = 1.0,
           "row_offset"_a = std::vector<float>{}, "row_slope"_a = std::vector<float>{}, "slope_col"_a = 0.f,
+          "col_offset"_a = std::vector<float>{}, "col_slope"_a = std::vector<float>{}, "slope_row"_a = 0.f,
           "row_offset, row_slope, slope_col: registration of the scan's frames per projection (helical.hpp): rows added "
-          "to the vertical position, and a row offset of row_slope (column - slope_col)");
+          "to the vertical position, and a row offset of row_slope (column - slope_col); col_offset, col_slope, "
+          "slope_row: the lateral counterpart, a column offset of col_offset + col_slope (row - slope_row), applied "
+          "where columns are shifted exactly (x_interp=sinc)");
     nb::class_<PySliceReconstructor>(m, "SliceReconstructor")
         .def(nb::init<std::vector<ScanData>, const nb::dict&>(), "scans"_a, "config"_a)
         .def_prop_ro("info", &PySliceReconstructor::info)

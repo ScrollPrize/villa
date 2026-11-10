@@ -81,6 +81,13 @@ struct AccumScanView {
     float slope_col = 0;
     const float* z_lut = nullptr;
     int z_lut_n = 0;
+    // optional lateral registration of the frames (ScanTrajectory::col_offset, col_slope, per projection; both or
+    // neither): the sample for column c of the row at detector row v is taken at column
+    // c + col_offset[k] + col_slope[k] (v - slope_row). With x_exact the block's rows are delayed accordingly, each
+    // by its own amount (accumulate; shift_rows); otherwise it is not applied.
+    const float* col_offset = nullptr;
+    const float* col_slope = nullptr;
+    float slope_row = 0;
     // optional (accumulate sets it for the block in hand): the vertically interpolated values of the block's
     // projections, each computed once instead of at every column tap of every pixel it lands on. The value of
     // projection k at stack row t, column c is col_val[(col_slot[k] * col_rows + t) * det_cols + c].

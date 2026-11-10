@@ -390,9 +390,13 @@ def test_tile_shifts_recover_an_offset_and_a_roll():
     # the knots of a calibration become per-projection arrays within their stretches
     reg = dict(projection=[10, 30, 60, 90], row_offset=[1.0, 1.0, -2.0, -2.0], row_slope=[1e-3, 3e-3, 0.0, 0.0],
                segments=[[0, 50], [50, 100]], slope_col=7.5)
-    off, slope_p, col = calibration.registration_arrays(reg, 100)
-    assert off[0] == 1.0 and off[49] == 1.0 and off[50] == -2.0 and off[99] == -2.0 and col == 7.5
+    arr = calibration.registration_arrays(reg, 100)
+    off, slope_p = arr["row_offset"], arr["row_slope"]
+    assert off[0] == 1.0 and off[49] == 1.0 and off[50] == -2.0 and off[99] == -2.0 and arr["slope_col"] == 7.5
     assert abs(slope_p[20] - 2e-3) < 1e-9 and slope_p[49] == np.float32(3e-3) and slope_p[50] == 0
+    assert "col_slope" not in arr and "slope_row" not in arr            # (a registration without the lateral part)
+    lat = calibration.registration_arrays(dict(reg, col_slope=[0.0, 0.0, 5e-4, 5e-4], slope_row=3.5), 100)
+    assert lat["col_slope"][60] == np.float32(5e-4) and lat["col_slope"][20] == 0 and lat["slope_row"] == 3.5
     assert calibration.registration_arrays({}, 100) is None and calibration.registration_arrays(None, 100) is None
 
 

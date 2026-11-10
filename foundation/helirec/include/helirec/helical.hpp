@@ -31,9 +31,15 @@ struct ScanTrajectory {
     // to the vertical position, like z_readjustment. row_slope: the frame is sheared along the rows about detector
     // column slope_col (the rotation axis in this scan's columns): what the geometry puts at row v of column c is
     // read at row v + row_slope[i] (c - slope_col): a roll of the detector against the rotation axis.
+    // col_offset, col_slope: the lateral counterpart: what the geometry puts at column c of row v is read at column
+    // c + col_offset[i] + col_slope[i] (v - slope_row). Applied where the columns are shifted exactly
+    // (x_interp = sinc, not in the gridding of measured pixels only).
     std::vector<float> row_offset;
     std::vector<float> row_slope;
     float slope_col = 0;
+    std::vector<float> col_offset;
+    std::vector<float> col_slope;
+    float slope_row = 0;
     std::size_t n() const { return angles_deg.size(); }
 };
 
@@ -63,6 +69,7 @@ struct ChunkScan {
     std::vector<int32_t> row0;           // first raw row of the window (h_lo - margin - ishift)
     std::vector<float> fract_v;          // vertical interpolation fraction a
     std::vector<float> row_slope;        // ScanTrajectory::row_slope of the projections (empty: none)
+    std::vector<float> col_offset, col_slope;   // ScanTrajectory::col_offset, col_slope (both, or both empty)
     std::vector<int32_t> j0;             // lower grid angle bin (unwrapped; j1 = (j0 + 1) % n_grid)
     std::vector<float> alpha;            // angular splat fraction (weight alpha to j0+1)
     std::vector<float> current_div;      // float32(I_p / 0.2): flat-field divisor

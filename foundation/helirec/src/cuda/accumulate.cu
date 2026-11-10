@@ -37,6 +37,12 @@ __global__ void column_values_kernel(AccumScanView s, const int32_t* __restrict_
     out[(static_cast<size_t>(blockIdx.z) * H + t) * stride + c] = column_interp(s, slot_proj[blockIdx.z], t, c);
 }
 
+// the delay of every cached row for the frames' lateral registration (column_delay): (n_slots, H)
+__global__ void column_delay_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int n_slots, int H, float* __restrict__ out) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q < n_slots * H) out[q] = column_delay(s, slot_proj[q / H], q % H);
+}
+
 __global__ void lum_sums_kernel(const float* R, const float* RW, int L, int H, int NX, int cx, const float* gx,
                                 const float* gz, int radius, float* A, float* B) {
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
@@ -102,7 +108,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     // (work buffers of the calling thread, kept between blocks: every call finishes before it returns)
     thread_local DeviceBuffer<int32_t> d_off, d_proj, d_slot, d_slot_proj;
     thread_local DeviceBuffer<int8_t> d_role;
-    thread_local DeviceBuffer<float> d_col;
+    thread_local DeviceBuffer<float> d_col, d_delay;
     AccumScanView s = view;
     // the vertically interpolated values of the block's projections, once each (they are the same at every column
     // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead
@@ -110,14 +116,23 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     if (!p.measured_only && !s.col_val) {
         contributor_slots(c, s.n_proj, slot, slot_proj);
         const std::size_t n_slots = slot_proj.size();
-        const bool shift = s.x_exact && s.fract_x != 0.f;
+        const bool shift = s.x_exact && (s.fract_x != 0.f || s.col_offset);
         const int stride = shift ? shift_row_stride(s.det_cols) : s.det_cols;
         d_col.ensure(n_slots * p.H * stride);
         s.col_slot = load(d_slot, slot, st);
         dim3 block(128, 1, 1), grid((s.det_cols + 127) / 128, p.H, static_cast<unsigned>(n_slots));
-        column_values_kernel<<<grid, block, 0, st>>>(s, load(d_slot_proj, slot_proj, st), p.H, stride, d_col.data());
+        const int32_t* sp = load(d_slot_proj, slot_proj, st);
+        column_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, d_col.data());
         HELIREC_CUDA_CHECK(cudaGetLastError());
-        if (shift) shift_rows(d_col.data(), static_cast<int>(n_slots) * p.H, s.det_cols, s.fract_x, st);
+        const int n_rows = static_cast<int>(n_slots) * p.H;
+        if (shift && s.col_offset) {   // each row by its own amount: the frames' lateral registration
+            d_delay.ensure(n_rows);
+            column_delay_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(s, sp, static_cast<int>(n_slots), p.H, d_delay.data());
+            HELIREC_CUDA_CHECK(cudaGetLastError());
+            shift_rows(d_col.data(), n_rows, s.det_cols, s.fract_x, st, d_delay.data());
+        } else if (shift) {
+            shift_rows(d_col.data(), n_rows, s.det_cols, s.fract_x, st);
+        }
         s.col_val = d_col.data();
         s.col_rows = p.H;
         s.col_stride = stride;

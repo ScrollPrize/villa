@@ -173,13 +173,14 @@ void bspline_prefilter(const float* in, float* out, int n_rows, int n, int degre
 // samples per row, the rest work space. The transform has upsample_fft_length(n) samples, the ones beyond n a
 // raised-cosine bridge from the row's last sample to its first, so that the periodic extension is continuous. For
 // an even length the Nyquist bin, which a real row cannot delay by a fraction, is scaled by cos(pi shift).
+// shifts (n_rows; CUDA: a device pointer): row r is delayed by shift + shifts[r].
 int shift_row_stride(int n);
 namespace cpu {
-void shift_rows(float* rows, int n_rows, int n, float shift);
+void shift_rows(float* rows, int n_rows, int n, float shift, const float* shifts = nullptr);
 }
 #ifdef HELIREC_WITH_CUDA
 namespace cuda {
-void shift_rows(float* rows, int n_rows, int n, float shift, void* stream = nullptr);
+void shift_rows(float* rows, int n_rows, int n, float shift, void* stream = nullptr, const float* shifts = nullptr);
 }
 #endif
 

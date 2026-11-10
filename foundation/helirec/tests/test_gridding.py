@@ -211,3 +211,33 @@ def test_band_weights_without_smear_change_nothing(tmp_path, device):
     for bad in dict(detector_smear="1:2:3"), dict(detector_smear="0:0:0:0:0:0", sharp_band="0.3:0.2"), dict(detector_smear="a:0:0:0:0:0"):
         with pytest.raises(Exception):
             run(**bad)
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+def test_frame_registration_lateral(tmp_path, device):
+    """a scan whose frames are displaced along the columns by 0.3 px and by 0.02 px per row grids like the plain one
+    when its lateral registration is given (ScanTrajectory::col_offset, col_slope; exact column shifts)"""
+    nu, nr, nd, n, off, slope, v0 = 0.3, 40, 160, 129, 0.3, 0.02, 19.5
+    r, c = np.mgrid[:nr, :nd].astype(np.float64)
+
+    def scan(displaced, register):
+        e = off + slope * (r - v0) if displaced else 0.0          # what belongs at column c is at column c + e
+        frame = np.rint(40000 * (1 + .05 * np.cos(2 * np.pi * nu * (c - e)))).astype(np.uint16)
+        path = tmp_path / f"lateral_{displaced}.h5"
+        if not path.exists():
+            with h5py.File(path, "w") as f:
+                f.create_dataset("data", data=np.broadcast_to(frame, (n, nr, nd)).copy(), chunks=(1, nr, nd))
+        reg = dict(col_offset=[off] * n, col_slope=[slope] * n, slope_row=v0) if register else {}
+        return _core.make_scan_data(np.arange(n) * (360 / 64), np.zeros(n), .01, nr, nd, 0, 0., 0., np.full(n, .2),
+                                    np.array([0], np.float32), np.zeros((nr, nd), np.float32),
+                                    np.full((1, nr, nd), 50000, np.float32), np.ones((nr, nd), np.float32),
+                                    _core.RawReader([str(path)], "data", nr, nd), np.zeros(n, np.int32),
+                                    np.arange(n, dtype=np.int32), **reg)
+    sino = lambda s, **k: recon(s, device, backprojector="fbp", rot_center=79.5, grid_size=33,
+                                **k).reconstruct(8, 32, debug=True)["sino"][:, :, 40:120]
+    plain = sino(scan(False, False))
+    assert np.ptp(plain.mean((0, 1))) > 0.08                      # the column pattern is there
+    assert np.abs(sino(scan(True, True)) - plain).max() < 3e-3
+    assert np.abs(sino(scan(True, False)) - plain).max() > 0.03
+    # only where the columns are shifted exactly
+    np.testing.assert_array_equal(sino(scan(True, True), x_interp="lanczos3"), sino(scan(True, False), x_interp="lanczos3"))

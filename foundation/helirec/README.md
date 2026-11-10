@@ -366,16 +366,20 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   * `companion_registration=auto|off` (default `auto`): the calibration compares the companion's frames with the
     main scan's frames of the same angle where the two detector positions overlap, at 240 projections along the
     scan (`calibration.measure_registration`; tiles registered by `calib::tile_shifts` on the continuous
-    cross-correlation), and fits per pair a row displacement at the rotation axis and its slope along the columns:
-    a roll of the companion's frames about the axis. One calibrated vector is right only in the middle of the
-    overlap when there is a roll. Smoothed along the scan, the two are applied per projection in the gridding
-    (`ScanTrajectory::row_offset`, `row_slope`): every sample is read at its registered row, in the one vertical
-    interpolation there already was. PHerc0343P: roll −0.72 mrad (−0.53 … −0.91 along the scan), 0.1–1.1 rows at
+    cross-correlation), and fits per pair a row displacement at the rotation axis and its slope along the columns,
+    and the column displacement's slope along the rows: a roll of the companion's frames about the axis. One calibrated vector is right only in the middle of the
+    overlap when there is a roll. Smoothed along the scan, they are applied per projection in the gridding
+    (`ScanTrajectory::row_offset`, `row_slope`, `col_slope`): every sample is read at its registered row, in the
+    one vertical interpolation there already was, and every row is delayed by its own column offset in the exact
+    column shift (`x_interp=sinc`). PHerc0343P: roll −0.72 mrad (−0.53 … −0.91 along the scan), 0.1–1.1 rows at
     the axis; the companion's content lay −0.79 + 0.50 r / 1000 voxels from the main scan's along z (r: px from
     the axis), after it +0.03 + 0.07 r / 1000; axial correlation with the 2.215 µm volume 0.774 → 0.850 at 0.36
-    and 0.564 → 0.674 at 0.45 cycles/voxel (centre block). 17 s once per scan (cached); +0.06 s per 32-slice
-    chunk. `off`: the vector alone. The lateral part of the registration is measured (`details.registration`) and
-    not applied.
+    and 0.564 → 0.674 at 0.45 cycles/voxel (centre block); the column slope (0.55 px per 1000 rows) halves the
+    companion's in-plane displacement from the main scan (0.17 → 0.08 voxel) and is otherwise a small gain. 17 s
+    once per scan (cached); +0.13 s per 32-slice chunk. `off`: the vector alone. The column *offset* the frames
+    show at the axis is measured and logged but not applied: where the detector's blur is one-sided and differs
+    between the two places a ray is recorded at, it is the blur's displacement, not the scan's (applying it on
+    PHerc0343P moved the companion 0.3–0.4 voxel radially off the main scan).
   * `detector_smear=auto|off|a11:a12:a21:a22:c1:c2` (default `auto`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
     band-dependent redundancy weights for a detector that is not equally sharp everywhere. The field is a uniform
     smear of A r + c pixels at r = (column, row) from the detector's centre in units of 1000 pixels; `auto` takes

@@ -48,7 +48,7 @@ void upsample_rows(const float* in, float* out, int n_rows, int n, int os) {
 }
 
 // rows delayed by `shift` samples in place (sino.hpp): each row's transform in its own storage (r2c in place)
-void shift_rows(float* rows, int n_rows, int n, float shift) {
+void shift_rows(float* rows, int n_rows, int n, float shift, const float* shifts) {
     if (n_rows <= 0 || n <= 1) return;
     const int L = upsample_fft_length(n), S = shift_row_stride(n);
     std::mutex& m = fftw_planner_mutex();
@@ -65,7 +65,8 @@ void shift_rows(float* rows, int n_rows, int n, float shift) {
         const float last = a[n - 1], first = a[0];
         for (int i = n; i < L; ++i) a[i] = sino_core::shift_bridge(last, first, i, n, L);
         fftwf_execute_dft_r2c(fwd, a, reinterpret_cast<fftwf_complex*>(a));
-        for (int k = 0; k <= L / 2; ++k) sino_core::shift_bin(a[2 * k], a[2 * k + 1], k, L, shift);
+        const float sh = shifts ? shift + shifts[r] : shift;
+        for (int k = 0; k <= L / 2; ++k) sino_core::shift_bin(a[2 * k], a[2 * k + 1], k, L, sh);
         fftwf_execute_dft_c2r(inv, reinterpret_cast<fftwf_complex*>(a), a);
     }
     std::lock_guard<std::mutex> lock(m);
