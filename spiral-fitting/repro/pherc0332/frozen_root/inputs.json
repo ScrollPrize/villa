@@ -1,0 +1,30 @@
+{
+ "inputs": {
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_sheet/abs_winding.json": "db7b4a8fb53913af37ddddc730a43c8bcbf680eff17c0a158202f36bcdcc1f71",
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_sheet/fibers": "542b49b3d57868844be3545d54914b36eb15f59d3eca6b2ed5d6eee45ad4f50a",
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_sheet/fibers_old": "0beae97bfda33cbb09577c9f1a9e2b89bd4801911a8a2b5b31a18909ad03a084",
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_sheet/lasagna_inputs": "80c50dcbca2a8b203eeb691cd74b90475edbd1b73ea3dfacba4bc60bdb739821",
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_sheet/outer_shell": "d0a3932dff7c933c9c1abe6c5f1946e160f9f3320137aa01d000acea07b5d957",
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_sheet/spiral-scroll.json": "cc99862348f32c198f628cbcc0a89499d3387aeff8bd6e3620610d7991a7e84a",
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_sheet/tracks": "87eb954a0817ab5e597893ef95f30e648539d5176866498999304501f065db31",
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_sheet/umbilicus.json": "5dff922e91ddbbe24f1c159ba0f0cdc9f520d3044f8e5c616f65c7c7bac10a17",
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_sheet/verified_patches": "cb54c721afe97798f29a6ba6e57b81c7de5adedb9bcefbec799f60d0f9721d8f",
+  "/media/djosey/nvme4/spiral_0332/dataset_tta_hub1030h_legacy/abs_winding.json": "43bebdb7a5307d27b5f436ce5c315ecc6f63a4af15d3450f3fe5b242aac945a4",
+  "/media/djosey/nvme4/fibers/PHerc0332_vcslices.volpkg.json": "3273514e547a8cfdcce5b3c9754813ad357c9c8356ac30529e39ae7b61de0c99",
+  "/media/djosey/nvme4/spiral_0332/work/s1/anchors_train_records.json": "e185183d5decf8aef97e5a8a8cd5e1d9b82a3444046e518c6c748891c788e3d5",
+  "/media/djosey/nvme4/spiral_0332/work/s1/anchors_held_records.json": "c3458c4761eb8fe7de8de0a603119165f016810c9a830b8aa895fad928b7bdfe",
+  "/media/djosey/nvme4/spiral_0332/work/s1/holdout_eval_set.json": "cc2bafc1ba3b4f4c5d06d4392d33d5dcf9830765cd4e5d88b83a554ed5e7224e",
+  "/media/djosey/nvme4/spiral_0332/work/winding_gauge.json": "d6e5931c61da061b402ccf04f3433e8083ece313dab9c517ea54c1498e7eb678",
+  "/media/djosey/nvme4/spiral_0332/work/holdout.json": "95248137d438dd3c3588e8a96d4d3f54431828acb47e620dc9b83051172f4da5",
+  "/media/djosey/nvme4/spiral_0332/overrides_Va_hub1030h_10k.json": "bd3b30f10b0973926d7534d37232802f13a1e6eb51455be963e5629be9e94327",
+  "/media/djosey/nvme4/spiral_0332/overrides_Va_hub1030h_sheet_10k.json": "f4b8d4f2d5b5853669e3db728b67aeab65209225ee58d2c461d4c2cccb64ec10",
+  "/media/djosey/nvme4/spiral_0332/overrides_Va_hub1030h_sheetpt_10k.json": "e757cadb830ed2064ecfa735c323f690fee01e9e77d0724c3ad1e1afb30a1fcb",
+  "/media/djosey/nvme4/spiral_0332/overrides_Vb_hub1030h_25k.json": "14c9b37923f260aca4f200d61ae282b9f7f0ccb38a079eebdd3c3867933770c1",
+  "/media/djosey/nvme4/spiral_0332/overrides_Vb_hub1030h_sheet_25k.json": "3f5734a254302365c656e78ac2d4771820661e6f10f843623bc265715f565235",
+  "/media/djosey/nvme4/spiral_0332/overrides_Vb_hub1030h_sheetpt_25k.json": "77d5b293201f0d9d06eacb8381453df1abea9405bc4036b675c28cca1f79d187"
+ },
+ "files": 1216018,
+ "bytes": 31783261897,
+ "all_sha256": "cdcda4d5add18d99b858e3e7eec8de8126625d00a156168b3e80b49a8f8123a7",
+ "seconds": 86.5
+}
