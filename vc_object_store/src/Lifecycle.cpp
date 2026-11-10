@@ -130,7 +130,7 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
             // Install the selected managed descriptor before restoring its
             // metadata, just as an existing geometry head is preserved by
             // upsert. This also supports a metadata-only current object.
-            materializeGeometry(db,uuid,*source->geometryRevision);
+            restoreGeometryReference(db,uuid,*source->geometryRevision);
         } else {
             execute(db,"UPDATE objects SET geometry_manifest=NULL WHERE uuid=?",parseUuid(uuid));
         }

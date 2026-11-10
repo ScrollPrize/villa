@@ -236,6 +236,29 @@ void unpublishedRelationship()
     require(!store.edgeGeometryState(read,id).stale,"explicit retain binds the new relationship to its final endpoints");
 }
 
+void restoreBorrowedDelta()
+{
+    TemporaryDirectory dir;const auto path=dir.path/"base";const auto id=util::newUuid();ObjectVersion selected;
+    std::string geometry;
+    {auto base=ObjectStore::create(path,options());
+        {auto w=base.write();base.upsertObject(w,track(id));geometry=base.putGeometry(w,id,shape());w.commit();}
+        for(const auto value:{10,20}) {auto w=base.write();const std::array<int32_t,1> bytes{value};
+            geometry=base.editGeometry(w,id,{{"points",0,scalarBytes<int32_t>(bytes)}},geometry);w.commit();
+            if(value==10){auto r=base.read();selected=base.currentObjectRevision(r,id)->reference();}}
+        auto w=base.write();base.seal(w);w.commit();}
+    for(const auto mode:{HistoryMode::Off,HistoryMode::On}) {
+        auto opt=options();opt.history=mode;const auto overlay=dir.path/ std::to_string(int(mode));
+        {auto collection=ObjectCollection::create(overlay,{path},opt);}
+        auto store=ObjectStore::open(overlay,opt);
+        {auto w=store.write(VersionSelection{{id,3}});store.restoreObject(w,id,selected);w.commit();}
+        auto r=store.read();const auto revision=store.currentGeometry(r,id)->uuid;
+        const auto bytes=store.readGeometryArray(r,revision,"points");
+        int32_t first=0;std::memcpy(&first,bytes.data(),sizeof(first));
+        require(first==10,"borrowed historical delta restored exactly in either history policy");
+        require(chunks(ObjectStoreImplAccess::conn(r))==0,"restore references existing payload without copying it");
+    }
+}
+
 void changedRelationshipKeepsPublishedGeometry(bool retainFirst)
 {
     TemporaryDirectory dir;auto store=ObjectStore::create(dir.path/"changed-relationship",options());
@@ -263,5 +286,5 @@ void changedRelationshipKeepsPublishedGeometry(bool retainFirst)
     require((record.aUuid==a?state.aRevision:state.bRevision)==before,"keep-recorded preserves the published endpoint geometry");
 }
 }
-int main()try{borrowedChunks();currentDescriptor(HistoryMode::Off);currentDescriptor(HistoryMode::On);independentGeometryBranches();retainedPointIdentities();restoreArchivedGeometry();unpublishedRelationship();changedRelationshipKeepsPublishedGeometry(false);changedRelationshipKeepsPublishedGeometry(true);std::cout<<"geometry descriptor tests passed\n";}
+int main()try{restoreBorrowedDelta();borrowedChunks();currentDescriptor(HistoryMode::Off);currentDescriptor(HistoryMode::On);independentGeometryBranches();retainedPointIdentities();restoreArchivedGeometry();unpublishedRelationship();changedRelationshipKeepsPublishedGeometry(false);changedRelationshipKeepsPublishedGeometry(true);std::cout<<"geometry descriptor tests passed\n";}
 catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

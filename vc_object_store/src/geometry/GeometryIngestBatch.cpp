@@ -50,6 +50,7 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
 {
     geometryCoordinates(nlohmann::json::parse(coordinateContext));
     auto* connection=ObjectStoreImplAccess::conn(write);
+    detail::Savepoint savepoint(connection);
     std::set<std::string> incoming;
     std::vector<std::string> clashes;
     // Check the entire batch under the writer lock before mutating any object.
@@ -90,7 +91,11 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
 
     }
     // Source JSON that does not describe its relationships rejects the source.
-    try { return detail::importSourceRelationships(db, write, sources); }
+    try {
+        const auto count = detail::importSourceRelationships(db, write, sources);
+        savepoint.release();
+        return count;
+    }
     catch (const nlohmann::json::exception& error) { throw GeometrySourceRejected(error.what()); }
 }
 GeometryIdentitiesExist::GeometryIdentitiesExist(std::vector<std::string> existing)

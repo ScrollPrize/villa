@@ -349,11 +349,39 @@ int main() try {
         auto create=session.newRequest(attachment);create.expectedObjects[surface.uuid]=std::nullopt;
         create.operations.push_back(CreateObjectOp{objectRecordJson(surface)});session.submit(attachment,create);
         AttachedCollection corrections=collection;corrections.uuid=vc::objects::util::newUuid();
-        replaceAttachedCollections(session,attachment,surface.uuid,"corrections",{corrections},volumeCoordinates("w",1));
+        auto correctionSnapshot=attachedCollections(session,attachment,surface.uuid,"corrections");
+        replaceAttachedCollections(session,attachment,correctionSnapshot,{corrections},volumeCoordinates("w",1));
         auto uppercase=surface.uuid;std::transform(uppercase.begin(),uppercase.end(),uppercase.begin(),[](unsigned char c){return std::toupper(c);});
-        require(attachedCollections(session,attachment,uppercase,"corrections").front().uuid==corrections.uuid,
+        require(attachedCollections(session,attachment,uppercase,"corrections").collections.front().uuid==corrections.uuid,
                 "attachment readers use canonical opposite endpoints");
-        replaceAttachedCollections(session,attachment,uppercase,"corrections",{},volumeCoordinates("w",1));
+        auto staleCorrections = correctionSnapshot;
+        session.editCurrent(attachment, {corrections.uuid}, [&](const StoreReader& reader, const auto&) {
+            auto record = reader.currentObject(corrections.uuid)->record; record.name = "concurrent edit";
+            std::vector<TransactionOperation> edits{UpdateObjectOp{objectRecordJson(record)}};
+            for (const auto& edge : attachments(reader, surface.uuid, "corrections")) edits.push_back(RetainRelationshipOp{edge.uuid});
+            return edits;
+        });
+        mustFail([&]{replaceAttachedCollections(session,attachment,staleCorrections,{corrections},volumeCoordinates("w",1));});
+        require(staleCorrections.owner == correctionSnapshot.owner, "a rejected edit preserves the loaded correction baseline");
+        correctionSnapshot=attachedCollections(session,attachment,surface.uuid,"corrections");
+        staleCorrections=correctionSnapshot;
+        auto secondCorrection=corrections;secondCorrection.uuid=vc::objects::util::newUuid();
+        replaceAttachedCollections(session,attachment,correctionSnapshot,{correctionSnapshot.collections.front(),secondCorrection},volumeCoordinates("w",1));
+        mustFail([&]{replaceAttachedCollections(session,attachment,staleCorrections,{},volumeCoordinates("w",1));});
+        require(attachedCollections(session,attachment,surface.uuid,"corrections").collections.size()==2,
+                "stale replacement cannot retire an unseen attachment");
+        auto mappedCorrections=attachedCollections(session,attachment,surface.uuid,"corrections",ViewFrame{"w2",1});
+        session.editCurrent(attachment,{collectionRegistration},[&](const StoreReader& reader,const auto&){
+            return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(volumeTransformRecord(
+                reader.currentObject(collectionRegistration)->record,"w","w2",VolumeAffine::scale(3),"changed"))}};
+        });
+        mustFail([&]{replaceAttachedCollections(session,attachment,mappedCorrections,mappedCorrections.collections,volumeCoordinates("w2",1));});
+        session.editCurrent(attachment,{collectionRegistration},[&](const StoreReader& reader,const auto&){
+            return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(volumeTransformRecord(
+                reader.currentObject(collectionRegistration)->record,"w","w2",VolumeAffine::scale(2),"twice"))}};
+        });
+        correctionSnapshot=attachedCollections(session,attachment,uppercase,"corrections");
+        replaceAttachedCollections(session,attachment,correctionSnapshot,{},volumeCoordinates("w",1));
         session.readStore(attachment,[&](const StoreReader& reader,const auto&){
             require(!reader.currentObject(surface.uuid)->record.retired,"removing attachments never retires their owner");
         });

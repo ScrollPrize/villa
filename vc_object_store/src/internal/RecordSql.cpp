@@ -7,6 +7,7 @@
 #include "geometry/GeometryToken.hpp"
 #include "internal/RecordResolver.hpp"
 #include "internal/RecordOverrides.hpp"
+#include "internal/RecordJson.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 
 namespace vc::objects::detail {
@@ -387,14 +388,35 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
 {
     Savepoint savepoint(db);
     auto rec=prepareObjectRecord(input);
+    normalizeObjectCoordinates(rec,!preserveRecord,db);
+    const auto original=resolveObject(db,rec.uuid);
+    if (original && !preserveRecord && !restoringExtensions) {
+        if (original->record.kind != rec.kind)
+            throw std::runtime_error("object store: object kind cannot change");
+        if (original->record.storageKind == "sqlite") {
+            rec.storageKind=original->record.storageKind;
+            rec.storageRef=original->record.storageRef;
+            rec.dataChecksum=original->record.dataChecksum;
+        }
+        const auto editable=[](ObjectRecord r) {
+            static const std::set<std::string> fields{"name","format_version","storage_kind","storage_ref",
+                "data_checksum","meta","tags","fiber","surface","track"};
+            std::sort(r.tags.begin(),r.tags.end());
+            r.tags.erase(std::unique(r.tags.begin(),r.tags.end()),r.tags.end());
+            if(r.meta.empty())r.meta="{}";
+            return objectToJson(r,&fields);
+        };
+        if (editable(rec)==editable(original->record)) {savepoint.release();return rec.uuid;}
+    }
     if(auto* source=objectSource(db,rec.uuid);source&&source!=db){
-        const auto original=resolveObject(db,rec.uuid)->record;
         createRecordOverride(db,"objects",rec.uuid);
-        if(rec.storageKind==original.storageKind&&rec.storageRef==original.storageRef)
-            rec.storageRef=resolveObject(db,rec.uuid)->record.storageRef;
+        const auto rebased=resolveObject(db,rec.uuid)->record;
+        if(rec.storageKind==original->record.storageKind&&rec.storageRef==original->record.storageRef)
+            rec.storageRef=rebased.storageRef;
+        if(rec.track&&original->record.track&&rec.track->datasetRef==original->record.track->datasetRef)
+            rec.track->datasetRef=rebased.track->datasetRef;
     }
     const auto uuid=parseUuid(rec.uuid);
-    normalizeObjectCoordinates(rec,!preserveRecord,db);
     const auto bounds = detail::recordBounds(rec);
     if (resolveReference(db, [&](sqlite3* source) {
         Statement collision(source, "SELECT 1 FROM edges WHERE uuid=?", uuid);

@@ -112,6 +112,8 @@ public:
         std::vector<vc::objects::VisibleRun> runs;
         bool complete = true;
         std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> remote;
+        // Required before deriving persistent annotations from a query.
+        void requireComplete() const;
     };
     static Crossings region(vc::objects::ObjectStoreSession& session,
                             const std::vector<vc::objects::AttachmentIdentity>& sources,

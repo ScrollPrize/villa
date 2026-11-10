@@ -36,6 +36,7 @@
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
 #include "SegmentationAutosaveState.hpp"
+#include "SurfaceCorrections.hpp"
 
 namespace segmentation { class CorrectionsState; }
 
@@ -557,6 +558,7 @@ private:
     static constexpr int kCorrectionsSaveDelayMs = 2000;
     QTimer* _correctionsSaveTimer{nullptr};
     std::string _correctionsSurfaceId;
+    std::optional<vc3d::corrections::Snapshot> _correctionsSnapshot;
     void scheduleCorrectionsAutoSave();
     void performCorrectionsAutoSave();
 

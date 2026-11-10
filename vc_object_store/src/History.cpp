@@ -14,6 +14,30 @@
 
 namespace vc::objects {
 using namespace detail;
+void detail::transformArchivedObjectRecords(sqlite3* db,
+    const std::function<void(const std::string&,nlohmann::json&)>& transform)
+{
+    using Json=nlohmann::json;
+    // Retain parents per object, including branches. Parent FKs are local and
+    // revision sequence is append-only; an inherited override starts a root.
+    std::map<std::string,std::pair<Json,Json>> states;
+    std::string object;
+    Statement rows(db,"SELECT object_uuid,uuid,parent_uuid,metadata_delta FROM object_revisions ORDER BY object_uuid,seq");
+    Statement update(db,"UPDATE object_revisions SET metadata_delta=? WHERE uuid=?");
+    Statement head(db,"UPDATE object_head_records SET record=? WHERE revision_uuid=?");
+    while(rows.row()) {
+        if(object!=rows.uuid(0)){object=rows.uuid(0);states.clear();}
+        const auto uuid=rows.uuid(1);const auto parent=rows.optUuid(2);
+        const auto delta=Json::parse(rows.text(3));
+        auto original=delta.is_object()?delta:(parent?states.at(*parent).first:Json::object()).patch(delta);
+        auto changed=original;transform(uuid,changed);
+        const auto rewritten=parent?Json::diff(states.at(*parent).second,changed):changed;
+        if(rewritten!=delta)update.run(rewritten.dump(),parseUuid(uuid));
+        if(changed!=original)head.run(changed.dump(),parseUuid(uuid));
+        states.emplace(uuid,std::make_pair(std::move(original),std::move(changed)));
+    }
+}
+
 nlohmann::json detail::dependencyFields(const nlohmann::json* meta, bool retired,
                                 const std::string& epoch, const Anchor& anchor)
 {
@@ -1044,17 +1068,10 @@ std::optional<RelationshipRevision> detail::recordedRelationship(sqlite3* db,con
 
 void ObjectStore::retainRelationship(WriteTxn& txn, const std::string& uuid)
 {
-    auto* db = static_cast<sqlite3*>(connection(txn));
     const auto edge = edgeByUuid(txn, uuid);
     if (!edge) throw std::invalid_argument("object history: unknown relationship");
-    Savepoint savepoint(db);
-    EdgeGeometryRepair repair;
-    repair.edgeUuid = edge->uuid; repair.expectedVersion = edge->version.value_or(0);
-    repair.aRevision = geometryHead(db, edge->aUuid); repair.bRevision = geometryHead(db, edge->bUuid);
-    repair.aAnchor = edge->aAnchor; repair.bAnchor = edge->bAnchor;
-    repairEdgeGeometry(txn, repair);
-    recordRelationshipValidation(db, *edge);
-    savepoint.release();
+    // The ordinary edge writer owns validation and no-op handling together.
+    updateEdge(txn, *edge);
 }
 
 void ObjectStore::keepRecordedRelationshipsOf(WriteTxn& txn, const std::string& objectUuid)

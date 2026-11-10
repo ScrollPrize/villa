@@ -1060,7 +1060,7 @@ NB_MODULE(_native, m)
 
     m.def("enable_history", [](const std::filesystem::path& path) {
         nb::gil_scoped_release release; vo::changeHistoryMode(path, vo::HistoryMode::On);
-    }, nb::arg("path"), "Offline history enablement; close all handles and reload geometry tokens afterward.");
+    }, nb::arg("path"), "Offline history enablement; close all handles first. Current geometry identities are preserved.");
     m.def("remove_history_and_disable", [](const std::filesystem::path& path) {
         nb::gil_scoped_release release; vo::changeHistoryMode(path, vo::HistoryMode::Off);
     }, nb::arg("path"), "Explicitly remove all retained history and disable future history; close all handles first.");
@@ -1553,21 +1553,17 @@ NB_MODULE(_native, m)
                              nb::str(update.detail.data(), update.detail.size()));
                 };
             }
-            vo::TransactionReceipt receipt;
-            {
-                nb::gil_scoped_release release;
-                auto& db = self.require();
+            const auto receipt = self.withStore<true>([&](auto& db) {
                 const auto prepared = db.prepare(parsed, options);
-                receipt = db.submit(parsed, prepared);
-            }
+                return db.submit(parsed, prepared);
+            });
             return jsonLoads(vo::transactionReceiptToJson(receipt));
         }, nb::arg("request"), nb::arg("payloads") = nb::dict(), nb::arg("progress") = nb::none(),
            "Atomic checked request; identical retries return the saved receipt. Conflicts raise RuntimeError. "
            "A link_objects request runs its detectors here first (progress(stage, completed, total, detail) "
            "follows them) and then commits their links with the link marker in one checked write.")
         .def("start_history_generation", [](PyObjectStore& self, const std::string& reason) {
-            nb::gil_scoped_release release;
-            return self.require().startHistoryGeneration(reason);
+            return self.withStore<true>([&](auto& db) { return db.startHistoryGeneration(reason); });
         }, nb::arg("reason"), "Restore tooling: a fresh generation for new writes.")
         .def("objects_at_versions", [](PyObjectStore& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);

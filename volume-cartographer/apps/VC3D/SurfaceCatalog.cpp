@@ -277,6 +277,12 @@ std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name
     return uuid;
 }
 
+void SurfaceCatalog::Crossings::requireComplete() const
+{
+    if (!complete || !remote.empty())
+        throw std::runtime_error("Incomplete surface intersections; fetch the missing surfaces or narrow the selection before deriving annotations");
+}
+
 SurfaceCatalog::Crossings SurfaceCatalog::region(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources,
                                                  const VolumeVoxels& volume, const RegionSlice& slice, RegionOptions options,
                                                  const std::function<bool()>& cancelled)

@@ -1,5 +1,6 @@
 #pragma once
 #include "internal/Sqlite.hpp"
+#include "internal/RecordOverrides.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include <functional>
 

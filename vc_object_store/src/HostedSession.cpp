@@ -2,6 +2,7 @@
 #include "geometry/ArrayLayout.hpp"
 #include "internal/Artifacts.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/native/disk_cache.hpp>
 #include <fstream>
@@ -22,7 +23,7 @@ int64_t nowUs()
 std::size_t cost(const ObjectRevision& revision) { return revision.record.meta.size() + 1024; }
 std::size_t cost(const GeometryRevision& geometry) { return geometry.attributes.size() + 512 + 64 * geometry.arrays.size(); }
 
-std::string headKey(const std::string& object) { return "head/" + object; }
+std::string headKey(const std::string& object) { return "head/" + util::canonicalUuid(object); }
 // Conversion preserves logical identities, but schema-20 cached JSON has the
 // old generation fields. Version metadata separately; raw payload keys stay
 // unchanged so a schema upgrade never duplicates geometry/artifact blocks.

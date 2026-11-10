@@ -392,7 +392,7 @@ try {
                 session.currentObject(hosted, choice)->record.kind == "volume_transform_choice", "hosted transform writes");
         session.refresh(hosted);
         require(chooseVolumeTransform(session, hosted, "hosted-a", "hosted-b", route) == choice &&
-                session.currentObject(hosted, choice)->version == 2, "a choice is replaced in place");
+                session.currentObject(hosted, choice)->version == 1, "an unchanged choice preserves its version");
         mustFail([&] { (void)chooseVolumeTransform(session, hosted, "hosted-a", "hosted-b", {util::newUuid()}); });
     }
 
@@ -420,10 +420,11 @@ try {
         fix.uuid = util::newUuid(); fix.name = "fix";
         fix.points = {{0}, {{0, 0, 1}}};
         fix.annotations = nlohmann::json::array({nlohmann::json::object()});
-        replaceAttachedCollections(session, hosted, surface, "corrections", {fix}, volumeCoordinates(voxels));
-        require(attachedCollections(session, hosted, surface, "corrections").size() == 1, "hosted attached collection");
-        replaceAttachedCollections(session, hosted, surface, "corrections", {}, volumeCoordinates(voxels));
-        require(attachedCollections(session, hosted, surface, "corrections").empty(), "hosted attached collection removed");
+        auto corrections = attachedCollections(session, hosted, surface, "corrections");
+        replaceAttachedCollections(session, hosted, corrections, {fix}, volumeCoordinates(voxels));
+        require(attachedCollections(session, hosted, surface, "corrections").collections.size() == 1, "hosted attached collection");
+        replaceAttachedCollections(session, hosted, corrections, {}, volumeCoordinates(voxels));
+        require(attachedCollections(session, hosted, surface, "corrections").collections.empty(), "hosted attached collection removed");
         const auto copied = session.copyObject(hosted, hosted, fiber, "copied");
         const auto copy = session.currentObject(hosted, copied);
         const auto from = nlohmann::json::parse(copy->record.meta).at("copied_from");

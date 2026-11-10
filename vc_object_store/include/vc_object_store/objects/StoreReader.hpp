@@ -136,10 +136,10 @@ void expectRelationshipEndpoints(const StoreReader&, VersionSelection& expected)
 // `objectUuids` at its current version (throws when one is absent) and every
 // endpoint of their relationships, appends `operations`, then keeps every
 // surviving relationship of each object as recorded. Relationships removed
-// explicitly or by retirement/historical restoration are not retained. With
-// history disabled there is no archival binding; retain and validate the
-// current relationships instead. Geometry-changing requests must make their
-// affected-relationship decisions explicitly.
+// explicitly or by retirement/historical restoration are not retained. Explicit
+// relationship decisions take precedence. Retention follows the endpoint owner:
+// unavailable recorded states require explicit revalidation or removal, never
+// a history-mode-dependent change of meaning.
 void editCurrentRequest(const StoreReader&, TransactionRequest&, const std::vector<std::string>& objectUuids,
                         std::vector<TransactionOperation> operations);
 // Callback form: capture expected versions before computing the edits, then

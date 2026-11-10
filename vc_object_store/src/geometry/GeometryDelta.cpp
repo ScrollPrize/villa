@@ -167,30 +167,15 @@ void clearGeometryMaterialization(sqlite3* db, const std::string& object) {
         execute(db, std::string("DELETE FROM ") + table + " WHERE object_uuid=?", parseUuid(object));
     }
 }
-void materializeGeometry(sqlite3* db, const std::string& object, const std::string& revision) {
+void restoreGeometryReference(sqlite3* db, const std::string& object, const std::string& revision) {
     const auto record=resolveGeometryRecord(db,revision);
     if (!record||record->revision.objectUuid!=object) throw std::runtime_error("geometry: missing or mismatched revision");
-    const auto& descriptor = record->descriptor;
-    clearGeometryMaterialization(db, object);
-    if (!descriptor.contains("delta")) {
-        execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=? WHERE uuid=?",
-            revision,descriptor.dump(),record->revision.contentHash,parseUuid(object));
-        return;
-    }
     GeometryReader reader(db, revision, false);
-    GeometryReader base(db, descriptor.at("delta").at("base").get<std::string>(), false);
-    const auto& manifest = reader.manifest();
-    Statement insert(db, "INSERT INTO geometry_current_chunks VALUES(?,?,?,?,?)");
-    for (const auto& [name, a] : manifest.at("arrays").items())
-        for (int64_t index = 0; index < geometryLayout(a).chunkCount(); ++index) {
-            const std::string hash = a.at("chunks").at(index);
-            if (hash == base.manifest().at("arrays").at(name).at("chunks").at(index).get<std::string>()) continue;
-            auto bytes = reader.chunk(name, index);
-            insert.run(parseUuid(object), name, index, parseDigest(hash), bytes);
-        }
-    execute(db, "INSERT INTO geometry_materializations VALUES(?,?,?)", parseUuid(object), parseUuid(revision),
-        manifest.dump());
+    const auto manifest = reader.manifest().dump();
+    clearGeometryMaterialization(db, object);
+    // The retained revision owns its delta chain. Restoring a descriptor must
+    // not copy its payload or require history tables in the destination.
     execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=? WHERE uuid=?",
-        revision,manifest.dump(),record->revision.contentHash,parseUuid(object));
+        revision,manifest,record->revision.contentHash,parseUuid(object));
 }
 }

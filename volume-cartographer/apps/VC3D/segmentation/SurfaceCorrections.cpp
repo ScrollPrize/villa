@@ -26,26 +26,26 @@ AttachedCollection toStore(uint64_t id, const nlohmann::json& collection)
 }
 }
 
-std::map<uint64_t, nlohmann::json> vc3d::corrections::read(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+vc3d::corrections::Snapshot vc3d::corrections::read(ObjectStoreSession& session, const AttachmentIdentity& attachment,
                                                         const std::string& surfaceUuid, const std::optional<vc::objects::ViewFrame>& view)
 {
-    std::map<uint64_t, nlohmann::json> result;
-    for (auto stored : attachedCollections(session, attachment, surfaceUuid, kRole, view)) {
+    Snapshot result;
+    result.baseline = attachedCollections(session, attachment, surfaceUuid, kRole, view);
+    for (auto stored : result.baseline.collections) {
         const auto id = std::stoull(stored.source.value("source_collection_id", std::string("0")));
         stored.source.erase("source_collection_id");
-        result[id] = vc::collectionJson(stored);
+        result.collections[id] = vc::collectionJson(stored);
     }
     return result;
 }
 
-void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& surfaceUuid,
-                              const std::map<uint64_t, nlohmann::json>& collections, const vc::objects::VolumeVoxels& volume,
-                              const std::optional<vc::objects::ViewFrame>& view)
+void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdentity& attachment, Snapshot& snapshot,
+                              const std::map<uint64_t, nlohmann::json>& collections, const vc::objects::VolumeVoxels& volume)
 {
     std::vector<AttachedCollection> stored;
     for (const auto& [id, json] : collections) stored.push_back(toStore(id, json));
-    replaceAttachedCollections(session, attachment, surfaceUuid, kRole, stored,
-                               vc::objects::volumeCoordinates(volume), view);
+    replaceAttachedCollections(session, attachment, snapshot.baseline, stored, vc::objects::volumeCoordinates(volume));
+    snapshot.collections = collections;
 }
 
 std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session, const AttachmentIdentity& attachment,

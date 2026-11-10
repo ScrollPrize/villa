@@ -4,6 +4,7 @@
 // role "corrections", attached to the surface by "attachment" relationships
 // with the same role (data on the surface, never graph links).
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <nlohmann/json.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
@@ -19,7 +20,11 @@ namespace vc3d::corrections {
 // The surface's corrections, as collection JSON by VC collection id, with
 // points read through `view` (the surface's) when given. Throws when a
 // collection has no mapping to the view's volume.
-std::map<uint64_t, nlohmann::json> read(vc::objects::ObjectStoreSession& session,
+struct Snapshot {
+    std::map<uint64_t, nlohmann::json> collections;
+    vc::objects::AttachedCollectionsSnapshot baseline;
+};
+Snapshot read(vc::objects::ObjectStoreSession& session,
                                      const vc::objects::AttachmentIdentity& attachment,
                                      const std::string& surfaceUuid,
                                      const std::optional<vc::objects::ViewFrame>& view = std::nullopt);
@@ -29,9 +34,8 @@ std::map<uint64_t, nlohmann::json> read(vc::objects::ObjectStoreSession& session
 // back through `view` to each collection's stored frame), and dropped ones are
 // retired. One checked action.
 void write(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
-           const std::string& surfaceUuid, const std::map<uint64_t, nlohmann::json>& collections,
-           const vc::objects::VolumeVoxels& volume,
-           const std::optional<vc::objects::ViewFrame>& view = std::nullopt);
+           Snapshot&, const std::map<uint64_t, nlohmann::json>& collections,
+           const vc::objects::VolumeVoxels& volume);
 
 // A growth that used corrections, kept for training: the surface's geometry
 // revisions before and after, the grid region and volume bounds the

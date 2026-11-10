@@ -172,35 +172,63 @@ std::optional<nlohmann::json> attachedDocument(ObjectStoreSession& session, cons
     return document;
 }
 
-std::vector<AttachedCollection> attachedCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+AttachedCollectionsSnapshot attachedCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment,
                                                     const std::string& objectUuid, const std::string& role,
                                                     const std::optional<ViewFrame>& frame)
 {
-    std::vector<AttachedCollection> result;
+    AttachedCollectionsSnapshot result;
+    result.role = role;
+    result.frame = frame;
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        result.snapshot = reader.status();
+        const auto owner = reader.currentObject(objectUuid);
+        if (!owner || owner->deleted) throw std::runtime_error("object not found: " + objectUuid);
+        result.owner = owner->reference();
         for (const auto& [uuid, edge] : attachedEdges(reader, objectUuid, role)) {
             const auto object = reader.currentObject(uuid);
             if (!object || object->record.retired || !object->geometryRevision) continue;
-            result.push_back(readCollection(reader, *object, frame));
+            result.collections.push_back(readCollection(reader, *object, frame));
         }
+        const auto after = reader.status();
+        if (after.storeUuid != result.snapshot.storeUuid || after.generation != result.snapshot.generation ||
+            after.commitSequence != result.snapshot.commitSequence)
+            throw TransactionConflict(TransactionConflict::Reason::CommitSequence, {}, "Attached collections changed while loading; reload");
     });
     return result;
 }
 
-void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& objectUuid,
-                                const std::string& role, const std::vector<AttachedCollection>& collections,
-                                const nlohmann::json& coordinates, const std::optional<ViewFrame>& frame)
+void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment, AttachedCollectionsSnapshot& baseline,
+                                const std::vector<AttachedCollection>& collections, const nlohmann::json& coordinates)
 {
+    auto next = baseline;
+    next.collections = collections;
+    const auto& objectUuid = baseline.owner.objectUuid;
+    const auto& role = baseline.role;
+    const auto& frame = baseline.frame;
+    std::map<std::string, const AttachedCollection*> loaded;
+    for (const auto& collection : baseline.collections) loaded.emplace(util::canonicalUuid(collection.uuid), &collection);
     std::map<std::string, const AttachedCollection*> desired;
-    for (const auto& collection : collections) desired[util::canonicalUuid(collection.uuid)] = &collection;
+    for (auto& collection : next.collections) {
+        collection.uuid = util::canonicalUuid(collection.uuid);
+        if (const auto found = loaded.find(collection.uuid); found != loaded.end()) {
+            collection.reference = found->second->reference;
+            collection.mapping = found->second->mapping;
+        }
+        if (!desired.emplace(collection.uuid, &collection).second) throw std::invalid_argument("duplicate attached collection");
+    }
     auto request = session.newRequest(attachment);
+    request.storeUuid = baseline.snapshot.storeUuid;
+    request.generation = baseline.snapshot.generation;
+    request.expectedCommitSequence = baseline.snapshot.commitSequence;
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         const auto linked = attachedEdges(reader, objectUuid, role);
         const auto object = reader.currentObject(objectUuid);
         if (!object) throw std::runtime_error("object not found: " + objectUuid);
         request.expectedObjects[object->record.uuid] = object->version;
         for (const auto& [uuid, wanted] : desired) {
-            writeCollection(reader, request, uuid, *wanted, {{"coordinates", coordinates}, {"role", role}}, frame);
+            // New points are already expressed in the displayed frame.
+            const auto createdCoordinates = frame ? volumeCoordinates(frame->volume, frame->scale) : coordinates;
+            writeCollection(reader, request, uuid, *wanted, {{"coordinates", createdCoordinates}, {"role", role}}, frame);
             if (!linked.contains(uuid)) {
                 auto edge = attachmentEdge(uuid, object->record.uuid, role);
                 edge.uuid = util::newUuid();
@@ -214,8 +242,28 @@ void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIde
             request.operations.push_back(RetireObjectOp{uuid});
         }
         expectRelationshipEndpoints(reader, request);
+        // These loaded guards must win over current-state expectations above.
+        // Membership is guarded by the query's commit sequence: inherited
+        // endpoints need not change identity when local attachments change.
+        expectObject(request, baseline.owner);
+        for (const auto& loaded : baseline.collections) {
+            if (!loaded.reference) throw std::invalid_argument("attached collection has no loaded reference");
+            expectObject(request, *loaded.reference);
+        }
+        for (const auto& [uuid, unused] : desired) if (!loaded.contains(uuid)) {
+            request.expectedObjects[uuid] = std::nullopt;
+            request.expectedObjectReferences.erase(uuid);
+        }
     });
-    session.submit(attachment, request);
+    const auto receipt = session.submit(attachment, request);
+    next.snapshot.commitSequence = receipt.commitSequence.value_or(baseline.snapshot.commitSequence);
+    next.owner = *receipt.objectReference(objectUuid);
+    for (auto& collection : next.collections) {
+        collection.reference = receipt.objectReference(collection.uuid);
+        if (frame && !collection.mapping)
+            collection.mapping = CheckVolumeMappingOp{collection.uuid, frame->volume, frame->scale, VolumeAffine::identity()};
+    }
+    baseline = std::move(next);
 }
 
 std::vector<AttachedCollection> volumeCollections(const StoreReader& reader, const VolumeVoxels& volume)

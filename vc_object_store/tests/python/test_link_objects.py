@@ -80,6 +80,22 @@ def test_link_objects_refuses_a_bad_plan(db):
     assert db.object(vos.link_marker_uuid()) is None
 
 
+def test_submit_retains_store_through_reentrant_progress(db):
+    plane(db), plane(db)
+    closes = []
+
+    def progress(*_):
+        with pytest.raises(RuntimeError, match="cannot close"):
+            db.close()
+        closes.append(True)
+
+    receipt = db.submit(link_request(db.status(), {
+        "detectors": [{"detector": "surface-overlap", "params": {}}], "marker": {},
+    }), progress=progress)
+    assert closes
+    assert receipt["commit_sequence"] == db.status()["commit_sequence"]
+
+
 def test_link_objects_fails_when_a_detector_cannot_run(db):
     plane(db), plane(db), collection(db)
     put(db, "track", [array("points", [[1, 1, 20], [8, 8, 20], [16, 16, 20]], "<i4")], {"family": "h"},

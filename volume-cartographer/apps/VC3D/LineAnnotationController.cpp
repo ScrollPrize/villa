@@ -15095,7 +15095,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                 vc::geometry::Fiber geometry;
                 geometry.controlPointIds = view.controlPointIds(0, view.controlPointCount());
                 geometry.controlPoints = fiber.frame
-                    ? view.viewTransformedAt(head, target.volume, target.scale).points("control_points", 0, view.controlPointCount())
+                    ? GeometrySnapshot(reader).viewTransformedAt(head, target.volume, target.scale, &*transforms).points("control_points", 0, view.controlPointCount())
                     : view.controlPoints(0, view.controlPointCount());
                 if (withLines) geometry.linePoints = storedFiberLinePoints(view, fiber.frame);
                 const auto source = metadata.value("source", nlohmann::json::object());

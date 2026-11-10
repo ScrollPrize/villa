@@ -80,7 +80,7 @@ void editCurrentLifecycle(HistoryMode history)
     const auto attachment = session.attach(path, options);
     session.editCurrent(attachment, {a, b}, [&](const StoreReader&, const std::string& uuid) {
         if (uuid == a) return std::vector<TransactionOperation>{RetireObjectOp{a}};
-        return std::vector<TransactionOperation>{SetMetaOp{b, "note", "1"}};
+        return std::vector<TransactionOperation>{SetMetaOp{b, "note", "1"}, RetainRelationshipOp{bc.uuid}};
     });
     {
         auto txn = store.read();
@@ -99,7 +99,7 @@ void editCurrentLifecycle(HistoryMode history)
     // A no-op restore of an active endpoint must still retain its relationships
     // when the same request also edits its metadata.
     session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
-        return std::vector<TransactionOperation>{RestoreObjectOp{b, {}}, SetMetaOp{b, "note", "2"}};
+        return std::vector<TransactionOperation>{RestoreObjectOp{b, {}}, SetMetaOp{b, "note", "2"}, RetainRelationshipOp{bc.uuid}};
     });
     {
         auto txn = store.read();

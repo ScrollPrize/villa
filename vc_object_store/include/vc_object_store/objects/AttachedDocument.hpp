@@ -49,17 +49,27 @@ struct AttachedCollection {
 };
 // The live collections attached to `objectUuid` in `role`, with their points in
 // `frame` when given (else as stored).
-std::vector<AttachedCollection> attachedCollections(ObjectStoreSession&, const AttachmentIdentity&,
+struct AttachedCollectionsSnapshot {
+    ObjectVersion owner;
+    StoreStatus snapshot;
+    std::string role;
+    std::optional<ViewFrame> frame;
+    std::vector<AttachedCollection> collections;
+};
+AttachedCollectionsSnapshot attachedCollections(ObjectStoreSession&, const AttachmentIdentity&,
                                                     const std::string& objectUuid, const std::string& role,
                                                     const std::optional<ViewFrame>& frame = std::nullopt);
 // Make the collections attached to `objectUuid` in `role` exactly
 // `collections` (by UUID) in one commit: new ones are created with
 // `coordinates` and attached; changed ones get a new geometry revision whose
 // remaining points keep their identity, and keep their attachment; the others
-// are detached and retired. Points are in `frame` when given.
-void replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& objectUuid,
-                                const std::string& role, const std::vector<AttachedCollection>& collections,
-                                const nlohmann::json& coordinates, const std::optional<ViewFrame>& frame = std::nullopt);
+// are detached and retired. The loaded snapshot guards membership, complete
+// collection identities and coordinate mappings. On success it is repinned
+// from the receipt, ready for another edit; on conflict it stays unchanged.
+// Membership uses the store's commit sequence, so unrelated commits also
+// require reloading. An inherited owner's unchanged version is not sufficient.
+void replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, AttachedCollectionsSnapshot&,
+                                const std::vector<AttachedCollection>& collections, const nlohmann::json& coordinates);
 
 // A volume's point collections: the live point_collection objects whose
 // coordinates map to `volume`'s volume (bound to it, or through a

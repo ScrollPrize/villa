@@ -6,6 +6,7 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
 #include <vc_reader/http.hpp>
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -130,6 +131,42 @@ void referencedRecordsCache()
     const auto cached=cold.objectsAtVersions(refs);
     require(cached.size()==2&&cached[0]&&cached[1]&&cached[0]->reference()==refs[0]&&cached[1]->reference()==refs[1],
             "mixed-source prefetch retains both owner-qualified records across restart");
+}
+
+void selectedHeadAndCanonicalCache()
+{
+    TemporaryDirectory directory;const auto path=directory.path/"store.vcobj";
+    const std::string id="abcdefab-abcd-4abc-8abc-abcdefabcdef",upper="ABCDEFAB-ABCD-4ABC-8ABC-ABCDEFABCDEF";
+    OpenOptions options;options.author="cache-test";
+    ObjectVersion initial;
+    {auto store=ObjectStore::create(path,options);auto w=store.write();ObjectRecord record;record.uuid=id;record.kind="track";record.track.emplace();
+        store.upsertObject(w,record);store.putGeometry(w,id,vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,6}}}));w.commit();
+        auto r=store.read();initial=store.currentObjectRevision(r,id)->reference();}
+    server::Server server(path,{});server.start();
+    const auto endpoint="http://127.0.0.1:"+std::to_string(server.port());
+    HostedStore writer(endpoint);PausingProxy proxy(endpoint,"/v1/objects/"+id);
+    HostedSessionOptions settings;settings.client.retries=0;settings.client.requestTimeoutMs=10000;
+    detail::HostedAttachment attachment(proxy.endpoint(),settings);
+    auto viewRead=std::async(std::launch::async,[&] {
+        detail::HostedStoreReader reader(attachment);
+        const auto view=GeometrySnapshot(reader).track(id);
+        require(view.reference()==initial,"typed current view carries the selected complete identity");
+        require(view.points(0,1).front()[0]==1,"typed view must not pair the selected identity with a newer geometry head");
+    });
+    try {
+        proxy.wait();const auto status=writer.status();TransactionRequest request;
+        request.requestUuid=util::newUuid();request.storeUuid=status.storeUuid;request.generation=status.generation;request.author="cache-test";
+        expectObject(request,initial);
+        request.operations={UpdateGeometryArraysOp{id,vc::geometry::encode(vc::geometry::Track{{{9,2,3},{4,5,6}}}),{}}};
+        writer.submit(request);attachment.refresh();
+    } catch(...) {proxy.release();viewRead.wait();throw;}
+    proxy.release();viewRead.get();
+    require(attachment.currentObject(upper)->version==2&&attachment.currentObject(id)->version==2,"both UUID spellings select the updated head");
+    const auto status=writer.status();TransactionRequest update;
+    update.requestUuid=util::newUuid();update.storeUuid=status.storeUuid;update.generation=status.generation;update.author="cache-test";
+    update.expectedObjects={{id,2}};update.operations={SetMetaOp{id,"label","true"}};
+    attachment.submit(update);
+    require(attachment.currentObject(upper)->version==3&&attachment.currentObject(id)->version==3,"canonical invalidation clears all UUID spellings");
 }
 
 void invalidationDuringRead(bool poll)
@@ -453,6 +490,7 @@ void persistentObjects()
 
 int main()
 try {
+    selectedHeadAndCanonicalCache();
     referencedRecordsCache();
 #ifdef VC_REAL_SURFACE
     persistentObjects();

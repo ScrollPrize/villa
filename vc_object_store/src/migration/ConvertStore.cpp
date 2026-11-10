@@ -3,6 +3,8 @@
 #include "internal/Sqlite.hpp"
 #include "internal/Versions.hpp"
 #include "internal/RecordJson.hpp"
+#include "internal/RecordOverrides.hpp"
+#include "internal/History.hpp"
 #include "internal/EdgeSql.hpp"
 #include "geometry/GeometryDelta.hpp"
 #include "geometry/GeometryReader.hpp"
@@ -267,24 +269,14 @@ std::map<std::string, Json> numberArchivedRecords(sqlite3* db)
     // Rewrite complete states and re-diff against the converted parent. Editing
     // individual old JSON-patch operations would miss inherited fields or
     // confuse a per-setter mutation count with a committed numbered version.
-    std::map<std::string, Json> original, converted;
-    Statement rows(db, "SELECT r.uuid,r.parent_uuid,r.metadata_delta,v.version,v.commit_seq,v.generation "
-                      "FROM object_revisions r JOIN object_versions v ON v.revision_uuid=r.uuid ORDER BY r.seq");
-    Statement update(db, "UPDATE object_revisions SET metadata_delta=? WHERE uuid=?");
-    while (rows.row()) {
-        const auto uuid = rows.uuid(0);
-        const auto parent = rows.optUuid(1);
-        const auto patch = Json::parse(rows.text(2));
-        Json old = patch.is_object() ? patch : (parent ? original.at(*parent) : Json::object()).patch(patch);
-        auto value = numberedRecord(old, rows.i64(3), rows.isNull(4) ? 0 : rows.i64(4), rows.uuid(5));
-        const auto delta = parent ? Json::diff(converted.at(*parent), value) : value;
-        update.run(delta.dump(), parseUuid(uuid));
-        original.emplace(uuid, std::move(old));
-        converted.emplace(uuid, std::move(value));
-    }
-    Statement heads(db, "SELECT revision_uuid FROM object_head_records");
-    Statement updateHead(db, "UPDATE object_head_records SET record=? WHERE revision_uuid=?");
-    while (heads.row()) updateHead.run(converted.at(heads.uuid(0)).dump(), heads.blob16(0));
+    std::map<std::string, Json> converted;
+    Statement version(db,"SELECT version,coalesce(commit_seq,0),generation FROM object_versions WHERE revision_uuid=?");
+    transformArchivedObjectRecords(db,[&](const std::string& uuid,Json& value) {
+        version.reset();version.bind(1,parseUuid(uuid));
+        if(!version.row())throw std::runtime_error("convert: archived object has no numbered version");
+        value=numberedRecord(std::move(value),version.i64(0),version.i64(1),version.uuid(2));
+        converted.emplace(uuid,value);
+    });
     Statement edges(db, "SELECT r.uuid,r.record,v.version,v.commit_seq,v.generation FROM relationship_revisions r "
                        "JOIN relationship_versions v ON v.revision_uuid=r.uuid");
     Statement updateEdge(db, "UPDATE relationship_revisions SET record=? WHERE uuid=?");
@@ -340,7 +332,8 @@ void retainDeletedVersions(sqlite3* db, const std::map<std::string, Json>& recor
 // a parent stores its whole record, materialized head records are kept only
 // for heads with a parent, and hex geometry hashes become 32-byte blobs
 // (schema-19 sources already have these forms and pass through).
-void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesystem::path& destination, Json& report)
+void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesystem::path& sourceLocation,
+                         const std::filesystem::path& destination, Json& report)
 {
     Connection out;
     out.db = openRaw(destination, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
@@ -520,6 +513,7 @@ void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesyst
         Statement revisions(db, "SELECT uuid,manifest,content_hash FROM main.geometry_revisions");
         while (revisions.row()) loadGeometryManifest(db, revisions.uuid(0), revisions.text(1), revisions.hash(2));
     }
+    relocateExternalLocators(db,sourceLocation,destination);
     for (const auto& [name, sql] : triggers) exec(db, (sql + ";").c_str());
     exec(db, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
     exec(db, "COMMIT;");
@@ -918,7 +912,7 @@ ConversionResult convertStoreImpl(const std::filesystem::path& source, const std
         exec(db, "COMMIT;");
         staged = {};
 
-        copyToCurrentSchema(stage, destination, report);
+        copyToCurrentSchema(stage, source, destination, report);
         copyArtifacts(source, destination, report);
         removeFiles(stage);
         report["destination_bytes"] = int64_t(std::filesystem::file_size(destination));

@@ -4,19 +4,65 @@
 #include "vc_object_store/objects/PackedStore.hpp"
 
 namespace vc::objects::detail {
+namespace {
+std::filesystem::path externalDirectory(const std::filesystem::path& path)
+{
+    return std::filesystem::absolute(isPackedDatabasePath(path)?packedContainerPath(path):path).lexically_normal().parent_path();
+}
+}
+std::string rebaseExternalLocator(const std::string& locator, const std::filesystem::path& source,
+                                 const std::filesystem::path& destination)
+{
+    namespace fs = std::filesystem;
+    if(locator.empty() || locator.find("://") != std::string::npos || !fs::path(locator).is_relative())return locator;
+    const auto from=externalDirectory(source), to=externalDirectory(destination);
+    if(from==to)return locator;
+    const auto absolute=(from/locator).lexically_normal();
+    const auto relative=absolute.lexically_relative(to);
+    return (relative.empty()?absolute:relative).generic_string();
+}
+
+void relocateExternalLocators(sqlite3* db, const std::filesystem::path& source,
+                              const std::filesystem::path& destination)
+{
+    if(externalDirectory(source)==externalDirectory(destination))return;
+    // This connection owns an unpublished copy. Mutating only physical hints
+    // must not trigger history, version increments or sealed-store guards.
+    struct Triggers {
+        sqlite3* db; int enabled=0;
+        explicit Triggers(sqlite3* value):db(value) {
+            check(sqlite3_db_config(db,SQLITE_DBCONFIG_ENABLE_TRIGGER,-1,&enabled),db,"read trigger policy");
+            check(sqlite3_db_config(db,SQLITE_DBCONFIG_ENABLE_TRIGGER,0,nullptr),db,"suspend export triggers");
+        }
+        ~Triggers(){sqlite3_db_config(db,SQLITE_DBCONFIG_ENABLE_TRIGGER,enabled,nullptr);}
+    } triggers(db);
+    const auto rebase=[&](const std::string& value){return rebaseExternalLocator(value,source,destination);};
+    for(const auto* table:{"objects","tracks"}) {
+        const std::string column=std::string_view(table)=="objects"?"storage_ref":"dataset_ref";
+        const std::string key=std::string_view(table)=="objects"?"id":"object_id";
+        Statement rows(db,"SELECT "+key+","+column+" FROM "+table+
+            (std::string_view(table)=="objects"?" WHERE storage_kind='file'":"")+" ORDER BY "+key);
+        Statement update(db,"UPDATE "+std::string(table)+" SET "+column+"=? WHERE "+key+"=?");
+        while(rows.row()) {const auto old=rows.text(1), value=rebase(old);if(value!=old)update.run(value,rows.i64(0));}
+    }
+    Statement history(db,"SELECT 1 FROM sqlite_schema WHERE type='table' AND name='object_revisions'");
+    if(!history.row())return;
+    using Json=nlohmann::json;
+    transformArchivedObjectRecords(db,[&](const std::string&,Json& record) {
+        const auto field=[&](Json& object,const char* name) {
+            const auto it=object.find(name);
+            if(it!=object.end()&&it->is_string())*it=rebase(it->get<std::string>());
+        };
+        if(record.value("storage_kind",std::string())=="file")field(record,"storage_ref");
+        if(record.contains("track")&&record["track"].is_object())field(record["track"],"dataset_ref");
+    });
+}
+
 void prepareOverrideReferences(sqlite3* source,sqlite3* db,ObjectRecord& record)
 {
     if(source==db)return;
     const auto rebase = [&](std::string& locator) {
-      if(!locator.empty()&&locator.find("://")==std::string::npos&&std::filesystem::path(locator).is_relative()){
-        auto path=std::filesystem::path(sqlite3_db_filename(source,"main"));
-        if(isPackedDatabasePath(path))path=packedContainerPath(path);
-        auto destination=std::filesystem::path(sqlite3_db_filename(db,"main"));
-        if(isPackedDatabasePath(destination))destination=packedContainerPath(destination);
-        const auto absolute=std::filesystem::absolute(path.parent_path()/locator).lexically_normal();
-        const auto relative=absolute.lexically_relative(std::filesystem::absolute(destination).parent_path());
-        locator=(relative.empty()?absolute:relative).generic_string();
-      }
+        locator=rebaseExternalLocator(locator,sqlite3_db_filename(source,"main"),sqlite3_db_filename(db,"main"));
     };
     if(record.storageKind=="file") rebase(record.storageRef);
     if(record.track) rebase(record.track->datasetRef);

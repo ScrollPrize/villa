@@ -1,6 +1,13 @@
 #pragma once
 #include "internal/RecordResolver.hpp"
 namespace vc::objects::detail {
+// Location changes preserve the target, not the spelling of a relative hint.
+std::string rebaseExternalLocator(const std::string&, const std::filesystem::path& source,
+                                 const std::filesystem::path& destination);
+// Private export/conversion snapshot only, inside the caller's transaction.
+// Rewrites current and retained record hints without publishing logical edits.
+void relocateExternalLocators(sqlite3*, const std::filesystem::path& source,
+                              const std::filesystem::path& destination);
 // Rebase location hints and register extension schemas when metadata moves
 // between owners. Payload references are retained, never copied.
 void prepareOverrideReferences(sqlite3* source,sqlite3* destination,ObjectRecord&);

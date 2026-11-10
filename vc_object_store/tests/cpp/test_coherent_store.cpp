@@ -90,10 +90,10 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
         repair.edgeUuid=f.edge;repair.expectedVersion=*unchanged.version;
         repair.aRevision=store.currentGeometry(r,unchanged.aUuid)->uuid;repair.bRevision=store.currentGeometry(r,unchanged.bUuid)->uuid;
         repair.aAnchor=unchanged.aAnchor;repair.bAnchor=unchanged.bAnchor;}
-    {auto w=store.write();store.updateEdge(w,unchanged);store.repairEdgeGeometry(w,repair);w.commit();}
+    {auto w=store.write();store.updateEdge(w,unchanged);store.repairEdgeGeometry(w,repair);store.retainRelationship(w,f.edge);w.commit();}
     {auto r=store.read();require(store.edgeByUuid(r,f.edge)->versionStoreUuid==unchanged.versionStoreUuid,
-        "unchanged edge update/repair preserves inherited ownership");
-        require(store.status(r).commitSequence==sequence,"unchanged edge update/repair does not publish");}
+        "unchanged edge update/repair/retain preserves inherited ownership");
+        require(store.status(r).commitSequence==sequence,"unchanged edge update/repair/retain does not publish");}
     {auto w=store.write();const std::array<ExtensionRow,1> rows{ExtensionRow{extensionUuid(f.edge),int64_t(4)}};
         store.replaceExtensionRows(w,extension().name,f.edge,rows);w.commit();}
     {auto r=store.read();require(store.status(r).commitSequence==sequence,"inherited no-op remains a no-op");}
@@ -626,7 +626,54 @@ void inventoryPackedAndCoordinates() {
     {auto r=store.read();require(store.currentObjectRevision(r,surface)->reference()==ref,"identity resize preserves owner/version");}
 }
 
+void followupAtomicityAndPolicy()
+{
+    for(const auto mode:{HistoryMode::Off,HistoryMode::On}) {
+        Fixture f(HistoryMode::On,mode);
+        auto store=ObjectStore::open(f.overlay,options(mode));
+        ObjectRecord previous;
+        {auto r=store.read();previous=*store.objectByUuid(r,f.a);}
+        {auto w=store.write();store.upsertObject(w,previous);w.commit();}
+        {auto r=store.read();require(store.currentObjectRevision(r,f.a)->reference()==f.av,"full-record no-op preserves inherited identity");}
+        std::optional<std::filesystem::path> originalPath;
+        {auto r=store.read();originalPath=store.resolveStoragePath(r,f.a);}
+        previous.name="renamed";
+        {auto w=store.write(VersionSelection{{f.a,f.av.version}});store.upsertObject(w,previous);w.commit();}
+        ObjectVersion after;
+        {auto r=store.read();require(store.resolveStoragePath(r,f.a)==originalPath,"full-record override keeps the unchanged relative track dataset target");
+            previous=*store.objectByUuid(r,f.a);after=store.currentObjectRevision(r,f.a)->reference();}
+        {auto w=store.write(VersionSelection{{f.a,after.version}});store.upsertObject(w,previous);w.commit();}
+        {auto r=store.read();require(store.currentObjectRevision(r,f.a)->reference()==after,"full-record local no-op preserves the version");}
+        TransactionRequest request;
+        {auto r=store.read();const auto status=store.status(r);
+            request.requestUuid=util::newUuid();request.storeUuid=status.storeUuid;request.generation=status.generation;request.author="test";
+            buildCurrentEditRequest(LocalStoreReader(store,r),request,{f.a},[&]{return std::vector<TransactionOperation>{SetMetaOp{f.a,"quality","9"}};});}
+        store.submit(request);
+        {auto r=store.read();EdgeSelection selection;selection.applicableOnly=true;
+            require(store.selectEdges(r,selection).empty(),"generic edit preserves recorded evidence regardless of destination history policy");}
+        GeometrySource good;good.source=nlohmann::json::object();good.object.uuid=util::newUuid();good.object.kind="umbilicus";
+        good.geometry=vc::geometry::encode(vc::geometry::Umbilicus{{{1,2,3}}});
+        auto bad=good;bad.object.uuid=util::newUuid();bad.geometry.arrays.clear();
+        ObjectRecord unrelated;unrelated.kind="note";
+        {auto w=store.write();unrelated.uuid=store.upsertObject(w,unrelated);
+            mustFail([&]{ingestGeometryBatch(store,w,{good,bad});});w.commit();}
+        {auto r=store.read();require(store.objectByUuid(r,unrelated.uuid).has_value(),"unrelated caller work survives caught batch failure");
+            require(!store.objectByUuid(r,good.object.uuid)&&!store.objectByUuid(r,bad.object.uuid),"failed batch rolls back every imported object");}
+    }
+    for(const auto cache:{size_t(0),size_t(1024*1024)}) {
+        TemporaryDirectory dir;auto opt=options(HistoryMode::On);opt.spatialIndex=true;opt.spatialCacheBytes=cache;
+        auto store=ObjectStore::create(dir.path/"spatial",opt);std::string retired,deleted;
+        {auto w=store.write();for(auto* id:{&retired,&deleted}){ObjectRecord r;r.kind="track";r.track.emplace();
+            *id=store.upsertObject(w,r);store.putGeometry(w,*id,shape());}w.commit();}
+        {auto w=store.write(VersionSelection{{retired,1},{deleted,1}});store.retireObject(w,retired);store.deleteObject(w,deleted);w.commit();}
+        auto r=store.read();ObjectSelection selection;selection.bbox=std::array<double,6>{0,0,0,100,100,100};selection.includeRetired=true;
+        const auto regions=store.spatialRegions(r,selection);
+        require(regions.size()==1&&regions.front().objectUuid==retired,"spatial queries include retired but never deleted objects, with or without cache");
+    }
+}
+
 int main()try{
+    followupAtomicityAndPolicy();
     inventoryIdentityAndSources();
     inventorySelectedMembership();inventoryPackedAndCoordinates();inventoryArtifactAlias();
 #ifdef VC_TEST_NATIVE_EXPORT

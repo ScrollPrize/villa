@@ -24,6 +24,7 @@ void packObjectCollection(const std::filesystem::path& source,
         try {
             // This is physical relocation of a private snapshot, not an object
             // edit. UUIDs, lineage/commit pins and retained history remain intact.
+            relocateExternalLocators(db.get(),member.locator,destination);
             relocateCollectionMembers(db.get(),[&](const std::string& target) {
                 builder.databasePath(target); // Fail if dependency closure is incomplete.
                 return packedMemberReference(target);

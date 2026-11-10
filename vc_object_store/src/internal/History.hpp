@@ -3,6 +3,11 @@
 
 namespace vc::objects::detail {
 void createHistorySchema(sqlite3*);
+// Private conversion/export only: transform complete archived states, then
+// rebuild their deltas and cached heads without changing revision identities.
+// The caller owns the transaction and suspends mutation/immutability triggers.
+void transformArchivedObjectRecords(sqlite3*,
+    const std::function<void(const std::string& revision, nlohmann::json&)>&);
 void beginCurrentWrite(sqlite3*);
 void publishHistory(sqlite3*, bool baseline = false);
 void expectHistory(sqlite3*, const RevisionSelection&);

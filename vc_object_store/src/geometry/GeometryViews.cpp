@@ -168,8 +168,8 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
     state_->require();
     const auto object = geometryRevision ? std::optional<ObjectRevision>{} : state_->reader->currentObject(id);
     if (!geometryRevision && !object) throw std::invalid_argument("object not found");
-    const auto revision = geometryRevision ? state_->reader->geometryRevision(*geometryRevision)
-                                           : state_->reader->currentGeometry(id);
+    const auto selected = geometryRevision ? geometryRevision : object->geometryRevision;
+    const auto revision = selected ? state_->reader->geometryRevision(*selected) : std::nullopt;
     if (!revision) throw std::invalid_argument("object has no stored geometry");
     if (revision->objectUuid != util::canonicalUuid(id))
         throw std::invalid_argument("geometry revision belongs to another object");

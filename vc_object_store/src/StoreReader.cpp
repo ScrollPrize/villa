@@ -203,21 +203,23 @@ void buildCurrentEditRequest(const StoreReader& reader, TransactionRequest& requ
     edges.endpointUuids = uuids;
     edges.includeRetired = true;
     std::set<std::string> kept;
-    const bool history = reader.status().historyEnabled;
-    std::set<std::string> removedEdges, removedEndpoints;
+    std::set<std::string> decidedEdges, removedEndpoints;
     for (const auto& operation : request.operations) {
         if (const auto* remove = std::get_if<RemoveEdgeOp>(&operation))
-            removedEdges.insert(util::canonicalUuid(remove->uuid));
+            decidedEdges.insert(util::canonicalUuid(remove->uuid));
+        else if (const auto* retain = std::get_if<RetainRelationshipOp>(&operation))
+            decidedEdges.insert(util::canonicalUuid(retain->uuid));
+        else if (const auto* keep = std::get_if<KeepRecordedRelationshipOp>(&operation))
+            decidedEdges.insert(util::canonicalUuid(keep->uuid));
         else if (const auto* retire = std::get_if<RetireObjectOp>(&operation))
             removedEndpoints.insert(util::canonicalUuid(retire->uuid));
         else if (const auto* restore = std::get_if<RestoreObjectOp>(&operation); restore && restore->source)
             removedEndpoints.insert(util::canonicalUuid(restore->uuid));
     }
     for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{}))
-        if (!removedEdges.contains(edge.uuid) && !removedEndpoints.contains(edge.aUuid) &&
+        if (!decidedEdges.contains(edge.uuid) && !removedEndpoints.contains(edge.aUuid) &&
             !removedEndpoints.contains(edge.bUuid) && kept.insert(edge.uuid).second) {
-            if (history) request.operations.push_back(KeepRecordedRelationshipOp{edge.uuid});
-            else request.operations.push_back(RetainRelationshipOp{edge.uuid});
+            request.operations.push_back(KeepRecordedRelationshipOp{edge.uuid});
         }
 }
 

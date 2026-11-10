@@ -392,14 +392,16 @@ void SegmentationModule::applyCorrectionAnchorOffset(float offsetX, float offset
 void SegmentationModule::loadCorrections(QuadSurface* surface)
 {
     _correctionsSurfaceId.clear();
+    _correctionsSnapshot.reset();
     if (!_pointCollection) {
         return;
     }
     std::map<uint64_t, nlohmann::json> stored;
     if (const auto storeEdit = storeEditFor(surface)) {
         try {
-            stored = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid(),
+            _correctionsSnapshot = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid(),
                                              storeEdit->view());
+            stored = _correctionsSnapshot->collections;
             _correctionsSurfaceId = storeEdit->uuid();
         } catch (const std::exception& error) {
             emit statusMessageRequested(tr("Cannot read correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
@@ -413,13 +415,13 @@ void SegmentationModule::saveCorrections()
     if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
         _correctionsSaveTimer->stop();
     }
-    if (!_pointCollection || _correctionsSurfaceId.empty() || !_storeEdit || _storeEdit->uuid() != _correctionsSurfaceId ||
+    if (!_pointCollection || !_correctionsSnapshot || _correctionsSurfaceId.empty() || !_storeEdit || _storeEdit->uuid() != _correctionsSurfaceId ||
         !_state || !_state->annotationVolume()) {
         return;
     }
     try {
-        vc3d::corrections::write(*_state->objectStoreSession(), _storeEdit->pin().attachment, _correctionsSurfaceId,
-                                 _pointCollection->anchoredCollections(), *_state->annotationVolume(), _storeEdit->view());
+        vc3d::corrections::write(*_state->objectStoreSession(), _storeEdit->pin().attachment, *_correctionsSnapshot,
+                                 _pointCollection->anchoredCollections(), *_state->annotationVolume());
     } catch (const std::exception& error) {
         qCWarning(lcSegModule) << "Saving correction points failed:" << error.what();
         emit statusMessageRequested(tr("Failed to save correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);

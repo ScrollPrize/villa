@@ -150,15 +150,6 @@ ObjectKey canonical(ObjectKey key) {
     if(!key.storeUuid.empty())key.storeUuid=util::canonicalUuid(key.storeUuid);
     key.objectUuid=util::canonicalUuid(key.objectUuid);return key;
 }
-nlohmann::json editableObject(ObjectRecord record) {
-    // Reuse the record serializer so detail schemas stay shared with native
-    // reads/writes. Caller-controlled content excludes provenance and approval.
-    static const std::set<std::string> fields{"name","format_version","storage_kind","storage_ref",
-        "data_checksum","meta","tags","fiber","surface","track"};
-    std::sort(record.tags.begin(),record.tags.end());record.tags.erase(std::unique(record.tags.begin(),record.tags.end()),record.tags.end());
-    if(record.meta.empty())record.meta="{}";
-    return objectToJson(record,&fields);
-}
 void validateRoutes(const std::vector<KeyRoute>& routes,const std::vector<CollectionMember>& members) {
     for(const auto* space:{"objects","edges"}){
         std::vector<KeyRoute> group;for(const auto& r:routes)if(r.keySpace==space)group.push_back(r);
@@ -649,6 +640,7 @@ void copyObjectCollection(const std::filesystem::path& source, const std::filesy
                 openConnection(path,SQLITE_OPEN_READWRITE,options,false),sqlite3_close_v2);
             exec(db.get(),"BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON;");
             try {
+                relocateExternalLocators(db.get(),member.locator,path);
                 relocateCollectionMembers(db.get(),[&](const std::string& id){
                     return fs::relative(paths.at(id),path.parent_path()).generic_string();
                 });
@@ -788,7 +780,6 @@ void ObjectCollection::replaceObject(CollectionTxn& t,const ObjectKey& input,con
     auto key=canonical(input);auto& w=impl_->writer(t);Savepoint save(impl_->db(t,0));
     const auto previous=object(t,key);if(!previous)throw std::runtime_error("collection: missing/deleted object");
     auto proposed=r;proposed.uuid=key.objectUuid;
-    if(editableObject(proposed)==editableObject(previous->record)){save.release();return;}
     impl_->nodes[0].store->upsertObject(w,proposed);
     save.release();
 }

@@ -56,6 +56,75 @@ void storeSurface(ObjectStoreSession& session, const AttachmentIdentity& attachm
     session.submit(attachment, request);
 }
 
+void checkCorrectionSnapshots(const fs::path& directory)
+{
+    SurfaceCatalog::Crossings crossings;
+    crossings.requireComplete();
+    auto rejectsIncomplete = [&] {
+        bool rejected = false;
+        try { crossings.requireComplete(); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "partial/remote surface queries cannot be used for persistent annotations");
+    };
+    crossings.complete = false;
+    rejectsIncomplete();
+    crossings.complete = true;
+    crossings.remote.emplace_back(AttachmentIdentity{}, util::newUuid());
+    rejectsIncomplete();
+    for (const bool history : {false, true}) for (const bool referenced : {false, true}) {
+        OpenOptions options; options.author = "correction-test"; options.history = history ? HistoryMode::On : HistoryMode::Off;
+        const auto path = directory / (std::string("corrections-") + std::to_string(history) + std::to_string(referenced) + ".vcobj");
+        { auto store = ObjectStore::create(path, options); }
+        ObjectStoreSession session;
+        auto attachment = session.attach(path, options);
+        ObjectRecord surface; surface.uuid = util::newUuid(); surface.kind = "surface";
+        auto request = session.newRequest(attachment);
+        request.expectedObjects[surface.uuid] = std::nullopt;
+        request.operations.push_back(CreateObjectOp{objectRecordJson(surface)});
+        session.submit(attachment, request);
+        auto first = vc3d::corrections::read(session, attachment, surface.uuid);
+        std::map<uint64_t, nlohmann::json> data{{1, {{"uuid", util::newUuid()}, {"name", "fix"},
+            {"points", {{"7", {{"p", {1., 2., 3.}}}}}}}}};
+        vc3d::corrections::write(session, attachment, first, data, {"volume"});
+        if (referenced) {
+            session.detach(attachment);
+            { auto base = ObjectStore::open(path, options); auto txn = base.write(); base.seal(txn); txn.commit(); }
+            const auto overlay = fs::path(path.string() + ".overlay");
+            { auto collection = ObjectCollection::create(overlay, {path}, options); }
+            attachment = session.attach(overlay, options);
+        }
+        first = vc3d::corrections::read(session, attachment, surface.uuid);
+        const auto unchangedOwner = first.baseline.owner;
+        const auto unchangedCommit = first.baseline.snapshot.commitSequence;
+        vc3d::corrections::write(session, attachment, first, first.collections, {"volume"});
+        require(first.baseline.owner == unchangedOwner && first.baseline.snapshot.commitSequence == unchangedCommit,
+                "no-op correction save preserves ownership and the loaded commit baseline");
+        auto stale = vc3d::corrections::read(session, attachment, surface.uuid);
+        data.at(1)["points"]["7"]["p"] = {4., 5., 6.};
+        vc3d::corrections::write(session, attachment, first, data, {"volume"});
+        bool rejected = false;
+        try { vc3d::corrections::write(session, attachment, stale, stale.collections, {"volume"}); }
+        catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "JSON correction editing retains the loaded object references");
+        stale = first;
+        data.emplace(2, nlohmann::json{{"uuid", util::newUuid()}, {"name", "new"}, {"points", nlohmann::json::object()}});
+        vc3d::corrections::write(session, attachment, first, data, {"volume"});
+        rejected = false;
+        try { vc3d::corrections::write(session, attachment, stale, {}, {"volume"}); }
+        catch (const TransactionConflict&) { rejected = true; }
+        const auto remaining = vc3d::corrections::read(session, attachment, surface.uuid).collections.size();
+        if (!rejected || remaining != 2)
+            throw std::runtime_error("stale correction membership guard: history=" + std::to_string(history) +
+                " referenced=" + std::to_string(referenced) + " rejected=" + std::to_string(rejected) + " remaining=" + std::to_string(remaining));
+        stale = first;
+        vc3d::corrections::write(session, attachment, first, {}, {"volume"});
+        rejected = false;
+        try { vc3d::corrections::write(session, attachment, stale, stale.collections, {"volume"}); }
+        catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "a stale editor cannot resurrect removed corrections");
+        require(vc3d::corrections::read(session, attachment, surface.uuid).collections.empty(), "receipt baseline supports subsequent saves");
+    }
+}
+
 void checkHistoryGenerationSaves(const fs::path& directory)
 {
     const auto path = directory / "generation.vcobj";
@@ -219,6 +288,7 @@ int main(int argc, char** argv)
         QTemporaryDir dir;
         checkHistoryGenerationSaves(fs::path(dir.path().toStdString()));
         checkReferencedSurfaceSelections(fs::path(dir.path().toStdString()));
+        checkCorrectionSnapshots(fs::path(dir.path().toStdString()));
         if (argc > 1) checkDraftRecovery(argv[1], fs::path(dir.path().toStdString()));
         const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
         const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
@@ -338,9 +408,10 @@ int main(int argc, char** argv)
             const auto fix = points.getCollectionId("fix").value();
             points.setCollectionAnchor2d(fix, cv::Vec2f(1.5f, 0.5f));
             const auto saved = points.anchoredCollections();
-            vc3d::corrections::write(*session, attachment, half, saved, {volume->id()});
+            auto correctionSnapshot = vc3d::corrections::read(*session, attachment, half);
+            vc3d::corrections::write(*session, attachment, correctionSnapshot, saved, {volume->id()});
             auto stored = vc3d::corrections::read(*session, attachment, half);
-            require(stored.size() == 1 && stored.begin()->first == fix, "corrections round-trip by collection id");
+            require(stored.collections.size() == 1 && stored.collections.begin()->first == fix, "corrections round-trip by collection id");
             session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
                 const auto uuid = reader.neighbours(half, std::string(vc::objects::kAttachmentEdgeKind)).at(0);
                 require(nlohmann::json::parse(reader.currentObject(uuid)->record.meta)["role"] == "corrections" &&
@@ -348,21 +419,21 @@ int main(int argc, char** argv)
                         "corrections are attached data, not graph links");
             });
             PointCollections reloaded;
-            require(reloaded.replaceAnchoredCollections(stored), "stored corrections load");
+            require(reloaded.replaceAnchoredCollections(stored.collections), "stored corrections load");
             const auto& collection = reloaded.getAllCollections().at(fix);
             require(collection.uuid == points.getAllCollections().at(fix).uuid && collection.anchor2d == cv::Vec2f(1.5f, 0.5f) &&
                     collection.points.size() == 1 && collection.points.begin()->second.p == cv::Vec3f(1, 2, 3),
                     "corrections keep identity, anchor and points");
             points.addPoint("fix", {4, 5, 6});
-            vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), {volume->id()});
-            require(vc3d::corrections::read(*session, attachment, half).at(fix).at("points").size() == 2, "corrections update in place");
+            vc3d::corrections::write(*session, attachment, correctionSnapshot, points.anchoredCollections(), {volume->id()});
+            require(vc3d::corrections::read(*session, attachment, half).collections.at(fix).at("points").size() == 2, "corrections update in place");
             {
                 const auto firstPoint = points.getAllCollections().at(fix).points.begin()->second;
                 auto movedPoint = firstPoint;
                 movedPoint.p = {7, 8, 9};
                 points.updatePoint(movedPoint);
-                vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), {volume->id()});
-                const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix);
+                vc3d::corrections::write(*session, attachment, correctionSnapshot, points.anchoredCollections(), {volume->id()});
+                const auto stored = vc3d::corrections::read(*session, attachment, half).collections.at(fix);
                 const auto& moved = stored.at("points").at(std::to_string(firstPoint.id)).at("p");
                 require(moved[0].get<double>() == 7 && moved[2].get<double>() == 9, "moved correction points keep their id");
             }
@@ -373,16 +444,17 @@ int main(int argc, char** argv)
                 auto shown = vc3d::corrections::read(*session, attachment, half, coarse);
                 const auto& ordered = points.getAllCollections().at(fix).points;
                 const auto firstId = std::to_string(ordered.begin()->first), secondId = std::to_string(std::next(ordered.begin())->first);
-                require(shown.at(fix).at("points").at(firstId).at("p")[0].get<double>() == 3.5, "corrections read through the view");
-                shown.at(fix)["points"][secondId]["p"] = nlohmann::json::parse("[1.0, 1.0, 1.0]");
-                vc3d::corrections::write(*session, attachment, half, shown, {volume->id()}, coarse);
-                const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix).at("points");
+                require(shown.collections.at(fix).at("points").at(firstId).at("p")[0].get<double>() == 3.5, "corrections read through the view");
+                shown.collections.at(fix)["points"][secondId]["p"] = nlohmann::json::parse("[1.0, 1.0, 1.0]");
+                vc3d::corrections::write(*session, attachment, shown, shown.collections, {volume->id()});
+                const auto stored = vc3d::corrections::read(*session, attachment, half).collections.at(fix).at("points");
                 require(stored.at(firstId).at("p")[0].get<double>() == 7 && stored.at(secondId).at("p")[0].get<double>() == 2,
                         "corrections save back to their stored frame");
             }
-            vc3d::corrections::write(*session, attachment, half, {}, {volume->id()});
-            require(vc3d::corrections::read(*session, attachment, half).empty(), "dropped corrections are retired");
-            require(vc3d::corrections::read(*session, attachment, native).empty(), "corrections belong to one surface");
+            correctionSnapshot = vc3d::corrections::read(*session, attachment, half);
+            vc3d::corrections::write(*session, attachment, correctionSnapshot, {}, {volume->id()});
+            require(vc3d::corrections::read(*session, attachment, half).collections.empty(), "dropped corrections are retired");
+            require(vc3d::corrections::read(*session, attachment, native).collections.empty(), "corrections belong to one surface");
             vc3d::corrections::GrowthAnnotation annotation;
             annotation.surfaceUuid = half;
             annotation.beforeGeometry = "before";
@@ -397,7 +469,7 @@ int main(int argc, char** argv)
                     vc::geometry::decode(reader.readGeometryData(reader.currentGeometry(annotationUuid)->uuid)));
                 require(points.ids == std::vector<int64_t>{1, 2}, "annotation points keep placement order");
             });
-            require(vc3d::corrections::read(*session, attachment, half).empty(), "annotations are not corrections");
+            require(vc3d::corrections::read(*session, attachment, half).collections.empty(), "annotations are not corrections");
         }
 
         session->tagObjects(attachment, {native}, {"reviewed"}, {"approved"});
