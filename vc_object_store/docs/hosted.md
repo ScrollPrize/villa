@@ -265,6 +265,7 @@ bytes, `Content-Length` required; 400 hash/length mismatch, 411 no length,
 | `GET /v1/objects/{uuid}/versions/{n}?store&generation` | that numbered revision or 404 |
 | `GET /v1/objects/{uuid}/history` | every recorded revision, or 404 |
 | `GET /v1/geometry/{revision}` | geometry descriptor (immutable) |
+| `GET /v1/geometry/{revision}/object` | latest retained object metadata naming that geometry, or 404; not immutable, use an exact object reference to pin metadata |
 | `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes; 413 above the response limit |
 | `GET /v1/geometry/{revision}/annotations/{name}` | per-point annotations (exact JSON, immutable) |
 | `PUT /v1/artifacts/{sha256}` (bytes) | kept durably by the store |

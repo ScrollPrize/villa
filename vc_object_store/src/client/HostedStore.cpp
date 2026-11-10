@@ -167,6 +167,13 @@ std::optional<GeometryRevision> HostedStore::geometryRevision(const std::string&
     return geometryRevisionFromJson(expectOk(response, "geometry").body);
 }
 
+std::optional<ObjectRevision> HostedStore::objectAtGeometry(const std::string& revisionUuid)
+{
+    const auto response=impl_->http.request("GET",requestEndpoint_+"/v1/geometry/"+revisionUuid+"/object");
+    if(response.status==404)return std::nullopt;
+    return objectRevisionFromJson(expectOk(response,"geometry object").body);
+}
+
 std::vector<uint8_t> HostedStore::readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                                     int64_t byteOffset, const std::optional<int64_t>& byteCount)
 {

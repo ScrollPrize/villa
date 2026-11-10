@@ -643,6 +643,9 @@ public:
     // conflict, which aborts a checked write.
     std::optional<std::string> geometryAtVersion(const Txn&, const std::string& objectUuid, int64_t expectedVersion) const;
     std::optional<GeometryRevision> geometryRevision(const Txn& txn, const std::string& revisionUuid) const;
+    // Latest retained metadata for this geometry, preferring the visible head
+    // when it still names it. Explicit ObjectVersion reads select metadata exactly.
+    std::optional<ObjectRevision> objectAtGeometry(const Txn&, const std::string& revisionUuid) const;
     std::vector<GeometryRevision> geometryHistory(const Txn& txn, const std::string& objectUuid) const;
     // Byte ranges allow bounded loading without materializing a whole array.
     // Every touched chunk is verified against its SHA-256 content address.

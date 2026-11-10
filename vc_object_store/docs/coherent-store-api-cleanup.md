@@ -8,7 +8,7 @@ Baseline: `3812cb17b`. C++ store plus VC3D adapters; existing CMake/approved PR 
 - [x] T. Centralize canonical opposite-endpoint lookup for traversal and attached documents. Coherent-store and transform tests pass, including uppercase attachment removal without retiring the owner; VC3D and source metadata use the same helper.
 - [x] U. Preserve ownership on no-op edge update/repair; repair delegates to the ordinary update path instead of duplicating SQL/validation/stamping. Coherent-store and transform regressions pass, including no-op source identity/commit sequence and real endpoint edits.
 - [x] V. Route geometry history to the owning record instead of the attachment database. Coherent-store regressions verify both source history policies through both overlay policies.
-- [ ] W. Carry selected metadata through historical geometry transforms and transform listings.
+- [x] W. Carry selected metadata through historical geometry transforms and transform listings. Shared `objectAtGeometry` resolves retained metadata across referenced stores, and local/hosted readers use it. Exact transforms retain selected metadata and only retain write eligibility for the same complete current reference. Coherent, transforms, history-off view and hosted regressions pass after a clean native rebuild.
 - [ ] X. Resolve full exact surface references before deciding whether a VC3D surface is editable.
 - [ ] Y. Materialize QuadSurface/stored fits from the selected revision, never current metadata plus old geometry.
 - [ ] Z. Share CLI/Python historical export reference selection.

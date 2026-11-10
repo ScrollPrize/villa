@@ -172,6 +172,8 @@ try {
         const auto remote = uncached.attachHosted(endpoint, noCache);
         uncached.readStore(remote, [&](const StoreReader& reader, const auto&) {
             const auto revision = *reader.currentObject(surface)->geometryRevision;
+            require(reader.objectAtGeometry(revision)->reference()==expected.objectAtGeometry(revision)->reference(),
+                    "hosted and local geometry metadata selection are identical");
             require(reader.readGeometryArray(revision, "points", 12, 24) == expected.readGeometryArray(revision, "points", 12, 24),
                     "uncached range");
             for (const auto& rect : {std::array<int64_t, 4>{2, 3, 5, 4}, {2, 0, 5, 20}, {30, 0, 0, 20}, {2, 3, 5, 0}})

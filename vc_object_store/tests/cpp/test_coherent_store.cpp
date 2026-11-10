@@ -325,7 +325,8 @@ void deletedAndExactReads(HistoryMode baseMode,HistoryMode overlayMode){
     mustFail([&]{auto w=store.write();GeometrySource p;p.object.uuid=deleted;p.object.kind="surface";
         p.geometry=vc::geometry::encode(shape);p.source=nlohmann::json::object();ingestGeometryBatch(store,w,{p});w.commit();});
     {auto r=store.read();require(!store.objectByUuid(r,deleted),"rejected import must not resurrect inherited tombstone");}
-    {auto w=store.write();store.setMeta(w,live,"changed","true");w.commit();}
+    {auto w=store.write();store.setMeta(w,live,"changed","true");
+        store.setMeta(w,live,"coordinates",R"({"volume_uuid":"test-volume","scale_factor":2})");w.commit();}
     {auto r=store.read();LocalStoreReader reader(store,r);const auto current=reader.currentObject(live)->reference();
         require(current.storeUuid!=original.storeUuid,"override has new owning store");
         require(bool(reader.objectsAtVersions({current}).front()),"new owner reference resolves after edit");
@@ -336,6 +337,14 @@ void deletedAndExactReads(HistoryMode baseMode,HistoryMode overlayMode){
     {auto r=store.read();LocalStoreReader reader(store,r);GeometrySnapshot snapshot(reader);
         require(snapshot.surface(live,geometry).rows()==2,"exact typed geometry survives current deletion");
         require(readSurfaceGrid(reader,original,"test-volume").rows==2,"exact grid survives current deletion");
+        const auto retained=reader.objectAtGeometry(geometry);
+        require(retained&&retained->geometryRevision==geometry,"geometry metadata resolves through deleted overlay");
+        if(overlayMode==HistoryMode::Off)require(retained->reference()==original,"current-only overlay resolves retained source metadata");
+        const double scale=overlayMode==HistoryMode::On?.5:1;
+        require(snapshot.surface(live,geometry).viewTransformedAt("test-volume").readTile(0,0,2,2).points.front()==vc::geometry::Point{scale,scale,scale},
+                "retained geometry transforms with its retained source metadata");
+        require(snapshot.surface(live,geometry).availableTransforms().size()==reader.availableTransforms(*reader.objectsAtVersions({original}).front()).size(),
+                "historical transform listing uses the same selected metadata");
         mustFail([&]{snapshot.surface(deleted,geometry);});}
 }
 }

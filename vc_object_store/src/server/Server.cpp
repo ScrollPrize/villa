@@ -611,6 +611,13 @@ struct ServerState {
         return jsonReply(geometryRevisionToJson(*revision));
     }
 
+    Reply geometryObject(const std::string& revisionUuid)
+    {
+        auto txn=store->read();
+        const auto object=store->objectAtGeometry(txn,uuidSegment(revisionUuid));
+        return object?jsonReply(objectRevisionToJson(*object)):errorReply(http::status::not_found,"geometry metadata unavailable");
+    }
+
     Reply geometryAnnotations(const std::string& revisionUuid, const std::string& array)
     {
         auto txn = store->read();
@@ -836,6 +843,8 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryNearestSurfaces(*body); }};
         if (method == http::verb::get && is({"v1", "geometry", "*"}))
             return {readers.get(), [this, target] { return geometry(target->path[2]); }};
+        if (method == http::verb::get && is({"v1", "geometry", "*", "object"}))
+            return {readers.get(), [this, target] { return geometryObject(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "artifacts", "*", "info"}))
             return {transfers.get(), [this, target] { return artifactInfo(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "artifacts", "*"})) {

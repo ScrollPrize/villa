@@ -145,6 +145,8 @@ public:
     {
         return attachment_->geometryRevision(revisionUuid);
     }
+    std::optional<ObjectRevision> objectAtGeometry(const std::string& revisionUuid) const override
+    { return attachment_->client().objectAtGeometry(revisionUuid); }
     std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                            int64_t byteOffset = 0,
                                            const std::optional<int64_t>& byteCount = std::nullopt) const override;

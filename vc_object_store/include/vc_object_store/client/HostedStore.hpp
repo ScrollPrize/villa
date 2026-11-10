@@ -85,6 +85,7 @@ public:
     // above rangeBytes, and reads the server refuses as too large for one
     // response, arrive as several range requests within both limits.
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid);
+    std::optional<ObjectRevision> objectAtGeometry(const std::string& revisionUuid);
     std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                            int64_t byteOffset = 0, const std::optional<int64_t>& byteCount = std::nullopt);
 

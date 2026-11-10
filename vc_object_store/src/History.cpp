@@ -806,6 +806,28 @@ std::optional<ObjectRevision> ObjectStore::currentObjectRevision(const Txn& txn,
     return revision ? objectRevision(txn, *revision) : std::nullopt;
 }
 
+std::optional<ObjectRevision> ObjectStore::objectAtGeometry(const Txn& txn,const std::string& uuid) const
+{
+    const auto geometry=geometryRevision(txn,uuid);
+    if(!geometry)return {};
+    const auto current=currentObjectRevision(txn,geometry->objectUuid);
+    if(current&&current->geometryRevision==geometry->uuid)return current;
+    std::optional<ObjectRevision> result;
+    resolveReference(static_cast<sqlite3*>(connection(txn)),[&](sqlite3* source){
+        if(historyEnabled(source)){
+            Statement row(source,"SELECT uuid FROM object_revisions WHERE object_uuid=? AND geometry_uuid=? "
+                "AND metadata_complete=1 AND deleted=0 ORDER BY seq DESC LIMIT 1",parseUuid(geometry->objectUuid),parseUuid(geometry->uuid));
+            if(row.row())result=resolveObjectRevision(source,row.uuid(0))->revision;
+        }else{
+            Statement row(source,std::string("SELECT ")+kObjectCols+" FROM objects WHERE uuid=? AND storage_ref=? AND state<>2",
+                parseUuid(geometry->objectUuid),geometry->uuid);
+            if(row.row())result=resolveObjectVersion(source,readObjectRow(source,row).reference())->revision;
+        }
+        return bool(result);
+    });
+    return result;
+}
+
 std::vector<ObjectRevision> ObjectStore::objectHistory(const Txn& txn, const std::string& object) const
 {
     auto* db=static_cast<sqlite3*>(connection(txn));

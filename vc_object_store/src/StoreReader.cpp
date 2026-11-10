@@ -14,8 +14,13 @@ std::vector<vcr::catalog::TransformResolution> StoreReader::availableTransforms(
 {
     const auto object = currentObject(objectUuid);
     if (!object) throw std::invalid_argument("object not found");
+    return availableTransforms(*object);
+}
+
+std::vector<vcr::catalog::TransformResolution> StoreReader::availableTransforms(const ObjectRevision& object) const
+{
     const auto coordinates = geometryCoordinates(
-        nlohmann::json::parse(object->record.meta).value("coordinates", nlohmann::json::object()));
+        nlohmann::json::parse(object.record.meta).value("coordinates", nlohmann::json::object()));
     if (coordinates["volume_uuid"].is_null() || coordinates["scale_factor"].is_null()) return {};
     const auto source = coordinates["volume_uuid"].get<std::string>();
     const auto context = volumeTransforms();
@@ -288,6 +293,8 @@ nlohmann::json LocalStoreReader::geometryPointAnnotations(const std::string& rev
     return store_->geometryPointAnnotations(*txn_, revisionUuid, arrayName);
 }
 
+std::optional<ObjectRevision> LocalStoreReader::objectAtGeometry(const std::string& uuid) const
+{ return store_->objectAtGeometry(*txn_,uuid); }
 VolumeTransforms LocalStoreReader::volumeTransforms() const { return store_->volumeTransforms(*txn_); }
 
 std::vector<ObjectRecord> LocalStoreReader::selectObjects(const ObjectSelection& selection,

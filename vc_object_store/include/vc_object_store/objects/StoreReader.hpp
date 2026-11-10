@@ -35,6 +35,7 @@ public:
     // The geometry of the object's current revision.
     virtual std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const = 0;
     virtual std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const = 0;
+    virtual std::optional<ObjectRevision> objectAtGeometry(const std::string& revisionUuid) const = 0;
     // Exact logical (C-order) bytes, as ObjectStore::readGeometryArray.
     virtual std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                                    int64_t byteOffset = 0,
@@ -74,6 +75,7 @@ public:
     // The transforms from the object's recorded volume to every reachable
     // volume (ObjectStore::availableTransforms).
     std::vector<vcr::catalog::TransformResolution> availableTransforms(const std::string& objectUuid) const;
+    std::vector<vcr::catalog::TransformResolution> availableTransforms(const ObjectRevision&) const;
     // Every array of a geometry revision (ObjectStore::readGeometryData);
     // throws when their bytes exceed `byteBudget`.
     GeometryData readGeometryData(const std::string& revisionUuid, uint64_t byteBudget = 64 * 1024 * 1024) const;
@@ -143,6 +145,7 @@ public:
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const override;
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override;
+    std::optional<ObjectRevision> objectAtGeometry(const std::string& revisionUuid) const override;
     std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                            int64_t byteOffset = 0,
                                            const std::optional<int64_t>& byteCount = std::nullopt) const override;
