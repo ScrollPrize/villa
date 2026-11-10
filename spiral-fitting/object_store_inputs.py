@@ -74,7 +74,7 @@ FIT_UNITS = 'reference-volume voxels (ZYX)'
 # selected object), so versions resolve the inputs exactly but are left out
 # of the digest. Geometry revisions, record UUIDs, consumed content and
 # approval states define them.
-VERSION_FIELDS = {'objects': ('version',), 'relationships': ('version',)}
+VERSION_FIELDS = {'objects': ('version', 'reference'), 'relationships': ('version',)}
 
 
 class ObjectStoreInputError(ValueError):
@@ -168,11 +168,15 @@ class InputPins:
     ``objects`` may be empty (a position alone, e.g. a configuration's
     object_store_input_position): the versions are then those at the
     store's head when the head is that position, else read from the
-    store's history at the position's publication (local stores)."""
+    store's history at the position's publication (local stores).
+    ``references`` retains each selected version's actual source owner, which
+    may differ from the attached store. Legacy pins without these references
+    retain their original single-store interpretation."""
     position: InputPosition
     objects: dict = dataclasses.field(default_factory=dict)  # {uuid: version}
     selection: dict = dataclasses.field(default_factory=dict)  # {kind: sorted UUIDs}
     outer_shell: str = None
+    references: dict = dataclasses.field(default_factory=dict)  # complete source identities; absent in legacy pins
 
     @property
     def pinned(self):
@@ -183,7 +187,7 @@ class InputPins:
         return {'position': self.position.provenance(),
                 'objects': dict(sorted(self.objects.items())),
                 'selection': {kind: list(self.selection.get(kind, ())) for kind in KINDS},
-                'outer_shell': self.outer_shell}
+                'outer_shell': self.outer_shell, 'references': self.references}
 
     @classmethod
     def from_provenance(cls, value):
@@ -194,7 +198,7 @@ class InputPins:
             return cls(position)
         return cls(position, {str(k): int(v) for k, v in value['objects'].items()},
                    {kind: sorted(value.get('selection', {}).get(kind, ())) for kind in KINDS},
-                   value.get('outer_shell'))
+                   value.get('outer_shell'), dict(value.get('references') or {}))
 
     @classmethod
     def from_manifest(cls, manifest):
@@ -203,21 +207,30 @@ class InputPins:
         position = InputPosition.from_provenance((manifest or {}).get('position'))
         if position is None:
             return None
-        objects, selection = {}, {kind: [] for kind in KINDS}
+        objects, selection, references = {}, {kind: [] for kind in KINDS}, {}
         for entry in manifest.get('objects') or ():
             objects[entry['uuid']] = int(entry['version'])
             selection[entry['kind']].append(entry['uuid'])
+            if entry.get('reference'):
+                references[entry['uuid']] = entry['reference']
         shell = manifest.get('outer_shell') or None
         if shell:
             objects[shell['uuid']] = int(shell['version'])
+            if shell.get('reference'):
+                references[shell['uuid']] = shell['reference']
         return cls(position, objects, {kind: sorted(uuids) for kind, uuids in selection.items()},
-                   shell['uuid'] if shell else None)
+                   shell['uuid'] if shell else None, references)
 
     def refs(self, uuids=None):
         """Numbered references of ``uuids`` (default: every pinned object)."""
-        return [{'store': self.position.store, 'generation': self.position.generation,
-                 'object': uuid, 'version': self.objects[uuid]}
-                for uuid in (self.objects if uuids is None else uuids)]
+        result = []
+        for uuid in (self.objects if uuids is None else uuids):
+            ref = self.references.get(uuid, {'store': self.position.store, 'generation': self.position.generation,
+                                             'object': uuid, 'version': self.objects[uuid]})
+            if ref['object'] != uuid or ref['version'] != self.objects[uuid]:
+                raise ValueError(f'inconsistent exact input reference for {uuid}')
+            result.append(dict(ref))
+        return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -332,6 +345,7 @@ class StoredObject:
     frame: ObjectFrame = None
     fiber: dict = None
     track: dict = None
+    reference: dict = None
 
     @property
     def metadata_sha256(self):
@@ -342,7 +356,7 @@ class StoredObject:
         with an object's current metadata as values; ``metadata_sha256`` is
         its identity in the digest."""
         return {'uuid': self.uuid, 'kind': self.kind, 'name': self.name,
-                'version': self.version,
+                'version': self.version, 'reference': self.reference,
                 'geometry_revision': self.geometry_revision,
                 'metadata': adapter_metadata(self.kind, self.meta, self.fiber, self.track),
                 'metadata_sha256': self.metadata_sha256,
@@ -410,7 +424,9 @@ class InputSnapshot:
             objects[self.outer_shell.uuid] = self.outer_shell.version
         return InputPins(self.position, objects,
                          {kind: sorted(obj.uuid for obj in self.objects_of(kind)) for kind in KINDS},
-                         None if self.outer_shell is None else self.outer_shell.uuid)
+                         None if self.outer_shell is None else self.outer_shell.uuid,
+                         {obj.uuid: obj.reference for obj in [*self.objects.values(), self.outer_shell]
+                          if obj is not None and obj.reference is not None})
 
     def objects_of(self, kind):
         return [obj for obj in self.objects.values() if obj.kind == kind]
@@ -468,7 +484,7 @@ def fit_input(record):
     return not attached_data(record) and not outer_shell(record) and not spiral_fit(record)
 
 
-def resolve_selector(store, kind, selector, records=None):
+def resolve_selector(store, kind, selector, records=None, references=None):
     """``{UUID: version}`` of the objects ``selector`` selects among active
     objects, at the numbered versions read.
 
@@ -476,14 +492,20 @@ def resolve_selector(store, kind, selector, records=None):
     committed Spiral fits; naming any of them by UUID is an error. ``records``
     ({UUID: record} of every pinned object, retired ones included) replaces
     the store's current objects."""
+    def remember(record):
+        if references is not None:
+            from vc_object_store import object_reference
+            references[record['uuid']] = object_reference(record)
+        return record['version']
+
     def matching(tag=None):
         if records is not None:
-            return {uuid: record['version'] for uuid, record in records.items()
+            return {uuid: remember(record) for uuid, record in records.items()
                     if record['kind'] == kind and not record.get('retired')
                     and (tag is None or tag in (record.get('tags') or ()))
                     and fit_input(record)}
         query = {} if tag is None else {'tag': tag}
-        return {record['uuid']: record['version'] for record in store.select_objects(
+        return {record['uuid']: remember(record) for record in store.select_objects(
             object_kind=kind, fields=['uuid', 'kind', 'meta', 'tags'], **query)
             if fit_input(record)}
 
@@ -510,7 +532,7 @@ def resolve_selector(store, kind, selector, records=None):
             problems.append(f'selected {kind} {uuid} is a committed Spiral fit (tagged '
                             f'{SPIRAL_FIT_TAG}), not a fit input')
         else:
-            selected[record['uuid']] = record['version']
+            selected[record['uuid']] = remember(record)
     if problems:
         raise ObjectStoreInputError(problems)
     for tag in selector.tags or ():
@@ -651,13 +673,14 @@ class SelectedObjects:
     versions: dict
     position: InputPosition
     outer_shell: str = None
+    references: dict = dataclasses.field(default_factory=dict)
 
     def __getitem__(self, kind):
         return self.uuids[kind]
 
     def pins(self):
         return InputPins(self.position, dict(self.versions),
-                         {kind: list(self.uuids[kind]) for kind in KINDS}, self.outer_shell)
+                         {kind: list(self.uuids[kind]) for kind in KINDS}, self.outer_shell, self.references)
 
 
 def check_position(store, position):
@@ -723,21 +746,25 @@ CAPTURE_ATTEMPTS = 8
 
 
 def _capture_current(store, request):
-    """``(status, {kind: {UUID: version}}, shells)`` of the request's
+    """``(status, {kind: {UUID: version}}, shells, exact_references)`` of the request's
     selection among the store's current objects and the surfaces tagged
     OUTER_SHELL_TAG, all at the head ``status`` names. The queries are
     separate reads, so the head is read before and after them: a commit in
     between would label versions of a later commit with an earlier head,
     and the capture is repeated from the new head (CAPTURE_ATTEMPTS)."""
     for _ in range(CAPTURE_ATTEMPTS):
+        from vc_object_store import object_reference
+        references = {}
         status = store.status()
-        selected = {kind: resolve_selector(store, kind, request.selector(kind)) for kind in KINDS}
-        shells = [] if request.outer_shell == 'off' else [
-            (record['uuid'], record['version']) for record in store.select_objects(
-                object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])]
+        selected = {kind: resolve_selector(store, kind, request.selector(kind), references=references) for kind in KINDS}
+        shells = []
+        if request.outer_shell != 'off':
+            for record in store.select_objects(object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid']):
+                shells.append((record['uuid'], record['version']))
+                references[record['uuid']] = object_reference(record)
         after = store.status()
         if (after['generation'], after['commit_sequence']) == (status['generation'], status['commit_sequence']):
-            return status, selected, shells
+            return status, selected, shells, references
     raise ObjectStoreInputError([
         f'the store kept changing while its inputs were read ({CAPTURE_ATTEMPTS} attempts); retry'])
 
@@ -768,12 +795,15 @@ def resolve_selection(store, request):
     the store's head when that is the position, else from the store's
     history at the position. The selection, the outer shell and the
     position are one capture: every version is of the position's commit."""
+    references = {}
     def resolve(records):
+        from vc_object_store import object_reference
+        references.update({uuid: object_reference(record) for uuid, record in records.items()})
         return {kind: resolve_selector(store, kind, request.selector(kind), records)
                 for kind in KINDS}
     pins = request.pins
     if pins is None:
-        status, selected, shells = _capture_current(store, request)
+        status, selected, shells, references = _capture_current(store, request)
         position = InputPosition.of_status(status)
     elif pins.pinned:
         records = _pinned_records(store, pins)
@@ -794,7 +824,7 @@ def resolve_selection(store, request):
         if status['commit_sequence'] == position.commit_sequence:
             # The head is the position: its current objects, unless a commit
             # moves the head meanwhile (the capture then reads a later one).
-            status, selected, shells = _capture_current(store, request)
+            status, selected, shells, references = _capture_current(store, request)
             if status['commit_sequence'] == position.commit_sequence:
                 captured = selected, shells
         if captured is None:
@@ -805,7 +835,7 @@ def resolve_selection(store, request):
     if shell is not None:
         versions[shell[0]] = shell[1]
     return SelectedObjects({kind: sorted(selected[kind]) for kind in KINDS}, versions, position,
-                           None if shell is None else shell[0])
+                           None if shell is None else shell[0], {uuid: references[uuid] for uuid in versions})
 
 
 def resolve_outer_shell(store, request):
@@ -839,8 +869,9 @@ def read_snapshot(store, request, selected=None):
         raise ObjectStoreInputError([
             f'the fit needs the outer shell, and no surface is tagged {OUTER_SHELL_TAG}'])
     position = selected.position
-    pins = InputPins(position, selected.versions)
+    pins = selected.pins()
     refs = pins.refs()
+    refs_by_uuid = {ref['object']: ref for ref in refs}
     revisions = {}
     for ref, revision in zip(refs, store.objects_at_versions(refs)):
         if revision is None or revision.get('deleted'):
@@ -891,7 +922,8 @@ def read_snapshot(store, request, selected=None):
             meta=record['meta'] or {}, tags=list(record.get('tags') or ()),
             version=int(revision['version']),
             geometry_revision=revision['geometry_revision'], frame=frame,
-            fiber=record.get('fiber'), track=record.get('track'))
+            fiber=record.get('fiber'), track=record.get('track'),
+            reference=refs_by_uuid[record['uuid']])
 
     objects = {}
     for revision in usable:
@@ -904,8 +936,7 @@ def read_snapshot(store, request, selected=None):
     relationships, exclusions = filter_relationships(
         relationships_read, objects, request.approved_links_only)
     pinned_request = request if request.pins is not None and request.pins.pinned \
-        else dataclasses.replace(request, pins=InputPins(
-            position, selected.versions, {kind: list(selected[kind]) for kind in KINDS}, shell))
+        else dataclasses.replace(request, pins=selected.pins())
     return InputSnapshot(
         store_location=store_location(store), store_uuid=position.store,
         store_generation=position.generation, volume_uuid=volume_uuid,
@@ -2634,13 +2665,17 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, head, in
     # The links' commit versions every endpoint it touched: the pins are
     # those versions, at the links' commit.
     objects = dict(pins.objects)
+    references = {ref['object']: ref for ref in pins.refs()}
     for uuid, version in (receipt.get('objects') or {}).items():
         if uuid in objects and version is not None:
+            if int(version) != objects[uuid]:
+                references[uuid] = {'store': receipt['store_uuid'], 'generation': receipt['generation'],
+                                    'object': uuid, 'version': int(version)}
             objects[uuid] = int(version)
     lines.append(f'links committed at commit {receipt["commit_sequence"]} (linked at {head})')
     return LinkResult(lines, plan, receipt, dataclasses.replace(
         pins, position=dataclasses.replace(position, commit_sequence=int(receipt['commit_sequence'])),
-        objects=objects))
+        objects=objects, references=references))
 
 
 @contextlib.contextmanager
@@ -2891,6 +2926,9 @@ def _compared(manifest):
     manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
     manifest.pop('link_refresh', None)
     manifest.pop('position', None)
+    if manifest.get('outer_shell'):
+        manifest['outer_shell'] = {key: value for key, value in manifest['outer_shell'].items()
+                                   if key != 'reference'}
     # Schema-20 checkpoints also recorded a relationship generation. Its
     # content hash already identifies the consumed data; schema 21 has no
     # equivalent counter. Do not discard it from older, hash-less manifests:

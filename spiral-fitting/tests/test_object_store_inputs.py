@@ -71,6 +71,40 @@ def test_unknown_selector_kind_is_refused():
         request(patch={'uuids': ()})
 
 
+def test_selection_preserves_inherited_source_identity_and_manifest_pins(db):
+    """A collection attachment has its own position, not its inherited objects' identities.
+
+    Delegate actual object/geometry/version reads to a real native store while exposing
+    a distinct attachment identity. Native collection routing is covered by test_coherent_store.
+    """
+    import uuid
+    import dataclasses
+    from vc_object_store import object_reference
+
+    fiber = put_fiber(db, _line(), [0, 5])
+    source = object_reference(db.object(fiber))
+    class Attachment:
+        def __getattr__(self, name):
+            return getattr(db, name)
+
+        def status(self):
+            return {**db.status(), 'store': owner, 'generation': generation}
+
+    owner, generation = str(uuid.uuid4()), str(uuid.uuid4())
+    attachment = Attachment()
+    snapshot = osi.read_snapshot(attachment, request())
+    assert snapshot.pins().refs() == [source]
+    assert snapshot.request.pins.refs() == [source]
+    pins = osi.InputPins.from_manifest(snapshot.manifest())
+    assert pins.refs() == [source]
+    assert osi.InputPins.from_provenance(pins.provenance()).refs() == [source]
+    again = osi.read_snapshot(attachment, dataclasses.replace(request(), pins=pins))
+    assert again.digest() == snapshot.digest()
+    # Legacy same-store pins remain supported; they must not affect new captures.
+    legacy = osi.InputPins(osi.InputPosition.of_status(db.status()), {fiber: source['version']})
+    assert legacy.refs() == [source]
+
+
 def test_explicit_selectors_tags_and_empty_matches(db):
     a = put_patch(db, _grid(10.0), tags=['keep'])
     b = put_patch(db, _grid(20.0))
@@ -231,6 +265,13 @@ def test_the_outer_shell_is_read_on_its_own_never_as_a_patch(db):
     # Its revision is part of the manifest and so of the digest.
     snapshot = osi.read_snapshot(db, request())
     assert snapshot.manifest()['outer_shell']['uuid'] == shell
+    # Exact pins identify owners without changing the consumed-content digest.
+    manifest = snapshot.manifest()
+    legacy = json.loads(json.dumps(manifest))
+    legacy['outer_shell'].pop('reference')
+    for entry in legacy['objects']:
+        entry.pop('reference')
+    assert osi._compared(manifest) == osi._compared(legacy)
     assert any(line.startswith('outer shell: ') and shell in line
                for line in osi.snapshot_report(snapshot))
     moved = _grid(31.0, size=8)[..., ::-1].astype('<f4')

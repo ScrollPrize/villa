@@ -78,10 +78,10 @@ def test_a_commit_while_reading_the_selection_rereads_it(shared, monkeypatch):
     original = osi.resolve_selector
     edits = []
 
-    def racing(store, kind, selector, records=None):
+    def racing(store, kind, selector, records=None, references=None):
         if not edits:  # after the head is read, before the objects are
             edits.append(shared_edit(shared, lambda db: db.set_meta(walk, 'review_note', 'mid-read')))
-        return original(store, kind, selector, records)
+        return original(store, kind, selector, records, references=references)
     monkeypatch.setattr(osi, 'resolve_selector', racing)
     request = osi.request_from_config(fit_config(shared, 'service'))
     with ObjectStore.open(shared, read_only=True) as db:
