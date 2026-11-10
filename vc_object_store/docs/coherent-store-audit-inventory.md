@@ -2,6 +2,8 @@
 
 Baseline: `557a6f925`, reviewed 2026-11-10. The original review inventoried the implementation and consumers without changing production code. Findings were code-traced; subsequent implementation and regression evidence are recorded below.
 
+Follow-up: the [post-cleanup review at `3df5b7783`](coherent-store-review-3df5b7783.md) initially reviewed the 88-file production delta, then expanded into a **fresh 456-file full-inventory scan, including unchanged files, with zero pending entries**. It retains the original seven findings and appends 14 additional cases: **21 open findings, one P1 and 20 P2**. Fourteen have runtime evidence; seven are code-traced. The linked report and four new per-file ledgers are the current review record. The completed entries below describe their original scenarios and must not be read as overriding that follow-up evidence.
+
 ## Review method
 
 Three agents reviewed core, storage/transport, and C++ consumer lanes; the coordinating agent reviewed Python consumers, followed wrapper calls and reconciled overlapping findings. There was **no finding quota**. Each assigned file has a disposition and the relevant symbols or exclusion reason. Findings are grouped by cause, not multiplied by the number of affected files.

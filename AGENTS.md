@@ -243,6 +243,8 @@ Read `vc_object_store/docs/reading.md` and the contract in `vc_object_store/docs
 - Repin edits with the receipt's complete object references, not its committing store plus numeric versions: receipts also contain unchanged inherited inputs. Allocate structural point IDs through the shared retained-allocation API, never a restorable metadata counter.
 - Use shared selection for geometry and artifacts from the same version. Query optional history through the owning record's policy, not the attachment's history flag. Copy/export collections through the shared closure APIs rather than backing up only their physical root.
 - History policy controls retention, not identity or routing. Do not add history-off alternatives, proxy rows, per-object directories or copies of referenced payloads.
+- Persisted caches and solved evidence must identify the selected source revision, not just its UUID or row ordinals. Geometry-derived counts, lengths and bounds come from the selected geometry, not ingestion summaries. Editors retain the loaded membership and transform baseline as well as object references.
+- Public batch writes must roll back the entire operation even if the caller catches an error and commits its surrounding transaction. Physical copy/pack/conversion must preserve external locator targets through the shared relocation helper, including retained historical records.
 - Extend a shared API when it lacks a capability; migrate existing callers instead of adding another partial resolver. Test local and referenced cases, history on/off, retained exact reads after override/deletion, and no-op writes. Keep production-code growth separate from regression-test/documentation growth when reporting refactors.
 
 ---

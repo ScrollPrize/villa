@@ -1,5 +1,7 @@
 # Coherent store API cleanup
 
+Latest completed follow-up: [21-finding fix tracker and validation](coherent-store-fix-tasks.md). The dated review sections below retain their historical evidence.
+
 ## Open findings from review of `557a6f925`
 
 These findings were originally code-traced during a read-only review. The implementation pass now addresses AH–AR and the additional inventory entries through shared APIs, with targeted regressions and a review of the resulting delta. Current evidence and explicit capability limits are recorded in [the consolidated implementation checklist](coherent-store-audit-inventory.md#implementation-pass); previous suite counts are not used as evidence for newly covered cases.
@@ -59,7 +61,7 @@ Replace repeated open-ended scans with one coverage ledger at a fixed commit. Th
 | Snapshot consistency | Hosted selections, transforms, cache invalidation, local parity | AI | Partial; exact inventory/dispositions still required |
 | Placement and payloads | Shared geometry/artifact resolution, copy/export/packing, source paths, graph/spatial adapters | Earlier targeted fixes closed; no new item in this pass | Partial; absence of a new finding is not complete coverage |
 
-Report progress as inventoried entries reviewed/total, confirmed issues open/closed, new regressions versus older omissions, and contract cases passing/missing. Current status: eleven open code-traced findings; no runtime reproductions for this batch yet; exhaustive coverage denominator not yet established. Do not use number of agent runs or total existing test count as the completion metric.
+Report progress as inventoried entries reviewed/total, confirmed issues open/closed, new regressions versus older omissions, and contract cases passing/missing. Historical discovery status at this stage was eleven open code-traced findings, before the full inventory and runtime checks. For the current pass, use [the fix tracker](coherent-store-fix-tasks.md); do not use number of agent runs or total existing test count as the completion metric.
 
 ## Latest review tasks
 
