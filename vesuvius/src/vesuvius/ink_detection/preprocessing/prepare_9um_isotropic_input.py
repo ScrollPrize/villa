@@ -11,7 +11,7 @@ import numpy as np
 from vc_reader.reader import ZarrReader, ZarrWriteGroup, ZarrWriter, create_group
 
 from vesuvius.ink_detection.preprocessing.staged_write import publish_staged_output
-from vesuvius.ink_detection.volume_io import open_volume_root
+from vesuvius.ink_detection.volume_io import open_volume_root, require_pyramid_depth_scale
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -36,6 +36,7 @@ def open_source_array(path: str, level: str) -> ZarrReader:
     node = open_volume_root(path)
     if hasattr(node, "shape"):
         return node
+    require_pyramid_depth_scale(node, level, source=path)
     if level not in node:
         available = sorted(node.array_keys())
         raise KeyError(
