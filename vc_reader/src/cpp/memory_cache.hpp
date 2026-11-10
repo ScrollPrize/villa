@@ -54,14 +54,19 @@ public:
         std::uint64_t bypasses, admitted_bytes, evicted_bytes, batches;
         std::size_t headroom_bytes, reclaiming_bytes;
         std::uint64_t assist_puts, assist_bytes, assist_batches;
-        std::uint64_t selection_scans, reclaim_claims, evicted_entries;
+        std::uint64_t selection_scans, reclaim_claims, evicted_entries, inline_batches;
     };
-    // Configure before concurrent use; opt-in until real-workload validation.
-    void enable_maintenance(std::size_t workers=4, std::size_t candidate_scan=0) {
-        if (!workers || workers>64 || maintenance_.load())
-            throw std::invalid_argument("maintenance requires 1..64 workers and can only be enabled once");
+    // Configure an explicitly synchronous cache before concurrent use.
+    void enable_maintenance(std::size_t workers=4, std::size_t candidate_scan=8) {
+        if (!workers || workers>64)
+            throw std::invalid_argument("maintenance requires 1..64 workers");
+        candidate_scan=std::min(candidate_scan,shards_.size());
+        if (maintenance_.load()) {
+            if (workers==vacuum_threads_.size() && candidate_scan==candidate_scan_) return;
+            throw std::invalid_argument("maintenance policy cannot change after startup");
+        }
         stopping_.store(false);
-        candidate_scan_=std::min(candidate_scan,shards_.size());
+        candidate_scan_=candidate_scan;
         headroom_.store(std::max<std::size_t>(1,max_bytes()/100));
         maintenance_.store(true);
         try {
@@ -73,7 +78,7 @@ public:
     MaintenanceStats maintenance_stats() const {
         return {bypasses_.load(),admitted_.load(),evicted_.load(),batches_.load(),effective_headroom(),reclaiming_.load(),
                 assist_puts_.load(),assist_bytes_.load(),assist_batches_.load(),
-                selection_scans_.load(),reclaim_claims_.load(),evicted_entries_.load()};
+                selection_scans_.load(),reclaim_claims_.load(),evicted_entries_.load(),inline_batches_.load()};
     }
     // Explicit testing/shutdown barrier; ordinary reads/writes never wait here.
     bool wait_for_maintenance(std::chrono::milliseconds timeout=std::chrono::seconds(2)) {
@@ -94,8 +99,14 @@ public:
         std::function<std::uint64_t()> available = memory::available_bytes;
         std::function<std::chrono::steady_clock::time_point()> now = std::chrono::steady_clock::now;
     };
-    explicit MemoryCache(std::size_t max_bytes, std::size_t shards = default_shards()) : budget_(max_bytes) { init_shards(shards); }
-    explicit MemoryCache(AutoOptions options, std::size_t shards = default_shards()) : auto_(std::move(options))
+    explicit MemoryCache(std::size_t max_bytes, std::size_t shards = default_shards(), bool background = true)
+        : budget_(max_bytes)
+    {
+        init_shards(shards);
+        if (background && max_bytes) enable_maintenance();
+    }
+    explicit MemoryCache(AutoOptions options, std::size_t shards = default_shards(), bool background = true)
+        : auto_(std::move(options))
     {
         init_shards(shards);
         if (!std::isfinite(auto_->fraction) || auto_->fraction <= 0 || auto_->fraction >= 1)
@@ -105,6 +116,7 @@ public:
         if (auto_->refresh_interval.count() < 0 || !auto_->available || !auto_->now)
             throw std::invalid_argument("auto cache requires a nonnegative refresh interval, memory probe and clock");
         refresh_budget();
+        if (background) enable_maintenance();
     }
     static std::shared_ptr<MemoryCache> automatic(double fraction = 0.5, double smoothing_seconds = 10)
     {
@@ -354,10 +366,28 @@ private:
         } while(!bytes_.compare_exchange_weak(used,used+cost,std::memory_order_relaxed));
         return true;
     }
-    void request_eviction() {
+    bool above_watermark() const {
         const auto budget=max_bytes(), head=std::min(effective_headroom(),budget);
-        if(nbytes()>budget-(head-head/4) && !pressure_.load(std::memory_order_relaxed)
-                && !pressure_.exchange(true))vacuum_cv_.notify_all();
+        return nbytes()>budget-(head-head/4);
+    }
+    void request_eviction(bool inline_batch=false) {
+        if(!above_watermark() || pressure_.load(std::memory_order_relaxed))return;
+        if(inline_batch) {
+            std::unique_lock inline_lock(inline_mutex_,std::try_to_lock);
+            if(inline_lock.owns_lock() && !pressure_.load(std::memory_order_relaxed)) {
+                // One nonblocking batch. Contention or insufficient progress
+                // hands off to the background workers.
+                thread_local EvictionCursor cursor(1);
+                thread_local std::vector<Record> retired;
+                retired.reserve(64);
+                cursor.next=cursor.end;
+                if(vacuum_batch(retired,cursor)) {
+                    inline_batches_.fetch_add(1,std::memory_order_relaxed);
+                    if(!above_watermark())return;
+                }
+            }
+        }
+        if(!pressure_.exchange(true))vacuum_cv_.notify_all();
     }
     std::size_t effective_headroom() const { return std::min(headroom_.load(std::memory_order_relaxed),max_bytes()/20); }
     std::size_t eviction_target() const {
@@ -375,15 +405,23 @@ private:
           std::size_t needed=0;
           {
             TimedLock lock(*this,shard.mutex,shard.profile.put);
-            const auto before=shard.entries.bytes();
-            const auto old_cost=shard.entries.cost(key);
-            const auto extra=cost>old_cost?cost-old_cost:0;
             if(cost>max_bytes()) { bypasses_.fetch_add(1,std::memory_order_relaxed);return; }
+            const auto epoch=epoch_.load(std::memory_order_relaxed);
+            const auto [existing,old_cost,replaced]=shard.entries.replace_same_cost(key,cost,[&](Record& old) {
+                previous=std::move(old.chunk);
+                old={std::move(value),epoch};
+            });
+            if(replaced) {
+                update_oldest(shard);
+                return; // The lock unwinds before the previous payload is released.
+            }
+            const auto before=shard.entries.bytes();
+            const auto extra=cost>old_cost?cost-old_cost:0;
             if(extra && !offered) { offered_.fetch_add(extra,std::memory_order_relaxed);offered=true; }
             if(extra && !reserve_bytes(extra)) {
                 needed=extra;
             } else {
-            if(const auto* old=shard.entries.peek(key))previous=old->chunk;
+            if(existing)previous=existing->chunk;
             try { shard.entries.put(key,Record{std::move(value),epoch_.load(std::memory_order_relaxed)},cost); }
             catch (...) {
                 account(before+extra,shard.entries.bytes());
@@ -412,7 +450,7 @@ private:
         }
         previous.reset();
         if(release)bytes_.fetch_sub(release,std::memory_order_relaxed);
-        request_eviction();
+        request_eviction(candidate_scan_!=0);
     }
     std::size_t vacuum_batch(std::vector<Record>& retired, EvictionCursor& cursor, std::size_t required_free=0) {
         if(cursor.next==cursor.end || cursor.epoch!=epoch_.load(std::memory_order_relaxed))refill_candidates(cursor);
@@ -534,6 +572,8 @@ private:
     std::unique_ptr<std::atomic<std::uint64_t>[]> oldest_epochs_;
     std::vector<std::unique_ptr<Shard>> shards_;
     std::size_t candidate_scan_=0; // Zero: full-directory cohort; nonzero: sampled tails.
+    std::mutex inline_mutex_;
+    std::atomic<std::uint64_t> inline_batches_{0};
     alignas(64) std::atomic<std::size_t> bytes_{0};
     alignas(64) std::atomic<std::size_t> budget_{0};
     std::atomic<std::size_t> eviction_cursor_{0};

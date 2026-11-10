@@ -41,8 +41,8 @@ void trial(const std::string& mode,size_t workers,int repeat,double duration) {
     vcr::MemoryCache::AutoOptions options;
     options.available=[&]{return available.load(std::memory_order_relaxed);};
     options.smoothing_seconds=0; options.refresh_interval=std::chrono::hours(24);
-    auto cache=mode=="mixed_shrink" ? std::make_unique<vcr::MemoryCache>(options,cacheShards)
-        : std::make_unique<vcr::MemoryCache>((mode=="hits"||mode=="hot"||mode=="replace"||mode=="insert") ? keysCount*chunkBytes*2 : capacity*chunkBytes,cacheShards);
+    auto cache=mode=="mixed_shrink" ? std::make_unique<vcr::MemoryCache>(options,cacheShards,false)
+        : std::make_unique<vcr::MemoryCache>((mode=="hits"||mode=="hot"||mode=="replace"||mode=="insert") ? keysCount*chunkBytes*2 : capacity*chunkBytes,cacheShards,false);
     if(mode!="insert") for(size_t i=0;i<(mode=="hits"||mode=="hot"||mode=="replace" ? keysCount : capacity);++i)
         cache->put(keys[i],payloads[i]);
     if(maintenanceWorkers)cache->enable_maintenance(maintenanceWorkers,candidateScan);
@@ -133,7 +133,7 @@ void shrinkTrial(int repeat) {
     uint64_t available=capacity*chunkBytes*2;
     options.available=[&]{return available;}; options.smoothing_seconds=0;
     options.refresh_interval=std::chrono::hours(24);
-    vcr::MemoryCache cache(options,cacheShards);
+    vcr::MemoryCache cache(options,cacheShards,false);
     std::vector<std::string> keys;std::vector<vcr::ChunkPtr> values;
     for(size_t i=0;i<capacity;++i){keys.push_back(std::to_string(i));values.push_back(std::make_shared<vcr::Chunk>(chunkBytes));}
     double elapsed=0;size_t evicted=0;

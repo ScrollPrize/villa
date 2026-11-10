@@ -17,7 +17,7 @@ int main()
                 "over-limit cgroup cannot underflow");
         require(vcr::memory::cgroup_available(1000, 100, 200) == 1000,
                 "racing reclaimable counter cannot underflow usage");
-        vcr::MemoryCache fixed(100,1); // Exact global LRU is the one-shard policy.
+        vcr::MemoryCache fixed(100,1,false); // Exact synchronous LRU control.
         require(!fixed.is_auto() && fixed.max_bytes() == 100, "fixed mode unchanged");
         fixed.put("a", std::make_shared<vcr::Chunk>(60));
         fixed.put("b", std::make_shared<vcr::Chunk>(60));
@@ -31,7 +31,7 @@ int main()
         options.available = [&] { return available; };
         options.refresh_interval = std::chrono::hours(1);
         options.smoothing_seconds = 0; // exact unsmoothed arithmetic/eviction checks
-        vcr::MemoryCache cache(options,1);
+        vcr::MemoryCache cache(options,1,false);
         require(cache.is_auto() && cache.fraction() == .5 && cache.max_bytes() == 500, "default 50 percent");
         cache.put("a", std::make_shared<vcr::Chunk>(200));
         available = 800;
@@ -75,7 +75,7 @@ int main()
             ema.available = [&] { return free; };
             ema.now = [&] { return now; };
             ema.refresh_interval = std::chrono::hours(1);
-            vcr::MemoryCache smooth(ema);
+            vcr::MemoryCache smooth(ema,1,false);
             require(smooth.max_bytes() == 500 && smooth.smoothing_seconds() == 10,
                 "EMA initial budget is immediate, default time constant ten seconds");
             for (int i=0;i<4;++i) smooth.put(std::to_string(i),std::make_shared<vcr::Chunk>(100));
@@ -103,7 +103,7 @@ int main()
             // Refresh frequency does not alter the EMA for a constant target.
             now = Clock::time_point{};
             free = 1000;
-            vcr::MemoryCache one_step(ema), ten_steps(ema);
+            vcr::MemoryCache one_step(ema,1,false), ten_steps(ema,1,false);
             free = 2000;
             for (int i=0;i<10;++i) {
                 now += std::chrono::seconds(1);
@@ -119,8 +119,8 @@ int main()
             std::unique_ptr<vcr::MemoryCache> a,b;
             constexpr std::size_t total = 90000;
             ema.available = [&] { return total-(a ? a->nbytes() : 0)-(b ? b->nbytes() : 0); };
-            a = std::make_unique<vcr::MemoryCache>(ema);
-            b = std::make_unique<vcr::MemoryCache>(ema);
+            a = std::make_unique<vcr::MemoryCache>(ema,1,false);
+            b = std::make_unique<vcr::MemoryCache>(ema,1,false);
             std::uint64_t serial = 0;
             const auto fill = [&](vcr::MemoryCache& cache) {
                 while (cache.nbytes()+10 <= cache.max_bytes())
@@ -173,7 +173,7 @@ int main()
         // Shared budget, not a fixed quota per shard: even one hot key may use
         // the whole budget. Concurrent replacement/erase must conserve bytes.
         for (const auto shards : {1u, 8u, 64u}) {
-            vcr::MemoryCache sharded(4096,shards);
+            vcr::MemoryCache sharded(4096,shards,false);
             sharded.put("large",std::make_shared<vcr::Chunk>(4096));
             require(sharded.get("large").first && sharded.nbytes()==4096,"no per-shard quota");
             for(int i=0;i<32;++i) {
@@ -217,7 +217,7 @@ int main()
             auto pressure=options;
             pressure.available=[&]{return free.load();};
             pressure.refresh_interval=std::chrono::hours(1);
-            vcr::MemoryCache cache(pressure,32);
+            vcr::MemoryCache cache(pressure,32,false);
             std::vector<std::thread> writers;
             for(int t=0;t<8;++t) writers.emplace_back([&,t] {
                 for(int i=0;i<4000;++i) {

@@ -40,14 +40,16 @@ def report(root, results, workers):
              "The finite insertion case is not a steady-state throughput test. "
              "Optional post-workload headroom replenishment is excluded.", ""]
     if virtual:
+        capacities = sorted({float(r['policy'].split()[0]) for r in results})
         lines = ['# Full virtual-capacity cache suite', '',
                  'Foreground-worker ablation with fixed shard count; four maintenance workers, eight-tail sampling. Six consecutive 2-second windows per ordinary case, not independent repetitions. Table entries are median M requests/s of the last three windows. Insert is the finite parallel prefill (synchronous, before maintenance starts); isolated shrink is entries reclaimed/s for one 5% reduction. Mixed reads refill misses. Allocation/eviction immediately replaces each fresh 4 KiB payload with a shared dummy: two puts per request, bounded live payloads. No final headroom drain.', '',
-                 '| Case | Workers | 0.25 GiB | 64 GiB | 512 GiB |', '|---|---:|---:|---:|---:|']
+                 '| Case | Workers | ' + ' | '.join(f'{size:g} GiB' for size in capacities) + ' |',
+                 '|---|---:|' + '---:|' * len(capacities)]
         for case in [*CASES,'shrink_only']:
             for w in workers:
                 cells=[]
-                for size in ('.25','64','512'):
-                    policy=f'{float(size):g} GiB '+('pre-reader' if historical else 'sampled8')
+                for size in capacities:
+                    policy=f'{size:g} GiB '+('pre-reader' if historical else 'sampled8')
                     row=next((r for r in results if (r['case'],r['workers'],r['policy'])==(case,w,policy)),None)
                     cells.append('—' if row is None else 'ERROR' if 'error' in row else f"{row['last_three_median']/1e6:.2f}")
                 lines.append(f'| {case} | {w} | '+' | '.join(cells)+' |')
@@ -178,7 +180,8 @@ def virtual_suite(args, binary, root, cores):
         reusable=json.loads((args.reuse_from/'results.json').read_text())
     names = {'ops_per_second':'chunks_per_second', 'p50_ns':'put_p50_ns',
              'p95_ns':'put_p95_ns', 'p99_ns':'put_p99_ns', 'scans':'selection_scans'}
-    for entries in (65536,16777216,134217728):
+    for capacity in args.capacities:
+        entries = int(capacity * 2**30 // 4096)
         for w in workers:
             backend='pre-reader' if args.backend=='pre-reader' else 'sampled8'
             policy=f'{entries*4096/2**30:g} GiB {backend}'
@@ -265,6 +268,8 @@ def main():
     parser.add_argument('--seconds', type=float, default=.5)
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--virtual', action='store_true', help='Full suite at .25/64/512 GiB with bench_cache_scale; six consecutive 2s windows')
+    parser.add_argument('--capacities', type=float, nargs='+', choices=(.25, 64, 512), default=(.25, 64, 512),
+                        help='Virtual cache capacities in GiB')
     parser.add_argument('--backend',choices=('sampled8','pre-reader'),default='sampled8')
     parser.add_argument('--historical-source',type=Path,help='Historical checkout used to build the pre-reader executable')
     parser.add_argument('--report-only', action='store_true', help='Regenerate tables from existing results without running benchmarks')
@@ -303,7 +308,7 @@ def main():
         if tracked.strip():raise SystemExit('Historical source has tracked modifications')
     (root/'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
     if args.virtual:
-        metadata.update(workers=workers,payload_bytes=4096,capacity_entries=[65536,16777216,134217728],seconds=2,windows=6,repeats=None,pressure_entries=None,key_count=None,memory_limit_gib=args.memory_limit_gib,allocation_case='Fresh payload followed by shared replacement; two puts per request',reuse_from=str(args.reuse_from) if args.reuse_from else None,rss_limit_gib=args.rss_limit_gib,prefill_seconds=args.prefill_seconds)
+        metadata.update(workers=workers,payload_bytes=4096,capacity_entries=[int(capacity * 2**30 // 4096) for capacity in args.capacities],seconds=2,windows=6,repeats=None,pressure_entries=None,key_count=None,memory_limit_gib=args.memory_limit_gib,allocation_case='Fresh payload followed by shared replacement; two puts per request',reuse_from=str(args.reuse_from) if args.reuse_from else None,rss_limit_gib=args.rss_limit_gib,prefill_seconds=args.prefill_seconds)
         (root/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
         virtual_suite(args,binary,root,cores)
         return
