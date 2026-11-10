@@ -172,7 +172,7 @@ void aStoredFitReadsAsItsArtifact(const fs::path& directory)
         store.setMeta(txn, uuid, "source_fit_iteration", "240");
         auto changed = quad_surface_grid(*fit.surface);
         changed.points[1][0] += 10;
-        store.putGeometry(txn, uuid, vc::geometry::encode(changed));
+        store.putGeometry(txn, uuid, vc::geometry::encode(changed), fit.geometryRevision);
         txn.commit();
         auto removal = store.write(); store.deleteObject(removal, uuid); removal.commit();
     }
@@ -193,8 +193,9 @@ void onlyCommittedFitsAreListedAndRead(const fs::path& directory)
             "only the committed fit is listed, with its iteration");
     requireThrows([&] { vc3d::spiral::readStoredFit(fixture.session, fixture.attachment, other); },
                   "is not a committed Spiral fit", "a surface not tagged spiral-fit");
-    requireThrows([&] { vc3d::spiral::readStoredFit(fixture.session, fixture.attachment, util::newUuid()); },
-                  "is not in the attached object store", "a fit the store does not hold");
+    const auto missing = util::newUuid();
+    requireThrows([&] { vc3d::spiral::readStoredFit(fixture.session, fixture.attachment, missing); },
+                  missing, "the shared geometry loader reports the missing fit identity");
     // A changed surface the workspace counts as another input unless it is
     // a committed fit (SpiralWorkspace::noteStoreChanges).
     const auto fits = vc3d::spiral::spiralFitsAmong(*fixture.session, fixture.attachment,
