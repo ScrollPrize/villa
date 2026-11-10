@@ -2,6 +2,9 @@
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/InitialImport.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
+#include <vc_reader/native/atomic_file.hpp>
 #include "vc_object_store/Uuid.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "support/SqliteMutexProfile.hpp"
@@ -29,6 +32,32 @@ volatile std::sig_atomic_t cancelled=0;
 void cancelImport(int) { cancelled=1; }
 void checkCancelled(const std::atomic<bool>* failed=nullptr) { if(cancelled || (failed && failed->load()))throw std::runtime_error("import cancelled"); }
 double seconds(Clock::time_point start) { return std::chrono::duration<double>(Clock::now()-start).count(); }
+void protectReport(const Json& config, const std::filesystem::path& configPath,
+                   const std::filesystem::path& output, const std::filesystem::path& report)
+{
+    namespace fs = std::filesystem;
+    const auto target = fs::weakly_canonical(fs::absolute(report));
+    const auto destination = fs::weakly_canonical(output);
+    for (auto parent = target; !parent.empty(); parent = parent.parent_path()) {
+        if (parent == destination) throw std::invalid_argument("report overlaps import output");
+        if (parent == parent.root_path()) break;
+    }
+    std::vector<fs::path> inputs{configPath, config.at("source").get<std::string>()};
+    if (config.contains("constraints")) inputs.emplace_back(config.at("constraints").get<std::string>());
+    for (const auto& input : inputs)
+        if (target == fs::weakly_canonical(fs::absolute(input)) ||
+            (fs::exists(target) && fs::exists(input) && fs::equivalent(target, input)))
+            throw std::invalid_argument("report overlaps an import input");
+}
+void protectStoreReport(const std::filesystem::path& store, const std::filesystem::path& report)
+{
+    ObjectStoreSession session;
+    OpenOptions options; options.readOnly = true;
+    const auto attachment = session.attach(store, options);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        reader.validateExportDestination(report);
+    });
+}
 OpenOptions readOptions(const Json& config)
 {
     OpenOptions options;options.readOnly=true;options.readerPoolSize=1;
@@ -328,6 +357,13 @@ int main(int argc,char** argv)
         const auto output=std::filesystem::absolute(config.at("output").get<std::string>());
         if (std::filesystem::exists(output) || std::filesystem::is_symlink(output)) throw std::runtime_error("output exists");
         if (!std::filesystem::is_directory(output.parent_path())) throw std::runtime_error("output parent must exist");
+        const auto report = config.contains("report")
+            ? std::optional<std::filesystem::path>(config.at("report").get<std::string>()) : std::nullopt;
+        if (report) {
+            protectReport(config, argv[1], output, *report);
+            if (config.contains("geometry_collection"))
+                protectStoreReport(config.at("geometry_collection").get<std::string>(), *report);
+        }
         const auto limit=config.value("fiber_limit", int64_t(0));
         const auto batch=config.value("batch_size", int64_t(256));
         const auto maxBytes=config.value("batch_bytes", int64_t(64*1024*1024));
@@ -345,8 +381,13 @@ int main(int argc,char** argv)
         result["source_open_seconds"]=sourceOpenSeconds;
         result["end_to_end_seconds"]=seconds(sourceStart);
         std::cout<<result.dump(2)<<std::endl;
-        if(config.contains("report")){std::ofstream report(config.at("report").get<std::string>());report<<result.dump(2)<<'\n';
-            if(!report)throw std::runtime_error("report write failed");}
+        if (report) {
+            protectStoreReport(std::filesystem::is_directory(output) ? output / "collection.vcobj" : output, *report);
+            const auto text = result.dump(2) + '\n';
+            vcr::AtomicFile file(report->string());
+            file.write(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+            file.publish(true);
+        }
         return 0;
     } catch (const std::exception& error) { std::cerr<<"AFV import failed: "<<error.what()<<'\n'; return 1; }
 }

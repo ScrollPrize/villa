@@ -118,6 +118,7 @@ def test_native_batch_command_readback_is_opt_in(tmp_path, shards, verify):
     fixture(source)
     output = tmp_path / 'native.vcobj'
     report = tmp_path / 'report.json'
+    report.write_text('old report')
     config = dict(source=str(source), output=str(output), unbound=True,
                   shards=shards, report=str(report))
     if verify is not None:
@@ -138,6 +139,44 @@ def test_native_batch_command_readback_is_opt_in(tmp_path, shards, verify):
     assert rejected.returncode != 0
     assert 'initial_batch:false is removed' in rejected.stderr
     assert not Path(config['output']).exists()
+
+
+@pytest.mark.parametrize('collision', ['source', 'hardlink', 'symlink', 'constraints', 'output', 'member', 'config', 'geometry'])
+def test_native_report_cannot_overwrite_inputs_or_output(tmp_path, collision):
+    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
+    tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
+    if not tool or not tool.exists():
+        pytest.skip('needs the built native importer')
+    source, output, config_path = tmp_path / 'input.afv', tmp_path / 'output', tmp_path / 'config.json'
+    fixture(source)
+    original = source.read_bytes()
+    alias = tmp_path / 'alias'
+    geometry = tmp_path / 'geometry.vcobj'
+    if collision == 'geometry':
+        with ObjectStore.create(str(geometry), author='report-test') as store:
+            store.seal()
+    geometry_bytes = geometry.read_bytes() if geometry.exists() else None
+    if collision == 'hardlink':
+        os.link(source, alias)
+    elif collision == 'symlink':
+        alias.symlink_to(source)
+    reports = dict(source=source, hardlink=alias, symlink=alias, constraints=source,
+                   output=output, member=output / 'collection.vcobj', config=config_path, geometry=geometry)
+    config = dict(source=str(source), output=str(output), report=str(reports[collision]),
+                  unbound=True, shards=2 if collision == 'member' else 1)
+    if collision == 'constraints':
+        config['constraints'] = str(source)  # reject before attempting AFC parsing
+    if collision == 'geometry':
+        config['geometry_collection'] = str(geometry)
+    config_path.write_text(json.dumps(config))
+    config_bytes = config_path.read_bytes()
+    completed = subprocess.run([str(tool), str(config_path)], capture_output=True, text=True, timeout=30)
+    assert completed.returncode != 0
+    assert ('backing' if collision == 'geometry' else 'report overlaps') in completed.stderr
+    assert source.read_bytes() == original and config_path.read_bytes() == config_bytes
+    if geometry_bytes is not None:
+        assert geometry.read_bytes() == geometry_bytes
+    assert not output.exists(), 'reject path collisions before doing the import'
 
 
 def constraint_fixture(path, source_uuid):
