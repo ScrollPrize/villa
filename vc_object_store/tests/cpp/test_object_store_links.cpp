@@ -2,6 +2,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 
 #include <nlohmann/json.hpp>
@@ -205,6 +206,37 @@ void storedTrackCrossingsSelectionAndAtomicFailure(const TemporaryDirectory& dir
     require(!links::linkTracksToTracks(db, params).problems.empty(), "a selection outside the dataset is a problem");
 }
 
+void referencedTrackDatasets(const TemporaryDirectory& directory)
+{
+    const auto root=directory.path/"dataset-routing";
+    for(const auto* name:{"a","b","overlay"})std::filesystem::create_directories(root/name);
+    OpenOptions options;options.author="link-test";
+    std::vector<int32_t> horizontal,vertical;
+    for(int32_t i=0;i<31;++i){horizontal.insert(horizontal.end(),{i,15,20});vertical.insert(vertical.end(),{15,i,20});}
+    std::string a,b;
+    {auto db=ObjectStore::create(root/"a/base.vcobj",options);
+        a=track(db,"11",horizontal,"horizontal","data.tracks");
+        b=track(db,"99",vertical,"vertical","data.tracks");
+        auto w=db.write();db.seal(w);w.commit();}
+    {auto db=ObjectStore::create(root/"b/base.vcobj",options);
+        // Same relative spelling/ordinal, but another owning dataset.
+        track(db,"11",vertical,"vertical","data.tracks");
+        auto w=db.write();db.seal(w);w.commit();}
+    {auto collection=ObjectCollection::create(root/"overlay/graph.vcobj",{root/"a/base.vcobj",root/"b/base.vcobj"},options);}
+    auto db=ObjectStore::open(root/"overlay/graph.vcobj",options);
+    {auto w=db.write();db.setMeta(w,a,"label","\"override\"");w.commit();}
+    {auto r=db.read();require(db.objectByUuid(r,a)->track->datasetRef!=db.objectByUuid(r,b)->track->datasetRef,
+        "override rebases one locator, without changing its source dataset");}
+    const auto report=links::linkTracksToTracks(db);
+    require(report.problems.empty()&&report.edgesCreated==1,"resolved dataset identity groups rebased tracks, separates other owners");
+    const auto edges=edgesOf(db,a);
+    require(edges.size()==1&&(edges.front().aUuid==b||edges.front().bUuid==b),"crossing joins only the same source dataset");
+    links::TrackTrackParams selected;selected.trackUuids={a,b};selected.datasetRef="data.tracks";
+    require(links::linkTracksToTracks(db,selected).problems.empty(),"raw dataset filter includes its rebased peers");
+    selected.datasetRef=(root/"a/data.tracks").string();
+    require(links::linkTracksToTracks(db,selected).problems.empty(),"resolved dataset filter identifies its group");
+}
+
 void storedCollectionIdsWindingScalingAndRerun(const TemporaryDirectory& directory)
 {
     auto db = create(directory, "collections.vcobj");
@@ -289,6 +321,7 @@ try {
     surfaceDiscoveryUsesCurrentRevisionsAndPreservesReview(directory);
     surfaceSelectionMissingGeometryAndStaleScope(directory);
     storedTrackCrossingsSelectionAndAtomicFailure(directory);
+    referencedTrackDatasets(directory);
     storedCollectionIdsWindingScalingAndRerun(directory);
     attachedCollectionsAreNotGraphLinks(directory);
     std::cout << "object links passed\n";

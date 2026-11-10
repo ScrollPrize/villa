@@ -56,6 +56,8 @@ public:
     std::set<std::string> objectsNear(const std::string& kind, const Box& box, double margin,
                                       const CoordinateParams& params, double explicitScale = 1.0);
     const objects::ReadTxn& txn() const;
+    // Source identity through the same pinned store snapshot as geometry.
+    std::filesystem::path sourcePath(const objects::ObjectRecord& object) const;
 private:
     objects::ObjectStore& db_;
     std::optional<objects::ReadTxn> read_;

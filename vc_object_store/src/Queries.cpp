@@ -31,7 +31,7 @@ struct SelectionFilter {
     std::string sql;
     std::vector<std::string> parameters;
 };
-SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection, const FrameFilter* frame)
+SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection)
 {
     if (selection.volume || selection.includeUnbound)
         throw std::invalid_argument("volume targets apply to object selections, spatial regions and geometry regions");
@@ -87,32 +87,6 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection, cons
              "(SELECT value FROM json_each(?)))", nlohmann::json(selection.withoutTags).dump());
     if (selection.family) bind(" AND d.family=?", *selection.family);
     if (selection.minLength) bind(" AND d.length>=?", nlohmann::json(*selection.minLength).dump());
-    if (frame && frame->unboundVolume) {
-        if (selection.kind) {
-            // Index ranges, so a store bound to one volume is not scanned.
-            const auto kind = "?" + std::to_string(filter.parameters.size() + 1);
-            const auto volume = "?" + std::to_string(filter.parameters.size() + 2);
-            filter.sql += " AND o.id IN (" + unboundObjectIdsSql(kind, volume) + ")";
-            filter.parameters.push_back(*selection.kind);
-            filter.parameters.push_back(*frame->unboundVolume);
-        } else {
-            bind(" AND NOT (o.coordinate_volume IS ?", *frame->unboundVolume);
-            filter.sql += " AND COALESCE(o.coordinate_scale>0,0))";
-        }
-    }
-    if (frame && frame->cursor) {
-        // Volume order within a frame: shorter volume length, or the same
-        // volume length and either a shorter stored length or a later UUID.
-        const auto& c = *frame->cursor;
-        auto hex = formatUuid(parseUuid(c.uuid));
-        hex.erase(std::remove(hex.begin(), hex.end(), '-'), hex.end());
-        bind(" AND (d.length<?", nlohmann::json(c.tieLow).dump());
-        bind(" OR (d.length>=?", nlohmann::json(c.tieLow).dump());
-        bind(" AND d.length<=?", nlohmann::json(c.tieHigh).dump());
-        bind(" AND (d.length<?", nlohmann::json(c.stored).dump());
-        bind(" OR (d.length=?", nlohmann::json(c.stored).dump());
-        filter.sql += " AND o.uuid>X'" + hex + "'))))";
-    }
     if (selection.afterUuid) {
         auto hex = formatUuid(parseUuid(*selection.afterUuid));
         hex.erase(std::remove(hex.begin(), hex.end(), '-'), hex.end());
@@ -184,27 +158,25 @@ ObjectSelection frameSelection(const ObjectSelection& selection, const VolumeFra
         validateBounds(*selection.bbox);
         sub.bbox = frame.registered ? transformBounds(*selection.bbox,frame.mapping.inverse()) : storedBox(*selection.bbox, frame.toVolume);
     }
-    if (selection.minLength) {
-        if (!std::isfinite(*selection.minLength) || *selection.minLength < 0)
-            throw std::invalid_argument("min_length must be finite and nonnegative");
-        sub.minLength = lowestStoredAtLeast(*selection.minLength, frame.toVolume);
-    }
+    sub.minLength.reset(); // Length is measured after mapping selected geometry.
     return sub;
 }
 struct VolumeRow {
     std::string uuid;
-    double stored = 0, volume = 0;
+    double volume = 0;
     bool bound = true;
 };
-std::vector<VolumeRow> registeredVolumeSelection(sqlite3* db,const ObjectSelection& selection) {
+std::vector<VolumeRow> measuredSelection(sqlite3* db,const ObjectSelection& selection) {
     requireVolumeSelection(selection);
     const bool byLength=selection.orderBy=="length_desc";
     std::vector<VolumeRow> rows;
     const bool inTail=byLength&&selection.afterUuid&&!selection.afterLength;
-    if(!inTail) for(const auto& frame:selectionFrames(db,selection)) {
-        auto sub=frameSelection(selection,frame);
+    const auto frames=selection.volume?selectionFrames(db,selection):std::vector<VolumeFrame>{{}};
+    if(!inTail) for(const auto& frame:frames) {
+        auto sub=selection.volume?frameSelection(selection,frame):selection;
+        sub.afterUuid.reset();sub.afterLength.reset();sub.offset=0;
         sub.limit.reset();sub.minLength.reset();sub.orderBy="uuid";
-        auto query=objectSelectionQuery(db,sub,"o.uuid",nullptr);
+        auto query=objectSelectionQuery(db,sub,"o.uuid");
         while(query->row()) {
             VolumeRow row{formatUuid(query->blob16(0))};
             if(byLength||selection.minLength) {
@@ -225,10 +197,10 @@ std::vector<VolumeRow> registeredVolumeSelection(sqlite3* db,const ObjectSelecti
         auto sub=selection;sub.volume.reset();sub.includeUnbound=false;sub.limit.reset();sub.offset=0;
         sub.minLength.reset();sub.orderBy="uuid";sub.afterLength.reset();
         if(byLength&&selection.afterLength)sub.afterUuid.reset();
-        auto query=objectSelectionQuery(db,sub,"o.uuid,o.meta",nullptr);
+        auto query=objectSelectionQuery(db,sub,"o.uuid,o.meta");
         while(query->row()) {
             const auto id=formatUuid(query->blob16(0));
-            if(!selection.transforms->toVolume(nlohmann::json::parse(query->text(1)),*selection.volume))rows.push_back({id,0,0,false});
+            if(!selection.transforms->toVolume(nlohmann::json::parse(query->text(1)),*selection.volume))rows.push_back({id,0,false});
         }
     }
     std::sort(rows.begin(),rows.end(),[&](const auto& a,const auto& b){
@@ -240,78 +212,15 @@ std::vector<VolumeRow> registeredVolumeSelection(sqlite3* db,const ObjectSelecti
     const size_t last=selection.limit?std::min(rows.size(),first+size_t(*selection.limit)):rows.size();
     return {std::make_move_iterator(rows.begin()+first),std::make_move_iterator(rows.begin()+last)};
 }
-// The volume selection's rows in its order, after the cursor or offset.
-std::vector<VolumeRow> volumeSelection(sqlite3* db, const ObjectSelection& selection,
-                                      std::optional<double> cursorStored = std::nullopt)
-{
-    requireVolumeSelection(selection);
-    if(selection.transforms&&!selection.transforms->graph.registrations().empty())return registeredVolumeSelection(db,selection);
-    const bool byLength = selection.orderBy == "length_desc";
-    const bool inTail = byLength && selection.afterUuid && !selection.afterLength;
-    if (byLength && selection.afterLength) {
-        if (!std::isfinite(*selection.afterLength)) throw std::invalid_argument("after_length must be finite");
-        if (!selection.kind || (*selection.kind != "fiber" && *selection.kind != "track"))
-            throw std::invalid_argument("typed catalog filters require fiber or track kind");
-        // Equal volume lengths order by stored length: the cursor's own.
-        if(!cursorStored){Statement cursor(db, std::string("SELECT d.length FROM objects o JOIN ") +
-                             (*selection.kind == "fiber" ? "fibers" : "tracks") + " d ON d.object_id=o.id WHERE o.uuid=?",
-                         parseUuid(*selection.afterUuid));
-        if (!cursor.row()) throw std::invalid_argument("after_uuid does not name a cataloged object");
-        cursorStored = cursor.f64(0);
-        }
-    }
-    std::vector<VolumeRow> rows;
-    if (!inTail) for (const auto& frame : selectionFrames(db, selection)) {
-        auto sub = frameSelection(selection, frame);
-        FrameFilter filter;
-        if (cursorStored) {
-            filter.cursor = FrameCursor{lowestStoredAtLeast(*selection.afterLength, frame.toVolume),
-                                        highestStoredAtMost(*selection.afterLength, frame.toVolume),
-                                        *cursorStored, *selection.afterUuid};
-        } else if (selection.afterUuid) {
-            sub.afterUuid = selection.afterUuid;
-        }
-        auto query = objectSelectionQuery(db, sub, byLength ? "o.uuid,d.length" : "o.uuid", &filter);
-        while (query->row()) {
-            VolumeRow row{formatUuid(query->blob16(0))};
-            if (byLength) { row.stored = query->f64(1); row.volume = row.stored * frame.toVolume; }
-            rows.push_back(std::move(row));
-        }
-    }
-    // Unbound objects have no volume position or length.
-    if (selection.includeUnbound && !selection.bbox && !(selection.minLength && *selection.minLength > 0)) {
-        auto sub = selection;
-        sub.volume.reset(); sub.includeUnbound = false;
-        sub.orderBy = "uuid"; sub.minLength.reset(); sub.afterLength.reset(); sub.offset = 0;
-        if (selection.limit) sub.limit = *selection.limit + selection.offset;
-        if (byLength && !inTail) sub.afterUuid.reset();
-        FrameFilter filter;
-        filter.unboundVolume = *selection.volume;
-        auto query = objectSelectionQuery(db, sub, "o.uuid", &filter);
-        while (query->row()) rows.push_back({formatUuid(query->blob16(0)), 0, 0, false});
-    }
-    std::sort(rows.begin(), rows.end(), [byLength](const VolumeRow& a, const VolumeRow& b) {
-        if (byLength) {
-            if (a.bound != b.bound) return a.bound;
-            if (a.bound && a.volume != b.volume) return a.volume > b.volume;
-            if (a.bound && a.stored != b.stored) return a.stored > b.stored;
-        }
-        return a.uuid < b.uuid;
-    });
-    const size_t begin = std::min(rows.size(), size_t(selection.offset));
-    const size_t end = selection.limit ? std::min(rows.size(), begin + size_t(*selection.limit)) : rows.size();
-    return {std::make_move_iterator(rows.begin() + begin), std::make_move_iterator(rows.begin() + end)};
-}
 }
 
 std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const ObjectSelection& selection,
-                                                       const std::string& columns, const FrameFilter* frame)
+                                                       const std::string& columns)
 {
     if (selection.bbox) requireSpatial(db);
-    auto filter = objectFilter(db, selection, frame);
+    auto filter = objectFilter(db, selection);
     const bool candidates = selection.bbox || !selection.uuids.empty() || selection.connectedTo || selection.tag ||
-                            !selection.tagGroups.empty() ||
-                            (frame && frame->unboundVolume && selection.kind);
+                            !selection.tagGroups.empty();
     // Force primary-key candidate probes instead of scanning objects_kind_uuid
     // to avoid a sort when the R-tree returned only a few matches.
     const bool typed = selection.family || selection.minLength || selection.orderBy == "length_desc";
@@ -335,16 +244,16 @@ std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const Objec
 
 namespace {
 std::vector<ObjectRecord> selectPhysicalObjects(sqlite3* db, const ObjectSelection& selection,
-    const ObjectFields& fields, bool published, std::optional<double> cursorStored = std::nullopt)
+    const ObjectFields& fields, bool published)
 {
     if(selection.bbox)requireSpatial(db);
-    if (!selection.volume && !selection.includeUnbound) {
+    if (!selection.volume && !selection.includeUnbound && !selection.minLength && selection.orderBy!="length_desc") {
         auto rows = objectSelectionQuery(db, selection, projectedObjectColumns(fields));
         auto records = readObjectRows(db, *rows, fields);
         if (published) attachObjectVersions(db, records);
         return records;
     }
-    const auto order = volumeSelection(db, selection, cursorStored);
+    const auto order = measuredSelection(db, selection);
     if (order.empty()) return {};
     ObjectSelection chosen;
     chosen.includeRetired = selection.includeRetired;
@@ -358,7 +267,7 @@ std::vector<ObjectRecord> selectPhysicalObjects(sqlite3* db, const ObjectSelecti
     });
     if (selection.orderBy == "length_desc")
         for (auto& record : records)
-            if (const auto& row = order[position.at(record.uuid)]; row.bound) record.volumeLength = row.volume;
+            if (const auto& row = order[position.at(record.uuid)]; row.bound) record.volumeLength=row.volume;
     if (published) attachObjectVersions(db, records);
     return records;
 }
@@ -381,39 +290,19 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
         selection.uuids=std::move(component);selection.connectedTo.reset();
     }
     auto physical=selection;physical.limit.reset();physical.offset=0;
-    std::optional<double> cursorStored;
-    if(selection.volume&&selection.afterUuid&&selection.afterLength){
-        const auto cursor=resolveObject(db,*selection.afterUuid);
-        if(!cursor||(!cursor->record.fiber&&!cursor->record.track))
-            throw std::invalid_argument("after_uuid does not name a cataloged object");
-        cursorStored=cursor->record.fiber?cursor->record.fiber->length:cursor->record.track->length;
-    }
-    auto loaded=fields;
-    if(loaded&&selection.orderBy=="length_desc")loaded->insert(selection.kind=="fiber"?"fiber":"track");
     std::vector<ObjectRecord> records;
-    for(auto* source:sources)for(auto& record:selectPhysicalObjects(source,physical,loaded,!txn.write_,cursorStored))
+    for(auto* source:sources)for(auto& record:selectPhysicalObjects(source,physical,fields,!txn.write_))
         if(objectSource(db,record.uuid)==source)records.push_back(std::move(record));
     std::sort(records.begin(),records.end(),[&](const auto& a,const auto& b){
         if(selection.orderBy=="length_desc"){
-            const auto length=[&](const auto& r)->std::optional<double>{
-                if(selection.volume)return r.volumeLength;
-                return r.fiber?std::optional(r.fiber->length):r.track?std::optional(r.track->length):std::nullopt;};
-            const auto x=length(a),y=length(b);
+            const auto x=a.volumeLength,y=b.volumeLength;
             if(x!=y)return x>y;
-            // Unbound tails and registered transforms order ties by UUID;
-            // native volume scales also use stored length, just as the SQL
-            // frame cursor does.
-            if(x&&(!selection.transforms||selection.transforms->graph.registrations().empty())){
-                const auto stored=[](const auto& r){return r.fiber?r.fiber->length:r.track?r.track->length:0.;};
-                if(stored(a)!=stored(b))return stored(a)>stored(b);
-            }
         }
         return a.uuid<b.uuid;
     });
     const auto begin=std::min(records.size(),size_t(selection.offset));
     const auto end=selection.limit?begin+std::min(records.size()-begin,size_t(*selection.limit)):records.size();
     std::vector<ObjectRecord> result(std::make_move_iterator(records.begin()+begin),std::make_move_iterator(records.begin()+end));
-    for(auto& record:result){if(!wants(fields,"fiber"))record.fiber.reset();if(!wants(fields,"track"))record.track.reset();}
     return result;
 }
 
@@ -441,6 +330,14 @@ std::vector<SpatialRegion> selectPhysicalRegions(sqlite3* db, const ObjectSelect
     if (!selection.bbox) throw std::invalid_argument("spatial regions require a bbox");
     detail::validateBounds(*selection.bbox);
     if (selection.includeUnbound) throw std::invalid_argument("spatial regions place only objects bound to a volume");
+    if(selection.minLength) {
+        auto objects=selection;objects.offset=0;objects.limit.reset();objects.afterUuid.reset();objects.afterLength.reset();
+        const auto matching=measuredSelection(db,objects);
+        if(matching.empty())return {};
+        auto filtered=selection;filtered.minLength.reset();filtered.uuids.clear();
+        for(const auto& row:matching)filtered.uuids.push_back(row.uuid);
+        return selectPhysicalRegions(db,filtered);
+    }
     if (selection.volume) {
         requireVolumeSelection(selection);
         std::vector<SpatialRegion> regions;
@@ -465,7 +362,7 @@ std::vector<SpatialRegion> selectPhysicalRegions(sqlite3* db, const ObjectSelect
     if (const auto lease = activeStatementPools.find(db); lease != activeStatementPools.end())
         if (const auto& cache = lease->second->spatialCache)
             if (auto result = cache->query(db, selection)) return *result;
-    const auto filter = objectFilter(db, selection, nullptr);
+    const auto filter = objectFilter(db, selection);
     // CROSS JOIN preserves the R-tree-first plan even with a kind filter.
     std::string sql = std::string("SELECT ") + detail::regionColumns + " FROM spatial_regions_rtree r "
         "CROSS JOIN spatial_regions b ON b.id=r.id CROSS JOIN objects o ON o.id=b.object_id "

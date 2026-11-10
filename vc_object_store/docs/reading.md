@@ -66,6 +66,8 @@ use **volume voxels**; `include_unbound=True` appends the rest in UUID order.
 `volume` and an exact `coordinates` declaration are mutually exclusive. See
 [transforms](transforms.md#volume-target-queries).
 
+Length filtering and ordering measure the selected stored polyline, never an ingestion summary. This applies to native and volume-target selections, spatial regions and viewport regions; registering an unrelated transform does not change their semantics. Equal measured lengths sort by UUID in every frame. Length-ordered rows expose their measured cursor value as `volume_length` (C++ `volumeLength`, the existing field name), in native units without a volume target and target voxels otherwise; persisted fiber/track detail metadata is not rewritten by a query. Records without stored geometry have no measurable length and are omitted from length-filtered/ordered selections, but remain in ordinary unfiltered listings. An unbound tail explicitly requested for a volume query remains UUID-ordered without a volume length.
+
 ## Geometry: snapshots and bounded reads
 
 A geometry snapshot pins one consistent store state. Views read only the

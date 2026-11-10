@@ -214,7 +214,6 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         return found == byObject.end() ? none : found->second;
     };
     auto processSurface = [&](sqlite3* source,const std::string& uuid, int64_t id, const std::string& revision) {
-        if(options.toTarget && options.minLength>0 && transformedLength(db,revision,*options.toTarget,options.kind)<options.minLength)return;
         RetainedGeometryReader retained(db, revision);
         auto& reader = *retained;
         const auto& arrays = reader.manifest().at("arrays");
@@ -244,7 +243,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
     };
     auto process = [&](sqlite3* source,const std::string& uuid, int64_t id, const std::string& revision, const std::string& family) {
         if (kind.surface) return processSurface(source,uuid, id, revision);
-        if(options.toTarget && options.minLength>0 && transformedLength(db,revision,*options.toTarget,options.kind)<options.minLength)return;
+        if(options.minLength>0 && transformedLength(db,revision,options.toTarget.value_or(VolumeAffine{}),options.kind)<options.minLength)return;
         RetainedGeometryReader retained(db, revision);
         auto& reader = *retained;
         const auto& arrays = reader.manifest().at("arrays");
@@ -336,7 +335,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
                 "LEFT JOIN " + std::string(kind.table) + " f ON f.object_id=o.id "
                 "WHERE o.state=0 AND o.kind=?12 AND b.array_name='' "
                 "AND o.geometry_manifest IS NOT NULL AND "+spatialOverlapSql()+
-                (kind.surface ? std::string() : " AND COALESCE(f.length,0)>=?7 AND (?8 IS NULL OR "+family+"=?8)");
+                (kind.surface ? std::string() : " AND (?8 IS NULL OR "+family+"=?8)");
             if(includedIds)sql+=" AND hex(o.uuid) IN (SELECT value FROM json_each(?10))";
             if(options.coordinates)sql+=coordinateFilterSql("o", "?11");
             if(selectedOnly)sql+=" AND o.uuid=?9";
@@ -348,7 +347,6 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             VisibleObjectRows candidates(db,[&](sqlite3* source){
                 auto row=std::make_unique<Statement>(source,sql);
                 for(int i=0;i<6;++i)row->bind(i+1,bounds[i]);
-                row->bind(7,options.toTarget?0.:options.minLength);
                 if(options.family)row->bind(8,*options.family);else row->bindNull(8);
                 if(selected)row->bind(9,parseUuid(*selected));
                 if(includedIds)row->bind(10,*includedIds);

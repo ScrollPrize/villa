@@ -17,6 +17,23 @@ using namespace vc::objects;
 int main() try {
     TemporaryDirectory directory;OpenOptions options;options.author="transform-test";
     auto db=ObjectStore::create(directory.path/"transforms.vcobj",options);
+    {
+        auto separate=ObjectStore::create(directory.path/"choice-race.vcobj",options);
+        {auto w=separate.write();separate.registerVolumeTransform(w,"a","b",VolumeAffine{},"route");w.commit();}
+        TransactionRequest first,second;
+        {auto r=separate.read();LocalStoreReader reader(separate,r);const auto status=reader.status();
+            for(auto* request:{&first,&second}) {
+                request->requestUuid=util::newUuid();request->storeUuid=status.storeUuid;
+                request->generation=status.generation;request->author="transform-test";
+                const auto path=reader.volumeTransforms().resolve("a","b").resolved().path;
+                chooseVolumeTransformRequest(reader,*request,"a","b",path);
+            }
+        }
+        separate.submit(first);
+        mustFail([&]{separate.submit(second);});
+        auto r=separate.read();require(separate.volumeTransforms(r).choices.size()==1,
+            "concurrent route-choice creation preserves one selection");
+    }
     std::string fiber,track,surface,points,umbilicus,registration;
     VolumeAffine matrix;matrix(0,0)=2;matrix(0,1)=.5;matrix(0,3)=10;matrix(2,3)=20;
     {

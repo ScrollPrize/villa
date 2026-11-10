@@ -339,7 +339,8 @@ struct TrackTrackParams {
     bool replaceStalePending = true;
 };
 // Opposite-family stored tracks sharing voxels within the same dataset.
-// datasetRef is an identity/grouping label, never a path to open. Raw local point
+// Dataset locators are resolved against their owning stores for grouping, but
+// no external track data is opened: detection uses stored geometry. Raw local point
 // indices and source XYZ anchor each crossing. Failure/cancellation writes nothing.
 DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackParams& params = {},
                                   const std::atomic_bool* cancel = nullptr);

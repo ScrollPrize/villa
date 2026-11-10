@@ -476,13 +476,24 @@ StoreStatus HostedAttachment::status() { return client_.status(); }
 
 TransactionReceipt HostedAttachment::submit(const TransactionRequest& request)
 {
+    // Serialize with the feed poll so an older status response cannot erase
+    // the commit floor supplied by this successful receipt. Do not advance
+    // the feed cursor: the poller must still deliver these changes.
+    std::lock_guard checking(checking_);
     auto receipt = client_.submit(request);
     std::vector<std::string> touched;
     for (const auto& [uuid, version] : receipt.objects) touched.push_back(uuid);
     invalidate(touched);
-    std::lock_guard lock(cacheMutex_);
-    transforms_.reset();
-    ++transformInvalidations_;
+    {
+        std::lock_guard lock(cacheMutex_);
+        transforms_.reset();
+        ++transformInvalidations_;
+    }
+    if (receipt.commitSequence) {
+        std::lock_guard lock(stateMutex_);
+        if (freshness_.status->generation == receipt.generation)
+            freshness_.status->commitSequence = std::max(freshness_.status->commitSequence, *receipt.commitSequence);
+    }
     return receipt;
 }
 
@@ -603,12 +614,31 @@ std::vector<SelectedRelationship> HostedAttachment::relationshipsAt(const std::v
 {
     if (!disk_) return client_.relationshipsAt(versions);
     const auto query = objectVersionsRequestToJson(versions);
-    const auto bytes = cachedPayload(payloadKey(metadataKey("relationships/" + payloadHash(bytesOf(query)))), [&] {
+    // Endpoint revisions are immutable; graph membership is not. An overlay
+    // can add edges without changing either inherited endpoint reference.
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const auto before = *freshness().status;
+        const auto key = metadataKey("relationships/" + before.storeUuid + "/" + before.generation + "/" +
+            std::to_string(before.commitSequence) + "/" + payloadHash(bytesOf(query)));
+        const auto bytes = cachedPayload(key, [&] {
+            StoreStatus asOf;
+            const auto relationships = client_.relationshipsAt(versions, &asOf);
+            return bytesOf(relationshipQueryResultToJson(asOf, relationships));
+        });
         StoreStatus asOf;
-        const auto relationships = client_.relationshipsAt(versions, &asOf);
-        return bytesOf(relationshipQueryResultToJson(asOf, relationships));
-    });
-    return relationshipQueryResultFromJson(textOf(bytes), nullptr);
+        auto relationships = relationshipQueryResultFromJson(textOf(bytes), &asOf);
+        // The key is a freshness floor, not a historical graph snapshot: a
+        // response may already include a newer commit than our last poll.
+        if (asOf.storeUuid != before.storeUuid || asOf.generation != before.generation ||
+            asOf.commitSequence < before.commitSequence) {
+            check();
+            continue;
+        }
+        const auto after = *freshness().status;
+        if (before.generation != after.generation || before.commitSequence != after.commitSequence) continue;
+        return relationships;
+    }
+    throw StoreBusy("hosted store: relationships kept changing while reading; retry later");
 }
 
 std::optional<GeometryRevision> HostedAttachment::geometryRevision(const std::string& revisionUuid)

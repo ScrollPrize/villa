@@ -5,9 +5,10 @@
 //
 // Cache keys are immutable identities (geometry revision UUIDs, numbered
 // versions) or current heads that the feed invalidates, so a cached answer is
-// "current as of the last check". The cache never answers queries: listings,
-// regions and proximity always run on the host, so a partial cache never
-// claims complete coverage.
+// "current as of the last check". Exact-endpoint relationship queries also
+// cache complete answers, scoped to the observed commit (membership can change
+// without changing inherited endpoints). Listings, regions and proximity run
+// on the host, so a partial object cache never claims complete coverage.
 
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"

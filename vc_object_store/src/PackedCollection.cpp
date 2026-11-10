@@ -22,9 +22,7 @@ void packObjectCollection(const std::filesystem::path& source,
             openConnection(builder.databasePath(member.databaseUuid), SQLITE_OPEN_READWRITE, {}, false), sqlite3_close_v2);
         exec(db.get(), "BEGIN IMMEDIATE");
         try {
-            // This is physical relocation of a private snapshot, not an object
-            // edit. UUIDs, lineage/commit pins and retained history remain intact.
-            relocateExternalLocators(db.get(),member.locator,destination);
+            // External locators are relocated by the shared snapshot importer.
             relocateCollectionMembers(db.get(),[&](const std::string& target) {
                 builder.databasePath(target); // Fail if dependency closure is incomplete.
                 return packedMemberReference(target);

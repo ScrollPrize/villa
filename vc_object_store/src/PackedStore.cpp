@@ -931,9 +931,10 @@ void PackedStoreBuilder::importDatabase(const std::string& databaseUuid, const s
     try {
         const auto path = isPackedDatabasePath(source) ? source : isPackedStore(source) ? packedDatabasePath(source) : source;
         check(sqlite3_open_v2(path.string().c_str(), &input, SQLITE_OPEN_READONLY, isPackedDatabasePath(path) ? packedStoreVfs() : nullptr), "open packed import source");
+        bool objectStore = false;
         {
             detail::Statement identityTable(input, "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='database_identity'");
-            if (identityTable.row()) {
+            if ((objectStore = identityTable.row())) {
                 detail::Statement identity(input, "SELECT uuid FROM database_identity WHERE singleton=1");
                 if (!identity.row() || detail::formatUuid(identity.blob16(0)) != util::canonicalUuid(databaseUuid))
                     throw std::invalid_argument("packed import database UUID does not match source identity");
@@ -951,6 +952,15 @@ void PackedStoreBuilder::importDatabase(const std::string& databaseUuid, const s
         std::shared_ptr<MutableMember> member;
         { std::lock_guard lock(state->mutex); member = state->members.at(util::canonicalUuid(databaseUuid)); }
         if (member->size >= 100) state->write(*member, rollbackVersion.data(), rollbackVersion.size(), 18);
+        if (objectStore) {
+            // Every packed snapshot import (including compaction) preserves
+            // external targets. This private copy is not a logical edit.
+            std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> db(
+                detail::openConnection(destination, SQLITE_OPEN_READWRITE, {}, false), sqlite3_close_v2);
+            detail::Savepoint save(db.get());
+            detail::relocateExternalLocators(db.get(), path, state->destination);
+            save.release();
+        }
         {std::lock_guard lock(state->mutex);impl_->artifactSources.emplace(databaseUuid,path);}
     } catch (...) {
         if (input) sqlite3_close(input);

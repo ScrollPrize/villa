@@ -657,13 +657,21 @@ void detail::publishHistory(sqlite3* db, bool baseline)
     // published by this action, including cycles and self relationships.
     for (auto& [object, p] : objects) {
         if (!p.exists) {
-            if (p.parent) {
+            if (const auto before = publicationBase(db, object)) {
                 // Record a physical deletion without changing existing deletion
                 // eligibility. This prevents time-based reads resurrecting it.
                 const auto tombstone = util::newUuid();
+                // An inherited predecessor stays in its owner. The deletion
+                // itself is a root tombstone, not a fabricated local baseline.
+                Json delta=Json::array();
+                if(!p.parent) {
+                    auto inherited=*resolveObject(db,object,true);
+                    prepareOverrideReferences(inherited.source,db,inherited.record);
+                    delta=objectToJson(inherited.record);
+                }
                 execute(db, "INSERT INTO object_revisions(uuid,object_uuid,parent_uuid,"
-                    "metadata_delta,published_at_us,deleted) VALUES(?,?,?,'[]',?,1)", parseUuid(tombstone),
-                    parseUuid(object), parseUuid(*p.parent), publishedAtUs);
+                    "metadata_delta,published_at_us,deleted) VALUES(?,?,?,?,?,1)", parseUuid(tombstone),
+                    parseUuid(object), sqlReference(p.parent), delta.dump(), publishedAtUs);
                 commit.object(object,tombstone,true);
             }
             for (const auto* table : {"object_heads", "object_head_records", "object_relationship_heads"}) {
@@ -1115,8 +1123,6 @@ void ObjectStore::keepRecordedRelationship(WriteTxn& txn, const std::string& uui
         save.release();
         return;
     }
-    if(createRecordOverride(db,"edges",uuid))
-        stampContentChange(db,author(),hostname(),"edges",*edgeIdByUuid(db,parseUuid(uuid)),parseUuid(uuid),"keep_recorded");
     recordRelationshipValidation(db,*edge,true);
     save.release();
 }

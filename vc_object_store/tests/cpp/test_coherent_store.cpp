@@ -16,6 +16,7 @@
 #include "vc_object_store/objects/ObjectCopy.hpp"
 #include "vc_object_store/objects/ToolObjects.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
+#include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "internal/Database.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include <fstream>
@@ -90,10 +91,14 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
         repair.edgeUuid=f.edge;repair.expectedVersion=*unchanged.version;
         repair.aRevision=store.currentGeometry(r,unchanged.aUuid)->uuid;repair.bRevision=store.currentGeometry(r,unchanged.bUuid)->uuid;
         repair.aAnchor=unchanged.aAnchor;repair.bAnchor=unchanged.bAnchor;}
-    {auto w=store.write();store.updateEdge(w,unchanged);store.repairEdgeGeometry(w,repair);store.retainRelationship(w,f.edge);w.commit();}
+    {auto w=store.write();store.updateEdge(w,unchanged);store.repairEdgeGeometry(w,repair);store.retainRelationship(w,f.edge);store.keepRecordedRelationship(w,f.edge);w.commit();}
     {auto r=store.read();require(store.edgeByUuid(r,f.edge)->versionStoreUuid==unchanged.versionStoreUuid,
-        "unchanged edge update/repair/retain preserves inherited ownership");
-        require(store.status(r).commitSequence==sequence,"unchanged edge update/repair/retain does not publish");}
+        "unchanged edge update/repair/retain/keep preserves inherited ownership");
+        require(store.status(r).commitSequence==sequence,"unchanged edge update/repair/retain/keep does not publish");}
+    TransactionRequest noop;noop.requestUuid=util::newUuid();noop.author="no-op";
+    {auto r=store.read();const auto state=store.status(r);noop.storeUuid=state.storeUuid;noop.generation=state.generation;
+        buildCurrentEditRequest(LocalStoreReader(store,r),noop,{f.a},[]{return std::vector<TransactionOperation>{};});}
+    require(!store.submit(noop).commitSequence,"default edit builder keeps unchanged inherited relationships without publication");
     {auto w=store.write();const std::array<ExtensionRow,1> rows{ExtensionRow{extensionUuid(f.edge),int64_t(4)}};
         store.replaceExtensionRows(w,extension().name,f.edge,rows);w.commit();}
     {auto r=store.read();require(store.status(r).commitSequence==sequence,"inherited no-op remains a no-op");}
@@ -672,7 +677,83 @@ void followupAtomicityAndPolicy()
     }
 }
 
+void firstInheritedDeletion(HistoryMode baseMode,HistoryMode overlayMode){
+    Fixture f(baseMode,overlayMode);auto store=ObjectStore::open(f.overlay,options(overlayMode));
+    StoreStatus before;ObjectVersion original;
+    {auto r=store.read();before=store.status(r);original=store.currentObjectRevision(r,f.file)->reference();}
+    TransactionRequest deletion;deletion.requestUuid=util::newUuid();deletion.author="delete";
+    deletion.storeUuid=before.storeUuid;deletion.generation=before.generation;expectObject(deletion,original);
+    deletion.operations.push_back(DeleteObjectOp{f.file});
+    require(store.submit(deletion).objects.at(f.file)==std::nullopt,"deletion receipt names removed inherited object");
+    auto r=store.read();require(!store.objectByUuid(r,f.file),"first inherited deletion hides the object");
+    require(bool(store.objectAtVersion(r,original)),"source version remains readable after first deletion");
+    const auto feed=store.changesSince(r,{before.storeUuid,before.generation,before.commitSequence,0});
+    if(overlayMode==HistoryMode::On){
+        require(feed.commits.size()==1&&feed.commits[0].changes.size()==1&&feed.commits[0].changes[0].uuid==f.file&&
+            feed.commits[0].changes[0].deleted,"first inherited deletion is published to the feed");
+        const auto history=store.objectHistory(r,f.file);
+        require(history.size()==1&&history[0].deleted,"first inherited deletion retains one real tombstone, not a fake baseline");
+        require((f.overlay.parent_path()/history[0].record.storageRef).lexically_normal()==f.base.parent_path()/"fiber.json",
+            "inherited deletion history preserves the external source target");
+    }else require(!feed.cursorValid&&store.status(r).commitSequence>before.commitSequence,"history-off deletion invalidates the old feed snapshot");
+}
+
+void atomicCompositeWrites(HistoryMode mode){
+    TemporaryDirectory dir;auto store=ObjectStore::create(dir.path/"atomic",options(mode));
+    ObjectRecord old;old.kind="umbilicus";old.uuid=util::newUuid();
+    old.meta=R"({"coordinates":{"volume_uuid":"a","scale_factor":1}})";
+    {auto w=store.write();setVolumeUmbilicus(store,w,"a",old,vc::geometry::Umbilicus{{{0,0,0},{0,0,1}}});w.commit();}
+    const auto surface=util::newUuid(),replacement=util::newUuid();StoreStatus before;
+    {auto r=store.read();before=store.status(r);}
+    {auto w=store.write();GeometryData malformed;malformed.kind="surface";
+        mustFail([&]{createSurface(store,w,surface,"invalid",{},nlohmann::json::object(),{},nlohmann::json::object(),malformed);});
+        auto next=old;next.uuid=replacement;
+        mustFail([&]{setVolumeUmbilicus(store,w,"a",next,vc::geometry::Umbilicus{});});
+        const vcr::catalog::Registration registration{"id","revision","a","b",VolumeAffine{},"test"};
+        mustFail([&]{store.recordCatalogTransforms(w,{registration,registration});});w.commit();}
+    auto r=store.read();require(!store.objectByUuid(r,surface)&&!store.objectByUuid(r,replacement),"failed composite writes leave no objects");
+    require(!store.objectByUuid(r,old.uuid)->retired,"failed replacement preserves active umbilicus");
+    require(store.objectsByKind(r,"volume_transform").empty(),"failed registration batch is atomic");
+    require(store.status(r).commitSequence==before.commitSequence,"caught composite failures leave no commit");
+}
+
+void measuredLengths(HistoryMode mode){
+    TemporaryDirectory dir;auto opt=options(mode);opt.spatialIndex=true;
+    const auto base=dir.path/"base",overlay=dir.path/"overlay";
+    std::vector<std::string> ids;
+    {auto store=ObjectStore::create(base,opt);auto w=store.write();
+        for(int i=1;i<=2;++i){ObjectRecord record;record.kind="fiber";record.fiber.emplace();record.fiber->length=i==1?100:1;
+            record.meta=R"({"coordinates":{"volume_uuid":"a","scale_factor":1}})";
+            ids.push_back(store.upsertObject(w,record));vc::geometry::Fiber fiber;fiber.linePoints={{0,0,0},{double(10*i),0,0}};
+            store.putGeometry(w,ids.back(),vc::geometry::encode(fiber));}
+        ObjectRecord placeholder;placeholder.kind="fiber";placeholder.fiber.emplace();placeholder.fiber->length=999;
+        placeholder.meta=R"({"coordinates":{"volume_uuid":"a","scale_factor":1}})";
+        store.upsertObject(w,placeholder);
+        store.seal(w);w.commit();}
+    {auto collection=ObjectCollection::create(overlay,{base},opt);}
+    auto store=ObjectStore::open(overlay,opt);
+    const auto check=[&]{auto r=store.read();ObjectSelection all;all.kind="fiber";
+        require(store.selectObjects(r,all).size()==3,"ordinary listing includes geometry-less placeholders");
+        for(bool volume:{false,true}){
+        ObjectSelection selection;selection.kind="fiber";if(volume)selection.volume="a";selection.minLength=15;
+        auto selected=store.selectObjects(r,selection);require(selected.size()==1&&selected[0].uuid==ids[1],"length filter measures geometry, not annotation");
+        selection.bbox=std::array<double,6>{-1,-1,-1,30,1,1};
+        const auto regions=store.spatialRegions(r,selection);require(!regions.empty(),"measured spatial selection retains long fiber");
+        for(const auto& region:regions)require(region.objectUuid==ids[1],"spatial length agrees with object length");
+        RegionOptions region;region.kind="fiber";region.minLength=15;if(volume)region.volume="a";
+        RegionSlice slice;slice.localBounds={-1,-1,-1,30,1,1};
+        const auto visible=store.geometryRegion(r,slice,region);require(visible.intersectingObjects==1&&visible.runs[0].objectUuid==ids[1],"viewport length agrees in native and volume frames");
+        selection.bbox.reset();selection.minLength.reset();selection.orderBy="length_desc";selection.limit=1;
+        const auto first=store.selectObjects(r,selection);require(first.size()==1&&first[0].uuid==ids[1],"geometry length determines order");
+        require(first[0].volumeLength==20&&first[0].fiber->length==1,"measured cursor does not mutate selected metadata");
+        selection.afterUuid=ids[1];selection.afterLength=20;
+        const auto second=store.selectObjects(r,selection);require(second.size()==1&&second[0].uuid==ids[0],"length pagination uses the same measurement");
+    }};
+    check();{auto w=store.write();store.registerVolumeTransform(w,"unrelated-x","unrelated-y",VolumeAffine{},"unrelated");w.commit();}check();
+}
+
 int main()try{
+    for(const auto mode:{HistoryMode::Off,HistoryMode::On}){atomicCompositeWrites(mode);measuredLengths(mode);}
     followupAtomicityAndPolicy();
     inventoryIdentityAndSources();
     inventorySelectedMembership();inventoryPackedAndCoordinates();inventoryArtifactAlias();
@@ -680,6 +761,7 @@ int main()try{
     inventoryMixedOwnerExport();
 #endif
     for(const auto base:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On}){
+        firstInheritedDeletion(base,overlay);
         inventoryCore(base,overlay);inventoryRestore(base,overlay);inventoryRevalidatedPeer(base,overlay);
     }
     allocationWithoutCurrentGeometry();

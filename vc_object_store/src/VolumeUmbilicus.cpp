@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "internal/Database.hpp"
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -59,10 +60,12 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession& session, cons
 std::string setVolumeUmbilicus(ObjectStore& store, WriteTxn& txn, const std::string& volume, ObjectRecord record,
                                const geometry::Umbilicus& geometry)
 {
+    detail::Savepoint save(ObjectStoreImplAccess::conn(txn));
     requireUmbilicusFor(store.volumeTransforms(txn), record, volume);
     for (const auto& existing : store.selectObjects(txn, umbilici(volume))) store.retireObject(txn, existing.uuid);
     const auto uuid = store.upsertObject(txn, record);
     store.putGeometry(txn, uuid, geometry::encode(geometry));
+    save.release();
     return uuid;
 }
 

@@ -91,6 +91,9 @@ int main() try {
         copyObjectCollection(source,copied,options);compare(before,records(copied,ids),source,copied);
         packObjectCollection(source,packed);compare(before,records(packed,ids),source,packed);
         packObjectCollection(packed,repacked);compare(before,records(repacked,ids),source,repacked);
+        const auto compacted=root/"copy/compacted.vcobj";
+        compactPackedStore(packed,compacted);
+        compare(before,records(compacted,ids),source,compacted);
         copyObjectCollection(packed,root/"copy/from-packed.vcobj",options);
         compare(before,records(root/"copy/from-packed.vcobj",ids),source,root/"copy/from-packed.vcobj");
         // Collection closure: the dependency moves into a sidecar for copying,
@@ -100,7 +103,9 @@ int main() try {
         {auto collection=ObjectCollection::create(overlay,{source},options);auto write=collection.write();
             collection.seal(write);write.commit();}
         copyObjectCollection(overlay,overlayCopy,options);packObjectCollection(overlay,overlayPack);
-        for(const auto& output:{overlayCopy,overlayPack}) {
+        const auto overlayCompact=root/"repack/overlay.vcobj";
+        compactPackedStore(overlayPack,overlayCompact);
+        for(const auto& output:{overlayCopy,overlayPack,overlayCompact}) {
             auto collection=ObjectCollection::open(output,OpenOptions{.readOnly=true});
             const auto members=collection.members();require(members.size()==2,"collection copy retains its dependency");
             const auto physical=members.back().locator;

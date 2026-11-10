@@ -54,9 +54,11 @@ int main() try
     };
     auto txn = store.read();
     ObjectSelection byLength; byLength.kind = "fiber"; byLength.volume = volume; byLength.orderBy = "length_desc";
-    const std::vector<std::string> ordered{"a40", "b72", "b60", "a30", "a10"};
+    std::vector<std::string> tied{"b60","a30"};
+    std::sort(tied.begin(),tied.end(),[&](const auto& a,const auto& b){return ids[a]<ids[b];});
+    const std::vector<std::string> ordered{"a40", "b72", tied[0], tied[1], "a10"};
     require(names(store.selectObjects(txn, byLength)) == ordered,
-            "bound frames merge by volume length, ties by stored length");
+            "bound frames merge by measured volume length, ties by UUID");
 
     // Pages resume exactly, including inside the cross-frame tie at 15.
     for (const int64_t size : {1, 2, 3}) {
@@ -74,7 +76,7 @@ int main() try
         require(paged == ordered, "volume cursor pages without repeats or gaps");
     }
     auto atLeast = byLength; atLeast.minLength = 15.0;
-    require(names(store.selectObjects(txn, atLeast)) == std::vector<std::string>{"a40", "b72", "b60", "a30"},
+    require(names(store.selectObjects(txn, atLeast)) == std::vector<std::string>(ordered.begin(),ordered.begin()+4),
             "minimum length is inclusive in volume voxels");
     atLeast.minLength = std::nextafter(15.0, 16.0);
     require(names(store.selectObjects(txn, atLeast)) == std::vector<std::string>{"a40", "b72"},
@@ -82,7 +84,7 @@ int main() try
     // At a working level, half the volume's voxels: lengths are measured there.
     auto atHalf = byLength; atHalf.targetScale = 0.5; atHalf.minLength = 7.5;
     const auto half = store.selectObjects(txn, atHalf, std::vector<std::string>{"name", "fiber"});
-    require(names(half) == std::vector<std::string>{"a40", "b72", "b60", "a30"} && half.front().volumeLength == 10.0,
+    require(names(half) == std::vector<std::string>(ordered.begin(),ordered.begin()+4) && half.front().volumeLength == 10.0,
             "a target scale measures lengths in its voxels");
     require(rejects([&] { auto bad = byLength; bad.targetScale = 0; (void)store.selectObjects(txn, bad); }),
             "a target scale must be positive");

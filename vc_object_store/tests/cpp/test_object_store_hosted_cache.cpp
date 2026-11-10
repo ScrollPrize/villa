@@ -133,6 +133,54 @@ void referencedRecordsCache()
             "mixed-source prefetch retains both owner-qualified records across restart");
 }
 
+void referencedGraphCache()
+{
+    TemporaryDirectory directory;
+    for(const auto policy:{HistoryMode::On,HistoryMode::Off}) {
+        const auto root=directory.path/std::to_string(int(policy));std::filesystem::create_directory(root);
+        OpenOptions options;options.author="cache-test";options.history=policy;
+        const auto base=root/"base.vcobj",overlay=root/"overlay.vcobj";
+        std::vector<ObjectVersion> refs;
+        {auto db=ObjectStore::create(base,options);auto w=db.write();ObjectRecord record;record.kind="note";
+            const auto a=db.upsertObject(w,record),b=db.upsertObject(w,record);w.commit();
+            {auto r=db.read();refs={db.currentObjectRevision(r,a)->reference(),db.currentObjectRevision(r,b)->reference()};}
+            auto seal=db.write();db.seal(seal);seal.commit();}
+        {auto db=ObjectCollection::create(overlay,{base},options);}
+        server::Server server(overlay,{});server.start();
+        const auto endpoint="http://127.0.0.1:"+std::to_string(server.port());HostedStore writer(endpoint);
+        HostedSessionOptions settings;settings.client.retries=0;settings.cacheDirectory=root/"cache";settings.minFreeBytes=0;
+        detail::HostedAttachment cached(endpoint,settings);
+        require(cached.relationshipsAt(refs).empty(),"cache initially empty inherited graph");
+        const auto request=[&] {
+            const auto status=writer.status();TransactionRequest value;value.requestUuid=util::newUuid();
+            value.storeUuid=status.storeUuid;value.generation=status.generation;value.author="cache-test";
+            for(const auto& ref:refs)expectObject(value,ref);
+            return value;
+        };
+        EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="test";edge.aUuid=refs[0].objectUuid;edge.bUuid=refs[1].objectUuid;
+        auto add=request();add.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});const auto added=writer.submit(add);
+        cached.refresh();require(cached.relationshipsAt(refs).size()==1,"refresh invalidates inherited graph disk cache");
+        detail::HostedAttachment reopened(endpoint,settings);
+        require(reopened.relationshipsAt(refs).size()==1,"reopened cache retains current graph membership");
+        auto remove=request();remove.expectedRelationships[edge.uuid]=added.relationships.at(edge.uuid);
+        remove.operations.push_back(RemoveEdgeOp{edge.uuid});cached.submit(remove);
+        require(cached.relationshipsAt(refs).empty(),"own submit invalidates graph without explicit refresh");
+        // An empty response already in flight must not outlive a refresh that
+        // observes a new overlay edge, even though endpoint pins are identical.
+        PausingProxy proxy(endpoint,"/v1/query/relationships");
+        auto raceSettings=settings;raceSettings.cacheDirectory=root/"race-cache";
+        detail::HostedAttachment racing(proxy.endpoint(),raceSettings);
+        auto pending=std::async(std::launch::async,[&]{return racing.relationshipsAt(refs);});
+        try {
+            proxy.wait();edge.uuid=util::newUuid();auto next=request();
+            next.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});writer.submit(next);
+            racing.refresh();proxy.release();
+            require(pending.get().size()==1,"late graph response retries after newer observed commit");
+        } catch (...) {proxy.release();throw;}
+        server.stop();
+    }
+}
+
 void selectedHeadAndCanonicalCache()
 {
     TemporaryDirectory directory;const auto path=directory.path/"store.vcobj";
@@ -492,6 +540,7 @@ int main()
 try {
     selectedHeadAndCanonicalCache();
     referencedRecordsCache();
+    referencedGraphCache();
 #ifdef VC_REAL_SURFACE
     persistentObjects();
 #endif

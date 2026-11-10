@@ -90,9 +90,10 @@ struct ObjectRecord : RecordCommon {
     std::optional<FiberDetail> fiber;
     std::optional<SurfaceDetail> surface;
     std::optional<TrackDetail> track;
-    // Set by volume selections ordered by length on objects bound to the
-    // volume: the target-voxel length they were ordered by, which is the
-    // afterLength cursor for the next page.
+    // Measured query-frame length for length-ordered selections: native units
+    // without a volume target, target voxels otherwise. Legacy field name;
+    // use this for afterLength, not the persisted ingestion summary. Unbound
+    // volume tails have no measured length.
     std::optional<double> volumeLength;
     ObjectVersion reference() const;
 };

@@ -84,6 +84,12 @@ const objects::ReadTxn& StoredGeometry::txn() const
     if (!read_) throw std::logic_error("object links: the stored geometry snapshot was closed");
     return *read_;
 }
+std::filesystem::path StoredGeometry::sourcePath(const objects::ObjectRecord& object) const
+{
+    const auto path = db_.resolveStoragePath(txn(), object.uuid);
+    if (!path) throw std::invalid_argument("object has no external source: " + object.uuid);
+    return std::filesystem::weakly_canonical(*path);
+}
 std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kind,
     const std::vector<std::string>& uuids)
 {
