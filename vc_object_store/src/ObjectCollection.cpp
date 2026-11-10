@@ -269,10 +269,10 @@ struct ObjectCollection::Impl {
         };
         // Edges and objects have the same UUID/tombstone routing semantics.
         const auto visibleScope=scope;
-        pool->edgeSource=[this,n,get,visibleScope](const std::string& uuid,bool inherited)->sqlite3*{
+        pool->edgeSource=[this,n,get,visibleScope](const std::string& uuid,bool inherited,bool includeDeleted)->sqlite3*{
             for(const auto i:uuidReadOrder(uuid,"edges"))if(visibleScope.contains(i)&&(!inherited||i!=n)){
                 auto* source=get(i);Statement row(source,"SELECT state FROM edges WHERE uuid=?",parseUuid(uuid));
-                if(row.row())return row.i64(0)==2?nullptr:source;
+                if(row.row())return includeDeleted||row.i64(0)!=2?source:nullptr;
             }
             return nullptr;
         };
@@ -418,7 +418,7 @@ struct detail::CollectionReadContext {
     StatementPool* borrowedPool=nullptr;
     std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> previousReferences;
     std::function<sqlite3*(const std::string&,bool,bool)> previousObjects;
-    std::function<sqlite3*(const std::string&,bool)> previousEdges;
+    std::function<sqlite3*(const std::string&,bool,bool)> previousEdges;
     std::function<std::vector<sqlite3*>()> previousQueries;
     std::map<size_t,std::unique_ptr<ReadTxn>> readers;
     std::set<StatementPool*> configured;

@@ -3,6 +3,7 @@
 #include "internal/SqlValues.hpp"
 #include "internal/ReferenceResolver.hpp"
 #include "internal/Versions.hpp"
+#include "internal/RecordResolver.hpp"
 #include "geometry/GeometryInternal.hpp"
 
 namespace vc::objects::detail {
@@ -276,9 +277,10 @@ EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string
     // Merely reviving an endpoint never reactivates relationships. Historical
     // relationship revisions retain the earlier state independently.
     int64_t nextVersion = 1;
-    {
-        Statement previous(db, "SELECT version FROM edges WHERE uuid=? AND state=2", parseUuid(rec.uuid));
+    if(auto* source=edgeSource(db,rec.uuid,false,true)) {
+        Statement previous(source, "SELECT version,state FROM edges WHERE uuid=?", parseUuid(rec.uuid));
         if (previous.row()) {
+            if(previous.i64(1)!=2)throw std::runtime_error("object store: edge UUID already exists: "+rec.uuid);
             if (previous.i64(0) == INT64_MAX) throw std::overflow_error("relationship version exhausted");
             nextVersion = previous.i64(0) + 1;
         }

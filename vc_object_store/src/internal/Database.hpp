@@ -49,7 +49,7 @@ struct StatementPool {
     // or per-record directories; returned connections live for the transaction.
     std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> referenceSource;
     std::function<sqlite3*(const std::string&,bool,bool)> objectSource;
-    std::function<sqlite3*(const std::string&,bool)> edgeSource;
+    std::function<sqlite3*(const std::string&,bool,bool)> edgeSource;
     // Physical query sources in this pinned logical scope; visibility is
     // checked by key resolution before filtering/pagination is finalized.
     std::function<std::vector<sqlite3*>()> querySources;

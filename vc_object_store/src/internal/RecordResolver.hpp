@@ -28,13 +28,13 @@ inline std::optional<ResolvedObject> resolveObject(sqlite3* db,const std::string
     if(!row.row())return std::nullopt;
     return ResolvedObject{source,readObjectRow(source,row)};
 }
-inline sqlite3* edgeSource(sqlite3* db,const std::string& uuid,bool inherited=false)
+inline sqlite3* edgeSource(sqlite3* db,const std::string& uuid,bool inherited=false,bool includeDeleted=false)
 {
     if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end()&&pool->second->edgeSource)
-        return pool->second->edgeSource(uuid,inherited);
+        return pool->second->edgeSource(uuid,inherited,includeDeleted);
     if(inherited)return nullptr;
     Statement row(db,"SELECT state FROM edges WHERE uuid=?",parseUuid(uuid));
-    return row.row()&&row.i64(0)!=2?db:nullptr;
+    return row.row()&&(includeDeleted||row.i64(0)!=2)?db:nullptr;
 }
 struct ResolvedEdge {sqlite3* source;EdgeRecord record;};
 inline std::optional<ResolvedEdge> resolveEdge(sqlite3* db,const std::string& uuid)

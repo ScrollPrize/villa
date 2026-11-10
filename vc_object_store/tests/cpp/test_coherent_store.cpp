@@ -90,6 +90,22 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
     mustFail([&]{auto w=store.write();store.setMeta(w,f.a,"quality","8");w.commit();});
 }
 
+void edgeIdentity(HistoryMode mode){
+    Fixture f(mode,mode);
+    auto store=ObjectStore::open(f.overlay,options(mode));EdgeRecord edge;
+    {auto r=store.read();edge=*store.edgeByUuid(r,f.edge);}
+    mustFail([&]{auto w=store.write();auto replacement=edge;replacement.kind="different";store.addEdge(w,replacement);w.commit();});
+    {auto r=store.read();require(store.edgeByUuid(r,f.edge)->kind==edge.kind,"add cannot replace an inherited live edge");}
+    {auto w=store.write();store.removeEdge(w,f.edge);store.seal(w);w.commit();}
+    int64_t deletedVersion;
+    {auto r=store.read();Statement row(ObjectStoreImplAccess::conn(r),"SELECT version FROM edges WHERE uuid=?",parseUuid(f.edge));row.row();deletedVersion=row.i64(0);}
+    const auto next=f.dir.path/"next.vcobj";
+    {auto collection=ObjectCollection::create(next,{f.overlay},options(mode));}
+    auto child=ObjectStore::open(next,options(mode));
+    {auto w=child.write();child.addEdge(w,edge);w.commit();}
+    {auto r=child.read();require(child.edgeByUuid(r,f.edge)->version==deletedVersion+1,"reviving an inherited tombstone continues its version");}
+}
+
 void geometryEdit(HistoryMode baseHistory,HistoryMode overlayHistory,const std::string& action){
     Fixture f(baseHistory,overlayHistory);
     auto store=ObjectStore::open(f.overlay,options(overlayHistory));
@@ -308,6 +324,7 @@ void deletedAndExactReads(HistoryMode baseMode,HistoryMode overlayMode){
 }
 }
 int main()try{
+    for(const auto mode:{HistoryMode::Off,HistoryMode::On})edgeIdentity(mode);
     for(const auto base:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On}){
         readsAndOverrides(base,overlay);geometryEdit(base,overlay,"retain");
         deletedAndExactReads(base,overlay);
