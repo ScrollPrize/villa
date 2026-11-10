@@ -1,6 +1,6 @@
 # Coherent store API cleanup
 
-Latest follow-up: [R3 16-finding fixes and validation](review-r3-summary.md); previous [21-finding fix tracker](coherent-store-fix-tasks.md). The dated review sections below retain their historical evidence.
+Latest completed follow-up: [R4 fixes and validation](review-r4/fixes.md); previous [R3 fixes](review-r3-summary.md) and [21-finding tracker](coherent-store-fix-tasks.md). The dated review sections below retain their historical evidence.
 
 ## Open findings from review of `557a6f925`
 
@@ -106,6 +106,8 @@ Production diff versus `3812cb17b`: 204 lines added, 205 removed (net −1); reg
 ## Contract
 
 Current and exact-version reads, graph queries, edits, geometry, extension data and artifacts must use shared resolution and validation. Physical placement (local, partitioned, referenced, packed) belongs in storage routing, not consumer-specific branches. History policy changes retention, not identity. Preserve binary identifiers, slim history-off storage, checked writes, tombstone precedence and immutable dependencies; do not introduce proxy records or per-object routing directories.
+
+R4 implementation rules: loaded tool outputs retain both the complete pin/write generation and any loaded coordinate-mapping guard, including artifact publication; use shared checked request preparation, not a fresh current lookup. Preserve a transformed reader's explicit validity mask rather than reconstructing it from transformed coordinates. Apply shadowing before region object-limit admission or refill bounded pages with cumulative work budgets; discarded output still costs work. A foreign structural slice does not prove ownership of an already allocated target point ID; restore identity from that target's retained history. Optional report/export files must respect the same backing-store closure protection as geometry exports and publish atomically.
 
 Additional regression-backed rules from [R3](review-r3-summary.md):
 

@@ -1,0 +1,14 @@
+# R4 native and parser fixes
+
+Baseline `2b5d1e01f`. Confirmed findings only; preserve schema 21, binary identifiers, shared routing and retention semantics. No extra persistent fields, tables or referenced payload copies.
+
+- N-001: editing restart saves pending corrections before preparing a new destination or resetting/reloading session state. A previous stop's failed save therefore vetoes restart instead of discarding data. Healthy restarts still proceed after successful/no-op saves. The four local/reference × history-on/off correction fixtures exercise failed persistence, retained baseline, successful retry and reload; the actual GUI restart caller is compile/code-path coverage, not an interactive GUI execution.
+- N-002: `ToolObjects` retains the loaded transformed view's existing `CheckVolumeMappingOp`. Its shared writable preparation adds the loaded generation, complete object expectation and mapping check from the same remembered read. `StoreSurfaces` uses that request instead of rebuilding only part of the guard. No-op geometry updates remain no-ops. Runtime tests cover an initially identity registration, a successful edit, a registration-only change and rejected stale edit with unchanged geometry, in all four history/reference fixture combinations.
+- S-004: stamped dimensions must fit the public positive `int` range before conversion. Existing malformed-frame reporting/refusal handles invalid dimensions, including large unsigned JSON integers; no new parser path or permissive fallback.
+- S-005: source point repair allocates the next ID only when repairing a point and checks exhaustion before incrementing. An unmodified maximum-ID input requires no successor. Exhausted repair rejects during preparation, before publication.
+
+## Validation
+
+`bash local/scripts/check_vcobj_consumers` passed all 33 translation units, including the actual edited session caller, shared StoreSurfaces and catalog regression source. `bash local/scripts/run_vcobj_consumer_checks` passed the native parser target `test_object_store_umbilicus_file` (one test, 0.02 s), Python `vc_object_store/tests/python/test_source_repairs.py` (five tests, 0.19 s), and all existing eight native consumer executables. The argument-free path remains unchanged; the runner now includes those parser/repair checks. Its temporary fixture root is automatically cleaned on success, error or interruption.
+
+The catalog runtime fixtures additionally verify mapped artifact provenance through the same remembered read: stale mapping rejects publication even with unchanged object identity, while reloading through a current nonidentity mapping permits artifact output. The selected `ObjectRevision` is passed directly into transformed geometry loading, rather than making a second head lookup. `git diff --check` passed. No installs, real-volume runs, macOS or full interactive GUI result claimed.
