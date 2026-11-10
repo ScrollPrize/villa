@@ -41,6 +41,16 @@ def test_resource_identity_distinguishes_location_and_owner(db):
     assert [v["uuid"] for v in db.project_resources("volume", viewer="bob")] == [shared]
 
 
+def test_readding_retired_resource_restores_visibility(db):
+    uuid = db.add_project_resource("volume", "/scan", owner="alice")
+    with db.write() as writer:
+        writer.retire_object(uuid)
+    assert db.project_resources("volume") == []
+    assert db.add_project_resource("volume", "/scan", owner="alice", meta={"checked": True}) == uuid
+    assert db.project_resources("volume", viewer="alice")[0]["meta"] == {"checked": True}
+    assert db.project_resources("volume", viewer="bob") == []
+
+
 @pytest.mark.parametrize("port", ["65536", "123junk", "-1"])
 def test_server_rejects_invalid_port_before_opening_store(tmp_path, port):
     server = os.environ.get("VC_OBJECT_SERVER")

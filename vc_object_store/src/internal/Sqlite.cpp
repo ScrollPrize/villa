@@ -89,10 +89,11 @@ std::string formatUuid(const std::array<unsigned char, 16>& bytes)
     return out;
 }
 
-std::string nowIsoUtc()
+std::string nowIsoUtc(bool fractional)
 {
     const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    const auto second = std::chrono::floor<std::chrono::seconds>(now);
+    const std::time_t t = std::chrono::system_clock::to_time_t(second);
     std::tm tm{};
 #ifdef _WIN32
     gmtime_s(&tm, &t);
@@ -100,8 +101,10 @@ std::string nowIsoUtc()
     gmtime_r(&t, &tm);
 #endif
     char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return buf;
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+    if (!fractional) return std::string(buf) + "Z";
+    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now-second).count();
+    return std::string(buf) + "." + std::to_string(1000000 + micros).substr(1) + "Z";
 }
 
 std::string detectHostname()

@@ -5,6 +5,7 @@
 #include "vc_object_store/objects/ObjectCopy.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <iostream>
@@ -52,20 +53,30 @@ void ownerHistoryPolicy(HistoryMode sourceMode,HistoryMode overlayMode)
     {auto collection=ObjectCollection::create(overlay,{base},overlayOptions);}
     auto store=ObjectStore::open(overlay,overlayOptions);
     const auto local=projectResourceRecord(kVolumeResource,"/volumes/local");
-    if(sourceMode==HistoryMode::Off && overlayMode==HistoryMode::On){
+    if(sourceMode!=overlayMode){
         auto w=store.write();store.upsertObject(w,local);w.commit();
     }
-    auto txn=store.read();LocalStoreReader reader(store,txn);
-    const auto listed=projectResources(reader,kVolumeResource);
-    if(sourceMode==HistoryMode::Off && overlayMode==HistoryMode::On)
-        require(listed.size()==2 && listed[0].uuid==resource.uuid && listed[1].uuid==local.uuid,
-                "current-only creation and retained publication sort on one time scale");
-    else require(listed.size()==1,"resource discovery uses owner history policy");
-    require(projectRecord(reader).has_value(),"project ordering uses owner history policy");
-    require(reader.objectHistory(deleted,true).size()==(sourceMode==HistoryMode::On?2:0),"optional history follows winning tombstone owner");
-    require(currentVersionOf(reader,deleted)==(sourceMode==HistoryMode::On?std::optional<int64_t>(2):std::nullopt),
-        "retained tombstone version does not depend on overlay history policy");
-    if(sourceMode==HistoryMode::Off)mustFail([&]{reader.objectHistory(resource.uuid);});
+    {
+        auto txn=store.read();LocalStoreReader reader(store,txn);
+        const auto listed=projectResources(reader,kVolumeResource);
+        if(sourceMode!=overlayMode)
+            require(listed.size()==2 && listed[0].uuid==resource.uuid && listed[1].uuid==local.uuid,
+                    "mixed history modes order resources by original creation");
+        else require(listed.size()==1,"resource discovery uses owner history policy");
+        require(projectRecord(reader).has_value(),"project ordering uses owner history policy");
+        require(reader.objectHistory(deleted,true).size()==(sourceMode==HistoryMode::On?2:0),"optional history follows winning tombstone owner");
+        require(currentVersionOf(reader,deleted)==(sourceMode==HistoryMode::On?std::optional<int64_t>(2):std::nullopt),
+            "retained tombstone version does not depend on overlay history policy");
+        if(sourceMode==HistoryMode::Off)mustFail([&]{reader.objectHistory(resource.uuid);});
+    }
+    if(sourceMode!=overlayMode) {
+        auto w=store.write();
+        auto override=resource;override.meta=R"({"reviewed":true})";
+        store.upsertObject(w,override);w.commit();
+        auto r=store.read();
+        require(projectResources(LocalStoreReader(store,r),kVolumeResource).front().uuid==resource.uuid,
+                "metadata override does not change original creation order");
+    }
 }
 
 void copyCollectionProject(bool packed,bool sharded)
@@ -349,12 +360,29 @@ int main() try
     require(addProjectResource(session, project, kVolumeResource, local), "re-added");
     require(resources(session, project, kVolumeResource).size() == 2, "re-added resource listed");
 
+    const auto legacyPath = directory.path / "legacy-resource.vcobj";
+    auto legacy = projectResourceRecord(kVolumeResource, "/legacy");
+    legacy.uuid = util::nameUuid("vc_project_resource/volume//legacy");
+    {
+        auto store = ObjectStore::create(legacyPath, as("alice"));
+        auto w = store.write();
+        store.upsertObject(w, legacy);
+        w.commit();
+    }
+    const auto legacyProject = session.attach(legacyPath, as("alice"));
+    const auto newKey = projectResourceUuid(kVolumeResource, "/legacy");
+    updateProjectResourceMeta(session, legacyProject, newKey, {{"checked", true}});
+    require(resources(session, legacyProject, kVolumeResource).front().uuid == legacy.uuid, "legacy UUID retained");
+    require(removeProjectResource(session, legacyProject, newKey), "new deterministic key addresses legacy resource");
+
     // A resource of one owner (a path on their disk) is theirs alone, even at a path another uses.
     const std::string onDisk = "/home/user/predictions.zarr";
     require(addProjectResource(session, project, kVolumeResource, onDisk, {}, Json::object(), "alice"), "alice's own");
     require(addProjectResource(session, project, kVolumeResource, onDisk, {}, Json::object(), "bob"), "bob's own");
     require(projectResourceUuid(kVolumeResource, onDisk, "alice") != projectResourceUuid(kVolumeResource, onDisk, "bob"),
             "owners name their resources apart");
+    mustFail([&] { updateProjectResourceMeta(session, project, projectResourceUuid(kVolumeResource, onDisk, "alice"),
+                                             {{"owner", ""}}); });
     const auto seenBy = [&](const std::string& viewer) {
         std::vector<std::string> owners;
         for (const auto& resource : resources(session, project, kVolumeResource, viewer))

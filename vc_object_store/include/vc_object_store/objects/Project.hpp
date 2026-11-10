@@ -59,24 +59,30 @@ std::optional<ObjectRecord> projectRecord(const StoreReader&);
 void setProjectName(ObjectStoreSession&, const AttachmentIdentity&, const std::string& name);
 
 // The live resources of `kind` `viewer` sees (the shared ones and those it
-// owns; every one when nullopt), in the order they were added.
+// owns; every one when nullopt), in creation order. Legacy whole-second
+// stamps sort after precise stamps within their second; ties use UUID.
 std::vector<ProjectResource> projectResources(const StoreReader&, const std::string& kind,
                                               const std::optional<std::string>& viewer = std::nullopt);
-// The resource's UUID, the same in every store.
+// Deterministic UUID for a new resource. An existing legacy resource keeps
+// its stored UUID; use the listed or returned UUID for generic object APIs.
 std::string projectResourceUuid(const std::string& kind, const std::string& location, const std::string& owner = {});
-// The record of a resource, as addProjectResource writes it (upsertObject).
+// Candidate record for a new resource, before resolving any legacy identity.
 ObjectRecord projectResourceRecord(const std::string& kind, const std::string& location,
                                    const std::vector<std::string>& tags = {},
                                    const nlohmann::json& meta = nlohmann::json::object(),
                                    const std::string& owner = {});
 // Preserve an existing legacy UUID only when it names this exact resource.
 ObjectRecord resolveProjectResourceIdentity(const StoreReader&, ObjectRecord);
+// Direct-store counterpart of the checked session helper, with the same
+// identity and retirement rules. Returns the actual stored UUID.
+std::string addProjectResource(ObjectStore&, WriteTxn&, ObjectRecord);
 // Add a resource (or bring back a removed one) with these tags and meta, shared
 // or `owner`'s; false when it is already there, unchanged.
 bool addProjectResource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& kind,
                         const std::string& location, const std::vector<std::string>& tags = {},
                         const nlohmann::json& meta = nlohmann::json::object(), const std::string& owner = {});
-// Merge `meta`'s keys into the resource's meta; no change, no revision.
+// Merge metadata without changing the resource's owner. The deterministic
+// new-resource UUID also resolves to a matching legacy record here.
 void updateProjectResourceMeta(ObjectStoreSession&, const AttachmentIdentity&, const std::string& uuid,
                                const nlohmann::json& meta);
 // Retire a resource; false when it is not there.

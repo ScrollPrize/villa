@@ -1661,7 +1661,7 @@ NB_MODULE(_native, m)
         const auto record=vo::projectResourceRecord(kind,location,tags,
             meta.is_none()?nlohmann::json::object():nlohmann::json::parse(jsonDumps(meta)),owner);
         return self.withWrite([&](auto& db,auto& txn){
-            return db.upsertObject(txn,vo::resolveProjectResourceIdentity(vo::LocalStoreReader(db,txn),record));
+            return vo::addProjectResource(db,txn,record);
         });
     },nb::arg("kind"),nb::arg("location"),nb::arg("tags")=std::vector<std::string>{},nb::arg("meta")=nb::none(),
       nb::arg("owner")="","Add (or update) a project resource, shared or owner's alone; returns its uuid.");

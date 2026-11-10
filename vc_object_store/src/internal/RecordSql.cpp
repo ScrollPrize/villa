@@ -9,6 +9,7 @@
 #include "internal/RecordOverrides.hpp"
 #include "internal/RecordJson.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
+#include "vc_object_store/objects/Project.hpp"
 
 namespace vc::objects::detail {
 const char* kObjectCols =
@@ -422,7 +423,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         Statement collision(source, "SELECT 1 FROM edges WHERE uuid=?", uuid);
         return collision.row();
     })) throw std::runtime_error("object store: UUID already belongs to an edge");
-    const std::string now = nowIsoUtc();
+    const std::string now = nowIsoUtc(rec.kind == kProjectKind || isProjectResourceKind(rec.kind));
     Statement managed(db, "SELECT version,data_checksum,storage_ref FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
         uuid);
     const bool hasGeometry = managed.row();

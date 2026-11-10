@@ -2,43 +2,21 @@
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
+#include "internal/Database.hpp"
 #include <algorithm>
-#include <charconv>
-#include <chrono>
-#include <map>
 #include <tuple>
 
 namespace vc::objects {
 namespace {
 using Json = nlohmann::json;
 
-std::optional<int64_t> addedAt(const StoreReader& reader, const ObjectRecord& record)
+void sortByAdded(std::vector<ObjectRecord>& records)
 {
-    const auto history = reader.objectHistory(record.uuid, true);
-    if (!history.empty() && history.front().publishedAtUs) return history.front().publishedAtUs;
-    const auto& s = record.createdAt;
-    if (s.size() != 20 || s[4] != '-' || s[7] != '-' || s[10] != 'T' ||
-        s[13] != ':' || s[16] != ':' || s[19] != 'Z') return {};
-    auto number = [&](int offset, int length) {
-        unsigned n = 0;
-        const auto end = s.data() + offset + length;
-        const auto [p, ec] = std::from_chars(s.data() + offset, end, n);
-        return ec == std::errc{} && p == end ? n : 10000u;
-    };
-    using namespace std::chrono;
-    const auto day = year(int(number(0,4))) / month(number(5,2)) / std::chrono::day(number(8,2));
-    const auto h = number(11,2), m = number(14,2), sec = number(17,2);
-    if (!day.ok() || h >= 24 || m >= 60 || sec >= 60) return {};
-    return duration_cast<microseconds>((sys_days(day) + hours(h) + minutes(m) + seconds(sec)).time_since_epoch()).count();
-}
-
-void sortByAdded(const StoreReader& reader, std::vector<ObjectRecord>& records)
-{
-    std::map<std::string, int64_t> added;
-    for (const auto& record : records)
-        added.emplace(record.uuid, addedAt(reader, record).value_or(INT64_MAX));
-    std::sort(records.begin(), records.end(), [&](const auto& a, const auto& b) {
-        return std::tie(added.at(a.uuid), a.uuid) < std::tie(added.at(b.uuid), b.uuid);
+    // UTC creation stamps survive overrides. Legacy whole-second stamps sort
+    // after precise stamps in the same second, then by UUID.
+    std::sort(records.begin(), records.end(), [](const auto& a, const auto& b) {
+        return std::tuple(a.createdAt.empty(), std::string_view(a.createdAt), std::string_view(a.uuid)) <
+               std::tuple(b.createdAt.empty(), std::string_view(b.createdAt), std::string_view(b.uuid));
     });
 }
 
@@ -57,6 +35,45 @@ std::optional<int64_t> currentRevision(ObjectStoreSession& session, const Attach
         if (record) *record = head ? std::optional(head->record) : std::nullopt;
     });
     return version;
+}
+
+std::string legacyResourceUuid(const ObjectRecord& record, const std::string& owner)
+{
+    return util::nameUuid("vc_project_resource/" + record.kind + "/" + record.storageRef +
+        (owner.empty() ? "" : "/owner/" + owner));
+}
+
+std::optional<ObjectRecord> resourceForEdit(const StoreReader& reader, const std::string& uuid)
+{
+    if (auto head = reader.currentObject(uuid)) return std::move(head->record);
+    if (currentVersionOf(reader, uuid)) return std::nullopt;
+    // The deterministic key for new resources can also address an exact legacy
+    // resource in this API; generic object lookups always require a stored UUID.
+    for (const auto* kind : {kVolumeResource, kNormalGridResource, kLasagnaDatasetResource})
+        for (const auto& resource : projectResources(reader, kind))
+            if (projectResourceUuid(kind, resource.location, resource.owner) == uuid) {
+                auto head = reader.currentObject(resource.uuid);
+                if (head && head->record.uuid == legacyResourceUuid(head->record, resource.owner))
+                    return std::move(head->record);
+            }
+    return std::nullopt;
+}
+
+struct ResourceWrite {
+    ObjectRecord record;
+    std::optional<ObjectRecord> existing;
+    bool unchanged() const {
+        return existing && !existing->retired && existing->tags == record.tags &&
+            Json::parse(existing->meta) == Json::parse(record.meta);
+    }
+    bool restore() const { return existing && existing->retired; }
+};
+
+ResourceWrite prepareResourceWrite(const StoreReader& reader, ObjectRecord record)
+{
+    record = resolveProjectResourceIdentity(reader, std::move(record));
+    auto existing = reader.currentObject(record.uuid);
+    return {std::move(record), existing ? std::optional(std::move(existing->record)) : std::nullopt};
 }
 
 // Write `record` over the object's current version `version` (created when
@@ -120,7 +137,7 @@ std::optional<ObjectRecord> projectRecord(const StoreReader& reader)
     if (records.empty()) return std::nullopt;
     if (records.size() == 1) return std::move(records.front());
     // A store holds one; with several, the first added.
-    sortByAdded(reader, records);
+    sortByAdded(records);
     return std::move(records.front());
 }
 
@@ -146,7 +163,7 @@ std::vector<ProjectResource> projectResources(const StoreReader& reader, const s
     ObjectSelection selection;
     selection.kind = kind;
     auto records = reader.selectObjects(selection);
-    sortByAdded(reader, records);
+    sortByAdded(records);
     std::vector<ProjectResource> resources;
     for (auto& record : records) {
         if (record.storageKind != kDatasetStorage) continue;
@@ -188,8 +205,8 @@ ObjectRecord projectResourceRecord(const std::string& kind, const std::string& l
 ObjectRecord resolveProjectResourceIdentity(const StoreReader& reader, ObjectRecord record)
 {
     const auto owner = Json::parse(record.meta).value("owner", std::string{});
-    const auto legacy = util::nameUuid("vc_project_resource/" + record.kind + "/" + record.storageRef +
-        (owner.empty() ? "" : "/owner/" + owner));
+    if (currentVersionOf(reader, record.uuid)) return record;
+    const auto legacy = legacyResourceUuid(record, owner);
     if (const auto existing = reader.currentObject(legacy); existing &&
         existing->record.kind == record.kind && existing->record.storageKind == record.storageKind &&
         existing->record.storageRef == record.storageRef &&
@@ -198,20 +215,29 @@ ObjectRecord resolveProjectResourceIdentity(const StoreReader& reader, ObjectRec
     return record;
 }
 
+std::string addProjectResource(ObjectStore& db, WriteTxn& txn, ObjectRecord record)
+{
+    auto write = prepareResourceWrite(LocalStoreReader(db, txn), std::move(record));
+    if (write.unchanged()) return write.record.uuid;
+    detail::Savepoint operation(ObjectStoreImplAccess::conn(txn));
+    if (write.restore()) db.restoreObject(txn, write.record.uuid);
+    auto uuid = db.upsertObject(txn, write.record);
+    operation.release();
+    return uuid;
+}
+
 bool addProjectResource(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& kind,
                         const std::string& location, const std::vector<std::string>& tags, const Json& meta,
                         const std::string& owner)
 {
-    auto record = projectResourceRecord(kind, location, tags, meta, owner);
+    ResourceWrite write;
+    std::optional<int64_t> revision;
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
-        record = resolveProjectResourceIdentity(reader, std::move(record));
+        write = prepareResourceWrite(reader, projectResourceRecord(kind, location, tags, meta, owner));
+        revision = write.existing ? write.existing->version : currentVersionOf(reader, write.record.uuid);
     });
-    std::optional<ObjectRecord> existing;
-    const auto revision = currentRevision(session, attachment, record.uuid, &existing);
-    if (existing && !existing->retired && existing->tags == record.tags &&
-        Json::parse(existing->meta) == Json::parse(record.meta))
-        return false;
-    writeRecord(session, attachment, record, revision, existing, existing && existing->retired);
+    if (write.unchanged()) return false;
+    writeRecord(session, attachment, write.record, revision, write.existing, write.restore());
     return true;
 }
 
@@ -219,25 +245,31 @@ void updateProjectResourceMeta(ObjectStoreSession& session, const AttachmentIden
                                const std::string& uuid, const Json& meta)
 {
     std::optional<ObjectRecord> record;
-    const auto revision = currentRevision(session, attachment, uuid, &record);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        record = resourceForEdit(reader, util::canonicalUuid(uuid));
+    });
     if (!record || record->retired || !isProjectResourceKind(record->kind))
         throw std::runtime_error("not a project resource: " + uuid);
     auto merged = Json::parse(record->meta);
     const auto before = merged;
     merged.update(meta);
+    if (merged.value("owner", std::string{}) != before.value("owner", std::string{}))
+        throw std::invalid_argument("project resource owner is part of its identity");
     if (merged == before) return;
     record->meta = merged.dump();
-    writeRecord(session, attachment, *record, revision, record);
+    writeRecord(session, attachment, *record, record->version, record);
 }
 
 bool removeProjectResource(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& uuid)
 {
     std::optional<ObjectRecord> record;
-    const auto revision = currentRevision(session, attachment, uuid, &record);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        record = resourceForEdit(reader, util::canonicalUuid(uuid));
+    });
     if (!record || record->retired || !isProjectResourceKind(record->kind)) return false;
     auto request = session.newRequest(attachment);
     expectObject(request, record->reference());
-    request.operations.push_back(RetireObjectOp{uuid});
+    request.operations.push_back(RetireObjectOp{record->uuid});
     session.submit(attachment, request);
     return true;
 }
