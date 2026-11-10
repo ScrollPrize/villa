@@ -24,7 +24,7 @@ try {
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: vc_object_export --db objects.vcobj --uuid UUID --output PATH [options]\n"
                 "  --version N      export a recorded object version (default: current)\n"
-                "  --generation G   history generation of --version (default: active)\n"
+                "  --generation G   history generation of --version (default: current owner's)\n"
                 "  --overwrite      replace the entire destination atomically\n"
                 "  --valid-only     surfaces: write invalid vertices as missing, no mask.tif\n"
                 "Exports one surface directory, fiber JSON, single-collection JSON, or\n"
@@ -40,8 +40,10 @@ try {
     if (generation && !version) throw std::runtime_error("--generation needs --version");
     std::optional<vc::objects::ObjectVersion> selected;
     if (version) {
-        const auto status = db.status(db.read());
-        selected = vc::objects::ObjectVersion{status.storeUuid, generation.value_or(status.generation), object, *version};
+        const auto read=db.read();
+        const auto current=db.currentObjectRevision(read,object);
+        if(!current)throw std::invalid_argument("export_geometry: object not found");
+        selected=current->reference(version,generation);
     }
     const auto exported = vc::objects::exportGeometry(db, object, destination, selected, overwrite, validOnly);
     std::cout << "Exported version " << exported.version << " (generation " << exported.generation << ") to "

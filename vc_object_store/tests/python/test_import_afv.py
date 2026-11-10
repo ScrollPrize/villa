@@ -233,6 +233,19 @@ def test_native_uuid_dispatch_combined_and_store_reference(tmp_path, packed):
         assert data['uuid_hash_routing'] and data['readback_verified']
         assert data['fibers'] == (0 if mode == 'store_reference' else 2)
         assert data['constraints'] == (0 if mode == 'geometry' else 5 if mode == 'limited' else 17)
+        if mode in ('geometry', 'store_reference'):
+            # Numbered export must select the owning shard/dependency, not the manifest.
+            database = output if packed else output / 'collection.vcobj'
+            with ObjectStore.open(str(database), read_only=True) as store:
+                record = store.objects_by_kind('fiber')[0]
+                python_output = tmp_path / (mode + '-python.json')
+                selected = store.export_geometry(record['uuid'], python_output, version=1)
+            cli_output = tmp_path / (mode + '-cli.json')
+            exported = subprocess.run([str(tool.with_name('vc_object_export')), '--db', str(database),
+                '--uuid', record['uuid'], '--version', '1', '--generation', selected['generation'],
+                '--output', str(cli_output)], text=True, capture_output=True, timeout=30)
+            assert exported.returncode == 0, exported.stderr
+            assert json.loads(cli_output.read_text()) == json.loads(python_output.read_text())
         if mode == 'limited':
             assert data['estimated_full_import_seconds'] is None
             assert 'sampling fractions differ' in data['estimate_basis']
