@@ -312,7 +312,8 @@ NEW_FIT_KEYS = frozenset(
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
-       "pcl_vertical_fiber_min_z_fraction", "spiral_outward_sense"}
+       "pcl_vertical_fiber_min_z_fraction", "spiral_outward_sense",
+       "umbilicus_smoothing_sigma"}
 )
 
 _AUDITED_PREFIXES = ("model_", "input_", "pcl_", "object_store_")
@@ -630,6 +631,7 @@ class Config:
         self.loss_weight_fiber_directions = 0.0
         self.loss_weight_dense_spacing = 12.0
         self.loss_weight_umbilicus = 1.25
+        self.umbilicus_smoothing_sigma = 75.0
         self.loss_weight_shell_outer = 1.0
         self.dense_min_spacing_d_min_wv = 6.0
         self.dense_normals_finite_difference_epsilon = 8.0

@@ -2,7 +2,6 @@ import functools
 import os
 
 import numpy as np
-import scipy.interpolate
 import scipy.ndimage
 import torch
 import torch.nn as nn
@@ -354,7 +353,8 @@ class VaryingLinearTransform(pyro.distributions.transforms.Transform):
 
 class UmbilicusTransform(pyro.distributions.transforms.Transform):
 
-    # This translates in the yx plane by a z-dependent value (i.e. shears the volume) s.t. the origin is moved to the umbilicus
+    # This translates in the yx plane by a z-dependent value (i.e. shears the volume) s.t. the origin is moved to the umbilicus.
+    # It uses the curve it is given as is: smooth it first (umbilicus.smooth_umbilicus_z_to_yx), so that the losses read the same centre.
 
     domain = pyro.distributions.constraints.real_vector
     codomain = domain
@@ -362,8 +362,7 @@ class UmbilicusTransform(pyro.distributions.transforms.Transform):
     def __init__(self, umbilicus_zyx, event_dim=2, cache_size=0):
         super().__init__(cache_size=cache_size)
         self._event_dim = event_dim
-        yx_filtered = scipy.ndimage.gaussian_filter1d(umbilicus_zyx[:, 1:].cpu().numpy(), sigma=75., axis=0, mode='nearest')
-        self._yx = torch.from_numpy(yx_filtered).to(umbilicus_zyx.device).contiguous()
+        self._yx = umbilicus_zyx[:, 1:].contiguous()
         self._z = umbilicus_zyx[:, :1].contiguous()
 
     def _call(self, input_zyx, inverse=False):
@@ -377,13 +376,6 @@ class UmbilicusTransform(pyro.distributions.transforms.Transform):
 
     def _inverse(self, input_zyx):
         return self._call(input_zyx, inverse=True)
-
-
-def umbilicus_centre_z_to_yx(z_to_yx, z_begin, z_end):
-    """z -> yx of the smoothed centre UmbilicusTransform uses for a model over [z_begin, z_end)."""
-    zs = np.arange(z_begin, z_end)
-    yx = UmbilicusTransform(torch.from_numpy(np.concatenate([zs[:, None], z_to_yx(zs)], axis=-1).astype(np.float32)))._yx
-    return scipy.interpolate.interp1d(zs, yx.numpy(), axis=0, fill_value='extrapolate')
 
 
 class SpiralAndTransform(nn.Module):
