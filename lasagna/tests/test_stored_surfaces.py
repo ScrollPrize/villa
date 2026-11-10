@@ -226,10 +226,13 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		self.store_path = Path(self._td.name) / "objects.vcobj"
 		self.source, _ = _source_surface(self.store_path)
 		fit_service._store = stored_surfaces.StoreSession(self.store_path, author="service")
+		self._old_object_store_dir = fit_service._object_store_dir
+		fit_service._object_store_dir = Path(self._td.name) / "cache"
 
 	def tearDown(self) -> None:
 		fit_service._store.close()
 		fit_service._store = None
+		fit_service._object_store_dir = self._old_object_store_dir
 		self._td.cleanup()
 
 	def test_requests_name_the_service_store_and_a_volume(self) -> None:
@@ -294,6 +297,22 @@ class ServiceStoreRequestTest(unittest.TestCase):
 			shared.close()
 		with ObjectStore.open(str(self.store_path), read_only=True) as db:
 			self.assertEqual(db.object(created)["name"], "written")
+
+	def test_model_reference_reads_the_selected_checkpoint_after_replacement_and_deletion(self) -> None:
+		checkpoint = Path(self._td.name) / "checkpoint.pt"
+		checkpoint.write_bytes(b"original model")
+		first = fit_service._store.publish_artifacts(self.source, {"model.pt": checkpoint})
+		ref = dict(type="surface", uuid=self.source, store=first["store_uuid"],
+				   generation=first["generation"], version=first["objects"][self.source])
+		checkpoint.write_bytes(b"new model")
+		fit_service._store.publish_artifacts(self.source, {"model.pt": checkpoint})
+		self.assertEqual(fit_service._stored_model_path(ref).read_bytes(), b"original model")
+		self.assertEqual(fit_service._stored_model_path(dict(type="surface", uuid=self.source)).read_bytes(), b"new model")
+		with ObjectStore.open(str(self.store_path), author="test") as db:
+			db.delete_object(self.source)
+		self.assertEqual(fit_service._stored_model_path(ref).read_bytes(), b"original model")
+		with self.assertRaisesRegex(ValueError, "numbered version"):
+			fit_service._stored_model_path(dict(type="surface", uuid=self.source, revision="old"))
 
 
 

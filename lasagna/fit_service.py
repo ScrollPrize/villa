@@ -670,24 +670,30 @@ def _require_store() -> stored_surfaces.StoreSession:
     return _store
 
 
-def _stored_surface_path(ref: dict[str, Any]) -> str:
-    """The fit's reference to a stored surface (read from the service store)."""
-    _require_store()
+def _stored_surface_version(ref: dict[str, Any]) -> tuple | None:
+    """Keep the same selected identity for a surface and its model checkpoint."""
     if "revision" in ref:
         raise ValueError("stored surface references select a numbered version (generation and version), not a revision")
     version = ref.get("version")
     if version is None:
-        return stored_surfaces.surface_ref(str(ref.get("uuid") or ""))
+        return None
     selected = (str(ref.get("generation") or ""), int(version))
     if ref.get("store"):
         selected += (str(ref["store"]),)
-    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), selected)
+    return selected
+
+
+def _stored_surface_path(ref: dict[str, Any]) -> str:
+    """The fit's reference to a stored surface (read from the service store)."""
+    _require_store()
+    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), _stored_surface_version(ref))
 
 
 def _stored_model_path(ref: dict[str, Any]) -> Path:
     """The model checkpoint a fit published with a stored surface (its ``model.pt`` artifact), as a local copy in
     the service's object cache."""
-    path = _require_store().artifact_file(str(ref.get("uuid") or ""), "model.pt", _object_store_root() / "artifacts")
+    path = _require_store().artifact_file(str(ref.get("uuid") or ""), "model.pt", _object_store_root() / "artifacts",
+                                         version=_stored_surface_version(ref))
     if path is None:
         raise ValueError(f"surface {ref.get('uuid')} has no Lasagna model")
     return path

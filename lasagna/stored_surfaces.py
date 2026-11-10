@@ -57,6 +57,17 @@ def parse_surface_ref(value: object) -> tuple[str, tuple | None] | None:
 	return str(uuidlib.UUID(uuid_text)), selected
 
 
+def _version_selector(object_uuid: str, version: tuple | None) -> dict:
+	"""The same object selection for geometry and artifacts; storage resolution stays in vcobj."""
+	if version is None:
+		return {}
+	if len(version) == 3:
+		return dict(reference=dict(store=version[2], generation=version[0], object=object_uuid, version=version[1]))
+	if len(version) == 2:
+		return dict(generation=version[0], version=version[1])
+	raise ValueError(f"not a numbered version: {version!r}")
+
+
 def next_free_name(store: str | Path, root: str, mode: str) -> str:
 	"""The name a new surface of ``root`` takes among the store's surfaces (``store`` a location): ``version``
 	gives the next ``<root>_vNNN`` after the highest stored, ``offset`` the first free ``<root>_offN``."""
@@ -97,10 +108,11 @@ class StoreSession:
 	def store_uuid(self) -> str:
 		return self._attachment.store_uuid
 
-	def artifact_file(self, object_uuid: str, name: str, cache_directory: str | Path) -> Path | None:
-		"""The object's current artifact ``name`` as a local file under ``cache_directory`` (kept by content);
+	def artifact_file(self, object_uuid: str, name: str, cache_directory: str | Path, *, version: tuple | None = None) -> Path | None:
+		"""The selected object's artifact ``name`` as a local file under ``cache_directory`` (kept by content);
 		None when it has none."""
-		path = self._session.artifact_file(self._attachment, object_uuid, name, str(cache_directory))
+		path = self._session.artifact_file(self._attachment, object_uuid, name, str(cache_directory),
+										 **_version_selector(object_uuid, version))
 		return None if path is None else Path(path)
 
 	def publish_artifacts(self, object_uuid: str, files: dict[str, str | Path]) -> dict:
@@ -153,10 +165,6 @@ def read_surface(store: str | Path, ref: str, *, volume: str | None, target_scal
 	surface_uuid, version = parsed
 	if volume is None:
 		raise ValueError(f"reading stored surface {surface_uuid} needs the volume its coordinates are in")
-	generation, number = version[:2] if version else (None, None)
-	if version and len(version) == 3:
-		reference = dict(store=version[2], generation=generation, object=surface_uuid, version=number)
-		grid = read_grid(store, surface_uuid, volume=volume, reference=reference, target_scale=target_scale)
-	else:
-		grid = read_grid(store, surface_uuid, volume=volume, version=number, generation=generation, target_scale=target_scale)
+	grid = read_grid(store, surface_uuid, volume=volume, target_scale=target_scale,
+					 **_version_selector(surface_uuid, version))
 	return StoredSurface(store, surface_uuid, grid)
