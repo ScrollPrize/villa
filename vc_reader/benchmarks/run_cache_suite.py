@@ -33,6 +33,7 @@ CASES = {
 
 def report(root, results, workers):
     virtual = any('GiB' in r['policy'] for r in results)
+    historical = json.loads((root/'metadata.json').read_text()).get('backend') == 'pre-reader'
     lines = ["# Complete synthetic cache suite", "",
              "Median of three repetitions by default; M operations/s (reads and puts, not bytes). "
              "Raw repetitions, exact commands, latencies and accounting are in results.json. "
@@ -46,11 +47,14 @@ def report(root, results, workers):
             for w in workers:
                 cells=[]
                 for size in ('.25','64','512'):
-                    policy=f'{float(size):g} GiB sampled8'
+                    policy=f'{float(size):g} GiB '+('pre-reader' if historical else 'sampled8')
                     row=next((r for r in results if (r['case'],r['workers'],r['policy'])==(case,w,policy)),None)
                     cells.append('—' if row is None else 'ERROR' if 'error' in row else f"{row['last_three_median']/1e6:.2f}")
                 lines.append(f'| {case} | {w} | '+' | '.join(cells)+' |')
         lines.append('')
+        if historical:
+            lines[2] = lines[2].replace('Foreground-worker ablation with fixed shard count; four maintenance workers, eight-tail sampling.',
+                'Historical VC ChunkCache decoded-storage benchmark: one source, synchronous shared-byte-budget enforcement, no background maintenance. Original implementation compiled from the checkout recorded in metadata; only benchmark access is added. Numeric source keys and opaque shared payloads avoid I/O, decode and scheduler overhead. Unsupported maintenance counters are not measured.')
         lines += ['## Physical memory', '', '| Fixture | Prefill seconds | Peak RSS GiB | Peak virtual GiB | AS limit GiB | RSS guard GiB |', '|---|---:|---:|---:|---:|---:|']
         for path in sorted(root.glob('virtual_*.stderr'),key=lambda p:tuple(map(int,p.stem.split('_')[1:]))):
             peak=0;prefill='—'
@@ -101,9 +105,10 @@ def report(root, results, workers):
         has_puts=any(float(x.get('puts') or 0) for x in rows)
         latencies = ' / '.join(f"{median(k)/1000:.1f}" for k in ('put_p50_ns','put_p95_ns','put_p99_ns')) if has_puts else '—'
         hits=f"{100*ratio('hits','reads'):.2f}" if any(float(x.get('reads') or 0) for x in rows) else '—'
-        assist=f"{100*ratio('assist_puts','puts'):.2f}" if has_puts else '—'
+        assist=f"{100*ratio('assist_puts','puts'):.2f}" if has_puts and not historical else '—'
+        batches=f"{ratio('evicted_entries','batches'):.1f}" if not historical else '—'
         per_worker=f"{r['median']/r['workers']/1000:.1f}" if r['case']!='shrink_only' else '—'
-        lines.append(f"| {r['policy']} | {r['case']} | {r['workers']} | {rates} | {per_worker} | {hits} | {latencies} | {assist} | {ratio('evicted_entries','batches'):.1f} | {max(float(x.get('peak_sampled_overshoot') or 0) for x in rows):.0f} |")
+        lines.append(f"| {r['policy']} | {r['case']} | {r['workers']} | {rates} | {per_worker} | {hits} | {latencies} | {assist} | {batches} | {max(float(x.get('peak_sampled_overshoot') or 0) for x in rows):.0f} |")
     if virtual:
         lines += ['', '## Window progression', '', '| Capacity | Case | Workers | Consecutive M ops/s |', '|---|---|---:|---|']
         for r in results:
@@ -164,6 +169,8 @@ def virtual_suite(args, binary, root, cores):
     if args.reuse_from:
         previous=json.loads((args.reuse_from/'metadata.json').read_text())
         current=json.loads((root/'metadata.json').read_text())
+        if previous.get('backend','sampled8')!=current.get('backend','sampled8'):
+            raise SystemExit('Cannot reuse a different cache backend')
         for field in ('sha256','host','shards','payload_bytes','seconds','windows',
                       'maintenance_workers','candidate_scan','memory_limit_gib','allocation_case'):
             if previous.get(field)!=current.get(field):
@@ -173,9 +180,12 @@ def virtual_suite(args, binary, root, cores):
              'p95_ns':'put_p95_ns', 'p99_ns':'put_p99_ns', 'scans':'selection_scans'}
     for entries in (65536,16777216,134217728):
         for w in workers:
-            policy=f'{entries*4096/2**30:g} GiB sampled8'
+            backend='pre-reader' if args.backend=='pre-reader' else 'sampled8'
+            policy=f'{entries*4096/2**30:g} GiB {backend}'
             if failed is not None and (policy,w) not in failed:continue
-            command=[str(binary),str(entries),str(w),str(cores),'4','2','8','0','6','full']
+            command=[str(binary),str(entries),str(w),str(1 if args.backend=='pre-reader' else cores),
+                     '0' if args.backend=='pre-reader' else '4','2',
+                     '0' if args.backend=='pre-reader' else '8','0','6','full']
             name=f'virtual_{entries}_{w}'
             reused=[r for r in reusable if r['workers']==w and r['policy']==policy]
             if len(reused)==len(CASES)+1 and not any('error' in r or 'process_error' in r for r in reused):
@@ -226,6 +236,7 @@ def combine_reports(args):
     for source in args.combine_from:
         meta=json.loads((source/'metadata.json').read_text())
         selected={k:meta.get(k) for k in fields}
+        selected['backend']=meta.get('backend','sampled8')
         if settings is not None and settings!=selected:
             raise SystemExit('Measured workload settings differ; refusing to combine')
         settings=selected;sources[str(source)]=meta;workers.update(meta['workers'])
@@ -254,6 +265,8 @@ def main():
     parser.add_argument('--seconds', type=float, default=.5)
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--virtual', action='store_true', help='Full suite at .25/64/512 GiB with bench_cache_scale; six consecutive 2s windows')
+    parser.add_argument('--backend',choices=('sampled8','pre-reader'),default='sampled8')
+    parser.add_argument('--historical-source',type=Path,help='Historical checkout used to build the pre-reader executable')
     parser.add_argument('--report-only', action='store_true', help='Regenerate tables from existing results without running benchmarks')
     parser.add_argument('--memory-limit-gib', type=float, default=256, help='Virtual-suite child address-space limit (GiB), enforced with RLIMIT_AS')
     parser.add_argument('--reuse-from',type=Path,help='Reuse completed virtual combinations only when executable hash and benchmark settings match')
@@ -279,6 +292,15 @@ def main():
                     repeats=args.repeats, seconds=args.seconds, payload_bytes=256,
                     pressure_entries=4096, key_count=65536, maintenance_workers=4,
                     candidate_scan=8, build_type='Use Release; verify CMakeCache.txt')
+    metadata['backend']=args.backend
+    if args.backend=='pre-reader':
+        if not args.virtual or not args.historical_source:
+            raise SystemExit('pre-reader requires --virtual and --historical-source')
+        metadata.update(shards=1,maintenance_workers=0,candidate_scan=0,
+                        historical_source=str(args.historical_source.resolve()),
+                        historical_commit=subprocess.check_output(['git','-C',str(args.historical_source),'rev-parse','HEAD'],text=True).strip())
+        tracked=subprocess.check_output(['git','-C',str(args.historical_source),'status','--porcelain','--untracked-files=no'],text=True)
+        if tracked.strip():raise SystemExit('Historical source has tracked modifications')
     (root/'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
     if args.virtual:
         metadata.update(workers=workers,payload_bytes=4096,capacity_entries=[65536,16777216,134217728],seconds=2,windows=6,repeats=None,pressure_entries=None,key_count=None,memory_limit_gib=args.memory_limit_gib,allocation_case='Fresh payload followed by shared replacement; two puts per request',reuse_from=str(args.reuse_from) if args.reuse_from else None,rss_limit_gib=args.rss_limit_gib,prefill_seconds=args.prefill_seconds)
