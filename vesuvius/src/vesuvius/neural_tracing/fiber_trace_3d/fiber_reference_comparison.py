@@ -454,7 +454,7 @@ def affine_vertical_setup(settings,surface,sample):
     ref=fit_vertical_affine(v[valid],z[valid]);fits={}
     endpoints=[0.,80000.,ref[1],ref[0]*(surface.full[0].shape[0]-1)*pitch+ref[1]]
     for entry in settings['solutions']:
-        root=Path(entry['run_root']);summary=json.loads((root/'summary.json').read_text());cfg=summary['config']
+        root=Path(entry['run_root']);cfg=json.loads((root/'summary.json').read_text())['config']
         with np.load(cfg['tensor_cache']) as src:d={k:src[k] for k in ('phase','z','family','node_ds','lengths','start')}
         with np.load(root/'solution.npz') as src:
             _,_,keep,_,_,anchor_v,_=uv.hard_geometry(d,src['state'],src['widths'].astype(float),cfg)
@@ -589,7 +589,7 @@ def metric_report(settings):
             ccw_tangential_weight_percent=float(100*positive),direction='ccw' if positive>.5 else 'cw',
             sampled_valid_segments=int(ok.sum()))
     for entry in settings.get('solutions',[]):
-        root=Path(entry['run_root']);cfg=json.loads((root/'summary.json').read_text())['config']
+        root=Path(entry['run_root']);summary=json.loads((root/'summary.json').read_text());cfg=summary['config']
         with np.load(cfg['tensor_cache']) as src:d={k:src[k] for k in src.files}
         projection=load_metric_projection(settings['projection_cache'],d,cfg,source=_verified_run_source(summary))
         if entry.get('initial_state',False):

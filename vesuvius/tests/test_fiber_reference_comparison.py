@@ -5,6 +5,27 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_reference_comparison import (
     surface_edges,discrete_winding)
 
 
+def test_metrics_only_uses_each_saved_solution_provenance(tmp_path, monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_reference_comparison as ref
+    tensor = tmp_path / 'tensors.npz'
+    np.savez(tensor, source_id=['source'])
+    np.savez(tmp_path / 'solution.npz', state=[1], widths=[2])
+    summary = dict(config=dict(tensor_cache=str(tensor)), input=dict(signature=dict(fibers='saved')))
+    (tmp_path / 'summary.json').write_text(json.dumps(summary))
+    def verified(saved):
+        assert saved == summary
+        return ('saved', {'commit': 7})
+    def projection(path, d, config, *, source):
+        assert source == ('saved', {'commit': 7})
+        return None
+    monkeypatch.setattr(ref, '_verified_run_source', verified)
+    monkeypatch.setattr(ref, 'load_metric_projection', projection)
+    monkeypatch.setattr(ref, 'reference_winding_metrics', lambda *args: dict(loss=0))
+    assert ref.metric_report(dict(output_root=tmp_path, projection_cache='fixture',
+                                  solutions=[dict(run_root=tmp_path, label='saved')])) == {
+                                      'solutions': [dict(label='saved', loss=0)]}
+
+
 def test_reference_width_units_offsets_and_coverage(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_reference_comparison import reference_interval_widths,reference_width_metrics
     meta=tmp_path/'meta.json'

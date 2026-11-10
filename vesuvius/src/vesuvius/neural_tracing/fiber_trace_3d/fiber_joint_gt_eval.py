@@ -59,7 +59,7 @@ def configure_gt_enablement(cfg,state,source_ids,gt_ids,forced=True):
 def run(settings):
     if settings.get('report_only'):return report(settings)
     from .fiber_workflows import run as dispatch
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume,fibers_digest,read_polylines,write_fibers
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_source_version,fiber_volume,fibers_digest,read_polylines,write_fibers
     root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     baseline=Path(settings['baseline_root']);gt=Path(settings['gt_root'])
     cfg=json.loads(Path(settings['base_config']).read_text())['fiber_implicit_winding']
@@ -82,7 +82,8 @@ def run(settings):
         write_fibers(store,curves,volume=volume)
     from .fiber_piece_split import split_graph
     cfg['fibers']=str(store)
-    merged=split_graph(merged,cfg,ids if forced else ())
+    source_version=fiber_source_version(store)
+    merged=split_graph(merged,cfg,ids if forced else (),source_version=source_version)
     tensor=root/'tensors.npz';np.savez(tensor,**merged)
     init=root/'init';init.mkdir(exist_ok=True)
     centers,widths=uv.radial_initial_geometry(merged,cfg)
@@ -94,7 +95,7 @@ def run(settings):
         output_root=str(root/'solve'),devices=settings.get('devices','0'))
     cfg['gpu_manager']=dict(cfg['gpu_manager'],exclusive=False,label='joint-GT-forced-enabled' if forced else 'joint-GT-selectable',
                             vram_bytes_per_gpu=settings.get('vram_bytes_per_gpu',32*1024**3))
-    np.savez(init/'samples.npz',**soft.prepare_samples(cfg,merged))
+    np.savez(init/'samples.npz',**soft.prepare_samples(cfg,merged,source_version=source_version))
     atomic_write(init/'config.json',dict(tensor_sha256=sha256_file(tensor),soft_samples=str(init/'samples.npz')),durable=False)
     atomic_write(root/'solve_config.json',{'fiber_implicit_winding':cfg},durable=False)
     audit=dict(test_fibers=len(d['family']),gt_fibers=len(gd['family']),gt_source_ids=ids.tolist(),
