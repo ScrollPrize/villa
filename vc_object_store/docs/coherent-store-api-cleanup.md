@@ -1,5 +1,17 @@
 # Coherent store API cleanup
 
+## Latest review tasks
+
+Baseline: `8c8a8ea00`. Resolve these six findings through shared APIs; keep schema 21, binary identities and history-off storage unchanged. Add regression tests, run the approved test runner and record any validation limitations.
+
+- [ ] AB. Compare complete selected object identities before transformed geometry writes; reject sibling-overlay versions with equal numeric counters.
+- [ ] AC. Make project copying preserve the resolved collection and its dependencies/artifacts rather than backing up only the root SQLite file.
+- [ ] AD. Resolve record-owned history policy centrally; project resource discovery and current-version helpers must not infer it from the attachment's policy.
+- [ ] AE. Resolve artifacts by complete object reference and carry historical Lasagna model references unchanged.
+- [ ] AF. Repin fiber edits and related endpoints through shared receipt-aware identity handling, preserving unchanged inherited ownership.
+- [ ] AG. Allocate structural control-point IDs through retained allocation history, not a GUI-only counter that can rewind after restore.
+- [ ] Run regressions and consumer checks, review the diff and record results.
+
 ## Current review fixes
 
 Baseline: `3812cb17b`. C++ store plus VC3D adapters; existing CMake/approved PR runner, Linux and macOS portability, unchanged schema 21 and binary identifiers. These fixes must remove duplicated resolution, not introduce more placement-specific branches. Each fix is committed separately with regressions; the final run uses `bash local/scripts/run_vcobj_pr_tests`.
