@@ -45,12 +45,15 @@ def fiber_volume(path):
     return volume
 
 
-def fiber_catalog(path, volume):
+def fiber_catalog(path, volume, *, source_version=None):
     """Catalog rows of the fibers bound to ``volume``, in UUID order, measured from selected geometry:
     dict(id, name, family, length, point_count, bbox, scale, reference); length and bbox (minx,miny,minz,maxx,maxy,maxz, or
-    None) are volume voxels."""
+    None) are volume voxels. Frozen evidence can require its recorded ``source_version``."""
     with open_store(path) as store:
-        return _catalog(store, volume)
+        _require_source_version(store, source_version)
+        rows = _catalog(store, volume)
+        _require_source_version(store, source_version)
+        return rows
 
 
 def _catalog(store, volume):
@@ -92,6 +95,11 @@ def fiber_source_version(path):
         return _source_version(store)
 
 
+def _require_source_version(store, expected):
+    if expected is not None and expected != _source_version(store):
+        raise ValueError('Fiber source changed or missing source version; regenerate frozen evidence')
+
+
 def _position(store):
     return tuple(_source_version(store).values())
 
@@ -104,10 +112,7 @@ def read_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
     volume = volume or fiber_volume(path)
     selected = None if fiber_ids is None else sorted({canonical_uuid(str(fid)) for fid in fiber_ids})
     with open_store(path) as store:
-        def check_source():
-            if source_version is not None and source_version != _source_version(store):
-                raise ValueError('Fiber source changed or missing source version; regenerate frozen evidence')
-        check_source()
+        _require_source_version(store, source_version)
         if selected == []:
             return []
         records = store.select_objects(object_kind='fiber', object_uuids=selected or [],
@@ -115,7 +120,7 @@ def read_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
         if selected is not None and sorted(r['uuid'] for r in records) != selected:
             raise ValueError('Unknown requested fiber')
         rows = sorted(_read_rows(store, records, volume, require_lines=selected is not None), key=lambda item: item[0]['id'])
-        check_source()
+        _require_source_version(store, source_version)
         return rows
 
 

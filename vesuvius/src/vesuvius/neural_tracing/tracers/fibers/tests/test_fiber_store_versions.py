@@ -62,6 +62,72 @@ def test_strip_index_rejects_changed_ordinal_source(tmp_path):
         RunFibers(path, index, 1)
 
 
+@pytest.mark.parametrize('change', ['translation', 'coordinate_scale', 'missing_reference', 'wrong_owner'])
+@pytest.mark.parametrize('history', [False, True])
+def test_strip_index_checks_producer_reference_before_certifying_matches(tmp_path, monkeypatch, change, history):
+    import json
+    from scipy.spatial import cKDTree
+    from vesuvius.neural_tracing.tracers.sheets.scripts import match_fibers_to_patches as matcher
+    from vesuvius.neural_tracing.tracers.sheets.data.patches import PatchInfo
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip import build_index
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.data import StripIndex, RunFibers
+    path, ids = source(tmp_path)
+    if not history:
+        remove_history_and_disable(path)
+    dataset = FiberStore(path, 'vol', split='all')
+    xyz = dataset.geometry(0).points
+    monkeypatch.setattr(matcher, '_STATE', dict(fibers=dataset, tree=cKDTree(xyz), pos=xyz,
+        nrm=np.tile([0., 0., 1.], (len(xyz), 1)), rc=np.c_[np.zeros(len(xyz), int), np.arange(len(xyz))],
+        patch=np.zeros(len(xyz), int), cell=np.array([1.]), sample=2., candidates=2, reach=2.,
+        max_inward=1., max_outward=1., max_tangential=2., min_run=4., roots=['root'], names=['patch']))
+    runs = matcher.match_fiber(0)
+    assert runs and runs[0]['fiber_reference'] == dataset.catalog[0]['reference']
+    evidence = tmp_path/'runs.jsonl'
+    evidence.write_text(''.join(json.dumps(run)+'\n' for run in runs))
+    monkeypatch.setattr(build_index, 'build_index', lambda *args: [PatchInfo('patch', 2, 32, 1., 64, (0, 0, 0, 32, 32, 32), 'root')])
+    def build(destination):
+        build_index.main(['--fibers', str(path), '--runs', str(evidence), '--patches-dir', 'root',
+                          '--grid-scale', '1', '--out', str(destination)])
+    good = tmp_path/'good'
+    build(good)
+    assert len(RunFibers(path, StripIndex(good, 'train'), 1)) == 1
+    if change in ('translation', 'coordinate_scale'):
+        with ObjectStore.open(str(path), author='editor') as store:
+            fid = dataset.catalog[0]['id']
+            if change == 'translation':
+                store.edit_geometry(fid, [dict(array='line_points', element_offset=0,
+                                                data=np.asarray(xyz+[0, 100, 0], '<f8').tobytes())],
+                                    store.current_version(fid))
+            else:
+                store.set_meta(fid, 'coordinates', dict(volume_uuid='vol', scale_factor=2))
+    else:
+        for run in runs:
+            if change == 'missing_reference':
+                run.pop('fiber_reference')
+            else:
+                run['fiber_reference'] = dict(run['fiber_reference'], store=str(uuid.uuid4()))
+        evidence.write_text(''.join(json.dumps(run)+'\n' for run in runs))
+    rejected = tmp_path/'rejected'
+    with pytest.raises(ValueError, match='stale or missing fiber reference'):
+        build(rejected)
+    assert not rejected.exists()
+
+
+def test_training_coordinates_use_declared_frame_not_registration_routes(tmp_path):
+    path, _ = source(tmp_path)
+    before = FiberStore(path, 'vol', split='all')
+    xyz = before.geometry(0).points.copy()
+    references = [row['reference'] for row in before.catalog]
+    with ObjectStore.open(str(path), author='editor') as store:
+        store.register_volume_transform('vol', 'other', [[2., 0., 0., 100.], [0., 2., 0., 0.], [0., 0., 2., 0.]])
+    after = FiberStore(path, 'vol', split='all')
+    assert [row['reference'] for row in after.catalog] == references
+    np.testing.assert_array_equal(after.geometry(0).points, xyz)
+    # This adapter deliberately supports the declared volume/scale only.
+    # Foreign-volume registration cannot silently reposition match evidence.
+    assert fiber_catalog(path, 'other') == []
+
+
 def test_strip_resume_requires_complete_input_identity(tmp_path):
     from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all import pending_fibers
     path, _ = source(tmp_path)
@@ -74,11 +140,12 @@ def test_strip_resume_requires_complete_input_identity(tmp_path):
 
 
 @pytest.mark.parametrize('change_during_read', [False, True])
-def test_frozen_evidence_rejects_source_edits(tmp_path, monkeypatch, change_during_read):
+@pytest.mark.parametrize('reader', [read_polylines, fiber_catalog])
+def test_frozen_evidence_rejects_source_edits(tmp_path, monkeypatch, change_during_read, reader):
     from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
     path, ids = source(tmp_path)
     expected = fiber_source_version(path)
-    assert len(read_polylines(path, source_version=expected)) == 2
+    assert len(reader(path, volume='vol', source_version=expected)) == 2
     def edit():
         with ObjectStore.open(str(path), author='editor') as store:
             store.set_meta(ids[0], 'coordinates', dict(volume_uuid='vol', scale_factor=2))
@@ -91,9 +158,9 @@ def test_frozen_evidence_rejects_source_edits(tmp_path, monkeypatch, change_duri
     else:
         edit()
     with pytest.raises(ValueError, match='source changed'):
-        read_polylines(path, source_version=expected)
+        reader(path, volume='vol', source_version=expected)
     with pytest.raises(ValueError, match='missing source version'):
-        read_polylines(path, source_version={})
+        reader(path, volume='vol', source_version={})
 
 
 @pytest.mark.parametrize('change', ['metadata', 'geometry'])

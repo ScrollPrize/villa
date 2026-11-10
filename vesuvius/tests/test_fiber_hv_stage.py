@@ -9,7 +9,7 @@ def test_preparation_freezes_stage1_and_active_degree(tmp_path):
     import json,sqlite3
     from lasagna.inference_provenance import sha256_file
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_hv_stage import prepare
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, write_fibers
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, fiber_source_version, write_fibers
     ids=[f'00000000-0000-4000-8000-0000000000{k}' for k in (10,20,30,40)]
     store=tmp_path/'source.vcobj'
     write_fibers(store,[(dict(id=f),np.array([[0.,0,k],[100.,0,k]])) for k,f in enumerate(ids)],volume='123')
@@ -17,7 +17,8 @@ def test_preparation_freezes_stage1_and_active_degree(tmp_path):
     db.executescript('CREATE TABLE metadata(key,value);CREATE TABLE fibers(id,source_index,length_base);'
         'CREATE TABLE constraints(id,fiber_a,fiber_b,parallel_score,perpendicular_score);')
     db.executemany('INSERT INTO metadata VALUES(?,?)',[(k,json.dumps(v)) for k,v in
-        dict(complete=True,provenance=dict(fibers_store_uuid='test',config=dict(fibers=str(store),coordinate_space='scroll/123'))).items()])
+        dict(complete=True,provenance=dict(fibers_store_uuid='test',fiber_source=fiber_source_version(store),
+             config=dict(fibers=str(store),coordinate_space='scroll/123'))).items()])
     db.executemany('INSERT INTO fibers VALUES(?,?,?)',[(f,k,100) for k,f in enumerate(ids)])
     db.executemany('INSERT INTO constraints VALUES(?,?,?,?,?)',[(0,ids[0],ids[1],1,0),(1,ids[0],ids[2],0,1)])
     db.commit();db.close()
@@ -49,6 +50,35 @@ def test_feature_export_records_store_identity(tmp_path,monkeypatch):
     monkeypatch.setattr(native,'run_native_constraints',lambda path,settings:calls.append(json.loads(Path(path).read_text())))
     run_features(dict(native_config=str(tmp_path/'native.json'),output_root=str(tmp_path/'out')))
     assert calls[0]['fibers_digest']==fibers_digest(store) and len(calls[0]['umbilicus_sha256'])==64
+
+
+@pytest.mark.parametrize('change',['missing_identity','translation'])
+def test_feature_verification_rejects_old_constraints_with_fresh_features(tmp_path,change):
+    import json,sqlite3
+    from vc_object_store import ObjectStore
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_hv_stage import verify_feature_source
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, fiber_source_version, write_fibers
+    store=tmp_path/'source.vcobj'
+    xyz=np.array([[0.,0,0],[100.,0,0]],'<f8')
+    fid=write_fibers(store,[(dict(),xyz)],volume='123')['ids'][0]
+    provenance=dict(config=dict(fibers=str(store),coordinate_space='scroll/123'),fiber_source=fiber_source_version(store))
+    dbpath=tmp_path/'constraints.sqlite'
+    with sqlite3.connect(dbpath) as db:
+        db.executescript('CREATE TABLE metadata(key,value);CREATE TABLE fibers(id,source_index,length_base);')
+        db.execute('INSERT INTO fibers VALUES(?,?,?)',(fid,0,100.))
+        db.execute('INSERT INTO metadata VALUES(?,?)',('provenance',json.dumps(provenance)))
+    assert verify_feature_source(dbpath,dict(fibers_digest=fibers_digest(store)))['fiber_lengths_checked']==1
+    if change=='translation':
+        with ObjectStore.open(str(store),author='editor') as source:
+            source.edit_geometry(fid,[dict(array='line_points',element_offset=0,data=(xyz+[0,100,0]).tobytes())],
+                                 source.current_version(fid))
+    else:
+        provenance.pop('fiber_source')
+        with sqlite3.connect(dbpath) as db:
+            db.execute('UPDATE metadata SET value=? WHERE key=?',(json.dumps(provenance),'provenance'))
+    # Fresh features and unchanged IDs/lengths cannot certify old constraints.
+    with pytest.raises(ValueError,match='source changed or missing source version'):
+        verify_feature_source(dbpath,dict(fibers_digest=fibers_digest(store)))
 
 
 def test_scalar_objective_and_gradients():

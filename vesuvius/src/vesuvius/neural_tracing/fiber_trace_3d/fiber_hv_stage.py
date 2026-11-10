@@ -63,8 +63,9 @@ def verify_feature_source(database,feature):
         provenance=json.loads(db.execute("SELECT value FROM metadata WHERE key='provenance'").fetchone()[0])
         source=provenance['config']['fibers']
         if fibers_digest(source)!=feature['fibers_digest']:raise ValueError('Axial/source fiber store content mismatch')
-        # Store summary lengths are the line-point arc lengths (volume voxels).
-        source_rows=[(row['id'],row['length']) for row in fiber_catalog(source,provenance['config']['coordinate_space'].split('/')[-1])]
+        # Measure selected geometry, guarded by the snapshot used for extraction.
+        source_rows=[(row['id'],row['length']) for row in fiber_catalog(source,
+            provenance['config']['coordinate_space'].split('/')[-1],source_version=provenance.get('fiber_source',{}))]
         rows=db.execute('SELECT id,length_base FROM fibers ORDER BY source_index').fetchall()
         if [r[0] for r in rows]!=[r[0] for r in source_rows]:raise ValueError('Constraint/store IDs differ')
         if not np.allclose([r[1] for r in rows],[r[1] for r in source_rows],rtol=1e-10,atol=1e-6):

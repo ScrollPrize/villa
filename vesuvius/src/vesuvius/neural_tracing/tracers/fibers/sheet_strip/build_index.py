@@ -8,6 +8,9 @@ is validation when all its samples lie in the z band ``--val-z`` (patch voxels),
     python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.build_index --fibers FIBERS.vcobj \\
         --runs H_runs.jsonl V_runs.jsonl --patches-dir PATCHES --out INDEX_DIR
 
+Store matches must carry the producer's complete ``fiber_reference``. Unversioned or stale matches must be regenerated;
+building an index does not certify old evidence against new geometry.
+
 Output (INDEX_DIR): ``runs_*.npy`` (one row per run, sorted by fiber then start), ``sample_*.npy`` (``run_samples``
 gives each run's slice), ``patches.json`` (sheets/data/patches.PatchInfo rows) and ``meta.json``.
 """
@@ -49,15 +52,18 @@ def main(argv=None):
         with open(path) as stream:
             for line in stream:
                 run = json.loads(line)
+                kind, fiber = run['fiber'].split(':', 1)
+                if kind != 'fiber':
+                    raise ValueError(f"Run of {run['fiber']}: the index holds fiber-store fibers (fiber:<UUID>) only")
+                ordinal = catalog[fiber]
+                if run.get('fiber_reference') != fibers.catalog[ordinal]['reference']:
+                    raise ValueError(f"Run of {run['fiber']}: stale or missing fiber reference; regenerate matches")
                 points = np.asarray(run['xyz'], np.float32)
                 z = points[:, 2]
                 lo, hi = args.val_z
                 split = ('validation' if ((z >= lo) & (z <= hi)).all() else
                          'train' if ((z < lo-args.val_margin) | (z > hi+args.val_margin)).all() else 'unused')
-                kind, fiber = run['fiber'].split(':', 1)
-                if kind != 'fiber':
-                    raise ValueError(f"Run of {run['fiber']}: the index holds fiber-store fibers (fiber:<UUID>) only")
-                rows.append((catalog[fiber], patch_id[(run['root'], run['patch'])], run['start'], run['end'],
+                rows.append((ordinal, patch_id[(run['root'], run['patch'])], run['start'], run['end'],
                              run['offset'], SPLITS[split]))
                 rc.append(np.asarray(run['rc'], np.int32))
                 xyz.append(points)
