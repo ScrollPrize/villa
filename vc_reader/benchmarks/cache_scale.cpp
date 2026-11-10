@@ -1,5 +1,9 @@
 // Entry-count-realistic cache stress; only the immutable payloads are shared.
+#ifdef VCR_BENCH_PRE_READER
+#include "pre_reader/cache_adapter.hpp"
+#else
 #include <vc_reader/native/memory_cache.hpp>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <barrier>

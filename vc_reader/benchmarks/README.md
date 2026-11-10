@@ -8,6 +8,7 @@ local artifacts ignored by Git. Input fixtures remain versioned.
 | Suite | Measures |
 | --- | --- |
 | [`run_cache_suite.py`](run_cache_suite.py) | Complete C++ cache contention suite: 13 workloads, synchronous versus sampled/background eviction, worker scaling and raw accounting |
+| [`pre_reader/`](pre_reader/README.md) | The same virtual-capacity workload suite against VC's historical decoded cache, compiled from a supplied checkout |
 | [`bench_pipeline.py`](bench_pipeline.py) | CPU/CUDA reading, sampling, normalization and transforms |
 | [`bench_transforms.py`](bench_transforms.py) | Individual transform recipes, including transfers and resident CUDA arrays |
 | [`bench_torch.py`](bench_torch.py) | Per-sample processing, CUDA batches and loader prefetch |
