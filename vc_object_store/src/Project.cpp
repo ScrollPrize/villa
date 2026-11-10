@@ -3,19 +3,32 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include <algorithm>
+#include <map>
 #include <tuple>
 
 namespace vc::objects {
 namespace {
 using Json = nlohmann::json;
 
-void sortByAdded(std::vector<ObjectRecord>& records)
+void sortByAdded(const StoreReader& reader, std::vector<ObjectRecord>& records)
 {
-    // UTC creation stamps survive overrides. Legacy whole-second stamps sort
-    // after precise stamps in the same second, then by UUID.
-    std::sort(records.begin(), records.end(), [](const auto& a, const auto& b) {
-        return std::tuple(a.createdAt.empty(), std::string_view(a.createdAt), std::string_view(a.uuid)) <
-               std::tuple(b.createdAt.empty(), std::string_view(b.createdAt), std::string_view(b.uuid));
+    // Creation time is independent of the selected record's owner. For legacy
+    // rows tied in the same second, retain first-publication order where the
+    // actual creation revision still belongs to that owner.
+    std::map<std::string, std::optional<int64_t>> published;
+    for (const auto& record : records) if (record.createdAt.size() == 20) {
+        const auto history = reader.objectHistory(record.uuid, true);
+        published.emplace(record.uuid, !history.empty() && history.front().version == 1 ?
+                          history.front().publishedAtUs : std::nullopt);
+    }
+    const auto key = [&](const auto& record) {
+        const auto it = published.find(record.uuid);
+        return std::tuple(record.createdAt.empty(), std::string_view(record.createdAt),
+                          it != published.end() ? it->second.value_or(INT64_MAX) : INT64_MAX,
+                          std::string_view(record.uuid));
+    };
+    std::sort(records.begin(), records.end(), [&](const auto& a, const auto& b) {
+        return key(a) < key(b);
     });
 }
 
@@ -72,6 +85,12 @@ ResourceWrite prepareResourceWrite(const StoreReader& reader, ObjectRecord recor
 {
     record = resolveProjectResourceIdentity(reader, std::move(record));
     auto existing = reader.currentObject(record.uuid);
+    if (existing && (existing->record.kind != record.kind ||
+        existing->record.storageKind != record.storageKind ||
+        existing->record.storageRef != record.storageRef ||
+        Json::parse(existing->record.meta).value("owner", std::string{}) !=
+            Json::parse(record.meta).value("owner", std::string{})))
+        throw std::invalid_argument("project resource UUID belongs to a different object");
     return {std::move(record), existing ? std::optional(std::move(existing->record)) : std::nullopt};
 }
 
@@ -143,7 +162,7 @@ std::optional<ObjectRecord> projectRecord(const StoreReader& reader)
     if (records.empty()) return std::nullopt;
     if (records.size() == 1) return std::move(records.front());
     // A store holds one; with several, the first added.
-    sortByAdded(records);
+    sortByAdded(reader, records);
     return std::move(records.front());
 }
 
@@ -169,7 +188,7 @@ std::vector<ProjectResource> projectResources(const StoreReader& reader, const s
     ObjectSelection selection;
     selection.kind = kind;
     auto records = reader.selectObjects(selection);
-    sortByAdded(records);
+    sortByAdded(reader, records);
     std::vector<ProjectResource> resources;
     for (auto& record : records) {
         if (record.storageKind != kDatasetStorage) continue;

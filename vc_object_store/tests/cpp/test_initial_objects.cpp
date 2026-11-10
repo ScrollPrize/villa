@@ -21,13 +21,17 @@ void parity(bool spatial){
     track.meta=R"({"coordinates":{"volume_uuid":"volume","scale_factor":2}})";records.push_back({track,{},{}});
     auto surface=record("surface");surface.surface=SurfaceDetail{};surface.surface->scale={2,3};surface.surface->area=12;
     records.push_back({surface,5,{}});records.push_back({record(),{}, {}});
+    records.push_back({record("project"),{}, {}});
     {auto t=normal.write();for(const auto& value:records){if(value.id)normal.insertObjectWithId(t,value.record,*value.id);else normal.upsertObject(t,value.record);}t.commit();}
     {auto t=initial.write();auto* db=ObjectStoreImplAccess::conn(t);Savepoint all(db);
-        const auto ids=insertInitialObjects(initial,t,records);require(ids.size()==4,"identity count");
+        const auto ids=insertInitialObjects(initial,t,records);require(ids.size()==5,"identity count");
         require(ids[0].second==20&&ids[1].second==21&&ids[2].second==5&&ids[3].second==22,"mixed explicit/automatic IDs preserve input order");
         all.release();t.commit();}
     auto a=normal.read(),b=initial.read();
     for(const auto& value:records)require(comparable(*normal.objectByUuid(a,value.record.uuid))==comparable(*initial.objectByUuid(b,value.record.uuid)),"initial native record parity");
+    require(normal.objectByUuid(a,records.back().record.uuid)->createdAt.size()==27 &&
+            initial.objectByUuid(b,records.back().record.uuid)->createdAt.size()==27,
+            "project creation is precise in both ordinary and immutable initial inserts");
     if(spatial)require(scalar(ObjectStoreImplAccess::conn(a),"SELECT count(*) FROM object_bounds")==scalar(ObjectStoreImplAccess::conn(b),"SELECT count(*) FROM object_bounds"),"bounds parity");
 }
 void geometry(){

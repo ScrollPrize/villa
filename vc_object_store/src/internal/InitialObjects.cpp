@@ -36,7 +36,8 @@ std::vector<std::pair<std::string,int64_t>> insertInitialObjectRefs(
         if(next&&id>=*next)next=id==upper?std::optional<int64_t>{}:std::optional<int64_t>{id+1};
     }
     execute(db,"UPDATE key_allocators SET next_id=? WHERE name='objects'",next);
-    const auto commit_sequence=writeCommitSequence(db);const auto time=nowIsoUtc(),author=store.author(),host=store.hostname();
+    const auto commit_sequence=writeCommitSequence(db);
+    const auto precise=nowIsoUtc(true),time=precise.substr(0,19)+"Z",author=store.author(),host=store.hostname();
     std::vector<std::pair<std::string,int64_t>> result;result.reserve(input.size());
     for(size_t i=0;i<input.size();++i){
         const auto& value=*input[i];auto rec=prepareObjectRecord(value.record);
@@ -48,7 +49,8 @@ std::vector<std::pair<std::string,int64_t>> insertInitialObjectRefs(
         else normalizeObjectCoordinates(rec,true);
         const auto id=ids[i];
         {GeometryPhase row("initial.object.rows");
-        insertObjectRow(db,rec,id,commit_sequence,author,host,time,false,geometry?&geometry->manifestText:nullptr);
+        insertObjectRow(db,rec,id,commit_sequence,author,host,preciseObjectTimestamp(rec.kind)?precise:time,
+                        false,geometry?&geometry->manifestText:nullptr);
         insertObjectDetail(db,id,rec);
         insertTags(db,"object_tags","object_id",id,rec.tags);
         // Active/default state is stored directly in the object row.

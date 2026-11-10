@@ -52,6 +52,7 @@ std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned cha
 void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
 void insertObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
 ObjectRecord prepareObjectRecord(const ObjectRecord&);
+bool preciseObjectTimestamp(std::string_view kind);
 void normalizeObjectCoordinates(ObjectRecord&,bool addDefaultCoordinates,sqlite3* existingStore=nullptr);
 void normalizeObjectCoordinates(nlohmann::json& meta,const std::string& kind,bool addDefaultCoordinates);
 void insertObjectRow(sqlite3*,const ObjectRecord&,int64_t id,int64_t commitSequence,

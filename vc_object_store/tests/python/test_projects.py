@@ -51,6 +51,14 @@ def test_readding_retired_resource_restores_visibility(db):
     assert db.project_resources("volume", viewer="bob") == []
 
 
+def test_project_resource_cannot_reuse_unrelated_uuid(db):
+    uuid = vos.project_resource_uuid("volume", "/scan")
+    db.upsert_object(dict(uuid=uuid, kind="note"))
+    with pytest.raises(ValueError, match="different object"):
+        db.add_project_resource("volume", "/scan")
+    assert db.object(uuid)["kind"] == "note"
+
+
 @pytest.mark.parametrize("port", ["65536", "123junk", "-1"])
 def test_server_rejects_invalid_port_before_opening_store(tmp_path, port):
     server = os.environ.get("VC_OBJECT_SERVER")

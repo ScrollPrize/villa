@@ -60,7 +60,8 @@ void setProjectName(ObjectStoreSession&, const AttachmentIdentity&, const std::s
 
 // The live resources of `kind` `viewer` sees (the shared ones and those it
 // owns; every one when nullopt), in creation order. Legacy whole-second
-// stamps sort after precise stamps within their second; ties use UUID.
+// stamps sort after precise stamps within their second. Tied legacy stamps
+// use retained creation publication order where available, then UUID.
 std::vector<ProjectResource> projectResources(const StoreReader&, const std::string& kind,
                                               const std::optional<std::string>& viewer = std::nullopt);
 // Deterministic UUID for a new resource. An existing legacy resource keeps
