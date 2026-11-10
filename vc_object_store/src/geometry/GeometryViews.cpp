@@ -377,15 +377,16 @@ std::string TransformedGeometryView::writeSurface(ObjectStore& db,WriteTxn& txn,
 }
 namespace {
 geometry::SurfacePoint inverseSurfacePoint(const geometry::SurfacePoint& desired,
-    const std::optional<geometry::SurfacePoint>& original,bool valid,const VolumeAffine& forward,const VolumeAffine& inverse) {
+    const std::optional<geometry::SurfacePoint>& original,bool valid,const VolumeAffine& forward,const VolumeAffine& inverse,
+    bool explicitValid = false) {
     const geometry::SurfacePoint missing{-1,-1,-1};
     auto shown=missing;
     if(original&&valid) {
         const auto p=forward.apply({(*original)[0],(*original)[1],(*original)[2]});
         shown={float(p[0]),float(p[1]),float(p[2])};
     }
-    if(original&&desired==shown)return *original;
-    if(desired==missing)return missing;
+    if(original&&desired==shown&&(valid||!explicitValid))return *original;
+    if(desired==missing&&!explicitValid)return missing;
     const auto p=inverse.apply({desired[0],desired[1],desired[2]});
     geometry::SurfacePoint result{float(p[0]),float(p[1]),float(p[2])};
     // A position the validity rule rejects in the canonical frame is missing there.
@@ -442,7 +443,8 @@ geometry::PointCollection TransformedGeometryView::canonicalPointCollection(cons
 geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surface& desired) const {
     const auto* surface=std::get_if<SurfaceView>(&source_);
     if(!surface)throw std::invalid_argument("not a surface");
-    if(desired.rows<0||desired.columns<0||size_t(desired.rows)*size_t(desired.columns)!=desired.points.size())
+    if(desired.rows<0||desired.columns<0||size_t(desired.rows)*size_t(desired.columns)!=desired.points.size()||
+       (!desired.validity.empty()&&desired.validity.size()!=desired.points.size()))
         throw std::invalid_argument("surface shape mismatch");
     const auto stored=surface->readTile(0,0,surface->rows(),surface->columns());
     auto result=desired;result.scale=stored.scale;
@@ -457,7 +459,7 @@ geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surf
         const auto i=r*desired.columns+c;
         const bool exists=r<stored.rows&&c<stored.columns;
         result.points[i]=inverseSurfacePoint(desired.points[i],exists?std::optional(stored.points[r*stored.columns+c]):std::nullopt,
-            exists&&stored.valid(r,c),mapping_,inverse);
+            exists&&stored.valid(r,c),mapping_,inverse,!desired.validity.empty()&&desired.validity[i]!=0);
     }
     result.validate();return result;
 }

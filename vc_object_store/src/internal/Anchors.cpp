@@ -92,8 +92,18 @@ void dependenciesFromJson(Anchor& anchor, const nlohmann::json& value)
     anchor.channels = value.value("channels", std::vector<std::string>{});
     anchor.wholeGeometry = value.value("whole_geometry", false);
     anchor.metadataKeys = value.value("metadata_keys", std::vector<std::string>{});
-    for (const auto& point : value.value("points", nlohmann::json::array()))
-        anchor.points.push_back({point.at("array").get<std::string>(), point.at("index").get<std::vector<int64_t>>()});
+    for (const auto& point : value.value("points", nlohmann::json::array())) {
+        const auto& index = point.at("index");
+        if (!index.is_array()) throw std::invalid_argument("anchor point index must be an array");
+        std::vector<int64_t> indices;
+        for (const auto& coordinate : index) {
+            if (!coordinate.is_number_integer() ||
+                (coordinate.is_number_unsigned() && coordinate.get<uint64_t>() > INT64_MAX))
+                throw std::invalid_argument("anchor point index must contain signed 64-bit integers");
+            indices.push_back(coordinate.get<int64_t>());
+        }
+        anchor.points.push_back({point.at("array").get<std::string>(), std::move(indices)});
+    }
     (void)dependenciesToJson(anchor);
 }
 

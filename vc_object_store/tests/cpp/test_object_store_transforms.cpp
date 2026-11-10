@@ -42,6 +42,8 @@ int main() try {
         VolumeAffine translated;
         translated(0,3)=-3; translated(2,3)=-3;
         db.registerVolumeTransform(txn,"a","negative",translated,"negative target coordinates");
+        translated(1,3)=-3;
+        db.registerVolumeTransform(txn,"a","sentinel",translated,"all-negative target coordinates");
         bool pending=false;
         try { (void)db.volumeTransforms(txn); } catch(const std::runtime_error&) { pending=true; }
         require(pending,"new registrations must have a published revision before resolving views");
@@ -160,6 +162,13 @@ int main() try {
         const auto deleted=negative.surfaceEdits(0,0,1,1,{{-1,-1,-1}});
         require(deleted.size()==1 && vc::objects::xyzFromBytes<float>(deleted[0].bytes).front()==
             std::array<float,3>{-1,-1,-1},"full missing sentinel deletes a vertex");
+        vc::objects::geometry::Surface explicitValid;
+        explicitValid.rows=explicitValid.columns=1;
+        explicitValid.points={{-1,-1,-1}};
+        explicitValid.validity={255};
+        const auto sentinel=snapshot.surface(surface).viewTransformedAt("sentinel");
+        require(sentinel.canonicalSurface(explicitValid).points.front()==std::array<float,3>{2,2,2},
+            "an explicitly valid full-surface point may coincide with the display sentinel");
         changes=surfaceChanges;objectVersion=surfaceView.version();geometryRevision=surfaceView.revision().uuid;
         snapshot.close();
         bool closed=false;try{view.points("points",0,1);}catch(const std::exception&){closed=true;}require(closed,"snapshot lifetime retained");

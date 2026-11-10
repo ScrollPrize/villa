@@ -439,6 +439,9 @@ def test_fiber_branch_control_index_resolves_stable_ids_not_positions(db):
     ids = [90, 10, 55]
     assert fiber_branch_control_index(ids, anchor('control_point_ids', 10)) == 1
     assert fiber_branch_control_index(ids, anchor('control_point_ids', 55)) == 2
+    for malformed in (10.9, 10.0, 2**64, True):
+        with pytest.raises((ValueError, TypeError)):
+            fiber_branch_control_index(ids, anchor('control_point_ids', malformed))
     for bad in (anchor('control_point_ids', 1), anchor('control_points', 1)):
         with pytest.raises(RuntimeError, match='absent from selected geometry'):
             fiber_branch_control_index(ids, bad)
