@@ -1,6 +1,7 @@
 #include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/objects/VolumeTransforms.hpp>
+#include <vc_object_store/objects/ObjectCollection.hpp>
 #include <utility>
 // The VC3D surface catalog over a real object store: rows of the current
 // volume's surfaces kept current from commit events, opening a surface in the
@@ -108,6 +109,48 @@ void checkHistoryGenerationSaves(const fs::path& directory)
             "reloaded tool input saves in the active generation");
 }
 
+void checkReferencedSurfaceSelections(const fs::path& directory)
+{
+    OpenOptions options; options.author = "surface-reference-test"; options.history = HistoryMode::Off;
+    const auto base = directory / "surface-base.vcobj", overlay = directory / "surface-overlay.vcobj";
+    ObjectVersion original, other;
+    {
+        auto store = ObjectStore::create(base, options);
+        auto txn = store.write();
+        for (auto* ref : {&original, &other}) {
+            ObjectRecord record; record.kind = "surface"; record.name = "original";
+            record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":1}})";
+            const auto uuid = store.upsertObject(txn, record);
+            vc::geometry::Surface grid{1, 1, {1, 1}, {{2, 4, 6}}};
+            store.putGeometry(txn, uuid, vc::geometry::encode(grid));
+            ref->objectUuid = uuid;
+        }
+        txn.commit();
+        { auto read = store.read(); for (auto* ref : {&original, &other}) *ref = store.currentObjectRevision(read, ref->objectUuid)->reference(); }
+        auto seal = store.write(); store.seal(seal); seal.commit();
+    }
+    { auto collection = ObjectCollection::create(overlay, {base}, options); }
+    auto session = std::make_shared<ObjectStoreSession>();
+    const auto attachment = session->attach(overlay, options);
+    const auto open = [&](const ObjectVersion& ref) { return SurfaceCatalog::open(session, attachment, {"vol", 1}, original.objectUuid, ref); };
+    require(open(original).editable, "exact current inherited surface remains editable");
+    bool rejected = false;
+    try { open(other); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "same-number reference for a different object is rejected");
+    auto wrongOwner = original; wrongOwner.storeUuid = util::newUuid(); rejected = false;
+    try { open(wrongOwner); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "same-number reference for a different owner is rejected");
+    {
+        auto store = ObjectStore::open(overlay, options); auto txn = store.write();
+        store.setMeta(txn, original.objectUuid, "coordinates", R"({"volume_uuid":"vol","scale_factor":2})"); txn.commit();
+        auto deletion = store.write(); store.deleteObject(deletion, original.objectUuid); deletion.commit();
+    }
+    const auto past = open(original);
+    require(!past.current && !past.editable && past.pin.reference() == original &&
+            (*past.surface->rawPointsPtr())(0, 0) == cv::Vec3f(2, 4, 6),
+            "deleted overlays retain exact source geometry and metadata as a read-only view");
+}
+
 // Optional real-data check: copy one stored surface, checkpoint a mask edit,
 // recover it in a new session, then verify that saving preserves every XYZ.
 void checkDraftRecovery(const fs::path& sourcePath, const fs::path& directory)
@@ -175,6 +218,7 @@ int main(int argc, char** argv)
     try {
         QTemporaryDir dir;
         checkHistoryGenerationSaves(fs::path(dir.path().toStdString()));
+        checkReferencedSurfaceSelections(fs::path(dir.path().toStdString()));
         if (argc > 1) checkDraftRecovery(argv[1], fs::path(dir.path().toStdString()));
         const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
         const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};

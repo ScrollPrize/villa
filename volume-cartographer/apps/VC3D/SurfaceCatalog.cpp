@@ -216,22 +216,19 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
     auto& current = opened.current;
     session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
         const auto activeGeneration = reader.status().generation;
-        auto revision = reader.currentObject(uuid);
-        if (!revision || revision->record.retired || revision->record.kind != "surface")
+        auto revision = at?reader.objectsAtVersions({*at}).front():reader.currentObject(uuid);
+        if (!revision || revision->deleted || revision->objectUuid!=util::canonicalUuid(uuid) ||
+            (!at&&revision->record.retired) || revision->record.kind != "surface")
             throw std::runtime_error("The surface is no longer in the object store");
-        if (at && (at->version != revision->version || at->generation != revision->generation)) {
-            auto found = reader.objectsAtVersions({*at}).front();
-            if (!found || found->objectUuid != revision->objectUuid || found->deleted)
-                throw std::runtime_error("The surface has no such revision");
-            revision = std::move(found);
-            current = false;
+        if(at){
+            const auto head=reader.currentObject(uuid);
+            current=head&&!head->record.retired&&head->reference()==revision->reference();
         }
         if (!revision->geometryRevision) throw NoGeometry("The surface has no geometry");
         const GeometrySnapshot snapshot(reader);
-        const auto view = current ? snapshot.viewTransformedAt(revision->objectUuid, volume.volume, volume.scale)
-                                  : snapshot.surface(revision->objectUuid, revision->geometryRevision)
-                                        .viewTransformedAt(volume.volume, volume.scale);
-        opened.surface = load_quad_from_store(reader, revision->objectUuid, *revision->geometryRevision, true, &view);
+        const auto view = snapshot.surface(revision->objectUuid,revision->geometryRevision)
+                             .viewTransformedAt(*revision,volume.volume,volume.scale);
+        opened.surface = load_quad_from_store(reader,*revision,true,&view);
         opened.view = view.frame();
         opened.pin = pinOf(attachment, *revision, activeGeneration);
     });
