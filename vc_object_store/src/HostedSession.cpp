@@ -504,8 +504,6 @@ std::optional<ObjectRevision> HostedAttachment::currentObject(const std::string&
 
 std::vector<std::optional<ObjectRevision>> HostedAttachment::objectsAtVersions(const std::vector<ObjectVersion>& references)
 {
-    for (const auto& reference : references)
-        if (reference.storeUuid != storeUuid_) return client_.objectsAtVersions(references);
     std::vector<std::optional<ObjectRevision>> result(references.size());
     std::vector<ObjectVersion> missing;
     std::vector<std::size_t> positions;

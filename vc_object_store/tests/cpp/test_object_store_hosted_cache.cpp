@@ -5,6 +5,7 @@
 #include "vc_object_store/server/Server.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include <vc_reader/http.hpp>
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -102,6 +103,34 @@ private:
     std::vector<std::thread> workers_;
     std::thread thread_;
 };
+
+void referencedRecordsCache()
+{
+    TemporaryDirectory directory;OpenOptions options;options.author="cache-test";options.history=HistoryMode::Off;
+    const auto base=directory.path/"base.vcobj",overlay=directory.path/"overlay.vcobj";
+    std::vector<ObjectVersion> refs;
+    {auto store=ObjectStore::create(base,options);auto w=store.write();ObjectRecord r;r.kind="note";
+        const auto id=store.upsertObject(w,r);w.commit();
+        {auto read=store.read();refs.push_back(store.currentObjectRevision(read,id)->reference());}
+        auto seal=store.write();store.seal(seal);seal.commit();}
+    {auto collection=ObjectCollection::create(overlay,{base},options);}
+    {auto store=ObjectStore::open(overlay,options);auto w=store.write();ObjectRecord r;r.kind="note";
+        const auto id=store.upsertObject(w,r);w.commit();auto read=store.read();refs.push_back(store.currentObjectRevision(read,id)->reference());}
+    server::Server server(overlay,{});server.start();
+    const auto endpoint="http://127.0.0.1:"+std::to_string(server.port());
+    HostedSessionOptions settings;settings.client.retries=0;settings.cacheDirectory=directory.path/"cache";settings.minFreeBytes=0;
+    {ObjectStoreSession session;const auto attachment=session.attachHosted(endpoint,settings);
+        const auto job=session.prefetchObjects(attachment);
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+        while(!job->snapshot().done&&std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(job->snapshot().complete,"mixed-source prefetch completes");}
+    // A fresh attachment must find every prefetched record on disk, with no service.
+    detail::HostedAttachment cold(endpoint,settings);
+    server.stop();
+    const auto cached=cold.objectsAtVersions(refs);
+    require(cached.size()==2&&cached[0]&&cached[1]&&cached[0]->reference()==refs[0]&&cached[1]->reference()==refs[1],
+            "mixed-source prefetch retains both owner-qualified records across restart");
+}
 
 void invalidationDuringRead(bool poll)
 {
@@ -424,6 +453,7 @@ void persistentObjects()
 
 int main()
 try {
+    referencedRecordsCache();
 #ifdef VC_REAL_SURFACE
     persistentObjects();
 #endif

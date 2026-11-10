@@ -12,7 +12,7 @@ Baseline: `3812cb17b`. C++ store plus VC3D adapters; existing CMake/approved PR 
 - [x] X. Resolve full exact surface references before deciding whether a VC3D surface is editable. SurfaceCatalog resolves the requested owner/generation/object/version even after current deletion, then compares the complete reference to the head. Added inherited/deleted/wrong-object/wrong-owner catalog regressions; production and regression sources pass syntax checks (GUI runtime not built).
 - [x] Y. Materialize QuadSurface/stored fits from the selected revision, never current metadata plus old geometry. The shared grid materializer now serves raw and transformed adapters, including editing without validity masking; Spiral uses the same transform path instead of its own scaling loop. Native transform/grid tests pass; changed VC3D production and stored-fit regression sources pass syntax checks (GUI runtime not built).
 - [ ] Z. Share CLI/Python historical export reference selection.
-- [ ] AA. Cache referenced hosted records through the ordinary owner-qualified cache path.
+- [x] AA. Cache referenced hosted records through the ordinary owner-qualified cache path. Removed the attachment-owner bypass; mixed local/referenced records prefetch and read from a fresh disk cache with the server stopped. The hosted-cache native regression passes.
 
 Agent-facing rules are in the root `AGENTS.md` so they apply to consumers as well as the store implementation. The recurring failure is discarding a resolved owner/version downstream and reconstructing it from current/local state. Keep one resolved state throughout the operation; placement decisions belong only in shared storage routing.
 
