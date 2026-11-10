@@ -162,7 +162,7 @@ int main() try {
         const auto deleted=negative.surfaceEdits(0,0,1,1,{{-1,-1,-1}});
         require(deleted.size()==1 && vc::objects::xyzFromBytes<float>(deleted[0].bytes).front()==
             std::array<float,3>{-1,-1,-1},"full missing sentinel deletes a vertex");
-        vc::objects::geometry::Surface explicitValid;
+        vc::geometry::Surface explicitValid;
         explicitValid.rows=explicitValid.columns=1;
         explicitValid.points={{-1,-1,-1}};
         explicitValid.validity={255};
