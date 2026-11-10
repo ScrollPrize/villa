@@ -641,13 +641,8 @@ def projection_coverage_report(settings):
 
 
 def _verified_run_source(summary):
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_source
-    path = summary['config']['fibers']
-    signature = summary.get('input', {}).get('signature', {})
-    digest = (signature.get('inputs') or signature).get('fibers')
-    if not digest:
-        raise ValueError('Saved layout has no fiber provenance; regenerate frozen evidence')
-    return digest, verify_fiber_source(path, digest, signature.get('fiber_source'))
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_signature
+    return verify_fiber_signature(summary['config']['fibers'], summary.get('input', {}).get('signature', {}))
 
 
 def run(settings):

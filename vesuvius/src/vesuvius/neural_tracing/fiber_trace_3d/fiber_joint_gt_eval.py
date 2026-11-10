@@ -59,30 +59,54 @@ def configure_gt_enablement(cfg,state,source_ids,gt_ids,forced=True):
 def run(settings):
     if settings.get('report_only'):return report(settings)
     from .fiber_workflows import run as dispatch
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_source_version,fiber_volume,fibers_digest,read_polylines,write_fibers
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
+        fiber_source_version,fiber_volume,fibers_digest,read_polylines,verify_fiber_signature,verify_fiber_source,write_fibers)
     root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     baseline=Path(settings['baseline_root']);gt=Path(settings['gt_root'])
     cfg=json.loads(Path(settings['base_config']).read_text())['fiber_implicit_winding']
     cfg.update(settings.get('execution_parameters',{}))
     forced=settings.get('force_gt_enabled',True)
-    gc=json.loads((gt/'uv_whole/config.json').read_text())
+    gt_summary=json.loads((gt/'uv_whole/summary.json').read_text())
+    gc=gt_summary['config']
+    gt_digest,gt_version=verify_fiber_signature(gc['fibers'],gt_summary.get('input',{}).get('signature',{}))
     if cfg.get('optimizer_kind')!='scaled_lbfgs':raise ValueError('Forced subset currently supported by scaled L-BFGS only')
     d=arrays(baseline/'tensors.npz');gd=arrays(gc['tensor_cache'])
     events=remap_events(json.loads((baseline/'gt_events.json').read_text()),d)
     merged,ids,filtered=combine(d,gd,events,cfg)
-    paths=[Path(settings['base_config']),baseline/'tensors.npz',baseline/'gt_events.json',Path(gc['tensor_cache'])]
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},gt_fibers=fibers_digest(gc['fibers']))
+    inputs=baseline/'inputs.json'
+    parent=json.loads(inputs.read_text())
+    baseline_digest=parent.get('fibers')
+    if isinstance(baseline_digest,dict):
+        baseline_digest=baseline_digest.get('source')
+    if not baseline_digest:
+        raise ValueError('Baseline tensors have no saved fiber source; regenerate frozen evidence')
+    baseline_version=verify_fiber_source(cfg['fibers'],baseline_digest,parent.get('fiber_source'))
+    paths=[Path(settings['base_config']),inputs,baseline/'tensors.npz',baseline/'gt_events.json',Path(gc['tensor_cache'])]
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},
+                   baseline_fibers=baseline_digest,baseline_source=baseline_version,
+                   gt_fibers=gt_digest,gt_source=gt_version)
     if (root/'inputs.json').exists() and json.loads((root/'inputs.json').read_text())!=signature:raise ValueError('Changed joint GT inputs')
     atomic_write(root/'inputs.json',signature,durable=False)
-    if (root/'results.json').exists():return json.loads((root/'results.json').read_text())
+    results=root/'results.json'
     volume=fiber_volume(cfg['fibers'])
     store=root/'fibers.vcobj'
-    if not store.exists():
-        curves=read_polylines(cfg['fibers'],d['source_id'],volume=volume)+read_polylines(gc['fibers'],volume=volume)
+    store_stamp=root/'fiber_source.json'
+    if store.exists():
+        if not store_stamp.exists():
+            raise ValueError('Combined fiber store lacks publication evidence; use a new output directory')
+        saved=json.loads(store_stamp.read_text())
+        source_version=verify_fiber_source(store,saved['digest'],saved['version'])
+    else:
+        if results.exists():raise ValueError('Completed joint run lost its combined fiber store')
+        curves=read_polylines(cfg['fibers'],d['source_id'],volume=volume,source_version=baseline_version)
+        curves+=read_polylines(gc['fibers'],volume=volume,source_version=gt_version)
         write_fibers(store,curves,volume=volume)
+        source_version=fiber_source_version(store)
+        atomic_write(store_stamp,dict(version=source_version,digest=fibers_digest(store,source_version=source_version)),
+                     durable=False)
+    if results.exists():return json.loads(results.read_text())
     from .fiber_piece_split import split_graph
     cfg['fibers']=str(store)
-    source_version=fiber_source_version(store)
     merged=split_graph(merged,cfg,ids if forced else (),source_version=source_version)
     tensor=root/'tensors.npz';np.savez(tensor,**merged)
     init=root/'init';init.mkdir(exist_ok=True)

@@ -185,7 +185,7 @@ def run(settings):
             raise ValueError('Unknown initialization model')
         atomic_write(root/f'initialization_{index}_config.json',{stage['model']:stage_config},durable=False)
         if not (stage_root/'summary.json').exists():
-            if stage['model']=='fiber_soft_winding':soft.run_prepared(stage_config)
+            if stage['model']=='fiber_soft_winding':soft.run_prepared(stage_config,source_version=source_version)
             else:dispatch({stage['model']:stage_config})
         stage_saved=json.loads((stage_root/'config.json').read_text())
         if any(stage_saved.get(k)!=v for k,v in stage_config.items()):raise ValueError('Initialization configuration mismatch')

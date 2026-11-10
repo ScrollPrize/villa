@@ -697,7 +697,7 @@ def run(config):
     return run_prepared(config)
 
 
-def run_prepared(config):
+def run_prepared(config, *, source_version=None):
     """Launch on an explicitly prepared graph without rebuilding its selection."""
     config = dict(config, layout_mode='shared_anchor')
     validate(config)
@@ -705,12 +705,10 @@ def run_prepared(config):
         raise FileExistsError('Completed output exists')
     cache = Path(config['tensor_cache'])
     stamp = cache.with_suffix('.json')
-    source_version = None
-    if stamp.exists():
-        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_source
+    if source_version is None and stamp.exists():
+        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_signature
         signature = json.loads(stamp.read_text())['signature']
-        if digest := (signature.get('inputs') or signature).get('fibers'):
-            source_version = verify_fiber_source(config['fibers'], digest, signature.get('fiber_source'))
+        _, source_version = verify_fiber_signature(config['fibers'], signature)
     with np.load(cache) as src:
         d = {k: src[k] for k in src.files}
     root = Path(config['output_root']); root.mkdir(parents=True, exist_ok=True)

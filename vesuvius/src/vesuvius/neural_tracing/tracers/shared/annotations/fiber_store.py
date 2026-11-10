@@ -150,6 +150,14 @@ def verify_fiber_source(path, digest, source_version=None):
     return version
 
 
+def verify_fiber_signature(path, signature):
+    """Validate flat or subset tensor provenance and return digest and pin."""
+    digest = (signature.get('inputs') or signature).get('fibers')
+    if not digest:
+        raise ValueError('Saved tensors have no fiber provenance; regenerate frozen evidence')
+    return digest, verify_fiber_source(path, digest, signature.get('fiber_source'))
+
+
 def _references_digest(references):
     digest = hashlib.sha256(f'{FIBERS_DIGEST_FORMAT}\n'.encode())
     for ref in sorted(references, key=lambda r: r['object']):
