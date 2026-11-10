@@ -440,13 +440,17 @@ std::vector<cv::Vec3d> scatteredEstimates(std::uint32_t seed, double sd, int eve
                                           std::vector<double>& slices)
 {
     std::mt19937 rng(seed);
-    std::normal_distribution<double> noise(0.0, sd);
+    // libstdc++ asserts stddev > 0 when built without optimisation, so with sd 0 the
+    // distribution gets a placeholder stddev and is never drawn from.
+    std::normal_distribution<double> noise(0.0, sd > 0.0 ? sd : 1.0);
     std::uniform_real_distribution<double> angle(0.0, 6.283185307179586);
     std::vector<cv::Vec3d> e;
     slices.clear();
     for (int i = 0; i < 60; ++i) {
         const double z = 256.0 * i;
-        cv::Vec2d p = tiltedAxis(z) + cv::Vec2d(noise(rng), noise(rng));
+        cv::Vec2d p = tiltedAxis(z);
+        if (sd > 0.0)
+            p += cv::Vec2d(noise(rng), noise(rng));
         if (every > 0 && i % every == every / 2) {
             const double a = angle(rng);
             p += cv::Vec2d(jump * std::cos(a), jump * std::sin(a));
