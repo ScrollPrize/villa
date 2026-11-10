@@ -1039,6 +1039,21 @@ def iter_probability_tiles(
             yield probability.astype(np.uint8, copy=False)
 
 
+def _write_tiled_tiff(
+    output_path: Path,
+    shape: tuple[int, int],
+    tile_shape: tuple[int, int],
+    tiles: Iterator[np.ndarray],
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = (int(value) for value in shape)
+    tile_h, tile_w = (int(value) for value in tile_shape)
+    positions = ((y0, x0) for y0 in range(0, height, tile_h) for x0 in range(0, width, tile_w))
+    with images.TiffWriter(output_path, (height, width), np.uint8, compression="lzw", tile=(tile_h, tile_w)) as writer:
+        for (y0, x0), tile in zip(positions, tiles):
+            writer.write_tile(y0, x0, tile)
+
+
 def write_output_tiff(
     prob_sum_store: Any,
     weight_sum_store: Any,
@@ -1047,13 +1062,12 @@ def write_output_tiff(
 ) -> None:
     """Write one tiled, LZW, BigTIFF-compatible flat probability image."""
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    height, width = (int(value) for value in prob_sum_store.shape)
-    tile_h, tile_w = (int(value) for value in tile_shape)
-    positions = ((y0, x0) for y0 in range(0, height, tile_h) for x0 in range(0, width, tile_w))
-    with images.TiffWriter(output_path, (height, width), np.uint8, compression="lzw", tile=(tile_h, tile_w)) as writer:
-        for (y0, x0), tile in zip(positions, iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape)):
-            writer.write_tile(y0, x0, tile)
+    _write_tiled_tiff(
+        output_path,
+        tuple(prob_sum_store.shape),
+        tile_shape,
+        iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
+    )
 
 
 def open_temp_zarr_array(
@@ -1743,7 +1757,12 @@ def parse_args(argv: Sequence[str] | None = None):
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the flat inference command."""
 
-    args = normalize_inference_paths(parse_args(argv))
+    return run(normalize_inference_paths(parse_args(argv)))
+
+
+def run(args: argparse.Namespace) -> int:
+    """Run parsed flat inference arguments."""
+
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(message)s",
