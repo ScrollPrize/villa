@@ -1,5 +1,66 @@
 # Coherent store API cleanup
 
+## Open findings from review of `557a6f925`
+
+These findings were originally code-traced during a read-only review. The implementation pass now addresses AH–AR and the additional inventory entries through shared APIs, with targeted regressions and a review of the resulting delta. Current evidence and explicit capability limits are recorded in [the consolidated implementation checklist](coherent-store-audit-inventory.md#implementation-pass); previous suite counts are not used as evidence for newly covered cases.
+
+- [x] AH. Extension registration (`src/Extensions.cpp:203`): reject incompatible inherited definitions before committing registration, using the same collection-wide compatibility rules as scans and exact reads.
+- [x] AI. Hosted transforms (`src/HostedSession.cpp:727`): construct registrations, identities and route choices from one coherent server state, not independent current reads guarded only by client polling.
+- [x] AJ. Restoration (`src/Lifecycle.cpp:102`): resolve source availability independently of destination history policy, including both mixed-policy directions and current-only reactivation.
+- [x] AK. Spiral point editing (`volume-cartographer/apps/VC3D/SpiralStoreEdits.cpp:140`): replace surviving-draft maximum-ID allocation with the shared retained allocator; test deletion plus append in one save and separate saves, and after restore.
+- [x] AL. Copy-with-NT (`volume-cartographer/apps/VC3D/segmentation/growth/SegmentationGrower.cpp:874`, `vesuvius/src/vesuvius/neural_tracing/inference/surface_store.py:17`): carry complete references through queued jobs and returned provenance, including intervening overlay edits/deletion.
+- [x] AM. Neural fiber fingerprints (`vesuvius/src/vesuvius/neural_tracing/tracers/shared/annotations/fiber_store.py:117`): include owning-store identity and bump the digest format; divergent copies must not collide.
+- [x] AN. Editor guard (`src/ObjectStoreSession.cpp:1382`): compare the complete pinned reference in `requireCurrent`, not only generation/version.
+- [x] AO. Umbilicus references (`src/VolumeUmbilicus.cpp:46`): construct references from the selected owner, not the attachment.
+- [x] AP. Copy provenance (`src/ObjectCopy.cpp:30`): retain the selected source owner's identity in `copied_from`.
+- [x] AQ. Relationship exact reads (`src/History.cpp:941`): replace the incomplete history-off result constructor with the shared complete endpoint-reference path. Current extension callers do not consume the missing fields; this is an API consistency gap.
+- [x] AR. Metadata/approval no-ops (`src/Metadata.cpp:32,66`): compare before preparing an inherited override, while preserving required relationship validation. Existing rollback preserves ownership but still performs unnecessary work.
+
+### Inventory-driven extension of this task list
+
+The extensive follow-up review at the same baseline is recorded in [the consolidated audit inventory and checklist](coherent-store-audit-inventory.md). Its four per-file ledgers cover **444 unique files**, including wrapper/caller closure, with **zero pending dispositions** and no finding quotas. It added **26 entries** (`CORE-1–7`, `TRANS-1–5`, `CPP-1–9`, `PY-1–5`) to AH–AR: **37 addressed task entries in total**. Their canonical checkboxes and detailed evidence live in that inventory and its linked ledgers; do not maintain a second conflicting copy here.
+
+The list explicitly distinguishes code-traced correctness/API issues, fail-closed capability gaps, duplication/maintenance work and stale documentation. No production code changed and no runtime verification was claimed during this review. Coverage of named paths is recorded; it is not a claim that an arbitrary source file or the entire repository is bug-free. Future fixes must migrate the affected sibling callers and add the documented regressions, followed by delta review against this fixed inventory.
+
+### Why repeated reviews find more issues
+
+Source-history check on 2026-11-10: `git blame` of the failing logic, inspection of the relevant commits, and ancestry checks against the already-fetched `origin/main` distinguish inherited upstream assumptions from branch additions. None of the eleven flagged implementations was introduced in the last fix batch (`8c8a8ea00..557a6f925`). This is source-level attribution, not a before/after runtime proof; shared-code changes can expose older assumptions.
+
+| Findings | Origin of the relevant logic | Classification |
+| --- | --- | --- |
+| AI, AL, AM, AN, AO, AP | `7e6b82164` (upstream object-store hub rework; some surrounding plumbing is older) | Six inherited upstream paths not fully migrated to complete identities/coherent reads |
+| AK | `c3d9da6fe` (upstream Spiral object-store consumer) | One inherited local point-ID allocator missed when migrating the fiber editor |
+| AH, AJ | `c42feac81` (schema-21 branch implementation) | Earlier branch limitations: local-only schema registration and destination-history restore branching |
+| AQ | `2fea874e0` (earlier shared-resolution cleanup) | Earlier cleanup left a second, incomplete relationship-result constructor |
+| AR | `ce429d54a` (earlier query/edit cleanup) | Earlier cleanup inserted override preparation into a lookup called before no-op comparison; rollback protects correctness but not cost |
+
+Therefore the current batch is seven inherited upstream paths plus four earlier branch paths, not eleven newly introduced regressions from the last fixes. Fixing an individual reported site did not close the corresponding invariant across all consumers. For example, fixing fiber ID allocation left the point-collection allocator untouched, and fixing surface references left umbilicus/copy/queued-job/cache references untouched.
+
+The review process was incomplete: agents received broad areas plus a request for only their strongest two to four findings. They had no exhaustive assigned-file checklist or persisted negative-review coverage. The result was selective, search-order-dependent inspection, not a random statistical sample and not a repository-wide proof. Completed finding checkboxes and green tests establish only their covered cases. Earlier wording about finishing fixes must not be interpreted as closing the entire architecture audit.
+
+### Finite review and closure procedure
+
+Replace repeated open-ended scans with one coverage ledger at a fixed commit. The inventory review described above has now completed this protocol's discovery/disposition stage; implementation and regression closure remain open. No additional model/schema features are in scope.
+
+1. Enumerate production vcobj APIs and consumers with tracked-file searches, including wrappers, caches, async protocols and hosted adapters. Save the concrete files/symbols assigned to each lane below. Keyword matches are discovery seeds, not proof of coverage; follow callers and wrappers too.
+2. Assign each lane a bounded file/symbol inventory. Require a disposition for every entry: shared path used, justified storage-layer special case, covered defect ID, or unchecked. Do not cap the number of findings. Unchecked entries remain visible and cannot be called clean.
+3. Reproduce AH–AR with failing tests before fixes; merge duplicates by root cause. Extend one shared API where necessary, then migrate every inventoried sibling caller before closing that invariant. Preserve legitimate validation and history-retention differences.
+4. Test a reusable contract matrix: local versus referenced versus sharded/packed; local versus hosted transport; all four source/destination history-policy pairs where applicable; active/retired/deleted/overridden states; exact reads and no-op writes; sibling owners with equal generation/version counters. Concurrency and retained-ID tests are explicit additions, not inferred from ordinary CRUD coverage. Mark inapplicable combinations with a reason rather than silently skipping them.
+5. Review the implementation diff for regressions separately from reviewing untouched inventory. Subsequent edits reopen the affected ledger entries and dependent callers, not the entire repository without a recorded reason.
+6. Close this audit when all inventory entries have evidence-backed dispositions, all confirmed issues are fixed or explicitly accepted by the user, required contract tests and consumer checks pass, and the final delta review has no unresolved findings. This is an auditable completion condition, not a guarantee of zero undiscovered bugs. Do not require indefinitely repeated clean open-ended agent runs.
+
+| Coverage lane | Scope to enumerate | Known open items | Current coverage |
+| --- | --- | --- | --- |
+| Identity construction and guards | Core readers, reference constructors, editor pins/receipts, provenance | AN, AO, AP | Partial; exact inventory/dispositions still required |
+| Identity transport and caches | VC3D jobs, neural services, Spiral/Lasagna wrappers, serialized references and fingerprints | AL, AM | Partial; exact inventory/dispositions still required |
+| History and lifecycle | Object/relationship exact reads, restoration, optional retention, endpoint bindings | AJ, AQ | Partial; exact inventory/dispositions still required |
+| Mutation preparation | Metadata, approval, structural edits, overrides, no-op/revalidation paths | AK, AR | Partial; exact inventory/dispositions still required |
+| Extension schema/data | Registration, compatibility, exact snapshots, overlay/shard scans and writes | AH | Partial; exact inventory/dispositions still required |
+| Snapshot consistency | Hosted selections, transforms, cache invalidation, local parity | AI | Partial; exact inventory/dispositions still required |
+| Placement and payloads | Shared geometry/artifact resolution, copy/export/packing, source paths, graph/spatial adapters | Earlier targeted fixes closed; no new item in this pass | Partial; absence of a new finding is not complete coverage |
+
+Report progress as inventoried entries reviewed/total, confirmed issues open/closed, new regressions versus older omissions, and contract cases passing/missing. Current status: eleven open code-traced findings; no runtime reproductions for this batch yet; exhaustive coverage denominator not yet established. Do not use number of agent runs or total existing test count as the completion metric.
+
 ## Latest review tasks
 
 Baseline: `8c8a8ea00`. Resolve these six findings through shared APIs; keep schema 21, binary identities and history-off storage unchanged. Add regression tests, run the approved test runner and record any validation limitations.

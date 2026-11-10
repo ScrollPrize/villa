@@ -42,6 +42,10 @@ the writer lock, but cannot protect a read made before it. Standalone Python
 mutations (`store.set_meta`, `store.put_geometry`, ...) each commit their own
 transaction.
 
+For a loaded object in a collection, use `expectObject(request, selected.reference())`: it carries the complete store/lineage/object/version identity and checks it under the writer lock. Equal numeric versions from different owners are not interchangeable. Typed requests with these guards use command encoding 2 (`expected_object_references`); ordinary number-only requests retain encoding 1, including their retry digest. Both encodings are read, and an older server rejects encoding 2 rather than silently ignoring its guards. This is a command-format change, not a database-schema change.
+
+Editable `AttachedCollection` values carry both the loaded reference and the coordinate mapping used to display their points. Preserve both through UI edits. `writeVolumeCollections` checks both before applying inverse coordinate edits; reloading is required if either the object or its registration changed. Unrelated store commits do not invalidate the mapping.
+
 ## Creating objects and geometry
 
 ```python
@@ -144,8 +148,8 @@ const auto receipt = store.submit(r); // receipt.objects[objectUuid] == 4
   dict or text with payloads keyed by SHA-256. Missing payloads raise/return
   their hashes: stage them and resubmit the identical request.
 - Helpers fill in the expectations an edit depends on:
-  `expectRelationshipEndpoints` (far ends of an edited object's
-  relationships), `editCurrentRequest` / session `editCurrent` (edit existing
+  `expectRelationshipEndpoints(reader, request)` (complete owner/lineage/version
+  guards for far ends of an edited object's relationships), `editCurrentRequest` / session `editCurrent` (edit existing
   objects at current versions, relationships kept as recorded),
   `bindCoordinatesOperation`, `volumeTransformRecord`,
   `volumeTransformChoiceRecord`, `attachmentEdge`, `createSurfaceOperations`.
@@ -228,6 +232,10 @@ the version they read. Hosted clients get `putArtifact` / `fetchArtifact`
 longer read or written, and their contents are not migrated.
 
 All three session artifact readers accept `reference={store, generation, object, version}` (C++: the optional `ObjectVersion` argument). This selects the exact manifest through the shared version resolver, including a retained referenced version after an overlay edit or deletion. It cannot be combined with `version`/`generation` and must name the requested object. The older number-only selectors use the current owner's history; they do not identify a different source owner. Geometry and model-checkpoint consumers must carry the same complete reference to both reads.
+
+## Derived geometry versus copying a store
+
+Python writers of newly computed geometry can use `vc_object_store.derivation.derived_metadata(metadata, policy=..., reference=...)`. The default `portable` policy preserves application metadata but rejects managed `vcobj_extensions` and `artifacts` descriptors: JSON alone cannot copy their payloads. Explicit `geometry_only` removes those managed descriptors and records the policy and complete selected source reference in `meta.derivation`. It does not copy relationships or history. Use the shared collection-copy API when those data must be preserved. This policy is shared by the neural fiber writer/snapping workflow; callers must not independently strip or reinterpret managed descriptors.
 
 ## Projects
 
