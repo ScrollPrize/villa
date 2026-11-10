@@ -61,6 +61,11 @@ public:
 
     const std::string& endpoint() const { return endpoint_; }
     StoreStatus status();
+    // Registrations and route choices selected in one server read transaction.
+    VolumeTransforms volumeTransforms();
+    std::vector<ObjectVersion> versionsAt(const ObjectVersion& anchor);
+    std::optional<std::filesystem::path> resolveStoragePath(const std::string& objectUuid,
+        const std::optional<std::filesystem::path>& datasetRoot = std::nullopt);
     // The service's own state as JSON text (queues, staging, connections,
     // WAL checkpoints); see vc_object_server.
     std::string serviceReport();

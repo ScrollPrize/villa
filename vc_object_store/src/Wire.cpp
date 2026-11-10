@@ -8,8 +8,21 @@
 namespace vc::objects {
 using namespace detail;
 using Json = nlohmann::json;
+static void versionToJson(const RecordCommon&, Json&);
+static void versionFromJson(const Json&, RecordCommon&);
 
 namespace {
+void requireKeys(const Json&, std::initializer_list<const char*>, const char*);
+Json objectVersionJson(const ObjectVersion& v)
+{
+    return {{"store", v.storeUuid}, {"generation", v.generation}, {"object", v.objectUuid}, {"version", v.version}};
+}
+ObjectVersion objectVersionFrom(const Json& v)
+{
+    requireKeys(v, {"store", "generation", "object", "version"}, "object version");
+    return {v.at("store").get<std::string>(), v.at("generation").get<std::string>(),
+        v.at("object").get<std::string>(), v.at("version").get<int64_t>()};
+}
 const char* reasonName(TransactionConflict::Reason reason)
 {
     switch (reason) {
@@ -295,10 +308,13 @@ Json fieldsJson(const std::optional<std::vector<std::string>>& fields) { return 
 
 Json relationshipJson(const RelationshipRevision& r)
 {
-    return Json{{"uuid", r.uuid}, {"record", withExactMeta(edgeToJson(r.record, nullptr, false), r.record)}, {"a_revision", r.aRevision},
+    auto record = withExactMeta(edgeToJson(r.record, nullptr, false), r.record);
+    versionToJson(r.record, record);
+    return Json{{"uuid", r.uuid}, {"record", std::move(record)}, {"a_revision", r.aRevision},
                 {"b_revision", r.bRevision}, {"a_geometry_revision", optionalText(r.aGeometryRevision)},
                 {"b_geometry_revision", optionalText(r.bGeometryRevision)}, {"version", r.version},
-                {"generation", r.generation}, {"a_version", r.aVersion}, {"b_version", r.bVersion}};
+                {"generation", r.generation}, {"a_version", r.aVersion}, {"b_version", r.bVersion},
+                {"a_reference", objectVersionJson(r.aReference)}, {"b_reference", objectVersionJson(r.bReference)}};
 }
 
 RelationshipRevision relationshipFrom(const Json& j)
@@ -306,6 +322,7 @@ RelationshipRevision relationshipFrom(const Json& j)
     RelationshipRevision r;
     r.uuid = j.at("uuid").get<std::string>();
     r.record = exactMetaFrom(j.at("record"), edgeFromJson(j.at("record")));
+    versionFromJson(j.at("record"), r.record);
     r.aRevision = j.at("a_revision").get<std::string>();
     r.bRevision = j.at("b_revision").get<std::string>();
     r.aGeometryRevision = textFrom(j.at("a_geometry_revision"));
@@ -314,6 +331,8 @@ RelationshipRevision relationshipFrom(const Json& j)
     r.generation = j.at("generation").get<std::string>();
     r.aVersion = j.at("a_version").get<int64_t>();
     r.bVersion = j.at("b_version").get<int64_t>();
+    r.aReference = objectVersionFrom(j.at("a_reference"));
+    r.bReference = objectVersionFrom(j.at("b_reference"));
     return r;
 }
 
@@ -517,8 +536,7 @@ std::vector<ObjectRevision> objectHistoryFromJson(const std::string& text, Store
 std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>& versions)
 {
     auto array = Json::array();
-    for (const auto& v : versions)
-        array.push_back({{"store", v.storeUuid}, {"generation", v.generation}, {"object", v.objectUuid}, {"version", v.version}});
+    for (const auto& v : versions) array.push_back(objectVersionJson(v));
     return Json{{"versions", std::move(array)}}.dump();
 }
 
@@ -527,11 +545,7 @@ std::vector<ObjectVersion> objectVersionsRequestFromJson(const std::string& text
     const auto j = Json::parse(text);
     requireKeys(j, {"versions"}, "object versions request");
     std::vector<ObjectVersion> result;
-    for (const auto& v : j.at("versions")) {
-        requireKeys(v, {"store", "generation", "object", "version"}, "object version");
-        result.push_back({v.at("store").get<std::string>(), v.at("generation").get<std::string>(),
-                          v.at("object").get<std::string>(), v.at("version").get<int64_t>()});
-    }
+    for (const auto& v : j.at("versions")) result.push_back(objectVersionFrom(v));
     return result;
 }
 
@@ -613,7 +627,9 @@ std::string regionQueryResultToJson(const StoreStatus& status, const RegionResul
     for (const auto& run : r.runs)
         runs.push_back({{"object", run.objectUuid}, {"revision", run.revisionUuid}, {"array", run.arrayName},
                         {"family", run.family}, {"first_segment", run.firstSegment}, {"points", run.points},
-                        {"grid", run.grid}});
+                        {"grid", run.grid},
+                        {"object_reference", objectVersionJson(run.objectReference)},
+                        {"object_to_volume", run.objectToVolume ? run.objectToVolume->json() : Json(nullptr)}});
     const auto& s = r.stats;
     Json stats{{"output_bytes", s.outputBytes}, {"processing_bytes", s.processingBytes},
                {"payload_bytes", s.payloadBytes}, {"verified_bytes", s.verifiedBytes},
@@ -635,7 +651,9 @@ RegionResult regionQueryResultFromJson(const std::string& text, StoreStatus* asO
                           run.at("array").get<std::string>(), run.at("family").get<std::string>(),
                           run.at("first_segment").get<int64_t>(),
                           run.at("points").get<std::vector<std::array<double, 3>>>(),
-                          run.at("grid").get<std::vector<std::array<double, 2>>>()});
+                          run.at("grid").get<std::vector<std::array<double, 2>>>(),
+                          objectVersionFrom(run.at("object_reference")),
+                          run.at("object_to_volume").is_null() ? std::nullopt : std::optional(VolumeAffine::fromJson(run.at("object_to_volume")))});
     r.remote = j.at("remote").get<std::vector<std::string>>();
     const auto& s = j.at("stats");
     auto& t = r.stats;

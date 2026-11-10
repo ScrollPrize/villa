@@ -20,11 +20,9 @@ std::optional<int64_t> currentRevision(ObjectStoreSession& session, const Attach
 {
     std::optional<int64_t> version;
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
-        version = currentVersionOf(reader, uuid);
-        if (record) {
-            const auto head = reader.currentObject(uuid);
-            *record = head ? std::optional(head->record) : std::nullopt;
-        }
+        const auto head = reader.currentObject(uuid);
+        version = head ? std::optional(head->version) : currentVersionOf(reader, uuid);
+        if (record) *record = head ? std::optional(head->record) : std::nullopt;
     });
     return version;
 }
@@ -32,12 +30,13 @@ std::optional<int64_t> currentRevision(ObjectStoreSession& session, const Attach
 // Write `record` over the object's current version `version` (created when
 // it is not in the store; restored first when `restore`), in one checked request.
 void writeRecord(ObjectStoreSession& session, const AttachmentIdentity& attachment, const ObjectRecord& record,
-                 const std::optional<int64_t>& version, bool present, bool restore = false)
+                 const std::optional<int64_t>& version, const std::optional<ObjectRecord>& existing, bool restore = false)
 {
     auto request = session.newRequest(attachment);
     request.expectedObjects[util::canonicalUuid(record.uuid)] = version;
+    if (existing) expectObject(request, existing->reference());
     if (restore) request.operations.push_back(RestoreObjectOp{record.uuid, std::nullopt});
-    if (present) request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
+    if (existing) request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
     else request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
     session.submit(attachment, request);
 }
@@ -104,15 +103,14 @@ void setProjectName(ObjectStoreSession& session, const AttachmentIdentity& attac
     std::optional<ObjectRecord> record;
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) { record = projectRecord(reader); });
     if (record && record->name == name) return;
+    const auto existing = record;
     if (!record) {
         record.emplace();
         record->uuid = util::newUuid();
         record->kind = kProjectKind;
     }
     record->name = name;
-    std::optional<ObjectRecord> existing;
-    const auto version = currentRevision(session, attachment, record->uuid, &existing);
-    writeRecord(session, attachment, *record, version, existing.has_value());
+    writeRecord(session, attachment, *record, existing ? existing->version : std::nullopt, existing);
 }
 
 std::vector<ProjectResource> projectResources(const StoreReader& reader, const std::string& kind,
@@ -180,7 +178,7 @@ bool addProjectResource(ObjectStoreSession& session, const AttachmentIdentity& a
     if (existing && !existing->retired && existing->tags == record.tags &&
         Json::parse(existing->meta) == Json::parse(record.meta))
         return false;
-    writeRecord(session, attachment, record, revision, existing.has_value(), existing && existing->retired);
+    writeRecord(session, attachment, record, revision, existing, existing && existing->retired);
     return true;
 }
 
@@ -196,7 +194,7 @@ void updateProjectResourceMeta(ObjectStoreSession& session, const AttachmentIden
     merged.update(meta);
     if (merged == before) return;
     record->meta = merged.dump();
-    writeRecord(session, attachment, *record, revision, true);
+    writeRecord(session, attachment, *record, revision, record);
 }
 
 bool removeProjectResource(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& uuid)
@@ -205,7 +203,7 @@ bool removeProjectResource(ObjectStoreSession& session, const AttachmentIdentity
     const auto revision = currentRevision(session, attachment, uuid, &record);
     if (!record || record->retired || !isProjectResourceKind(record->kind)) return false;
     auto request = session.newRequest(attachment);
-    request.expectedObjects[util::canonicalUuid(uuid)] = revision;
+    expectObject(request, record->reference());
     request.operations.push_back(RetireObjectOp{uuid});
     session.submit(attachment, request);
     return true;
@@ -231,7 +229,7 @@ void setProjectView(ObjectStoreSession& session, const AttachmentIdentity& attac
     std::optional<ObjectRecord> existing;
     const auto revision = currentRevision(session, attachment, record.uuid, &existing);
     if (existing && Json::parse(existing->meta) == Json::parse(record.meta)) return;
-    writeRecord(session, attachment, record, revision, existing.has_value());
+    writeRecord(session, attachment, record, revision, existing);
 }
 
 } // namespace vc::objects

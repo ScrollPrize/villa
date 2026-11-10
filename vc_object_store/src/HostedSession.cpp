@@ -719,19 +719,7 @@ VolumeTransforms HostedAttachment::volumeTransforms()
             if (transforms_) return *transforms_;
             epoch = transformInvalidations_;
         }
-        // Recorded registrations and choices only: a shared store never applies
-        // a client's unrecorded catalog registrations.
-        ObjectSelection registrations;
-        registrations.kind = "volume_transform";
-        std::vector<std::pair<ObjectRecord, std::string>> recorded;
-        for (auto& record : client_.selectAllObjects(registrations)) {
-            const auto head = client_.currentObjectRevision(record.uuid);
-            if (!head) continue; // removed since the listing; the next check invalidates
-            recorded.emplace_back(std::move(record), head->uuid);
-        }
-        ObjectSelection choices;
-        choices.kind = "volume_transform_choice";
-        auto transforms = volumeTransformsFrom(recorded, client_.selectAllObjects(choices), nullptr);
+        auto transforms = client_.volumeTransforms();
         std::lock_guard lock(cacheMutex_);
         // A poll or submission may have invalidated the snapshot while HTTP was in flight.
         if (epoch != transformInvalidations_) continue;

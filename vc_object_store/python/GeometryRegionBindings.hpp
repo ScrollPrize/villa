@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "StorageBindings.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 
@@ -55,6 +56,8 @@ inline nb::dict regionResultToPy(const vo::RegionResult& result)
         item["object_uuid"] = run.objectUuid; item["revision_uuid"] = run.revisionUuid;
         item["array_name"] = run.arrayName; item["family"] = run.family;
         item["first_segment"] = run.firstSegment; item["points"] = run.points;
+        item["object_reference"] = jsonLoads(vo::objectVersionsRequestToJson({run.objectReference}))["versions"][0];
+        item["object_to_volume"] = run.objectToVolume ? jsonLoads(run.objectToVolume->json().dump()) : nb::none();
         if (!run.grid.empty()) item["grid"] = run.grid;
         runs.append(item);
     }

@@ -32,15 +32,19 @@ std::map<std::string, EdgeRecord> attachedEdges(const StoreReader& reader, const
 }
 
 // A live collection with geometry `head`, its points in `frame` when given.
-AttachedCollection readCollection(const StoreReader& reader, const ObjectRecord& object,
-                                  const std::string& head, const std::optional<ViewFrame>& frame)
+AttachedCollection readCollection(const StoreReader& reader, const ObjectRevision& selected,
+                                  const std::optional<ViewFrame>& frame)
 {
+    const auto& object = selected.record;
+    const auto& head = *selected.geometryRevision;
     AttachedCollection collection;
+    collection.reference = selected.reference();
     collection.uuid = object.uuid;
     collection.name = object.name;
     collection.points = std::get<geometry::PointCollection>(geometry::decode(reader.readGeometryData(head)));
     if (frame) {
-        const auto shown = GeometrySnapshot(reader).viewTransformedAt(object.uuid, frame->volume, frame->scale);
+        const auto shown = GeometrySnapshot(reader).viewTransformedAt(selected, frame->volume, frame->scale);
+        collection.mapping = shown.checkMappingOperation();
         collection.points.points = shown.points("points", 0, int64_t(collection.points.points.size()));
     }
     collection.annotations = reader.geometryPointAnnotations(head, "points");
@@ -58,9 +62,15 @@ void writeCollection(const StoreReader& reader, TransactionRequest& request, con
                      const AttachedCollection& wanted, const nlohmann::json& created, const std::optional<ViewFrame>& frame)
 {
     auto& operations = request.operations;
+    if (wanted.mapping) operations.push_back(*wanted.mapping);
     auto points = wanted.points;
     const auto current = reader.currentObject(uuid);
     request.expectedObjects[uuid] = currentVersionOf(reader, uuid);
+    if (current) expectObject(request, current->reference());
+    if (wanted.reference) {
+        if (util::canonicalUuid(wanted.reference->objectUuid) != uuid) throw std::invalid_argument("collection reference names another object");
+        expectObject(request, *wanted.reference);
+    }
     if (current && current->record.retired) operations.push_back(RestoreObjectOp{uuid, std::nullopt});
     auto record = current ? current->record : ObjectRecord{};
     auto meta = nlohmann::json::parse(record.meta.empty() ? std::string("{}") : record.meta);
@@ -83,7 +93,7 @@ void writeCollection(const StoreReader& reader, TransactionRequest& request, con
     }
     record.meta = meta.dump();
     if (frame) {
-        const auto shown = GeometrySnapshot(reader).viewTransformedAt(uuid, frame->volume, frame->scale);
+        const auto shown = GeometrySnapshot(reader).viewTransformedAt(*current, frame->volume, frame->scale);
         points = shown.canonicalPointCollection(points);
         operations.push_back(shown.checkMappingOperation());
     }
@@ -130,7 +140,7 @@ std::string attachDocument(ObjectStoreSession& session, const AttachmentIdentity
         auto edge = attachmentEdge(collection.uuid, object->record.uuid, layout.role);
         edge.uuid = util::newUuid();
         request.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});
-        expectRelationshipEndpoints(reader, request.expectedObjects);
+        expectRelationshipEndpoints(reader, request);
     });
     session.submit(attachment, request);
     return collection.uuid;
@@ -171,7 +181,7 @@ std::vector<AttachedCollection> attachedCollections(ObjectStoreSession& session,
         for (const auto& [uuid, edge] : attachedEdges(reader, objectUuid, role)) {
             const auto object = reader.currentObject(uuid);
             if (!object || object->record.retired || !object->geometryRevision) continue;
-            result.push_back(readCollection(reader, object->record, *object->geometryRevision, frame));
+            result.push_back(readCollection(reader, *object, frame));
         }
     });
     return result;
@@ -203,7 +213,7 @@ void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIde
             request.operations.push_back(RemoveEdgeOp{edge.uuid});
             request.operations.push_back(RetireObjectOp{uuid});
         }
-        expectRelationshipEndpoints(reader, request.expectedObjects);
+        expectRelationshipEndpoints(reader, request);
     });
     session.submit(attachment, request);
 }
@@ -217,8 +227,8 @@ std::vector<AttachedCollection> volumeCollections(const StoreReader& reader, con
     selection.targetScale = volume.scale;
     for (const auto& object : reader.selectObjects(selection)) {
         if (nlohmann::json::parse(object.meta).contains("role")) continue;
-        if (const auto head = reader.currentGeometry(object.uuid))
-            result.push_back(readCollection(reader, object, head->uuid, ViewFrame{volume.volume, volume.scale}));
+        if (const auto selected = reader.selectedObject(object.uuid, {}, {}, object.reference()); selected && selected->geometryRevision)
+            result.push_back(readCollection(reader, *selected, ViewFrame{volume.volume, volume.scale}));
     }
     return result;
 }
@@ -232,7 +242,7 @@ std::vector<AttachedCollection> pointCollections(const StoreReader& reader, cons
         if (!object || object->record.retired || object->record.kind != "point_collection")
             throw std::runtime_error("point collection not found: " + uuid);
         if (!object->geometryRevision) throw std::runtime_error("point collection has no geometry: " + uuid);
-        result.push_back(readCollection(reader, object->record, *object->geometryRevision, ViewFrame{volume.volume, volume.scale}));
+        result.push_back(readCollection(reader, *object, ViewFrame{volume.volume, volume.scale}));
     }
     return result;
 }
@@ -247,7 +257,8 @@ std::vector<AttachedCollection> volumeCollections(ObjectStoreSession& session, c
 
 TransactionReceipt writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment,
                                           const VolumeVoxels& volume, const std::vector<AttachedCollection>& changed,
-                                          const std::vector<std::string>& removed, const VersionSelection& expected)
+                                          const std::vector<std::string>& removed, const VersionSelection& expected,
+                                          const std::vector<ObjectVersion>& references)
 {
     auto request = session.newRequest(attachment);
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
@@ -262,7 +273,8 @@ TransactionReceipt writeVolumeCollections(ObjectStoreSession& session, const Att
         }
         // The caller's pins win over the current versions read here.
         for (const auto& [uuid, version] : expected) request.expectedObjects[util::canonicalUuid(uuid)] = version;
-        expectRelationshipEndpoints(reader, request.expectedObjects);
+        for (const auto& reference : references) expectObject(request, reference);
+        expectRelationshipEndpoints(reader, request);
     });
     return session.submit(attachment, request);
 }

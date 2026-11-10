@@ -148,9 +148,10 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
             Prepared p;
             if (object.kind == "track") {
                 if (!object.track) throw std::runtime_error("track detail missing");
-                fs::path path(object.track->datasetRef);
-                if (path.is_relative()) path = datasetRoot.value_or(db.path().parent_path()) / path;
-                const auto packed = resolvePackedTrackStore(path);
+                std::optional<fs::path> path;
+                { auto read = db.read(); path = db.resolveStoragePath(read, object.uuid, datasetRoot); }
+                if (!path) throw std::runtime_error("track source is unavailable");
+                const auto packed = resolvePackedTrackStore(*path);
                 auto& store = trackCache[packed];
                 if (!store) store = std::make_unique<PackedTrackStore>(packed);
                 const auto id = detail::trackSourceId(object.track->externalKey);
@@ -205,8 +206,6 @@ struct IngestTarget {
     std::function<TransactionReceipt(const TransactionRequest&)> submit;
     // Stops before the next surface or track, or before a batch commits.
     std::function<bool()> cancelled;
-    // Relative track dataset references resolve here (the store's directory).
-    std::optional<fs::path> storeDirectory;
 };
 
 // Ends ingestion at a failure that is not the source's (stopOnInfrastructureError).
@@ -285,11 +284,11 @@ try {
                 ObjectSelection tracks; tracks.kind = "track"; tracks.includeRetired = true;
                 for (const auto& object : reader.selectObjects(tracks)) {
                     if (!object.track) continue;
-                    fs::path path(object.track->datasetRef);
-                    if (path.is_relative() && target.storeDirectory) path = *target.storeDirectory / path;
+                    const auto path = reader.resolveStoragePath(object.uuid);
+                    if (!path) continue;
                     std::error_code error;
-                    if (fs::weakly_canonical(path, error) == packed && !error) {
-                        refs.insert(object.track->datasetRef); existing.emplace(object.track->externalKey, object);
+                    if (fs::weakly_canonical(*path, error) == packed && !error) {
+                        refs.insert(path->string()); existing.emplace(object.track->externalKey, object);
                     }
                 }
             });
@@ -367,7 +366,6 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
     };
     target.submit = [&](const TransactionRequest& request) { return db.submit(request); };
     target.cancelled = [] { return false; };
-    target.storeDirectory = db.path().parent_path();
     GeometryIngestReport report;
     ingestSource(report, target, kind, source, progress, coordinateContext, tags, options);
     return report;
@@ -392,7 +390,6 @@ GeometryIngestReport ingestGeometrySource(ObjectStoreSession& session, const Att
     target.newRequest = [&] { return session.newRequest(attachment); };
     target.submit = [&](const TransactionRequest& request) { return session.submit(attachment, request); };
     target.cancelled = [&] { return !session.current(attachment) || (cancel && cancel->load()); };
-    if (!session.hosted(attachment)) target.storeDirectory = fs::path(session.location(attachment)).parent_path();
     ingestSource(report, target, kind, source, progress, coordinateContext, tags, options);
     return report;
 }

@@ -109,7 +109,11 @@ def test_manual_relationship_reference(db):
                   expected_relationships={edge: 1}) as txn:
         txn.replace_extension_rows(spec["name"], edge, first)
     state = db.status()
-    ref = dict(store=state["store"], generation=state["generation"], relationship=edge, version=2)
+    selected = db.relationships_at_versions([
+        dict(store=state["store"], generation=state["generation"], object=uid, version=db.current_version(uid))
+        for uid in (a, b)])[0]
+    ref = dict(store=selected["store"], generation=selected["generation"], relationship=edge, version=selected["version"])
+    assert ref["version"] == 2 and selected["record"]["version_store"] == ref["store"]
     assert db.extension_rows_at_version(spec["name"], ref) == first
     with db.write(expected_versions={a: db.current_version(a), b: db.current_version(b)},
                   expected_relationships={edge: 2}) as txn:

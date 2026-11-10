@@ -322,8 +322,9 @@ int main() try {
         // point identity, retired; read through views (here a registration).
         const auto storePath=directory.path/(policy==HistoryMode::On ? "collections.vcobj" : "collections-direct.vcobj");
         auto collectionOptions=options; collectionOptions.history=policy;
+        std::string collectionRegistration;
         {auto created=ObjectStore::create(storePath,collectionOptions);
-         auto txn=created.write();(void)created.registerVolumeTransform(txn,"w","w2",VolumeAffine::scale(2),"twice");txn.commit();}
+         auto txn=created.write();collectionRegistration=created.registerVolumeTransform(txn,"w","w2",VolumeAffine::scale(2),"twice");txn.commit();}
         ObjectStoreSession session;const auto attachment=session.attach(storePath,collectionOptions);
         AttachedCollection collection;collection.uuid=vc::objects::util::newUuid();collection.name="seeds";
         collection.points.ids={4,9};collection.points.points={{1,2,3},{4,5,6}};
@@ -357,6 +358,19 @@ int main() try {
             require(!reader.currentObject(surface.uuid)->record.retired,"removing attachments never retires their owner");
         });
         require(volumeCollections(session,attachment,{"w"}).size()==1,"attached collections are not the volume's");
+        // Changing registration must not reinterpret points loaded before it,
+        // even though the collection's complete object reference stays unchanged.
+        auto loaded=volumeCollections(session,attachment,{"w2"}).front();
+        loaded.points.points[0][0]+=1;
+        session.editCurrent(attachment,{collectionRegistration},[&](const StoreReader& reader,const auto&){
+            return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(volumeTransformRecord(
+                reader.currentObject(collectionRegistration)->record,"w","w2",VolumeAffine::scale(3),"changed"))}};
+        });
+        mustFail([&]{writeVolumeCollections(session,attachment,{"w2"},{loaded},{});});
+        auto reloaded=volumeCollections(session,attachment,{"w2"}).front();
+        require(reloaded.reference==loaded.reference,"registration change alone preserves collection identity");
+        reloaded.points.points[0][0]+=1;
+        writeVolumeCollections(session,attachment,{"w2"},{reloaded},{});
         writeVolumeCollections(session,attachment,{"w"},{},{collection.uuid});
         require(volumeCollections(session,attachment,{"w"}).empty(),"a removed collection is retired");
         // At a working level: written and read at a scale of the volume's voxels.

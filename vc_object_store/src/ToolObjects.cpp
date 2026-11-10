@@ -41,17 +41,21 @@ CoordinateJson ToolObjects::coordinatesFor(const std::vector<std::string>& sourc
 {
     if (volume) return volumeCoordinates(*volume);
     std::set<std::optional<VolumeVoxels>> frames;
+    std::optional<ObjectVersion> reference;
     {
         std::lock_guard lock(mutex_);
         for (const auto& source : sources)
-            if (const auto found = read_.find(source); found != read_.end()) frames.insert(found->second.volume);
+            if (const auto found = read_.find(util::canonicalUuid(source)); found != read_.end()) {
+                frames.insert(found->second.volume);
+                if (&source == &sources.front()) reference = found->second.pin.reference();
+            }
     }
     if (frames.size() > 1) throw std::runtime_error("sources were loaded in different frames");
     if (!frames.empty() && *frames.begin()) return volumeCoordinates(**frames.begin());
     auto coordinates = CoordinateJson::object();
     if (!sources.empty())
         session_->readStore(attachment_, [&](const StoreReader& reader, const auto&) {
-            const auto source = reader.currentObject(sources.front());
+            const auto source = reader.selectedObject(sources.front(), {}, {}, reference);
             if (!source) throw std::runtime_error("source object not found: " + sources.front());
             const auto meta = nlohmann::json::parse(source->record.meta);
             if (meta.contains("coordinates")) coordinates = meta.at("coordinates");

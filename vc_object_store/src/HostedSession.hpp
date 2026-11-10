@@ -140,6 +140,11 @@ public:
     {
         return attachment_->relationshipsAt(versions);
     }
+    std::vector<ObjectVersion> versionsAt(const ObjectVersion& anchor) const override
+    { return attachment_->client().versionsAt(anchor); }
+    std::optional<std::filesystem::path> resolveStoragePath(const std::string& objectUuid,
+        const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const override
+    { return attachment_->client().resolveStoragePath(objectUuid, datasetRoot); }
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override
     {

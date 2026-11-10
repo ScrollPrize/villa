@@ -285,7 +285,7 @@ std::map<std::string, std::string> fiberNetworkJson(
     if (pending.empty()) for (const auto& [uuid, revision] : revisions)
         if (!revision.record.retired) pending.push_back(uuid);
     while (!pending.empty()) {
-        auto uuid = std::move(pending.back()); pending.pop_back();
+        auto uuid = util::canonicalUuid(pending.back()); pending.pop_back();
         if (!revisions.contains(uuid) || revisions.at(uuid).record.retired)
             throw std::invalid_argument("Unknown active fiber export root " + uuid);
         if (!included.insert(uuid).second) continue;

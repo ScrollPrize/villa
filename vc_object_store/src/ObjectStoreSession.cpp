@@ -1380,7 +1380,7 @@ void ObjectStoreSession::requireCurrent(const PinnedObject& pin)
     readStore(pin.attachment, [&](const StoreReader& reader, const auto&) {
         const auto head = reader.currentObject(pin.object.objectUuid);
         if (reader.status().generation != pin.writeGeneration ||
-            !head || head->version != pin.version || head->generation != pin.generation)
+            !head || head->reference() != pin.reference())
             throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");
     });
 }

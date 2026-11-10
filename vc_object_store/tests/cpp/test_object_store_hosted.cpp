@@ -408,6 +408,17 @@ try {
                 h[0].relationship.version == l[0].relationship.version && h[0].applicable == l[0].applicable &&
                 h[0].relationship.aVersion == (h[0].relationship.record.aUuid == a ? va : vb) &&
                 h[0].relationship.bVersion == (h[0].relationship.record.bUuid == b ? vb : va), "numbered relationship parity");
+            require(h[0].relationship.record.versionStoreUuid == hostedInitial.storeUuid &&
+                h[0].relationship.record.versionGeneration == h[0].relationship.generation &&
+                h[0].relationship.record.version == h[0].relationship.version,
+                "relationship wire preserves complete owner identity");
+            require(h[0].relationship.aReference.storeUuid == hostedInitial.storeUuid &&
+                h[0].relationship.aReference.objectUuid == h[0].relationship.record.aUuid &&
+                h[0].relationship.aReference.version == h[0].relationship.aVersion &&
+                h[0].relationship.bReference.storeUuid == hostedInitial.storeUuid &&
+                h[0].relationship.bReference.objectUuid == h[0].relationship.record.bUuid &&
+                h[0].relationship.bReference.version == h[0].relationship.bVersion,
+                "relationship wire preserves complete selected endpoint references");
         }
         mustFail([&] { (void)hosted.relationshipsAt({{hostedInitial.storeUuid, hostedInitial.generation, a, 99}}); });
         mustFail([&] { (void)hosted.relationshipsAt({{hostedInitial.storeUuid, util::newUuid(), a, 1}}); });
@@ -420,6 +431,15 @@ try {
             hostedRegion.runs.size() == 1 && hostedRegion.runs[0].objectUuid == sheetUuid &&
             hostedRegion.runs[0].points == localRegion.runs[0].points && hostedRegion.runs[0].grid == localRegion.runs[0].grid &&
             hostedRegion.intersectingObjects == localRegion.intersectingObjects, "region parity (exact doubles)");
+        require(hostedRegion.runs[0].objectReference == hosted.currentObjectRevision(sheetUuid)->reference() &&
+            localRegion.runs[0].objectReference == local.currentObjectRevision(txn, sheetUuid)->reference() &&
+            !hostedRegion.runs[0].objectToVolume,
+            "region wire retains selected owner state and exact display mapping");
+        const auto hostedAnchor = hosted.currentObjectRevision(sheetUuid)->reference();
+        const auto hostedSnapshot = hosted.versionsAt(hostedAnchor);
+        require(std::find(hostedSnapshot.begin(), hostedSnapshot.end(), hostedAnchor) != hostedSnapshot.end(),
+            "hosted export snapshot retains its exact anchor");
+        require(!hosted.resolveStoragePath(util::newUuid()), "hosted source path resolver preserves missing-object result");
         surfaces.processingByteBudget = 0;
         require(hosted.geometryRegion(plane, surfaces).stop == RegionStop::ProcessingBudget, "region budget stop");
 
@@ -469,7 +489,8 @@ try {
     // exact membership and versions as of the feed position it reports.
     std::vector<std::string> churned;
     {
-        std::atomic<bool> done{false};
+        std::atomic<bool> done{false}, writerFinished{false};
+        std::atomic<size_t> createdCount{0};
         std::string writerError;
         std::thread writer([&] {
             try {
@@ -483,6 +504,7 @@ try {
                         client.submit(request({{created, std::nullopt}},
                             {CreateObjectOp{objectRecordJson(trackRecord(created))}}).hosted);
                         churned.push_back(created);
+                        ++createdCount;
                     } else if (i % 3 == 1) {
                         const auto v = *client.currentVersion(extra[0]);
                         client.submit(request({{extra[0], v}}, {SetMetaOp{extra[0], "tick", std::to_string(i)}}).hosted);
@@ -494,13 +516,16 @@ try {
             } catch (const std::exception& e) {
                 writerError = e.what();
             }
+            writerFinished = true;
         });
         ObjectSelection tracks; tracks.kind = "track";
         std::vector<std::pair<StoreStatus, std::vector<ObjectRecord>>> listings;
         std::string listingError;
         try {
             const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-            while (std::chrono::steady_clock::now() < until || listings.size() < 20) {
+            const auto deadline = until + std::chrono::seconds(20);
+            while (std::chrono::steady_clock::now() < until || listings.size() < 20 || createdCount < 3) {
+                if (writerFinished || std::chrono::steady_clock::now() > deadline) break;
                 StoreStatus asOf;
                 auto listed = hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1, 0, &asOf);
                 listings.emplace_back(asOf, std::move(listed));

@@ -499,7 +499,9 @@ int main() try
             auto request = session.newRequest(replacement);
             session.readStore(replacement, [&](const StoreReader& reader, const auto&) {
                 request.expectedObjects[sheet] = reader.currentObject(sheet)->version;
-                expectRelationshipEndpoints(reader, request.expectedObjects);
+                expectRelationshipEndpoints(reader, request);
+                require(request.expectedObjectReferences.at(marker) == reader.currentObject(marker)->reference(),
+                        "relationship peers have complete snapshot expectations");
             });
             std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
             request.operations.push_back(EditGeometryOp{sheet, {{"points", 0, moved}}, {}, keepRecorded});

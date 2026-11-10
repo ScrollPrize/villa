@@ -36,8 +36,25 @@ public:
         const std::optional<ObjectVersion>& reference = std::nullopt) const;
     virtual std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, bool ifRetained = false) const = 0;
     virtual std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&) const = 0;
+    // The selected owner's snapshot at this publication (or its retained
+    // current-only state). Does not substitute the attachment's moving head.
+    virtual std::vector<ObjectVersion> versionsAt(const ObjectVersion&) const;
+    // Export destinations are in the reader client's filesystem. Local
+    // readers protect their complete backing-file closure; remote readers
+    // own no database files in that filesystem.
+    virtual void validateExportDestination(const std::filesystem::path&) const {}
+    virtual std::optional<std::filesystem::path> resolveStoragePath(const std::string& objectUuid,
+        const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;
     // The relationships among objects at these versions (ObjectStore::relationshipsAt).
     virtual std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const = 0;
+    GraphReadView graphReadViewAt(const std::vector<ObjectVersion>&, const EdgeSelection& = {}) const;
+    // Expand through recorded relationship endpoints, without current-head reads.
+    // Explicit selections win. Other endpoints use the newest referenced version
+    // within one owner/lineage; competing owners/lineages are ambiguous and fail.
+    // Final applicability uses graphReadViewAt. This is an evidence closure, not
+    // a claim that all nodes were selected at one global historical publication.
+    GraphReadView graphReadViewAround(const std::vector<ObjectVersion>&, const EdgeSelection& = {},
+                                     const std::atomic_bool* cancel = nullptr) const;
     // The geometry of the object's current revision.
     virtual std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const = 0;
     virtual std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const = 0;
@@ -109,7 +126,10 @@ std::optional<int64_t> currentVersionOf(const StoreReader&, const std::string& o
 // Adds every endpoint of the relationships (retired included) of the objects
 // `expected` expects present, at its current version (absent: nullopt), so a
 // geometry change that keeps or edits those relationships is checked against
-// both ends. Existing entries are kept.
+// both ends. Existing entries are kept. The request overload also guards the
+// complete selected owner/lineage identity; use it for writes. The numeric-only
+// overload remains for callers explicitly requesting numeric expectations.
+void expectRelationshipEndpoints(const StoreReader&, TransactionRequest&);
 void expectRelationshipEndpoints(const StoreReader&, VersionSelection& expected);
 // The typed form of an edit of existing objects that keeps their
 // relationships as recorded (ObjectStoreSession::editCurrent): expects each of
@@ -154,6 +174,10 @@ public:
     std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const override;
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, bool ifRetained = false) const override;
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&) const override;
+    std::vector<ObjectVersion> versionsAt(const ObjectVersion&) const override;
+    void validateExportDestination(const std::filesystem::path&) const override;
+    std::optional<std::filesystem::path> resolveStoragePath(const std::string&,
+        const std::optional<std::filesystem::path>& = std::nullopt) const override;
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const override;
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override;

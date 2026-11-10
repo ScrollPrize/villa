@@ -209,8 +209,11 @@ void detail::createExtensionTable(sqlite3* db,const ExtensionTable& spec) {
             Statement exists(db,"SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",spec.name+"_idx"+std::to_string(i));
             const auto expected=std::string("CREATE ")+(idx.unique?"UNIQUE ":"")+"INDEX "+identifier(spec.name+"_idx"+std::to_string(i))+" ON "+name+"("+joined(idx.columns)+")";
             if(!exists.row()||exists.text(0)!=expected)throw std::invalid_argument("extension: index definition differs");}
+        (void)resolvedExtensionTable(db,spec.name);
         return;
     }
+    if(const auto visible=resolvedExtensionTable(db,spec.name))
+        requireCompatibleExtension(extensionDefinition(*visible),spec);
     Savepoint save(db);registry(db);
     exec(db,("CREATE TABLE "+name+"("+body+",PRIMARY KEY("+joined(spec.primaryKey)+")) WITHOUT ROWID").c_str());
     for(size_t i=0;i<spec.indexes.size();++i){const auto& idx=spec.indexes[i];
@@ -266,10 +269,20 @@ ExtensionTable detail::extensionDefinition(const ExtensionTableInfo& info){
         info.primaryKey,info.indexes,info.keySpace,info.versioned};
 }
 void detail::requireCompatibleExtension(const ExtensionTableInfo& a,const ExtensionTableInfo& b){
+    requireCompatibleExtension(extensionDefinition(a), extensionDefinition(b));
+}
+void detail::requireCompatibleExtension(const ExtensionTable& a,const ExtensionTable& b){
     if(a.extension!=b.extension||a.formatVersion!=b.formatVersion||a.columns!=b.columns||
        a.primaryKey!=b.primaryKey||a.keySpace!=b.keySpace||a.versioned!=b.versioned||
        Json::parse(a.provisioning)!=Json::parse(b.provisioning))
         throw std::runtime_error("incompatible extension definitions: "+a.name);
+}
+std::optional<ExtensionTableInfo> detail::resolvedExtensionTable(sqlite3* db,const std::string& name){
+    std::optional<ExtensionTableInfo> result;
+    for(auto* source:querySources(db))if(auto candidate=extensionTable(source,name)){
+        if(result)requireCompatibleExtension(*result,*candidate);else result=std::move(candidate);
+    }
+    return result;
 }
 void ObjectStore::createExtensionTable(WriteTxn& t,const ExtensionTable& spec){detail::createExtensionTable(static_cast<sqlite3*>(connection(t)),spec);}
 std::vector<ExtensionTableInfo> ObjectStore::extensionTables(const Txn& t) const{
@@ -282,11 +295,8 @@ std::vector<ExtensionTableInfo> ObjectStore::extensionTables(const Txn& t) const
 void ObjectStore::appendExtensionRows(WriteTxn& t,const std::string& name,std::span<const ExtensionRow> rows){detail::appendExtensionRows(static_cast<sqlite3*>(connection(t)),name,rows);}
 void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix) const {
     auto* db=static_cast<sqlite3*>(connection(t));
-    std::optional<ExtensionTableInfo> table;
+    const auto table=resolvedExtensionTable(db,name);
     const auto sources=querySources(db);
-    for(auto* source:sources)if(auto candidate=extensionTable(source,name)){
-        if(table)requireCompatibleExtension(*table,*candidate);else table=std::move(candidate);
-    }
     if(!table)throw std::invalid_argument("extension: unregistered table "+name);
     if(!visitor||prefix.size()>table->primaryKey.size())throw std::invalid_argument("extension: invalid scan");
     if(table->versioned){

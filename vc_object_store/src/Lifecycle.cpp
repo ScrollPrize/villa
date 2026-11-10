@@ -99,26 +99,18 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
     const auto current = objectByUuid(txn, uuid);
     if (!current) throw std::invalid_argument("object lifecycle: unknown object");
     if (!current->retired && !sourceVersion) return;
-    if (!historyEnabled(db)) {
-        if (sourceVersion) requireHistory(db);
-        Savepoint savepoint(db);
-        createRecordOverride(db,"objects",uuid);
-        auto restored = *current;
-        restored.retired = false; restored.lifecycleEpoch = std::to_string(writeCommitSequence(db));
-        const auto id = *objectIdByUuid(db, parseUuid(uuid));
-        writeLifecycle(db, id, restored);
-        stampContentChange(db, author(), hostname(), "objects", id, parseUuid(uuid), "restore");
-        savepoint.release();
-        return;
-    }
     std::optional<ObjectRevision> source;
     if (sourceVersion) {
         source = objectAtVersion(txn, *sourceVersion);
         if (!source) throw std::invalid_argument("object lifecycle: restore source version is not recorded in this store");
     } else {
-        auto history = objectHistory(txn, uuid);
+        auto history = objectHistory(txn, uuid, true);
         for (auto it = history.rbegin(); it != history.rend(); ++it)
             if (it->publishedAtUs && !it->deleted && !it->record.retired) { source = *it; break; }
+        if (history.empty()) {
+            source = currentObjectRevision(txn, uuid);
+            if (source) source->record.retired = false;
+        }
     }
     if (!source || source->objectUuid != current->uuid || source->deleted || source->record.retired)
         throw std::invalid_argument("object lifecycle: restoration requires an active revision of this object");

@@ -227,12 +227,13 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             const auto tile = surfaceTile(impl_->options.surfaceTiles.get(), revision, reader, row0, col0, rows, cols);
             result.stats.segmentTests += cut.add(*tile, row0, col0, rows, cols);
         }
+        const auto reference = currentObjectRevision(txn, uuid)->reference();
         bool hit = false;
         cut.pieces([&](int64_t segment, bool continues, const auto& start, const auto& end) {
             // Each point is XYZ and its grid position.
             const uint64_t added = continues ? 40 : 80;
             if (added > options.outputByteBudget - result.stats.outputBytes) request.stop(RegionStop::OutputBudget);
-            if (!continues) result.runs.push_back({uuid, revision, "points", "", segment, {start.point}, {start.grid}});
+            if (!continues) result.runs.push_back({uuid, revision, "points", "", segment, {start.point}, {start.grid}, reference, options.toTarget});
             result.runs.back().points.push_back(end.point);
             result.runs.back().grid.push_back(end.grid);
             result.stats.outputBytes += added;
@@ -255,6 +256,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         if (points < options.minPoints) return;
         if (array.at("dtype") != kind.dtype)
             throw std::runtime_error(options.kind + " coordinates must be " + kind.dtype);
+        const auto reference = currentObjectRevision(txn, uuid)->reference();
         bool hit = false;
         int64_t nextSegment = 0;
         auto appendRegion = [&](const SpatialRegion& region) {
@@ -282,7 +284,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
                             result.runs.back().firstSegment+int64_t(result.runs.back().points.size())-1==index;
                         const uint64_t added=contiguous?24:48;
                         if (added>options.outputByteBudget-result.stats.outputBytes) request.stop(RegionStop::OutputBudget);
-                        if (!contiguous) result.runs.push_back({uuid,revision,name,family,index,{a}});
+                        if (!contiguous) result.runs.push_back({uuid,revision,name,family,index,{a},{},reference,options.toTarget});
                         result.runs.back().points.push_back(b);
                         result.stats.outputBytes+=added;
                         if (!hit) {hit=true;++result.intersectingObjects;}

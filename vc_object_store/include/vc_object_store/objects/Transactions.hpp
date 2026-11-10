@@ -86,6 +86,7 @@ struct TransactionContext {
     std::optional<std::string> storeUuid, generation;
     std::optional<std::string> author;
     VersionSelection expectedObjects, expectedRelationships, readDependencies;
+    std::map<std::string, ObjectVersion> expectedObjectReferences;
     std::optional<int64_t> expectedCommitSequence;
 };
 
@@ -299,7 +300,7 @@ using TransactionOperation = std::variant<
     UpdateGeometryArraysOp, IngestGeometryOp, CheckVolumeMappingOp, LinkObjectsOp>;
 
 // Wire/command format version, part of every request digest.
-inline constexpr int kTransactionCommandVersion = 1;
+inline constexpr int kTransactionCommandVersion = 2;
 
 struct TransactionRequest {
     std::string requestUuid;       // required: identifies retries
@@ -307,9 +308,13 @@ struct TransactionRequest {
     std::string generation;        // required: expected active generation
     std::string author;            // required: attribution, not authentication
     VersionSelection expectedObjects, expectedRelationships, readDependencies;
+    std::map<std::string, ObjectVersion> expectedObjectReferences;
     std::optional<int64_t> expectedCommitSequence;
     std::vector<TransactionOperation> operations;
 };
+
+// Guard the selected owner, lineage and version as well as its numeric version.
+void expectObject(TransactionRequest&, const ObjectVersion&);
 
 // ---- Prepared operations ---------------------------------------------------
 // An operation whose work happens before the writer lock is taken (link

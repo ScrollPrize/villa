@@ -27,8 +27,7 @@ Json manifest(const std::string& metadata)
 
 ExtensionTableInfo versionedTable(sqlite3* db, const std::string& name, const char* ownerTable = nullptr)
 {
-    std::optional<ExtensionTableInfo> info;
-    resolveReference(db,[&](sqlite3* source){info=extensionTable(source,name);return bool(info);});
+    const auto info=resolvedExtensionTable(db,name);
     if (!info || !info->versioned || info->keySpace.empty())
         throw std::invalid_argument("extension: operation requires a versioned owner table");
     if (ownerTable && info->keySpace != ownerTable)

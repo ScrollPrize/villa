@@ -51,6 +51,12 @@ std::vector<GeometryRevision> ObjectStore::geometryHistory(const Txn& txn, const
 }
 
 namespace {
+nlohmann::json logicalManifest(nlohmann::json value)
+{
+    for (auto& array : value.at("arrays")) array.erase("source_revision");
+    if (value.at("kind") == "surface" && !value.contains("grid_origin")) value["grid_origin"] = {0, 0};
+    return value;
+}
 int64_t revisionSurfaceTileSize(const Txn& txn, const GeometryRevision& revision)
 {
     if (revision.kind != "surface") return 0;
@@ -535,6 +541,10 @@ std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn,
     bindSequenceIdentities(after,db,manifest);
     const auto affected=affectedEdges(store,txn,objectUuid,current,after,changedIds);
     const auto decisions=validateEdgeEdits(store,txn,db,objectUuid,after,affected,edgeEdits);
+    if (logicalManifest(manifest) == logicalManifest(GeometryReader(txn, current->uuid).manifest())) {
+        applyEdgeDecisions(store,txn,db,affected,decisions);
+        return current->uuid;
+    }
     const auto object=*store.objectByUuid(txn,objectUuid);
     createRecordOverride(db, "objects", objectUuid);
     const auto uuid=util::newUuid(); const auto id=*objectIdByUuid(db,parseUuid(objectUuid));
@@ -699,11 +709,7 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
         forEachGeometryChunk(array, tile, [&](int64_t, auto bytes) { descriptor["chunks"].push_back(geometryPayloadHash(array.name, bytes)); });
         arrays[array.name] = std::move(descriptor);
     }
-    auto logical = [](nlohmann::json value) {
-        for (auto& a : value.at("arrays")) a.erase("source_revision");
-        return value;
-    };
-    if (logical(manifest) == logical(original)) {
+    if (logicalManifest(manifest) == logicalManifest(original)) {
         if (explicitEdgeDecisions(edgeEdits)) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
         return current->uuid;
     }

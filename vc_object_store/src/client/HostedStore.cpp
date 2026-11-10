@@ -83,6 +83,37 @@ StoreStatus HostedStore::status()
     return storeStatusFromJson(expectOk(impl_->http.request("GET", requestEndpoint_ + "/v1/status"), "status").body);
 }
 
+VolumeTransforms HostedStore::volumeTransforms()
+{
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/volume-transforms");
+    std::vector<std::pair<ObjectRecord, std::string>> registrations;
+    std::vector<ObjectRecord> choices;
+    for (const auto& selected : objectsAtVersionsResultFromJson(expectOk(response, "volume transforms").body, nullptr)) {
+        if (!selected) throw std::runtime_error("hosted store: missing transform state");
+        if (selected->record.kind == "volume_transform") registrations.emplace_back(selected->record, selected->uuid);
+        else choices.push_back(selected->record);
+    }
+    return volumeTransformsFrom(registrations, choices, nullptr);
+}
+
+std::vector<ObjectVersion> HostedStore::versionsAt(const ObjectVersion& anchor)
+{
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/versions-at",
+        objectVersionsRequestToJson({anchor}), {{"Content-Type", "application/json"}});
+    return objectVersionsRequestFromJson(expectOk(response, "version snapshot").body);
+}
+
+std::optional<std::filesystem::path> HostedStore::resolveStoragePath(const std::string& objectUuid,
+    const std::optional<std::filesystem::path>& datasetRoot)
+{
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/storage-path",
+        Json{{"uuid", objectUuid}, {"dataset_root", datasetRoot ? Json(datasetRoot->string()) : Json(nullptr)}}.dump(),
+        {{"Content-Type", "application/json"}});
+    const auto path = Json::parse(expectOk(response, "storage path").body);
+    if (path.is_null()) return std::nullopt;
+    return std::filesystem::path(path.get<std::string>());
+}
+
 std::string HostedStore::serviceReport()
 {
     return expectOk(impl_->http.request("GET", requestEndpoint_ + "/v1/service"), "service").body;

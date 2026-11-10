@@ -7,14 +7,10 @@
 namespace vc::objects {
 using namespace detail;
 namespace {
-std::pair<const char*, int64_t> recordLocation(sqlite3* db, const std::array<unsigned char, 16>& bytes, const std::string& uuid)
+std::pair<const char*, RecordCommon> currentRecord(sqlite3* db, const std::string& uuid)
 {
-    if (objectSource(db, uuid)) createRecordOverride(db, "objects", uuid);
-    else if (edgeSource(db, uuid)) createRecordOverride(db, "edges", uuid);
-    Statement object(db,"SELECT id FROM objects WHERE uuid=? AND state<>2",bytes);
-    if(object.row())return {"objects",object.i64(0)};
-    Statement edge(db,"SELECT id FROM edges WHERE uuid=? AND state=0",bytes);
-    if(edge.row())return {"edges",edge.i64(0)};
+    if (const auto object = resolveObject(db, uuid)) return {"objects", object->record};
+    if (const auto edge = resolveEdge(db, uuid)) return {"edges", edge->record};
     throw std::runtime_error("object store: record not found: " + uuid);
 }
 }
@@ -28,15 +24,13 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
     if (state == "approved" && edgeByUuid(txn, recordUuid) && edgeGeometryState(txn, recordUuid).stale)
         throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
-    const auto [table, id] = recordLocation(db, bytes, recordUuid);
-    {
-        Statement current(db, std::string("SELECT approval_state FROM ") + table + " WHERE id=?", id);
-        if (current.row() && current.text(0) == state) return;
-    }
+    const auto [table, current] = currentRecord(db, recordUuid);
+    if (current.approvalState == state) return;
+    createRecordOverride(db, table, recordUuid);
     const auto version = writeRecordVersion(db, table, recordUuid);
     const int64_t commit_sequence = writeCommitSequence(db);
     Statement s(db, std::string("UPDATE ") + table +
-                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=?,commit_sequence=? WHERE id=?",
+                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=?,commit_sequence=? WHERE uuid=?",
         state);
     if (state == "pending") {
         s.bindNull(2); s.bindNull(3); s.bindNull(4); s.bindNull(5);
@@ -46,7 +40,7 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
         s.bind(4, impl_->hostname);
         s.bind(5, version);
     }
-    s.bind(6, commit_sequence); s.bind(7, id);
+    s.bind(6, commit_sequence); s.bind(7, bytes);
     s.stepDone();
     appendJournal(db, author(), impl_->hostname, bytes, commit_sequence, "approval");
     savepoint.release();
@@ -63,20 +57,22 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
         throw std::invalid_argument("extension: vcobj_extensions is reserved; use replaceExtensionRows");
     const auto path = jsonPathForKey(key);
     const auto bytes = parseUuid(recordUuid);
-    const auto [table, id] = recordLocation(db, bytes, recordUuid);
+    const auto [table, current] = currentRecord(db, recordUuid);
     // Compare JSON values, not their spelling. Missing and explicit null are
     // distinct; removing a missing key is also a no-op. Keep approval/history
     // untouched when an autosave submits the same logical value.
     {
-        Statement current(db, std::string("SELECT meta FROM ") + table + " WHERE id=?", id);
-        (void)current.row();
-        const auto meta = nlohmann::json::parse(current.text(0));
+        const auto meta = nlohmann::json::parse(current.meta);
         const auto found = meta.find(key);
         if (jsonValue ? found != meta.end() && *found == nlohmann::json::parse(*jsonValue)
                       : found == meta.end()) {
             return;
         }
     }
+    createRecordOverride(db, table, recordUuid);
+    Statement location(db, std::string("SELECT id FROM ") + table + " WHERE uuid=?", bytes);
+    location.row();
+    const auto id = location.i64(0);
     if(std::string_view(table)=="objects")beforeCurrentObjectEdit(db,recordUuid);
     if (jsonValue) {
         execute(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?", path, *jsonValue,

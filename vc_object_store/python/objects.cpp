@@ -35,6 +35,8 @@ nb::list collectionsToPy(const std::vector<vo::AttachedCollection>& collections)
         item["ids"] = collection.points.ids; item["points"] = collection.points.points;
         item["annotations"] = jsonLoads(collection.annotations.dump());
         item["source"] = jsonLoads(collection.source.dump());
+        item["reference"] = collection.reference
+            ? jsonLoads(vo::objectVersionsRequestToJson({*collection.reference}))["versions"][0] : nb::none();
         out.append(item);
     }
     return out;
@@ -63,6 +65,9 @@ nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
     d["a_geometry_revision"] = revision.aGeometryRevision; d["b_geometry_revision"] = revision.bGeometryRevision;
     d["version"] = revision.version; d["generation"] = revision.generation;
     d["a_version"] = revision.aVersion; d["b_version"] = revision.bVersion;
+    d["store"] = revision.record.versionStoreUuid;
+    const auto refs = nb::cast<nb::list>(jsonLoads(vo::objectVersionsRequestToJson({revision.aReference, revision.bReference}))["versions"]);
+    d["a_reference"] = refs[0]; d["b_reference"] = refs[1];
     return d;
 }
 
@@ -80,6 +85,19 @@ std::optional<vo::ObjectVersion> optionalObjectVersionFromPy(const nb::object& r
     if (reference.is_none()) return std::nullopt;
     nb::list refs; refs.append(reference);
     return objectVersionsFromPy(refs).front();
+}
+
+std::vector<vc::object_links::OverlapEdgeAt> overlapEdgesFromPy(const nb::list& edges)
+{
+    std::vector<vc::object_links::OverlapEdgeAt> result;
+    for (auto item : edges) {
+        const auto edge = nb::cast<nb::dict>(item);
+        nb::list refs; refs.append(edge["a_reference"]); refs.append(edge["b_reference"]);
+        const auto endpoints = objectVersionsFromPy(refs);
+        result.push_back({nb::cast<std::string>(edge["uuid"]), nb::cast<bool>(edge["whole_geometry"]),
+            nb::cast<std::string>(edge["meta"]), endpoints[0], endpoints[1]});
+    }
+    return result;
 }
 
 nb::list objectVersionsToPy(const std::vector<vo::ObjectVersion>& refs)
@@ -787,19 +805,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
            "Every edge the query (wire form, as HostedStore.select_edges; complete without a limit) selects in one read.")
         .def("overlap_correspondences_at", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& edges,
                                               const std::string& volume, double spacing, std::size_t maxPairs) {
-            std::vector<vc::object_links::OverlapEdgeAt> pinned;
-            for (auto item : edges) {
-                const auto edge = nb::cast<nb::dict>(item);
-                auto text = [&](const char* key) { return nb::cast<std::string>(edge[key]); };
-                vc::object_links::OverlapEdgeAt at;
-                at.uuid = text("uuid"); at.aUuid = text("a"); at.bUuid = text("b");
-                at.wholeGeometry = nb::cast<bool>(edge["whole_geometry"]);
-                at.meta = text("meta");
-                at.aObjectMeta = text("a_object_meta"); at.bObjectMeta = text("b_object_meta");
-                at.aGeometryRevision = text("a_geometry_revision");
-                at.bGeometryRevision = text("b_geometry_revision");
-                pinned.push_back(std::move(at));
-            }
+            const auto pinned = overlapEdgesFromPy(edges);
             const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, maxPairs};
             std::vector<vc::object_links::OverlapCorrespondences> results;
             {
@@ -974,6 +980,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
 
 NB_MODULE(_native, m)
 {
+    m.def("canonical_uuid", &vo::util::canonicalUuid, nb::arg("uuid"));
     m.def("receipt_object_reference", [](const nb::dict& receipt,const std::string& uuid) -> nb::object {
         const auto ref=vo::transactionReceiptFromJson(jsonDumps(receipt)).objectReference(uuid);
         return ref?nb::object(objectVersionsToPy({*ref})[0]):nb::none();
@@ -1246,22 +1253,23 @@ NB_MODULE(_native, m)
         .def("export_geometry", [](PyObjectStore& self, const std::string& object,
                                    const std::filesystem::path& destination,
                                    const std::optional<int64_t>& version, const std::optional<std::string>& generation,
-                                   bool overwrite, bool validOnly) {
-            if (generation && !version) throw std::invalid_argument("export_geometry: generation needs version");
+                                   bool overwrite, bool validOnly, const nb::object& reference) {
+            const auto exact = optionalObjectVersionFromPy(reference);
             const auto exported = self.withStore<true>([&](auto& db) {
+                auto read = db.read();
                 std::optional<vo::ObjectVersion> selected;
-                if (version) {
-                    auto read=db.read();
-                    const auto current=db.currentObjectRevision(read,object);
-                    if(!current)throw std::invalid_argument("export_geometry: object not found");
-                    selected=current->reference(version,generation);
+                if (version || generation || exact) {
+                    const auto state = vo::LocalStoreReader(db, read).selectedObject(object, version, generation, exact);
+                    if (!state) throw std::runtime_error("active object version not found for this object");
+                    selected = state->reference();
                 }
-                return vo::exportGeometry(db, object, destination, selected, overwrite, validOnly);
+                return vo::exportGeometry(db, read, object, destination, selected, overwrite, validOnly);
             });
             return nb::cast<nb::dict>(objectVersionsToPy({exported})[0]);
         }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("version") = std::nullopt,
            nb::arg("generation") = std::nullopt, nb::arg("overwrite") = false, nb::arg("valid_only") = false,
-           "Export an object version (default: current; generation defaults to the active one) to native files; "
+           nb::arg("reference") = nb::none(),
+           "Export an object version (default: current; numbered selectors use its current owner) to native files; "
            "return the exported {store, generation, object, version}. Does not modify the store.")
         .def("edge_geometry_state", [](PyObjectStore& self, const std::string& uuid) {
             const auto state = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.edgeGeometryState(txn, uuid); });
@@ -1446,19 +1454,7 @@ NB_MODULE(_native, m)
             "overlap_correspondences_at",
             [](PyObjectStore& self, const nb::list& edges, const std::string& volume, double spacing,
                std::size_t maxPairs) {
-                std::vector<vc::object_links::OverlapEdgeAt> pinned;
-                for (auto item : edges) {
-                    const auto edge = nb::cast<nb::dict>(item);
-                    auto text = [&](const char* key) { return nb::cast<std::string>(edge[key]); };
-                    vc::object_links::OverlapEdgeAt at;
-                    at.uuid = text("uuid"); at.aUuid = text("a"); at.bUuid = text("b");
-                    at.wholeGeometry = nb::cast<bool>(edge["whole_geometry"]);
-                    at.meta = text("meta");
-                    at.aObjectMeta = text("a_object_meta"); at.bObjectMeta = text("b_object_meta");
-                    at.aGeometryRevision = text("a_geometry_revision");
-                    at.bGeometryRevision = text("b_geometry_revision");
-                    pinned.push_back(std::move(at));
-                }
+                const auto pinned = overlapEdgesFromPy(edges);
                 const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, maxPairs};
                 return overlapCorrespondencesToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::materializeOverlapCorrespondences(db, pinned, p);
@@ -1466,9 +1462,8 @@ NB_MODULE(_native, m)
             },
             nb::arg("edges"), nb::arg("volume_uuid"), nb::arg("spacing") = 8.0, nb::arg("max_pairs") = 256,
             "overlap_correspondences from overlap edges as read at an earlier state, e.g. a pinned input position: dicts "
-            "with uuid, a and b (stored order), whole_geometry, meta (the edge's metadata JSON), a_object_meta and "
-            "b_object_meta (the endpoints' metadata JSON) and a_geometry_revision and b_geometry_revision (which "
-            "this store must hold). Not checked against the store's current state.")
+            "with uuid, whole_geometry, meta (the edge's metadata JSON), and complete a_reference and b_reference "
+            "endpoint versions. Metadata and geometry are resolved together, independently of current state.")
         .def(
             "link_tracks_to_tracks",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
@@ -1694,17 +1689,18 @@ NB_MODULE(_native, m)
         }, "The committed write's numbered receipt (commit sequence, versions); None before it commits.")
         .def("retire_object", writeMethod<&vo::ObjectStore::retireObject, PyObjectWriteTxn>(), nb::arg("uuid"))
         .def("restore_object", [](PyObjectWriteTxn& self, const std::string& uuid, const std::optional<int64_t>& version,
-                                  const std::optional<std::string>& generation) {
-            if (generation && !version) throw std::invalid_argument("restore_object: source_generation needs source_version");
+                                  const std::optional<std::string>& generation, const nb::object& reference) {
             auto& db = self.owner->require(); auto& txn = self.require();
             std::optional<vo::ObjectVersion> source;
-            if (version) {
-                const auto current=db.currentObjectRevision(txn,uuid);
-                if(!current)throw std::invalid_argument("restore_object: object not found");
-                source=current->reference(version,generation);
+            if (version || generation || !reference.is_none()) {
+                const auto selected = vo::LocalStoreReader(db, txn).selectedObject(uuid, version, generation,
+                    optionalObjectVersionFromPy(reference));
+                if (!selected) throw std::invalid_argument("restore_object: source version not found");
+                source = selected->reference();
             }
             db.restoreObject(txn, uuid, source);
         }, nb::arg("uuid"), nb::arg("source_version") = std::nullopt, nb::arg("source_generation") = std::nullopt,
+           nb::arg("source_reference") = nb::none(),
            "Restore from a recorded version of the object (default: its last active one).")
         .def("retain_relationship", writeMethod<&vo::ObjectStore::retainRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))
         .def("keep_recorded_relationship", writeMethod<&vo::ObjectStore::keepRecordedRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))

@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/objects/VolumeTransforms.hpp"
+#include "vc_object_store/objects/Transactions.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -63,6 +64,9 @@ struct VisibleRun {
     // Surfaces: where each point lies on the points grid (column, row; fractional
     // along the cut grid edge). Empty for polyline kinds.
     std::vector<std::array<double, 2>> grid;
+    // Selected metadata and mapping from the same query snapshot as the points.
+    ObjectVersion objectReference;
+    std::optional<VolumeAffine> objectToVolume;
 };
 struct RegionResult {
     std::vector<VisibleRun> runs;

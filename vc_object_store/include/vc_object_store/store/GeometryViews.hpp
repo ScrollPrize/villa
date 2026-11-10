@@ -178,6 +178,8 @@ public:
     void close();
     TransformedGeometryView viewTransformedAt(const std::string& objectUuid,const std::string& target,
         double targetScale=1, const VolumeTransforms* transforms=nullptr) const;
+    TransformedGeometryView viewTransformedAt(const ObjectRevision&, const std::string& target,
+        double targetScale=1, const VolumeTransforms* transforms=nullptr) const;
     // The object's geometry (current, or `geometryRevision`) in its stored
     // coordinates: the identity view, so edits in stored units take the same
     // path as edits through a transformed view.

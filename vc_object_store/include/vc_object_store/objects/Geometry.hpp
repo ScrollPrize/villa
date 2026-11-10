@@ -75,9 +75,8 @@ struct GeometrySurfaceResize {
     std::vector<GeometryArray> fill; // shape {1,1[,components]}, matching dtype
 };
 
-// Descriptors do not load payloads. Treat uuid as an opaque geometry token:
-// history-on uses independent revision UUIDs and parentage; history-off derives
-// it from object UUID and object version and retains no archival parent.
+// Descriptors do not load payloads. Every new geometry has an independent UUID;
+// history policy controls retention and parentage, never identity or routing.
 struct GeometryRevision {
     std::string uuid, objectUuid;
     std::optional<std::string> parentUuid;

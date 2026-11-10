@@ -240,7 +240,7 @@ def test_checked_relationships_lifecycle_and_graph(db):
     assert db.versions_at(pinned['published_at_us']) == sorted(selected, key=lambda ref: ref['object'])
     restored = db.current_version(a)
     with db.write(expected_versions=versions(db, a, b)) as tx:
-        tx.restore_object(a, source_version=selected[0]['version'])
+        tx.restore_object(a, source_reference=selected[0])
     assert db.current_geometry(a)['uuid'] == first and db.current_version(a) == restored + 1
     assert db.edge(edge) is None
     with pytest.raises(ValueError):
@@ -562,6 +562,8 @@ def test_native_export_pins_object_metadata_and_geometry(db, tmp_path, kind, geo
     uid, first_geometry = put(db, geometry, kind)
     db.set_meta(uid, 'coordinates', {'scale_factor': 2})
     before = db.current_version(uid)
+    state = db.current_object_revision(uid)
+    reference = {"object": uid, **{k: state[k] for k in ("store", "generation", "version")}}
     db.set_meta(uid, 'coordinates', {'scale_factor': 4})
     output = tmp_path / 'historical.json'
     assert db.export_geometry(uid, output, version=before)['version'] == before
@@ -570,6 +572,18 @@ def test_native_export_pins_object_metadata_and_geometry(db, tmp_path, kind, geo
     if kind == 'point_collection':
         doc = next(iter(doc['collections'].values()))
     assert doc['coordinates']['scale_factor'] == 2
+    assert db.export_geometry(uid, output, reference=reference, overwrite=True) == reference
+    import os
+    if build := os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH'):
+        cli = Path(build).parent / 'bin' / 'vc_object_export'
+        result = subprocess.run([str(cli), '--db', db.path, '--uuid', uid, '--output', str(output),
+                                 '--store', reference['store'], '--generation', reference['generation'],
+                                 '--version', str(reference['version']), '--overwrite'], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        exported = json.loads(output.read_text())
+        if kind == 'point_collection':
+            exported = next(iter(exported['collections'].values()))
+        assert exported['coordinates']['scale_factor'] == 2
     with pytest.raises(RuntimeError, match='object version'):
         db.export_geometry(uid, tmp_path / 'wrong.json', version=99)
     with pytest.raises(RuntimeError, match='object version'):

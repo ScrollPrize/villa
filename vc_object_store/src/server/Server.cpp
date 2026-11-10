@@ -823,6 +823,15 @@ struct ServerState {
         }
         if (method == http::verb::get && is({"v1", "changes"}))
             return {readers.get(), [this, target] { return changes(*target); }};
+        if (method == http::verb::get && is({"v1", "volume-transforms"}))
+            return {readers.get(), [this] {
+                auto txn = store->read();
+                std::vector<std::optional<ObjectRevision>> selected;
+                for (const auto* kind : {"volume_transform", "volume_transform_choice"})
+                    for (const auto& object : store->objectsByKind(txn, kind))
+                        selected.push_back(store->currentObjectRevision(txn, object.uuid));
+                return jsonReply(objectsAtVersionsResultToJson(store->status(txn), selected));
+            }};
         if (method == http::verb::get && is({"v1", "objects", "*"}))
             return {readers.get(), [this, target] { return currentObject(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "objects", "*", "versions", "*"}))
@@ -843,6 +852,22 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryTags(*body); }};
         if (method == http::verb::post && is({"v1", "query", "versions"}))
             return {readers.get(), [this, body] { return queryVersions(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "versions-at"}))
+            return {readers.get(), [this, body] {
+                const auto anchors = objectVersionsRequestFromJson(*body);
+                if (anchors.size() != 1) throw std::invalid_argument("version snapshot needs one anchor");
+                auto txn = store->read();
+                return jsonReply(objectVersionsRequestToJson(store->versionsAt(txn, anchors.front())));
+            }};
+        if (method == http::verb::post && is({"v1", "query", "storage-path"}))
+            return {readers.get(), [this, body] {
+                const auto request = Json::parse(*body);
+                std::optional<std::filesystem::path> root;
+                if (!request.at("dataset_root").is_null()) root = request.at("dataset_root").get<std::string>();
+                auto txn = store->read();
+                const auto path = store->resolveStoragePath(txn, request.at("uuid").get<std::string>(), root);
+                return jsonReply((path ? Json(path->string()) : Json(nullptr)).dump());
+            }};
         if (method == http::verb::post && is({"v1", "query", "region"}))
             return {readers.get(), [this, body] { return queryRegion(*body); }};
         if (method == http::verb::post && is({"v1", "query", "nearest_surfaces"}))

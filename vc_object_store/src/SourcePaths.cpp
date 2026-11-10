@@ -4,14 +4,45 @@
 
 namespace vc::objects {
 using namespace detail;
+void ObjectStore::validateExportDestination(const Txn& txn, const std::filesystem::path& destination) const
+{
+    namespace fs = std::filesystem;
+    const auto target = fs::weakly_canonical(fs::absolute(destination));
+    const auto ancestor = [](fs::path child, const fs::path& parent) {
+        for (; !child.empty(); child = child.parent_path()) {
+            if (child == parent) return true;
+            if (child == child.root_path()) break;
+        }
+        return false;
+    };
+    for (auto* source : querySources(static_cast<sqlite3*>(connection(txn)))) {
+        fs::path file = sqlite3_db_filename(source, "main");
+        if (isPackedDatabasePath(file)) file = packedContainerPath(file);
+        file = fs::weakly_canonical(file);
+        if (ancestor(file, target)) throw std::runtime_error("export destination contains a backing object database");
+        for (const auto* suffix : {"", "-wal", "-shm", "-journal", "-owner", ".artifacts"}) {
+            const fs::path protectedPath = fs::weakly_canonical(file.string() + suffix);
+            if (target == protectedPath || (fs::exists(target) && fs::exists(protectedPath) && fs::equivalent(target, protectedPath)) ||
+                (std::string_view(suffix) == ".artifacts" && (ancestor(target, protectedPath) || ancestor(protectedPath, target))))
+                throw std::runtime_error("cannot export over backing database files or artifacts");
+        }
+    }
+}
+
 std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     const Txn& txn, const std::string& objectUuid,
     const std::optional<std::filesystem::path>& datasetRoot) const
 {
     namespace fs = std::filesystem;
     const auto resolved = resolveObject(static_cast<sqlite3*>(connection(txn)), objectUuid);
-    const auto object = resolved ? std::optional(resolved->record) : std::nullopt;
-    if (!object || (object->storageKind != "file" && object->storageKind != "sqlite") ||
+    if (!resolved) return std::nullopt;
+    const auto* object = &resolved->record;
+    fs::path ownerPath = sqlite3_db_filename(resolved->source, "main");
+    if (isPackedDatabasePath(ownerPath)) ownerPath = packedContainerPath(ownerPath);
+    const auto root = fs::absolute(datasetRoot.value_or(fs::absolute(ownerPath).parent_path())).lexically_normal();
+    if (object->track && !object->track->datasetRef.empty())
+        return (root / object->track->datasetRef).lexically_normal();
+    if ((object->storageKind != "file" && object->storageKind != "sqlite") ||
         (object->kind != "surface" && object->kind != "fiber" && object->kind != "point_collection"))
         return std::nullopt;
 
@@ -46,9 +77,6 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
         }
     };
 
-    fs::path ownerPath = sqlite3_db_filename(resolved->source, "main");
-    if (isPackedDatabasePath(ownerPath)) ownerPath = packedContainerPath(ownerPath);
-    const auto root = fs::absolute(datasetRoot.value_or(fs::absolute(ownerPath).parent_path())).lexically_normal();
     if (!object->storageRef.empty() && object->storageRef.find("://") == std::string::npos) {
         const auto hint = (root / object->storageRef).lexically_normal();
         if (matches(hint))

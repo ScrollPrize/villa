@@ -146,7 +146,7 @@ void invalidationDuringRead(bool poll)
     server::Server server(path, {}); server.start();
     const auto endpoint = "http://127.0.0.1:" + std::to_string(server.port());
     HostedStore writer(endpoint);
-    PausingProxy proxy(endpoint, "/v1/objects/" + registration.uuid);
+    PausingProxy proxy(endpoint, "/v1/volume-transforms");
     HostedSessionOptions hosted; hosted.client.retries = 0; hosted.client.requestTimeoutMs = 10000;
     detail::HostedAttachment attachment(proxy.endpoint(), hosted);
     auto read = std::async(std::launch::async, [&] { return attachment.volumeTransforms(); });

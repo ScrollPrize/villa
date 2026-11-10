@@ -6,6 +6,8 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <nlohmann/json.hpp>
 #include <iostream>
+#include <algorithm>
+#include <cctype>
 using namespace vc::objects;
 using Json = nlohmann::json;
 namespace {
@@ -77,6 +79,10 @@ int main() try {
       require(txn.receipt()->objects.at(uuid) != receipt.at(uuid), "external commit produces different pin"); }
     storeReader(store,[&](const StoreReader& reader,const auto&) {
         const auto pinned = versionsOf(reader, receipt).front();
+        auto uppercase = uuid;
+        std::transform(uppercase.begin(), uppercase.end(), uppercase.begin(), [](unsigned char c) { return std::toupper(c); });
+        require(fiberNetworkJson(reader, {pinned}, {uppercase}) == fiberNetworkJson(reader, {pinned}, {uuid}),
+                "export traversal normalizes UUID spelling before visited/pinned lookup");
         require(reader.objectsAtVersions({pinned}).front()->record.meta.find("external") == std::string::npos, "receipt is immutable after external commit");
         const auto historical=Json::parse(fiberVersionJson(reader,pinned));
         require(historical["control_points"]==root["control_points"] && historical["line_points"]==root["line_points"], "pinned wire geometry and annotations");

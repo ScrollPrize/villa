@@ -345,6 +345,10 @@ try {
     const auto committed = session.geometryRegion(order, plane(10.25), surfaces());
     require(!committed.empty() && committed[0].attachment == hosted && !committed[0].result.runs.empty() &&
             committed[0].result.runs[0].objectUuid == surface, "hosted region");
+    require(committed[0].result.runs[0].objectReference.objectUuid == surface &&
+            committed[0].result.runs[0].objectToVolume &&
+            committed[0].result.runs[0].objectToVolume->json() == VolumeAffine::scale(1).json(),
+            "target-volume region carries its selected mapping rather than requiring a later current lookup");
     SurfaceProximityQuery near; near.volume = volume; near.point = {10, 20, 11.2}; near.tolerance = 1;
     require(session.nearestSurfaces(order, near).size() == 1, "hosted proximity");
     // A draft moved off the plane hides the committed surface everywhere.
@@ -605,6 +609,41 @@ try {
         writeVolumeCollections(session, hosted, {target, 1}, shown, {});
         require(read().front().points.points.front() == vc::geometry::Point{20, 20, 20},
                 "collection saves correctly after refreshing the mapping");
+    }
+
+    // Transform registrations and their revision evidence come from one server
+    // snapshot, even while another client replaces both registrations together.
+    {
+        const auto source = util::newUuid(), middle = util::newUuid(), target = util::newUuid();
+        const auto a = registerVolumeTransform(session, hosted, source, middle, VolumeAffine::scale(1), "a");
+        const auto b = registerVolumeTransform(session, hosted, middle, target, VolumeAffine::scale(1), "b");
+        std::exception_ptr writerFailure;
+        std::jthread writer([&] {
+            try {
+                HostedStore client(endpoint);
+                const auto status = client.status();
+                for (int i = 0; i < 20; ++i) {
+                    const auto ar = client.currentObjectRevision(a), br = client.currentObjectRevision(b);
+                    TransactionRequest change;
+                    change.storeUuid = status.storeUuid; change.generation = status.generation;
+                    change.requestUuid = util::newUuid(); change.author = "atomic-transform-test";
+                    change.expectedObjects = {{a, ar->version}, {b, br->version}};
+                    const auto scale = VolumeAffine::scale(2 + i % 2);
+                    change.operations = {UpdateObjectOp{objectRecordJson(volumeTransformRecord(ar->record, source, middle, scale, "a"))},
+                                         UpdateObjectOp{objectRecordJson(volumeTransformRecord(br->record, middle, target, scale, "b"))}};
+                    client.submit(change);
+                }
+            } catch (...) { writerFailure = std::current_exception(); }
+        });
+        HostedStore client(endpoint);
+        for (int i = 0; i < 40; ++i) {
+            const auto transforms = client.volumeTransforms();
+            require(transforms.resolve(source, middle).resolved().forward.json() ==
+                    transforms.resolve(middle, target).resolved().forward.json(),
+                    "hosted transform snapshot never combines registrations from different commits");
+        }
+        writer.join();
+        if (writerFailure) std::rethrow_exception(writerFailure);
     }
 
     // Two imports prepared before either commits must not create two live

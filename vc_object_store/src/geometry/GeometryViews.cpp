@@ -107,10 +107,20 @@ TransformedGeometryView GeometrySnapshot::viewTransformedAt(const std::string& u
     state_->require();
     const auto object=state_->reader->currentObject(uuid);
     if(!object)throw std::invalid_argument("object not found");
+    return viewTransformedAt(*object, target, targetScale, context);
+}
+TransformedGeometryView GeometrySnapshot::viewTransformedAt(const ObjectRevision& object,const std::string& target,
+    double targetScale,const VolumeTransforms* context) const
+{
+    state_->require();
+    if(!object.geometryRevision || !object.metadataComplete)throw std::invalid_argument("selected object has no geometry or coordinate metadata");
     const auto local=context?VolumeTransforms{}:state_->reader->volumeTransforms();
-    const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(object->record.meta),target,targetScale);
+    const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(object.record.meta),target,targetScale);
     if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
-    return TransformedGeometryView(geometry(uuid),*mapping,target,targetScale);
+    auto selected=geometry(object.objectUuid,object.geometryRevision);
+    if(const auto current=state_->reader->currentObject(object.objectUuid); current && current->reference()==object.reference())
+        std::visit([&](auto& view){view.state_->reference=object.reference();},selected);
+    return TransformedGeometryView(std::move(selected),*mapping,target,targetScale);
 }
 
 TransformedGeometryView GeometrySnapshot::viewStored(const std::string& uuid,
@@ -131,12 +141,10 @@ TransformedGeometryView GeometryView::viewTransformedAt(const ObjectRevision& ob
     state_->read->require();
     if(object.objectUuid!=state_->revision.objectUuid||object.geometryRevision!=state_->revision.uuid||!object.metadataComplete)
         throw std::invalid_argument("object revision does not name this geometry and its coordinate metadata");
-    const auto mapping=state_->read->reader->volumeTransforms().toVolume(nlohmann::json::parse(object.record.meta),target,scale);
-    if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
-    auto geometry=GeometrySnapshot(state_->read).geometry(object.objectUuid,state_->revision.uuid);
-    if(state_->reference==object.reference())
-        std::visit([&](auto& view){view.state_->reference=state_->reference;},geometry);
-    return TransformedGeometryView(std::move(geometry),*mapping,target,scale);
+    auto result=GeometrySnapshot(state_->read).viewTransformedAt(object,target,scale);
+    if(state_->reference!=object.reference())
+        std::visit([](auto& view){view.state_->reference.reset();},result.source_);
+    return result;
 }
 
 std::vector<vcr::catalog::TransformResolution> GeometryView::availableTransforms() const {

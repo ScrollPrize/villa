@@ -10,6 +10,17 @@
 
 namespace vc::objects {
 
+std::vector<ObjectVersion> StoreReader::versionsAt(const ObjectVersion&) const
+{
+    throw std::runtime_error("reader does not support publication snapshot selection");
+}
+std::vector<ObjectVersion> LocalStoreReader::versionsAt(const ObjectVersion& ref) const { return store_->versionsAt(*txn_, ref); }
+void LocalStoreReader::validateExportDestination(const std::filesystem::path& path) const { store_->validateExportDestination(*txn_, path); }
+std::optional<std::filesystem::path> StoreReader::resolveStoragePath(const std::string&,
+    const std::optional<std::filesystem::path>&) const { throw std::runtime_error("reader does not support source location resolution"); }
+std::optional<std::filesystem::path> LocalStoreReader::resolveStoragePath(const std::string& uuid,
+    const std::optional<std::filesystem::path>& root) const { return store_->resolveStoragePath(*txn_, uuid, root); }
+
 std::optional<ObjectRevision> StoreReader::selectedObject(const std::string& objectUuid,std::optional<int64_t> version,
     const std::optional<std::string>& generation,const std::optional<ObjectVersion>& reference) const
 {
@@ -138,22 +149,34 @@ double StoreReader::geometryLengthInVolume(const std::string& objectUuid, const 
         rows(name), kind, *mapping);
 }
 
-void expectRelationshipEndpoints(const StoreReader& reader, VersionSelection& expected)
+void expectRelationshipEndpoints(const StoreReader& reader, TransactionRequest& request)
 {
+    auto& expected = request.expectedObjects;
     EdgeSelection edges;
     edges.endpointUuids.emplace();
     for (const auto& [uuid, version] : expected)
         if (version) edges.endpointUuids->push_back(uuid);
     if (edges.endpointUuids->empty()) return;
     edges.includeRetired = true;
-    std::set<std::string> endpoints;
+    std::set<std::string> endpoints(edges.endpointUuids->begin(), edges.endpointUuids->end());
     for (const auto& edge : reader.selectEdges(edges))
         for (const auto& endpoint : {edge.aUuid, edge.bUuid})
             if (!expected.contains(endpoint)) endpoints.insert(endpoint);
     for (const auto& endpoint : endpoints) {
+        if (request.expectedObjectReferences.contains(endpoint)) continue;
         const auto head = reader.currentObject(endpoint);
-        expected.emplace(endpoint, head ? std::optional(head->version) : std::nullopt);
+        const auto entry = expected.emplace(endpoint, head ? std::optional(head->version) : std::nullopt).first;
+        // Never replace a stale caller expectation with a newer snapshot.
+        if (head && entry->second == head->version) expectObject(request, head->reference());
     }
+}
+
+void expectRelationshipEndpoints(const StoreReader& reader, VersionSelection& expected)
+{
+    TransactionRequest request;
+    request.expectedObjects = expected;
+    expectRelationshipEndpoints(reader, request);
+    expected = std::move(request.expectedObjects);
 }
 
 void editCurrentRequest(const StoreReader& reader, TransactionRequest& request, const std::vector<std::string>& objectUuids,
@@ -170,10 +193,10 @@ void buildCurrentEditRequest(const StoreReader& reader, TransactionRequest& requ
         const auto uuid = util::canonicalUuid(objectUuid);
         const auto current = reader.currentObject(uuid);
         if (!current) throw std::runtime_error("object is not in the store: " + uuid);
-        request.expectedObjects[uuid] = current->version;
+        expectObject(request, current->reference());
         uuids.push_back(uuid);
     }
-    expectRelationshipEndpoints(reader, request.expectedObjects);
+    expectRelationshipEndpoints(reader, request);
     for (auto& operation : operations()) request.operations.push_back(std::move(operation));
     if (uuids.empty()) return;
     EdgeSelection edges;
@@ -187,7 +210,7 @@ void buildCurrentEditRequest(const StoreReader& reader, TransactionRequest& requ
             removedEdges.insert(util::canonicalUuid(remove->uuid));
         else if (const auto* retire = std::get_if<RetireObjectOp>(&operation))
             removedEndpoints.insert(util::canonicalUuid(retire->uuid));
-        else if (const auto* restore = std::get_if<RestoreObjectOp>(&operation); restore && history && restore->source)
+        else if (const auto* restore = std::get_if<RestoreObjectOp>(&operation); restore && restore->source)
             removedEndpoints.insert(util::canonicalUuid(restore->uuid));
     }
     for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{}))

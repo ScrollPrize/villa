@@ -816,13 +816,29 @@ void storeReferenceVersionedFields(HistoryMode history)
         auto incompatible = relationship ? edgeTable : objectTable;
         incompatible.provisioning = R"({"units":{"residual":"base_voxels"},"source":"fixture"})";
         {
-            auto txn = mismatch.write(); mismatch.createExtensionTable(txn, incompatible); txn.commit();
+            auto txn = mismatch.write();
+            mustFail([&] { mismatch.createExtensionTable(txn, incompatible); }); txn.commit();
+        }
+        {
+            auto txn = mismatch.read();
+            require(rows(mismatch, txn, incompatible.name, relationship ? edgePrefix : firstPrefix) ==
+                    (relationship ? edges : first), "conflicting registration preserves the inherited definition and rows");
+        }
+        // Simulate an already-invalid collection made by an older writer; the
+        // normal API must not create this state, but every reader must reject it.
+        {
+            auto physical=ObjectStore::open(mismatchPath,OpenOptions{.physicalPartitionOnly=true,.author="fixture"});
+            auto txn=physical.write();physical.createExtensionTable(txn,incompatible);txn.commit();
         }
         int64_t before = 0;
         {
             auto txn = mismatch.read(); before = mismatch.provisioning(txn).commitSequence;
             mustFail([&] { rows(mismatch, txn, incompatible.name); });
             mustFail([&] { rows(mismatch, txn, incompatible.name, relationship ? edgePrefix : firstPrefix); });
+            mustFail([&] {
+                if(relationship)mismatch.scanExtensionRowsAtVersion(txn,incompatible.name,baseEdgeVersion,[](const auto&){return true;});
+                else mismatch.scanExtensionRowsAtVersion(txn,incompatible.name,baseObjectVersion,[](const auto&){return true;});
+            });
         }
         {
             auto txn = mismatch.write();

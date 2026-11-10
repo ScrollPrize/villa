@@ -43,6 +43,9 @@ struct AttachedCollection {
     geometry::PointCollection points;
     nlohmann::json annotations = nlohmann::json::array();
     nlohmann::json source = nlohmann::json::object();
+    std::optional<ObjectVersion> reference;
+    // Mapping used when loading editable coordinates; checked under the write lock.
+    std::optional<CheckVolumeMappingOp> mapping;
 };
 // The live collections attached to `objectUuid` in `role`, with their points in
 // `frame` when given (else as stored).
@@ -78,5 +81,6 @@ std::vector<AttachedCollection> pointCollections(const StoreReader&, const std::
 TransactionReceipt writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume,
                                           const std::vector<AttachedCollection>& changed,
                                           const std::vector<std::string>& removed,
-                                          const VersionSelection& expected = {});
+                                          const VersionSelection& expected = {},
+                                          const std::vector<ObjectVersion>& references = {});
 }

@@ -403,6 +403,14 @@ void detail::checkTransactionContext(sqlite3* db, const TransactionContext& cont
             {{"store", storeUuidText(db), context.expectedCommitSequence, commitSequence(db)}},
             "object store: commit sequence changed since the guarded query");
     std::vector<ConflictDetail> conflicts;
+    for (const auto& [uuid, ref] : context.expectedObjectReferences) {
+        const auto id = canonical(uuid);
+        const ObjectVersion expected{canonical(ref.storeUuid), canonical(ref.generation), canonical(ref.objectUuid), ref.version};
+        if (id != expected.objectUuid || expected.version <= 0) throw std::invalid_argument("invalid expected object reference");
+        const auto current = resolveObject(db, id);
+        if (!current || objectVersion(*current) != expected)
+            conflicts.push_back({"object", id, ref.version, current ? current->record.version : std::nullopt});
+    }
     for (const auto& [uuid, expected] : context.expectedObjects) {
         const auto id = canonical(uuid);
         const auto actual = headVersion(db, id);

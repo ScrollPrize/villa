@@ -180,6 +180,8 @@ struct RelationshipRevision {
     int64_t version = 0;
     std::string generation;
     int64_t aVersion = 0, bVersion = 0;
+    // Resolved endpoint identities for consumers; no parsing of internal revision tokens.
+    ObjectVersion aReference, bReference;
 };
 
 struct SelectedRelationship {
@@ -562,6 +564,7 @@ public:
     // (UTC Unix microseconds), ordered by object UUID; actions are indivisible.
     // Empty before the first publication; excludes deletions.
     std::vector<ObjectVersion> versionsAt(const Txn&, int64_t publishedAtUs, bool includeRetired = false) const;
+    std::vector<ObjectVersion> versionsAt(const Txn&, const ObjectVersion& anchor) const;
     // Relationships recorded between the selected objects, each at an exact
     // recorded version of this store (one per object; omitted endpoints are
     // not selected; deleted versions and unknown references fail).
@@ -715,8 +718,8 @@ public:
     void setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state);
 
     // Open-ended metadata: single-key atomic updates via SQLite JSON1.
-    // All four geometry kinds use meta.coordinates = {volume_uuid, scale_factor}.
-    // UUID is canonical hyphenated hex (or null); scale is positive finite (or
+    // Geometry kinds use meta.coordinates = {volume_uuid, scale_factor}.
+    // volume_uuid is a catalog volume identifier (or null); scale is positive finite (or
     // null), with stored XYZ = volume-voxel XYZ * scale_factor. Metadata only:
     // neither writes nor import transform geometry. Omission means unknown.
     // jsonValue is JSON text (e.g. "\"reviewed\"", "3", "true").
@@ -818,6 +821,7 @@ public:
     std::optional<std::filesystem::path> resolveStoragePath(
         const Txn& txn, const std::string& objectUuid,
         const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;
+    void validateExportDestination(const Txn&, const std::filesystem::path&) const;
 
     // Flush the WAL into the main DB file (safe copying). Must not be
     // called while a WriteTxn is live on this handle.

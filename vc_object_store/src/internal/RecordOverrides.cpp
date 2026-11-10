@@ -7,15 +7,19 @@ namespace vc::objects::detail {
 void prepareOverrideReferences(sqlite3* source,sqlite3* db,ObjectRecord& record)
 {
     if(source==db)return;
-    if(record.storageKind=="file"&&!record.storageRef.empty()&&record.storageRef.find("://")==std::string::npos&&std::filesystem::path(record.storageRef).is_relative()){
+    const auto rebase = [&](std::string& locator) {
+      if(!locator.empty()&&locator.find("://")==std::string::npos&&std::filesystem::path(locator).is_relative()){
         auto path=std::filesystem::path(sqlite3_db_filename(source,"main"));
         if(isPackedDatabasePath(path))path=packedContainerPath(path);
         auto destination=std::filesystem::path(sqlite3_db_filename(db,"main"));
         if(isPackedDatabasePath(destination))destination=packedContainerPath(destination);
-        const auto absolute=std::filesystem::absolute(path.parent_path()/record.storageRef).lexically_normal();
+        const auto absolute=std::filesystem::absolute(path.parent_path()/locator).lexically_normal();
         const auto relative=absolute.lexically_relative(std::filesystem::absolute(destination).parent_path());
-        record.storageRef=(relative.empty()?absolute:relative).generic_string();
-    }
+        locator=(relative.empty()?absolute:relative).generic_string();
+      }
+    };
+    if(record.storageKind=="file") rebase(record.storageRef);
+    if(record.track) rebase(record.track->datasetRef);
     referenceExtensionSchemas(source,db,"objects",record.meta);
 }
 bool createRecordOverride(sqlite3* db,const char* table,const std::string& uuid)

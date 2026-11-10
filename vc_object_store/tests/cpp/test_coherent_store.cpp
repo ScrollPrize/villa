@@ -12,6 +12,10 @@
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/GeometryEdits.hpp"
+#include "vc_object_store/objects/GeometryExport.hpp"
+#include "vc_object_store/objects/ObjectCopy.hpp"
+#include "vc_object_store/objects/ToolObjects.hpp"
+#include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "internal/Database.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include <fstream>
@@ -21,7 +25,7 @@ using namespace vc::objects;
 using namespace vc::objects::detail;
 namespace {
 OpenOptions options(HistoryMode mode){OpenOptions o;o.author="coherent-api";o.history=mode;o.spatialIndex=false;return o;}
-ObjectRecord track(const std::string& id){ObjectRecord r;r.uuid=id;r.kind="track";r.track.emplace();r.meta=R"({"quality":7})";return r;}
+ObjectRecord track(const std::string& id){ObjectRecord r;r.uuid=id;r.kind="track";r.track.emplace();r.track->externalKey="0";r.track->datasetRef=id;r.meta=R"({"quality":7})";return r;}
 GeometryData shape(){return vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,6},{7,8,9}}});}
 ExtensionTable extension(){
     ExtensionTable spec;spec.name="ext_manual_edges";spec.extension="manual";spec.keySpace="edges";spec.versioned=true;
@@ -155,7 +159,9 @@ void queries(){
         require(first.size()==1&&second.size()==1&&first[0].uuid<second[0].uuid,"pagination is global");
         const auto json=nlohmann::json::parse(store.exportJson(r));
         require(json.at("objects").size()==3&&json.at("edges").size()==1,"export follows same visible graph");}
-    {auto w=store.write();store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
+    VersionSelection expected;
+    {auto r=store.read();for(const auto& id:{f.a,f.b})expected[id]=store.currentVersion(r,id);}
+    {auto w=store.write(expected);store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
     {auto r=store.read();require(store.objectCount(r,"track")==1&&store.selectEdges(r,{}).empty(),"tombstones suppress inherited records across APIs");}
 }
 
@@ -395,7 +401,9 @@ void completeReceipts(HistoryMode mode){
     request.requestUuid=util::newUuid();request.expectedObjects=receipt.objects;
     const auto noop=store.submit(request);
     require(!noop.commitSequence&&noop.objectReferences==receipt.objectReferences,"no-op receipt retains both owners");
-    {auto w=store.write();store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
+    VersionSelection expected;
+    {auto r=store.read();for(const auto& id:{f.a,f.b})expected[id]=store.currentVersion(r,id);}
+    {auto w=store.write(expected);store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
     require(store.submit(request).objectReferences==noop.objectReferences,"later deletion cannot change a saved receipt");
 }
 void retainedPointAllocation(HistoryMode overlayMode){
@@ -429,14 +437,211 @@ void allocationWithoutCurrentGeometry(){
     {auto r=store.read();require(!store.currentGeometry(r,id),"restored version predates geometry");
         require(store.nextGeometryPointId(r,id,"control_points")==8,"absent current geometry does not erase retained allocations");}
 }
+void inventoryCore(HistoryMode baseMode, HistoryMode overlayMode) {
+    Fixture f(baseMode, overlayMode, true);
+    auto store=ObjectStore::open(f.overlay, options(overlayMode));
+    // Registration, scans and reads share the same inherited schema contract.
+    {auto w=store.write();auto incompatible=extension();incompatible.columns.back().type=ExtensionType::Text;
+        mustFail([&]{store.createExtensionTable(w,incompatible);});w.commit();}
+    {auto w=store.write();store.createExtensionTable(w,extension());w.commit();}
+    // No-op comparison must precede override creation, not merely roll it back.
+    {auto w=store.write();int mutations=0;auto* db=ObjectStoreImplAccess::conn(w);
+        sqlite3_update_hook(db,[](void* value,int,const char*,const char* table,sqlite3_int64){
+            if(std::string_view(table)=="objects"||std::string_view(table)=="edges")++*static_cast<int*>(value);
+        },&mutations);
+        store.setMeta(w,f.a,"quality","7");store.removeMeta(w,f.a,"absent");store.setApproval(w,f.a,"pending");
+        store.setApproval(w,f.edge,"pending");store.removeMeta(w,f.edge,"absent");
+        sqlite3_update_hook(db,nullptr,nullptr);require(mutations==0,"metadata no-ops must not create transient overrides");w.commit();}
+    {auto w=store.write(VersionSelection{{f.a,f.av.version}});GeometrySequenceEdit edit;edit.array="points";
+        require(store.editGeometrySequence(w,f.a,edit,f.geometry)==f.geometry,"empty splice keeps geometry identity");w.commit();}
+    {auto r=store.read();require(store.currentObjectRevision(r,f.a)->reference()==f.av,"empty splice keeps source owner");
+        const auto exact=store.relationshipAtVersion(r,{store.edgeByUuid(r,f.edge)->versionStoreUuid,
+            store.edgeByUuid(r,f.edge)->versionGeneration,f.edge,f.edgeVersion});
+        require(exact&& !exact->aRevision.empty()&&!exact->bRevision.empty(),"all retention policies return endpoint references");
+        require(exact->record.versionStoreUuid==f.av.storeUuid,"relationship history retains its own owner");}
+    // Exact borrowed geometry still exports after a metadata override or deletion.
+    {auto w=store.write();store.setMeta(w,f.a,"note","true");w.commit();}
+#ifdef VC_TEST_NATIVE_EXPORT
+    exportGeometry(store,f.a,f.dir.path/"exported",f.av);
+#endif
+    {auto r=store.read();const auto snapshot=store.versionsAt(r,f.av);
+        require(std::find(snapshot.begin(),snapshot.end(),f.av)!=snapshot.end(),"publication selection uses source owner");
+        for(const auto& protectedPath:std::vector<std::filesystem::path>{f.base,f.base.parent_path(),f.base.string()+"-wal",f.base.string()+".artifacts"})
+            mustFail([&]{store.validateExportDestination(r,protectedPath);});}
+    const auto hardlink=f.dir.path/"hardlink";std::filesystem::create_hard_link(f.base,hardlink);
+    {auto r=store.read();mustFail([&]{store.validateExportDestination(r,hardlink);});}
+#ifdef VC_TEST_NATIVE_EXPORT
+    mustFail([&]{exportGeometry(store,f.a,hardlink,f.av,true);});
+#endif
+    VersionSelection expected;
+    {auto r=store.read();for(const auto& id:{f.a,f.b})expected[id]=store.currentVersion(r,id);}
+    {auto w=store.write(expected);store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
+#ifdef VC_TEST_NATIVE_EXPORT
+    exportGeometry(store,f.a,f.dir.path/"exported-deleted",f.av);
+#endif
+    {auto r=store.read();require(store.readGeometryArray(r,f.geometry,"points")==shape().arrays.front().bytes,"protected dependencies stay intact");}
+}
+
+void inventoryRestore(HistoryMode baseMode,HistoryMode overlayMode) {
+    Fixture f(baseMode,overlayMode);
+    auto store=ObjectStore::open(f.overlay,options(overlayMode));
+    {auto w=store.write(VersionSelection{{f.a,f.av.version},{f.b,f.bv.version}});store.retireObject(w,f.a);w.commit();}
+    int64_t version;{auto r=store.read();version=*store.currentVersion(r,f.a);}
+    {auto w=store.write(VersionSelection{{f.a,version}});store.restoreObject(w,f.a,f.av);w.commit();}
+    {auto r=store.read();require(!store.objectByUuid(r,f.a)->retired,"explicit retained source restores independent destination history");}
+    // Retired current-only source can be reactivated in a history-on overlay.
+    const auto next=f.dir.path/"next.vcobj";
+    {auto r=store.read();version=*store.currentVersion(r,f.a);}
+    {auto w=store.write(VersionSelection{{f.a,version}});store.retireObject(w,f.a);store.seal(w);w.commit();}
+    {auto collection=ObjectCollection::create(next,{f.overlay},options(HistoryMode::On));}
+    auto child=ObjectStore::open(next,options(HistoryMode::On));
+    {auto r=child.read();version=*child.currentVersion(r,f.a);}
+    {auto w=child.write(VersionSelection{{f.a,version}});child.restoreObject(w,f.a);w.commit();}
+    {auto r=child.read();require(!child.objectByUuid(r,f.a)->retired,"default reactivation uses source retention");}
+}
+
+void inventoryIdentityAndSources() {
+    Fixture f(HistoryMode::Off,HistoryMode::Off);
+    {auto store=ObjectStore::open(f.overlay,options(HistoryMode::Off));auto r=store.read();
+        const auto copy=readObjectCopy(LocalStoreReader(store,r),f.a);
+        require(nlohmann::json::parse(copy.record.meta).at("copied_from").at("store_uuid")==f.av.storeUuid,"copy provenance uses source owner");}
+    ObjectStoreSession session;const auto attachment=session.attach(f.overlay,options(HistoryMode::Off));
+    PinnedObject pin;
+    session.readStore(attachment,[&](const StoreReader& reader,const auto&){pin=pinOf(attachment,*reader.currentObject(f.a),reader.status().generation);});
+    session.requireCurrent(pin);
+    auto wrong=pin;wrong.object.storeUuid=util::newUuid();mustFail([&]{session.requireCurrent(wrong);});
+    auto request=session.newRequest(attachment);auto other=f.av;other.storeUuid=util::newUuid();expectObject(request,other);
+    request.operations.push_back(SetMetaOp{f.a,"note","true"});
+    const auto wire=transactionRequestToJson(request);const auto roundtrip=transactionRequestFromJson(wire,{});
+    require(roundtrip.expectedObjectReferences==request.expectedObjectReferences,"full write expectations survive transport");
+    auto inconsistent=nlohmann::json::parse(wire);inconsistent["expected_objects"][f.a]=other.version+1;
+    mustFail([&]{transactionRequestFromJson(inconsistent.dump(),{});});
+    inconsistent=nlohmann::json::parse(wire);inconsistent["command_version"]=1;
+    mustFail([&]{transactionRequestFromJson(inconsistent.dump(),{});});
+    mustFail([&]{session.submit(attachment,roundtrip);});
+    // A tool-created output inherits the frame actually loaded, not today's head.
+    ToolObjects tool(f.overlay,"test");
+    tool.session()->readStore(tool.attachment(),[&](const StoreReader& reader,const auto&){
+        tool.noteRead(pinOf(tool.attachment(),*reader.currentObject(f.a),reader.status().generation),{},true);});
+    const auto loadedCoordinates=tool.coordinatesFor({f.a},{});
+    session.editCurrent(attachment,{f.a},[&](const auto&,const auto&){return std::vector<TransactionOperation>{SetMetaOp{f.a,"coordinates",R"({"volume_uuid":"new-frame","scale_factor":1})"}};});
+    require(tool.coordinatesFor({f.a},{})==loadedCoordinates,"derived coordinates follow retained source pin");
+}
+
+void inventorySelectedMembership() {
+    TemporaryDirectory dir;const auto base=dir.path/"base.vcobj",overlay=dir.path/"overlay.vcobj";
+    const auto a=util::newUuid(),b=util::newUuid();std::vector<ObjectVersion> refs;std::string edge;
+    {auto store=ObjectStore::create(base,options(HistoryMode::On));
+        {auto w=store.write();store.upsertObject(w,track(a));store.upsertObject(w,track(b));
+            EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="old";edge=store.addEdge(w,e);w.commit();}
+        {auto r=store.read();refs={store.currentObjectRevision(r,a)->reference(),store.currentObjectRevision(r,b)->reference()};}
+        {auto w=store.write();store.removeEdge(w,edge);EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="new";store.addEdge(w,e);store.seal(w);w.commit();}}
+    {auto collection=ObjectCollection::create(overlay,{base},options(HistoryMode::Off));}
+    auto store=ObjectStore::open(overlay,options(HistoryMode::Off));auto r=store.read();
+    const auto graph=LocalStoreReader(store,r).graphReadViewAt(refs);
+    require(graph.selectedRelationships->size()==1&&graph.selectedRelationships->front().record.kind=="old",
+        "history-off attachment cannot substitute newer source graph memberships");
+}
+
+void inventoryRevalidatedPeer(HistoryMode baseMode, HistoryMode overlayMode) {
+    Fixture f(baseMode,overlayMode);
+    auto store=ObjectStore::open(f.overlay,options(overlayMode));
+    {auto w=store.write(VersionSelection{{f.a,f.av.version},{f.b,f.bv.version}});
+        store.setMeta(w,f.b,"quality","8");store.retainRelationship(w,f.edge);w.commit();}
+    auto r=store.read();
+    require(store.currentObjectRevision(r,f.a)->reference()==f.av,"revalidation leaves the borrowed endpoint unchanged");
+    require(store.currentObjectRevision(r,f.b)->reference()!=f.bv,"revalidated peer has a new local version");
+    const auto graph=LocalStoreReader(store,r).graphReadViewAt({f.av,f.bv});
+    require(graph.edgeUuids==std::vector<std::string>{f.edge},
+        "new binding on one unchanged endpoint must not replace the selected historical peer binding");
+    require(graph.selectedRelationships->front().version==f.edgeVersion,
+        "the exact old pair retains its original relationship version");
+}
+
+void inventoryArtifactAlias() {
+    TemporaryDirectory dir;const auto path=dir.path/"store.vcobj",payloads=dir.path/"payloads";
+    auto store=ObjectStore::create(path,options(HistoryMode::Off));
+    std::filesystem::create_directory(payloads);
+    std::ofstream(payloads/"payload")<<"immutable artifact";
+    std::filesystem::create_directory_symlink(payloads,path.string()+".artifacts");
+    auto r=store.read();
+    mustFail([&]{store.validateExportDestination(r,payloads/"payload");});
+    mustFail([&]{store.validateExportDestination(r,std::filesystem::path(path.string()+".artifacts")/"payload");});
+}
+
+#ifdef VC_TEST_NATIVE_EXPORT
+void inventoryMixedOwnerExport() {
+    TemporaryDirectory dir;const auto base=dir.path/"base.vcobj",overlay=dir.path/"overlay.vcobj";
+    const auto a=util::newUuid(),b=util::newUuid();ObjectVersion selected;
+    const auto addFiber=[](auto& store,auto& write,const std::string& uuid){
+        ObjectRecord object;object.uuid=uuid;object.kind="fiber";object.formatVersion=4;
+        store.upsertObject(write,object);
+        store.putGeometry(write,uuid,vc::geometry::encode(vc::geometry::Fiber{
+            {{1,2,3},{4,5,6}},{{1,2,3},{4,5,6}},{0,1}}));
+    };
+    {auto store=ObjectStore::create(base,options(HistoryMode::Off));auto w=store.write();
+        addFiber(store,w,b);store.seal(w);w.commit();}
+    {auto collection=ObjectCollection::create(overlay,{base},options(HistoryMode::Off));}
+    auto store=ObjectStore::open(overlay,options(HistoryMode::Off));
+    {auto w=store.write();addFiber(store,w,a);EdgeRecord edge;edge.kind="fiber_branch";edge.aUuid=a;edge.bUuid=b;
+        edge.aAnchor.points={{"control_point_ids",{0}}};edge.bAnchor.points={{"control_point_ids",{1}}};
+        edge.aAnchor.direction={1,0,0};edge.bAnchor.direction={0,1,0};
+        edge.aAnchor.position={1,2,3};edge.bAnchor.position={4,5,6};store.addEdge(w,edge);w.commit();}
+    {auto r=store.read();selected=store.currentObjectRevision(r,a)->reference();}
+    const auto currentPath=dir.path/"current.json",exactPath=dir.path/"exact.json";
+    exportGeometry(store,a,currentPath);exportGeometry(store,a,exactPath,selected);
+    std::ifstream currentFile(currentPath),exactFile(exactPath);
+    const auto current=nlohmann::json::parse(currentFile),exact=nlohmann::json::parse(exactFile);
+    require(current.at("branches").size()==1,"current export includes the inherited branch peer");
+    require(exact.at("branches")==current.at("branches"),"exact current-only export preserves mixed-owner graph closure");
+}
+#endif
+
+void inventoryPackedAndCoordinates() {
+    TemporaryDirectory dir;const auto base=dir.path/"base.vcobj",packed=dir.path/"packed.vcobj",overlay=dir.path/"overlay.vcobj";
+    const auto id=util::newUuid(),umb=util::newUuid(),surface=util::newUuid();ObjectVersion ref;
+    {auto store=ObjectStore::create(base,options(HistoryMode::Off));
+        {auto w=store.write();auto object=track(id);object.track->datasetRef="tracks";store.upsertObject(w,object);
+            object={};object.uuid=umb;object.kind="umbilicus";object.meta=R"({"coordinates":{"volume_uuid":"v","scale_factor":1}})";
+            store.upsertObject(w,object);store.putGeometry(w,umb,vc::geometry::encode(vc::geometry::Umbilicus{{{1,2,3},{4,5,6}}}));
+            object={};object.uuid=surface;object.kind="surface";store.upsertObject(w,object);
+            store.putGeometry(w,surface,vc::geometry::encode(vc::geometry::Surface{2,2,{1,1},{{0,0,1},{1,0,1},{0,1,1},{1,1,1}}}));w.commit();}
+        {auto r=store.read();ref=store.currentObjectRevision(r,surface)->reference();}
+        {auto w=store.write();store.seal(w);w.commit();}}
+    packObjectCollection(base,packed);
+    std::filesystem::create_directory(dir.path/"nested");
+    const auto nested=dir.path/"nested"/"overlay.vcobj";
+    {auto collection=ObjectCollection::create(nested,{packed},options(HistoryMode::On));}
+    auto store=ObjectStore::open(nested,options(HistoryMode::On));
+    {auto r=store.read();mustFail([&]{store.validateExportDestination(r,packed);});
+        require(store.resolveStoragePath(r,id)==dir.path/"tracks","track dataset uses physical owner's directory");
+        const auto selected=volumeUmbilicus(LocalStoreReader(store,r),{"v",1});
+        require(selected&&selected->version.storeUuid==ref.storeUuid,"umbilicus uses selected owner");}
+    {auto w=store.write();store.setMeta(w,id,"note","true");w.commit();}
+    {auto r=store.read();require(store.resolveStoragePath(r,id)==dir.path/"tracks","track path survives metadata override");}
+    std::string geometry;{auto r=store.read();geometry=store.currentGeometry(r,surface)->uuid;}
+    {auto w=store.write(VersionSelection{{surface,ref.version}});GeometrySurfaceResize resize;resize.rows=resize.columns=2;
+        resize.fill={scalarArray<float>("points","<f4",{1,1,3},std::array<float,3>{-1,-1,-1})};
+        require(store.resizeSurface(w,surface,resize,geometry)==geometry,"identity resize preserves geometry");w.commit();}
+    {auto r=store.read();require(store.currentObjectRevision(r,surface)->reference()==ref,"identity resize preserves owner/version");}
+}
+
 int main()try{
+    inventoryIdentityAndSources();
+    inventorySelectedMembership();inventoryPackedAndCoordinates();inventoryArtifactAlias();
+#ifdef VC_TEST_NATIVE_EXPORT
+    inventoryMixedOwnerExport();
+#endif
+    for(const auto base:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On}){
+        inventoryCore(base,overlay);inventoryRestore(base,overlay);inventoryRevalidatedPeer(base,overlay);
+    }
     allocationWithoutCurrentGeometry();
     for(const auto mode:{HistoryMode::Off,HistoryMode::On}){siblingViewWrites(mode);completeReceipts(mode);retainedPointAllocation(mode);}
     for(const auto mode:{HistoryMode::Off,HistoryMode::On})edgeIdentity(mode);
     for(const auto base:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On}){
         readsAndOverrides(base,overlay);geometryEdit(base,overlay,"retain");
         deletedAndExactReads(base,overlay);
-        if(overlay==HistoryMode::On)geometryEdit(base,overlay,"keep_recorded");
+        geometryEdit(base,overlay,"keep_recorded");
     }
     queries();packing();spatialQueries();followupRegressions();restoreFileReference();std::cout<<"coherent store API tests passed\n";
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

@@ -2,6 +2,7 @@
 #include "internal/History.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/RecordResolver.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -233,7 +234,7 @@ void finishGraph(GraphReadView& result, sqlite3* db)
             result.neighbours[slot] = to; result.edgeIndices[slot] = edge;
         }
     }
-    if(historyEnabled(db)) {
+    if(db && historyEnabled(db)) {
         Statement journal(db, "SELECT coalesce(max(seq),0) FROM journal");
         (void)journal.row(); result.journalSequence = journal.i64(0);
     }
@@ -271,15 +272,21 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
 GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<ObjectVersion>& versions,
                                          const EdgeSelection& edges) const
 {
-    auto* db = static_cast<sqlite3*>(connection(txn));
     requirePublishedGraphRead(txn);
+    auto result = LocalStoreReader(*this, txn).graphReadViewAt(versions, edges);
+    if (historyEnabled(ObjectStoreImplAccess::conn(txn))) result.journalSequence = journalPosition(txn);
+    return result;
+}
+
+GraphReadView StoreReader::graphReadViewAt(const std::vector<ObjectVersion>& versions, const EdgeSelection& edges) const
+{
     validateEdgeSelection(edges);
     if (edges.endpointUuids)
         throw std::invalid_argument("graph endpoint scope is specified by its version selection");
     GraphReadView result;
     result.selectedObjects.emplace(); result.selectedRelationships.emplace();
     std::map<std::string,ObjectRevision> resolved;
-    for(auto& value:objectsAtVersions(txn,versions)) {
+    for(auto& value:objectsAtVersions(versions)) {
         if(!value||value->deleted)throw std::invalid_argument("object history: selected version is unavailable or deleted");
         if (!resolved.emplace(value->objectUuid,*value).second)
             throw std::invalid_argument("duplicate object in revision selection");
@@ -293,7 +300,7 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<Obj
     }
     auto graphEdges = edges;
     if (!graphEdges.kind) graphEdges.attachments = false;
-    for (auto& selected : relationshipsAt(txn, versions))
+    for (auto& selected : relationshipsAt(versions))
         if (selected.applicable && matchesEdgeSelection(selected.relationship.record, graphEdges))
             result.selectedRelationships->push_back(std::move(selected.relationship));
     auto& relationships = *result.selectedRelationships;
@@ -304,8 +311,54 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<Obj
         result.edgeUuids.push_back(edge.uuid);
         result.endpoints.push_back({nodes.at(edge.aUuid), nodes.at(edge.bUuid)});
     }
-    finishGraph(result, db);
+    finishGraph(result, nullptr);
     return result;
+}
+
+GraphReadView StoreReader::graphReadViewAround(const std::vector<ObjectVersion>& versions,
+                                              const EdgeSelection& edges, const std::atomic_bool* cancel) const
+{
+    validateEdgeSelection(edges);
+    if (edges.endpointUuids)
+        throw std::invalid_argument("graph endpoint scope is specified by its version selection");
+    std::map<std::string,ObjectVersion> selected, pending;
+    std::set<std::string> pinned;
+    for (const auto& object : objectsAtVersions(versions)) {
+        if (!object || object->deleted) throw std::invalid_argument("graph seed version is unavailable or deleted");
+        const auto reference = object->reference();
+        if (!selected.emplace(reference.objectUuid, reference).second)
+            throw std::invalid_argument("duplicate object in graph seed selection");
+        pinned.insert(reference.objectUuid);
+        pending.emplace(reference.objectUuid, reference);
+    }
+    auto filter = edges;
+    if (!filter.kind) filter.attachments = false;
+    while (!pending.empty()) {
+        if (cancel && cancel->load()) throw std::runtime_error("graph selection cancelled");
+        std::vector<ObjectVersion> frontier;
+        for (const auto& [uuid, reference] : pending) frontier.push_back(reference);
+        pending.clear();
+        for (const auto& relationship : relationshipsAt(frontier)) {
+            const auto& edge = relationship.relationship;
+            if (!matchesEdgeSelection(edge.record, filter)) continue;
+            for (const auto& reference : {edge.aReference, edge.bReference}) {
+                if (reference.objectUuid.empty() || reference.storeUuid.empty() || reference.generation.empty() || reference.version <= 0)
+                    throw std::invalid_argument("recorded graph endpoint reference is unavailable");
+                if (pinned.contains(reference.objectUuid)) continue;
+                const auto found = selected.find(reference.objectUuid);
+                if (found != selected.end()) {
+                    if (found->second.storeUuid != reference.storeUuid || found->second.generation != reference.generation)
+                        throw std::invalid_argument("ambiguous recorded owners/lineages for graph endpoint " + reference.objectUuid);
+                    if (found->second.version >= reference.version) continue;
+                }
+                selected.insert_or_assign(reference.objectUuid, reference);
+                pending.insert_or_assign(reference.objectUuid, reference);
+            }
+        }
+    }
+    std::vector<ObjectVersion> closure;
+    for (const auto& [uuid, reference] : selected) closure.push_back(reference);
+    return graphReadViewAt(closure, edges);
 }
 
 GraphReadView ObjectStore::graphReadViewAt(const Txn& txn,const RevisionSelection& selection,const EdgeSelection& edges) const

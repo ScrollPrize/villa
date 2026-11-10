@@ -35,6 +35,14 @@ def materialize(db, edge, **kwargs):
     return result
 
 
+def pinned(db, edge):
+    endpoints = {side: db.current_object_revision(edge[side]) for side in "ab"}
+    return {"uuid": edge["uuid"], "whole_geometry": True, "meta": json.dumps(edge["meta"]),
+            **{f"{side}_reference": {"object": revision["object_uuid"],
+                                    **{key: revision[key] for key in ("store", "generation", "version")}}
+               for side, revision in endpoints.items()}}
+
+
 @pytest.mark.parametrize("history_enabled", [False, True])
 def test_incremental_overlaps_and_current_pairs_with_optional_history(tmp_path, history_enabled):
     from vc_object_store import ObjectStore
@@ -207,10 +215,7 @@ def test_correspondence_agreement_boundary(db, radius, accepted):
 def test_pairs_from_an_earlier_state_ignore_later_changes(db):
     edge, geometry = overlapping_pair(db)
     # The edge and its endpoints as a reader holding them now would pass them.
-    then = {"uuid": edge["uuid"], "a": edge["a"], "b": edge["b"], "whole_geometry": True,
-            "meta": json.dumps(edge["meta"]),
-            **{f"{side}_object_meta": json.dumps(db.object(edge[side])["meta"]) for side in "ab"},
-            **{f"{side}_geometry_revision": db.current_geometry(edge[side])["uuid"] for side in "ab"}}
+    then = pinned(db, edge)
     before = materialize(db, edge)
     assert db.overlap_correspondences_at([then], VOLUME) == [before]
     # Later HIGH moves and the edge is removed: the earlier state still reads
@@ -232,10 +237,7 @@ def test_pinned_pairs_read_through_a_session_attachment(db, db_path, tmp_path):
     from vc_object_store.locations import open_store
 
     edge, _ = overlapping_pair(db)
-    then = {"uuid": edge["uuid"], "a": edge["a"], "b": edge["b"], "whole_geometry": True,
-            "meta": json.dumps(edge["meta"]),
-            **{f"{side}_object_meta": json.dumps(db.object(edge[side])["meta"]) for side in "ab"},
-            **{f"{side}_geometry_revision": db.current_geometry(edge[side])["uuid"] for side in "ab"}}
+    then = pinned(db, edge)
     expected = db.overlap_correspondences_at([then], VOLUME)
     assert expected[0]["error"] is None and expected[0]["pairs"]
     db.close()
@@ -262,3 +264,18 @@ def test_pinned_pairs_read_through_a_session_attachment(db, db_path, tmp_path):
     finally:
         server.terminate()
         assert server.wait(timeout=30) == 0
+
+
+def test_pinned_cache_distinguishes_metadata_only_coordinate_edits(db):
+    edge, _ = overlapping_pair(db)
+    before = pinned(db, edge)
+    db.set_meta(HIGH, "coordinates", frame(2))
+    after = pinned(db, edge)
+    # Geometry bytes/revision are unchanged, but the selected coordinate frame
+    # differs. Batching must not reuse the first endpoint's transform.
+    assert before["b_reference"] != after["b_reference"]
+    old = db.overlap_correspondences_at([before], VOLUME)[0]
+    new = db.overlap_correspondences_at([after], VOLUME)[0]
+    assert old["error"] is None and "grid scale differs" in new["error"]
+    assert db.overlap_correspondences_at([before, after], VOLUME) == [old, new]
+    assert db.overlap_correspondences_at([after, before], VOLUME) == [new, old]

@@ -39,12 +39,12 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(const StoreReader& reader, const 
         throw std::runtime_error("several umbilici map to volume " + volume.volume + ":" + names);
     }
     const auto& record = records.front();
-    const auto head = reader.currentObject(record.uuid);
+    const auto head = reader.selectedObject(record.uuid, {}, {}, record.reference());
     if (!head || !head->geometryRevision) throw std::runtime_error("umbilicus " + record.name + " has no geometry");
     // The geometry of the version read, so points and version agree.
     const auto canonical = GeometrySnapshot(reader).umbilicus(record.uuid, *head->geometryRevision);
-    VolumeUmbilicus result{record.uuid, record.name, {reader.status().storeUuid, head->generation, record.uuid, head->version},
-                           canonical.viewTransformedAt(volume.volume, volume.scale).points("points", 0, canonical.size())};
+    VolumeUmbilicus result{record.uuid, record.name, head->reference(),
+                           canonical.viewTransformedAt(*head, volume.volume, volume.scale).points("points", 0, canonical.size())};
     return result;
 }
 
