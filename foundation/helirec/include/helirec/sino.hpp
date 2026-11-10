@@ -15,13 +15,36 @@ namespace cpu {
 void minus_log(float* x, std::size_t n, float clip_min = 1e-6f, float clip_max = 10.f);
 // x[i] *= w[i]
 void multiply(float* x, const float* w, std::size_t n);
+// x[i] += s * y[i]
+void add_scaled(float* x, const float* y, float s, std::size_t n);
+// t[i] = x[i] * (w2[i] - w[i])
+void weight_difference(const float* x, const float* w, const float* w2, float* t, std::size_t n);
+// x[i] = x[i] * w[i] + t[i]
+void multiply_add(float* x, const float* w, const float* t, std::size_t n);
 }  // namespace cpu
 #ifdef HELIREC_WITH_CUDA
 namespace cuda {
 void minus_log(float* x, std::size_t n, float clip_min = 1e-6f, float clip_max = 10.f, void* stream = nullptr);
 void multiply(float* x, const float* w, std::size_t n, void* stream = nullptr);
+void add_scaled(float* x, const float* y, float s, std::size_t n, void* stream = nullptr);
+void weight_difference(const float* x, const float* w, const float* w2, float* t, std::size_t n, void* stream = nullptr);
+void multiply_add(float* x, const float* w, const float* t, std::size_t n, void* stream = nullptr);
 }  // namespace cuda
 #endif
+
+// ------------------------------------------------------------- band-dependent redundancy weights
+// When the recordings of a ray differ in sharpness (PipelineConfig::detector_smear), they are combined with two sets
+// of weights: the usual ones below the band [f1, f2] cycles per pixel, weights that favour the sharper recording
+// above it. With X the result of the usual weights and Y that of the others, the combination is X + HP (Y - X), HP
+// a raised cosine from 0 at f1 to 1 at f2: both sets sum to one for every ray, so every band is an unbiased average.
+// The high-pass as a Fourier filter (fourier.hpp): ndim 2 on frames (h, w), on the frequency magnitude in the
+// frame; ndim 1 along rows of w samples. Edge padding.
+FourierFilterSpec band_filter_spec(int ndim, int h, int w, double f1, double f2);
+// The detector's squared response at `f` cycles per pixel along the columns, for a uniform smear whose width is
+// smear[0] X + smear[1] Y + smear[4] pixels at (X, Y) = (column, row) from the detector's centre in units of 1000
+// pixels (the first row and the constant of the smear field s = A r + c); 0 beyond the response's first zero.
+// (rows, cols), floored at 1e-6.
+std::vector<float> smear_response(const std::vector<double>& smear, double f, int rows, int cols);
 
 // ------------------------------------------------------------- rebalance
 // R, W: (n_proj, n_rows, n_cols), grid angles theta_i = 2 pi i / n_proj over one full turn.
@@ -140,6 +163,23 @@ void bspline_prefilter(const float* in, float* out, int n_rows, int n, int degre
 namespace cuda {
 void upsample_rows(const float* in, float* out, int n_rows, int n, int os, void* stream = nullptr);
 void bspline_prefilter(const float* in, float* out, int n_rows, int n, int degree, void* stream = nullptr);
+}
+#endif
+
+// ------------------------------------------------------------- band-limited shift
+// Rows delayed by `shift` samples, in place, without loss: sample i of a row becomes the row's band-limited value at
+// position i - shift (a phase ramp on its discrete Fourier transform; a kernel of a few taps cannot do it: at half a
+// sample lanczos3 passes 0.83 at 0.36 cycles per sample, 0.33 at 0.45). `rows` is (n_rows, shift_row_stride(n)): n
+// samples per row, the rest work space. The transform has upsample_fft_length(n) samples, the ones beyond n a
+// raised-cosine bridge from the row's last sample to its first, so that the periodic extension is continuous. For
+// an even length the Nyquist bin, which a real row cannot delay by a fraction, is scaled by cos(pi shift).
+int shift_row_stride(int n);
+namespace cpu {
+void shift_rows(float* rows, int n_rows, int n, float shift);
+}
+#ifdef HELIREC_WITH_CUDA
+namespace cuda {
+void shift_rows(float* rows, int n_rows, int n, float shift, void* stream = nullptr);
 }
 #endif
 

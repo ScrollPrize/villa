@@ -45,10 +45,22 @@ struct ReconConfig {
     int n_grid = 0;                     // <=0: round(360 / mean step) of the main scan
     double angular_tolerance_steps = 5;
     float luminosity_repartition = 100.f;
-    // fractional column offset of a scan in the merged frame: "lanczos3" (default), "cubic", or "linear" = the
-    // reference's two-column splat, which averages neighbouring columns (cos(pi nu) at half a pixel). The legacy
-    // reference mode always uses the splat.
-    std::string x_interp = "lanczos3";
+    // fractional column offset of a scan in the merged frame: "sinc" (default) = each projection row delayed by the
+    // offset exactly (a phase ramp on its transform; the gridding of measured pixels only, for the iterative methods,
+    // uses lanczos3); "lanczos3" / "cubic" = a kernel of 6 / 4 columns, which loses the top of the band (lanczos3 at
+    // half a pixel: 0.83 at 0.36 cycles per pixel, 0.33 at 0.45); "linear" = the reference's two-column splat, which
+    // averages neighbouring columns (cos(pi nu) at half a pixel). The legacy reference mode always uses the splat.
+    std::string x_interp = "sinc";
+    // Band-dependent redundancy weights (sino.hpp), for a detector whose sharpness depends on the place: "" = off, or
+    // the detector's smear field "a11:a12:a21:a22:c1:c2" (a uniform smear of A r + c pixels at r = (column, row) from
+    // the detector's centre in units of 1000 pixels; only its component along the columns, a11 a12 c1, is used).
+    // Below sharp_band = "f1:f2" (cycles per pixel) the recordings of a ray are combined with the usual weights,
+    // above it with those weights times the detector's squared response at sharp_f; raised-cosine crossover. On the
+    // frames before the phase filter the band is taken on the frequency magnitude (columns and rows), between
+    // opposite views along the columns. Not in the legacy reference mode or for measured-only gridding.
+    std::string detector_smear;
+    double sharp_f = 0.35;
+    std::string sharp_band = "0.15:0.30";
     // vertical position of a slice in a projection (a fractional detector row): "lanczos3" (default) or "cubic"
     // (6 / 4 rows; accumulate.hpp), or "linear" = the reference's two rows, a triangle kernel along z (sinc^2). The
     // legacy reference mode always interpolates linearly.
@@ -62,6 +74,12 @@ struct ReconConfig {
     // continuous rotation: fraction of the angular step between projections swept during one exposure (0: none, or
     // step scans). > 0: that box blur along the angle is deconvolved in every sinogram (sino.hpp angular_fir).
     double exposure_arc = 0;
+    // Split reconstructions: with angle_subsets > 1 only subset number angle_subset of that many interleaved subsets
+    // of the projections is used (helical.hpp angle_subset: by angle, the same angles in every scan), on a grid of
+    // 1 / angle_subsets of the angles (unless n_grid says otherwise). The subsets of a scan have independent noise
+    // and share everything else (flats, calibration, geometry); exposure_arc stays the fraction of the recorded
+    // step. The doable heights are those of the whole scan.
+    int angle_subsets = 1, angle_subset = 0;
     float mend_threshold = 1e-4f;       // mending domain: the merged columns the scans' weight maps cover
     float log_clip_min = 1e-6f, log_clip_max = 10.f;
     int block_angles = 500;
@@ -180,6 +198,7 @@ class SliceReconstructor {
     double exposure_arc_bins() const;          // the deconvolved exposure arc in grid angles (0: none)
     std::string angle_interp() const;          // the angular gridding in use: "nearest" or "linear"
     std::string z_interp() const;              // the vertical kernel in use
+    std::vector<int> projection_counts() const;   // projections in use, per scan (a subset: fewer than recorded)
     const ReconConfig& config() const;
 
     // slices for view heights h_lo .. h_hi-1 -> out (h_hi - h_lo, N, N), or (n, y1 - y0, x1 - x0) with an ROI

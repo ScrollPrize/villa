@@ -37,14 +37,33 @@ DEFAULTS = dict(
     mode="corrected", filters=DEFAULT_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9, sld="", x_interp="lanczos3", z_interp="lanczos3", angle_interp="nearest", exposure_arc="auto",
+    axis_source_meters=1e9, sld="", x_interp="sinc", z_interp="lanczos3", angle_interp="nearest", exposure_arc="auto",
+    angle_subset="", z_translation_scale="auto", detector_smear="auto", sharp_f=0.35, sharp_band="0.15:0.30",
+    companion_registration="auto",
 )
+# companion_registration: "auto" (the companion's frames are placed on the main scan's as the calibration registered
+#   them: a row offset and a roll per projection, calibration.measure_registration) | "off" (the calibrated vector
+#   alone)
+# detector_smear: "auto" (the field the calibration measured from the flats' noise; none if nothing significant) |
+#   "" or "off" | "a11:a12:a21:a22:c1:c2": the detector's smear field for the band-dependent redundancy weights
+#   (pipeline.hpp); sharp_f, sharp_band = "f1:f2": the frequency the weights are taken at, and the crossover band.
 # z_interp: lanczos3 | cubic | linear, the vertical interpolation of a slice's (fractional) detector row.
 # angle_interp: nearest (each projection whole in one bin, slices backprojected at the measured angles) | linear (the
 #   reference's two-bin angular splat). ghbp, whose plan fixes its angles, keeps the splat: info["angle_interp"]
 #   records the gridding in use.
 # exposure_arc: fraction of the angular step swept during an exposure, deconvolved along the angle; "auto" (default)
 #   takes it from the scan (bliss.BlissScan.exposure_arc; 0 for step scans), 0 leaves the sinogram as recorded.
+# z_translation_scale: detector rows the sample really moves per row of recorded z translation: the calibration of
+#   the helical pitch. "auto" (default): what the calibration measured from the frames (calibration.measure_pitch:
+#   projections half a turn apart are mirror images displaced by the travel; 1 where no significant error was found
+#   or nothing could be measured); a number: that value (1: the recorded translations as they are). An error of a
+#   fraction e displaces what the top and the bottom rows of the detector see of a slice by e x (rows between them):
+#   a blur along z. Volume slice indices (z = view height - first doable height) and the place of the sample in them
+#   change with it. The rotation axis and overlap searches still use the recorded translations.
+# angle_subset: "" (default: every projection) or "I/N": subset I of N interleaved subsets of the projections, chosen
+#   by angle (the same angles in every scan), reconstructed on a grid of 1 / N of the angles. The subsets have
+#   independent noise and share the calibration: "0/2" and "1/2" are the two halves whose shell correlation
+#   (evaluation/shell_correlation.py --pair) measures the scan's own signal-to-noise ratio.
 
 # mode "legacy_reference": every parameter pinned to the reference workflow
 LEGACY_REFERENCE = dict(
@@ -52,6 +71,8 @@ LEGACY_REFERENCE = dict(
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
     axis_source_meters=1e9, sld="", x_interp="linear", z_interp="linear", angle_interp="linear", exposure_arc=0.0,
+    angle_subset="", z_translation_scale=1.0, detector_smear="", sharp_f=0.35, sharp_band="0.15:0.30",
+    companion_registration="off",
 )
 assert set(LEGACY_REFERENCE) == set(DEFAULTS) - {"mode"}
 
@@ -72,7 +93,8 @@ CONVENTIONS = {
                       rebalance="periodic_opposite_view", ramp_padding_reflection="2*rot_center (interpolated)",
                       mending_domain="merged columns covered by the scans' weight maps",
                       paganin_kernel="fixed, rows [-m, m], unit DC",
-                      column_offset="x_interp kernel (lanczos3 by default); linear splat next to unmeasured columns",
+                      column_offset="x_interp (sinc by default: rows shifted exactly; lanczos3 for measured-only gridding); "
+                                    "linear splat next to unmeasured columns",
                       luminosity_window="full 25 rows (12 context rows read either side of a chunk)",
                       row_position="z_interp kernel (lanczos3 by default); linear next to unmeasured rows",
                       angular_gridding="angle_interp (nearest by default: one bin, measured angles; ghbp and "
@@ -155,6 +177,20 @@ def backprojector_config(spec):
     return out
 
 
+def angle_subset_config(spec):
+    """params["angle_subset"] ("" or "I/N") -> (subset, subsets)"""
+    text = str(spec or "").strip()
+    if not text:
+        return 0, 1
+    try:
+        i, n = (int(v) for v in text.split("/"))
+    except ValueError:
+        raise ValueError(f"angle_subset must be 'I/N' (subset I of N), not {spec!r}") from None
+    if not 0 <= i < n:
+        raise ValueError(f"angle_subset {spec!r}: I must be in [0, N)")
+    return i, n
+
+
 @dataclass
 class SliceInfo:
     fraction: float
@@ -203,7 +239,21 @@ class HelicalRecon:
             np.ascontiguousarray(scan.flats_unwrapped_angles_deg, np.float32),
             np.ascontiguousarray(self.arrays[f"{tag}_dark"]), np.ascontiguousarray(flats),
             np.ascontiguousarray(self.arrays[f"{tag}_weight"]), reader, scan.projections.file_index,
-            scan.projections.frame_index)
+            scan.projections.frame_index, self.z_translation_scale(), **self._registration(scan, tag))
+
+    def _registration(self, scan, tag) -> dict:
+        """make_scan_data's registration arguments: the companion's frames on the main scan's
+        (params["companion_registration"]: "auto" = what the calibration measured, "off")"""
+        v = self.params["companion_registration"]
+        v = v.strip().lower() if isinstance(v, str) else v
+        if v not in ("auto", "off", "", None):
+            raise ValueError("companion_registration must be 'auto' or 'off'")
+        if tag != "companion" or v != "auto" or self.params["mode"] == "legacy_reference":
+            return {}
+        arr = calibration.registration_arrays(getattr(self.cal, "companion_registration", None), len(scan.projections))
+        if arr is None:
+            return {}
+        return dict(row_offset=arr[0].tolist(), row_slope=arr[1].tolist(), slope_col=arr[2])
 
     def _build(self):
         p = dict(self.params)
@@ -216,6 +266,10 @@ class HelicalRecon:
         self._resolved_sld = sld_config(cfg.pop("sld"))
         cfg.update(self._resolved_sld)
         cfg["exposure_arc"] = self.exposure_arc()
+        cfg["detector_smear"] = "" if mode == "legacy_reference" else self.detector_smear()
+        cfg["angle_subset"], cfg["angle_subsets"] = angle_subset_config(cfg.pop("angle_subset"))
+        cfg.pop("z_translation_scale")   # (of the scans: _scan_data)
+        cfg.pop("companion_registration")
         scans = [self._scan_data(self.main, "main"), self._scan_data(self.companion, "companion")]
         self.rec = _core.SliceReconstructor(scans, cfg)
         self.info = self.rec.info
@@ -227,6 +281,30 @@ class HelicalRecon:
         if isinstance(v, str) and v.strip().lower() == "auto":
             return float(self.main.exposure_arc or 0.0)
         return float(v)
+
+    def detector_smear(self) -> str:
+        """params["detector_smear"] resolved to "a11:a12:a21:a22:c1:c2" or "" (off); "auto" = the calibration's"""
+        v = self.params["detector_smear"]
+        if v is None or (isinstance(v, str) and v.strip().lower() in ("", "off", "none")):
+            return ""
+        if isinstance(v, str) and v.strip().lower() == "auto":
+            field = getattr(self.cal, "detector_smear", None) or []
+            return ":".join(f"{x:.6g}" for x in field)
+        if not isinstance(v, str):
+            v = ":".join(f"{float(x):.6g}" for x in v)
+        if len(v.split(":")) != 6:
+            raise ValueError("detector_smear must be 'auto', 'off' or a11:a12:a21:a22:c1:c2")
+        return v
+
+    def z_translation_scale(self) -> float:
+        """params["z_translation_scale"] resolved: a number, or "auto" = the calibration's measured pitch scale"""
+        v = self.params["z_translation_scale"]
+        if isinstance(v, str) and v.strip().lower() == "auto":
+            return float(getattr(self.cal, "z_translation_scale", None) or 1.0)
+        v = float(v)
+        if not v > 0:
+            raise ValueError("z_translation_scale must be positive (or 'auto')")
+        return v
 
     @property
     def legacy(self) -> bool:
@@ -273,7 +351,11 @@ class HelicalRecon:
                     output_units=CONVENTIONS[mode]["output_units"],
                     calibration=dict(source=self.cal.source, fingerprint=self.cal.fingerprint,
                                      version=self.cal.version, rot_center=self.cal.rot_center,
-                                     vector=list(self.cal.vector), cor_main_detector=self.cal.cor_main_detector),
+                                     vector=list(self.cal.vector), cor_main_detector=self.cal.cor_main_detector,
+                                     z_translation_scale=getattr(self.cal, "z_translation_scale", None)),
+                    resolved_z_translation_scale=self.z_translation_scale(),
+                    resolved_detector_smear=self.detector_smear(),
+                    companion_registration=bool(self._registration(self.companion, "companion")),
                     reconstructor=dict(self.info), pixel_size_m=self.main.pixel_size_m,
                     energy_kev=self.main.energy_kev, distance_m=self.main.distance_m,
                     helirec=_build_identity())

@@ -4,6 +4,7 @@
 #include "common/accumulate_core.hpp"
 #include "cuda_utils.cuh"
 #include "helirec/accumulate.hpp"
+#include "helirec/sino.hpp"
 
 namespace helirec::cuda {
 
@@ -28,11 +29,12 @@ __global__ void accumulate_kernel(AccumScanView s, const int32_t* __restrict__ o
 
 // the vertically interpolated values of the block's projections: threads x over detector columns, y over rows t, z
 // over the projections (slots)
-__global__ void column_values_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int H, float* __restrict__ out) {
+__global__ void column_values_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int H, int stride,
+                                     float* __restrict__ out) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (c >= s.det_cols || t >= H) return;
-    out[(static_cast<size_t>(blockIdx.z) * H + t) * s.det_cols + c] = column_interp(s, slot_proj[blockIdx.z], t, c);
+    out[(static_cast<size_t>(blockIdx.z) * H + t) * stride + c] = column_interp(s, slot_proj[blockIdx.z], t, c);
 }
 
 __global__ void lum_sums_kernel(const float* R, const float* RW, int L, int H, int NX, int cx, const float* gx,
@@ -93,7 +95,7 @@ const T* load(DeviceBuffer<T>& d, const std::vector<T>& v, cudaStream_t s) {
 }
 
 void accumulate(const AccumScanView& view, const ContributorList& c, const AccumParams& p, float* R, float* RW,
-                void* stream) {
+                void* stream, const float* weight2, float* R2, float* RW2) {
     cudaStream_t st = as_stream(stream);
     const int L = c.g1 - c.g0;
     if (L <= 0 || p.H <= 0 || p.NX <= 0 || c.proj.empty()) return;
@@ -108,13 +110,18 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     if (!p.measured_only && !s.col_val) {
         contributor_slots(c, s.n_proj, slot, slot_proj);
         const std::size_t n_slots = slot_proj.size();
-        d_col.ensure(n_slots * p.H * s.det_cols);
+        const bool shift = s.x_exact && s.fract_x != 0.f;
+        const int stride = shift ? shift_row_stride(s.det_cols) : s.det_cols;
+        d_col.ensure(n_slots * p.H * stride);
         s.col_slot = load(d_slot, slot, st);
         dim3 block(128, 1, 1), grid((s.det_cols + 127) / 128, p.H, static_cast<unsigned>(n_slots));
-        column_values_kernel<<<grid, block, 0, st>>>(s, load(d_slot_proj, slot_proj, st), p.H, d_col.data());
+        column_values_kernel<<<grid, block, 0, st>>>(s, load(d_slot_proj, slot_proj, st), p.H, stride, d_col.data());
         HELIREC_CUDA_CHECK(cudaGetLastError());
+        if (shift) shift_rows(d_col.data(), static_cast<int>(n_slots) * p.H, s.det_cols, s.fract_x, st);
         s.col_val = d_col.data();
         s.col_rows = p.H;
+        s.col_stride = stride;
+        s.col_shifted = shift ? 1 : 0;
     }
     const int32_t* off = load(d_off, c.offsets, st);
     const int32_t* proj = load(d_proj, c.proj, st);
@@ -122,6 +129,11 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     dim3 block(128, 1, 1), grid((p.NX + 127) / 128, p.H, L);
     accumulate_kernel<<<grid, block, 0, st>>>(s, off, proj, role, L, p.H, p.NX, p, R, RW);
     HELIREC_CUDA_CHECK(cudaGetLastError());
+    if (weight2) {   // the same contributions with the second weight map
+        s.weight = weight2;
+        accumulate_kernel<<<grid, block, 0, st>>>(s, off, proj, role, L, p.H, p.NX, p, R2, RW2);
+        HELIREC_CUDA_CHECK(cudaGetLastError());
+    }
     HELIREC_CUDA_CHECK(cudaStreamSynchronize(st));
 }
 

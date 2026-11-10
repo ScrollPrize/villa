@@ -10,10 +10,11 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
 * `corrected` (default): output in attenuation (cm⁻¹); every measured line counted once in the half-acquisition
   rebalance; ramp padding reflected about the true rotation axis; mending over the merged columns both scans cover;
   a unit-DC Paganin kernel and a two-scan luminosity window independent of the chunk height; a scan at a
-  fractional column offset interpolated with a Lanczos-3 kernel (`x_interp`), as is a slice's fractional detector
-  row (`z_interp`); each projection gridded whole into one angular bin and backprojected at its measured angle
+  fractional column offset shifted exactly (`x_interp=sinc`), a slice's fractional detector row interpolated with
+  a Lanczos-3 kernel (`z_interp`); each projection gridded whole into one angular bin and backprojected at its measured angle
   (`angle_interp=nearest`; GHBP keeps the two-bin splat); the exposure arc of a continuous scan deconvolved
-  (`exposure_arc=auto`). No projection filters by default.
+  (`exposure_arc=auto`); the helical pitch measured from the frames (`z_translation_scale=auto`). No projection
+  filters by default.
 * `legacy_reference`: the reference workflow's conventions (half-attenuation units, its rebalance endpoints,
   integer padding reflection, mending bounds, chunk-dependent Paganin and luminosity window, two-column splat of
   fractional column offsets, linear rows, two-bin angular splat, no exposure-arc correction) with every parameter pinned (GHBP, Paganin 1000 + unsharp 1.2/4, …); overriding one
@@ -54,7 +55,11 @@ helirec-slices PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif       
   `--uint8_only` run downloads one byte per voxel and keeps no float32 volume on the host.
 * `--reference_volume ZARR` reuses the mask of a masked uint8 volume on the same grid (e.g. the published volume of
   the scan): the uint8 output is 0 wherever the reference is 0; the float32 output is not masked. The reference's
-  level 0 must have the reconstruction's full shape (z, y, x). `--reference_scale LEVEL` takes the mask from a coarser
+  level 0 must have the reconstruction's slices (y, x); its number of slices may differ by up to 2 %, as it does
+  when the reference was made with another helical pitch calibration (`z_translation_scale`): its slices are then
+  spread evenly over the reconstruction's, which places the mask to within a few slices (PHerc0343P, published
+  volume of 5398 slices on the 5411 of the measured pitch: within 0.1 slice mid-volume, about 2 at the two ends).
+  `--reference_scale LEVEL` takes the mask from a coarser
   pyramid level instead (each of its voxels decides the block of output voxels it covers), which is a far smaller
   read: an 8x level is 1/512 of the data. The reference is read in C++ with helirec's own Zarr reader
   (`helirec::ReferenceMask` on `zarr.hpp`: a Zarr v2 array or OME-Zarr pyramid at a local path, or at an `http(s)://`
@@ -320,12 +325,42 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     On PHerc0343P `nearest` and the arc correction together sharpen the tangential edge of the wrap at r ≈ 1200 px by
     3 % (Paganin only) to 7 % (with the unsharp mask); as the removed blurs also averaged noise, the noise in the outer
     air rises by 16 % (Paganin) to 33 % (unsharp).
-  * `x_interp=lanczos3|cubic|linear` (default `lanczos3`): how a scan at a fractional column offset in the merged
-    frame is resampled. `linear` is the reference's two-column splat: at half a pixel (the PHerc0343P main scan
-    sits at 843.5) it averages neighbouring columns, a response of cos(πν) — 0.65 at ν = 0.28 cycles/pixel, where
-    `lanczos3` keeps 1.00 and `cubic` 0.84 (measured on that scan against integer placement). The kernel
-    interpolates the values; the accumulated weights are the splat's. Next to the detector edges and to columns
-    without weight the splat is used, so unmeasured values never enter.
+  * `z_translation_scale=auto|S` (default `auto`): detector rows the sample really moves per row of recorded z
+    translation, the calibration of the helical pitch. A slice is seen at every row of the detector as the sample
+    travels; if the recorded travel is off by a fraction e, what two rows see of it is placed e × (rows between
+    them) apart along z, a blur along z that no filter undoes. `auto` uses what the calibration measures from the
+    frames (`calibration.measure_pitch`): two projections half a turn apart are mirror images about the rotation
+    axis, displaced along the rows by the travel in between, so the displacement of ~40 such pairs over the
+    recorded one is the scale (1 when the difference is not significant or nothing can be measured: a scan that
+    does not move, an axis off the detector). PHerc0343P: 1.00316 ± 0.00003, i.e. 1053.4 rows per turn where the
+    metadata gives 1050.1; against the 2.215 µm volume of the same sample the correlation at 0.39 cycles per voxel
+    rises from 0.56 to 0.71 (0.10 to 0.74 for frequencies along z). `1` uses the recorded translations as they
+    are. The volume's slice indices (z = view height − first doable height) and the sample's place in them change
+    with the scale: compare runs by view height (`--heights`). The rotation-axis and overlap searches still use
+    the recorded translations.
+  * `angle_subset=I/N` (default: every projection): subset I of N interleaved subsets of the projections, chosen
+    by angle (the same angles in every scan) and reconstructed on a grid of 1 / N of the angles. `0/2` and `1/2`
+    are two reconstructions of one scan with independent noise and everything else in common
+    (`evaluation/shell_correlation.py --pair`).
+  * `x_interp=sinc|lanczos3|cubic|linear` (default `sinc`): how a scan at a fractional column offset in the merged
+    frame is resampled (the PHerc0343P main scan sits at 843.5). `sinc` delays every projection row by the offset
+    exactly, as a phase ramp on its Fourier transform (`shift_rows`, `sino.hpp`): no part of the band is lost. Any
+    kernel of a few columns loses the top of it, and at half a pixel all of it at Nyquist:
+
+    | half a pixel, response at | 0.25 | 0.36 | 0.45 cycles/pixel |
+    |---|---|---|---|
+    | `sinc` | 1.00 | 1.00 | 1.00 |
+    | `lanczos3` (6 columns) | 1.02 | 0.83 | 0.35 |
+    | `cubic` (4 columns) | 0.88 | 0.60 | 0.23 |
+    | `linear` (the reference's two-column splat, cos(πν)) | 0.71 | 0.43 | 0.16 |
+
+    Measured on PHerc0343P (Teflon film, main scan alone): `sinc` equals an integer placement of the scan to 0.001;
+    against the 2.215 µm volume the default reconstruction's in-plane correlation rises from 0.60 / 0.40 / 0.18 to
+    0.67 / 0.54 / 0.41 at 0.42 / 0.45 / 0.48 cycles/voxel over `lanczos3`, unchanged below 0.33. Cost: 0.035 s per
+    32-slice chunk on an RTX 5090 (gridding 0.22 → 0.26 s). The accumulated weights are the splat's in every case.
+    Next to the detector edges and to columns without weight the splat is used, so unmeasured values never enter.
+    Notes: a row's two ends leak into a shifted row as 1 / distance (0.3 % of the high-frequency amplitude at the
+    end, 400 columns in); the gridding of measured pixels only (SIRT, MLEM) uses `lanczos3` under `sinc`.
   * The two-scan luminosity equalisation estimates each row's HA / TA difference in a 25 × 25 window at the seam
     and applies it as an offset of the intensity. Twelve context rows are read either side of a chunk, and context
     rows (the filters' too) are gridded from every projection that sees them, not only from those of the chunk's
@@ -333,8 +368,9 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     per chunk on the PHerc0343P pair).
 * **Geometry**: `--cor` / `--vector` override the calibration for one run (never cached; not allowed in
   `legacy_reference`).
-* **Calibration cache** (`--cache_dir`): darks/flats reduction and the measured calibration, keyed by a
-  fingerprint of the acquisition and the calibration version; written atomically.
+* **Calibration cache** (`--cache_dir`): darks/flats reduction and the measured calibration (rotation axis,
+  overlap vector, helical pitch), keyed by a fingerprint of the acquisition and the calibration version; written
+  atomically. A cache written before the pitch measurement existed gets it added on its next use.
 * **New kernels**: add a function with the same signature in `src/cpu` and `src/cuda`; shared per-element
   arithmetic lives in `src/common/*_core.hpp` so the backends cannot drift apart.
 
@@ -440,6 +476,29 @@ AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 uv pip install --python .venv/bin/pyt
 Run GPU commands on a host/session with NVIDIA device access. Use `--overwrite` to recompute every slice after
 switching devices; `run_cuda.log` can be captured with `2>&1 | tee /mnt/raid_nvme/343p_recon_work/output/baselines/run_cuda.log`.
 
+## Shell correlation (`evaluation/shell_correlation.py`)
+
+How much of a reconstruction is signal, per spatial frequency and direction: the 3D Fourier shell correlation of
+volumes against a registered reference volume of the same sample (a finer scan: `--ref` JSON with its location and
+the affine from the volumes' grid, as the open-data catalogue's `volume_transforms`), and / or between two
+reconstructions of one scan (`--pair`, e.g. `angle_subset=0/2` and `1/2`). Computed on cubic blocks with
+`helirec.BlockCorrelator` (`block_spectra.hpp`, CPU and CUDA): the reference is resampled twice finer than the
+volumes' grid and band-limited to it in the Fourier domain, registered per block by a sub-voxel shift, and the
+cross-spectra are summed in bins of |k| and of the angle of k from the z axis, so that in-plane and axial
+frequencies are reported apart. `matched` is the number to compare reconstructions with (no linear filter that is
+constant over a bin changes it; the plain shell correlation rises under a blur along z). Sharpening filters leave
+every curve where it was.
+
+```bash
+.venv/bin/python evaluation/shell_correlation.py --ref evaluation/343p_reference_2p215um.json \
+    --volume base=RUN/base/volume.zarr --volume unsharp=RUN/unsharp/volume.zarr --baseline base --out OUT
+```
+
+Against a reference the implied signal-to-noise ratio is a lower bound (the reference has noise of its own); between
+two halves of a scan it is an upper bound, and blind to anything all projections share (a geometry error leaves the
+halves in agreement). `evaluation/detector_noise.py` measures the detector's noise spectrum, lag and flat-field
+stability from a scan's flats and darks.
+
 ## Speed
 
 Seconds per slice on the PHerc0343P pair (8000 × 3372 sinogram, 5057² slice), RTX 5090, raw data in the page cache
@@ -496,4 +555,6 @@ These raise explicit errors:
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.
 
-The calibration kernels are CPU-only (they are cheap).
+The calibration kernels are CPU-only (they are cheap). The helical pitch is one scale for the whole scan: a
+stage that comes to rest away from its recorded position is not corrected (PHerc0343P: the projection pairs that
+reach into the final stationary turn sit about one row off the scale).

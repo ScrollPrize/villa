@@ -5,6 +5,7 @@
 #include "common/accumulate_core.hpp"
 #include "common/interp_core.hpp"
 #include "helirec/accumulate.hpp"
+#include "helirec/sino.hpp"
 
 namespace helirec {
 
@@ -42,9 +43,11 @@ void contributor_slots(const ContributorList& c, int n_proj, std::vector<int32_t
         }
 }
 
-void set_x_kernel(AccumScanView& v, int interp) {
+void set_x_kernel(AccumScanView& v, int interp, bool exact) {
     v.x_taps = 0;
+    v.x_exact = 0;
     if (v.fract_x == 0.f || interp == interp_core::Linear) return;
+    v.x_exact = exact ? 1 : 0;
     if (interp != interp_core::Cubic && interp != interp_core::Lanczos3)
         throw Error("x_interp must be linear, cubic or lanczos3");
     const int T = interp == interp_core::Cubic ? 4 : 6;
@@ -81,6 +84,12 @@ std::vector<float> z_kernel_weights(const std::vector<float>& fract_v, int inter
     return out;
 }
 
+std::vector<float> z_kernel_lut(int interp, int n) {
+    std::vector<float> fr(n + 1);
+    for (int i = 0; i <= n; ++i) fr[i] = static_cast<float>(i) / static_cast<float>(n);
+    return z_kernel_weights(fr, interp);
+}
+
 LuminosityKernel luminosity_kernel() {
     LuminosityKernel k;
     const int r = k.radius;
@@ -98,7 +107,8 @@ namespace cpu {
 
 using namespace helirec::accum_core;
 
-void accumulate(const AccumScanView& view, const ContributorList& c, const AccumParams& p, float* R, float* RW) {
+void accumulate(const AccumScanView& view, const ContributorList& c, const AccumParams& p, float* R, float* RW,
+                const float* weight2, float* R2, float* RW2) {
     const int L = c.g1 - c.g0;
     AccumScanView s = view;
     // the vertically interpolated values of the block's projections, once each (they are the same at every column
@@ -108,31 +118,41 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     if (!p.measured_only && !s.col_val && !c.proj.empty()) {
         contributor_slots(c, s.n_proj, slot, slot_proj);
         const int n_slots = static_cast<int>(slot_proj.size()), W = s.det_cols;
-        col.resize(static_cast<std::size_t>(n_slots) * p.H * W);
+        const bool shift = s.x_exact && s.fract_x != 0.f;
+        const int stride = shift ? shift_row_stride(W) : W;
+        col.resize(static_cast<std::size_t>(n_slots) * p.H * stride);
         float* const values = col.data();   // (the calling thread's buffer: `col` names another in each worker)
 #pragma omp parallel for collapse(2) schedule(dynamic, 4)
         for (int q = 0; q < n_slots; ++q)
             for (int t = 0; t < p.H; ++t) {
-                float* out = values + (static_cast<std::size_t>(q) * p.H + t) * W;
+                float* out = values + (static_cast<std::size_t>(q) * p.H + t) * stride;
                 for (int x = 0; x < W; ++x) out[x] = column_interp(s, slot_proj[q], t, x);
             }
+        if (shift) shift_rows(values, n_slots * p.H, W, s.fract_x);
         s.col_val = values;
         s.col_slot = slot.data();
         s.col_rows = p.H;
+        s.col_stride = stride;
+        s.col_shifted = shift ? 1 : 0;
     }
+    for (int pass = 0; pass < (weight2 ? 2 : 1); ++pass) {
+        if (pass == 1) s.weight = weight2;
+        float* const Rp = pass ? R2 : R;
+        float* const RWp = pass ? RW2 : RW;
 #pragma omp parallel for collapse(2) schedule(dynamic, 4)
-    for (int jl = 0; jl < L; ++jl)
-        for (int t = 0; t < p.H; ++t) {
-            float* r = R + (static_cast<std::size_t>(jl) * p.H + t) * p.NX;
-            float* w = RW + (static_cast<std::size_t>(jl) * p.H + t) * p.NX;
-            for (int X = 0; X < p.NX; ++X) {
-                float a = r[X], b = w[X];
-                for (int e = c.offsets[jl]; e < c.offsets[jl + 1]; ++e)
-                    contribute(s, c.proj[e], c.role[e], t, X, p, a, b);
-                r[X] = a;
-                w[X] = b;
+        for (int jl = 0; jl < L; ++jl)
+            for (int t = 0; t < p.H; ++t) {
+                float* r = Rp + (static_cast<std::size_t>(jl) * p.H + t) * p.NX;
+                float* w = RWp + (static_cast<std::size_t>(jl) * p.H + t) * p.NX;
+                for (int X = 0; X < p.NX; ++X) {
+                    float a = r[X], b = w[X];
+                    for (int e = c.offsets[jl]; e < c.offsets[jl + 1]; ++e)
+                        contribute(s, c.proj[e], c.role[e], t, X, p, a, b);
+                    r[X] = a;
+                    w[X] = b;
+                }
             }
-        }
+    }
 }
 
 void luminosity_sums(const float* R, const float* RW, int L, int H, int NX, int cx, const LuminosityKernel& k,

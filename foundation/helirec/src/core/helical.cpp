@@ -9,6 +9,10 @@ namespace helirec {
 SpanInfo make_span_info(const ScanTrajectory& t, double tol_steps) {
     const int n = static_cast<int>(t.n());
     if (n < 2 || static_cast<int>(t.z_translation_m.size()) != n) throw Error("make_span_info: bad trajectory");
+    if (!(t.z_translation_scale > 0)) throw Error("make_span_info: z_translation_scale must be positive");
+    if ((!t.row_offset.empty() && static_cast<int>(t.row_offset.size()) != n) ||
+        (!t.row_slope.empty() && static_cast<int>(t.row_slope.size()) != n))
+        throw Error("make_span_info: row_offset / row_slope must have one value per projection");
     SpanInfo s;
     s.z_pix_per_proj.resize(n);
     s.x_pix_per_proj.resize(n);
@@ -16,10 +20,10 @@ SpanInfo make_span_info(const ScanTrajectory& t, double tol_steps) {
     s.fract_complement.resize(n);
     const double zp0 = t.z_translation_m[0] / t.pixel_size_m;
     for (int i = 0; i < n; ++i) {
-        s.z_pix_per_proj[i] = static_cast<float>(t.z_translation_m[i] / t.pixel_size_m - zp0);
+        s.z_pix_per_proj[i] = static_cast<float>((t.z_translation_m[i] / t.pixel_size_m - zp0) * t.z_translation_scale);
         const double lat = t.lateral_correction_m.empty() ? 0.0 : t.lateral_correction_m[i] / t.pixel_size_m;
         s.x_pix_per_proj[i] = static_cast<float>(lat) + t.x_readjustment;
-        const float trans_v = s.z_pix_per_proj[i] + t.z_readjustment;
+        const float trans_v = s.z_pix_per_proj[i] + t.z_readjustment + (t.row_offset.empty() ? 0.f : t.row_offset[i]);
         const int c = static_cast<int>(std::ceil(trans_v));
         s.integer_shift_v[i] = c;
         s.fract_complement[i] = static_cast<float>(c) - trans_v;
@@ -121,6 +125,17 @@ AngleBins nearest_angle_bins(const std::vector<double>& a, int n_grid, double ph
     return out;
 }
 
+std::vector<int32_t> angle_subset(const std::vector<double>& a, int n_grid, double phase, int count, int index) {
+    if (count < 1 || index < 0 || index >= count) throw Error("angle_subset: index must be in [0, count)");
+    const AngleBins bins = nearest_angle_bins(a, n_grid, phase);
+    std::vector<int32_t> keep;
+    for (std::size_t p = 0; p < a.size(); ++p) {
+        const int r = bins.bin[p] % count;
+        if ((r < 0 ? r + count : r) == index) keep.push_back(static_cast<int32_t>(p));
+    }
+    return keep;
+}
+
 FlatInterpolation interpolate_flats(const FlatSeriesInfo& flats, float ang) {
     const auto& fa=flats.angles_deg;
     const int nf=static_cast<int>(fa.size());
@@ -188,6 +203,7 @@ ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const s
         const int p = p0 + k;
         c.row0[k] = h_lo - margin - s.integer_shift_v[p];
         c.fract_v[k] = s.fract_complement[p];
+        if (!t.row_slope.empty()) c.row_slope.push_back(t.row_slope[p]);
         // angular splat (InterpInfo::setup_for_iproj)
         double a = t.angles_deg[p] * (2 * M_PI / 360.0);
         a = std::fmod(a, 2 * M_PI);

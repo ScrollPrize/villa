@@ -7,12 +7,14 @@
 #include <vector>
 
 #include "common/interp_core.hpp"
+#include "common/sino_core.hpp"
 #include "helirec/filters.hpp"
 #include "helirec/sino.hpp"
 
 namespace helirec {
 
 int upsample_fft_length(int n) { return next_smooth_power(n + 64); }
+int shift_row_stride(int n) { return 2 * (upsample_fft_length(n) / 2 + 1); }
 
 namespace cpu {
 
@@ -39,6 +41,32 @@ void upsample_rows(const float* in, float* out, int n_rows, int n, int os) {
         fftwf_execute(inv);
         const float s = 1.f / static_cast<float>(L);
         for (int i = 0; i < n * os; ++i) out[static_cast<std::size_t>(r) * n * os + i] = b[i] * s;
+    }
+    std::lock_guard<std::mutex> lock(m);
+    fftwf_destroy_plan(fwd);
+    fftwf_destroy_plan(inv);
+}
+
+// rows delayed by `shift` samples in place (sino.hpp): each row's transform in its own storage (r2c in place)
+void shift_rows(float* rows, int n_rows, int n, float shift) {
+    if (n_rows <= 0 || n <= 1) return;
+    const int L = upsample_fft_length(n), S = shift_row_stride(n);
+    std::mutex& m = fftw_planner_mutex();
+    fftwf_plan fwd, inv;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        // (planned on the first row; FFTW_ESTIMATE leaves it untouched, FFTW_UNALIGNED lets every row use the plan)
+        fwd = fftwf_plan_dft_r2c_1d(L, rows, reinterpret_cast<fftwf_complex*>(rows), FFTW_ESTIMATE | FFTW_UNALIGNED);
+        inv = fftwf_plan_dft_c2r_1d(L, reinterpret_cast<fftwf_complex*>(rows), rows, FFTW_ESTIMATE | FFTW_UNALIGNED);
+    }
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < n_rows; ++r) {
+        float* a = rows + static_cast<std::size_t>(r) * S;
+        const float last = a[n - 1], first = a[0];
+        for (int i = n; i < L; ++i) a[i] = sino_core::shift_bridge(last, first, i, n, L);
+        fftwf_execute_dft_r2c(fwd, a, reinterpret_cast<fftwf_complex*>(a));
+        for (int k = 0; k <= L / 2; ++k) sino_core::shift_bin(a[2 * k], a[2 * k + 1], k, L, shift);
+        fftwf_execute_dft_c2r(inv, reinterpret_cast<fftwf_complex*>(a), a);
     }
     std::lock_guard<std::mutex> lock(m);
     fftwf_destroy_plan(fwd);

@@ -2,6 +2,7 @@
 
 #include "cuda_utils.cuh"
 #include "common/interp_core.hpp"
+#include "common/sino_core.hpp"
 #include "helirec/sino.hpp"
 
 namespace helirec::cuda {
@@ -58,7 +59,72 @@ struct Upsampler {
         B.ensure(static_cast<size_t>(rows) * (L * os / 2 + 1));
     }
 };
+
+// rows (n_rows, S) holding n samples: the bridge to the transform's length L
+__global__ void shift_bridge_kernel(float* rows, int n_rows, int n, int L, int S) {
+    const int pad = L - n;
+    const size_t total = static_cast<size_t>(n_rows) * pad;
+    for (size_t q = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; q < total; q += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        float* a = rows + (q / pad) * S;
+        const int i = n + static_cast<int>(q % pad);
+        a[i] = sino_core::shift_bridge(a[n - 1], a[0], i, n, L);
+    }
+}
+__global__ void shift_phase_kernel(cufftComplex* A, int n_rows, int nc, int L, float shift) {
+    const size_t total = static_cast<size_t>(n_rows) * nc;
+    for (size_t q = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; q < total; q += static_cast<size_t>(gridDim.x) * blockDim.x)
+        sino_core::shift_bin(A[q].x, A[q].y, static_cast<int>(q % nc), L, shift);
+}
+
+// In-place transforms of batches of `batch` rows (a plan is tied to its batch size: the rows are taken `batch` at a
+// time, the last, incomplete batch through `tail`).
+struct RowShifter {
+    int L = 0, batch = 0;
+    cufftHandle fwd = 0, inv = 0;
+    DeviceBuffer<float> tail;
+    ~RowShifter() { release(); }
+    void release() {
+        if (fwd) { cufftDestroy(fwd); cufftDestroy(inv); fwd = inv = 0; }
+    }
+    void ensure(int l, int b) {
+        if (l == L && b == batch) return;
+        release();
+        L = l; batch = b;
+        int n = L, real = 2 * (L / 2 + 1), cplx = L / 2 + 1;
+        check(cufftPlanMany(&fwd, 1, &n, &real, 1, real, &cplx, 1, cplx, CUFFT_R2C, batch), "plan R2C (shift)");
+        check(cufftPlanMany(&inv, 1, &n, &cplx, 1, cplx, &real, 1, real, CUFFT_C2R, batch), "plan C2R (shift)");
+        tail.ensure(static_cast<size_t>(batch) * real);
+        HELIREC_CUDA_CHECK(cudaMemset(tail.data(), 0, static_cast<size_t>(batch) * real * sizeof(float)));
+    }
+};
 }  // namespace
+
+void shift_rows(float* rows, int n_rows, int n, float shift, void* stream) {
+    if (n_rows <= 0 || n <= 1) return;
+    cudaStream_t s = as_stream(stream);
+    thread_local RowShifter U;
+    const int L = upsample_fft_length(n), S = shift_row_stride(n), nc = L / 2 + 1;
+    U.ensure(L, 4096);
+    check(cufftSetStream(U.fwd, s), "stream");
+    check(cufftSetStream(U.inv, s), "stream");
+    shift_bridge_kernel<<<grid_for(static_cast<size_t>(n_rows) * (L - n)), 256, 0, s>>>(rows, n_rows, n, L, S);
+    for (int r0 = 0; r0 < n_rows; r0 += U.batch) {
+        const int nr = std::min(U.batch, n_rows - r0);
+        float* a = rows + static_cast<size_t>(r0) * S;
+        float* w = a;
+        if (nr < U.batch) {   // (the rows of the buffer beyond nr are zero or earlier rows: finite either way)
+            w = U.tail.data();
+            HELIREC_CUDA_CHECK(cudaMemcpyAsync(w, a, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        }
+        check(cufftExecR2C(U.fwd, w, reinterpret_cast<cufftComplex*>(w)), "R2C (shift)");
+        const int np = w == a ? nr : U.batch;   // (every row of `tail`: its spare rows must stay bounded)
+        shift_phase_kernel<<<grid_for(static_cast<size_t>(np) * nc), 256, 0, s>>>(reinterpret_cast<cufftComplex*>(w), np, nc, L, shift);
+        check(cufftExecC2R(U.inv, reinterpret_cast<cufftComplex*>(w), w), "C2R (shift)");
+        if (w != a)
+            HELIREC_CUDA_CHECK(cudaMemcpyAsync(a, w, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
+    }
+    HELIREC_CUDA_CHECK(cudaGetLastError());
+}
 
 __global__ void bspline_prefilter_kernel(const float* in, float* out, int n_rows, int n, int degree) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;

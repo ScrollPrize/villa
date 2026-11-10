@@ -69,8 +69,39 @@ def test_reference_mask_reads_any_pyramid_level(tmp_path):
             np.testing.assert_array_equal(got != 0, want[z0:z1, roi[2]:roi[3], roi[0]:roi[1]])
     with pytest.raises(RuntimeError, match="same grid"):
         ReferenceMask(str(tmp_path / "ref.zarr"), 0, (21, 34, 28))
+    with pytest.raises(RuntimeError, match="same grid"):
+        ReferenceMask(str(tmp_path / "ref.zarr"), 0, (23, 34, 27))    # 10 % more slices: not the same scan
     with pytest.raises(RuntimeError, match="no pyramid level 5"):
         ReferenceMask(str(tmp_path / "ref.zarr"), 5, vol.shape)
+
+
+def test_reference_mask_with_a_few_more_slices(tmp_path):
+    """a reference of 400 slices on a reconstruction of 404 (another pitch calibration): its slices spread evenly"""
+    ref_n, n = 400, 404
+    vol = np.zeros((ref_n, 20, 24), np.uint8)
+    edge = (60 + 0.5 * np.arange(20)).astype(int)                      # the support's first slice varies with y
+    for y in range(20):
+        vol[edge[y]:edge[y] + 250, y, 3:21] = 200
+    w = OmeZarrWriter(str(tmp_path / "ref.zarr"), vol.shape, np.uint8, chunks=(16, 8, 8), levels=3)
+    w.write(0, vol)
+    w.close()
+    ones = np.ones((n, 20, 24), np.float32)
+    for scale in (0, 2):
+        ref = ReferenceMask(str(tmp_path / "ref.zarr"), scale, (n, 20, 24))
+        assert abs(ref.slice_ratio - ref_n / n) < 1e-12 and tuple(ref.factors) == (2 ** scale,) * 3
+        level = w.read(scale, 0, w.level_shapes[scale][0])
+        f = 2 ** scale
+        for z0, z1 in ((0, n), (37, 101), (300, 404), (203, 204)):
+            got = to_uint8(ones[z0:z1], 0.0, 1.0, mask=ref.read(z0, z1, (0, 24, 0, 20))) != 0
+            z = np.arange(z0, z1)
+            middle = (z // f) * f + (f - 1) / 2                         # of the f slices that share a mask row
+            src = np.clip(np.floor((((middle + 0.5) * ref_n / n - 0.5) - (f - 1) / 2) / f + 0.5).astype(int), 0, level.shape[0] - 1)
+            want = level[src][:, np.minimum(np.arange(20) // f, level.shape[1] - 1)][:, :, np.minimum(np.arange(24) // f, level.shape[2] - 1)] != 0
+            np.testing.assert_array_equal(got, want)
+        # the support begins where the reference's does, stretched: within a slice and the level's voxel
+        whole = to_uint8(ones, 0.0, 1.0, mask=ref.read(0, n, (0, 24, 0, 20))) != 0
+        first = whole[:, 10, 10].argmax()
+        assert abs(first - (edge[10] + 0.5) * n / ref_n) <= 1 + f
 
 
 @pytest.mark.parametrize("device", helirec.devices())

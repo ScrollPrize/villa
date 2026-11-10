@@ -59,16 +59,26 @@ std::vector<int32_t> window_rows(const ChunkScan& c, int z_pad) {
 }
 
 // the vertical kernel of a view (z_w: host or device copy of ScanChunk::z_w)
-void set_z_kernel(AccumScanView& v, int z_pad, const float* z_w) {
+// z_pad: context rows of the window; z_ctx: those the kernel needs (the rest covers the frames' roll)
+void set_z_kernel(AccumScanView& v, int z_pad, int z_ctx, const float* z_w) {
     v.win_off = z_pad;
-    v.z_taps = z_pad > 0 ? 2 + 2 * z_pad : 0;
-    v.z_w = z_pad > 0 ? z_w : nullptr;
+    v.z_taps = z_ctx > 0 ? 2 + 2 * z_ctx : 0;
+    v.z_w = z_ctx > 0 ? z_w : nullptr;
+}
+
+// the roll of a scan's frames (ScanTrajectory::row_slope; slope, lut: host or device copies)
+void set_roll(AccumScanView& v, const ScanData& sd, const float* slope, const float* lut, int lut_n) {
+    if (sd.traj.row_slope.empty()) return;
+    v.row_slope = slope;
+    v.slope_col = sd.traj.slope_col;
+    v.z_lut = v.z_taps > 0 ? lut : nullptr;
+    v.z_lut_n = lut_n;
 }
 
 AccumScanView make_view(const ScanData& sd, const ScanChunk& ch, const uint16_t* raw, const float* dark,
                         const float* flats, const float* weight, const int32_t* row0, const float* fract_v,
                         const float* alpha, const float* cdiv, const float* wfac, const float* ffrac,
-                        const int32_t* fi0, const int32_t* fi1, int x_kernel) {
+                        const int32_t* fi0, const int32_t* fi1, int x_kernel, bool x_exact) {
     AccumScanView v;
     v.n_proj = ch.cs.p1 - ch.cs.p0;
     v.det_rows = sd.traj.det_rows;
@@ -78,7 +88,7 @@ AccumScanView make_view(const ScanData& sd, const ScanChunk& ch, const uint16_t*
     v.row0 = row0; v.fract_v = fract_v; v.alpha = alpha; v.current_div = cdiv; v.weight_factor = wfac;
     v.flat_frac = ffrac; v.flat_i0 = fi0; v.flat_i1 = fi1;
     v.sx = ch.cs.sx; v.ixs = ch.cs.ixs; v.fract_x = ch.cs.fract_x;
-    set_x_kernel(v, x_kernel);
+    set_x_kernel(v, x_kernel, x_exact);
     return v;
 }
 
@@ -105,7 +115,17 @@ struct SliceReconstructor::Impl {
     int filter_margin = 0;   // margin of single-step filter chains (cfg.margin, or the chain's own)
     int lum_margin = 0;      // context rows of the luminosity window, added to the filters' in `margin`
     int x_kernel = 0;        // interp_core::Interp of fractional column offsets (legacy reference: Linear, the splat)
+    bool x_exact = false;    // x_interp=sinc: the exact shift (the lanczos3 kernel where measured pixels alone are gridded)
+    // band-dependent redundancy weights (PipelineConfig::detector_smear)
+    bool sharp = false;
+    double sharp_f1 = 0, sharp_f2 = 0;
+    std::vector<std::vector<float>> weight2;          // per scan: its weight map x the detector's squared response
+    std::unique_ptr<FourierFilter> band2d, band1d;    // the high-pass on frames (H, NX) and along sinogram rows
+    int band2d_h = -1;
     int z_kernel = 0, z_pad = 0;   // vertical kernel and its context rows either side of the window (linear: 0)
+    int z_ctx = 0;                 // ... of which the kernel's own (the rest covers the frames' roll: row_slope)
+    static constexpr int z_lut_n = 2048;
+    std::vector<float> z_lut;      // the kernel's weights by fraction (z_kernel_lut), for scans with a roll
     // nearest-bin angular gridding: each scan's bins (helical.hpp), the mean weight of each detector row (how much
     // a projection weighs in a slice), and the angles of the chunk's slices (DY, n_grid), -angle as fbp_angles
     bool nearest = false;
@@ -119,6 +139,7 @@ struct SliceReconstructor::Impl {
     // exposure arc: taps of its inverse along the angle (empty: none), and the arc in grid angles
     std::vector<float> arc_taps;
     double arc_bins = 0;
+    double recorded_step = 0;   // degrees between consecutive recorded projections of the main scan
     std::vector<float> arc_h;
     // context rows gridded from every projection that sees them (prepare_chunk_scan); the legacy reference grids
     // them from the projections of the chunk's own heights, as the reference does
@@ -160,7 +181,7 @@ struct SliceReconstructor::Impl {
     ChunkGlare chunk_glare(std::size_t s, const ScanChunk& chunk);
 #ifdef HELIREC_WITH_CUDA
     struct DevScan {
-        cuda::DeviceBuffer<float> dark, flats, weight;
+        cuda::DeviceBuffer<float> dark, flats, weight, weight2;
     };
     std::vector<DevScan> dev;
     // persistent GPU work buffers (grow-only), pinned raw staging, copy stream
@@ -198,6 +219,7 @@ struct SliceReconstructor::Impl {
         if (pf_thread.joinable()) pf_thread.join();
     }
     cuda::DeviceBuffer<float> R, RW, Wp, Aha, Bha, Atot, Btot, S, W, row, wrow, pad, slice, arc_d;
+    cuda::DeviceBuffer<float> R2, RW2, Wp2, Aha2, Bha2, Atot2, Btot2, W2, w2row, brow;   // (band-dependent weights)
     cuda::PinnedBuffer<float> slice_host;   // staging of the slices' download
     cuda::DeviceBuffer<std::uint8_t> slice_u8, slice_mask;
     cuda::PinnedBuffer<std::uint8_t> slice_u8_host;
@@ -244,6 +266,7 @@ struct SliceReconstructor::Impl {
     }
 #ifdef HELIREC_WITH_CUDA
     cuda::DeviceBuffer<float> Icache;   // sweeps: pre-filter intensity of the chunk, or (one Fourier step) its spectra
+    cuda::DeviceBuffer<float> d_z_lut;
 #endif
 };
 
@@ -256,15 +279,61 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         I.cfg.external = make_tomo_backprojector(I.cfg.backprojector, I.cfg.tomo_params);
         I.cfg.backprojector = "external";
     }
-    for (const auto& s : I.scans) {
-        if (s.traj.n() != s.control_A.size() || s.traj.n() != s.file_index.size() || s.traj.n() != s.frame_index.size())
+    for (const auto& s : I.scans)
+        if (s.traj.n() != s.control_A.size() || s.traj.n() != s.file_index.size() || s.traj.n() != s.frame_index.size() ||
+            s.traj.n() != s.traj.z_translation_m.size() ||
+            (!s.traj.lateral_correction_m.empty() && s.traj.lateral_correction_m.size() != s.traj.n()) ||
+            (!s.traj.row_offset.empty() && s.traj.row_offset.size() != s.traj.n()) ||
+            (!s.traj.row_slope.empty() && s.traj.row_slope.size() != s.traj.n()))
             throw Error("ScanData: per-projection arrays have inconsistent lengths");
+    if (I.scans.empty() || I.scans[0].traj.n() < 2) throw Error("SliceReconstructor: no scan");
+    {   // the step between consecutive recorded projections: the median, which skipped projections do not stretch
+        const auto& a = I.scans[0].traj.angles_deg;
+        std::vector<double> steps(a.size() - 1);
+        for (std::size_t i = 1; i < a.size(); ++i) steps[i - 1] = std::fabs(a[i] - a[i - 1]);
+        std::nth_element(steps.begin(), steps.begin() + steps.size() / 2, steps.end());
+        I.recorded_step = steps[steps.size() / 2];
+    }
+    std::pair<int, int> whole_doable{0, 0};
+    if (I.cfg.angle_subsets != 1) {
+        if (I.cfg.legacy_reference) throw Error("legacy reference mode has no projection subsets");
+        if (I.cfg.angle_subsets < 1 || I.cfg.angle_subset < 0 || I.cfg.angle_subset >= I.cfg.angle_subsets)
+            throw Error("angle_subset must be in [0, angle_subsets)");
+        std::vector<SpanInfo> whole;
+        for (const auto& s : I.scans) whole.push_back(make_span_info(s.traj, I.cfg.angular_tolerance_steps));
+        whole_doable = doable_span(whole);
+        const int full = grid_angle_count(I.scans[0].traj.angles_deg);
+        const double phase = angle_grid_phase(I.scans[0].traj.angles_deg, full);
+        for (auto& s : I.scans) {
+            const std::vector<int32_t> keep = angle_subset(s.traj.angles_deg, full, phase, I.cfg.angle_subsets, I.cfg.angle_subset);
+            if (keep.size() < 2) throw Error("angle_subset: no projections left");
+            auto take = [&](auto& v) {
+                if (v.empty()) return;
+                std::decay_t<decltype(v)> out(keep.size());
+                for (std::size_t i = 0; i < keep.size(); ++i) out[i] = v[keep[i]];
+                v = std::move(out);
+            };
+            take(s.traj.angles_deg);
+            take(s.traj.z_translation_m);
+            take(s.traj.lateral_correction_m);
+            take(s.traj.row_offset);
+            take(s.traj.row_slope);
+            take(s.control_A);
+            take(s.file_index);
+            take(s.frame_index);
+        }
+    }
+    for (const auto& s : I.scans) {
         const std::size_t plane = static_cast<std::size_t>(s.traj.det_rows) * s.traj.det_cols;
         if (s.dark.size() != plane || s.weight.size() != plane || s.flats.size() != plane * s.flat_info.angles_deg.size())
             throw Error("ScanData: calibration arrays have wrong sizes");
         I.spans.push_back(make_span_info(s.traj, I.cfg.angular_tolerance_steps));
     }
     I.doable = doable_span(I.spans);
+    if (I.cfg.angle_subsets != 1) {   // (a subset's wider angular tolerance may reach a few heights further)
+        I.doable = {std::max(I.doable.first, whole_doable.first), std::min(I.doable.second, whole_doable.second)};
+        if (I.doable != whole_doable) throw Error("angle_subset: the subset cannot reconstruct every height of the scan");
+    }
     const auto& m = I.scans[0].traj;
     I.fctx = FilterContext{I.cfg.energy_kev, I.cfg.distance_m, I.cfg.pixel_size_m, m.det_rows, m.det_cols,
                            I.cfg.legacy_reference};
@@ -278,11 +347,54 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     }
     I.measured = I.cfg.external && I.cfg.external->measured_only();
     I.full_context = I.measured || !I.cfg.legacy_reference;
-    I.x_kernel = I.cfg.legacy_reference ? static_cast<int>(interp_core::Linear) : interp_from_name(I.cfg.x_interp);
+    I.x_exact = !I.cfg.legacy_reference && I.cfg.x_interp == "sinc";
+    I.x_kernel = I.cfg.legacy_reference ? static_cast<int>(interp_core::Linear)
+                 : I.x_exact ? static_cast<int>(interp_core::Lanczos3) : interp_from_name(I.cfg.x_interp);
     if (I.x_kernel != interp_core::Linear && I.x_kernel != interp_core::Cubic && I.x_kernel != interp_core::Lanczos3)
-        throw Error("x_interp must be linear, cubic or lanczos3");
+        throw Error("x_interp must be sinc, lanczos3, cubic or linear");
     I.z_kernel = I.cfg.legacy_reference ? static_cast<int>(interp_core::Linear) : interp_from_name(I.cfg.z_interp);
-    I.z_pad = z_kernel_context(I.z_kernel);
+    I.z_ctx = I.z_pad = z_kernel_context(I.z_kernel);
+    {   // rolled frames: rows of context for the largest row offset on the detector, and the kernel's table
+        float reach = 0.f;
+        for (const auto& s : I.scans) {
+            if (I.cfg.legacy_reference && !s.traj.row_slope.empty()) throw Error("legacy reference mode has no frame registration");
+            const float span = std::max(std::fabs(s.traj.slope_col), std::fabs(static_cast<float>(s.traj.det_cols - 1) - s.traj.slope_col));
+            for (float v : s.traj.row_slope) reach = std::max(reach, std::fabs(v) * span);
+        }
+        if (reach > 0.f) {
+            if (reach > 16.f) throw Error("row_slope: a row offset of more than 16 rows across the detector is not a roll");
+            I.z_pad += static_cast<int>(std::ceil(reach)) + 1;
+            I.z_lut = z_kernel_lut(I.z_kernel, Impl::z_lut_n);
+        }
+    }
+    if (!I.cfg.detector_smear.empty() && !I.cfg.legacy_reference && !I.measured) {
+        auto numbers = [](const std::string& text, const char* what) {
+            std::vector<double> v;
+            std::size_t pos = 0;
+            while (pos <= text.size()) {
+                const std::size_t next = std::min(text.find(':', pos), text.size());
+                try {
+                    v.push_back(std::stod(text.substr(pos, next - pos)));
+                } catch (const std::exception&) {
+                    throw Error(std::string(what) + ": numbers separated by ':' are expected ('" + text + "')");
+                }
+                pos = next + 1;
+            }
+            return v;
+        };
+        const auto smear = numbers(I.cfg.detector_smear, "detector_smear");
+        const auto band = numbers(I.cfg.sharp_band, "sharp_band");
+        if (band.size() != 2) throw Error("sharp_band: f1:f2 (cycles per pixel) is expected");
+        I.sharp_f1 = band[0];
+        I.sharp_f2 = band[1];
+        band_filter_spec(1, 1, 16, I.sharp_f1, I.sharp_f2);   // (checks the band)
+        for (const auto& s : I.scans) {
+            auto w2 = smear_response(smear, I.cfg.sharp_f, s.traj.det_rows, s.traj.det_cols);
+            for (std::size_t i = 0; i < w2.size(); ++i) w2[i] *= s.weight[i];
+            I.weight2.push_back(std::move(w2));
+        }
+        I.sharp = true;
+    }
     I.n_grid = I.cfg.n_grid > 0 ? I.cfg.n_grid : grid_angle_count(m.angles_deg);
     if (I.cfg.angle_interp != "linear" && I.cfg.angle_interp != "nearest")
         throw Error("angle_interp must be linear or nearest");
@@ -303,13 +415,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     if (I.cfg.exposure_arc != 0) {
         if (I.cfg.legacy_reference) throw Error("legacy reference mode has no exposure arc correction");
         if (!(I.cfg.exposure_arc > 0 && I.cfg.exposure_arc <= 1)) throw Error("exposure_arc must be in [0, 1]");
-        // the step between consecutive projections: the median, which skipped projections do not stretch
-        const auto& a = m.angles_deg;
-        std::vector<double> steps(a.size() - 1);
-        for (std::size_t i = 1; i < a.size(); ++i) steps[i - 1] = std::fabs(a[i] - a[i - 1]);
-        std::nth_element(steps.begin(), steps.begin() + steps.size() / 2, steps.end());
-        const double step = steps[steps.size() / 2];
-        I.arc_bins = I.cfg.exposure_arc * step * I.n_grid / 360.0;
+        I.arc_bins = I.cfg.exposure_arc * I.recorded_step * I.n_grid / 360.0;
         I.arc_taps = arc_deblur_taps(I.arc_bins);
     }
     // merged width: main width + ceil(max |companion offset|)
@@ -361,7 +467,9 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             Impl::DevScan d;
             d.dark.upload(s.dark.data(), s.dark.size());
             d.flats.upload(s.flats.data(), s.flats.size());
+            if (!I.z_lut.empty() && I.d_z_lut.size() == 0) I.d_z_lut.upload(I.z_lut.data(), I.z_lut.size());
             d.weight.upload(s.weight.data(), s.weight.size());
+            if (I.sharp) d.weight2.upload(I.weight2[I.dev.size()].data(), I.weight2[I.dev.size()].size());
             I.dev.push_back(std::move(d));
         }
         HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
@@ -376,6 +484,11 @@ SliceReconstructor::~SliceReconstructor() = default;
 std::pair<int, int> SliceReconstructor::doable() const { return impl_->doable; }
 int SliceReconstructor::margin() const { return impl_->margin; }
 int SliceReconstructor::n_grid() const { return impl_->n_grid; }
+std::vector<int> SliceReconstructor::projection_counts() const {
+    std::vector<int> n;
+    for (const auto& s : impl_->scans) n.push_back(static_cast<int>(s.traj.n()));
+    return n;
+}
 int SliceReconstructor::grid_size() const { return impl_->grid_size; }
 int SliceReconstructor::merged_width() const { return impl_->NX; }
 std::pair<int, int> SliceReconstructor::mend_domain() const { return {impl_->mend_x0, impl_->mend_x1}; }
@@ -748,6 +861,20 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     ap.H = H;
     ap.NX = NX;
     ap.measured_only = measured_only;
+    const bool sharp = I.sharp && !measured_only;
+    if (sharp) {
+        auto make = [&](const FourierFilterSpec& sp) {
+#ifdef HELIREC_WITH_CUDA
+            if (gpu) return cuda::make_fourier_filter(sp);
+#endif
+            return cpu::make_fourier_filter(sp);
+        };
+        if (!I.band2d || I.band2d_h != H) {
+            I.band2d = make(band_filter_spec(2, H, NX, I.sharp_f1, I.sharp_f2));
+            I.band2d_h = H;
+        }
+        if (!I.band1d) I.band1d = make(band_filter_spec(1, 1, NX, I.sharp_f1, I.sharp_f2));
+    }
     // Keep phase retrieval and luminosity correction in intensity space. With neither,
     // interpolate line integrals, avoiding -log(mean(I)) != mean(-log(I)).
     ap.log_values = ap.measured_only && (scans.size() == 1 || cfg.luminosity_repartition == 0.f);
@@ -774,9 +901,14 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         step("grid");
         std::vector<float> S(sino_n), Wc(sino_n);
         std::vector<float> R(blk), RW(blk), Wp, Aha, Bha, Atot, Btot;
+        std::vector<float> Wc2(sharp ? sino_n : 0), R2(sharp ? blk : 0), RW2(sharp ? blk : 0), Wp2, Aha2, Bha2, Atot2, Btot2;
         for (int g0 = 0; g0 < NG; g0 += BL) {
             const int g1 = std::min(NG, g0 + BL), L = g1 - g0;
             const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
+            if (sharp) {
+                std::fill(R2.begin(), R2.begin() + n_el, 0.f);
+                std::fill(RW2.begin(), RW2.begin() + n_el, 0.f);
+            }
             std::fill(R.begin(), R.begin() + n_el, 0.f);
             std::fill(RW.begin(), RW.begin() + n_el, 0.f);
             for (std::size_t s = 0; s < chunks.size(); ++s) {
@@ -788,12 +920,14 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 auto view = make_view(sd, ch, ch.raw.data(), sd.dark.data(), sd.flats.data(), sd.weight.data(),
                                       c.row0.data(), c.fract_v.data(), c.alpha.data(), c.current_div.data(),
                                       c.weight_factor.data(), c.flat_frac.data(), c.flat_i0.data(), c.flat_i1.data(),
-                                      I.x_kernel);
-                set_z_kernel(view, I.z_pad, ch.z_w.data());
+                                      I.x_kernel, I.x_exact);
+                set_z_kernel(view, I.z_pad, I.z_ctx, ch.z_w.data());
+                set_roll(view, sd, c.row_slope.data(), I.z_lut.data(), Impl::z_lut_n);
                 if (cfg.sld.enabled())
                     set_glare(view, *I.glare[s], cg[s].maps.data(), cg[s].i0.data(), cg[s].i1.data(), cg[s].frac.data(),
                               cg[s].rows, cg[s].row0.empty() ? nullptr : cg[s].row0.data());
-                cpu::accumulate(view, contrib, ap, R.data(), RW.data());
+                cpu::accumulate(view, contrib, ap, R.data(), RW.data(), sharp ? I.weight2[s].data() : nullptr,
+                                sharp ? R2.data() : nullptr, sharp ? RW2.data() : nullptr);
                 tick("accumulate");
                 const bool lum = cfg.luminosity_repartition != 0.f && chunks.size() == 2;
                 if (lum && s == 0) {
@@ -807,6 +941,17 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                     cpu::luminosity_apply(R.data(), RW.data(), Wp.data(), Aha.data(), Bha.data(), Atot.data(),
                                           Btot.data(), L, H, NX, cfg.luminosity_repartition);
                 }
+                if (sharp && lum && s == 0) {
+                    Aha2.resize(static_cast<std::size_t>(L) * H); Bha2.resize(Aha2.size());
+                    cpu::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam_cx, I.lum, Aha2.data(), Bha2.data());
+                    Wp2.assign(RW2.begin(), RW2.begin() + n_el);
+                }
+                if (sharp && lum && s == 1) {
+                    Atot2.resize(Aha2.size()); Btot2.resize(Aha2.size());
+                    cpu::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam_cx, I.lum, Atot2.data(), Btot2.data());
+                    cpu::luminosity_apply(R2.data(), RW2.data(), Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
+                                          Btot2.data(), L, H, NX, cfg.luminosity_repartition);
+                }
                 tick("luminosity");
             }
             cpu::divide(R.data(), RW.data(), n_el);
@@ -814,6 +959,14 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 cpu::prepare_measured(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, filter_context, ap.log_values ? 0.f : 1.f);
             else if (cfg.mend_threshold > 0)
                 cpu::mend_null_weights(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
+            if (sharp) {   // the two weightings' intensities, combined by band: R + HP (R2 - R)
+                cpu::divide(R2.data(), RW2.data(), n_el);
+                if (cfg.mend_threshold > 0)
+                    cpu::mend_null_weights(R2.data(), RW2.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
+                cpu::add_scaled(R2.data(), R.data(), -1.f, n_el);
+                I.band2d->apply(R2.data(), R2.data(), L);
+                cpu::add_scaled(R.data(), R2.data(), 1.f, n_el);
+            }
             tick("divide_mend");
             apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, fm);
             tick("filters");
@@ -826,21 +979,29 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                     const std::size_t dst = (static_cast<std::size_t>(g0 + j) * DY + y) * NX;
                     std::memcpy(&S[dst], &R[src], NX * sizeof(float));
                     std::memcpy(&Wc[dst], &RW[src], NX * sizeof(float));
+                    if (sharp) std::memcpy(&Wc2[dst], &RW2[src], NX * sizeof(float));
                 }
             tick("sino_crop");
         }
         for (auto& ch : chunks) std::vector<uint16_t>().swap(ch.raw);
         if (dbg && dbg->keep) { dbg->sino = S; dbg->weights = Wc; }
         if (!ap.measured_only) cpu::rebalance(S.data(), Wc.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        if (sharp) {   // the balanced weights of the second set (the sinogram's holes are filled already)
+            std::vector<float> scratch(S);
+            cpu::rebalance(scratch.data(), Wc2.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        }
         if (dbg && dbg->keep) { dbg->wbal = Wc; dbg->filtered.resize(static_cast<std::size_t>(DY) * NG * NX); }
         tick("rebalance");
         std::vector<float> row(static_cast<std::size_t>(NG) * NX), wrow(row.size());
+        std::vector<float> w2row(sharp ? row.size() : 0), brow(sharp ? row.size() : 0);
         std::vector<float> padded(static_cast<std::size_t>(NG) * rg.npad);
         step("backproject");
         for (int y = 0; y < DY; ++y) {
             for (int i = 0; i < NG; ++i) {
                 std::memcpy(&row[static_cast<std::size_t>(i) * NX], &S[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
                 std::memcpy(&wrow[static_cast<std::size_t>(i) * NX], &Wc[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
+                if (sharp)
+                    std::memcpy(&w2row[static_cast<std::size_t>(i) * NX], &Wc2[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
             }
             tick("ramp_gather");
             if (!arc_taps.empty()) {
@@ -854,7 +1015,13 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 cpu::ramp_pad(row.data(), padded.data(), rg);
                 ramp_filter->apply(padded.data(), padded.data(), NG);
                 cpu::ramp_crop(padded.data(), row.data(), rg);
-                cpu::multiply(row.data(), wrow.data(), row.size());
+                if (sharp) {   // usual pair weights, and above the band the second set's: row w + HP (row (w2 - w))
+                    cpu::weight_difference(row.data(), wrow.data(), w2row.data(), brow.data(), row.size());
+                    I.band1d->apply(brow.data(), brow.data(), NG);
+                    cpu::multiply_add(row.data(), wrow.data(), brow.data(), row.size());
+                } else {
+                    cpu::multiply(row.data(), wrow.data(), row.size());
+                }
             }
             if (dbg && dbg->keep) std::memcpy(&dbg->filtered[static_cast<std::size_t>(y) * NG * NX], row.data(), row.size() * sizeof(float));
             tick("ramp");
@@ -876,7 +1043,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     if (prefetched) step("grid");
     struct DevChunk {
         cuda::DeviceBuffer<int32_t> row0, fi0, fi1, gi0, gi1, grow0;
-        cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac, z_w;
+        cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac, z_w, slope;
     };
     std::vector<DevChunk> dc(nsc);
     std::vector<std::size_t> per(nsc);
@@ -891,6 +1058,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         dc[s].fi0.upload(c.flat_i0.data(), c.flat_i0.size());
         dc[s].fi1.upload(c.flat_i1.data(), c.flat_i1.size());
         dc[s].fract_v.upload(c.fract_v.data(), c.fract_v.size());
+        if (!c.row_slope.empty()) dc[s].slope.upload(c.row_slope.data(), c.row_slope.size());
         dc[s].alpha.upload(c.alpha.data(), c.alpha.size());
         dc[s].cdiv.upload(c.current_div.data(), c.current_div.size());
         dc[s].wfac.upload(c.weight_factor.data(), c.weight_factor.size());
@@ -1032,6 +1200,10 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     };
     tick("upload_issue");
     R.ensure(blk); RW.ensure(blk); Wp.ensure(blk);
+    if (sharp) {
+        R2.ensure(blk); RW2.ensure(blk); Wp2.ensure(blk); W2.ensure(sino_n);
+        Aha2.ensure(static_cast<std::size_t>(BL) * H); Bha2.ensure(Aha2.size()); Atot2.ensure(Aha2.size()); Btot2.ensure(Aha2.size());
+    }
     Aha.ensure(static_cast<std::size_t>(BL) * H); Bha.ensure(Aha.size()); Atot.ensure(Aha.size()); Btot.ensure(Aha.size());
     S.ensure(sino_n); W.ensure(sino_n);
     // sweeps: one Fourier step per chain -> cache the spectra (filter + inverse per chain); else the intensity
@@ -1050,6 +1222,10 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         const int g0 = plans[b].g0, g1 = plans[b].g1, L = g1 - g0;
         const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
         if (b + 1 < plans.size()) issue_upload(b + 1);
+        if (sharp) {
+            HELIREC_CUDA_CHECK(cudaMemsetAsync(R2.data(), 0, n_el * sizeof(float)));
+            HELIREC_CUDA_CHECK(cudaMemsetAsync(RW2.data(), 0, n_el * sizeof(float)));
+        }
         HELIREC_CUDA_CHECK(cudaMemsetAsync(R.data(), 0, n_el * sizeof(float)));
         HELIREC_CUDA_CHECK(cudaMemsetAsync(RW.data(), 0, n_el * sizeof(float)));
         HELIREC_CUDA_CHECK(cudaStreamWaitEvent(nullptr, ev_up[r], 0));
@@ -1060,13 +1236,15 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             auto view = make_view(sd, ch, d_raw[r][s].data(), I.dev[s].dark.data(), I.dev[s].flats.data(),
                                   I.dev[s].weight.data(), dc[s].row0.data(), dc[s].fract_v.data(),
                                   dc[s].alpha.data(), dc[s].cdiv.data(), dc[s].wfac.data(), dc[s].ffrac.data(),
-                                  dc[s].fi0.data(), dc[s].fi1.data(), I.x_kernel);
+                                  dc[s].fi0.data(), dc[s].fi1.data(), I.x_kernel, I.x_exact);
             view.raw_slot = d_slot[r][s].data();
-            set_z_kernel(view, I.z_pad, dc[s].z_w.data());
+            set_z_kernel(view, I.z_pad, I.z_ctx, dc[s].z_w.data());
+            set_roll(view, sd, dc[s].slope.data(), I.d_z_lut.data(), Impl::z_lut_n);
             if (cfg.sld.enabled())
                 set_glare(view, *I.glare[s], dc[s].glare.data(), dc[s].gi0.data(), dc[s].gi1.data(), dc[s].gfrac.data(),
                           cg[s].rows, cg[s].row0.empty() ? nullptr : dc[s].grow0.data());
-            cuda::accumulate(view, plans[b].contrib[s], ap, R.data(), RW.data());
+            cuda::accumulate(view, plans[b].contrib[s], ap, R.data(), RW.data(), nullptr,
+                             sharp ? I.dev[s].weight2.data() : nullptr, sharp ? R2.data() : nullptr, sharp ? RW2.data() : nullptr);
             if (s + 1 == nsc) HELIREC_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
             tick("accumulate");
             const bool lum = cfg.luminosity_repartition != 0.f && nsc == 2;
@@ -1079,6 +1257,15 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 cuda::luminosity_apply(R.data(), RW.data(), Wp.data(), Aha.data(), Bha.data(), Atot.data(),
                                        Btot.data(), L, H, NX, cfg.luminosity_repartition);
             }
+            if (sharp && lum && s == 0) {
+                cuda::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam_cx, I.lum, Aha2.data(), Bha2.data());
+                HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp2.data(), RW2.data(), n_el * sizeof(float), cudaMemcpyDeviceToDevice));
+            }
+            if (sharp && lum && s == 1) {
+                cuda::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam_cx, I.lum, Atot2.data(), Btot2.data());
+                cuda::luminosity_apply(R2.data(), RW2.data(), Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
+                                       Btot2.data(), L, H, NX, cfg.luminosity_repartition);
+            }
             tick("luminosity");
         }
         cuda::divide(R.data(), RW.data(), n_el);
@@ -1086,6 +1273,14 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             cuda::prepare_measured(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, filter_context, ap.log_values ? 0.f : 1.f);
         else if (cfg.mend_threshold > 0)
             cuda::mend_null_weights(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
+        if (sharp) {   // the two weightings' intensities, combined by band: R + HP (R2 - R)
+            cuda::divide(R2.data(), RW2.data(), n_el);
+            if (cfg.mend_threshold > 0)
+                cuda::mend_null_weights(R2.data(), RW2.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
+            cuda::add_scaled(R2.data(), R.data(), -1.f, n_el);
+            I.band2d->apply(R2.data(), R2.data(), L);
+            cuda::add_scaled(R.data(), R2.data(), 1.f, n_el);
+        }
         tick("divide_mend");
         if (spectral) {  // sweep: keep the spectra of the padded intensity; filter / inverse / log / crop per chain below
             fwd = fft_for(0, sets[0]->step_spec(0, H, NX, fm));
@@ -1108,6 +1303,10 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(W.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
                                              RW.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
                                              static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
+        if (sharp)
+            HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(W2.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
+                                                 RW2.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
+                                                 static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
         tick("sino_crop");
     }
     if (!prefetched) {
@@ -1124,6 +1323,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     }
     const std::size_t rown = static_cast<std::size_t>(NG) * NX;
     row.ensure(rown); wrow.ensure(rown); pad.ensure(static_cast<std::size_t>(NG) * rg.npad);
+    if (sharp) { w2row.ensure(rown); brow.ensure(rown); }
     auto slices = [&](int k) {  // ramp filter x balanced weights per slice -> sink
         for (int y = 0; y < DY; ++y) {
             HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(row.data(), NX * sizeof(float), S.data() + static_cast<std::size_t>(y) * NX,
@@ -1132,6 +1332,10 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(wrow.data(), NX * sizeof(float), W.data() + static_cast<std::size_t>(y) * NX,
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NG,
                                                  cudaMemcpyDeviceToDevice));
+            if (sharp)
+                HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(w2row.data(), NX * sizeof(float), W2.data() + static_cast<std::size_t>(y) * NX,
+                                                     static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NG,
+                                                     cudaMemcpyDeviceToDevice));
             tick("ramp_gather");
             if (!arc_taps.empty()) {
                 arc_d.ensure(rown);
@@ -1144,7 +1348,13 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 cuda::ramp_pad(row.data(), pad.data(), rg);
                 ramp_filter->apply(pad.data(), pad.data(), NG);
                 cuda::ramp_crop(pad.data(), row.data(), rg);
-                cuda::multiply(row.data(), wrow.data(), rown);
+                if (sharp) {   // usual pair weights, and above the band the second set's: row w + HP (row (w2 - w))
+                    cuda::weight_difference(row.data(), wrow.data(), w2row.data(), brow.data(), rown);
+                    I.band1d->apply(brow.data(), brow.data(), NG);
+                    cuda::multiply_add(row.data(), wrow.data(), brow.data(), rown);
+                } else {
+                    cuda::multiply(row.data(), wrow.data(), rown);
+                }
             }
             if (dbg && dbg->keep && K == 1)
                 HELIREC_CUDA_CHECK(cudaMemcpy(&dbg->filtered[static_cast<std::size_t>(y) * rown], row.data(), rown * sizeof(float),
@@ -1161,6 +1371,11 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             HELIREC_CUDA_CHECK(cudaMemcpy(dbg->weights.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
         }
         if (!ap.measured_only) cuda::rebalance(S.data(), W.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        if (sharp) {   // the balanced weights of the second set (the sinogram's holes are filled already)
+            const auto holes = cuda::rebalance_holes(W2.data(), NG, DY, NX);
+            cuda::fill_holes(W2.data(), holes, NG, DY, NX);
+            cuda::balance_weights(W2.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        }
         if (dbg && dbg->keep) {
             dbg->wbal.resize(sino_n);
             HELIREC_CUDA_CHECK(cudaMemcpy(dbg->wbal.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
@@ -1176,6 +1391,10 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     if (!all_empty) {
         cuda::fill_holes(W.data(), holes, NG, DY, NX);
         cuda::balance_weights(W.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        if (sharp) {
+            cuda::fill_holes(W2.data(), holes, NG, DY, NX);
+            cuda::balance_weights(W2.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        }
     }
     tick("rebalance");
     for (int k = 0; k < K; ++k) {

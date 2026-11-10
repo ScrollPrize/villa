@@ -1,0 +1,170 @@
+{
+ "projections": "/mnt/raid_nvme/343p_recon_work/projections",
+ "cache_dir": "/mnt/raid_nvme/343p_recon_work/output/baselines/_calibration",
+ "device": "cuda",
+ "params": {
+  "mode": "corrected",
+  "filters": []
+ },
+ "slices": {
+  "z": [
+   2698,
+   3598
+  ]
+ },
+ "roi": null,
+ "window": [
+  -0.06,
+  0.29
+ ],
+ "crops": [
+  [
+   2300,
+   2920,
+   2150,
+   2650
+  ],
+  [
+   2250,
+   2870,
+   1560,
+   2060
+  ],
+  [
+   1150,
+   1770,
+   2250,
+   2750
+  ]
+ ],
+ "sheet_columns": 5,
+ "tile": 1024,
+ "methods": [
+  {
+   "name": "ramp_ramlak",
+   "backprojector": "fbp(filter_name=ramlak)",
+   "params": {
+    "filters": [
+     {
+      "type": "paganin",
+      "delta_beta": 1000.0
+     },
+     {
+      "type": "unsharp",
+      "sigma": 1.2,
+      "coeff": 4.0
+     }
+    ]
+   },
+   "desc": "FBP, Paganin 1000 + unsharp 1.2/4; ramp window: none (the plain ramp, the default) (x in cycles / pixel)"
+  },
+  {
+   "name": "ramp_shepp",
+   "backprojector": "fbp(filter_name=shepp)",
+   "params": {
+    "filters": [
+     {
+      "type": "paganin",
+      "delta_beta": 1000.0
+     },
+     {
+      "type": "unsharp",
+      "sigma": 1.2,
+      "coeff": 4.0
+     }
+    ]
+   },
+   "desc": "FBP, Paganin 1000 + unsharp 1.2/4; ramp window: Shepp-Logan, sinc(x) (x in cycles / pixel)"
+  },
+  {
+   "name": "ramp_cosine",
+   "backprojector": "fbp(filter_name=cosine)",
+   "params": {
+    "filters": [
+     {
+      "type": "paganin",
+      "delta_beta": 1000.0
+     },
+     {
+      "type": "unsharp",
+      "sigma": 1.2,
+      "coeff": 4.0
+     }
+    ]
+   },
+   "desc": "FBP, Paganin 1000 + unsharp 1.2/4; ramp window: cosine, cos(pi x) (x in cycles / pixel)"
+  },
+  {
+   "name": "ramp_hann",
+   "backprojector": "fbp(filter_name=hann)",
+   "params": {
+    "filters": [
+     {
+      "type": "paganin",
+      "delta_beta": 1000.0
+     },
+     {
+      "type": "unsharp",
+      "sigma": 1.2,
+      "coeff": 4.0
+     }
+    ]
+   },
+   "desc": "FBP, Paganin 1000 + unsharp 1.2/4; ramp window: Hann, (1 + cos(pi x / p0)) / 2, cutoff p0 = 0.5 (x in cycles / pixel)"
+  },
+  {
+   "name": "ramp_hamming",
+   "backprojector": "fbp(filter_name=hamming)",
+   "params": {
+    "filters": [
+     {
+      "type": "paganin",
+      "delta_beta": 1000.0
+     },
+     {
+      "type": "unsharp",
+      "sigma": 1.2,
+      "coeff": 4.0
+     }
+    ]
+   },
+   "desc": "FBP, Paganin 1000 + unsharp 1.2/4; ramp window: Hamming, 0.54 + 0.46 cos(pi x / p0), cutoff p0 = 0.5 (x in cycles / pixel)"
+  },
+  {
+   "name": "ramp_parzen",
+   "backprojector": "fbp(filter_name=parzen)",
+   "params": {
+    "filters": [
+     {
+      "type": "paganin",
+      "delta_beta": 1000.0
+     },
+     {
+      "type": "unsharp",
+      "sigma": 1.2,
+      "coeff": 4.0
+     }
+    ]
+   },
+   "desc": "FBP, Paganin 1000 + unsharp 1.2/4; ramp window: Parzen, (1 - |x| / p0)^3, cutoff p0 = 0.5 (x in cycles / pixel)"
+  },
+  {
+   "name": "ramp_butterworth",
+   "backprojector": "fbp(filter_name=butterworth)",
+   "params": {
+    "filters": [
+     {
+      "type": "paganin",
+      "delta_beta": 1000.0
+     },
+     {
+      "type": "unsharp",
+      "sigma": 1.2,
+      "coeff": 4.0
+     }
+    ]
+   },
+   "desc": "FBP, Paganin 1000 + unsharp 1.2/4; ramp window: Butterworth, half amplitude at p0 = 0.5, order 8 (x in cycles / pixel)"
+  }
+ ]
+}

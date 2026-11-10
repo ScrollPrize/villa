@@ -21,6 +21,21 @@ __global__ void multiply_kernel(float* x, const float* w, size_t n) {
         x[i] = __fmul_rn(x[i], w[i]);
 }
 
+__global__ void add_scaled_kernel(float* x, const float* y, float s, size_t n) {
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
+        x[i] = __fadd_rn(x[i], __fmul_rn(s, y[i]));
+}
+
+__global__ void weight_difference_kernel(const float* x, const float* w, const float* w2, float* t, size_t n) {
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
+        t[i] = __fmul_rn(x[i], __fsub_rn(w2[i], w[i]));
+}
+
+__global__ void multiply_add_kernel(float* x, const float* w, const float* t, size_t n) {
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
+        x[i] = __fadd_rn(__fmul_rn(x[i], w[i]), t[i]);
+}
+
 __global__ void angular_fir_kernel(const float* __restrict__ in, float* __restrict__ out, int n_proj, int n_cols,
                                    const float* __restrict__ g, int radius, const float* __restrict__ support) {
     const size_t n = static_cast<size_t>(n_proj) * n_cols;
@@ -216,6 +231,21 @@ void minus_log(float* x, std::size_t n, float lo, float hi, void* stream) {
 
 void multiply(float* x, const float* w, std::size_t n, void* stream) {
     multiply_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, n);
+    HELIREC_CUDA_CHECK(cudaGetLastError());
+}
+
+void add_scaled(float* x, const float* y, float s, std::size_t n, void* stream) {
+    add_scaled_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, y, s, n);
+    HELIREC_CUDA_CHECK(cudaGetLastError());
+}
+
+void weight_difference(const float* x, const float* w, const float* w2, float* t, std::size_t n, void* stream) {
+    weight_difference_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, w2, t, n);
+    HELIREC_CUDA_CHECK(cudaGetLastError());
+}
+
+void multiply_add(float* x, const float* w, const float* t, std::size_t n, void* stream) {
+    multiply_add_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, t, n);
     HELIREC_CUDA_CHECK(cudaGetLastError());
 }
 

@@ -588,8 +588,13 @@ std::vector<T> vec(const A& a) { return std::vector<T>(a.data(), a.data() + a.si
 ScanData make_scan_data(DIn angles_deg, DIn z_translation_m, double pixel_size_m, int det_rows, int det_cols,
                         int shift_x, float x_readjustment, float z_readjustment, DIn control_A, HostIn flat_angles_deg,
                         HostIn dark, HostIn flats, HostIn weight, std::shared_ptr<RawReader> reader, IntIn file_index,
-                        IntIn frame_index) {
+                        IntIn frame_index, double z_translation_scale, std::vector<float> row_offset,
+                        std::vector<float> row_slope, float slope_col) {
     ScanData d;
+    d.traj.z_translation_scale = z_translation_scale;
+    d.traj.row_offset = std::move(row_offset);
+    d.traj.row_slope = std::move(row_slope);
+    d.traj.slope_col = slope_col;
     d.traj.angles_deg = vec<double>(angles_deg);
     d.traj.z_translation_m = vec<double>(z_translation_m);
     d.traj.pixel_size_m = pixel_size_m;
@@ -648,9 +653,14 @@ class PySliceReconstructor {
         f("angular_tolerance_steps", cfg.angular_tolerance_steps);
         f("luminosity_repartition", cfg.luminosity_repartition);
         f("x_interp", cfg.x_interp);
+        f("detector_smear", cfg.detector_smear);
+        f("sharp_f", cfg.sharp_f);
+        f("sharp_band", cfg.sharp_band);
         f("z_interp", cfg.z_interp);
         f("angle_interp", cfg.angle_interp);
         f("exposure_arc", cfg.exposure_arc);
+        f("angle_subsets", cfg.angle_subsets);
+        f("angle_subset", cfg.angle_subset);
         f("mend_threshold", cfg.mend_threshold);
         f("legacy_reference", cfg.legacy_reference);
         f("log_clip_min", cfg.log_clip_min);
@@ -689,6 +699,9 @@ class PySliceReconstructor {
         d["exposure_arc_bins"] = impl_->exposure_arc_bins();
         d["angle_interp"] = impl_->angle_interp();
         d["z_interp"] = impl_->z_interp();
+        d["angle_subsets"] = impl_->config().angle_subsets;
+        d["angle_subset"] = impl_->config().angle_subset;
+        d["projections"] = impl_->projection_counts();
         return d;
     }
     nb::object reconstruct(int h_lo, int h_hi, bool debug, bool timing, std::optional<std::array<int, 4>> roi,
@@ -820,6 +833,7 @@ class PySliceReconstructor {
 }  // namespace
 
 void bind_calib(nb::module_& m);  // bindings/calib_bindings.cpp
+void bind_spectra(nb::module_& m);  // bindings/spectra_bindings.cpp
 
 NB_MODULE(_core, m) {
     register_filter("python", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
@@ -827,6 +841,7 @@ NB_MODULE(_core, m) {
     });
 
     bind_calib(m);
+    bind_spectra(m);
     m.doc() = "helirec C++/CUDA kernels";
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
@@ -874,6 +889,34 @@ NB_MODULE(_core, m) {
               return out;
           },
           "rows"_a, "os"_a, "device"_a = "cpu", "band-limited (FFT) upsampling of rows by os");
+    m.def("shift_rows",
+          [](HostIn rows, float shift, const std::string& device) {
+              require(rows.ndim() == 2, "rows must be (n_rows, n)");
+              const int nr = static_cast<int>(rows.shape(0)), n = static_cast<int>(rows.shape(1));
+              const int S = shift_row_stride(n);
+              HostOut out = new_array({static_cast<std::size_t>(nr), static_cast<std::size_t>(n)});
+              nb::gil_scoped_release nogil;
+              std::vector<float> work(static_cast<std::size_t>(nr) * S, 0.f);
+              for (int r = 0; r < nr; ++r)
+                  std::copy(rows.data() + static_cast<std::size_t>(r) * n, rows.data() + static_cast<std::size_t>(r + 1) * n,
+                            work.begin() + static_cast<std::size_t>(r) * S);
+              if (parse_device(device) == Device::CPU) {
+                  cpu::shift_rows(work.data(), nr, n, shift);
+              } else {
+#ifdef HELIREC_WITH_CUDA
+                  cuda::DeviceBuffer<float> d;
+                  d.upload(work.data(), work.size());
+                  cuda::shift_rows(d.data(), nr, n, shift);
+                  d.download(work.data());
+#endif
+              }
+              for (int r = 0; r < nr; ++r)
+                  std::copy(work.begin() + static_cast<std::size_t>(r) * S, work.begin() + static_cast<std::size_t>(r) * S + n,
+                            data(out) + static_cast<std::size_t>(r) * n);
+              return out;
+          },
+          "rows"_a, "shift"_a, "device"_a = "cpu",
+          "rows delayed by `shift` samples without loss (a phase ramp on their transform): out[r, i] = row r at i - shift");
     m.def("bspline_prefilter",
           [](HostIn rows, int degree, const std::string& device) {
               require(rows.ndim() == 2, "rows must be (n_rows, n)");
@@ -1155,7 +1198,10 @@ NB_MODULE(_core, m) {
     nb::class_<ScanData>(m, "ScanData", "one scan (raw access + calibration), see helirec.scan_data()");
     m.def("make_scan_data", &make_scan_data, "angles_deg"_a, "z_translation_m"_a, "pixel_size_m"_a, "det_rows"_a,
           "det_cols"_a, "shift_x"_a, "x_readjustment"_a, "z_readjustment"_a, "control_A"_a, "flat_angles_deg"_a,
-          "dark"_a, "flats"_a, "weight"_a, "reader"_a, "file_index"_a, "frame_index"_a);
+          "dark"_a, "flats"_a, "weight"_a, "reader"_a, "file_index"_a, "frame_index"_a, "z_translation_scale"_a = 1.0,
+          "row_offset"_a = std::vector<float>{}, "row_slope"_a = std::vector<float>{}, "slope_col"_a = 0.f,
+          "row_offset, row_slope, slope_col: registration of the scan's frames per projection (helical.hpp): rows added "
+          "to the vertical position, and a row offset of row_slope (column - slope_col)");
     nb::class_<PySliceReconstructor>(m, "SliceReconstructor")
         .def(nb::init<std::vector<ScanData>, const nb::dict&>(), "scans"_a, "config"_a)
         .def_prop_ro("info", &PySliceReconstructor::info)
@@ -1286,7 +1332,8 @@ NB_MODULE(_core, m) {
     nb::class_<ReferenceMask>(m, "ReferenceMask",
                               "The mask of a masked uint8 reference volume on the reconstruction's grid, read with "
                               "vc_reader from any of its pyramid levels (`scale`; 0: full resolution). shape: the "
-                              "reconstruction's whole volume (z, y, x), which the reference's level 0 must have.")
+                              "reconstruction's whole volume (z, y, x): the reference's level 0 must have its y and "
+                              "x, and its number of slices to within 2 % (slice_ratio).")
         .def("__init__", [](ReferenceMask* self, const std::string& location, int scale, std::array<std::int64_t, 3> shape,
                             const std::string& cache_dir) {
                  nb::gil_scoped_release nogil;
@@ -1296,6 +1343,9 @@ NB_MODULE(_core, m) {
         .def_prop_ro("scale", &ReferenceMask::scale)
         .def_prop_ro("factors", &ReferenceMask::factors, "volume voxels per mask voxel (z, y, x)")
         .def_prop_ro("level_shape", &ReferenceMask::level_shape)
+        .def_prop_ro("slice_ratio", &ReferenceMask::slice_ratio,
+                     "reference slices per slice of the volume: 1 on the same grid; else the reference's slices are "
+                     "spread evenly over the volume's (a reconstruction with another helical pitch calibration)")
         .def("read", [](nb::object self, int z0, int z1, std::array<int, 4> roi, int slot) {
                  auto& ref = nb::cast<ReferenceMask&>(self);
                  PyOutputMask out;

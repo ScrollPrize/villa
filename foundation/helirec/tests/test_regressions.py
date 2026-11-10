@@ -125,6 +125,59 @@ def test_calibration_cache_fingerprint(tmp_path):
     assert calibration._load_cache(str(cache), fp, log.append)[0] is None   # pre-fingerprint caches are stale
 
 
+# ---------------------------------------------------------------- helical pitch from opposite projections
+def test_pitch_scale_from_opposite_projections():
+    """a texture seen by projections half a turn apart, mirrored about the axis and displaced by the true travel"""
+    rng = np.random.default_rng(5)
+    rows, cols, axis, per_turn = 160, 300, 171.25, 200
+    g = lambda a, ax: _core.gaussian_filter1d(np.ascontiguousarray(a, np.float32), ax, 1.5, "reflect")
+    tex = g(g(rng.standard_normal((1, 1400, cols)), 1), 2)[0]                       # (height, mirrored column)
+    angles = np.arange(5 * per_turn) * (360.0 / per_turn)
+    moving = np.clip(np.arange(len(angles)) - per_turn, 0, 3 * per_turn)             # a stationary turn at each end
+    recorded = -moving * (80.0 / (per_turn / 2))                                     # 80 rows per half turn
+    u = np.arange(cols) - axis
+
+    def frames(true_scale):
+        def line(p):
+            top = 1300 + recorded[p] * true_scale - rows                             # what is at row v: height top + v
+            v = top + np.arange(rows)
+            i = np.floor(v).astype(int)
+            img = tex[i] * (1 - (v - i))[:, None] + tex[i + 1] * (v - i)[:, None]
+            if int(round(angles[p] / 180.0)) % 2:                                    # the opposite view: mirrored
+                x = axis - u
+                j = np.clip(np.floor(x).astype(int), 0, cols - 2)
+                img = img[:, j] * (1 - (x - j)) + img[:, j + 1] * (x - j)
+            return np.ascontiguousarray(img, np.float32)
+        return line
+
+    shift, corr, edge = _core.mirror_row_shift(frames(1.004)(300), frames(1.004)(400), axis, 100, 80.0, 8)
+    assert not edge and corr > 0.8 and abs(shift - 80.32) < 0.05
+    for true in (1.004, 1.0):
+        res = calibration.pitch_scale_from_pairs(frames(true), angles, recorded, axis, (rows, cols), n_pairs=12,
+                                                 log=lambda *a: None)
+        assert res["n_pairs"] >= 8 and abs(res["measured"] - true) < 3e-4
+        assert res["significant"] is (true != 1.0) and res["scale"] == (res["measured"] if true != 1.0 else 1.0)
+    # nothing to measure: a scan that does not move, or an axis at the detector's edge
+    still = calibration.pitch_scale_from_pairs(frames(1.0), angles, 0 * recorded, axis, (rows, cols), log=lambda *a: None)
+    edge = calibration.pitch_scale_from_pairs(frames(1.0), angles, recorded, 290.0, (rows, cols), log=lambda *a: None)
+    assert still["scale"] == 1.0 and still["measured"] is None and "helical" in still["reason"]
+    assert edge["scale"] == 1.0 and edge["measured"] is None and "mirrored" in edge["reason"]
+
+
+def test_z_translation_scale_parameter():
+    r = bare_recon()
+    assert DEFAULTS["z_translation_scale"] == "auto" and LEGACY_REFERENCE["z_translation_scale"] == 1.0
+    r.cal = SimpleNamespace(z_translation_scale=1.003)
+    assert r.z_translation_scale() == 1.003
+    r.cal = SimpleNamespace(z_translation_scale=None)                               # (not measured)
+    assert r.z_translation_scale() == 1.0
+    r.params["z_translation_scale"] = "1.002"
+    assert r.z_translation_scale() == 1.002
+    r.params["z_translation_scale"] = 0
+    with pytest.raises(ValueError):
+        r.z_translation_scale()
+
+
 # ---------------------------------------------------------------- output scale (attenuation)
 @pytest.mark.parametrize("device", DEVICES)
 def test_ramp_scale_attenuation(device):

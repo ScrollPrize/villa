@@ -35,14 +35,33 @@ HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
     return div(sig, flat);
 }
 
-// The value at row t + fract_v[k] from the z_taps rows around it (AccumScanView::z_w); false: one of them is off the
+// The vertical position of the sample for stack row t at column c: window row tt and fraction a, i.e. row
+// t + fract_v[k], plus the frame's row offset at that column (AccumScanView::row_slope).
+HR_HD void row_position(const AccumScanView& s, int k, int t, int c, int& tt, float& a) {
+    tt = t;
+    a = s.fract_v[k];
+    if (s.row_slope) {
+        const float pos = add(a, mul(s.row_slope[k], sub(static_cast<float>(c), s.slope_col)));
+        const float fl = hd::floor(pos);
+        tt = t + static_cast<int>(fl);
+        a = sub(pos, fl);
+    }
+}
+
+// the vertical kernel's weights for projection k at fraction a (per projection, or with a roll from the table)
+HR_HD const float* z_weights(const AccumScanView& s, int k, float a) {
+    if (s.row_slope && s.z_lut)
+        return s.z_lut + static_cast<std::size_t>(static_cast<int>(add(mul(a, static_cast<float>(s.z_lut_n)), 0.5f))) * s.z_taps;
+    return s.z_w + static_cast<std::size_t>(k) * s.z_taps;
+}
+
+// The value at row t + a from the z_taps rows around it (weights zw); false: one of them is off the
 // detector, unweighted or (with `finite`) not finite, and the caller interpolates rows t, t + 1 linearly.
 // `log_values`: -log of each row first.
-HR_HD bool z_kernel_value(const AccumScanView& s, int k, int t, int c, bool finite, bool log_values, float clip_min,
-                          float clip_max, float& val) {
+HR_HD bool z_kernel_value(const AccumScanView& s, int k, int t, const float* zw, int c, bool finite, bool log_values,
+                          float clip_min, float clip_max, float& val) {
     const int T = s.z_taps, t0 = t - (T / 2 - 1), first = s.row0[k] + t0;
     if (first < 0 || first + T > s.det_rows) return false;
-    const float* zw = s.z_w + static_cast<std::size_t>(k) * T;
     float v = 0.f;
     for (int i = 0; i < T; ++i) {
         if (!(s.weight[static_cast<std::size_t>(first + i) * s.det_cols + c] > 0.f)) return false;
@@ -67,38 +86,46 @@ HR_HD int padded_row(const AccumScanView& s, int k, int t, bool& pad) {
 }
 
 // vertically interpolated value at window row t of column c: the value of column_value
-HR_HD float column_interp(const AccumScanView& s, int k, int t, int c) {
-    const float a = s.fract_v[k];
+HR_HD float column_interp(const AccumScanView& s, int k, int t0, int c) {
+    int t;
+    float a;
+    row_position(s, k, t0, c, t, a);
     bool pad;
     const int tv = padded_row(s, k, t, pad);
     float val;
-    if (!(a != 0.0f && s.z_taps > 0 && !pad && z_kernel_value(s, k, t, c, false, false, 0.f, 0.f, val))) {
+    if (!(a != 0.0f && s.z_taps > 0 && !pad && z_kernel_value(s, k, t, z_weights(s, k, a), c, false, false, 0.f, 0.f, val))) {
         val = flat_field(s, k, tv, c);
         if (a != 0.0f) val = add(mul(sub(1.0f, a), val), mul(a, flat_field(s, k, tv + 1, c)));
     }
     return val;
 }
 
-// vertically interpolated value (column_interp, or what was computed of it: AccumScanView::col_val) and weight at
-// window row t
-HR_HD void column_value(const AccumScanView& s, int k, int t, int c, float non_zero, float& val, float& wt) {
-    const float a = s.fract_v[k];
+// what accumulate computed of column_interp for the block in hand (AccumScanView::col_val)
+HR_HD float column_cached(const AccumScanView& s, int k, int t, int c) {
+    return s.col_val[(static_cast<std::size_t>(s.col_slot[k]) * s.col_rows + t) * s.col_stride + c];
+}
+
+// vertically interpolated weight at window row t of column c
+HR_HD float column_weight(const AccumScanView& s, int k, int t0, int c, float non_zero) {
+    int t;
+    float a;
+    row_position(s, k, t0, c, t, a);
     bool pad;
     const int tv = padded_row(s, k, t, pad);
-    val = s.col_val ? s.col_val[(static_cast<std::size_t>(s.col_slot[k]) * s.col_rows + t) * s.det_cols + c]
-                    : column_interp(s, k, t, c);
-    if (pad) {
-        wt = non_zero;
-    } else {
-        const int rr = s.row0[k] + tv;
-        const float dw = s.weight_factor[k];
-        const float w0 = mul(s.weight[static_cast<std::size_t>(rr) * s.det_cols + c], dw);
-        wt = w0;
-        if (a != 0.0f) {
-            const float w1 = mul(s.weight[static_cast<std::size_t>(rr + 1) * s.det_cols + c], dw);
-            wt = add(mul(sub(1.0f, a), w0), mul(a, w1));
-        }
-    }
+    if (pad) return non_zero;
+    const int rr = s.row0[k] + tv;
+    const float dw = s.weight_factor[k];
+    const float w0 = mul(s.weight[static_cast<std::size_t>(rr) * s.det_cols + c], dw);
+    if (a == 0.0f) return w0;
+    const float w1 = mul(s.weight[static_cast<std::size_t>(rr + 1) * s.det_cols + c], dw);
+    return add(mul(sub(1.0f, a), w0), mul(a, w1));
+}
+
+// vertically interpolated value (column_interp, or what was computed of it: column_cached, unless those rows are
+// the shifted ones) and weight at window row t
+HR_HD void column_value(const AccumScanView& s, int k, int t, int c, float non_zero, float& val, float& wt) {
+    val = s.col_val && !s.col_shifted ? column_cached(s, k, t, c) : column_interp(s, k, t, c);
+    wt = column_weight(s, k, t, c, non_zero);
 }
 
 // the same sample as the splat uses it: value x weight, weight
@@ -111,14 +138,16 @@ HR_HD void column_sample(const AccumScanView& s, int k, int t, int c, float non_
 
 // Interpolation corners carry their own measured weights; invalid corners and detector
 // padding never contribute. In particular, do not multiply an invalid value by zero.
-HR_HD void measured_column(const AccumScanView& s, int k, int t, int c, const AccumParams& p,
+HR_HD void measured_column(const AccumScanView& s, int k, int t0, int c, const AccumParams& p,
                            float& v, float& w) {
     v = w = 0.f;
-    const float a = s.fract_v[k];
+    int t;
+    float a;
+    row_position(s, k, t0, c, t, a);
     const int base_row = s.row0[k] + t;
     if (base_row < 0 || base_row >= s.det_rows || (a > 0.f && base_row + 1 >= s.det_rows)) return;
     float kv;
-    if (a > 0.f && s.z_taps > 0 && z_kernel_value(s, k, t, c, true, p.log_values, p.log_clip_min, p.log_clip_max, kv)) {
+    if (a > 0.f && s.z_taps > 0 && z_kernel_value(s, k, t, z_weights(s, k, a), c, true, p.log_values, p.log_clip_min, p.log_clip_max, kv)) {
         // every row is measured: the kernel's value with the linear weight
         const float fac = s.weight_factor[k];
         const float w0 = mul(mul(s.weight[static_cast<std::size_t>(base_row) * s.det_cols + c], fac), sub(1.f, a));
@@ -172,6 +201,20 @@ HR_HD bool kernel_term(const AccumScanView& s, int k, int t, int c0, float A, co
     return true;
 }
 
+// Fractional column offset from the block's shifted rows (AccumScanView::col_shifted): the row's band-limited value
+// at source position c0 - fract_x, with the splat's weight as in kernel_term. Over the columns the lanczos3 kernel
+// would take (c0 - 3 .. c0 + 2 on the detector, positive weights at the splat's two); false: nothing added, use the
+// splat (with the unshifted values).
+HR_HD bool exact_term(const AccumScanView& s, int k, int t, int c0, float A, const AccumParams& p, float& R, float& RW) {
+    if (c0 - 3 < 0 || c0 + 3 > s.det_cols) return false;
+    const float w0 = column_weight(s, k, t, c0 - 1, p.non_zero), w1 = column_weight(s, k, t, c0, p.non_zero);
+    if (!(w0 > 0.f) || !(w1 > 0.f)) return false;
+    const float wlin = add(mul(s.fract_x, w0), mul(sub(1.0f, s.fract_x), w1));
+    R = add(R, mul(mul(column_cached(s, k, t, c0), wlin), A));
+    RW = add(RW, mul(wlin, A));
+    return true;
+}
+
 // all contributions of projection k (role: 0 lower bin, 1 upper bin) to merged column X, row t,
 // in project_radio order: [c-1 right share] [left border pad (c == 0)] [c left share] [right border pad]
 HR_HD void contribute(const AccumScanView& s, int k, int role, int t, int X, const AccumParams& p,
@@ -185,7 +228,11 @@ HR_HD void contribute(const AccumScanView& s, int k, int role, int t, int X, con
     const int c0 = rel - s.ixs;              // source column whose left share lands on X
     const int c1 = c0 - 1;                   // source column whose right share lands on X
     // (all taps inside the detector: no border pad lands on X either)
-    if (s.x_taps > 0 && kernel_term(s, k, t, c0, A, p, R, RW)) return;
+    if (s.col_shifted) {
+        if (exact_term(s, k, t, c0, A, p, R, RW)) return;
+    } else if (s.x_taps > 0 && kernel_term(s, k, t, c0, A, p, R, RW)) {
+        return;
+    }
     auto add_term = [&](int c, float fx) {
         if (p.measured_only && (A <= 0.f || fx <= 0.f)) return;
         float v, w;

@@ -126,6 +126,27 @@ def test_upsample_rows_band_limited(device):
     np.testing.assert_allclose(up[:, mid], exact[:, mid], atol=0.05)
 
 
+@pytest.mark.parametrize("device", helirec.devices())
+def test_shift_rows_exact(device):
+    """A delay by a fraction of a sample that keeps the whole band (a phase ramp on the row's transform)."""
+    n = 512
+    x = np.arange(n)
+    f = lambda x: 1 + 0.3 * np.cos(2 * np.pi * 0.013 * x + 0.4) + 0.05 * np.cos(2 * np.pi * 0.36 * x + 1.0) \
+        + 0.05 * np.cos(2 * np.pi * 0.47 * x + 0.2)
+    rows = np.stack([f(x), 0.5 * f(x + 7.3) + 0.2]).astype(np.float32)
+    mid = slice(100, n - 100)   # (the rows end abruptly: their ends leak in as 1 / distance)
+    for d in (0.5, -0.5, 0.25):
+        out = _core.shift_rows(rows, d, device=device)
+        np.testing.assert_allclose(out[:, mid], np.stack([f(x - d), 0.5 * f(x + 7.3 - d) + 0.2])[:, mid], atol=3e-3)
+    np.testing.assert_allclose(_core.shift_rows(rows, 1.0, device=device)[:, 1:], rows[:, :-1], atol=1e-5)   # a whole sample
+    np.testing.assert_allclose(_core.shift_rows(rows, 0.0, device=device), rows, atol=1e-5)
+    # a constant stays a constant; more rows than one transform batch (CUDA: 4096) give the same rows
+    np.testing.assert_allclose(_core.shift_rows(np.full((3, 77), 2.5, np.float32), 0.5, device=device), 2.5, rtol=1e-6)
+    many = np.repeat(rows, 2500, 0)
+    np.testing.assert_allclose(_core.shift_rows(many, 0.5, device=device), np.repeat(_core.shift_rows(rows, 0.5, device=device), 2500, 0),
+                               atol=1e-5)
+
+
 def test_backprojector_specs():
     assert backprojector_config("ghbp") == {"backprojector": "ghbp"}
     assert backprojector_config("fbp(interp=cubic,oversample=2)") == {"backprojector": "fbp", "bp_interp": "cubic", "bp_oversample": 2}

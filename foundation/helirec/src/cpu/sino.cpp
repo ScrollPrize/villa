@@ -8,6 +8,7 @@
 
 #include "common/rebalance_core.hpp"
 #include "common/sino_core.hpp"
+#include "helirec/filters.hpp"
 #include "helirec/sino.hpp"
 
 namespace helirec {
@@ -160,6 +161,51 @@ FourierFilterSpec ramp_filter_spec(const RampGeometry& g, float scale, const std
     return s;
 }
 
+FourierFilterSpec band_filter_spec(int ndim, int h, int w, double f1, double f2) {
+    if (ndim != 1 && ndim != 2) throw Error("band_filter_spec: ndim must be 1 or 2");
+    if (!(f1 >= 0 && f2 > f1 && f2 <= 0.75)) throw Error("band_filter_spec: need 0 <= f1 < f2 <= 0.75 cycles per pixel");
+    FourierFilterSpec s;
+    s.ndim = ndim;
+    s.h = ndim == 2 ? h : 1;
+    s.w = w;
+    s.ph = ndim == 2 ? roundfft(h) : 1;      // (the frames carry their own margin rows)
+    s.pw = roundfft(w + 64);
+    s.pad_top = ndim == 2 ? (s.ph - h) / 2 : 0;
+    s.pad_left = (s.pw - w) / 2;
+    s.mode = PadMode::Edge;
+    const int nc = s.pw / 2 + 1;
+    s.filter.resize(static_cast<std::size_t>(s.ph) * nc);
+    for (int i = 0; i < s.ph; ++i) {
+        const double fy = ndim == 2 ? static_cast<double>(std::min(i, s.ph - i)) / s.ph : 0.0;
+        for (int j = 0; j < nc; ++j) {
+            const double fr = std::hypot(fy, static_cast<double>(j) / s.pw);
+            const double v = fr <= f1 ? 0.0 : (fr >= f2 ? 1.0 : 0.5 - 0.5 * std::cos(M_PI * (fr - f1) / (f2 - f1)));
+            s.filter[static_cast<std::size_t>(i) * nc + j] = static_cast<float>(v);
+        }
+    }
+    return s;
+}
+
+std::vector<float> smear_response(const std::vector<double>& smear, double f, int rows, int cols) {
+    if (smear.size() != 6) throw Error("detector_smear: six numbers a11:a12:a21:a22:c1:c2 are needed");
+    if (!(f > 0 && f <= 0.5)) throw Error("sharp_f must be in (0, 0.5] cycles per pixel");
+    std::vector<float> out(static_cast<std::size_t>(rows) * cols);
+    for (int r = 0; r < rows; ++r) {
+        const double Y = (r - 0.5 * (rows - 1)) / 1000.0;
+        for (int c = 0; c < cols; ++c) {
+            const double X = (c - 0.5 * (cols - 1)) / 1000.0;
+            const double a = (smear[0] * X + smear[1] * Y + smear[4]) * f;
+            double v = 0.0;
+            if (std::fabs(a) < 1.0) {
+                const double pa = M_PI * a;
+                v = std::fabs(pa) < 1e-9 ? 1.0 : std::sin(pa) / pa;
+            }
+            out[static_cast<std::size_t>(r) * cols + c] = static_cast<float>(std::max(v * v, 1e-6));
+        }
+    }
+    return out;
+}
+
 std::vector<float> arc_deblur_taps(double arc, int radius) {
     if (!(arc > 0 && arc <= 1.5)) throw Error("exposure arc must be in (0, 1.5] grid angles");
     if (radius < 1 || radius > 16) throw Error("arc_deblur_taps: radius must be 1..16");
@@ -187,6 +233,21 @@ void minus_log(float* x, std::size_t n, float lo, float hi) {
 void multiply(float* x, const float* w, std::size_t n) {
 #pragma omp parallel for schedule(static)
     for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = x[i] * w[i];
+}
+
+void add_scaled(float* x, const float* y, float s, std::size_t n) {
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = x[i] + s * y[i];
+}
+
+void weight_difference(const float* x, const float* w, const float* w2, float* t, std::size_t n) {
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) t[i] = x[i] * (w2[i] - w[i]);
+}
+
+void multiply_add(float* x, const float* w, const float* t, std::size_t n) {
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = x[i] * w[i] + t[i];
 }
 
 void angular_fir(const float* in, float* out, int n_proj, int n_cols, const float* g, int radius, const float* support) {

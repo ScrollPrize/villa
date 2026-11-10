@@ -1,0 +1,11 @@
+{
+ "name": "PHerc0343P at 2.215 um (scan 20250512023932, published volume 20260304131111)",
+ "location": "s3://vesuvius-challenge-open-data/PHerc0343P/volumes/20260304131111-2.215um-0.4m-111keV-masked.zarr",
+ "level": 1,
+ "grid": "published volume 20250521134555 at 8.64 um = helirec's grid for scan 20250510090703 (5398 x 5057 x 5057)",
+ "affine_xyz": [[3.8973422176241357, 0.0008685445272584857, -0.001136188318300757, -3271.8121956197174],
+                [-5.241326074237525e-07, 3.9006770576735876, -2.3599291477366835e-07, -3289.997898168948],
+                [0.0020017840203783548, -0.0005219617284409577, 3.901359087196994, 655.0867865378058]],
+ "source": "https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json: samples.PHerc0343P.sample.properties.volume_transforms, from 20250521134555 to 20260304131111; (x, y, z) voxel indices",
+ "cache_dir": "/mnt/raid_nvme/volume_cache"
+}

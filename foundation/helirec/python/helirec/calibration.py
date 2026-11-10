@@ -4,7 +4,7 @@ Reproduces the reference (nabu-helical / nabuxx) calibration:
   * darks / flats reduction (nx2etf), weight map + horizontal apodisation (prepare_weights_double),
   * rotation axis of the main (HA) scan (nabuxx-calibrate extract_cor),
   * HA -> TA overlap vector (nabuxx-calibrate get_overlap),
-and derives the placement of both scans in the merged frame and the rotation axis there.
+and, beyond the reference, measures the helical pitch (rows of travel per recorded row: measure_pitch), and derives the placement of both scans in the merged frame and the rotation axis there.
 Heavy kernels are C++ (helirec._core); the bookkeeping is numpy.
 """
 from __future__ import annotations
@@ -417,6 +417,112 @@ def find_overlap(ext_main: Extractor, span_main: Span, ext_comp: Extractor, span
 
 
 # ============================================================================ top level
+# ============================================================================ helical pitch
+PITCH_MIN_TRAVEL_ROWS = 20.0     # least travel in half a turn for the pitch to be measurable
+PITCH_MAX_ERROR = 0.02           # a larger |scale - 1| is taken for a failed measurement
+
+
+def pitch_scale_from_pairs(line, angles_deg, z_pix, axis, shape, n_pairs=40, min_half_width=64, log=print,
+                           progress=None):
+    """Detector rows the sample really moves per row of recorded z translation, from the frames themselves.
+
+    A parallel-beam projection and the one half a turn later are mirror images about the rotation axis, displaced
+    along the rows by the sample's travel in between: what is at row v of projection p is at row v + (z_pix[p] -
+    z_pix[q]) x scale of projection q. The displacement of n_pairs such pairs spread over the scan is measured
+    (_core.mirror_row_shift) and compared with the recorded one. Only pairs with the full travel of half a turn count
+    (those reaching into a stationary turn or a ramp also see where the stage came to rest).
+
+    line(p): the (rows, cols) float32 line integrals of projection p; axis: the rotation axis in its columns.
+    Returns a dict: scale (1.0 unless a significant error was measured), measured (the raw ratio, or None),
+    stderr, n_pairs, significant, reason (when nothing could be measured), pairs [[p, q, recorded, measured,
+    correlation], ...]."""
+    rows, cols = shape
+    out = dict(scale=1.0, measured=None, stderr=None, n_pairs=0, significant=False, pairs=[])
+    half = int(min(axis, cols - 1 - axis)) - 4
+    if half < min_half_width:
+        return dict(out, reason=f"rotation axis at column {axis:.1f}: only {max(half, 0)} mirrored columns")
+    ang = np.asarray(angles_deg, np.float64)
+    z = np.asarray(z_pix, np.float64)
+    n = len(ang)
+    step = float(np.median(np.abs(np.diff(ang))))
+    turn = 180.0 if ang[-1] >= ang[0] else -180.0
+    q_of = np.searchsorted(ang * np.sign(turn), (ang + turn) * np.sign(turn))
+    q_of = np.clip(q_of, 1, n - 1)
+    q_of = np.where(np.abs(ang[q_of - 1] - ang - turn) < np.abs(ang[q_of] - ang - turn), q_of - 1, q_of)
+    ok = np.abs(ang[q_of] - ang - turn) <= 0.5 * step + 1e-9
+    travel = z - z[q_of]
+    most = float(np.abs(travel[ok]).max()) if ok.any() else 0.0
+    if most < PITCH_MIN_TRAVEL_ROWS:
+        return dict(out, reason=f"travel of {most:.1f} rows in half a turn: not a helical scan")
+    # (the two projections must share enough rows beside the search range and the kernel's margins)
+    full = np.flatnonzero(ok & (np.abs(travel) >= 0.98 * most) & (rows - np.abs(travel) >= max(64, 0.1 * rows)))
+    if len(full) < 8:
+        return dict(out, reason="too few projection pairs half a turn apart see the same rows")
+    chosen = full[np.unique(np.linspace(0, len(full) - 1, n_pairs).round().astype(int))]
+    pairs = []
+    for p in chosen:
+        q = int(q_of[p])
+        d = float(travel[p])
+        radius = max(8, int(math.ceil(0.01 * abs(d))) + 2)
+        shift, corr, edge = _core.mirror_row_shift(line(int(p)), line(q), float(axis), half, d, radius)
+        if not edge and corr > 0.2:
+            pairs.append([int(p), q, d, float(shift), float(corr)])
+        if progress:
+            progress(1)
+    out["pairs"] = pairs
+    if len(pairs) < 8:
+        return dict(out, reason=f"only {len(pairs)} of {len(chosen)} pairs correlate")
+    r = np.array([m / d for _, _, d, m, _ in pairs])
+    med = float(np.median(r))
+    mad = float(np.median(np.abs(r - med)))
+    keep = np.abs(r - med) <= 4 * 1.4826 * mad + 1e-5
+    measured = float(r[keep].mean())
+    stderr = float(r[keep].std(ddof=1) / math.sqrt(keep.sum())) if keep.sum() > 1 else float("inf")
+    out.update(measured=measured, stderr=stderr, n_pairs=int(keep.sum()))
+    if abs(measured - 1) > PITCH_MAX_ERROR:
+        log(f"  WARNING: helical pitch: the frames give {measured:.5f} x the recorded travel: taken for a failed "
+            f"measurement, not applied (set z_translation_scale to use a value)")
+        return dict(out, reason="implausible ratio")
+    out["significant"] = bool(abs(measured - 1) > 3 * stderr)
+    if out["significant"]:
+        out["scale"] = measured
+    return out
+
+
+def find_pitch_scale(ext: "Extractor", span: "Span", axis, n_pairs=40, log=print, progress=False):
+    """pitch_scale_from_pairs on a scan: its flat-fielded projections, its recorded travel (span), its rotation axis
+    (detector columns)."""
+    def line(p):
+        raw = ext.src.frames(np.array([p]))[0].astype(np.float32)
+        sig = ((raw - ext.dark) / ext.cd[p]) / np.maximum(ext._flat(p), FLT_MIN)
+        return np.ascontiguousarray(-np.log(np.clip(sig, 1e-6, None)), np.float32)
+    with _bar(progress, n_pairs, "helical pitch", "pair") as bar:
+        return pitch_scale_from_pairs(line, span.angles, span.z_pix, axis, ext.scan.frame_shape, n_pairs, log=log,
+                                      progress=bar.update)
+
+
+def measure_pitch(main, companion, arrays, cal_cor_main, placement, rot_center, log=print, progress=False):
+    """The helical pitch of the pair, from whichever scan's detector holds the rotation axis with the more mirrored
+    columns (both scans ride the same stage): the dict of pitch_scale_from_pairs, with the scan's name."""
+    wm = arrays["weight_map"]
+    cands = []
+    for tag, sc in (("main", main), ("companion", companion)):
+        pl = placement[sc.name]
+        axis = cal_cor_main if tag == "main" else rot_center - (pl.shift_x - pl.x_readjustment)
+        cands.append((min(axis, sc.frame_shape[1] - 1 - axis), tag, sc, axis))
+    _, tag, sc, axis = max(cands, key=lambda c: c[0])
+    ext = Extractor(sc, arrays[f"{tag}_dark"], arrays[f"{tag}_flats"], wm)
+    res = find_pitch_scale(ext, Span(sc, 50.0), float(axis), log=log, progress=progress)
+    res["scan"] = sc.name
+    if res["measured"] is None:
+        log(f"helical pitch: not measured ({res.get('reason')}): the recorded z translation is used")
+    else:
+        log(f"helical pitch: the frames of {sc.name} show {res['measured']:.5f} +- {res['stderr']:.5f} x the recorded z "
+            f"travel ({res['n_pairs']} pairs half a turn apart): "
+            + (f"z_translation_scale {res['scale']:.5f}" if res["significant"] else "no significant error, scale 1"))
+    return res
+
+
 @dataclass
 class ScanPlacement:
     shift_x: int
@@ -457,6 +563,17 @@ class Calibration:
     apodisation: dict                 # name -> (w_left, w_right)
     estimated_cor_from_motor_pix: dict
     details: dict = field(default_factory=dict)
+    # Detector rows the sample really moves per row of recorded z translation (measure_pitch; details["pitch"]).
+    # None: not measured yet (a cache written before the measurement existed: measured and added on loading).
+    z_translation_scale: float | None = None
+    # The detector's smear field (measure_smear; details["smear"]): [a11, a12, a21, a22, c1, c2], a uniform smear of
+    # A r + c pixels at r = (column, row) from the detector's centre in units of 1000 pixels, from the noise of the
+    # flats. []: measured, nothing significant. None: not measured yet (an older cache: measured on loading).
+    detector_smear: list | None = None
+    # Registration of the companion's frames on the main scan's (measure_registration; details["registration"]):
+    # dict(projection, row_offset, row_slope: knots along the companion's projections, segments: the stretches they
+    # are interpolated within, slope_col). {}: measured, nothing usable. None: not measured yet (an older cache).
+    companion_registration: dict | None = None
     source: str = "measured"          # measured | override (cor and / or vector given by the caller; never cached)
     fingerprint: str = ""             # acquisition_fingerprint() of the scan pair it was computed from
     version: int = CALIBRATION_VERSION
@@ -557,6 +674,15 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
         if "cor" in cal.details:
             check_cor_drift(cal.details["cor"]["cor_begin_end"], log=log)
         log(f"calibration loaded from {cache_dir}")
+        if cal.z_translation_scale is None:   # (a cache from before the pitch measurement)
+            _add_pitch(cal, main, companion, arrays, log, progress)
+            _save_calibration(cache_dir, cal)
+        if cal.detector_smear is None:        # (a cache from before the smear measurement)
+            _add_smear(cal, main, arrays, log)
+            _save_calibration(cache_dir, cal)
+        if cal.companion_registration is None:   # (a cache from before the frame registration)
+            _add_registration(cal, main, companion, arrays, log, progress)
+            _save_calibration(cache_dir, cal)
         return cal, {**arrays, **_scan_weights(arrays["weight_map"], main, cal)}
     t0 = time.time()
     if arrays is None:
@@ -617,14 +743,253 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
                       estimated_cor_from_motor_pix={main.name: main.estimated_cor_from_motor_pix,
                                                     companion.name: companion.estimated_cor_from_motor_pix},
                       details=details, source="override" if override else "measured", fingerprint=fp)
+    _add_pitch(cal, main, companion, arrays, log, progress)
+    if override and cached_cal is not None and cached_cal.get("detector_smear") is not None:
+        # (the detector does not change with the caller's axis or vector: take the cached measurement)
+        cal.detector_smear = list(cached_cal["detector_smear"])
+        cal.details["smear"] = cached_cal.get("details", {}).get("smear")
+    else:
+        _add_smear(cal, main, arrays, log)
+    _add_registration(cal, main, companion, arrays, log, progress)
     log(f"calibration ({cal.source}) done in {time.time() - t0:.0f}s: COR {cor_main:.3f} (detector), vector {vector}, "
         f"rotation axis {rot_center:.3f} in a {width}-px merged frame")
     if cache_dir and not override:
-        def save_json(t):
-            with open(t, "w") as fh:
-                fh.write(cal.to_json())
-        _atomic_write(os.path.join(cache_dir, "calibration.json"), save_json)
+        _save_calibration(cache_dir, cal)
     return cal, {**arrays, **_scan_weights(wm, main, cal)}
+
+
+def _save_calibration(cache_dir, cal):
+    def save_json(t):
+        with open(t, "w") as fh:
+            fh.write(cal.to_json())
+    _atomic_write(os.path.join(cache_dir, "calibration.json"), save_json)
+
+
+def _add_pitch(cal, main, companion, arrays, log, progress):
+    """measure the helical pitch and record it in the calibration"""
+    res = measure_pitch(main, companion, arrays, cal.cor_main_detector, cal.placement, cal.rot_center, log=log,
+                        progress=progress)
+    cal.z_translation_scale = float(res["scale"])
+    cal.details["pitch"] = res
+
+
+def _add_registration(cal, main, companion, arrays, log, progress):
+    """register the companion's frames on the main scan's and record it in the calibration"""
+    res = measure_registration(main, companion, arrays, cal, log=log, progress=progress)
+    cal.companion_registration = res.pop("registration")
+    cal.details["registration"] = res
+
+
+# ============================================================================ companion frames against the main scan's
+REGISTRATION_MIN_TILES = 20
+REGISTRATION_MAX_SCATTER = 0.35    # rows: scatter of the pairs about the smoothed offset above which nothing is applied
+
+
+def _smooth_knots(y, median, mean):
+    """running median, then running mean (edge values repeated)"""
+    y = np.asarray(y, np.float64)
+    def run(v, n, f):
+        if n <= 1 or len(v) < 2:
+            return v
+        h = n // 2
+        pad = np.concatenate([np.full(h, v[0]), v, np.full(h, v[-1])])
+        return np.array([f(pad[i:i + n]) for i in range(len(v))])
+    return run(run(y, min(median, 2 * (len(y) // 2) + 1), np.median), min(mean, 2 * (len(y) // 2) + 1), np.mean)
+
+
+def registration_arrays(reg, n_proj):
+    """Calibration.companion_registration -> per-projection (row_offset, row_slope, slope_col) of the companion
+    (float32 arrays; None when there is no registration)"""
+    if not reg:
+        return None
+    p = np.asarray(reg["projection"], np.float64)
+    off, slope = np.zeros(n_proj, np.float32), np.zeros(n_proj, np.float32)
+    for s0, s1 in reg["segments"]:
+        m = (p >= s0) & (p < s1)
+        if not m.any():
+            continue
+        x = np.arange(s0, min(s1, n_proj))
+        off[x] = np.interp(x, p[m], np.asarray(reg["row_offset"])[m])
+        slope[x] = np.interp(x, p[m], np.asarray(reg["row_slope"])[m])
+    return off, slope, float(reg["slope_col"])
+
+
+def measure_registration(main, companion, arrays, cal, n_pairs=240, tile=240, log=print, progress=False):
+    """How the companion's frames lie on the main scan's, along the scan, from the frames themselves.
+
+    The calibrated vector places the companion by one (dy, dx) for the whole scan, found where the two detectors
+    overlap. For n_pairs projections spread over the scan, the main frame and the companion frame of the same angle
+    are compared where they see the same rays: their high-passed line integrals are registered on tiles
+    (_core.tile_shifts), and per pair  dv = a + phi u  is fitted (u: columns from the rotation axis): the row
+    displacement at the axis and its slope along the columns, a roll of the companion's frames against the main
+    scan's about the rotation axis. With a roll the one dy is right only at the middle of the overlap.
+    Against what the geometry assumes (the recorded z of both scans, the pitch scale, dy) the residual offset at the
+    axis and the slope are smoothed along the scan (running median, then mean), within the stretches where the
+    recorded difference of the two scans' z is continuous, and returned as knots for registration_arrays().
+
+    Returns a dict: registration ({} when too few pairs register or they scatter by more than
+    REGISTRATION_MAX_SCATTER rows), pairs [[main projection, companion projection, tiles, a, phi (rows per 1000
+    columns), b, psi (columns per 1000 rows), residual], ...] (b, psi: the lateral displacement at the axis and its
+    slope along the rows, measured but not applied), scatter, reason."""
+    t0 = time.time()
+    rows, cols = main.frame_shape
+    out = dict(registration={}, pairs=[], scatter=None, reason=None)
+    if tuple(companion.frame_shape) != (rows, cols):
+        return dict(out, reason="the scans' frames differ in shape")
+    pa, pb = cal.placement[main.name], cal.placement[companion.name]
+    off = (pa.shift_x - pa.x_readjustment) - (pb.shift_x - pb.x_readjustment)     # companion column = main column + off
+    lo, hi = max(0.0, -off), min(cols - 1.0, cols - 1.0 - off)                      # main columns both scans hold
+    c0, n_ov = int(math.ceil(lo)), int(math.floor(hi)) - int(math.ceil(lo))
+    if n_ov < 2 * tile:
+        return dict(out, reason=f"the scans overlap over {max(n_ov, 0)} columns only")
+    scale = cal.z_translation_scale or 1.0
+    dy = pb.z_readjustment - pa.z_readjustment
+    am, ac = np.asarray(main.unwrapped_angles_deg, np.float64), np.asarray(companion.unwrapped_angles_deg, np.float64)
+    zm = (np.asarray(main.z_translation_m, np.float64) - main.z_translation_m[0]) / main.pixel_size_m * scale
+    zc = (np.asarray(companion.z_translation_m, np.float64) - companion.z_translation_m[0]) / companion.pixel_size_m * scale
+    step = float(np.median(np.abs(np.diff(am))))
+    order = np.argsort(ac)
+    def partner(p):
+        i = int(np.clip(np.searchsorted(ac[order], am[p]), 1, len(ac) - 1))
+        q = order[i - 1] if abs(ac[order[i - 1]] - am[p]) <= abs(ac[order[i]] - am[p]) else order[i]
+        return int(q) if abs(ac[q] - am[p]) <= 0.5 * step + 1e-9 else -1
+    wm = arrays["weight_map"]
+    ext = {"m": Extractor(main, arrays["main_dark"], arrays["main_flats"], wm),
+           "c": Extractor(companion, arrays["companion_dark"], arrays["companion_flats"], wm)}
+    def line(e, p):
+        raw = e.src.frames(np.array([p]))[0].astype(np.float32)
+        sig = ((raw - e.dark) / e.cd[p]) / np.maximum(e._flat(p), FLT_MIN)
+        return -np.log(np.clip(sig, 1e-6, None))
+    def high_pass(im):
+        im = np.ascontiguousarray(im, np.float32)
+        return im - _core.gaussian_filter1d(_core.gaussian_filter1d(im, 0, 6.0, "reflect"), 1, 6.0, "reflect")
+    io, fo = int(math.floor(c0 + off)), (c0 + off) - math.floor(c0 + off)
+    picks = np.unique(np.linspace(0, len(am) - 1, n_pairs + 2)[1:-1].round().astype(int))
+    pairs = []
+    with _bar(progress, len(picks), "frame registration", "pair") as bar:
+        for p in picks:
+            q = partner(int(p))
+            if q >= 0:
+                A = high_pass(line(ext["m"], int(p))[:, c0:c0 + n_ov])
+                Bf = line(ext["c"], q)
+                B = high_pass(Bf[:, io:io + n_ov] * (1 - fo) + Bf[:, io + 1:io + 1 + n_ov] * fo if fo > 0 else Bf[:, io:io + n_ov])
+                t = _core.tile_shifts(np.ascontiguousarray(A), np.ascontiguousarray(B), tile, tile // 2, 20, 6)
+                t = t[np.isfinite(t[:, 2]) & (t[:, 4] > 0.3)]
+                if len(t) >= REGISTRATION_MIN_TILES:
+                    u = (t[:, 1] + c0 - cal.cor_main_detector) / 1000.0
+                    v = (t[:, 0] - 0.5 * (rows - 1)) / 1000.0
+                    M = np.stack([np.ones(len(t)), u, v], -1)
+                    cv, cu = np.linalg.lstsq(M, t[:, 2], rcond=None)[0], np.linalg.lstsq(M, t[:, 3], rcond=None)[0]
+                    keep = np.abs(t[:, 2] - M @ cv) <= 3 * 1.4826 * np.median(np.abs(t[:, 2] - M @ cv)) + 0.05
+                    if keep.sum() >= REGISTRATION_MIN_TILES:
+                        cv = np.linalg.lstsq(M[keep], t[keep, 2], rcond=None)[0]
+                    # what the geometry assumes: a row of the companion = the main scan's - (z difference) - dy
+                    residual = cv[0] + dy + (zc[q] - zm[p])
+                    pairs.append([int(p), q, int(len(t)), float(cv[0]), float(cv[1]), float(cu[0]), float(cu[2]), float(residual)])
+            bar.update(1)
+    out["pairs"] = pairs
+    if len(pairs) < max(8, len(picks) // 2):
+        log(f"frame registration: only {len(pairs)} of {len(picks)} projection pairs register: none applied")
+        return dict(out, reason="too few projection pairs register")
+    P = np.array(pairs)
+    q, d = P[:, 1], zc[P[:, 1].astype(int)] - zm[P[:, 0].astype(int)]
+    # stretches of continuous recorded difference (e.g. the stationary turns and the helix), in companion projections
+    cuts = [0]
+    for i in np.flatnonzero(np.abs(np.diff(d)) > 0.25):
+        qa, qb = int(q[i]), int(q[i + 1])
+        cut = (qa + qb + 1) // 2
+        if len(am) == len(ac) and np.allclose(am[qa:qb + 1], ac[qa:qb + 1], atol=0.5 * step):
+            full = zc[qa:qb + 1] - zm[qa:qb + 1]            # (the same projections in both scans: the exact place)
+            cut = qa + int(np.argmax(np.abs(full - d[i]) > 0.5 * abs(d[i + 1] - d[i])))
+        cuts.append(cut)
+    cuts.append(len(ac))
+    segments = [[int(a), int(b)] for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
+    row_offset, row_slope, dev = np.zeros(len(P)), np.zeros(len(P)), np.zeros(len(P))
+    for s0, s1 in segments:
+        m = (q >= s0) & (q < s1)
+        if m.any():
+            smooth = _smooth_knots(P[m, 7], 9, 5)
+            row_offset[m] = -smooth
+            dev[m] = P[m, 7] - smooth
+            row_slope[m] = _smooth_knots(P[m, 4], 21, 11) / 1000.0
+    scatter = float(1.4826 * np.median(np.abs(dev)))
+    out["scatter"] = scatter
+    summary = (f"frame registration of {companion.name} on {main.name} ({len(pairs)} projection pairs): rows at the "
+               f"rotation axis {(-row_offset).min():+.2f} .. {(-row_offset).max():+.2f} from the calibrated vector, roll "
+               f"{np.median(row_slope) * 1e3:+.2f} mrad ({row_slope.min() * 1e3:+.2f} .. {row_slope.max() * 1e3:+.2f}), "
+               f"scatter {scatter:.2f} rows  [{time.time() - t0:.0f}s]")
+    if scatter > REGISTRATION_MAX_SCATTER:
+        log(summary + ": too scattered, none applied")
+        return dict(out, reason="the pairs scatter too much")
+    log(summary)
+    out["registration"] = dict(projection=[int(v) for v in q], row_offset=[float(v) for v in row_offset],
+                               row_slope=[float(v) for v in row_slope], segments=segments,
+                               slope_col=float(cal.rot_center - (pb.shift_x - pb.x_readjustment)))
+    return out
+
+
+def _add_smear(cal, main, arrays, log):
+    """measure the detector's smear field from the main scan's flats and record it in the calibration"""
+    res = measure_smear(main, arrays["main_dark"], log=log)
+    cal.detector_smear = [float(v) for v in res["field"]]
+    cal.details["smear"] = res
+
+
+# ============================================================================ detector smear from the flats' noise
+SMEAR_TILE = 128
+SMEAR_MIN_PX = 0.5        # a field whose smear nowhere reaches this many pixels is not used
+SMEAR_MIN_GAIN = 0.97     # ... nor one that does not bring the residual of the noise spectra below this share
+
+
+def flat_noise_spectra(scan: BlissScan, dark, n_flats=200, tile=SMEAR_TILE):
+    """Noise power spectra of the scan's first flat series on a lattice of tiles (_core.tile_power_spectra): of the
+    differences of consecutive flats, each less the dark and scaled to its mean (what is the same in both, the beam's
+    profile and the fixed pattern, drops out; the noise stays). Returns (power (ny, nx, tile, tile / 2 + 1), tile
+    origins ys, xs, flats used)."""
+    refs = scan.flats[0]
+    n = min(n_flats, len(refs)) // 2 * 2
+    if n < 2:
+        raise ValueError("the detector's smear needs at least two flats")
+    rows, cols = scan.frame_shape
+    ys = list(range((rows % tile) // 2, rows - tile + 1, tile))
+    xs = list(range((cols % tile) // 2, cols - tile + 1, tile))
+    dark = np.asarray(dark, np.float32)
+    power = np.zeros((len(ys), len(xs), tile, tile // 2 + 1))
+    for k0 in range(0, n, 40):
+        fl = scan.read_frames(refs, slice(k0, min(n, k0 + 40))).astype(np.float32) - dark
+        fl /= fl.mean((1, 2), keepdims=True)
+        power += _core.tile_power_spectra(np.ascontiguousarray(fl[0::2] - fl[1::2]), tile, ys, xs)
+    return power, ys, xs, n
+
+
+def measure_smear(scan: BlissScan, dark, n_flats=200, log=print):
+    """The detector's smear field of a scan, from the noise of its flats (_core.smear_field_fit: calib.hpp). The field is kept
+    only if it explains the noise spectra (residual below SMEAR_MIN_GAIN of the residual without it) and reaches
+    SMEAR_MIN_PX somewhere on the detector; otherwise "field" is [] and nothing changes in the reconstruction."""
+    t0 = time.time()
+    power, ys, xs, n = flat_noise_spectra(scan, dark, n_flats)
+    rows, cols = scan.frame_shape
+    field, rms_none, rms_fit = _core.smear_field_fit(power, ys, xs, rows, cols)
+    th = np.array(field)
+    try:
+        zero = (-np.linalg.solve(th[:4].reshape(2, 2), th[4:]) * 1000 + [0.5 * (cols - 1), 0.5 * (rows - 1)]).tolist()
+    except np.linalg.LinAlgError:
+        zero = [float("nan"), float("nan")]
+    res = dict(field=[float(v) for v in field], rms_none=float(rms_none), rms_fit=float(rms_fit), zero=zero,
+               tiles=[len(ys), len(xs)])
+    corners = [(x, y) for x in (-0.5 * cols / 1000, 0.5 * cols / 1000) for y in (-0.5 * rows / 1000, 0.5 * rows / 1000)]
+    reach = max(abs(th[0] * x + th[1] * y + th[4]) for x, y in corners)
+    res.update(n_flats=int(n), max_smear_px=float(reach), scan=scan.name)
+    ok = res["rms_fit"] < SMEAR_MIN_GAIN * res["rms_none"] and reach >= SMEAR_MIN_PX
+    res["measured"] = res["field"]
+    if not ok:
+        res["field"] = []
+    log(f"detector smear from the noise of {n} flats of {scan.name}: "
+        + (f"{reach:.1f} px along the columns at the worst corner, none at column {res['zero'][0]:.0f} "
+           f"(residual of the noise spectra {res['rms_none']:.3f} -> {res['rms_fit']:.3f})" if ok else
+           f"nothing significant (residual {res['rms_none']:.3f} -> {res['rms_fit']:.3f}, reach {reach:.2f} px)")
+        + f"  [{time.time() - t0:.0f}s]")
+    return res
 
 
 def _scan_weights(wm, main, cal):

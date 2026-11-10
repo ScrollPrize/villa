@@ -74,11 +74,16 @@ def reference_mask(a, r):
         sys.exit(f"--reference_volume: {e}")
     print(f"reference volume {a.reference_volume}: uint8 output masked where its level {ref.scale} "
           f"({'x'.join(map(str, ref.level_shape))}, {'x'.join(map(str, ref.factors))} voxels each) is 0")
+    if ref.slice_ratio != 1:
+        print(f"  the reference has {ref.slice_ratio:.5f} slices per slice of this reconstruction (another helical pitch "
+              f"calibration): its slices are spread evenly over the {r.hi - r.lo} of the reconstruction; the mask is "
+              f"placed to within a few slices")
     return ref
 
 
 def describe_reference(ref):
-    return dict(location=ref.location, scale=ref.scale, factors=list(ref.factors), level_shape=list(ref.level_shape))
+    return dict(location=ref.location, scale=ref.scale, factors=list(ref.factors), level_shape=list(ref.level_shape),
+                slice_ratio=ref.slice_ratio)
 
 
 
@@ -324,8 +329,9 @@ def main(argv=None):
                           "(--roi crops it) and is 0 elsewhere")
     out.add_argument("--reference_volume", default=None, metavar="ZARR",
                      help="a masked uint8 volume on the reconstruction's grid (a local or http(s):// / s3:// Zarr array "
-                          "or OME-Zarr, read with vc_reader): the uint8 output is 0 where it is 0, so its mask need "
-                          "not be redone")
+                          "or OME-Zarr): the uint8 output is 0 where it is 0, so its mask need not be redone. Its "
+                          "number of slices may differ by up to 2 %% (a volume made with another helical pitch "
+                          "calibration): its slices are then spread evenly over the reconstruction's")
     out.add_argument("--reference_scale", type=int, default=0, metavar="LEVEL",
                      help="pyramid level of --reference_volume that decides the mask (default 0, full resolution): a "
                           "coarser level is a much smaller read and marks the same area to within its voxel size")

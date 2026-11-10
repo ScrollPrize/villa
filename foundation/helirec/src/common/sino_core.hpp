@@ -98,4 +98,26 @@ HR_HD float ramp_pad_value(const float* row, const float* mrow, float adj, int x
     return sub(mrow[nx - 1], adj);
 }
 
+// ---------------------------------------------------------------- band-limited shift of rows (sino.hpp)
+// sample i >= n of a row padded to L: the bridge from its last sample to its first
+HR_HD float shift_bridge(float last, float first, int i, int n, int L) {
+    const float t = static_cast<float>(i - n + 1) / static_cast<float>(L - n + 1);
+    const float w = 0.5f - 0.5f * cosf(3.14159265358979f * t);
+    return last + (first - last) * w;
+}
+// bin k of L (k <= L / 2) of a row delayed by `shift` samples, times 1 / L (the unnormalised inverse transform)
+HR_HD void shift_bin(float& re, float& im, int k, int L, float shift) {
+    const float s = 1.f / static_cast<float>(L);
+    if (2 * k == L) {
+        re *= cosf(3.14159265358979f * shift) * s;
+        im = 0.f;
+        return;
+    }
+    const float a = -6.28318530717959f * shift * static_cast<float>(k) / static_cast<float>(L);
+    const float c = cosf(a) * s, d = sinf(a) * s;
+    const float r = re * c - im * d;
+    im = re * d + im * c;
+    re = r;
+}
+
 }  // namespace helirec::sino_core

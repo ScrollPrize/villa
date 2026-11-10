@@ -18,11 +18,22 @@ struct ScanTrajectory {
     std::vector<double> z_translation_m;    // (n)
     std::vector<double> lateral_correction_m;  // (n) or empty (= 0)
     double pixel_size_m = 0;                // x pixel size used to convert translations
+    // Detector rows the sample really moves per row of recorded translation (z_translation_m / pixel_size_m): the
+    // calibration of the helical pitch. A pitch off by a fraction e misplaces what the top and the bottom of the
+    // detector see of a slice by e x (rows between them) along z: a blur along z that grows with the pitch.
+    double z_translation_scale = 1.0;
     int det_rows = 0, det_cols = 0;
     // placement in the merged (extended field of view) frame
     int shift_x = 0;           // integer column offset of this scan in the merged frame
     float x_readjustment = 0;  // shift_x - desired offset (e.g. -0.5)
     float z_readjustment = 0;  // vertical readjustment (pixels)
+    // Registration of this scan's frames on the pair's geometry, per projection (empty: none). row_offset: rows added
+    // to the vertical position, like z_readjustment. row_slope: the frame is sheared along the rows about detector
+    // column slope_col (the rotation axis in this scan's columns): what the geometry puts at row v of column c is
+    // read at row v + row_slope[i] (c - slope_col): a roll of the detector against the rotation axis.
+    std::vector<float> row_offset;
+    std::vector<float> row_slope;
+    float slope_col = 0;
     std::size_t n() const { return angles_deg.size(); }
 };
 
@@ -51,6 +62,7 @@ struct ChunkScan {
     int p0 = 0, p1 = 0;                  // projection range [p0, p1)
     std::vector<int32_t> row0;           // first raw row of the window (h_lo - margin - ishift)
     std::vector<float> fract_v;          // vertical interpolation fraction a
+    std::vector<float> row_slope;        // ScanTrajectory::row_slope of the projections (empty: none)
     std::vector<int32_t> j0;             // lower grid angle bin (unwrapped; j1 = (j0 + 1) % n_grid)
     std::vector<float> alpha;            // angular splat fraction (weight alpha to j0+1)
     std::vector<float> current_div;      // float32(I_p / 0.2): flat-field divisor
@@ -101,5 +113,12 @@ struct AngleBins {
 };
 double angle_grid_phase(const std::vector<double>& angles_deg, int n_grid);   // f_0 - round(f_0)
 AngleBins nearest_angle_bins(const std::vector<double>& angles_deg, int n_grid, double phase = 0);
+
+// One of `count` interleaved subsets of a scan's projections, for split reconstructions (independent parts of one
+// scan, e.g. the two halves whose shell correlation measures the scan's own signal-to-noise ratio): the indices of
+// the projections whose bin on the full angular grid (nearest_angle_bins, with the main scan's phase) is congruent to
+// `index` modulo `count`. Chosen by angle, not by projection number, so that every scan of a set keeps the same
+// angles in a subset.
+std::vector<int32_t> angle_subset(const std::vector<double>& angles_deg, int n_grid, double phase, int count, int index);
 
 }  // namespace helirec
