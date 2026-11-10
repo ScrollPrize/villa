@@ -24,4 +24,7 @@ bool currentRelationshipApplicable(const ObjectStore&, const Txn&, const std::st
 std::optional<RelationshipRevision> recordedRelationship(sqlite3*,const std::string& edgeUuid);
 std::optional<std::string> currentObjectReference(sqlite3*,const std::string& objectUuid);
 void requirePublishedGraphRead(const Txn&);
+// One logical store's timeline (including its physical shards). The owner is
+// explicit for consumers restoring/exporting a state from a referenced store.
+RevisionSelection revisionSelectionAt(sqlite3*,const std::string& owner,int64_t publishedAtUs,bool includeRetired);
 }

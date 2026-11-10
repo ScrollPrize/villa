@@ -30,6 +30,7 @@ def test_checked_request_versions_and_selection_record(db):
 
     rows = {r["uuid"]: r for r in db.select_objects(object_kind="note")}
     assert rows[a]["version"] == 1 and rows[a]["version_generation"] == status["generation"]
+    assert rows[a]["version_store"] == status["store"]
 
     ref = dict(store=status["store"], generation=status["generation"], object=a, version=1)
     missing = dict(ref, version=9)

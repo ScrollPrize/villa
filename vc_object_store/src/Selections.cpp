@@ -21,7 +21,7 @@ using detail::formatUuid;
 using detail::parseUuid;
 
 namespace {
-constexpr char kMagic[8] = {'V', 'C', 'S', 'E', 'L', '\0', '\1', '\n'};
+constexpr char kMagic[8] = {'V', 'C', 'S', 'E', 'L', '\0', '\2', '\n'};
 constexpr std::size_t kEntryBytes = 24;
 
 void putU32(std::vector<uint8_t>& out, uint32_t value)
@@ -36,7 +36,7 @@ uint32_t getU32(const uint8_t* p)
 
 Json versionJson(const ObjectVersion& v)
 {
-    return Json{{"generation", v.generation}, {"object", v.objectUuid}, {"version", v.version}};
+    return Json{{"store", v.storeUuid}, {"generation", v.generation}, {"object", v.objectUuid}, {"version", v.version}};
 }
 
 std::string uuidField(const Json& j, const char* key)
@@ -47,19 +47,19 @@ std::string uuidField(const Json& j, const char* key)
 
 std::vector<uint8_t> encodeSelectionRecord(const SelectionRecord& record)
 {
-    std::vector<std::string> generations;
-    std::map<std::string, uint32_t> generationIndex;
+    using Origin=std::pair<std::string,std::string>;
+    std::vector<Origin> origins;
+    std::map<Origin, uint32_t> originIndex;
     for (const auto& object : record.objects) {
-        if (formatUuid(parseUuid(object.storeUuid)) != formatUuid(parseUuid(record.storeUuid)))
-            throw std::invalid_argument("selection record: object " + object.objectUuid + " is from another store");
-        if (generationIndex.emplace(object.generation, uint32_t(generations.size())).second)
-            generations.push_back(object.generation);
+        const Origin origin{object.storeUuid,object.generation};
+        if (originIndex.emplace(origin, uint32_t(origins.size())).second)
+            origins.push_back(origin);
     }
     auto transforms = Json::array();
     for (const auto& transform : record.transforms) transforms.push_back(versionJson(transform));
     const auto header = Json{{"store", record.storeUuid}, {"generation", record.generation},
                              {"commit_sequence", record.commitSequence}, {"query", Json::parse(record.queryJson)},
-                             {"transforms", std::move(transforms)}, {"generations", generations},
+                             {"transforms", std::move(transforms)}, {"origins", origins},
                              {"count", record.objects.size()}}.dump();
     if (header.size() > std::numeric_limits<uint32_t>::max())
         throw std::invalid_argument("selection record: header too large");
@@ -72,7 +72,7 @@ std::vector<uint8_t> encodeSelectionRecord(const SelectionRecord& record)
             throw std::invalid_argument("selection record: version out of range for " + object.objectUuid);
         const auto uuid = parseUuid(object.objectUuid);
         out.insert(out.end(), uuid.begin(), uuid.end());
-        putU32(out, generationIndex.at(object.generation));
+        putU32(out, originIndex.at({object.storeUuid,object.generation}));
         putU32(out, uint32_t(object.version));
     }
     return out;
@@ -81,13 +81,14 @@ std::vector<uint8_t> encodeSelectionRecord(const SelectionRecord& record)
 SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
 {
     auto bad = [](const std::string& why) { return std::invalid_argument("selection record: " + why); };
-    if (bytes.size() < sizeof kMagic + 4 || std::memcmp(bytes.data(), kMagic, sizeof kMagic) != 0)
+    if (bytes.size() < sizeof kMagic + 4 || std::memcmp(bytes.data(), kMagic, 6) != 0 ||
+        (bytes[6]!=1&&bytes[6]!=2) || bytes[7]!=kMagic[7])
         throw bad("not a selection record (or an unknown format version)");
     const std::size_t headerBytes = getU32(bytes.data() + sizeof kMagic);
     const std::size_t entriesAt = sizeof kMagic + 4 + headerBytes;
     if (headerBytes > bytes.size() - sizeof kMagic - 4) throw bad("truncated header");
     SelectionRecord record;
-    std::vector<std::string> generations;
+    std::vector<std::pair<std::string,std::string>> origins;
     uint64_t count = 0;
     try {
         const auto header = Json::parse(bytes.begin() + sizeof kMagic + 4, bytes.begin() + entriesAt);
@@ -98,9 +99,14 @@ SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
         for (const auto& t : header.at("transforms")) {
             const auto version = t.at("version").get<int64_t>();
             if (version <= 0) throw bad("transform version must be positive");
-            record.transforms.push_back({record.storeUuid, uuidField(t, "generation"), uuidField(t, "object"), version});
+            record.transforms.push_back({bytes[6]==1?record.storeUuid:uuidField(t,"store"), uuidField(t, "generation"), uuidField(t, "object"), version});
         }
-        for (const auto& g : header.at("generations")) generations.push_back(formatUuid(parseUuid(g.get<std::string>())));
+        if(bytes[6]==1) {
+            for(const auto& g:header.at("generations"))origins.emplace_back(record.storeUuid,formatUuid(parseUuid(g.get<std::string>())));
+        } else for(const auto& origin:header.at("origins")) {
+            if(!origin.is_array()||origin.size()!=2)throw bad("invalid origin");
+            origins.emplace_back(formatUuid(parseUuid(origin.at(0).get<std::string>())),formatUuid(parseUuid(origin.at(1).get<std::string>())));
+        }
         count = header.at("count").get<uint64_t>();
     } catch (const Json::exception& e) {
         throw bad(std::string("malformed header: ") + e.what());
@@ -113,9 +119,9 @@ SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
         std::memcpy(uuid.data(), bytes.data() + at, 16);
         const auto generation = getU32(bytes.data() + at + 16);
         const auto version = getU32(bytes.data() + at + 20);
-        if (generation >= generations.size()) throw bad("generation index out of range");
+        if (generation >= origins.size()) throw bad("origin index out of range");
         if (version == 0) throw bad("version must be positive");
-        record.objects.push_back({record.storeUuid, generations[generation], formatUuid(uuid), int64_t(version)});
+        record.objects.push_back({origins[generation].first, origins[generation].second, formatUuid(uuid), int64_t(version)});
     }
     return record;
 }
@@ -138,7 +144,7 @@ SelectionRecord recordSelection(const ObjectStore& store, const Txn& txn, const 
         for (const auto& r : records) {
             if (!r.version)
                 throw std::invalid_argument("selection record: requires a read transaction (published versions)");
-            out.push_back({status.storeUuid, r.versionGeneration, r.uuid, *r.version});
+            out.push_back(r.reference());
         }
     };
     versions(store.selectObjects(txn, selection, std::vector<std::string>{}), record.objects);

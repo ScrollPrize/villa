@@ -7,6 +7,7 @@
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/Selections.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/server/Server.hpp"
@@ -113,7 +114,20 @@ try {
         auto zeroVersion = bytes; std::fill(zeroVersion.end() - 4, zeroVersion.end(), 0);
         require(rejects([&] { decodeSelectionRecord(zeroVersion); }), "zero version");
         auto foreign = captured; foreign.objects[0].storeUuid = util::newUuid();
-        require(rejects([&] { encodeSelectionRecord(foreign); }), "objects from another store refused");
+        if(!foreign.transforms.empty())foreign.transforms[0].storeUuid=util::newUuid();
+        require(decodeSelectionRecord(encodeSelectionRecord(foreign))==foreign, "mixed-store references round trip");
+        // Existing v1 artifacts used a single store plus a generation dictionary.
+        auto legacyHeader=nlohmann::json::parse(bytes.begin()+12,bytes.begin()+12+header);
+        legacyHeader["generations"]=nlohmann::json::array();
+        for(const auto& origin:legacyHeader.at("origins"))legacyHeader["generations"].push_back(origin.at(1));
+        legacyHeader.erase("origins");
+        for(auto& transform:legacyHeader["transforms"])transform.erase("store");
+        const auto text=legacyHeader.dump();
+        std::vector<uint8_t> legacy(bytes.begin(),bytes.begin()+8);legacy[6]=1;
+        for(int i=0;i<4;++i)legacy.push_back(uint8_t(text.size()>>(8*i)));
+        legacy.insert(legacy.end(),text.begin(),text.end());
+        legacy.insert(legacy.end(),bytes.begin()+12+header,bytes.end());
+        require(decodeSelectionRecord(legacy)==captured,"existing v1 artifacts remain readable");
     }
 
     // Kept as an artifact, and read back at its versions after edits.
@@ -211,6 +225,25 @@ try {
         require(recorded > 0, "some records completed under churn");
         std::cout << "records under transform churn: " << recorded << " exact, " << busy << " busy, "
                   << versionsSeen.size() << " transform versions seen\n";
+    }
+    // Paged hosted listings retain the owner on every row, not the server's
+    // writable attachment identity. Exact references must survive transport.
+    {
+        const auto base=directory.path/"base.vcobj",overlay=directory.path/"overlay.vcobj";
+        OpenOptions slim;slim.author="selection-test";slim.history=HistoryMode::Off;slim.spatialIndex=false;
+        {auto baseStore=ObjectStore::create(base,slim);auto w=baseStore.write();
+            ObjectRecord r;r.kind="fiber";baseStore.upsertObject(w,r);baseStore.seal(w);w.commit();}
+        {auto collection=ObjectCollection::create(overlay,{base},slim);}
+        SelectionRecord expected;
+        {auto overlayStore=ObjectStore::open(overlay,slim);
+            {auto w=overlayStore.write();ObjectRecord r;r.kind="fiber";overlayStore.upsertObject(w,r);w.commit();}
+            auto r=overlayStore.read();expected=recordSelection(overlayStore,r,{});}
+        server::Server mixed(overlay,serverOptions);mixed.start();
+        HostedStore client("http://127.0.0.1:"+std::to_string(mixed.port()));
+        const auto recorded=client.recordSelection({},1);
+        require(recorded==expected,"hosted selection retains mixed-source ownership");
+        for(const auto& revision:client.objectsAtVersions(recorded.objects))
+            require(bool(revision),"every hosted selected reference resolves");
     }
     std::cout << "object_store_selections: ok\n";
     return 0;

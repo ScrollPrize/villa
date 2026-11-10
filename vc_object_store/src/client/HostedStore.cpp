@@ -497,17 +497,17 @@ SelectionRecord HostedStore::recordSelection(const ObjectSelection& selection, i
     if (selection.transforms)
         throw std::invalid_argument("hosted store: selections use the store's recorded transforms, not explicit ones");
     const auto query = objectQueryRequestToJson(selection, std::nullopt);
-    auto versions = [](const StoreStatus& at, const std::vector<ObjectRecord>& records, std::vector<ObjectVersion>& out) {
+    auto versions = [](const std::vector<ObjectRecord>& records, std::vector<ObjectVersion>& out) {
         for (const auto& r : records) {
             if (!r.version) throw std::runtime_error("hosted store: selected record without a version");
-            out.push_back({at.storeUuid, r.versionGeneration, r.uuid, *r.version});
+            out.push_back(r.reference());
         }
     };
     for (int attempt = 0; attempt <= maxRestarts; ++attempt) {
         StoreStatus asOf;
         const auto objects = selectAllObjects(selection, std::vector<std::string>{}, pageSize, maxRestarts, &asOf);
         SelectionRecord record{asOf.storeUuid, asOf.generation, asOf.commitSequence, query, {}, {}};
-        versions(asOf, objects, record.objects);
+        versions(objects, record.objects);
         if (!selectionUsesTransforms(selection)) return record;
         // The transforms in force at asOf: read them, then make sure the feed
         // since asOf touched none of them (the listing itself restarts on
@@ -544,7 +544,7 @@ SelectionRecord HostedStore::recordSelection(const ObjectSelection& selection, i
         if (!valid || touchesTransforms(*this, changed, deleted, pageSize)) continue;
         std::sort(transforms.begin(), transforms.end(),
                   [](const ObjectRecord& a, const ObjectRecord& b) { return a.uuid < b.uuid; });
-        versions(asOf, transforms, record.transforms);
+        versions(transforms, record.transforms);
         return record;
     }
     throw StoreBusy("hosted store: transforms kept changing while recording a selection; retry later");

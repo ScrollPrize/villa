@@ -123,6 +123,7 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
     if (!source || source->objectUuid != current->uuid || source->deleted || source->record.retired)
         throw std::invalid_argument("object lifecycle: restoration requires an active revision of this object");
     Savepoint savepoint(db);
+    createRecordOverride(db,"objects",uuid);
     // An explicit historical restore can replace active geometry/metadata.
     // Its old observations remain in history, not attached to the new current
     // state without an explicit revalidation decision.
@@ -143,6 +144,9 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
         }
     }
     auto restored = source->record;
+    const auto origin=resolveObjectVersion(db,source->reference());
+    if(!origin)throw std::runtime_error("object lifecycle: restore source is unavailable");
+    prepareOverrideReferences(origin->source,db,restored);
     restoreCurrentExtensionRows(db, "objects", uuid, restored.meta);
     // upsert preserves identity/creation stamps and resets approval normally.
     upsertObjectImpl(db, author(), hostname(), restored, false, "restore", true);

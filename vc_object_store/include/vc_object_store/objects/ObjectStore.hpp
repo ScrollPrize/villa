@@ -74,6 +74,8 @@ struct RecordCommon {
     // history-off stores and records edited in the current transaction.
     std::optional<int64_t> version;
     std::string versionGeneration;
+    // Runtime/wire owner of a selected state, not a persistent row field.
+    std::string versionStoreUuid;
 };
 
 struct ObjectRecord : RecordCommon {
@@ -92,6 +94,7 @@ struct ObjectRecord : RecordCommon {
     // volume: the target-voxel length they were ordered by, which is the
     // afterLength cursor for the next page.
     std::optional<double> volumeLength;
+    ObjectVersion reference() const;
 };
 
 struct PointReference {
@@ -147,6 +150,11 @@ struct ObjectRevision {
     std::string storeUuid;
     std::optional<int64_t> commitSequence;
     ObjectRecord record;
+    // Construct a reference in this state's owning store/lineage, never the
+    // reader's attachment. Optional numbers select another retained version
+    // in that owner; use a full ObjectVersion to name a different owner.
+    ObjectVersion reference(std::optional<int64_t> selectedVersion = std::nullopt,
+                            const std::optional<std::string>& selectedGeneration = std::nullopt) const;
 };
 
 // Edge kind tying a data object to the object it describes (e.g. fit results

@@ -344,13 +344,17 @@ def test_record_fields_and_transaction_bindings(db, kind, detail):
     fields = ['name', 'format_version', 'storage_kind', 'storage_ref', 'data_checksum', kind]
     rows = db.select_objects(fields=fields)
     assert rows[0].pop('version') >= 1 and rows[0].pop('version_generation') == db.status()['generation']
+    assert rows[0].pop('version_store') == db.status()['store']
     assert rows == [{key: record[key] for key in ['uuid', 'kind', *fields]}]
     with ObjectStore.create(db.path + '.copy', author='copy') as other:
         other.import_json(db.export_json())
         imported = other.object(uid)
         assert imported['version_generation'] == other.status()['generation']
         assert imported['version_generation'] != record['version_generation']
-        assert {**imported, 'version_generation': record['version_generation']} == record
+        assert imported['version_store'] == other.status()['store']
+        assert imported['version_store'] != record['version_store']
+        assert {**imported, 'version_generation': record['version_generation'],
+                'version_store': record['version_store']} == record
     with db.write() as tx:
         peer = tx.upsert_object(dict(kind='note'))
         edge = tx.add_edge(dict(a=uid, b=peer, kind='related'))

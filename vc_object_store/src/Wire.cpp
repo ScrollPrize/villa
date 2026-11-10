@@ -146,6 +146,7 @@ ObjectRevision revisionFrom(const Json& j)
     const auto& record = j.at("record");
     r.record = exactMetaFrom(record, objectFromJson(record));
     commonFromJson(record, r.record);
+    r.record.versionStoreUuid=r.storeUuid;
     return r;
 }
 } // namespace
@@ -345,6 +346,7 @@ static void versionToJson(const RecordCommon& record, Json& j)
     if (!record.version) return;
     j["version"] = *record.version;
     j["version_generation"] = record.versionGeneration;
+    j["version_store"] = record.versionStoreUuid;
 }
 
 static void versionFromJson(const Json& j, RecordCommon& record)
@@ -352,6 +354,7 @@ static void versionFromJson(const Json& j, RecordCommon& record)
     if (!j.contains("version")) return;
     record.version = j.at("version").get<int64_t>();
     record.versionGeneration = j.at("version_generation").get<std::string>();
+    record.versionStoreUuid = j.value("version_store", std::string());
 }
 
 std::string objectQueryResultToJson(const StoreStatus& status, const std::vector<ObjectRecord>& objects,

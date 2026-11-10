@@ -458,7 +458,7 @@ ObjectVersion ObjectStore::versionReference(const Txn& txn, const ObjectRevision
 {
     if (revision.version <= 0) throw std::invalid_argument("object history: revision has no numbered version");
     if(!revision.storeUuid.empty()) {
-        const ObjectVersion reference{revision.storeUuid,revision.generation,revision.objectUuid,revision.version};
+        const auto reference=revision.reference();
         if(!resolveObjectVersion(static_cast<sqlite3*>(connection(txn)),reference))
             throw std::invalid_argument("object history: exact version is unavailable");
         return reference;
@@ -466,6 +466,22 @@ ObjectVersion ObjectStore::versionReference(const Txn& txn, const ObjectRevision
     const auto resolved=resolveObjectRevision(static_cast<sqlite3*>(connection(txn)),revision.uuid);
     if(!resolved)throw std::invalid_argument("object history: revision is unavailable");
     return {storeUuidText(resolved->source), resolved->revision.generation, resolved->revision.objectUuid, resolved->revision.version};
+}
+
+ObjectVersion ObjectRevision::reference(std::optional<int64_t> selectedVersion,
+                                       const std::optional<std::string>& selectedGeneration) const
+{
+    const auto number=selectedVersion.value_or(version);
+    if(number<=0||storeUuid.empty()||generation.empty()||objectUuid.empty())
+        throw std::invalid_argument("object reference: missing published identity");
+    return {storeUuid,selectedGeneration.value_or(generation),objectUuid,number};
+}
+
+ObjectVersion ObjectRecord::reference() const
+{
+    if(!version||*version<=0||versionStoreUuid.empty()||versionGeneration.empty())
+        throw std::invalid_argument("object reference: selected record lacks its published identity");
+    return {versionStoreUuid,versionGeneration,uuid,*version};
 }
 
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectVersion>& versions) const

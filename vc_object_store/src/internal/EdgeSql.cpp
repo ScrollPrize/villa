@@ -1,6 +1,8 @@
 #include "internal/EdgeSql.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "internal/SqlValues.hpp"
+#include "internal/ReferenceResolver.hpp"
+#include "internal/Versions.hpp"
 #include "geometry/GeometryInternal.hpp"
 
 namespace vc::objects::detail {
@@ -112,6 +114,7 @@ void bindAnchor(Statement& s, int firstIdx, const Anchor& a)
 EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const ObjectFields& fields)
 {
     EdgeRecord rec;
+    rec.versionStoreUuid=storeUuidText(db);
     const int64_t id = s.i64(0);
     rec.aUuid = formatUuid(s.blob16(2));
     rec.bUuid = formatUuid(s.blob16(3));
@@ -195,10 +198,12 @@ void requireUnusedObjectUuids(sqlite3* db,std::span<const EdgeInsertRow> rows,si
         std::string parameters;
         for(size_t i=0;i<count;++i){if(i)parameters+=',';parameters+='?'+std::to_string(i+1);}
         std::string sql="SELECT 1 FROM objects WHERE uuid IN ("+parameters+") LIMIT 1";
-        Statement collision(db,sql);
-        for(size_t i=0;i<count;++i){const auto& row=rows[begin+i];
-            collision.bind(int(i+1),row.binaryUuid?*row.binaryUuid:parseUuid(row.record->uuid));}
-        if(collision.row())throw std::runtime_error("object store: UUID already belongs to an object");
+        if(resolveReference(db,[&](sqlite3* source){
+            Statement collision(source,sql);
+            for(size_t i=0;i<count;++i){const auto& row=rows[begin+i];
+                collision.bind(int(i+1),row.binaryUuid?*row.binaryUuid:parseUuid(row.record->uuid));}
+            return collision.row();
+        }))throw std::runtime_error("object store: UUID already belongs to an object");
         begin+=count;
     }
 }

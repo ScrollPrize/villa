@@ -8,9 +8,8 @@ SurfaceGrid readSurfaceGrid(const StoreReader& reader, const std::string& surfac
 {
     std::optional<ObjectRevision> revision;
     if (version) {
-        const auto status = reader.status();
-        revision = reader.objectsAtVersions({ObjectVersion{status.storeUuid, generation.value_or(status.generation),
-                                                           surfaceUuid, *version}}).front();
+        const auto current=reader.currentObject(surfaceUuid);
+        if(current)revision=reader.objectsAtVersions({current->reference(version,generation)}).front();
         if (!revision || revision->deleted || revision->record.kind != "surface")
             throw std::invalid_argument("no surface " + surfaceUuid + " version " + std::to_string(*version));
     } else {

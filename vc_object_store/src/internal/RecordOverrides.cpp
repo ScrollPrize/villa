@@ -4,6 +4,20 @@
 #include "vc_object_store/objects/PackedStore.hpp"
 
 namespace vc::objects::detail {
+void prepareOverrideReferences(sqlite3* source,sqlite3* db,ObjectRecord& record)
+{
+    if(source==db)return;
+    if(record.storageKind=="file"&&!record.storageRef.empty()&&record.storageRef.find("://")==std::string::npos&&std::filesystem::path(record.storageRef).is_relative()){
+        auto path=std::filesystem::path(sqlite3_db_filename(source,"main"));
+        if(isPackedDatabasePath(path))path=packedContainerPath(path);
+        auto destination=std::filesystem::path(sqlite3_db_filename(db,"main"));
+        if(isPackedDatabasePath(destination))destination=packedContainerPath(destination);
+        const auto absolute=std::filesystem::absolute(path.parent_path()/record.storageRef).lexically_normal();
+        const auto relative=absolute.lexically_relative(std::filesystem::absolute(destination).parent_path());
+        record.storageRef=(relative.empty()?absolute:relative).generic_string();
+    }
+    referenceExtensionSchemas(source,db,"objects",record.meta);
+}
 bool createRecordOverride(sqlite3* db,const char* table,const std::string& uuid)
 {
     const bool object=std::string_view(table)=="objects";
@@ -15,17 +29,7 @@ bool createRecordOverride(sqlite3* db,const char* table,const std::string& uuid)
     RecordCommon common;
     if(object){
         auto record=resolveObject(db,uuid)->record;common=record;
-        if(record.storageKind=="file"&&!record.storageRef.empty()&&record.storageRef.find("://")==std::string::npos&&std::filesystem::path(record.storageRef).is_relative()){
-            auto path=std::filesystem::path(sqlite3_db_filename(source,"main"));
-            if(isPackedDatabasePath(path))path=packedContainerPath(path);
-            auto destination=std::filesystem::path(sqlite3_db_filename(db,"main"));
-            if(isPackedDatabasePath(destination))destination=packedContainerPath(destination);
-            // Preserve the same file reference when its owner changes.
-            const auto absolute=std::filesystem::absolute(path.parent_path()/record.storageRef).lexically_normal();
-            const auto relative=absolute.lexically_relative(std::filesystem::absolute(destination).parent_path());
-            record.storageRef=(relative.empty()?absolute:relative).generic_string();
-        }
-        referenceExtensionSchemas(source,db,table,record.meta);
+        prepareOverrideReferences(source,db,record);
         Statement descriptor(source,"SELECT geometry_manifest FROM objects WHERE uuid=?",parseUuid(uuid));
         descriptor.row();const auto text=descriptor.optText(0);
         insertObjectRow(db,record,id,record.commitSequence,record.createdBy,record.createdHost,record.createdAt,true,text?&*text:nullptr);

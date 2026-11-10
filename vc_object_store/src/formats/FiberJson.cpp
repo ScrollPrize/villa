@@ -312,11 +312,9 @@ std::map<std::string, std::string> currentFiberNetworkJson(
     const ObjectStore& db, const Txn& txn, const std::vector<std::string>& roots, uint64_t byteBudget)
 {
     LocalStoreReader reader(db, txn);
-    const auto status = reader.status();
     std::vector<ObjectVersion> selection;
     for (const auto& object : db.objectsByKind(txn, "fiber", {}, true))
-        selection.push_back({status.storeUuid, object.versionGeneration.empty() ? status.generation : object.versionGeneration,
-            object.uuid, object.version.value_or(0)});
+        selection.push_back(object.reference());
     return fiberNetworkJson(reader, selection, roots, byteBudget);
 }
 

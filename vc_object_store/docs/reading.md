@@ -208,6 +208,10 @@ force. `record_selection(query)` captures one (hosted stores too);
 [artifact](writing.md#artifacts). Read the objects back with
 `objects_at_versions`. Explicit transforms and limits are refused.
 
+Selection encoding version 2 retains each object's owning store and publication lineage through a compact origin dictionary; entries remain 24 bytes. Transforms carry the same complete identity. Existing version-1 single-store records remain readable. This is an artifact format update, not a database schema change. Number-only version selectors use the current record's owner and lineage by default; a full `ObjectVersion` is required to select a state from another owner or branch explicitly.
+
+Current listings include `version_store` alongside `version` and `version_generation`, including projected and hosted listings. This is read-result metadata derived from the owning database, not a stored per-record column. Hosted clients require this identity when creating exact references; they do not substitute the server attachment's identity when it is missing. Per-object history follows the visible owner's retained history, and historical exports use that owner's timeline (including its shards), not the overlay's publication timestamps. This does not define a combined historical timeline for independently published linked stores.
+
 ## Converting old stores
 
 The runtime opens schema 21 only. Upstream schemas 16–20 require conversion; unpublished experimental layouts are not supported. Stop every client, then convert into a new

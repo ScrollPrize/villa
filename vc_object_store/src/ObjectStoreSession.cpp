@@ -254,7 +254,7 @@ StoreStatus ObjectStoreSession::status(const AttachmentIdentity& identity)
 
 PinnedObject pinOf(const AttachmentIdentity& attachment, const ObjectRevision& revision, const std::string& activeGeneration)
 {
-    return {attachment, {attachment.storeUuid, revision.objectUuid}, revision.generation, revision.version,
+    return {attachment, {revision.reference().storeUuid, revision.objectUuid}, revision.generation, revision.version,
             revision.geometryRevision, activeGeneration};
 }
 
@@ -344,8 +344,8 @@ std::vector<ArtifactFile> ObjectStoreSession::artifacts(const AttachmentIdentity
     const auto uuid = util::canonicalUuid(objectUuid);
     std::optional<ObjectRevision> revision;
     if (version) {
-        const auto status = this->status(identity);
-        revision = objectsAtVersions(identity, {{status.storeUuid, generation.value_or(status.generation), uuid, *version}}).front();
+        const auto current=currentObject(identity,uuid);
+        if(current)revision=objectsAtVersions(identity,{current->reference(version,generation)}).front();
     } else {
         revision = currentObject(identity, uuid);
     }

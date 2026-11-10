@@ -11,12 +11,14 @@
 //
 // The binary form is compact, about 24 bytes per object, and is meant to be
 // kept as an artifact (objects/Artifacts.hpp):
-//   "VCSEL\0\1\n"  8-byte magic (format version 1)
+//   "VCSEL\0\2\n"  8-byte magic (format version 2)
 //   u32            header length (little-endian), then the header JSON:
 //                  store, generation, commit_sequence, query, transforms,
-//                  generations (the publication generations entries use), count
-//   count x 24 B   object UUID (16 bytes), u32 index into generations,
+//                  origins ([store, generation] pairs entries use), count
+//   count x 24 B   object UUID (16 bytes), u32 index into origins,
 //                  u32 version (little-endian)
+// Version 1 (single-store generation dictionary) remains readable. Version 2
+// transforms also include their owning store, independent of the query store.
 
 #include <cstdint>
 #include <span>

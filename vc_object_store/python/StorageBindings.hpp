@@ -123,7 +123,8 @@ void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::stri
     });
     if (include("meta")) d["meta"] = jsonLoads(r.meta);
     // Inline numbered version (including pending edits inside a write).
-    if (r.version) { d["version"] = *r.version; d["version_generation"] = r.versionGeneration; }
+    if (r.version) { d["version"] = *r.version; d["version_generation"] = r.versionGeneration;
+        d["version_store"] = r.versionStoreUuid; }
 }
 
 nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fields = nullptr)

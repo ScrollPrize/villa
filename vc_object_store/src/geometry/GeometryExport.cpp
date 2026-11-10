@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "internal/Database.hpp"
+#include "internal/History.hpp"
 #include "geometry/SourceMetadata.hpp"
 #include "vc_object_store/objects/GeometryExport.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
@@ -75,9 +76,12 @@ ObjectVersion exportGeometry(const ObjectStore& db, const ReadTxn& read, const s
         const auto revision = db.geometryRevision(read, *object->geometryRevision);
         if (!revision) throw std::runtime_error("geometry revision not found");
         std::optional<RevisionSelection> selection;
-        if (version && db.provisioning(read).history == HistoryMode::On) {
-            if (!object->publishedAtUs) throw std::runtime_error("object version has no publication time");
-            selection = ObjectStoreImplAccess::revisionSelectionAt(db, read, *object->publishedAtUs, true);
+        if (version && object->publishedAtUs) {
+            selection = detail::revisionSelectionAt(ObjectStoreImplAccess::conn(read),object->storeUuid,*object->publishedAtUs,true);
+        } else if(version) {
+            const auto current=db.currentObjectRevision(read,objectUuid);
+            if(!current||current->reference()!=*version)
+                throw std::runtime_error("object version has no publication time");
         }
         snapshot.revision = *revision;
         if (revision->kind == "fiber") {
@@ -85,12 +89,11 @@ ObjectVersion exportGeometry(const ObjectStore& db, const ReadTxn& read, const s
                 fiberJson = currentFiberNetworkJson(db, read, {object->objectUuid},
                     std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
             } else {
-                const auto store = db.status(read).storeUuid;
                 std::vector<ObjectVersion> fibers;
                 for (const auto& [uuid, pin] : *selection)
                     if (pin)
                         if (const auto pinned = ObjectStoreImplAccess::objectRevision(db, read, *pin); pinned && pinned->record.kind == "fiber")
-                            fibers.push_back({store, pinned->generation, uuid, pinned->version});
+                            fibers.push_back(pinned->reference());
                 fiberJson = fiberNetworkJson(LocalStoreReader(db, read), fibers, {object->objectUuid},
                                              std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
             }

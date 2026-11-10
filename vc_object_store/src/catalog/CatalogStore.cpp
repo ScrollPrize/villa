@@ -285,7 +285,7 @@ void restoreCatalogVersion(ObjectStoreSession& session, const AttachmentIdentity
         for (const auto& version : reader.objectHistory(uuid))
             if (!version.deleted && Json::parse(version.record.meta).value("catalog_write", std::string()) == token)
                 return std::vector<TransactionOperation>{RestoreObjectOp{
-                    uuid, ObjectVersion{reader.status().storeUuid, version.generation, uuid, version.version}}};
+                    uuid, version.reference()}};
         throw std::runtime_error("the catalog version of " + uuid + " is not in its history");
     });
 }

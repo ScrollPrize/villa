@@ -5,6 +5,7 @@
 #include "geometry/SequenceMetadata.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/ImmutableImport.hpp"
+#include "internal/VisibleRows.hpp"
 
 namespace vc::objects::detail {
 namespace {
@@ -136,23 +137,29 @@ void updateSourcePointIdentities(sqlite3* db, const std::string& object,
     clearDirty(db,object);
 }
 std::optional<SourcePoint> sourcePoint(sqlite3* db, const std::string& origin, int64_t id) {
-    if(!hasSourceIdentityIndex(db))return std::nullopt;
-    Statement s(db,"SELECT p.object_uuid,p.point_offset FROM source_points p JOIN objects o ON o.uuid=p.object_uuid WHERE o.state=0 AND p.origin=? AND p.point_id=? LIMIT 2",
-        origin, id);
-    if(geometryWork) ++geometryWork->identityRows;
-    if(!s.row()) return std::nullopt;
-    SourcePoint result{formatUuid(s.blob16(0)),s.i64(1)};
-    if(s.row()) throw GeometrySourceRejected("duplicate point ID in source document");
+    VisibleObjectRows rows(db,[&](sqlite3* source)->std::unique_ptr<Statement>{
+        if(!hasSourceIdentityIndex(source))return {};
+        if(geometryWork)++geometryWork->identityRows;
+        return std::make_unique<Statement>(source,
+            "SELECT p.object_uuid,p.point_offset FROM source_points p JOIN objects o ON o.uuid=p.object_uuid "
+            "WHERE o.state=0 AND p.origin=? AND p.point_id=? ORDER BY p.object_uuid",origin,id);
+    });
+    if(!rows.row())return {};
+    const SourcePoint result{rows.values().uuid(0),rows.values().i64(1)};
+    if(rows.row())throw GeometrySourceRejected("duplicate point ID in source document");
     return result;
 }
 std::optional<std::string> sourceCollection(sqlite3* db, const std::string& origin, const std::string& id) {
-    if(!hasSourceIdentityIndex(db))return std::nullopt;
-    Statement s(db,"SELECT s.object_uuid FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid WHERE o.state=0 AND s.origin=? AND s.collection_id=? LIMIT 2",
-        origin, id);
-    if(geometryWork) ++geometryWork->identityRows;
-    if(!s.row()) return std::nullopt;
-    const auto result=formatUuid(s.blob16(0));
-    if(s.row()) throw GeometrySourceRejected("duplicate source collection ID");
+    VisibleObjectRows rows(db,[&](sqlite3* source)->std::unique_ptr<Statement>{
+        if(!hasSourceIdentityIndex(source))return {};
+        if(geometryWork)++geometryWork->identityRows;
+        return std::make_unique<Statement>(source,
+            "SELECT s.object_uuid FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid "
+            "WHERE o.state=0 AND s.origin=? AND s.collection_id=? ORDER BY s.object_uuid",origin,id);
+    });
+    if(!rows.row())return {};
+    const auto result=rows.values().uuid(0);
+    if(rows.row())throw GeometrySourceRejected("duplicate source collection ID");
     return result;
 }
 void validateSourceIdentities(sqlite3* db, const std::string& object) {

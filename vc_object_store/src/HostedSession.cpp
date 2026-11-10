@@ -229,7 +229,7 @@ void HostedAttachment::prefetch(ObjectPrefetchJob& job, const std::atomic_bool& 
         std::vector<ObjectVersion> versions;
         for (const auto& record : records) {
             if (!record.version) throw std::runtime_error("Object listing has no version");
-            versions.push_back({captured.storeUuid, record.versionGeneration, record.uuid, *record.version});
+            versions.push_back(record.reference());
         }
         {
             std::lock_guard lock(job.mutex_);

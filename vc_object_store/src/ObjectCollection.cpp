@@ -44,6 +44,11 @@ bool KeyRoute::matches(int64_t id) const {
     return value%divisor==remainder;
 }
 namespace {
+OpenOptions readonlyOptions(OpenOptions options) {
+    options.readOnly=true;
+    options.serviceOwner=false; // Ownership belongs to the writable attachment, never its sealed dependencies.
+    return options;
+}
 bool hasCollection(sqlite3* db) {
     Statement s(db,"SELECT 1 FROM store_required_features WHERE name='collection-v1'"); return s.row();
 }
@@ -329,7 +334,7 @@ const Txn& ObjectCollection::Impl::txn(const CollectionTxn& t,size_t n)const{
 WriteTxn& ObjectCollection::Impl::writer(CollectionTxn& t){check(t);if(!t.writable())throw std::runtime_error("collection: read-only transaction");if(t.impl_->producingInitialEdges)throw std::runtime_error("collection: initial edge producer cannot mutate the destination");return std::get<WriteTxn>(t.impl_->root);}
 
 void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,const std::optional<CollectionMember>& expected,std::set<std::string>& visiting,sqlite3* existingRoot) {
-    auto path=input;auto opt=options;opt.physicalPartitionOnly=true;if(!root)opt.readOnly=true;
+    auto path=input;auto opt=root?options:readonlyOptions(options);opt.physicalPartitionOnly=true;
     std::unique_ptr<ObjectStore> store;std::unique_ptr<ReadTxn> read;
     if(expected&&!existingRoot){
         // Reuse the successful candidate's connection/snapshot. This is file
@@ -418,7 +423,7 @@ struct detail::CollectionReadContext {
     std::map<size_t,std::unique_ptr<ReadTxn>> readers;
     std::set<StatementPool*> configured;
     CollectionReadContext(sqlite3* sql,const std::filesystem::path& path,const OpenOptions& options):root(sql){
-        collection.options=options;collection.options.readOnly=true;std::set<std::string> visiting;collection.load(path,true,{},visiting,sql);
+        collection.options=readonlyOptions(options);std::set<std::string> visiting;collection.load(path,true,{},visiting,sql);
         if(const auto found=activeStatementPools.find(root);found!=activeStatementPools.end()) {
             borrowedPool=found->second;previousReferences=borrowedPool->referenceSource;previousObjects=borrowedPool->objectSource;
             previousEdges=borrowedPool->edgeSource;previousQueries=borrowedPool->querySources;
@@ -480,7 +485,7 @@ ObjectCollection ObjectCollection::open(const std::filesystem::path& path,const 
 }
 ObjectCollection ObjectCollection::create(const std::filesystem::path& path,const std::vector<std::filesystem::path>& bases,const OpenOptions& options){
     std::vector<CollectionMember> members;int64_t commitSequence=options.initialCommitSequence;
-    auto readOptions=options;readOptions.readOnly=true;
+    const auto readOptions=readonlyOptions(options);
     for(const auto& base:bases){auto c=open(base,readOptions);auto t=c.read();auto p=c.provisioning(t);
         if(!p.sealed)throw std::runtime_error("collection: base must be sealed");
         if(p.commitSequence>=INT64_MAX-1)throw std::runtime_error("collection: dependency commit sequence exhausted");
@@ -502,7 +507,7 @@ ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::
     // This path is private to the initial builder, which owns staging and
     // publication. No intermediate writable store is published or reopened.
     std::vector<CollectionMember> members;int64_t commitSequence=options.initialCommitSequence;
-    auto readOptions=options;readOptions.readOnly=true;
+    const auto readOptions=readonlyOptions(options);
     for(const auto& base:bases){auto c=ObjectCollection::open(base,readOptions);auto r=c.read();
         const auto p=c.provisioning(r);if(!p.sealed||p.commitSequence>=INT64_MAX-1)
             throw std::runtime_error("initial collection needs sealed, non-exhausted dependencies");
@@ -544,7 +549,7 @@ void detail::InitialCollectionAccess::writeManifest(const std::filesystem::path&
 }
 ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& path,const std::vector<std::filesystem::path>& shards,const OpenOptions& options,const std::vector<KeyRoute>& requestedRoutes){
     if(shards.empty())throw std::runtime_error("collection: empty shard list");
-    auto readOptions=options;readOptions.readOnly=true;
+    const auto readOptions=readonlyOptions(options);
     std::vector<CollectionMember> members;for(const auto& shard:shards){
         auto c=open(shard,readOptions);auto t=c.read();if(!c.provisioning(t).sealed)throw std::runtime_error("collection: unpublished shard");
         // A physical partition may itself have immutable dependencies (for
@@ -579,7 +584,7 @@ ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& pa
     // Validate all targets and the routing map before the publication name exists.
     {auto verified=open(stage,readOptions);}
     staged.publish();
-    auto readonly=options;readonly.readOnly=true;return open(path,readonly);
+    return open(path,readonlyOptions(options));
 }
 CollectionTxn ObjectCollection::read(){return CollectionTxn(std::make_unique<CollectionTxn::Impl>(impl_.get(),false));}
 void ObjectCollection::checkpoint(){impl_->nodes[0].store->checkpoint();}

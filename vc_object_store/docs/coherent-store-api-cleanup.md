@@ -39,4 +39,21 @@ Exact references resolve across stores; arbitrary collection-wide historical sna
 
 ## Verification
 
-Final command: `bash local/scripts/run_vcobj_pr_tests` (Linux, RelWithDebInfo native build, Python 3.14). Results: 52 native tests passed and one optional SSH test skipped; 199 Python tests passed; 117 Spiral integration tests passed and one optional real-data test skipped. Native fixtures cover plain/packed/sharded stores and source/overlay history on/off combinations. `git diff --check` passed. The existing Spiral `PatchSamplingAtlas` nanobind shutdown leak diagnostic remains; it was present in the baseline and is outside this cleanup. No full-volume performance or macOS result is claimed.
+Previous completed pass: `bash local/scripts/run_vcobj_pr_tests` (Linux, RelWithDebInfo native build, Python 3.14). Results: 52 native tests passed and one optional SSH test skipped; 199 Python tests passed; 117 Spiral integration tests passed and one optional real-data test skipped. Native fixtures cover plain/packed/sharded stores and source/overlay history on/off combinations. `git diff --check` passed. The existing Spiral `PatchSamplingAtlas` nanobind shutdown leak diagnostic remains; it was present in the baseline and is outside this cleanup. No full-volume performance or macOS result is claimed.
+
+## Follow-up audit tasks
+
+Baseline: `ce429d54a`. The local audit probe reproduced all five issues below. Fix through shared resolution, without proxy records or payload duplication, and add permanent regressions before closing each item.
+
+- [x] H. Restore inherited archived geometry: create the ordinary record override before restoration; never silently retain the newer geometry or dereference a missing local ID.
+- [x] I. Exact references in consumers: use the selected record's source identity in selections, fiber exports and other version consumers; support mixed-source saved selections.
+- [x] J. UUID namespace: reject object/edge collisions across visible referenced stores, not only within the writable database.
+- [x] K. Source identity lookup: resolve indexed source identities across referenced stores with overlay precedence instead of treating inherited objects as absent.
+- [x] L. History policy changes: preserve borrowed geometry references rather than copying their payloads into the overlay.
+- [x] Add targeted regressions, run the approved PR suite and record results for H–L.
+
+Implemented: H shares override preparation for restored metadata (including relative file references) and selects default restore history from the visible owner. I uses shared reference construction, mixed-source selection artifacts and explicit owning-store snapshot queries for historical exports; hosted listings/downloads carry runtime owner identity too. J checks the shared reference scope without changing trusted initial batch imports. K reuses the indexed visible-row merger. L leaves immutable dependency geometry under its original retention policy. The hosted regression also exposed inherited `serviceOwner` options on read-only dependencies; one shared read-option helper now removes that invalid combination. No persistent tables, columns, proxy records or payload copies have been added.
+
+Permanent regressions cover active/retired/default inherited restores, relative file references, mixed local/inherited selections over paged hosted transport, version-1 selection artifact compatibility, inherited historical geometry export, both cross-kind UUID collision directions, source collection/point duplicates across stores, override/deletion precedence, and repeated On→Off→On→Off history transitions retaining borrowed delta geometry with zero local geometry chunks.
+
+Follow-up verification: `bash local/scripts/run_vcobj_pr_tests` completed successfully on Linux with 52 native tests passed (one optional SSH skip), 199 Python tests passed, and 117 Spiral integration tests passed (one optional real-data skip). `git diff --check` passed. The pre-existing Spiral nanobind shutdown leak diagnostic remains unchanged. No macOS or full-volume performance validation was run. Selection artifacts now encode version 2 while decoding existing version 1; database schema remains 21, with unchanged binary persistent identifiers.

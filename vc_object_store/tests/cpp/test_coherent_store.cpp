@@ -4,7 +4,11 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
+#include "vc_object_store/objects/Selections.hpp"
+#include "vc_object_store/objects/FiberJson.hpp"
+#include "vc_object_store/objects/StoreConversion.hpp"
 #include "internal/Database.hpp"
+#include "imports/SourceIdentityIndex.hpp"
 #include <fstream>
 #include <iostream>
 
@@ -176,11 +180,100 @@ void spatialQueries(){
     {auto r=store.read();SurfaceProximityQuery near;near.point={1,1,2};near.tolerance=.1;
         require(store.nearestSurfaces(r,near).empty(),"spatial tombstone hides source mesh");}
 }
+
+void followupRegressions(){
+    TemporaryDirectory dir;const auto opt=options(HistoryMode::On);const auto basePath=dir.path/"base.vcobj";
+    std::string a,b,retired,edge,point,oldGeometry,newGeometry;ObjectVersion oldVersion,newVersion;
+    vc::geometry::Fiber fiber;fiber.linePoints={{0,0,0},{10,0,0}};
+    const auto original=vc::geometry::encode(fiber);
+    {auto store=ObjectStore::create(basePath,opt);
+        {auto w=store.write();ObjectRecord r;r.kind="fiber";a=store.upsertObject(w,r);b=store.upsertObject(w,r);retired=store.upsertObject(w,r);
+            oldGeometry=store.putGeometry(w,a,original);
+            ObjectRecord p;p.kind="point_collection";p.meta=R"({"source":{"origin":"audit-source","source_collection_id":"7"}})";
+            point=store.upsertObject(w,p);vc::geometry::PointCollection points;points.ids={42};points.points={{1,2,3}};
+            store.putGeometry(w,point,vc::geometry::encode(points));w.commit();}
+        {auto r=store.read();oldVersion=store.currentObjectRevision(r,a)->reference();}
+        {auto w=store.write();const std::array<double,6> xyz{0,0,0,20,0,0};
+            newGeometry=store.editGeometry(w,a,{{"line_points",0,scalarBytes<double>(xyz)}},oldGeometry);w.commit();}
+        {auto r=store.read();newVersion=store.currentObjectRevision(r,a)->reference();}
+        {auto w=store.write(VersionSelection{{retired,1},{a,newVersion.version},{b,1}});store.retireObject(w,retired);
+            EdgeRecord e;e.kind="related";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
+            edge=store.addEdge(w,e);store.seal(w);w.commit();}
+    }
+    const auto overlay=[&](const char* name){const auto path=dir.path/name;
+        {auto collection=ObjectCollection::create(path,{basePath},opt);}return ObjectStore::open(path,opt);};
+    {auto store=overlay("select.vcobj");
+        {auto w=store.write();store.upsertObject(w,track(util::newUuid()));w.commit();}
+        auto r=store.read();const auto record=recordSelection(store,r,{});
+        require(record.objects.size()==4,"selection includes local and inherited objects");
+        require(decodeSelectionRecord(encodeSelectionRecord(record))==record,"mixed-owner selection round trips");
+        for(const auto& ref:record.objects)require(bool(store.objectAtVersion(r,ref)),"selection references actual owner");
+        require(currentFiberNetworkJson(store,r,{a},1024*1024).size()==1,"fiber export resolves inherited exact state");
+    }
+    {auto store=overlay("collision.vcobj");
+        mustFail([&]{auto w=store.write();auto r=track(edge);store.upsertObject(w,r);w.commit();});
+        mustFail([&]{auto w=store.write();EdgeRecord e;e.uuid=point;e.kind="related";e.aUuid=a;e.bUuid=b;
+            e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;store.addEdge(w,e);w.commit();});
+        {auto w=store.write();store.removeEdge(w,edge);w.commit();}
+        mustFail([&]{auto w=store.write();store.upsertObject(w,track(edge));w.commit();});
+    }
+    {auto store=overlay("source.vcobj");
+        const auto check=[&](bool found){auto r=store.read();auto* db=ObjectStoreImplAccess::conn(r);
+            const auto p=sourcePoint(db,"audit-source",42);const auto c=sourceCollection(db,"audit-source","7");
+            require(bool(p)==found&&bool(c)==found,"source lookup follows visible owner and tombstones");
+            if(found)require(p->object==point&&*c==point,"source lookup resolves correct object");};
+        check(true);
+        for(bool sameCollection:{true,false})mustFail([&]{auto w=store.write();auto p=*store.objectByUuid(w,point);p.uuid=util::newUuid();p.storageKind="";p.storageRef="";
+            if(!sameCollection)p.meta=R"({"source":{"origin":"audit-source","source_collection_id":"8"}})";
+            const auto id=store.upsertObject(w,p);vc::geometry::PointCollection points;points.ids={42};points.points={{1,2,3}};
+            store.putGeometry(w,id,vc::geometry::encode(points));
+            auto* db=ObjectStoreImplAccess::conn(w);refreshSourceIdentityIndex(db);validateSourceIdentities(db,id);w.commit();});
+        {auto w=store.write();store.setMeta(w,point,"note","true");w.commit();}check(true);
+        {auto w=store.write();store.deleteObject(w,point);w.commit();}check(false);
+    }
+    for(bool retire:{false,true}){auto store=overlay(retire?"restore-retired.vcobj":"restore-active.vcobj");
+        if(retire){int64_t current;{auto r=store.read();current=*store.currentVersion(r,a);}
+            auto w=store.write(VersionSelection{{a,current}});store.retireObject(w,a);w.commit();}
+        int64_t version;{auto r=store.read();version=*store.currentVersion(r,a);}
+        {auto w=store.write(VersionSelection{{a,version}});store.restoreObject(w,a,oldVersion);w.commit();}
+        auto r=store.read();const auto current=store.currentObjectRevision(r,a);
+        require(!current->record.retired&&current->version==version+1,"restore publishes once, preserving version continuity");
+        require(store.currentGeometry(r,a)->uuid==oldGeometry,"restore installs requested inherited archived geometry");
+        require(store.readGeometryArray(r,oldGeometry,"line_points")==scalarBytes<double>(std::array<double,6>{0,0,0,10,0,0}),"restored bytes match old geometry");
+        require(store.objectAtVersion(r,newVersion)->geometryRevision==newGeometry,"restore preserves old source version");
+        require(store.edgesOf(r,a,true).empty(),"restore does not revive outdated relationships");
+    }
+    {auto store=overlay("restore-default.vcobj");int64_t version;
+        {auto r=store.read();version=*store.currentVersion(r,retired);}
+        {auto w=store.write(VersionSelection{{retired,version}});store.restoreObject(w,retired);w.commit();}
+        auto r=store.read();require(!store.objectByUuid(r,retired)->retired,"default restore finds inherited owner's last active revision");
+    }
+    {const auto path=dir.path/"policy.vcobj";
+        {auto store=overlay("policy.vcobj");auto w=store.write();store.setMeta(w,a,"note","true");w.commit();}
+        for(auto mode:{HistoryMode::Off,HistoryMode::On,HistoryMode::Off}){
+            changeHistoryMode(path,mode);auto store=ObjectStore::open(path,options(mode));auto r=store.read();
+            Statement count(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM geometry_chunks");count.row();
+            require(count.i64(0)==0,"history policy must not copy borrowed delta geometry");
+            require(store.currentGeometry(r,a)->uuid==newGeometry,"policy preserves borrowed geometry identity");
+            const auto bytes=store.readGeometryArray(r,newGeometry,"line_points");
+            require(bytes==scalarBytes<double>(std::array<double,6>{0,0,0,20,0,0}),"borrowed geometry readable after each history transition");
+        }
+    }
+}
+
+void restoreFileReference(){
+    Fixture f(HistoryMode::On,HistoryMode::On);
+    auto store=ObjectStore::open(f.overlay,options(HistoryMode::On));ObjectVersion original;
+    {auto r=store.read();original=store.currentObjectRevision(r,f.file)->reference();}
+    {auto w=store.write(VersionSelection{{f.file,original.version}});store.restoreObject(w,f.file,original);w.commit();}
+    auto r=store.read();require(store.resolveStoragePath(r,f.file)==f.base.parent_path()/"fiber.json",
+        "restore rebases metadata file references through the ordinary override helper");
+}
 }
 int main()try{
     for(const auto base:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On}){
         readsAndOverrides(base,overlay);geometryEdit(base,overlay,"retain");
         if(overlay==HistoryMode::On)geometryEdit(base,overlay,"keep_recorded");
     }
-    queries();packing();spatialQueries();std::cout<<"coherent store API tests passed\n";
+    queries();packing();spatialQueries();followupRegressions();restoreFileReference();std::cout<<"coherent store API tests passed\n";
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

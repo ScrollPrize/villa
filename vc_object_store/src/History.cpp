@@ -735,6 +735,7 @@ ObjectRevision revisionColumns(Statement& s, int c, std::string uuid)
 void setRecord(ObjectRevision& revision, const Json& record)
 {
     revision.record = objectFromJson(record); commonFromJson(record, revision.record);
+    revision.record.versionStoreUuid=revision.storeUuid;
 }
 } // namespace
 
@@ -807,8 +808,13 @@ std::optional<ObjectRevision> ObjectStore::currentObjectRevision(const Txn& txn,
 
 std::vector<ObjectRevision> ObjectStore::objectHistory(const Txn& txn, const std::string& object) const
 {
-    requireHistory(static_cast<sqlite3*>(connection(txn)));
-    Statement s(static_cast<sqlite3*>(connection(txn)), "SELECT uuid FROM object_revisions WHERE object_uuid=? ORDER BY seq",
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    // History follows the visible owner, just like current reads. A deleted
+    // local object has no visible owner but still retains its local history.
+    auto* source=objectSource(db,object);
+    if(!source)source=db;
+    requireHistory(source);
+    Statement s(source, "SELECT uuid FROM object_revisions WHERE object_uuid=? ORDER BY seq",
         parseUuid(object));
     std::vector<ObjectRevision> result;
     while (s.row()) result.push_back(*objectRevision(txn, formatUuid(s.blob16(0))));
@@ -817,29 +823,38 @@ std::vector<ObjectRevision> ObjectStore::objectHistory(const Txn& txn, const std
 
 RevisionSelection ObjectStore::revisionSelectionAt(const Txn& txn, int64_t publishedAtUs, bool includeRetired) const
 {
-    requireHistory(static_cast<sqlite3*>(connection(txn)));
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    return detail::revisionSelectionAt(db,storeUuidText(db),publishedAtUs,includeRetired);
+}
+
+RevisionSelection detail::revisionSelectionAt(sqlite3* db,const std::string& owner,int64_t publishedAtUs,bool includeRetired)
+{
     if (publishedAtUs < 0) throw std::invalid_argument("object history: publication time must be nonnegative");
-    Statement s(static_cast<sqlite3*>(connection(txn)),
+    RevisionSelection result;bool found=false;
+    for(auto* source:querySources(db)) {
+    if(storeUuidText(source)!=owner)continue;
+    found=true;requireHistory(source);
+    Statement s(source,
         "SELECT object_uuid,uuid FROM (SELECT object_uuid,uuid,deleted,"
         "row_number() OVER (PARTITION BY object_uuid ORDER BY published_at_us DESC,seq DESC) AS position "
         "FROM object_revisions WHERE published_at_us<=?) WHERE position=1 AND deleted=0 ORDER BY object_uuid",
         publishedAtUs);
-    RevisionSelection result;
     while (s.row())
-        if (includeRetired || !objectRevision(txn, formatUuid(s.blob16(1)))->record.retired)
+        if (includeRetired || !resolveObjectRevision(source,formatUuid(s.blob16(1)))->revision.record.retired)
             result.emplace(formatUuid(s.blob16(0)), formatUuid(s.blob16(1)));
+    }
+    if(!found)throw std::invalid_argument("object history: snapshot owner is unavailable");
     return result;
 }
 
 std::vector<ObjectVersion> ObjectStore::versionsAt(const Txn& txn, int64_t publishedAtUs, bool includeRetired) const
 {
-    const auto store = status(txn).storeUuid;
     std::vector<ObjectVersion> result;
     for (const auto& [object, revision] : revisionSelectionAt(txn, publishedAtUs, includeRetired)) {
         const auto value = objectRevision(txn, *revision);
         if (!value->version)
             throw std::runtime_error("object history: revision of " + object + " has no numbered version");
-        result.push_back({store, value->generation, object, value->version});
+        result.push_back(value->reference());
     }
     return result;
 }

@@ -164,6 +164,7 @@ template<class Visit> void detailTables(Visit visit)
 ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details)
 {
     ObjectRecord rec;
+    rec.versionStoreUuid=storeUuidText(db);
     const int64_t id = s.i64(0);
     readCommon(rec, s, 1, 2, 4);
     rec.name = s.text(3);
@@ -395,8 +396,10 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     const auto uuid=parseUuid(rec.uuid);
     normalizeObjectCoordinates(rec,!preserveRecord,db);
     const auto bounds = detail::recordBounds(rec);
-    Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?", uuid);
-    if (collision.row()) throw std::runtime_error("object store: UUID already belongs to an edge");
+    if (resolveReference(db, [&](sqlite3* source) {
+        Statement collision(source, "SELECT 1 FROM edges WHERE uuid=?", uuid);
+        return collision.row();
+    })) throw std::runtime_error("object store: UUID already belongs to an edge");
     const std::string now = nowIsoUtc();
     Statement managed(db, "SELECT version,data_checksum,storage_ref FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
         uuid);

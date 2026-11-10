@@ -1218,8 +1218,10 @@ NB_MODULE(_native, m)
             const auto exported = self.withStore<true>([&](auto& db) {
                 std::optional<vo::ObjectVersion> selected;
                 if (version) {
-                    const auto status = db.status(db.read());
-                    selected = vo::ObjectVersion{status.storeUuid, generation.value_or(status.generation), object, *version};
+                    auto read=db.read();
+                    const auto current=db.currentObjectRevision(read,object);
+                    if(!current)throw std::invalid_argument("export_geometry: object not found");
+                    selected=current->reference(version,generation);
                 }
                 return vo::exportGeometry(db, object, destination, selected, overwrite, validOnly);
             });
@@ -1664,8 +1666,9 @@ NB_MODULE(_native, m)
             auto& db = self.owner->require(); auto& txn = self.require();
             std::optional<vo::ObjectVersion> source;
             if (version) {
-                const auto status = db.status(txn);
-                source = vo::ObjectVersion{status.storeUuid, generation.value_or(status.generation), uuid, *version};
+                const auto current=db.currentObjectRevision(txn,uuid);
+                if(!current)throw std::invalid_argument("restore_object: object not found");
+                source=current->reference(version,generation);
             }
             db.restoreObject(txn, uuid, source);
         }, nb::arg("uuid"), nb::arg("source_version") = std::nullopt, nb::arg("source_generation") = std::nullopt,

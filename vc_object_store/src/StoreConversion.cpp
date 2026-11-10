@@ -167,7 +167,13 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
         Statement heads(db,"SELECT storage_ref,uuid,version,changed_by,changed_at,changed_host "
                            "FROM objects WHERE geometry_manifest IS NOT NULL");
         while (heads.row()) {
-            const auto uuid=readGeometryTokenColumn(heads,0); GeometryReader reader(db,uuid,false);
+            const auto uuid=readGeometryTokenColumn(heads,0);
+            const auto resolved=resolveGeometryRecord(db,uuid);
+            if(!resolved)throw std::runtime_error("history policy: missing current geometry");
+            // Immutable dependencies keep their own retention policy. Do not
+            // flatten their delta chains or copy payloads to change ours.
+            if(resolved->source!=db)continue;
+            GeometryReader reader(db,uuid,false);
             const auto object=formatUuid(heads.blob16(1));
             auto manifest=reader.manifest();
             for (auto& [name,array]:manifest.at("arrays").items()) {
