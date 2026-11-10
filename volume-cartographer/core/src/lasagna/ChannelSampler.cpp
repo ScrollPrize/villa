@@ -242,6 +242,23 @@ struct CornerCoordinates {
     void prefetch(size_t) const {}
 };
 
+// Interleave requested channels at each spatial corner so the reader's chunk
+// planner sees them together, including when it splits a large point batch.
+struct ChannelCornerCoordinates {
+    using value_type = int64_t;
+    static constexpr size_t kDimensions = 4;
+    CornerCoordinates spatial;
+    const std::vector<int64_t>* channels;
+    int64_t base(size_t) const { return 0; }
+    const int64_t* operator()(size_t p, int64_t* c) const
+    {
+        c[0] = (*channels)[p % channels->size()];
+        spatial(p / channels->size(), c + 1);
+        return c;
+    }
+    void prefetch(size_t) const {}
+};
+
 // Spatial corners on the selected scalar GPU reader; false on a GPU failure.
 inline bool readCornersOnDevice(const LasagnaChannelBinding& binding, const CornerCoordinates& coords, size_t n,
                                 uint8_t* out)
@@ -380,6 +397,8 @@ LasagnaChannelBinding bindLasagnaChannel(
         binding.chunksZYX[0] == 0 || binding.chunksZYX[1] == 0 || binding.chunksZYX[2] == 0) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' has empty zarr shape/chunks");
     }
+    if (binding.packed && arrays.channelCache)
+        binding.array->request_channel_cache({int64_t(binding.channelIndex)});
     binding.cuda = vc::cuda::toolReader(*opened,
         binding.packed ? std::optional<std::int64_t>(binding.channelIndex) : std::nullopt);
     return binding;
@@ -449,7 +468,41 @@ void sampleLasagnaChannelCornerBatch(
         points.push_back(index);
     }
     std::vector<uint8_t> values;
+    std::vector<bool> read(bindings.size(), false);
     for (size_t b = 0; b < bindings.size(); ++b) {
+        if (read[b]) continue;
+        const auto& binding = *bindings[b];
+        if (binding.packed && !binding.cuda) {
+            std::vector<size_t> group;
+            std::vector<int64_t> channels;
+            for (size_t j = b; j < bindings.size(); ++j) {
+                if (!read[j] && !bindings[j]->cuda && bindings[j]->array == binding.array) {
+                    group.push_back(j);
+                    channels.push_back(int64_t(bindings[j]->channelIndex));
+                    read[j] = true;
+                }
+            }
+            const ChannelCornerCoordinates coords{{&cubes.lower,
+                {int64_t(binding.shapeZYX[2])-1, int64_t(binding.shapeZYX[1])-1,
+                 int64_t(binding.shapeZYX[0])-1}, -1}, &channels};
+            const size_t count = cubes.lower.size() * 8 * group.size();
+            values.resize(count);
+            if (binding.float32) {
+                std::vector<float> floats(count);
+                binding.array->sample_nearest_coordinates(coords, count,
+                    reinterpret_cast<uint8_t*>(floats.data()));
+                for (size_t i = 0; i < count; ++i) values[i] = byteValue(floats[i]);
+            } else {
+                binding.array->sample_nearest_coordinates(coords, count, values.data());
+            }
+            for (size_t j = 0; j < group.size(); ++j)
+                for (size_t i = 0; i < points.size(); ++i)
+                    for (size_t k = 0; k < 8; ++k)
+                        samples.values[group[j]][points[i]][k] =
+                            values[(size_t(cubes.of[i]) * 8 + k) * group.size() + j];
+            continue;
+        }
+        read[b] = true;
         readCorners(*bindings[b], cubes.lower, values);
         auto& out = samples.values[b];
         for (size_t i = 0; i < points.size(); ++i)

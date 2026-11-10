@@ -164,6 +164,57 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
     fs::remove_all(dir);
 }
 
+TEST_CASE("packed corner batches combine channels without changing corner values")
+{
+    using namespace vc::lasagna;
+    const auto dir=tmpDir("channel_batch");
+    struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path,ec); } } cleanup{dir};
+    for (bool floats : {false,true}) {
+        const auto root=dir/(floats?"float":"byte"); fs::create_directories(root);
+        auto writer=vcr::zarr::Writer::create(root/"pred.zarr",{
+            .shape={7,3,3,3},.chunks={4,3,3,3},.dtype=floats?"<f4":"|u1",.compressor="blosc"});
+        for (int c=0;c<2;++c) {
+            std::vector<uint8_t> bytes(4*27);
+            std::vector<float> f(4*27);
+            for (size_t i=0;i<bytes.size();++i) {
+                bytes[i]=uint8_t((c*108+i)%256); f[i]=bytes[i];
+            }
+            writer.writeChunk({c,0,0,0},floats?reinterpret_cast<const uint8_t*>(f.data()):bytes.data(),
+                              floats?f.size()*sizeof(float):bytes.size());
+        }
+        writeText(root/"dataset.lasagna.json",R"({"version":2,"packed_channel_view":true,
+            "source_to_base":1,"grad_mag_encode_scale":255,"grad_mag_factor":1,
+            "groups":{"pred":{"zarr":"pred.zarr","scaledown":0,
+                "channels":["extra0","extra1","extra2","extra3","nx","ny","grad_mag"]}}})");
+        const auto dataset=LasagnaDataset::open(root/"dataset.lasagna.json");
+        for (bool channelCache : {false,true}) {
+            LasagnaGroupArrays arrays(1<<20,channelCache);
+            const auto nx=bindLasagnaChannel(dataset.manifest(),"nx",arrays);
+            const auto ny=bindLasagnaChannel(dataset.manifest(),"ny",arrays);
+            const auto mag=bindLasagnaChannel(dataset.manifest(),"grad_mag",arrays);
+            const std::vector<const LasagnaChannelBinding*> bindings{&ny,&mag,&nx,&ny};
+            const std::vector<cv::Vec3f> points{{0.2f,0.4f,0.8f},{1.9f,1.4f,1.1f},{2,2,2},{-1,0,0},{0.2f,0.4f,0.8f}};
+            LasagnaCornerBatch batch;
+            sampleLasagnaChannelCornerBatch(bindings,points,batch);
+            for(size_t b=0;b<bindings.size();++b) {
+                std::vector<cv::Vec3d> doublePoints;
+                for(const auto& p:points)doublePoints.emplace_back(p[0],p[1],p[2]);
+                LasagnaCubes scalar;readLasagnaCubes(*bindings[b],doublePoints,scalar);
+                CHECK(batch.valid==scalar.valid);
+                for(size_t i=0;i<points.size();++i)if(batch.valid[i])
+                    for(size_t k=0;k<8;++k)CHECK(batch.values[b][i][k]==scalar.values[i][k]);
+            }
+        }
+        LasagnaNormalSamplerOptions options;
+        options.autoCacheFraction=0.5;options.channelCache=true;
+        LasagnaNormalSampler automatic(dataset,options);
+        const auto channels=automatic.regionChannels();
+        REQUIRE(channels[0].array->memory_cache());
+        CHECK(channels[0].array->memory_cache()==channels[1].array->memory_cache());
+        CHECK(channels[0].array->memory_cache()->max_bytes()>0);
+    }
+}
+
 TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordinate scaling")
 {
     const auto dir = tmpDir("3d");

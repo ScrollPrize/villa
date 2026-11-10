@@ -146,7 +146,8 @@ public:
     std::array<LasagnaChannelBinding,3> regionChannels() const {return {gradMag_,nx_,ny_};}
     Impl(const LasagnaDataset& dataset, const LasagnaNormalSamplerOptions& options)
         : arrays_(options.memoryCache ? options.memoryCache
-                                      : std::make_shared<vcr::MemoryCache>(options.maxCachedBytes)),
+                    : options.autoCacheFraction ? vcr::MemoryCache::automatic(*options.autoCacheFraction)
+                    : std::make_shared<vcr::MemoryCache>(options.maxCachedBytes), options.channelCache),
           gradMagDecodeScale_(
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_encode_scale") /
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_factor"))
