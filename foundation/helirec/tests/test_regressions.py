@@ -367,3 +367,57 @@ def test_legacy_mode_pins_parameters():
 def test_default_params_are_corrected():
     assert DEFAULTS["mode"] == "corrected" and DEFAULTS["filters"] == []
     assert os.path.basename(_core.__file__).startswith("_core")
+
+
+# ---------------------------------------------------------------- registration of frames on tiles
+def test_tile_shifts_recover_an_offset_and_a_roll():
+    """b is a displaced along the rows by 0.4 + 0.9 rows per 1000 columns and along the columns by -0.3"""
+    rng = np.random.default_rng(3)
+    rows, cols, d0, slope, du = 360, 1400, 0.4, 0.9e-3, -0.3
+    waves = [(rng.uniform(-0.12, 0.12), rng.uniform(-0.12, 0.12), rng.uniform(0, 2 * np.pi)) for _ in range(120)]
+    r, c = np.mgrid[:rows, :cols].astype(np.float64)
+    image = lambda rr, cc: sum(np.cos(2 * np.pi * (fy * rr + fx * cc) + ph) for fy, fx, ph in waves).astype(np.float32)
+    a = image(r, c)
+    b = image(r - (d0 + slope * c), c - du)             # what is at (r, c) of a is at (r + dv, c + du) of b
+    t = _core.tile_shifts(a, b, 120, 60, 10, 6)
+    assert t.shape[1] == 5 and len(t) > 60 and np.isfinite(t).all() and t[:, 4].min() > 0.8
+    fit = np.linalg.lstsq(np.stack([np.ones(len(t)), t[:, 1]], -1), t[:, 2], rcond=None)[0]
+    assert abs(fit[0] - d0) < 0.03 and abs(fit[1] - slope) < 5e-5
+    assert abs(np.median(t[:, 3]) - du) < 0.03
+    # nothing in common: no shift is reported for most tiles, and none with a high correlation
+    n = _core.tile_shifts(a, rng.standard_normal(a.shape).astype(np.float32), 120, 60, 10, 6)
+    assert (n[:, 4] < 0.3).all()
+    # the knots of a calibration become per-projection arrays within their stretches
+    reg = dict(projection=[10, 30, 60, 90], row_offset=[1.0, 1.0, -2.0, -2.0], row_slope=[1e-3, 3e-3, 0.0, 0.0],
+               segments=[[0, 50], [50, 100]], slope_col=7.5)
+    off, slope_p, col = calibration.registration_arrays(reg, 100)
+    assert off[0] == 1.0 and off[49] == 1.0 and off[50] == -2.0 and off[99] == -2.0 and col == 7.5
+    assert abs(slope_p[20] - 2e-3) < 1e-9 and slope_p[49] == np.float32(3e-3) and slope_p[50] == 0
+    assert calibration.registration_arrays({}, 100) is None and calibration.registration_arrays(None, 100) is None
+
+
+# ---------------------------------------------------------------- detector smear from the noise of flats
+def test_smear_field_from_noise_spectra():
+    """noise smeared along the columns by 4 px per 1000 columns (0.5 px at the centre) on a white floor"""
+    rng = np.random.default_rng(11)
+    rows, cols, tile, a11, c1 = 384, 1024, 128, 4.0, 0.5
+    ys, xs = list(range(0, rows, tile)), list(range(0, cols, tile))
+    f = np.fft.rfftfreq(cols)
+    power = np.zeros((len(ys), len(xs), tile, tile // 2 + 1))
+    for _ in range(6):
+        # (what passed the optics is band-limited before it is smeared: little of it is left at the white floor's corner)
+        g = lambda v, ax: _core.gaussian_filter1d(np.ascontiguousarray(v, np.float32), ax, 0.8, "reflect")
+        w = np.fft.rfft(np.stack([g(g(v, 0), 1) for v in rng.standard_normal((16, rows, cols))]), axis=-1)
+        img = 0.5 * rng.standard_normal((16, rows, cols))
+        for x0 in xs:
+            s = a11 * (x0 + tile / 2 - 0.5 * (cols - 1)) / 1000 + c1
+            img[:, :, x0:x0 + tile] += np.fft.irfft(w * np.sinc(s * f), cols, axis=-1)[:, :, x0:x0 + tile]
+        power += _core.tile_power_spectra(np.ascontiguousarray(img, np.float32), tile, ys, xs)
+    assert power.shape == (3, 8, 128, 65) and (power > 0).all()
+    field, rms_none, rms_fit = _core.smear_field_fit(power, ys, xs, rows, cols)
+    assert abs(field[0] - a11) < 0.5 and abs(field[4] - c1) < 0.15 and rms_fit < 0.6 * rms_none
+    assert abs(field[2]) * 0.5 + abs(field[3]) * 0.2 + abs(field[5]) < 0.6       # no smear along the rows
+    # white noise everywhere: nothing to fit
+    white = _core.tile_power_spectra(rng.standard_normal((40, rows, cols)).astype(np.float32), tile, ys, xs)
+    with pytest.raises(Exception):
+        _core.smear_field_fit(white, ys, xs, rows, cols)

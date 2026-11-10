@@ -385,6 +385,7 @@ std::vector<double> tile_shifts(const float* a, const float* b, std::size_t rows
     {
         std::vector<float> ta(area), tb(area);
         std::vector<std::complex<float>> A(per), B(per);
+        std::vector<std::complex<double>> ev(tile), eu(nc);
         auto load = [&](const float* img, int y0, int x0, std::vector<float>& t) {   // windowed tile less its mean; its energy
             double sw = 0, sv = 0;
             for (int i = 0; i < tile; ++i)
@@ -415,7 +416,7 @@ std::vector<double> tile_shifts(const float* a, const float* b, std::size_t rows
             if (!(ea > 0) || !(eb > 0)) continue;
             fftwf_execute_dft_r2c(fwd, ta.data(), reinterpret_cast<fftwf_complex*>(A.data()));
             fftwf_execute_dft_r2c(fwd, tb.data(), reinterpret_cast<fftwf_complex*>(B.data()));
-            for (std::size_t i = 0; i < per; ++i) A[i] = std::conj(A[i]) * B[i];
+            for (std::size_t i = 0; i < per; ++i) A[i] = B[i] = std::conj(A[i]) * B[i];        // (the inverse overwrites A)
             fftwf_execute_dft_c2r(inv, reinterpret_cast<fftwf_complex*>(A.data()), ta.data());   // ta[d] = area x sum a(n) b(n + d)
             auto cc = [&](int dv, int du) { return ta[static_cast<std::size_t>((dv + tile) % tile) * tile + (du + tile) % tile]; };
             int bv = 0, bu = 0;
@@ -424,13 +425,48 @@ std::vector<double> tile_shifts(const float* a, const float* b, std::size_t rows
                 for (int du = -search; du <= search; ++du)
                     if (cc(dv, du) > best) { best = cc(dv, du); bv = dv; bu = du; }
             if (std::abs(bv) == search || std::abs(bu) == search) continue;
-            auto vertex = [](double lo, double mid, double hi) {
-                const double den = lo - 2 * mid + hi;
-                return den < 0 ? 0.5 * (lo - hi) / den : 0.0;
-            };
-            o[2] = bv + vertex(cc(bv - 1, bu), best, cc(bv + 1, bu));
-            o[3] = bu + vertex(cc(bv, bu - 1), best, cc(bv, bu + 1));
-            o[4] = best / static_cast<double>(area) / std::sqrt(ea * eb);
+            // the maximum of the continuous correlation c(d) = sum_k C(k) exp(2 pi i k . d / tile) (the cross-spectrum
+            // B holds), by Newton steps from the whole-pixel maximum: a parabola through the neighbours along each
+            // axis is off by up to 0.1 pixel where the peak is elongated obliquely
+            double dv = bv, du = bu, value = best;
+            bool ok = true;
+            for (int it = 0; it < 8 && ok; ++it) {
+                for (int i = 0; i < tile; ++i) {
+                    const double ph = 2.0 * M_PI * (i < tile / 2 ? i : i - tile) / tile * dv;
+                    ev[i] = std::complex<double>(std::cos(ph), std::sin(ph));
+                }
+                for (int j = 0; j < nc; ++j) {
+                    const double ph = 2.0 * M_PI * j / tile * du;
+                    eu[j] = std::complex<double>(std::cos(ph), std::sin(ph));
+                }
+                double c = 0, gv = 0, gu = 0, hvv = 0, hvu = 0, huu = 0;
+                for (int i = 0; i < tile; ++i) {
+                    const double kv = 2.0 * M_PI * (i < tile / 2 ? i : i - tile) / tile;
+                    for (int j = 0; j < nc; ++j) {
+                        const double ku = 2.0 * M_PI * j / tile, mult = (j == 0 || j == tile / 2) ? 1.0 : 2.0;
+                        const std::complex<double> z = std::complex<double>(B[static_cast<std::size_t>(i) * nc + j]) * ev[i] * eu[j];
+                        const double re = mult * z.real(), im = mult * z.imag();
+                        c += re;
+                        gv -= kv * im;
+                        gu -= ku * im;
+                        hvv -= kv * kv * re;
+                        hvu -= kv * ku * re;
+                        huu -= ku * ku * re;
+                    }
+                }
+                value = c;
+                const double det = hvv * huu - hvu * hvu;
+                if (!(hvv < 0) || !(det > 0)) { ok = false; break; }      // not a maximum
+                const double sv = -(huu * gv - hvu * gu) / det, su = -(hvv * gu - hvu * gv) / det;
+                dv += std::clamp(sv, -0.5, 0.5);
+                du += std::clamp(su, -0.5, 0.5);
+                if (std::fabs(dv - bv) > 1.0 || std::fabs(du - bu) > 1.0) { ok = false; break; }
+                if (std::fabs(sv) < 1e-4 && std::fabs(su) < 1e-4) break;
+            }
+            if (!ok) continue;
+            o[2] = dv;
+            o[3] = du;
+            o[4] = value / static_cast<double>(area) / std::sqrt(ea * eb);
         }
     }
     std::lock_guard<std::mutex> lock(m);

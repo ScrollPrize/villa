@@ -71,10 +71,10 @@ std::vector<float> weight_border_v(int L, double transition_width, int crop_top 
 // ---------------------------------------------------------------- registration of two frames on tiles
 // Displacement of image b's content from image a's on a lattice of tiles: tiles of `tile` x `tile` pixels every
 // `step`, `margin` pixels from the borders; each tile less its mean under a Hann window; the largest value of the
-// cross-correlation within `search` pixels, refined by a parabola through its neighbours along each axis. Returns
-// (n, 5): the tile's centre row and column, dv, du (what is at (r, c) of a is at (r + dv, c + du) of b) and the
-// normalised correlation there; dv, du are NaN (correlation 0) where the largest value lies on the edge of the
-// search range.
+// cross-correlation within `search` pixels, then the maximum of the continuous (band-limited) correlation next to
+// it, by Newton steps on the cross-spectrum. Returns (n, 5): the tile's centre row and column, dv, du (what is at
+// (r, c) of a is at (r + dv, c + du) of b) and the normalised correlation there; dv, du are NaN (correlation 0)
+// where the largest value lies on the edge of the search range or is not a maximum.
 std::vector<double> tile_shifts(const float* a, const float* b, std::size_t rows, std::size_t cols, int tile, int step,
                                 int margin, int search);
 

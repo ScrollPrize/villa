@@ -13,8 +13,10 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
   fractional column offset shifted exactly (`x_interp=sinc`), a slice's fractional detector row interpolated with
   a Lanczos-3 kernel (`z_interp`); each projection gridded whole into one angular bin and backprojected at its measured angle
   (`angle_interp=nearest`; GHBP keeps the two-bin splat); the exposure arc of a continuous scan deconvolved
-  (`exposure_arc=auto`); the helical pitch measured from the frames (`z_translation_scale=auto`). No projection
-  filters by default.
+  (`exposure_arc=auto`); the helical pitch measured from the frames (`z_translation_scale=auto`); the companion
+  scan's frames placed as they register on the main scan's, row offset and roll per projection
+  (`companion_registration=auto`); recordings of a ray combined with band-dependent weights where the detector's
+  sharpness depends on the place (`detector_smear=auto`). No projection filters by default.
 * `legacy_reference`: the reference workflow's conventions (half-attenuation units, its rebalance endpoints,
   integer padding reflection, mending bounds, chunk-dependent Paganin and luminosity window, two-column splat of
   fractional column offsets, linear rows, two-bin angular splat, no exposure-arc correction) with every parameter pinned (GHBP, Paganin 1000 + unsharp 1.2/4, …); overriding one
@@ -361,6 +363,32 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     Next to the detector edges and to columns without weight the splat is used, so unmeasured values never enter.
     Notes: a row's two ends leak into a shifted row as 1 / distance (0.3 % of the high-frequency amplitude at the
     end, 400 columns in); the gridding of measured pixels only (SIRT, MLEM) uses `lanczos3` under `sinc`.
+  * `companion_registration=auto|off` (default `auto`): the calibration compares the companion's frames with the
+    main scan's frames of the same angle where the two detector positions overlap, at 240 projections along the
+    scan (`calibration.measure_registration`; tiles registered by `calib::tile_shifts` on the continuous
+    cross-correlation), and fits per pair a row displacement at the rotation axis and its slope along the columns:
+    a roll of the companion's frames about the axis. One calibrated vector is right only in the middle of the
+    overlap when there is a roll. Smoothed along the scan, the two are applied per projection in the gridding
+    (`ScanTrajectory::row_offset`, `row_slope`): every sample is read at its registered row, in the one vertical
+    interpolation there already was. PHerc0343P: roll −0.72 mrad (−0.53 … −0.91 along the scan), 0.1–1.1 rows at
+    the axis; the companion's content lay −0.79 + 0.50 r / 1000 voxels from the main scan's along z (r: px from
+    the axis), after it +0.03 + 0.07 r / 1000; axial correlation with the 2.215 µm volume 0.774 → 0.850 at 0.36
+    and 0.564 → 0.674 at 0.45 cycles/voxel (centre block). 17 s once per scan (cached); +0.06 s per 32-slice
+    chunk. `off`: the vector alone. The lateral part of the registration is measured (`details.registration`) and
+    not applied.
+  * `detector_smear=auto|off|a11:a12:a21:a22:c1:c2` (default `auto`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
+    band-dependent redundancy weights for a detector that is not equally sharp everywhere. The field is a uniform
+    smear of A r + c pixels at r = (column, row) from the detector's centre in units of 1000 pixels; `auto` takes
+    the one the calibration fits to the noise of the scan's flats (`calibration.measure_smear`: the noise that
+    passed the optics is smeared like the signal; none if it reaches less than 0.5 px). Below `sharp_band` the
+    recordings of a ray are combined with the usual weights, above it with the usual weights × the detector's
+    squared response at `sharp_f` along the columns, with a raised-cosine crossover: both sets sum to one, so no
+    band is biased, and a zero field gives the usual result bit for bit. PHerc0343P (2 px of smear per 1000
+    columns from column 1194): in-plane correlation with the 2.215 µm volume 0.859 → 0.885 at 0.36 and
+    0.546 → 0.626 at 0.45 cycles/voxel, nothing lost below. Cost on an RTX 5090, whole slices: 6.9 → 7.5 s per
+    32-slice chunk and 7.5 GB more GPU memory (a second gridded stack); use a smaller `--chunk` or `off` on a
+    smaller card. FBP and GHBP; the gridding of measured pixels only and the legacy reference keep the usual
+    weights.
   * The two-scan luminosity equalisation estimates each row's HA / TA difference in a 25 × 25 window at the seam
     and applies it as an offset of the intensity. Twelve context rows are read either side of a chunk, and context
     rows (the filters' too) are gridded from every projection that sees them, not only from those of the chunk's

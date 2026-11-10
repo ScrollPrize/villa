@@ -937,6 +937,7 @@ def _add_smear(cal, main, arrays, log):
 
 # ============================================================================ detector smear from the flats' noise
 SMEAR_TILE = 128
+SMEAR_MIN_FLATS = 20      # fewer flats in the series do not carry the noise spectra
 SMEAR_MIN_PX = 0.5        # a field whose smear nowhere reaches this many pixels is not used
 SMEAR_MIN_GAIN = 0.97     # ... nor one that does not bring the residual of the noise spectra below this share
 
@@ -967,8 +968,14 @@ def measure_smear(scan: BlissScan, dark, n_flats=200, log=print):
     only if it explains the noise spectra (residual below SMEAR_MIN_GAIN of the residual without it) and reaches
     SMEAR_MIN_PX somewhere on the detector; otherwise "field" is [] and nothing changes in the reconstruction."""
     t0 = time.time()
-    power, ys, xs, n = flat_noise_spectra(scan, dark, n_flats)
     rows, cols = scan.frame_shape
+    n_have = min(n_flats, len(scan.flats[0])) if scan.flats else 0
+    if n_have < SMEAR_MIN_FLATS or (rows // SMEAR_TILE) * (cols // SMEAR_TILE) < 6:
+        reason = (f"{n_have} flats in the first series" if n_have < SMEAR_MIN_FLATS else
+                  f"a detector of {rows} x {cols} holds too few tiles of {SMEAR_TILE}")
+        log(f"detector smear: not measured ({reason})")
+        return dict(field=[], measured=None, reason=reason, scan=scan.name)
+    power, ys, xs, n = flat_noise_spectra(scan, dark, n_flats)
     field, rms_none, rms_fit = _core.smear_field_fit(power, ys, xs, rows, cols)
     th = np.array(field)
     try:

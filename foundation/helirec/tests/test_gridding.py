@@ -151,3 +151,63 @@ def test_overlap_cross_check_flags_noise_locked_offsets():
         assert check["sub"] == (0.0, 0.0)
         assert check["differs"] is flagged and len(msgs) == int(flagged)
         assert (tuple(res["best_sub"]) != (0.0, 0.0)) is flagged
+
+
+def rolled_scan(tmp_path, offset, slope, nu=0.2, nr=40, nd=48, c0=20.25):
+    """a stationary scan whose frames show 1 + 5 % cos(2 pi nu row), displaced along the rows by `offset` and sheared
+    by `slope` rows per column about column c0; with its registration (row_offset, row_slope) when `register`"""
+    p = np.arange(129)
+    r, c = np.mgrid[:nr, :nd].astype(np.float64)
+
+    def make(register):
+        frame = np.rint(40000 * (1 + .05 * np.cos(2 * np.pi * nu * (r - offset - slope * (c - c0))))).astype(np.uint16)
+        path = tmp_path / f"rolled_{offset}_{slope}.h5"
+        if not path.exists():
+            with h5py.File(path, "w") as f:
+                f.create_dataset("data", data=np.broadcast_to(frame, (len(p), nr, nd)).copy(), chunks=(1, nr, nd))
+        reader = _core.RawReader([str(path)], "data", nr, nd)
+        reg = dict(row_offset=[-offset] * len(p), row_slope=[slope] * len(p), slope_col=c0) if register else {}
+        return _core.make_scan_data(p * (360 / 64), np.zeros(len(p)), .01, nr, nd, 0, 0., 0., np.full(len(p), .2),
+                                    np.array([0], np.float32), np.zeros((nr, nd), np.float32),
+                                    np.full((1, nr, nd), 50000, np.float32), np.ones((nr, nd), np.float32), reader,
+                                    np.zeros(len(p), np.int32), np.arange(len(p), dtype=np.int32), **reg)
+    return make
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("backprojector", ["fbp", "sirt"])   # padded / measured-only gridding
+def test_frame_registration_undoes_offset_and_roll(tmp_path, device, backprojector):
+    """frames displaced by 0.3 rows and sheared by 0.08 rows per column (up to 2.2 rows) grid like the plain ones when
+    their registration is given (ScanTrajectory::row_offset, row_slope)"""
+    kw = dict(backprojector=backprojector, tomo_params={"num_iter": "1"} if backprojector == "sirt" else {},
+              rot_center=23.5, grid_size=33)
+    sino = lambda scan, **k: recon(scan, device, **kw, **k).reconstruct(12, 28, debug=True)["sino"][:, :, 6:42]
+    plain = sino(rolled_scan(tmp_path, 0.0, 0.0)(False))
+    assert np.ptp(plain.mean((0, 2))) > 0.08                 # the row pattern is there
+    registered = sino(rolled_scan(tmp_path, 0.3, 0.08)(True))
+    left = sino(rolled_scan(tmp_path, 0.3, 0.08)(False))
+    assert np.abs(registered - plain).max() < 4e-3           # (lanczos3 at 0.2 cycles / row: 0.3 % ripple)
+    assert np.abs(left - plain).max() > 0.05
+    # the linear vertical kernel takes the same positions
+    lin = lambda scan: sino(scan, z_interp="linear")
+    assert np.abs(lin(rolled_scan(tmp_path, 0.3, 0.08)(True)) - plain).max() < 0.02
+    with pytest.raises(Exception):                           # one value per projection
+        _core.make_scan_data(np.arange(4.) * 5, np.zeros(4), .01, 8, 8, 0, 0., 0., np.full(4, .2), np.array([0], np.float32),
+                             np.zeros((8, 8), np.float32), np.ones((1, 8, 8), np.float32), np.ones((8, 8), np.float32),
+                             _core.RawReader([str(tmp_path / "rolled_0.0_0.0.h5")], "data", 40, 48), np.zeros(4, np.int32),
+                             np.arange(4, dtype=np.int32), row_slope=[0.1, 0.1]) and recon(None, device)
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+def test_band_weights_without_smear_change_nothing(tmp_path, device):
+    """detector_smear: a zero field gives both weight sets the same weights, and the result of the usual ones bit for
+    bit; a field leaves every ray an average of its recordings (weights that sum to one)"""
+    run = lambda **k: recon(pattern_scan(tmp_path, 0.5, nd=160, nu=0.45), device, backprojector="fbp",
+                            **k).reconstruct(7, 8, debug=True)["sino"]
+    usual = run()
+    np.testing.assert_array_equal(run(detector_smear="0:0:0:0:0:0"), usual)
+    smeared = run(detector_smear="20:0:0:0:1:0")             # (3.2 px across this small detector)
+    assert np.isfinite(smeared).all() and abs(float(smeared.mean() - usual.mean())) < 1e-3
+    for bad in dict(detector_smear="1:2:3"), dict(detector_smear="0:0:0:0:0:0", sharp_band="0.3:0.2"), dict(detector_smear="a:0:0:0:0:0"):
+        with pytest.raises(Exception):
+            run(**bad)

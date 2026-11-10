@@ -253,6 +253,7 @@ class HelicalRecon:
         arr = calibration.registration_arrays(getattr(self.cal, "companion_registration", None), len(scan.projections))
         if arr is None:
             return {}
+        self._registered = True
         return dict(row_offset=arr[0].tolist(), row_slope=arr[1].tolist(), slope_col=arr[2])
 
     def _build(self):
@@ -355,7 +356,7 @@ class HelicalRecon:
                                      z_translation_scale=getattr(self.cal, "z_translation_scale", None)),
                     resolved_z_translation_scale=self.z_translation_scale(),
                     resolved_detector_smear=self.detector_smear(),
-                    companion_registration=bool(self._registration(self.companion, "companion")),
+                    companion_registration=bool(getattr(self, "_registered", False)),
                     reconstructor=dict(self.info), pixel_size_m=self.main.pixel_size_m,
                     energy_kev=self.main.energy_kev, distance_m=self.main.distance_m,
                     helirec=_build_identity())
