@@ -168,6 +168,8 @@ struct VolumeRow {
 };
 std::vector<VolumeRow> measuredSelection(sqlite3* db,const ObjectSelection& selection) {
     requireVolumeSelection(selection);
+    auto afterUuid = selection.afterUuid;
+    if (afterUuid) *afterUuid = formatUuid(parseUuid(*afterUuid));
     const bool byLength=selection.orderBy=="length_desc";
     std::vector<VolumeRow> rows;
     const bool inTail=byLength&&selection.afterUuid&&!selection.afterLength;
@@ -185,10 +187,10 @@ std::vector<VolumeRow> measuredSelection(sqlite3* db,const ObjectSelection& sele
                 row.volume=transformedLength(db,readGeometryTokenColumn(head,0),frame.mapping,*selection.kind);
                 if(selection.minLength&&row.volume<*selection.minLength)continue;
             }
-            if(selection.afterUuid) {
+            if(afterUuid) {
                 if(byLength&&selection.afterLength) {
-                    if(row.volume>*selection.afterLength||(row.volume==*selection.afterLength&&row.uuid<=*selection.afterUuid))continue;
-                } else if(byLength||row.uuid<=*selection.afterUuid)continue;
+                    if(row.volume>*selection.afterLength||(row.volume==*selection.afterLength&&row.uuid<=*afterUuid))continue;
+                } else if(byLength||row.uuid<=*afterUuid)continue;
             }
             rows.push_back(std::move(row));
         }

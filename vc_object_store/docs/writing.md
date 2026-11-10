@@ -256,8 +256,7 @@ with ObjectStore.open("project.vcobj", author="reviewer") as store:
 
 Resource kinds are `volume`, `normal_grid`, and `lasagna_dataset`; a resource
 is shared, or one `owner`'s alone (`project_resources(kind, viewer=...)`).
-`vos.project_resource_uuid(kind, location, owner="")` is the deterministic
-identity `add_project_resource` returns.
+`vos.project_resource_uuid(kind, location, owner="")` is the deterministic identity for a new resource. Updating a matching legacy resource keeps its original UUID; use the UUID returned by `add_project_resource` or by the resource listing.
 
 Documents attached to objects (point-collection documents such as growth
 corrections) go through `documents.attach_document(location, ...)` /

@@ -199,6 +199,7 @@ void buildCurrentEditRequest(const StoreReader& reader, TransactionRequest& requ
     expectRelationshipEndpoints(reader, request);
     for (auto& operation : operations()) request.operations.push_back(std::move(operation));
     if (uuids.empty()) return;
+    const auto status = reader.status();
     EdgeSelection edges;
     edges.endpointUuids = uuids;
     edges.includeRetired = true;
@@ -217,7 +218,10 @@ void buildCurrentEditRequest(const StoreReader& reader, TransactionRequest& requ
             removedEndpoints.insert(util::canonicalUuid(restore->uuid));
     }
     for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{}))
-        if (!decidedEdges.contains(edge.uuid) && !removedEndpoints.contains(edge.aUuid) &&
+        // In direct mode, the writer checks local edges' dependencies without
+        // inventing an archive. Inherited bindings remain retained by their owner.
+        if ((status.historyEnabled || edge.versionStoreUuid != status.storeUuid) &&
+            !decidedEdges.contains(edge.uuid) && !removedEndpoints.contains(edge.aUuid) &&
             !removedEndpoints.contains(edge.bUuid) && kept.insert(edge.uuid).second) {
             request.operations.push_back(KeepRecordedRelationshipOp{edge.uuid});
         }

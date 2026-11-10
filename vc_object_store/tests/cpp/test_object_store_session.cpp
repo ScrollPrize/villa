@@ -119,6 +119,11 @@ void editCurrentLifecycle(HistoryMode history)
     }
     // The standalone request helper must also omit an explicitly removed edge.
     auto removal = session.newRequest(attachment);
+    session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+        return std::vector<TransactionOperation>{SetMetaOp{b, "unrelated_note", "42"}};
+    });
+    { auto txn = store.read(); require(store.edgeByUuid(txn, bc.uuid).has_value(),
+        "unrelated checked metadata edit keeps a relationship without requiring retained history"); }
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         editCurrentRequest(reader, removal, {b}, {SetMetaOp{b, "note", "3"}, RemoveEdgeOp{bc.uuid}});
     });

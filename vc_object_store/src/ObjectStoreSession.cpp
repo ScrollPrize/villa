@@ -1020,6 +1020,7 @@ TransactionReceipt ObjectStoreSession::submitDurably(const AttachmentIdentity& a
 {
     if (request.requestUuid.empty()) throw std::invalid_argument("a durable submission needs a request UUID");
     const auto requestUuid = util::canonicalUuid(request.requestUuid);
+    std::unique_lock writing(durable_->writing);
     bool durable = false;
     {
         std::lock_guard lock(mutex_);
@@ -1043,18 +1044,30 @@ TransactionReceipt ObjectStoreSession::submitDurably(const AttachmentIdentity& a
     }
     if (durable) {
         try {
-            {
-                std::lock_guard writing(durable_->writing);
-                TransactionPayloads payloads;
-                const auto canonical = transactionRequestToJson(request, &payloads);
-                durable_->directory->storeRequest(requestUuid, canonical, payloads);
-            }
+            TransactionPayloads payloads;
+            const auto canonical = transactionRequestToJson(request, &payloads);
+            durable_->directory->storeRequest(requestUuid, canonical, payloads);
+            writing.unlock();
             checkpointDrafts();
         } catch (...) {
+            // Remove any unstaged pending record before allowing a checkpoint.
+            if (writing.owns_lock()) {
+                std::lock_guard lock(mutex_);
+                auto record = durable_->pending.extract(requestUuid);
+                if (!record.empty()) for (const auto& [uuid, revision] : record.mapped().drafts) {
+                    auto found = durable_->meta.find(uuid);
+                    if (found != durable_->meta.end() && found->second.pendingRequest == requestUuid) {
+                        found->second.pendingRequest.reset();
+                        found->second.submittedRevision.reset();
+                    }
+                }
+                throw;
+            }
             conclude(requestUuid, nullptr, "");
             throw;
         }
     }
+    if (writing.owns_lock()) writing.unlock();
     return sendPending(attachment, request, requestUuid);
 }
 

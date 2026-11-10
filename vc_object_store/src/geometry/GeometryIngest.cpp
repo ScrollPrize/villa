@@ -163,13 +163,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
                 // Remote tifxyz: fetched once, decoded here, then held by the store.
                 if (object.kind != "surface" || !formats::isRemoteSource(object.storageRef))
                     throw std::runtime_error("remote sources are tifxyz surfaces at http(s):// or s3:// URLs");
-                const auto staging = fs::temp_directory_path() / ("vc-object-fetch-" + util::newUuid());
-                fs::create_directory(staging);
-                try {
-                    formats::fetchRemoteSurface(object.storageRef, staging);
-                    p = surface(staging);
-                } catch (...) { std::error_code ignored; fs::remove_all(staging, ignored); throw; }
-                std::error_code ignored; fs::remove_all(staging, ignored);
+                p = formats::readRemoteSurfaceGeometry(object.storageRef);
                 // The registration, not the remote meta.json, is the identity.
                 p.object.uuid = object.uuid;
             } else {

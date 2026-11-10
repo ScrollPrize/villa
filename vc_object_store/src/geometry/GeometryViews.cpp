@@ -385,7 +385,7 @@ geometry::SurfacePoint inverseSurfacePoint(const geometry::SurfacePoint& desired
         shown={float(p[0]),float(p[1]),float(p[2])};
     }
     if(original&&desired==shown)return *original;
-    if(!geometry::validSurfacePoint(desired))return missing;
+    if(desired==missing)return missing;
     const auto p=inverse.apply({desired[0],desired[1],desired[2]});
     geometry::SurfacePoint result{float(p[0]),float(p[1]),float(p[2])};
     // A position the validity rule rejects in the canonical frame is missing there.

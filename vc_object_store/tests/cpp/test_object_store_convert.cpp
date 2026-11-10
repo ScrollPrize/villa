@@ -287,6 +287,12 @@ try {
         require(bytesOf(source) == before && scalar(source, "PRAGMA user_version") == 20,
                 "unsupported extension rejects in-place conversion without modifying source");
         sql(source, "DROP VIEW extension_current;");
+        const auto mapping = directory.path / "in-place-mapping.json";
+        mustFail([&] { (void)migration::convertStoreInPlace(source, [&](const auto& converted) {
+            migration::writeConversionReports(converted, mapping, directory.path / "absent" / "report.json");
+        }); });
+        require(scalar(source, "PRAGMA user_version") == 20 && !std::filesystem::exists(mapping),
+                "unstageable conversion report leaves legacy store and no partial mapping");
         const auto result = migration::convertStoreInPlace(source);
         require(Json::parse(result.reportJson).at("in_place") == true && scalar(source, "PRAGMA user_version") == 21,
                 "explicit in-place conversion publishes current schema");

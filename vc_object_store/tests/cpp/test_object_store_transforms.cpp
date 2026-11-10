@@ -39,6 +39,9 @@ int main() try {
     {
         auto txn=db.write();
         registration=db.registerVolumeTransform(txn,"a","b",matrix,"scan registration");
+        VolumeAffine translated;
+        translated(0,3)=-3; translated(2,3)=-3;
+        db.registerVolumeTransform(txn,"a","negative",translated,"negative target coordinates");
         bool pending=false;
         try { (void)db.volumeTransforms(txn); } catch(const std::runtime_error&) { pending=true; }
         require(pending,"new registrations must have a published revision before resolving views");
@@ -61,6 +64,12 @@ int main() try {
         const auto ordered=db.selectObjects(txn,select);
         require(ordered.size()==1&&ordered.front().volumeLength==db.geometryLengthInVolume(txn,fiber,"b"),
                 "registered rows carry the target length they were ordered by");
+        auto upper=fiber;
+        for(auto& c:upper) if(c>='a'&&c<='f')c=char(c-'a'+'A');
+        select.afterUuid=upper;select.afterLength=ordered.front().volumeLength;
+        require(db.selectObjects(txn,select).empty(),"length cursor accepts uppercase UUID");
+        select.orderBy="uuid";select.afterLength.reset();
+        require(db.selectObjects(txn,select).empty(),"volume cursor accepts uppercase UUID");
         // A reader measures the same lengths from the array bytes it reads.
         const LocalStoreReader reader(db,txn);
         require(reader.geometryLengthInVolume(fiber,"b")==db.geometryLengthInVolume(txn,fiber,"b")&&
@@ -143,6 +152,14 @@ int main() try {
         require(surfaceChanges.size()==1,"surface inverse edits supplied by store");
         const auto changedPoint=vc::objects::xyzFromBytes<float>(surfaceChanges.front().bytes).front();
         require(changedPoint==std::array<float,3>{1,0,1},"surface inverse uses registration");
+        const auto negative=snapshot.surface(surface).viewTransformedAt("negative");
+        require(negative.readTile(0,0,1,1).validity[0],"negative target coordinate remains valid");
+        const auto negativeEdit=negative.surfaceEdits(0,0,1,1,{{-1,0,-1}});
+        require(negativeEdit.size()==1 && vc::objects::xyzFromBytes<float>(negativeEdit[0].bytes).front()==
+            std::array<float,3>{2,0,2},"target components equal to -1 do not delete a vertex");
+        const auto deleted=negative.surfaceEdits(0,0,1,1,{{-1,-1,-1}});
+        require(deleted.size()==1 && vc::objects::xyzFromBytes<float>(deleted[0].bytes).front()==
+            std::array<float,3>{-1,-1,-1},"full missing sentinel deletes a vertex");
         changes=surfaceChanges;objectVersion=surfaceView.version();geometryRevision=surfaceView.revision().uuid;
         snapshot.close();
         bool closed=false;try{view.points("points",0,1);}catch(const std::exception&){closed=true;}require(closed,"snapshot lifetime retained");

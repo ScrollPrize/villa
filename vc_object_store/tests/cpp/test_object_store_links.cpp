@@ -154,6 +154,25 @@ void surfaceDiscoveryUsesCurrentRevisionsAndPreservesReview(const TemporaryDirec
     require([&] { auto txn = db.read(); return db.edgeByUuid(txn, edge)->version; }() == approved, "reviewed link untouched");
 }
 
+void callerCanCommitAfterFailedCandidateBatch(const TemporaryDirectory& directory)
+{
+    auto db = create(directory, "candidate-savepoint.vcobj");
+    const auto a = plane(db), b = plane(db), c = plane(db);
+    links::LinkCandidate candidate;
+    candidate.kind = "surface-overlap"; candidate.aUuid = a; candidate.bUuid = b;
+    candidate.aAnchor.wholeGeometry = candidate.bAnchor.wholeGeometry = true;
+    require(links::commitCandidates(db,"atomic-test",1,{candidate},false).edgesCreated == 1,
+            "candidate to be replaced is published");
+    const auto old = edgesOf(db,a).front().uuid;
+    candidate.bUuid = c;
+    candidate.meta = "[]";
+    auto txn = db.write();
+    mustFail([&] { links::commitCandidates(db,txn,"atomic-test",1,{candidate},true); });
+    txn.commit();
+    auto read = db.read();
+    require(db.edgeByUuid(read,old).has_value(),"failed candidate batch restores its stale edge before caller commits");
+}
+
 void surfaceSelectionMissingGeometryAndStaleScope(const TemporaryDirectory& directory)
 {
     auto db = create(directory, "selection.vcobj");
@@ -319,6 +338,7 @@ int main()
 try {
     TemporaryDirectory directory;
     surfaceDiscoveryUsesCurrentRevisionsAndPreservesReview(directory);
+    callerCanCommitAfterFailedCandidateBatch(directory);
     surfaceSelectionMissingGeometryAndStaleScope(directory);
     storedTrackCrossingsSelectionAndAtomicFailure(directory);
     referencedTrackDatasets(directory);

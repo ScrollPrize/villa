@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sqlite3
 import struct
 import uuid
@@ -174,6 +175,10 @@ def test_remote_registered_surface_is_fetched_once(db, tmp_path):
     served = tmp_path / 'served'
     served.mkdir()
     db.export_geometry(source, served / 'segment.tifxyz')
+    metadata = served / 'segment.tifxyz' / 'meta.json'
+    legacy = json.loads(metadata.read_text())
+    legacy['uuid'] = 'legacy-segment-name'
+    metadata.write_text(json.dumps(legacy))
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(served))
     handler.log_message = lambda *args: None
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
@@ -192,6 +197,28 @@ def test_remote_registered_surface_is_fetched_once(db, tmp_path):
     assert db.object(remote)['name'] == 'catalog'
     assert db.read_geometry_array(revision, 'points') == points.tobytes()
     assert db.read_geometry_array(revision, 'valid') == valid.tobytes()
+
+
+def test_surface_point_anchors_observe_selected_validity(db):
+    points = np.array([[[1, 1, 1], [2, 1, 1]], [[1, 2, 1], [2, 2, 1]]], dtype='<f4')
+    mask = np.full((2, 2), 255, 'u1')
+    surface, _ = put(db, dict(kind='surface', attributes={'scale': [1, 1]},
+                               arrays=[array('points', points), array('valid', mask)]), 'surface')
+    other = db.upsert_object(dict(kind='surface'))
+    anchor = dict(points=[dict(array='points', index=(0, 0))], channels=None,
+                  position=np.array([1., 1., 1.]))
+    edge = db.add_edge(dict(kind='attachment', a=surface, b=other, a_anchor=anchor))
+    result = db.edge(edge)
+    selected = result['a_anchor'] if result['a'] == surface else result['b_anchor']
+    assert selected == {'points': [{'array': 'points', 'index': [0, 0]}], 'position': (1., 1., 1.)}
+    mask[1, 1] = 0
+    db.update_surface_channels(surface, [array('valid', mask)], [], db.current_version(surface))
+    mask[0, 0] = 0
+    with pytest.raises(Exception, match='affected edge'):
+        db.update_surface_channels(surface, [array('valid', mask)], [], db.current_version(surface))
+    masked = dict(points=[dict(array='points', index=[1, 1])])
+    with pytest.raises(Exception, match='missing or invalid point'):
+        db.add_edge(dict(kind='attachment', a=surface, b=other, a_anchor=masked))
 
 
 def test_checked_relationships_lifecycle_and_graph(db):

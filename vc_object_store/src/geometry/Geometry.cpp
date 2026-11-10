@@ -729,8 +729,12 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
         }
         a["source_revision"] = source;
     }
-    // Point dependencies still use the unchanged points reader. Channel
-    // dependencies compare descriptors/hashes, including absence.
+    after.read = [read = std::move(after.read), &channels](const std::string& name, int64_t offset, int64_t length) {
+        for (const auto& channel : channels)
+            if (channel.name == name)
+                return std::vector<uint8_t>(channel.bytes.begin() + offset, channel.bytes.begin() + offset + length);
+        return read(name, offset, length);
+    };
     const auto affected = affectedEdges(*this, txn, objectUuid, current, after);
     const auto decisions = validateEdgeEdits(*this, txn, db, objectUuid, after, affected, edgeEdits);
     const auto object = *objectByUuid(txn, objectUuid);

@@ -94,6 +94,17 @@ void roundTrip(size_t shards,bool packed)
     }
     // A sealed output cannot be reopened writable, independently of callback lifetime.
     mustFail([&]{auto mutableStore=ObjectCollection::open(result.path,opt.store);auto w=mutableStore.write();mutableStore.seal(w);});
+    if(shards==1) {
+        const auto copied=dir.path/"copy.vcobj";
+        copyObjectCollection(result.path,copied,opt.store);
+        auto writable=ObjectStore::open(copied,opt.store);
+        auto w=writable.write();
+        writable.setMeta(w,uuids.front(),"review","true");
+        w.commit();
+        auto current=writable.read();
+        require(nlohmann::json::parse(writable.objectByUuid(current,uuids.front())->meta).at("review")==true,
+                "one-shard immutable import copies to an editable overlay");
+    }
 }
 void failures()
 {

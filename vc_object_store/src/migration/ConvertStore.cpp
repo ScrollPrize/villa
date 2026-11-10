@@ -5,11 +5,13 @@
 #include "internal/RecordJson.hpp"
 #include "internal/RecordOverrides.hpp"
 #include "internal/History.hpp"
+#include "internal/Publication.hpp"
 #include "internal/EdgeSql.hpp"
 #include "geometry/GeometryDelta.hpp"
 #include "geometry/GeometryReader.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_reader/native/platform_io.hpp"
+#include "vc_reader/native/atomic_file.hpp"
 
 #include <functional>
 #include <map>
@@ -937,7 +939,27 @@ ConversionResult convertStore(const std::filesystem::path& source, const std::fi
     return convertStoreImpl(source, destination);
 }
 
-ConversionResult convertStoreInPlace(const std::filesystem::path& input)
+void writeConversionReports(const ConversionResult& result, const std::filesystem::path& mapping,
+    const std::filesystem::path& report)
+{
+    for (const auto& path : {mapping, report})
+        if (const auto parent = path.parent_path(); !parent.empty() && !std::filesystem::is_directory(parent))
+            throw std::runtime_error("conversion report directory does not exist: " + parent.string());
+    StagedDatabase stagedMapping(mapping, false), stagedReport(report, false);
+    const auto prepare = [](const auto& path, const std::string& json) {
+        vcr::AtomicFile file(path.string());
+        const auto text = json + '\n';
+        file.write(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+        file.publish(true);
+    };
+    prepare(stagedMapping.path, result.mappingJson);
+    prepare(stagedReport.path, result.reportJson);
+    stagedMapping.publish();
+    stagedReport.publish();
+}
+
+ConversionResult convertStoreInPlace(const std::filesystem::path& input,
+    const std::function<void(const ConversionResult&)>& beforeReplace)
 {
     const auto source = std::filesystem::absolute(input).lexically_normal();
     if (!std::filesystem::is_regular_file(source) || std::filesystem::is_symlink(source))
@@ -964,15 +986,16 @@ ConversionResult convertStoreInPlace(const std::filesystem::path& input)
         }
     } cleanup{sibling};
     auto result = convertStoreImpl(source, sibling, locked.db);
+    auto report = Json::parse(result.reportJson);
+    report["destination"] = source.string();
+    report["in_place"] = true;
+    result.reportJson = report.dump(2);
+    if (beforeReplace) beforeReplace(result);
     // The converter verified and copied every referenced artifact. In-place
     // replacement keeps the original, identical content-addressed files;
     // only the SQLite file changes atomically. The verified copies are private.
     vcr::platform::replace_file(sibling, source, true);
     vcr::platform::sync_directory(source.parent_path(), "vcobj schema conversion");
-    auto report = Json::parse(result.reportJson);
-    report["destination"] = source.string();
-    report["in_place"] = true;
-    result.reportJson = report.dump(2);
     return result;
 }
 

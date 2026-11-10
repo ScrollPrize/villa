@@ -106,14 +106,21 @@ nlohmann::json anchorToJson(const Anchor& a)
     return j;
 }
 
-Anchor anchorFromJson(const nlohmann::json& j)
+Anchor anchorFromJson(const nlohmann::json& j, bool omitNullFields)
 {
     Anchor a;
     if (!j.is_object()) throw std::invalid_argument("anchor must be a JSON object");
     for (const auto& [key, value] : j.items())
         if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction" && key != "metadata_keys" && key != "channels")
             throw std::invalid_argument("unknown anchor field: " + key);
-    dependenciesFromJson(a, j);
+    if (omitNullFields) {
+        auto normalized = nlohmann::json::object();
+        for (const auto& [key, value] : j.items())
+            if (!value.is_null()) normalized[key] = value;
+        dependenciesFromJson(a, normalized);
+    } else {
+        dependenciesFromJson(a, j);
+    }
     for (const char* key : {"position", "direction"}) {
         if (j.contains(key) && !j.at(key).is_null()) {
             if (!j.at(key).is_array() || j.at(key).size() != 3)

@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 
 namespace vc::objects::migration {
@@ -42,6 +43,12 @@ ConversionResult convertStore(const std::filesystem::path& source, const std::fi
 // durable atomic database replacement. Existing source artifacts stay in place.
 // On validation failure the source remains an upstream store; no partial
 // converted database is published. Stop and reopen every client around this call.
-ConversionResult convertStoreInPlace(const std::filesystem::path& source);
+// A report sink, if supplied, runs with the final report and mapping before
+// replacing the source. A failed sink leaves the legacy database in place.
+ConversionResult convertStoreInPlace(const std::filesystem::path& source,
+    const std::function<void(const ConversionResult&)>& beforeReplace = {});
+
+void writeConversionReports(const ConversionResult&, const std::filesystem::path& mapping,
+    const std::filesystem::path& report);
 
 } // namespace vc::objects::migration

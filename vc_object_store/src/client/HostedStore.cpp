@@ -1,6 +1,7 @@
 #include "vc_object_store/client/HostedStore.hpp"
 
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include "internal/Artifacts.hpp"
 
 #include <nlohmann/json.hpp>
@@ -416,6 +417,21 @@ std::vector<std::string> restrictTo(const std::vector<std::string>& chunk, const
         if (keep.contains(uuid)) result.push_back(uuid);
     return result;
 }
+
+template<class Selection>
+void normalizePagingIds(Selection& selection)
+{
+    const auto normalize = [](auto& ids) {
+        for (auto& uuid : ids) uuid = util::canonicalUuid(std::move(uuid));
+    };
+    if constexpr (std::is_same_v<Selection, EdgeSelection>) {
+        if (selection.uuids) normalize(*selection.uuids);
+        if (selection.endpointUuids) normalize(*selection.endpointUuids);
+    } else {
+        normalize(selection.uuids);
+    }
+    if (selection.afterUuid) *selection.afterUuid = util::canonicalUuid(std::move(*selection.afterUuid));
+}
 } // namespace
 
 std::vector<ObjectRecord> HostedStore::selectObjects(const ObjectSelection& selection,
@@ -438,6 +454,7 @@ std::vector<ObjectRecord> HostedStore::selectAllObjects(ObjectSelection selectio
     const std::optional<std::vector<std::string>>& fields, int64_t pageSize, int maxRestarts, StoreStatus* asOf)
 {
     if (selection.limit) throw std::invalid_argument("hosted store: selectAllObjects pages itself; remove the limit");
+    normalizePagingIds(selection);
     // UUID order pages by cursor and catches up from the feed. Length order
     // and volume listings with unbound objects, or an explicit initial offset,
     // page by offset within one snapshot: they restart when a commit lands.
@@ -499,6 +516,7 @@ std::vector<EdgeRecord> HostedStore::selectAllEdges(EdgeSelection selection,
     const std::optional<std::vector<std::string>>& fields, int64_t pageSize, int maxRestarts, StoreStatus* asOf)
 {
     if (selection.limit) throw std::invalid_argument("hosted store: selectAllEdges pages itself; remove the limit");
+    normalizePagingIds(selection);
     const auto start = selection;
     CatchUp<EdgeRecord> listing{*this, pageSize, maxRestarts};
     listing.page = [&](const std::optional<std::string>& after, StoreStatus* status) {

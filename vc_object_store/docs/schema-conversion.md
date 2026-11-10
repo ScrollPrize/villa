@@ -14,6 +14,8 @@ With separate source/destination paths, the source is never modified and the des
 
 The converter preserves store and lineage UUIDs, numbered object/relationship versions, historical revision references, commit receipts, timestamps, approvals, geometry bytes and artifact contents. Legacy mutation counters become numbered versions; they are not renamed as commit numbers. The report identifies incomplete upstream history and legacy journal entries whose individual mutation cannot be assigned to a commit: those journal entries retain attribution and approval provenance, with `commit_sequence=0` and no invented approval-version pin.
 
+The in-place CLI prepares and publishes the mapping and report before replacing the legacy database. Their parent directories must already exist, and existing files are not overwritten. These are separate files: a complete sidecar can remain if a later publication step fails. Inspect or move it before retrying.
+
 Upstream schema 17 receives the same deterministic numbered-history reconstruction and revision-to-version mapping as the upstream converter. Schema 16 retains its existing restrictions: surface/patch histories and unsettled synchronization baselines are rejected. Replicas with unpublished edits and stores with unfinished writes must be settled using their original tooling first. Unknown tables, columns, views, triggers and indexes are rejected rather than silently dropped; extensions must be explicitly ported. The unpublished experimental schema-18/v2 branch layout is not a supported input.
 
 ## Changing history retention

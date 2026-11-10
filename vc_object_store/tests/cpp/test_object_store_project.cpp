@@ -50,8 +50,17 @@ void ownerHistoryPolicy(HistoryMode sourceMode,HistoryMode overlayMode)
         auto remove=store.write();store.deleteObject(remove,deleted);store.seal(remove);remove.commit();}
     auto overlayOptions=as("test");overlayOptions.history=overlayMode;
     {auto collection=ObjectCollection::create(overlay,{base},overlayOptions);}
-    auto store=ObjectStore::open(overlay,overlayOptions);auto txn=store.read();LocalStoreReader reader(store,txn);
-    require(projectResources(reader,kVolumeResource).size()==1,"resource discovery uses owner history policy");
+    auto store=ObjectStore::open(overlay,overlayOptions);
+    const auto local=projectResourceRecord(kVolumeResource,"/volumes/local");
+    if(sourceMode==HistoryMode::Off && overlayMode==HistoryMode::On){
+        auto w=store.write();store.upsertObject(w,local);w.commit();
+    }
+    auto txn=store.read();LocalStoreReader reader(store,txn);
+    const auto listed=projectResources(reader,kVolumeResource);
+    if(sourceMode==HistoryMode::Off && overlayMode==HistoryMode::On)
+        require(listed.size()==2 && listed[0].uuid==resource.uuid && listed[1].uuid==local.uuid,
+                "current-only creation and retained publication sort on one time scale");
+    else require(listed.size()==1,"resource discovery uses owner history policy");
     require(projectRecord(reader).has_value(),"project ordering uses owner history policy");
     require(reader.objectHistory(deleted,true).size()==(sourceMode==HistoryMode::On?2:0),"optional history follows winning tombstone owner");
     require(currentVersionOf(reader,deleted)==(sourceMode==HistoryMode::On?std::optional<int64_t>(2):std::nullopt),

@@ -5,7 +5,7 @@
 #include "formats/RemoteSource.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include <vc_reader/native/http.hpp>
-#include <fstream>
+#include <vc_reader/native/atomic_file.hpp>
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <nlohmann/json.hpp>
@@ -167,6 +167,11 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
                 ++report.preserved;
                 continue;
             }
+            // The placeholder provides only catalog-owned fields. Compare the
+            // resulting record, not the placeholder, with the live record.
+            auto meta = Json::parse(existing.meta);
+            meta.update(Json::parse(record.meta));
+            record.meta = meta.dump();
             if (sameCatalogRecord(existing, record)) continue;
             if (geometry) {
                 auto meta = Json::parse(record.meta);
@@ -184,9 +189,9 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
                 }
             }
             record.tags = existing.tags;
-            request.expectedObjects[record.uuid] = head->version;
+            expectObject(request, head->reference());
             ++report.updated;
-            auto meta = Json::parse(record.meta);
+            meta = Json::parse(record.meta);
             meta["catalog_write"] = util::newUuid();
             record.meta = meta.dump();
             request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
@@ -202,13 +207,9 @@ void downloadFile(const std::string& url, const fs::path& path)
     std::vector<std::uint8_t> body;
     if (!client.get(url, body)) throw std::runtime_error("cannot fetch " + url);
     fs::create_directories(path.parent_path());
-    const auto partial = path.string() + ".partial-" + util::newUuid();
-    {
-        std::ofstream output(partial, std::ios::binary);
-        output.write(reinterpret_cast<const char*>(body.data()), std::streamsize(body.size()));
-        if (!output) throw std::runtime_error("cannot write " + path.string());
-    }
-    fs::rename(partial, path);
+    vcr::AtomicFile output(path.string());
+    output.write(body.data(), body.size());
+    output.publish();
 }
 
 } // namespace detail
@@ -230,15 +231,7 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
     }
     const auto reference = record ? catalogReference(*record) : std::nullopt;
     if (!reference || reference->url.empty()) throw std::runtime_error("not a catalog surface: " + uuid);
-    const auto staging = fs::temp_directory_path() / ("vc-catalog-fetch-" + util::newUuid());
-    fs::create_directory(staging);
-    formats::Prepared prepared;
-    try {
-        formats::fetchRemoteSurface(reference->url, staging);
-        prepared = formats::surfaceGeometry(staging);
-    } catch (...) { std::error_code ignored; fs::remove_all(staging, ignored); throw; }
-    std::error_code ignored;
-    fs::remove_all(staging, ignored);
+    auto prepared = formats::readRemoteSurfaceGeometry(reference->url);
     const auto coordinates = Json::parse(record->meta.empty() ? std::string("{}") : record->meta).value("coordinates", Json::object());
     if (const auto scale = coordinates.find("scale_factor"); scale != coordinates.end() && scale->is_number())
         centreOnReducedBlocks(prepared.geometry, scale->get<double>());

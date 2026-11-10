@@ -296,6 +296,13 @@ int main() try
     const auto both = session.selectObjects({mine, catalog}, near);
     require(both.size() == 1 && both.front().attachment == mine, "imported copy shadows the original");
 
+    (void)session.editRecords(catalog, {uuid}, [](ObjectRecord& record) {
+        auto meta = nlohmann::json::parse(record.meta); meta["review"] = "preserve"; record.meta = meta.dump();
+    });
+    const auto editedReference = session.currentObject(catalog, uuid)->reference();
+    require(refreshCatalog(session, catalog, sample).updated == 0 &&
+            session.currentObject(catalog, uuid)->reference() == editedReference,
+            "unchanged catalog refresh does not overwrite independent metadata");
     // Refresh follows the catalog only when asked; a changed tifxyz is fetched again.
     writeSurface(served / "seg-a-v2.tifxyz", 31);
     const auto revised = vcr::catalog::parseOpenDataManifest(sampleJson(server, "seg-a-v2.tifxyz/", "missing.tifxyz/"))
@@ -311,6 +318,8 @@ int main() try
         });
         return fresh;
     }, "new revision");
+    require(nlohmann::json::parse(session.currentObject(catalog, uuid)->record.meta).at("review") == "preserve",
+            "changed catalog refresh and refetch preserve independent metadata");
     session.readStore(mine, [&](const StoreReader& reader, const auto&) {
         require(nlohmann::json::parse(reader.currentGeometry(uuid)->attributes).at("source_url") == server.url("seg-a.tifxyz"),
                 "other stores untouched by refresh");

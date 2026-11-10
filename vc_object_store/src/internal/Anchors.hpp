@@ -8,7 +8,7 @@ void validateEdgeAnchors(const EdgeRecord&);
 nlohmann::json dependenciesToJson(const Anchor&);
 void dependenciesFromJson(Anchor&, const nlohmann::json&);
 nlohmann::json anchorToJson(const Anchor&);
-Anchor anchorFromJson(const nlohmann::json&);
+Anchor anchorFromJson(const nlohmann::json&, bool omitNullFields = false);
 void swapEndpoints(EdgeRecord&);
 // Logical order is stable across databases; SQL storage may use row-ID order.
 bool canonicalizeEdge(EdgeRecord&);

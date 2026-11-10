@@ -69,6 +69,8 @@ ObjectRecord projectResourceRecord(const std::string& kind, const std::string& l
                                    const std::vector<std::string>& tags = {},
                                    const nlohmann::json& meta = nlohmann::json::object(),
                                    const std::string& owner = {});
+// Preserve an existing legacy UUID only when it names this exact resource.
+ObjectRecord resolveProjectResourceIdentity(const StoreReader&, ObjectRecord);
 // Add a resource (or bring back a removed one) with these tags and meta, shared
 // or `owner`'s; false when it is already there, unchanged.
 bool addProjectResource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& kind,

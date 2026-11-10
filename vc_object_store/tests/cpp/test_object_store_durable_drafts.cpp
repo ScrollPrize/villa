@@ -132,8 +132,11 @@ try {
         session.setDraft(surface, flat(7), coordinates, attachment);
         std::filesystem::permissions(drafts, std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
         mustFail([&] { (void)session.checkpointDrafts(); });
+        mustFail([&] { (void)session.submitDurably(attachment, save(session, attachment, surface, 1, 7), {surface}); });
         std::filesystem::permissions(drafts, std::filesystem::perms::owner_all);
         require(!session.draftCheckpointError().empty() && !session.draftState(surface)->checkpointed, "failure reported");
+        require(session.pendingSubmissions().empty() && !session.draftState(surface)->pendingRequest,
+                "an unstaged save never becomes a recoverable pending submission");
     }
     {
         ObjectStoreSession session;

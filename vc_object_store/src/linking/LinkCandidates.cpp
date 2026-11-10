@@ -1,5 +1,6 @@
 #include "linking/StoredGeometry.hpp"
 #include "internal/Anchors.hpp"
+#include "internal/Database.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 
 #include <algorithm>
@@ -54,6 +55,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
 {
     if (detectorName.empty())
         throw std::runtime_error("object links: detector name must be non-empty");
+    objects::detail::Savepoint operation(objects::ObjectStoreImplAccess::conn(txn));
     DetectorReport report;
     report.candidatesFound = int64_t(candidates.size());
 
@@ -166,6 +168,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
     }
 
     objects::util::reportProgress(progress, "writing links", candidates.size(), candidates.size());
+    operation.release();
     return report;
 }
 

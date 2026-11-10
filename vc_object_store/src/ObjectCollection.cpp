@@ -615,11 +615,13 @@ void copyObjectCollection(const std::filesystem::path& source, const std::filesy
         return m.partition && m.storeUuid==members.front().storeUuid;
     });
     if(partitioned&&!provisioning.sealed)throw std::runtime_error("partitioned collection root must be sealed");
+    const bool needsOverlay = partitioned ||
+        immutableInitial(ObjectStoreImplAccess::conn(collection.impl_->txn(snapshot,0)));
     if(before==std::numeric_limits<int64_t>::max())throw std::overflow_error("copied store commit sequence exhausted");
     StagedDatabase staged(target,false);
     bool ownsSidecar=false;
     try {
-        if(members.size()>1||partitioned){
+        if(members.size()>1||needsOverlay){
             if(!fs::create_directory(sidecar))throw std::runtime_error("cannot create collection copy sidecar");
             ownsSidecar=true;
         }
@@ -628,7 +630,7 @@ void copyObjectCollection(const std::filesystem::path& source, const std::filesy
         std::vector<fs::path> artifactSnapshots;
         for(size_t i=0;i<members.size();++i){
             const auto& member=members[i];
-            paths[member.databaseUuid]=i==0&&!partitioned?staged.path:sidecar/(member.databaseUuid+".vcobj");
+            paths[member.databaseUuid]=i==0&&!needsOverlay?staged.path:sidecar/(member.databaseUuid+".vcobj");
             copySqliteSnapshot(ObjectStoreImplAccess::conn(collection.impl_->txn(snapshot,i)),paths.at(member.databaseUuid));
             artifactSources.push_back(member.locator);
             artifactSnapshots.push_back(paths.at(member.databaseUuid));
@@ -644,7 +646,7 @@ void copyObjectCollection(const std::filesystem::path& source, const std::filesy
                 relocateCollectionMembers(db.get(),[&](const std::string& id){
                     return fs::relative(paths.at(id),path.parent_path()).generic_string();
                 });
-                if(i==0&&!partitioned){
+                if(i==0&&!needsOverlay){
                     forkStorageIdentity(db.get());
                     const auto newStore=util::newUuid();
                     exec(db.get(),"DROP TRIGGER store_identity_immutable_update; DROP TRIGGER store_identity_immutable_delete;");
@@ -660,7 +662,7 @@ void copyObjectCollection(const std::filesystem::path& source, const std::filesy
                 exec(db.get(),"UPDATE store_write_state SET dirty=0 WHERE singleton=1; COMMIT;");
             } catch(...) {sqlite3_exec(db.get(),"ROLLBACK",nullptr,nullptr,nullptr);throw;}
         }
-        if(partitioned){
+        if(needsOverlay){
             auto writable=options;writable.history=provisioning.history;writable.readOnly=false;writable.serviceOwner=false;
             auto overlay=ObjectCollection::create(staged.path,{paths.at(members.front().databaseUuid)},writable);
         }

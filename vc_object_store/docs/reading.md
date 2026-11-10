@@ -25,7 +25,7 @@ store = ObjectStore.open("objects.vcobj", author="reader", read_only=True)
 A writable open takes a host-local ownership lock on `<path>-owner`, shared
 between standalone writers and exclusive for the server's service owner, so a
 store served by `vc_object_server` rejects other writable opens (read-only
-ones still work). A store with an unsupported schema is rejected untouched;
+ones still work). Writable opens reject hard-linked database files because aliases would use different ownership and journal sidecars. Use a symlink or a normal store copy instead. A store with an unsupported schema is rejected untouched;
 convert it with `vc_object_convert` (see [Converting old stores](#converting-old-stores)).
 
 Closing a store with live snapshots is an error in Python. Use the store as a

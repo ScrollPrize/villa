@@ -401,6 +401,10 @@ try {
         auto host = ObjectStore::open(path, service);
         mustFail([&] { (void)ObjectStore::open(path, options); });
         mustFail([&] { (void)ObjectStore::open(directory.path / "alias.vcobj", options); });
+        const auto hardAlias = directory.path / "hard-alias.vcobj";
+        std::filesystem::create_hard_link(path, hardAlias);
+        mustFail([&] { (void)ObjectStore::open(hardAlias, options); });
+        std::filesystem::remove(hardAlias);
         OpenOptions reader; reader.readOnly = true;
         auto readOnly = ObjectStore::open(path, reader);
         auto txn = readOnly.read();
