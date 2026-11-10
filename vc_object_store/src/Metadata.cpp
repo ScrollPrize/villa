@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/RecordOverrides.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 
@@ -8,6 +9,8 @@ using namespace detail;
 namespace {
 std::pair<const char*, int64_t> recordLocation(sqlite3* db, const std::array<unsigned char, 16>& bytes, const std::string& uuid)
 {
+    if (objectSource(db, uuid)) createRecordOverride(db, "objects", uuid);
+    else if (edgeSource(db, uuid)) createRecordOverride(db, "edges", uuid);
     Statement object(db,"SELECT id FROM objects WHERE uuid=? AND state<>2",bytes);
     if(object.row())return {"objects",object.i64(0)};
     Statement edge(db,"SELECT id FROM edges WHERE uuid=? AND state=0",bytes);
@@ -28,7 +31,7 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
     const auto [table, id] = recordLocation(db, bytes, recordUuid);
     {
         Statement current(db, std::string("SELECT approval_state FROM ") + table + " WHERE id=?", id);
-        if (current.row() && current.text(0) == state) { savepoint.release(); return; }
+        if (current.row() && current.text(0) == state) return;
     }
     const auto version = writeRecordVersion(db, table, recordUuid);
     const int64_t commit_sequence = writeCommitSequence(db);
@@ -71,7 +74,6 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
         const auto found = meta.find(key);
         if (jsonValue ? found != meta.end() && *found == nlohmann::json::parse(*jsonValue)
                       : found == meta.end()) {
-            savepoint.release();
             return;
         }
     }

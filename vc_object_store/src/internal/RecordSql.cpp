@@ -6,6 +6,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 
 namespace vc::objects::detail {
@@ -385,6 +386,12 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
 {
     Savepoint savepoint(db);
     auto rec=prepareObjectRecord(input);
+    if(auto* source=objectSource(db,rec.uuid);source&&source!=db){
+        const auto original=resolveObject(db,rec.uuid)->record;
+        createRecordOverride(db,"objects",rec.uuid);
+        if(rec.storageKind==original.storageKind&&rec.storageRef==original.storageRef)
+            rec.storageRef=resolveObject(db,rec.uuid)->record.storageRef;
+    }
     const auto uuid=parseUuid(rec.uuid);
     normalizeObjectCoordinates(rec,!preserveRecord,db);
     const auto bounds = detail::recordBounds(rec);

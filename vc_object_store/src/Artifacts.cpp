@@ -138,6 +138,50 @@ std::filesystem::path artifactBlobPath(const std::filesystem::path& storePath, c
     return artifactBlobDirectory(storePath) / sha256.substr(0, 2) / sha256;
 }
 
+detail::ArtifactExport::ArtifactExport(const std::vector<std::filesystem::path>& sources,
+                                      const std::filesystem::path& destination)
+{
+    std::set<std::filesystem::path> roots;
+    for(const auto& source:sources)roots.insert(artifactBlobDirectory(source));
+    try {
+        for(const auto& root:roots){
+            if(!std::filesystem::exists(root))continue;
+            for(const auto& entry:std::filesystem::recursive_directory_iterator(root)){
+                if(!entry.is_regular_file())continue;
+                const auto hash=entry.path().filename().string();
+                if(!isArtifactHash(hash)||entry.path().parent_path().filename()!=hash.substr(0,2))
+                    throw std::runtime_error("artifact: unexpected payload file in source sidecar");
+                if(owned_.empty()){
+                    auto target=artifactBlobDirectory(destination).parent_path();
+                    if(!std::filesystem::create_directory(target))
+                        throw std::runtime_error("artifact destination already exists: "+target.string());
+                    owned_=std::move(target);
+                }
+                const auto target=artifactBlobPath(destination,hash);
+                ArtifactFileRef file{hash,hash,entry.file_size()};
+                if(std::filesystem::exists(target)){
+                    if(!artifactFileMatches(file,entry.path()))throw std::runtime_error("artifact: corrupt duplicate payload");
+                    continue;
+                }
+                std::filesystem::create_directories(target.parent_path());
+                Descriptor input(entry.path(),O_RDONLY);
+                writeArtifactFile(file,target,kBlock,[&](uint64_t offset,uint64_t count){
+                    std::vector<uint8_t> bytes;bytes.reserve(count);
+                    readBlocks(input.fd,offset,count,[&](const uint8_t* data,size_t size){bytes.insert(bytes.end(),data,data+size);});
+                    return bytes;
+                });
+            }
+        }
+    }catch(...){
+        if(!owned_.empty()){std::error_code error;std::filesystem::remove_all(owned_,error);}
+        throw;
+    }
+}
+detail::ArtifactExport::~ArtifactExport()
+{
+    if(!committed_&&!owned_.empty()){std::error_code error;std::filesystem::remove_all(owned_,error);}
+}
+
 std::string artifactManifestJson(std::vector<ArtifactFile> files)
 {
     std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.name < b.name; });

@@ -3,6 +3,7 @@
 #include "internal/History.hpp"
 #include "internal/Extensions.hpp"
 #include "geometry/GeometryInternal.hpp"
+#include "internal/RecordResolver.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -10,7 +11,7 @@ using namespace detail;
 std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& options) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
-    rejectExtensionLoss(db,"metadata JSON export");
+    for(auto* source:querySources(db))rejectExtensionLoss(source,"metadata JSON export");
     nlohmann::json out{{"format", "vc_object_metadata"}, {"version", 2}, {"metadata_only", true},
         {"store_uuid", uuid(txn)}, {"objects", nlohmann::json::array()}, {"edges", nlohmann::json::array()}};
     const std::set<std::string> fields(options.fields.begin(), options.fields.end());
@@ -27,44 +28,24 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
     };
     const auto objectProjection = projection({"name", "format_version", "storage_kind", "storage_ref", "version", "data_checksum", "fiber", "surface", "track"});
     const auto edgeProjection = projection({"a", "b", "a_anchor", "b_anchor"});
-    ObjectFields edgeFields = edgeProjection ? ObjectFields(std::in_place, edgeProjection->begin(), edgeProjection->end()) : std::nullopt;
     // Export canonicalizes endpoint order, including self-link dependency order.
     // Both anchors are needed for that even when only one is requested.
-    if (edgeFields) { edgeFields->insert("a_anchor"); edgeFields->insert("b_anchor"); }
-    nlohmann::json included = nlohmann::json::array();
+    std::vector<std::string> included;
     for (const auto& object : selectObjects(txn, options.selection, objectProjection)) {
-        included.push_back(*objectIdByUuid(db, parseUuid(object.uuid)));
+        included.push_back(object.uuid);
         auto record = objectToJson(object, fields.empty() ? nullptr : &fields);
         if (const auto geometry = currentGeometry(txn, object.uuid))
             record["geometry"] = {{"revision_uuid", geometry->uuid}, {"content_hash", geometry->contentHash}};
         out["objects"].push_back(std::move(record));
     }
-    std::string members = "SELECT e.id FROM json_each(?1) selected CROSS JOIN objects selected_object ON selected_object.id=selected.value "
-        "CROSS JOIN edges e INDEXED BY edges_a WHERE e.state=0 AND e.a_uuid=selected_object.uuid "
-        "AND e.b_uuid IN (SELECT uuid FROM objects WHERE id IN (SELECT value FROM json_each(?1)))";
-    if (!options.selection.includeRetired)
-        members += " AND e.id IN (SELECT id FROM edges WHERE " + activeEdgeSql() + ")";
-    if (!options.selection.edgeKinds.empty()) members += " AND e.kind IN (SELECT value FROM json_each(?2))";
-    Statement states(db, "SELECT e.uuid,CASE WHEN a.geometry_manifest IS NOT NULL THEN a.storage_ref END,"
-        "CASE WHEN z.geometry_manifest IS NOT NULL THEN z.storage_ref END FROM edges e "
-        "JOIN objects a ON a.uuid=e.a_uuid JOIN objects z ON z.uuid=e.b_uuid "
-        "WHERE e.id IN (" + members + ")", included.dump());
-    if (!options.selection.edgeKinds.empty()) states.bind(2, nlohmann::json(options.selection.edgeKinds).dump());
-    std::map<std::string, EdgeGeometryState> geometryStates;
-    while (states.row()) {
-        const auto id = formatUuid(states.blob16(0));
-        auto revision = [&](int col) -> std::optional<std::string> {
-            return states.isNull(col) ? std::nullopt : std::optional(readGeometryTokenColumn(states,col));
-        };
-        EdgeGeometryState state{revision(1), revision(2), false};
-        geometryStates.emplace(id, std::move(state));
-    }
-    Statement edges(db, "SELECT " + projectedEdgeColumns(edgeFields) + " FROM edges WHERE id IN (" + members + ") ORDER BY uuid",
-        included.dump());
-    if (!options.selection.edgeKinds.empty()) edges.bind(2, nlohmann::json(options.selection.edgeKinds).dump());
-    for (const auto& edge : readEdgeRows(db, edges, edgeFields)) {
+    EdgeSelection selection;selection.endpointUuids=std::move(included);selection.bothEndpoints=true;
+    selection.includeRetired=options.selection.includeRetired;
+    auto selectedFields=edgeProjection;
+    if(selectedFields){selectedFields->push_back("a_anchor");selectedFields->push_back("b_anchor");selectedFields->push_back("kind");}
+    for (const auto& edge : selectEdges(txn,selection,selectedFields)) {
+        if(!options.selection.edgeKinds.empty()&&std::find(options.selection.edgeKinds.begin(),options.selection.edgeKinds.end(),edge.kind)==options.selection.edgeKinds.end())continue;
         auto record = edgeToJson(edge, fields.empty() ? nullptr : &fields);
-        const auto& state = geometryStates.at(edge.uuid);
+        const auto state=edgeGeometryState(txn,edge.uuid);
         const bool swap = record["a"] != edge.aUuid;
         auto a = swap ? state.bRevision : state.aRevision, b = swap ? state.aRevision : state.bRevision;
         record["geometry_bindings"] = {{"a", a ? nlohmann::json(*a) : nlohmann::json()},

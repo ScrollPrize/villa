@@ -142,6 +142,9 @@ struct ObjectRevision {
     // recorded publication (e.g. untimed imported baselines).
     int64_t version = 0;
     std::string generation;
+    // Origin of this exact state, independent of a newer visible overlay.
+    // Runtime/wire identity, not another per-record storage column.
+    std::string storeUuid;
     std::optional<int64_t> commitSequence;
     ObjectRecord record;
 };
@@ -390,6 +393,7 @@ private:
     const ObjectStore* db_ = nullptr;
     void* handle_ = nullptr;  // sqlite3*
     bool write_ = false;
+    std::shared_ptr<void> referenceContext_;
     RevisionSelection expectedRevisions_;
     std::optional<TransactionReceipt> receipt_;
     VersionSelection expectedObjectVersions_, expectedRelationshipVersions_;

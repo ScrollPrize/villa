@@ -60,6 +60,18 @@ void roundTrip(size_t shards,bool packed)
     require(result.path==(shards>1&&!packed?output/"collection.vcobj":output),"public root locator");
     require(result.shards.size()==shards,"all shards reported");
     require(result.totalSeconds>=result.ingestionSeconds && result.persistenceSeconds>=0,"timings reported");
+    {
+        auto native=ObjectStore::open(result.path,OpenOptions{.readOnly=true});auto read=native.read();
+        const auto graph=native.graphReadView(read);
+        require(graph.objectUuids.size()==shards+1&&graph.edgeUuids.size()==shards,
+            "ordinary graph API spans shards and their sealed dependency");
+        require(native.componentOf(read,reference.objectUuid).size()==shards+1,
+            "ordinary traversal reaches sibling-shard edges");
+        std::vector<ObjectVersion> versions;
+        for(const auto& uuid:graph.objectUuids)versions.push_back(native.versionReference(read,*native.currentObjectRevision(read,uuid)));
+        require(native.graphReadViewAt(read,versions).edgeUuids.size()==shards,
+            "exact current-only graph retains cross-shard relationships");
+    }
     auto store=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto r=store.read();
     require(store.uuid(r)==result.storeUuid,"published logical owner");
     require(store.provisioning(r).sealed && store.provisioning(r).commitSequence>baseSequence,

@@ -2,10 +2,12 @@
 #include "internal/History.hpp"
 #include "internal/Versions.hpp"
 #include "imports/SourceIdentityIndex.hpp"
+#include "internal/CollectionReads.hpp"
 
 namespace vc::objects {
 using namespace detail;
 Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_),
+    referenceContext_(std::move(other.referenceContext_)),
     expectedRevisions_(std::move(other.expectedRevisions_)),
     receipt_(std::move(other.receipt_)), expectedObjectVersions_(std::move(other.expectedObjectVersions_)),
     expectedRelationshipVersions_(std::move(other.expectedRelationshipVersions_))
@@ -35,6 +37,7 @@ void Txn::release(bool commit)
     auto* conn = static_cast<sqlite3*>(handle_);
     auto releaseConnection = [&] {
         handle_ = nullptr;
+        referenceContext_.reset();
         // Collection resolvers capture the transaction's pinned dependencies;
         // pooled connections must never retain those captures after release.
         if (const auto pool = activeStatementPools.find(conn); pool != activeStatementPools.end()) {
@@ -43,6 +46,8 @@ void Txn::release(bool commit)
             if (pool->second->referenceSource) pool->second->geometryCache.reset();
             pool->second->referenceSource = {};
             pool->second->objectSource = {};
+            pool->second->edgeSource = {};
+            pool->second->querySources = {};
             pool->second->currentWrite.reset();
         }
         activeStatementPools.erase(conn);
@@ -106,7 +111,10 @@ ReadTxn ObjectStore::read() const
         impl_->checkinReader(conn);
         throw;
     }
-    return ReadTxn(this, conn);
+    ReadTxn txn(this,conn);
+    if(impl_->composed&&!impl_->options.physicalPartitionOnly)
+        txn.referenceContext_=attachCollectionReferenceResolver(conn,impl_->path,impl_->options);
+    return txn;
 }
 
 WriteTxn ObjectStore::write()
@@ -137,7 +145,10 @@ WriteTxn ObjectStore::write()
     }
     catch (...) { sqlite3_exec(impl_->writer, "ROLLBACK;", nullptr, nullptr, nullptr); activeStatementPools.erase(impl_->writer); throw; }
     lock.release(); // WriteTxn releases the mutex on commit or rollback.
-    return WriteTxn(this, impl_->writer);
+    WriteTxn txn(this,impl_->writer);
+    if(impl_->composed&&!impl_->options.physicalPartitionOnly)
+        txn.referenceContext_=attachCollectionReferenceResolver(impl_->writer,impl_->path,impl_->options);
+    return txn;
 }
 
 WriteTxn ObjectStore::write(const VersionSelection& expectedObjects)

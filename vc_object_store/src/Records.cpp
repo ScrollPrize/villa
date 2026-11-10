@@ -1,5 +1,6 @@
 #include "internal/RecordSql.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "geometry/GeometryDelta.hpp"
 
@@ -28,6 +29,12 @@ std::vector<ObjectRecord> ObjectStore::objectsByKind(const Txn& txn, const std::
                                                  const std::optional<std::string>& approvalState, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
+    if(querySources(db).size()>1){
+        ObjectSelection selection;selection.kind=kind;selection.includeRetired=includeRetired;
+        auto records=selectObjects(txn,selection);
+        if(approvalState)std::erase_if(records,[&](const auto& r){return r.approvalState!=*approvalState;});
+        return records;
+    }
     std::string sql = std::string("SELECT ") + kObjectCols + " FROM objects WHERE kind=? AND state<>2";
     if (!includeRetired) sql += " AND " + activeObjectSql("objects.id");
     if (approvalState) sql += " AND approval_state=?";
@@ -40,6 +47,10 @@ std::vector<ObjectRecord> ObjectStore::objectsByKind(const Txn& txn, const std::
 int64_t ObjectStore::objectCount(const Txn& txn, const std::string& kind, bool includeRetired) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
+    if(querySources(db).size()>1){
+        ObjectSelection selection;selection.kind=kind;selection.includeRetired=includeRetired;
+        return selectObjects(txn,selection,std::vector<std::string>{}).size();
+    }
     Statement s(db, "SELECT count(*) FROM objects WHERE kind=? AND state<>2" +
         (includeRetired ? std::string() : " AND " + activeObjectSql("objects.id")), kind);
     (void)s.row();
@@ -49,6 +60,10 @@ int64_t ObjectStore::objectCount(const Txn& txn, const std::string& kind, bool i
 std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
+    if(querySources(db).size()>1){
+        ObjectSelection selection;selection.tag=tag;selection.includeRetired=includeRetired;
+        return selectObjects(txn,selection);
+    }
     // Column names are ambiguous under the join only for id; qualify by selecting explicit object columns.
     Statement s(db, "SELECT o.id,o.uuid,o.kind,o.name,o.commit_sequence,o.created_by,o.created_at,o.created_host,o.changed_by,o.changed_at,"
                     "o.changed_host,o.approval_state,o.approved_by,o.approved_at,o.approved_host,o.approved_version,o.format_version,"
@@ -61,6 +76,12 @@ std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::s
 std::vector<std::string> ObjectStore::objectTags(const Txn& txn, const std::optional<std::string>& kind) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
+    if(querySources(db).size()>1){
+        ObjectSelection selection;selection.kind=kind;std::set<std::string> tags;
+        for(const auto& record:selectObjects(txn,selection,std::vector<std::string>{"tags"}))
+            tags.insert(record.tags.begin(),record.tags.end());
+        return {tags.begin(),tags.end()};
+    }
     Statement s(db, "SELECT DISTINCT t.tag FROM object_tags t JOIN objects o ON o.id=t.object_id WHERE (?1 IS NULL OR o.kind=?1) AND " +
                     activeObjectSql("o.id") + " ORDER BY t.tag");
     if (kind) s.bind(1, *kind); else s.bindNull(1);
@@ -73,13 +94,13 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
+    createRecordOverride(db,"objects",uuid);
     const auto bytes = parseUuid(uuid);
     Statement row(db, "SELECT id,kind FROM objects WHERE uuid=? AND state<>2", bytes);
     if (!row.row()) throw std::runtime_error("object store: object not found: " + uuid);
     const auto kind = row.text(1);
     // UUID endpoints may live in referenced stores; RESTRICT is checked by the API.
-    Statement incident(db, "SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1", bytes);
-    if (incident.row()) throw std::runtime_error("object store: remove incident relationships before deletion");
+    if (!incidentEdges(db,uuid).empty()) throw std::runtime_error("object store: remove incident relationships before deletion");
     beforeCurrentObjectEdit(db,uuid);
     writeObjectVersion(db,uuid);
     clearCurrentExtensionRows(db, "objects", uuid);

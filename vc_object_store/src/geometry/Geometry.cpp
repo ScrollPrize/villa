@@ -10,6 +10,7 @@
 #include "geometry/SequenceMetadata.hpp"
 #include "geometry/InitialGeometry.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -166,6 +167,7 @@ void writeRevision(sqlite3* db, const ObjectStore& store, const ObjectRecord& ob
     const std::string& uuid, const GeometryRevision* parent, const std::string& hash, const std::string& text,
     const std::string* currentText=nullptr)
 {
+    createRecordOverride(db, "objects", object.uuid);
     if (!historyEnabled(db)) {
         if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end())pool->second->geometryCache.reset();
         if(activeDependencies)activeDependencies->clear();
@@ -533,6 +535,7 @@ std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn,
     const auto affected=affectedEdges(store,txn,objectUuid,current,after,changedIds);
     const auto decisions=validateEdgeEdits(store,txn,db,objectUuid,after,affected,edgeEdits);
     const auto object=*store.objectByUuid(txn,objectUuid);
+    createRecordOverride(db, "objects", objectUuid);
     const auto uuid=util::newUuid(); const auto id=*objectIdByUuid(db,parseUuid(objectUuid));
     const auto text=manifest.dump(), hash=hashText(text);
     if (geometryWork) geometryWork->manifestBytesWritten += text.size();

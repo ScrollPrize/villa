@@ -2,6 +2,7 @@
 #include "internal/RecordSql.hpp"
 #include "vc_object_store/objects/VolumeTransforms.hpp"
 #include "internal/Sqlite.hpp"
+#include "internal/RecordResolver.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
@@ -92,6 +93,19 @@ inline std::vector<VolumeFrame> volumeFrames(sqlite3* db, const std::string& vol
     for (const double scale : scales)
         frames.push_back({nlohmann::json{{"volume_uuid", volume}, {"scale_factor", scale}}.dump(), 1.0 / scale, VolumeAffine::scale(1.0 / scale)});
     return frames;
+}
+
+// Coordinate declarations are a small candidate set. Physical frames with
+// only shadowed objects are harmless: visible queries find no rows in them.
+inline std::vector<VolumeFrame> scopedVolumeFrames(sqlite3* db,const std::string& volume,
+    const std::optional<std::string>& kind,bool includeRetired,const VolumeTransforms* transforms=nullptr)
+{
+    std::map<std::string,VolumeFrame> frames;
+    for(auto* source:querySources(db))for(auto& frame:volumeFrames(source,volume,kind,includeRetired,transforms))
+        frames.emplace(frame.coordinates,std::move(frame));
+    std::vector<VolumeFrame> result;
+    for(auto& [key,frame]:frames)result.push_back(std::move(frame));
+    return result;
 }
 
 // Exact inverses of the monotonic map stored -> stored * toVolume: the lowest

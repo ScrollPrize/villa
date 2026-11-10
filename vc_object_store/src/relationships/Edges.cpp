@@ -6,6 +6,7 @@
 #include "internal/History.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
 #include <nlohmann/json.hpp>
 #include <variant>
 
@@ -57,16 +58,18 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
     std::sort(rec.tags.begin(), rec.tags.end());
     rec.tags.erase(std::unique(rec.tags.begin(), rec.tags.end()), rec.tags.end());
+    Savepoint savepoint(db);
+    createRecordOverride(db, "edges", rec.uuid);
     if (rec.aAnchor == existing->aAnchor && rec.bAnchor == existing->bAnchor &&
         rec.tags == existing->tags && nlohmann::json::parse(rec.meta) == nlohmann::json::parse(existing->meta)) {
         if (!lifecycleBindingMatches(db, rec))
             stampContentChange(db, author(), hostname(), "edges", *edgeIdByUuid(db, parseUuid(rec.uuid)),
                                parseUuid(rec.uuid), "lifecycle_revalidated");
         recordRelationshipValidation(db, rec);
+        savepoint.release();
         return;
     }
     const auto id = *edgeIdByUuid(db, parseUuid(rec.uuid));
-    Savepoint savepoint(db);
     Statement s(db, "UPDATE edges SET a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
         "b_anchor_x=?,b_anchor_y=?,b_anchor_z=?,b_dir_x=?,b_dir_y=?,b_dir_z=?,meta=?,a_dependencies=?,b_dependencies=? WHERE id=?");
     bindAnchor(s, 1, rec.aAnchor); bindAnchor(s, 7, rec.bAnchor);
@@ -81,16 +84,15 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
 
 std::optional<EdgeRecord> ObjectStore::edgeByUuid(const Txn& txn, const std::string& uuid) const
 {
-    sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=? AND state=0", parseUuid(uuid));
-    if (!s.row()) return std::nullopt;
-    return readEdgeRow(db, s);
+    const auto edge=resolveEdge(static_cast<sqlite3*>(connection(txn)),uuid);
+    return edge?std::optional(edge->record):std::nullopt;
 }
 
 void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
+    createRecordOverride(db, "edges", uuid);
     const auto bytes = parseUuid(uuid);
     Statement row(db, "SELECT id,kind FROM edges WHERE uuid=? AND state=0", bytes);
     if (!row.row()) throw std::runtime_error("object store: edge not found: " + uuid);
@@ -108,17 +110,25 @@ std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& 
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     const auto key=parseUuid(objectUuid);
     if(!resolveObject(db,objectUuid))throw std::runtime_error("object store: object not found: "+objectUuid);
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE state=0 AND (a_uuid=? OR b_uuid=?)" +
-        (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id", key, key);
-    return readEdgeRows(db, s);
+    if(querySources(db).size()==1){
+        Statement rows(db,std::string("SELECT ")+kEdgeCols+" FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1)"+
+            (includeRetired?std::string{}:" AND "+activeEdgeSql())+" ORDER BY id",key);
+        return readEdgeRows(db,rows);
+    }
+    EdgeSelection selection;selection.endpointUuids=std::vector{objectUuid};selection.includeRetired=includeRetired;
+    return selectEdges(txn,selection);
 }
 
 std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::string& edgeKind, bool includeRetired) const
 {
-    sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE state=0 AND kind=?" +
-        (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id", edgeKind);
-    return readEdgeRows(db, s);
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    if(querySources(db).size()==1){
+        Statement rows(db,std::string("SELECT ")+kEdgeCols+" FROM edges WHERE state=0 AND kind=?"+
+            (includeRetired?std::string{}:" AND "+activeEdgeSql())+" ORDER BY id",edgeKind);
+        return readEdgeRows(db,rows);
+    }
+    EdgeSelection selection;selection.kind=edgeKind;selection.includeRetired=includeRetired;
+    return selectEdges(txn,selection);
 }
 
 std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSelection& selection,
@@ -190,6 +200,28 @@ std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelec
     auto* db = static_cast<sqlite3*>(connection(txn));
     const ObjectFields fields = projection ? ObjectFields(std::in_place, projection->begin(), projection->end()) : std::nullopt;
     const auto columns = projectedEdgeColumns(fields);
+    const auto sources=querySources(db);
+    if(sources.size()>1){
+        validateEdgeSelection(selection);
+        if(selection.applicableOnly)requirePublishedGraphRead(txn);
+        auto physical=selection;physical.limit.reset();physical.applicableOnly=false;physical.includeRetired=true;
+        std::vector<EdgeRecord> records;
+        for(auto* source:sources){
+            auto rows=edgeSelectionQuery(source,physical,columns);
+            auto selected=readEdgeRows(source,*rows,fields);
+            if(!txn.write_)attachRelationshipVersions(source,selected);
+            for(auto& edge:selected){
+                if(edgeSource(db,edge.uuid)!=source)continue;
+                const auto a=resolveObject(db,edge.aUuid),b=resolveObject(db,edge.bUuid);
+                if(!a||!b||(!selection.includeRetired&&(a->record.retired||b->record.retired)))continue;
+                if(selection.applicableOnly&&!currentRelationshipApplicable(*this,txn,edge.uuid))continue;
+                records.push_back(std::move(edge));
+            }
+        }
+        std::sort(records.begin(),records.end(),[](const auto& a,const auto& b){return a.uuid<b.uuid;});
+        if(selection.limit&&records.size()>size_t(*selection.limit))records.resize(size_t(*selection.limit));
+        return records;
+    }
     if (selection.applicableOnly) {
         validateEdgeSelection(selection);
         requirePublishedGraphRead(txn);

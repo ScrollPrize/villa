@@ -18,7 +18,7 @@ Schema-20 Spiral checkpoint manifests with relationship content hashes remain co
 
 Current input snapshots and overlap correspondence reads work with history enabled or disabled. A history-off store cannot reconstruct a superseded state: historical requests must fail rather than substitute current data. Incremental relationship discovery requires the optional spatial index; it must not create one implicitly. Full discovery remains available without that index.
 
-The local/hosted `open_store` convenience API and current Spiral consumer operate on individual stores. Collections still require `ObjectCollection`; a physical-store open rejects the collection feature rather than silently reading only a root or shard. Collection-wide Spiral input selection is not introduced by this integration.
+The local/hosted `open_store` convenience API uses `ObjectStore`, which now installs the same pinned logical-store resolver as `ObjectCollection`. Ordinary selections and graph/geometry reads include visible referenced and partitioned records. Explicit physical-partition opens are reserved for maintenance. Consumers do not implement a separate collection query path.
 
 ## One commit clock and one record version
 

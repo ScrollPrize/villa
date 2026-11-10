@@ -124,7 +124,7 @@ Json revisionJson(const ObjectRevision& r)
     return Json{{"uuid", r.uuid}, {"object", r.objectUuid}, {"parent", optionalText(r.parentUuid)},
                 {"geometry_revision", optionalText(r.geometryRevision)}, {"sequence", r.sequence},
                 {"metadata_complete", r.metadataComplete}, {"published_at_us", optionalInt(r.publishedAtUs)},
-                {"deleted", r.deleted}, {"version", r.version}, {"generation", r.generation},
+                {"deleted", r.deleted}, {"version", r.version}, {"generation", r.generation}, {"store", r.storeUuid},
                 {"commit_sequence", optionalInt(r.commitSequence)}, {"record", withExactMeta(objectToJson(r.record), r.record)}};
 }
 
@@ -141,6 +141,7 @@ ObjectRevision revisionFrom(const Json& j)
     r.deleted = j.at("deleted").get<bool>();
     r.version = j.at("version").get<int64_t>();
     r.generation = j.at("generation").get<std::string>();
+    r.storeUuid = j.value("store", std::string{});
     r.commitSequence = intFrom(j.at("commit_sequence"));
     const auto& record = j.at("record");
     r.record = exactMetaFrom(record, objectFromJson(record));

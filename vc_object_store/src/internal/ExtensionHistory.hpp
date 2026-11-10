@@ -36,4 +36,6 @@ void scanExtensionOwnerKeys(sqlite3*, const ExtensionTableInfo&, std::span<const
 // interpretable. No owner rows or snapshot payloads are copied.
 void referenceExtensionSchemas(sqlite3* sourceDb, ObjectStore& target, WriteTxn&,
                                const char* ownerTable, const std::string& sourceMeta);
+void referenceExtensionSchemas(sqlite3* sourceDb, sqlite3* targetDb,
+                               const char* ownerTable, const std::string& sourceMeta);
 } // namespace vc::objects::detail

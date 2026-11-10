@@ -4,6 +4,7 @@
 #include "internal/RecordSql.hpp"
 #include "internal/History.hpp"
 #include "internal/ReferenceResolver.hpp"
+#include "internal/RecordOverrides.hpp"
 #include "geometry/SharedGeometry.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include <nlohmann/json.hpp>
@@ -181,6 +182,9 @@ void ObjectStore::replaceExtensionRows(WriteTxn& txn, const std::string& name, c
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto table = versionedTable(db, name);
+    Savepoint save(db);
+    createRecordOverride(db,table.keySpace.c_str(),owner);
+    if(!extensionTable(db,name))detail::createExtensionTable(db,extensionDefinition(table));
     Statement existing(db, "SELECT id,meta FROM " + table.keySpace + " WHERE uuid=? AND state<>2", parseUuid(owner));
     if (!existing.row()) throw std::invalid_argument("extension: owner is not present in the writable store");
     const auto id = existing.i64(0);
@@ -188,7 +192,6 @@ void ObjectStore::replaceExtensionRows(WriteTxn& txn, const std::string& name, c
     const auto oldDescriptors=manifest(meta.dump());
     const auto oldRows = oldDescriptors.contains(name)
         ? readSnapshot(db,table,owner,oldDescriptors.at(name)) : currentRows(db,name,owner);
-    Savepoint save(db);
     detail::replaceCurrentExtensionRows(db, name, owner, rows);
     // SQL validates the proposed data and canonicalizes its key order. A no-op
     // rolls back even the table's mutation stamp, not just the owner version.
@@ -283,15 +286,14 @@ std::vector<std::string> detail::currentExtensionChunks(sqlite3* db)
 void detail::referenceExtensionSchemas(sqlite3* source, ObjectStore& target, WriteTxn& txn,
                                        const char* ownerTable, const std::string& sourceMeta)
 {
+    referenceExtensionSchemas(source,ObjectStoreImplAccess::conn(txn),ownerTable,sourceMeta);
+}
+void detail::referenceExtensionSchemas(sqlite3* source,sqlite3* target,const char* ownerTable,const std::string& sourceMeta)
+{
     const auto descriptors = manifest(sourceMeta);
     for (const auto& [name, descriptor] : descriptors.items()) {
         const auto table = versionedTable(source, name, ownerTable);
-        ExtensionTable spec;
-        spec.name = table.name; spec.extension = table.extension; spec.formatVersion = table.formatVersion;
-        spec.provisioning = table.provisioning; spec.basedOn = table.basedOn; spec.columns = table.columns;
-        spec.primaryKey = table.primaryKey; spec.keySpace = table.keySpace; spec.versioned = true;
-        spec.indexes = table.indexes;
-        target.createExtensionTable(txn, spec);
+        createExtensionTable(target, extensionDefinition(table));
     }
 }
 } // namespace vc::objects

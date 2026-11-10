@@ -203,7 +203,8 @@ int main()try{
         auto seal=base.write();base.seal(seal);seal.commit();
     }
     auto overlay=ObjectCollection::create(overlayPath,{basePath},options);
-    mustFail([&]{ObjectStore::open(overlayPath,OpenOptions{.readOnly=true});});
+    {auto native=ObjectStore::open(overlayPath,OpenOptions{.readOnly=true});auto r=native.read();
+     require(native.objectCount(r,"fiber")==2,"ordinary store API opens logical collections");}
     {
         auto r=overlay.read();require(overlay.readGeometryArray(r,a,"line_points")==geometry,"inherited geometry exact");
         require(overlay.provisioning(r).commitSequence>overlay.members()[1].commitSequence,"derived commit sequence above parent");

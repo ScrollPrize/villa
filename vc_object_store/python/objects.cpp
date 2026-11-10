@@ -48,6 +48,7 @@ nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
     d["sequence"] = revision.sequence; d["metadata_complete"] = revision.metadataComplete;
     d["published_at_us"] = revision.publishedAtUs; d["deleted"] = revision.deleted;
     d["version"] = revision.version; d["generation"] = revision.generation;
+    d["store"] = revision.storeUuid;
     d["commit_sequence"] = revision.commitSequence;
 
     d["record"] = objectToPy(revision.record);

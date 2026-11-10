@@ -13,6 +13,7 @@
 #include "geometry/Dependencies.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
 #include "internal/Artifacts.hpp"
 #include "internal/Publication.hpp"
 #include "internal/Extensions.hpp"
@@ -43,12 +44,6 @@ bool KeyRoute::matches(int64_t id) const {
     return value%divisor==remainder;
 }
 namespace {
-void requireCompatibleExtension(const ExtensionTableInfo& a,const ExtensionTableInfo& b) {
-    if(a.extension!=b.extension||a.formatVersion!=b.formatVersion||a.columns!=b.columns||
-       a.primaryKey!=b.primaryKey||a.keySpace!=b.keySpace||a.versioned!=b.versioned||
-       nlohmann::json::parse(a.provisioning)!=nlohmann::json::parse(b.provisioning))
-        throw std::runtime_error("collection: incompatible extension definitions: "+a.name);
-}
 bool hasCollection(sqlite3* db) {
     Statement s(db,"SELECT 1 FROM store_required_features WHERE name='collection-v1'"); return s.row();
 }
@@ -158,17 +153,6 @@ nlohmann::json editableObject(ObjectRecord record) {
     if(record.meta.empty())record.meta="{}";
     return objectToJson(record,&fields);
 }
-void validateInheritedMetadata(const std::vector<CollectionEdge>& edges,const std::string& localOwner,
-                               const ObjectKey& key,const ObjectRecord& before,const ObjectRecord& after) {
-    const auto original=objectToJson(before),updated=objectToJson(after);
-    // Local edges participate in native transaction validation against the
-    // same-key override. Only inherited edges require
-    // removal/recreation here: their readonly owner cannot revalidate them.
-    for(const auto& edge:edges)if(edge.key.storeUuid!=localOwner)
-        for(const auto& [endpoint,anchor]:{std::pair{edge.a,edge.record.aAnchor},std::pair{edge.b,edge.record.bAnchor}})
-            if(endpoint==key&&dependencyMetadata(original,anchor)!=dependencyMetadata(updated,anchor))
-                throw std::runtime_error("collection: explicitly remove/recreate inherited metadata-dependent edges before changing their endpoint metadata");
-}
 void validateRoutes(const std::vector<KeyRoute>& routes,const std::vector<CollectionMember>& members) {
     for(const auto* space:{"objects","edges"}){
         std::vector<KeyRoute> group;for(const auto& r:routes)if(r.keySpace==space)group.push_back(r);
@@ -272,12 +256,23 @@ struct ObjectCollection::Impl {
             }
             return nullptr;
         };
-        pool->objectSource=[this,n,get,scope=std::move(scope)](const std::string& uuid,bool inherited)->sqlite3*{
+        pool->objectSource=[this,n,get,scope](const std::string& uuid,bool inherited)->sqlite3*{
             const auto found=locateSourceSql({{},uuid},get,0,[&](size_t i){
                 return scope.contains(i)&&(!inherited||i!=n);
             });
             return found?get(*found):nullptr;
         };
+        // Edges and objects have the same UUID/tombstone routing semantics.
+        const auto visibleScope=scope;
+        pool->edgeSource=[this,n,get,visibleScope](const std::string& uuid,bool inherited)->sqlite3*{
+            for(const auto i:uuidReadOrder(uuid,"edges"))if(visibleScope.contains(i)&&(!inherited||i!=n)){
+                auto* source=get(i);Statement row(source,"SELECT state FROM edges WHERE uuid=?",parseUuid(uuid));
+                if(row.row())return row.i64(0)==2?nullptr:source;
+            }
+            return nullptr;
+        };
+        pool->querySources=[get,visibleScope]{std::vector<sqlite3*> result;
+            for(auto i:visibleScope)result.push_back(get(i));return result;};
     }
     void check(const CollectionTxn&) const;
     const Txn& txn(const CollectionTxn&,size_t) const;
@@ -286,20 +281,9 @@ struct ObjectCollection::Impl {
     ObjectKey decode(const CollectionTxn&,size_t n,const std::string& uuid) const {
         return {nodes[n].member.storeUuid,uuid};
     }
-    struct Located {size_t node; std::string local; ObjectRecord record;};
     std::optional<size_t> locateSourceSql(const ObjectKey&,const std::function<sqlite3*(size_t)>&,size_t start=0,
                                          const std::function<bool(size_t)>& eligible={}) const;
-    std::optional<Located> locateSql(const ObjectKey&,const std::function<sqlite3*(size_t)>&,size_t start=0,
-                                   const std::function<bool(size_t)>& eligible={}) const;
-    std::optional<Located> locate(const CollectionTxn&,const ObjectKey&,size_t start=0) const;
-    std::optional<std::pair<size_t,GeometryRevision>> geometry(const CollectionTxn&,const ObjectKey&) const;
-    std::string createObjectOverride(CollectionTxn&,const ObjectKey&);
     ObjectKey insertEdge(CollectionTxn&,const ObjectKey&,const ObjectKey&,const EdgeRecord&,std::optional<int64_t>);
-    CollectionEdge edge(const CollectionTxn& t,size_t n,EdgeRecord r) const {
-        auto a=decode(t,n,r.aUuid),b=decode(t,n,r.bUuid);
-        ObjectKey key{nodes[n].member.storeUuid,r.uuid};
-        r.aUuid=a.objectUuid;r.bUuid=b.objectUuid;return {key,a,b,std::move(r)};
-    }
 };
 struct CollectionTxn::Impl {
     ObjectCollection::Impl* owner;
@@ -322,7 +306,7 @@ struct CollectionTxn::Impl {
         auto* pool=activeStatementPools.at(db);
         if(configured.insert(pool).second){
             try{owner->installCallbacks(db,n,[this](size_t i){return ObjectStoreImplAccess::conn(get(i));});}
-            catch(...){pool->referenceSource={};pool->objectSource={};configured.erase(pool);throw;}
+            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};configured.erase(pool);throw;}
         }
         return *txn;
     }
@@ -429,12 +413,15 @@ struct detail::CollectionReadContext {
     StatementPool* borrowedPool=nullptr;
     std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> previousReferences;
     std::function<sqlite3*(const std::string&,bool)> previousObjects;
+    std::function<sqlite3*(const std::string&,bool)> previousEdges;
+    std::function<std::vector<sqlite3*>()> previousQueries;
     std::map<size_t,std::unique_ptr<ReadTxn>> readers;
     std::set<StatementPool*> configured;
-    CollectionReadContext(sqlite3* sql,const std::filesystem::path& path):root(sql){
-        collection.options.readOnly=true;std::set<std::string> visiting;collection.load(path,true,{},visiting,sql);
+    CollectionReadContext(sqlite3* sql,const std::filesystem::path& path,const OpenOptions& options):root(sql){
+        collection.options=options;collection.options.readOnly=true;std::set<std::string> visiting;collection.load(path,true,{},visiting,sql);
         if(const auto found=activeStatementPools.find(root);found!=activeStatementPools.end()) {
             borrowedPool=found->second;previousReferences=borrowedPool->referenceSource;previousObjects=borrowedPool->objectSource;
+            previousEdges=borrowedPool->edgeSource;previousQueries=borrowedPool->querySources;
         } else {
             rootPool=std::make_unique<StatementPool>();rootPool->historyEnabled=historyEnabled(root);rootPool->spatialEnabled=spatialEnabled(root);
             activeStatementPools[root]=rootPool.get();
@@ -446,11 +433,12 @@ struct detail::CollectionReadContext {
         const bool borrowedActive=active!=activeStatementPools.end()&&active->second==borrowedPool;
         for(auto* p:configured){
             if(p==borrowedPool&&!borrowedActive)continue; // Lease already returned by commit/rollback.
-            p->geometryCache.reset();p->referenceSource={};p->objectSource={};
+            p->geometryCache.reset();p->referenceSource={};p->objectSource={};p->edgeSource={};p->querySources={};
         }
         if(rootPool)activeStatementPools.erase(root);
         else if(const auto found=activeStatementPools.find(root);found!=activeStatementPools.end()&&found->second==borrowedPool){
             borrowedPool->referenceSource=std::move(previousReferences);borrowedPool->objectSource=std::move(previousObjects);
+            borrowedPool->edgeSource=std::move(previousEdges);borrowedPool->querySources=std::move(previousQueries);
         }
     }
     ~CollectionReadContext(){detach();}
@@ -460,26 +448,16 @@ struct detail::CollectionReadContext {
         auto* pool=activeStatementPools.at(sql);
         if(configured.insert(pool).second){
             try{collection.installCallbacks(sql,n,[this](size_t i){return get(i);});}
-            catch(...){pool->referenceSource={};pool->objectSource={};configured.erase(pool);throw;}
+            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};configured.erase(pool);throw;}
         }
         return sql;
     }
 };
 std::shared_ptr<void> detail::attachCollectionReferenceResolver(sqlite3* db,const std::filesystem::path& path){
-    return hasCollection(db)?std::make_shared<CollectionReadContext>(db,path):std::shared_ptr<void>{};
+    return attachCollectionReferenceResolver(db,path,OpenOptions{});
 }
-std::optional<ObjectCollection::Impl::Located> ObjectCollection::Impl::locate(const CollectionTxn& t,const ObjectKey& key,size_t start)const{
-    check(t);
-    return locateSql(key,[&](size_t n){return db(t,n);},start);
-}
-std::optional<ObjectCollection::Impl::Located> ObjectCollection::Impl::locateSql(const ObjectKey& key,
-    const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible)const{
-    const auto n=locateSourceSql(key,get,start,eligible);
-    if(!n)return {};
-    auto* sql=get(*n);
-    Statement row(sql,std::string("SELECT ")+kObjectCols+" FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
-    if(!row.row())throw std::runtime_error("collection: object disappeared inside a read snapshot");
-    return Located{*n,key.objectUuid,readObjectRow(sql,row)};
+std::shared_ptr<void> detail::attachCollectionReferenceResolver(sqlite3* db,const std::filesystem::path& path,const OpenOptions& options){
+    return hasCollection(db)?std::make_shared<CollectionReadContext>(db,path,options):std::shared_ptr<void>{};
 }
 std::optional<size_t> ObjectCollection::Impl::locateSourceSql(const ObjectKey& key,
     const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible)const{
@@ -492,38 +470,6 @@ std::optional<size_t> ObjectCollection::Impl::locateSourceSql(const ObjectKey& k
         return n;
     }
     return {};
-}
-std::optional<std::pair<size_t,GeometryRevision>> ObjectCollection::Impl::geometry(const CollectionTxn& t,const ObjectKey& key)const{
-    const auto found=locate(t,key);if(!found)return {};
-    if(auto geometry=nodes[found->node].store->currentGeometry(txn(t,found->node),key.objectUuid))
-        return std::pair{found->node,*geometry};
-    return {};
-}
-std::string ObjectCollection::Impl::createObjectOverride(CollectionTxn& t,const ObjectKey& key){
-    auto& w=writer(t);
-    const auto source=locate(t,key);
-    if(!source)throw std::runtime_error("collection: missing/deleted object");
-    if(source->node==0)return key.objectUuid;
-    auto record=source->record;
-    // Copy the record and its small geometry descriptor, not the geometry
-    // payload or archive. The existing geometry token/chunk references stay
-    // unchanged, as do versioned extension snapshot references.
-    if(record.storageKind=="file"&&!record.storageRef.empty()&&std::filesystem::path(record.storageRef).is_relative())
-        record.storageRef=locator(nodes[0].member.locator,resolve(nodes[source->node].member.locator,record.storageRef));
-    detail::referenceExtensionSchemas(db(t,source->node),*nodes[0].store,w,"objects",record.meta);
-    detail::upsertObjectImpl(db(t,0),nodes[0].store->author(),nodes[0].store->hostname(),record,false,"override",true);
-    Statement descriptor(db(t,source->node),"SELECT geometry_manifest FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
-    if(descriptor.row()&&!descriptor.isNull(0))
-        execute(db(t,0),"UPDATE objects SET geometry_manifest=? WHERE uuid=?",descriptor.text(0),parseUuid(key.objectUuid));
-    // Continue the ordinary object version above the inherited state. Geometry
-    // identity is independent and changes only on a real geometry write.
-    if(record.version){
-        if(*record.version==INT64_MAX)throw std::overflow_error("collection: object version exhausted");
-        execute(db(t,0),"UPDATE objects SET version=? WHERE uuid=?",*record.version+1,parseUuid(key.objectUuid));
-    }
-    if(record.retired||!record.lifecycleEpoch.empty())
-        writeLifecycle(db(t,0),*objectIdByUuid(db(t,0),parseUuid(key.objectUuid)),record);
-    return key.objectUuid;
 }
 
 ObjectCollection::ObjectCollection(std::unique_ptr<Impl> p):impl_(std::move(p)){}
@@ -645,78 +591,14 @@ void ObjectCollection::createExtensionTable(CollectionTxn& t,const ExtensionTabl
 }
 void ObjectCollection::replaceExtensionRows(CollectionTxn& t,const std::string& table,const ObjectKey& input,
                                              std::span<const ExtensionRow> rows){
-    const auto owner=canonical(input);auto& w=impl_->writer(t);auto* target=impl_->db(t,0);Savepoint save(target);
-    std::optional<ExtensionTableInfo> info;
-    for(size_t n=0;n<impl_->nodes.size();++n)if(auto candidate=detail::extensionTable(impl_->db(t,n),table)){
-        if(info)requireCompatibleExtension(*info,*candidate);else info=std::move(candidate);
-    }
-    if(!info||!info->versioned)throw std::invalid_argument("collection: replacement requires a versioned extension");
-    if(info->keySpace=="objects")impl_->createObjectOverride(t,owner);
-    else {
-        const auto existing=edge(t,owner);if(!existing)throw std::invalid_argument("collection: missing/deleted edge");
-        if(!impl_->nodes[0].store->edgeByUuid(w,owner.objectUuid)) {
-            size_t source=0;
-            for(auto n:impl_->uuidReadOrder(owner.objectUuid,"edges")){
-                Statement exists(impl_->db(t,n),"SELECT 1 FROM edges WHERE uuid=?",parseUuid(owner.objectUuid));
-                if(exists.row()){source=n;break;}}
-            auto record=existing->record;const auto sourceMeta=record.meta;
-            auto meta=nlohmann::json::parse(record.meta);meta.erase(detail::extensionManifestKey);record.meta=meta.dump();
-            record.aUuid=existing->a.objectUuid;record.bUuid=existing->b.objectUuid;
-            impl_->nodes[0].store->addEdge(w,record);
-            detail::referenceExtensionSchemas(impl_->db(t,source),*impl_->nodes[0].store,w,"edges",sourceMeta);
-            execute(target,"UPDATE edges SET meta=? WHERE uuid=?",sourceMeta,parseUuid(owner.objectUuid));
-        }
-    }
-    if(!detail::extensionTable(target,table)){
-        ExtensionTable spec;spec.name=info->name;spec.extension=info->extension;spec.formatVersion=info->formatVersion;
-        spec.provisioning=info->provisioning;spec.basedOn=info->basedOn;spec.columns=info->columns;spec.primaryKey=info->primaryKey;
-        spec.indexes=info->indexes;spec.keySpace=info->keySpace;spec.versioned=info->versioned;
-        impl_->nodes[0].store->createExtensionTable(w,spec);
-    }
-    const auto metadata=[&]{Statement value(target,"SELECT meta FROM "+info->keySpace+" WHERE uuid=?",parseUuid(owner.objectUuid));
-        if(!value.row())throw std::runtime_error("collection: extension owner disappeared");return value.text(0);};
-    const auto before=metadata();impl_->nodes[0].store->replaceExtensionRows(w,table,owner.objectUuid,rows);
-    if(metadata()==before)return; // Also undo tentative localization on an inherited no-op.
-    save.release();
+    impl_->nodes[0].store->replaceExtensionRows(impl_->writer(t),table,canonical(input).objectUuid,rows);
 }
 std::vector<ExtensionTableInfo> ObjectCollection::extensionTables(const CollectionTxn& t)const{
-    impl_->check(t);std::vector<ExtensionTableInfo> result;
-    for(size_t n=0;n<impl_->nodes.size();++n){auto tables=detail::extensionTables(impl_->db(t,n));
-        result.insert(result.end(),std::make_move_iterator(tables.begin()),std::make_move_iterator(tables.end()));}
-    return result;
+    return impl_->nodes[0].store->extensionTables(impl_->txn(t,0));
 }
 void ObjectCollection::scanExtensionRows(const CollectionTxn& t,const std::string& name,
     const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix)const{
-    impl_->check(t);std::optional<ExtensionTableInfo> schema;
-    for(size_t n=0;n<impl_->nodes.size()&&!schema;++n)schema=detail::extensionTable(impl_->db(t,n),name);
-    if(!schema)throw std::invalid_argument("collection: extension table not found: "+name);
-    std::vector<size_t> order;
-    if(!schema->keySpace.empty()&&!prefix.empty())order=impl_->uuidReadOrder(extensionUuid(prefix.front()),schema->keySpace.c_str());
-    else for(size_t n=0;n<impl_->nodes.size();++n)order.push_back(n);
-    std::vector<size_t> keys;
-    for(const auto& key:schema->primaryKey){const auto col=std::find_if(schema->columns.begin(),schema->columns.end(),[&](const auto& c){return c.name==key;});keys.push_back(size_t(col-schema->columns.begin()));}
-    if(!visitor||prefix.size()>schema->primaryKey.size())throw std::invalid_argument("collection: invalid extension scan");
-    std::set<ExtensionRow> seen;bool more=true;
-    std::set<std::string> owners;
-    for(const auto n:order){auto* db=impl_->db(t,n);const auto info=detail::extensionTable(db,name);if(!info)continue;
-        requireCompatibleExtension(*schema,*info);
-        if(schema->versioned) {
-            // Enumerate identities, resolve the selected record normally, then
-            // follow its snapshot. Physical extension rows are not authority.
-            detail::scanExtensionOwnerKeys(db,*schema,prefix,[&](const std::string& owner){
-                if(!owners.insert(owner).second)return true;
-                std::optional<std::string> metadata;
-                if(schema->keySpace=="objects") {
-                    if(const auto value=object(t,{{},owner}))metadata=value->record.meta;
-                } else if(const auto value=edge(t,{{},owner}))metadata=value->record.meta;
-                if(metadata)more=detail::scanExtensionSnapshot(impl_->db(t,0),*schema,owner,*metadata,visitor,prefix);
-                return more;
-            });
-        } else detail::scanExtensionRows(db,name,[&](const ExtensionRow& row){
-            ExtensionRow key;for(auto i:keys)key.push_back(row.at(i));
-            if(seen.insert(std::move(key)).second)more=visitor(row);return more;},prefix);
-        if(!more)break;
-    }
+    impl_->nodes[0].store->scanExtensionRows(impl_->txn(t,0),name,visitor,prefix);
 }
 std::vector<CollectionMember> ObjectCollection::members()const{std::vector<CollectionMember> r;for(const auto& n:impl_->nodes)r.push_back(n.member);return r;}
 std::optional<ObjectRevision> ObjectCollection::objectAtVersion(const CollectionTxn& t,const ObjectVersion& version)const{
@@ -746,7 +628,9 @@ std::vector<uint8_t> ObjectCollection::readGeometryArrayAtVersion(const Collecti
     return impl_->nodes[0].store->readGeometryArray(impl_->txn(t,0),*record->geometryRevision,array);
 }
 std::optional<CollectionObject> ObjectCollection::object(const CollectionTxn& t,const ObjectKey& input)const{
-    const auto key=canonical(input);auto r=impl_->locate(t,key);if(!r)return {};return CollectionObject{key,std::move(r->record)};
+    const auto key=canonical(input);
+    auto record=impl_->nodes[0].store->objectByUuid(impl_->txn(t,0),key.objectUuid);
+    return record?std::optional(CollectionObject{key,std::move(*record)}):std::nullopt;
 }
 std::optional<CollectionObject> ObjectCollection::objectById(const CollectionTxn& t,const std::string& owner,int64_t id)const{
     const auto uuid=util::canonicalUuid(owner);std::optional<ObjectKey> found;
@@ -763,90 +647,43 @@ std::optional<CollectionObject> ObjectCollection::objectById(const CollectionTxn
     return found?object(t,*found):std::nullopt;
 }
 void ObjectCollection::scanObjects(const CollectionTxn& t,const std::function<bool(const CollectionObject&)>& visit,const std::optional<std::string>& kind)const{
-    std::set<ObjectKey> seen;
-    for(size_t n=0;n<impl_->nodes.size();++n){ObjectSelection selection;selection.limit=4096;
-        while(true){const auto rows=impl_->nodes[n].store->selectObjects(impl_->txn(t,n),selection);if(rows.empty())break;
-            for(const auto& r:rows){auto key=impl_->decode(t,n,r.uuid);if(!seen.insert(key).second)continue;
-                auto resolved=object(t,key);if(resolved&&(!kind||resolved->record.kind==*kind)&&!visit(*resolved))return;}
-            selection.afterUuid=rows.back().uuid;}}
+    ObjectSelection selection;selection.kind=kind;selection.limit=4096;
+    while(true){const auto rows=impl_->nodes[0].store->selectObjects(impl_->txn(t,0),selection);if(rows.empty())break;
+        for(const auto& row:rows){const auto resolved=object(t,{uuid(t),row.uuid});if(resolved&&!visit(*resolved))return;}
+        selection.afterUuid=rows.back().uuid;}
 }
 std::optional<GeometryRevision> ObjectCollection::currentGeometry(const CollectionTxn& t,const ObjectKey& key)const{
-    const auto normalizedKey=canonical(key);auto g=impl_->geometry(t,normalizedKey);if(!g)return {};g->second.objectUuid=normalizedKey.objectUuid;return g->second;
+    return impl_->nodes[0].store->currentGeometry(impl_->txn(t,0),canonical(key).objectUuid);
 }
 std::vector<uint8_t> ObjectCollection::readGeometryArray(const CollectionTxn& t,const ObjectKey& key,const std::string& array)const{
-    auto g=impl_->geometry(t,canonical(key));if(!g)throw std::runtime_error("collection: geometry absent");
-    return impl_->nodes[g->first].store->readGeometryArray(impl_->txn(t,g->first),g->second.uuid,array);
+    const auto geometry=currentGeometry(t,key);if(!geometry)throw std::runtime_error("collection: geometry absent");
+    return impl_->nodes[0].store->readGeometryArray(impl_->txn(t,0),geometry->uuid,array);
 }
 std::string ObjectCollection::putGeometry(CollectionTxn& t,const ObjectKey& input,const GeometryData& data){
-    const auto key=canonical(input);auto& w=impl_->writer(t);Savepoint save(impl_->db(t,0));
-    if(currentGeometry(t,key))throw std::invalid_argument("collection: use sparse/structural edit for existing geometry");
-    const auto local=impl_->createObjectOverride(t,key);const auto result=impl_->nodes[0].store->putGeometry(w,local,data);
-    save.release();return result;
+    return impl_->nodes[0].store->putGeometry(impl_->writer(t),canonical(input).objectUuid,data);
 }
 std::string ObjectCollection::editGeometry(CollectionTxn& t,const ObjectKey& input,const std::vector<GeometryArrayEdit>& edits,const std::string& expected,const std::vector<GeometryEdgeEdit>& decisions){
-    const auto key=canonical(input);auto& w=impl_->writer(t);auto current=currentGeometry(t,key);
-    if(!current||current->uuid!=expected)throw std::runtime_error("collection: geometry changed; reload before editing");
-    for(const auto& edge:edgesOf(t,key))if(edge.key.storeUuid!=uuid(t))
-        throw std::runtime_error("collection: explicitly remove/recreate inherited incident edges before editing geometry");
-    std::map<std::string,CollectionEdge> observed;
-    for(const auto& decision:decisions){
-        const auto before=edge(t,{uuid(t),decision.edgeUuid});
-        if(!before||before->record.version.value_or(0)!=decision.expectedVersion)throw std::runtime_error("collection: geometry decision edge changed");
-        const auto ga=currentGeometry(t,before->a),gb=currentGeometry(t,before->b);
-        if(decision.aRevision!=(ga?std::optional(ga->uuid):std::nullopt)||decision.bRevision!=(gb?std::optional(gb->uuid):std::nullopt))
-            throw std::runtime_error("collection: geometry decision endpoint changed");
-        observed.emplace(decision.edgeUuid,*before);
-    }
-    Savepoint save(impl_->db(t,0));const auto local=impl_->createObjectOverride(t,key);
-    auto adapted=decisions;for(auto& d:adapted){
-        const auto after=*impl_->nodes[0].store->edgeByUuid(w,d.edgeUuid);
-        if(impl_->decode(t,0,after.aUuid)!=observed.at(d.edgeUuid).a){std::swap(d.aAnchor,d.bAnchor);std::swap(d.aRevision,d.bRevision);}
-        d.expectedVersion=after.version.value_or(0);
-        d.aRevision=geometryHead(impl_->db(t,0),after.aUuid);d.bRevision=geometryHead(impl_->db(t,0),after.bUuid);
-    }
-    const auto result=impl_->nodes[0].store->editGeometry(w,local,edits,expected,adapted);save.release();return result;
+    return impl_->nodes[0].store->editGeometry(impl_->writer(t),canonical(input).objectUuid,edits,expected,decisions);
 }
 std::vector<CollectionEdge> ObjectCollection::edgesOf(const CollectionTxn& t,const ObjectKey& input)const{
-    const auto key=canonical(input);const auto endpoint=object(t,key);
-    if(!endpoint)throw std::runtime_error("collection: object absent");
-    if(endpoint->record.retired)return {};
-    std::vector<CollectionEdge> out;std::set<std::string> seen;
-    for(size_t n=0;n<impl_->nodes.size();++n){
-        Statement selected(impl_->db(t,n),"SELECT uuid FROM edges WHERE a_uuid=?1 OR b_uuid=?1",parseUuid(key.objectUuid));
-        while(selected.row()){
-            const auto uuid=formatUuid(selected.blob16(0));if(!seen.insert(uuid).second)continue;
-            auto current=edge(t,{impl_->nodes[n].member.storeUuid,uuid});
-            if(current&&(current->a==key||current->b==key))out.push_back(std::move(*current));
-        }
-    }
+    std::vector<CollectionEdge> out;
+    for(const auto& row:impl_->nodes[0].store->edgesOf(impl_->txn(t,0),canonical(input).objectUuid))
+        if(auto current=edge(t,{uuid(t),row.uuid}))out.push_back(std::move(*current));
     return out;
 }
 std::vector<CollectionEdge> ObjectCollection::edgesByKind(const CollectionTxn& t,const std::string& kind)const{
-    std::vector<CollectionEdge> out;std::set<std::string> seen;
-    for(size_t n=0;n<impl_->nodes.size();++n){
-        Statement selected(impl_->db(t,n),"SELECT uuid FROM edges WHERE kind=?",kind);
-        while(selected.row()){
-            const auto uuid=formatUuid(selected.blob16(0));if(!seen.insert(uuid).second)continue;
-            auto current=edge(t,{impl_->nodes[n].member.storeUuid,uuid});
-            if(current&&current->record.kind==kind)out.push_back(std::move(*current));
-        }
-    }
+    std::vector<CollectionEdge> out;
+    for(const auto& row:impl_->nodes[0].store->edgesByKind(impl_->txn(t,0),kind))
+        if(auto current=edge(t,{uuid(t),row.uuid}))out.push_back(std::move(*current));
     return out;
 }
 std::optional<CollectionEdge> ObjectCollection::edge(const CollectionTxn& t,const ObjectKey& input)const{
-    const auto key=canonical(input);
-    for(const auto n:impl_->uuidReadOrder(key.objectUuid,"edges")){
-        Statement state(impl_->db(t,n),"SELECT state FROM edges WHERE uuid=?",parseUuid(key.objectUuid));
-        if(!state.row())continue;
-        if(state.i64(0)==2)return {};
-        auto r=impl_->nodes[n].store->edgeByUuid(impl_->txn(t,n),key.objectUuid);
-        if(!r)throw std::runtime_error("collection: edge disappeared inside read snapshot");
-        auto result=impl_->edge(t,n,std::move(*r));
-        const auto a=object(t,result.a),b=object(t,result.b);
-        if(a&&b&&!a->record.retired&&!b->record.retired)return result;
-        return {};
-    }
-    return {};
+    auto resolved=resolveEdge(impl_->db(t,0),canonical(input).objectUuid);if(!resolved)return {};
+    const auto owner=storeUuidText(resolved->source);
+    CollectionEdge result{{owner,resolved->record.uuid},{owner,resolved->record.aUuid},
+        {owner,resolved->record.bUuid},std::move(resolved->record)};
+    const auto a=object(t,result.a),b=object(t,result.b);
+    return a&&b&&!a->record.retired&&!b->record.retired?std::optional(std::move(result)):std::nullopt;
 }
 std::optional<CollectionEdge> ObjectCollection::edgeById(const CollectionTxn& t,const std::string& owner,int64_t id)const{
     const auto uuid=util::canonicalUuid(owner);std::optional<std::string> routed;std::optional<ObjectKey> found;
@@ -874,50 +711,18 @@ void ObjectCollection::replaceObject(CollectionTxn& t,const ObjectKey& input,con
     const auto previous=object(t,key);if(!previous)throw std::runtime_error("collection: missing/deleted object");
     auto proposed=r;proposed.uuid=key.objectUuid;
     if(editableObject(proposed)==editableObject(previous->record)){save.release();return;}
-    const auto local=impl_->createObjectOverride(t,key);
-    if(proposed.storageKind==previous->record.storageKind&&proposed.storageRef==previous->record.storageRef)
-        proposed.storageRef=impl_->nodes[0].store->objectByUuid(w,local)->storageRef;
     impl_->nodes[0].store->upsertObject(w,proposed);
-    validateInheritedMetadata(edgesOf(t,key),uuid(t),key,previous->record,*impl_->nodes[0].store->objectByUuid(w,local));
     save.release();
 }
 void ObjectCollection::setMeta(CollectionTxn& t,const ObjectKey& input,const std::string& field,const std::string& json){
-    auto key=canonical(input);auto& w=impl_->writer(t);Savepoint save(impl_->db(t,0));
-    const auto previous=object(t,key);if(!previous)throw std::runtime_error("collection: missing/deleted object");
-    const auto local=impl_->createObjectOverride(t,key),before=impl_->nodes[0].store->objectByUuid(w,local)->meta;
-    impl_->nodes[0].store->setMeta(w,local,field,json);
-    const auto after=impl_->nodes[0].store->objectByUuid(w,local);
-    // No-op edits roll back a tentative same-key local override too.
-    if(before==after->meta)return;
-    validateInheritedMetadata(edgesOf(t,key),uuid(t),key,previous->record,*after);
-    save.release();
+    impl_->nodes[0].store->setMeta(impl_->writer(t),canonical(input).objectUuid,field,json);
 }
 void ObjectCollection::deleteObject(CollectionTxn& t,const ObjectKey& input){
-    const auto key=canonical(input);auto& w=impl_->writer(t);
-    const auto previous=object(t,key);if(!previous)throw std::runtime_error("collection: missing/deleted object");
-    if(!edgesOf(t,key).empty())throw std::runtime_error("collection: remove incident relationships before deletion");
-    Savepoint save(impl_->db(t,0));
-    if(objectSource(impl_->db(t,0),key.objectUuid)!=impl_->db(t,0)){
-        // Deletion needs only a same-key ordinary record, never copied payloads.
-        ObjectRecord marker;marker.uuid=key.objectUuid;marker.kind=previous->record.kind;
-        impl_->nodes[0].store->upsertObject(w,marker);
-    }
-    impl_->nodes[0].store->deleteObject(w,key.objectUuid);
-    save.release();
+    impl_->nodes[0].store->deleteObject(impl_->writer(t),canonical(input).objectUuid);
 }
 ObjectKey ObjectCollection::Impl::insertEdge(CollectionTxn& t,const ObjectKey& a,const ObjectKey& b,const EdgeRecord& input,std::optional<int64_t> id){
     GeometryPhase phase("collection.edge");
     auto& w=writer(t);Savepoint save(db(t,0));
-    {GeometryPhase geometryPhase("collection.edge.geometry");
-    for(const auto& [key,anchor]:{std::pair{canonical(a),input.aAnchor},std::pair{canonical(b),input.bAnchor}}){
-        auto endpoint=locate(t,key);
-        if(!endpoint||endpoint->record.retired)throw std::runtime_error("collection: missing/deleted/retired endpoint");
-        if(anchor.wholeGeometry&&anchor.points.empty())continue;
-        if(auto g=geometry(t,key)){
-            validateDependencies(anchor,dependencyGeometry(*nodes[g->first].store,txn(t,g->first),g->second));
-        }
-    }
-    }
     auto r=input;r.aUuid=canonical(a).objectUuid;r.bUuid=canonical(b).objectUuid;
     const auto result=id?nodes[0].store->insertEdgeWithId(w,r,*id):nodes[0].store->addEdge(w,r);
     save.release();return {nodes[0].member.storeUuid,result};
@@ -994,15 +799,7 @@ std::vector<InitialObjectIdentity> ObjectCollection::importInitialObjectRefs(
     save.release();return result;
 }
 void ObjectCollection::removeEdge(CollectionTxn& t,const ObjectKey& input){
-    const auto key=canonical(input);auto& w=impl_->writer(t);Savepoint save(impl_->db(t,0));
-    const auto current=edge(t,key);if(!current)throw std::runtime_error("collection: edge absent");
-    if(!impl_->nodes[0].store->edgeByUuid(w,key.objectUuid)){
-        auto copy=current->record;copy.aUuid=current->a.objectUuid;copy.bUuid=current->b.objectUuid;
-        auto meta=nlohmann::json::parse(copy.meta);meta.erase(detail::extensionManifestKey);copy.meta=meta.dump();
-        impl_->nodes[0].store->addEdge(w,copy);
-    }
-    impl_->nodes[0].store->removeEdge(w,key.objectUuid);
-    save.release();
+    impl_->nodes[0].store->removeEdge(impl_->writer(t),canonical(input).objectUuid);
 }
 void ObjectCollection::seal(CollectionTxn& t){impl_->nodes[0].store->seal(impl_->writer(t));}
 }

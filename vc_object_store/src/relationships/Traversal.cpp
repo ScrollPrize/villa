@@ -15,6 +15,18 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
     const auto own=resolveObject(db,objectUuid);
     if(!own||(!includeRetired&&own->record.retired))return {};
     if (applicableOnly) requirePublishedGraphRead(txn);
+    if(querySources(db).size()>1){
+        EdgeSelection selection;selection.kind=edgeKind;selection.endpointUuids=std::vector{objectUuid};
+        selection.adjacent=adjacentFilter;selection.includeRetired=includeRetired;
+        selection.applicableOnly=applicableOnly;selection.attachments=bool(edgeKind);
+        std::vector<std::string> result;std::set<std::string> seen;
+        for(const auto& edge:selectEdges(txn,selection)){
+            const auto next=edge.aUuid==objectUuid?edge.bUuid:edge.aUuid;
+            const auto endpoint=resolveObject(db,next);
+            if(endpoint&&(!neighbourKind||endpoint->record.kind==*neighbourKind)&&seen.insert(next).second)result.push_back(next);
+        }
+        return result;
+    }
     const std::string filter = " AND state=0" + fiberAdjacencySql(adjacentFilter) +
         (edgeKind ? std::string(" AND kind=?2") : " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'") +
         (includeRetired ? "" : " AND " + activeEdgeSql());
@@ -177,6 +189,7 @@ std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::str
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (applicableOnly) requirePublishedGraphRead(txn);
+    if(querySources(db).size()>1)return reachableWithin(txn,objectUuid,INT_MAX,edgeKindFilter,cancel,includeRetired,adjacentFilter,applicableOnly);
     return traverse(db,objectUuid,INT_MAX,edgeKindFilter,cancel,includeRetired,adjacentFilter,applicableOnly?this:nullptr,&txn);
 }
 
@@ -188,6 +201,19 @@ std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std:
     if (maxDepth < 0) throw std::runtime_error("object store: maxDepth must be >= 0");
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (applicableOnly) requirePublishedGraphRead(txn);
+    if(querySources(db).size()>1){
+        const auto root=resolveObject(db,objectUuid);
+        if(!root)throw std::runtime_error("object store: object not found: "+objectUuid);
+        if(root->record.retired&&!includeRetired)return {};
+        return breadthFirst(formatUuid(parseUuid(objectUuid)),maxDepth,cancel,[&](const auto& uuid,auto visit){
+            EdgeSelection selection;selection.endpointUuids=std::vector{uuid};selection.includeRetired=includeRetired;
+            selection.adjacent=adjacentFilter;selection.applicableOnly=applicableOnly;selection.attachments=!edgeKindFilter.empty();
+            for(const auto& edge:selectEdges(txn,selection)){
+                if(!edgeKindFilter.empty()&&std::find(edgeKindFilter.begin(),edgeKindFilter.end(),edge.kind)==edgeKindFilter.end())continue;
+                visit(edge.aUuid==uuid?edge.bUuid:edge.aUuid,[]{return true;});
+            }
+        });
+    }
     return traverse(db, objectUuid, maxDepth, edgeKindFilter, cancel, includeRetired,
                                 adjacentFilter, applicableOnly ? this : nullptr, &txn);
 }
@@ -222,56 +248,27 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     if (edges.endpointUuids)
         throw std::invalid_argument("graph endpoint scope is specified by its object selection");
     std::unordered_map<std::string, uint64_t> nodes;
-    std::vector<int64_t> ids;
-    auto objectsQuery = objectSelectionQuery(db, objects,
-        "o.id,o.uuid,o.version,CASE WHEN o.geometry_manifest IS NOT NULL THEN o.storage_ref END");
-    while (objectsQuery->row()) {
+    for(const auto& object:selectObjects(txn,objects,std::vector<std::string>{})) {
         const auto node = result.objectUuids.size();
-        const auto id = objectsQuery->i64(0);
-        nodes.emplace(formatUuid(objectsQuery->blob16(1)), node); ids.push_back(id);
-        result.objectUuids.push_back(formatUuid(objectsQuery->blob16(1)));
-        result.versions.push_back(objectsQuery->i64(2));
-        result.geometryRevisions.push_back(objectsQuery->isNull(3) ? std::nullopt :
-            std::optional(readGeometryTokenColumn(*objectsQuery,3)));
+        nodes.emplace(object.uuid,node);
+        result.objectUuids.push_back(object.uuid);
+        result.versions.push_back(object.version.value_or(0));
+        result.geometryRevisions.push_back(geometryHead(db,object.uuid));
     }
     auto selection = edges; selection.bothEndpoints = true;
     selection.includeRetired = objects.includeRetired;
     // Attachments are not graph links unless asked for by kind.
     if (!selection.kind) selection.attachments = false;
-    if (selection.applicableOnly) {
-        selection.endpointUuids = result.objectUuids;
-        for (const auto& edge : selectEdges(txn, selection, std::vector<std::string>{})) {
-            result.edgeUuids.push_back(edge.uuid);
-            result.endpoints.push_back({nodes.at(edge.aUuid),
-                                        nodes.at(edge.bUuid)});
-        }
-    } else {
-        auto links = edgeSelectionQuery(db, selection, "uuid,a_uuid,b_uuid", ids);
-        while (links->row()) {
-            result.edgeUuids.push_back(formatUuid(links->blob16(0)));
-            result.endpoints.push_back({nodes.at(formatUuid(links->blob16(1))), nodes.at(formatUuid(links->blob16(2)))});
-        }
+    selection.endpointUuids = result.objectUuids;
+    for (const auto& edge : selectEdges(txn, selection, std::vector<std::string>{})) {
+        result.edgeUuids.push_back(edge.uuid);
+        result.endpoints.push_back({nodes.at(edge.aUuid),nodes.at(edge.bUuid)});
     }
     finishGraph(result, db);
     return result;
 }
 
 GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<ObjectVersion>& versions,
-                                         const EdgeSelection& edges) const
-{
-    RevisionSelection selection;
-    const auto revisions = objectsAtVersions(txn, versions);
-    for (size_t i = 0; i < versions.size(); ++i) {
-        if (!revisions[i])
-            throw std::invalid_argument("object history: version " + std::to_string(versions[i].version) + " of " +
-                                        versions[i].objectUuid + " is not recorded in this store and generation");
-        if (!selection.emplace(revisions[i]->objectUuid, revisions[i]->uuid).second)
-            throw std::invalid_argument("duplicate object in version selection");
-    }
-    return graphReadViewAt(txn, selection, edges);
-}
-
-GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelection& selection,
                                          const EdgeSelection& edges) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
@@ -281,18 +278,14 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
         throw std::invalid_argument("graph endpoint scope is specified by its version selection");
     GraphReadView result;
     result.selectedObjects.emplace(); result.selectedRelationships.emplace();
-    RevisionSelection resolved;
-    for (const auto& [object, revision] : selection) {
-        const auto uuid = formatUuid(parseUuid(object));
-        const auto value = revision ? objectRevision(txn, *revision) : currentObjectRevision(txn, uuid);
-        if (!value || value->objectUuid != uuid || value->deleted)
-            throw std::invalid_argument("object history: selection revision does not belong to object");
-        if (!resolved.emplace(uuid, value->uuid).second)
+    std::map<std::string,ObjectRevision> resolved;
+    for(auto& value:objectsAtVersions(txn,versions)) {
+        if(!value||value->deleted)throw std::invalid_argument("object history: selected version is unavailable or deleted");
+        if (!resolved.emplace(value->objectUuid,*value).second)
             throw std::invalid_argument("duplicate object in revision selection");
     }
     std::map<std::string, uint64_t> nodes;
-    for (const auto& [object, revision] : resolved) {
-        auto value = *objectRevision(txn, *revision);
+    for (auto& [object, value] : resolved) {
         nodes.emplace(object, result.objectUuids.size());
         result.objectUuids.push_back(object); result.versions.push_back(value.record.version.value_or(0));
         result.geometryRevisions.push_back(value.geometryRevision);
@@ -300,7 +293,7 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
     }
     auto graphEdges = edges;
     if (!graphEdges.kind) graphEdges.attachments = false;
-    for (auto& selected : relationshipsAt(txn, resolved))
+    for (auto& selected : relationshipsAt(txn, versions))
         if (selected.applicable && matchesEdgeSelection(selected.relationship.record, graphEdges))
             result.selectedRelationships->push_back(std::move(selected.relationship));
     auto& relationships = *result.selectedRelationships;
@@ -313,6 +306,17 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
     }
     finishGraph(result, db);
     return result;
+}
+
+GraphReadView ObjectStore::graphReadViewAt(const Txn& txn,const RevisionSelection& selection,const EdgeSelection& edges) const
+{
+    std::vector<ObjectVersion> versions;
+    for(const auto& [object,revision]:selection){
+        const auto value=revision?objectRevision(txn,*revision):currentObjectRevision(txn,object);
+        if(!value||value->objectUuid!=formatUuid(parseUuid(object)))throw std::invalid_argument("object history: selection revision does not belong to object");
+        versions.push_back(versionReference(txn,*value));
+    }
+    return graphReadViewAt(txn,versions,edges);
 }
 
 std::vector<std::string> GraphReadView::reachableWithin(const std::string& objectUuid, int maxDepth,

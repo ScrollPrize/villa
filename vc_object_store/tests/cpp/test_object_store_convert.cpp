@@ -142,6 +142,7 @@ void requireSameHistory(const std::filesystem::path& path, const Json& expected,
         require(history.size() == recorded.size(), "revision count");
         for (size_t i = 0; i < history.size(); ++i) {
             auto want = recorded.at(i);
+            want["store"] = expected.at("store");
             if (generation) want["generation"] = *generation;
             auto& record = want.at("record");
             record["approved_version"] = record.at("approved_generation").is_null() ? Json(nullptr) : want.at("version");

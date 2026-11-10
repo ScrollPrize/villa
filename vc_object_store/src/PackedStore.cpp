@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "internal/Publication.hpp"
+#include "internal/Artifacts.hpp"
 #include "internal/Sqlite.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include <vc_reader/native/platform_io.hpp>
@@ -802,7 +803,11 @@ void writeDirectory(PhysicalFile& file, const Json& directory, std::uint64_t off
 }
 } // namespace
 
-struct PackedStoreBuilder::Impl { std::shared_ptr<BuildState> state; std::string token; };
+struct PackedStoreBuilder::Impl {
+    std::shared_ptr<BuildState> state;
+    std::string token;
+    std::vector<std::filesystem::path> artifactSources;
+};
 
 const char* packedStoreVfs()
 {
@@ -952,6 +957,7 @@ void PackedStoreBuilder::importDatabase(const std::string& databaseUuid, const s
         std::shared_ptr<MutableMember> member;
         { std::lock_guard lock(state->mutex); member = state->members.at(util::canonicalUuid(databaseUuid)); }
         if (member->size >= 100) state->write(*member, rollbackVersion.data(), rollbackVersion.size(), 18);
+        {std::lock_guard lock(state->mutex);impl_->artifactSources.push_back(path);}
     } catch (...) {
         if (backup) sqlite3_backup_finish(backup);
         if (input) sqlite3_close(input);
@@ -1061,7 +1067,9 @@ void PackedStoreBuilder::finalize(const std::string& rootDatabaseUuid, bool comp
     state.file.reset();
     // Link publication is atomic and fails if another publisher won the name;
     // an exists()+rename pair would silently clobber that competing result.
+    detail::ArtifactExport artifacts(impl_->artifactSources,state.destination);
     detail::publishNewFile(publish, state.destination);
+    artifacts.commit();
     state.finalized = true;
     std::error_code ec;
     if (compact) std::filesystem::remove(state.staging, ec);

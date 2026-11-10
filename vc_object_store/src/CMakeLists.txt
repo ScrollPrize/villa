@@ -38,6 +38,7 @@ add_library(vc_objects ${_vc_store_library_type}
     internal/Sqlite.cpp
     internal/Schema.cpp
     internal/RecordSql.cpp
+    internal/RecordOverrides.cpp
     internal/EdgeSql.cpp
     internal/InitialEdges.cpp
     internal/InitialObjects.cpp

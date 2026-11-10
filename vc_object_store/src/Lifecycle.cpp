@@ -5,6 +5,7 @@
 #include "geometry/GeometryDelta.hpp"
 #include "internal/ImmutableImport.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -78,6 +79,7 @@ void ObjectStore::retireObject(WriteTxn& txn, const std::string& uuid)
     if (!record) throw std::invalid_argument("object lifecycle: unknown object");
     if (record->retired) return;
     Savepoint savepoint(db);
+    createRecordOverride(db,"objects",uuid);
     // Retiring is a native publication, not an independent version namespace.
     // Removing current relationships also prevents restore from silently
     // reviving observations whose endpoint was deliberately retired.
@@ -100,6 +102,7 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
     if (!historyEnabled(db)) {
         if (sourceVersion) requireHistory(db);
         Savepoint savepoint(db);
+        createRecordOverride(db,"objects",uuid);
         auto restored = *current;
         restored.retired = false; restored.lifecycleEpoch = std::to_string(writeCommitSequence(db));
         const auto id = *objectIdByUuid(db, parseUuid(uuid));

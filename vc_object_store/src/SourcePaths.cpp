@@ -1,4 +1,6 @@
 #include "internal/RecordSql.hpp"
+#include "internal/RecordResolver.hpp"
+#include "vc_object_store/objects/PackedStore.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -7,7 +9,8 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     const std::optional<std::filesystem::path>& datasetRoot) const
 {
     namespace fs = std::filesystem;
-    const auto object = objectByUuid(txn, objectUuid);
+    const auto resolved = resolveObject(static_cast<sqlite3*>(connection(txn)), objectUuid);
+    const auto object = resolved ? std::optional(resolved->record) : std::nullopt;
     if (!object || (object->storageKind != "file" && object->storageKind != "sqlite") ||
         (object->kind != "surface" && object->kind != "fiber" && object->kind != "point_collection"))
         return std::nullopt;
@@ -43,7 +46,9 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
         }
     };
 
-    const auto root = fs::absolute(datasetRoot.value_or(fs::absolute(impl_->path).parent_path())).lexically_normal();
+    fs::path ownerPath = sqlite3_db_filename(resolved->source, "main");
+    if (isPackedDatabasePath(ownerPath)) ownerPath = packedContainerPath(ownerPath);
+    const auto root = fs::absolute(datasetRoot.value_or(fs::absolute(ownerPath).parent_path())).lexically_normal();
     if (!object->storageRef.empty() && object->storageRef.find("://") == std::string::npos) {
         const auto hint = (root / object->storageRef).lexically_normal();
         if (matches(hint))

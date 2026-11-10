@@ -49,6 +49,10 @@ struct StatementPool {
     // or per-record directories; returned connections live for the transaction.
     std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> referenceSource;
     std::function<sqlite3*(const std::string&,bool)> objectSource;
+    std::function<sqlite3*(const std::string&,bool)> edgeSource;
+    // Physical query sources in this pinned logical scope; visibility is
+    // checked by key resolution before filtering/pagination is finalized.
+    std::function<std::vector<sqlite3*>()> querySources;
     std::shared_ptr<CurrentWriteState> currentWrite;
     bool historyEnabled = true;
     bool spatialEnabled = true;
@@ -115,6 +119,7 @@ struct ObjectStore::Impl {
     std::string hostname;
     bool immutableInitial = false;
     sqlite3* writer = nullptr;
+    bool composed = false;
     std::mutex writerMutex;
     std::vector<sqlite3*> readerPool;
     std::mutex poolMutex;

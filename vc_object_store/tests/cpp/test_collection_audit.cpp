@@ -114,9 +114,11 @@ int main() try {
         auto c=ObjectCollection::create(dir.path/"metadata-overlay.vcobj",{parent},options);
         {auto w=c.write();c.setMeta(w,endpoint,"family","\"H\"");w.commit();}
         const auto before=generation(c);
-        {auto w=c.write();mustFail([&]{c.setMeta(w,endpoint,"foo","9");});
-         auto replacement=c.object(w,endpoint)->record;replacement.meta=R"({"foo":9})";
-         mustFail([&]{c.replaceObject(w,endpoint,replacement);});w.commit();}
+        // Like ordinary stores, dependencies are validated on the transaction's
+        // final state, allowing an explicit retain/remove later in the action.
+        {auto w=c.write();c.setMeta(w,endpoint,"foo","9");mustFail([&]{w.commit();});}
+        {auto w=c.write();auto replacement=c.object(w,endpoint)->record;replacement.meta=R"({"foo":9})";
+         c.replaceObject(w,endpoint,replacement);mustFail([&]{w.commit();});}
         require(generation(c)==before,"rejected inherited metadata change advanced generation");
         {auto w=c.write();c.removeEdge(w,{endpoint.storeUuid,inheritedEdge});c.setMeta(w,endpoint,"foo","9");w.commit();}
         auto r=c.read();require(nlohmann::json::parse(c.object(r,endpoint)->record.meta).at("foo")==9,"removed relationship still blocked endpoint change");r.commit();

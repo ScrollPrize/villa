@@ -1,5 +1,6 @@
 #pragma once
 #include "internal/RecordSql.hpp"
+#include "internal/EdgeSql.hpp"
 #include "internal/Versions.hpp"
 #include "internal/ReferenceResolver.hpp"
 
@@ -25,6 +26,41 @@ inline std::optional<ResolvedObject> resolveObject(sqlite3* db,const std::string
     Statement row(source,std::string("SELECT ")+kObjectCols+" FROM objects WHERE uuid=? AND state<>2",parseUuid(uuid));
     if(!row.row())return std::nullopt;
     return ResolvedObject{source,readObjectRow(source,row)};
+}
+inline sqlite3* edgeSource(sqlite3* db,const std::string& uuid,bool inherited=false)
+{
+    if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end()&&pool->second->edgeSource)
+        return pool->second->edgeSource(uuid,inherited);
+    if(inherited)return nullptr;
+    Statement row(db,"SELECT state FROM edges WHERE uuid=?",parseUuid(uuid));
+    return row.row()&&row.i64(0)!=2?db:nullptr;
+}
+struct ResolvedEdge {sqlite3* source;EdgeRecord record;};
+inline std::optional<ResolvedEdge> resolveEdge(sqlite3* db,const std::string& uuid)
+{
+    auto* source=edgeSource(db,uuid);
+    if(!source)return {};
+    Statement row(source,std::string("SELECT ")+kEdgeCols+" FROM edges WHERE uuid=? AND state=0",parseUuid(uuid));
+    return row.row()?std::optional(ResolvedEdge{source,readEdgeRow(source,row)}):std::nullopt;
+}
+inline std::vector<sqlite3*> querySources(sqlite3* db)
+{
+    const auto pool=activeStatementPools.find(db);
+    return pool!=activeStatementPools.end()&&pool->second->querySources?pool->second->querySources():std::vector{db};
+}
+// Enumerate incident visible records once, regardless of physical partition.
+inline std::vector<EdgeRecord> incidentEdges(sqlite3* db,const std::string& uuid)
+{
+    std::vector<EdgeRecord> result;
+    for(auto* source:querySources(db)){
+        Statement rows(source,std::string("SELECT ")+kEdgeCols+
+            " FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) ORDER BY id",parseUuid(uuid));
+        while(rows.row()){
+            auto edge=readEdgeRow(source,rows);
+            if(edgeSource(db,edge.uuid)==source)result.push_back(std::move(edge));
+        }
+    }
+    return result;
 }
 inline ObjectVersion objectVersion(const ResolvedObject& object)
 {

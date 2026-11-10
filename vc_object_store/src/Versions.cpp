@@ -114,6 +114,8 @@ std::string detail::storeUuidText(sqlite3* db)
 
 std::optional<int64_t> detail::headVersion(sqlite3* db, const std::string& objectUuid)
 {
+    db=objectSource(db,objectUuid);
+    if(!db)return {};
     Statement s(db, "SELECT version FROM objects WHERE uuid=? AND state<>2", parseUuid(objectUuid));
     return s.row() ? std::optional(s.i64(0)) : std::nullopt;
 }
@@ -148,6 +150,8 @@ void detail::attachRelationshipVersions(sqlite3* db, std::vector<EdgeRecord>& re
 
 std::optional<int64_t> detail::relationshipHeadVersion(sqlite3* db, const std::string& edgeUuid)
 {
+    db=edgeSource(db,edgeUuid);
+    if(!db)return {};
     Statement s(db, "SELECT version,state=2 FROM edges WHERE uuid=?",
         parseUuid(edgeUuid));
     if (!s.row() || s.i64(1)) return std::nullopt;
@@ -292,7 +296,7 @@ void detail::recordCurrentChange(sqlite3* db, const std::array<unsigned char,16>
     for(const auto column:{0,1}) {
         const auto endpoint=edge.uuid(column);
         // An immutable dependency cannot be versioned by this overlay.
-        if(!headVersion(db,endpoint)) continue;
+        if(objectSource(db,endpoint)!=db) continue;
         expectObject(endpoint);
         writeObjectVersion(db,endpoint);
         state->changedObjects.insert(endpoint);
@@ -392,8 +396,7 @@ void detail::checkTransactionContext(sqlite3* db, const TransactionContext& cont
     if (!historyEnabled(db)) return;
     for (const auto& [uuid, expected] : context.expectedObjects) {
         const auto id = canonical(uuid);
-        Statement head(db, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?", parseUuid(id));
-        expectedRevisions[id] = head.row() ? std::optional(head.uuid(0)) : std::nullopt;
+        expectedRevisions[id] = currentObjectReference(db,id);
     }
 }
 
@@ -454,11 +457,11 @@ std::optional<ObjectRevision> ObjectStore::objectAtVersion(const Txn& txn, const
 ObjectVersion ObjectStore::versionReference(const Txn& txn, const ObjectRevision& revision) const
 {
     if (revision.version <= 0) throw std::invalid_argument("object history: revision has no numbered version");
-    if(revision.uuid.empty()) {
-        const auto current=resolveObject(static_cast<sqlite3*>(connection(txn)),revision.objectUuid);
-        if(!current||current->record.version!=revision.version||current->record.versionGeneration!=revision.generation)
-            throw std::invalid_argument("object history: current-only version is unavailable");
-        return objectVersion(*current);
+    if(!revision.storeUuid.empty()) {
+        const ObjectVersion reference{revision.storeUuid,revision.generation,revision.objectUuid,revision.version};
+        if(!resolveObjectVersion(static_cast<sqlite3*>(connection(txn)),reference))
+            throw std::invalid_argument("object history: exact version is unavailable");
+        return reference;
     }
     const auto resolved=resolveObjectRevision(static_cast<sqlite3*>(connection(txn)),revision.uuid);
     if(!resolved)throw std::invalid_argument("object history: revision is unavailable");
@@ -467,21 +470,6 @@ ObjectVersion ObjectStore::versionReference(const Txn& txn, const ObjectRevision
 
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectVersion>& versions) const
 {
-    if (!historyEnabled(static_cast<sqlite3*>(connection(txn)))) {
-        std::vector<std::string> ids;
-        for (const auto& reference : versions) {
-            if (!objectAtVersion(txn,reference)) throw std::invalid_argument("historical selection is unavailable with history off");
-            ids.push_back(reference.objectUuid);
-        }
-        EdgeSelection query; query.endpointUuids=ids; query.bothEndpoints=true; query.approvalStates.clear(); query.attachments=true;
-        std::vector<SelectedRelationship> result;
-        const auto store=status(txn).storeUuid;
-        for (const auto& edge : selectEdges(txn,query)) {
-            const auto current=relationshipAtVersion(txn,{store,edge.versionGeneration,edge.uuid,edge.version.value_or(0)});
-            if (current) result.push_back({*current,currentRelationshipApplicable(*this,txn,edge.uuid)});
-        }
-        return result;
-    }
     RevisionSelection selection;
     for (const auto& reference : versions) {
         const auto revision = objectAtVersion(txn, reference);

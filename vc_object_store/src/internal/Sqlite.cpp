@@ -21,6 +21,18 @@ void exec(sqlite3* db, const char* sql)
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::string msg = err ? err : sqlite3_errmsg(db);
         sqlite3_free(err);
+        if(sqlite3_extended_errcode(db)==SQLITE_CONSTRAINT_FOREIGNKEY){
+            // Failed commits otherwise hide which reference could not be
+            // satisfied. This diagnostic does no work on successful writes.
+            sqlite3_stmt* check=nullptr;
+            if(sqlite3_prepare_v2(db,"PRAGMA foreign_key_check",-1,&check,nullptr)==SQLITE_OK&&sqlite3_step(check)==SQLITE_ROW){
+                msg+=" ["+std::string(reinterpret_cast<const char*>(sqlite3_column_text(check,0)))+
+                    " -> "+std::string(reinterpret_cast<const char*>(sqlite3_column_text(check,2)))+
+                    ", row "+std::to_string(sqlite3_column_int64(check,1))+
+                    ", key "+std::to_string(sqlite3_column_int(check,3))+"]";
+            }
+            sqlite3_finalize(check);
+        }
         throw std::runtime_error("sqlite exec failed: " + msg + " (" + sql + ")");
     }
 }

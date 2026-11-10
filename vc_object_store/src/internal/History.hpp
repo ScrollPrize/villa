@@ -20,5 +20,8 @@ nlohmann::json dependencyFields(const nlohmann::json* metadata, bool retired,
 // Latest-head checks reuse the selected-revision dependency evaluator. Indexed
 // membership probes avoid enumerating unrelated incident relationships.
 bool currentRelationshipApplicable(const ObjectStore&, const Txn&, const std::string& edgeUuid);
+// The last published binding, archived or still current in a sealed source.
+std::optional<RelationshipRevision> recordedRelationship(sqlite3*,const std::string& edgeUuid);
+std::optional<std::string> currentObjectReference(sqlite3*,const std::string& objectUuid);
 void requirePublishedGraphRead(const Txn&);
 }
