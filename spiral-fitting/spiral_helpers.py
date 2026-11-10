@@ -134,7 +134,13 @@ def _decimate_ordered_points_min_spacing(points, min_spacing, return_indices=Fal
     return points[keep]
 
 
-def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
+# Span tags (vc3d_fiber format v4 segment_to_next.tags) whose interior line
+# points are not fit: the span crosses a hole in the sheet or damaged material.
+EXCLUDED_SPAN_TAGS = frozenset({'gap', 'damaged'})
+
+
+def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None,
+                                use_adjacent_links=False):
     # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points and
     # line_points are x/y/z coordinates at 4x the scale used by the regular PCL
     # JSONs unless coordinate_base_shape_zyx declares their domain. line_points
@@ -201,17 +207,55 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     original_num_points = len(points_xyz)
     # Force-keep this fiber's link endpoint control points through decimation so
     # cross-fiber links (which reference control_point indices) resolve to the
-    # exact point rather than a surviving neighbour.
+    # exact point rather than a surviving neighbour. Adjacent-link endpoints
+    # are kept only when the fit uses adjacent links, so the decimated point
+    # set is unchanged otherwise.
     link_endpoint_indices = set()
-    for br in (data.get('branches') or []):
-        control_index = int(br.get('control_point_index', -1))
-        if 0 <= control_index < num_control_points:
-            link_endpoint_indices.add(int(control_line_indices[control_index]))
+    link_record_keys = ('branches', 'adjacent_branches') if use_adjacent_links else ('branches',)
+    for record_key in link_record_keys:
+        for br in (data.get(record_key) or []):
+            control_index = int(br.get('control_point_index', -1))
+            if 0 <= control_index < num_control_points:
+                link_endpoint_indices.add(int(control_line_indices[control_index]))
+    # Spans tagged 'gap' or 'damaged' (format v4 segment_to_next tags) hold no
+    # sheet: their line points are the tracer's bridge across a hole, or run
+    # over material the annotator marked unusable. Drop the interior line
+    # points of those spans so they neither anchor the radius/DT losses nor
+    # seed anchors; the span's two control points stay (an annotated control
+    # point is a correct point) and are force-kept so the gap edges survive
+    # decimation. The polyline remains one chain across the gap, i.e. both
+    # sides keep sharing a winding.
+    excluded_span_indices = set()
+    excluded_spans = 0
+    for control_index, segment in enumerate(parsed.control_point_segments):
+        tags = set(getattr(segment, 'tags', ()) or ())
+        if not (tags & EXCLUDED_SPAN_TAGS) or control_index + 1 >= num_control_points:
+            continue
+        a = int(control_line_indices[control_index])
+        b = int(control_line_indices[control_index + 1])
+        lo, hi = min(a, b), max(a, b)
+        if hi - lo > 1:
+            excluded_span_indices.update(range(lo + 1, hi))
+        link_endpoint_indices.update((a, b))
+        excluded_spans += 1
+    if excluded_span_indices:
+        surviving = np.array(
+            [i for i in range(len(points_xyz)) if i not in excluded_span_indices],
+            dtype=np.int64)
+        surviving_position = {int(i): k for k, i in enumerate(surviving)}
+        points_xyz = points_xyz[surviving]
+        link_endpoint_indices = {
+            surviving_position[i] for i in link_endpoint_indices
+            if i in surviving_position}
+    else:
+        surviving = None
     # Keep the surviving points' pre-decimation (trimmed line) indices so
     # cross-fiber links resolve exactly after decimation.
     points_xyz, kept_orig_indices = _decimate_ordered_points_min_spacing(
         points_xyz, min_point_spacing, return_indices=True,
         force_keep=link_endpoint_indices)
+    if surviving is not None:
+        kept_orig_indices = surviving[np.asarray(kept_orig_indices, dtype=np.int64)]
     name = data.get('name') or os.path.splitext(os.path.basename(path))[0]
     thing = data.get('webknossos', {}).get('thing', {})
     wk_color = thing.get('color', {})
@@ -237,6 +281,8 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
             'pcl_fiber_min_point_spacing': min_point_spacing,
             'fiber_original_num_points': original_num_points,
             'fiber_num_control_points': num_control_points,
+            'fiber_excluded_spans': excluded_spans,
+            'fiber_excluded_span_points': len(excluded_span_indices),
         },
         'color': color,
     }
@@ -262,26 +308,36 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     # junction (delta 0). Stored reciprocally in both fibers' JSONs (see VC3D
     # LineAnnotationController). Resolved to retained point ids downstream via
     # kept_orig_indices (see resolve_fiber_links).
+    # Adjacent links ("adjacent_branches", format v4) have the same record
+    # shape but tie a vertical fiber to the horizontal fiber one winding
+    # outside it (W_V = W_H - 1). They are parsed alongside and only consumed
+    # when resolve_fiber_links is asked to include them.
     adjacent_branches = data.get('adjacent_branches') or []
-    if adjacent_branches:
+    if adjacent_branches and not use_adjacent_links:
         print(f'WARNING: ignoring {len(adjacent_branches)} adjacent fiber link(s) '
               f'in {path}: spiral fitting only supports same-winding links')
-    branches = []
-    for br in (data.get('branches') or []):
+    collection['branches'] = _parse_fiber_link_records(data.get('branches'))
+    collection['adjacent_branches'] = _parse_fiber_link_records(adjacent_branches)
+    collection['file_basename'] = os.path.basename(path)
+    return collection
+
+
+def _parse_fiber_link_records(records):
+    """Normalise raw 'branches' / 'adjacent_branches' entries of a fiber JSON."""
+    parsed = []
+    for br in (records or []):
         branch_file = br.get('branch_file')
         local_index = int(br.get('control_point_index', -1))
         branch_index = int(br.get('branch_control_point_index', -1))
         if not branch_file or local_index < 0 or branch_index < 0:
             continue
-        branches.append({
+        parsed.append({
             'local_index': local_index,
             'branch_file': os.path.basename(branch_file),
             'branch_index': branch_index,
             'pending': bool(br.get('pending', False)),
         })
-    collection['branches'] = branches
-    collection['file_basename'] = os.path.basename(path)
-    return collection
+    return parsed
 
 
 def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
@@ -345,7 +401,8 @@ def fiber_collection_hv_tag(pcl, *, min_z_fraction, min_auto_certainty):
         min_auto_certainty=min_auto_certainty)
 
 
-def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None):
+def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None,
+                                 use_adjacent_links=False):
     if not path:
         return {}, next_id
     fiber_paths = sorted(glob.glob(os.path.join(path, '*.json')))
@@ -360,7 +417,8 @@ def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_
         try:
             pcl = load_fiber_point_collection(
                 fiber_path, next_id, min_point_spacing=min_point_spacing,
-                base_shape_zyx=base_shape_zyx)
+                base_shape_zyx=base_shape_zyx,
+                use_adjacent_links=use_adjacent_links)
         except Exception as e:
             print(f'WARNING: failed to load fiber {fiber_path}: {e}')
             skipped += 1
@@ -403,8 +461,24 @@ def _point_id_for_orig_index(pcl, orig_index):
     return int(np.argmin(np.abs(np.asarray(kept) - orig_index)))
 
 
+def _adjacent_link_delta(tag_a, tag_b):
+    """Winding of fiber b relative to fiber a across an adjacent link.
+
+    An adjacent link ties a vertical fiber to the horizontal fiber one winding
+    outside it (W_V = W_H - 1), so the step is -1 from H to V and +1 from V to
+    H. Any other tag pair (two of a kind, or an untagged fiber) gives None: the
+    link then contributes no winding constraint at all. It must never fall
+    back to a same-winding (delta 0) statement."""
+    if tag_a == 'H' and tag_b == 'V':
+        return -1
+    if tag_a == 'V' and tag_b == 'H':
+        return 1
+    return None
+
+
 def resolve_fiber_links(point_collections, include_pending=False,
-                        assume_unannotated=False):
+                        assume_unannotated=False, *, include_adjacent=False,
+                        hv_tag_of=None):
     """Resolve stored branch metadata into concrete point-to-point links.
 
     Fibers/PCLs carry raw 'branches' (see load_fiber_point_collection), each
@@ -414,21 +488,32 @@ def resolve_fiber_links(point_collections, include_pending=False,
     undirected link appears once.
 
     Returns a list of dicts:
-        {'a_coll', 'a_point', 'b_coll', 'b_point', 'pending'}
+        {'a_coll', 'a_point', 'b_coll', 'b_point', 'pending', 'delta'}
+    where 'delta' is the integer winding of the b endpoint relative to the a
+    endpoint: 0 for an ordinary (same-winding) link, -1 or +1 for an adjacent
+    link (see _adjacent_link_delta).
+
+    With ``include_adjacent`` the collections' 'adjacent_branches' are resolved
+    as well; ``hv_tag_of(cid)`` must then return the collection's effective
+    'H' / 'V' tag (None when untagged). An adjacent link whose two fibers are
+    not one H and one V is dropped with a warning, and so is any link whose
+    reciprocal records disagree on the kind (one side ordinary, the other
+    adjacent): both contribute no winding constraint.
 
     ``assume_unannotated`` is for the canonical fiber catalog: its shared
     point dictionaries are zero-normalized after their first materialization,
     but source fiber documents are intrinsically unannotated.
     """
+    if include_adjacent and hv_tag_of is None:
+        raise ValueError('include_adjacent requires hv_tag_of')
     by_basename = {}
     for cid, pcl in point_collections.items():
         basename = pcl.get('file_basename')
         if basename is not None:
             by_basename.setdefault(basename, cid)
 
-    # Links are same-winding statements between unannotated collections; adjacent
-    # links are intentionally excluded by load_fiber_point_collection because this
-    # resolver has no winding-offset representation. Drop any
+    # Links are integer-winding statements between unannotated collections
+    # (delta 0 for ordinary links, +-1 for adjacent ones). Drop any
     # link touching an explicitly-annotated collection here, before the component
     # decomposition, so every consumer of the link graph (the cross-patch merge,
     # the unattached walk sampling) agrees on membership. Must run before
@@ -439,9 +524,14 @@ def resolve_fiber_links(point_collections, include_pending=False,
     }
 
     links = []
-    seen = set()
+    link_keys = []
+    key_delta = {}
+    conflicting = set()
     for cid, pcl in point_collections.items():
-        for br in pcl.get('branches', []):
+        records = [(br, False) for br in pcl.get('branches', [])]
+        if include_adjacent:
+            records.extend((br, True) for br in pcl.get('adjacent_branches', []))
+        for br, adjacent in records:
             if br.get('pending') and not include_pending:
                 continue
             target_cid = by_basename.get(br['branch_file'])
@@ -452,20 +542,46 @@ def resolve_fiber_links(point_collections, include_pending=False,
                       f'{br["branch_file"]}: links must join unannotated '
                       f'(same-winding) collections')
                 continue
+            if adjacent:
+                tag_a, tag_b = hv_tag_of(cid), hv_tag_of(target_cid)
+                delta = _adjacent_link_delta(tag_a, tag_b)
+                if delta is None:
+                    print(f'WARNING: dropping adjacent fiber link {pcl.get("name")} -> '
+                          f'{br["branch_file"]}: it needs one horizontal and one '
+                          f'vertical fiber (tags {tag_a!r}, {tag_b!r}) and '
+                          f'contributes no winding constraint')
+                    continue
+            else:
+                delta = 0
             a_point = _point_id_for_orig_index(pcl, br['local_index'])
             b_point = _point_id_for_orig_index(
                 point_collections[target_cid], br['branch_index'])
             if a_point is None or b_point is None:
                 continue
-            key = tuple(sorted([(cid, a_point), (target_cid, b_point)]))
-            if key in seen:
+            endpoint_a, endpoint_b = (cid, a_point), (target_cid, b_point)
+            key = tuple(sorted([endpoint_a, endpoint_b]))
+            # The delta in the key's endpoint order, so the reciprocal record
+            # (which names the endpoints the other way round) compares equal.
+            key_oriented_delta = delta if key[0] == endpoint_a else -delta
+            if key in key_delta:
+                if key_delta[key] != key_oriented_delta and key not in conflicting:
+                    conflicting.add(key)
+                    print(f'WARNING: dropping fiber link {pcl.get("name")} <-> '
+                          f'{br["branch_file"]}: its records disagree on the link '
+                          f'kind (same-winding vs adjacent); it contributes no '
+                          f'winding constraint')
                 continue
-            seen.add(key)
+            key_delta[key] = key_oriented_delta
+            link_keys.append(key)
             links.append({
                 'a_coll': cid, 'a_point': a_point,
                 'b_coll': target_cid, 'b_point': b_point,
                 'pending': bool(br.get('pending')),
+                'delta': delta,
             })
+    if conflicting:
+        links = [link for key, link in zip(link_keys, links)
+                 if key not in conflicting]
     return links
 
 
@@ -502,6 +618,43 @@ def build_link_components(resolved_links):
                     queue.append(other)
         components.append((member_cids, member_links))
     return components
+
+
+def link_component_winding_offsets(member_cids, member_links):
+    """Integer winding of every member relative to the first one, along the links.
+
+    Breadth-first from ``member_cids[0]`` (then from any member the links do
+    not reach, each starting again at 0): a link states
+    winding(b_coll) = winding(a_coll) + delta. Returns ``(offsets,
+    inconsistent)``: ``offsets`` maps every member to its integer winding, and
+    ``inconsistent`` lists the links whose delta contradicts offsets already
+    assigned along other links (a link cycle whose deltas do not sum to zero).
+    Such links keep their chain routing; the breadth-first assignment stands,
+    and find_inconsistent_windings reports the holonomy."""
+    adjacency = {}
+    for link in member_links:
+        delta = int(link.get('delta', 0))
+        adjacency.setdefault(link['a_coll'], []).append((link, link['b_coll'], delta))
+        adjacency.setdefault(link['b_coll'], []).append((link, link['a_coll'], -delta))
+    offsets = {}
+    inconsistent = []
+    flagged = set()
+    for seed in member_cids:
+        if seed in offsets:
+            continue
+        offsets[seed] = 0
+        queue = [seed]
+        while queue:
+            cid = queue.pop(0)
+            for link, other, delta in adjacency.get(cid, ()):
+                expected = offsets[cid] + delta
+                if other not in offsets:
+                    offsets[other] = expected
+                    queue.append(other)
+                elif offsets[other] != expected and id(link) not in flagged:
+                    flagged.add(id(link))
+                    inconsistent.append(link)
+    return offsets, inconsistent
 
 
 class Chain:
@@ -811,7 +964,9 @@ def merge_linked_point_collections(point_collections, link_components,
         cross_patch_point_collections[merged_id] = {
             'id': merged_id,
             'name': merged_id,
-            'sampling_group': rep.get('sampling_group', 'fibers'),
+            # a component with any manual member is sampled with the manual fibers
+            'sampling_group': ('fibers' if any(pcl.get('sampling_group', 'fibers') == 'fibers' for _, pcl in members)
+                               else rep.get('sampling_group', 'fibers')),
             'metadata': {'winding_is_absolute': False,
                          'input_role': 'fiber_link_component',
                          'logical_input_ids': logical_members},
@@ -1417,10 +1572,14 @@ def _build_spliced_overlay(
             quad_spirals[..., 1:], dr_per_winding)
         vertex_winding = (vertex_shifted / dr).round().to(torch.float32)
 
-        packed_ids = packed_ids_cpu.to(device=device)
-        quad_target_w = patch_evaluation.target_winding_indices[packed_ids]
+        # The evaluation's per-quad tensors may live on the host (large atlas).
+        quad_target_w = patch_evaluation.target_winding_indices[
+            packed_ids_cpu.to(device=patch_evaluation.target_winding_indices.device)
+        ].to(device=device)
         target_w_float = quad_target_w.to(torch.float32)
-        center_theta = patch_evaluation.center_theta[packed_ids]
+        center_theta = patch_evaluation.center_theta[
+            packed_ids_cpu.to(device=patch_evaluation.center_theta.device)
+        ].to(device=device)
         reference_full = center_theta + target_w_float * (2 * np.pi)
         vertex_full = vertex_theta + vertex_winding * (2 * np.pi)
         vertex_full -= torch.round(

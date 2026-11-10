@@ -45,7 +45,10 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
+from winding_convention import accepted as sheet_accepted
+from winding_convention import branch_target, is_sheet_collection, validate_sheet_collections
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, CHECKPOINT_SUPERVISION_KEYS,
+                    Config, FitConfig,
                     SHELL_ATLAS_KEYS)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
@@ -57,6 +60,18 @@ from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          shell_losses_enabled, winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 
+
+
+def fiber_sampling_group(pcl, cfg):
+    """'auto_fibers' for an automatically traced fiber when
+    cfg['pcl_auto_fiber_sampling_group'] is on, else 'fibers'."""
+    if not cfg.get('pcl_auto_fiber_sampling_group', False):
+        return 'fibers'
+    tags = (pcl.get('metadata') or {}).get('fiber_tags') or ()
+    basename = str(pcl.get('file_basename') or os.path.basename(str(pcl.get('source_file') or '')))
+    if 'auto' in tags or basename.startswith('auto_'):
+        return 'auto_fibers'
+    return 'fibers'
 
 def _startup_resource_suffix(started_at=None):
     """Small cross-platform startup timing/high-water diagnostic."""
@@ -95,6 +110,7 @@ from dt_targets import (
 from tracks import (
     PackedTrackCollection,
     configure_prepared_track_sampling,
+    filter_tracks_inside_umbilicus_radius,
     filter_tracks_to_outer_shell,
     get_track_satisfied_counts_in_chunks,
     iter_track_losses,
@@ -110,6 +126,7 @@ from sample_spiral import (
     get_radial_covector_in_scroll_space,
     get_radial_normal_stretch,
     get_spiral_points,
+    get_theta_and_radii,
     get_theta,
     get_winding_xy,
 )
@@ -120,7 +137,9 @@ from losses import (
     get_fiber_direction_loss,
     get_min_spacing_loss,
     iter_lasagna_losses,
+    get_dense_phase_loss,
     get_patch_abs_winding_loss,
+    get_point_abs_winding_loss,
     get_patch_and_umbilicus_losses,
     get_patch_rel_winding_loss,
     get_shell_outer_loss,
@@ -141,6 +160,7 @@ from spiral_helpers import (
     _decimate_ordered_points_min_spacing,
     resolve_fiber_links,
     build_link_components,
+    link_component_winding_offsets,
     merge_linked_point_collections,
     SequenceChain,
     scale_and_split_counts,
@@ -843,6 +863,7 @@ def regular_unattached_strip(pcl_id, pcl, min_point_spacing):
 def materialize_fiber_fit_inputs(
         fiber_catalog, verified_patches, *, z_begin, z_end, z_margin,
         min_point_spacing, use_links=True, use_pending_links=False,
+        use_adjacent_links=False,
         vertical_min_z_fraction=0.8, vertical_min_auto_certainty=0.5,
         vertical_radial_offset=0.0):
     """Derive every CPU training view from the resident fiber catalog.
@@ -852,6 +873,16 @@ def materialize_fiber_fit_inputs(
     geometry, but trimming and decimation never mutate the catalog's point
     membership. Re-running this function over the same catalog therefore
     produces the same graph and ordered training views.
+
+    ``use_adjacent_links`` also resolves the fibers' adjacent links (a
+    vertical fiber one winding inside a horizontal one, W_V = W_H - 1). Which
+    side is inside follows each collection's H/V tag under the vertical_*
+    thresholds (spiral_helpers.fiber_collection_hv_tag); a link whose fibers
+    are not one H and one V contributes nothing. The integer winding of every
+    linked member relative to its component's first member is written into
+    the shared point dictionaries' ``winding_annotation`` (after the
+    zero-fill below), so the relative-winding loss, the unattached-strip
+    walks and the inconsistency diagnostics all read the step from one place.
 
     Each strip carries ``hv_tag`` ('V', 'H', or None; see
     spiral_helpers.classify_fiber_hv) and ``is_vertical`` for radial-offset updates.
@@ -876,7 +907,7 @@ def materialize_fiber_fit_inputs(
         metadata['winding_is_absolute'] = False
         metadata.setdefault('input_role', 'fiber')
         pcl.setdefault('file_basename', f'{logical_id}.json')
-        pcl['sampling_group'] = 'fibers'
+        pcl['sampling_group'] = pcl.get('fiber_sampling_group', 'fibers')
         pcl['chain'] = SequenceChain(pcl)
         for point in pcl['points'].values():
             point['collectionId'] = pcl['id']
@@ -890,9 +921,21 @@ def materialize_fiber_fit_inputs(
 
     resolved_links = []
     if use_links:
+        hv_tag_of = None
+        if use_adjacent_links:
+            hv_tags = {}
+
+            def hv_tag_of(cid):
+                if cid not in hv_tags:
+                    hv_tags[cid] = fiber_collection_hv_tag(
+                        point_collections[cid],
+                        min_z_fraction=vertical_min_z_fraction,
+                        min_auto_certainty=vertical_min_auto_certainty)
+                return hv_tags[cid]
         resolved_links = resolve_fiber_links(
             point_collections, include_pending=use_pending_links,
-            assume_unannotated=True)
+            assume_unannotated=True, include_adjacent=use_adjacent_links,
+            hv_tag_of=hv_tag_of)
     link_components = build_link_components(resolved_links)
     catalog_position = {
         pcl['id']: position
@@ -932,6 +975,37 @@ def materialize_fiber_fit_inputs(
         pcl['has_winding_annotations'] = False
         for point in pcl['points'].values():
             point['winding_annotation'] = 0.0
+
+    # Adjacent links put their vertical member one winding inside the
+    # horizontal one. Write each linked member's integer winding relative to
+    # its component's first member into the shared point dictionaries: the
+    # relative-winding loss forms winding_diff from them, the strips below
+    # copy them into their per-point windings (so a component walk hops an
+    # adjacent junction with the right step), and find_inconsistent_windings
+    # sees the same deltas. Components holding only ordinary links keep every
+    # offset at 0 and are skipped, leaving the zero-fill above untouched.
+    member_winding_offsets = {}
+    for member_cids, member_links in link_components:
+        if not any(link.get('delta', 0) for link in member_links):
+            continue
+        offsets, inconsistent = link_component_winding_offsets(
+            member_cids, member_links)
+        for link in inconsistent:
+            print(f'WARNING: fiber-link component {member_cids}: link '
+                  f'{link["a_coll"]}:{link["a_point"]} -> '
+                  f'{link["b_coll"]}:{link["b_point"]} (delta {link["delta"]}) '
+                  f'contradicts the winding offsets assigned along the other '
+                  f'links; keeping the breadth-first assignment')
+        member_winding_offsets.update(offsets)
+    for cid, offset in member_winding_offsets.items():
+        if offset:
+            for point in point_collections[cid]['points'].values():
+                point['winding_annotation'] = float(offset)
+    for pcl in cross_patch.values():
+        member_cids = pcl.get('link_member_cids')
+        if member_cids and any(member_winding_offsets.get(cid) for cid in member_cids):
+            pcl['link_member_winding_offsets'] = {
+                cid: member_winding_offsets.get(cid, 0) for cid in member_cids}
 
     for pcl in cross_patch.values():
         points_by_patch = {}
@@ -1538,6 +1612,7 @@ class FitContext:
             elif reason is not None:
                 dropped[reason] += 1
             else:
+                patch.entry_name = entry
                 patches[entry] = patch
         if dropped['z ROI prefilter']:
             print(f"z ROI prefilter skipped {dropped['z ROI prefilter']}/"
@@ -1593,13 +1668,109 @@ class FitContext:
 
     def _patch_sampling_probabilities(self, patches):
         if not patches:
+            if self.config.get('patch_sampling_reserved') is not None:
+                # astra fh2 F5: a configured reservation never silently
+                # disappears with an empty active pool.
+                raise ValueError(
+                    'patch_sampling_reserved is set but the active patch pool '
+                    'is empty')
             return None
         areas = np.asarray([
             float(getattr(patch, '_sampling_area', patch.area))
             for patch in patches
         ], dtype=np.float32)
         weights = areas ** self.config['patch_sampling_area_exponent']
-        return weights / weights.sum()
+        # A patch's meta.json loss_weight_scale scales its draw probability:
+        # the patch losses average over drawn patches, so in expectation this
+        # multiplies the patch's contribution by that factor.
+        weights = weights * np.asarray([
+            float(getattr(patch, 'loss_weight_scale', 1.0))
+            for patch in patches
+        ], dtype=np.float32)
+        overrides = self.config.get('patch_loss_weight_scale_overrides')
+        if overrides:
+            prefixes = sorted(overrides, key=len, reverse=True)
+            factors = []
+            for patch in patches:
+                name = str(getattr(patch, 'entry_name', '') or '')
+                factor = 1.0
+                for prefix in prefixes:
+                    if name.startswith(prefix):
+                        factor = float(overrides[prefix])
+                        break
+                factors.append(factor)
+            weights = weights * np.asarray(factors, dtype=np.float32)
+        if self.config.get('exclude_holdout_patches_from_training', False):
+            weights = weights * np.asarray([
+                0.0 if getattr(patch, 'holdout', False) else 1.0
+                for patch in patches
+            ], dtype=np.float32)
+        if not weights.sum() > 0:
+            raise ValueError('every patch has loss_weight_scale 0')
+        probabilities = weights / weights.sum()
+        core_share = float(self.config['patch_sampling_core_share'])
+        if core_share > 0:
+            # Reserve a fixed share of draws for inner-core patches (meta.json
+            # inner_core_radius), keeping zero weights at zero.
+            core = np.asarray([
+                getattr(patch, 'inner_core_radius', None) is not None
+                for patch in patches
+            ], dtype=np.float32)
+            core_probabilities = probabilities * core
+            if core_probabilities.sum() > 0:
+                probabilities = (
+                    (1.0 - core_share) * probabilities
+                    + core_share * core_probabilities / core_probabilities.sum())
+        reserved_cfg = self.config.get('patch_sampling_reserved')
+        if reserved_cfg is not None:
+            probabilities = FitContext._reserved_share_probabilities(
+                self,
+                patches, weights, reserved_cfg)
+        return probabilities
+
+    def _reserved_share_probabilities(self, patches, weights, reserved_cfg):
+        """patch_sampling_reserved (frozen/s1fh, PLAN-fencehold-v2 C3): a fixed
+        share s of every draw from the patches whose entry_name starts with one
+        of the prefixes, 1 - s from the others; within each group the final
+        weights (area^exponent x loss_weight_scale x overrides x hold-out
+        zeroing) keep their ratios. The share is exact whatever the size of
+        either group. Computed in float64."""
+        share = float(reserved_cfg['share'])
+        prefixes = tuple(reserved_cfg['prefixes'])
+        if not 0.0 <= share < 1.0:
+            raise ValueError(f'patch_sampling_reserved share {share} not in [0, 1)')
+        if float(self.config.get('patch_sampling_core_share', 0.0) or 0.0) > 0:
+            raise ValueError('patch_sampling_reserved cannot be combined with '
+                             'patch_sampling_core_share > 0')
+        mask = np.asarray([
+            str(getattr(patch, 'entry_name', '') or '').startswith(prefixes)
+            for patch in patches], dtype=bool)
+        w = np.asarray(weights, dtype=np.float64)
+        w_res = np.where(mask, w, 0.0)
+        w_rest = np.where(mask, 0.0, w)
+        if not w_res.sum() > 0:
+            raise ValueError(
+                f'patch_sampling_reserved: no patch with prefix {list(prefixes)} '
+                'has a nonzero weight')
+        if not w_rest.sum() > 0:
+            raise ValueError(
+                'patch_sampling_reserved: no non-reserved patch has a nonzero '
+                'weight')
+        probabilities = ((1.0 - share) * w_rest / w_rest.sum()
+                         + share * w_res / w_res.sum())
+        line = (f'PATCH_SAMPLING_RESERVED prefixes={list(prefixes)} share={share} '
+                f'reserved_patches={int(mask.sum())} '
+                f'reserved_nonzero={int((w_res > 0).sum())} '
+                f'reserved_weight={w_res.sum():.6g} total_weight={w.sum():.6g} '
+                f'unreserved_share_of_weight={w_rest.sum() / w.sum():.6f} '
+                f'realized_reserved_mass={probabilities[mask].sum():.12f}')
+        if getattr(self, '_patch_sampling_reserved_logged', None) != line:
+            print(line, flush=True)
+            try:
+                self._patch_sampling_reserved_logged = line
+            except AttributeError:
+                pass
+        return probabilities
 
     def _rebuild_pcl_sampling_strata(self):
         """Rebuild the per-family sampling strata in place.
@@ -1612,11 +1783,27 @@ class FitContext:
         # draw samples at most sample_count_relative_winding_patch_pairs_per_pcl
         # patch pairs regardless of pcl size, so without this a component would
         # get ~1/N the pair-sampling pressure its N members had before merging.
+        # Auto fibers ('auto_fibers' group) draw with pcl_auto_fiber_sampling_weight
+        # times a manual member's weight; at 0 they leave both pools.
+        auto_weight = float(self.config.get('pcl_auto_fiber_sampling_weight', 1.0))
+
+        def _group(group, eligible=True):
+            if not eligible or (group == 'auto_fibers' and auto_weight <= 0):
+                return None
+            return group
+
+        def _scale(group):
+            return auto_weight if group == 'auto_fibers' else 1.0
+
+        # Sheet anchors evaluated at their own points never form patch pairs.
+        at_point = bool(self.config.get('abs_winding_eval_at_point', False))
         self.pcl_sampling_strata['cross_patch'] = build_pcl_sampling_strata(
-            [pcl['sampling_group'] if len(pcl['points']) > 1 else None
+            [_group(pcl['sampling_group'],
+                    len(pcl['points']) > 1
+                    and not (at_point and is_sheet_collection(pcl)))
              for pcl in self.cross_patch_pcls],
             self.config,
-            member_weights=[len(pcl.get('link_member_cids', ())) or 1
+            member_weights=[(len(pcl.get('link_member_cids', ())) or 1) * _scale(pcl['sampling_group'])
                             for pcl in self.cross_patch_pcls],
         )
         self._rebuild_unattached_components()
@@ -1624,20 +1811,26 @@ class FitContext:
         # the per-strip sampling pressure its members had before merging (each
         # sampled walk covers only one random path through the component).
         self.pcl_sampling_strata['unattached'] = build_pcl_sampling_strata(
-            self.unattached_component_groups, self.config,
-            member_weights=[len(members) for members in self.unattached_components])
+            [_group(group) for group in self.unattached_component_groups], self.config,
+            member_weights=[len(members) * _scale(group)
+                            for members, group in zip(self.unattached_components,
+                                                      self.unattached_component_groups)])
 
     def _rebuild_unattached_components(self):
         """Rebuild the unattached link-component view in place.
 
         Each entry of self.unattached_components is the list of member strip
-        indices connected by same-winding links (singletons for unlinked
-        strips). The 'unattached' sampling strata index these components; each
+        indices connected by fiber links (singletons for unlinked strips).
+        The 'unattached' sampling strata index these components; each
         step the loss samples a chain *walk* through a chosen component -- along
         a strip, optionally hopping to the linked strip at each junction -- and
         applies the ordinary constant-winding strip target along the walk (the
         junction hop is a regular |dtheta| < pi step, so the sequential theta=0
-        unwrap handles the seam). unattached_component_edges[c] lists component
+        unwrap handles the seam). The step across an adjacent link is carried
+        by the strips' per-point windings (materialize_fiber_fit_inputs writes
+        each member's integer winding offset into them), which the loss
+        subtracts before demanding a constant shifted radius, so no hop here
+        assumes the same winding. unattached_component_edges[c] lists component
         c's junctions as (strip_a, pos_a, strip_b, pos_b) with pos_* row indices
         into the strips' (decimated) point arrays.
 
@@ -1673,8 +1866,10 @@ class FitContext:
                     continue
                 edges.append((a, pos_a, b, pos_b))
             self.unattached_components.append(comp_members)
+            # a component with any manual-fiber member is sampled as manual
+            comp_groups = [self.unattached_strip_sampling_groups[m] for m in comp_members]
             self.unattached_component_groups.append(
-                self.unattached_strip_sampling_groups[comp_members[0]])
+                'fibers' if 'fibers' in comp_groups else comp_groups[0])
             self.unattached_component_edges.append(edges)
         for idx in range(len(self.unattached_pcl_strips)):
             if idx not in in_linked_component:
@@ -1729,7 +1924,8 @@ class FitContext:
         # like _maybe_relink_fibers_for_direction.
         self._fiber_link_direction_source = direction_source
         link_options = self._patch_link_options(
-            point_collections, 1.0, direction_source=direction_source)
+            point_collections, 1.0, direction_source=direction_source,
+            patches=verified_patches)
         if link_options.side_rules:
             print(self._describe_fiber_link_side_rules(link_options))
         link_points_to_patches(
@@ -1907,6 +2103,7 @@ class FitContext:
             min_point_spacing=min_point_spacing,
             use_links=self.config['pcl_use_fiber_links'],
             use_pending_links=self.config['pcl_use_pending_fiber_links'],
+            use_adjacent_links=self.config['pcl_use_adjacent_fiber_links'],
             vertical_min_z_fraction=self.config['pcl_vertical_fiber_min_z_fraction'],
             vertical_min_auto_certainty=self.config['pcl_vertical_fiber_min_auto_certainty'],
             vertical_radial_offset=self._vertical_fiber_radial_offset(),
@@ -2135,6 +2332,9 @@ class FitContext:
                     next_id += 1
             progress.update(
                 spec_number, detail=f'{len(point_collections):,} collections loaded')
+        num_sheet, num_sheet_points = validate_sheet_collections(point_collections, self.config)
+        if num_sheet:
+            print(f'Sheet-convention absolute anchors: {num_sheet} collections, {num_sheet_points:,} points')
 
         progress.begin('loading', 'Loading fiber point collections')
         fiber_point_collections, next_id = load_fiber_point_collections(
@@ -2142,11 +2342,13 @@ class FitContext:
             next_id,
             min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
             base_shape_zyx=getattr(self, 'base_shape_zyx', None),
+            use_adjacent_links=self.config['pcl_use_adjacent_fiber_links'],
         )
         # All fibers (horizontal, vertical, and merged link components) form one
         # sampling group, rather than one group per source file like the regular pcls.
         for pcl in fiber_point_collections.values():
-            pcl['sampling_group'] = 'fibers'
+            pcl['sampling_group'] = fiber_sampling_group(pcl, self.config)
+            pcl['fiber_sampling_group'] = pcl['sampling_group']
             source = pcl.get('source_file', '')
             logical_id = os.path.splitext(os.path.basename(source))[0]
             try:
@@ -2260,6 +2462,15 @@ class FitContext:
                     tracks, shell_envelope, track_families, return_indices=True)
                 if track_source_ids is not None:
                     track_source_ids = track_source_ids[kept_track_indices]
+            inner_exclusion = float(self.config['track_inner_exclusion_radius'])
+            if inner_exclusion > 0:
+                progress.begin(
+                    'loading', 'Filtering tracks inside the core',
+                    detail=f'{len(tracks):,} tracks')
+                tracks, track_families, kept_track_indices = filter_tracks_inside_umbilicus_radius(
+                    tracks, umbilicus, inner_exclusion, track_families, return_indices=True)
+                if track_source_ids is not None:
+                    track_source_ids = track_source_ids[kept_track_indices]
             print(f'loaded {len(tracks)} tracks within z-roi [{self.z_begin}, {self.z_end})')
         else:
             tracks = None
@@ -2296,6 +2507,9 @@ class FitContext:
         # CUDA, and immediately copying it back here.
         trusted_counts = []
         for patch in verified_patches_list:
+            if self._held_out_of_training(patch):
+                trusted_counts.append(0)
+                continue
             z_flat = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
             valid_flat = patch.valid_vertex_mask.reshape(-1)
             z_in_roi = (z_flat[:, 0] >= self.z_begin) & (z_flat[:, 0] < self.z_end)
@@ -2493,6 +2707,7 @@ class FitContext:
                 * voxel_scale),
             use_links=self.config['pcl_use_fiber_links'],
             use_pending_links=self.config['pcl_use_pending_fiber_links'],
+            use_adjacent_links=self.config['pcl_use_adjacent_fiber_links'],
             vertical_min_z_fraction=self.config[
                 'pcl_vertical_fiber_min_z_fraction'],
             vertical_min_auto_certainty=self.config[
@@ -2572,12 +2787,52 @@ class FitContext:
                 if getattr(self, 'frozen_epochs', ()) else 1.0)
 
 
+    def _fiber_link_exclusions(self, collections, patches=None):
+        """(patch ids excluded for every collection, {collection id: patch ids
+        its points may not attach to}) from pcl_fiber_link_exclude_patch_regex
+        and pcl_fiber_link_exclude_own_strip (a strip's meta.json source_fiber
+        names the fiber file it was predicted from), plus the held-out patches
+        under exclude_holdout_patches_from_training. Both empty when no
+        option is set."""
+        regex = self.config.get('pcl_fiber_link_exclude_patch_regex')
+        own_strip = bool(self.config.get('pcl_fiber_link_exclude_own_strip', False))
+        if patches is None:
+            patches = getattr(self, 'verified_patches', None) or {}
+        excluded_all = frozenset(
+            patch_id for patch_id in patches if re.search(regex, patch_id)) if regex else frozenset()
+        if self.config.get('exclude_holdout_patches_from_training', False):
+            # Held-out evaluation patches never receive attachments.
+            excluded_all = excluded_all | frozenset(
+                patch_id for patch_id, patch in patches.items()
+                if getattr(patch, 'holdout', False))
+        by_collection = {}
+        if own_strip:
+            strips_of = {}
+            for patch_id, patch in patches.items():
+                source = getattr(patch, 'source_fiber', None)
+                if source:
+                    strips_of.setdefault(source, set()).add(patch_id)
+            for collection_id, pcl in collections.items():
+                basename = str(pcl.get('file_basename')
+                               or os.path.basename(str(pcl.get('source_file') or '')))
+                own = strips_of.get(basename, set()) - excluded_all
+                if own:
+                    by_collection[collection_id] = frozenset(own)
+        return excluded_all, by_collection
+
     def _patch_link_options(self, collections, voxel_scale, *,
-                            direction_source=None, umbilicus_z_to_yx=None):
+                            direction_source=None, umbilicus_z_to_yx=None,
+                            patches=None):
         """PatchLinkOptions for linking ``collections`` (resident id -> pcl)
         in the current input frame. ``voxel_scale`` converts scroll-voxel
         thresholds to that frame; ``direction_source`` defaults to the
-        session's current fiber link direction source."""
+        session's current fiber link direction source; ``patches`` (default:
+        the resident verified patches) is the patch set being linked against."""
+        excluded_all, excluded_by_collection = self._fiber_link_exclusions(
+            collections, patches)
+        if excluded_all or excluded_by_collection:
+            print(f'fiber link exclusions: {len(excluded_all)} patch(es) excluded for every '
+                  f'collection, {len(excluded_by_collection)} collection(s) kept off their own strip')
         rules = self._fiber_link_side_rules(collections)
         inward = None
         if rules:
@@ -2592,7 +2847,9 @@ class FitContext:
             side_rules=rules,
             inward_direction=inward,
             side_margin=(float(self.config['pcl_fiber_link_side_margin_voxels'])
-                         * voxel_scale))
+                         * voxel_scale),
+            excluded_patches=excluded_all,
+            excluded_patches_by_collection=excluded_by_collection)
 
     def _describe_fiber_link_side_rules(self, options):
         rules = options.side_rules
@@ -2720,11 +2977,53 @@ class FitContext:
             num_theta_bins=self.config['shell_num_theta_bins'],
             device=self.device, config=self.config)
 
+    def _load_dense_phase_pool(self, progress):
+        """Fixed pool of scan-space samples with lasagna cos targets for the
+        dense phase loss: (zyxs (N, 3) float32 fit-frame, targets (N,) in
+        [0, 1]), both on the fit device. The cos store sits next to the
+        normals store (``..._cos.ome.zarr``) at ``dense_phase_zarr_group``."""
+        import zarr
+        if not self.normal_nx_zarr_path:
+            raise RuntimeError('dense phase loss needs the lasagna normals path to locate the cos store')
+        base = str(self.normal_nx_zarr_path).rstrip('/')
+        cos_path = base.replace('_nx.ome.zarr', '_cos.ome.zarr')
+        if cos_path == base or not os.path.isdir(cos_path):
+            raise RuntimeError(f'dense phase loss: cos store not found next to {base}')
+        group = str(self.config['dense_phase_zarr_group'])
+        scale = float(self.config['dense_phase_scale'])
+        store = zarr.open(os.path.join(cos_path, group), mode='r')
+        z0 = max(int(self.z_begin / scale), 0)
+        z1 = min(int(np.ceil(self.z_end / scale)), store.shape[0])
+        chunk = int(store.chunks[0])
+        min_value = max(1, int(round(float(self.config['dense_phase_min_cos']) * 255)))
+        pool_size = int(self.config['dense_phase_pool_points'])
+        rng = np.random.default_rng(int(self.config.get('optimizer_random_seed', 1)))
+        starts = list(range(z0 // chunk * chunk, z1, chunk))
+        per_chunk = max(1, pool_size // max(1, len(starts)))
+        zyxs = []; values = []
+        progress.begin('loading', 'Sampling dense phase pool', step=0, total_steps=len(starts), unit='chunks')
+        for k, c0 in enumerate(starts):
+            a0, a1 = max(c0, z0), min(c0 + chunk, z1)
+            block = np.asarray(store[a0:a1])
+            zz, yy, xx = np.nonzero(block >= min_value)
+            if len(zz):
+                pick = rng.choice(len(zz), min(per_chunk, len(zz)), replace=False)
+                zyxs.append(np.stack([(zz[pick] + a0 + 0.5) * scale, (yy[pick] + 0.5) * scale, (xx[pick] + 0.5) * scale], 1).astype(np.float32))
+                values.append(block[zz[pick], yy[pick], xx[pick]].astype(np.float32) / 255.0)
+            progress.update(k + 1)
+        if not zyxs:
+            raise RuntimeError('dense phase loss: no cos samples inside the z range')
+        zyxs = np.concatenate(zyxs); values = np.concatenate(values)
+        print(f'dense phase pool: {len(values):,} samples from {cos_path} group {group} (scale {scale:g}), '
+              f'cos mean {values.mean():.3f}, {np.mean(values > 0.7):.0%} on-sheet (> 0.7)')
+        return (torch.from_numpy(zyxs).to(self.device), torch.from_numpy(values).to(self.device))
+
     def _infer_outer_winding_idx_for_this_run(self):
         return _infer_shell_outer_winding_idx(
             self.spiral_and_transform.get_slice_to_spiral_transform(),
             self.spiral_and_transform.get_dr_per_winding(),
-            self.verified_patches_list,
+            [patch for patch in self.verified_patches_list
+             if not self._held_out_of_training(patch)],
             self.unattached_pcl_strips,
             self.config,
             self.z_begin,
@@ -2818,7 +3117,7 @@ class FitContext:
 
         Bumps nonfinite_grad_steps once per step with any nonfinite gradient
         and nonfinite_grad_by_param per affected parameter, then replaces
-        NaN and +/-inf with zero in place.
+        NaN and +/-inf with zero in place. Returns the step's (device) flag.
         """
         step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
         for name, p in self.dist_grad_named:
@@ -2832,6 +3131,7 @@ class FitContext:
                 self.nonfinite_grad_by_param[name] += param_nonfinite.to(self.nonfinite_grad_steps.dtype)
                 torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
         self.nonfinite_grad_steps += step_had_nonfinite.to(self.nonfinite_grad_steps.dtype)
+        return step_had_nonfinite
 
     def _clip_flow_grads(self):
         """Robustly clip both flow lattices' gradients per stage (see
@@ -3009,6 +3309,10 @@ class FitContext:
         if interactive_driver is not None and self.lasagna_volume:
             self._lasagna_store = self.lasagna_volume['store']
 
+        self.dense_phase_pool = None
+        if self.config['loss_weight_dense_phase'] > 0:
+            self.dense_phase_pool = self._load_dense_phase_pool(progress)
+
         self.winding_inference = None
         if self.winding_model_mode:
             if (not self.winding_inference_path
@@ -3114,10 +3418,18 @@ class FitContext:
                 report.write(f'{path}\n')
         os.replace(temporary_path, report_path)
 
+    def _held_out_of_training(self, patch):
+        """Whether a held-out patch is kept out of training geometry
+        (exclude_holdout_patches_from_training)."""
+        return (bool(self.config.get('exclude_holdout_patches_from_training', False))
+                and bool(getattr(patch, 'holdout', False)))
+
     def _trusted_geometry_from_active_inputs(self):
         """Rebuild retained trusted geometry after rejecting verified patches."""
         pieces = []
         for patch in self.verified_patches_list:
+            if self._held_out_of_training(patch):
+                continue
             points = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32).cpu()
             valid = patch.valid_vertex_mask.reshape(-1).cpu()
             in_roi = (points[:, 0] >= self.z_begin) & (points[:, 0] < self.z_end)
@@ -3154,6 +3466,10 @@ class FitContext:
         # Preserve list identities where possible because resident-session
         # loss closures may already hold them.
         self.verified_patches_list[:] = self.verified_patches.values()
+        if (not self.verified_patches_list
+                and self.config.get('patch_sampling_reserved') is not None):
+            raise ValueError(
+                'patch_sampling_reserved is set but every patch was rejected')
         self.patch_sampling_probabilities = (
             self._patch_sampling_probabilities(self.verified_patches_list)
             if self.verified_patches_list else np.empty(0, dtype=np.float32))
@@ -3645,6 +3961,47 @@ class FitContext:
             completed_iterations = self._initial_num_training_steps
         return self.save_checkpoint(f'{self.out_path}/checkpoint_{suffix}.ckpt', completed_iterations)
 
+    def _maybe_abs_winding_audit(self, completed_iterations, *, final=False):
+        """Evaluate the frozen sheet anchor records (abs_winding_audit_records)
+        at the current model and append the counts to abs_winding_audit.jsonl.
+
+        Independent of the losses and of which targets the run trains on: every
+        record is evaluated once (no sampling) under no_grad, with the sheet
+        rule of winding_convention.py. Run validity is judged from this file."""
+        path = self.config.get('abs_winding_audit_records')
+        interval = int(self.config.get('abs_winding_audit_interval', 1000))
+        if (not path or not self.dist.is_main_process
+                or not (final or (interval > 0 and completed_iterations % interval == 0))):
+            return None
+        if getattr(self, '_abs_winding_audit_arrays', None) is None:
+            with open(path) as stream:
+                records = json.load(stream)
+            zyx = np.asarray([record['p'][::-1] for record in records], dtype=np.float32).reshape(-1, 3)
+            w_cont = np.asarray([record['w_cont'] for record in records], dtype=np.float32)
+            inside = (zyx[:, 0] >= self.z_begin) & (zyx[:, 0] < self.z_end)
+            self._abs_winding_audit_arrays = (zyx[inside], w_cont[inside], int((~inside).sum()))
+        zyx, w_cont, outside = self._abs_winding_audit_arrays
+        started = time.perf_counter()
+        transform = self.spiral_and_transform.get_slice_to_spiral_transform()
+        dr = self.spiral_and_transform.get_dr_per_winding()
+        counts = dict(attempted=int(len(zyx)), nonfinite=0, rejected=0, off=0)
+        with torch.no_grad():
+            for lo in range(0, len(zyx), 65536):
+                points = torch.from_numpy(zyx[lo:lo + 65536]).to(self.device)
+                theta, _, shifted = get_theta_and_radii(transform(points)[..., 1:], dr)
+                q = (shifted / dr).float().cpu().numpy()
+                t, rho = branch_target(w_cont[lo:lo + 65536], theta.float().cpu().numpy())
+                finite = np.isfinite(q) & np.isfinite(rho)
+                ok = finite & sheet_accepted(rho)
+                counts['nonfinite'] += int((~finite).sum())
+                counts['rejected'] += int((finite & ~ok).sum())
+                counts['off'] += int((~ok | (np.abs(q - t) >= 0.5)).sum())
+        entry = dict(iteration=int(completed_iterations), final=bool(final), outside_z=outside,
+                     seconds=round(time.perf_counter() - started, 3), **counts)
+        with open(os.path.join(self.out_path, 'abs_winding_audit.jsonl'), 'a') as stream:
+            stream.write(json.dumps(entry) + '\n')
+        return entry
+
     def _maybe_save_headless_checkpoint(self, completed_iterations):
         """Refresh the final checkpoint path at each headless autosave boundary.
 
@@ -3793,6 +4150,19 @@ class FitContext:
                     + ', '.join(
                         f'{key}={checkpoint_cfg[key]!r} != {self.config[key]!r}'
                         for key in incompatible))
+            # Supervision semantics: tolerate_checkpoint_config() filled
+            # pre-existing checkpoints with the defaults they were trained
+            # under, so a missing key compares as its default.
+            supervision = [
+                key for key in CHECKPOINT_SUPERVISION_KEYS
+                if checkpoint_cfg.get(key, Config().as_dict()[key]) != self.config[key]
+            ]
+            if supervision:
+                reasons.append(
+                    'checkpoint supervision config mismatch: '
+                    + ', '.join(
+                        f'{key}={checkpoint_cfg.get(key)!r} != {self.config[key]!r}'
+                        for key in supervision))
             steps_key = 'model_num_flow_integration_steps'
             if (steps_key in checkpoint_cfg
                     and checkpoint_cfg[steps_key] != self.config[steps_key]):
@@ -3917,6 +4287,13 @@ class FitContext:
         return completed
 
     def _restore_rng_state(self, checkpoint):
+        if os.environ.get('SPIRAL_RESUME_FRESH_RNG', '') not in ('', '0'):
+            # Matched-continuation experiments: keep the seeds set from
+            # optimizer_random_seed at startup instead of the checkpoint's
+            # RNG streams, so two resumes of one checkpoint can differ only
+            # in their sampling.
+            print('SPIRAL_RESUME_FRESH_RNG set: checkpoint RNG states not restored')
+            return
         if checkpoint.get('numpy_rng_state') is not None:
             np.random.set_state(checkpoint['numpy_rng_state'])
         if checkpoint.get('torch_cpu_rng_state') is not None:
@@ -4104,11 +4481,13 @@ class FitContext:
                 for name in (
                     'patch_radius', 'patch_dt',
                     'sym_dirichlet', 'rel_winding', 'abs_winding',
-                    'dense_normals', 'dense_spacing',
+                    'dense_normals', 'dense_spacing', 'dense_phase',
                     'unattached_pcl_radius', 'unattached_pcl_dt',
                     'track_radius', 'track_dt',
                 )
             }
+            diagnostic_weights['point_abs_winding'] = self.config.get(
+                'loss_weight_abs_winding', 0.0)
             if self._winding_model_mode_active():
                 diagnostic_weights['dense_spacing_winding_model_relative'] = max(
                     float(self.config['loss_weight_dense_spacing']), 1.0)
@@ -4154,6 +4533,11 @@ class FitContext:
                         transform, dr, self.verified_patches, self.patch_atlas,
                         self.cross_patch_pcls,
                         crossing_map=self.theta_crossing_map,
+                        cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
+                if (self.config.get('abs_winding_eval_at_point', False)
+                        and self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls):
+                    get_point_abs_winding_loss(
+                        transform, dr, self.cross_patch_pcls,
                         cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
                 if self.lasagna_volume is not None and (
                         (self.dense_normals_enabled
@@ -4342,12 +4726,14 @@ class FitContext:
                         pcl = load_fiber_point_collection(
                             path, resident_id,
                             min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
-                            base_shape_zyx=getattr(self, 'base_shape_zyx', None))
+                            base_shape_zyx=getattr(self, 'base_shape_zyx', None),
+                            use_adjacent_links=self.config['pcl_use_adjacent_fiber_links'])
                         if pcl is None:
                             raise ValueError(f'Fiber {logical_id} has no usable control points')
-                        pcl['sampling_group'] = 'fibers'
                         pcl['file_basename'] = f'{source_id}.json'
                         pcl['source_file'] = path
+                        pcl['sampling_group'] = fiber_sampling_group(pcl, self.config)
+                        pcl['fiber_sampling_group'] = pcl['sampling_group']
                         pcl.setdefault('metadata', {}).update(
                             input_role='fiber', winding_is_absolute=False)
                     else:
@@ -4357,6 +4743,8 @@ class FitContext:
                         pcl = next(iter(loaded.values()))
                         stamp_loaded_pcl_metadata(
                             pcl, record.get('source_path') or path, record.get('role'), resident_id)
+                        validate_sheet_collections(
+                            {**source, resident_id: pcl}, self.config)
                     pcl.setdefault('metadata', {}).update({
                         'workspace_input_id': logical_id,
                         'logical_input_kind': kind,
@@ -4772,7 +5160,8 @@ class FitContext:
                 raise ValueError(
                     'loss_weight_fiber_directions > 0 needs resident '
                     'fiber-direction samples; rebuild with that input enabled')
-            rebuild_strata = 'pcl_sampling_weights' in changed
+            rebuild_strata = ('pcl_sampling_weights' in changed
+                              or 'pcl_auto_fiber_sampling_weight' in changed)
             if rebuild_strata and self.config['pcl_sampling_weights'] is not None:
                 build_pcl_sampling_strata(
                     [pcl['sampling_group'] for pcl in self.cross_patch_pcls]
@@ -5111,6 +5500,17 @@ class FitContext:
                 ) * self.config['loss_weight_abs_winding'],
             })
 
+        if (self.config.get('abs_winding_eval_at_point', False)
+                and self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls):
+            backward_family({
+                'point_abs_winding': get_point_abs_winding_loss(
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
+                    self.cross_patch_pcls,
+                    cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
+                ) * self.config['loss_weight_abs_winding'],
+            })
+
         if (
             ((self.dense_normals_enabled
               and self.config['loss_weight_dense_normals'] > 0)
@@ -5143,6 +5543,17 @@ class FitContext:
                     f'lasagna_{name}': value
                     for name, value in self.lasagna_volume['store'].last_timings.items()
                 })
+
+        if self.config['loss_weight_dense_phase'] > 0 and self.dense_phase_pool is not None:
+            pool_zyxs, pool_targets = self.dense_phase_pool
+            num_phase = min(int(self.config['sample_count_dense_phase_points']), len(pool_targets))
+            pick = torch.randint(len(pool_targets), (num_phase,), device=pool_targets.device)
+            backward_family({
+                'dense_phase': get_dense_phase_loss(
+                    self.slice_to_spiral_transform, self.dr_per_winding,
+                    pool_zyxs[pick], pool_targets[pick],
+                ) * self.config['loss_weight_dense_phase'],
+            })
 
         if (self.config['loss_weight_fiber_directions'] > 0
                 and self.fiber_direction_samples is not None):
@@ -5295,7 +5706,19 @@ class FitContext:
         # from these counters, and smoothing would spread a single NaN over
         # every cell within its kernel. This does not check for overflow in
         # subsequent arithmetic or repair invalid parameter/moment state.
-        self._sanitize_nonfinite_grads_()
+        if self.config.get('abort_on_nonfinite', False):
+            # Experiment runs: a non-finite loss term or gradient invalidates
+            # the run instead of being zeroed (one host sync per step).
+            bad_losses = [name for name, value in losses.items()
+                          if not bool(torch.isfinite(value).all())]
+            if bad_losses:
+                raise FloatingPointError(
+                    f'non-finite loss term(s) at iteration {iteration}: {bad_losses} '
+                    '(abort_on_nonfinite)')
+        step_had_nonfinite = self._sanitize_nonfinite_grads_()
+        if self.config.get('abort_on_nonfinite', False) and bool(step_had_nonfinite):
+            raise FloatingPointError(
+                f'non-finite gradient at iteration {iteration} (abort_on_nonfinite)')
 
         # Clip after the all-reduce (identical gradients and statistics on
         # every rank) and before smoothing, so a cell with an unsatisfiable
@@ -5440,6 +5863,7 @@ class FitContext:
             progress.update(iteration - self.start_iteration + 1)
             self.log_step_metrics(iteration, loss, losses, log_metrics, shell_metrics)
             self._maybe_save_headless_checkpoint(iteration + 1)
+            self._maybe_abs_winding_audit(iteration + 1)
 
         # ==========================================================================
         # Final outputs
@@ -5451,6 +5875,7 @@ class FitContext:
                 'saving_checkpoint', 'Saving final checkpoint',
                 detail=f'checkpoint_{suffix}.ckpt')
             self._save_model(suffix, self.num_training_steps)
+            self._maybe_abs_winding_audit(self.num_training_steps, final=True)
             if self.config.get('output_save_png_visualizations', False):
                 progress.begin(
                     'finalizing', 'Preparing final visualizations')

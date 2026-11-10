@@ -2,7 +2,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -60,12 +60,20 @@ class PatchLinkOptions:
     ``s >= -side_margin`` and a SIDE_BEHIND one hits with ``s <= side_margin``
     (margin in point units). Rejected hits are dropped before selection, so
     in a window they count as misses.
+
+    ``excluded_patches`` names patches no collection may attach to;
+    ``excluded_patches_by_collection`` maps a collection id to patches its
+    own points may not attach to (e.g. the strip predicted from that fiber).
+    Excluded hits are dropped like side-rule rejections, before the window
+    gate and the selection.
     """
     window_points: int = 1
     window_min_points: int = 1
     side_rules: Mapping[int, str] = None
     inward_direction: Optional[Callable[[np.ndarray], np.ndarray]] = None
     side_margin: float = 0.0
+    excluded_patches: Collection[str] = None
+    excluded_patches_by_collection: Mapping[int, Collection[str]] = None
 
     def __post_init__(self):
         if int(self.window_points) < 1:
@@ -87,6 +95,23 @@ class PatchLinkOptions:
         object.__setattr__(self, 'side_rules', rules)
         if rules and self.inward_direction is None:
             raise ValueError('side rules need an inward_direction function')
+        object.__setattr__(
+            self, 'excluded_patches', frozenset(self.excluded_patches or ()))
+        object.__setattr__(
+            self, 'excluded_patches_by_collection',
+            {collection_id: frozenset(patch_ids)
+             for collection_id, patch_ids
+             in (self.excluded_patches_by_collection or {}).items()
+             if patch_ids})
+
+    @property
+    def has_exclusions(self) -> bool:
+        return bool(self.excluded_patches or self.excluded_patches_by_collection)
+
+    def exclusions(self, collection_id) -> Tuple[frozenset, frozenset]:
+        """(patches excluded for every collection, patches excluded for this one)."""
+        return (self.excluded_patches,
+                self.excluded_patches_by_collection.get(collection_id, frozenset()))
 
     @property
     def window_half(self) -> int:
@@ -166,6 +191,14 @@ def load_point_collection(filename: str) -> Optional[Dict[int, Dict[str, Any]]]:
                     "winding_annotation": point_data.get("wind_a") if point_data.get("wind_a") is not None else float('nan'),
                     "creation_time": point_data.get("creation_time", 0)
                 }
+                # Sheet-convention absolute anchors (winding_convention.py)
+                # carry their continuous gauged winding, undeformed angle and
+                # source identity; validated after loading, never here.
+                # Copied raw: a malformed value must reach the validator and
+                # stop the run, not raise inside this function's broad except.
+                for key in ("w_cont", "phi_ref", "source_fiber", "src_index"):
+                    if key in point_data:
+                        point[key] = point_data[key]
                 collection["points"][point_id] = point
 
             collections[collection_id] = collection
@@ -389,6 +422,14 @@ def _link_from_hits(
     keep = surf_idx >= 0
     if target_idxs is not None:
         keep &= np.isin(surf_idx, target_idxs)
+    if options.has_exclusions:
+        excluded_all, excluded_here = options.exclusions(collection_id)
+        if excluded_all or excluded_here:
+            keep &= np.fromiter(
+                (surface_ids[int(surface)] not in excluded_all
+                 and surface_ids[int(surface)] not in excluded_here
+                 for surface in surf_idx),
+                dtype=bool, count=len(surf_idx))
     if not keep.all():
         point_idx, surf_idx, distances, ijs = (
             point_idx[keep], surf_idx[keep], distances[keep], ijs[keep])
@@ -477,9 +518,10 @@ def _link_points_to_patches_with_surface_index(
     print(f'linking points to patches with vc_spiral.surface_index ({len(surface_ids)} patches)')
 
     if not hasattr(index, 'locate_all_xyz_batch'):
-        if options.gates_on_window or options.side_rules:
-            # The single-hit legacy query cannot count window hits or test
-            # the side rules; let the brute-force path handle it.
+        if options.gates_on_window or options.side_rules or options.has_exclusions:
+            # The single-hit legacy query cannot count window hits, test
+            # the side rules or skip excluded patches; let the brute-force
+            # path handle it.
             return None
         for collection_id, collection in tqdm(point_collections.items(), 'linking points to patches'):
             for point_id, point in collection['points'].items():

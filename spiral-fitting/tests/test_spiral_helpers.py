@@ -136,6 +136,53 @@ class FiberPointCollectionTests(unittest.TestCase):
 
             self.assertEqual(collection["branches"], [])
 
+    def test_drops_the_interior_line_points_of_gap_and_damaged_spans(self):
+        # Format v4 span tags: a 'gap' (or 'damaged') span's line points are the
+        # tracer's bridge over a hole, not sheet; only its two control points
+        # remain, and they survive decimation so the gap edges are kept. The
+        # untagged span keeps its dense points, and link index mapping still
+        # resolves through the dropped region.
+        from test_bracket_fiber_links import _segment
+        with tempfile.TemporaryDirectory() as temporary:
+            line = [[0, 0, 0], [4, 0, 0], [8, 0, 0], [12, 0, 0],   # control 0 .. control 1
+                    [16, 0, 0], [20, 0, 0], [24, 0, 0],            # gap span interior
+                    [28, 0, 0],                                    # control 2
+                    [32, 0, 0], [36, 0, 0]]                        # control 3 at 36
+            gap = dict(_segment(), tags=['gap'])
+            path = self._write_fiber(temporary, {
+                "type": "vc3d_fiber", "version": 4, "generation": 3,
+                "optimization_mode": "native_fiber_trace3d",
+                "hv_classification": {"automatic_tag": "H", "automatic_certainty": 1.0, "manual_tag": ""},
+                "sequence": 1, "started_at": "20260101T000000000", "tags": [], "username": "test",
+                "filename": "fiber.json",
+                "control_points": [
+                    {"position": [0, 0, 0], "segment_to_next": _segment()},
+                    {"position": [12, 0, 0], "segment_to_next": gap},
+                    {"position": [28, 0, 0], "segment_to_next": _segment()},
+                    {"position": [36, 0, 0]},
+                ],
+                "line_points": line,
+                "branches": [{"branch_file": "peer.json", "control_point_index": 3,
+                              "branch_control_point_index": 0}],
+            })
+
+            collection = load_fiber_point_collection(
+                path, collection_id=7, coordinate_scale=1.0, min_point_spacing=0)
+
+            points = [point["p"][0] for point in collection["points"].values()]
+            self.assertEqual(points, [0, 4, 8, 12, 28, 32, 36])
+            np.testing.assert_array_equal(collection["kept_orig_indices"], [0, 1, 2, 3, 7, 8, 9])
+            np.testing.assert_array_equal(collection["control_line_indices"], [0, 3, 7, 9])
+            self.assertEqual(collection["metadata"]["fiber_excluded_spans"], 1)
+            self.assertEqual(collection["metadata"]["fiber_excluded_span_points"], 3)
+            # the gap's bounding control points are force-kept even under coarse decimation
+            coarse = load_fiber_point_collection(
+                path, collection_id=8, coordinate_scale=1.0, min_point_spacing=100)
+            coarse_x = [point["p"][0] for point in coarse["points"].values()]
+            self.assertIn(12, coarse_x)
+            self.assertIn(28, coarse_x)
+            self.assertNotIn(20, coarse_x)
+
     def test_declared_coordinate_domain_overrides_legacy_scale(self):
         for shape, expected_scale in (([101, 201, 301], 1),
                                       ([100, 200, 300], 1),

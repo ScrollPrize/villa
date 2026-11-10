@@ -158,3 +158,21 @@ def test_annotation_outside_retained_mask_is_skipped():
         _IdentityTransform(), torch.tensor(DR), patches, atlas, [pcl],
         crossing_map=crossing_map, cfg=_cfg(), z_begin=-1, z_end=1)
     assert loss.item() == 0.0
+
+
+def test_absolute_winding_local_to_attachment_supervises_the_annotation_point():
+    ref = _spiral_point(6.0, 4)
+    patch_points = [[_spiral_point(0.1, 5), _spiral_point(0.2, 5)]]
+    crossing_map, atlas, patches = _setup([ref], patch_points)
+    point = {
+        '_theta_node_id': 0,
+        'winding_annotation': 4.0,
+        'on_patch': {'id': 'p1', 'ij': [0.0, 0.0]},
+    }
+    pcl = {'metadata': {'winding_is_absolute': True},
+           'points_by_patch': {'p1': [point]}}
+    cfg = dict(_cfg(), abs_winding_local_to_attachment=True)
+    loss = losses.get_patch_abs_winding_loss(
+        _IdentityTransform(), torch.tensor(DR), patches, atlas, [pcl],
+        crossing_map=crossing_map, cfg=cfg, z_begin=-1, z_end=1)
+    assert loss.item() < 1e-5

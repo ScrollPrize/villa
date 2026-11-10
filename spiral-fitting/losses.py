@@ -22,6 +22,8 @@ from sample_spiral import (
     radius_from_unwrapped_shifted,
 )
 from spiral_helpers import _huber_abs
+from winding_convention import accepted as sheet_accepted
+from winding_convention import branch_target, is_sheet_collection
 
 
 def _masked_mean(values, mask):
@@ -712,6 +714,15 @@ def _valid_patch_annotation(patches_dict, patch_atlas, pid, i, j):
     return patch_idx, int(node_id)
 
 
+def _annotation_lookup_ij(patches_dict, pid, i, j):
+    """The annotation's ij clamped so floor(ij) is its retained valid quad."""
+    mask = patches_dict[pid]._sampling_valid_quad_mask_np
+    i_q = min(max(int(i), 0), mask.shape[0] - 1)
+    j_q = min(max(int(j), 0), mask.shape[1] - 1)
+    return (i_q + min(max(float(i) - i_q, 0.0), 0.999),
+            j_q + min(max(float(j) - j_q, 0.0), 0.999))
+
+
 def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
     """Sample already-validated annotation patch rows without replacement."""
     patch_indices = np.asarray(patch_indices, dtype=np.int64)
@@ -738,6 +749,73 @@ def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
     mask = torch.arange(point_cap, device=patch_atlas.device)[None, :] < counts[:, None]
     return ijs, zyxs, node_ids, mask
 
+# Below this many candidate pairs the legacy enumerate-and-choose path is kept
+# (same RNG draws as before); above it, pairs are unranked from sampled indices.
+_PAIR_ENUMERATE_LIMIT = 4096
+
+
+def _unrank_pairs(num_items, ranks):
+    """Map ranks into itertools.combinations(range(num_items), 2) order.
+
+    Pair (a, b), a < b, has rank offset(a) + (b - a - 1) where
+    offset(a) = a * num_items - a * (a + 1) / 2 counts the pairs whose first
+    item is smaller than a. Vectorised; O(num_items) memory, no O(num_items^2)
+    enumeration.
+    """
+    ranks = np.asarray(ranks, dtype=np.int64)
+    first_candidates = np.arange(num_items, dtype=np.int64)
+    offsets = (first_candidates * num_items
+               - first_candidates * (first_candidates + 1) // 2)
+    first = np.searchsorted(offsets, ranks, side='right') - 1
+    second = ranks - offsets[first] + first + 1
+    return first, second
+
+
+def _sample_patch_pairs(num_patches, pair_count, *, adjacent_only):
+    """Uniformly sample distinct (first, second) index pairs over a PCL's patches.
+
+    The candidate set is every unordered pair (first < second) or, with
+    adjacent_only, every consecutive pair, in the lexicographic order the
+    loss has always used. Up to _PAIR_ENUMERATE_LIMIT candidates are drawn
+    exactly as before (np.random.choice without replacement over the
+    enumerated set); larger sets draw distinct ranks by rejection and unrank
+    them, which is the same uniform-without-replacement distribution without
+    materialising the O(n^2) candidate list that dominated whole-scroll steps
+    (merged link components attach to thousands of patches).
+    """
+    if adjacent_only:
+        candidate_count = max(num_patches - 1, 0)
+    else:
+        candidate_count = num_patches * (num_patches - 1) // 2
+    pair_count = min(candidate_count, int(pair_count))
+    if pair_count <= 0:
+        return []
+    if candidate_count <= _PAIR_ENUMERATE_LIMIT:
+        ranks = np.random.choice(candidate_count, pair_count, replace=False)
+    else:
+        ranks = np.unique(np.random.randint(candidate_count, size=pair_count))
+        while len(ranks) < pair_count:
+            ranks = np.unique(np.concatenate([
+                ranks, np.random.randint(candidate_count, size=pair_count - len(ranks))]))
+        np.random.shuffle(ranks)
+    if adjacent_only:
+        first = np.asarray(ranks, dtype=np.int64)
+        second = first + 1
+    else:
+        first, second = _unrank_pairs(num_patches, ranks)
+    return list(zip(first.tolist(), second.tolist()))
+
+
+def _sheet_targets(crossing_map, node_ids, w_cont):
+    """Sheet-convention targets in the frame of the given PCL nodes' cached theta.
+
+    Returns (t, accepted): the branch label round(w_cont - theta/2pi) and the
+    phase-acceptance mask |rho| <= RHO_MAX (winding_convention.py). The cached
+    node theta is the frame adjustments_from_potentials compares in."""
+    theta = crossing_map.node_theta[node_ids].to(torch.float32)
+    t, rho = branch_target(w_cont.to(torch.float32), theta)
+    return t, sheet_accepted(rho)
+
 
 def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
                                patches_dict, patch_atlas, point_collections,
@@ -755,18 +833,11 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
     for pcl_idx in _choose_pcl_indices(sampling_strata, num_pcls, cfg):
         pcl = point_collections[pcl_idx]
         patch_ids = list(pcl['points_by_patch'])
-        if cfg['pcl_rel_winding_adjacent_patches_only']:
-            candidates = list(zip(patch_ids, patch_ids[1:]))
-        else:
-            candidates = list(itertools.combinations(patch_ids, 2))
-        pair_count = min(
-            len(candidates),
-            cfg['sample_count_relative_winding_patch_pairs_per_pcl'])
-        if pair_count <= 0:
-            continue
-        for pair_idx in np.random.choice(
-                len(candidates), pair_count, replace=False):
-            pid1, pid2 = candidates[pair_idx]
+        for first, second in _sample_patch_pairs(
+                len(patch_ids),
+                cfg['sample_count_relative_winding_patch_pairs_per_pcl'],
+                adjacent_only=cfg['pcl_rel_winding_adjacent_patches_only']):
+            pid1, pid2 = patch_ids[first], patch_ids[second]
             p1s = pcl['points_by_patch'][pid1]
             p2s = pcl['points_by_patch'][pid2]
             p1 = p1s[np.random.randint(len(p1s))]
@@ -782,11 +853,21 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
             chain_nodes = np.fromiter(
                 (point['_theta_node_id'] for point in
                  pcl['chain'].points_between(p1, p2)), dtype=np.int64)
+            # Sheet anchors (both endpoints sheet-labelled; absolute and
+            # fiber collections are separate pcls, so a pair never mixes).
+            sheet = is_sheet_collection(pcl)
             rows.append({
+                'sheet': sheet,
+                'w_cont': ((float(p1['w_cont']), float(p2['w_cont'])) if sheet
+                           else (0.0, 0.0)),
                 'patch_indices': (attached1[0], attached2[0]),
                 'patch_nodes': (attached1[1], attached2[1]),
                 'reference_nodes': (
                     int(p1['_theta_node_id']), int(p2['_theta_node_id'])),
+                # For merged fiber-link components the annotations carry each
+                # member's integer winding offset (adjacent links: the
+                # vertical member sits one winding inside), so the target
+                # across such a junction is +-1, not 0.
                 'winding_diff': p2['winding_annotation'] - p1['winding_annotation'],
                 'chain_nodes': chain_nodes,
             })
@@ -832,6 +913,23 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
     expected -= _pcl_chain_seam_adjustments(
         crossing_map, dr_per_winding,
         [row['chain_nodes'] for row in rows])
+    if any(row['sheet'] for row in rows):
+        # Sheet rows: (t2 - t1) * dr in the two reference frames; the branch
+        # labels already contain the seam steps, so no chain subtraction.
+        # Rows with a rejected endpoint are masked (their values are finite).
+        sheet_rows = _pinned_to_device(
+            torch.as_tensor([row['sheet'] for row in rows], dtype=torch.bool),
+            dr_per_winding.device)
+        w_cont = _pinned_to_device(
+            torch.as_tensor([w for row in rows for w in row['w_cont']],
+                            dtype=torch.float32),
+            dr_per_winding.device)
+        t, ok = _sheet_targets(crossing_map, reference_nodes, w_cont)
+        t, ok = t.reshape(len(rows), 2), ok.reshape(len(rows), 2)
+        sheet_expected = (t[:, 1] - t[:, 0]).to(dr_per_winding.dtype) * dr_per_winding
+        expected = torch.where(sheet_rows, sheet_expected, expected)
+        keep = ~sheet_rows | ok.all(dim=1)
+        mask = mask & keep[:, None, None]
     loss = _masked_all_pairs_l1(
         shifted[:, 0], shifted[:, 1], mask[:, 0], mask[:, 1], expected)
     if diagnostics_enabled():
@@ -851,10 +949,17 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
 def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
                                patches_dict, patch_atlas, point_collections,
                                *, crossing_map, cfg, z_begin, z_end):
-    """Absolute winding supervision over unordered uniform patch samples."""
+    """Absolute winding supervision over unordered uniform patch samples.
+
+    Legacy collections compare with wind_a; sheet-convention collections
+    (winding_convention.py) with round(w_cont - theta/2pi) in the frame of the
+    PCL node's cached theta. Sheet collections evaluated at their own points
+    (abs_winding_eval_at_point) are left to get_point_abs_winding_loss."""
+    at_point = bool(cfg.get('abs_winding_eval_at_point', False))
     abs_pcls = [
         pcl for pcl in point_collections
-        if pcl.get('metadata', {}).get('winding_is_absolute', False)]
+        if pcl.get('metadata', {}).get('winding_is_absolute', False)
+        and not (at_point and is_sheet_collection(pcl))]
     num_pcls = min(cfg['sample_count_absolute_winding_pcls'], len(abs_pcls))
     if num_pcls <= 0:
         return torch.zeros([], device=dr_per_winding.device)
@@ -879,13 +984,30 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
                 continue
             rows.append((
                 resolved[0], resolved[1], int(point['_theta_node_id']),
-                point['winding_annotation']))
+                point['winding_annotation'],
+                _annotation_lookup_ij(patches_dict, pid, ij[0], ij[1]),
+                float(point['w_cont']) if is_sheet_collection(pcl) else None))
     if not rows:
         return torch.zeros([], device=dr_per_winding.device)
 
-    point_cap = cfg['sample_count_points_per_patch']
-    _, zyxs, node_ids, mask = _sample_requested_patch_rows(
-        [row[0] for row in rows], point_cap, patch_atlas)
+    if cfg.get('abs_winding_local_to_attachment', False):
+        # One atlas lookup per annotation, at its attachment: the anchor
+        # supervises only the patch point it was placed on.
+        patch_indices_t = _pinned_to_device(
+            torch.as_tensor([row[0] for row in rows], dtype=torch.int64),
+            patch_atlas.device)
+        ijs = _pinned_to_device(
+            torch.as_tensor([row[4] for row in rows], dtype=torch.float32),
+            patch_atlas.device)[:, None, :]
+        zyxs = patch_atlas.lookup(patch_indices_t[:, None], ijs)
+        node_ids = _pinned_to_device(
+            torch.as_tensor([[row[1]] for row in rows], dtype=torch.int64),
+            patch_atlas.device)
+        mask = torch.ones(node_ids.shape, dtype=torch.bool, device=zyxs.device)
+    else:
+        point_cap = cfg['sample_count_points_per_patch']
+        _, zyxs, node_ids, mask = _sample_requested_patch_rows(
+            [row[0] for row in rows], point_cap, patch_atlas)
     spiral = slice_to_spiral_transform(
         zyxs.reshape(-1, 3)).reshape(*zyxs.shape)
     theta, _, shifted = get_theta_and_radii(
@@ -906,7 +1028,19 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
         zyxs[..., 0] < z_end + z_margin)
     target = _pinned_to_device(
         torch.as_tensor([row[3] for row in rows], dtype=dr_per_winding.dtype),
-        dr_per_winding.device)[:, None] * dr_per_winding
+        dr_per_winding.device)
+    if any(row[5] is not None for row in rows):
+        sheet_rows = _pinned_to_device(
+            torch.as_tensor([row[5] is not None for row in rows], dtype=torch.bool),
+            dr_per_winding.device)
+        w_cont = _pinned_to_device(
+            torch.as_tensor([row[5] if row[5] is not None else 0.0 for row in rows],
+                            dtype=torch.float32),
+            dr_per_winding.device)
+        t, ok = _sheet_targets(crossing_map, reference_nodes, w_cont)
+        target = torch.where(sheet_rows, t.to(target.dtype), target)
+        mask = mask & (~sheet_rows | ok)[:, None]
+    target = target[:, None] * dr_per_winding
     error = (shifted - target).abs()
 
     target_radii = radius_from_unwrapped_shifted(
@@ -917,6 +1051,57 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
     record_loss_samples(
         'abs_winding', spiral, error, mask,
         display_spiral_zyx=target_spiral)
+    return _masked_mean(error, mask)
+
+
+def _point_abs_arrays(pcl):
+    """(zyx float32 [N, 3], w_cont float32 [N]) of a sheet collection, cached on it."""
+    cached = pcl.get('_point_abs_arrays')
+    if cached is None or cached[0].shape[0] != len(pcl['points']):
+        points = [pcl['points'][key] for key in sorted(pcl['points'], key=int)]
+        zyx = np.asarray([np.asarray(point.get('zyx', point['p'][::-1]), dtype=np.float32)
+                          for point in points], dtype=np.float32).reshape(-1, 3)
+        w_cont = np.asarray([float(point['w_cont']) for point in points], dtype=np.float32)
+        cached = pcl['_point_abs_arrays'] = (zyx, w_cont)
+    return cached
+
+
+def get_point_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
+                               point_collections, *, cfg, z_begin, z_end):
+    """Sheet-convention absolute anchors evaluated at their own coordinates.
+
+    Draws collections uniformly, then points within each (the absolute loss's
+    sampling, so long fibers are not overweighted), and compares q with
+    round(w_cont - theta/2pi) at the point's current angle. Rejected points
+    (|rho| > RHO_MAX) and points outside the z window are masked; their values
+    are finite. Returns the mean over the kept draws (0 when none remain)."""
+    sheet = [pcl for pcl in point_collections
+             if pcl.get('metadata', {}).get('winding_is_absolute', False)
+             and is_sheet_collection(pcl)]
+    num_pcls = min(cfg['sample_count_absolute_winding_pcls'], len(sheet))
+    if num_pcls <= 0:
+        return torch.zeros([], device=dr_per_winding.device)
+    zyxs, w_conts = [], []
+    for pcl_idx in np.random.choice(len(sheet), num_pcls, replace=False):
+        zyx, w_cont = _point_abs_arrays(sheet[pcl_idx])
+        count = min(len(zyx), cfg['sample_count_absolute_winding_points_per_pcl'])
+        if count <= 0:
+            continue
+        chosen = np.random.choice(len(zyx), count, replace=False)
+        zyxs.append(zyx[chosen])
+        w_conts.append(w_cont[chosen])
+    if not zyxs:
+        return torch.zeros([], device=dr_per_winding.device)
+    zyx = _pinned_to_device(torch.from_numpy(np.concatenate(zyxs)), dr_per_winding.device)
+    w_cont = _pinned_to_device(torch.from_numpy(np.concatenate(w_conts)), dr_per_winding.device)
+    spiral = slice_to_spiral_transform(zyx)
+    theta, _, shifted = get_theta_and_radii(spiral[..., 1:], dr_per_winding)
+    t, rho = branch_target(w_cont, theta.detach().to(torch.float32))
+    z_margin = cfg['patch_loss_z_margin']
+    mask = (sheet_accepted(rho) & (zyx[:, 0] >= z_begin - z_margin)
+            & (zyx[:, 0] < z_end + z_margin))
+    error = (shifted - t.to(shifted.dtype) * dr_per_winding).abs()
+    record_loss_samples('point_abs_winding', spiral, error, mask)
     return _masked_mean(error, mask)
 
 
@@ -995,6 +1180,17 @@ def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points, z
 
 
 
+def get_dense_phase_loss(slice_to_spiral_transform, dr_per_winding, zyxs, targets):
+    """Match 0.5 + 0.5 cos(2 pi W_model) at scan-space samples ``zyxs`` (N, 3)
+    to lasagna's cos targets (N,) in [0, 1]. Invariant to integer windings,
+    so it carries no winding identity, only local phase."""
+    spiral = slice_to_spiral_transform(zyxs)
+    _theta, _radius, shifted = get_theta_and_radii(spiral[..., 1:], dr_per_winding)
+    winding = shifted / dr_per_winding
+    model = 0.5 + 0.5 * torch.cos(2 * torch.pi * winding)
+    return ((model - targets) ** 2).mean()
+
+
 def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None, compute_spacing=True, compute_normals=True, *, cfg, z_begin, z_end):
     # Sample points uniformly over the spiral cylinder (a disk of radius
     # dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI). Two losses are computed:
@@ -1053,7 +1249,13 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     # Look up the precomputed scroll-space targets at the midpoint of the displacement (the
     # geometric centre of the one-winding step in scroll space).
     scroll_mid = ((scroll_inner + scroll_outer) / 2).detach()
-    sample_zyx = (scroll_mid / lasagna_scale).round().long()
+    # The model normal is evaluated at scroll_center; under a nonlinear
+    # deformation the midpoint of the one-winding segment is a different
+    # point, so optionally read the normal target where the model normal is.
+    normal_anchor = (scroll_center.detach()
+                     if cfg.get('dense_normals_target_at_center', False)
+                     else scroll_mid)
+    sample_zyx = (normal_anchor / lasagna_scale).round().long()
     zi = sample_zyx[:, 0] - z_origin
     yi = sample_zyx[:, 1] - y_origin
     xi = sample_zyx[:, 2] - x_origin

@@ -231,8 +231,12 @@ def pcl_input_enabled(config: Mapping[str, Any], role: PclRole | str | None,
     effective_role = effective_pcl_role(role, path)
     enabled = bool(config.get(_PCL_ROLE_TOGGLE_KEYS[effective_role], True))
     # Absolute winding annotations only have meaning after attaching to
-    # verified patches. Other roles can still provide unattached strips.
-    if effective_role is PclRole.ABSOLUTE:
+    # verified patches, unless they are evaluated at their own points
+    # (abs_winding_eval_at_point, sheet convention only; mixed legacy
+    # absolute inputs are refused at load in that mode). Other roles can
+    # still provide unattached strips.
+    if (effective_role is PclRole.ABSOLUTE
+            and not bool(config.get("abs_winding_eval_at_point", False))):
         enabled = enabled and input_source_enabled(config, "verified_patches")
     return enabled
 
