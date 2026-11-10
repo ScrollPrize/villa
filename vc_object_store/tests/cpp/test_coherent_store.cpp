@@ -61,6 +61,8 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
     {
         auto r=store.read();
         require(store.objectCount(r,"track")==2,"collection counts use visible records");
+        if(baseHistory==HistoryMode::On)require(store.geometryHistory(r,f.a).size()==1,"geometry history belongs to the inherited owner");
+        else mustFail([&]{store.geometryHistory(r,f.a);});
         require(store.objectsByTag(r,"base").size()==2,"tag queries include inherited objects");
         require(store.componentOf(r,f.a).size()==2,"traversal resolves inherited endpoints");
         auto uppercase=f.a;std::transform(uppercase.begin(),uppercase.end(),uppercase.begin(),[](unsigned char c){return std::toupper(c);});

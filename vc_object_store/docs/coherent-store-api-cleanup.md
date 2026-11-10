@@ -7,7 +7,7 @@ Baseline: `3812cb17b`. C++ store plus VC3D adapters; existing CMake/approved PR 
 - [x] S. Reject inherited live edge UUID insertion; continue inherited deleted-edge versions through shared tombstone resolution. `test_coherent_store` passes for history on/off insertion rejection and inherited resurrection.
 - [x] T. Centralize canonical opposite-endpoint lookup for traversal and attached documents. Coherent-store and transform tests pass, including uppercase attachment removal without retiring the owner; VC3D and source metadata use the same helper.
 - [x] U. Preserve ownership on no-op edge update/repair; repair delegates to the ordinary update path instead of duplicating SQL/validation/stamping. Coherent-store and transform regressions pass, including no-op source identity/commit sequence and real endpoint edits.
-- [ ] V. Route geometry history to the owning record instead of the attachment database.
+- [x] V. Route geometry history to the owning record instead of the attachment database. Coherent-store regressions verify both source history policies through both overlay policies.
 - [ ] W. Carry selected metadata through historical geometry transforms and transform listings.
 - [ ] X. Resolve full exact surface references before deciding whether a VC3D surface is editable.
 - [ ] Y. Materialize QuadSurface/stored fits from the selected revision, never current metadata plus old geometry.
