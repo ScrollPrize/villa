@@ -28,7 +28,7 @@ helirec-slices PROJ -n 8 --tag unfiltered                                    # 8
 helirec-slices PROJ -n 8 --set mode=legacy_reference --tag reference         # the reference workflow
 helirec-slices PROJ --fractions 0.4 0.5 --set "filters=paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)" --tag db500
 helirec-slices PROJ -n 4 --set backprojector=fbp --device cpu --tag exact_fbp
-helirec-slices PROJ -n 8 --set backprojector=fbp --set "filters=mtf_paganin(delta_beta=1000,sigma=1.06,nsr=0.01)" \
+helirec-slices PROJ -n 8 --set backprojector=fbp --set "filters=mtf_paganin(delta_beta=1000,sigma=1.06)" \
     --set sld=fraction=0.6,length=400 --tag mtf        # fused phase retrieval + detector deblur, calibrated glare
 ```
 
@@ -45,7 +45,8 @@ helirec-slices PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif       
   slices, so a cropped slice is identical to the same pixels of an uncropped run. The OME-Zarr transforms place the
   crop in the full volume.
 * Each chunk's raw rows are read while the previous chunk computes, reusing the rows the two share.
-* float32 is always written (raw chunks). `--uint8` adds an 8-bit copy with `--u8_window` (default [−0.06, 0.29]
+* float32 is written by default (raw chunks). `--uint8` adds an 8-bit copy and `--uint8_only` writes that copy
+  alone (no float32 output), with `--u8_window` (default [−0.06, 0.29]
   cm⁻¹; [−0.03, 0.145] in `legacy_reference`), 0 outside the reconstruction disk, compressed losslessly with
   vc-delta3d (`{"id": "vc-delta3d", "quant": 1}`, preset `fast`; `--u8_delta3d_preset delta` writes D3D1 frames
   for older readers). Chunks default to 128³ (keep multiples of 32). All-fill chunks are not written.
@@ -85,7 +86,9 @@ auto` steps toward the denser side. Output: `max.tif`, `mean.tif` (float32), uin
 
 From the projections, `helirec.band.BandComposite` skips slices and volumes: it runs the exact backprojector only
 at the slice pixels the composite's sample points need, samples them on the GPU and returns max/mean. Raw data
-streams through pinned memory with read-ahead, and a filter sweep shares everything before the filters:
+streams through pinned memory with read-ahead (`--no_prefetch` turns the read-ahead off: it holds a second chunk's
+raw windows, tens of GB where a z range overlaps a stationary turn and the filters need many context rows), and a
+filter sweep shares everything before the filters:
 
 ```python
 bc = BandComposite(r, pts, valid)                       # pts (L, H, W, 3) XYZ voxels, valid (H, W)
@@ -165,21 +168,40 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   parameter of the current chain with `--set paganin.delta_beta=500`. Sweeps take the same keys
   (`--sweep paganin.delta_beta=250,500`, or `filters=CHAIN1;CHAIN2`); a sweep of one intensity-stage FFT step shares
   the forward FFT.
-* **Fused MTF / Paganin Wiener filter** (`mtf_paganin(delta_beta=…, sigma=… | mtf=…, nsr=0.01)`, in place of
-  `paganin + unsharp`): phase retrieval and detector deblurring as one filter. The detector records the propagated
-  intensity blurred by its point spread, `Î_det = (M / P) Î` (`P`: the Paganin response, `M`: the detector MTF). For
-  white detector noise and an object spectrum falling as `P²` (≈ k⁻⁴ beyond the Paganin corner, the law of sharp
-  interfaces) the Wiener estimate is `P · (1 + nsr) M / (M² + nsr)`: Paganin times the exact inverse of the MTF where
-  `M² ≫ nsr`, at most `(1 + nsr) / (2 √nsr)` (5 for 0.01) at `M = √nsr`, falling with `M` beyond. `nsr` is the one
-  regularisation parameter (larger: smoother, less noise). `M` is a Gaussian (`sigma` in pixels) or a measured radial
-  table `mtf=ν:M/ν:M/…` (ν in cycles per pixel). Like `paganin` the kernel is fixed and has unit DC, so the result is
-  independent of the chunk height; its margin is Paganin's plus the deblur kernel's (29 rows for σ 1.06, nsr 0.01,
-  truncated where it falls below 10⁻⁴ of its peak: the response is within about 3 % of the formula along the rows
-  near Nyquist). It is one Fourier step, so sweeps share the forward FFT (`--sweep mtf_paganin.nsr=0.003,0.01,0.03`).
-  On the PHerc0343P pair the Teflon wrap's edge (10–90 % rise) is 2.6 px after Paganin alone and 0.8 px after
-  `paganin + unsharp(1.2, 4)`, the latter with 27 % overshoot and a 44 % dip beside the edge; `mtf_paganin` with the
-  σ = 1.06 px fitted to that edge gives 1.2 px with 8 % / 20 %, at a third less noise than the unsharp mask on the
-  same gridding (`evaluation/343p_v5_resolution.json`).
+* **Fused MTF / Paganin filter** (`mtf_paganin(delta_beta=…, sigma=… | mtf=…, target=0.5, gain=12 | nsr=…)`, in
+  place of `paganin + unsharp`): phase retrieval and detector deblurring as one filter. The detector records the
+  propagated intensity blurred by its point spread, `Î_det = (M / P) Î` (`P`: the Paganin response, `M`: the
+  detector MTF, a Gaussian of `sigma` pixels or a measured radial table `mtf=ν:M/ν:M/…`, ν in cycles per pixel). The
+  filter is `P · D`, with one of two deblur gains `D`:
+  * **Gaussian target** (default): `D = T · √(1 + ε²) / √(M² + ε²)`, `T` the MTF of a Gaussian of `target` pixels,
+    `ε = 1 / gain`. Where `M ≫ ε` the detector blur is replaced by the target blur; the gain never exceeds about
+    `gain`. The system response `M · D` falls monotonically, so edges do not ring and the noise spectrum has no
+    hump. `target` is the sharpness / noise trade (smaller: sharper, noisier; `0`: the gain cap alone), `gain` limits
+    the noise where the detector passes almost nothing.
+  * **Wiener** (`nsr=…`, excludes `target` / `gain`): `D = (1 + nsr) M / (M² + nsr)`, the minimum-error estimate for
+    white detector noise and an object spectrum falling as `P²`: the exact inverse where `M² ≫ nsr`, at most
+    `(1 + nsr) / (2 √nsr)` (5 for 0.01, 9 for 0.003) at `M = √nsr`, falling with `M` beyond. That peak is a band-pass
+    boost (0.36 cycles per pixel for σ 1.06, nsr 0.003): a slab rings by ±7 % at its edges even with the exact MTF,
+    and the noise is band-limited (a grain of about 3 px period, 1.6 × the low-frequency noise amplitude on 343P).
+  Like `paganin` the kernel is fixed and has unit DC, so the result is independent of the chunk height; its margin
+  is Paganin's plus the deblur kernel's, truncated where it falls below 10⁻⁴ of its peak, at most 64 rows (σ 1.06:
+  44 rows for the default target form, 29 for nsr 0.01, 40 for nsr 0.003; the response is within about 3 % of the
+  formula along the rows near Nyquist). It is one Fourier step, so sweeps share the forward FFT
+  (`--sweep mtf_paganin.target=0.4,0.5,0.6`).
+  On the PHerc0343P pair (slice z 2698, calibrated SLD, v5 gridding) the Teflon wrap's edge has, as overshoot / dip
+  beside the edge at a radial and a tangential site, and noise in the outer air:
+
+  | chain | radial | tangential | noise (cm⁻¹) |
+  |---|---|---|---|
+  | `paganin(1000)` | 1 % / 4 % | 2 % / 3 % | 0.0042 |
+  | `paganin(1000) + unsharp(1.2, 4)` | 26 % / 45 % | 24 % / 31 % | 0.0160 |
+  | `mtf_paganin(1000, sigma=1.06, nsr=0.003)` | 10 % / 24 % | 8 % / 9 % | 0.0173 |
+  | `mtf_paganin(1000, sigma=1.06)` (target 0.5, gain 12) | 4 % / 15 % | 4 % / 4 % | 0.0129 |
+  | `mtf_paganin(1250, sigma=1.06)` | 2 % / 9 % | 4 % / 2 % | 0.0104 |
+
+  `delta_beta` matters more once the blur is removed: a blur alone cannot undershoot, yet Paganin alone leaves a
+  4 % dip outside the wrap at δ/β 1000, 1 % at 1250 and none at 1500 (the residual phase fringe, which the
+  deblurring amplifies). Recipes: `evaluation/343p_v5_resolution.json`.
 * **Eikonal phase retrieval** (`epr(delta_beta=…, iters=3, relax=0.75, max_shift=12.5)`, in place of `paganin`):
   the local second-order closure of Mirone et al. (*J. Synchrotron Rad.* 32, 2025; arXiv:2601.22793, eq. 1) for a
   homogeneous object. Paganin inverts the first-order (TIE) model `I_det = I − A ∇²I`, with
@@ -201,6 +223,37 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   between. `fraction` and `length` are properties of the scintillator and optics and must be measured; 0.1 / 100
   are the Night Rail defaults, not a calibration of any particular scan. Not available in `legacy_reference`.
   Example: `--set sld=fraction=0.1,length=100`.
+  For ESRF **BM18 calibration files**, use the new full-resolution profile:
+
+  ```bash
+  helirec-slices PROJ -n 4 --set "sld=json=/path/to/diffusion.json" --tag bm18_sld
+  # Explicit model, with two diffusion tails (illustrative values, not a calibration):
+  helirec-slices PROJ -n 4 --set "sld=profile=bm18,fraction=0.06:0.03,length=40:200" --tag bm18_sld
+  ```
+
+  Night Rail JSON fields `fraction` and `scale_l` may be scalars or equal-length lists; lengths are in original
+  detector pixels. The BM18 profile defaults to **100-pixel illuminated borders** on both axes, `bin=1` and
+  `stride=1`. Override borders with `border_x=…`, `border_y=…` (zero means dark outside that detector edge).
+  It uses the unit-mass multi-tail PSF from Nabuxx `nr_26_10_27`, correcting both flats and projections before
+  flat division. Both low and high spatial frequencies are retained by full-frame FFTs; it does not approximate
+  the high-frequency part with a cropped kernel. Flats are clipped at zero; projection corrections stay linear.
+  This is the reference-quality path, with substantially more I/O and FFT work than the older binned setting.
+  Each full frame is processed separately and only the rows needed by the current chunk are retained/uploaded;
+  consecutive chunks recompute those full-frame corrections. `stride=4` explicitly trades temporal accuracy for
+  fewer FFTs, interpolating current-normalized correction maps. Spatial binning is rejected for this profile.
+  Correction FFTs run on the CPU; the corrected data can feed either CPU or CUDA reconstruction.
+
+  The resolved model, borders and sampling are saved as `provenance.resolved_sld`. Nonzero shifted replicas and
+  JSONs fitted with `save_binning != 1` are rejected rather than silently misinterpreted. Use a full-resolution
+  calibration for the detector/scintillator configuration in question; fitted legacy parameters below should be
+  rechecked when changing the illuminated-border assumption. Existing scalar specs retain their old behavior,
+  and SLD remains disabled unless requested. Python frame checks use `helirec.sld.correct(frames, spec)`.
+
+  Validation: `python -m pytest -q tests/test_sld.py tests/test_sld_bm18.py tests/test_fourier.py tests/test_provenance.py`.
+  The small fixture `tests/reference/sld_bm18.json` is generated from Nabuxx commit
+  `515e0df11cf34f669ae1cf918f219a8454c90e1c`, with NumPy FFTs replacing PyFFTW, by
+  `python tests/reference/generate_sld_bm18.py /path/to/pinned/diffusion_digest.py` (source hash checked).
+
   `evaluation/calibrate_sld.py` measures them from the scan itself: air must reconstruct to zero, and glare leaves
   it positive around and inside the object. It reconstructs slices over a grid of (fraction, length) and reports the
   pair that brings the air closest to zero, in bands of distance to the object, separately for the open air and the
@@ -274,8 +327,8 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
 
 Reconstructs the same slices with each method of a JSON config (default `evaluation/default_methods.json`: FBP,
 SIRT, MLEM and gridrec on unfiltered data) and writes float32 `slices/<method>/z<Z>.tif` and `manifest.json`
-(time, mean, std, fine-scale std). PNG slices and contact sheets are opt-in with `--previews`, also for
-`helirec-slices`. Preview windows are shared in attenuation units; legacy TIFFs retain native reference units.
+(time, mean, std, fine-scale std). PNG contact and crop sheets are opt-in with `--previews` (the slice folders hold
+TIFFs only); `helirec-slices --previews` writes PNG slices. Preview windows are shared in attenuation units; legacy TIFFs retain native reference units.
 Options: `--projections`, `--cache_dir`, `-n`, `--z Z0 Z1`, `--roi X0 X1 Y0 Y1` (`-1`: whole slices),
 `--methods NAME ...`, `--overwrite`; existing slices with matching provenance are reused.
 
@@ -319,9 +372,9 @@ AGENTS_AGENT_MODE=1 .venv/bin/python -u evaluation/compare_methods.py evaluation
     --out /mnt/raid_nvme/343p_recon_work/output/baselines --run-name v4
 ```
 
-`evaluation/343p_v5_resolution.json` compares 14 FBP variants on two slices: the previous methods (no filters,
+`evaluation/343p_v5_resolution.json` compares 16 FBP variants on two slices: the previous methods (no filters,
 Paganin, + unsharp, + SLD, eikonal) with the previous gridding (`z_interp=linear`, `angle_interp=linear`,
-`exposure_arc=0`), and the v5 gridding with the unsharp mask, the fused `mtf_paganin` filter (three `nsr`), the
+`exposure_arc=0`), and the v5 gridding with the unsharp mask, the fused `mtf_paganin` filter (three `nsr`, and the Gaussian target at δ/β 1000 and 1250), the
 calibrated SLD and eikonal phase retrieval. The earlier recipes pin the previous gridding, so they keep reproducing
 their folders bit for bit.
 
@@ -330,7 +383,7 @@ AGENTS_AGENT_MODE=1 .venv/bin/python -u evaluation/compare_methods.py evaluation
     --out /mnt/raid_nvme/343p_recon_work/output/resolution_v5/compare --previews
 ```
 
-With `--previews` every PNG and sheet tile carries a header with the method's name, description and display
+With `--previews` every sheet tile carries a header with the method's name, description and display
 window. All methods of a config share one window (`window`: here the standard −0.06 … 0.29 cm⁻¹), so a grey level
 is the same attenuation in every image; methods are not rescaled individually (the SLD-corrected ones are brighter
 because their attenuation is higher). `crops` writes full-resolution crop sheets `sheets/z<Z>_crop<K>.png`;
@@ -376,8 +429,8 @@ consecutive 8-slice chunks):
 
 The table predates the default Lanczos-3 rows, nearest-bin angles and arc correction: with them the FBP chunk time
 rises by 11 % (0.29 → 0.32 s per slice measured back to back; the gridding reads six rows per sample instead of two,
-the other two are free). `mtf_paganin` costs as `paganin + unsharp` per row, with 18 more context rows either side
-of a chunk.
+the other two are free). `mtf_paganin` costs as `paganin + unsharp` per row, with 33 more context rows either side
+of a chunk (default target form; 18 for `nsr=0.01`).
 
 A SIRT iteration is 0.22 s (forward 0.09 s, backward 0.13 s); the exact backprojection of one slice 0.16 s. An
 isolated slice uploads 8.7 GB of raw rows (0.4 s), and with SLD reads 12 GB of whole frames for its glare maps: from

@@ -5,6 +5,7 @@
 #include <omp.h>
 
 #include <mutex>
+#include <algorithm>
 #include <vector>
 
 #include "helirec/fourier.hpp"
@@ -63,7 +64,11 @@ class FftwFourierFilter final : public FourierFilter {
         const auto& p = spec_;
         // unit of work: a whole frame (2D) or one row (1D)
         const std::ptrdiff_t n_items = p.ndim == 2 ? n_frames : static_cast<std::ptrdiff_t>(n_frames) * p.h;
-#pragma omp parallel
+        if (n_items == 0) return;
+        // A full BM18 detector FFT can require hundreds of MB per worker.
+        // Do not allocate idle worker buffers when filtering only one frame.
+        const int workers = static_cast<int>(std::min<std::ptrdiff_t>(omp_get_max_threads(), n_items));
+#pragma omp parallel num_threads(workers)
         {
             FftwBuf buf(static_cast<std::size_t>(rows_) * p.pw, rows_ * nc_);
 #pragma omp for schedule(dynamic)

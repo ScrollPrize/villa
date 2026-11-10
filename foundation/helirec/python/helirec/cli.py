@@ -16,7 +16,8 @@ Two modes:
   --heights uses helirec view heights; both are [start, end). --roi X0 X1 Y0 Y1 crops each slice ([start, end)).
   Output: volume.zarr (float32 OME-Zarr, raw chunks), volume_uint8.zarr with --uint8 (window --u8_window,
   lossless vc-delta3d chunks, 0 outside the reconstruction disk); empty chunks are not written; or
-  float32/ (and uint8/) TIFF stacks with --format tiff; manifest.json.
+  float32/ (and uint8/) TIFF stacks with --format tiff; manifest.json. --uint8_only writes the uint8 version
+  alone (no float32 output).
 
 Units: attenuation in cm^-1 by default; --set mode=legacy_reference gives the reference workflow's units (half of
 it) and conventions. The default uint8 window is the reference one in the run's units.
@@ -127,14 +128,16 @@ def run_fractions(a, r, out, manifest):
         img = crop(r.reconstruct_heights(si.view_height, si.view_height + 1)[0], a.roi)
         dt = time.time() - t
         name = f"slice_f{f:.4f}"
-        path = os.path.join(out, name + ".tiff")
-        tifffile.imwrite(path, img)
         entry = dict(name=name, fraction=f, view_height=si.view_height, z=si.view_height - r.lo,
-                     nabu_index=si.nabu_index, height_mm=si.height_mm, seconds=round(dt, 2), tiff=path)
+                     nabu_index=si.nabu_index, height_mm=si.height_mm, seconds=round(dt, 2))
+        if not a.uint8_only:
+            entry["tiff"] = os.path.join(out, name + ".tiff")
+            tifffile.imwrite(entry["tiff"], img)
         u8 = to_u8(img, a.u8_window)
         if a.uint8:
             entry["tiff_uint8"] = os.path.join(out, name + "_uint8.tif")
             tifffile.imwrite(entry["tiff_uint8"], u8)
+        path = entry.get("tiff", entry.get("tiff_uint8"))
         if not a.no_preview:
             entry["preview"] = os.path.join(out, "preview", name + ".png")
             write_png_gray(entry["preview"], u8)
@@ -180,9 +183,10 @@ def run_range(a, r, out, manifest):
     vox = r.main.pixel_size_m * 1e6
     if a.format == "zarr":
         chunks = tuple(a.zarr_chunks) if a.zarr_chunks else (128, 128, 128)  # 32-aligned for vc-delta3d presets
-        writers.append(("float32", OmeZarrWriter(os.path.join(out, "volume.zarr"), shape, np.float32, chunks, vox,
-                                                 (z0, y0, x0), a.levels, a.compression, name=f"{a.tag} float32",
-                                                 attrs=provenance, overwrite=a.overwrite)))
+        if not a.uint8_only:
+            writers.append(("float32", OmeZarrWriter(os.path.join(out, "volume.zarr"), shape, np.float32, chunks, vox,
+                                                     (z0, y0, x0), a.levels, a.compression, name=f"{a.tag} float32",
+                                                     attrs=provenance, overwrite=a.overwrite)))
         if a.uint8:
             writers.append(("uint8", OmeZarrWriter(os.path.join(out, "volume_uint8.zarr"), shape, np.uint8, chunks,
                                                    vox, (z0, y0, x0), a.levels, a.u8_compression,
@@ -192,11 +196,10 @@ def run_range(a, r, out, manifest):
                                                    overwrite=a.overwrite)))
         manifest["outputs"] = {k: w.path for k, w in writers}
     else:
-        os.makedirs(os.path.join(out, "float32"), exist_ok=True)
-        if a.uint8:
-            os.makedirs(os.path.join(out, "uint8"), exist_ok=True)
-        manifest["outputs"] = {"float32": os.path.join(out, "float32"),
+        manifest["outputs"] = {**({} if a.uint8_only else {"float32": os.path.join(out, "float32")}),
                                **({"uint8": os.path.join(out, "uint8")} if a.uint8 else {})}
+        for d in manifest["outputs"].values():
+            os.makedirs(d, exist_ok=True)
     save_manifest(out, manifest)
     t_all = time.time()
     done = 0
@@ -213,7 +216,8 @@ def run_range(a, r, out, manifest):
         else:
             for k in range(vol.shape[0]):
                 zz = c0 + k - r.lo
-                tifffile.imwrite(os.path.join(out, "float32", f"z{zz:05d}.tiff"), vol[k])
+                if not a.uint8_only:
+                    tifffile.imwrite(os.path.join(out, "float32", f"z{zz:05d}.tiff"), vol[k])
                 if a.uint8:
                     tifffile.imwrite(os.path.join(out, "uint8", f"z{zz:05d}.tif"),
                                      to_uint8(vol[k], *a.u8_window, outside=outside))
@@ -257,6 +261,7 @@ def main(argv=None):
     out.add_argument("--format", choices=["zarr", "tiff"], default=None,
                      help="range mode default: zarr; fraction mode: tiff only")
     out.add_argument("--uint8", action="store_true", help="also write a uint8 version")
+    out.add_argument("--uint8_only", action="store_true", help="write the uint8 version alone (no float32 output)")
     out.add_argument("--u8_window", nargs=2, type=float, default=None, metavar=("LO", "HI"),
                      help="float window mapped to 0..255 (default: the reference window, in the run's "
                           "units: [-0.06, 0.29] cm^-1, or [-0.03, 0.145] in mode legacy_reference)")
@@ -310,6 +315,7 @@ def main(argv=None):
         sys.exit("OME-Zarr output needs a contiguous range (--z or --heights)")
     if a.chunk < 1:
         sys.exit("--chunk must be >= 1")
+    a.uint8 = a.uint8 or a.uint8_only
 
     from .recon import HelicalRecon
     a.tag = a.tag or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

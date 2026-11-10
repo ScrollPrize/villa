@@ -52,6 +52,7 @@ struct AccumScanView {
     const int32_t* glare_i0 = nullptr;
     const int32_t* glare_i1 = nullptr;
     const float* glare_frac = nullptr;
+    const int32_t* glare_row0 = nullptr;  // optional first detector row of each full-resolution map strip
     // horizontal placement
     int sx = 0, ixs = 0;
     float fract_x = 0;

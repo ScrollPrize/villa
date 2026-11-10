@@ -385,8 +385,17 @@ class Epr final : public ProjectionFilter {
 class MtfPaganin final : public ProjectionFilter {
   public:
     MtfPaganin(const FilterParams& p, const FilterContext& c)
-        : pag_(paganin_params(p), fixed_kernel(c)), sigma_(p.num("sigma", 0)), nsr_(p.num("nsr", 0.01)) {
-        if (!(nsr_ > 0)) throw Error("mtf_paganin: nsr must be > 0");
+        : pag_(paganin_params(p), fixed_kernel(c)), sigma_(p.num("sigma", 0)), wiener_(p.has("nsr")) {
+        if (wiener_) {
+            nsr_ = p.num("nsr");
+            if (!(nsr_ > 0)) throw Error("mtf_paganin: nsr must be > 0");
+            if (p.has("target") || p.has("gain")) throw Error("mtf_paganin: nsr (the Wiener form) excludes target and gain");
+        } else {
+            target_ = p.num("target", 0.5);
+            gain_ = p.num("gain", 12);
+            if (!(target_ >= 0)) throw Error("mtf_paganin: target must be >= 0");
+            if (!(gain_ > 1)) throw Error("mtf_paganin: gain must be > 1");
+        }
         const std::string table = p.str("mtf", "");
         if (table.empty() == !(sigma_ > 0)) throw Error("mtf_paganin: give either sigma > 0 or an mtf table");
         if (!table.empty()) {
@@ -419,6 +428,16 @@ class MtfPaganin final : public ProjectionFilter {
         const auto lo = hi - 1;
         return lo->second + (hi->second - lo->second) * (nu - lo->first) / (hi->first - lo->first);
     }
+    // The deblur gain at radial frequency nu (cycles per pixel), M the detector MTF there; 1 at nu = 0.
+    //   target form (default): T sqrt(1 + e^2) / sqrt(M^2 + e^2), T the Gaussian MTF of `target` pixels, e = 1 / gain:
+    //     the blur is replaced by the target blur where M >> e, and the gain never exceeds ~gain. The response
+    //     M x gain falls monotonically (no pass-band hump), so edges do not ring and the noise stays unstructured.
+    //   Wiener form (nsr given): (1 + nsr) M / (M^2 + nsr), peaking at (1 + nsr) / (2 sqrt(nsr)) where M = sqrt(nsr).
+    double deblur_gain(double nu, double m) const {
+        if (wiener_) return (1 + nsr_) * m / (m * m + nsr_);
+        const double e = 1 / gain_, t = std::exp(-2 * M_PI * M_PI * target_ * target_ * nu * nu);
+        return t * std::sqrt((1 + e * e) / (m * m + e * e));
+    }
     // D on an n0 x n1 grid (radial frequency in cycles per pixel)
     std::vector<cplx> deblur_response(int n0, int n1) const {
         std::vector<cplx> D(static_cast<std::size_t>(n0) * n1);
@@ -426,15 +445,15 @@ class MtfPaganin final : public ProjectionFilter {
             const double f0 = static_cast<double>(signed_index(i, n0)) / n0;
             for (int j = 0; j < n1; ++j) {
                 const double f1 = static_cast<double>(signed_index(j, n1)) / n1;
-                const double m = mtf(std::hypot(f0, f1));
-                D[static_cast<std::size_t>(i) * n1 + j] = (1 + nsr_) * m / (m * m + nsr_);
+                const double nu = std::hypot(f0, f1);
+                D[static_cast<std::size_t>(i) * n1 + j] = deblur_gain(nu, mtf(nu));
             }
         }
         return D;
     }
-    // rows of D's real-space kernel: the last row whose central value reaches 1e-4 of the peak, + 1 (at most 64). D
-    // does not vanish at Nyquist, so its kernel decays slowly (~ r^-2): this truncation leaves the response within
-    // about 3 % (nsr 0.01) along the rows near their Nyquist frequency, exact elsewhere.
+    // rows of D's real-space kernel: the last row whose central value reaches 1e-4 of the peak, + 1 (at most 64). The
+    // Wiener form does not vanish at Nyquist, so its kernel decays slowly (~ r^-2): this truncation leaves the
+    // response within about 3 % (nsr 0.01) along the rows near their Nyquist frequency, exact elsewhere.
     int deblur_margin() const {
         if (dmargin_ >= 0) return dmargin_;
         const int n = 256;
@@ -468,7 +487,8 @@ class MtfPaganin final : public ProjectionFilter {
         return c;
     }
     Paganin pag_;
-    double sigma_, nsr_;
+    double sigma_, nsr_ = 0, target_ = 0, gain_ = 0;
+    bool wiener_;
     std::vector<std::pair<double, double>> table_;
     mutable int dmargin_ = -1;
 };
@@ -543,7 +563,7 @@ std::map<std::string, FilterFactory>& registry() {
              return std::make_unique<Epr>(p, c);
          }},
         {"mtf_paganin", [](const FilterParams& p, const FilterContext& c) -> std::unique_ptr<ProjectionFilter> {
-             check_keys("mtf_paganin", p, {"delta_beta", "sigma", "mtf", "nsr"});
+             check_keys("mtf_paganin", p, {"delta_beta", "sigma", "mtf", "nsr", "target", "gain"});
              return std::make_unique<MtfPaganin>(p, c);
          }},
         {"unsharp", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {

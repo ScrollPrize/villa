@@ -527,6 +527,23 @@ ScanData make_scan_data(DIn angles_deg, DIn z_translation_m, double pixel_size_m
     return d;
 }
 
+SldParams sld_from(const nb::dict& c) {
+    SldParams p;
+    auto get = [&](const char* key, auto& dst) {
+        if (c.contains(key) && !c[key].is_none()) dst = nb::cast<std::decay_t<decltype(dst)>>(c[key]);
+    };
+    get("sld_fraction", p.fraction);
+    get("sld_length", p.length);
+    get("sld_bin", p.bin);
+    get("sld_stride", p.stride);
+    get("sld_bm18", p.bm18);
+    get("sld_fractions", p.fractions);
+    get("sld_lengths", p.lengths);
+    get("sld_border_x", p.border_x);
+    get("sld_border_y", p.border_y);
+    return p;
+}
+
 class PySliceReconstructor {
   public:
     PySliceReconstructor(std::vector<ScanData> scans, const nb::dict& c) {
@@ -544,10 +561,7 @@ class PySliceReconstructor {
         f("pixel_size_m", cfg.pixel_size_m);
         if (c.contains("filters")) cfg.filters = chain_from(c["filters"]);
         f("margin", cfg.margin);
-        f("sld_fraction", cfg.sld.fraction);
-        f("sld_length", cfg.sld.length);
-        f("sld_bin", cfg.sld.bin);
-        f("sld_stride", cfg.sld.stride);
+        cfg.sld = sld_from(c);
         f("n_grid", cfg.n_grid);
         f("angular_tolerance_steps", cfg.angular_tolerance_steps);
         f("luminosity_repartition", cfg.luminosity_repartition);
@@ -928,6 +942,18 @@ NB_MODULE(_core, m) {
           "Scintillator light diffusion correction of detector frames (n, rows, cols): the frames minus their glare, "
           "i.e. the deconvolved frames / (1 + fraction) (the factor cancels between projections and flats)");
     m.def("roundfft", &roundfft, "n"_a);
+
+    m.def("sld_correct_config", [](HostIn frames, const nb::dict& config) {
+        require(frames.ndim() == 3, "frames must be (n, rows, cols)");
+        auto p = sld_from(config);
+        HostOut out = copy_of(frames);
+        if (p.enabled()) {
+            nb::gil_scoped_release nogil;
+            ScintillatorGlare g(static_cast<int>(frames.shape(1)), static_cast<int>(frames.shape(2)), p);
+            g.correct(data(out), static_cast<int>(frames.shape(0)));
+        }
+        return out;
+    }, "frames"_a, "config"_a, "Correct frames with a resolved SLD configuration (helirec.sld.sld_config)");
 
     m.def("delta3d_available", &delta3d_available, "True if built with the vc-delta3d codec");
     m.def(

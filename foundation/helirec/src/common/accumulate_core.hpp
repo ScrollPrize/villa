@@ -23,8 +23,10 @@ HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
     if (s.glare) {   // scintillator light diffusion: minus the glare, interpolated between its sampled projections
         const std::size_t cell = static_cast<std::size_t>(s.glare_rows) * s.glare_cols;
         const float gf = s.glare_frac[k];
-        const float g0 = sld_core::glare_sample(s.glare + s.glare_i0[k] * cell, s.glare_rows, s.glare_cols, s.glare_inv_bin, r, c);
-        const float g1 = sld_core::glare_sample(s.glare + s.glare_i1[k] * cell, s.glare_rows, s.glare_cols, s.glare_inv_bin, r, c);
+        const int r0 = r - (s.glare_row0 ? s.glare_row0[s.glare_i0[k]] : 0);
+        const int r1 = r - (s.glare_row0 ? s.glare_row0[s.glare_i1[k]] : 0);
+        const float g0 = sld_core::glare_sample(s.glare + s.glare_i0[k] * cell, s.glare_rows, s.glare_cols, s.glare_inv_bin, r0, c);
+        const float g1 = sld_core::glare_sample(s.glare + s.glare_i1[k] * cell, s.glare_rows, s.glare_cols, s.glare_inv_bin, r1, c);
         sig = sub(sig, add(mul(sub(1.0f, gf), g0), mul(gf, g1)));
     }
     const std::size_t plane = static_cast<std::size_t>(s.det_rows) * s.det_cols;

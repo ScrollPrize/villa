@@ -43,6 +43,7 @@ class FakeRecon:
         self.lo, self.hi = 0, 10
         self.info = {"grid_size": 8, "margin": 0}
         self.cal = SimpleNamespace(rot_center=3.5, to_json=lambda: "{}")
+        self.main = SimpleNamespace(pixel_size_m=8.64e-6)
 
     def set_params(self, **kw):
         HelicalRecon._update(self, kw)
@@ -67,6 +68,7 @@ def test_baseline_previews_opt_in(tmp_path, monkeypatch, previews):
     assert len(list(out.rglob("*.tif"))) == 2
     assert bool(list(out.rglob("*.png"))) == previews
     assert (out / "sheets_new").exists() == previews
+    assert not list((out / "slices").rglob("*.png"))          # the slice folders hold TIFFs only
     manifest = json.loads((out / "manifest_new.json").read_text())
     assert manifest["legacy"]["2"]["output_units"] == "reference_units (attenuation / 2)"
     assert not (out / "manifest.json").exists()
@@ -79,3 +81,22 @@ def test_slice_cli_previews_opt_in(tmp_path, monkeypatch, flag, expected):
     monkeypatch.setattr(cli, "run_fractions", lambda a, *args: seen.append(a.no_preview))
     cli.main(["unused", "--out_root", str(tmp_path), "--tag", "test"] + flag)
     assert seen == [expected]
+
+
+@pytest.mark.parametrize("fmt", ["zarr", "tiff"])
+@pytest.mark.parametrize("flags,kinds", [([], {"float32"}), (["--uint8"], {"float32", "uint8"}),
+                                         (["--uint8_only"], {"uint8"})])
+def test_slice_cli_uint8_only_skips_float32(tmp_path, monkeypatch, fmt, flags, kinds):
+    import tifffile
+    from helirec.omezarr import outside_disk, to_uint8
+    monkeypatch.setattr("helirec.recon.HelicalRecon", FakeRecon)
+    cli.main(["unused", "--out_root", str(tmp_path), "--tag", "t", "--z", "2", "5", "--format", fmt,
+              "--u8_window", "0", "63", "--u8_compression", "none"] + flags)
+    out = tmp_path / "t"
+    names = {"float32": "volume.zarr", "uint8": "volume_uint8.zarr"} if fmt == "zarr" else {"float32": "float32", "uint8": "uint8"}
+    assert {k for k, n in names.items() if (out / n).exists()} == kinds
+    assert set(json.loads((out / "manifest.json").read_text())["outputs"]) == kinds
+    if fmt == "tiff" and "uint8" in kinds:
+        want = to_uint8(np.arange(64, dtype=np.float32).reshape(8, 8), 0, 63, outside=outside_disk(8))
+        assert sorted(f.name for f in (out / "uint8").iterdir()) == ["z00002.tif", "z00003.tif", "z00004.tif"]
+        np.testing.assert_array_equal(tifffile.imread(out / "uint8" / "z00003.tif"), want)

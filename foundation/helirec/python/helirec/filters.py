@@ -6,8 +6,10 @@ A chain is a list of dicts, applied in order to every gridded stack before (stag
     [{"type": "paganin", "delta_beta": 1000}, {"type": "unsharp", "sigma": 1.2, "coeff": 4}]
 
 Text form (CLI): "paganin(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)", or JSON.
-In place of paganin + unsharp, "mtf_paganin(delta_beta=1000,sigma=1.06,nsr=0.01)" retrieves the phase and deconvolves
-the detector MTF (Gaussian `sigma` in pixels, or a measured table mtf=0.1:0.8/0.2:0.45/...) as one Wiener filter.
+In place of paganin + unsharp, "mtf_paganin(delta_beta=1000,sigma=1.06)" retrieves the phase and deconvolves the
+detector MTF (Gaussian `sigma` in pixels, or a measured table mtf=0.1:0.8/0.2:0.45/...) in one filter: the blur is
+replaced by a Gaussian of `target` pixels (default 0.5) with the gain capped at `gain` (default 12); nsr=0.01 selects
+the Wiener form instead.
 Overrides address a filter by type (first of that type) or type[k] (k-th of that type):
     {"paganin.delta_beta": 500, "unsharp.coeff": 0, "unsharp[1].sigma": 3}
 Python filters: register(name, fn); fn(frames, **params) gets (n, H, W) float32 frames (NumPy; on CUDA a host copy,

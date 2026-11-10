@@ -28,8 +28,8 @@ Config (JSON):
 
 Output (OUT):
   slices/<method>/z<Z>.tif             float32 slice (pipeline units)
-  With --previews: slices/<method>/z<Z>.png, sheets/z<Z>.png (+ crops), contact_sheet.png; every image and
-  tile carries a header with the method's name and description
+  With --previews: sheets/z<Z>.png (+ crops), contact_sheet.png; every tile carries a header with the method's
+  name and description. The slice folders hold TIFFs only.
   config.json, manifest.json           the resolved config; per method / slice timing and statistics
 Existing slice TIFFs are reused only when their provenance fingerprint matches.
 """
@@ -241,7 +241,7 @@ def main(argv=None):
     p.add_argument("--cache_dir", default=None)
     p.add_argument("--device", default=None, choices=["cuda", "cpu"])
     p.add_argument("--overwrite", action="store_true", help="recompute slices that already exist")
-    p.add_argument("--previews", action="store_true", help="also write PNG slices and contact sheets (default: TIFFs only)")
+    p.add_argument("--previews", action="store_true", help="also write PNG contact and crop sheets (the slice folders hold TIFFs only)")
     p.add_argument("--run-name", default="", help="suffix for metadata and preview sheets, preserving earlier runs")
     a = p.parse_args(argv)
     if a.roi is not None and a.roi != [-1] and len(a.roi) != 4:
@@ -302,7 +302,8 @@ def main(argv=None):
         print("wrote TIFF slices under", os.path.join(out, "slices"))
         return
 
-    # 2. optional images: shared window per slice; per-slice sheets (whole slices, crops); the overall contact sheet
+    # 2. optional sheets (no PNG copies of the slices): shared window per slice; per-slice sheets (whole slices,
+    #    crops); the overall contact sheet
     tile = int(cfg.get("tile", 1024))
     columns = cfg.get("sheet_columns")
     crops = cfg.get("crops") or []
@@ -313,9 +314,6 @@ def main(argv=None):
                 * display_scale(manifest[m["name"]][str(z)]["output_units"]) for m in cfg["methods"]]
         win = window_of(imgs[0], cfg.get("window", "auto"))
         note = f"   window [{win[0]:.4g}, {win[1]:.4g}] cm^-1"
-        for m, img in zip(cfg["methods"], imgs):
-            write_png_gray(os.path.join(out, "slices", m["name"], f"z{z:05d}.png"),
-                           with_headers([to_u8(img, win)], [m], z, h, [note])[0])
         tiles = with_headers([to_u8(thumb(img, tile), win) for img in imgs], cfg["methods"], z, h, [note] * len(imgs))
         write_png_gray(os.path.join(out, "sheets" + suffix, f"z{z:05d}.png"), grid(wrap_rows(tiles, columns)))
         for k, (x0, x1, y0, y1) in enumerate(crops):

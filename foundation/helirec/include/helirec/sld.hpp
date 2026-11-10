@@ -14,8 +14,12 @@
 // In the reconstruction (SliceReconstructor, ReconConfig::sld) the glare of the normalised signal
 // (raw - dark) / current is subtracted before the flat division: the flats are corrected once, and the glare of
 // every `stride`-th projection is computed from its whole frame and interpolated linearly in between.
+// The opt-in BM18 profile instead uses the unit-mass multi-tail PSF and full-resolution FFTs, with an
+// illuminated edge extension followed by zero padding. Its maps are the complete signed correction
+// M - K^-1*M, including high frequencies. Flats are clipped after correction; projections remain linear.
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "helirec/common.hpp"
 
@@ -26,7 +30,12 @@ struct SldParams {
     double length = 100;   // l: damping length of the tail (detector pixels)
     int bin = 8;           // box binning of the frames the glare is computed from
     int stride = 10;       // every stride-th projection gets its own glare map
-    bool enabled() const { return fraction > 0; }
+    // BM18: full-resolution, unit-mass PSF, multiple tails and illuminated borders.
+    // Python's BM18 profile defaults to bin=1, stride=1, borders=100 detector pixels.
+    bool bm18 = false;
+    std::vector<double> fractions, lengths;
+    int border_x = 0, border_y = 0;
+    bool enabled() const { return bm18 || fraction > 0 || !fractions.empty(); }
 };
 
 class ScintillatorGlare {
@@ -44,7 +53,7 @@ class ScintillatorGlare {
     void filter(float* maps, int n);
     // glare maps (n, rows, cols) of float frames (n, det_rows, det_cols)
     void from_frames(const float* frames, int n, float* out);
-    // in place: frames (n, det_rows, det_cols) minus their glare, T / (1 + f)  (flats; tests)
+    // in place: frames minus correction; legacy T/(1+f), BM18 full T clipped at zero (flats; tests)
     void correct(float* frames, int n);
 
   private:

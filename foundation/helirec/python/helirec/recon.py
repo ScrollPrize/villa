@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import _core, bliss, calibration
+from .sld import sld_config
 from .filters import DEFAULT_CHAIN, REFERENCE_CHAIN, is_filter_key, override, parse_chain
 
 MODES = ("corrected", "legacy_reference")
@@ -107,25 +108,6 @@ def _same(key, a, b):
         except (TypeError, ValueError):
             return False
     return a == b
-
-
-def sld_config(spec):
-    """Scintillator light diffusion correction spec -> reconstructor config keys. '' / None: no correction; else text
-    or dict: fraction (tail weight relative to the direct image, e.g. 0.1), length (damping length in detector
-    pixels, default 100), bin (binning of the glare maps, default 8), stride (projections per glare map, default 10),
-    e.g. "fraction=0.1,length=100"."""
-    if not spec:
-        return {}
-    if isinstance(spec, dict):
-        d = dict(spec)
-    else:
-        d = dict(kv.split("=", 1) for kv in str(spec).replace(" ", "").split(",") if kv)
-    unknown = set(d) - {"fraction", "length", "bin", "stride"}
-    if unknown or "fraction" not in d:
-        raise ValueError(f"sld: expected fraction=F[,length=L,bin=B,stride=S], got {spec!r}")
-    out = dict(sld_fraction=float(d["fraction"]), sld_length=float(d.get("length", 100.0)),
-               sld_bin=int(float(d.get("bin", 8))), sld_stride=int(float(d.get("stride", 10))))
-    return out if out["sld_fraction"] > 0 else {}
 
 
 def legacy_reference_config():
@@ -223,7 +205,8 @@ class HelicalRecon:
                    pixel_size_m=m.pixel_size_m, rot_center=self.cal.rot_center,
                    legacy_reference=mode == "legacy_reference")
         cfg.update(backprojector_config(p["backprojector"]))
-        cfg.update(sld_config(cfg.pop("sld")))
+        self._resolved_sld = sld_config(cfg.pop("sld"))
+        cfg.update(self._resolved_sld)
         cfg["exposure_arc"] = self.exposure_arc()
         scans = [self._scan_data(self.main, "main"), self._scan_data(self.companion, "companion")]
         self.rec = _core.SliceReconstructor(scans, cfg)
@@ -277,6 +260,7 @@ class HelicalRecon:
         so later method/filter changes cannot alter saved provenance."""
         mode = self.params["mode"]
         return dict(mode=mode, conventions=CONVENTIONS[mode], params=copy.deepcopy(self.params),
+                    resolved_sld=copy.deepcopy(getattr(self, "_resolved_sld", {})),
                     pinned=sorted(LEGACY_REFERENCE) if mode == "legacy_reference" else [],
                     output_units=CONVENTIONS[mode]["output_units"],
                     calibration=dict(source=self.cal.source, fingerprint=self.cal.fingerprint,

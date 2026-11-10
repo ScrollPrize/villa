@@ -50,12 +50,45 @@ def test_mtf_paganin_response_and_fusion():
             helirec.filter_margin([bad], **PH)
 
 
+def test_mtf_paganin_target_form():
+    # the default (no nsr): the blur replaced by a Gaussian of `target` pixels, the gain capped at ~gain
+    sigma, target, gain = 1.06, 0.5, 12.0
+    base = {"type": "mtf_paganin", "delta_beta": 0, "sigma": sigma}
+    R = response([base])
+    f0, f1 = np.meshgrid(np.fft.fftfreq(R.shape[0]), np.fft.fftfreq(R.shape[1]), indexing="ij")
+    nu2 = f0 ** 2 + f1 ** 2
+    M, e = np.exp(-2 * np.pi ** 2 * sigma ** 2 * nu2), 1 / gain
+
+    def D(target, gain):
+        return np.exp(-2 * np.pi ** 2 * target ** 2 * nu2) * np.sqrt((1 + 1 / gain ** 2) / (M ** 2 + 1 / gain ** 2))
+    np.testing.assert_allclose(R, D(target, gain), atol=0.035)
+    np.testing.assert_allclose(response([dict(base, target=0.5, gain=12)]), R, atol=1e-6)      # the defaults
+    np.testing.assert_allclose(response([dict(base, target=0.8, gain=6)]), D(0.8, 6), atol=0.035)
+    np.testing.assert_allclose(response([dict(base, target=0, gain=6)]), D(0, 6), atol=0.035)   # the gain cap alone
+    assert abs(R[0, 0] - 1) < 1e-5 and R.max() < gain
+    # the system response M x D falls monotonically along a frequency axis: no pass-band hump (the Wiener form's
+    # gain peaks at M = sqrt(nsr), which rings at edges and colours the noise)
+    axis = (M * D(target, gain))[0, : R.shape[1] // 2]
+    assert np.all(np.diff(axis) < 0) and abs(axis[0] - 1) < 1e-12
+    k = int(np.argmin(np.abs(M[0, : R.shape[1] // 2] - 0.5)))                                   # where M >> 1 / gain
+    assert abs(axis[k] - np.exp(-2 * np.pi ** 2 * target ** 2 * nu2[0, k])) < 0.02              # ... it is the target
+    # fused with Paganin, constants, and the parameter checks
+    full = dict(base, delta_beta=1000)
+    np.testing.assert_allclose(response([full]), response([{"type": "paganin", "delta_beta": 1000}]) * D(target, gain), atol=0.035)
+    flat = helirec.apply_filters(np.full((2, 151, 192), 3.0, np.float32), [full], helirec.filter_margin([full], **PH), **PH)
+    np.testing.assert_allclose(flat, 3.0, rtol=2e-6)
+    for bad in (dict(full, target=-1), dict(full, gain=1), dict(full, nsr=0.01, target=0.5), dict(full, nsr=0.01, gain=8)):
+        with pytest.raises(Exception, match="mtf_paganin"):
+            helirec.filter_margin([bad], **PH)
+
+
 @pytest.mark.skipif(not helirec.cuda_available(), reason="no CUDA")
-def test_mtf_paganin_cpu_cuda_agree():
+@pytest.mark.parametrize("chain", [MTF, {"type": "mtf_paganin", "delta_beta": 1000, "sigma": 1.06}], ids=["wiener", "target"])
+def test_mtf_paganin_cpu_cuda_agree(chain):
     a = np.random.default_rng(0).uniform(0.5, 1.5, (3, 151, 200)).astype(np.float32)
-    m = helirec.filter_margin([MTF], **PH)
-    np.testing.assert_allclose(helirec.apply_filters(a, [MTF], m, device="cuda", **PH),
-                               helirec.apply_filters(a, [MTF], m, device="cpu", **PH), rtol=0, atol=5e-5)
+    m = helirec.filter_margin([chain], **PH)
+    np.testing.assert_allclose(helirec.apply_filters(a, [chain], m, device="cuda", **PH),
+                               helirec.apply_filters(a, [chain], m, device="cpu", **PH), rtol=0, atol=5e-5)
 
 
 # ------------------------------------------------------------------ z_interp

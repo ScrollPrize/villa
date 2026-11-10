@@ -82,14 +82,15 @@ AccumScanView make_view(const ScanData& sd, const ScanChunk& ch, const uint16_t*
 }
 
 void set_glare(AccumScanView& v, const ScintillatorGlare& g, const float* maps, const int32_t* i0, const int32_t* i1,
-               const float* frac) {
+               const float* frac, int rows, const int32_t* row0) {
     v.glare = maps;
-    v.glare_rows = g.rows();
+    v.glare_rows = rows;
     v.glare_cols = g.cols();
     v.glare_inv_bin = 1.f / static_cast<float>(g.bin());
     v.glare_i0 = i0;
     v.glare_i1 = i1;
     v.glare_frac = frac;
+    v.glare_row0 = row0;
 }
 
 }  // namespace
@@ -149,11 +150,13 @@ struct SliceReconstructor::Impl {
     std::vector<std::unique_ptr<ScintillatorGlare>> glare;
     std::vector<std::map<int, std::vector<float>>> glare_maps;
     struct ChunkGlare {
+        int rows = 0;
         std::vector<float> maps;        // (n_maps, rows, cols): the sampled projections bracketing the chunk's
         std::vector<int32_t> i0, i1;    // per chunk projection: the maps before / after it
+        std::vector<int32_t> row0;      // BM18: retain only the rows this chunk samples, per map
         std::vector<float> frac;
     };
-    ChunkGlare chunk_glare(std::size_t s, const ChunkScan& c);
+    ChunkGlare chunk_glare(std::size_t s, const ScanChunk& chunk);
 #ifdef HELIREC_WITH_CUDA
     struct DevScan {
         cuda::DeviceBuffer<float> dark, flats, weight;
@@ -498,7 +501,8 @@ void SliceReconstructor::Impl::apply_filters(const FilterPipeline& P, FilterStag
 
 // Glare maps of scan s for the projections [c.p0, c.p1): those of every stride-th projection of the scan (and its
 // last), computed from whole frames on first use.
-SliceReconstructor::Impl::ChunkGlare SliceReconstructor::Impl::chunk_glare(std::size_t s, const ChunkScan& c) {
+SliceReconstructor::Impl::ChunkGlare SliceReconstructor::Impl::chunk_glare(std::size_t s, const ScanChunk& chunk) {
+    const auto& c = chunk.cs;
     const auto& sd = scans[s];
     auto& g = *glare[s];
     auto& have = glare_maps[s];
@@ -508,6 +512,53 @@ SliceReconstructor::Impl::ChunkGlare SliceReconstructor::Impl::chunk_glare(std::
     for (int p = first;; p += stride) {
         samples.push_back(std::min(p, last));
         if (samples.back() >= c.p1 - 1) break;
+    }
+    ChunkGlare cg;
+    const int n = c.p1 - c.p0, n_maps = static_cast<int>(samples.size());
+    cg.i0.resize(n);
+    cg.i1.resize(n);
+    cg.frac.resize(n);
+    for (int k = 0; k < n; ++k) {
+        const int p = c.p0 + k;
+        const int i0 = std::min((p - first) / stride, n_maps - 1), i1 = std::min(i0 + 1, n_maps - 1);
+        const int d = samples[i1] - samples[i0];
+        cg.i0[k] = i0;
+        cg.i1[k] = i1;
+        cg.frac[k] = d > 0 ? static_cast<float>(p - samples[i0]) / static_cast<float>(d) : 0.f;
+    }
+    cg.rows = g.rows();
+    if (cfg.sld.bm18) {
+        // Full detector context for the FFT, but only chunk strips are retained
+        // and uploaded. Memory does not grow by n_projections * detector_height.
+        const int nr = sd.traj.det_rows, nc = sd.traj.det_cols;
+        cg.row0.assign(n_maps, nr);
+        std::vector<int> ends(n_maps, 0);
+        for (int k = 0; k < n; ++k) {
+            // Include the nearest boundary pair used by vertical extrapolation.
+            const int lo = std::clamp(c.row0[k] - z_pad, 0, std::max(0, nr - 2));
+            const int hi = std::clamp(c.row0[k] - z_pad + chunk.win_rows, std::min(2, nr), nr);
+            for (int i : {cg.i0[k], cg.i1[k]}) {
+                cg.row0[i] = std::min(cg.row0[i], lo);
+                ends[i] = std::max(ends[i], hi);
+            }
+        }
+        cg.rows = 1;
+        for (int i = 0; i < n_maps; ++i) cg.rows = std::max(cg.rows, ends[i] - cg.row0[i]);
+        const std::size_t strip = static_cast<std::size_t>(cg.rows) * nc;
+        cg.maps.resize(static_cast<std::size_t>(n_maps) * strip, 0.f);
+        std::vector<float> frame(static_cast<std::size_t>(nr) * nc);
+        for (int i = 0; i < n_maps; ++i) {
+            if (ends[i] <= cg.row0[i]) continue;
+            const int p = samples[i];
+            const int32_t fi = sd.file_index[p], fr = sd.frame_index[p];
+            sd.reader->visit_frames(&fi, &fr, 1, 64, [&](std::size_t, int r0, int count, const uint16_t* raw) {
+                g.bin_raw(raw, r0, count, sd.dark.data(), static_cast<float>(sd.control_A[p] / 0.2), frame.data());
+            });
+            g.filter(frame.data(), 1);
+            std::copy_n(frame.data() + static_cast<std::size_t>(cg.row0[i]) * nc,
+                        static_cast<std::size_t>(ends[i] - cg.row0[i]) * nc, cg.maps.data() + i * strip);
+        }
+        return cg;
     }
     for (auto it = have.begin(); it != have.end();)   // keep only what this chunk uses
         it = std::binary_search(samples.begin(), samples.end(), it->first) ? std::next(it) : have.erase(it);
@@ -530,21 +581,8 @@ SliceReconstructor::Impl::ChunkGlare SliceReconstructor::Impl::chunk_glare(std::
         g.filter(out.data(), static_cast<int>(n));
         for (std::size_t i = 0; i < n; ++i) have[todo[i]].assign(out.begin() + i * cell, out.begin() + (i + 1) * cell);
     }
-    ChunkGlare cg;
     cg.maps.resize(samples.size() * cell);
     for (std::size_t i = 0; i < samples.size(); ++i) std::copy(have[samples[i]].begin(), have[samples[i]].end(), cg.maps.begin() + i * cell);
-    const int n = c.p1 - c.p0, n_maps = static_cast<int>(samples.size());
-    cg.i0.resize(n);
-    cg.i1.resize(n);
-    cg.frac.resize(n);
-    for (int k = 0; k < n; ++k) {
-        const int p = c.p0 + k;
-        const int i0 = std::min((p - first) / stride, n_maps - 1), i1 = std::min(i0 + 1, n_maps - 1);
-        const int d = samples[i1] - samples[i0];
-        cg.i0[k] = i0;
-        cg.i1[k] = i1;
-        cg.frac[k] = d > 0 ? static_cast<float>(p - samples[i0]) / static_cast<float>(d) : 0.f;
-    }
     return cg;
 }
 
@@ -677,7 +715,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     tick("prepare");
     std::vector<ChunkGlare> cg(I.scans.size());
     if (cfg.sld.enabled()) {
-        for (std::size_t s = 0; s < I.scans.size(); ++s) cg[s] = chunk_glare(s, chunks[s].cs);
+        for (std::size_t s = 0; s < I.scans.size(); ++s) cg[s] = chunk_glare(s, chunks[s]);
         tick("glare");
     }
 
@@ -727,7 +765,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                       I.x_kernel);
                 set_z_kernel(view, I.z_pad, ch.z_w.data());
                 if (cfg.sld.enabled())
-                    set_glare(view, *I.glare[s], cg[s].maps.data(), cg[s].i0.data(), cg[s].i1.data(), cg[s].frac.data());
+                    set_glare(view, *I.glare[s], cg[s].maps.data(), cg[s].i0.data(), cg[s].i1.data(), cg[s].frac.data(),
+                              cg[s].rows, cg[s].row0.empty() ? nullptr : cg[s].row0.data());
                 cpu::accumulate(view, contrib, ap, R.data(), RW.data());
                 tick("accumulate");
                 const bool lum = cfg.luminosity_repartition != 0.f && chunks.size() == 2;
@@ -808,7 +847,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     const bool prefetched = take_prefetch(h_lo, h_hi, m);
     tick("read_wait");
     struct DevChunk {
-        cuda::DeviceBuffer<int32_t> row0, fi0, fi1, gi0, gi1;
+        cuda::DeviceBuffer<int32_t> row0, fi0, fi1, gi0, gi1, grow0;
         cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac, z_w;
     };
     std::vector<DevChunk> dc(nsc);
@@ -830,6 +869,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         dc[s].ffrac.upload(c.flat_frac.data(), c.flat_frac.size());
         if (!chunks[s].z_w.empty()) dc[s].z_w.upload(chunks[s].z_w.data(), chunks[s].z_w.size());
         if (cfg.sld.enabled()) {
+            if (!cg[s].row0.empty()) dc[s].grow0.upload(cg[s].row0.data(), cg[s].row0.size());
             dc[s].glare.upload(cg[s].maps.data(), cg[s].maps.size());
             dc[s].gi0.upload(cg[s].i0.data(), cg[s].i0.size());
             dc[s].gi1.upload(cg[s].i1.data(), cg[s].i1.size());
@@ -996,7 +1036,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             view.raw_slot = d_slot[r][s].data();
             set_z_kernel(view, I.z_pad, dc[s].z_w.data());
             if (cfg.sld.enabled())
-                set_glare(view, *I.glare[s], dc[s].glare.data(), dc[s].gi0.data(), dc[s].gi1.data(), dc[s].gfrac.data());
+                set_glare(view, *I.glare[s], dc[s].glare.data(), dc[s].gi0.data(), dc[s].gi1.data(), dc[s].gfrac.data(),
+                          cg[s].rows, cg[s].row0.empty() ? nullptr : dc[s].grow0.data());
             cuda::accumulate(view, plans[b].contrib[s], ap, R.data(), RW.data());
             if (s + 1 == nsc) HELIREC_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
             tick("accumulate");

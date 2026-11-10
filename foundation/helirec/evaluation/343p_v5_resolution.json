@@ -284,6 +284,40 @@
         "sld": "fraction=0.6,length=400"
       },
       "desc": "FBP, calibrated SLD 0.6/400 + eikonal phase 1000 + MTF-Wiener deblur (sigma 1.06, nsr 0.01); v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_sldcal_mtf_target05",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "mtf_paganin",
+            "delta_beta": 1000.0,
+            "sigma": 1.06,
+            "target": 0.5,
+            "gain": 12.0
+          }
+        ],
+        "sld": "fraction=0.6,length=400"
+      },
+      "desc": "FBP, calibrated SLD 0.6/400 + fused MTF Paganin 1000, Gaussian target 0.5 px, gain cap 12 (sigma 1.06); v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_sldcal_mtf_target05_db1250",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "mtf_paganin",
+            "delta_beta": 1250.0,
+            "sigma": 1.06,
+            "target": 0.5,
+            "gain": 12.0
+          }
+        ],
+        "sld": "fraction=0.6,length=400"
+      },
+      "desc": "FBP, calibrated SLD 0.6/400 + fused MTF Paganin 1250, Gaussian target 0.5 px, gain cap 12 (sigma 1.06); v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
     }
   ]
 }
