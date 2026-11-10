@@ -9,9 +9,91 @@ def _concat_if_multi_task(output, is_multi_task: bool, concat_fn):
     return concat_fn(output)
 
 
+# Heads whose channels are the components of a direction (x, y, z order, as the auxiliary
+# tasks write them) or of the structure tensor. Mirroring or transposing the input does not
+# only move such values, it also negates or swaps their components, so the TTA has to undo
+# both before averaging; otherwise the variants cancel (normals average to zero).
+# Spatial axes are named by their tensor dim: z = -3, y = -2, x = -1.
+_AXES = {'z': -3, 'y': -2, 'x': -1}
+# task_type -> whether the direction's sign is arbitrary (an eigenvector)
+_VECTOR_TASKS = {'surface_normals': False, 'nearest_component': False, 'inplane_direction': True}
+_TENSOR_ORDER = {3: ('zz', 'zy', 'zx', 'yy', 'yx', 'xx'), 2: ('yy', 'yx', 'xx')}
+
+
+def tta_channel_groups(targets, target_info, spatial_dims: int):
+    """Geometric channel groups of a multi-task output, for `infer_with_tta(channel_groups=...)`.
+
+    `targets` is the checkpoint's target configuration (with each auxiliary head's
+    `task_type`), `target_info` the channel range of each target in the concatenated output.
+    Each group maps a tuple of spatial dims to an output channel: (axis,) for a vector
+    component, (axis_a, axis_b) for a structure tensor component.
+    """
+    groups = []
+    for name, info in (target_info or {}).items():
+        task = str(((targets or {}).get(name) or {}).get('task_type', '')).lower()
+        start, count = int(info['start_channel']), int(info['out_channels'])
+        if task in _VECTOR_TASKS and count >= spatial_dims:
+            channels = {(_AXES[a],): start + i for i, a in enumerate('xyz'[:spatial_dims])}
+            groups.append({'kind': 'axial' if _VECTOR_TASKS[task] else 'vector', 'channels': channels})
+        elif task == 'structure_tensor' and count == len(_TENSOR_ORDER[spatial_dims]):
+            channels = {(_AXES[c[0]], _AXES[c[1]]): start + i
+                        for i, c in enumerate(_TENSOR_ORDER[spatial_dims])}
+            groups.append({'kind': 'tensor', 'channels': channels})
+    return groups
+
+
+def _undo_component_change(output: torch.Tensor, channel_groups, flipped=(), swapped=None) -> torch.Tensor:
+    """Bring the components of an un-flipped / un-transposed variant back to the input frame.
+
+    `flipped`: the spatial dims the input was mirrored over (a component along one of
+    them changes sign). `swapped`: the pair of spatial dims the input was transposed over
+    (components along them trade places).
+    """
+    if not channel_groups:
+        return output
+    flipped = set(flipped)
+    sigma = {}
+    if swapped is not None:
+        a, b = swapped
+        sigma = {a: b, b: a}
+    perm = list(range(output.shape[1]))
+    negate = []
+    for group in channel_groups:
+        channels = group['channels']
+        for key, ch in channels.items():
+            if sum(axis in flipped for axis in key) % 2:
+                negate.append(ch)
+            if sigma:
+                source = tuple(sigma.get(axis, axis) for axis in key)
+                perm[ch] = channels[source] if source in channels else channels[source[::-1]]
+    if negate:
+        output = output.clone()
+        output[:, negate] = -output[:, negate]
+    if sigma:
+        output = output[:, perm]
+    return output
+
+
+def _average_variants(variants, channel_groups) -> torch.Tensor:
+    """Mean of the TTA variants; sign-ambiguous directions are first aligned with the first variant."""
+    axial = [list(g['channels'].values()) for g in (channel_groups or []) if g['kind'] == 'axial']
+    if axial:
+        reference = variants[0]
+        aligned = [reference]
+        for variant in variants[1:]:
+            variant = variant.clone()
+            for chs in axial:
+                dot = (variant[:, chs] * reference[:, chs]).sum(dim=1, keepdim=True)
+                variant[:, chs] = torch.where(dot < 0, -variant[:, chs], variant[:, chs])
+            aligned.append(variant)
+        variants = aligned
+    return torch.mean(torch.stack(list(variants), dim=0), dim=0)
+
+
 def infer_with_tta_batched_3d(model, inputs: torch.Tensor,
                                *, is_multi_task: bool = False,
-                               concat_multi_task_outputs=None) -> torch.Tensor:
+                               concat_multi_task_outputs=None,
+                               channel_groups=None) -> torch.Tensor:
     """
     Batched TTA for 3D mirroring - processes all 8 flips in a single forward pass.
 
@@ -65,13 +147,20 @@ def infer_with_tta_batched_3d(model, inputs: torch.Tensor,
     outputs[6] = torch.flip(outputs[6], dims=[-2, -3])
     outputs[7] = torch.flip(outputs[7], dims=[-1, -2, -3])
 
+    if channel_groups:
+        flips = [(), (-1,), (-2,), (-3,), (-1, -2), (-1, -3), (-2, -3), (-1, -2, -3)]
+        return _average_variants(
+            [_undo_component_change(outputs[k], channel_groups, flipped=f) for k, f in enumerate(flips)],
+            channel_groups)
+
     # Average across augmentations
     return outputs.mean(dim=0)
 
 
 def infer_with_tta_batched_2d(model, inputs: torch.Tensor,
                                *, is_multi_task: bool = False,
-                               concat_multi_task_outputs=None) -> torch.Tensor:
+                               concat_multi_task_outputs=None,
+                               channel_groups=None) -> torch.Tensor:
     """
     Batched TTA for 2D mirroring - processes all 4 flips in a single forward pass.
     """
@@ -102,6 +191,12 @@ def infer_with_tta_batched_2d(model, inputs: torch.Tensor,
     outputs[2] = torch.flip(outputs[2], dims=[-2])
     outputs[3] = torch.flip(outputs[3], dims=[-2, -1])
 
+    if channel_groups:
+        flips = [(), (-1,), (-2,), (-2, -1)]
+        return _average_variants(
+            [_undo_component_change(outputs[k], channel_groups, flipped=f) for k, f in enumerate(flips)],
+            channel_groups)
+
     return outputs.mean(dim=0)
 
 
@@ -110,7 +205,8 @@ def infer_with_tta_sequential(model,
                                tta_type: str = 'mirroring',
                                *,
                                is_multi_task: bool = False,
-                               concat_multi_task_outputs=None) -> torch.Tensor:
+                               concat_multi_task_outputs=None,
+                               channel_groups=None) -> torch.Tensor:
     """
     Sequential TTA - original implementation with 8 separate model calls.
     Used as fallback when batched TTA runs out of memory.
@@ -139,6 +235,7 @@ def infer_with_tta_sequential(model,
             m6 = _concat_if_multi_task(m6, is_multi_task, concat_multi_task_outputs)
             m7 = _concat_if_multi_task(m7, is_multi_task, concat_multi_task_outputs)
 
+            flips = [(), (-1,), (-2,), (-3,), (-1, -2), (-1, -3), (-2, -3), (-1, -2, -3)]
             outputs = [
                 m0,
                 torch.flip(m1, dims=[-1]),
@@ -149,7 +246,8 @@ def infer_with_tta_sequential(model,
                 torch.flip(m6, dims=[-2, -3]),
                 torch.flip(m7, dims=[-1, -2, -3])
             ]
-            return torch.mean(torch.stack(outputs, dim=0), dim=0)
+            outputs = [_undo_component_change(o, channel_groups, flipped=f) for o, f in zip(outputs, flips)]
+            return _average_variants(outputs, channel_groups)
         else:  # 2D flips over H and W
             m0 = model(inputs)
             m1 = model(torch.flip(inputs, dims=[-1]))
@@ -161,13 +259,15 @@ def infer_with_tta_sequential(model,
             m2 = _concat_if_multi_task(m2, is_multi_task, concat_multi_task_outputs)
             m3 = _concat_if_multi_task(m3, is_multi_task, concat_multi_task_outputs)
 
+            flips = [(), (-1,), (-2,), (-2, -1)]
             outputs = [
                 m0,
                 torch.flip(m1, dims=[-1]),
                 torch.flip(m2, dims=[-2]),
                 torch.flip(m3, dims=[-2, -1])
             ]
-            return torch.mean(torch.stack(outputs, dim=0), dim=0)
+            outputs = [_undo_component_change(o, channel_groups, flipped=f) for o, f in zip(outputs, flips)]
+            return _average_variants(outputs, channel_groups)
 
     else:  # rotation
         if spatial_dims == 3:
@@ -183,10 +283,10 @@ def infer_with_tta_sequential(model,
 
             outputs = [
                 r0,
-                torch.transpose(r_x_up, -3, -1),
-                torch.transpose(r_z_up, -3, -2)
+                _undo_component_change(torch.transpose(r_x_up, -3, -1), channel_groups, swapped=(-3, -1)),
+                _undo_component_change(torch.transpose(r_z_up, -3, -2), channel_groups, swapped=(-3, -2)),
             ]
-            return torch.mean(torch.stack(outputs, dim=0), dim=0)
+            return _average_variants(outputs, channel_groups)
         else:  # 2D
             r0 = model(inputs)
             hw = torch.transpose(inputs, -2, -1)
@@ -197,9 +297,9 @@ def infer_with_tta_sequential(model,
 
             outputs = [
                 r0,
-                torch.transpose(r_hw, -2, -1)
+                _undo_component_change(torch.transpose(r_hw, -2, -1), channel_groups, swapped=(-2, -1)),
             ]
-            return torch.mean(torch.stack(outputs, dim=0), dim=0)
+            return _average_variants(outputs, channel_groups)
 
 
 # Global flag to track if batched TTA has failed (to avoid repeated OOM errors)
@@ -212,7 +312,8 @@ def infer_with_tta(model,
                    *,
                    is_multi_task: bool = False,
                    concat_multi_task_outputs=None,
-                   use_batched: bool = True) -> torch.Tensor:
+                   use_batched: bool = True,
+                   channel_groups=None) -> torch.Tensor:
     """
     Apply TTA for 3D or 2D models with automatic batched/sequential selection.
 
@@ -223,6 +324,8 @@ def infer_with_tta(model,
                 'rotation' uses axis transpositions (sequential only)
     - use_batched: If True, try batched TTA first for mirroring (40-60% faster).
                    Falls back to sequential on OOM.
+    - channel_groups: vector and tensor channels of the output (see `tta_channel_groups`),
+                   whose components are negated / swapped back with each variant.
     """
     global _batched_tta_disabled
 
@@ -246,13 +349,15 @@ def infer_with_tta(model,
                 return infer_with_tta_batched_3d(
                     model, inputs,
                     is_multi_task=is_multi_task,
-                    concat_multi_task_outputs=concat_multi_task_outputs
+                    concat_multi_task_outputs=concat_multi_task_outputs,
+                    channel_groups=channel_groups,
                 )
             else:
                 return infer_with_tta_batched_2d(
                     model, inputs,
                     is_multi_task=is_multi_task,
-                    concat_multi_task_outputs=concat_multi_task_outputs
+                    concat_multi_task_outputs=concat_multi_task_outputs,
+                    channel_groups=channel_groups,
                 )
         except torch.cuda.OutOfMemoryError:
             # Batched TTA failed due to OOM, disable for rest of session
@@ -264,5 +369,6 @@ def infer_with_tta(model,
     return infer_with_tta_sequential(
         model, inputs, tta_type,
         is_multi_task=is_multi_task,
-        concat_multi_task_outputs=concat_multi_task_outputs
+        concat_multi_task_outputs=concat_multi_task_outputs,
+        channel_groups=channel_groups,
     )
