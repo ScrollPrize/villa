@@ -1,6 +1,7 @@
 #include "helirec/pipeline.hpp"
 
 #include "common/interp_core.hpp"
+#include "common/output_core.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -173,6 +174,21 @@ struct SliceReconstructor::Impl {
     struct Held { int lo = 0, hi = 0, m = -1; std::vector<int> p0, p1; std::vector<std::vector<int32_t>> row0; };
     Held held;
     bool reuse_overlap = true;
+    // Projections the raw buffers are sized for: the most any chunk of this height has. Growing a page-locked buffer
+    // of GBs mid-run stalls every CUDA call for seconds, and chunks along a scan see different numbers of projections.
+    int cap_rows = -1, cap_m = -1;
+    std::vector<std::size_t> cap_proj;
+    std::size_t raw_capacity(std::size_t s, int rows, int m) {
+        if (rows != cap_rows || m != cap_m) {
+            cap_proj.assign(scans.size(), 0);
+            for (std::size_t i = 0; i < scans.size(); ++i)
+                cap_proj[i] = static_cast<std::size_t>(max_chunk_projections(scans[i].traj, spans[i], doable.first, doable.second,
+                                                                             rows, m, full_context, !measured));
+            cap_rows = rows;
+            cap_m = m;
+        }
+        return cap_proj[s];
+    }
     std::thread pf_thread;
     int pf_lo = 0, pf_hi = 0, pf_m = -1;
     std::exception_ptr pf_err;
@@ -439,7 +455,7 @@ void SliceReconstructor::Impl::setup_invariants() {
     // output units: the ramp's angular weight 2 pi / NG with pair-balanced full-turn weights gives attenuation; the
     // reference's pi / NG gives attenuation / (angular span / pi) = half of it
     bp.unit_gain = legacy ? static_cast<float>(M_PI / (std::fabs(static_cast<double>(fbp_angles[1]) - fbp_angles[0]) * NG)) : 1.f;
-    const FourierFilterSpec rspec = ramp_filter_spec(rg, ramp_scale(NG, legacy));
+    const FourierFilterSpec rspec = ramp_filter_spec(rg, ramp_scale(NG, legacy), cfg.ramp_filter_name, cfg.ramp_filter_par);
 #ifdef HELIREC_WITH_CUDA
     if (cfg.device == Device::CUDA) {
         ramp_filter = cuda::make_fourier_filter(rspec);
@@ -598,7 +614,9 @@ void SliceReconstructor::Impl::start_prefetch(int lo, int hi, int m) {
     pf_lo = lo; pf_hi = hi; pf_m = m; pf_err = nullptr;
     if (pinned_next.size() != scans.size()) pinned_next.resize(scans.size());
     const bool chained = reuse_overlap && held.m == m && held.hi == lo && held.p0.size() == scans.size();
-    pf_thread = std::thread([this, lo, hi, m, chained] {
+    std::vector<std::size_t> cap(scans.size());
+    for (std::size_t s = 0; s < scans.size(); ++s) cap[s] = raw_capacity(s, hi - lo, m);
+    pf_thread = std::thread([this, lo, hi, m, chained, cap] {
         try {
             for (std::size_t s = 0; s < scans.size(); ++s) {
                 const auto& sd = scans[s];
@@ -607,7 +625,7 @@ void SliceReconstructor::Impl::start_prefetch(int lo, int hi, int m) {
                 const int n = c.p1 - c.p0, win = hi - lo + 2 * m + 1 + 2 * z_pad, cols = sd.traj.det_cols;
                 const std::vector<int32_t> win0 = window_rows(c, z_pad);
                 const std::size_t per = static_cast<std::size_t>(win) * cols;
-                pinned_next[s].ensure(static_cast<std::size_t>(n) * per);
+                pinned_next[s].ensure(std::max(static_cast<std::size_t>(n), cap[s]) * per);
                 uint16_t* dst = pinned_next[s].data();
                 // projections shared with the held chunk: copy its bottom 2m + 1 rows, read only the new rows
                 int a = c.p0, b = c.p0;  // shared range [a, b)
@@ -866,7 +884,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     for (std::size_t s = 0; s < nsc; ++s) {
         const auto& c = chunks[s].cs;
         if (!prefetched) {
-            pinned[s].ensure(static_cast<std::size_t>(c.p1 - c.p0) * per[s]);
+            pinned[s].ensure(std::max(static_cast<std::size_t>(c.p1 - c.p0), next_hi > next_lo ? raw_capacity(s, DY, m) : 0) * per[s]);
             tick("alloc");
         }
         dc[s].row0.upload(c.row0.data(), c.row0.size());
@@ -1245,6 +1263,26 @@ Block mask_bounds(const OutputMask& m, int n, int ry, int rx) {
     return {x0, y0, x1 - x0, y1 - y0};
 }
 
+// The backprojector's tiles (kernels.hpp) of a (bh, bw) block that hold a pixel the mask slice keeps; the block's
+// pixel (y, x) reads the mask element (mask_index(y, oy, fy, ny), mask_index(x, ox, fx, nx)) (as to_uint8).
+void kept_tiles(const std::uint8_t* mask, int ny, int nx, int fy, int fx, int oy, int ox, int bh, int bw,
+                std::vector<std::int32_t>& tiles) {
+    const int T = kBackprojectTile, ntx = (bw + T - 1) / T, nty = (bh + T - 1) / T;
+    const auto index = output_core::mask_index;
+    tiles.clear();
+    for (int ty = 0; ty < nty; ++ty) {
+        const int i0 = index(ty * T, oy, fy, ny), i1 = index(std::min(bh, (ty + 1) * T) - 1, oy, fy, ny);
+        for (int tx = 0; tx < ntx; ++tx) {
+            const int j0 = index(tx * T, ox, fx, nx), j1 = index(std::min(bw, (tx + 1) * T) - 1, ox, fx, nx);
+            bool kept = false;
+            for (int i = i0; i <= i1 && !kept; ++i)
+                kept = std::any_of(mask + static_cast<std::size_t>(i) * nx + j0, mask + static_cast<std::size_t>(i) * nx + j1 + 1,
+                                   [](std::uint8_t v) { return v != 0; });
+            if (kept) tiles.push_back(ty * ntx + tx);
+        }
+    }
+}
+
 }  // namespace
 
 void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out, ChunkDebug* dbg, const SliceRoi* roi_in,
@@ -1254,7 +1292,8 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
     const SliceRoi roi = roi_in ? *roi_in : SliceRoi{0, N, 0, N};
     if (!(0 <= roi.x0 && roi.x0 < roi.x1 && roi.x1 <= N && 0 <= roi.y0 && roi.y0 < roi.y1 && roi.y1 <= N))
         throw Error("reconstruct: ROI outside the slice");
-    if (!out.f32 && !out.u8) throw Error("reconstruct: no output");
+    const bool want_f32 = out.f32 || out.f32_sink, want_u8 = out.u8 || out.u8_sink;
+    if (!want_f32 && !want_u8) throw Error("reconstruct: no output");
     if (h_hi <= h_lo) throw Error("reconstruct: empty height range");
     const int n = h_hi - h_lo, rx = roi.x1 - roi.x0, ry = roi.y1 - roi.y0;
     const std::size_t plane = static_cast<std::size_t>(rx) * ry, N2 = static_cast<std::size_t>(N) * N;
@@ -1268,14 +1307,20 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
         B = b > a && d > c ? Block{a, c, b - a, d - c} : Block{};
     };
     if (out.region) cut(out.region->x0 - roi.x0, out.region->x1 - roi.x0, out.region->y0 - roi.y0, out.region->y1 - roi.y0);
-    if (mask.data && !out.f32 && B.w) {
+    if (mask.data && !want_f32 && B.w) {
         const Block kept = mask_bounds(mask, n, ry, rx);
         cut(kept.x0, kept.x0 + kept.w, kept.y0, kept.y0 + kept.h);
     }
     const bool partial = B.w != rx || B.h != ry;
+    // slice y of the chunk to the sinks, as its block (null: an empty slice)
+    auto to_sinks = [&](int y, const float* f32, const std::uint8_t* u8) {
+        if (out.f32_sink) out.f32_sink->block(out.sink_z + y, B.x0, B.y0, f32 ? B.w : 0, f32 ? B.h : 0, f32);
+        if (out.u8_sink) out.u8_sink->block(out.sink_z + y, B.x0, B.y0, u8 ? B.w : 0, u8 ? B.h : 0, u8);
+    };
     if (!B.w) {   // nothing to compute
         if (out.f32) clear_outside(out.f32, n * ry, rx, Block{});
         if (out.u8) clear_outside(out.u8, n * ry, rx, Block{});
+        for (int y = 0; y < n; ++y) to_sinks(y, nullptr, nullptr);
         if (progress) progress->update(static_cast<std::uint64_t>(n));
         return;
     }
@@ -1307,6 +1352,22 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
     BackprojectParams bp = I.bp;
     bp.x0 = computed.x0;
     bp.y0 = computed.y0;
+    // uint8 slices alone under a mask: the exact backprojector computes only the tiles holding a pixel the mask
+    // keeps (the others are 0 in the output either way). The list is that of the mask slice in hand.
+    const bool mask_tiles = mask.data && !want_f32 && I.cfg.backprojector == "fbp";
+    std::vector<std::int32_t> tiles;
+    int tiles_of = -1;
+    auto set_tiles = [&](int y) {   // false: the mask keeps nothing of slice y
+        if (!mask_tiles) return true;
+        if (mask_slice(y) != tiles_of) {
+            tiles_of = mask_slice(y);
+            kept_tiles(mask.data + tiles_of * mask_plane, mask.ny, mask.nx, mask.fy, mask.fx, mask.oy + B.y0,
+                       mask.ox + B.x0, bh, bw, tiles);
+        }
+        bp.tiles = tiles.data();
+        bp.n_tiles = static_cast<int>(tiles.size());
+        return !tiles.empty();
+    };
     const bool external = I.cfg.backprojector == "external";
     I.raw_rows = external && !I.cfg.external->filtered();
     const int nd = I.NX * I.cfg.bp_oversample;
@@ -1320,24 +1381,26 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
     auto u8_of = [&](int y) { return out.u8 + static_cast<std::size_t>(y) * plane; };
     // a block computed on the host (CPU kernels, external backprojectors): `compute` fills its (bh, bw) floats
     std::vector<float> host_block(out.f32 && !partial ? 0 : block_plane);
-    std::vector<std::uint8_t> host_u8(out.u8 && partial ? block_plane : 0);
+    std::vector<std::uint8_t> host_u8(want_u8 && !(out.u8 && !partial) ? block_plane : 0);
     auto host_sink = [&](int y, const std::function<void(float*)>& compute) {
         float* blk = out.f32 && !partial ? f32_of(y) : host_block.data();
         compute(blk);
-        const Uint8Window w = window(mask.data ? mask.data + mask_slice(y) * mask_plane : nullptr);
-        if (!partial) {
-            if (out.u8) cpu::to_uint8(blk, bw, u8_of(y), bh, bw, w);
-        } else {
+        std::uint8_t* blk8 = nullptr;
+        if (want_u8) {
+            blk8 = out.u8 && !partial ? u8_of(y) : host_u8.data();
+            cpu::to_uint8(blk, bw, blk8, bh, bw, window(mask.data ? mask.data + mask_slice(y) * mask_plane : nullptr));
+        }
+        if (partial) {
             if (out.f32) {
                 clear_outside(f32_of(y), ry, rx, B);
                 place(f32_of(y), rx, B, blk);
             }
             if (out.u8) {
-                cpu::to_uint8(blk, bw, host_u8.data(), bh, bw, w);
                 clear_outside(u8_of(y), ry, rx, B);
-                place(u8_of(y), rx, B, host_u8.data());
+                place(u8_of(y), rx, B, blk8);
             }
         }
+        to_sinks(y, blk, blk8);
         if (progress) progress->update(1);
     };
     if (I.cfg.device == Device::CPU) {
@@ -1352,8 +1415,10 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
                     for (int r = 0; r < bh; ++r)
                         std::memcpy(dst + static_cast<std::size_t>(r) * bw,
                                     full.data() + static_cast<std::size_t>(computed.y0 + r) * N + computed.x0, bw * sizeof(float));
-                } else {
+                } else if (set_tiles(y)) {
                     cpu::backproject(I.fbp_rows(row), I.fbp_angles_of(y), dst, I.n_grid, nd, bh, bw, bp);
+                } else {
+                    std::fill(dst, dst + block_plane, 0.f);
                 }
             });
         });
@@ -1362,8 +1427,8 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
 #ifdef HELIREC_WITH_CUDA
     if (use_ghbp && !I.ghbp) I.ghbp = std::make_unique<cuda::Ghbp>(I.plan);
     if (!external) I.slice.ensure(use_ghbp ? N2 : block_plane);
-    if (!external && out.u8) I.slice_u8.ensure(block_plane);
-    if (!external && out.u8 && mask.data) I.slice_mask.ensure(mask_plane);
+    if (!external && want_u8) I.slice_u8.ensure(block_plane);
+    if (!external && want_u8 && mask.data) I.slice_mask.ensure(mask_plane);
     int mask_loaded = -1;   // the mask slice on the device
     const std::size_t at = static_cast<std::size_t>(B.y0) * rx + B.x0;   // the block in an output slice
     const auto P = I.pipeline(I.cfg.filters);
@@ -1381,10 +1446,15 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
             I.ghbp->run(row, I.slice.data());
             dev += static_cast<std::size_t>(computed.y0) * N + computed.x0;
             pitch = static_cast<std::size_t>(N);
-        } else {
+        } else if (set_tiles(y)) {
             cuda::backproject(I.fbp_rows(row), I.fbp_angles_of(y), I.slice.data(), I.n_grid, nd, bh, bw, bp);
+        } else {   // nothing kept: an empty slice
+            if (out.u8) clear_outside(u8_of(y), ry, rx, Block{});
+            to_sinks(y, nullptr, nullptr);
+            if (progress) progress->update(1);
+            return;
         }
-        if (out.u8) {   // converted before the float download, which then overlaps it
+        if (want_u8) {   // converted before the float download, which then overlaps it
             if (mask.data && mask_slice(y) != mask_loaded) {
                 mask_loaded = mask_slice(y);
                 HELIREC_CUDA_CHECK(cudaMemcpyAsync(I.slice_mask.data(), mask.data + mask_loaded * mask_plane, mask_plane,
@@ -1392,15 +1462,24 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
             }
             cuda::to_uint8(dev, pitch, I.slice_u8.data(), bh, bw, window(mask.data ? I.slice_mask.data() : nullptr));
         }
-        if (out.f32) {
-            if (partial) clear_outside(f32_of(y), ry, rx, B);
-            cuda::download_rows(f32_of(y) + at, dev, pitch, bw, bh, I.slice_host, rx);
+        // the block: device -> page-locked staging -> the sinks as it is, the host arrays at its place in the slice
+        const float* host = nullptr;
+        const std::uint8_t* host8 = nullptr;
+        if (want_f32) {
+            host = cuda::download_block(dev, pitch, bw, bh, I.slice_host);
+            if (out.f32) {
+                if (partial) clear_outside(f32_of(y), ry, rx, B);
+                cuda::copy_rows(f32_of(y) + at, host, bw, bh, rx);
+            }
         }
-        if (out.u8) {
-            if (partial) clear_outside(u8_of(y), ry, rx, B);
-            cuda::download_rows(u8_of(y) + at, static_cast<const std::uint8_t*>(I.slice_u8.data()), bw, bw, bh,
-                                I.slice_u8_host, rx);
+        if (want_u8) {
+            host8 = cuda::download_block(static_cast<const std::uint8_t*>(I.slice_u8.data()), bw, bw, bh, I.slice_u8_host);
+            if (out.u8) {
+                if (partial) clear_outside(u8_of(y), ry, rx, B);
+                cuda::copy_rows(u8_of(y) + at, host8, bw, bh, rx);
+            }
         }
+        to_sinks(y, host, host8);
         if (progress) progress->update(1);
     }, next_lo, next_hi);
 #endif

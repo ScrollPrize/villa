@@ -9,6 +9,7 @@ namespace helirec::cuda {
 
 namespace {
 constexpr int kTile = 16;           // 16x16 threads per block; a block takes a tile of 32x32 pixels, four per thread
+static_assert(2 * kTile == kBackprojectTile, "a block computes one tile");
 constexpr int kPix = 4;             // (kTile apart on each axis)
 constexpr int kAngleChunk = 512;    // angles staged in shared memory per pass
 
@@ -16,9 +17,11 @@ template <int K>
 __global__ void backproject_kernel(const float* __restrict__ sino, const float2* __restrict__ cs_sn,
                                    float* __restrict__ slice, int n_angles, int n_det, int ny, int nx,
                                    float rot_center, float scale, float c, int x0, int y0, bool clip,
-                                   float r2, float us) {
+                                   float r2, float us, const int32_t* __restrict__ tiles, int ntx) {
     __shared__ float2 s_cs[kAngleChunk];
-    const int q0 = blockIdx.x * kTile * 2 + threadIdx.x, r0 = blockIdx.y * kTile * 2 + threadIdx.y;
+    // the block's tile: (blockIdx.x, blockIdx.y), or entry blockIdx.x of the tile list
+    const int bx = tiles ? tiles[blockIdx.x] % ntx : blockIdx.x, by = tiles ? tiles[blockIdx.x] / ntx : blockIdx.y;
+    const int q0 = bx * kTile * 2 + threadIdx.x, r0 = by * kTile * 2 + threadIdx.y;
     float x[kPix], y[kPix], acc[kPix], umax[kPix];
     bool any = false;
 #pragma unroll
@@ -67,11 +70,28 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
     for (int a = 0; a < n_angles; ++a)
         cs[a] = make_float2(std::cos(angles_host[a]), std::sin(angles_host[a]));
     cudaStream_t s = as_stream(stream);
-    DeviceBuffer<float2> d_cs;
-    d_cs.upload(cs.data(), cs.size(), s);
-    dim3 block(kTile, kTile), grid((nx + 2 * kTile - 1) / (2 * kTile), (ny + 2 * kTile - 1) / (2 * kTile));
+    // (kept between calls: one slice after another on the calling thread, each finished before it returns)
+    thread_local DeviceBuffer<float2> d_cs;
+    thread_local DeviceBuffer<int32_t> d_tiles;
+    d_cs.ensure(cs.size());
+    HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_cs.data(), cs.data(), cs.size() * sizeof(float2), cudaMemcpyHostToDevice, s));
+    const int ntx = (nx + 2 * kTile - 1) / (2 * kTile), nty = (ny + 2 * kTile - 1) / (2 * kTile);
+    dim3 block(kTile, kTile), grid(ntx, nty);
+    const int32_t* tiles = nullptr;
+    if (p.tiles) {   // the listed tiles alone; the others are 0
+        HELIREC_CUDA_CHECK(cudaMemsetAsync(slice, 0, static_cast<size_t>(ny) * nx * sizeof(float), s));
+        if (p.n_tiles <= 0) {
+            HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+            return;
+        }
+        d_tiles.ensure(static_cast<size_t>(p.n_tiles));
+        HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_tiles.data(), p.tiles, p.n_tiles * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        tiles = d_tiles.data();
+        grid = dim3(p.n_tiles, 1);
+    }
 #define HELIREC_BP(K) backproject_kernel<K><<<grid, block, 0, s>>>(sino, d_cs.data(), slice, n_angles, n_det, ny, nx, \
-                                           p.rot_center, p.scale, c, p.x0, p.y0, p.clip_outer_circle, r * r, p.u_scale)
+                                           p.rot_center, p.scale, c, p.x0, p.y0, p.clip_outer_circle, r * r, p.u_scale, \
+                                           tiles, ntx)
     switch (p.interp) {
         case interp_core::Linear: HELIREC_BP(interp_core::Linear); break;
         case interp_core::Cubic: HELIREC_BP(interp_core::Cubic); break;
@@ -82,7 +102,7 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
     }
 #undef HELIREC_BP
     HELIREC_CUDA_CHECK(cudaGetLastError());
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));  // d_cs is freed on return
+    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));  // the slice is complete on return
 }
 
 }  // namespace helirec::cuda

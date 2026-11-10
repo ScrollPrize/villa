@@ -124,6 +124,9 @@ def backprojector_config(spec):
       fbp(interp=linear|cubic|lanczos3|bspline3|bspline5, oversample=1..8)   exact pixel-driven backprojector
                                             (default interp=bspline3, oversample=2: ~ideal interpolation)
                                             (oversample: FFT upsampling of the filtered rows before interpolating)
+                                            ghbp and fbp also take the ramp filter, as gridrec:
+                                            filter_name=ramlak (default)|shepp|cosine|hann|hamming|parzen|butterworth|none,
+                                            filter_par=p0:p1
       sirt(num_iter=, relax=, norm=rowsum, weighting=mask|confidence, projector=sf|chord, init=constant|gridrec, init_value=)
       mlem(num_iter=, projector=sf|chord, init=constant|gridrec, init_value=)
       gridrec(filter_name=shepp|ramlak|..., filter_par=a:b)
@@ -132,10 +135,13 @@ def backprojector_config(spec):
     from .filters import parse_chain
     s = dict(spec) if isinstance(spec, dict) else parse_chain(str(spec))[0]
     typ = s.pop("type")
-    if typ == "ghbp":
-        out = dict(backprojector="ghbp")
-    elif typ == "fbp":
-        out = dict(backprojector="fbp", bp_interp=str(s.pop("interp", "bspline3")), bp_oversample=int(s.pop("oversample", 2)))
+    if typ in ("ghbp", "fbp"):
+        out = dict(backprojector=typ)
+        if typ == "fbp":
+            out.update(bp_interp=str(s.pop("interp", "bspline3")), bp_oversample=int(s.pop("oversample", 2)))
+        for k in ("filter_name", "filter_par"):   # the ramp filter (C++ parses and checks it)
+            if k in s:
+                out["ramp_" + k] = str(s.pop(k))
     elif typ in ("sirt", "mlem", "gridrec"):
         out = dict(backprojector=typ, tomo_params={k: str(v) for k, v in s.items()})
         s = {}
@@ -299,7 +305,7 @@ class HelicalRecon:
         return SliceInfo(fraction, h, 999999 - (self.hi - h), height)
 
     def reconstruct_heights(self, h_lo: int, h_hi: int, debug=False, timing=False, roi=None, next=None, uint8=None,
-                            float32=True, progress=None, mask=None, region=None):
+                            float32=True, progress=None, mask=None, region=None, float32_to=None, uint8_to=None, z_to=0):
         """Slices [h_lo, h_hi) -> (n, N, N), or (n, y1 - y0, x1 - x0) with roi = (x0, x1, y0, y1).
         next = (h_lo, h_hi): the chunk the caller will ask for next; its raw data is read while this one computes
         (CUDA).
@@ -309,13 +315,16 @@ class HelicalRecon:
         mask: the uint8 slices are 0 where it is 0: a uint8 array of the output's shape, or a helirec OutputMask
         (possibly coarser: ReferenceMask.read, the mask of a masked reference volume).
         region = (x0, x1, y0, y1): only these pixels of the slice are computed; the rest of the output is 0. With
-        uint8 slices alone and a mask, only the pixels within the bounds of what the mask keeps are computed."""
+        uint8 slices alone and a mask, only the pixels within the bounds of what the mask keeps are computed.
+        float32_to / uint8_to: an OmeZarrWriter that takes the float32 / uint8 slices as slices [z_to, z_to + n) of its
+        volume, straight from the reconstructor (each slice as the block that was computed: no whole slice is built);
+        None is returned in place of that array."""
         if uint8 is not None:   # (lo, hi), or (lo, hi, zero_outside) to say it outright
             uint8 = (float(uint8[0]), float(uint8[1]),
                      bool(uint8[2] if len(uint8) > 2 else self.params["clip_outer_circle"]))
         return self.rec.reconstruct(int(h_lo), int(h_hi), debug, timing, None if roi is None else tuple(map(int, roi)),
                                     None if next is None else (int(next[0]), int(next[1])), uint8, float32, progress, mask,
-                                    None if region is None else tuple(map(int, region)))
+                                    None if region is None else tuple(map(int, region)), float32_to, uint8_to, int(z_to))
 
     def reconstruct_fractions(self, fractions):
         out = []

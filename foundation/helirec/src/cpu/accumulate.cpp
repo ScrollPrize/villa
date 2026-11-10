@@ -31,6 +31,17 @@ ContributorList make_contributors(const int32_t* j0, int n_proj, int n_grid, int
     return c;
 }
 
+void contributor_slots(const ContributorList& c, int n_proj, std::vector<int32_t>& slot, std::vector<int32_t>& slot_proj) {
+    slot.assign(static_cast<std::size_t>(n_proj), -1);
+    for (int32_t k : c.proj) slot[k] = 0;
+    slot_proj.clear();
+    for (int k = 0; k < n_proj; ++k)
+        if (slot[k] == 0) {
+            slot[k] = static_cast<int32_t>(slot_proj.size());
+            slot_proj.push_back(k);
+        }
+}
+
 void set_x_kernel(AccumScanView& v, int interp) {
     v.x_taps = 0;
     if (v.fract_x == 0.f || interp == interp_core::Linear) return;
@@ -87,8 +98,28 @@ namespace cpu {
 
 using namespace helirec::accum_core;
 
-void accumulate(const AccumScanView& s, const ContributorList& c, const AccumParams& p, float* R, float* RW) {
+void accumulate(const AccumScanView& view, const ContributorList& c, const AccumParams& p, float* R, float* RW) {
     const int L = c.g1 - c.g0;
+    AccumScanView s = view;
+    // the vertically interpolated values of the block's projections, once each (they are the same at every column
+    // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead
+    thread_local std::vector<float> col;
+    std::vector<int32_t> slot, slot_proj;
+    if (!p.measured_only && !s.col_val && !c.proj.empty()) {
+        contributor_slots(c, s.n_proj, slot, slot_proj);
+        const int n_slots = static_cast<int>(slot_proj.size()), W = s.det_cols;
+        col.resize(static_cast<std::size_t>(n_slots) * p.H * W);
+        float* const values = col.data();   // (the calling thread's buffer: `col` names another in each worker)
+#pragma omp parallel for collapse(2) schedule(dynamic, 4)
+        for (int q = 0; q < n_slots; ++q)
+            for (int t = 0; t < p.H; ++t) {
+                float* out = values + (static_cast<std::size_t>(q) * p.H + t) * W;
+                for (int x = 0; x < W; ++x) out[x] = column_interp(s, slot_proj[q], t, x);
+            }
+        s.col_val = values;
+        s.col_slot = slot.data();
+        s.col_rows = p.H;
+    }
 #pragma omp parallel for collapse(2) schedule(dynamic, 4)
     for (int jl = 0; jl < L; ++jl)
         for (int t = 0; t < p.H; ++t) {

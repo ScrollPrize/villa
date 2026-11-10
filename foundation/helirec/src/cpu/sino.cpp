@@ -2,6 +2,8 @@
 #include <cmath>
 #include <cstring>
 #include <set>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "common/rebalance_core.hpp"
@@ -105,7 +107,44 @@ std::vector<float> ramlak_half_spectrum(int npad, float scale) {
     return H;
 }
 
-FourierFilterSpec ramp_filter_spec(const RampGeometry& g, float scale) {
+std::vector<std::string> ramp_filter_names() {
+    return {"none", "shepp", "cosine", "hann", "hamming", "ramlak", "parzen", "butterworth"};
+}
+
+std::vector<float> ramp_filter_par(const std::string& text) {
+    std::vector<float> out;
+    std::string t = text;
+    for (char& c : t)
+        if (std::strchr(":/;,[]()", c)) c = ' ';
+    std::istringstream is(t);
+    float v;
+    while (is >> v) out.push_back(v);
+    return out;
+}
+
+float ramp_windowed(const std::string& name, float x, const std::vector<float>& p, float ramp) {
+    const float pi = static_cast<float>(M_PI);
+    const float p0 = p.empty() ? 0.5f : p[0], p1 = p.size() > 1 ? p[1] : 8.f;
+    if (name == "none") return 1.f;
+    if (name == "shepp") return x == 0.f ? ramp : ramp * (std::sin(pi * x) / (pi * x));
+    if (name == "cosine") return ramp * std::cos(pi * x);
+    if (name == "ramlak") return ramp;
+    const bool cut = name == "hann" || name == "hamming" || name == "parzen";   // zero beyond the cutoff p0
+    if (cut || name == "butterworth") {
+        if (!(p0 > 0.f) || !std::isfinite(p0)) throw Error("ramp filter " + name + ": the cutoff (filter_par) must be > 0");
+        if (cut && std::fabs(x) > p0) return 0.f;
+        if (name == "hann") return ramp * 0.5f * (1.f + std::cos(pi * x / p0));
+        if (name == "hamming") return ramp * (0.54f + 0.46f * std::cos(pi * x / p0));
+        if (name == "parzen") return ramp * std::pow(1.f - std::fabs(x) / p0, 3.f);
+        return ramp / (1.f + std::pow(x / p0, 2 * p1));
+    }
+    std::string list;
+    for (const auto& n : ramp_filter_names()) list += (list.empty() ? "" : ", ") + n;
+    throw Error("unknown ramp filter '" + name + "' (" + list + ")");
+}
+
+FourierFilterSpec ramp_filter_spec(const RampGeometry& g, float scale, const std::string& filter_name,
+                                   const std::vector<float>& filter_par) {
     FourierFilterSpec s;
     s.ndim = 1;
     s.h = 1;
@@ -115,7 +154,9 @@ FourierFilterSpec ramp_filter_spec(const RampGeometry& g, float scale) {
     s.pad_top = 0;
     s.pad_left = 0;
     s.mode = PadMode::Zero;
-    s.filter = ramlak_half_spectrum(g.npad, scale);
+    s.filter = ramlak_half_spectrum(g.npad, 1.f);
+    for (std::size_t k = 0; k < s.filter.size(); ++k)
+        s.filter[k] = ramp_windowed(filter_name, static_cast<float>(k) / g.npad, filter_par, s.filter[k]) * scale;
     return s;
 }
 

@@ -66,6 +66,12 @@ struct AccumScanView {
     // positive weight (else the linear interpolation of rows t, t + 1). The weight stays the linear one.
     int z_taps = 0;
     const float* z_w = nullptr;   // (n_proj, z_taps)
+    // optional (accumulate sets it for the block in hand): the vertically interpolated values of the block's
+    // projections, each computed once instead of at every column tap of every pixel it lands on. The value of
+    // projection k at stack row t, column c is col_val[(col_slot[k] * col_rows + t) * det_cols + c].
+    const float* col_val = nullptr;
+    const int32_t* col_slot = nullptr;
+    int col_rows = 0;
 };
 
 // Kernel of the fractional column offset of a scan: `interp` linear (the reference splat; x_taps = 0), cubic (Keys,
@@ -86,6 +92,9 @@ struct ContributorList {
 };
 // upper_bin false (nearest-bin gridding: every alpha is 0, j0 is wrapped): only the role 0 entries.
 ContributorList make_contributors(const int32_t* j0, int n_proj, int n_grid, int g0, int g1, bool upper_bin = true);
+// The projections a block's contributors name, in ascending order (slot_proj), and each projection's place in that
+// list (slot: n_proj entries, -1 for the others).
+void contributor_slots(const ContributorList& c, int n_proj, std::vector<int32_t>& slot, std::vector<int32_t>& slot_proj);
 
 struct AccumParams {
     int H = 0;              // rows of the gridded stack (slices + 2 margins)

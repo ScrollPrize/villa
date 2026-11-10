@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <vector>
+
 #include "common/accumulate_core.hpp"
 #include "cuda_utils.cuh"
 #include "helirec/accumulate.hpp"
@@ -21,6 +24,15 @@ __global__ void accumulate_kernel(AccumScanView s, const int32_t* __restrict__ o
     for (int e = offsets[jl]; e < offsets[jl + 1]; ++e) contribute(s, proj[e], role[e], t, X, p, a, b);
     R[o] = a;
     RW[o] = b;
+}
+
+// the vertically interpolated values of the block's projections: threads x over detector columns, y over rows t, z
+// over the projections (slots)
+__global__ void column_values_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int H, float* __restrict__ out) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (c >= s.det_cols || t >= H) return;
+    out[(static_cast<size_t>(blockIdx.z) * H + t) * s.det_cols + c] = column_interp(s, slot_proj[blockIdx.z], t, c);
 }
 
 __global__ void lum_sums_kernel(const float* R, const float* RW, int L, int H, int NX, int cx, const float* gx,
@@ -72,15 +84,43 @@ DeviceBuffer<T> upload(const std::vector<T>& v, cudaStream_t s) {
 
 }  // namespace
 
-void accumulate(const AccumScanView& s, const ContributorList& c, const AccumParams& p, float* R, float* RW,
+// `v` into a device buffer kept between calls (grow-only)
+template <class T>
+const T* load(DeviceBuffer<T>& d, const std::vector<T>& v, cudaStream_t s) {
+    d.ensure(std::max<std::size_t>(1, v.size()));
+    if (!v.empty()) HELIREC_CUDA_CHECK(cudaMemcpyAsync(d.data(), v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice, s));
+    return d.data();
+}
+
+void accumulate(const AccumScanView& view, const ContributorList& c, const AccumParams& p, float* R, float* RW,
                 void* stream) {
     cudaStream_t st = as_stream(stream);
     const int L = c.g1 - c.g0;
-    auto d_off = upload(c.offsets, st);
-    auto d_proj = upload(c.proj, st);
-    auto d_role = upload(c.role, st);
+    if (L <= 0 || p.H <= 0 || p.NX <= 0 || c.proj.empty()) return;
+    // (work buffers of the calling thread, kept between blocks: every call finishes before it returns)
+    thread_local DeviceBuffer<int32_t> d_off, d_proj, d_slot, d_slot_proj;
+    thread_local DeviceBuffer<int8_t> d_role;
+    thread_local DeviceBuffer<float> d_col;
+    AccumScanView s = view;
+    // the vertically interpolated values of the block's projections, once each (they are the same at every column
+    // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead
+    std::vector<int32_t> slot, slot_proj;
+    if (!p.measured_only && !s.col_val) {
+        contributor_slots(c, s.n_proj, slot, slot_proj);
+        const std::size_t n_slots = slot_proj.size();
+        d_col.ensure(n_slots * p.H * s.det_cols);
+        s.col_slot = load(d_slot, slot, st);
+        dim3 block(128, 1, 1), grid((s.det_cols + 127) / 128, p.H, static_cast<unsigned>(n_slots));
+        column_values_kernel<<<grid, block, 0, st>>>(s, load(d_slot_proj, slot_proj, st), p.H, d_col.data());
+        HELIREC_CUDA_CHECK(cudaGetLastError());
+        s.col_val = d_col.data();
+        s.col_rows = p.H;
+    }
+    const int32_t* off = load(d_off, c.offsets, st);
+    const int32_t* proj = load(d_proj, c.proj, st);
+    const int8_t* role = load(d_role, c.role, st);
     dim3 block(128, 1, 1), grid((p.NX + 127) / 128, p.H, L);
-    accumulate_kernel<<<grid, block, 0, st>>>(s, d_off.data(), d_proj.data(), d_role.data(), L, p.H, p.NX, p, R, RW);
+    accumulate_kernel<<<grid, block, 0, st>>>(s, off, proj, role, L, p.H, p.NX, p, R, RW);
     HELIREC_CUDA_CHECK(cudaGetLastError());
     HELIREC_CUDA_CHECK(cudaStreamSynchronize(st));
 }

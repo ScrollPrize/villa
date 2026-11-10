@@ -131,10 +131,8 @@ FlatInterpolation interpolate_flats(const FlatSeriesInfo& flats, float ang) {
     return {i1-1,i1,(ang-fa[i1-1])/(fa[i1]-fa[i1-1])};
 }
 
-ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const std::vector<double>& control_A,
-                             const FlatSeriesInfo& flats, int h_lo, int h_hi, int margin, int n_grid,
-                             double nominal_current, bool full_context, bool padded_rows) {
-    ChunkScan c;
+std::pair<int, int> chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int h_lo, int h_hi, int margin,
+                                      bool full_context, bool padded_rows) {
     // the reference includes the height h_hi itself (inclusive end of span_v) when selecting projections
     auto [p0, p1] = chunk_projection_span(s, h_lo, h_hi);
     if (full_context) {
@@ -152,6 +150,28 @@ ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const s
         }
         if (p1 <= p0) throw Error("prepare_chunk_scan: no projection sees the chunk");
     }
+    return {p0, p1};
+}
+
+int max_chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int lo, int hi, int rows, int margin,
+                          bool full_context, bool padded_rows) {
+    int most = 0;
+#pragma omp parallel for schedule(static) reduction(max : most)
+    for (int h = lo; h < hi; ++h) {
+        try {
+            const auto [p0, p1] = chunk_projections(t, s, h, std::min(hi, h + rows), margin, full_context, padded_rows);
+            most = std::max(most, p1 - p0);
+        } catch (const Error&) {   // (not a chunk that can be reconstructed)
+        }
+    }
+    return most;
+}
+
+ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const std::vector<double>& control_A,
+                             const FlatSeriesInfo& flats, int h_lo, int h_hi, int margin, int n_grid,
+                             double nominal_current, bool full_context, bool padded_rows) {
+    ChunkScan c;
+    const auto [p0, p1] = chunk_projections(t, s, h_lo, h_hi, margin, full_context, padded_rows);
     c.p0 = p0;
     c.p1 = p1;
     const int n = p1 - p0;

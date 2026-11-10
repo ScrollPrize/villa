@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -21,19 +22,29 @@ namespace {
 template <int K>
 void backproject_k(const float* sino, const std::vector<float>& cs, const std::vector<float>& sn, float* slice,
                    int n_angles, int n_det, int ny, int nx, const BackprojectParams& p, float c, float r) {
-#pragma omp parallel for schedule(dynamic, 4)
-    for (int iy = 0; iy < ny; ++iy) {
-        const float y = static_cast<float>(iy + p.y0) - c;
-        for (int ix = 0; ix < nx; ++ix) {
-            const float x = static_cast<float>(ix + p.x0) - c;
-            float acc = 0.f;
-            if (!p.clip_outer_circle || x * x + y * y <= r * r)
-                for (int a = 0; a < n_angles; ++a)
-                    acc += interp_core::sample_row<K>(sino + static_cast<std::size_t>(a) * n_det, n_det,
-                                                      (x * cs[a] + y * sn[a] + p.rot_center) * p.u_scale);
-            slice[static_cast<std::size_t>(iy) * nx + ix] = acc * p.scale;
+    auto pixel = [&](int iy, int ix) {
+        const float y = static_cast<float>(iy + p.y0) - c, x = static_cast<float>(ix + p.x0) - c;
+        float acc = 0.f;
+        if (!p.clip_outer_circle || x * x + y * y <= r * r)
+            for (int a = 0; a < n_angles; ++a)
+                acc += interp_core::sample_row<K>(sino + static_cast<std::size_t>(a) * n_det, n_det,
+                                                  (x * cs[a] + y * sn[a] + p.rot_center) * p.u_scale);
+        slice[static_cast<std::size_t>(iy) * nx + ix] = acc * p.scale;
+    };
+    if (p.tiles) {   // the listed tiles; the rest of the slice is 0
+        const int T = kBackprojectTile, ntx = (nx + T - 1) / T;
+        std::fill(slice, slice + static_cast<std::size_t>(ny) * nx, 0.f);
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < p.n_tiles; ++i) {
+            const int tx = p.tiles[i] % ntx, ty = p.tiles[i] / ntx;
+            for (int iy = ty * T; iy < std::min(ny, (ty + 1) * T); ++iy)
+                for (int ix = tx * T; ix < std::min(nx, (tx + 1) * T); ++ix) pixel(iy, ix);
         }
+        return;
     }
+#pragma omp parallel for schedule(dynamic, 4)
+    for (int iy = 0; iy < ny; ++iy)
+        for (int ix = 0; ix < nx; ++ix) pixel(iy, ix);
 }
 }  // namespace
 

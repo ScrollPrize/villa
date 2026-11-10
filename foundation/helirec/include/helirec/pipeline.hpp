@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "helirec/block_sink.hpp"
 #include "helirec/ghbp.hpp"
 #include "helirec/helical.hpp"
 #include "helirec/filters.hpp"
@@ -74,6 +75,9 @@ struct ReconConfig {
     // time (linear alone loses ~10 % of the high-frequency contrast)
     std::string bp_interp = "bspline3";
     int bp_oversample = 2;
+    // ramp filter of "ghbp", "fbp" and filtered "external": ramlak, or a windowed ramp (sino.hpp ramp_windowed)
+    std::string ramp_filter_name = "ramlak";
+    std::vector<float> ramp_filter_par;  // {p0, p1}; empty: 0.5, 8
     std::shared_ptr<class ExternalBackprojector> external;  // backprojector "external" (e.g. Python)
     FilterParams tomo_params;            // backprojectors "sirt", "mlem", "gridrec" (tomo.hpp)
     int grid_size = 0;                  // <=0: as the reference (2 * rot_center + 1 rounding rule)
@@ -121,17 +125,22 @@ struct OutputMask {
     int oz = 0, oy = 0, ox = 0;
 };
 
-// Where the slices of a chunk go: host arrays (n, y1 - y0, x1 - x0), either or both. The uint8 version is
+// Where the slices of a chunk go, float32 and / or uint8: host arrays (n, y1 - y0, x1 - x0), or sinks (block_sink.hpp,
+// e.g. an OmeZarrWriter) that take each slice as the block of it that was computed, so that no whole slice is built:
+// slice y of the chunk is the sink's slice sink_z + y, the block in the coordinates of the ROI. The uint8 version is
 // to_uint8 (kernels.hpp) of each slice with the window [u8_lo, u8_hi], 0 outside the reconstruction disk with
 // u8_zero_outside and where u8_mask is 0; on CUDA it is converted on the device, so a uint8-only chunk downloads
 // one byte per pixel.
 // Only the pixels that are needed are backprojected: those of `region` (slice coordinates; the rest of the output is
-// 0), and with uint8 slices alone, those within the bounds of what u8_mask keeps (the others are 0 either way). The
-// exact backprojector computes each pixel on its own, so the pixels computed are those of a whole-slice run; a chunk
-// with none is not reconstructed at all.
+// 0), and with uint8 slices alone, those within the bounds of what u8_mask keeps, and for the exact backprojector
+// only its tiles that hold a kept pixel (the others are 0 either way). The exact backprojector computes each pixel on
+// its own, so the pixels computed are those of a whole-slice run; a chunk with none is not reconstructed at all.
 struct SliceOutput {
     float* f32 = nullptr;
     std::uint8_t* u8 = nullptr;
+    BlockSink* f32_sink = nullptr;
+    BlockSink* u8_sink = nullptr;
+    std::int64_t sink_z = 0;
     double u8_lo = 0.0, u8_hi = 1.0;
     bool u8_zero_outside = false;
     OutputMask u8_mask;

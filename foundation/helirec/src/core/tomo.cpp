@@ -1,5 +1,7 @@
 #include "helirec/tomo.hpp"
 
+#include "helirec/sino.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -18,19 +20,6 @@ bool is_tomo_method(const std::string& backprojector) {
     return std::find(names.begin(), names.end(), backprojector) != names.end();
 }
 
-namespace {
-std::vector<float> float_list(const std::string& s) {  // "1:0.5" or "1/0.5" or a single value
-    std::vector<float> out;
-    std::string t = s;
-    for (char& c : t)
-        if (c == ':' || c == '/' || c == ';') c = ' ';
-    std::istringstream is(t);
-    float v;
-    while (is >> v) out.push_back(v);
-    return out;
-}
-}  // namespace
-
 TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p) {
     TomoArgs a;
     a.algorithm = algorithm;
@@ -43,7 +32,7 @@ TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p) {
         const std::string err = algorithm + ": unknown parameter '" + k + "' (" + known + ")";
         if (gridrec) {
             if (k == "filter_name") a.filter_name = v;
-            else if (k == "filter_par") a.filter_par = float_list(v);
+            else if (k == "filter_par") a.filter_par = ramp_filter_par(v);
             else throw Error(err);
         } else if (k == "num_iter") {
             const double n = p.num(k);

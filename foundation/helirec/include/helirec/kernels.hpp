@@ -1,6 +1,7 @@
 #pragma once
 // Kernel interfaces. One block per pipeline stage; the CPU and CUDA versions
 // have identical semantics and are validated against each other in tests/.
+#include <cstdint>
 #include <string>
 
 #include "helirec/common.hpp"
@@ -39,6 +40,10 @@ void flatfield(const float* raw, const float* dark, const float* flat, float* ou
 // result *= scale. With clip_outer_circle, pixels with x^2 + y^2 > R^2 are 0,
 // R = clip_radius (default: c).
 // sino: (n_angles, n_det), angles: (n_angles) radians, slice: (ny, nx)
+// With `tiles`, only the pixels of the listed tiles are computed and the others are 0 (a caller that knows which
+// pixels it keeps, e.g. under an output mask, skips the rest): the slice is cut in tiles of kBackprojectTile x
+// kBackprojectTile pixels from its first pixel, tile ty * ceil(nx / kBackprojectTile) + tx.
+constexpr int kBackprojectTile = 32;
 struct BackprojectParams {
     float rot_center = 0.f;
     float scale = 1.f;
@@ -50,6 +55,8 @@ struct BackprojectParams {
     float u_scale = 1.f;      // rows sampled u_scale times per detector bin (oversampled): index = u * u_scale
     float unit_gain = 1.f;    // pipeline output / attenuation (cm^-1): 1; legacy reference mode 1/2 (methods that
                               // compute attenuation themselves, e.g. iterative ones, multiply by it)
+    const std::int32_t* tiles = nullptr;   // (n_tiles) host: the tiles to compute, each once; null: the whole slice
+    int n_tiles = 0;
 };
 // interpolation name <-> BackprojectParams::interp
 int interp_from_name(const std::string& name);

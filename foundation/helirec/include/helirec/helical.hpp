@@ -76,6 +76,13 @@ FlatInterpolation interpolate_flats(const FlatSeriesInfo&, float angle);
 ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const std::vector<double>& control_A,
                              const FlatSeriesInfo& flats, int h_lo, int h_hi, int margin, int n_grid,
                              double nominal_current = 0.2, bool full_context = false, bool padded_rows = false);
+// the projections [p0, p1) of that chunk
+std::pair<int, int> chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int h_lo, int h_hi, int margin,
+                                      bool full_context = false, bool padded_rows = false);
+// the most projections a chunk of `rows` slices (fewer at the end) starting anywhere in [lo, hi) has: what buffers
+// that serve one chunk after another need to hold
+int max_chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int lo, int hi, int rows, int margin,
+                          bool full_context = false, bool padded_rows = false);
 
 // number of grid angles: round(360 / |mean step|) over the whole scan
 int grid_angle_count(const std::vector<double>& angles_deg);

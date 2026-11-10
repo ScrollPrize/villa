@@ -24,6 +24,7 @@
 #include "helirec/kernels.hpp"
 #include "helirec/progress.hpp"
 #include "helirec/reference.hpp"
+#include "helirec/zarr.hpp"
 #include "ndarray_utils.hpp"
 
 #ifdef HELIREC_WITH_CUDA
@@ -141,7 +142,7 @@ int projector_id(const std::string& p) {
 
 HostOut backproject_py(HostIn sino, HostIn angles, int ny, int nx, float rot_center, float scale,
                        float center, int x0, int y0, bool clip_outer_circle, float clip_radius,
-                       const std::string& device, int interp, float u_scale) {
+                       const std::string& device, int interp, float u_scale, std::optional<std::vector<std::int32_t>> tiles) {
     require(sino.ndim() == 2, "sino must be (n_angles, n_det)");
     const int n_angles = static_cast<int>(sino.shape(0)), n_det = static_cast<int>(sino.shape(1));
     require(angles.size() == static_cast<std::size_t>(n_angles), "angles length != sino rows");
@@ -150,6 +151,17 @@ HostOut backproject_py(HostIn sino, HostIn angles, int ny, int nx, float rot_cen
     p.rot_center = rot_center; p.scale = scale; p.center = center; p.x0 = x0; p.y0 = y0;
     p.clip_outer_circle = clip_outer_circle; p.clip_radius = clip_radius;
     p.interp = interp; p.u_scale = u_scale;
+    if (tiles) {
+        const int T = kBackprojectTile, n_tiles = ((nx + T - 1) / T) * ((ny + T - 1) / T);
+        std::vector<char> seen(static_cast<std::size_t>(std::max(n_tiles, 0)), 0);
+        for (std::int32_t t : *tiles) {
+            require(t >= 0 && t < n_tiles && !seen[t], "tiles: indices of the slice's tiles, each once");
+            seen[t] = 1;
+        }
+        static const std::int32_t none = 0;   // (an empty list is still a list: nothing is computed)
+        p.tiles = tiles->empty() ? &none : tiles->data();
+        p.n_tiles = static_cast<int>(tiles->size());
+    }
     if (parse_device(device) == Device::CPU) {
         nb::gil_scoped_release nogil;
         cpu::backproject(sino.data(), angles.data(), data(out), n_angles, n_det, ny, nx, p);
@@ -496,14 +508,16 @@ std::pair<HostOut, HostOut> rebalance_py(HostIn R, HostIn W, float rot_center, b
     return {r, w};
 }
 
-HostOut ramp_filter_py(HostIn sino, float rot_center, int pad_factor, bool normalize, bool legacy, const std::string& device) {
+HostOut ramp_filter_py(HostIn sino, float rot_center, int pad_factor, bool normalize, bool legacy, const std::string& device,
+                       const std::string& filter_name, const std::string& filter_par) {
     require(sino.ndim() == 2, "sino must be (n_proj, n_bins)");
     const int n_proj = static_cast<int>(sino.shape(0)), n_bins = static_cast<int>(sino.shape(1));
     const Device dev = parse_device(device);
     HostOut out = new_array(shape_of(sino));
     nb::gil_scoped_release nogil;
     const RampGeometry g = ramp_geometry(n_bins, n_proj, rot_center, pad_factor, legacy);
-    const FourierFilterSpec spec = ramp_filter_spec(g, normalize ? ramp_scale(n_proj, legacy) : 1.f);
+    const FourierFilterSpec spec = ramp_filter_spec(g, normalize ? ramp_scale(n_proj, legacy) : 1.f, filter_name,
+                                                    ramp_filter_par(filter_par));
     if (dev == Device::CPU) {
         std::vector<float> padded(static_cast<std::size_t>(n_proj) * g.npad);
         cpu::ramp_pad(sino.data(), padded.data(), g);
@@ -648,6 +662,8 @@ class PySliceReconstructor {
             for (auto [k, v] : nb::cast<nb::dict>(c["tomo_params"])) cfg.tomo_params.values[nb::cast<std::string>(k)] = to_text(v);
         f("bp_interp", cfg.bp_interp);
         f("bp_oversample", cfg.bp_oversample);
+        f("ramp_filter_name", cfg.ramp_filter_name);
+        if (nb::object o = get("ramp_filter_par"); o.is_valid() && !o.is_none()) cfg.ramp_filter_par = ramp_filter_par(to_text(o));
         if (c.contains("external_bp") && !nb::object(c["external_bp"]).is_none())
             cfg.external = std::make_shared<PyExternalBackprojector>(nb::cast<nb::dict>(c["external_bp"]));
         f("grid_size", cfg.grid_size);
@@ -678,7 +694,8 @@ class PySliceReconstructor {
     nb::object reconstruct(int h_lo, int h_hi, bool debug, bool timing, std::optional<std::array<int, 4>> roi,
                            std::optional<std::array<int, 2>> next, std::optional<std::tuple<double, double, bool>> uint8,
                            bool float32, ProgressBar* progress, nb::object mask,
-                           std::optional<std::array<int, 4>> region) {
+                           std::optional<std::array<int, 4>> region, OmeZarrWriter* float32_to, OmeZarrWriter* uint8_to,
+                           std::int64_t z_to) {
         const int N = impl_->grid_size();
         SliceRoi r{0, N, 0, N};
         if (roi) r = SliceRoi{(*roi)[0], (*roi)[1], (*roi)[2], (*roi)[3]};
@@ -691,19 +708,35 @@ class PySliceReconstructor {
                                              static_cast<std::size_t>(r.x1 - r.x0)};
         SliceOutput o;
         nb::object f32 = nb::none(), u8 = nb::none();
-        if (float32) {
+        // a writer takes an output as the blocks computed, in place of an array
+        auto sink = [&](OmeZarrWriter* w, const char* dtype, const char* what) -> BlockSink* {
+            require(w->dtype() == dtype, std::string(what) + ": the writer's dtype is not the output's");
+            require(static_cast<std::size_t>(w->shape()[1]) == shape[1] && static_cast<std::size_t>(w->shape()[2]) == shape[2] &&
+                    z_to >= 0 && z_to + static_cast<std::int64_t>(shape[0]) <= w->shape()[0],
+                    std::string(what) + ": the writer's volume does not hold these slices (z_to, y1 - y0, x1 - x0)");
+            return w;
+        };
+        o.sink_z = z_to;
+        require(!debug || !(float32_to || uint8_to), "debug=True returns arrays");
+        if (float32 && float32_to) {
+            o.f32_sink = sink(float32_to, "<f4", "float32_to");
+        } else if (float32) {
             HostOut a = new_array(shape);
             o.f32 = data(a);
             f32 = nb::cast(a);
         }
         if (uint8) {
             require(std::get<1>(*uint8) > std::get<0>(*uint8), "uint8=(lo, hi, zero_outside) needs hi > lo");
-            auto a = new_array_t<std::uint8_t>(shape);
-            o.u8 = static_cast<std::uint8_t*>(a.data());
+            if (uint8_to) {
+                o.u8_sink = sink(uint8_to, "|u1", "uint8_to");
+            } else {
+                auto a = new_array_t<std::uint8_t>(shape);
+                o.u8 = static_cast<std::uint8_t*>(a.data());
+                u8 = nb::cast(a);
+            }
             o.u8_lo = std::get<0>(*uint8);
             o.u8_hi = std::get<1>(*uint8);
             o.u8_zero_outside = std::get<2>(*uint8);
-            u8 = nb::cast(a);
         }
         if (region) {
             require((*region)[0] < (*region)[1] && (*region)[2] < (*region)[3], "region (x0, x1, y0, y1) is empty");
@@ -738,8 +771,8 @@ class PySliceReconstructor {
         for (const auto& [k, v] : dbg.seconds) sec[k.c_str()] = v;
         for (const auto& [k, v] : dbg.stats) sec[("stat_" + k).c_str()] = v;
         nb::dict d;
-        if (float32) d["slices"] = f32;
-        if (uint8) d["uint8"] = u8;
+        if (o.f32) d["slices"] = f32;
+        if (o.u8) d["uint8"] = u8;
         if (timing) d["seconds"] = sec;
         if (!debug) return d;
         const std::size_t DY = h_hi - h_lo, NG = impl_->n_grid(), NX = impl_->merged_width();
@@ -817,10 +850,11 @@ NB_MODULE(_core, m) {
           "-log(max((raw - dark) / (flat - dark), threshold)) per frame");
     m.def("backproject", &backproject_py, "sino"_a, "angles"_a, "ny"_a, "nx"_a, "rot_center"_a,
           "scale"_a = 1.f, "center"_a = -1.f, "x0"_a = 0, "y0"_a = 0, "clip_outer_circle"_a = false,
-          "clip_radius"_a = -1.f, "device"_a = "cpu", "interp"_a = 0, "u_scale"_a = 1.f,
+          "clip_radius"_a = -1.f, "device"_a = "cpu", "interp"_a = 0, "u_scale"_a = 1.f, "tiles"_a = nb::none(),
           "Exact pixel-driven parallel-beam backprojection; interp 0 linear, 1 cubic (Keys), 2 lanczos3, 3 bspline3, 4 bspline5 "
           "(B-spline: pass bspline_prefilter'd rows); rows "
-          "sampled u_scale times per bin");
+          "sampled u_scale times per bin. tiles: only these 32 x 32 pixel tiles of the slice (index ty * ceil(nx / 32) + "
+          "tx) are computed, the others are 0");
     m.def("upsample_rows",
           [](HostIn rows, int os, const std::string& device) {
               require(rows.ndim() == 2, "rows must be (n_rows, n)");
@@ -1128,6 +1162,7 @@ NB_MODULE(_core, m) {
         .def("reconstruct", &PySliceReconstructor::reconstruct, "h_lo"_a, "h_hi"_a, "debug"_a = false,
              "timing"_a = false, "roi"_a = nb::none(), "next"_a = nb::none(), "uint8"_a = nb::none(), "float32"_a = true,
              nb::arg("progress").none() = nb::none(), "mask"_a = nb::none(), "region"_a = nb::none(),
+             nb::arg("float32_to").none() = nb::none(), nb::arg("uint8_to").none() = nb::none(), "z_to"_a = 0,
              "slices for view heights [h_lo, h_hi) -> (n, N, N), or (n, y1 - y0, x1 - x0) with roi=(x0, x1, y0, y1); "
              "uint8=(lo, hi, zero_outside): also the uint8 slices of that window (to_uint8; 0 outside the "
              "reconstruction disk with zero_outside), converted on the device with CUDA -> (float32, uint8), or the "
@@ -1138,7 +1173,10 @@ NB_MODULE(_core, m) {
              "where it is 0: a uint8 array of the output's shape, or an OutputMask (possibly coarser, e.g. "
              "ReferenceMask.read); region=(x0, x1, y0, y1): only these pixels of the slice are computed, the rest of "
              "the output is 0. With uint8 slices alone, only the pixels within the bounds of what the mask keeps are "
-             "computed (the others are 0 either way); the pixels computed are those of a whole-slice run")
+             "computed (the others are 0 either way); the pixels computed are those of a whole-slice run. "
+             "float32_to / uint8_to: an OmeZarrWriter that takes the float32 / uint8 slices as slices [z_to, z_to + n) of "
+             "its volume, each as the block of it that was computed, so that no whole slice is built; None is returned "
+             "in place of that array")
         .def("reconstruct_band", &PySliceReconstructor::reconstruct_band, "h_lo"_a, "h_hi"_a, "band"_a,
              "timing"_a = false, "sweep"_a = nb::none(), "next"_a = nb::none(),
              "reconstruct the chunk [h_lo, h_hi) only at the band pixels `band` needs (exact backprojector) and "
@@ -1271,6 +1309,110 @@ NB_MODULE(_core, m) {
              "the OutputMask of volume slices [z0, z1) of roi = (x0, x1, y0, y1); its data is this object's buffer "
              "`slot`, valid until the next read into that slot");
 
+    nb::class_<OmeZarrWriter>(m, "OmeZarrWriter",
+                              "Streaming OME-Zarr (NGFF 0.4, Zarr v2) writer of a (z, y, x) uint8 or float32 volume: level "
+                              "0 is stored z-chunk by z-chunk as slices arrive (any order, each once), chunks raw, zlib or "
+                              "(uint8) lossless vc-delta3d, on worker threads; chunks that are all 0 are not stored; "
+                              "close() builds the further pyramid levels (2x mean pooling). A SliceReconstructor writes "
+                              "into it directly (reconstruct(float32_to= / uint8_to=))")
+        .def("__init__", [](OmeZarrWriter* self, const std::string& path, std::array<std::int64_t, 3> shape, nb::object dtype,
+                            std::array<std::int64_t, 3> chunks, double voxel_size_um, std::array<std::int64_t, 3> origin_zyx,
+                            int levels, const std::string& compression, int zlib_level, nb::object name, nb::object attrs,
+                            bool overwrite, int threads, bool skip_empty, const std::string& delta3d_preset) {
+                 OmeZarrOptions o;
+                 o.shape = shape;
+                 o.dtype = nb::cast<std::string>(nb::module_::import_("numpy").attr("dtype")(dtype).attr("str"));
+                 require(o.dtype == "|u1" || o.dtype == "<f4", "dtype must be uint8 or float32");
+                 o.chunks = chunks;
+                 o.voxel_size_um = voxel_size_um;
+                 o.origin = origin_zyx;
+                 o.levels = levels;
+                 o.compression = compression;
+                 o.zlib_level = zlib_level;
+                 if (!name.is_none()) o.name = nb::cast<std::string>(name);
+                 if (!attrs.is_none()) o.attrs_json = nb::cast<std::string>(nb::module_::import_("json").attr("dumps")(attrs));
+                 o.overwrite = overwrite;
+                 o.threads = threads;
+                 o.skip_empty = skip_empty;
+                 o.delta3d_preset = delta3d_preset;
+                 new (self) OmeZarrWriter(path, o);
+             }, "path"_a, "shape"_a, "dtype"_a, "chunks"_a = std::array<std::int64_t, 3>{32, 256, 256}, "voxel_size_um"_a = 1.0,
+             "origin_zyx"_a = std::array<std::int64_t, 3>{0, 0, 0}, "levels"_a = 1, "compression"_a = "none", "zlib_level"_a = 1,
+             "name"_a = nb::none(), "attrs"_a = nb::none(), "overwrite"_a = false, "threads"_a = 16, "skip_empty"_a = true,
+             "delta3d_preset"_a = "fast")
+        .def_prop_ro("path", &OmeZarrWriter::path)
+        .def_prop_ro("shape", [](const OmeZarrWriter& w) { return nb::make_tuple(w.shape()[0], w.shape()[1], w.shape()[2]); })
+        .def_prop_ro("chunks", [](const OmeZarrWriter& w) { return nb::make_tuple(w.chunks()[0], w.chunks()[1], w.chunks()[2]); })
+        .def_prop_ro("dtype", [](const OmeZarrWriter& w) { return nb::module_::import_("numpy").attr("dtype")(w.dtype()); })
+        .def_prop_ro("levels", &OmeZarrWriter::levels)
+        .def_prop_ro("level_shapes", [](const OmeZarrWriter& w) {
+            nb::list out;
+            for (const auto& s : w.level_shapes()) out.append(nb::make_tuple(s[0], s[1], s[2]));
+            return out;
+        })
+        .def_prop_ro("n_written", &OmeZarrWriter::n_written, "chunks stored so far")
+        .def_prop_ro("n_skipped", &OmeZarrWriter::n_skipped, "chunks not stored, being all 0")
+        .def("write", [](OmeZarrWriter& w, std::int64_t z0, nb::object data) {
+                 // (converted to the volume's dtype as NumPy does, when it is another)
+                 nb::object a = nb::module_::import_("numpy").attr("ascontiguousarray")(data, w.dtype());
+                 const void* p = nullptr;
+                 std::size_t n = 0, ny = 0, nx = 0;
+                 auto take = [&](const auto& v) {
+                     require(v.ndim() == 3, "data must be (n, Y, X)");
+                     p = v.data(); n = v.shape(0); ny = v.shape(1); nx = v.shape(2);
+                 };
+                 if (w.dtype() == "|u1") take(nb::cast<nb::ndarray<const std::uint8_t, nb::c_contig, nb::device::cpu>>(a));
+                 else take(nb::cast<nb::ndarray<const float, nb::c_contig, nb::device::cpu>>(a));
+                 require(static_cast<std::int64_t>(ny) == w.shape()[1] && static_cast<std::int64_t>(nx) == w.shape()[2] && z0 >= 0 &&
+                         z0 + static_cast<std::int64_t>(n) <= w.shape()[0], "the slices do not fit the volume");
+                 nb::gil_scoped_release nogil;
+                 w.write(z0, static_cast<std::int64_t>(n), p);
+             }, "z0"_a, "data"_a, "write slices [z0, z0 + len(data)) of level 0 (any order / granularity, each slice once)")
+        .def("close", [](OmeZarrWriter& w, nb::object progress) {
+                 std::function<std::function<void()>(int, std::int64_t)> cb;
+                 if (!progress.is_none())
+                     cb = [&progress](int level, std::int64_t slabs) -> std::function<void()> {
+                         nb::gil_scoped_acquire gil;
+                         nb::object step = progress(level, slabs);
+                         if (step.is_none()) return {};
+                         auto held = std::shared_ptr<nb::object>(new nb::object(std::move(step)), [](nb::object* o) {
+                             nb::gil_scoped_acquire gil;
+                             delete o;
+                         });
+                         return [held] {
+                             nb::gil_scoped_acquire gil;
+                             (*held)();
+                         };
+                     };
+                 nb::gil_scoped_release nogil;
+                 w.close(cb);
+             }, "progress"_a = nb::none(),
+             "store what is left and build the pyramid levels. progress(level, n_slabs): called before a level is built; "
+             "its return value, when not None, is called after each of the level's slabs")
+        .def("read", [](const OmeZarrWriter& w, int level, std::int64_t z0, std::int64_t z1) {
+                 require(level >= 0 && level < w.levels(), "no such level");
+                 const auto& s = w.level_shapes()[level];
+                 require(0 <= z0 && z0 <= z1 && z1 <= s[0], "slices outside the level");
+                 const std::vector<std::size_t> shape{static_cast<std::size_t>(z1 - z0), static_cast<std::size_t>(s[1]),
+                                                      static_cast<std::size_t>(s[2])};
+                 nb::object out;
+                 void* p = nullptr;
+                 if (w.dtype() == "|u1") {
+                     auto a = new_array_t<std::uint8_t>(shape);
+                     p = a.data();
+                     out = nb::cast(a);
+                 } else {
+                     HostOut a = new_array(shape);
+                     p = data(a);
+                     out = nb::cast(a);
+                 }
+                 {
+                     nb::gil_scoped_release nogil;
+                     w.read(level, z0, z1, p);
+                 }
+                 return out;
+             }, "level"_a, "z0"_a, "z1"_a, "slices [z0, z1) of a level (whole y, x) as stored: after close()");
+
     nb::class_<ProgressBar>(m, "ProgressBar",
                             "tqdm-style terminal progress bar: redrawn in place on a terminal, one line every "
                             "log_interval seconds otherwise. Thread-safe; usable as a context manager.")
@@ -1312,9 +1454,11 @@ NB_MODULE(_core, m) {
           "Hole filling + half-acquisition balanced weights (opposite view, periodic; legacy_reference: the nabuxx "
           "endpoint handling); returns (R, W_bal) copies");
     m.def("ramp_filter", &ramp_filter_py, "sino"_a, "rot_center"_a, "pad_factor"_a = 1, "normalize"_a = true,
-          "legacy_reference"_a = false, "device"_a = "cpu",
-          "Ram-Lak filter with opposite-ray padding, (n_proj, n_bins) -> same shape. normalize: x 2 pi / n_proj "
-          "(attenuation for pair-balanced full-turn data; legacy_reference: pi / n_proj and integer padding reflection)");
+          "legacy_reference"_a = false, "device"_a = "cpu", "filter_name"_a = "ramlak", "filter_par"_a = "",
+          "Ramp filter with opposite-ray padding, (n_proj, n_bins) -> same shape. normalize: x 2 pi / n_proj "
+          "(attenuation for pair-balanced full-turn data; legacy_reference: pi / n_proj and integer padding reflection). "
+          "filter_name: ramlak or a windowed ramp (ramp_filter_names), filter_par 'p0:p1'");
+    m.def("ramp_filter_names", &ramp_filter_names, "ramp filters of fbp / ghbp and gridrec");
     m.def("ramp_scale", &ramp_scale, "n_proj"_a, "legacy_reference"_a = false);
     m.def("ramp_geometry", [](int n_bins, int n_proj, float rot_center, int pad_factor, bool legacy) {
               const RampGeometry g = ramp_geometry(n_bins, n_proj, rot_center, pad_factor, legacy);

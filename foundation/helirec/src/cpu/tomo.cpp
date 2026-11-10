@@ -66,28 +66,14 @@ void pswf_tables(int pdim, std::vector<float>& wtbl, std::vector<float>& winv) {
     }
 }
 
-// ramp-filter windows; x = j / pdim
-float filter_value(const std::string& name, float x, int j, const std::vector<float>& p) {
-    const float pi = static_cast<float>(M_PI), ax = std::fabs(2 * x);
-    const float p0 = p.empty() ? 0.5f : p[0], p1 = p.size() > 1 ? p[1] : 8.f;
-    if (name == "none") return 1.f;
-    if (name == "shepp") return j == 0 ? 0.f : ax * (std::sin(pi * x) / (pi * x));
-    if (name == "cosine") return ax * std::cos(pi * x);
-    if (name == "hann") return ax * 0.5f * (1.f + std::cos(2 * pi * x / p0));
-    if (name == "hamming") return ax * (0.54f + 0.46f * std::cos(2 * pi * x / p0));
-    if (name == "ramlak") return ax;
-    if (name == "parzen") return ax * std::pow(1.f - std::fabs(x) / p0, 3.f);
-    if (name == "butterworth") return ax / (1.f + std::pow(x / p0, 2 * p1));
-    throw Error("gridrec: unknown filter '" + name + "' (none, shepp, cosine, hann, hamming, ramlak, parzen, butterworth)");
-}
-
 // filter x phase factors, pdim / 2 entries; `scale` multiplies the normalisation pi / pd / dt
 std::vector<std::complex<float>> filter_phase(int pdim, int n_angles, float center, const TomoArgs& a, float scale) {
     const int pd2 = pdim / 2;
     const float norm = static_cast<float>(M_PI) / pdim / n_angles * scale, rtmp1 = 2 * static_cast<float>(M_PI) * center / pdim;
     std::vector<std::complex<float>> A(pd2);
     for (int j = 0; j < pd2; ++j) {
-        const float f = filter_value(a.filter_name, static_cast<float>(j) / pdim, j, a.filter_par);
+        const float xf = static_cast<float>(j) / pdim;   // cycles per pixel; the ramp |2 xf| x window (sino.hpp)
+        const float f = ramp_windowed(a.filter_name, xf, a.filter_par, std::fabs(2 * xf));
         const float x = j * rtmp1;
         A[j] = f * std::complex<float>(std::cos(x), -std::sin(x)) * norm;
     }

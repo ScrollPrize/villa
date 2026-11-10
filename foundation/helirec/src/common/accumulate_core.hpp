@@ -55,21 +55,38 @@ HR_HD bool z_kernel_value(const AccumScanView& s, int k, int t, int c, bool fini
     return true;
 }
 
-// vertically interpolated value at window row t (raw row r = row0 + t), with the reference's
-// edge padding: rows above / below the detector take the value at raw row 0 / det_rows - 2
-// and the weight non_zero.
-HR_HD void column_value(const AccumScanView& s, int k, int t, int c, float non_zero, float& val, float& wt) {
+// window row of the (interpolated) sample used at window row t (raw row r = row0 + t), with the reference's edge
+// padding (`pad`): rows above / below the detector take the value at raw row 0 / det_rows - 2 and the weight non_zero
+HR_HD int padded_row(const AccumScanView& s, int k, int t, bool& pad) {
     const int r = s.row0[k] + t;
+    pad = true;
+    if (r < 0) return -s.row0[k];
+    if (r > s.det_rows - 2) return s.det_rows - 2 - s.row0[k];
+    pad = false;
+    return t;
+}
+
+// vertically interpolated value at window row t of column c: the value of column_value
+HR_HD float column_interp(const AccumScanView& s, int k, int t, int c) {
     const float a = s.fract_v[k];
-    int tv;  // window row of the (interpolated) sample used
-    bool pad = false;
-    if (r < 0) { tv = -s.row0[k]; pad = true; }
-    else if (r > s.det_rows - 2) { tv = s.det_rows - 2 - s.row0[k]; pad = true; }
-    else tv = t;
+    bool pad;
+    const int tv = padded_row(s, k, t, pad);
+    float val;
     if (!(a != 0.0f && s.z_taps > 0 && !pad && z_kernel_value(s, k, t, c, false, false, 0.f, 0.f, val))) {
         val = flat_field(s, k, tv, c);
         if (a != 0.0f) val = add(mul(sub(1.0f, a), val), mul(a, flat_field(s, k, tv + 1, c)));
     }
+    return val;
+}
+
+// vertically interpolated value (column_interp, or what was computed of it: AccumScanView::col_val) and weight at
+// window row t
+HR_HD void column_value(const AccumScanView& s, int k, int t, int c, float non_zero, float& val, float& wt) {
+    const float a = s.fract_v[k];
+    bool pad;
+    const int tv = padded_row(s, k, t, pad);
+    val = s.col_val ? s.col_val[(static_cast<std::size_t>(s.col_slot[k]) * s.col_rows + t) * s.det_cols + c]
+                    : column_interp(s, k, t, c);
     if (pad) {
         wt = non_zero;
     } else {

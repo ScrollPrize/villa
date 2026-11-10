@@ -177,6 +177,103 @@ def test_reconstruct_only_the_pixels_needed(tmp_path, device, backprojector):
         r.reconstruct(h0, h1, region=(3, 3, 0, 4))
 
 
+@pytest.mark.parametrize("device", helirec.devices())
+def test_reconstruct_into_a_writer(tmp_path, device):
+    """a writer takes the slices as the blocks computed: what it stores is what the arrays hold"""
+    scan, *_ = helical_scan(tmp_path)
+    r = recon(scan, device, backprojector="fbp", clip_outer_circle=False, grid_size=70)     # several backprojector tiles
+    lo, hi = r.info["doable"]
+    h0, h1 = lo + 1, min(hi, lo + 6)
+    n = h1 - h0
+    whole = r.reconstruct(h0, h1)
+    window = (float(np.percentile(whole, 20)), float(np.percentile(whole, 90)))
+    rng = np.random.default_rng(7)
+    k = 0
+    for roi, region, masked in [(None, None, False), ((3, 60, 8, 70), (10, 50, 20, 44), False), (None, None, True),
+                                ((3, 60, 8, 70), None, True)]:
+        shape = (n, roi[3] - roi[2], roi[1] - roi[0]) if roi else whole.shape
+        mask = rest = None
+        if masked:      # a coarse mask keeping patches: some tiles hold nothing, slices of the same mask element share it
+            coarse = (rng.random(tuple(-(-s // f) for s, f in zip(shape, (2, 8, 8)))) < 0.3).astype(np.uint8)
+            mask, rest = OutputMask(coarse, (2, 8, 8)), OutputMask(coarse, (2, 8, 8), (2, 0, 0))    # (of the slices from 2 on)
+        kw = dict(roi=roi, region=region, uint8=(*window, True), mask=mask)
+        f, u = r.reconstruct(h0, h1, **kw)
+        assert u.any() and (not masked or (u == 0).mean() > 0.5)
+        vol = (n + 3,) + shape[1:]                                                 # the chunk's slices at z 1.., in two calls
+        k += 1
+        wf = OmeZarrWriter(str(tmp_path / f"f{k}.zarr"), vol, np.float32, chunks=(4, 16, 32))
+        wu = OmeZarrWriter(str(tmp_path / f"u{k}.zarr"), vol, np.uint8, chunks=(4, 16, 32), levels=2)
+        assert r.reconstruct(h0, h0 + 2, float32_to=wf, uint8_to=wu, z_to=1, **kw) == (None, None)
+        both = r.reconstruct(h0 + 2, h1, uint8_to=wu, z_to=3, **dict(kw, mask=rest))   # a writer for one, an array for the other
+        assert both[1] is None
+        np.testing.assert_array_equal(both[0], f[2:])
+        wf.write(3, both[0])
+        only = OmeZarrWriter(str(tmp_path / f"o{k}.zarr"), shape, np.uint8, chunks=(4, 16, 32))
+        assert r.reconstruct(h0, h1, float32=False, uint8_to=only, **kw) is None    # uint8 alone: bounds and tiles of the mask
+        for w in (wf, wu, only):
+            w.close()
+        pad = lambda a: np.concatenate([np.zeros_like(a[:1]), a, np.zeros_like(a[:2])])
+        np.testing.assert_array_equal(wf.read(0, 0, n + 3), pad(f))
+        np.testing.assert_array_equal(wu.read(0, 0, n + 3), pad(u))
+        np.testing.assert_array_equal(only.read(0, 0, n), u)
+        assert wu.read(1, 0, wu.level_shapes[1][0]).any()
+    with pytest.raises(RuntimeError, match="dtype"):
+        r.reconstruct(h0, h1, float32_to=only)
+    with pytest.raises(RuntimeError, match="does not hold"):
+        r.reconstruct(h0, h1, uint8=(*window, True), float32=False, uint8_to=only, z_to=1)
+    with pytest.raises(RuntimeError, match="written twice"):
+        again = OmeZarrWriter(str(tmp_path / "again.zarr"), whole.shape, np.float32, chunks=(8, 16, 32))
+        r.reconstruct(h0, h1, float32_to=again)
+        r.reconstruct(h0, h1, float32_to=again)
+
+
+def test_remote_reference_reads_through_a_cache(tmp_path):
+    """an http(s):// / s3:// Zarr is read chunk by chunk, each kept in the cache directory once read"""
+    import functools
+    import http.server
+    import json
+    import shutil
+    import threading
+    rng = np.random.default_rng(6)
+    vol = np.zeros((21, 34, 27), np.uint8)
+    vol[3:17, 6:30, 4:20] = rng.integers(1, 255, (14, 24, 16))
+    root = tmp_path / "served"
+    w = OmeZarrWriter(str(root / "ref.zarr"), vol.shape, np.uint8, chunks=(8, 8, 8), levels=3)
+    w.write(0, vol)
+    w.close()
+    # the same pyramid without the translations of its levels: taken as block-reduced, which is what they say
+    shutil.copytree(root / "ref.zarr", root / "plain.zarr")
+    attrs = json.loads((root / "plain.zarr" / ".zattrs").read_text())
+    for d in attrs["multiscales"][0]["datasets"]:
+        d["coordinateTransformations"] = [t for t in d["coordinateTransformations"] if t["type"] == "scale"]
+    (root / "plain.zarr" / ".zattrs").write_text(json.dumps(attrs))
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(root)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    ones = np.ones(vol.shape, np.float32)
+    read = lambda ref, slot=0: to_uint8(ones, 0.0, 1.0, mask=ref.read(0, 21, (0, 27, 0, 34), slot))
+    cache = str(tmp_path / "cache")
+    try:
+        for scale in range(3):
+            want = read(ReferenceMask(str(root / "ref.zarr"), scale, vol.shape))
+            np.testing.assert_array_equal(read(ReferenceMask(str(root / "plain.zarr"), scale, vol.shape)), want)
+            np.testing.assert_array_equal(read(ReferenceMask(f"{url}/ref.zarr", scale, vol.shape)), want)           # no cache
+            np.testing.assert_array_equal(read(ReferenceMask(f"{url}/plain.zarr", scale, vol.shape, cache)), want)
+        with pytest.raises(RuntimeError, match="no Zarr v2 array or OME-Zarr group"):
+            ReferenceMask(f"{url}/nothing.zarr", 0, vol.shape)
+    finally:
+        server.shutdown()
+        server.server_close()
+    # the server gone: chunks, the fact that others do not exist, and the metadata all come from the cache
+    np.testing.assert_array_equal(read(ReferenceMask(f"{url}/plain.zarr", 2, vol.shape, cache)), want)
+    with pytest.raises(RuntimeError, match="cannot read"):
+        ReferenceMask(f"{url}/ref.zarr", 2, vol.shape, cache)
+
+
 def test_progress_text():
     f = ProgressBar.format
     assert f(2272, 5398, 192, 11.8, "reconstruct", "slice", "backproject", 100, False) == \

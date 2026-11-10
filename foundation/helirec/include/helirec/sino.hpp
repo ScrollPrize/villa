@@ -67,8 +67,24 @@ RampGeometry ramp_geometry(int n_bins, int n_proj, float rot_center, int pad_fac
 // half the attenuation (legacy reference units).
 std::vector<float> ramlak_half_spectrum(int npad, float scale);
 float ramp_scale(int n_proj, bool legacy);
-// 1D FourierFilterSpec on padded rows of length npad (no further padding)
-FourierFilterSpec ramp_filter_spec(const RampGeometry& g, float scale);
+// Ramp filters (the FBP ramp and gridrec): `ramp` at x cycles per pixel (|x| <= 1/2) times the window `name`.
+//   ramlak       1 (the ramp itself)
+//   shepp        sinc(x)
+//   cosine       cos(pi x)
+//   hann         (1 + cos(pi x / p0)) / 2            zero beyond the cutoff p0
+//   hamming      0.54 + 0.46 cos(pi x / p0)          zero beyond p0
+//   parzen       (1 - |x| / p0)^3                    zero beyond p0
+//   butterworth  1 / (1 + (x / p0)^(2 p1))           half amplitude at p0, order p1
+//   none         no ramp either: the value is 1 (plain backprojection)
+// par = {p0, p1}: the cutoff p0 in cycles per pixel (default 0.5, Nyquist) and the Butterworth order p1 (default 8);
+// text "p0:p1": ramp_filter_par. Hann and Hamming are tomopy 1.0's: since 1.1 tomopy's cos(2 pi x / p0) puts their
+// minimum at p0 / 2 (half Nyquist by default) and returns to 1 at p0, and tomopy's windows are not cut beyond p0.
+std::vector<std::string> ramp_filter_names();
+std::vector<float> ramp_filter_par(const std::string& text);   // "0.5:8", "0.5/8", "[0.5, 8]" or a single value
+float ramp_windowed(const std::string& name, float x, const std::vector<float>& par, float ramp);
+// 1D FourierFilterSpec on padded rows of length npad (no further padding): the Ram-Lak spectrum x window x scale
+FourierFilterSpec ramp_filter_spec(const RampGeometry& g, float scale, const std::string& filter_name = "ramlak",
+                                   const std::vector<float>& filter_par = {});
 
 // sino (n_proj, n_bins) -> padded (n_proj, npad): own row, opposite (theta+pi) row
 // mirrored about the axis (offset-matched near the axis), constant edge elsewhere. The mirror is x -> 2 rot_center - x,

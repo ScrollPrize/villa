@@ -65,6 +65,17 @@ def test_gridrec_position_and_scale(device):
     assert best[1:] == (0, 0)
 
 
+@pytest.mark.parametrize("device", helirec.devices())
+def test_gridrec_windows_cut_at_nyquist(device):
+    # a detector-Nyquist pattern: the default hann (cutoff 0.5 cycles per pixel) removes it, hamming leaves 8 %
+    s = np.tile(np.where(np.arange(ND) % 2, -1, 1) * np.hanning(ND), (len(ANG), 1)).astype(np.float32)
+    w = np.full_like(s, 0.5)
+    rms = {f: np.sqrt(np.mean(_core.tomo_reconstruct(s, w, ANG, N, ROT, "gridrec", {"filter_name": f}, device=device)[MASK] ** 2))
+           for f in ("ramlak", "hann", "hamming", "parzen")}
+    assert rms["hann"] < 0.02 * rms["ramlak"] and rms["parzen"] < 0.02 * rms["ramlak"], rms
+    assert 0.05 * rms["ramlak"] < rms["hamming"] < 0.12 * rms["ramlak"], rms
+
+
 ITER = [("sirt", {"num_iter": 60}, 0.2), ("mlem", {"num_iter": 40}, 0.12), ("sirt", {"num_iter": 10, "init": "gridrec"}, 0.15),
         ("mlem", {"num_iter": 10, "init": "gridrec"}, 0.12)]
 
@@ -119,6 +130,10 @@ def test_backprojector_specs():
     assert backprojector_config("ghbp") == {"backprojector": "ghbp"}
     assert backprojector_config("fbp(interp=cubic,oversample=2)") == {"backprojector": "fbp", "bp_interp": "cubic", "bp_oversample": 2}
     assert backprojector_config("fbp") == {"backprojector": "fbp", "bp_interp": "bspline3", "bp_oversample": 2}
+    assert backprojector_config("fbp(filter_name=hann,filter_par=1)") == {
+        "backprojector": "fbp", "bp_interp": "bspline3", "bp_oversample": 2, "ramp_filter_name": "hann", "ramp_filter_par": "1"}
+    assert backprojector_config("ghbp(filter_name=butterworth,filter_par=0.4:6)") == {
+        "backprojector": "ghbp", "ramp_filter_name": "butterworth", "ramp_filter_par": "0.4:6"}
     c = backprojector_config("sirt(num_iter=5,init=gridrec)")
     assert c == {"backprojector": "sirt", "tomo_params": {"num_iter": "5", "init": "gridrec"}}
     assert backprojector_config("mlem")["backprojector"] == "mlem"

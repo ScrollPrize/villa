@@ -42,3 +42,22 @@ def test_cpu_cuda_agree_offcenter_roi_clip():
     b = helirec.backproject(sino, angles, device="cuda", **kw)
     np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-3 * np.abs(a).max())
     assert (a == 0).any() and (a != 0).any()  # clip circle crosses the ROI
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+def test_only_the_listed_tiles_are_computed(device):
+    rng = np.random.default_rng(2)
+    sino = rng.standard_normal((200, 180)).astype(np.float32)
+    angles = rng.uniform(-7, 7, 200).astype(np.float32)
+    ny, nx, T = 70, 101, 32
+    kw = dict(ny=ny, nx=nx, rot_center=88.2, scale=0.7, center=60.0, x0=5, y0=9, interp=1, device=device)
+    full = helirec.backproject(sino, angles, **kw)
+    ntx, nty = -(-nx // T), -(-ny // T)
+    for tiles in ([], [0], [5, 2, 11], list(range(ntx * nty))):     # tile ty * ntx + tx; the others are 0
+        keep = np.zeros((ny, nx), bool)
+        for t in tiles:
+            keep[(t // ntx) * T:(t // ntx + 1) * T, (t % ntx) * T:(t % ntx + 1) * T] = True
+        np.testing.assert_array_equal(helirec.backproject(sino, angles, tiles=tiles, **kw), np.where(keep, full, 0))
+    for bad in ([ntx * nty], [1, 1]):
+        with pytest.raises(RuntimeError, match="tiles"):
+            helirec.backproject(sino, angles, tiles=bad, **kw)

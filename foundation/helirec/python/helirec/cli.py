@@ -245,24 +245,24 @@ def run_range(a, r, out, manifest):
             if reader:
                 mask = pending.result()
                 pending = read_mask(i + 1) if i + 1 < len(chunks) else None
-            # float32 and / or uint8 slices: the uint8 ones are converted on the device
+            zc = c0 - h0  # index inside the output
+            # float32 and / or uint8 slices (the uint8 ones converted on the device); OME-Zarr: the reconstructor
+            # hands them to the writers itself, as the blocks it computed
+            to = dict(writers)
             res = r.reconstruct_heights(c0, c1, roi=roi, next=chunks[i + 1] if i + 1 < len(chunks) else None,
                                         uint8=a.u8_window if a.uint8 else None, float32=not a.uint8_only, progress=bar,
-                                        mask=mask, region=a.bbox)
+                                        mask=mask, region=a.bbox, float32_to=to.get("float32"), uint8_to=to.get("uint8"),
+                                        z_to=zc)
             vol, vol8 = res if a.uint8 and not a.uint8_only else (None, res) if a.uint8 else (res, None)
             bar.set_postfix("write")
-            zc = c0 - h0  # index inside the output
-            if a.format == "zarr":
-                for kind, w in writers:
-                    w.write(zc, vol if kind == "float32" else vol8)
-            else:
+            if a.format != "zarr":
                 for k in range(c1 - c0):
                     zz = c0 + k - r.lo
                     if not a.uint8_only:
                         tifffile.imwrite(os.path.join(out, "float32", f"z{zz:05d}.tiff"), vol[k])
                     if a.uint8:
                         tifffile.imwrite(os.path.join(out, "uint8", f"z{zz:05d}.tif"), vol8[k])
-            if mid_preview is None and c0 <= (h0 + h1) // 2 < c1 and not a.no_preview:
+            if a.format != "zarr" and c0 <= (h0 + h1) // 2 < c1 and not a.no_preview:
                 k = (h0 + h1) // 2 - c0
                 mid_preview = vol8[k] if a.uint8_only else to_u8(vol[k], a.u8_window)
     if reader:
@@ -280,6 +280,10 @@ def run_range(a, r, out, manifest):
         for b in bars:
             b.close()
         manifest.setdefault("chunks_written", {})[kind] = dict(written=w.n_written, skipped_empty=w.n_skipped)
+    if writers and not a.no_preview:   # the middle slice, as stored
+        k = (h0 + h1) // 2 - h0
+        stored = {kind: w.read(0, k, k + 1)[0] for kind, w in writers}
+        mid_preview = stored["uint8"] if "uint8" in stored else to_u8(stored["float32"], a.u8_window)
     if mid_preview is not None:
         write_png_gray(os.path.join(out, "preview_mid.png"), mid_preview)
     manifest["seconds"] = round(time.time() - t_all, 1)

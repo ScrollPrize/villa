@@ -2,7 +2,8 @@
 // The mask of a reference volume on the reconstruction's grid: a masked uint8 volume of the same scan (e.g. the
 // published one), whose zero voxels are zero in the uint8 output, so that its mask need not be redone. Any pyramid
 // level of the reference serves (`scale`): a coarse level is a small read and marks the same area to within its voxel
-// size. Read with vc_reader: a local or http(s):// / s3:// Zarr array or OME-Zarr pyramid, with an optional disk cache.
+// size. Read with zarr.hpp: a local or http(s):// / s3:// Zarr v2 array or OME-Zarr pyramid, with an optional disk
+// cache.
 #include <array>
 #include <cstdint>
 #include <memory>

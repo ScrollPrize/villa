@@ -56,8 +56,13 @@ helirec-slices PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif       
   the scan): the uint8 output is 0 wherever the reference is 0; the float32 output is not masked. The reference's
   level 0 must have the reconstruction's full shape (z, y, x). `--reference_scale LEVEL` takes the mask from a coarser
   pyramid level instead (each of its voxels decides the block of output voxels it covers), which is a far smaller
-  read: an 8x level is 1/512 of the data. The reference is read in C++ with vc_reader (`helirec::ReferenceMask`: a
-  local path, or an `http(s)://` / `s3://` location with `--reference_cache DIR` as its disk cache).
+  read: an 8x level is 1/512 of the data. The reference is read in C++ with helirec's own Zarr reader
+  (`helirec::ReferenceMask` on `zarr.hpp`: a Zarr v2 array or OME-Zarr pyramid at a local path, or at an `http(s)://`
+  / `s3://` location (a public bucket, no credentials) with `--reference_cache DIR` as its disk cache: each chunk is
+  kept under `DIR/helirec_zarr/` once read). A pyramid level that declares no translation is taken as block-reduced.
+  Under a mask the exact backprojector computes only its 32 x 32 pixel tiles that hold a kept pixel.
+* The volume is written in C++ (`helirec::OmeZarrWriter`): the reconstructor hands it each slice as the block it
+  computed, so no whole slice is built on the host and only the chunks that hold data are buffered, encoded and stored.
 * Only the pixels that are needed are backprojected, and their values are those of a whole-slice run (the exact
   backprojector computes each pixel on its own): `--bbox X0 X1 Y0 Y1` reconstructs that box of each slice and leaves
   the rest of the output 0 (the output keeps its shape; `--roi` crops it), and a `--uint8_only` run with a
@@ -137,8 +142,14 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
 * `ghbp`: the reference hierarchical backprojector (default).
 * `fbp(interp=linear|cubic|lanczos3|bspline3|bspline5, oversample=1..8)`: exact pixel-driven backprojector;
   `oversample` FFT-upsamples the filtered rows before interpolating (default bspline3, 2×).
+* `ghbp` and `fbp` take the ramp filter as `filter_name` (default `ramlak`) and `filter_par=p0:p1` (defaults 0.5, 8),
+  e.g. `fbp(filter_name=hann,filter_par=1)`: the windows of gridrec (`sino.hpp` `ramp_windowed`) on the band-limited
+  Ram-Lak ramp. `p0` is the cutoff in cycles per pixel (default 0.5, Nyquist) and `p1` the Butterworth order;
+  `hann`, `hamming` and `parzen` are zero beyond `p0`. These differ from tomopy ≥ 1.1 for `hann` and `hamming`
+  (there the window's minimum is at `p0 / 2`, half Nyquist by default, and it returns to 1 at `p0`) and for cutoffs
+  below Nyquist (tomopy's windows are not cut beyond `p0`); gridrec uses the same windows.
 * Whole-slice methods (`tomo.hpp`; CPU `src/cpu/tomo.cpp`, CUDA `src/cuda/tomo.cu`). SIRT, MLEM and gridrec began
-  as ports of tomopy's libtomo implementations (https://github.com/tomography/tomopy):
+  as ports of tomopy's libtomo implementations (https://github.com/tomopy/tomopy):
   * `sirt(num_iter, relax, norm=rowsum, weighting=mask|confidence, projector=sf|chord, init=constant|gridrec, init_value)`
   * `mlem(num_iter, projector, init, init_value)`
   * `gridrec(filter_name, filter_par=a:b)`, filters `none`, `shepp`, `cosine`, `hann`, `hamming`, `ramlak`,
@@ -459,15 +470,15 @@ whole-slice methods, and regression checks of the corrected conventions (`tests/
 
 ## Build
 
-Requirements: CMake ≥ 3.24, a C++20 compiler, FFTW3 (float + double), HDF5 (C), Python ≥ 3.10, the libraries
-vc_reader's native library needs (libcurl, blosc, zstd, lz4, SQLite3, nlohmann-json, zlib, libtiff, libpng, libjpeg),
-and optionally the CUDA toolkit. vc_reader's native library is built from `../../vc_reader` into helirec (or an
-installed `vc_reader` CMake package is used). CUDA code is compiled for the build machine's GPU (`native`); override with
+Requirements: CMake ≥ 3.24, a C++20 compiler, FFTW3 (float + double), HDF5 (C), zlib, libcurl, Python ≥ 3.10, and
+optionally the CUDA toolkit. The vc-delta3d codec is fetched at configure time (offline:
+`-DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>`). CUDA code is compiled for the build machine's GPU (`native`); override with
 `-DCMAKE_CUDA_ARCHITECTURES=...`. `HELIREC_CUDA=AUTO` (default) builds CUDA only if `nvcc` is found, so put it on
 `PATH` (or pass `-C cmake.define.HELIREC_CUDA=ON`); check with `helirec.devices()`.
 
-Run from `foundation/helirec` in a Villa checkout containing `vc_reader` at `../../vc_reader`.
-The local dependency source is configured in `pyproject.toml`; `uv sync` includes composite support.
+Run from `foundation/helirec` in a Villa checkout containing `vc_reader` at `../../vc_reader`: `helirec-composite`
+uses the vc_reader Python package (surfaces), which `pyproject.toml` takes from there; `uv sync` includes it. The
+native library itself does not use vc_reader.
 To also install the test dependencies:
 
 ```bash

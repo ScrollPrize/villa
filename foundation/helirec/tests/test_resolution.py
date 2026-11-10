@@ -305,3 +305,21 @@ def test_exposure_arc_in_the_pipeline(tmp_path, device):
     for bad in (dict(exposure_arc=1.5), dict(exposure_arc=0.5, legacy_reference=True)):
         with pytest.raises(Exception, match="exposure"):
             recon(scan, device, backprojector="fbp", **bad)
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("backprojector", ["fbp", "ghbp"])
+def test_pipeline_ramp_filter(tmp_path, device, backprojector):
+    # the reconstructor's ramp is ramp_filter with the configured window; the default is the Ram-Lak ramp
+    scan, *_ = helical_scan(tmp_path)
+    run = lambda **kw: recon(scan, device, backprojector=backprojector, tomo_params={}, **kw).reconstruct(7, 8, debug=True)
+    base = run()
+    np.testing.assert_array_equal(base["slices"], run(ramp_filter_name="ramlak")["slices"])
+    for name, par in (("hann", "1"), ("butterworth", "0.3:4"), ("shepp", None)):
+        d = run(ramp_filter_name=name, ramp_filter_par=par)
+        rows = _core.ramp_filter(np.ascontiguousarray(d["sino"][:, 0]), 11.5, device=device, filter_name=name, filter_par=par or "")
+        np.testing.assert_allclose(d["filtered"][0], rows * d["wbal"][:, 0], atol=1e-6, err_msg=name)
+        assert np.abs(d["slices"] - base["slices"]).max() > 1e-3 * np.abs(base["slices"]).max(), name
+    with pytest.raises(Exception, match="unknown ramp filter"):
+        run(ramp_filter_name="lanczos")
+

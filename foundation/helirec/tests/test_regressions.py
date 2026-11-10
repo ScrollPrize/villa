@@ -228,6 +228,47 @@ def test_ramp_padding_reflection():
     assert err[False] < err[True], err
 
 
+# ---------------------------------------------------------------- ramp filters (windowed ramps of fbp / ghbp)
+def ramp_window(name, x, p0=0.5, p1=8.0):
+    """the window of each ramp filter at x cycles per pixel"""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return {"ramlak": lambda: np.ones_like(x),
+                "shepp": lambda: np.sinc(x),
+                "cosine": lambda: np.cos(np.pi * x),
+                "hann": lambda: np.where(x <= p0, 0.5 * (1 + np.cos(np.pi * x / p0)), 0),      # zero beyond the cutoff p0
+                "hamming": lambda: np.where(x <= p0, 0.54 + 0.46 * np.cos(np.pi * x / p0), 0),
+                "parzen": lambda: np.where(x <= p0, (1 - np.abs(x) / p0) ** 3, 0),
+                "butterworth": lambda: 1 / (1 + (x / p0) ** (2 * p1))}[name]()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("par", [None, (0.3, 4.0), (1.0,)])
+def test_ramp_filter_windows(device, par):
+    assert set(_core.ramp_filter_names()) == {"none", "shepp", "cosine", "hann", "hamming", "ramlak", "parzen", "butterworth"}
+    # an impulse on a centred axis has zero padding: the filtered row is the filter's kernel around the impulse
+    nb, n_proj, c = 96, 4, 40
+    rot = (nb - 1) / 2
+    npad = _core.ramp_geometry(nb, n_proj, rot)["npad"]
+    S = np.zeros((n_proj, nb), np.float32)
+    S[:, c] = 1
+    h = np.zeros(npad)
+    h[0] = 0.25
+    n = np.arange(1, npad // 2, 2)
+    h[n] = h[-n] = -1 / (np.pi * n) ** 2
+    H, x = np.fft.rfft(h).real, np.arange(npad // 2 + 1) / npad
+    scale, text = _core.ramp_scale(n_proj), "" if par is None else ":".join(map(str, par))
+    np.testing.assert_array_equal(_core.ramp_filter(S, rot, device=device), _core.ramp_filter(S, rot, device=device, filter_name="ramlak", filter_par=text))
+    for name in _core.ramp_filter_names():
+        spectrum = np.ones_like(H) if name == "none" else H * ramp_window(name, x, *(par or ()))
+        expect = np.roll(np.fft.irfft(spectrum * scale, npad), c)[:nb]
+        q = _core.ramp_filter(S, rot, device=device, filter_name=name, filter_par=text)
+        np.testing.assert_allclose(q, np.tile(expect, (n_proj, 1)), atol=2e-6 * scale, err_msg=name)
+    with pytest.raises(Exception, match="unknown ramp filter"):
+        _core.ramp_filter(S, rot, device=device, filter_name="lanczos")
+    with pytest.raises(Exception, match="cutoff"):
+        _core.ramp_filter(S, rot, device=device, filter_name="hann", filter_par="0")
+
+
 # ---------------------------------------------------------------- mending domain
 @pytest.mark.parametrize("device", DEVICES)
 def test_mending_domain(device):

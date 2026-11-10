@@ -54,16 +54,22 @@ class FakeRecon:
                 if self.params["mode"] == "legacy_reference" else "attenuation_cm-1"}
 
     def reconstruct_heights(self, lo, hi, roi=None, uint8=None, float32=True, progress=None, mask=None, region=None,
-                            **kwargs):
+                            float32_to=None, uint8_to=None, z_to=0, **kwargs):
         vol = np.broadcast_to(np.arange(64, dtype=np.float32).reshape(8, 8), (hi - lo, 8, 8)).copy()
         self.regions.append(region)
         if progress is not None:
             progress.update(hi - lo)
+
+        def out(a, writer):     # (as HelicalRecon: a writer takes the slices in place of the array)
+            if writer is None:
+                return a
+            writer.write(z_to, a)
+
         if uint8 is None:
-            return vol
+            return out(vol, float32_to)
         lo, hi, *zero_outside = uint8      # (as HelicalRecon: the outer circle is clipped unless told otherwise)
         u8 = to_uint8(vol, lo, hi, disk=(8, 0, 0) if not zero_outside or zero_outside[0] else None, mask=mask)
-        return (vol, u8) if float32 else u8
+        return (out(vol, float32_to), out(u8, uint8_to)) if float32 else out(u8, uint8_to)
 
 
 @pytest.mark.parametrize("previews", [False, True])
