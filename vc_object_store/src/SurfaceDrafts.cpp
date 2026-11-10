@@ -86,6 +86,23 @@ std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface
     return draft;
 }
 
+vc::geometry::Surface draftGrid(const SurfaceDraft& draft)
+{
+    const auto count = std::size_t(draft.rows * draft.columns);
+    vc::geometry::Surface surface{draft.rows, draft.columns, {1, 1}, {}};
+    surface.points.resize(count);
+    surface.validity.assign(count, 1);
+    for (const auto& tile : draft.tiles)
+        for (int64_t r = 0; r < tile.rect.rows; ++r)
+            for (int64_t c = 0; c < tile.rect.columns; ++c) {
+                const auto source = std::size_t(r * tile.rect.columns + c);
+                const auto target = std::size_t((tile.rect.row + r) * draft.columns + tile.rect.column + c);
+                surface.points[target] = tile.data->tile.points[source];
+                surface.validity[target] = tile.data->channel[source];
+            }
+    return surface;
+}
+
 std::shared_ptr<const SurfaceDraft> editSurfaceDraft(const SurfaceDraft& draft, int64_t row, int64_t column, int64_t rows,
                                                      int64_t columns, std::span<const SurfacePoint> points,
                                                      std::span<const uint8_t> validity)

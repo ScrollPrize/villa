@@ -217,6 +217,8 @@ set(srcs
     overlays/ViewerOverlayControllerBase.hpp
     overlays/SpiralOverlayController.cpp
     overlays/SpiralOverlayController.hpp
+    overlays/SpiralFiberOverlayController.cpp
+    overlays/SpiralFiberOverlayController.hpp
     SurfacePanelController.cpp
     SurfacePanelController.hpp
     MenuActionController.cpp
@@ -267,6 +269,16 @@ set(srcs
     SpiralServiceManager.hpp
     SpiralServiceProfile.hpp
     SpiralSessionSync.hpp
+    SpiralProjectInputs.cpp
+    SpiralProjectInputs.hpp
+    SpiralStoreInputs.cpp
+    SpiralStoreInputs.hpp
+    SpiralPreviewWindings.cpp
+    SpiralPreviewWindings.hpp
+    SpiralStoredFits.cpp
+    SpiralStoredFits.hpp
+    SpiralStoreEdits.cpp
+    SpiralStoreEdits.hpp
     SpiralSshTunnel.cpp
     SpiralSshTunnel.hpp
     SpiralDescriptions.cpp
@@ -307,6 +319,8 @@ set(srcs
     ToolProcess.hpp
     PointCollectionSync.cpp
     PointCollectionSync.hpp
+    SessionDrafts.cpp
+    SessionDrafts.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
     ConsoleOutputWidget.cpp
@@ -369,6 +383,7 @@ endif()
 add_library(vc3d_app OBJECT ${srcs} resources.qrc)
 add_executable(VC3D VCAppMain.cpp)
 target_link_libraries(VC3D PRIVATE vc3d_app)
+add_dependencies(VC3D vc_object_convert)
 # Its uic headers (ui_*.h) are included by VCAppMain.cpp and the benchmarks too.
 target_include_directories(vc3d_app PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/vc3d_app_autogen/include)
 

@@ -73,7 +73,7 @@ namespace {
 void requireCheckedLifecycle(sqlite3* db)
 {
     Statement checked(db, "SELECT 1 FROM history_checked");
-    if (!checked.row()) throw std::runtime_error("object lifecycle requires write(expected_revisions)");
+    if (!checked.row()) throw std::runtime_error("object lifecycle requires a checked write (expected versions)");
 }
 }
 
@@ -93,16 +93,18 @@ void ObjectStore::retireObject(WriteTxn& txn, const std::string& uuid)
 }
 
 void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
-                               const std::optional<std::string>& sourceRevision)
+                               const std::optional<ObjectVersion>& sourceVersion)
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     requireCheckedLifecycle(db);
     const auto current = objectByUuid(txn, uuid);
     if (!current) throw std::invalid_argument("object lifecycle: unknown object");
-    if (!current->retired && !sourceRevision) return;
+    if (!current->retired && !sourceVersion) return;
     std::optional<ObjectRevision> source;
-    if (sourceRevision) source = objectRevision(txn, *sourceRevision);
-    else {
+    if (sourceVersion) {
+        source = objectAtVersion(txn, *sourceVersion);
+        if (!source) throw std::invalid_argument("object lifecycle: restore source version is not recorded in this store");
+    } else {
         auto history = objectHistory(txn, uuid);
         for (auto it = history.rbegin(); it != history.rend(); ++it)
             if (it->publishedAtUs && !it->deleted && !it->record.retired) { source = *it; break; }

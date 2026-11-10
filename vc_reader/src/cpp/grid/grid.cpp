@@ -289,6 +289,8 @@ struct ChunkLookup {
     float fill;
     std::int64_t shape[3], block[3], stride[3], grid[3];
     int shift[3];
+    std::optional<std::int64_t> channelChunk;
+    std::int64_t channelOffset = 0, keyOffset = 0;
 
     struct Slot {
         std::int64_t key = -1;
@@ -304,15 +306,21 @@ struct ChunkLookup {
     {
         const auto& spec = array->spec();
         fill = float(L.type.load(spec.fill.data()));
+        const std::size_t first = L.channel ? 1 : 0;
         for (std::size_t a = 0; a < 3; ++a) {
-            shape[a] = spec.shape[a];
-            block[a] = spec.chunks[a];
+            shape[a] = spec.shape[first + a];
+            block[a] = spec.chunks[first + a];
             grid[a] = (shape[a] + block[a] - 1) / block[a];
             shift[a] = std::has_single_bit(std::uint64_t(block[a])) ? std::countr_zero(std::uint64_t(block[a])) : -1;
         }
         stride[2] = std::int64_t(spec.itemsize);
         stride[1] = block[2] * stride[2];
         stride[0] = block[1] * stride[1];
+        if (L.channel) {
+            channelChunk = *L.channel / spec.chunks[0];
+            channelOffset = (*L.channel % spec.chunks[0]) * block[0] * stride[0];
+            keyOffset = *channelChunk * grid[0] * grid[1] * grid[2];
+        }
     }
     std::int64_t chunkOf(std::int64_t v, int a) const { return shift[a] >= 0 ? v >> shift[a] : v / block[a]; }
     float load(const unsigned char* p) const { return float(loader(p)); }
@@ -322,12 +330,12 @@ struct ChunkLookup {
     const unsigned char* voxel(const std::int64_t* v, bool& available)
     {
         const std::int64_t c[3]{chunkOf(v[0], 0), chunkOf(v[1], 1), chunkOf(v[2], 2)};
-        const std::int64_t key = (c[0] * grid[1] + c[1]) * grid[2] + c[2];
+        const std::int64_t key = keyOffset + (c[0] * grid[1] + c[1]) * grid[2] + c[2];
         const Slot& slot = slots[last].key == key ? slots[last] : find(key, c);
         available = slot.available;
         if (!available || !slot.chunk)
             return nullptr;
-        return slot.chunk->data() + (v[0] - c[0] * block[0]) * stride[0] + (v[1] - c[1] * block[1]) * stride[1] +
+        return slot.chunk->data() + channelOffset + (v[0] - c[0] * block[0]) * stride[0] + (v[1] - c[1] * block[1]) * stride[1] +
                (v[2] - c[2] * block[2]) * stride[2];
     }
 
@@ -339,7 +347,9 @@ struct ChunkLookup {
         Slot& slot = slots[last = next];
         next = (next + 1) % slots.size();
         slot.key = key;
-        const Index idx{c[0], c[1], c[2]};
+        Index idx{c[0], c[1], c[2]};
+        if (channelChunk)
+            idx.insert(idx.begin(), *channelChunk);
         if (cachedOnly) {
             auto [found, data] = array->cached_chunk(idx);
             slot.available = found;
@@ -461,9 +471,12 @@ void checkRequest(const Request& request, int width, int height)
         throw std::invalid_argument("a sample request needs at least one level");
     if (request.levels.size() > 127)
         throw std::invalid_argument("a sample request takes at most 127 levels");
-    for (const auto& L : request.levels)
-        if (!L.array || L.array->ndim() != 3)
-            throw std::invalid_argument("sample levels must be 3-D arrays");
+    for (const auto& L : request.levels) {
+        if (!L.array || L.array->ndim() != (L.channel ? 4 : 3))
+            throw std::invalid_argument("sample levels must be ZYX arrays or selected CZYX channels");
+        if (L.channel && (*L.channel < 0 || *L.channel >= L.array->spec().shape[0]))
+            throw std::invalid_argument("sample channel is outside the array");
+    }
     if (request.offsets.empty())
         throw std::invalid_argument("a sample request needs at least one layer");
     if (request.order != 0 && request.order != 1)
@@ -662,6 +675,10 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
     for (auto* r : readers)
         if (!r || r->device_id() != readers.front()->device_id())
             throw std::invalid_argument("CUDA readers must share one device");
+    for (std::size_t i = 0; i < readers.size(); ++i)
+        if (readers[i]->channel() != request.levels[i].channel ||
+            readers[i]->array().spec().identity != request.levels[i].array->spec().identity)
+            throw std::invalid_argument("CUDA reader must match the level's array and channel");
     const int deviceId = readers.front()->device_id();
     device::Guard guard(deviceId);
     const std::size_t pixels = std::size_t(width) * std::size_t(height);

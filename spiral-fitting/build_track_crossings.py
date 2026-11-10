@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build an exact-crossing CSR sidecar beside a Spiral tracks DBM.
 
-The default output is ``TRACKS_DBM.crossings.npz``.  ``fit_spiral.py`` loads
-that file automatically when its DBM fingerprint matches, avoiding the large
-packed-coordinate sort at every session load.
+The default output is ``TRACKS_DBM.crossings.npz``, which
+``grow_track_graph.py`` reads. (A fit takes its crossings from the object
+store's track-crossing links instead.)
 
 Example:
 
@@ -15,8 +15,7 @@ To build only the tracks wholly contained in a fitting ROI:
         --z-min 4000 --z-max 17000 --temp-dir /fast/disk/tmp
 
 The z range is half-open: ``[z_min, z_max)``. A range-limited build replaces
-the adjacent sidecar, so the fitter using it must select the same or a narrower
-track range.
+the adjacent sidecar.
 
 The builder stages 20 bytes per selected point in temporary disk files beside
 the tracks DBM by default (12 bytes of coordinates plus an 8-byte packed voxel

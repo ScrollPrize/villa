@@ -125,7 +125,7 @@ public:
     // Make object revision `revision` of a surface in a writable store its
     // current one (a new revision with its content); the open surface reopens
     // from the commit. False with a reason when it cannot.
-    bool restoreRevision(const std::string& id, const std::string& revision, QString* errorMessage = nullptr);
+    bool restoreRevision(const std::string& id, const vc::objects::ObjectVersion& version, QString* errorMessage = nullptr);
     // Restore an imported catalog surface's catalog version: its first revision.
     bool resetToCatalogVersion(const std::string& id, QString* errorMessage = nullptr);
 

@@ -1,4 +1,5 @@
 #include "MenuActionController.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_reader/zarr.hpp>
 #include "OpenedVolumes.hpp"
 #include <vc_object_store/Uuid.hpp>
@@ -33,7 +34,6 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include <vc_object_store/objects/UmbilicusFile.hpp>
 #include "BindCoordinatesPrompt.hpp"
@@ -160,10 +160,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _removeUmbilicusAct = new QAction(QObject::tr("Remove Um&bilicus"), this);
     connect(_removeUmbilicusAct, &QAction::triggered, this, &MenuActionController::removeUmbilicus);
 
-    _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna Manifest..."), this);
+    _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna / Compound Dataset..."), this);
     connect(_attachLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachLasagnaManifest);
 
-    _attachRemoteLasagnaManifestAct = new QAction(QObject::tr("Attach Remote Lasagna Manifest..."), this);
+    _attachRemoteLasagnaManifestAct = new QAction(QObject::tr("Attach Remote Lasagna / Compound Dataset..."), this);
     connect(_attachRemoteLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachRemoteLasagnaManifest);
 
     _detachEntryAct = new QAction(QObject::tr("&Detach..."), this);
@@ -228,7 +228,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
     _fileMenu->addAction(_openAct);
-    _fileMenu->addAction(QObject::tr("Clone Hosted Project..."), this, [this]() { cloneHostedStore(true); });
     _fileMenu->addAction(_saveProjectAsAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
@@ -1754,7 +1753,7 @@ void MenuActionController::removeUmbilicus()
             QObject::tr("Open a project and a volume first."));
         return;
     }
-    if (umbilici->pins.empty()) {
+    if (umbilici->uuids.empty()) {
         QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),
             QObject::tr("Volume %1 has no umbilicus.").arg(QString::fromStdString(umbilici->volume)));
         return;
@@ -1849,7 +1848,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
     QString location;
     if (remote) {
         location =
-            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, false, false);
+            promptLocation(QObject::tr("Attach Remote Lasagna / Compound Dataset"), QObject::tr("Pick a remote .lasagna.json manifest or compound .zarr directory."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, true, false);
         if (location.isEmpty())
             return;
         if (!vcr::zarr::isRemote(location.toStdString())) {
@@ -1857,12 +1856,16 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             return;
         }
     } else {
-        location = QFileDialog::
-            getOpenFileName(_window, QObject::tr("Attach Lasagna Manifest"), settings.value(vc3d::settings::project::DEFAULT_PATH).toString(), QObject::tr("Lasagna manifests (*.lasagna.json);;JSON files (*.json)"));
+        location = promptLocation(QObject::tr("Attach Lasagna / Compound Dataset"),
+            QObject::tr("Select a .lasagna.json manifest or compound .zarr directory; use Fiber inference for AFV predictions."),
+            settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+            {QStringLiteral("*.json")}, true, true, false);
         if (location.isEmpty())
             return;
-        location = QFileInfo(location).absoluteFilePath();
-        settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(location).absolutePath());
+        if (!vcr::zarr::isRemote(location.toStdString())) {
+            location = QFileInfo(location).absoluteFilePath();
+            settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(location).absolutePath());
+        }
     }
 
     bool roleAccepted = false;
@@ -1969,7 +1972,7 @@ bool MenuActionController::startLasagnaManifestAttachment(const QString& locatio
                 throw std::runtime_error("regular Lasagna data requires grad_mag, nx, and ny normal channels");
             for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(
                      dataset, persistedLocation)) {
-                result.volumes.push_back({std::move(prepared.location), std::move(prepared.tags), std::move(prepared.volume)});
+                result.volumes.push_back(std::move(prepared));
             }
         } catch (const std::exception& error) {
             result.error = QString::fromUtf8(error.what());
@@ -2091,6 +2094,28 @@ bool MenuActionController::attachStore(bool readOnly, const std::string& kind)
     return true;
 }
 
+bool MenuActionController::attachHostedStore()
+{
+    auto& state = *_window->_state;
+    if (!requireProject(QObject::tr("Attaching a store"))) return false;
+    bool ok = false;
+    const auto endpoint = QInputDialog::getText(_window, QObject::tr("Attach Hosted Store"),
+        QObject::tr("Server address, for example ssh://host:8750.\n"
+                    "ssh:// and sftp:// connect automatically using SSH; the port is the database service port.\n"
+                    "http:// and https:// endpoints are also supported."),
+        QLineEdit::Normal, QStringLiteral("http://127.0.0.1:8750"), &ok).trimmed();
+    if (!ok || endpoint.isEmpty()) return false;
+    const auto author = objectStoreAuthor();
+    if (author.isEmpty()) return false;
+    try {
+        state.attachHostedStore(endpoint.toStdString(), author);
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_window, QObject::tr("Cannot attach hosted store"), QString::fromUtf8(error.what()));
+        return false;
+    }
+    return true;
+}
+
 bool MenuActionController::requireProject(const QString& purpose)
 {
     if (_window->_state->hasVpkg()) return true;
@@ -2116,14 +2141,16 @@ void MenuActionController::refreshStoresMenu()
     const bool project = state.hasVpkg();
     const auto attached = state.attachedStores();
     const auto storeName = [&](const vc::objects::AttachmentIdentity& attachment) {
-        auto name = QString::fromStdString(session->path(attachment).filename().string());
+        const bool hosted = session->hosted(attachment);
+        auto name = hosted ? QString::fromStdString(session->location(attachment))
+                           : QString::fromStdString(session->path(attachment).filename().string());
         if (!session->writable(attachment)) name += QObject::tr(" [read-only]");
-        if (session->hubStatus(attachment)) name += QObject::tr(" [hosted]");
+        if (hosted) name += QObject::tr(" [hosted]");
         return name.replace("&", "&&");
     };
     _storesMenu->addAction(QObject::tr("Attach Store..."), this, [this]() { attachStore(false); })->setEnabled(project);
     _storesMenu->addAction(QObject::tr("Attach Read-only Store..."), this, [this]() { attachStore(true); })->setEnabled(project);
-    _storesMenu->addAction(QObject::tr("Clone Hosted Store..."), this, [this]() { cloneHostedStore(false); })->setEnabled(project);
+    _storesMenu->addAction(QObject::tr("Attach Hosted Store..."), this, [this]() { attachHostedStore(); })->setEnabled(project);
     _storesMenu->addAction(tr("New Store..."), this, &MenuActionController::newStore)->setEnabled(project);
     _storesMenu->addSeparator();
     const std::vector<std::pair<std::string, QString>> kinds{
@@ -2164,13 +2191,6 @@ void MenuActionController::refreshStoresMenu()
     _storesMenu->addSeparator();
     _storesMenu->addAction(QObject::tr("Import from Folder..."), this, &MenuActionController::importIntoObjectStore)
         ->setEnabled(project);
-    std::vector<vc::objects::AttachmentIdentity> hosted;
-    for (const auto& attachment : attached) if (session->hubStatus(attachment)) hosted.push_back(attachment);
-    auto* sync = _storesMenu->addAction(QObject::tr("Sync Hosted Stores Now"), this, [this, hosted]() {
-        for (const auto& attachment : hosted) _window->_state->objectStoreSession()->syncHub(attachment);
-        _window->promptHubConflicts();
-    });
-    sync->setEnabled(!hosted.empty());
     auto* detach = _storesMenu->addMenu(QObject::tr("Detach Store"));
     detach->setEnabled(!attached.empty());
     for (const auto& attachment : attached)
@@ -2185,95 +2205,6 @@ void MenuActionController::refreshStoresMenu()
         _storesMenu->addAction(QObject::tr("Reset Project to Open Data..."), this, &MenuActionController::resetOpenDataProject)
             ->setEnabled(state.vpkg()->writable());
     }
-}
-
-void MenuActionController::cloneHostedStore(bool asProject)
-{
-    if (!asProject && !requireProject(QObject::tr("Attaching a hosted store"))) return;
-    const auto filter = QObject::tr("Object store (*.vcobj);;All files (*)");
-    QDialog chooser(_window);
-    chooser.setWindowTitle(asProject ? QObject::tr("Clone Hosted Project") : QObject::tr("Clone Hosted Store"));
-    auto* layout = new QVBoxLayout(&chooser);
-    layout->addWidget(new QLabel(QObject::tr("Hub on a network share, or an sftp:// or ssh:// address "
-                                             "(sftp://user@host/path/hub.vcobj):"), &chooser));
-    auto* row = new QHBoxLayout;
-    auto* location = new QLineEdit(&chooser);
-    location->setMinimumWidth(480);
-    location->setPlaceholderText(QStringLiteral("sftp://user@host/path/hub.vcobj"));
-    auto* browse = new QPushButton(QObject::tr("Browse..."), &chooser);
-    QObject::connect(browse, &QPushButton::clicked, &chooser, [&] {
-        const auto file = QFileDialog::getOpenFileName(&chooser,
-            QObject::tr("Choose the hub on the network share"), {}, filter);
-        if (!file.isEmpty()) location->setText(file);
-    });
-    row->addWidget(location);
-    row->addWidget(browse);
-    layout->addLayout(row);
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &chooser);
-    QObject::connect(buttons, &QDialogButtonBox::accepted, &chooser, &QDialog::accept);
-    QObject::connect(buttons, &QDialogButtonBox::rejected, &chooser, &QDialog::reject);
-    layout->addWidget(buttons);
-    if (chooser.exec() != QDialog::Accepted) return;
-    const auto hub = location->text().trimmed();
-    if (hub.isEmpty()) return;
-    // The last path component names the replica, for addresses and files alike.
-    const auto hubName = QFileInfo(hub.section(QLatin1Char('/'), -1)).completeBaseName();
-    const auto replica = QFileDialog::getSaveFileName(_window, QObject::tr("Local Replica"),
-        QDir::home().filePath(hubName + QStringLiteral("-replica.vcobj")), filter);
-    if (replica.isEmpty()) return;
-    const auto author = objectStoreAuthor();
-    if (author.isEmpty()) return;
-
-    auto* progressDialog = new QProgressDialog(QObject::tr("Copying the hosted store..."), {}, 0, 1000, _window);
-    progressDialog->setWindowModality(Qt::WindowModal);
-    progressDialog->setMinimumDuration(0);
-    progressDialog->setValue(0);
-    QPointer<QProgressDialog> guardedDialog(progressDialog);
-    auto progress = [guardedDialog](const vc::objects::util::ProgressUpdate& event) {
-        if (!event.total) return;
-        const int value = int(1000 * event.completed / event.total);
-        QMetaObject::invokeMethod(guardedDialog, [guardedDialog, value] {
-            if (guardedDialog) guardedDialog->setValue(value);
-        }, Qt::QueuedConnection);
-    };
-    auto* watcher = new QFutureWatcher<QString>(this);
-    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, progressDialog, replica, author, asProject] {
-        const auto error = watcher->result();
-        watcher->deleteLater();
-        progressDialog->close();
-        progressDialog->deleteLater();
-        if (!error.isEmpty()) {
-            QMessageBox::critical(_window, QObject::tr("Cannot clone hosted store"), error);
-            return;
-        }
-        if (asProject) {
-            try {
-                auto project = std::filesystem::path(replica.toStdString());
-                project.replace_extension(".vcproj");
-                vc::project::ProjectDocument::create(project, project.stem().string(), replica.toStdString());
-                _window->OpenVolume(QString::fromStdString(project.string()));
-            } catch (const std::exception& error) {
-                QMessageBox::warning(_window, tr("Cannot create project"), QString::fromUtf8(error.what()));
-            }
-            _window->UpdateView();
-            return;
-        }
-        try {
-            _window->_state->attachStore(replica.toStdString(), author);
-        } catch (const std::exception& attachError) {
-            QMessageBox::critical(_window, QObject::tr("Cannot attach store"), QString::fromUtf8(attachError.what()));
-        }
-    });
-    watcher->setFuture(QtConcurrent::run([hub, replica, author, progress]() {
-        try {
-            vc::objects::OpenOptions options;
-            options.author = author.toStdString();
-            vc::objects::cloneHub(hub.toStdString(), replica.toStdString(), options, progress);
-            return QString();
-        } catch (const std::exception& error) {
-            return QString::fromUtf8(error.what());
-        }
-    }));
 }
 
 void MenuActionController::importIntoObjectStore()

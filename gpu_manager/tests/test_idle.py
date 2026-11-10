@@ -48,5 +48,6 @@ def test_live_journal_rejects_cpu_inventory_change(tmp_path):
         s.drain()
         s.close(force=True)
     with pytest.raises(ProtocolError, match="inventory differs"):
-        with Server(path, POOL | {"cpu_cores": 224}):
+        with Server(path, POOL | {"cpu_cores": 224},
+                    engine_options={"inspect": lambda p, u: "alive"}):
             pass

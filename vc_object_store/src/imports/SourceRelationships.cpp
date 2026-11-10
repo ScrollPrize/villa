@@ -4,6 +4,7 @@
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/Dependencies.hpp"
 #include "imports/SourceIdentityIndex.hpp"
+#include <cmath>
 #include <map>
 #include <set>
 
@@ -23,6 +24,15 @@ struct Points {
         return result;
     }
 };
+// Each end of a version-3 link computes the shared directions separately, so they
+// can differ in the last bits.
+bool sameDirection(const Anchor& left, const Anchor& right)
+{
+    if (!left.direction || !right.direction) return !left.direction && !right.direction;
+    for (size_t axis = 0; axis < 3; ++axis)
+        if (std::abs((*left.direction)[axis] - (*right.direction)[axis]) > 1e-9) return false;
+    return true;
+}
 }
 int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vector<SourceRecord>& sources)
 {
@@ -59,8 +69,8 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
                 if (edge.kind == "fiber_branch" &&
                     ((!edge.uuid.empty() && edge.uuid != current.uuid) || edge.approvalState != current.approvalState ||
                      Json::parse(current.meta).value("auto", false) != Json::parse(edge.meta).value("auto", false) ||
-                     (forward ? current.aAnchor.direction != edge.aAnchor.direction || current.bAnchor.direction != edge.bAnchor.direction
-                              : current.bAnchor.direction != edge.aAnchor.direction || current.aAnchor.direction != edge.bAnchor.direction)))
+                     (forward ? !sameDirection(current.aAnchor, edge.aAnchor) || !sameDirection(current.bAnchor, edge.bAnchor)
+                              : !sameDirection(current.bAnchor, edge.aAnchor) || !sameDirection(current.aAnchor, edge.bAnchor))))
                     throw GeometrySourceRejected("conflicting reciprocal fiber branch declarations");
                 return; // Consistent reciprocal declarations represent one edge.
             }

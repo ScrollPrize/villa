@@ -23,6 +23,10 @@ struct EditablePclPoint {
     // drawing them does not depend on projecting their rounded 3D position
     // back through the surface index. Imported points have no such coordinate.
     std::optional<QPointF> previewSurfacePosition;
+    // The point's id in its source collection (stable in the object store);
+    // none for appended points. replacementDocument() renumbers; a store save
+    // keeps these.
+    std::optional<qint64> sourceId;
 };
 
 // One editable collection. Point order, preview geometry, and the source JSON

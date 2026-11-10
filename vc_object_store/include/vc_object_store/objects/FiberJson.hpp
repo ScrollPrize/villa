@@ -1,10 +1,16 @@
 #pragma once
 #include "vc_object_store/objects/GeometryIngest.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 
 namespace vc::objects {
 // Native wire/file codec only. Identity, transactions, history and relationships
 // remain ObjectStore operations. Source annotations contain no coordinate arrays.
 size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anchor&);
+
+// Restore H/V tags from authoritative typed fields, retaining source confidence
+// and scores. This only assembles metadata; it does not classify geometry.
+nlohmann::json fiberHvClassification(nlohmann::json sourceClassification,
+                                   const std::string& family, bool manualFamily);
 
 GeometrySource decodeFiberJson(const std::string& json);
 // The fibers outside a prepared fiber batch that its branches link to: the
@@ -14,16 +20,17 @@ std::vector<std::string> fiberBatchEndpoints(const std::vector<GeometrySource>&)
 std::string encodeFiberJson(const std::string& objectUuid, const GeometryData&,
                             const std::string& sourceAnnotations);
 // Materialize a bounded, immutable native geometry/annotation document from a
-// selected object revision. Relationship topology is read separately by callers.
-std::string fiberRevisionJson(const ObjectStore&, const Txn&, const std::string& objectRevision,
+// numbered fiber version. Relationship topology is read separately by callers.
+std::string fiberVersionJson(const StoreReader&, const ObjectVersion&,
                              uint64_t byteBudget = 64 * 1024 * 1024);
-// Export an explicitly pinned fiber graph. Empty roots exports the selection;
+// Export a fiber graph pinned at numbered versions (one per object; a missing,
+// deleted or non-fiber version fails). Empty roots exports the selection;
 // otherwise exports the connected components containing roots. Applicable
 // fiber_branch edges become reciprocal native branch entries, addressed by
 // UUID.json. Names remain labels. Include retired endpoints in the selection to
 // resolve lifecycle applicability; they are never exported. The byte budget
 // applies to each fiber.
 std::map<std::string, std::string> fiberNetworkJson(
-    const ObjectStore&, const Txn&, const RevisionSelection&,
+    const StoreReader&, const std::vector<ObjectVersion>&,
     const std::vector<std::string>& roots = {}, uint64_t byteBudget = 64 * 1024 * 1024);
 }

@@ -122,6 +122,8 @@ void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::stri
         if (include(key)) d[key] = value;
     });
     if (include("meta")) d["meta"] = jsonLoads(r.meta);
+    // Selected in a read snapshot: the numbered head version it was read from.
+    if (r.version) { d["version"] = *r.version; d["version_generation"] = r.versionGeneration; }
 }
 
 nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fields = nullptr)
@@ -260,6 +262,7 @@ nb::dict geometryReportToPy(const vo::GeometryIngestReport& r)
 {
     nb::dict result;
     result["edges_imported"] = r.edgesImported; result["ingested"] = r.ingested; result["problems"] = r.problems;
+    result["notices"] = r.notices;
     result["uuids"] = r.uuids; result["existing"] = r.existing; result["cancelled"] = r.cancelled;
     if (r.fatalError) {
         nb::dict fatal; fatal["message"] = *r.fatalError;
@@ -391,7 +394,8 @@ struct PyObjectWriteTxn {
     PyObjectStore* owner = nullptr;
     std::shared_ptr<vo::ObjectStore> lease;
     std::unique_ptr<vo::WriteTxn> txn;
-    std::optional<vo::RevisionSelection> expected;
+    std::optional<vo::TransactionContext> context;
+    std::optional<vo::TransactionReceipt> receipt;
 
     vo::WriteTxn& require()
     {
@@ -403,14 +407,15 @@ struct PyObjectWriteTxn {
         if (txn) throw std::runtime_error("transaction is already active");
         owner->require();
         lease = owner->db;
-        try { txn = std::make_unique<vo::WriteTxn>(expected ? lease->write(*expected) : lease->write()); }
+        receipt.reset();
+        try { txn = std::make_unique<vo::WriteTxn>(context ? lease->write(*context) : lease->write()); }
         catch (...) { lease.reset(); throw; }
         return *this;
     }
     void exit(bool failed)
     {
         if (txn) {
-            try { if (!failed) txn->commit(); }
+            try { if (!failed) { txn->commit(); receipt = txn->receipt(); } }
             catch (...) { txn.reset(); lease.reset(); throw; }
             txn.reset();  // RAII rolls back when not committed
             lease.reset();

@@ -11,7 +11,14 @@ public:
     using SurfacePtr=std::shared_ptr<SurfaceGrid>;
     struct SurfaceFilter {const std::unordered_set<SurfaceGrid*>* includeRaw=nullptr; const std::unordered_set<SurfaceGrid*>* excludeRaw=nullptr; SurfaceGrid* only=nullptr;};
     struct PointQuery {cv::Vec3f worldPoint;float tolerance=1;SurfaceFilter surfaces;};
-    struct LookupResult {SurfacePtr surface; cv::Vec2f grid; float distance;};
+    struct LookupResult {
+        SurfacePtr surface;
+        cv::Vec2f grid;
+        float distance;
+        // Winning quad (column, row). floor(grid) can name a different,
+        // invalid quad when the closest point lies on a shared boundary.
+        cv::Vec2i cell;
+    };
     bool empty() const { return tiles_.empty(); }
     size_t tileCount() const { return tiles_.size(); }
     void rebuild(const std::vector<SurfacePtr>& surfaces);

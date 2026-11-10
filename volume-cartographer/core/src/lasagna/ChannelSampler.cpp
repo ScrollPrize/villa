@@ -242,13 +242,15 @@ struct CornerCoordinates {
     void prefetch(size_t) const {}
 };
 
-// The corners on the group's GPU reader (3-D groups only have one); false on a GPU failure.
+// Spatial corners on the selected scalar GPU reader; false on a GPU failure.
 inline bool readCornersOnDevice(const LasagnaChannelBinding& binding, const CornerCoordinates& coords, size_t n,
                                 uint8_t* out)
 {
     std::vector<int64_t> zyx(3 * n);
+    auto spatial = coords;
+    spatial.channel = -1;
     for (size_t p = 0; p < n; ++p)
-        coords(p, zyx.data() + 3 * p);
+        spatial(p, zyx.data() + 3 * p);
     try {
         vc::cuda::readVoxels(*binding.cuda, zyx.data(), n, out);
     } catch (const std::runtime_error&) {
@@ -354,7 +356,6 @@ LasagnaChannelBinding bindLasagnaChannel(
     binding.group = group;
     binding.channelIndex = *channelIndex;
     binding.array = std::shared_ptr<vcr::Array>(opened, opened->array.get());  // shares the whole opened level
-    binding.cuda = vc::cuda::toolReader(*opened);
     binding.spacing = static_cast<double>(group->scaleFactor()) *
                       manifest.sourceToBase / manifest.workingToBaseScale;
     binding.float32 = meta.dtype == "<f4";
@@ -379,6 +380,8 @@ LasagnaChannelBinding bindLasagnaChannel(
         binding.chunksZYX[0] == 0 || binding.chunksZYX[1] == 0 || binding.chunksZYX[2] == 0) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' has empty zarr shape/chunks");
     }
+    binding.cuda = vc::cuda::toolReader(*opened,
+        binding.packed ? std::optional<std::int64_t>(binding.channelIndex) : std::nullopt);
     return binding;
 }
 
@@ -645,7 +648,7 @@ std::optional<double> sampleLasagnaChannel(
     double value = 0.0;
     if (binding.cuda) {
         float single = 0.0f;
-        vc::cuda::sampleLinear(*binding.array, vcr::ElementType{'u', 1, false}, binding.cuda, coordinates, 1, &single);
+        vc::cuda::sampleLinear(*binding.array, vcr::ElementType{'u', 1, false}, binding.cuda, zyx, 1, &single);
         return double(single);
     }
     binding.array->sample_linear(coordinates, 1,

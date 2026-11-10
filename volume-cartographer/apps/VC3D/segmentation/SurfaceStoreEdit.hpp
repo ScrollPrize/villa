@@ -8,6 +8,7 @@
 #include <opencv2/core/types.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,7 +25,15 @@ public:
     // Publish `surface`: with the stored grid size, the named channels ("mask"
     // is validity) and then the vertices of `rect` that changed; with another
     // grid size (growth), a new geometry of points, validity and channels.
-    void save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels = {});
+    // A durable save (ObjectStoreSession::submitDurably): written to the
+    // session's draft directory before it is sent. `draftRevision` is the
+    // revision of the surface's session draft that `surface` was copied at:
+    // the draft stays (the editor keeps it) and is marked saved when it did
+    // not change since. When a hosted store does not answer, the save stays
+    // pending and the next save first resolves it (its receipt, or the
+    // identical request again), so saves never skip one another.
+    void save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels = {},
+              std::optional<uint64_t> draftRevision = std::nullopt);
 
     vc::objects::PinnedObject pin() const;
     // The pin the edit started from (the opened surface's).
@@ -38,5 +47,8 @@ private:
     mutable std::mutex _mutex;
     vc::objects::PinnedObject _pin;
     const vc::objects::PinnedObject _origin;
+    std::optional<std::string> _pending; // a save whose outcome is unknown
+    void settlePending();
+    void repin(const vc::objects::TransactionReceipt&);
     const std::optional<vc::objects::ViewFrame> _view;
 };

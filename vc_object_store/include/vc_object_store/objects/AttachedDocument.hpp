@@ -1,6 +1,7 @@
 #pragma once
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
@@ -20,15 +21,15 @@ struct AttachmentIdentity;
 struct DocumentLayout {
     std::string role, listKey, positionKey;
 };
-// Attach `document` to `objectUuid` as a new point collection `collectionUuid`
-// named `name` whose meta.coordinates are `coordinates`. The caller's checked
-// transaction expects `collectionUuid` absent and pins the object.
-void attachDocument(ObjectStore&, WriteTxn&, const std::string& objectUuid, const std::string& collectionUuid,
-                    const nlohmann::json& document, const DocumentLayout&, const std::string& name,
-                    const nlohmann::json& coordinates);
+// Attach `document` to `objectUuid` (at its current version) as a new point
+// collection named `name` whose meta.coordinates are `coordinates`, in one
+// checked request; returns the collection's UUID.
+std::string attachDocument(ObjectStoreSession&, const AttachmentIdentity&, const std::string& objectUuid,
+                           const nlohmann::json& document, const DocumentLayout&, const std::string& name,
+                           const nlohmann::json& coordinates);
 // The document attached to `objectUuid` in `role` (its first live collection
 // with geometry); nullopt when there is none.
-std::optional<nlohmann::json> attachedDocument(const ObjectStore&, const Txn&, const std::string& objectUuid,
+std::optional<nlohmann::json> attachedDocument(const StoreReader&, const std::string& objectUuid,
                                                const std::string& role);
 // The same, read from a session's attachment.
 std::optional<nlohmann::json> attachedDocument(ObjectStoreSession&, const AttachmentIdentity&,
@@ -61,15 +62,21 @@ void replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, 
 // coordinates map to `volume`'s volume (bound to it, or through a
 // registration) and that are no object's attached data (no meta.role), in
 // `volume`.
-std::vector<AttachedCollection> volumeCollections(const ObjectStore&, const Txn&, const VolumeVoxels& volume);
+std::vector<AttachedCollection> volumeCollections(const StoreReader&, const VolumeVoxels& volume);
 // The same, read from a session's attachment.
 std::vector<AttachedCollection> volumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume);
 // The live point collections `uuids` (any role), in `volume` and in that
 // order. Throws for one that is missing or does not map to the volume.
-std::vector<AttachedCollection> pointCollections(const ObjectStore&, const Txn&, const std::vector<std::string>& uuids,
+std::vector<AttachedCollection> pointCollections(const StoreReader&, const std::vector<std::string>& uuids,
                                                  const VolumeVoxels& volume);
 // In one commit: `changed` (in `volume`) are created, bound to `volume`, or
-// revised keeping their points' identity; `removed` are retired.
-void writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume,
-                            const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed);
+// revised keeping their points' identity; `removed` are retired. `expected`
+// pins objects at the versions an edit started from (null: the edit creates
+// it); the commit refuses (TransactionConflict) when one has moved on.
+// Unpinned objects are expected at their current versions. The receipt
+// carries each written object's version.
+TransactionReceipt writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume,
+                                          const std::vector<AttachedCollection>& changed,
+                                          const std::vector<std::string>& removed,
+                                          const VersionSelection& expected = {});
 }

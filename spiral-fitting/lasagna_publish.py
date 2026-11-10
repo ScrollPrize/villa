@@ -50,6 +50,10 @@ import numpy as np
 from PIL import Image
 import scipy.ndimage
 
+# Preview surfaces and overlays are written by this service and span whole
+# scroll regions, so PIL's decompression-bomb guard rejects legitimate files.
+Image.MAX_IMAGE_PIXELS = None
+
 from surface_orientation import GridLayout
 
 LASAGNA_PREVIEW_OUTPUT_STEP_VX = 20.0
@@ -58,6 +62,12 @@ LASAGNA_CONFIG_NAME = "flatten_fast_nofilter.json"
 # being written; the job status does not distinguish that phase.
 _LASAGNA_SAVING_MARKER = "[fit] peak GPU memory:"
 _LASAGNA_PORT_LINE = re.compile(r"listening on http://[^:]+:(\d+)")
+
+
+def flatten_profile():
+    """The Lasagna flatten a published preview is: its config and output step."""
+    return {"config": LASAGNA_CONFIG_NAME,
+            "output_step_vx": LASAGNA_PREVIEW_OUTPUT_STEP_VX}
 
 
 def _flatten_request_body(config, surface_ref, *, surface_id, publish_root,
@@ -526,7 +536,7 @@ class PreviewPublication:
                  "artifact", "diagnostics_artifact", "error", "process",
                  "previous_raw_manifest", "stage_started", "progress",
                  "source_fit_iteration", "active_source_fit_iteration",
-                 "model_state_sha256",
+                 "model_state_sha256", "input_position",
                  "pending_generation", "pending_manifest",
                  "pending_source_fit_iteration", "pending_diagnostics")
 
@@ -558,6 +568,9 @@ class PreviewPublication:
         #: Surface identity of the artifact on display, so a checkpoint load
         #: that lands on the same model state is not re-shown.
         self.model_state_sha256 = None
+        #: The input position the artifact on display was fitted at (its
+        #: raw manifest's), so a client can show an old preview as old.
+        self.input_position = None
         self.pending_generation = 0
         self.pending_manifest = None
         self.pending_source_fit_iteration = None
@@ -583,6 +596,7 @@ class PreviewPublication:
         self.source_fit_iteration = None
         self.active_source_fit_iteration = None
         self.model_state_sha256 = None
+        self.input_position = None
         self.pending_generation = 0
         self.pending_manifest = None
         self.pending_source_fit_iteration = None
@@ -1017,6 +1031,9 @@ class LasagnaPublisher:
                 published["surface_path"] = str(final_root / surface_id)
                 published["manifest_path"] = str(final_root / "manifest.json")
                 published["output_step_vx"] = LASAGNA_PREVIEW_OUTPUT_STEP_VX
+                # What a commit keys on besides the model state and inputs:
+                # another config or step is another surface of the same fit.
+                published["flatten_profile"] = flatten_profile()
                 published["grid_shape"] = [
                     int(flattened_xyz.shape[0]), int(flattened_xyz.shape[1])]
                 published["winding_ids"] = [

@@ -258,7 +258,7 @@ std::vector<EditablePclDraft> importEditablePcls(
             }
             if (pclRoleHasWindingAnnotations(role) && !payloadWinding(payload))
                 draft.editable = false;
-            draft.points.push_back({preview, payload, true});
+            draft.points.push_back({preview, payload, true, std::nullopt, pointId.toLongLong()});
         }
         if (draft.points.size() < 2) draft.editable = false;
         result.push_back(std::move(draft));
