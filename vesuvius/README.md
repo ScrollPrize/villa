@@ -32,7 +32,6 @@ _this package is in active development_
 | `vesuvius.voxelize_obj`       | `label_processing.voxelize_objs`     | voxelizes tifxyz surfaces with bicubic interpolation into OME-Zarr pyramids or TIFF stacks |
 | `vesuvius.refine_labels`      | `label_processing.refine_labels`  | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
 | `vesuvius.train`              | `models.training.train`            | main entry point for training models                                                                                                                                                                      |
-| `vesuvius.accept_terms`       | `install.accept_terms`             | accepts the data terms and conditions; pass `--yes` to accept non-interactively |
 | `vesuvius.blend_and_finalize` | `models.run.blending`              | fused `vesuvius.blend_logits` + `vesuvius.finalize_outputs` in a single pass |
 | `vesuvius.find_patches`       | `models.preprocessing.patches.cli` | scans a Zarr dataset and writes the valid-patch cache used by training |
 
@@ -94,10 +93,17 @@ To get started, we recommend these notebooks that jump right in:
 
 ## Installation
 
-`vesuvius` can be installed with `pip`.
+`vesuvius` on `main` requires Python 3.14 and reads data through `vc-reader`,
+which is built from this monorepo (it is not on PyPI yet). To install `vc-reader`
+on its own, which is all the notebooks above need (CPU-only build):
 ```sh
-$ pip install vesuvius
+$ pip install "vc-reader @ git+https://github.com/ScrollPrize/villa.git#subdirectory=vc_reader" \
+    --config-settings=cmake.define.VC_READER_ENABLE_CUDA=OFF
 ```
+`vc-reader` needs its native libraries first (Ubuntu/Debian: `libblosc-dev libzstd-dev
+liblz4-dev libsqlite3-dev nlohmann-json3-dev libcurl4-openssl-dev zlib1g-dev libtiff-dev
+libpng-dev libjpeg-dev pkg-config`). The `vesuvius` release on PyPI (0.2.x) predates the
+`vc-reader` migration and has a different API.
 
 For monorepo development, `uv sync --extra models`, `uv sync --extra all`, and
 `uv sync --all-extras` build the local `volume-cartographer` and `vc-object-store`
