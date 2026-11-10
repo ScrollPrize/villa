@@ -1,5 +1,21 @@
 # Coherent store API cleanup
 
+## Current review fixes
+
+Baseline: `3812cb17b`. C++ store plus VC3D adapters; existing CMake/approved PR runner, Linux and macOS portability, unchanged schema 21 and binary identifiers. These fixes must remove duplicated resolution, not introduce more placement-specific branches. Each fix is committed separately with regressions; the final run uses `bash local/scripts/run_vcobj_pr_tests`.
+
+- [ ] S. Reject inherited live edge UUID insertion; continue inherited deleted-edge versions through shared tombstone resolution.
+- [ ] T. Centralize canonical opposite-endpoint lookup for traversal and attached documents.
+- [ ] U. Preserve ownership on no-op edge update/repair; share actual mutation/revalidation handling.
+- [ ] V. Route geometry history to the owning record instead of the attachment database.
+- [ ] W. Carry selected metadata through historical geometry transforms and transform listings.
+- [ ] X. Resolve full exact surface references before deciding whether a VC3D surface is editable.
+- [ ] Y. Materialize QuadSurface/stored fits from the selected revision, never current metadata plus old geometry.
+- [ ] Z. Share CLI/Python historical export reference selection.
+- [ ] AA. Cache referenced hosted records through the ordinary owner-qualified cache path.
+
+Agent-facing rules are in the root `AGENTS.md` so they apply to consumers as well as the store implementation. The recurring failure is discarding a resolved owner/version downstream and reconstructing it from current/local state. Keep one resolved state throughout the operation; placement decisions belong only in shared storage routing.
+
 ## Contract
 
 Current and exact-version reads, graph queries, edits, geometry, extension data and artifacts must use shared resolution and validation. Physical placement (local, partitioned, referenced, packed) belongs in storage routing, not consumer-specific branches. History policy changes retention, not identity. Preserve binary identifiers, slim history-off storage, checked writes, tombstone precedence and immutable dependencies; do not introduce proxy records or per-object routing directories.
