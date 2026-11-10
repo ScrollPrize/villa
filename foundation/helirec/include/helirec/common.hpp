@@ -22,6 +22,9 @@ inline const char* device_name(Device d) { return d == Device::CPU ? "cpu" : "cu
 
 // true when compiled with CUDA support and at least one device is usable
 bool cuda_available();
+// Page-locked host buffers (raw windows, download staging) are kept for reuse when a reconstructor is destroyed
+// (page-locking costs ~0.2 s/GB); this frees the ones not in use. No-op without CUDA.
+void release_pinned_memory();
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;

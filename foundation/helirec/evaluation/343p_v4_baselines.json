@@ -1,0 +1,97 @@
+{
+  "projections": "/mnt/raid_nvme/343p_recon_work/projections",
+  "cache_dir": "/mnt/raid_nvme/343p_recon_work/output/baselines/_calibration",
+  "device": "cuda",
+  "params": {
+    "mode": "corrected",
+    "filters": []
+  },
+  "slices": {
+    "z": [
+      4497,
+      3598,
+      2698,
+      1798,
+      899
+    ]
+  },
+  "roi": null,
+  "window": "auto",
+  "tile": 1024,
+  "methods": [
+    {
+      "name": "fbp_paganin_unsharp_v4",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ]
+      },
+      "desc": "FBP, cubic B-spline, 2x oversampling; Paganin delta/beta 1000 + unsharp 1.2/4; corrected gridrec scale, Lanczos-3 column offset, chunk-independent luminosity window"
+    },
+    {
+      "name": "sirt_paganin_unsharp_v4",
+      "backprojector": "sirt(num_iter=20,init=gridrec,norm=rowsum,relax=1)",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ]
+      },
+      "desc": "SIRT, 20 iterations from gridrec; Paganin delta/beta 1000 + unsharp 1.2/4; corrected gridrec scale, Lanczos-3 column offset, chunk-independent luminosity window"
+    },
+    {
+      "name": "fbp_sld_paganin_unsharp_v4",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ],
+        "sld": "fraction=0.1,length=100"
+      },
+      "desc": "FBP; scintillator diffusion correction (fraction 0.1, length 100 px: uncalibrated defaults); Paganin 1000 + unsharp 1.2/4; corrected gridrec scale, Lanczos-3 column offset, chunk-independent luminosity window"
+    },
+    {
+      "name": "sirt_sld_paganin_unsharp_v4",
+      "backprojector": "sirt(num_iter=20,init=gridrec,norm=rowsum,relax=1)",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ],
+        "sld": "fraction=0.1,length=100"
+      },
+      "desc": "SIRT, 20 iterations from gridrec; scintillator diffusion correction (fraction 0.1, length 100 px: uncalibrated defaults); Paganin 1000 + unsharp 1.2/4; corrected gridrec scale, Lanczos-3 column offset, chunk-independent luminosity window"
+    }
+  ]
+}

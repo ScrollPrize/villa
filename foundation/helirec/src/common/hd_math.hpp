@@ -23,6 +23,24 @@ HR_HD float fma(float a, float b, float c) {
     return std::fma(a, b, c);
 #endif
 }
+// a * b + c as the compilers evaluate the plain expression: contracted by nvcc (one rounding), two rounded
+// operations on the CPU (-ffp-contract=off). For kernels whose results are pinned per backend rather than across them.
+HR_HD float muladd(float a, float b, float c) {
+#if defined(__CUDA_ARCH__)
+    return __fmaf_rn(a, b, c);
+#else
+    return a * b + c;
+#endif
+}
+// x / 6, correctly rounded for x = 0 and x >= 2.4e-38 (checked over every float); CUDA: without the division
+HR_HD float div6(float x) {
+#if defined(__CUDA_ARCH__)
+    const float r = 0.16666667163372039795f, q = __fmul_rn(x, r);
+    return __fmaf_rn(__fmaf_rn(-6.f, q, x), r, q);
+#else
+    return x / 6.f;
+#endif
+}
 HR_HD float mul(float a, float b) {
 #if defined(__CUDA_ARCH__)
     return __fmul_rn(a, b);

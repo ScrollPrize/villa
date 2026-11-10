@@ -19,17 +19,28 @@ struct ScintillatorGlare::Impl {
     std::unique_ptr<FourierFilter> filter;   // S on the zero-padded map grid
     std::vector<float> maps;                 // work: glare maps of correct()
 
-    // mean of each bin x bin cell (edge cells: of the pixels they hold)
-    template <class Pixel>
-    void bin_frame(Pixel&& pixel, float* out) const {
-        for (int i = 0; i < rows; ++i) {
+    // mean of each bin x bin cell (edge cells: of the pixels they hold), for the cells of detector rows [ra, rb)
+    // (ra a multiple of bin); row(r, v): detector row r -> v (det_cols). Each cell sums its pixels in double, row by
+    // row.
+    template <class Row>
+    void bin_rows(Row&& row, int ra, int rb, float* out) const {
+        std::vector<float> v(det_cols);
+        std::vector<double> s(cols);
+        for (int i = ra / bin; i * bin < rb; ++i) {
             const int r0 = i * bin, r1 = std::min(det_rows, r0 + bin);
+            std::fill(s.begin(), s.end(), 0.0);
+            for (int r = r0; r < r1; ++r) {
+                row(r, v.data());
+                for (int j = 0; j < cols; ++j) {
+                    const int c0 = j * bin, c1 = std::min(det_cols, c0 + bin);
+                    double a = s[j];
+                    for (int c = c0; c < c1; ++c) a += v[c];
+                    s[j] = a;
+                }
+            }
             for (int j = 0; j < cols; ++j) {
                 const int c0 = j * bin, c1 = std::min(det_cols, c0 + bin);
-                double s = 0;
-                for (int r = r0; r < r1; ++r)
-                    for (int c = c0; c < c1; ++c) s += pixel(static_cast<std::size_t>(r) * det_cols + c);
-                out[static_cast<std::size_t>(i) * cols + j] = static_cast<float>(s / ((r1 - r0) * (c1 - c0)));
+                out[static_cast<std::size_t>(i) * cols + j] = static_cast<float>(s[j] / ((r1 - r0) * (c1 - c0)));
             }
         }
     }
@@ -101,17 +112,18 @@ int ScintillatorGlare::rows() const { return impl_->rows; }
 int ScintillatorGlare::cols() const { return impl_->cols; }
 int ScintillatorGlare::bin() const { return impl_->bin; }
 
-void ScintillatorGlare::from_raw(const uint16_t* raw, const float* dark, const float* div, int n, float* out) {
+void ScintillatorGlare::bin_raw(const uint16_t* data, int r0, int nr, const float* dark, float div, float* out) const {
     const auto& I = *impl_;
-    const std::size_t plane = static_cast<std::size_t>(I.det_rows) * I.det_cols, cell = static_cast<std::size_t>(I.rows) * I.cols;
-#pragma omp parallel for schedule(static)
-    for (int f = 0; f < n; ++f) {
-        const uint16_t* fr = raw + f * plane;
-        const float d = div[f];
-        I.bin_frame([&](std::size_t k) { return (static_cast<float>(fr[k]) - dark[k]) / d; }, out + f * cell);
-    }
-    I.filter->apply(out, out, n);
+    if (r0 % I.bin || r0 < 0 || r0 + nr > I.det_rows || (nr % I.bin && r0 + nr != I.det_rows))
+        throw Error("sld: bin_raw takes whole rows of cells");
+    I.bin_rows([&](int r, float* v) {
+        const uint16_t* f = data + static_cast<std::size_t>(r - r0) * I.det_cols;
+        const float* d = dark + static_cast<std::size_t>(r) * I.det_cols;
+        for (int c = 0; c < I.det_cols; ++c) v[c] = (static_cast<float>(f[c]) - d[c]) / div;
+    }, r0, r0 + nr, out);
 }
+
+void ScintillatorGlare::filter(float* maps, int n) { impl_->filter->apply(maps, maps, n); }
 
 void ScintillatorGlare::from_frames(const float* frames, int n, float* out) {
     const auto& I = *impl_;
@@ -119,9 +131,10 @@ void ScintillatorGlare::from_frames(const float* frames, int n, float* out) {
 #pragma omp parallel for schedule(static)
     for (int f = 0; f < n; ++f) {
         const float* fr = frames + f * plane;
-        I.bin_frame([&](std::size_t k) { return fr[k]; }, out + f * cell);
+        I.bin_rows([&](int r, float* v) { std::copy(fr + static_cast<std::size_t>(r) * I.det_cols, fr + static_cast<std::size_t>(r + 1) * I.det_cols, v); },
+                   0, I.det_rows, out + f * cell);
     }
-    I.filter->apply(out, out, n);
+    filter(out, n);
 }
 
 void ScintillatorGlare::correct(float* frames, int n) {

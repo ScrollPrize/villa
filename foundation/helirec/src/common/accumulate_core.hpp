@@ -36,7 +36,7 @@ HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
 // vertically interpolated value at window row t (raw row r = row0 + t), with the reference's
 // edge padding: rows above / below the detector take the value at raw row 0 / det_rows - 2
 // and the weight non_zero.
-HR_HD void column_sample(const AccumScanView& s, int k, int t, int c, float non_zero, float& v, float& w) {
+HR_HD void column_value(const AccumScanView& s, int k, int t, int c, float non_zero, float& val, float& wt) {
     const int r = s.row0[k] + t;
     const float a = s.fract_v[k];
     int tv;  // window row of the (interpolated) sample used
@@ -44,9 +44,8 @@ HR_HD void column_sample(const AccumScanView& s, int k, int t, int c, float non_
     if (r < 0) { tv = -s.row0[k]; pad = true; }
     else if (r > s.det_rows - 2) { tv = s.det_rows - 2 - s.row0[k]; pad = true; }
     else tv = t;
-    float val = flat_field(s, k, tv, c);
+    val = flat_field(s, k, tv, c);
     if (a != 0.0f) val = add(mul(sub(1.0f, a), val), mul(a, flat_field(s, k, tv + 1, c)));
-    float wt;
     if (pad) {
         wt = non_zero;
     } else {
@@ -59,6 +58,12 @@ HR_HD void column_sample(const AccumScanView& s, int k, int t, int c, float non_
             wt = add(mul(sub(1.0f, a), w0), mul(a, w1));
         }
     }
+}
+
+// the same sample as the splat uses it: value x weight, weight
+HR_HD void column_sample(const AccumScanView& s, int k, int t, int c, float non_zero, float& v, float& w) {
+    float val, wt;
+    column_value(s, k, t, c, non_zero, val, wt);
     v = mul(val, wt);
     w = wt;
 }
@@ -85,6 +90,34 @@ HR_HD void measured_column(const AccumScanView& s, int k, int t, int c, const Ac
     }
 }
 
+// Fractional column offset with the scan's kernel (AccumScanView::x_taps > 0) in place of the two splat shares: the
+// value at source position c0 - fract_x from the x_taps columns around it, with the splat's weight
+// (fract_x w(c0 - 1) + (1 - fract_x) w(c0)), so that RW is the splat's. Only where every tap is a measured column
+// with a positive weight (never a value the splat would not have used); false: nothing added, use the splat.
+HR_HD bool kernel_term(const AccumScanView& s, int k, int t, int c0, float A, const AccumParams& p, float& R, float& RW) {
+    const int T = s.x_taps, first = c0 - T / 2;
+    if (first < 0 || first + T > s.det_cols) return false;
+    if (p.measured_only && A <= 0.f) return true;
+    float val = 0.f, wlin = 0.f;
+    for (int i = 0; i < T; ++i) {
+        float v, w;
+        if (p.measured_only) {
+            measured_column(s, k, t, first + i, p, v, w);
+            if (!(w > 0.f)) return false;
+            v = div(v, w);
+        } else {
+            column_value(s, k, t, first + i, p.non_zero, v, w);
+            if (!(w > 0.f)) return false;
+        }
+        val = add(val, mul(s.x_w[i], v));
+        if (i == T / 2 - 1) wlin = add(wlin, mul(s.fract_x, w));
+        if (i == T / 2) wlin = add(wlin, mul(sub(1.0f, s.fract_x), w));
+    }
+    R = add(R, mul(mul(val, wlin), A));
+    RW = add(RW, mul(wlin, A));
+    return true;
+}
+
 // all contributions of projection k (role: 0 lower bin, 1 upper bin) to merged column X, row t,
 // in project_radio order: [c-1 right share] [left border pad (c == 0)] [c left share] [right border pad]
 HR_HD void contribute(const AccumScanView& s, int k, int role, int t, int X, const AccumParams& p,
@@ -97,6 +130,8 @@ HR_HD void contribute(const AccumScanView& s, int k, int role, int t, int X, con
     const int rel = X - s.sx;                // column relative to the scan's origin (k in the reference)
     const int c0 = rel - s.ixs;              // source column whose left share lands on X
     const int c1 = c0 - 1;                   // source column whose right share lands on X
+    // (all taps inside the detector: no border pad lands on X either)
+    if (s.x_taps > 0 && kernel_term(s, k, t, c0, A, p, R, RW)) return;
     auto add_term = [&](int c, float fx) {
         if (p.measured_only && (A <= 0.f || fx <= 0.f)) return;
         float v, w;

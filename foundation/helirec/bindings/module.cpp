@@ -527,6 +527,7 @@ class PySliceReconstructor {
         f("n_grid", cfg.n_grid);
         f("angular_tolerance_steps", cfg.angular_tolerance_steps);
         f("luminosity_repartition", cfg.luminosity_repartition);
+        f("x_interp", cfg.x_interp);
         f("mend_threshold", cfg.mend_threshold);
         f("legacy_reference", cfg.legacy_reference);
         f("log_clip_min", cfg.log_clip_min);
@@ -562,7 +563,8 @@ class PySliceReconstructor {
         d["legacy_reference"] = impl_->config().legacy_reference;
         return d;
     }
-    nb::object reconstruct(int h_lo, int h_hi, bool debug, bool timing, std::optional<std::array<int, 4>> roi) {
+    nb::object reconstruct(int h_lo, int h_hi, bool debug, bool timing, std::optional<std::array<int, 4>> roi,
+                           std::optional<std::array<int, 2>> next) {
         const int N = impl_->grid_size();
         SliceRoi r{0, N, 0, N};
         if (roi) r = SliceRoi{(*roi)[0], (*roi)[1], (*roi)[2], (*roi)[3]};
@@ -576,7 +578,7 @@ class PySliceReconstructor {
         dbg.timing = timing;
         {
             nb::gil_scoped_release nogil;
-            impl_->reconstruct(h_lo, h_hi, data(out), &dbg, &r);
+            impl_->reconstruct(h_lo, h_hi, data(out), &dbg, &r, next ? (*next)[0] : 0, next ? (*next)[1] : 0);
         }
         nb::dict sec;
         for (const auto& [k, v] : dbg.seconds) sec[k.c_str()] = v;
@@ -651,6 +653,8 @@ NB_MODULE(_core, m) {
     });
 
     m.def("cuda_available", &cuda_available, "True if built with CUDA and a GPU is usable");
+    m.def("release_pinned_memory", &release_pinned_memory,
+          "free the page-locked host buffers kept for reuse by later reconstructors (CUDA; up to 24 GB)");
 #ifdef HELIREC_WITH_CUDA
     m.attr("built_with_cuda") = true;
 #else
@@ -959,10 +963,11 @@ NB_MODULE(_core, m) {
         .def(nb::init<std::vector<ScanData>, const nb::dict&>(), "scans"_a, "config"_a)
         .def_prop_ro("info", &PySliceReconstructor::info)
         .def("reconstruct", &PySliceReconstructor::reconstruct, "h_lo"_a, "h_hi"_a, "debug"_a = false,
-             "timing"_a = false, "roi"_a = nb::none(),
+             "timing"_a = false, "roi"_a = nb::none(), "next"_a = nb::none(),
              "slices for view heights [h_lo, h_hi) -> (n, N, N), or (n, y1 - y0, x1 - x0) with roi=(x0, x1, y0, y1); "
              "debug=True returns a dict with intermediates; timing=True returns a dict with 'slices' and per-stage "
-             "'seconds' (GPU synchronised per stage)")
+             "'seconds' (GPU synchronised per stage); next=(h_lo, h_hi): the chunk that will follow, read in the "
+             "background (CUDA)")
         .def("reconstruct_band", &PySliceReconstructor::reconstruct_band, "h_lo"_a, "h_hi"_a, "band"_a,
              "timing"_a = false, "sweep"_a = nb::none(), "next"_a = nb::none(),
              "reconstruct the chunk [h_lo, h_hi) only at the band pixels `band` needs (exact backprojector) and "

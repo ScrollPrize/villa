@@ -36,8 +36,12 @@ class ScintillatorGlare {
     int rows() const;   // glare map size: ceil(det / bin)
     int cols() const;
     int bin() const;
-    // glare maps (n, rows, cols) of raw frames (n, det_rows, det_cols): S * bin((raw - dark) / div[i])
-    void from_raw(const uint16_t* raw, const float* dark, const float* div, int n, float* out);
+    // glare maps (n, rows, cols) of raw frames, S * bin((raw - dark) / div), in two steps: bin_raw() bins detector
+    // rows [r0, r0 + nr) of one frame (`data`: those rows; r0 a multiple of bin(), nr a multiple of it or up to the
+    // last row; thread safe) into the rows r0 / bin() ... of its binned frame `out` (rows, cols); filter() turns n
+    // binned frames into their glare, in place
+    void bin_raw(const uint16_t* data, int r0, int nr, const float* dark, float div, float* out) const;
+    void filter(float* maps, int n);
     // glare maps (n, rows, cols) of float frames (n, det_rows, det_cols)
     void from_frames(const float* frames, int n, float* out);
     // in place: frames (n, det_rows, det_cols) minus their glare, T / (1 + f)  (flats; tests)

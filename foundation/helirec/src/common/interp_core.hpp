@@ -37,13 +37,18 @@ HR_HD float lanczos3(float t) {
     return 3.f * sinf(pt) * sinf(pt / 3.f) / (pt * pt);
 }
 
+// cubic B-spline, spelled out as nvcc contracts  2/3 - t t + 0.5 t t t  and without the division on CUDA
+HR_HD float bspline3_inner(float t) {   // 0 <= t < 1
+    return hd::muladd(t, hd::mul(t, hd::mul(t, 0.5f)), hd::muladd(-t, t, 2.f / 3.f));
+}
+HR_HD float bspline3_outer(float t) {   // 1 <= t <= 2 (2 - t is 0 or >= 1e-7: div6 is exact)
+    const float u = 2.f - t;
+    return hd::div6(hd::mul(u, hd::mul(u, u)));
+}
 HR_HD float bspline3(float t) {
     t = fabsf(t);
-    if (t < 1.f) return 2.f / 3.f - t * t + 0.5f * t * t * t;
-    if (t < 2.f) {
-        const float u = 2.f - t;
-        return u * u * u / 6.f;
-    }
+    if (t < 1.f) return bspline3_inner(t);
+    if (t < 2.f) return bspline3_outer(t);
     return 0.f;
 }
 
@@ -74,33 +79,56 @@ HR_HD void bspline_prefilter_row(float* c, int n, int degree) {
     }
 }
 
+// taps of kernel K: row[i0 + tap_lo<K>() + t], t = 0 .. tap_count<K>() - 1, i0 = floor(u)
 template <int K>
-HR_HD float sample_row(const float* row, int n, float u) {
+HR_HD int tap_count() { return K == Linear ? 2 : ((K == Cubic || K == BSpline3) ? 4 : 6); }
+template <int K>
+HR_HD int tap_lo() { return K == Linear ? 0 : ((K == Cubic || K == BSpline3) ? -1 : -2); }
+// u in [reach_lo, n + reach_hi): some tap lies on the detector (elsewhere the sample is 0)
+template <int K>
+HR_HD float reach_lo() { return static_cast<float>(1 - tap_count<K>() - tap_lo<K>()); }
+template <int K>
+HR_HD float reach_hi() { return static_cast<float>(-tap_lo<K>()); }
+
+// u within the kernel's reach of the detector (see reach_lo / reach_hi)
+template <int K>
+HR_HD float sample_row_reach(const float* row, int n, float u) {
     const float fu = floorf(u);
-    const int i0 = static_cast<int>(fu);
     const float w = u - fu;
+    const int j = static_cast<int>(fu) + tap_lo<K>(), T = tap_count<K>();
+    float v[6];
+    if (j >= 0 && j + T <= n) {   // every tap on the detector
+        for (int t = 0; t < T; ++t) v[t] = row[j + t];
+    } else {
+        for (int t = 0; t < T; ++t) v[t] = tap(row, n, j + t);
+    }
     if (K == Linear) {
-        const float v0 = tap(row, n, i0), v1 = tap(row, n, i0 + 1);
-        return v0 + w * (v1 - v0);
+        return v[0] + w * (v[1] - v[0]);
     } else if (K == Cubic) {
-        return tap(row, n, i0 - 1) * keys(w + 1.f) + tap(row, n, i0) * keys(w) + tap(row, n, i0 + 1) * keys(1.f - w) +
-               tap(row, n, i0 + 2) * keys(2.f - w);
-    } else if (K == BSpline3) {
-        return tap(row, n, i0 - 1) * bspline3(w + 1.f) + tap(row, n, i0) * bspline3(w) +
-               tap(row, n, i0 + 1) * bspline3(1.f - w) + tap(row, n, i0 + 2) * bspline3(2.f - w);
+        return v[0] * keys(w + 1.f) + v[1] * keys(w) + v[2] * keys(1.f - w) + v[3] * keys(2.f - w);
+    } else if (K == BSpline3) {   // bspline3(w + 1), (w), (1 - w), (2 - w), each on the branch its argument takes
+        const float t2 = 1.f - w;
+        const float k0 = bspline3_outer(w + 1.f), k1 = bspline3_inner(w), k3 = bspline3_outer(2.f - w);
+        const float k2 = t2 < 1.f ? bspline3_inner(t2) : 1.f / 6.f;
+        return hd::muladd(v[3], k3, hd::muladd(v[2], k2, hd::muladd(v[1], k1, hd::mul(v[0], k0))));
     } else if (K == BSpline5) {
         float acc = 0.f;
-        for (int k = -2; k <= 3; ++k) acc += tap(row, n, i0 + k) * bspline5(w - static_cast<float>(k));
+        for (int k = -2; k <= 3; ++k) acc += v[k + 2] * bspline5(w - static_cast<float>(k));
         return acc;
     } else {
         float acc = 0.f, ws = 0.f;
         for (int k = -2; k <= 3; ++k) {
             const float wk = lanczos3(w - static_cast<float>(k));
-            acc += tap(row, n, i0 + k) * wk;
+            acc += v[k + 2] * wk;
             ws += wk;
         }
         return acc / ws;
     }
+}
+
+template <int K>
+HR_HD float sample_row(const float* row, int n, float u) {
+    return u >= reach_lo<K>() && u < static_cast<float>(n) + reach_hi<K>() ? sample_row_reach<K>(row, n, u) : 0.f;
 }
 
 }  // namespace helirec::interp_core

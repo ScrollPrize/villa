@@ -3,6 +3,7 @@
 #include <numeric>
 
 #include "common/accumulate_core.hpp"
+#include "common/interp_core.hpp"
 #include "helirec/accumulate.hpp"
 
 namespace helirec {
@@ -28,6 +29,22 @@ ContributorList make_contributors(const int32_t* j0, int n_proj, int n_grid, int
             c.role.push_back(r);
         }
     return c;
+}
+
+void set_x_kernel(AccumScanView& v, int interp) {
+    v.x_taps = 0;
+    if (v.fract_x == 0.f || interp == interp_core::Linear) return;
+    if (interp != interp_core::Cubic && interp != interp_core::Lanczos3)
+        throw Error("x_interp must be linear, cubic or lanczos3");
+    const int T = interp == interp_core::Cubic ? 4 : 6;
+    double w[8], sum = 0;
+    for (int i = 0; i < T; ++i) {   // tap i: column c0 - T / 2 + i, at  i - T / 2 + fract_x  from the source position
+        const float d = static_cast<float>(i - T / 2) + v.fract_x;
+        w[i] = interp == interp_core::Cubic ? interp_core::keys(d) : interp_core::lanczos3(d);
+        sum += w[i];
+    }
+    for (int i = 0; i < T; ++i) v.x_w[i] = static_cast<float>(w[i] / sum);
+    v.x_taps = T;
 }
 
 LuminosityKernel luminosity_kernel() {

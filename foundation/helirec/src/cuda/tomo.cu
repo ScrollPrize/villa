@@ -23,8 +23,8 @@ using tomo_core::Geom;
 constexpr int kTile = 16, kAngles = 256;
 unsigned grid_for(std::size_t n) { return static_cast<unsigned>(std::min<std::size_t>((n + 255) / 256, 65535u * 16u)); }
 
-// one thread per ray (neighbouring threads: neighbouring rays of one angle)
-template <int PJ, class E>
+// Chord model: one thread per ray (neighbouring threads: neighbouring rays of one angle)
+template <class E>
 __global__ void project_kernel(const float* __restrict__ x, const float* __restrict__ xT, const int32_t* sel, int n_sel,
                                const AngleC* __restrict__ ak, Geom g, E epi) {
     const std::size_t total = static_cast<std::size_t>(n_sel) * g.n_det;
@@ -38,13 +38,13 @@ __global__ void project_kernel(const float* __restrict__ x, const float* __restr
         // the warp walks the union of its rays' spans in step (same major index -> neighbouring addresses)
         const unsigned mask = __activemask();
         const int mlo = __reduce_min_sync(mask, s1 > s0 ? s0 : INT_MAX), mhi = __reduce_max_sync(mask, s1 > s0 ? s1 : INT_MIN);
-        const float v = s1 > s0 ? tomo_core::project_ray_steps<true, false, PJ>(x, xT, g, k, t0, s0, s1, mlo, mhi, 1, nullptr) : 0.f;
+        const float v = s1 > s0 ? tomo_core::project_ray_steps<true, false>(x, xT, g, k, t0, s0, s1, mlo, mhi, 1, nullptr) : 0.f;
         epi(static_cast<std::size_t>(a) * g.n_det + d, v);
     }
 }
 
-// a warp per ray (few rays, e.g. ART's single angles: one thread per ray would be latency bound)
-template <int PJ, class E>
+// a warp per ray (few rays: one thread per ray would be latency bound)
+template <class E>
 __global__ void project_warp_kernel(const float* __restrict__ x, const float* __restrict__ xT, const int32_t* sel, int n_sel,
                                     const AngleC* __restrict__ ak, Geom g, E epi) {
     const std::size_t total = static_cast<std::size_t>(n_sel) * g.n_det;
@@ -54,39 +54,88 @@ __global__ void project_warp_kernel(const float* __restrict__ x, const float* __
     for (std::size_t q = w0; q < total; q += nw) {
         const int a = sel[q / g.n_det], d = static_cast<int>(q % g.n_det);
         const AngleC k = ak[a];
-        float v = tomo_core::project_ray<true, false, PJ>(x, xT, g, k, d, nullptr, lane, 32);
+        float v = tomo_core::project_ray<true, false>(x, xT, g, k, d, nullptr, lane, 32);
         for (int o = 16; o; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
         if (lane == 0) epi(static_cast<std::size_t>(a) * g.n_det + d, v);
     }
 }
 
-template <int PJ, int L2>
+template <int L2>
 __global__ void len2_kernel(const AngleC* __restrict__ ak, int n_angles, Geom g, float* l2) {
     const std::size_t total = static_cast<std::size_t>(n_angles) * g.n_det;
     for (std::size_t q = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; q < total;
          q += static_cast<std::size_t>(gridDim.x) * blockDim.x)
-        tomo_core::project_ray<false, L2, PJ>(nullptr, nullptr, g, ak[q / g.n_det], static_cast<int>(q % g.n_det), &l2[q]);
+        tomo_core::project_ray<false, L2>(nullptr, nullptr, g, ak[q / g.n_det], static_cast<int>(q % g.n_det), &l2[q]);
 }
 
-// box pixels x the angles of sel (angle constants staged in shared memory); kPix pixels per thread (rows r + j kTile)
-constexpr int kPix = 2;
+// SF model (tomo_core.hpp): one thread per cell boundary. A warp walks 32 consecutive boundaries of one angle in
+// step and writes the 31 cells between them (warps overlap by one boundary). The warps of a block take the same
+// boundaries at kSfGroup consecutive angles of sel: their walks read nearly the same image lines (L1). wpa: warps per
+// angle.
+constexpr int kSfCells = 31, kSfGroup = 8;
+template <class E>
+__global__ void sf_project_kernel(tomo_core::SfImage im, const int32_t* sel, int n_sel, const AngleC* __restrict__ ak,
+                                  const tomo_core::SfAngle* __restrict__ sfa, Geom g, int wpa, E epi) {
+    const int lane = threadIdx.x & 31, wb = threadIdx.x >> 5;   // warp of the block: the angle within the group
+    const std::size_t total = static_cast<std::size_t>((n_sel + kSfGroup - 1) / kSfGroup) * wpa;   // blocks of work
+    for (std::size_t q = blockIdx.x; q < total; q += gridDim.x) {
+        const int ia = static_cast<int>(q / wpa) * kSfGroup + wb;
+        if (ia >= n_sel) continue;
+        const int a = sel[ia], beta = static_cast<int>(q % wpa) * kSfCells + lane;
+        const AngleC k = ak[a];
+        int s0 = 0, s1 = 0;
+        if (beta <= g.n_det) tomo_core::ray_span(g, k, static_cast<float>(beta) - 0.5f - g.rot, s0, s1);
+        const int mlo = __reduce_min_sync(0xffffffffu, s1 > s0 ? s0 : INT_MAX);
+        const int mhi = __reduce_max_sync(0xffffffffu, s1 > s0 ? s1 : INT_MIN);
+        float A = 0.f, Eb = 0.f;
+        tomo_core::sf_boundary_steps(im, g, k, tomo_core::sf_walk(g, k, sfa[a], beta), s0, s1, mlo, mhi, A, Eb);
+        const float An = __shfl_down_sync(0xffffffffu, A, 1);
+        if (lane < kSfCells && beta < g.n_det) epi(static_cast<std::size_t>(a) * g.n_det + beta, An + Eb);
+    }
+}
+
+// the box image -> the SF walks' copies (SfImage): zero outside the disk; the padding stays zero
+__global__ void sf_image_kernel(const float* __restrict__ x, float* rows, float* cols, Geom g) {
+    __shared__ float t[32][33];
+    const int bx = blockIdx.x * 32, by = blockIdx.y * 32, P = tomo_core::kSfPad;
+    for (int j = threadIdx.y; j < 32; j += blockDim.y) {
+        const int ix = bx + threadIdx.x, iy = by + j;
+        if (ix < g.W && iy < g.H) {
+            const float v = tomo_core::sf_image_value(x, g, ix, iy);
+            t[j][threadIdx.x] = v;
+            rows[static_cast<std::size_t>(iy) * (g.W + 2 * P) + P + ix] = v;
+        }
+    }
+    __syncthreads();
+    for (int j = threadIdx.y; j < 32; j += blockDim.y) {
+        const int iy = by + threadIdx.x, ix = bx + j;
+        if (ix < g.W && iy < g.H) cols[static_cast<std::size_t>(ix) * (g.H + 2 * P) + P + iy] = t[threadIdx.x][j];
+    }
+}
+
+// box pixels x the angles of sel (angle constants staged in shared memory); a block takes a tile of 2 kTile x 2 kTile
+// pixels, four per thread (kTile apart on each axis)
+constexpr int kPix = 4;
 template <int PJ>
 __global__ void backproject_kernel(const float* __restrict__ y, float* x, const int32_t* sel, int n_sel,
                                    const AngleC* __restrict__ ak, Geom g, bool accumulate) {
     __shared__ AngleC s_k[kAngles];
     __shared__ int s_a[kAngles];
-    const int q = blockIdx.x * kTile + threadIdx.x, r0 = blockIdx.y * kTile * kPix + threadIdx.y;
-    const float X = g.ox + q - g.c;
+    const int q0 = blockIdx.x * kTile * 2 + threadIdx.x, r0 = blockIdx.y * kTile * 2 + threadIdx.y;
     bool in[kPix];
-    float Y[kPix], s[kPix];
+    float X[kPix], Y[kPix], s[kPix], inner[kPix], reach[kPix];
     bool any = false;
 #pragma unroll
     for (int j = 0; j < kPix; ++j) {
-        const int r = r0 + j * kTile;
+        const int q = q0 + (j & 1) * kTile, r = r0 + (j >> 1) * kTile;
+        X[j] = g.ox + q - g.c;
         Y[j] = g.oy + r - g.c;
-        in[j] = q < g.W && r < g.H && (!g.clip || tomo_core::in_disk(X, Y[j], g));
+        in[j] = q < g.W && r < g.H && (!g.clip || tomo_core::in_disk(X[j], Y[j], g));
         any |= in[j];
         s[j] = 0.f;
+        // SF: the pixel's detector positions with all four cells on the detector [1, inner), or some (-2, reach)
+        inner[j] = in[j] ? static_cast<float>(g.n_det - 2) : -1e30f;
+        reach[j] = in[j] ? static_cast<float>(g.n_det + 1) : -1e30f;
     }
     const int tid = threadIdx.y * kTile + threadIdx.x;
     for (int k0 = 0; k0 < n_sel; k0 += kAngles) {
@@ -103,13 +152,20 @@ __global__ void backproject_kernel(const float* __restrict__ y, float* x, const 
                 const AngleC k = s_k[t];
                 const float* yr = y + static_cast<std::size_t>(s_a[t]) * g.n_det;
 #pragma unroll
-                for (int j = 0; j < kPix; ++j)
-                    if (in[j]) s[j] += tomo_core::backproject_pixel<PJ>(yr, g, X, Y[j], k);
+                for (int j = 0; j < kPix; ++j) {
+                    if (PJ == tomo_core::SF) {
+                        const float u0 = X[j] * k.ca + Y[j] * k.sa + g.rot;
+                        if (u0 >= 1.f && u0 < inner[j]) s[j] = tomo_core::sf_backproject_inner(yr, u0, k, s[j]);
+                        else if (u0 < reach[j]) s[j] = tomo_core::sf_backproject_edge(yr, g.n_det, u0, k, s[j]);
+                    } else if (in[j]) {
+                        s[j] += tomo_core::backproject_pixel<PJ>(yr, g, X[j], Y[j], k);
+                    }
+                }
             }
     }
 #pragma unroll
     for (int j = 0; j < kPix; ++j) {
-        const int r = r0 + j * kTile;
+        const int q = q0 + (j & 1) * kTile, r = r0 + (j >> 1) * kTile;
         if (q < g.W && r < g.H) {
             const std::size_t i = static_cast<std::size_t>(r) * g.W + q;
             x[i] = accumulate ? x[i] + s[j] : s[j];
@@ -219,10 +275,11 @@ struct CudaBackend final : TomoWorkspace {
     int n_angles = 0;
     std::vector<float> angles;
     DeviceBuffer<AngleC> ak;
+    DeviceBuffer<tomo_core::SfAngle> sfa;
     std::map<int, DeviceBuffer<float>> bufs;
     std::vector<std::unique_ptr<DeviceBuffer<int32_t>>> keep;
-    DeviceBuffer<float> l2, xT;
-    int have_l2 = -1;    // projector the cached chord sums belong to
+    DeviceBuffer<float> l2, xT, sf_rows, sf_cols, ones;
+    int have_l2 = -1;    // projector the cached ray norms belong to
     int pj = tomo_core::Chord;
     int norm = 1;        // SIRT ray norm: 1 |a_i|^2, 2 row sum
     // gridrec state
@@ -242,6 +299,9 @@ struct CudaBackend final : TomoWorkspace {
         std::vector<AngleC> h(n_angles);
         for (int i = 0; i < n_angles; ++i) h[i] = tomo_core::angle_constants(std::cos(ang[i]), std::sin(ang[i]));
         ak.upload(h.data(), h.size());
+        std::vector<tomo_core::SfAngle> hs(n_angles);
+        for (int i = 0; i < n_angles; ++i) hs[i] = tomo_core::sf_angle_constants(gfull, h[i]);
+        sfa.upload(hs.data(), hs.size());
     }
     ~CudaBackend() override {
         for (auto& [n, p] : gr_plans) cufftDestroy(p);
@@ -263,6 +323,23 @@ struct CudaBackend final : TomoWorkspace {
     }
     template <class E>
     void project(const float* x, const int32_t* sel, int n_sel, const E& epi) {
+        if (pj == tomo_core::SF) {
+            const std::size_t nr = static_cast<std::size_t>(g.H) * (g.W + 2 * tomo_core::kSfPad);
+            const std::size_t nc = static_cast<std::size_t>(g.W) * (g.H + 2 * tomo_core::kSfPad);
+            if (sf_rows.size() != nr || sf_cols.size() != nc) {
+                sf_rows.resize(nr);
+                sf_cols.resize(nc);
+                HELIREC_CUDA_CHECK(cudaMemsetAsync(sf_rows.data(), 0, nr * sizeof(float)));
+                HELIREC_CUDA_CHECK(cudaMemsetAsync(sf_cols.data(), 0, nc * sizeof(float)));
+            }
+            sf_image_kernel<<<dim3((g.W + 31) / 32, (g.H + 31) / 32), dim3(32, 8)>>>(x, sf_rows.data(), sf_cols.data(), g);
+            const int wpa = g.n_det / kSfCells + 1;   // boundaries 0 .. n_det
+            const std::size_t work = static_cast<std::size_t>((n_sel + kSfGroup - 1) / kSfGroup) * wpa;
+            sf_project_kernel<<<static_cast<unsigned>(std::min<std::size_t>(work, 1u << 20)), 32 * kSfGroup>>>(
+                tomo_core::SfImage{sf_rows.data(), sf_cols.data()}, sel, n_sel, ak.data(), sfa.data(), g, wpa, epi);
+            HELIREC_CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         const float* xt = nullptr;
         if (n_sel >= 16) {  // columns-walking rays read the transposed box (coalesced)
             xT.ensure(static_cast<std::size_t>(g.W) * g.H);
@@ -270,32 +347,36 @@ struct CudaBackend final : TomoWorkspace {
             xt = xT.data();
         }
         const std::size_t rays = static_cast<std::size_t>(n_sel) * g.n_det;
-        const bool sf = pj == tomo_core::SF;
-        if (rays < (1u << 16)) {
-            if (sf) project_warp_kernel<tomo_core::SF><<<grid_for(rays * 32), 256>>>(x, xt, sel, n_sel, ak.data(), g, epi);
-            else project_warp_kernel<tomo_core::Chord><<<grid_for(rays * 32), 256>>>(x, xt, sel, n_sel, ak.data(), g, epi);
-        } else {
-            if (sf) project_kernel<tomo_core::SF><<<grid_for(rays), 256>>>(x, xt, sel, n_sel, ak.data(), g, epi);
-            else project_kernel<tomo_core::Chord><<<grid_for(rays), 256>>>(x, xt, sel, n_sel, ak.data(), g, epi);
-        }
+        if (rays < (1u << 16)) project_warp_kernel<<<grid_for(rays * 32), 256>>>(x, xt, sel, n_sel, ak.data(), g, epi);
+        else project_kernel<<<grid_for(rays), 256>>>(x, xt, sel, n_sel, ak.data(), g, epi);
         HELIREC_CUDA_CHECK(cudaGetLastError());
     }
+    // ray norms over the disk; SF row sums: the projection of the all-ones image
     const float* len2() {
         if (have_l2 != pj * 4 + norm) {
-            l2.ensure(static_cast<std::size_t>(n_angles) * g.n_det);
-            const unsigned gr = grid_for(static_cast<std::size_t>(n_angles) * g.n_det);
-            const bool sf = pj == tomo_core::SF, rs = norm == 2;
-            if (sf && rs) len2_kernel<tomo_core::SF, 2><<<gr, 256>>>(ak.data(), n_angles, gfull, l2.data());
-            else if (sf) len2_kernel<tomo_core::SF, 1><<<gr, 256>>>(ak.data(), n_angles, gfull, l2.data());
-            else if (rs) len2_kernel<tomo_core::Chord, 2><<<gr, 256>>>(ak.data(), n_angles, gfull, l2.data());
-            else len2_kernel<tomo_core::Chord, 1><<<gr, 256>>>(ak.data(), n_angles, gfull, l2.data());
+            const std::size_t rays = static_cast<std::size_t>(n_angles) * g.n_det;
+            l2.ensure(rays);
+            if (pj == tomo_core::SF) {
+                if (norm != 2) throw Error("sf projector: only row-sum ray norms");
+                ones.resize(static_cast<std::size_t>(g.W) * g.H);
+                fill(ones.data(), 1.f, ones.size());
+                std::vector<int32_t> all(n_angles);
+                for (int i = 0; i < n_angles; ++i) all[i] = i;
+                project(ones.data(), ints(all), n_angles, tomo_algos::StoreEpi{l2.data()});
+                HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+                ones.reset();
+            } else if (norm == 2) {
+                len2_kernel<2><<<grid_for(rays), 256>>>(ak.data(), n_angles, gfull, l2.data());
+            } else {
+                len2_kernel<1><<<grid_for(rays), 256>>>(ak.data(), n_angles, gfull, l2.data());
+            }
             HELIREC_CUDA_CHECK(cudaGetLastError());
             have_l2 = pj * 4 + norm;
         }
         return l2.data();
     }
     void backproject(const float* y, float* x, const int32_t* sel, int n_sel, bool accumulate) {
-        dim3 block(kTile, kTile), grid((g.W + kTile - 1) / kTile, (g.H + kTile * kPix - 1) / (kTile * kPix));
+        dim3 block(kTile, kTile), grid((g.W + 2 * kTile - 1) / (2 * kTile), (g.H + 2 * kTile - 1) / (2 * kTile));
         if (pj == tomo_core::SF) backproject_kernel<tomo_core::SF><<<grid, block>>>(y, x, sel, n_sel, ak.data(), g, accumulate);
         else backproject_kernel<tomo_core::Chord><<<grid, block>>>(y, x, sel, n_sel, ak.data(), g, accumulate);
         HELIREC_CUDA_CHECK(cudaGetLastError());
@@ -341,7 +422,7 @@ struct CudaBackend final : TomoWorkspace {
         const std::size_t H_n = static_cast<std::size_t>(pdim) * pdim;
         HELIREC_CUDA_CHECK(cudaMemsetAsync(gr_H.data(), 0, H_n * sizeof(cufftComplex)));
         const float L2 = static_cast<float>(static_cast<int>(kC / M_PI));
-        const int L = static_cast<int>(2 * kC / M_PI);
+        const int L = kernel_cells();
         const float tblspcg = 2.f * kLtbl / L;
         for (int p0 = 0; p0 < NG; p0 += gr_chunk) {
             const int n = std::min(gr_chunk, NG - p0);

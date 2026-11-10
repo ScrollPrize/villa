@@ -91,20 +91,22 @@ class TomoBackprojector final : public ExternalBackprojector {
         t.n_angles = n_angles; t.n_det = n_det; t.N = N; t.rot = p.rot_center;
         t.R = p.clip_outer_circle ? rad : 1e30f;
         const int rx = roi.x1 - roi.x0, ry = roi.y1 - roi.y0;
-        std::vector<float> crop(static_cast<std::size_t>(rx) * ry);
+        const float* crop = nullptr;       // the ROI, rows of `pitch`
+        std::size_t pitch = rx;
         if (device == Device::CPU) {
             img_host_.resize(static_cast<std::size_t>(N) * N);
             cpu::tomo_reconstruct(a_, t, rows, weights, angles, img_host_.data(), &ws_cpu_);
-            for (int r = 0; r < ry; ++r)
-                std::memcpy(&crop[static_cast<std::size_t>(r) * rx],
-                            &img_host_[static_cast<std::size_t>(roi.y0 + r) * N + roi.x0], rx * sizeof(float));
+            crop = img_host_.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0;
+            pitch = N;
         } else {
 #ifdef HELIREC_WITH_CUDA
             img_.ensure(static_cast<std::size_t>(N) * N);
             cuda::tomo_reconstruct(a_, t, rows, weights, angles, img_.data(), &ws_cuda_);
-            HELIREC_CUDA_CHECK(cudaMemcpy2D(crop.data(), rx * sizeof(float),
+            crop_.ensure(static_cast<std::size_t>(rx) * ry);
+            HELIREC_CUDA_CHECK(cudaMemcpy2D(crop_.data(), rx * sizeof(float),
                                             img_.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0,
                                             N * sizeof(float), rx * sizeof(float), ry, cudaMemcpyDeviceToHost));
+            crop = crop_.data();
 #else
             throw Error("built without CUDA");
 #endif
@@ -112,11 +114,12 @@ class TomoBackprojector final : public ExternalBackprojector {
         // pipeline units: the methods give attenuation per pixel -> x scale (1 / voxel cm) x unit_gain (1; legacy
         // reference mode: 1 / angular span, as the reference's FBP normalisation)
         const float units = p.scale * p.unit_gain;
+#pragma omp parallel for schedule(static)
         for (int r = 0; r < ry; ++r)
             for (int q = 0; q < rx; ++q) {
                 const float X = roi.x0 + q - c, Y = roi.y0 + r - c;
                 const bool inside = !p.clip_outer_circle || X * X + Y * Y <= rad * rad;
-                out[static_cast<std::size_t>(r) * rx + q] = inside ? crop[static_cast<std::size_t>(r) * rx + q] * units : 0.f;
+                out[static_cast<std::size_t>(r) * rx + q] = inside ? crop[static_cast<std::size_t>(r) * pitch + q] * units : 0.f;
             }
     }
 
@@ -126,6 +129,7 @@ class TomoBackprojector final : public ExternalBackprojector {
     std::unique_ptr<TomoWorkspace> ws_cpu_, ws_cuda_;
 #ifdef HELIREC_WITH_CUDA
     cuda::DeviceBuffer<float> img_;
+    cuda::PinnedBuffer<float> crop_;   // staging of the ROI's download
 #endif
 };
 }  // namespace

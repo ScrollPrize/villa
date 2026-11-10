@@ -36,7 +36,7 @@ DEFAULTS = dict(
     mode="corrected", filters=DEFAULT_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9, sld="",
+    axis_source_meters=1e9, sld="", x_interp="lanczos3",
 )
 
 # mode "legacy_reference": every parameter pinned to the reference workflow
@@ -44,7 +44,7 @@ LEGACY_REFERENCE = dict(
     filters=REFERENCE_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9, sld="",
+    axis_source_meters=1e9, sld="", x_interp="linear",
 )
 assert set(LEGACY_REFERENCE) == set(DEFAULTS) - {"mode"}
 
@@ -64,11 +64,14 @@ CONVENTIONS = {
     "corrected": dict(output_units="attenuation_cm-1", ramp_angular_weight="2pi/n_angles",
                       rebalance="periodic_opposite_view", ramp_padding_reflection="2*rot_center (interpolated)",
                       mending_domain="merged columns covered by the scans' weight maps",
-                      paganin_kernel="fixed, rows [-m, m], unit DC"),
+                      paganin_kernel="fixed, rows [-m, m], unit DC",
+                      column_offset="x_interp kernel (lanczos3 by default); linear splat next to unmeasured columns",
+                      luminosity_window="full 25 rows (12 context rows read either side of a chunk)"),
     "legacy_reference": dict(output_units="reference_units (attenuation / 2)", ramp_angular_weight="pi/n_angles",
                              rebalance="nabuxx (endpoint quirks)", ramp_padding_reflection="lround(2*rot_center)",
                              mending_domain="main-scan first/last column as left/right widths",
-                             paganin_kernel="nabuxx pag_version 2 (truncated per chunk, DC not renormalised)"),
+                             paganin_kernel="nabuxx pag_version 2 (truncated per chunk, DC not renormalised)",
+                             column_offset="two-column linear splat", luminosity_window="clipped to the chunk"),
 }
 
 
@@ -290,9 +293,12 @@ class HelicalRecon:
         height = px_mm * ((rows - 1) / 2 - h) - z0 * 1e3
         return SliceInfo(fraction, h, 999999 - (self.hi - h), height)
 
-    def reconstruct_heights(self, h_lo: int, h_hi: int, debug=False, timing=False, roi=None):
-        """Slices [h_lo, h_hi) -> (n, N, N), or (n, y1 - y0, x1 - x0) with roi = (x0, x1, y0, y1)."""
-        return self.rec.reconstruct(int(h_lo), int(h_hi), debug, timing, None if roi is None else tuple(map(int, roi)))
+    def reconstruct_heights(self, h_lo: int, h_hi: int, debug=False, timing=False, roi=None, next=None):
+        """Slices [h_lo, h_hi) -> (n, N, N), or (n, y1 - y0, x1 - x0) with roi = (x0, x1, y0, y1).
+        next = (h_lo, h_hi): the chunk the caller will ask for next; its raw data is read while this one computes
+        (CUDA)."""
+        return self.rec.reconstruct(int(h_lo), int(h_hi), debug, timing, None if roi is None else tuple(map(int, roi)),
+                                    None if next is None else (int(next[0]), int(next[1])))
 
     def reconstruct_fractions(self, fractions):
         out = []

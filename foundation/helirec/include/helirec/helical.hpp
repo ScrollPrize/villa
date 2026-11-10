@@ -68,10 +68,14 @@ struct FlatSeriesInfo {
 struct FlatInterpolation { int i0=0, i1=0; float fraction=0; };
 FlatInterpolation interpolate_flats(const FlatSeriesInfo&, float angle);
 
-// h_lo..h_hi-1: slice heights of the chunk; margin: phase margin (rows)
+// h_lo..h_hi-1: slice heights of the chunk; margin: context rows either side (filters, luminosity window).
+// Projections: those seeing the chunk's heights (the reference); full_context: every projection seeing a row of
+// [h_lo - margin, h_hi + margin), so that the context rows do not depend on the chunking. padded_rows (with
+// full_context): the gridding that pads rows beyond the detector from its last interpolable row needs that row
+// inside the window.
 ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const std::vector<double>& control_A,
                              const FlatSeriesInfo& flats, int h_lo, int h_hi, int margin, int n_grid,
-                             double nominal_current = 0.2, bool measured_context = false);
+                             double nominal_current = 0.2, bool full_context = false, bool padded_rows = false);
 
 // number of grid angles: round(360 / |mean step|) over the whole scan
 int grid_angle_count(const std::vector<double>& angles_deg);

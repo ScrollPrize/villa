@@ -111,24 +111,24 @@ FlatInterpolation interpolate_flats(const FlatSeriesInfo& flats, float ang) {
 
 ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const std::vector<double>& control_A,
                              const FlatSeriesInfo& flats, int h_lo, int h_hi, int margin, int n_grid,
-                             double nominal_current, bool measured_context) {
+                             double nominal_current, bool full_context, bool padded_rows) {
     ChunkScan c;
     // the reference includes the height h_hi itself (inclusive end of span_v) when selecting projections
     auto [p0, p1] = chunk_projection_span(s, h_lo, h_hi);
-    if (measured_context) {
+    if (full_context) {
         // All observations contributing to the central slices AND their filter/luminosity
         // context. Selecting only the central heights makes the context depend on chunking.
         p0 = static_cast<int>(t.n());
         p1 = 0;
         for (int p = 0; p < static_cast<int>(t.n()); ++p) {
             const int first = s.integer_shift_v[p];
-            const int last = first + t.det_rows - 1 - (s.fract_complement[p] > 0.f ? 1 : 0);
+            const int last = first + t.det_rows - 1 - ((padded_rows || s.fract_complement[p] > 0.f) ? 1 : 0);
             if (last >= h_lo - margin && first < h_hi + margin) {
                 p0 = std::min(p0, p);
                 p1 = p + 1;
             }
         }
-        if (p1 <= p0) throw Error("prepare_chunk_scan: no measured context");
+        if (p1 <= p0) throw Error("prepare_chunk_scan: no projection sees the chunk");
     }
     c.p0 = p0;
     c.p1 = p1;

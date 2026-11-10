@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <exception>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <map>
 #include <cmath>
@@ -50,7 +52,7 @@ struct ScanChunk {  // host data of one scan for the current chunk
 AccumScanView make_view(const ScanData& sd, const ScanChunk& ch, const uint16_t* raw, const float* dark,
                         const float* flats, const float* weight, const int32_t* row0, const float* fract_v,
                         const float* alpha, const float* cdiv, const float* wfac, const float* ffrac,
-                        const int32_t* fi0, const int32_t* fi1) {
+                        const int32_t* fi0, const int32_t* fi1, int x_kernel) {
     AccumScanView v;
     v.n_proj = ch.cs.p1 - ch.cs.p0;
     v.det_rows = sd.traj.det_rows;
@@ -60,6 +62,7 @@ AccumScanView make_view(const ScanData& sd, const ScanChunk& ch, const uint16_t*
     v.row0 = row0; v.fract_v = fract_v; v.alpha = alpha; v.current_div = cdiv; v.weight_factor = wfac;
     v.flat_frac = ffrac; v.flat_i0 = fi0; v.flat_i1 = fi1;
     v.sx = ch.cs.sx; v.ixs = ch.cs.ixs; v.fract_x = ch.cs.fract_x;
+    set_x_kernel(v, x_kernel);
     return v;
 }
 
@@ -82,6 +85,12 @@ struct SliceReconstructor::Impl {
     std::vector<SpanInfo> spans;
     std::pair<int, int> doable;
     int margin = 0, n_grid = 0, NX = 0, grid_size = 0;
+    int filter_margin = 0;   // margin of single-step filter chains (cfg.margin, or the chain's own)
+    int lum_margin = 0;      // context rows of the luminosity window, added to the filters' in `margin`
+    int x_kernel = 0;        // interp_core::Interp of fractional column offsets (legacy reference: Linear, the splat)
+    // context rows gridded from every projection that sees them (prepare_chunk_scan); the legacy reference grids
+    // them from the projections of the chunk's own heights, as the reference does
+    bool full_context = false, measured = false;
     int mend_x0 = 0, mend_x1 = 0, seam_cx = 0;   // mending domain [mend_x0, mend_x1) of the merged row
     LuminosityKernel lum = luminosity_kernel();
     // per-chunk invariants (built on first use)
@@ -140,6 +149,7 @@ struct SliceReconstructor::Impl {
         if (pf_thread.joinable()) pf_thread.join();
     }
     cuda::DeviceBuffer<float> R, RW, Wp, Aha, Bha, Atot, Btot, S, W, row, wrow, pad, slice;
+    cuda::PinnedBuffer<float> slice_host;   // staging of the slices' download
     std::unique_ptr<cuda::Ghbp> ghbp;
     std::unique_ptr<cuda::Stream> copy;
 #endif
@@ -149,8 +159,10 @@ struct SliceReconstructor::Impl {
     // weights -> sink(k, y, row, wrow) (row: (n_grid, NX) filtered sinogram, wrow: balanced weights; device pointers on
     // CUDA, host on CPU; with raw_rows, row is the unfiltered -log sinogram).
     // Several chains (CUDA only) share everything before the filters; `margin` must suit every chain.
+    // margin_rows: context rows read either side of the chunk; filter_rows: the margin of single-step filter chains
+    // (their horizontal padding; <= margin_rows, which may add the luminosity window's rows)
     void run(int h_lo, int h_hi, ChunkDebug* dbg, const std::vector<const FilterPipeline*>& sets, int margin_rows,
-             const std::function<void(int, int, float*, float*)>& sink, int next_lo = 0, int next_hi = 0);
+             int filter_rows, const std::function<void(int, int, float*, float*)>& sink, int next_lo = 0, int next_hi = 0);
     bool raw_rows = false;  // sinks get the unfiltered rows (external backprojectors that filter themselves)
     std::vector<float> up_h;
 #ifdef HELIREC_WITH_CUDA
@@ -201,13 +213,19 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     const auto& m = I.scans[0].traj;
     I.fctx = FilterContext{I.cfg.energy_kev, I.cfg.distance_m, I.cfg.pixel_size_m, m.det_rows, m.det_cols,
                            I.cfg.legacy_reference};
-    I.margin = I.cfg.margin >= 0 ? I.cfg.margin : I.pipeline(I.cfg.filters)->margin_rows();
+    I.margin = I.filter_margin = I.cfg.margin >= 0 ? I.cfg.margin : I.pipeline(I.cfg.filters)->margin_rows();
     // Sequential operations need the sum of their supports: filter context must itself
     // have a full luminosity window. Keep this separate from each filter's kernel support.
-    if (I.cfg.external && I.cfg.external->measured_only()) {
-        const int lum_margin = I.scans.size() == 2 && I.cfg.luminosity_repartition != 0.f ? I.lum.radius : 0;
-        I.margin = std::max(I.margin, I.pipeline(I.cfg.filters)->margin_rows() + lum_margin);
+    // (The legacy reference clips the luminosity window to the chunk, as the reference does.)
+    if (!I.cfg.legacy_reference || (I.cfg.external && I.cfg.external->measured_only())) {
+        I.lum_margin = I.scans.size() == 2 && I.cfg.luminosity_repartition != 0.f ? I.lum.radius : 0;
+        I.margin = std::max(I.margin, I.pipeline(I.cfg.filters)->margin_rows() + I.lum_margin);
     }
+    I.measured = I.cfg.external && I.cfg.external->measured_only();
+    I.full_context = I.measured || !I.cfg.legacy_reference;
+    I.x_kernel = I.cfg.legacy_reference ? static_cast<int>(interp_core::Linear) : interp_from_name(I.cfg.x_interp);
+    if (I.x_kernel != interp_core::Linear && I.x_kernel != interp_core::Cubic && I.x_kernel != interp_core::Lanczos3)
+        throw Error("x_interp must be linear, cubic or lanczos3");
     I.n_grid = I.cfg.n_grid > 0 ? I.cfg.n_grid : grid_angle_count(m.angles_deg);
     // merged width: main width + ceil(max |companion offset|)
     float max_off = 0.f;
@@ -393,28 +411,21 @@ SliceReconstructor::Impl::ChunkGlare SliceReconstructor::Impl::chunk_glare(std::
     std::vector<int> todo;
     for (int p : samples)
         if (!have.count(p)) todo.push_back(p);
-    const std::size_t plane = static_cast<std::size_t>(sd.traj.det_rows) * sd.traj.det_cols;
     const std::size_t cell = static_cast<std::size_t>(g.rows()) * g.cols();
-    const std::size_t batch = std::max<std::size_t>(1, (std::size_t(512) << 20) / (plane * sizeof(uint16_t)));
-    std::vector<uint16_t> raw;
-    std::vector<float> out, div;
-    std::vector<int32_t> fi, fr;
-    for (std::size_t a = 0; a < todo.size(); a += batch) {
-        const std::size_t n = std::min(batch, todo.size() - a);
-        raw.resize(n * plane);
-        out.resize(n * cell);
-        div.resize(n);
-        fi.resize(n);
-        fr.resize(n);
+    if (!todo.empty()) {   // the frames are binned as they are read (a few rows of cells at a time), then filtered
+        const std::size_t n = todo.size();
+        std::vector<float> out(n * cell);
+        std::vector<int32_t> fi(n), fr(n);
         for (std::size_t i = 0; i < n; ++i) {
-            const int p = todo[a + i];
-            fi[i] = sd.file_index[p];
-            fr[i] = sd.frame_index[p];
-            div[i] = static_cast<float>(sd.control_A[p] / 0.2);   // as prepare_chunk_scan's current_div
+            fi[i] = sd.file_index[todo[i]];
+            fr[i] = sd.frame_index[todo[i]];
         }
-        sd.reader->read_frames(fi.data(), fr.data(), n, raw.data());
-        g.from_raw(raw.data(), sd.dark.data(), div.data(), static_cast<int>(n), out.data());
-        for (std::size_t i = 0; i < n; ++i) have[todo[a + i]].assign(out.begin() + i * cell, out.begin() + (i + 1) * cell);
+        sd.reader->visit_frames(fi.data(), fr.data(), n, 4 * g.bin(), [&](std::size_t i, int r0, int nr, const uint16_t* rows) {
+            // (the divisor as prepare_chunk_scan's current_div)
+            g.bin_raw(rows, r0, nr, sd.dark.data(), static_cast<float>(sd.control_A[todo[i]] / 0.2), out.data() + i * cell);
+        });
+        g.filter(out.data(), static_cast<int>(n));
+        for (std::size_t i = 0; i < n; ++i) have[todo[i]].assign(out.begin() + i * cell, out.begin() + (i + 1) * cell);
     }
     ChunkGlare cg;
     cg.maps.resize(samples.size() * cell);
@@ -444,7 +455,8 @@ void SliceReconstructor::Impl::start_prefetch(int lo, int hi, int m) {
         try {
             for (std::size_t s = 0; s < scans.size(); ++s) {
                 const auto& sd = scans[s];
-                const ChunkScan c = prepare_chunk_scan(sd.traj, spans[s], sd.control_A, sd.flat_info, lo, hi, m, n_grid);
+                const ChunkScan c = prepare_chunk_scan(sd.traj, spans[s], sd.control_A, sd.flat_info, lo, hi, m, n_grid,
+                                                       0.2, full_context, !measured);
                 const int n = c.p1 - c.p0, win = hi - lo + 2 * m + 1, cols = sd.traj.det_cols;
                 const std::size_t per = static_cast<std::size_t>(win) * cols;
                 pinned_next[s].ensure(static_cast<std::size_t>(n) * per);
@@ -499,8 +511,8 @@ bool SliceReconstructor::Impl::take_prefetch(int lo, int hi, int m) {
 #endif
 
 void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const std::vector<const FilterPipeline*>& sets,
-                                   int margin_rows, const std::function<void(int, int, float*, float*)>& sink, int next_lo,
-                                   int next_hi) {
+                                   int margin_rows, int filter_rows,
+                                   const std::function<void(int, int, float*, float*)>& sink, int next_lo, int next_hi) {
     auto& I = *this;
     if (h_lo < I.doable.first || h_hi > I.doable.second || h_hi <= h_lo)
         throw Error("reconstruct: heights outside the doable span");
@@ -525,10 +537,11 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
 
     // ---------------------------------------------------------------- per-scan chunk geometry
     const bool measured_only = cfg.external && cfg.external->measured_only();
+    const int fm = measured_only ? -1 : filter_rows;   // (measured data: every step its own margin)
     std::vector<ScanChunk> chunks(I.scans.size());
     for (std::size_t s = 0; s < I.scans.size(); ++s) {
         chunks[s].cs = prepare_chunk_scan(I.scans[s].traj, I.spans[s], I.scans[s].control_A, I.scans[s].flat_info,
-                                          h_lo, h_hi, m, NG, 0.2, measured_only);
+                                          h_lo, h_hi, m, NG, 0.2, I.full_context, !measured_only);
         chunks[s].win_rows = H + 1;
         if (timing) {
             const double np = chunks[s].cs.p1 - chunks[s].cs.p0;
@@ -586,7 +599,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 const auto contrib = make_contributors(c.j0.data(), n, NG, g0, g1);
                 auto view = make_view(sd, ch, ch.raw.data(), sd.dark.data(), sd.flats.data(), sd.weight.data(),
                                       c.row0.data(), c.fract_v.data(), c.alpha.data(), c.current_div.data(),
-                                      c.weight_factor.data(), c.flat_frac.data(), c.flat_i0.data(), c.flat_i1.data());
+                                      c.weight_factor.data(), c.flat_frac.data(), c.flat_i0.data(), c.flat_i1.data(),
+                                      I.x_kernel);
                 if (cfg.sld.enabled())
                     set_glare(view, *I.glare[s], cg[s].maps.data(), cg[s].i0.data(), cg[s].i1.data(), cg[s].frac.data());
                 cpu::accumulate(view, contrib, ap, R.data(), RW.data());
@@ -611,10 +625,10 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             else if (cfg.mend_threshold > 0)
                 cpu::mend_null_weights(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
             tick("divide_mend");
-            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, measured_only ? -1 : m);
+            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, fm);
             tick("filters");
             if (!ap.log_values) cpu::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
-            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, measured_only ? -1 : m);
+            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, fm);
             tick("log");
             for (int j = 0; j < L; ++j)
                 for (int y = 0; y < DY; ++y) {
@@ -667,17 +681,12 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     };
     std::vector<DevChunk> dc(nsc);
     std::vector<std::size_t> per(nsc);
+    for (std::size_t s = 0; s < nsc; ++s) per[s] = static_cast<std::size_t>(chunks[s].win_rows) * I.scans[s].traj.det_cols;
     for (std::size_t s = 0; s < nsc; ++s) {
-        const auto& sd = I.scans[s];
         const auto& c = chunks[s].cs;
-        const int n = c.p1 - c.p0;
-        per[s] = static_cast<std::size_t>(chunks[s].win_rows) * sd.traj.det_cols;
         if (!prefetched) {
-            pinned[s].ensure(static_cast<std::size_t>(n) * per[s]);
+            pinned[s].ensure(static_cast<std::size_t>(c.p1 - c.p0) * per[s]);
             tick("alloc");
-            sd.reader->read_rows(sd.file_index.data() + c.p0, sd.frame_index.data() + c.p0, c.row0.data(), n,
-                                 chunks[s].win_rows, pinned[s].data());
-            tick("read_raw");
         }
         dc[s].row0.upload(c.row0.data(), c.row0.size());
         dc[s].fi0.upload(c.flat_i0.data(), c.flat_i0.size());
@@ -741,11 +750,71 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         held.p0[s] = chunks[s].cs.p0; held.p1[s] = chunks[s].cs.p1;
         held.row0[s] = chunks[s].cs.row0;
     }
-    // the next chunk's raw windows are read while this one computes
-    if (next_hi > next_lo && next_lo >= I.doable.first && next_hi <= I.doable.second) start_prefetch(next_lo, next_hi, m);
+    // Not prefetched: a background thread reads the raw windows in the order the blocks need them, so the uploads and
+    // the gridding start with the first block's projections (wait(b): block b's are in `pinned`).
+    struct RawRead {
+        std::mutex m;
+        std::condition_variable cv;
+        std::size_t done = 0;
+        std::exception_ptr err;
+        std::thread t;
+        ~RawRead() {
+            if (t.joinable()) t.join();
+        }
+        void wait(std::size_t b) {
+            std::unique_lock<std::mutex> lock(m);
+            cv.wait(lock, [&] { return done > b || err; });
+            if (err) std::rethrow_exception(err);
+        }
+    } raw_read;
+    if (!prefetched)
+        raw_read.t = std::thread([&] {
+            try {
+                std::vector<std::vector<char>> got(nsc);
+                for (std::size_t s = 0; s < nsc; ++s) got[s].assign(chunks[s].cs.p1 - chunks[s].cs.p0, 0);
+                auto read = [&](std::size_t s, int a0, int e0) {   // the unread projections of [a0, e0)
+                    const auto& sd = I.scans[s];
+                    const auto& c = chunks[s].cs;
+                    for (int k = a0; k < e0;) {
+                        if (got[s][k]) { ++k; continue; }
+                        const int k0 = k;
+                        while (k < e0 && !got[s][k]) got[s][k++] = 1;
+                        sd.reader->read_rows(sd.file_index.data() + c.p0 + k0, sd.frame_index.data() + c.p0 + k0,
+                                             c.row0.data() + k0, k - k0, chunks[s].win_rows,
+                                             pinned[s].data() + static_cast<std::size_t>(k0) * per[s]);
+                    }
+                };
+                for (std::size_t b = 0; b <= plans.size(); ++b) {
+                    for (std::size_t s = 0; s < nsc; ++s) {
+                        if (b == plans.size()) read(s, 0, static_cast<int>(got[s].size()));   // (any no block uses)
+                        else
+                            for (auto [a0, e0] : plans[b].ranges[s]) read(s, a0, e0);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(raw_read.m);
+                        raw_read.done = b + 1;
+                    }
+                    raw_read.cv.notify_all();
+                }
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(raw_read.m);
+                    raw_read.err = std::current_exception();
+                }
+                raw_read.cv.notify_all();
+            }
+        });
+    // the next chunk's raw windows are read while this one computes (its rows shared with this chunk are copied from
+    // `pinned`: once that is complete)
+    const bool want_next = next_hi > next_lo && next_lo >= I.doable.first && next_hi <= I.doable.second;
+    if (want_next && prefetched) start_prefetch(next_lo, next_hi, m);
     cudaStream_t cs = copy->get();
     auto issue_upload = [&](std::size_t b) {
         const int r = static_cast<int>(b & 1);
+        if (!prefetched) {
+            raw_read.wait(b);
+            tick("read_raw");
+        }
         HELIREC_CUDA_CHECK(cudaStreamWaitEvent(cs, ev_done[r], 0));  // ring slot free (block b - 2 done)
         for (std::size_t s = 0; s < nsc; ++s) {
             std::size_t off = 0;
@@ -769,7 +838,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     for (const auto* P : sets) spectral = spectral && P->single_fourier();
     FourierFilter* fwd = nullptr;
     if (spectral) {
-        fwd = fft_for(0, sets[0]->step_spec(0, H, NX, m));
+        fwd = fft_for(0, sets[0]->step_spec(0, H, NX, fm));
         Icache.ensure(static_cast<std::size_t>(NG) * fwd->spectrum_floats());
     } else if (K > 1) {
         Icache.ensure(static_cast<std::size_t>(NG) * H * NX);
@@ -790,7 +859,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             auto view = make_view(sd, ch, d_raw[r][s].data(), I.dev[s].dark.data(), I.dev[s].flats.data(),
                                   I.dev[s].weight.data(), dc[s].row0.data(), dc[s].fract_v.data(),
                                   dc[s].alpha.data(), dc[s].cdiv.data(), dc[s].wfac.data(), dc[s].ffrac.data(),
-                                  dc[s].fi0.data(), dc[s].fi1.data());
+                                  dc[s].fi0.data(), dc[s].fi1.data(), I.x_kernel);
             view.raw_slot = d_slot[r][s].data();
             if (cfg.sld.enabled())
                 set_glare(view, *I.glare[s], dc[s].glare.data(), dc[s].gi0.data(), dc[s].gi1.data(), dc[s].gfrac.data());
@@ -816,17 +885,17 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             cuda::mend_null_weights(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
         tick("divide_mend");
         if (spectral) {  // sweep: keep the spectra of the padded intensity; filter / inverse / log / crop per chain below
-            fwd = fft_for(0, sets[0]->step_spec(0, H, NX, m));
+            fwd = fft_for(0, sets[0]->step_spec(0, H, NX, fm));
             fwd->forward(R.data(), Icache.data() + static_cast<std::size_t>(g0) * fwd->spectrum_floats(), L);
             tick("filters");
         } else if (K > 1) {  // sweep: keep the intensity; the whole chain runs per chain below
             HELIREC_CUDA_CHECK(cudaMemcpyAsync(Icache.data() + static_cast<std::size_t>(g0) * H * NX, R.data(),
                                                n_el * sizeof(float), cudaMemcpyDeviceToDevice));
         } else {
-            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, measured_only ? -1 : m);
+            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, fm);
             tick("filters");
             if (!ap.log_values) cuda::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
-            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, measured_only ? -1 : m);
+            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, fm);
             tick("log");
             // rows [m, m + DY) of each grid angle -> device sinogram (NG, DY, NX)
             HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(S.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
@@ -837,6 +906,11 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                              RW.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
                                              static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
         tick("sino_crop");
+    }
+    if (!prefetched) {
+        raw_read.wait(plans.size());
+        raw_read.t.join();
+        if (want_next) start_prefetch(next_lo, next_hi, m);
     }
     const std::size_t rown = static_cast<std::size_t>(NG) * NX;
     row.ensure(rown); wrow.ensure(rown); pad.ensure(static_cast<std::size_t>(NG) * rg.npad);
@@ -892,16 +966,16 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             const int L = std::min(NG, g0 + BL) - g0;
             const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
             if (spectral) {
-                FourierFilter* f = fft_for(0, sets[k]->step_spec(0, H, NX, m));
+                FourierFilter* f = fft_for(0, sets[k]->step_spec(0, H, NX, fm));
                 f->inverse(Icache.data() + static_cast<std::size_t>(g0) * f->spectrum_floats(), R.data(), L);
             } else {
                 HELIREC_CUDA_CHECK(cudaMemcpyAsync(R.data(), Icache.data() + static_cast<std::size_t>(g0) * H * NX,
                                                    n_el * sizeof(float), cudaMemcpyDeviceToDevice));
-                apply_filters(*sets[k], FilterStage::Intensity, R.data(), L, H, m);
+                apply_filters(*sets[k], FilterStage::Intensity, R.data(), L, H, fm);
             }
             tick("filters");
             cuda::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
-            apply_filters(*sets[k], FilterStage::Log, R.data(), L, H, m);
+            apply_filters(*sets[k], FilterStage::Log, R.data(), L, H, fm);
             HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(S.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
                                                  R.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
@@ -914,7 +988,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
 #endif
 }
 
-void SliceReconstructor::reconstruct(int h_lo, int h_hi, float* out, ChunkDebug* dbg, const SliceRoi* roi_in) {
+void SliceReconstructor::reconstruct(int h_lo, int h_hi, float* out, ChunkDebug* dbg, const SliceRoi* roi_in, int next_lo,
+                                     int next_hi) {
     auto& I = *impl_;
     const int N = I.grid_size;
     const SliceRoi roi = roi_in ? *roi_in : SliceRoi{0, N, 0, N};
@@ -937,7 +1012,7 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, float* out, ChunkDebug*
     if (I.cfg.device == Device::CPU) {
         std::vector<float> full(use_ghbp ? N2 : 0);
         const auto P = I.pipeline(I.cfg.filters);
-        I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, [&](int, int y, float* row, float* wrow) {
+        I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
             float* dst = out + static_cast<std::size_t>(y) * plane;
             if (external) {
                 I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles.data(), bp, N, roi, Device::CPU, dst);
@@ -957,19 +1032,18 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, float* out, ChunkDebug*
     if (use_ghbp && !I.ghbp) I.ghbp = std::make_unique<cuda::Ghbp>(I.plan);
     if (!external) I.slice.ensure(use_ghbp ? N2 : plane);
     const auto P = I.pipeline(I.cfg.filters);
-    I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, [&](int, int y, float* row, float* wrow) {
+    I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
         float* dst = out + static_cast<std::size_t>(y) * plane;
         if (external) {
             I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles.data(), bp, N, roi, Device::CUDA, dst);
         } else if (use_ghbp) {
             I.ghbp->run(row, I.slice.data());
-            HELIREC_CUDA_CHECK(cudaMemcpy2D(dst, rx * sizeof(float), I.slice.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0,
-                                            N * sizeof(float), rx * sizeof(float), ry, cudaMemcpyDeviceToHost));
+            cuda::download_rows(dst, I.slice.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0, N, rx, ry, I.slice_host);
         } else {
             cuda::backproject(I.fbp_rows(row), I.fbp_angles.data(), I.slice.data(), I.n_grid, nd, ry, rx, bp);
-            HELIREC_CUDA_CHECK(cudaMemcpy(dst, I.slice.data(), plane * sizeof(float), cudaMemcpyDeviceToHost));
+            cuda::download_rows(dst, I.slice.data(), rx, rx, ry, I.slice_host);
         }
-    });
+    }, next_lo, next_hi);
     I.raw_rows = false;
 #endif
 }
@@ -995,17 +1069,22 @@ void SliceReconstructor::reconstruct_band(int h_lo, int h_hi, BandSampler& band,
         throw Error("band reconstruction evaluates the exact backprojector at band pixels: backprojector must be fbp "
                     "(use whole slices + sampling for '" + I.cfg.backprojector + "')");
     const int nd = I.NX * I.cfg.bp_oversample;
-    I.run(h_lo, h_hi, dbg, sets, sw ? sweep_margin(*sweep) : I.margin, [&](int k, int y, float* row, float*) {
+    // a sweep's single-step chains share one margin (the largest), so that they share the FFT geometry
+    int fm = I.filter_margin;
+    if (sw && I.cfg.margin < 0) {
+        fm = 0;
+        for (const auto& h : held) fm = std::max(fm, h->margin_rows());
+    }
+    I.run(h_lo, h_hi, dbg, sets, sw ? sweep_margin(*sweep) : I.margin, fm, [&](int k, int y, float* row, float*) {
         band.slice(h_lo + y, I.fbp_rows(row), I.n_grid, nd, I.fbp_angles.data(), I.bp, k);
     }, next_lo, next_hi);
 }
 
 int SliceReconstructor::sweep_margin(const std::vector<FilterChain>& chains) const {
     const auto& I = *impl_;
-    if (I.cfg.margin >= 0) return I.cfg.margin;
     int m = 0;
     for (const auto& c : chains) m = std::max(m, I.pipeline(c)->margin_rows());
-    return m;
+    return std::max(I.cfg.margin >= 0 ? I.cfg.margin : m, m + I.lum_margin);
 }
 
 std::string SliceReconstructor::describe(const FilterChain& chain) const { return impl_->pipeline(chain)->describe(); }

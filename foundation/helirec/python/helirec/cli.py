@@ -204,7 +204,7 @@ def run_range(a, r, out, manifest):
     for c0 in range(h0, h1, a.chunk):
         c1 = min(h1, c0 + a.chunk)
         t = time.time()
-        vol = crop(r.reconstruct_heights(c0, c1), (x0, x1, y0, y1))
+        vol = crop(r.reconstruct_heights(c0, c1, next=(c1, min(h1, c1 + a.chunk)) if c1 < h1 else None), (x0, x1, y0, y1))
         t_rec = time.time() - t
         zc = c0 - h0  # index inside the output
         if a.format == "zarr":

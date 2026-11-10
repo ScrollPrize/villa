@@ -129,6 +129,21 @@ def test_helical_mask_and_chunk_invariance(tmp_path, device, filters):
 
 
 @pytest.mark.parametrize("device", helirec.devices())
+def test_next_chunk_read_ahead(tmp_path, device):
+    # reading the next chunk in the background (reusing the rows it shares with this one) changes nothing
+    scan, *_ = helical_scan(tmp_path)
+    kw = dict(backprojector="fbp", filters=[{"type": "paganin", "delta_beta": 1000.}], pixel_size_m=1e-5)
+    r = recon(scan, device, **kw)
+    plain = [r.reconstruct(h, h + 1) for h in (7, 8, 9)]
+    r = recon(scan, device, **kw)
+    ahead = [r.reconstruct(h, h + 1, next=(h + 1, h + 2) if h < 9 else None) for h in (7, 8, 9)]
+    np.testing.assert_array_equal(np.concatenate(ahead), np.concatenate(plain))
+    assert np.abs(plain[1]).max() > 0
+    del r
+    helirec.release_pinned_memory()
+
+
+@pytest.mark.parametrize("device", helirec.devices())
 def test_log_before_fractional_vertical_rebinning(tmp_path, device):
     scan, angles, z, raw = helical_scan(tmp_path, row_pattern=True)
     h = 7

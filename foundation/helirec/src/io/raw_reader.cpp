@@ -161,6 +161,56 @@ void RawReader::read_rows(const int32_t* file_index, const int32_t* frame_index,
     if (!error.empty()) throw Error(error);
 }
 
+void RawReader::visit_frames(const int32_t* file_index, const int32_t* frame_index, std::size_t n, int nrows,
+                             const std::function<void(std::size_t, int, int, const uint16_t*)>& visit, int n_threads) {
+    if (nrows < 1) throw Error("RawReader: visit_frames needs nrows >= 1");
+    std::map<int, std::vector<std::size_t>> by_file;
+    for (std::size_t i = 0; i < n; ++i) by_file[file_index[i]].push_back(i);
+    std::vector<std::pair<int, const std::vector<std::size_t>*>> groups;
+    for (auto& [f, v] : by_file) {
+        info(f);  // inspect serially (HDF5)
+        groups.push_back({f, &v});
+    }
+    const std::size_t row_bytes = static_cast<std::size_t>(cols_) * 2;
+    const int nt = n_threads > 0 ? n_threads : std::min(32, omp_get_max_threads());
+    std::string error;
+#pragma omp parallel num_threads(nt)
+    {
+        std::vector<uint16_t> buf(static_cast<std::size_t>(nrows) * cols_);
+#pragma omp for schedule(dynamic, 1)
+        for (std::ptrdiff_t g = 0; g < static_cast<std::ptrdiff_t>(groups.size()); ++g) {
+            const int f = groups[g].first;
+            const std::string& path = files_[f];
+            try {
+                const int fd = ::open(path.c_str(), O_RDONLY);
+                if (fd < 0) throw Error("RawReader: cannot open " + path);
+                const FileInfo& fi = *infos_[f];
+                try {
+                    for (std::size_t i : *groups[g].second) {
+                        const int k = frame_index[i];
+                        if (k < 0 || static_cast<std::size_t>(k) >= fi.frame_offset.size())
+                            throw Error("RawReader: frame index out of range in " + path);
+                        for (int r0 = 0; r0 < rows_; r0 += nrows) {
+                            const int nr = std::min(nrows, rows_ - r0);
+                            pread_all(fd, buf.data(), static_cast<std::size_t>(nr) * row_bytes,
+                                      fi.frame_offset[k] + static_cast<std::int64_t>(r0) * row_bytes, path);
+                            visit(i, r0, nr, buf.data());
+                        }
+                    }
+                } catch (...) {
+                    ::close(fd);
+                    throw;
+                }
+                ::close(fd);
+            } catch (const std::exception& e) {
+#pragma omp critical(helirec_reader_error)
+                if (error.empty()) error = e.what();
+            }
+        }
+    }
+    if (!error.empty()) throw Error(error);
+}
+
 void RawReader::read_frames(const int32_t* file_index, const int32_t* frame_index, std::size_t n, uint16_t* out,
                             int n_threads) {
     std::vector<int32_t> row0(n, 0);

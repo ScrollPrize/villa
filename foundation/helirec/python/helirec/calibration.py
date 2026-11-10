@@ -335,6 +335,25 @@ def _filter_overlap(sig, w, low_pass=0.4, high_pass=10.0):
     return out
 
 
+def overlap_cross_check(img0, w0, img1, w1, res, sigma=2.0, tolerance=0.375, log=print):
+    """Guard of the sub-pixel overlap search. find_offset compares img0 with img1 interpolated bilinearly; at
+    half-pixel offsets the interpolation averages img1's noise (up to 4 x less variance), so on noise-dominated
+    stripes the L1 loss is lowest there whatever the true offset. The search is repeated around the same integer
+    offset on copies smoothed by `sigma` pixels, whose noise interpolation can hardly lower; a warning is logged if
+    the two sub-pixel offsets differ by more than `tolerance` pixels. The calibration keeps the reference estimate.
+    Returns dict(sub=(dy, dx) of the smoothed search, differs=bool)."""
+    g = lambda a: _core.gaussian_filter1d(_core.gaussian_filter1d(np.ascontiguousarray(a, np.float64), 1, sigma, "reflect"),
+                                          2, sigma, "reflect")
+    r = _core.find_offset(g(img0), np.ascontiguousarray(w0, np.float64), g(img1), np.ascontiguousarray(w1, np.float64),
+                          int(res["best_int"][0]), int(res["best_int"][1]), 1, 1)
+    sub = tuple(float(v) for v in r["best_sub"])
+    differs = max(abs(a - b) for a, b in zip(sub, res["best_sub"])) > tolerance
+    if differs:
+        log(f"  WARNING: sub-pixel overlap {tuple(res['best_sub'])} is not confirmed on smoothed stripes ({sub}): the "
+            f"stripes may be too noisy for the half-pixel estimate; check the vector (vector_override / --vector)")
+    return dict(sub=sub, differs=bool(differs))
+
+
 def find_overlap(ext_main: Extractor, span_main: Span, ext_comp: Extractor, span_comp: Span, init_dx,
                  radius_x=40, radius_z=10, n_slices=80, low_pass=0.4, high_pass=10.0, log=print):
     """(dy, dx): main[y, x] == companion[y - dy, x - dx] at equal angle and view height."""
@@ -372,6 +391,7 @@ def find_overlap(ext_main: Extractor, span_main: Span, ext_comp: Extractor, span
                                              low_pass, high_pass)
     res = _core.find_offset(img0, w0, img1, w1, 0, int(init_dx), radius_z, radius_x)
     log(f"  overlap: {len(slices)} stripes x {S} rows, integer {res['best_int']} -> sub-pixel {res['best_sub']}")
+    res["cross_check"] = overlap_cross_check(img0, w0, img1, w1, res, log=log)
     res["slices"] = slices
     return res
 
@@ -386,6 +406,23 @@ class ScanPlacement:
 
 # bump when anything that changes the cached results changes (reduction, COR / overlap search, cache layout)
 CALIBRATION_VERSION = 2
+
+# The rotation-axis search fits the axis at both ends of the scan (in steps of 1/8 pixel); the reconstruction uses one
+# axis for every slice. A larger difference than this needs the per-projection lateral correction.
+COR_DRIFT_TOLERANCE_PX = 0.25
+
+
+def check_cor_drift(cor_begin_end, tolerance=COR_DRIFT_TOLERANCE_PX, log=print):
+    """The measured rotation axis at the two ends of the scan must agree: slices are reconstructed with one axis
+    (the fitted line at z = 0), so a drift along the scan would misplace it by up to that drift."""
+    a, b = (float(v) for v in cor_begin_end)
+    if abs(b - a) > tolerance:
+        raise NotImplementedError(
+            f"the rotation axis drifts by {b - a:+.3f} px along the scan ({a:.3f} -> {b:.3f}); per-projection lateral "
+            f"correction is not supported yet. To reconstruct with one fixed axis, give it explicitly "
+            f"(cor_override / --cor)")
+    if b != a:
+        log(f"  rotation axis differs by {b - a:+.3f} px between the ends of the scan (within {tolerance} px: ignored)")
 
 
 @dataclass
@@ -495,6 +532,8 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
         d["vector"] = tuple(d["vector"])
         d["apodisation"] = {k: tuple(v) for k, v in d["apodisation"].items()}
         cal = Calibration(**d)
+        if "cor" in cal.details:
+            check_cor_drift(cal.details["cor"]["cor_begin_end"], log=log)
         log(f"calibration loaded from {cache_dir}")
         return cal, {**arrays, **_scan_weights(arrays["weight_map"], main, cal)}
     t0 = time.time()
@@ -526,6 +565,7 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
         log("rotation axis ...")
         e = extractors()
         cr = find_cor(e["m"], e["sm"], main.estimated_cor_from_motor_pix, log=log)
+        check_cor_drift(cr["cor_begin_end"], log=log)
         cor_main = float(cr["cor0"])
         details["cor"] = dict(cor_begin_end=cr["cor_begin_end"], z_begin_end=cr["z_begin_end"],
                               best_index=cr["best_index"])
@@ -539,7 +579,8 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
         ov = find_overlap(e["m"], e["sm"], e["c"], e["sc"], init_dx, log=log)
         vector = tuple(float(v) for v in ov["best_sub"])
         details["overlap"] = dict(best_int=ov["best_int"], best_int_loss=ov["best_int_loss"],
-                                  best_sub_loss=ov["best_sub_loss"])
+                                  best_sub_loss=ov["best_sub_loss"], smoothed_sub=ov["cross_check"]["sub"],
+                                  smoothed_differs=ov["cross_check"]["differs"])
     else:
         vector = tuple(float(v) for v in vector_override)
         details["vector_override"] = list(vector)

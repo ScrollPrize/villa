@@ -8,7 +8,8 @@
 namespace helirec::cuda {
 
 namespace {
-constexpr int kTile = 16;           // 16x16 pixels per block
+constexpr int kTile = 16;           // 16x16 threads per block; a block takes a tile of 32x32 pixels, four per thread
+constexpr int kPix = 4;             // (kTile apart on each axis)
 constexpr int kAngleChunk = 512;    // angles staged in shared memory per pass
 
 template <int K>
@@ -17,25 +18,44 @@ __global__ void backproject_kernel(const float* __restrict__ sino, const float2*
                                    float rot_center, float scale, float c, int x0, int y0, bool clip,
                                    float r2, float us) {
     __shared__ float2 s_cs[kAngleChunk];
-    const int ix = blockIdx.x * kTile + threadIdx.x;
-    const int iy = blockIdx.y * kTile + threadIdx.y;
-    const float x = static_cast<float>(ix + x0) - c;
-    const float y = static_cast<float>(iy + y0) - c;
-    const bool inside = ix < nx && iy < ny && (!clip || x * x + y * y <= r2);
+    const int q0 = blockIdx.x * kTile * 2 + threadIdx.x, r0 = blockIdx.y * kTile * 2 + threadIdx.y;
+    float x[kPix], y[kPix], acc[kPix], umax[kPix];
+    bool any = false;
+#pragma unroll
+    for (int j = 0; j < kPix; ++j) {
+        const int ix = q0 + (j & 1) * kTile, iy = r0 + (j >> 1) * kTile;
+        x[j] = static_cast<float>(ix + x0) - c;
+        y[j] = static_cast<float>(iy + y0) - c;
+        const bool inside = ix < nx && iy < ny && (!clip || x[j] * x[j] + y[j] * y[j] <= r2);
+        any |= inside;
+        acc[j] = 0.f;
+        // detector positions (bins) within the kernel's reach: [reach_lo, umax)
+        umax[j] = inside ? static_cast<float>(n_det) + interp_core::reach_hi<K>() : -1e30f;
+    }
     const int tid = threadIdx.y * kTile + threadIdx.x;
-    float acc = 0.f;
     for (int a0 = 0; a0 < n_angles; a0 += kAngleChunk) {
         const int na = min(kAngleChunk, n_angles - a0);
         __syncthreads();
         for (int k = tid; k < na; k += kTile * kTile) s_cs[k] = cs_sn[a0 + k];
         __syncthreads();
-        if (inside) {
+        if (any) {
             const float* row = sino + static_cast<size_t>(a0) * n_det;
-            for (int k = 0; k < na; ++k, row += n_det)
-                acc += interp_core::sample_row<K>(row, n_det, (x * s_cs[k].x + y * s_cs[k].y + rot_center) * us);
+            for (int k = 0; k < na; ++k, row += n_det) {
+                const float2 t = s_cs[k];
+#pragma unroll
+                for (int j = 0; j < kPix; ++j) {
+                    // (the contraction nvcc applies to (x cos + y sin + rot) us, spelled out)
+                    const float u = __fmul_rn(__fadd_rn(__fmaf_rn(x[j], t.x, __fmul_rn(y[j], t.y)), rot_center), us);
+                    if (u >= interp_core::reach_lo<K>() && u < umax[j]) acc[j] += interp_core::sample_row_reach<K>(row, n_det, u);
+                }
+            }
         }
     }
-    if (ix < nx && iy < ny) slice[static_cast<size_t>(iy) * nx + ix] = inside ? acc * scale : 0.f;
+#pragma unroll
+    for (int j = 0; j < kPix; ++j) {
+        const int ix = q0 + (j & 1) * kTile, iy = r0 + (j >> 1) * kTile;
+        if (ix < nx && iy < ny) slice[static_cast<size_t>(iy) * nx + ix] = acc[j] * scale;
+    }
 }
 }  // namespace
 
@@ -49,7 +69,7 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
     cudaStream_t s = as_stream(stream);
     DeviceBuffer<float2> d_cs;
     d_cs.upload(cs.data(), cs.size(), s);
-    dim3 block(kTile, kTile), grid((nx + kTile - 1) / kTile, (ny + kTile - 1) / kTile);
+    dim3 block(kTile, kTile), grid((nx + 2 * kTile - 1) / (2 * kTile), (ny + 2 * kTile - 1) / (2 * kTile));
 #define HELIREC_BP(K) backproject_kernel<K><<<grid, block, 0, s>>>(sino, d_cs.data(), slice, n_angles, n_det, ny, nx, \
                                            p.rot_center, p.scale, c, p.x0, p.y0, p.clip_outer_circle, r * r, p.u_scale)
     switch (p.interp) {

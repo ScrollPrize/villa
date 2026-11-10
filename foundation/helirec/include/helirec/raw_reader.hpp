@@ -4,6 +4,7 @@
 // filters) or as a contiguous dataset. HDF5 is only used to locate each frame's
 // bytes; the data is then read with pread(), in parallel over files.
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +31,11 @@ class RawReader {
     // Whole frames: out (n, rows, cols)
     void read_frames(const int32_t* file_index, const int32_t* frame_index, std::size_t n, uint16_t* out,
                      int n_threads = 0);
+    // Whole frames in pieces of `nrows` rows: visit(i, r0, nr, data) with data = rows [r0, r0 + nr) of frame i, in
+    // row order for each frame, from the reading threads (frames in parallel, any order). `data` is that thread's
+    // buffer, valid during the call (small pieces stay in its cache: the frame is traversed once).
+    void visit_frames(const int32_t* file_index, const int32_t* frame_index, std::size_t n, int nrows,
+                      const std::function<void(std::size_t, int, int, const uint16_t*)>& visit, int n_threads = 0);
 
   private:
     struct FileInfo;

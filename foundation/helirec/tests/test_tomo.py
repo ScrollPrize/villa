@@ -179,6 +179,16 @@ def test_sf_projector(device):
     np.testing.assert_allclose(ones[10:55, 10:55], len(ANG), rtol=1e-5)
 
 
+@pytest.mark.parametrize("device", helirec.devices())
+def test_sf_cells_off_the_image(device):
+    # a detector much wider than the image: cells whose boundaries miss it take no step and are exactly 0
+    n, nd, rot = 33, 160, 79.5
+    s = _core.chord_project(np.ones((n, n), np.float32), ANG, nd, rot, device=device, projector="sf")
+    far = np.abs(np.arange(nd) - rot) > n / np.sqrt(2) + 2
+    assert far.sum() > 100 and np.all(s[:, far] == 0)
+    np.testing.assert_allclose(s.sum(1), n * n, rtol=1e-5)
+    np.testing.assert_allclose(s, _core.chord_project(np.ones((n, n), np.float32), ANG, nd, rot, projector="sf"), atol=1e-4)
+
 
 @pytest.mark.parametrize("device", helirec.devices())
 def test_sirt_noisy(device):

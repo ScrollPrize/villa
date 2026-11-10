@@ -9,10 +9,12 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
 
 * `corrected` (default): output in attenuation (cm⁻¹); every measured line counted once in the half-acquisition
   rebalance; ramp padding reflected about the true rotation axis; mending over the merged columns both scans cover;
-  a unit-DC Paganin kernel independent of the chunk height. No projection filters by default.
+  a unit-DC Paganin kernel and a two-scan luminosity window independent of the chunk height; a scan at a
+  fractional column offset interpolated with a Lanczos-3 kernel (`x_interp`). No projection filters by default.
 * `legacy_reference`: the reference workflow's conventions (half-attenuation units, its rebalance endpoints,
-  integer padding reflection, mending bounds, chunk-dependent Paganin) with every parameter pinned (GHBP, Paganin
-  1000 + unsharp 1.2/4, …); overriding one is an error, and only the measured calibration is allowed.
+  integer padding reflection, mending bounds, chunk-dependent Paganin and luminosity window, two-column splat of
+  fractional column offsets) with every parameter pinned (GHBP, Paganin 1000 + unsharp 1.2/4, …); overriding one
+  is an error, and only the measured calibration is allowed.
 
 Outputs record the mode, its conventions and every resolved parameter (`manifest.json`, OME-Zarr attributes).
 
@@ -37,12 +39,14 @@ helirec-slices PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif       
   view heights; both are [start, end). `--roi X0 X1 Y0 Y1` crops the output: every method reconstructs whole
   slices, so a cropped slice is identical to the same pixels of an uncropped run. The OME-Zarr transforms place the
   crop in the full volume.
+* Each chunk's raw rows are read while the previous chunk computes, reusing the rows the two share.
 * float32 is always written (raw chunks). `--uint8` adds an 8-bit copy with `--u8_window` (default [−0.06, 0.29]
   cm⁻¹; [−0.03, 0.145] in `legacy_reference`), 0 outside the reconstruction disk, compressed losslessly with
   vc-delta3d (`{"id": "vc-delta3d", "quant": 1}`, preset `fast`; `--u8_delta3d_preset delta` writes D3D1 frames
   for older readers). Chunks default to 128³ (keep multiples of 32). All-fill chunks are not written.
 * In `legacy_reference`, chunked slices inherit the reference Paganin kernel's chunk-height dependence (a small
-  uniform offset compared with single-slice runs); the default mode does not.
+  uniform offset compared with single-slice runs) and the luminosity window clipped to the chunk; the default mode
+  has neither (it reads the window's 12 context rows either side of a chunk).
 
 Python:
 
@@ -52,7 +56,11 @@ r = HelicalRecon("/path/to/projections", cache_dir="cache", device="cuda")
 img = r.reconstruct_fractions([0.5])[0]                  # N x N float32
 r.set_params(filters="paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)")           # rebuilds the reconstructor, keeps the calibration
 dbg = r.reconstruct_heights(h, h + 1, debug=True)         # + sinogram, weights, balanced weights, filtered rows
+vol = r.reconstruct_heights(h, h + 32, next=(h + 32, h + 64))   # reads the next chunk's raw rows meanwhile (CUDA)
 ```
+
+Page-locked host buffers (the chunk's raw windows, several GB) are kept when a reconstructor is replaced, e.g. by
+`set_params`, so the next one does not lock them again (~0.2 s/GB); `helirec.release_pinned_memory()` frees them.
 
 ## Surface composites (`helirec-composite`)
 
@@ -116,9 +124,18 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     `len2` is rejected because it lacks this stability guarantee. `weighting=mask` (default) selects valid rays;
     `confidence` uses nonnegative measured weights in both the residual and column normalization. Accumulated
     support is an exposure/interpolation proxy, not a calibrated inverse noise variance.
-    MLEM ignores rays with b ≤ 0 or Ax ≤ 0.
+    MLEM takes rays with b ≤ 0 as zero measurements (they stay in the normalisation A^T 1, so negative noise is
+    clipped rather than excluded); rays with Ax ≤ 0 give no update.
+  * gridrec is quantitative: its de-apodisation is the transform of the gridding kernel actually used, and its
+    scale is that of the exact FBP (peak values of small features within 0.1 % at any radius,
+    `tests/test_tomo.py`). The closed form inherited from tomopy overestimated them by 12 % at the centre, rising
+    to 44 % at 0.59 of the padded half width, and `init=gridrec` carried that into SIRT / MLEM.
   * Projectors: `sf` (default), the separable footprint (Long, Fessler & Balter 2010), integrates the chord
     trapezoid over the detector cell; `chord` takes it at the cell centre. Both are exact transpose pairs.
+    `sf` evaluates the footprint's cumulative integral at the cell boundaries, which neighbouring cells share: the
+    forward projector walks one boundary per thread (two pixels per step, positions in 2⁻³² pixel fixed point) and a
+    cell is the difference of its two boundaries; the backprojector reaches a pixel's four cells through three
+    boundaries and skips pixels that project off the detector (`src/common/tomo_core.hpp`).
   * SIRT and MLEM grid only measured detector pixels: no edge padding or invalid-pixel values enter their sums.
     `mend_threshold` removes weak support relative to each row's mean positive weight. Filter context can fill
     unsupported values, but their weights stay zero. Missing angles remain excluded. `init=gridrec` fills and
@@ -165,7 +182,19 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   slit or an opaque edge); 0.1 / 100 are the Night Rail defaults, not a calibration of any particular scan. Not
   available in `legacy_reference`. Example: `--set sld=fraction=0.1,length=100`.
 * **Gridding**: `luminosity_repartition`, `mend_threshold`, `n_grid`, `angular_tolerance_steps`, `block_angles`
-  (memory/speed only).
+  (memory/speed only), `x_interp`.
+  * `x_interp=lanczos3|cubic|linear` (default `lanczos3`): how a scan at a fractional column offset in the merged
+    frame is resampled. `linear` is the reference's two-column splat: at half a pixel (the PHerc0343P main scan
+    sits at 843.5) it averages neighbouring columns, a response of cos(πν) — 0.65 at ν = 0.28 cycles/pixel, where
+    `lanczos3` keeps 1.00 and `cubic` 0.84 (measured on that scan against integer placement). The kernel
+    interpolates the values; the accumulated weights are the splat's. Next to the detector edges and to columns
+    without weight the splat is used, so unmeasured values never enter. Vertical and angular gridding remain
+    linear.
+  * The two-scan luminosity equalisation estimates each row's HA / TA difference in a 25 × 25 window at the seam
+    and applies it as an offset of the intensity. Twelve context rows are read either side of a chunk, and context
+    rows (the filters' too) are gridded from every projection that sees them, not only from those of the chunk's
+    own heights, so that the window, and therefore the result, does not depend on the chunking (about 0.2 s more
+    per chunk on the PHerc0343P pair).
 * **Geometry**: `--cor` / `--vector` override the calibration for one run (never cached; not allowed in
   `legacy_reference`).
 * **Calibration cache** (`--cache_dir`): darks/flats reduction and the measured calibration, keyed by a
@@ -179,6 +208,10 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   uses explicit FMAs in nvcc's contraction order and CPU code is built with `-ffp-contract=off`, so CPU and CUDA
   GHBP are bit-identical and match nabuxx to 3e-8.
 * The rotation-axis merit keeps the reference's filter roles in both modes, so the calibration matches it.
+* The sub-pixel HA → TA overlap search (the reference's: L1 difference against the bilinearly interpolated
+  companion) favours half-pixel offsets on noisy stripes, because the interpolation averages the companion's noise.
+  The calibration repeats it on smoothed stripes and logs a warning if the two disagree by more than 0.375 px
+  (`details.overlap.smoothed_sub`); the reference estimate is kept either way.
 
 ## Method comparison (`evaluation/compare_methods.py`)
 
@@ -220,11 +253,22 @@ AGENTS_AGENT_MODE=1 .venv/bin/python -u evaluation/compare_methods.py evaluation
     --out /mnt/raid_nvme/343p_recon_work/output/baselines --run-name epr_sld_v1
 ```
 
+`evaluation/343p_v4_baselines.json` repeats the sharpened Paganin baselines (FBP and SIRT, 20 iterations from
+gridrec), with and without the scintillator diffusion correction, after the gridrec scale, column-offset kernel and
+luminosity-window corrections (`_v4` folders):
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python -u evaluation/compare_methods.py evaluation/343p_v4_baselines.json \
+    --out /mnt/raid_nvme/343p_recon_work/output/baselines --run-name v4
+```
+
 `tests/test_epr.py` checks `epr` against exact Fresnel propagation of a homogeneous object (about half of Paganin's
 error where ray shifts reach a fraction of a pixel, Paganin's result where they do not), CPU/CUDA parity and chunk
 independence; `tests/test_sld.py` checks the glare model against the exact point spread and through the
 reconstructor.
 
+`tests/test_gridding.py` checks the column-offset kernels against their responses on both gridding paths, the
+chunk independence of the luminosity window, and the calibration guards.
 Measured-support and interpolation regressions are in `tests/test_sirt_pipeline.py`: explicit-matrix SIRT
 updates, excluded-ray invariance, a fractional helical analytic phantom, chunk consistency and CPU/CUDA parity.
 `tests/test_evaluation.py` checks pinned legacy settings and TIFF-only defaults.
@@ -238,6 +282,24 @@ AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 uv pip install --python .venv/bin/pyt
 
 Run GPU commands on a host/session with NVIDIA device access. Use `--overwrite` to recompute every slice after
 switching devices; `run_cuda.log` can be captured with `2>&1 | tee /mnt/raid_nvme/343p_recon_work/output/baselines/run_cuda.log`.
+
+## Speed
+
+Seconds per slice on the PHerc0343P pair (8000 × 3372 sinogram, 5057² slice), RTX 5090, raw data in the page cache
+(`evaluation/343p_v4_baselines.json` methods; isolated slices as `compare_methods.py` reconstructs them, and
+consecutive 8-slice chunks):
+
+| method | isolated slice | in 8-slice chunks |
+|---|---|---|
+| FBP, Paganin + unsharp | 0.81 | 0.27 |
+| FBP, SLD + Paganin + unsharp | 1.35 | 0.31 |
+| SIRT 20 iterations from gridrec, Paganin + unsharp | 5.4 | 5.0 |
+| SIRT, SLD + Paganin + unsharp | 5.9 | 5.0 |
+
+A SIRT iteration is 0.22 s (forward 0.09 s, backward 0.13 s); the exact backprojection of one slice 0.16 s. An
+isolated slice uploads 8.7 GB of raw rows (0.4 s), and with SLD reads 12 GB of whole frames for its glare maps: from
+disk rather than the page cache that read dominates. The first chunk of a process also page-locks its raw buffers
+(1.4 s).
 
 ## Tests
 
@@ -265,7 +327,8 @@ uv sync --python 3.12 --extra test
 These raise explicit errors:
 * exactly one companion scan, on the left of the main scan, with the rotation axis in the main scan's right half;
 * both scans moving in the same z direction;
-* no per-projection lateral-correction drift;
+* no per-projection lateral-correction drift: a rotation axis measured more than 0.25 px apart at the two ends of
+  the scan is an error (one axis is used for every slice; `--cor` reconstructs with a fixed one);
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.
 

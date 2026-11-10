@@ -38,6 +38,20 @@ def test_gridrec_centre_and_bounds(device, N, nd):
     assert np.any(g[0] != 0) and np.any(g[:, 0] != 0)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_gridrec_scale_is_uniform(device):
+    """a small feature reconstructs at its true value at any radius: the de-apodisation is the transform of the
+    gridding kernel in use (the closed form of the matched kernel gave 1.12 at the centre, 1.25 at radius 55 here)"""
+    N = nd = 129
+    ang = np.linspace(0, 2 * np.pi, 360, endpoint=False).astype(np.float32)
+    c = (N - 1) // 2
+    for r in (0, 30, 55):
+        sino, rot = gaussian_sino(nd, ang, float(r), 0.0, s=3.0)
+        g = _core.tomo_reconstruct(sino, np.full_like(sino, 0.5), ang, N, rot, "gridrec", {"filter_name": "ramlak"},
+                                   device=device)
+        assert abs(g[c, c + r] - 1.0) < 0.01, (r, g[c, c + r])
+
+
 # ---------------------------------------------------------------- chord adjointness on boundary rays
 def explicit_matrices(N, nd, rot, ang, device, projector):
     A = np.zeros((len(ang) * nd, N * N))

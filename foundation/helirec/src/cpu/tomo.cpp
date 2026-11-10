@@ -37,20 +37,32 @@ int pdim_for(int n_det, int N) {
 // sampled at offsets + 1/2: each gridded frequency sample (j cos, j sin) / pdim gets the shift's phase
 float grid_shift(int N) { return (N & 1) ? 0.f : 0.5f; }
 
-// wtbl (ltbl + 1): PSWF kernel table; winv (pdim - 1): its de-apodisation
+// width (grid cells) of the gridding kernel: the table wtbl over |offset| <= kernel_cells() / 2
+int kernel_cells() { return static_cast<int>(2 * kC / M_PI); }
+
+// wtbl (ltbl + 1): PSWF kernel table; winv (pdim - 1): its de-apodisation.
+// Gridding convolves the spectrum with K(d) = wtbl(|d| 2 ltbl / L) over |d| <= L / 2 cells, L = kernel_cells(),
+// which multiplies the image at offset i from the FFT origin by K's transform
+//   k(i) = integral K(d) cos(2 pi d i / pdim) dd.
+// winv is 1 / k, computed from the table itself. (The prolate function is its own transform only for
+// L = 2 C / pi = 4.46 cells; the kernel is the C = 7 function on L = 4, so the closed form 1 / wtbl of the matched
+// kernel over-corrects with the distance from the origin: + 29 % at 0.59 of the half width.) The factor 1 / sqrt 2 per
+// axis: the filters are normalised to 1 at Nyquist (|2 x|, x in cycles per sample), twice the ramp |x|. The signs
+// alternate for the half-period shift of the spectrum (origin at pdim / 2).
 void pswf_tables(int pdim, std::vector<float>& wtbl, std::vector<float>& winv) {
     const int linv = pdim / 2 - 1;
     wtbl.assign(kLtbl + 1, 0.f);
     winv.assign(2 * linv + 1, 0.f);
-    const float fac = static_cast<float>(kLtbl) / (linv + 0.5f);
     const float polyz = tomo_core::legendre(kNt, kCoefs, 0.f);
     wtbl[0] = 1.f;
     for (int i = 1; i <= kLtbl; ++i) wtbl[i] = tomo_core::legendre(kNt, kCoefs, static_cast<float>(i) / kLtbl) / polyz;
-    float norm = std::sqrt(static_cast<float>(M_PI) / 2 / kC / kLambda) / 1.2f;
-    winv[linv] = norm / wtbl[0];
-    for (int i = 1; i <= linv; ++i) {
-        norm = -norm;
-        winv[linv + i] = winv[linv - i] = norm / wtbl[static_cast<int>(std::round(i * fac))];
+    const double dd = 0.5 * kernel_cells() / kLtbl;   // table spacing in grid cells
+    for (int i = 0; i <= linv; ++i) {
+        double k = 0;
+        for (int t = 0; t <= kLtbl; ++t)   // trapezoid over [0, L / 2], x 2 for the even kernel
+            k += ((t == 0 || t == kLtbl) ? 0.5 : 1.0) * wtbl[t] * std::cos(2 * M_PI * (t * dd) * i / pdim);
+        k *= 2 * dd;
+        winv[linv + i] = winv[linv - i] = static_cast<float>(((i & 1) ? -1.0 : 1.0) * M_SQRT1_2 / k);
     }
 }
 
@@ -105,7 +117,7 @@ void gridrec_slice(const float* data, int NG, int ND, const float* angles, float
     const auto filphase = filter_phase(pdim, NG, center, a, span_factor(angles, NG));
     const float sh = grid_shift(N), w0 = -2.f * static_cast<float>(M_PI) * sh / pdim;
     const float L2 = static_cast<float>(static_cast<int>(kC / M_PI));
-    const int L = static_cast<int>(2 * kC / M_PI);
+    const int L = kernel_cells();
     const float tblspcg = 2.f * kLtbl / L;
     std::vector<cf> H(static_cast<std::size_t>(pdim) * pdim, cf(0));
     std::vector<cf> sino(pdim);
@@ -167,10 +179,11 @@ struct CpuBackend final : TomoWorkspace {
     int n_angles = 0;
     std::vector<float> angles;
     std::vector<tomo_core::AngleC> ak;
+    std::vector<tomo_core::SfAngle> sfa;
     std::map<int, std::vector<float>> bufs;
     std::vector<std::vector<int32_t>> keep;
-    std::vector<float> l2, xT;
-    int have_l2 = -1;    // projector the cached chord sums belong to
+    std::vector<float> l2, xT, sf_rows, sf_cols;
+    int have_l2 = -1;    // projector the cached ray norms belong to
     int pj = tomo_core::Chord;
     int norm = 1;        // SIRT ray norm: 1 |a_i|^2, 2 row sum
 
@@ -180,6 +193,8 @@ struct CpuBackend final : TomoWorkspace {
         g = gfull;
         ak.resize(n_angles);
         for (int i = 0; i < n_angles; ++i) ak[i] = tomo_core::angle_constants(std::cos(ang[i]), std::sin(ang[i]));
+        sfa.resize(n_angles);
+        for (int i = 0; i < n_angles; ++i) sfa[i] = tomo_core::sf_angle_constants(gfull, ak[i]);
     }
     bool matches(const TomoGeom& t, const float* ang) const {
         return t.n_angles == key.n_angles && t.n_det == key.n_det && t.N == key.N && t.rot == key.rot && t.R == key.R &&
@@ -199,8 +214,32 @@ struct CpuBackend final : TomoWorkspace {
         for (int ix = 0; ix < W; ++ix)
             for (int iy = 0; iy < H; ++iy) xT[static_cast<std::size_t>(ix) * H + iy] = x[static_cast<std::size_t>(iy) * W + ix];
     }
+    // SF model (tomo_core.hpp): the walks of an angle's cell boundaries, then the cells between them
+    template <class E>
+    void project_sf(const float* x, const int32_t* sel, int n_sel, const E& epi) {
+        const int ND = g.n_det, P = tomo_core::kSfPad;
+        const std::size_t wr = g.W + 2 * P, wc = g.H + 2 * P;
+        sf_rows.assign(g.H * wr, 0.f);
+        sf_cols.assign(g.W * wc, 0.f);
+#pragma omp parallel for schedule(static)
+        for (int iy = 0; iy < g.H; ++iy)
+            for (int ix = 0; ix < g.W; ++ix)
+                sf_rows[iy * wr + P + ix] = sf_cols[ix * wc + P + iy] = tomo_core::sf_image_value(x, g, ix, iy);
+        const tomo_core::SfImage im{sf_rows.data(), sf_cols.data()};
+#pragma omp parallel
+        {
+            std::vector<float> A(ND + 1), E_(ND + 1);
+#pragma omp for schedule(dynamic, 1)
+            for (int s = 0; s < n_sel; ++s) {
+                const int a = sel[s];
+                for (int beta = 0; beta <= ND; ++beta) tomo_core::sf_boundary(im, g, ak[a], sfa[a], beta, A[beta], E_[beta]);
+                for (int d = 0; d < ND; ++d) epi(static_cast<std::size_t>(a) * ND + d, A[d + 1] + E_[d]);
+            }
+        }
+    }
     template <class E>
     void project(const float* x, const int32_t* sel, int n_sel, const E& epi) {
+        if (pj == tomo_core::SF) return project_sf(x, sel, n_sel, epi);
         const int ND = g.n_det;
         const float* xt = nullptr;
         if (n_sel >= 16) {
@@ -211,22 +250,26 @@ struct CpuBackend final : TomoWorkspace {
 #pragma omp parallel for schedule(dynamic, 64)
         for (long q = 0; q < static_cast<long>(n_sel) * ND; ++q) {
             const int a = sel[q / ND], d = static_cast<int>(q % ND);
-            const float v = pj == tomo_core::SF ? tomo_core::project_ray<true, false, tomo_core::SF>(x, xt, g, ak[a], d, nullptr)
-                                                : tomo_core::project_ray<true, false>(x, xt, g, ak[a], d, nullptr);
-            epi(static_cast<std::size_t>(a) * ND + d, v);
+            epi(static_cast<std::size_t>(a) * ND + d, tomo_core::project_ray<true, false>(x, xt, g, ak[a], d, nullptr));
         }
     }
+    // ray norms over the disk; SF row sums: the projection of the all-ones image
     const float* len2() {
         if (have_l2 != pj * 4 + norm) {
             const int ND = g.n_det;
             l2.resize(static_cast<std::size_t>(n_angles) * ND);
+            if (pj == tomo_core::SF) {
+                if (norm != 2) throw Error("sf projector: only row-sum ray norms");
+                const std::vector<float> ones(static_cast<std::size_t>(g.W) * g.H, 1.f);
+                std::vector<int32_t> all(n_angles);
+                for (int i = 0; i < n_angles; ++i) all[i] = i;
+                project_sf(ones.data(), all.data(), n_angles, tomo_algos::StoreEpi{l2.data()});
+            } else {
 #pragma omp parallel for schedule(dynamic, 64)
-            for (long q = 0; q < static_cast<long>(n_angles) * ND; ++q)
-                pj == tomo_core::SF
-                    ? (norm == 2 ? (void)tomo_core::project_ray<false, 2, tomo_core::SF>(nullptr, nullptr, gfull, ak[q / ND], static_cast<int>(q % ND), &l2[q])
-                                 : (void)tomo_core::project_ray<false, 1, tomo_core::SF>(nullptr, nullptr, gfull, ak[q / ND], static_cast<int>(q % ND), &l2[q]))
-                    : (norm == 2 ? (void)tomo_core::project_ray<false, 2>(nullptr, nullptr, gfull, ak[q / ND], static_cast<int>(q % ND), &l2[q])
-                                 : (void)tomo_core::project_ray<false, 1>(nullptr, nullptr, gfull, ak[q / ND], static_cast<int>(q % ND), &l2[q]));
+                for (long q = 0; q < static_cast<long>(n_angles) * ND; ++q)
+                    norm == 2 ? (void)tomo_core::project_ray<false, 2>(nullptr, nullptr, gfull, ak[q / ND], static_cast<int>(q % ND), &l2[q])
+                              : (void)tomo_core::project_ray<false, 1>(nullptr, nullptr, gfull, ak[q / ND], static_cast<int>(q % ND), &l2[q]);
+            }
             have_l2 = pj * 4 + norm;
         }
         return l2.data();

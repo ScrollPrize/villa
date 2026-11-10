@@ -2,6 +2,8 @@
 
 #ifdef HELIREC_WITH_CUDA
 #include <cuda_runtime.h>
+
+#include "../cuda/cuda_utils.cuh"
 #endif
 
 namespace helirec {
@@ -12,6 +14,12 @@ bool cuda_available() {
     return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
 #else
     return false;
+#endif
+}
+
+void release_pinned_memory() {
+#ifdef HELIREC_WITH_CUDA
+    cuda::PinnedPool::get().trim();
 #endif
 }
 

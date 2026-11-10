@@ -7,6 +7,11 @@
 //   R [j, t, X] += (v * A) * fx      RW[j, t, X] += (w * A) * fx
 // v = interpolated flat-fielded intensity * interpolated weight, w = weight,
 // A = angular splat (1 - alpha or alpha), fx = horizontal splat.
+//
+// A scan placed at a fractional column offset is, by the reference splat, averaged over two columns (at half a
+// pixel: a [1/2, 1/2] box, response cos(pi nu)). With AccumScanView::x_taps > 0 its value is instead interpolated
+// across x_taps columns (the weight stays the splat's), wherever all of them are measured columns; next to the
+// detector edges and to unmeasured columns the splat is kept.
 #include <cstdint>
 #include <vector>
 
@@ -44,7 +49,16 @@ struct AccumScanView {
     // horizontal placement
     int sx = 0, ixs = 0;
     float fract_x = 0;
+    // optional kernel for the fractional column offset (x_taps > 0, set_x_kernel): the value landing on a merged
+    // column is sum_i x_w[i] value(c0 - x_taps / 2 + i), the source position being c0 - fract_x. 0: the reference's
+    // two-column linear splat
+    int x_taps = 0;
+    float x_w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 };
+
+// Kernel of the fractional column offset of a scan: `interp` linear (the reference splat; x_taps = 0), cubic (Keys,
+// 4 columns) or lanczos3 (6 columns), weights normalised to sum 1. A zero offset needs none.
+void set_x_kernel(AccumScanView& v, int interp);
 
 // Contributors of each grid angle of a block [g0, g1): CSR over (j - g0), entries
 // sorted by projection; role 0 = lower bin (weight 1 - alpha), 1 = upper bin (alpha).

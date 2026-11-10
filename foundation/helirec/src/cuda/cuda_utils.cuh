@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "helirec/common.hpp"
 
@@ -64,7 +67,67 @@ class DeviceBuffer {
     std::size_t n_ = 0;
 };
 
-// Grow-only page-locked host buffer (fast, asynchronous host <-> device copies). Contents are not initialised.
+// Process-wide cache of page-locked allocations. Locking pages costs ~0.2 s/GB, so the buffers a reconstructor
+// releases (its raw windows: several GB) serve the next one (e.g. after a parameter change). At most kKeepBytes are
+// kept (the rest is freed at once); trim() frees them all.
+class PinnedPool {
+  public:
+    static constexpr std::size_t kKeepBytes = std::size_t(24) << 30;
+    static PinnedPool& get() {
+        static PinnedPool* pool = new PinnedPool;   // (never destroyed: no CUDA calls at exit)
+        return *pool;
+    }
+    // an allocation of at least `bytes` (and not much more), or a new one; `got`: its size
+    void* take(std::size_t bytes, std::size_t& got) {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            std::size_t best = free_.size();
+            for (std::size_t i = 0; i < free_.size(); ++i)
+                if (free_[i].second >= bytes && free_[i].second <= bytes + bytes / 2 + (std::size_t(64) << 20) &&
+                    (best == free_.size() || free_[i].second < free_[best].second))
+                    best = i;
+            if (best < free_.size()) {
+                void* p = free_[best].first;
+                got = free_[best].second;
+                kept_ -= got;
+                free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(best));
+                return p;
+            }
+        }
+        void* p = nullptr;
+        HELIREC_CUDA_CHECK(cudaHostAlloc(&p, bytes, cudaHostAllocDefault));
+        got = bytes;
+        return p;
+    }
+    void give(void* p, std::size_t bytes) {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            if (kept_ + bytes <= kKeepBytes) {
+                free_.push_back({p, bytes});
+                kept_ += bytes;
+                return;
+            }
+        }
+        cudaFreeHost(p);
+    }
+    void trim() {
+        std::vector<std::pair<void*, std::size_t>> all;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            all.swap(free_);
+            kept_ = 0;
+        }
+        for (auto& e : all) cudaFreeHost(e.first);
+    }
+
+  private:
+    std::mutex m_;
+    std::vector<std::pair<void*, std::size_t>> free_;
+    std::size_t kept_ = 0;
+};
+
+// Grow-only page-locked host buffer (fast, asynchronous host <-> device copies), from the PinnedPool. Contents are
+// not initialised.
 template <class T>
 class PinnedBuffer {
   public:
@@ -72,26 +135,45 @@ class PinnedBuffer {
     ~PinnedBuffer() { reset(); }
     PinnedBuffer(const PinnedBuffer&) = delete;
     PinnedBuffer& operator=(const PinnedBuffer&) = delete;
-    PinnedBuffer(PinnedBuffer&& o) noexcept : ptr_(o.ptr_), n_(o.n_) { o.ptr_ = nullptr; o.n_ = 0; }
+    PinnedBuffer(PinnedBuffer&& o) noexcept : ptr_(o.ptr_), n_(o.n_), bytes_(o.bytes_) { o.ptr_ = nullptr; o.n_ = 0; o.bytes_ = 0; }
     void ensure(std::size_t n) {
         if (n <= n_) return;
         n = std::max(n, n_ + n_ / 4);  // geometric growth: page-locking is slow (~0.2 s/GB)
         reset();
-        HELIREC_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&ptr_), n * sizeof(T), cudaHostAllocDefault));
-        n_ = n;
+        ptr_ = static_cast<T*>(PinnedPool::get().take(n * sizeof(T), bytes_));
+        n_ = bytes_ / sizeof(T);
     }
     void reset() {
-        if (ptr_) cudaFreeHost(ptr_);
+        if (ptr_) PinnedPool::get().give(ptr_, bytes_);
         ptr_ = nullptr;
         n_ = 0;
+        bytes_ = 0;
     }
     T* data() { return ptr_; }
     std::size_t size() const { return n_; }
 
   private:
     T* ptr_ = nullptr;
-    std::size_t n_ = 0;
+    std::size_t n_ = 0, bytes_ = 0;
 };
+
+// Device rows -> pageable host memory (e.g. a new NumPy array) through a pinned staging buffer: `rows` rows of
+// `width` elements at device pitch `src_pitch` elements, packed at `dst`. The host copy runs on several threads
+// (first-touch page faults of a fresh destination dominate a direct pageable copy).
+template <class T>
+void download_rows(T* dst, const T* src, std::size_t src_pitch, std::size_t width, std::size_t rows, PinnedBuffer<T>& stage) {
+    const std::size_t n = width * rows;
+    stage.ensure(n);
+    HELIREC_CUDA_CHECK(cudaMemcpy2D(stage.data(), width * sizeof(T), src, src_pitch * sizeof(T), width * sizeof(T), rows,
+                                    cudaMemcpyDeviceToHost));
+    const std::size_t step = std::size_t(1) << 20;
+    const T* s = stage.data();
+#pragma omp parallel for schedule(static) num_threads(8)
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>((n + step - 1) / step); ++i) {
+        const std::size_t a = static_cast<std::size_t>(i) * step;
+        std::copy(s + a, s + std::min(n, a + step), dst + a);
+    }
+}
 
 // RAII stream
 class Stream {

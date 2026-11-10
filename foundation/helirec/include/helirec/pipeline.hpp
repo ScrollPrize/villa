@@ -42,6 +42,10 @@ struct ReconConfig {
     int n_grid = 0;                     // <=0: round(360 / mean step) of the main scan
     double angular_tolerance_steps = 5;
     float luminosity_repartition = 100.f;
+    // fractional column offset of a scan in the merged frame: "lanczos3" (default), "cubic", or "linear" = the
+    // reference's two-column splat, which averages neighbouring columns (cos(pi nu) at half a pixel). The legacy
+    // reference mode always uses the splat.
+    std::string x_interp = "lanczos3";
     float mend_threshold = 1e-4f;       // mending domain: the merged columns the scans' weight maps cover
     float log_clip_min = 1e-6f, log_clip_max = 10.f;
     int block_angles = 500;
@@ -65,8 +69,10 @@ struct ReconConfig {
     // Legacy reference mode: the inherited reference (Nabu / nabuxx) conventions, to reproduce existing
     // reconstructions: half-attenuation output scale (ramp pi / n_angles over pair-balanced full-turn weights),
     // nabuxx rebalance endpoints, integer ramp-padding reflection lround(2 rot_center), mending bounds = the main
-    // weight map's first / last column read as left / right widths of the merged row, and the chunk-truncated
-    // Paganin kernel. Default (false): attenuation in cm^-1, periodic opposite-view rebalance, reflection about
+    // weight map's first / last column read as left / right widths of the merged row, the chunk-truncated
+    // Paganin kernel, the two-column splat of fractional column offsets, the luminosity window clipped to the
+    // chunk and context rows gridded only from the projections of the chunk's own heights (the default reads the
+    // window's 12 context rows either side and grids context rows from every projection that sees them). Default (false): attenuation in cm^-1, periodic opposite-view rebalance, reflection about
     // 2 rot_center, mending over the merged columns the scans cover, the fixed unit-DC Paganin kernel.
     // (helirec.recon pins every other parameter of the reference when this mode is selected.)
     bool legacy_reference = false;
@@ -123,13 +129,14 @@ class SliceReconstructor {
 
     // slices for view heights h_lo .. h_hi-1 -> out (h_hi - h_lo, N, N), or (n, y1 - y0, x1 - x0) with an ROI
     // (GHBP computes whole slices and crops; FBP computes only the ROI)
-    void reconstruct(int h_lo, int h_hi, float* out, ChunkDebug* debug = nullptr, const SliceRoi* roi = nullptr);
+    // [next_lo, next_hi): the chunk that will follow; its raw windows are read in the background (CUDA)
+    void reconstruct(int h_lo, int h_hi, float* out, ChunkDebug* debug = nullptr, const SliceRoi* roi = nullptr,
+                     int next_lo = 0, int next_hi = 0);
     // same chunk, but only the band of pixels the sampler's points need, with the exact backprojector; the
     // sampler accumulates its point samples (call with contiguous, increasing chunks)
     // `sweep`: several filter chains (CUDA): everything before the filters is computed once per chunk and the
     // sampler's value set k receives chain k; the margin is the largest any chain needs (sweep_margin). Chains that
     // are one Fourier step at the intensity stage (e.g. paganin + unsharp) also share the forward FFT.
-    // [next_lo, next_hi): the chunk that will follow; its raw windows are read in the background (CUDA)
     void reconstruct_band(int h_lo, int h_hi, BandSampler& band, ChunkDebug* debug = nullptr,
                           const std::vector<FilterChain>* sweep = nullptr, int next_lo = 0, int next_hi = 0);
     int sweep_margin(const std::vector<FilterChain>& chains) const;  // margin rows used for a sweep
