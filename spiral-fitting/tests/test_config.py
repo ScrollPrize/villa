@@ -141,7 +141,7 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         "pcl_fiber_link_side_filter", "pcl_fiber_link_side_margin_voxels", "pcl_fiber_link_model_direction_step",
 
         "pcl_rel_winding_adjacent_patches_only",
-        "pcl_stratified_pcl_sampling", "pcl_sampling_weights",
+        "pcl_stratified_pcl_sampling", "pcl_sampling_weights", "pcl_auto_fiber_sampling_weight",
         "pcl_use_fiber_links", "pcl_use_pending_fiber_links",
         "pcl_unattached_pcl_min_point_spacing",
         "pcl_fiber_min_point_spacing",

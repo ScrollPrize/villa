@@ -172,6 +172,16 @@ specifically):
 }
 ```
 
+## Per-patch loss weight
+
+A patch's `meta.json` may carry `loss_weight_scale` (finite, non-negative,
+default 1). It multiplies the patch's draw probability in the patch radius
+and DT losses, which average over drawn patches, so in expectation the
+patch's contribution is scaled by that factor (0 excludes it from those
+losses). Use it to mix supervision of different reliability in one
+`verified_patches/` directory, e.g. model-predicted fiber strips at 0.3 next
+to grown patches at 1.
+
 ## Lasagna inputs must be packed first
 
 `fit_spiral.py` reads `normal_x`, `normal_y` and `gradient_magnitude` only

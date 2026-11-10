@@ -23,15 +23,19 @@ _ENUMS = {
     "track_radius_target": ["mean", "median"],
     "dense_spacing_mode": ["grad_mag", "winding_model"],
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
+    "abs_winding_target_convention": ["legacy", "sheet"],
 }
 
 _NULL_TYPES = {
     "pcl_sampling_weights": "dictionary",
+    "patch_loss_weight_scale_overrides": "dictionary",
     "track_length_bin_weights": "vector",
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "loss_start_unattached_pcl_dt": "integer",
     "patch_uuid_filter_regex": "string",
+    "pcl_fiber_link_exclude_patch_regex": "string",
+    "abs_winding_audit_records": "string",
 }
 
 # Settings host preparation consumes irreversibly: the patch loader erodes and
@@ -66,6 +70,7 @@ _SCALE_WITH_Z_FIELDS = {
     "sample_count_unattached_pcls_per_step",
     "sample_count_tracks_per_step",
     "sample_count_dense_normal_points",
+    "sample_count_dense_phase_points",
     "sample_count_fiber_direction_points",
     "sample_count_regularisation_points",
     "sample_count_winding_model_relative_pairs",
@@ -156,6 +161,18 @@ def describe_catalog(catalog, descriptions=None):
 # changes the map a fixed parameter set produces (by the discretisation
 # difference) but reshapes nothing, so it is a run-boundary setting and a
 # checkpoint written under another count loads with a printed notice.
+# Supervision semantics a checkpoint was trained under. Unlike the shape keys
+# above they reshape nothing, but resuming a lineage under different values
+# would silently mix two target conventions (or let held-out patches back in),
+# so checkpoint preflight refuses a mismatch. Checkpoints written before these
+# keys existed are brought onto the schema with the defaults ("legacy", False,
+# False), which is exactly how they were trained.
+CHECKPOINT_SUPERVISION_KEYS = (
+    "abs_winding_target_convention",
+    "abs_winding_eval_at_point",
+    "exclude_holdout_patches_from_training",
+)
+
 CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_flow_integration_solver",
     "model_num_flow_stages", "model_flow_bounds_z_margin",
@@ -253,6 +270,7 @@ _RUN_MUTABLE_PCL_KEYS = frozenset({
     "pcl_rel_winding_adjacent_patches_only",
     "pcl_stratified_pcl_sampling",
     "pcl_sampling_weights",
+    "pcl_auto_fiber_sampling_weight",
     "pcl_use_fiber_links",
     "pcl_use_pending_fiber_links",
     "pcl_unattached_pcl_min_point_spacing",
@@ -277,7 +295,10 @@ NEW_FIT_KEYS = frozenset(
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
-       "pcl_vertical_fiber_min_z_fraction"}
+       "pcl_vertical_fiber_min_z_fraction", "pcl_auto_fiber_sampling_group",
+       "pcl_fiber_link_exclude_own_strip", "pcl_fiber_link_exclude_patch_regex",
+       "pcl_use_adjacent_fiber_links"}
+    | set(CHECKPOINT_SUPERVISION_KEYS)
 )
 
 _AUDITED_PREFIXES = ("model_", "input_", "pcl_")
@@ -506,6 +527,16 @@ class Config:
         self.pcl_rel_winding_adjacent_patches_only = True
         self.pcl_stratified_pcl_sampling = True
         self.pcl_sampling_weights = None
+        # Fibers tagged 'auto' (VC3D tag) or named auto_*.json form their own
+        # 'auto_fibers' sampling group instead of sharing 'fibers' with the
+        # manual ones, so pcl_sampling_weights can weight them separately.
+        # A link component with any manual member stays in 'fibers'.
+        self.pcl_auto_fiber_sampling_group = False
+        # Relative draw weight of an 'auto_fibers' member against a manual one
+        # in the relative-winding and unattached-strip pools (1 = the same;
+        # 0 drops auto fibers from both pools; components with a manual
+        # member always count as manual).
+        self.pcl_auto_fiber_sampling_weight = 1.0
         self.pcl_fiber_min_point_spacing = 40.0
         self.pcl_unattached_pcl_min_point_spacing = 16.0
         # Point-to-patch linking (point_collection.link_points_to_patches;
@@ -526,6 +557,13 @@ class Config:
         # first step after loading a checkpoint that far along).
         self.pcl_fiber_link_side_filter = False
         self.pcl_fiber_link_side_margin_voxels = 0.5
+        # Keep a fiber's points off the sheet strip predicted from it (meta.json
+        # 'source_fiber'), so own-strip hits do not stand in for attachments.
+        self.pcl_fiber_link_exclude_own_strip = False
+        # Regex on verified-patch directory names that fiber and PCL points
+        # never attach to (e.g. "^strip-" keeps every strip a patch-loss-only
+        # input); None attaches to every patch.
+        self.pcl_fiber_link_exclude_patch_regex = None
         self.pcl_fiber_link_model_direction_step = 10000
         # Cross-fiber links ("branches"): same-winding continuations between
         # fibers. When on, linked collections merge into per-component
@@ -538,6 +576,14 @@ class Config:
         self.pcl_use_fiber_links = True
         # Include unapproved (pending) links.
         self.pcl_use_pending_fiber_links = False
+        # Adjacent links ("adjacent_branches", format v4): a vertical fiber
+        # tied to the horizontal fiber one winding outside it (W_V = W_H - 1).
+        # When on, they join the link components with a winding step of one
+        # across the junction (the fiber's H/V tag under the vertical_*
+        # thresholds below decides the side); a link whose two fibers are not
+        # one H and one V contributes no constraint. Read at fiber load (the
+        # junction control points are kept through decimation), so a new fit.
+        self.pcl_use_adjacent_fiber_links = False
         # Vertical/horizontal classification of fiber strips, used for radial
         # offsets and patch-side linking. VC3D's manual tag wins, then its automatic
         # tag when the recorded certainty (0..1) reaches the threshold, then a
@@ -568,6 +614,19 @@ class Config:
         self.track_crossing_precompute_max = 8
         self.track_max_track_crossing_per_step = 2
         self.track_exclusion_radius = 16.0
+        self.track_inner_exclusion_radius = 0.0
+        self.patch_sampling_core_share = 0.0
+        # {directory-name prefix: factor}: multiplies meta.json loss_weight_scale
+        # of every verified patch whose directory name starts with the prefix
+        # (longest matching prefix wins), e.g. {"strip-auto-": 0.5}.
+        self.patch_loss_weight_scale_overrides = None
+        self.abs_winding_local_to_attachment = False
+        self.abs_winding_target_convention = "legacy"
+        self.abs_winding_eval_at_point = False
+        self.exclude_holdout_patches_from_training = False
+        self.abort_on_nonfinite = False
+        self.abs_winding_audit_records = None
+        self.abs_winding_audit_interval = 1000
         self.track_radius_target = "mean"
         self.track_radius_loss_margin = 0.025
         self.track_radius_within_norm_p = 6.0
@@ -602,6 +661,17 @@ class Config:
         self.loss_weight_shell_outer = 1.0
         self.dense_min_spacing_d_min_wv = 6.0
         self.dense_normals_finite_difference_epsilon = 8.0
+        self.dense_normals_target_at_center = False
+        # Dense phase supervision from the lasagna `cos` channel
+        # (0.5 + 0.5 cos(2 pi W_true)): a fixed pool of scan-space samples
+        # with their cos values, matched against 0.5 + 0.5 cos(2 pi W_model).
+        # Off unless loss_weight_dense_phase > 0.
+        self.loss_weight_dense_phase = 0.0
+        self.sample_count_dense_phase_points = 16384
+        self.dense_phase_pool_points = 2000000
+        self.dense_phase_zarr_group = "3"
+        self.dense_phase_scale = 2
+        self.dense_phase_min_cos = 0.0
         self.fiber_directions_finite_difference_epsilon = 8.0
         self.model_sym_dirichlet_finite_difference_epsilon = 4.0
         self.optimizer_weight_decay_gap_expander = 0.01
@@ -670,6 +740,11 @@ class Config:
                     or type(item) not in (int, float)
                     for item_key, item in value.items()):
                 raise ValueError(f"Invalid dictionary value for {key}")
+        if (values["abs_winding_eval_at_point"]
+                and values["abs_winding_target_convention"] != "sheet"):
+            raise ValueError(
+                "abs_winding_eval_at_point requires "
+                "abs_winding_target_convention 'sheet'")
         if values["model_gap_expander_capacity_windings"] < 3:
             raise ValueError(
                 "model_gap_expander_capacity_windings must be at least 3")

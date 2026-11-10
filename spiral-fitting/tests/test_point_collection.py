@@ -298,3 +298,34 @@ class SideRuleLinkingTests(unittest.TestCase, _BackendCases):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExclusionLinkingTests(WindowLinkingTests):
+    """PatchLinkOptions.excluded_patches / excluded_patches_by_collection drop
+    hits before selection, so an excluded patch is a miss."""
+
+    def test_collection_exclusion_skips_its_own_patch(self):
+        def body():
+            # B is the best hit for the middle point; excluded for collection 1
+            # it falls back to A, while another collection id is unaffected.
+            pcl = self._link(PatchLinkOptions(excluded_patches_by_collection={1: {'b'}}))
+            self.assertEqual(_attached(pcl), ['a', 'a', 'a'])
+            self.assertAlmostEqual(pcl['points'][1]['on_patch']['distance'], 0.5, places=5)
+            pcl = self._link(PatchLinkOptions(excluded_patches_by_collection={2: {'b'}}))
+            self.assertEqual(_attached(pcl), ['a', 'b', 'a'])
+        self.for_each_backend(body)
+
+    def test_global_exclusion_leaves_points_unattached(self):
+        def body():
+            pcl = self._link(PatchLinkOptions(excluded_patches={'a'}))
+            self.assertEqual(_attached(pcl), [None, 'b', None])
+            pcl = self._link(PatchLinkOptions(excluded_patches={'a'}, excluded_patches_by_collection={1: {'b'}}))
+            self.assertEqual(_attached(pcl), [None, None, None])
+        self.for_each_backend(body)
+
+    def test_exclusions_normalise_to_frozensets(self):
+        options = PatchLinkOptions(excluded_patches=['a', 'a'], excluded_patches_by_collection={1: ['b'], 2: []})
+        self.assertEqual(options.excluded_patches, frozenset({'a'}))
+        self.assertEqual(options.excluded_patches_by_collection, {1: frozenset({'b'})})
+        self.assertTrue(options.has_exclusions)
+        self.assertFalse(PatchLinkOptions().has_exclusions)

@@ -116,6 +116,14 @@ def test_pcl_role_toggles_include_legacy_role_inference():
     # Absolute PCLs cascade off when their verified-patch prerequisite is off.
     assert pcl_input_enabled(
         {"input_use_verified_patches": False}, PclRole.ABSOLUTE) is False
+    assert pcl_input_enabled(
+        {"input_disable_patches": True}, PclRole.ABSOLUTE) is False
+    # ... unless sheet anchors are evaluated at their own points.
+    for patches_off in ({"input_use_verified_patches": False},
+                        {"input_disable_patches": True}):
+        assert pcl_input_enabled(
+            {**patches_off, "abs_winding_eval_at_point": True},
+            PclRole.ABSOLUTE) is True
     # Non-absolute inputs may still become unattached-strip supervision.
     assert pcl_input_enabled(
         {"input_use_verified_patches": False}, PclRole.RELATIVE) is True

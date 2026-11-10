@@ -22,6 +22,20 @@ class Patch:
     winding: Optional[Union[Literal['single'], torch.Tensor]]  # None means no winding.tif found
     uuid: Optional[str] = None
     erosion_cells_override: Optional[int] = None
+    # meta.json 'loss_weight_scale': multiplies this patch's share of the
+    # patch losses (through its sampling probability); 1 = ordinary patch.
+    loss_weight_scale: float = 1.0
+    # meta.json 'inner_core_radius': set by the staging scripts on patches whose
+    # median umbilicus distance lies inside the core; patch_sampling_core_share
+    # reserves draws for these.
+    inner_core_radius: Optional[float] = None
+    # meta.json 'source_fiber': basename of the fiber JSON this strip was
+    # predicted from (set by the staging scripts on sheet strips);
+    # pcl_fiber_link_exclude_own_strip keeps that fiber's points off it.
+    source_fiber: Optional[str] = None
+    # meta.json 'holdout': a held-out evaluation patch; with
+    # exclude_holdout_patches_from_training it takes no part in training.
+    holdout: bool = False
     _valid_vertex_indices: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
     _valid_quad_indices: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
     _valid_zyxs: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
@@ -322,6 +336,10 @@ def patch_to_payload(patch):
         'winding': winding,
         'uuid': patch.uuid,
         'erosion_cells_override': patch.erosion_cells_override,
+        'loss_weight_scale': patch.loss_weight_scale,
+        'inner_core_radius': patch.inner_core_radius,
+        'source_fiber': patch.source_fiber,
+        'holdout': patch.holdout,
         'valid_vertex_mask': patch.valid_vertex_mask.numpy(),
         'valid_quad_mask': patch.valid_quad_mask.numpy(),
         'area': patch.area.numpy(),
@@ -345,6 +363,10 @@ def patch_from_payload(payload):
     patch.winding = winding
     patch.uuid = payload['uuid']
     patch.erosion_cells_override = payload['erosion_cells_override']
+    patch.loss_weight_scale = payload.get('loss_weight_scale', 1.0)
+    patch.inner_core_radius = payload.get('inner_core_radius')
+    patch.source_fiber = payload.get('source_fiber')
+    patch.holdout = bool(payload.get('holdout', False))
     patch.valid_vertex_mask = torch.from_numpy(payload['valid_vertex_mask'])
     patch.valid_quad_mask = torch.from_numpy(payload['valid_quad_mask'])
     patch.area = torch.from_numpy(payload['area'])
@@ -378,6 +400,20 @@ def load_tifxyz(path, *, z_range=None):
         scale = torch.tensor(metadata['scale'])
         uuid = metadata.get('uuid')
         erosion_cells_override = metadata.get('spiral_patch_erode_cells')
+        loss_weight_scale = metadata.get('loss_weight_scale', 1.0)
+        if (type(loss_weight_scale) not in (int, float)
+                or not 0 <= loss_weight_scale < math.inf):
+            raise ValueError(
+                f'{path}/meta.json loss_weight_scale must be a finite non-negative number')
+        inner_core_radius = metadata.get('inner_core_radius')
+        if inner_core_radius is not None:
+            inner_core_radius = float(inner_core_radius)
+        source_fiber = metadata.get('source_fiber')
+        if source_fiber is not None and not isinstance(source_fiber, str):
+            raise ValueError(f'{path}/meta.json source_fiber must be a string')
+        holdout = metadata.get('holdout', False)
+        if type(holdout) is not bool:
+            raise ValueError(f'{path}/meta.json holdout must be a boolean')
     z_np = np.array(Image.open(f'{path}/z.tif'))
 
     # Some patches mark invalid vertices via mask.tif (mask == 0) rather than the -1 sentinel in
@@ -425,7 +461,8 @@ def load_tifxyz(path, *, z_range=None):
         winding_value = None
 
     return Patch(zyxs, scale, overlapping_ids, winding_value, uuid,
-                 erosion_cells_override)
+                 erosion_cells_override, float(loss_weight_scale),
+                 inner_core_radius, source_fiber, holdout)
 
 
 def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_metadata=None):
