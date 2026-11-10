@@ -23,10 +23,10 @@ PinnedObject SurfaceStoreEdit::pin() const
 
 void SurfaceStoreEdit::repin(const TransactionReceipt& receipt)
 {
-    const auto version = receipt.objects.find(_uuid);
-    if (version == receipt.objects.end() || !version->second || *version->second == _pin.version) return;
+    const auto reference = receipt.objectReference(_uuid);
+    if (!reference || *reference == _pin.reference()) return;
     const auto committed = _session->objectsAtVersions(
-        _pin.attachment, {{receipt.storeUuid, receipt.generation, _uuid, *version->second}});
+        _pin.attachment, {*reference});
     if (!committed.front()) throw std::runtime_error("the saved surface version cannot be read back");
     _pin = pinOf(_pin.attachment, *committed.front(), receipt.generation);
 }

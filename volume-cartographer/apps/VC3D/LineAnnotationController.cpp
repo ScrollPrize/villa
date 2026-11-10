@@ -15601,19 +15601,14 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             const auto& stored = inStoredFrame(fiber);
             auto incoming = fiberSourceMetadata(stored);
             source.update(incoming, true);
-            int64_t nextId = source.value("next_control_point_id", int64_t(0));
-            for (const auto& cp : fiber.controlPoints) nextId = std::max(nextId, cp.storeId + 1);
-            std::set<int64_t> ids;
             vc::geometry::Fiber geometry;
             // IDs are allocated on the working copy; positions are the stored frame's.
-            for (auto& cp : fiber.controlPoints) {
-                if (cp.storeId < 0 || ids.contains(cp.storeId)) cp.storeId = nextId++;
-                ids.insert(cp.storeId);
-                geometry.controlPointIds.push_back(cp.storeId);
-            }
+            for (const auto& cp : fiber.controlPoints) geometry.controlPointIds.push_back(cp.storeId);
+            geometry.controlPointIds = reader.assignGeometryPointIds(fiber.uuid,"control_points",std::move(geometry.controlPointIds));
+            for (size_t i=0;i<fiber.controlPoints.size();++i) fiber.controlPoints[i].storeId=geometry.controlPointIds[i];
             for (const auto& cp : stored.controlPoints) geometry.controlPoints.push_back({cp[0], cp[1], cp[2]});
             for (const auto& point : stored.linePoints) geometry.linePoints.push_back({point[0], point[1], point[2]});
-            source["next_control_point_id"] = nextId;
+            source.erase("next_control_point_id"); // allocation belongs to the geometry store, not restorable metadata
             FiberDetail detail;
             detail.controlPointCount = geometry.controlPoints.size(); detail.linePointCount = geometry.linePoints.size();
             detail.length = geometry.length(); detail.width = stored.width; detail.widthGapFraction = fiber.widthGapFraction;
@@ -15729,8 +15724,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     // The saved fibers' versions: their generations and geometry heads.
     std::vector<ObjectVersion> savedVersions;
     for (const auto& snapshot : edits)
-        savedVersions.push_back({attachment->storeUuid, receipt.generation, snapshot.fiber.uuid,
-                                 receipt.objects.at(snapshot.fiber.uuid).value()});
+        savedVersions.push_back(receipt.objectReference(snapshot.fiber.uuid).value());
     const auto saved = connection->objectsAtVersions(*attachment, savedVersions);
     for (size_t i = 0; i < edits.size(); ++i) {
         auto& fiber = edits[i].fiber;
@@ -15745,13 +15739,12 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         if (!pane.session || !pane.session->storePin) continue;
         auto& session = *pane.session;
         if (std::any_of(edits.begin(), edits.end(), [&](const auto& edit) { return edit.fiber.uuid == session.fiberUuid; })) continue;
-        const auto found = receipt.objects.find(session.fiberUuid);
-        if (found == receipt.objects.end() || !found->second ||
-            session.storePin->version == *found->second) continue;
+        const auto reference = receipt.objectReference(session.fiberUuid);
+        if (!reference || session.storePin->reference() == *reference) continue;
+        const auto committed = connection->objectsAtVersions(*attachment, {*reference}).front();
+        if (!committed) throw std::runtime_error("The saved endpoint version cannot be read back");
         if (session.watcher) session.solveQueue.noteSessionMutated();
-        session.storePin->version = *found->second;
-        session.storePin->generation = receipt.generation;
-        session.storePin->writeGeneration = receipt.generation;
+        session.storePin = pinOf(*attachment, *committed, receipt.generation);
     }
     snapshots = std::move(edits);
 }
