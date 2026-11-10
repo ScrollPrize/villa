@@ -10,7 +10,7 @@ from typing import Iterable
 
 import numpy as np
 from dtypes import numpy_float_hi
-from vc_reader import images
+from vc_reader import images, tifxyz
 
 
 @dataclass(frozen=True)
@@ -56,18 +56,16 @@ class ApprovalSurface:
 	d: np.ndarray  # (H, W) float32
 	approval: np.ndarray  # (H, W) bool
 	meta: dict
-
-	@property
-	def valid(self) -> np.ndarray:
-		return np.isfinite(self.xyz).all(axis=-1) & np.all(self.xyz != -1.0, axis=-1)
+	valid: np.ndarray  # source validity, independent of transformed XYZ values
 
 	def scaled(self, factor: float, *, base_shape_zyx: tuple[int, int, int] | None) -> "ApprovalSurface":
 		"""Coordinates scaled by ``factor`` (missing vertices kept), meta scaled to match."""
 		import volume_scale
-		x, y, z = volume_scale.scale_tifxyz_arrays(self.xyz[..., 0], self.xyz[..., 1], self.xyz[..., 2], factor)
+		xyz = self.xyz.copy()
+		xyz[self.valid] *= float(factor)
 		meta = volume_scale.scale_tifxyz_meta(
 			self.meta, factor, base_shape_zyx=base_shape_zyx, lasagna_base_shape_zyx=base_shape_zyx)
-		return ApprovalSurface(xyz=np.stack([x, y, z], axis=-1), d=self.d, approval=self.approval, meta=meta)
+		return ApprovalSurface(xyz=xyz, d=self.d, approval=self.approval, meta=meta, valid=self.valid)
 
 
 def _d_channel(d: np.ndarray | None, shape: tuple[int, int], *, name: str) -> np.ndarray:
@@ -100,7 +98,7 @@ def load_approval_surface(path: str | Path, *, store: str | Path | None = None,
 		if tuple(approval.shape) != tuple(shape):
 			raise ValueError(f"approval mask shape mismatch: got {approval.shape}, expected {shape}")
 		return ApprovalSurface(xyz=stored.xyz, d=_d_channel(stored.channel("d"), shape, name="d channel"),
-							   approval=approval.astype(bool, copy=False), meta=stored.meta)
+							   approval=approval.astype(bool, copy=False), meta=stored.meta, valid=stored.valid)
 
 	p = Path(path)
 	if not p.is_dir():
@@ -110,17 +108,11 @@ def load_approval_surface(path: str | Path, *, store: str | Path | None = None,
 	if missing:
 		raise ValueError(f"approval inpaint tifxyz is missing required file(s): {', '.join(missing)}")
 
-	x = images.read(str(p / "x.tif")).astype(np.float32)
-	y = images.read(str(p / "y.tif")).astype(np.float32)
-	z = images.read(str(p / "z.tif")).astype(np.float32)
-	if x.shape != y.shape or x.shape != z.shape:
-		raise ValueError(f"tifxyz shape mismatch: x={x.shape} y={y.shape} z={z.shape}")
-	if x.ndim != 2:
-		raise ValueError(f"tifxyz coordinate images must be 2D, got {x.shape}")
-	xyz = np.stack([x, y, z], axis=-1)
+	surface = tifxyz.read(p, mask=False)
+	xyz, valid = surface.xyz, surface.valid
 
 	d_path = p / "d.tif"
-	d = _d_channel(images.read(str(d_path)) if d_path.exists() else None, x.shape, name="d.tif")
+	d = _d_channel(images.read(str(d_path)) if d_path.exists() else None, xyz.shape[:2], name="d.tif")
 
 	meta: dict = {}
 	try:
@@ -129,8 +121,8 @@ def load_approval_surface(path: str | Path, *, store: str | Path | None = None,
 	except Exception:
 		meta = {}
 
-	approval = load_approval_mask(p / "approval.tif", expected_shape=x.shape)
-	return ApprovalSurface(xyz=xyz, d=d, approval=approval, meta=meta)
+	approval = load_approval_mask(p / "approval.tif", expected_shape=xyz.shape[:2])
+	return ApprovalSurface(xyz=xyz, d=d, approval=approval, meta=meta, valid=valid)
 
 
 def _source_mesh_step(meta: dict, fallback: float) -> float:

@@ -35,7 +35,7 @@ def _array(name: str, values: np.ndarray) -> dict:
 	return dict(name=name, dtype=values.dtype.str, shape=list(values.shape), data=values.tobytes())
 
 
-def _source_surface(path: Path, *, scale_factor: float = 1.0) -> tuple[str, np.ndarray]:
+def _source_surface(path: Path, *, scale_factor: float = 1.0, history_enabled: bool = True) -> tuple[str, np.ndarray]:
 	rows, cols = np.mgrid[:5, :6]
 	points = np.stack([cols * 2.0 + 10, rows * 2.0 + 20, np.full(rows.shape, 30.0)], axis=-1).astype("<f4")
 	points[0, 0] = -1
@@ -44,7 +44,7 @@ def _source_surface(path: Path, *, scale_factor: float = 1.0) -> tuple[str, np.n
 	approval = np.zeros((5, 6), "u1")
 	approval[1:4, 1:5] = 255
 	approval[2, 2] = 0
-	with ObjectStore.create(str(path), author="test") as db:
+	with ObjectStore.create(str(path), author="test", history_enabled=history_enabled) as db:
 		uid = db.upsert_object(dict(kind="surface", name="source", meta=dict(
 			coordinates=dict(volume_uuid=VOLUME, scale_factor=scale_factor))))
 		db.put_geometry(uid, dict(kind="surface", attributes=dict(scale=[0.5, 0.5]), arrays=[
@@ -55,6 +55,37 @@ def _source_surface(path: Path, *, scale_factor: float = 1.0) -> tuple[str, np.n
 
 @unittest.skipIf(ObjectStore is None, "vc_object_store is not importable")
 class StoredSurfaceReadTest(unittest.TestCase):
+	def test_transformed_validity_survives_all_fit_loaders_and_scaling(self) -> None:
+		for history in (False, True):
+			with self.subTest(history=history), tempfile.TemporaryDirectory() as td:
+				store = Path(td) / "objects.vcobj"
+				uid, points = _source_surface(store, history_enabled=history)
+				with ObjectStore.open(str(store), author="test") as db:
+					db.register_volume_transform(VOLUME, "target", [[1, 0, 0, -11], [0, 1, 0, 0], [0, 0, 1, 0]])
+				current_ref = stored_surfaces.surface_ref(uid)
+				first = stored_surfaces.read_surface(store, current_ref, volume="target")
+				refs = [current_ref, stored_surfaces.surface_ref(uid, first.version)]
+				if history:
+					with ObjectStore.open(str(store), author="test") as db:
+						record = db.object(uid)
+						record["name"] = "new name"
+						db.upsert_object(record)
+				for ref in refs:
+					with self.subTest(ref=ref):
+						loaded = stored_surfaces.read_surface(store, ref, volume="target")
+						self.assertTrue(loaded.valid[1, 0])
+						self.assertEqual(float(loaded.xyz[1, 0, 0]), -1.0)
+						xyz, valid, _ = tifxyz_io.load_tifxyz(ref, store=store, volume="target")
+						np.testing.assert_array_equal(valid.numpy(), loaded.valid)
+						np.testing.assert_array_equal(xyz[1, 0], loaded.xyz[1, 0])
+						self.assertTrue(np.all(xyz[~valid].numpy() == 0))
+						approval = approval_inpaint.load_approval_surface(ref, store=store, volume="target")
+						np.testing.assert_array_equal(approval.valid, loaded.valid)
+						scaled = approval.scaled(2, base_shape_zyx=(8, 8, 8))
+						np.testing.assert_array_equal(scaled.valid, loaded.valid)
+						np.testing.assert_array_equal(scaled.xyz[1, 0], (points[1, 0] - [11, 0, 0]) * 2)
+						np.testing.assert_array_equal(scaled.xyz[~scaled.valid], approval.xyz[~approval.valid])
+
 	def test_fit_loaders_read_stored_surfaces_in_volume_voxels(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
 			store = Path(td) / "objects.vcobj"

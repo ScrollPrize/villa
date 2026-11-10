@@ -75,19 +75,20 @@ def load_tifxyz(path: str | Path, *, device: torch.device | str = "cpu",
 			raise ValueError(f"stored surface {path} needs a store")
 		stored = read_surface(store, str(path), volume=volume, target_scale=target_scale)
 		xyz = stored.xyz
+		valid = stored.valid
 		meta = stored.meta
 		label = stored.meta["name"]
 	else:
 		p = Path(path)
 		if not p.is_dir():
 			raise ValueError(f"tifxyz path is not a directory: {p}")
-		xyz = tifxyz.read(p, mask=False).xyz.copy()  # (H, W, 3)
+		surface = tifxyz.read(p, mask=False)
+		xyz, valid = surface.xyz, surface.valid
 		meta = json.loads((p / "meta.json").read_text(encoding="utf-8"))
 		label = p.name
 
-	xyz_t = torch.from_numpy(xyz)
-	# VC3D uses (-1, -1, -1) as invalid sentinel
-	valid = (xyz_t != -1.0).all(dim=-1)  # (H, W) bool
+	xyz_t = torch.from_numpy(np.array(xyz, copy=True))
+	valid = torch.from_numpy(np.array(valid, dtype=bool, copy=True))
 	# Zero out invalid vertices so they don't pollute pyramid construction
 	xyz_t[~valid] = 0.0
 

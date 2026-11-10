@@ -189,8 +189,9 @@ allowed. A segment counts when it crosses the slab, even with both endpoints
 outside. Fibers use `line_points` when nonempty, else controls; tracks widen
 exactly to float64. `options.uuids` restricts candidates (`None` unrestricted,
 empty = nothing), `selected` is attempted first under a limit, and only
-intersecting objects consume the limit. Family and minimum-length filters use
-import annotations, not recomputed geometry; surfaces reject them. With
+intersecting objects consume the limit. Family filters use import annotations;
+minimum length measures the selected geometry in the requested frame, as for
+length-filtered listings. Surfaces reject both filters. With
 `options.volume`, run points come back in that volume's voxels.
 
 Region work is budgeted; a stopped result is valid but incomplete. Only

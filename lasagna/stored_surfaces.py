@@ -133,7 +133,8 @@ class StoreSession:
 class StoredSurface:
 	"""One version of a stored surface in voxels of a volume.
 
-	xyz: (H, W, 3) float32, -1 at missing vertices; meta: the record meta plus ``uuid``, ``name`` and the grid
+	xyz: (H, W, 3) float32; valid: the shared source-validity mask, preserved through coordinate transforms;
+	meta: the record meta plus ``uuid``, ``name`` and the grid
 	``scale``; channel(name) reads a per-vertex channel (None when absent)."""
 
 	def __init__(self, store, surface_uuid, grid):
@@ -142,6 +143,7 @@ class StoredSurface:
 		self.version = (grid.generation, grid.version, grid.record['version_store'])
 		self._geometry = grid.geometry_revision
 		self.xyz = grid.points
+		self.valid = grid.valid
 		self._channels = grid.channels
 		record = grid.record
 		self.meta = {**(record.get("meta") or {}), "uuid": surface_uuid, "name": record.get("name") or surface_uuid,
