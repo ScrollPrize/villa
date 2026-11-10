@@ -35,6 +35,7 @@ from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import (
     BLEND, MIN_HEAD_ARC, STEP, TRIM, StripPredictor, add_checkpoint_arguments, orient_decisions, recorded_file, stitch,
     stitch_values, trim_ends)
 from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
 
@@ -122,6 +123,9 @@ def main(argv=None):
     done = set()
     if log_path.exists():
         done = {json.loads(line)['fiber'] for line in log_path.read_text().splitlines() if line.strip()}
+    skipped_path = args.out/'index'/f'shard_{k}.skipped.jsonl'  # fibers whose strip could not be seeded; resumed runs skip them too
+    if skipped_path.exists():
+        done |= {json.loads(line)['fiber'] for line in skipped_path.read_text().splitlines() if line.strip()}
     checkpoint = predictor.source
     # A run resumed with another checkpoint keeps the earlier ones (each fiber's index line names its own).
     earlier = json.loads((args.out/'run.json').read_text()) if (args.out/'run.json').exists() else {}
@@ -141,7 +145,13 @@ def main(argv=None):
             tick = time.time()
             fiber_id, _, family, length = afv.catalog[catalog_index][:4]
             fiber = afv[catalog_index]
-            rows, keep, expected, arcs = strip_of_fiber(predictor, fiber, args.step, args.blend, args.trim*tpp)
+            try:
+                rows, keep, expected, arcs = strip_of_fiber(predictor, fiber, args.step, args.blend, args.trim*tpp)
+            except SeedHeadingError as error:
+                with open(skipped_path, 'a') as skipped:
+                    skipped.write(json.dumps(dict(fiber=int(fiber_id), catalog=int(catalog_index), family=family, error=str(error)))+'\n')
+                print(f'[shard {k}/{n}] skipping fiber {fiber_id}: {error}', flush=True)
+                continue
             out = args.out/'strips'/f'{catalog_index//1000:04d}'/f'fiber_{fiber_id}'
             nodes = int(keep.sum())
             rows, keep, expected, layout = display_grid(rows, keep, expected, family)

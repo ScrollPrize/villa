@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 from pathlib import Path
+import tempfile
 import time
 
 import numpy as np
@@ -169,6 +170,13 @@ class StripPredictor:
         self.data = self.ck['run_config']['data']
         self.spec = CTVolumeSpec.from_dict(self.ck['vol_spec'])
         configure_volume(volume or argparse.Namespace(), self.spec, self.cfg, path)
+        if getattr(volume, 'ct', None):
+            # Another CT than the checkpoint's: bind the per-crop z-score record to it, as tracing/inference.py
+            # does (the record carries no learned statistics, only the volume's identity).
+            from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
+            record_dir = getattr(volume, 'out', None) or tempfile.mkdtemp(prefix='sheet_strip_ct_normalization_')
+            Path(record_dir).mkdir(parents=True, exist_ok=True)
+            prepare_normalization(record_dir, [self.spec], known=self.ck.get('ct_normalization'))
         self.trace_per_patch = self.spec.ct_grid_scale/self.spec.grid_scale
         self.f, self.v = (a.numpy().astype(np.float64) for a in strip_grid(self.cfg))
         self.sample_cfg = SampleConfig(**dict(self.ck['sample_cfg'], crop=self.cfg.fine,
