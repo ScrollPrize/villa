@@ -99,6 +99,28 @@ int grid_angle_count(const std::vector<double>& a) {
     return static_cast<int>(std::nearbyint(360.0 / step));
 }
 
+double angle_grid_phase(const std::vector<double>& a, int n_grid) {
+    if (a.empty()) return 0;
+    const double f0 = a[0] * n_grid / 360.0;
+    return f0 - std::nearbyint(f0);
+}
+
+AngleBins nearest_angle_bins(const std::vector<double>& a, int n_grid, double phase) {
+    AngleBins out;
+    const std::size_t n = a.size();
+    out.bin.resize(n);
+    out.residual.resize(n);
+    const double per_deg = n_grid / 360.0;
+    long b = 0;
+    for (std::size_t p = 0; p < n; ++p) {
+        const double f = a[p] * per_deg;
+        b = p == 0 ? std::lround(f - phase) : b + std::lround(f - a[p - 1] * per_deg);
+        out.bin[p] = static_cast<int32_t>(b);
+        out.residual[p] = static_cast<float>(f - static_cast<double>(b));
+    }
+    return out;
+}
+
 FlatInterpolation interpolate_flats(const FlatSeriesInfo& flats, float ang) {
     const auto& fa=flats.angles_deg;
     const int nf=static_cast<int>(fa.size());

@@ -8,7 +8,7 @@
 
 namespace helirec {
 
-ContributorList make_contributors(const int32_t* j0, int n_proj, int n_grid, int g0, int g1) {
+ContributorList make_contributors(const int32_t* j0, int n_proj, int n_grid, int g0, int g1, bool upper_bin) {
     ContributorList c;
     c.g0 = g0;
     c.g1 = g1;
@@ -17,7 +17,7 @@ ContributorList make_contributors(const int32_t* j0, int n_proj, int n_grid, int
     for (int k = 0; k < n_proj; ++k) {  // ascending projection order
         const int a = j0[k], b = (j0[k] + 1) % n_grid;
         if (a >= g0 && a < g1) lists[a - g0].push_back({k, 0});  // j0 == n_grid is dropped (reference)
-        if (b >= g0 && b < g1) lists[b - g0].push_back({k, 1});
+        if (upper_bin && b >= g0 && b < g1) lists[b - g0].push_back({k, 1});
     }
     c.offsets.resize(L + 1, 0);
     for (int i = 0; i < L; ++i) c.offsets[i + 1] = c.offsets[i] + static_cast<int32_t>(lists[i].size());
@@ -45,6 +45,29 @@ void set_x_kernel(AccumScanView& v, int interp) {
     }
     for (int i = 0; i < T; ++i) v.x_w[i] = static_cast<float>(w[i] / sum);
     v.x_taps = T;
+}
+
+int z_kernel_context(int interp) {
+    if (interp == interp_core::Linear) return 0;
+    if (interp == interp_core::Cubic) return 1;
+    if (interp == interp_core::Lanczos3) return 2;
+    throw Error("z_interp must be linear, cubic or lanczos3");
+}
+
+std::vector<float> z_kernel_weights(const std::vector<float>& fract_v, int interp) {
+    const int T = 2 + 2 * z_kernel_context(interp);
+    if (T == 2) return {};
+    std::vector<float> out(fract_v.size() * T);
+    for (std::size_t k = 0; k < fract_v.size(); ++k) {
+        double w[8], sum = 0;
+        for (int i = 0; i < T; ++i) {   // tap i: row t - (T / 2 - 1) + i, at  i - (T / 2 - 1) - a  from the position t + a
+            const float d = static_cast<float>(i - (T / 2 - 1)) - fract_v[k];
+            w[i] = interp == interp_core::Cubic ? interp_core::keys(d) : interp_core::lanczos3(d);
+            sum += w[i];
+        }
+        for (int i = 0; i < T; ++i) out[k * T + i] = static_cast<float>(w[i] / sum);
+    }
+    return out;
 }
 
 LuminosityKernel luminosity_kernel() {

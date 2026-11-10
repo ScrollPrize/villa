@@ -110,6 +110,8 @@ class PinnedPool {
         }
         cudaFreeHost(p);
     }
+    // free an allocation outright (a block its buffer has outgrown: keeping it would hold both sizes at once)
+    void drop(void* p) { cudaFreeHost(p); }
     void trim() {
         std::vector<std::pair<void*, std::size_t>> all;
         {
@@ -139,7 +141,12 @@ class PinnedBuffer {
     void ensure(std::size_t n) {
         if (n <= n_) return;
         n = std::max(n, n_ + n_ / 4);  // geometric growth: page-locking is slow (~0.2 s/GB)
-        reset();
+        // the outgrown block is freed, not pooled: the pool could only hand it to a smaller buffer, and meanwhile
+        // both sizes would stay locked (raw windows are tens of GB where chunks see different numbers of projections)
+        if (ptr_) PinnedPool::get().drop(ptr_);
+        ptr_ = nullptr;
+        n_ = 0;
+        bytes_ = 0;
         ptr_ = static_cast<T*>(PinnedPool::get().take(n * sizeof(T), bytes_));
         n_ = bytes_ / sizeof(T);
     }

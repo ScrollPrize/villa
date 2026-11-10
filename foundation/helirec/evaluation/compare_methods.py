@@ -14,7 +14,11 @@ Config (JSON):
                                        z: volume slice index (view height - first doable height)
   roi                                  [X0, X1, Y0, Y1] crop of each slice, or null for whole slices
   window                               "auto" (0.5 / 99.5 percentiles of the first method, per slice, shared by all
-                                       methods) or [LO, HI]
+                                       methods) or [LO, HI] in attenuation (cm^-1): one window for every method, so
+                                       a grey level means the same attenuation in every image
+  crops                                [[X0, X1, Y0, Y1], ...] full-resolution crops (slice coordinates): one sheet
+                                       per slice and crop with every method's crop, sheets/z<Z>_crop<K>.png
+  sheet_columns                        tiles per sheet row (default: every method in one row)
   tile                                 longest side of a contact-sheet tile (pixels; slices are box-downsampled)
   methods                              [{"name", "backprojector", "desc"?, "params"?}, ...]; backprojector is a
                                        helirec spec (fbp(...), sirt(...), gridrec(...), ghbp); params override the
@@ -24,7 +28,8 @@ Config (JSON):
 
 Output (OUT):
   slices/<method>/z<Z>.tif             float32 slice (pipeline units)
-  With --previews: slices/<method>/z<Z>.png, sheets/z<Z>.png, contact_sheet.png
+  With --previews: slices/<method>/z<Z>.png, sheets/z<Z>.png (+ crops), contact_sheet.png; every image and
+  tile carries a header with the method's name and description
   config.json, manifest.json           the resolved config; per method / slice timing and statistics
 Existing slice TIFFs are reused only when their provenance fingerprint matches.
 """
@@ -193,6 +198,24 @@ def label_band(width, lines, size):
     return np.asarray(im)
 
 
+def wrap_rows(tiles, columns):
+    """tiles -> rows of `columns` (None / 0: one row)"""
+    if not columns:
+        return [tiles]
+    return [tiles[i:i + columns] for i in range(0, len(tiles), columns)]
+
+
+def with_headers(images, methods, z, h, extras=None):
+    """images with their method's name / description band on top (bands of one height, so tiles stay aligned)"""
+    bands = []
+    for i, (u8, m) in enumerate(zip(images, methods)):
+        size = max(14, min(u8.shape[1] // 40, 40))
+        bands.append(label_band(u8.shape[1], [(f"{m['name']}   z {z}  (h {h}){extras[i] if extras else ''}", 255),
+                                              (m.get("desc", m["backprojector"]), 190)], size))
+    top = max(b.shape[0] for b in bands)
+    return [np.concatenate([b, np.zeros((top - b.shape[0], b.shape[1]), np.uint8), u8], 0) for b, u8 in zip(bands, images)]
+
+
 def grid(rows, gap=8):
     """rows of equally sized 8-bit tiles -> one image"""
     th = max(t.shape[0] for row in rows for t in row)
@@ -279,23 +302,29 @@ def main(argv=None):
         print("wrote TIFF slices under", os.path.join(out, "slices"))
         return
 
-    # 2. optional images: shared window per slice; per-slice sheets; the overall contact sheet
+    # 2. optional images: shared window per slice; per-slice sheets (whole slices, crops); the overall contact sheet
     tile = int(cfg.get("tile", 1024))
+    columns = cfg.get("sheet_columns")
+    crops = cfg.get("crops") or []
+    x_off, y_off = (roi[0], roi[2]) if roi is not None else (0, 0)
     rows = []
     for z, h in slices:
         imgs = [tifffile.imread(os.path.join(out, "slices", m["name"], f"z{z:05d}.tif"))
                 * display_scale(manifest[m["name"]][str(z)]["output_units"]) for m in cfg["methods"]]
         win = window_of(imgs[0], cfg.get("window", "auto"))
-        tiles = []
+        note = f"   window [{win[0]:.4g}, {win[1]:.4g}] cm^-1"
         for m, img in zip(cfg["methods"], imgs):
-            u8 = to_u8(img, win)
-            write_png_gray(os.path.join(out, "slices", m["name"], f"z{z:05d}.png"), u8)
-            th = to_u8(thumb(img, tile), win)
-            size = max(14, th.shape[1] // 40)
-            band = label_band(th.shape[1], [(f"{m['name']}   z {z}  (h {h})", 255),
-                                            (m.get("desc", m["backprojector"]), 190)], size)
-            tiles.append(np.concatenate([band, th], 0))
-        write_png_gray(os.path.join(out, "sheets" + suffix, f"z{z:05d}.png"), grid([tiles]))
+            write_png_gray(os.path.join(out, "slices", m["name"], f"z{z:05d}.png"),
+                           with_headers([to_u8(img, win)], [m], z, h, [note])[0])
+        tiles = with_headers([to_u8(thumb(img, tile), win) for img in imgs], cfg["methods"], z, h, [note] * len(imgs))
+        write_png_gray(os.path.join(out, "sheets" + suffix, f"z{z:05d}.png"), grid(wrap_rows(tiles, columns)))
+        for k, (x0, x1, y0, y1) in enumerate(crops):
+            sel = (slice(y0 - y_off, y1 - y_off), slice(x0 - x_off, x1 - x_off))
+            if not (0 <= sel[0].start < sel[0].stop <= imgs[0].shape[0] and 0 <= sel[1].start < sel[1].stop <= imgs[0].shape[1]):
+                sys.exit(f"crop {[x0, x1, y0, y1]} outside the slices")
+            ctiles = with_headers([to_u8(img[sel], win) for img in imgs], cfg["methods"], z, h,
+                                  [f"   x {x0}-{x1} y {y0}-{y1}{note}"] * len(imgs))
+            write_png_gray(os.path.join(out, "sheets" + suffix, f"z{z:05d}_crop{k}.png"), grid(wrap_rows(ctiles, columns)))
         rows.append(tiles)
         print(f"  z {z}: window [{win[0]:.4g}, {win[1]:.4g}]", flush=True)
     write_png_gray(os.path.join(out, "contact_sheet" + suffix + ".png"), grid(rows))

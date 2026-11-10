@@ -1,4 +1,4 @@
-"""Projection filter chains (C++ registry: paganin, epr, unsharp, gaussian, median, python).
+"""Projection filter chains (C++ registry: paganin, epr, mtf_paganin, unsharp, gaussian, median, python).
 
 A chain is a list of dicts, applied in order to every gridded stack before (stage "intensity", default) or after
 (stage "log") -log:
@@ -6,6 +6,8 @@ A chain is a list of dicts, applied in order to every gridded stack before (stag
     [{"type": "paganin", "delta_beta": 1000}, {"type": "unsharp", "sigma": 1.2, "coeff": 4}]
 
 Text form (CLI): "paganin(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)", or JSON.
+In place of paganin + unsharp, "mtf_paganin(delta_beta=1000,sigma=1.06,nsr=0.01)" retrieves the phase and deconvolves
+the detector MTF (Gaussian `sigma` in pixels, or a measured table mtf=0.1:0.8/0.2:0.45/...) as one Wiener filter.
 Overrides address a filter by type (first of that type) or type[k] (k-th of that type):
     {"paganin.delta_beta": 500, "unsharp.coeff": 0, "unsharp[1].sigma": 3}
 Python filters: register(name, fn); fn(frames, **params) gets (n, H, W) float32 frames (NumPy; on CUDA a host copy,
@@ -112,6 +114,7 @@ def sweep_sets(items):
 
 def set_name(changes):
     def short(k):
-        return k.replace("paganin.delta_beta", "db").replace("unsharp.", "us_").replace(".", "_")
+        return (k.replace("mtf_paganin.", "mp_").replace("paganin.delta_beta", "db").replace("unsharp.", "us_")
+                .replace(".", "_"))
     return "_".join(f"{short(k)}{v:g}" if isinstance(v, (int, float)) else f"{short(k)}{v}"
                     for k, v in changes.items())

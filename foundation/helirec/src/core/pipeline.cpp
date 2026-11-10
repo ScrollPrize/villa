@@ -47,7 +47,22 @@ struct ScanChunk {  // host data of one scan for the current chunk
     ChunkScan cs;
     std::vector<uint16_t> raw;
     int win_rows = 0;
+    std::vector<int32_t> win0;   // first raw row of each projection's window (row0 - vertical kernel context)
+    std::vector<float> z_w;      // vertical kernel weights (z_kernel_weights)
 };
+
+std::vector<int32_t> window_rows(const ChunkScan& c, int z_pad) {
+    std::vector<int32_t> w(c.row0);
+    for (auto& r : w) r -= z_pad;
+    return w;
+}
+
+// the vertical kernel of a view (z_w: host or device copy of ScanChunk::z_w)
+void set_z_kernel(AccumScanView& v, int z_pad, const float* z_w) {
+    v.win_off = z_pad;
+    v.z_taps = z_pad > 0 ? 2 + 2 * z_pad : 0;
+    v.z_w = z_pad > 0 ? z_w : nullptr;
+}
 
 AccumScanView make_view(const ScanData& sd, const ScanChunk& ch, const uint16_t* raw, const float* dark,
                         const float* flats, const float* weight, const int32_t* row0, const float* fract_v,
@@ -88,6 +103,21 @@ struct SliceReconstructor::Impl {
     int filter_margin = 0;   // margin of single-step filter chains (cfg.margin, or the chain's own)
     int lum_margin = 0;      // context rows of the luminosity window, added to the filters' in `margin`
     int x_kernel = 0;        // interp_core::Interp of fractional column offsets (legacy reference: Linear, the splat)
+    int z_kernel = 0, z_pad = 0;   // vertical kernel and its context rows either side of the window (linear: 0)
+    // nearest-bin angular gridding: each scan's bins (helical.hpp), the mean weight of each detector row (how much
+    // a projection weighs in a slice), and the angles of the chunk's slices (DY, n_grid), -angle as fbp_angles
+    bool nearest = false;
+    std::vector<AngleBins> bins;
+    std::vector<std::vector<double>> row_weight;
+    std::vector<float> slice_fbp_angles;
+    const float* fbp_angles_of(int y) const {
+        return nearest ? slice_fbp_angles.data() + static_cast<std::size_t>(y) * n_grid : fbp_angles.data();
+    }
+    void set_slice_angles(const std::vector<ChunkScan*>& cs, int DY, int m);
+    // exposure arc: taps of its inverse along the angle (empty: none), and the arc in grid angles
+    std::vector<float> arc_taps;
+    double arc_bins = 0;
+    std::vector<float> arc_h;
     // context rows gridded from every projection that sees them (prepare_chunk_scan); the legacy reference grids
     // them from the projections of the chunk's own heights, as the reference does
     bool full_context = false, measured = false;
@@ -148,7 +178,7 @@ struct SliceReconstructor::Impl {
     ~Impl() {
         if (pf_thread.joinable()) pf_thread.join();
     }
-    cuda::DeviceBuffer<float> R, RW, Wp, Aha, Bha, Atot, Btot, S, W, row, wrow, pad, slice;
+    cuda::DeviceBuffer<float> R, RW, Wp, Aha, Bha, Atot, Btot, S, W, row, wrow, pad, slice, arc_d;
     cuda::PinnedBuffer<float> slice_host;   // staging of the slices' download
     std::unique_ptr<cuda::Ghbp> ghbp;
     std::unique_ptr<cuda::Stream> copy;
@@ -226,7 +256,37 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     I.x_kernel = I.cfg.legacy_reference ? static_cast<int>(interp_core::Linear) : interp_from_name(I.cfg.x_interp);
     if (I.x_kernel != interp_core::Linear && I.x_kernel != interp_core::Cubic && I.x_kernel != interp_core::Lanczos3)
         throw Error("x_interp must be linear, cubic or lanczos3");
+    I.z_kernel = I.cfg.legacy_reference ? static_cast<int>(interp_core::Linear) : interp_from_name(I.cfg.z_interp);
+    I.z_pad = z_kernel_context(I.z_kernel);
     I.n_grid = I.cfg.n_grid > 0 ? I.cfg.n_grid : grid_angle_count(m.angles_deg);
+    if (I.cfg.angle_interp != "linear" && I.cfg.angle_interp != "nearest")
+        throw Error("angle_interp must be linear or nearest");
+    // (the ghbp plan fixes its angles: it cannot take those of each slice, and keeps the splat)
+    I.nearest = !I.cfg.legacy_reference && I.cfg.angle_interp == "nearest" && I.cfg.backprojector != "ghbp";
+    if (I.nearest) {
+        const double phase = angle_grid_phase(m.angles_deg, I.n_grid);
+        for (const auto& s : I.scans) {
+            I.bins.push_back(nearest_angle_bins(s.traj.angles_deg, I.n_grid, phase));
+            std::vector<double> prof(s.traj.det_rows, 0.0);
+            for (int r = 0; r < s.traj.det_rows; ++r) {
+                for (int c = 0; c < s.traj.det_cols; ++c) prof[r] += s.weight[static_cast<std::size_t>(r) * s.traj.det_cols + c];
+                prof[r] /= s.traj.det_cols;
+            }
+            I.row_weight.push_back(std::move(prof));
+        }
+    }
+    if (I.cfg.exposure_arc != 0) {
+        if (I.cfg.legacy_reference) throw Error("legacy reference mode has no exposure arc correction");
+        if (!(I.cfg.exposure_arc > 0 && I.cfg.exposure_arc <= 1)) throw Error("exposure_arc must be in [0, 1]");
+        // the step between consecutive projections: the median, which skipped projections do not stretch
+        const auto& a = m.angles_deg;
+        std::vector<double> steps(a.size() - 1);
+        for (std::size_t i = 1; i < a.size(); ++i) steps[i - 1] = std::fabs(a[i] - a[i - 1]);
+        std::nth_element(steps.begin(), steps.begin() + steps.size() / 2, steps.end());
+        const double step = steps[steps.size() / 2];
+        I.arc_bins = I.cfg.exposure_arc * step * I.n_grid / 360.0;
+        I.arc_taps = arc_deblur_taps(I.arc_bins);
+    }
     // merged width: main width + ceil(max |companion offset|)
     float max_off = 0.f;
     for (const auto& s : I.scans) max_off = std::max(max_off, std::abs(static_cast<float>(s.traj.shift_x) - s.traj.x_readjustment - static_cast<float>(I.scans[0].traj.shift_x) + I.scans[0].traj.x_readjustment));
@@ -295,6 +355,49 @@ int SliceReconstructor::grid_size() const { return impl_->grid_size; }
 int SliceReconstructor::merged_width() const { return impl_->NX; }
 std::pair<int, int> SliceReconstructor::mend_domain() const { return {impl_->mend_x0, impl_->mend_x1}; }
 const ReconConfig& SliceReconstructor::config() const { return impl_->cfg; }
+double SliceReconstructor::exposure_arc_bins() const { return impl_->arc_bins; }
+std::string SliceReconstructor::angle_interp() const { return impl_->nearest ? "nearest" : "linear"; }
+std::string SliceReconstructor::z_interp() const {
+    return impl_->z_kernel == interp_core::Lanczos3 ? "lanczos3" : impl_->z_kernel == interp_core::Cubic ? "cubic" : "linear";
+}
+
+// Angles of the chunk's slices under nearest-bin gridding: bin b of slice y is at (b + d) 2 pi / n_grid, d the mean
+// residual of the projections it holds, each weighted as the gridding weighs it in that slice's row (the mean
+// detector weight of the rows it is interpolated from, times its current factor). A bin no projection reaches takes
+// the residual of the nearest filled bin before it (the first filled one's, for those ahead of it).
+void SliceReconstructor::Impl::set_slice_angles(const std::vector<ChunkScan*>& cs, int DY, int m) {
+    const int NG = n_grid;
+    slice_fbp_angles.resize(static_cast<std::size_t>(DY) * NG);
+    std::vector<double> sw(NG), sd(NG);
+    for (int y = 0; y < DY; ++y) {
+        std::fill(sw.begin(), sw.end(), 0.0);
+        std::fill(sd.begin(), sd.end(), 0.0);
+        for (std::size_t s = 0; s < cs.size(); ++s) {
+            const auto& c = *cs[s];
+            const auto& prof = row_weight[s];
+            const int rows = scans[s].traj.det_rows;
+            for (int k = 0; k < c.p1 - c.p0; ++k) {
+                const int r = c.row0[k] + m + y;
+                const double a = c.fract_v[k];
+                if (r < 0 || r > rows - 1 || (a > 0 && r + 1 > rows - 1)) continue;
+                const double w = ((1 - a) * prof[r] + (a > 0 ? a * prof[r + 1] : 0.0)) * c.weight_factor[k];
+                if (!(w > 0)) continue;
+                sw[c.j0[k]] += w;
+                sd[c.j0[k]] += w * bins[s].residual[c.p0 + k];
+            }
+        }
+        int first = -1;
+        for (int b = 0; b < NG && first < 0; ++b)
+            if (sw[b] > 0) first = b;
+        double d = first >= 0 ? sd[first] / sw[first] : 0.0;
+        float* out = slice_fbp_angles.data() + static_cast<std::size_t>(y) * NG;
+        for (int i = 0; i < NG; ++i) {   // from the first filled bin, around the circle
+            const int b = first >= 0 ? (first + i) % NG : i;
+            if (sw[b] > 0) d = sd[b] / sw[b];
+            out[b] = -static_cast<float>((b + d) * (2 * M_PI / NG));
+        }
+    }
+}
 
 void SliceReconstructor::Impl::setup_invariants() {
     if (!angles.empty()) return;
@@ -457,13 +560,14 @@ void SliceReconstructor::Impl::start_prefetch(int lo, int hi, int m) {
                 const auto& sd = scans[s];
                 const ChunkScan c = prepare_chunk_scan(sd.traj, spans[s], sd.control_A, sd.flat_info, lo, hi, m, n_grid,
                                                        0.2, full_context, !measured);
-                const int n = c.p1 - c.p0, win = hi - lo + 2 * m + 1, cols = sd.traj.det_cols;
+                const int n = c.p1 - c.p0, win = hi - lo + 2 * m + 1 + 2 * z_pad, cols = sd.traj.det_cols;
+                const std::vector<int32_t> win0 = window_rows(c, z_pad);
                 const std::size_t per = static_cast<std::size_t>(win) * cols;
                 pinned_next[s].ensure(static_cast<std::size_t>(n) * per);
                 uint16_t* dst = pinned_next[s].data();
                 // projections shared with the held chunk: copy its bottom 2m + 1 rows, read only the new rows
                 int a = c.p0, b = c.p0;  // shared range [a, b)
-                const int dy_old = held.hi - held.lo, ov = 2 * m + 1, win_old = dy_old + ov;
+                const int dy_old = held.hi - held.lo, ov = 2 * m + 1 + 2 * z_pad, win_old = dy_old + ov;
                 if (chained) {
                     a = std::max(c.p0, held.p0[s]);
                     b = std::max(a, std::min(c.p1, held.p1[s]));
@@ -478,18 +582,18 @@ void SliceReconstructor::Impl::start_prefetch(int lo, int hi, int m) {
                                     src + (static_cast<std::size_t>(k - held.p0[s]) * win_old + dy_old) * cols,
                                     static_cast<std::size_t>(ov) * cols * sizeof(uint16_t));
                     std::vector<int32_t> r0(b - a);
-                    for (int k = a; k < b; ++k) r0[k - a] = c.row0[k - c.p0] + ov;
+                    for (int k = a; k < b; ++k) r0[k - a] = win0[k - c.p0] + ov;
                     sd.reader->read_rows(sd.file_index.data() + a, sd.frame_index.data() + a, r0.data(), b - a,
                                          win - ov, dst + static_cast<std::size_t>(a - c.p0) * per + static_cast<std::size_t>(ov) * cols,
                                          0, per);
                 }
                 // the others: whole windows
                 if (a > c.p0)
-                    sd.reader->read_rows(sd.file_index.data() + c.p0, sd.frame_index.data() + c.p0, c.row0.data(), a - c.p0,
+                    sd.reader->read_rows(sd.file_index.data() + c.p0, sd.frame_index.data() + c.p0, win0.data(), a - c.p0,
                                          win, dst);
                 if (b < c.p1) {
                     const int s0 = std::max(b, c.p0);
-                    sd.reader->read_rows(sd.file_index.data() + s0, sd.frame_index.data() + s0, c.row0.data() + (s0 - c.p0),
+                    sd.reader->read_rows(sd.file_index.data() + s0, sd.frame_index.data() + s0, win0.data() + (s0 - c.p0),
                                          c.p1 - s0, win, dst + static_cast<std::size_t>(s0 - c.p0) * per);
                 }
             }
@@ -542,12 +646,32 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     for (std::size_t s = 0; s < I.scans.size(); ++s) {
         chunks[s].cs = prepare_chunk_scan(I.scans[s].traj, I.spans[s], I.scans[s].control_A, I.scans[s].flat_info,
                                           h_lo, h_hi, m, NG, 0.2, I.full_context, !measured_only);
-        chunks[s].win_rows = H + 1;
+        chunks[s].win_rows = H + 1 + 2 * I.z_pad;
+        chunks[s].win0 = window_rows(chunks[s].cs, I.z_pad);
+        chunks[s].z_w = z_kernel_weights(chunks[s].cs.fract_v, I.z_kernel);
+        if (I.nearest) {   // every projection whole in its bin
+            auto& c = chunks[s].cs;
+            for (int k = 0; k < c.p1 - c.p0; ++k) {
+                const int b = I.bins[s].bin[c.p0 + k] % NG;
+                c.j0[k] = b < 0 ? b + NG : b;
+                c.alpha[k] = 0.f;
+            }
+        }
         if (timing) {
             const double np = chunks[s].cs.p1 - chunks[s].cs.p0;
             dbg->stats["n_proj_" + std::to_string(s)] = np;
-            dbg->stats["raw_gb"] += np * (H + 1) * I.scans[s].traj.det_cols * 2 / 1e9;
+            dbg->stats["raw_gb"] += np * chunks[s].win_rows * I.scans[s].traj.det_cols * 2 / 1e9;
         }
+    }
+    if (I.nearest) {
+        std::vector<ChunkScan*> cs;
+        for (auto& ch : chunks) cs.push_back(&ch.cs);
+        set_slice_angles(cs, DY, m);
+    }
+    if (dbg && dbg->keep) {
+        dbg->angles.resize(static_cast<std::size_t>(DY) * NG);
+        for (int y = 0; y < DY; ++y)
+            for (int i = 0; i < NG; ++i) dbg->angles[static_cast<std::size_t>(y) * NG + i] = -fbp_angles_of(y)[i];
     }
     if (timing) dbg->stats["sino_gb"] = 2.0 * NG * DY * NX * 4 / 1e9;
     tick("prepare");
@@ -580,7 +704,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             auto& ch = chunks[s];
             const int n = ch.cs.p1 - ch.cs.p0;
             ch.raw.resize(static_cast<std::size_t>(n) * ch.win_rows * sd.traj.det_cols);
-            sd.reader->read_rows(sd.file_index.data() + ch.cs.p0, sd.frame_index.data() + ch.cs.p0, ch.cs.row0.data(),
+            sd.reader->read_rows(sd.file_index.data() + ch.cs.p0, sd.frame_index.data() + ch.cs.p0, ch.win0.data(),
                                  n, ch.win_rows, ch.raw.data());
         }
         tick("read_raw");
@@ -596,11 +720,12 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 const auto& ch = chunks[s];
                 const auto& c = ch.cs;
                 const int n = c.p1 - c.p0;
-                const auto contrib = make_contributors(c.j0.data(), n, NG, g0, g1);
+                const auto contrib = make_contributors(c.j0.data(), n, NG, g0, g1, !I.nearest);
                 auto view = make_view(sd, ch, ch.raw.data(), sd.dark.data(), sd.flats.data(), sd.weight.data(),
                                       c.row0.data(), c.fract_v.data(), c.alpha.data(), c.current_div.data(),
                                       c.weight_factor.data(), c.flat_frac.data(), c.flat_i0.data(), c.flat_i1.data(),
                                       I.x_kernel);
+                set_z_kernel(view, I.z_pad, ch.z_w.data());
                 if (cfg.sld.enabled())
                     set_glare(view, *I.glare[s], cg[s].maps.data(), cg[s].i0.data(), cg[s].i1.data(), cg[s].frac.data());
                 cpu::accumulate(view, contrib, ap, R.data(), RW.data());
@@ -652,6 +777,13 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 std::memcpy(&wrow[static_cast<std::size_t>(i) * NX], &Wc[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
             }
             tick("ramp_gather");
+            if (!arc_taps.empty()) {
+                arc_h.resize(row.size());
+                cpu::angular_fir(row.data(), arc_h.data(), NG, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1,
+                                 ap.measured_only ? wrow.data() : nullptr);
+                std::memcpy(row.data(), arc_h.data(), row.size() * sizeof(float));
+                tick("arc");
+            }
             if (!raw_rows) {
                 cpu::ramp_pad(row.data(), padded.data(), rg);
                 ramp_filter->apply(padded.data(), padded.data(), NG);
@@ -677,7 +809,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     tick("read_wait");
     struct DevChunk {
         cuda::DeviceBuffer<int32_t> row0, fi0, fi1, gi0, gi1;
-        cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac;
+        cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac, z_w;
     };
     std::vector<DevChunk> dc(nsc);
     std::vector<std::size_t> per(nsc);
@@ -696,6 +828,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         dc[s].cdiv.upload(c.current_div.data(), c.current_div.size());
         dc[s].wfac.upload(c.weight_factor.data(), c.weight_factor.size());
         dc[s].ffrac.upload(c.flat_frac.data(), c.flat_frac.size());
+        if (!chunks[s].z_w.empty()) dc[s].z_w.upload(chunks[s].z_w.data(), chunks[s].z_w.size());
         if (cfg.sld.enabled()) {
             dc[s].glare.upload(cg[s].maps.data(), cg[s].maps.size());
             dc[s].gi0.upload(cg[s].i0.data(), cg[s].i0.size());
@@ -720,7 +853,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         for (std::size_t s = 0; s < nsc; ++s) {
             const auto& c = chunks[s].cs;
             const int n = c.p1 - c.p0;
-            bpl.contrib.push_back(make_contributors(c.j0.data(), n, NG, bpl.g0, bpl.g1));
+            bpl.contrib.push_back(make_contributors(c.j0.data(), n, NG, bpl.g0, bpl.g1, !I.nearest));
             std::vector<char> used(n, 0);
             for (int32_t k : bpl.contrib.back().proj) used[k] = 1;
             std::vector<std::pair<int, int>> rg_;
@@ -780,7 +913,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                         const int k0 = k;
                         while (k < e0 && !got[s][k]) got[s][k++] = 1;
                         sd.reader->read_rows(sd.file_index.data() + c.p0 + k0, sd.frame_index.data() + c.p0 + k0,
-                                             c.row0.data() + k0, k - k0, chunks[s].win_rows,
+                                             chunks[s].win0.data() + k0, k - k0, chunks[s].win_rows,
                                              pinned[s].data() + static_cast<std::size_t>(k0) * per[s]);
                     }
                 };
@@ -861,6 +994,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                   dc[s].alpha.data(), dc[s].cdiv.data(), dc[s].wfac.data(), dc[s].ffrac.data(),
                                   dc[s].fi0.data(), dc[s].fi1.data(), I.x_kernel);
             view.raw_slot = d_slot[r][s].data();
+            set_z_kernel(view, I.z_pad, dc[s].z_w.data());
             if (cfg.sld.enabled())
                 set_glare(view, *I.glare[s], dc[s].glare.data(), dc[s].gi0.data(), dc[s].gi1.data(), dc[s].gfrac.data());
             cuda::accumulate(view, plans[b].contrib[s], ap, R.data(), RW.data());
@@ -923,6 +1057,13 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NG,
                                                  cudaMemcpyDeviceToDevice));
             tick("ramp_gather");
+            if (!arc_taps.empty()) {
+                arc_d.ensure(rown);
+                cuda::angular_fir(row.data(), arc_d.data(), NG, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1,
+                                  ap.measured_only ? wrow.data() : nullptr);
+                HELIREC_CUDA_CHECK(cudaMemcpyAsync(row.data(), arc_d.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
+                tick("arc");
+            }
             if (!raw_rows) {
                 cuda::ramp_pad(row.data(), pad.data(), rg);
                 ramp_filter->apply(pad.data(), pad.data(), NG);
@@ -1015,14 +1156,14 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, float* out, ChunkDebug*
         I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
             float* dst = out + static_cast<std::size_t>(y) * plane;
             if (external) {
-                I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles.data(), bp, N, roi, Device::CPU, dst);
+                I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles_of(y), bp, N, roi, Device::CPU, dst);
             } else if (use_ghbp) {
                 cpu::ghbp(I.plan, row, full.data());
                 for (int r = 0; r < ry; ++r)
                     std::memcpy(dst + static_cast<std::size_t>(r) * rx, full.data() + static_cast<std::size_t>(roi.y0 + r) * N + roi.x0,
                                 rx * sizeof(float));
             } else {
-                cpu::backproject(I.fbp_rows(row), I.fbp_angles.data(), dst, I.n_grid, nd, ry, rx, bp);
+                cpu::backproject(I.fbp_rows(row), I.fbp_angles_of(y), dst, I.n_grid, nd, ry, rx, bp);
             }
         });
         I.raw_rows = false;
@@ -1035,12 +1176,12 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, float* out, ChunkDebug*
     I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
         float* dst = out + static_cast<std::size_t>(y) * plane;
         if (external) {
-            I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles.data(), bp, N, roi, Device::CUDA, dst);
+            I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles_of(y), bp, N, roi, Device::CUDA, dst);
         } else if (use_ghbp) {
             I.ghbp->run(row, I.slice.data());
             cuda::download_rows(dst, I.slice.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0, N, rx, ry, I.slice_host);
         } else {
-            cuda::backproject(I.fbp_rows(row), I.fbp_angles.data(), I.slice.data(), I.n_grid, nd, ry, rx, bp);
+            cuda::backproject(I.fbp_rows(row), I.fbp_angles_of(y), I.slice.data(), I.n_grid, nd, ry, rx, bp);
             cuda::download_rows(dst, I.slice.data(), rx, rx, ry, I.slice_host);
         }
     }, next_lo, next_hi);
@@ -1076,7 +1217,7 @@ void SliceReconstructor::reconstruct_band(int h_lo, int h_hi, BandSampler& band,
         for (const auto& h : held) fm = std::max(fm, h->margin_rows());
     }
     I.run(h_lo, h_hi, dbg, sets, sw ? sweep_margin(*sweep) : I.margin, fm, [&](int k, int y, float* row, float*) {
-        band.slice(h_lo + y, I.fbp_rows(row), I.n_grid, nd, I.fbp_angles.data(), I.bp, k);
+        band.slice(h_lo + y, I.fbp_rows(row), I.n_grid, nd, I.fbp_angles_of(y), I.bp, k);
     }, next_lo, next_hi);
 }
 

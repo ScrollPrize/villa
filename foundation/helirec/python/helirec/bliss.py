@@ -152,6 +152,9 @@ class BlissScan:
     pixel_size_m: float                     # sample pixel size (x == y)
     detector_pixel_size_m: float | None = None
     count_time_s: float | None = None
+    # continuous rotation: fraction of the angular step between projections swept during one exposure (the recorded
+    # <rotation>_delta / <rotation>_period, else exposure / (exposure + latency)); None: unknown or a step scan
+    exposure_arc: float | None = None
     detector: str = "det3"
     sample_name: str = ""
     start_time: str = ""
@@ -602,6 +605,7 @@ def open_scan(path) -> BlissScan:
         kinds = []      # per NX frame: role
         flat_chunks = []  # FrameRefs per flat entry, with NX start index
         angles, zs, zunits, aunits = [], [], set(), set()
+        arc_delta, arc_period = [], []
         entries_info = {}
         frame_shape, dtype = None, None
         nx_index = 0
@@ -631,6 +635,12 @@ def open_scan(path) -> BlissScan:
                 zs.append(_to_si(z, zu, _LENGTH_TO_M, "mm"))
                 aunits.add(au or "deg")
                 proj_nx_index.append(np.arange(nx_index, nx_index + nfr))
+                meas = g.get("measurement")
+                for nm in rot_names:   # the angle swept during / between exposures, as the encoder recorded it
+                    if meas is not None and f"{nm}_delta" in meas and f"{nm}_period" in meas:
+                        arc_delta.append(np.abs(np.asarray(meas[f"{nm}_delta"][()], np.float64)))
+                        arc_period.append(np.abs(np.asarray(meas[f"{nm}_period"][()], np.float64)))
+                        break
             nx_index += nfr
         if not refs["proj"]:
             raise ValueError(f"{master}: no projection frames")
@@ -694,6 +704,17 @@ def open_scan(path) -> BlissScan:
                 distance_m = (-z1 * z2) / (-z1 + z2)
         et, _ = _scalar_with_units(scan, "exposure_time")
         count_time_s = None if et is None else float(et) * 1e-3
+        exposure_arc = None
+        continuous = scan is not None and "scan_type" in scan and _text(scan["scan_type"]).upper() == "CONTINUOUS"
+        if continuous and arc_delta:
+            period = float(np.median(np.concatenate(arc_period)))
+            if period > 0:
+                exposure_arc = float(np.median(np.concatenate(arc_delta))) / period
+        if continuous and exposure_arc is None and et:
+            lt, _ = _scalar_with_units(scan, "latency_time")
+            exposure_arc = float(et) / (float(et) + float(lt or 0.0))
+        if exposure_arc is not None and not 0.0 < exposure_arc <= 1.0:
+            exposure_arc = None
         # lateral motor: nxtomomill translation_y[0] (first frame of the sequence), mm -> m
         g0 = f[steps[0]]
         yv, yu, _ = _per_frame(g0, y_names, 1, "translation_y")
@@ -713,7 +734,8 @@ def open_scan(path) -> BlissScan:
         darks_control_A=darks_ctl,
         y_translation_m=y_translation_m, estimated_cor_from_motor_pix=float(estimated_cor),
         energy_kev=energy_kev, distance_m=float(distance_m), pixel_size_m=pixel_size_m,
-        detector_pixel_size_m=detector_pixel_size_m, count_time_s=count_time_s, detector=det,
+        detector_pixel_size_m=detector_pixel_size_m, count_time_s=count_time_s, exposure_arc=exposure_arc,
+        detector=det,
         sample_name=sample_name, start_time=start_time, end_time=end_time, entries=entries_info)
 
 

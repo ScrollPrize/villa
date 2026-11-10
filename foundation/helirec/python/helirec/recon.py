@@ -36,15 +36,21 @@ DEFAULTS = dict(
     mode="corrected", filters=DEFAULT_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9, sld="", x_interp="lanczos3",
+    axis_source_meters=1e9, sld="", x_interp="lanczos3", z_interp="lanczos3", angle_interp="nearest", exposure_arc="auto",
 )
+# z_interp: lanczos3 | cubic | linear, the vertical interpolation of a slice's (fractional) detector row.
+# angle_interp: nearest (each projection whole in one bin, slices backprojected at the measured angles) | linear (the
+#   reference's two-bin angular splat). ghbp, whose plan fixes its angles, keeps the splat: info["angle_interp"]
+#   records the gridding in use.
+# exposure_arc: fraction of the angular step swept during an exposure, deconvolved along the angle; "auto" (default)
+#   takes it from the scan (bliss.BlissScan.exposure_arc; 0 for step scans), 0 leaves the sinogram as recorded.
 
 # mode "legacy_reference": every parameter pinned to the reference workflow
 LEGACY_REFERENCE = dict(
     filters=REFERENCE_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9, sld="", x_interp="linear",
+    axis_source_meters=1e9, sld="", x_interp="linear", z_interp="linear", angle_interp="linear", exposure_arc=0.0,
 )
 assert set(LEGACY_REFERENCE) == set(DEFAULTS) - {"mode"}
 
@@ -66,12 +72,17 @@ CONVENTIONS = {
                       mending_domain="merged columns covered by the scans' weight maps",
                       paganin_kernel="fixed, rows [-m, m], unit DC",
                       column_offset="x_interp kernel (lanczos3 by default); linear splat next to unmeasured columns",
-                      luminosity_window="full 25 rows (12 context rows read either side of a chunk)"),
+                      luminosity_window="full 25 rows (12 context rows read either side of a chunk)",
+                      row_position="z_interp kernel (lanczos3 by default); linear next to unmeasured rows",
+                      angular_gridding="angle_interp (nearest by default: one bin, measured angles; ghbp and "
+                                       "linear: two-bin splat)",
+                      exposure_arc="deconvolved along the angle (the scan's recorded arc by default)"),
     "legacy_reference": dict(output_units="reference_units (attenuation / 2)", ramp_angular_weight="pi/n_angles",
                              rebalance="nabuxx (endpoint quirks)", ramp_padding_reflection="lround(2*rot_center)",
                              mending_domain="main-scan first/last column as left/right widths",
                              paganin_kernel="nabuxx pag_version 2 (truncated per chunk, DC not renormalised)",
-                             column_offset="two-column linear splat", luminosity_window="clipped to the chunk"),
+                             column_offset="two-column linear splat", luminosity_window="clipped to the chunk",
+                             row_position="linear", angular_gridding="two-bin splat", exposure_arc="none"),
 }
 
 
@@ -213,10 +224,18 @@ class HelicalRecon:
                    legacy_reference=mode == "legacy_reference")
         cfg.update(backprojector_config(p["backprojector"]))
         cfg.update(sld_config(cfg.pop("sld")))
+        cfg["exposure_arc"] = self.exposure_arc()
         scans = [self._scan_data(self.main, "main"), self._scan_data(self.companion, "companion")]
         self.rec = _core.SliceReconstructor(scans, cfg)
         self.info = self.rec.info
         self.lo, self.hi = self.info["doable"]
+
+    def exposure_arc(self) -> float:
+        """params["exposure_arc"] resolved: a number, or "auto" = the main scan's recorded fraction (0 if unknown)"""
+        v = self.params["exposure_arc"]
+        if isinstance(v, str) and v.strip().lower() == "auto":
+            return float(self.main.exposure_arc or 0.0)
+        return float(v)
 
     @property
     def legacy(self) -> bool:

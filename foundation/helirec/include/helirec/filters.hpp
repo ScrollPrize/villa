@@ -25,6 +25,10 @@
 //                                            second-order model F of the propagated intensity. iters=0 is Paganin.
 //                                            max_shift: limit of the modelled ray shift (pixels; <= 0: none).
 //                                            Intensity stage only; margin 2 x Paganin's + 4 rows
+//   mtf_paganin delta_beta, nsr=0.01,        phase retrieval and detector deblurring as one Wiener filter, in place of
+//            sigma | mtf                     paganin + unsharp: Paganin x (1 + nsr) M / (M^2 + nsr), M the detector MTF
+//                                            (Gaussian of `sigma` pixels, or a radial table mtf="nu:M/nu:M/...", nu in
+//                                            cycles per pixel). Fixed unit-DC kernel as paganin's.
 // Every filter accepts stage=intensity|log.
 #include <complex>
 #include <functional>

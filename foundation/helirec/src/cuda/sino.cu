@@ -21,6 +21,13 @@ __global__ void multiply_kernel(float* x, const float* w, size_t n) {
         x[i] = __fmul_rn(x[i], w[i]);
 }
 
+__global__ void angular_fir_kernel(const float* __restrict__ in, float* __restrict__ out, int n_proj, int n_cols,
+                                   const float* __restrict__ g, int radius, const float* __restrict__ support) {
+    const size_t n = static_cast<size_t>(n_proj) * n_cols;
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
+        out[i] = sino_core::angular_fir_at(in, support, n_proj, n_cols, static_cast<int>(i / n_cols), static_cast<int>(i % n_cols), g, radius);
+}
+
 // adj per row computed on the host-side formula but on device: one block per row
 __global__ void ramp_adj_kernel(const float* sino, float* adj, RampGeometry g) {
     const int y = blockIdx.x;
@@ -210,6 +217,17 @@ void minus_log(float* x, std::size_t n, float lo, float hi, void* stream) {
 void multiply(float* x, const float* w, std::size_t n, void* stream) {
     multiply_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, n);
     HELIREC_CUDA_CHECK(cudaGetLastError());
+}
+
+void angular_fir(const float* in, float* out, int n_proj, int n_cols, const float* g, int radius, const float* support,
+                 void* stream) {
+    if (radius < 0 || 2 * radius + 1 > n_proj) throw Error("angular_fir: bad radius");
+    cudaStream_t s = as_stream(stream);
+    DeviceBuffer<float> d_g;
+    d_g.upload(g, static_cast<std::size_t>(radius) + 1, s);
+    angular_fir_kernel<<<grid_for(static_cast<size_t>(n_proj) * n_cols), 256, 0, s>>>(in, out, n_proj, n_cols, d_g.data(), radius, support);
+    HELIREC_CUDA_CHECK(cudaGetLastError());
+    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));  // d_g is freed on return
 }
 
 void ramp_pad(const float* sino, float* padded, const RampGeometry& g, void* stream) {

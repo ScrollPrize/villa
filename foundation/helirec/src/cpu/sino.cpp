@@ -119,6 +119,23 @@ FourierFilterSpec ramp_filter_spec(const RampGeometry& g, float scale) {
     return s;
 }
 
+std::vector<float> arc_deblur_taps(double arc, int radius) {
+    if (!(arc > 0 && arc <= 1.5)) throw Error("exposure arc must be in (0, 1.5] grid angles");
+    if (radius < 1 || radius > 16) throw Error("arc_deblur_taps: radius must be 1..16");
+    // g[k] = integral over |f| <= 1/2 of cos(2 pi f k) / sinc(arc f) (midpoint rule), then unit sum
+    const int n = 8192;
+    std::vector<double> g(radius + 1, 0.0);
+    for (int i = 0; i < n; ++i) {
+        const double f = (i + 0.5) / n * 0.5, a = M_PI * arc * f, h = a / std::sin(a);
+        for (int k = 0; k <= radius; ++k) g[k] += h * std::cos(2 * M_PI * f * k) / n;
+    }
+    double sum = g[0];
+    for (int k = 1; k <= radius; ++k) sum += 2 * g[k];
+    std::vector<float> out(radius + 1);
+    for (int k = 0; k <= radius; ++k) out[k] = static_cast<float>(g[k] / sum);
+    return out;
+}
+
 namespace cpu {
 
 void minus_log(float* x, std::size_t n, float lo, float hi) {
@@ -129,6 +146,14 @@ void minus_log(float* x, std::size_t n, float lo, float hi) {
 void multiply(float* x, const float* w, std::size_t n) {
 #pragma omp parallel for schedule(static)
     for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = x[i] * w[i];
+}
+
+void angular_fir(const float* in, float* out, int n_proj, int n_cols, const float* g, int radius, const float* support) {
+    if (radius < 0 || 2 * radius + 1 > n_proj) throw Error("angular_fir: bad radius");
+#pragma omp parallel for schedule(static)
+    for (int j = 0; j < n_proj; ++j)
+        for (int x = 0; x < n_cols; ++x)
+            out[static_cast<std::size_t>(j) * n_cols + x] = sino_core::angular_fir_at(in, support, n_proj, n_cols, j, x, g, radius);
 }
 
 void ramp_pad(const float* sino, float* padded, const RampGeometry& g) {

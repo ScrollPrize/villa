@@ -271,6 +271,10 @@ def main(argv=None):
                      help="--projections: filter sweep, e.g. paganin.delta_beta=250,500,1000 (keys TYPE[.k].param, "
                           "lists zipped; filters=CHAIN1;CHAIN2 sweeps whole chains); one subfolder per set")
     src.add_argument("--chunk", type=int, default=None, help="--projections: slices per chunk (default 64; sweeps 40)")
+    src.add_argument("--no_prefetch", action="store_true",
+                     help="--projections: do not read the next chunk's raw rows while this one computes. Halves the "
+                          "page-locked host memory (one set of raw windows instead of two: projections x (chunk + "
+                          "2 x margin) rows x columns x 2 bytes per scan), at the cost of re-reading the rows chunks share")
     src.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     src.add_argument("--level", type=int, default=0, help="volume: pyramid level to sample (default 0)")
     lay = p.add_argument_group("layers")
@@ -415,7 +419,7 @@ def main(argv=None):
     chunk = a.chunk or (40 if K > 1 else 64)
     print(f"surface {surf.uuid}: window rows {window[:2]} cols {window[2:]}, {bc.n_points} points, "
           f"z {z0}..{z1 - 1} (h {h0}..{h1 - 1}), {K} parameter set(s), chunk {chunk}", flush=True)
-    sec = bc.run(chunk, sweep=sweep,
+    sec = bc.run(chunk, sweep=sweep, prefetch=not a.no_prefetch,
                  progress=lambda d, n, el: print(f"  {d}/{n} slices, {el:.0f}s", flush=True))
     print(f"band reconstruction {sec['wall']:.1f}s ({1e3 * sec['wall'] / (h1 - h0):.1f} ms/slice)", flush=True)
     good_all = bc.valid

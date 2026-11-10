@@ -147,7 +147,7 @@ def test_next_chunk_read_ahead(tmp_path, device):
 def test_log_before_fractional_vertical_rebinning(tmp_path, device):
     scan, angles, z, raw = helical_scan(tmp_path, row_pattern=True)
     h = 7
-    actual = recon(scan, device).reconstruct(h, h + 1, debug=True)
+    actual = recon(scan, device, z_interp="linear").reconstruct(h, h + 1, debug=True)   # (kernels: test_resolution)
     expected = []
     for a in range(64):
         values = []

@@ -12,6 +12,11 @@
 // pixel: a [1/2, 1/2] box, response cos(pi nu)). With AccumScanView::x_taps > 0 its value is instead interpolated
 // across x_taps columns (the weight stays the splat's), wherever all of them are measured columns; next to the
 // detector edges and to unmeasured columns the splat is kept.
+//
+// Vertically, a slice lies at a fractional detector row of each projection. The reference interpolates the two
+// neighbouring rows linearly; as the fraction sweeps all values along a helix, that is a triangle kernel along z
+// (sinc^2: 0.81 at half Nyquist, 0.41 at Nyquist). With AccumScanView::z_taps > 0 the value is interpolated across
+// z_taps rows instead (the weight stays the linear one), wherever all of them are measured.
 #include <cstdint>
 #include <vector>
 
@@ -23,7 +28,8 @@ namespace helirec {
 struct AccumScanView {
     int n_proj = 0;          // projections in the chunk
     int det_rows = 0, det_cols = 0;
-    int win_rows = 0;        // rows per projection window (H + 1)
+    int win_rows = 0;        // rows per projection window (H + 1 + 2 win_off)
+    int win_off = 0;         // window rows before stack row 0 (context of the vertical kernel)
     const uint16_t* raw = nullptr;     // (n_proj, win_rows, det_cols), or (n_slots, ...) with raw_slot
     const int32_t* raw_slot = nullptr; // optional: projection k's window is raw[raw_slot[k]] (streamed subsets)
     const float* dark = nullptr;       // (det_rows, det_cols)
@@ -54,11 +60,20 @@ struct AccumScanView {
     // two-column linear splat
     int x_taps = 0;
     float x_w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    // optional kernel for the vertical position (z_taps > 0): the value at row t + fract_v[k] of projection k is
+    // sum_i z_w[k * z_taps + i] value(t - (z_taps / 2 - 1) + i), wherever all those rows are on the detector with a
+    // positive weight (else the linear interpolation of rows t, t + 1). The weight stays the linear one.
+    int z_taps = 0;
+    const float* z_w = nullptr;   // (n_proj, z_taps)
 };
 
 // Kernel of the fractional column offset of a scan: `interp` linear (the reference splat; x_taps = 0), cubic (Keys,
 // 4 columns) or lanczos3 (6 columns), weights normalised to sum 1. A zero offset needs none.
 void set_x_kernel(AccumScanView& v, int interp);
+// Vertical kernel: rows of context it needs either side of the two linear rows (0 linear, 1 cubic, 2 lanczos3), and
+// its weights (n, taps) for the vertical fractions fract_v (taps = 2 + 2 context rows; empty for linear).
+int z_kernel_context(int interp);
+std::vector<float> z_kernel_weights(const std::vector<float>& fract_v, int interp);
 
 // Contributors of each grid angle of a block [g0, g1): CSR over (j - g0), entries
 // sorted by projection; role 0 = lower bin (weight 1 - alpha), 1 = upper bin (alpha).
@@ -68,7 +83,8 @@ struct ContributorList {
     std::vector<int32_t> proj;     // local projection index
     std::vector<int8_t> role;
 };
-ContributorList make_contributors(const int32_t* j0, int n_proj, int n_grid, int g0, int g1);
+// upper_bin false (nearest-bin gridding: every alpha is 0, j0 is wrapped): only the role 0 entries.
+ContributorList make_contributors(const int32_t* j0, int n_proj, int n_grid, int g0, int g1, bool upper_bin = true);
 
 struct AccumParams {
     int H = 0;              // rows of the gridded stack (slices + 2 margins)

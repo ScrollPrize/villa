@@ -18,7 +18,7 @@ HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
     const int r = s.row0[k] + t;  // raw detector row
     const std::size_t pix = static_cast<std::size_t>(r) * s.det_cols + c;
     const std::size_t slot = s.raw_slot ? static_cast<std::size_t>(s.raw_slot[k]) : static_cast<std::size_t>(k);
-    const float u = static_cast<float>(s.raw[(slot * s.win_rows + t) * s.det_cols + c]);
+    const float u = static_cast<float>(s.raw[(slot * s.win_rows + (t + s.win_off)) * s.det_cols + c]);
     float sig = div(sub(u, s.dark[pix]), s.current_div[k]);
     if (s.glare) {   // scintillator light diffusion: minus the glare, interpolated between its sampled projections
         const std::size_t cell = static_cast<std::size_t>(s.glare_rows) * s.glare_cols;
@@ -33,6 +33,26 @@ HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
     return div(sig, flat);
 }
 
+// The value at row t + fract_v[k] from the z_taps rows around it (AccumScanView::z_w); false: one of them is off the
+// detector, unweighted or (with `finite`) not finite, and the caller interpolates rows t, t + 1 linearly.
+// `log_values`: -log of each row first.
+HR_HD bool z_kernel_value(const AccumScanView& s, int k, int t, int c, bool finite, bool log_values, float clip_min,
+                          float clip_max, float& val) {
+    const int T = s.z_taps, t0 = t - (T / 2 - 1), first = s.row0[k] + t0;
+    if (first < 0 || first + T > s.det_rows) return false;
+    const float* zw = s.z_w + static_cast<std::size_t>(k) * T;
+    float v = 0.f;
+    for (int i = 0; i < T; ++i) {
+        if (!(s.weight[static_cast<std::size_t>(first + i) * s.det_cols + c] > 0.f)) return false;
+        float f = flat_field(s, k, t0 + i, c);
+        if (finite && !hd::is_finite(f)) return false;
+        if (log_values) f = sino_core::minus_log(f, clip_min, clip_max);
+        v = add(v, mul(zw[i], f));
+    }
+    val = v;
+    return true;
+}
+
 // vertically interpolated value at window row t (raw row r = row0 + t), with the reference's
 // edge padding: rows above / below the detector take the value at raw row 0 / det_rows - 2
 // and the weight non_zero.
@@ -44,8 +64,10 @@ HR_HD void column_value(const AccumScanView& s, int k, int t, int c, float non_z
     if (r < 0) { tv = -s.row0[k]; pad = true; }
     else if (r > s.det_rows - 2) { tv = s.det_rows - 2 - s.row0[k]; pad = true; }
     else tv = t;
-    val = flat_field(s, k, tv, c);
-    if (a != 0.0f) val = add(mul(sub(1.0f, a), val), mul(a, flat_field(s, k, tv + 1, c)));
+    if (!(a != 0.0f && s.z_taps > 0 && !pad && z_kernel_value(s, k, t, c, false, false, 0.f, 0.f, val))) {
+        val = flat_field(s, k, tv, c);
+        if (a != 0.0f) val = add(mul(sub(1.0f, a), val), mul(a, flat_field(s, k, tv + 1, c)));
+    }
     if (pad) {
         wt = non_zero;
     } else {
@@ -76,6 +98,19 @@ HR_HD void measured_column(const AccumScanView& s, int k, int t, int c, const Ac
     const float a = s.fract_v[k];
     const int base_row = s.row0[k] + t;
     if (base_row < 0 || base_row >= s.det_rows || (a > 0.f && base_row + 1 >= s.det_rows)) return;
+    float kv;
+    if (a > 0.f && s.z_taps > 0 && z_kernel_value(s, k, t, c, true, p.log_values, p.log_clip_min, p.log_clip_max, kv)) {
+        // every row is measured: the kernel's value with the linear weight
+        const float fac = s.weight_factor[k];
+        const float w0 = mul(mul(s.weight[static_cast<std::size_t>(base_row) * s.det_cols + c], fac), sub(1.f, a));
+        const float w1 = mul(mul(s.weight[static_cast<std::size_t>(base_row + 1) * s.det_cols + c], fac), a);
+        const float wl = add(w0, w1);
+        if (wl > 0.f && hd::is_finite(wl)) {
+            v = mul(kv, wl);
+            w = wl;
+            return;
+        }
+    }
     for (int dz = 0; dz < 2; ++dz) {
         const float f = dz ? a : sub(1.f, a);
         const int r = s.row0[k] + t + dz;

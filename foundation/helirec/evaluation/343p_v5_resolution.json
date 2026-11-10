@@ -1,0 +1,289 @@
+{
+  "projections": "/mnt/raid_nvme/343p_recon_work/projections",
+  "cache_dir": "/mnt/raid_nvme/343p_recon_work/output/baselines/_calibration",
+  "device": "cuda",
+  "params": {
+    "mode": "corrected",
+    "filters": []
+  },
+  "slices": {
+    "z": [
+      2698,
+      3598
+    ]
+  },
+  "roi": null,
+  "window": [
+    -0.06,
+    0.29
+  ],
+  "crops": [
+    [
+      2300,
+      2920,
+      2150,
+      2650
+    ],
+    [
+      2250,
+      2870,
+      1560,
+      2060
+    ],
+    [
+      1150,
+      1770,
+      2250,
+      2750
+    ]
+  ],
+  "sheet_columns": 5,
+  "tile": 1024,
+  "methods": [
+    {
+      "name": "fbp_only",
+      "backprojector": "fbp",
+      "params": {
+        "z_interp": "linear",
+        "angle_interp": "linear",
+        "exposure_arc": 0,
+        "filters": []
+      },
+      "desc": "FBP, no projection filters; previous gridding (linear rows, two-bin angular splat)"
+    },
+    {
+      "name": "fbp_paganin",
+      "backprojector": "fbp",
+      "params": {
+        "z_interp": "linear",
+        "angle_interp": "linear",
+        "exposure_arc": 0,
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          }
+        ]
+      },
+      "desc": "FBP, Paganin 1000; previous gridding (linear rows, two-bin angular splat)"
+    },
+    {
+      "name": "fbp_paganin_unsharp",
+      "backprojector": "fbp",
+      "params": {
+        "z_interp": "linear",
+        "angle_interp": "linear",
+        "exposure_arc": 0,
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ]
+      },
+      "desc": "FBP, Paganin 1000 + unsharp 1.2/4; previous gridding (linear rows, two-bin angular splat)"
+    },
+    {
+      "name": "fbp_sld_paganin_unsharp",
+      "backprojector": "fbp",
+      "params": {
+        "z_interp": "linear",
+        "angle_interp": "linear",
+        "exposure_arc": 0,
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ],
+        "sld": "fraction=0.1,length=100"
+      },
+      "desc": "FBP, SLD 0.1/100 (uncalibrated default) + Paganin 1000 + unsharp 1.2/4; previous gridding (linear rows, two-bin angular splat)"
+    },
+    {
+      "name": "fbp_sld_epr_unsharp",
+      "backprojector": "fbp",
+      "params": {
+        "z_interp": "linear",
+        "angle_interp": "linear",
+        "exposure_arc": 0,
+        "filters": [
+          {
+            "type": "epr",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ],
+        "sld": "fraction=0.1,length=100"
+      },
+      "desc": "FBP, SLD 0.1/100 (uncalibrated default) + eikonal phase 1000 + unsharp 1.2/4; previous gridding (linear rows, two-bin angular splat)"
+    },
+    {
+      "name": "v5_paganin_unsharp",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ]
+      },
+      "desc": "FBP, Paganin 1000 + unsharp 1.2/4; v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_mtf",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "mtf_paganin",
+            "delta_beta": 1000.0,
+            "sigma": 1.06,
+            "nsr": 0.01
+          }
+        ]
+      },
+      "desc": "FBP, fused MTF-Wiener Paganin (sigma 1.06, nsr 0.01); v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_sldcal_paganin",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          }
+        ],
+        "sld": "fraction=0.6,length=400"
+      },
+      "desc": "FBP, calibrated SLD 0.6/400 + Paganin 1000 (no sharpening); v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_sldcal_paganin_unsharp",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "paganin",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ],
+        "sld": "fraction=0.6,length=400"
+      },
+      "desc": "FBP, calibrated SLD 0.6/400 + Paganin 1000 + unsharp 1.2/4; v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_sldcal_mtf",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "mtf_paganin",
+            "delta_beta": 1000.0,
+            "sigma": 1.06,
+            "nsr": 0.01
+          }
+        ],
+        "sld": "fraction=0.6,length=400"
+      },
+      "desc": "FBP, calibrated SLD 0.6/400 + fused MTF-Wiener Paganin (sigma 1.06, nsr 0.01); v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_sldcal_mtf_nsr003",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "mtf_paganin",
+            "delta_beta": 1000.0,
+            "sigma": 1.06,
+            "nsr": 0.003
+          }
+        ],
+        "sld": "fraction=0.6,length=400"
+      },
+      "desc": "FBP, calibrated SLD 0.6/400 + fused MTF-Wiener Paganin, nsr 0.003 (sharper); v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_sldcal_mtf_nsr03",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "mtf_paganin",
+            "delta_beta": 1000.0,
+            "sigma": 1.06,
+            "nsr": 0.03
+          }
+        ],
+        "sld": "fraction=0.6,length=400"
+      },
+      "desc": "FBP, calibrated SLD 0.6/400 + fused MTF-Wiener Paganin, nsr 0.03 (smoother); v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_sldcal_epr_unsharp",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "epr",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "unsharp",
+            "sigma": 1.2,
+            "coeff": 4.0
+          }
+        ],
+        "sld": "fraction=0.6,length=400"
+      },
+      "desc": "FBP, calibrated SLD 0.6/400 + eikonal phase 1000 + unsharp 1.2/4; v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    },
+    {
+      "name": "v5_sldcal_epr_mtf",
+      "backprojector": "fbp",
+      "params": {
+        "filters": [
+          {
+            "type": "epr",
+            "delta_beta": 1000.0
+          },
+          {
+            "type": "mtf_paganin",
+            "delta_beta": 0.0,
+            "sigma": 1.06,
+            "nsr": 0.01
+          }
+        ],
+        "sld": "fraction=0.6,length=400"
+      },
+      "desc": "FBP, calibrated SLD 0.6/400 + eikonal phase 1000 + MTF-Wiener deblur (sigma 1.06, nsr 0.01); v5 gridding (Lanczos-3 rows, nearest-bin measured angles, exposure-arc deblur)"
+    }
+  ]
+}

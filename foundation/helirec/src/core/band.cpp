@@ -34,7 +34,7 @@ struct BandSampler::Impl {
     cuda::DeviceBuffer<uint8_t> d_mask;
     cuda::DeviceBuffer<int32_t> d_list;
     cuda::DeviceBuffer<float2> d_cs;
-    int cs_angles = 0;
+    std::vector<float> cs_src;   // the angles d_cs holds
 #endif
 
     std::pair<std::size_t, std::size_t> range(int h) const {
@@ -153,11 +153,12 @@ void BandSampler::slice(int h, const float* filtered, int n_angles, int n_det, c
         return;
     }
 #ifdef HELIREC_WITH_CUDA
-    if (I.cs_angles != n_angles) {
+    if (static_cast<int>(I.cs_src.size()) != n_angles || !std::equal(I.cs_src.begin(), I.cs_src.end(), angles_host)) {
         std::vector<float2> cs(n_angles);
         for (int a = 0; a < n_angles; ++a) cs[a] = make_float2(std::cos(angles_host[a]), std::sin(angles_host[a]));
         I.d_cs.upload(cs.data(), cs.size());
-        I.cs_angles = n_angles;
+        HELIREC_CUDA_CHECK(cudaStreamSynchronize(nullptr));   // (cs is local)
+        I.cs_src.assign(angles_host, angles_host + n_angles);
     }
     if (!I.prepared || I.prepared_h != h) {
         HELIREC_CUDA_CHECK(cudaMemsetAsync(I.d_mask.data(), 0, npx));

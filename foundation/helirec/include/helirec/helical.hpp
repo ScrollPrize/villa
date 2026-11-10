@@ -80,4 +80,19 @@ ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const s
 // number of grid angles: round(360 / |mean step|) over the whole scan
 int grid_angle_count(const std::vector<double>& angles_deg);
 
+// Nearest-bin angular gridding. The reference splits every projection between the two grid angles around its own
+// (weights 1 - alpha, alpha): an average of neighbouring views wherever the recorded angles sit off the grid. Here
+// each projection goes whole into one bin, and consecutive projections into consecutive bins:
+//   bin[0] = round(f_0 - phase),  bin[p + 1] = bin[p] + round(f_{p+1} - f_p),   f = angle / (360 / n_grid)
+// (unwrapped; a skipped projection leaves its bin empty, a step below half a bin shares one). `residual` = f - bin is
+// where the projection really is, in bins from its bin's nominal angle: the backprojection uses bin + residual.
+// The rule does not depend on the chunk. `phase`: the main scan's angle_grid_phase, so that companions recorded at
+// the same angles get the same bins.
+struct AngleBins {
+    std::vector<int32_t> bin;
+    std::vector<float> residual;
+};
+double angle_grid_phase(const std::vector<double>& angles_deg, int n_grid);   // f_0 - round(f_0)
+AngleBins nearest_angle_bins(const std::vector<double>& angles_deg, int n_grid, double phase = 0);
+
 }  // namespace helirec

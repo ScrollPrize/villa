@@ -92,6 +92,25 @@ void ramp_crop(const float* padded, float* out, const RampGeometry& g, void* str
 }
 #endif
 
+// ------------------------------------------------------------- exposure arc
+// In a continuous scan the detector integrates while the sample turns: each view is the sinogram averaged over an arc
+// of `arc` grid angles (a box along the angle; at radius r a tangential blur of r x arc x step). Its inverse
+// 1 / sinc(arc f) is bounded (arc 0.91: 1.43 at the angular Nyquist frequency) and well represented by a short
+// symmetric kernel: arc_deblur_taps returns g[0..radius] (the Fourier series of the inverse, unit sum), and
+// angular_fir applies  out[j, x] = sum_n g[|n|] in[(j + n) mod n_proj, x]  (in != out). With `support` (same shape),
+// only where every tap has support > 0; elsewhere out = in.
+std::vector<float> arc_deblur_taps(double arc, int radius = 4);
+namespace cpu {
+void angular_fir(const float* in, float* out, int n_proj, int n_cols, const float* g, int radius,
+                 const float* support = nullptr);
+}
+#ifdef HELIREC_WITH_CUDA
+namespace cuda {
+void angular_fir(const float* in, float* out, int n_proj, int n_cols, const float* g, int radius,
+                 const float* support = nullptr, void* stream = nullptr);
+}
+#endif
+
 // ------------------------------------------------------------- oversampling
 // band-limited upsampling of rows (FFT zero padding to upsample_fft_length(n), Nyquist bin split):
 // out (n_rows, n * os), out[r, i] = row r at position i / os

@@ -46,6 +46,19 @@ struct ReconConfig {
     // reference's two-column splat, which averages neighbouring columns (cos(pi nu) at half a pixel). The legacy
     // reference mode always uses the splat.
     std::string x_interp = "lanczos3";
+    // vertical position of a slice in a projection (a fractional detector row): "lanczos3" (default) or "cubic"
+    // (6 / 4 rows; accumulate.hpp), or "linear" = the reference's two rows, a triangle kernel along z (sinc^2). The
+    // legacy reference mode always interpolates linearly.
+    std::string z_interp = "lanczos3";
+    // angular gridding: "nearest" (default) = each projection whole in one bin and every slice backprojected at the
+    // measured mean angle of each bin (helical.hpp nearest_angle_bins): no angular averaging; "linear" = the
+    // reference's splat of each projection over the two grid angles around its own. Nearest needs a backprojector that
+    // takes the angles of each slice (fbp, the whole-slice methods, bands): ghbp, whose plan fixes its angles, and the
+    // legacy reference mode keep the splat (SliceReconstructor::angle_interp() tells which is in use).
+    std::string angle_interp = "nearest";
+    // continuous rotation: fraction of the angular step between projections swept during one exposure (0: none, or
+    // step scans). > 0: that box blur along the angle is deconvolved in every sinogram (sino.hpp angular_fir).
+    double exposure_arc = 0;
     float mend_threshold = 1e-4f;       // mending domain: the merged columns the scans' weight maps cover
     float log_clip_min = 1e-6f, log_clip_max = 10.f;
     int block_angles = 500;
@@ -85,6 +98,7 @@ struct ChunkDebug {
     std::vector<float> weights;   // (n_grid, DY, NX) accumulated weights (cropped)
     std::vector<float> wbal;      // backprojector weights: balanced for FBP/gridrec, measured support for SIRT/MLEM
     std::vector<float> filtered;  // (DY, n_grid, NX) backprojector input
+    std::vector<float> angles;    // (DY, n_grid) angle of each grid bin in each slice (radians)
     // per-stage wall time (seconds); with timing on, the GPU is synchronised at stage boundaries
     bool timing = false;
     std::map<std::string, double> seconds;
@@ -125,6 +139,9 @@ class SliceReconstructor {
     int grid_size() const;
     int merged_width() const;
     std::pair<int, int> mend_domain() const;   // [x0, x1) merged columns the mending works on
+    double exposure_arc_bins() const;          // the deconvolved exposure arc in grid angles (0: none)
+    std::string angle_interp() const;          // the angular gridding in use: "nearest" or "linear"
+    std::string z_interp() const;              // the vertical kernel in use
     const ReconConfig& config() const;
 
     // slices for view heights h_lo .. h_hi-1 -> out (h_hi - h_lo, N, N), or (n, y1 - y0, x1 - x0) with an ROI

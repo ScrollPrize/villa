@@ -381,6 +381,30 @@ HostOut minus_log_py(HostIn x, float clip_min, float clip_max, const std::string
     return out;
 }
 
+HostOut angular_fir_py(HostIn sino, const std::vector<float>& taps, std::optional<HostIn> support, const std::string& device) {
+    require(sino.ndim() == 2, "sino must be (n_proj, n_cols)");
+    require(!taps.empty(), "taps: g[0..radius]");
+    require(!support || (support->ndim() == 2 && support->size() == sino.size()), "support must have sino's shape");
+    const int np = static_cast<int>(sino.shape(0)), nc = static_cast<int>(sino.shape(1)), radius = static_cast<int>(taps.size()) - 1;
+    HostOut out = copy_of(sino);
+    const float* in = static_cast<const float*>(sino.data());
+    const float* sup = support ? static_cast<const float*>(support->data()) : nullptr;
+    const Device dev = parse_device(device);
+    nb::gil_scoped_release nogil;
+    if (dev == Device::CPU) {
+        cpu::angular_fir(in, data(out), np, nc, taps.data(), radius, sup);
+        return out;
+    }
+#ifdef HELIREC_WITH_CUDA
+    cuda::DeviceBuffer<float> d_in, d_out(sino.size()), d_sup;
+    d_in.upload(in, sino.size());
+    if (sup) d_sup.upload(sup, sino.size());
+    cuda::angular_fir(d_in.data(), d_out.data(), np, nc, taps.data(), radius, sup ? d_sup.data() : nullptr);
+    d_out.download(data(out));
+#endif
+    return out;
+}
+
 std::pair<HostOut, HostOut> rebalance_py(HostIn R, HostIn W, float rot_center, bool legacy, const std::string& device) {
     require(R.ndim() == 3 && W.ndim() == 3 && R.size() == W.size(), "R, W must be (n_proj, n_rows, n_cols)");
     HostOut r = copy_of(R), w = copy_of(W);
@@ -528,6 +552,9 @@ class PySliceReconstructor {
         f("angular_tolerance_steps", cfg.angular_tolerance_steps);
         f("luminosity_repartition", cfg.luminosity_repartition);
         f("x_interp", cfg.x_interp);
+        f("z_interp", cfg.z_interp);
+        f("angle_interp", cfg.angle_interp);
+        f("exposure_arc", cfg.exposure_arc);
         f("mend_threshold", cfg.mend_threshold);
         f("legacy_reference", cfg.legacy_reference);
         f("log_clip_min", cfg.log_clip_min);
@@ -561,6 +588,9 @@ class PySliceReconstructor {
         const auto [mx0, mx1] = impl_->mend_domain();
         d["mend_domain"] = nb::make_tuple(mx0, mx1);
         d["legacy_reference"] = impl_->config().legacy_reference;
+        d["exposure_arc_bins"] = impl_->exposure_arc_bins();
+        d["angle_interp"] = impl_->angle_interp();
+        d["z_interp"] = impl_->z_interp();
         return d;
     }
     nb::object reconstruct(int h_lo, int h_hi, bool debug, bool timing, std::optional<std::array<int, 4>> roi,
@@ -602,6 +632,8 @@ class PySliceReconstructor {
         d["weights"] = mk(dbg.weights, {NG, DY, NX});
         d["wbal"] = mk(dbg.wbal, {NG, DY, NX});
         d["filtered"] = mk(dbg.filtered, {DY, NG, NX});
+        // the angles each slice is backprojected at (radians, GHBP / nabu sign: -the exact backprojector's)
+        d["angles"] = mk(dbg.angles, {DY, NG});
         if (timing) d["seconds"] = sec;
         return d;
     }
@@ -1051,6 +1083,11 @@ NB_MODULE(_core, m) {
              },
              "file_index"_a, "frame_index"_a, "n_threads"_a = 0);
     m.def("minus_log", &minus_log_py, "x"_a, "clip_min"_a = 1e-6f, "clip_max"_a = 10.f, "device"_a = "cpu");
+    m.def("arc_deblur_taps", &arc_deblur_taps, "arc"_a, "radius"_a = 4,
+          "Taps g[0..radius] of the inverse of an exposure arc of `arc` grid angles (1 / sinc(arc f), unit sum)");
+    m.def("angular_fir", &angular_fir_py, "sino"_a, "taps"_a, "support"_a = nb::none(), "device"_a = "cpu",
+          "Symmetric periodic FIR along the angle of a sinogram (n_proj, n_cols); with support, only where every tap "
+          "has support > 0");
     m.def("rebalance", &rebalance_py, "R"_a, "W"_a, "rot_center"_a, "legacy_reference"_a = false, "device"_a = "cpu",
           "Hole filling + half-acquisition balanced weights (opposite view, periodic; legacy_reference: the nabuxx "
           "endpoint handling); returns (R, W_bal) copies");

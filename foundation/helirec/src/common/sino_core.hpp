@@ -20,6 +20,21 @@ HR_HD float minus_log(float v, float lo, float hi) {
 #endif
 }
 
+// one output of angular_fir (sino.hpp): taps in the order n = -radius .. radius
+HR_HD float angular_fir_at(const float* in, const float* support, int n_proj, int n_cols, int j, int x, const float* g,
+                           int radius) {
+    float v = 0.f;
+    for (int n = -radius; n <= radius; ++n) {
+        int jj = j + n;
+        if (jj < 0) jj += n_proj;
+        if (jj >= n_proj) jj -= n_proj;
+        const std::size_t o = static_cast<std::size_t>(jj) * n_cols + x;
+        if (support && !(support[o] > 0.f)) return in[static_cast<std::size_t>(j) * n_cols + x];
+        v = add(v, mul(g[n < 0 ? -n : n], in[o]));
+    }
+    return v;
+}
+
 // row sample at fractional position xf in [0, nx - 1] (linear)
 HR_HD float lerp_row(const float* row, float xf, int nx) {
     const int i = static_cast<int>(floorf(xf));

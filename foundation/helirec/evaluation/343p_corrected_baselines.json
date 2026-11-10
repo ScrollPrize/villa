@@ -4,7 +4,10 @@
   "device": "cuda",
   "params": {
     "mode": "corrected",
-    "filters": []
+    "filters": [],
+    "z_interp": "linear",
+    "angle_interp": "linear",
+    "exposure_arc": 0
   },
   "slices": {
     "n": 5

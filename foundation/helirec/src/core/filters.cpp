@@ -185,6 +185,25 @@ FourierFilterSpec fourier_step_spec(const std::vector<ProjectionFilter*>& member
     return sp;
 }
 
+// A response given on a fixed reference grid (Nr rows x N1 columns, so that it does not depend on the chunk height) as
+// the spectrum of its real-space kernel truncated to rows [-m, m], normalised to unit sum (unit DC) and embedded in
+// the step's (N0, N1) grid. `P` is consumed.
+std::vector<cplx> fixed_kernel_spectrum(std::vector<cplx> P, int Nr, int N0, int N1, int m) {
+    dft2(P, Nr, N1, FFTW_BACKWARD);
+    std::vector<cplx> Q(static_cast<std::size_t>(N0) * N1, cplx(0));
+    double sum = 0;
+    for (int dy = -m; dy <= m; ++dy) {
+        const std::size_t src = static_cast<std::size_t>((dy + Nr) % Nr) * N1, dst = static_cast<std::size_t>((dy + N0) % N0) * N1;
+        for (int j = 0; j < N1; ++j) {
+            Q[dst + j] = P[src + j].real();
+            sum += P[src + j].real();
+        }
+    }
+    for (auto& q : Q) q /= sum;
+    dft2(Q, N0, N1, FFTW_FORWARD);
+    return Q;
+}
+
 // ------------------------------------------------------------------ paganin
 // nabuxx paganin_filter.cpp (pag_version 2): H = 1 / (1 + (2 - cos f0 - cos f1) pfact), pfact = 2 (l/px / 2 pi)^2,
 // l = sqrt(lambda D delta/beta pi); real-space kernel truncated vertically to dy in [-m, m-1] (m = step margin)
@@ -238,38 +257,27 @@ class Paganin final : public ProjectionFilter {
             if (std::abs(k[static_cast<std::size_t>(r) * nxp]) < vmax / 1e3) return r == 0 ? det_rows : r;
         return det_rows;
     }
+    // the untruncated discrete-Laplacian response on an n0 x n1 grid
+    std::vector<cplx> response(int n0, int n1) const {
+        const double pfact = db_ > 0 ? this->pfact() : 0.0;
+        std::vector<cplx> P(static_cast<std::size_t>(n0) * n1);
+        for (int i = 0; i < n0; ++i) {
+            const double c0 = std::cos(2 * M_PI * signed_index(i, n0) / n0);
+            for (int j = 0; j < n1; ++j) {
+                const double c1 = std::cos(2 * M_PI * signed_index(j, n1) / n1);
+                P[static_cast<std::size_t>(i) * n1 + j] = 1.0 / (1.0 + (2 - c0 - c1) * pfact);
+            }
+        }
+        return P;
+    }
     void multiply_response(std::vector<cplx>& K, int N0, int N1, int margin) const override {
         if (db_ <= 0) return;
-        const double pfact = this->pfact();
-        auto response = [&](int n0, int n1) {   // the untruncated discrete-Laplacian response on an n0 x n1 grid
-            std::vector<cplx> P(static_cast<std::size_t>(n0) * n1);
-            for (int i = 0; i < n0; ++i) {
-                const double c0 = std::cos(2 * M_PI * signed_index(i, n0) / n0);
-                for (int j = 0; j < n1; ++j) {
-                    const double c1 = std::cos(2 * M_PI * signed_index(j, n1) / n1);
-                    P[static_cast<std::size_t>(i) * n1 + j] = 1.0 / (1.0 + (2 - c0 - c1) * pfact);
-                }
-            }
-            return P;
-        };
         if (!ctx_.legacy) {
             // the real-space kernel on a fixed reference height (independent of the chunk), rows [-m, m], unit sum,
             // embedded in the step's (N0, N1) grid
             const int m = own_margin(), Nr = next_smooth_power(std::max(64, 16 * m));
             if (N0 < 2 * m + 1) throw Error("paganin: padded stack height below the kernel support 2 x margin + 1");
-            auto P = response(Nr, N1);
-            dft2(P, Nr, N1, FFTW_BACKWARD);
-            std::vector<cplx> Q(static_cast<std::size_t>(N0) * N1, cplx(0));
-            double sum = 0;
-            for (int dy = -m; dy <= m; ++dy) {
-                const std::size_t src = static_cast<std::size_t>((dy + Nr) % Nr) * N1, dst = static_cast<std::size_t>((dy + N0) % N0) * N1;
-                for (int j = 0; j < N1; ++j) {
-                    Q[dst + j] = P[src + j].real();
-                    sum += P[src + j].real();
-                }
-            }
-            for (auto& q : Q) q /= sum;
-            dft2(Q, N0, N1, FFTW_FORWARD);
+            const auto Q = fixed_kernel_spectrum(response(Nr, N1), Nr, N0, N1, m);
             for (std::size_t k = 0; k < K.size(); ++k) K[k] *= Q[k];
             return;
         }
@@ -362,6 +370,109 @@ class Epr final : public ProjectionFilter {
     std::mutex mutex_;
 };
 
+// ------------------------------------------------------------------ mtf_paganin
+// Phase retrieval and detector deblurring as one Wiener filter. The detector records the propagated intensity
+// blurred by its point spread: I_det^ = (M / P) I^, with P the Paganin response (1 / P: the phase-contrast gain of a
+// homogeneous object) and M the detector MTF. For white detector noise and an object spectrum that falls as P^2
+// (~ k^-4 beyond the Paganin corner, the law of sharp interfaces) the Wiener estimate of I is
+//     W = P D,   D = (1 + nsr) M / (M^2 + nsr)
+// i.e. Paganin times a regularised inverse of the MTF: exact (1 / M) where M^2 >> nsr, at most (1 + nsr) / (2 sqrt nsr)
+// (at M = sqrt nsr), falling to zero with M beyond. nsr is the noise-to-signal power ratio at low frequency. The
+// factor 1 + nsr makes the DC gain one. Like the Paganin filter, the kernel is fixed: computed on its own grid,
+// truncated to [-m, m] rows, unit sum, so the result does not depend on the chunk height.
+//   mtf: Gaussian exp(-2 pi^2 sigma^2 nu^2) (sigma in pixels), or a radial table "nu:M/nu:M/..." (nu in cycles per
+//   pixel, increasing; linear in between, M(0) = 1, held beyond the last entry).
+class MtfPaganin final : public ProjectionFilter {
+  public:
+    MtfPaganin(const FilterParams& p, const FilterContext& c)
+        : pag_(paganin_params(p), fixed_kernel(c)), sigma_(p.num("sigma", 0)), nsr_(p.num("nsr", 0.01)) {
+        if (!(nsr_ > 0)) throw Error("mtf_paganin: nsr must be > 0");
+        const std::string table = p.str("mtf", "");
+        if (table.empty() == !(sigma_ > 0)) throw Error("mtf_paganin: give either sigma > 0 or an mtf table");
+        if (!table.empty()) {
+            std::istringstream in(table);
+            std::string item;
+            while (std::getline(in, item, '/')) {
+                const auto colon = item.find(':');
+                double nu = 0, m = 0;
+                try {
+                    if (colon == std::string::npos) throw Error("");
+                    nu = std::stod(item.substr(0, colon));
+                    m = std::stod(item.substr(colon + 1));
+                } catch (...) {
+                    throw Error("mtf_paganin: mtf table entries are nu:M, separated by '/' ('" + item + "')");
+                }
+                if (!(nu >= 0) || !(m > 0 && m <= 1) || (!table_.empty() && nu <= table_.back().first))
+                    throw Error("mtf_paganin: mtf table needs increasing nu >= 0 and 0 < M <= 1");
+                table_.push_back({nu, m});
+            }
+            if (table_.empty()) throw Error("mtf_paganin: empty mtf table");
+            if (table_.front().first > 0) table_.insert(table_.begin(), {0.0, 1.0});
+            else if (table_.front().second != 1.0) throw Error("mtf_paganin: M(0) must be 1");
+        }
+    }
+    bool fourier() const override { return true; }
+    double mtf(double nu) const {
+        if (table_.empty()) return std::exp(-2 * M_PI * M_PI * sigma_ * sigma_ * nu * nu);
+        if (nu >= table_.back().first) return table_.back().second;
+        auto hi = std::upper_bound(table_.begin(), table_.end(), nu, [](double v, const auto& e) { return v < e.first; });
+        const auto lo = hi - 1;
+        return lo->second + (hi->second - lo->second) * (nu - lo->first) / (hi->first - lo->first);
+    }
+    // D on an n0 x n1 grid (radial frequency in cycles per pixel)
+    std::vector<cplx> deblur_response(int n0, int n1) const {
+        std::vector<cplx> D(static_cast<std::size_t>(n0) * n1);
+        for (int i = 0; i < n0; ++i) {
+            const double f0 = static_cast<double>(signed_index(i, n0)) / n0;
+            for (int j = 0; j < n1; ++j) {
+                const double f1 = static_cast<double>(signed_index(j, n1)) / n1;
+                const double m = mtf(std::hypot(f0, f1));
+                D[static_cast<std::size_t>(i) * n1 + j] = (1 + nsr_) * m / (m * m + nsr_);
+            }
+        }
+        return D;
+    }
+    // rows of D's real-space kernel: the last row whose central value reaches 1e-4 of the peak, + 1 (at most 64). D
+    // does not vanish at Nyquist, so its kernel decays slowly (~ r^-2): this truncation leaves the response within
+    // about 3 % (nsr 0.01) along the rows near their Nyquist frequency, exact elsewhere.
+    int deblur_margin() const {
+        if (dmargin_ >= 0) return dmargin_;
+        const int n = 256;
+        auto D = deblur_response(n, n);
+        dft2(D, n, n, FFTW_BACKWARD);
+        const double peak = std::abs(D[0].real());
+        int last = 0;
+        for (int r = 1; r < n / 2; ++r)
+            if (std::abs(D[static_cast<std::size_t>(r) * n].real()) >= peak / 1e4) last = r;
+        return dmargin_ = std::min(last + 1, 64);
+    }
+    int margin_rows() const override { return pag_.own_margin() + deblur_margin(); }
+    void multiply_response(std::vector<cplx>& K, int N0, int N1, int) const override {
+        const int m = margin_rows(), Nr = next_smooth_power(std::max(64, 16 * m));
+        if (N0 < 2 * m + 1) throw Error("mtf_paganin: padded stack height below the kernel support 2 x margin + 1");
+        auto F = pag_.response(Nr, N1);
+        const auto D = deblur_response(Nr, N1);
+        for (std::size_t k = 0; k < F.size(); ++k) F[k] *= D[k];
+        const auto Q = fixed_kernel_spectrum(std::move(F), Nr, N0, N1, m);
+        for (std::size_t k = 0; k < K.size(); ++k) K[k] *= Q[k];
+    }
+
+  private:
+    static FilterParams paganin_params(const FilterParams& p) {
+        FilterParams q;
+        q.values["delta_beta"] = p.str("delta_beta", "");
+        return q;
+    }
+    static FilterContext fixed_kernel(FilterContext c) {
+        c.legacy = false;
+        return c;
+    }
+    Paganin pag_;
+    double sigma_, nsr_;
+    std::vector<std::pair<double, double>> table_;
+    mutable int dmargin_ = -1;
+};
+
 // ------------------------------------------------------------------ unsharp, gaussian
 class Unsharp final : public ProjectionFilter {
   public:
@@ -430,6 +541,10 @@ std::map<std::string, FilterFactory>& registry() {
              check_keys("epr", p, {"delta_beta", "iters", "relax", "max_shift"});
              if (stage_of(p) != FilterStage::Intensity) throw Error("epr: runs at the intensity stage");
              return std::make_unique<Epr>(p, c);
+         }},
+        {"mtf_paganin", [](const FilterParams& p, const FilterContext& c) -> std::unique_ptr<ProjectionFilter> {
+             check_keys("mtf_paganin", p, {"delta_beta", "sigma", "mtf", "nsr"});
+             return std::make_unique<MtfPaganin>(p, c);
          }},
         {"unsharp", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
              check_keys("unsharp", p, {"sigma", "coeff", "method"});
