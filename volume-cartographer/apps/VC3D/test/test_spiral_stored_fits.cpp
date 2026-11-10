@@ -162,6 +162,24 @@ void aStoredFitReadsAsItsArtifact(const fs::path& directory)
     require(vc3d::spiral::readStoredFit(fixture.session, fixture.attachment, uuid, fit.geometryRevision)
                     .geometryRevision == fit.geometryRevision,
             "a pinned revision reads");
+    {
+        OpenOptions options; options.author = "historical-fit-test";
+        auto store = ObjectStore::open(fixture.session->path(fixture.attachment), options);
+        auto txn = store.write();
+        auto record = *store.objectByUuid(txn, uuid);
+        record.name = "new fit";
+        store.upsertObject(txn, record);
+        store.setMeta(txn, uuid, "source_fit_iteration", "240");
+        auto changed = quad_surface_grid(*fit.surface);
+        changed.points[1][0] += 10;
+        store.putGeometry(txn, uuid, vc::geometry::encode(changed));
+        txn.commit();
+        auto removal = store.write(); store.deleteObject(removal, uuid); removal.commit();
+    }
+    const auto historical = vc3d::spiral::readStoredFit(fixture.session, fixture.attachment, uuid, fit.geometryRevision);
+    require(historical.name == fit.name && historical.surface->meta.at("source_fit_iteration") == 120 &&
+            (*historical.surface->rawPointsPtr())(0, 1) == generation.points(0, 1),
+            "historical fits retain their metadata and geometry after replacement and deletion");
 }
 
 void onlyCommittedFitsAreListedAndRead(const fs::path& directory)

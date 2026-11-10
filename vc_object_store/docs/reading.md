@@ -92,6 +92,7 @@ with store.geometry_snapshot() as snapshot:
   Snapshots are thread-confined and hold one reader slot — close them
   promptly. `load()` results stay valid after closure.
 - Explicit geometry revisions can be read even if their object is no longer visible. The revision must still belong to the requested object. For exact surface metadata and geometry together, use `readSurfaceGrid(reader, ObjectVersion, volume)` or Python `surfaces.read_surface(location, uuid, volume=..., reference=ref)`. This works through overlays and after current deletion as long as the selected source version remains retained. The older `version`/`generation` selectors remain available and select the current owner's history; they cannot identify a different source owner.
+- C++ consumers that already selected an `ObjectRevision` must pass that state to `viewTransformedAt(selected, volume)` and `readSurfaceGrid(reader, selected, transformedView)`, not look up its current record again. For a geometry-only selector, `StoreReader::objectAtGeometry` resolves the latest retained metadata naming that geometry through the shared reference scope. This is not an exact metadata-version selector: several object versions can share one geometry. Geometry transform listings use the same retained metadata, including through deleted overlays and history-off dependencies.
 - Any view can be read in another volume's frame with
   `view.view_transformed_at(target_volume)` — see
   [transforms](transforms.md#transformed-views).

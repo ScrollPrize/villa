@@ -1,4 +1,5 @@
 #include "SpiralStoreInputs.hpp"
+#include <vc_object_store/store/GeometryViews.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -223,21 +224,8 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
             if (!scale) throw std::runtime_error("it declares no frame in volume " + volume);
         }
         if (geometry && pin.kind == "surface") {
-            auto stored = load_quad_from_store(reader, pin.uuid, geometry->uuid);
-            if (*scale != 1.0) {
-                // Invalid vertices keep the sentinel; grid steps follow the frame.
-                auto* points = new cv::Mat_<cv::Vec3f>(stored->rawPointsPtr()->clone());
-                for (auto& point : *points)
-                    if (point[0] != -1.f) point *= float(*scale);
-                auto converted = std::make_unique<QuadSurface>(points, stored->scale() / float(*scale));
-                converted->id = stored->id;
-                converted->meta = stored->meta;
-                converted->tags = stored->tags;
-                const cv::Mat mask = stored->channel("mask");
-                if (!mask.empty()) converted->setChannel("mask", mask);
-                stored = std::move(converted);
-            }
-            surface.surface = std::shared_ptr<QuadSurface>(std::move(stored));
+            const auto view=vc::objects::GeometrySnapshot(reader).surface(pin.uuid,geometry->uuid).viewTransformedAt(*current,volume);
+            surface.surface = std::shared_ptr<QuadSurface>(load_quad_from_store(reader,*current,true,&view));
         } else if (geometry && pin.kind == "point_collection") {
             collection.absolute = valueOrNull(valueOrNull(meta, "source"), "winding_is_absolute") == Json(true);
             const auto ids = readIds(reader, *geometry);

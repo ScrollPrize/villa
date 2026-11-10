@@ -11,6 +11,7 @@
 #include <vector>
 
 namespace vc::objects {
+class TransformedGeometryView;
 struct SurfaceGrid {
     int64_t rows = 0, columns = 0;
     // Row-major xyz in the volume's voxels; (-1,-1,-1) at invalid vertices.
@@ -35,4 +36,9 @@ SurfaceGrid readSurfaceGrid(const StoreReader&, const std::string& surfaceUuid, 
 // Exact selection is independent of the object's current owner or visibility.
 SurfaceGrid readSurfaceGrid(const StoreReader&, const ObjectVersion&, const std::string& volume,
                             double targetScale = 1.0);
+// Materialize an already selected state, without re-resolving current metadata.
+// Without a transformed view, return stored coordinates; masked coordinates can
+// be retained for editing with applyValidity=false.
+SurfaceGrid readSurfaceGrid(const StoreReader&, const ObjectRevision&,
+                            const TransformedGeometryView* transformed = nullptr, bool applyValidity = true);
 }

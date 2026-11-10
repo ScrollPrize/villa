@@ -10,7 +10,7 @@ Baseline: `3812cb17b`. C++ store plus VC3D adapters; existing CMake/approved PR 
 - [x] V. Route geometry history to the owning record instead of the attachment database. Coherent-store regressions verify both source history policies through both overlay policies.
 - [x] W. Carry selected metadata through historical geometry transforms and transform listings. Shared `objectAtGeometry` resolves retained metadata across referenced stores, and local/hosted readers use it. Exact transforms retain selected metadata and only retain write eligibility for the same complete current reference. Coherent, transforms, history-off view and hosted regressions pass after a clean native rebuild.
 - [ ] X. Resolve full exact surface references before deciding whether a VC3D surface is editable.
-- [ ] Y. Materialize QuadSurface/stored fits from the selected revision, never current metadata plus old geometry.
+- [x] Y. Materialize QuadSurface/stored fits from the selected revision, never current metadata plus old geometry. The shared grid materializer now serves raw and transformed adapters, including editing without validity masking; Spiral uses the same transform path instead of its own scaling loop. Native transform/grid tests pass; changed VC3D production and stored-fit regression sources pass syntax checks (GUI runtime not built).
 - [ ] Z. Share CLI/Python historical export reference selection.
 - [ ] AA. Cache referenced hosted records through the ordinary owner-qualified cache path.
 

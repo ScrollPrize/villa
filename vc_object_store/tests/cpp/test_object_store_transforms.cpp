@@ -402,6 +402,10 @@ int main() try {
                     "record and geometry use the same numbered version");
             const auto scaled = readSurfaceGrid(reader, uuid, "a", .5, 1);
             require(scaled.points == second.points, "historical reads respect target scale");
+            const auto selected = reader.objectsAtVersions({reader.currentObject(uuid)->reference(1)}).front();
+            const auto stored = readSurfaceGrid(reader, *selected);
+            require(stored.points == first.points && stored.record.meta == first.record.meta,
+                    "stored-coordinate adapters retain the selected metadata too");
         };
         check();
         {
@@ -411,6 +415,21 @@ int main() try {
             txn.commit();
         }
         check(); // The historical payload is no longer the current geometry.
+    }
+    {
+        auto masked = ObjectStore::create(directory.path / "masked-grid.vcobj", options);
+        auto txn = masked.write(); ObjectRecord record; record.kind = "surface";
+        const auto uuid = masked.upsertObject(txn, record);
+        vc::geometry::Surface shape{1, 2, {1, 1}, {{2, 4, 6}, {8, 10, 12}}};
+        shape.validity = {0, 1};
+        masked.putGeometry(txn, uuid, vc::geometry::encode(shape)); txn.commit();
+        auto read = masked.read(); LocalStoreReader reader(masked, read);
+        const auto selected = *reader.currentObject(uuid);
+        const auto visible = readSurfaceGrid(reader, selected);
+        const auto editable = readSurfaceGrid(reader, selected, nullptr, false);
+        require(visible.points == std::vector<float>{-1,-1,-1,8,10,12} &&
+                editable.points == std::vector<float>{2,4,6,8,10,12} && visible.valid == editable.valid,
+                "shared surface materialization masks for display but preserves coordinates for editing");
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

@@ -4,6 +4,7 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/SurfaceGrid.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_reader/tifxyz.hpp>
@@ -85,50 +86,33 @@ std::vector<int64_t> pointsShape(const vc::objects::GeometryRevision& revision)
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader& reader,
     const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity, const vc::objects::TransformedGeometryView* transformed)
 {
-    const auto current = reader.currentObject(vc::objects::util::canonicalUuid(objectUuid));
-    if (!current || current->record.kind != "surface") throw std::runtime_error("not a surface object: " + objectUuid);
-    const auto* object = &current->record;
-    const auto revision = geometryRevision ? reader.geometryRevision(*geometryRevision) : reader.currentGeometry(object->uuid);
-    if (!revision || revision->objectUuid != object->uuid) throw std::runtime_error("surface has no such geometry revision: " + objectUuid);
-    const auto view = vc::objects::GeometrySnapshot(reader).surface(object->uuid, revision->uuid);
-    const int rows = int(view.rows()), cols = int(view.columns());
-    const auto stored = view.readTile(0, 0, rows, cols);
-    auto points = std::make_unique<cv::Mat_<cv::Vec3f>>(rows, cols);
-    for (int i = 0; i < rows * cols; ++i) {
-        const auto& p = stored.points[size_t(i)];
-        (*points)(i / cols, i % cols) = cv::Vec3f(p[0], p[1], p[2]);
-    }
-    cv::Mat_<uint8_t> mask;
-    if (!stored.validity.empty()) {
-        mask.create(rows, cols);
-        for (int i = 0; i < rows * cols; ++i) {
-            mask(i / cols, i % cols) = stored.validity[size_t(i)] ? 255 : 0;
-            if (applyValidity && !stored.validity[size_t(i)]) (*points)(i / cols, i % cols) = kInvalid;
-        }
-    }
-    cv::Vec2f scale(float(view.scale()[0]), float(view.scale()[1]));
-    if (transformed) {
-        if (transformed->revision().uuid != revision->uuid) throw std::invalid_argument("transformed view revision differs from surface");
-        const auto tile = transformed->readTile(0, 0, rows, cols);
-        scale={float(tile.scale[0]),float(tile.scale[1])};
-        for (int i=0; i<rows*cols; ++i) {
-            const auto& p=tile.points[i];
-            (*points)(i/cols,i%cols)=tile.validity[i] ? cv::Vec3f(float(p[0]),float(p[1]),float(p[2])) : kInvalid;
-        }
-    }
-    // A negative coordinate marks a vertex invalid, as in tifxyz files.
-    for (auto& p : *points)
-        if (!vcr::tifxyz::vertexValid(p.val)) p = kInvalid;
-    auto surface = std::make_unique<QuadSurface>(points.release(), scale);
-    surface->id = object->uuid;
-    surface->meta = nlohmann::json::parse(object->meta);
+    const auto selected=geometryRevision?reader.objectAtGeometry(*geometryRevision):reader.currentObject(objectUuid);
+    if(!selected||selected->objectUuid!=vc::objects::util::canonicalUuid(objectUuid))
+        throw std::runtime_error("surface has no such geometry revision: "+objectUuid);
+    return load_quad_from_store(reader,*selected,applyValidity,transformed);
+}
+
+std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader& reader,
+    const vc::objects::ObjectRevision& selected,bool applyValidity,const vc::objects::TransformedGeometryView* transformed)
+{
+    auto grid=vc::objects::readSurfaceGrid(reader,selected,transformed,applyValidity);
+    auto points=std::make_unique<cv::Mat_<cv::Vec3f>>(int(grid.rows),int(grid.columns));
+    std::memcpy(points->data,grid.points.data(),grid.points.size()*sizeof(float));
+    // Negative transformed coordinates use QuadSurface's missing-vertex sentinel.
+    for(auto& p:*points)if(!vcr::tifxyz::vertexValid(p.val))p=kInvalid;
+    auto surface=std::make_unique<QuadSurface>(points.release(),cv::Vec2f(float(grid.scale[0]),float(grid.scale[1])));
+    surface->id = grid.record.uuid;
+    surface->meta = nlohmann::json::parse(grid.record.meta);
     surface->setComponents(surface_components(surface->meta));
-    surface->meta["uuid"] = object->uuid;
-    surface->meta["name"] = object->name;
-    surface->tags = object->tags;
-    if (!mask.empty()) surface->setChannel("mask", mask);
-    for (const auto& array : revision->arrays)
-        if (array.name != "points" && array.name != "valid") surface->setChannel(array.name, cv::Mat());
+    surface->meta["uuid"] = grid.record.uuid;
+    surface->meta["name"] = grid.record.name;
+    surface->tags = grid.record.tags;
+    if(!grid.valid.empty()){
+        cv::Mat_<uint8_t> mask(int(grid.rows),int(grid.columns));
+        std::transform(grid.valid.begin(),grid.valid.end(),mask.begin(),[](uint8_t value){return value?255:0;});
+        surface->setChannel("mask",mask);
+    }
+    for(const auto& channel:grid.channels)surface->setChannel(channel,cv::Mat());
     return surface;
 }
 

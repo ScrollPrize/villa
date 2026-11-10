@@ -28,9 +28,9 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
         if (volume) {
             const auto view = vc::objects::GeometrySnapshot(reader).viewTransformedAt(head->objectUuid, volume->volume, volume->scale);
             identity = view.mapping() == vc::objects::VolumeAffine::identity();
-            surface = load_quad_from_store(reader, head->objectUuid, head->geometryRevision, applyValidity, &view);
+            surface = load_quad_from_store(reader, *head, applyValidity, &view);
         } else {
-            surface = load_quad_from_store(reader, head->objectUuid, head->geometryRevision, applyValidity);
+            surface = load_quad_from_store(reader, *head, applyValidity);
         }
         pin = vc::objects::pinOf(objects_.attachment(), *head, activeGeneration);
     });
