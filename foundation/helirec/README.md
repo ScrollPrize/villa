@@ -58,6 +58,10 @@ helirec-slices PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif       
   pyramid level instead (each of its voxels decides the block of output voxels it covers), which is a far smaller
   read: an 8x level is 1/512 of the data. The reference is read in C++ with vc_reader (`helirec::ReferenceMask`: a
   local path, or an `http(s)://` / `s3://` location with `--reference_cache DIR` as its disk cache).
+* Only the pixels that are needed are backprojected, and their values are those of a whole-slice run (the exact
+  backprojector computes each pixel on its own): `--bbox X0 X1 Y0 Y1` reconstructs that box of each slice and leaves
+  the rest of the output 0 (the output keeps its shape; `--roi` crops it), and a `--uint8_only` run with a
+  `--reference_volume` computes only the bounds of what the mask keeps in each chunk; chunks it empties are skipped.
 * Progress is a bar per multi-part step (calibration reductions and searches, slices, pyramid levels) with the step
   in hand after the rate; when the output is not a terminal it is one line every 10 s (`helirec.ProgressBar`, the
   C++ `helirec::ProgressBar`).
