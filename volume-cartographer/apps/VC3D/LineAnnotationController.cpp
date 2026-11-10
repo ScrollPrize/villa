@@ -344,10 +344,9 @@ std::vector<vc::objects::ObjectVersion> currentFiberVersions(const vc::objects::
     objects.kind = "fiber";
     objects.includeRetired = true;
     std::vector<vc::objects::ObjectVersion> versions;
-    const auto store = reader.status().storeUuid;
     for (const auto& record : reader.selectObjects(objects, std::vector<std::string>{})) {
         if (!record.version) throw std::runtime_error("Fiber listing without versions");
-        versions.push_back({store, record.versionGeneration, record.uuid, *record.version});
+        versions.push_back(record.reference());
     }
     return versions;
 }
@@ -15152,13 +15151,12 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         // version), read in batches: one listing, then the versions it names.
         std::vector<ObjectRevision> objects;
         std::set<std::string> requested;
-        const auto state = reader.status();
         auto heads = [&](ObjectSelection selection) {
             selection.kind = "fiber";
             std::vector<ObjectVersion> references;
             for (const auto& record : reader.selectObjects(selection, std::vector<std::string>{})) {
                 if (!record.version) throw std::runtime_error("Fiber listing without versions");
-                references.push_back({state.storeUuid, record.versionGeneration, record.uuid, *record.version});
+                references.push_back(record.reference());
             }
             std::map<std::string, ObjectRevision> result;
             if (references.empty()) return result;
@@ -15198,7 +15196,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         std::unordered_map<std::string, size_t> byUuid;
         for (const auto& head : objects) {
             if (cancel.load() || (context.cancelled && context.cancelled())) throw std::runtime_error("Object store read cancelled");
-            versions.push_back({state.storeUuid, head.generation, head.objectUuid, head.version});
+            versions.push_back(head.reference());
             byUuid[head.objectUuid] = decoded.size();
             decoded.push_back(decode(head.record, head, lines && requested.contains(head.objectUuid)));
         }

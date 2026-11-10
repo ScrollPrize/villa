@@ -643,6 +643,7 @@ void SurfacePanelController::showHistory(const std::string& id)
         item->setData(0, Qt::UserRole, QString::fromStdString(revision.uuid));
         item->setData(1, Qt::UserRole, QVariant::fromValue<qlonglong>(revision.version));
         item->setData(2, Qt::UserRole, QString::fromStdString(revision.generation));
+        item->setData(3, Qt::UserRole, QString::fromStdString(revision.reference().storeUuid));
         previousGeometry = revision.geometryRevision;
     }
     if (list->topLevelItemCount() > 0) {
@@ -653,10 +654,10 @@ void SurfacePanelController::showHistory(const std::string& id)
     auto* view = buttons->addButton(tr("View"), QDialogButtonBox::ActionRole);
     auto* restore = buttons->addButton(tr("Restore"), QDialogButtonBox::ActionRole);
     restore->setEnabled(_catalog->session()->writable(attachment));
-    auto selected = [list, &attachment, &id]() -> std::optional<vc::objects::ObjectVersion> {
+    auto selected = [list, &id]() -> std::optional<vc::objects::ObjectVersion> {
         const auto* item = list->currentItem();
         if (!item) return std::nullopt;
-        return vc::objects::ObjectVersion{attachment.storeUuid, item->data(2, Qt::UserRole).toString().toStdString(), id,
+        return vc::objects::ObjectVersion{item->data(3, Qt::UserRole).toString().toStdString(), item->data(2, Qt::UserRole).toString().toStdString(), id,
                                           item->data(1, Qt::UserRole).toLongLong()};
     };
     connect(view, &QPushButton::clicked, &dialog, [&]() {
@@ -664,8 +665,7 @@ void SurfacePanelController::showHistory(const std::string& id)
         if (!item || !selectSurfaceById(id)) {
             return;
         }
-        const vc::objects::ObjectVersion version{attachment.storeUuid, item->data(2, Qt::UserRole).toString().toStdString(), id,
-                                                 item->data(1, Qt::UserRole).toLongLong()};
+        const auto version = *selected();
         try {
             activate(id, false, _catalog->open(id, version));
         } catch (const std::exception& error) {

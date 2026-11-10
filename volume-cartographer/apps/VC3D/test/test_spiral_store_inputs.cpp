@@ -171,11 +171,10 @@ struct Fixture {
         // The link as the adapter records it: surface end first.
         Json relationships = Json::array();
         session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
-            const auto status = reader.status();
             std::vector<ObjectVersion> heads;
             for (const auto& uuid : {surface, pcl}) {
                 const auto current = reader.currentObject(uuid);
-                heads.push_back({status.storeUuid, current->generation, uuid, current->version});
+                heads.push_back(current->reference());
             }
             for (const auto& selected : reader.relationshipsAt(heads)) {
                 const auto& version = selected.relationship;

@@ -146,12 +146,11 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
         for (const auto& [uuid, kind] : kinds) endpoints.insert(uuid);
     }
     // The fitted endpoints at their current versions.
-    const auto status = reader.status();
     std::vector<vc::objects::ObjectVersion> heads;
     for (const auto& uuid : endpoints) {
         if (!kinds.contains(uuid)) continue;
         if (const auto current = reader.currentObject(uuid); current && !current->deleted)
-            heads.push_back({status.storeUuid, current->generation, uuid, current->version});
+            heads.push_back(current->reference());
     }
     std::map<std::string, Json> consumed;
     try {
