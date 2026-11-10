@@ -678,7 +678,10 @@ def _stored_surface_path(ref: dict[str, Any]) -> str:
     version = ref.get("version")
     if version is None:
         return stored_surfaces.surface_ref(str(ref.get("uuid") or ""))
-    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), (str(ref.get("generation") or ""), int(version)))
+    selected = (str(ref.get("generation") or ""), int(version))
+    if ref.get("store"):
+        selected += (str(ref["store"]),)
+    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), selected)
 
 
 def _stored_model_path(ref: dict[str, Any]) -> Path:

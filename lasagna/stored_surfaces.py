@@ -1,12 +1,13 @@
 """Surfaces in a VC object store (``vc_object_store``) for the fit service and its tools.
 
 A stored surface is named by a reference string ``vcobj:<uuid>`` (its current version) or
-``vcobj:<uuid>@<generation>/<version>`` (that numbered version of the store's history) in the
+``vcobj:<uuid>@<store>/<generation>/<version>`` (an exact source-owned version) in the
 places a tifxyz directory path is accepted; the store and the volume whose voxels coordinates are in travel
 separately (``--store`` / ``--volume-uuid``). A store is a location: a store file, or the endpoint of a
 ``vc_object_server`` (``http://...``) for a store on another machine. Geometry is a ``points`` array (rows x columns x 3, xyz, -1 for a
 missing vertex), an optional ``valid`` array and per-vertex channels (``d``, ``approval``, ...), as VC3D stores
 surfaces; coordinates are bound to a volume by ``meta.coordinates`` ({volume_uuid, scale_factor}).
+Legacy ``vcobj:<uuid>@<generation>/<version>`` references still select history from the current owner.
 
 Surfaces are created with ``vc_object_store.surfaces.create_surface``; fit results (correspondence and
 atlas-control results) are attached to them with ``vc_object_store.documents.attach_document``.
@@ -22,28 +23,38 @@ import numpy as np
 REF_PREFIX = "vcobj:"
 
 
-def surface_ref(surface_uuid: str, version: tuple[str, int] | None = None) -> str:
-	"""The reference to a surface's current version, or to ``version`` = (generation, number)."""
+def surface_ref(surface_uuid: str, version: tuple | None = None) -> str:
+	"""Current surface or (generation, number, owner store). Legacy two-field versions remain readable."""
 	if version is None:
 		return REF_PREFIX + str(surface_uuid)
-	generation, number = version
+	if len(version) not in (2, 3):
+		raise ValueError(f"not a numbered version: {version!r}")
+	generation, number = version[:2]
 	if not generation or int(number) < 1:
 		raise ValueError(f"not a numbered version: {version!r}")
-	return f"{REF_PREFIX}{surface_uuid}@{generation}/{int(number)}"
+	owner = f"{uuidlib.UUID(version[2])}/" if len(version) == 3 else ""
+	return f"{REF_PREFIX}{surface_uuid}@{owner}{generation}/{int(number)}"
 
 
-def parse_surface_ref(value: object) -> tuple[str, tuple[str, int] | None] | None:
-	"""(uuid, (generation, version) or None for the current version) of a stored-surface reference; None for
-	anything else (a path)."""
+def parse_surface_ref(value: object) -> tuple[str, tuple | None] | None:
+	"""Parse vcobj:UUID@[STORE/]GENERATION/VERSION into (uuid, version tuple).
+	New exact tuples include the owner as their third field; legacy two-field tuples remain readable.
+	No suffix selects the current object; a non-vcobj value is a path and returns None."""
 	if not isinstance(value, str) or not value.startswith(REF_PREFIX):
 		return None
 	uuid_text, at, version = value[len(REF_PREFIX):].partition("@")
 	if not at:
 		return str(uuidlib.UUID(uuid_text)), None
-	generation, slash, number = version.partition("/")
-	if not generation or not slash or not number.isdigit() or int(number) < 1:
+	parts = version.split("/")
+	if len(parts) not in (2, 3):
+		raise ValueError(f"stored surface version must name [store/]generation/version: {version!r}")
+	generation, number = parts[-2:]
+	if not generation or not number.isdigit() or int(number) < 1:
 		raise ValueError(f"stored surface reference {value!r} does not name <generation>/<version>")
-	return str(uuidlib.UUID(uuid_text)), (generation, int(number))
+	selected = (generation, int(number))
+	if len(parts) == 3:
+		selected += (str(uuidlib.UUID(parts[0])),)
+	return str(uuidlib.UUID(uuid_text)), selected
 
 
 def next_free_name(store: str | Path, root: str, mode: str) -> str:
@@ -116,7 +127,7 @@ class StoredSurface:
 	def __init__(self, store, surface_uuid, grid):
 		self._store = store
 		self.uuid = surface_uuid
-		self.version = (grid.generation, grid.version)
+		self.version = (grid.generation, grid.version, grid.record['version_store'])
 		self._geometry = grid.geometry_revision
 		self.xyz = grid.points
 		self._channels = grid.channels
@@ -142,6 +153,10 @@ def read_surface(store: str | Path, ref: str, *, volume: str | None, target_scal
 	surface_uuid, version = parsed
 	if volume is None:
 		raise ValueError(f"reading stored surface {surface_uuid} needs the volume its coordinates are in")
-	generation, number = version or (None, None)
-	grid = read_grid(store, surface_uuid, volume=volume, version=number, generation=generation, target_scale=target_scale)
+	generation, number = version[:2] if version else (None, None)
+	if version and len(version) == 3:
+		reference = dict(store=version[2], generation=generation, object=surface_uuid, version=number)
+		grid = read_grid(store, surface_uuid, volume=volume, reference=reference, target_scale=target_scale)
+	else:
+		grid = read_grid(store, surface_uuid, volume=volume, version=number, generation=generation, target_scale=target_scale)
 	return StoredSurface(store, surface_uuid, grid)
