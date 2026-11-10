@@ -2732,7 +2732,7 @@ void CWindow::CreateWidgets(void)
         auto known = _segmentationModule ? _segmentationModule->storePin(active.get()) : std::nullopt;
         if (!known && _surfacePanel->opened()) known = _surfacePanel->opened()->pin;
         const auto head = _surfaceCatalog->session()->currentObject(row->source, active->id);
-        if (!head || (known && known->version == head->version && known->generation == head->generation)) {
+        if (!head || (known && known->reference() == head->reference())) {
             return;
         }
         if (_segmentationModule && _segmentationModule->editingEnabled()) {

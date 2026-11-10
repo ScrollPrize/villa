@@ -431,7 +431,7 @@ vc::objects::CoordinateJson SegmentationModule::editCoordinates(const SurfaceSto
     if (const auto& view = storeEdit.view()) return vc::objects::volumeCoordinates(view->volume, view->scale);
     vc::objects::CoordinateJson coordinates = nlohmann::json::object();
     _state->objectStoreSession()->readStore(storeEdit.pin().attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-        if (const auto object = reader.currentObject(storeEdit.uuid()))
+        if (const auto object = reader.selectedObject(storeEdit.uuid(), {}, {}, storeEdit.pin().reference()))
             coordinates = nlohmann::json::parse(object->record.meta).value("coordinates", nlohmann::json::object());
     });
     return coordinates;
@@ -472,7 +472,7 @@ void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
         if (!state->base)
             text += QStringLiteral("\n\n") + tr("The version they were made on is not known; restoring them replaces "
                                                  "the surface's current geometry (version %1).").arg(pin.version);
-        else if (state->base->generation != pin.generation || state->base->version != pin.version)
+        else if (*state->base != pin.reference())
             text += QStringLiteral("\n\n") + tr("The surface was saved since they were made (version %1, now %2); "
                                                  "restoring them replaces those changes.")
                                                   .arg(state->base->version).arg(pin.version);

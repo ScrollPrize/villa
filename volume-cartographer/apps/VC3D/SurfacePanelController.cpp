@@ -704,7 +704,7 @@ bool SurfacePanelController::restoreRevision(const std::string& id, const vc::ob
             head = reader.currentObject(id);
         });
         if (!head) throw std::runtime_error("The surface is no longer in the object store");
-        if (head->version == version.version && head->generation == version.generation) return true;
+        if (head->reference() == version) return true;
         (void)_catalog->session()->editCurrent(attachment, {id}, [&](const vc::objects::StoreReader&, const std::string& uuid) {
             return std::vector<vc::objects::TransactionOperation>{vc::objects::RestoreObjectOp{uuid, version}};
         });

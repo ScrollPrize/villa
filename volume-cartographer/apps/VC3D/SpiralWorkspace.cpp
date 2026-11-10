@@ -1,4 +1,5 @@
 #include "SpiralWorkspace.hpp"
+#include <vc_object_store/objects/TransactionJson.hpp>
 
 #include "SpiralPreviewWindings.hpp"
 #include "SpiralUpdatedDrafts.hpp"
@@ -380,8 +381,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         if (phase != QStringLiteral("linking")) return;
         _updatingDrafts.clear();
         _updatingPatches.clear();
-        for (const auto& id : _savedDraftIds) _updatingDrafts[id] = _savedCollections.value(id).version;
-        for (const auto& id : _savedPatchIds) _updatingPatches[id] = _brushPatches.value(id).version;
+        for (const auto& id : _savedDraftIds) _updatingDrafts[id] = _savedCollections.value(id).reference;
+        for (const auto& id : _savedPatchIds) _updatingPatches[id] = _brushPatches.value(id).reference;
     });
     connect(_service, &SpiralServiceManager::inputUpdateFinished, this,
             [this](const SpiralServiceManager::InputUpdate& update) {
@@ -394,11 +395,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 // one was edited or saved again meanwhile (then it stays a
                 // drawing whose next save replaces its object). An update
                 // of a service's store not attached here includes none.
-                auto included = [this, &update](const QHash<QString, int64_t>& saved,
+                auto included = [this, &update](const QHash<QString, vc::objects::ObjectVersion>& saved,
                                                 const QHash<QString, SavedObject>& objects) {
                     return vc3d::spiralDraftsIncludedByUpdate(
                         update.error, update.requested, saved,
-                        [&objects](const QString& id) { return objects.value(id).version; },
+                        [&objects](const QString& id) { return objects.value(id).reference; },
                         [this](const QString& id) { return _brush->savedUnchanged(id); });
                 };
                 const QStringList fittedDrafts = included(drafts, _savedCollections);
@@ -1104,7 +1105,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         vc3d::spiral::BrushPatchSave save;
         std::optional<vc3d::spiral::SavedBrushPatch> written;
         QString error;
-        int64_t theirs = 0;  // refused: the version another editor saved
+        vc::objects::ObjectVersion theirs;  // refused: the state another editor saved
     };
     struct Result {
         std::vector<PatchJob> patches;
@@ -1113,7 +1114,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         std::vector<vc3d::spiral::SavedPointCollection> collections;
         QString collectionError;
         std::string changedUuid;  // refused: the object and its version now
-        int64_t changedTo = 0;
+        vc::objects::ObjectVersion changedTo;
         QString lastRequest;  // the receipt of the last commit written
     };
     auto result = std::make_shared<Result>();
@@ -1126,7 +1127,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
             continue;
         }
         const SavedObject previous = known == _brushPatches.cend() ? SavedObject{} : *known;
-        result->patches.push_back({patch.id, {previous.uuid, previous.version, patch.id.toStdString(),
+        result->patches.push_back({patch.id, {previous.uuid, previous.reference, patch.id.toStdString(),
                                               patch.surface, remove}, std::nullopt, {}});
     }
     for (const auto& collection : collections) {
@@ -1145,7 +1146,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         } else if (const auto known = _savedCollections.constFind(collection.id);
                    known != _savedCollections.cend()) {
             // Saved before but not in the fit yet: replace that object.
-            vc3d::spiral::setPointCollectionObject(result->drafts.back(), known->uuid, known->version);
+            vc3d::spiral::setPointCollectionObject(result->drafts.back(), known->reference);
         }
         result->savedIds << collection.id;
     }
@@ -1167,14 +1168,14 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
             if (!job.written) {
                 // Saving again replaces their version knowingly: it starts
                 // from the version the refusal named.
-                if (job.theirs != 0 && _brushPatches.contains(job.id))
-                    _brushPatches[job.id].version = job.theirs;
+                if (job.theirs.version != 0 && _brushPatches.contains(job.id))
+                    _brushPatches[job.id].reference = job.theirs;
                 _brush->finalizationFailed(job.id, job.error);
                 errors << tr("%1: %2").arg(job.id, job.error);
                 continue;
             }
             if (job.save.remove) _brushPatches.remove(job.id);
-            else _brushPatches[job.id] = {job.written->uuid, job.written->version};
+            else _brushPatches[job.id] = {job.written->uuid, job.written->reference};
             _brush->finalizationSucceeded(job.id);
             if (!_savedPatchIds.contains(job.id)) _savedPatchIds << job.id;
             saved << job.id;
@@ -1185,15 +1186,15 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
                 // version the refusal named.
                 for (auto& saved : _savedCollections)
                     if (!result->changedUuid.empty() && saved.uuid == result->changedUuid)
-                        saved.version = result->changedTo;
+                        saved.reference = result->changedTo;
                 for (const auto& id : result->ids) _brush->finalizationFailed(id, result->collectionError);
                 errors << tr("point collections: %1").arg(result->collectionError);
             } else {
                 for (std::size_t i = 0; i < result->collections.size(); ++i) {
                     const QString& id = result->savedIds[int(i)];
                     if (result->fitted.contains(id)) continue;
-                    if (result->collections[i].version == 0) _savedCollections.remove(id);
-                    else _savedCollections[id] = {result->collections[i].uuid, result->collections[i].version};
+                    if (result->collections[i].reference.version == 0) _savedCollections.remove(id);
+                    else _savedCollections[id] = {result->collections[i].uuid, result->collections[i].reference};
                 }
                 for (const auto& id : result->ids) _brush->finalizationSucceeded(id);
                 // Edits of fitted collections are shown from the store now;
@@ -2040,7 +2041,8 @@ void SpiralWorkspace::rebuildFitPclDocuments()
             {QStringLiteral("points"), points},
             {QStringLiteral("metadata"), QJsonObject{
                 {QStringLiteral("object_uuid"), QString::fromStdString(entry.pin.uuid)},
-                {QLatin1String(vc3d::spiral::kLocalObjectVersionKey), QJsonValue(qint64(entry.version))},
+                {QLatin1String(vc3d::spiral::kLocalObjectReferenceKey), QJsonDocument::fromJson(
+                    QByteArray::fromStdString(vc::objects::objectVersionsRequestToJson({entry.reference}))).object()["versions"].toArray().first()},
                 {QStringLiteral("winding_is_absolute"), entry.absolute}}}};
     }
     const QString digest = QString::fromStdString(_fitInputs->digest).left(12);

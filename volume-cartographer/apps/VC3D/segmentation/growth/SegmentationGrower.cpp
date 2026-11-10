@@ -319,8 +319,8 @@ struct CopyDisplacementJob
     // the store file the service shares with this session; the outputs are
     // new surfaces there.
     QString store;
-    std::string surfaceUuid, generation, volumeUuid;
-    int64_t version{0};
+    std::string surfaceUuid, volumeUuid;
+    nlohmann::json surfaceReference;
     QString volumeZarrPath;
     int volumeScale{0};
     QString checkpointPath;
@@ -344,8 +344,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     request["request_type"] = "displacement_copy_grow";
     request["store"] = job.store.toStdString();
     request["surface_uuid"] = job.surfaceUuid;
-    request["surface_version"] = job.version;
-    request["surface_generation"] = job.generation;
+    request["surface_reference"] = job.surfaceReference;
     request["volume_uuid"] = job.volumeUuid;
     request["volume_path"] = job.volumeZarrPath.toStdString();
     request["volume_scale"] = std::max(0, job.volumeScale);
@@ -872,8 +871,9 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     copyJob.socketPath = socketPath;
     copyJob.store = QString::fromStdString(toolStore.store.string());
     copyJob.surfaceUuid = pin->object.objectUuid;
-    copyJob.version = pin->version;
-    copyJob.generation = pin->generation;
+    const auto reference = pin->reference();
+    copyJob.surfaceReference = {{"store", reference.storeUuid}, {"generation", reference.generation},
+                                {"object", reference.objectUuid}, {"version", reference.version}};
     // The service works in level-0 voxels of the zarr it is given, not in the
     // open volume's working level: the store volume's own voxels.
     copyJob.volumeUuid = toolStore.volume.volume;

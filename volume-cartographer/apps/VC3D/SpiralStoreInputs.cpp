@@ -7,7 +7,6 @@
 #include <vc_object_store/objects/StoreReader.hpp>
 
 #include <algorithm>
-#include <cstring>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -23,55 +22,15 @@ Json valueOrNull(const Json& object, const char* key)
     return object.is_object() && object.contains(key) ? object.at(key) : Json(nullptr);
 }
 
-std::vector<cv::Vec3d> readXyz(const StoreReader& reader,
-                               const vc::objects::GeometryRevision& revision,
-                               const std::string& name, double scale)
+std::vector<cv::Vec3d> scaledPoints(const std::vector<vc::geometry::Point>& points, double scale)
 {
-    const auto info = std::find_if(revision.arrays.begin(), revision.arrays.end(),
-                                   [&](const auto& array) { return array.name == name; });
-    if (info == revision.arrays.end())
-        throw std::runtime_error("geometry " + revision.uuid + " has no " + name + " array");
-    const std::size_t itemSize = info->dtype == "<f8" ? 8 : info->dtype == "<f4" ? 4 : 0;
-    if (!itemSize) throw std::runtime_error(name + " has unsupported dtype " + info->dtype);
-    if (info->shape.size() != 2 || info->shape[1] != 3 || info->shape[0] < 0)
-        throw std::runtime_error(name + " is not an (N, 3) array");
-    const auto count = std::size_t(info->shape[0]);
-    const auto bytes = reader.readGeometryArray(revision.uuid, name);
-    // The bytes read must hold the shape: a short read is refused, never read past.
-    if (bytes.size() < count * 3 * itemSize)
-        throw std::runtime_error(name + " holds " + std::to_string(bytes.size()) + " bytes, fewer than its "
-                                 + std::to_string(count) + " x 3 " + info->dtype + " values");
-    std::vector<cv::Vec3d> points(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        for (int axis = 0; axis < 3; ++axis) {
-            double value = 0;
-            if (itemSize == 8) {
-                std::memcpy(&value, bytes.data() + (i * 3 + axis) * 8, 8);
-            } else {
-                float single = 0;
-                std::memcpy(&single, bytes.data() + (i * 3 + axis) * 4, 4);
-                value = single;
-            }
-            points[i][axis] = value * scale;
-        }
-    }
-    return points;
+    std::vector<cv::Vec3d> result;
+    result.reserve(points.size());
+    for (const auto& p : points) result.emplace_back(p[0] * scale, p[1] * scale, p[2] * scale);
+    return result;
 }
 
-std::vector<int64_t> readIds(const StoreReader& reader, const vc::objects::GeometryRevision& revision)
-{
-    const auto info = std::find_if(revision.arrays.begin(), revision.arrays.end(),
-                                   [](const auto& array) { return array.name == "point_ids"; });
-    if (info == revision.arrays.end() || info->dtype != "<i8")
-        throw std::runtime_error("geometry " + revision.uuid + " has no int64 point_ids");
-    const auto bytes = reader.readGeometryArray(revision.uuid, "point_ids");
-    std::vector<int64_t> ids(bytes.size() / 8);
-    std::memcpy(ids.data(), bytes.data(), ids.size() * 8);
-    return ids;
-}
-
-// object_store_inputs.KINDS and FAMILIES: the relationship families the
-// fitter consumes, by edge kind and endpoint kinds in KINDS order.
+// The fitter's supported input-kind order (shared with its input protocol).
 int kindIndex(const std::string& kind)
 {
     constexpr const char* kinds[] = {"surface", "point_collection", "fiber", "track"};
@@ -206,7 +165,7 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
     FitPointCollection collection;
     collection.pin = pin;
     collection.state = state;
-    if (present) collection.version = current->version;
+    if (present) collection.reference = current->reference();
     FitFiber fiber{pin, state, {}, {}, {}, {}};
     if (pin.kind == "track") {
         // Its state is all a track contributes; its geometry is not shown.
@@ -228,8 +187,9 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
             surface.surface = std::shared_ptr<QuadSurface>(load_quad_from_store(reader,*current,true,&view));
         } else if (geometry && pin.kind == "point_collection") {
             collection.absolute = valueOrNull(valueOrNull(meta, "source"), "winding_is_absolute") == Json(true);
-            const auto ids = readIds(reader, *geometry);
-            const auto points = readXyz(reader, *geometry, "points", *scale);
+            const auto view = vc::objects::GeometrySnapshot(reader).pointCollection(pin.uuid, geometry->uuid);
+            const auto ids = view.ids(0, view.size());
+            const auto points = scaledPoints(view.points(0, view.size()), *scale);
             if (ids.size() != points.size()) throw std::runtime_error("point IDs and points differ in length");
             const auto annotations = reader.geometryPointAnnotations(geometry->uuid, "points");
             std::vector<std::size_t> order(ids.size());
@@ -245,8 +205,9 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
             }
         } else if (geometry && pin.kind == "fiber") {
             if (current->record.fiber) fiber.family = current->record.fiber->family;
-            fiber.controls = readXyz(reader, *geometry, "control_points", *scale);
-            fiber.line = readXyz(reader, *geometry, "line_points", *scale);
+            const auto view = vc::objects::GeometrySnapshot(reader).fiber(pin.uuid, geometry->uuid);
+            fiber.controls = scaledPoints(view.controlPoints(0, view.controlPointCount()), *scale);
+            fiber.line = scaledPoints(view.linePoints(0, view.linePointCount()), *scale);
         }
     } catch (const std::exception& error) {
         // Nothing of an unreadable input is shown.
@@ -352,6 +313,9 @@ std::vector<StoreInputPin> manifestPins(const Json& document)
     return pins;
 }
 
+// Spiral input-protocol projection, mirrored by object_store_inputs.adapter_metadata.
+// test_spiral_store_inputs pins this domain contract; geometry/placement decoding
+// belongs exclusively to GeometrySnapshot, not to either adapter.
 Json adapterMetadata(const std::string& kind, const Json& meta,
                      const std::optional<vc::objects::FiberDetail>& fiber,
                      const std::optional<vc::objects::TrackDetail>& track)

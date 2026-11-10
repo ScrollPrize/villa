@@ -68,6 +68,8 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
             // moves its surface between drafted and stored targets there.
             for (auto& [viewer, view] : _views) view->dirty = true;
             refreshAll();
+        } else if (event.touches({"volume_transform", "volume_transform_choice"})) {
+            invalidate();
         } else if (event.touches({"surface"})) {
             refreshCommittedSurfaces();
         }
@@ -78,8 +80,15 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
     });
     // Edits update their drafts before announcing the surface; intersect
     // targets and planes are named surfaces.
-    connect(_state, &CState::surfaceChanged, this, [this](std::string, std::shared_ptr<Surface>, bool) {
-        for (auto& [viewer, view] : _views) view->dirty = true;
+    connect(_state, &CState::surfaceChanged, this, [this](std::string, std::shared_ptr<Surface> surface, bool) {
+        for (auto& [viewer, view] : _views) {
+            view->dirty = true;
+            if (!surface || view->cutDisplayed == surface.get()) {
+                view->cutSurface.reset();
+                view->cutRequests.refresh();
+                view->cutsStale = true;
+            }
+        }
         refreshAll();
     });
     bindToViewerManager(manager);
@@ -88,8 +97,10 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
 StoreSurfaceOverlayController::~StoreSurfaceOverlayController()
 {
     _fetchCancel->store(true);
-    for (auto& [viewer, view] : _views)
+    for (auto& [viewer, view] : _views) {
         if (view->region.cancelled) view->region.cancelled->store(true);
+        view->cutRequests.reset();
+    }
 }
 
 void StoreSurfaceOverlayController::setSurfaces(const std::vector<std::string>& uuids)
@@ -149,6 +160,10 @@ void StoreSurfaceOverlayController::invalidate()
     _fetchFailures.clear();
     for (auto& [viewer, view] : _views) {
         view->region.reset();
+        view->cutRequests.reset();
+        view->cutObject.clear();
+        view->cutSurface.reset();
+        view->cutDisplayed = nullptr;
         view->runs.clear();
         view->displayed.reset();
         view->targets.clear();
@@ -170,6 +185,7 @@ void StoreSurfaceOverlayController::refreshCommittedSurfaces()
     for (auto& [viewer, view] : _views) {
         view->dirty = true;
         view->cutsStale = true;
+        view->cutRequests.refresh();
         if (view->region.busy) {
             // Fetching a placeholder commits its geometry. Cancelling here
             // would repeatedly interrupt the batch that is waiting for it.
@@ -193,6 +209,7 @@ void StoreSurfaceOverlayController::detachViewer(VolumeViewerBase* viewer)
 {
     if (auto it = _views.find(viewer); it != _views.end()) {
         if (it->second->region.cancelled) it->second->region.cancelled->store(true);
+        it->second->cutRequests.reset();
         _views.erase(it);
     }
     ViewerOverlayControllerBase::detachViewer(viewer);
@@ -315,31 +332,39 @@ void StoreSurfaceOverlayController::requestCuts(VolumeViewerBase* viewer, const 
                                                 const std::vector<PlaneCut>& cuts)
 {
     auto& v = *_views.at(viewer);
-    if (v.cutsBusy) {
-        v.cutsStale = true;
+    v.cutRequests.refresh();
+    if (cuts.empty()) {
+        v.planeRuns.clear();
+        v.cutsStale = false;
         return;
     }
-    v.cutsBusy = true;
+    const auto query = v.cutRequests.start(cuts.front().slab);
+    if (!query) { v.cutsStale = true; return; }
+    const auto token = v.cutRequests.cancelled;
     v.cutsStale = false;
     using Cut = std::map<std::string, std::vector<Run>>;
     vc3d::store::background<Cut>(this,
-        [session = _state->objectStoreSession(), sources = _state->surfaceSources(),
-         volume = vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{})),
-         uuid, cuts] {
+        [surface = v.cutSurface,
+         uuid, cuts, token] {
             Cut result;
             for (const auto& cut : cuts) {
-                auto crossings = SurfaceCatalog::region(*session, sources, volume,
-                                                        vc3d::store::regionSlice(cut.slab), surfaceOptions({uuid}));
+                auto crossings = surface->region(uuid, vc3d::store::regionSlice(cut.slab),
+                                                 [token](const auto&) { return token->load(); });
+                if (!crossings.complete() && !token->load())
+                    throw std::runtime_error("Displayed surface cut exceeds its output budget");
                 result[cut.plane] = runsOf(std::move(crossings.runs));
             }
             return result;
         },
-        [this, viewer](vc3d::store::Outcome<Cut> outcome) {
+        [this, viewer, token, view = cuts.front().slab, query = *query](vc3d::store::Outcome<Cut> outcome) {
             const auto found = _views.find(viewer);
             if (found == _views.end()) return;
             auto& v = *found->second;
-            v.cutsBusy = false;
-            if (outcome.error.isEmpty()) v.planeRuns = std::move(outcome.value);
+            using Finished = vc3d::store::RegionRequests::Finished;
+            const auto finished = v.cutRequests.finish(token, view, query, true, outcome.error);
+            if (finished == Finished::Stale) return;
+            if (finished == Finished::Install && outcome.error.isEmpty()) v.planeRuns = std::move(outcome.value);
+            if (finished == Finished::Retry) v.cutsStale = true;
             v.dirty = true;
             refreshViewer(viewer);
         });
@@ -549,20 +574,20 @@ void StoreSurfaceOverlayController::addLines(VolumeViewerBase* viewer, const std
 void StoreSurfaceOverlayController::drawSurfaceViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder)
 {
     auto* surface = dynamic_cast<QuadSurface*>(viewer->currentSurface());
-    if (!surface || !vc::objects::util::isUuid(surface->id)) return;
+    if (!surface) return;
     const auto cuts = planeCuts(viewer);
-    const bool cutsChanged = cuts.size() != v.cuts.size() ||
+    const bool cutsChanged = v.cutObject != surface->id || cuts.size() != v.cuts.size() ||
         !std::equal(cuts.begin(), cuts.end(), v.cuts.begin(),
                     [](const PlaneCut& a, const PlaneCut& b) { return a.plane == b.plane && a.slab == b.slab; });
     v.cuts = cuts;
-    if (const auto revision = _state->objectStoreSession()->draftRevision(surface->id)) {
-        if (cutsChanged || revision != v.cutRevision) {
-            v.planeRuns.clear();
-            for (const auto& cut : cuts) v.planeRuns[cut.plane] = draftRuns({surface->id}, cut.slab);
-            v.cutRevision = revision;
-        }
-    } else if (cutsChanged || v.cutsStale) {
-        v.cutRevision = 0;
+    v.cutObject = surface->id;
+    if (!v.cutSurface || v.cutDisplayed != surface) {
+        v.cutSurface = std::make_shared<vc::objects::ResidentSurface>(quad_surface_grid(*surface));
+        v.cutDisplayed = surface;
+        v.cutsStale = true;
+        v.planeRuns.clear();
+    }
+    if (cutsChanged || v.cutsStale) {
         requestCuts(viewer, surface->id, cuts);
     }
 

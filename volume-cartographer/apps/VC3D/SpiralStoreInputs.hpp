@@ -59,7 +59,7 @@ struct FitPointCollection {
     std::vector<cv::Vec3d> points;
     std::vector<std::optional<double>> windings;  // wind_a annotations
     std::string problem;
-    int64_t version = 0;  // the object version read: what an edit starts from
+    vc::objects::ObjectVersion reference;  // the exact state an edit starts from
 };
 
 struct FitFiber {

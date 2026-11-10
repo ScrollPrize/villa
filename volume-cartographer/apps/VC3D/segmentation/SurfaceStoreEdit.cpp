@@ -60,7 +60,7 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
     const auto& points = *surface.rawPointsPtr();
     auto request = _session->newRequest(_pin.attachment);
     request.generation = _pin.writeGeneration;
-    request.expectedObjects = {{_uuid, _pin.version}};
+    vc::objects::expectObject(request, _pin.reference());
     _session->readStore(_pin.attachment, [&](const StoreReader& reader, const auto&) {
         const GeometrySnapshot snapshot(reader);
         std::optional<TransformedGeometryView> transformed;
@@ -106,7 +106,7 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
         // and route choices that a list of existing record versions cannot guard.
         if (transformed && !request.operations.empty())
             request.operations.insert(request.operations.begin(), transformed->checkMappingOperation());
-        expectRelationshipEndpoints(reader, request.expectedObjects);
+        expectRelationshipEndpoints(reader, request);
     });
     if (request.operations.empty()) return;
     DurableSave durable;

@@ -1120,7 +1120,7 @@ private:
     // same snapshot; missing and retired objects are skipped. Line points are
     // read on request, otherwise loaded on demand by ensureFiberLines().
     struct StoredFiberDependencies {
-        std::map<std::string, std::optional<uint64_t>> peers;
+        std::map<std::string, std::optional<vc::objects::ObjectVersion>> peers;
         std::set<std::string> relationships;
     };
     using FiberDependencies = std::unordered_map<std::string, StoredFiberDependencies>;

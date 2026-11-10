@@ -1632,6 +1632,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
         for (qsizetype i = 0; i < linkedSurfaces.size(); ++i) {
             QJsonObject link = linkedSurfaces[i].toObject();
             if (link[QStringLiteral("uuid")].toString() == QString::fromStdString(activeUuid) && revision) {
+                link[QStringLiteral("store")] = QString::fromStdString(revision->reference().storeUuid);
                 link[QStringLiteral("generation")] = QString::fromStdString(revision->generation);
                 link[QStringLiteral("version")] = static_cast<qint64>(revision->version);
                 linkedSurfaces[i] = link;

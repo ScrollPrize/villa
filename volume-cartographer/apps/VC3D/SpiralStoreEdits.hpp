@@ -27,34 +27,34 @@ inline constexpr const char* kBrushPatchTag = "spiral-brush";
 
 // One brush patch: its geometry in the preview's frame, which is declared
 // as `previewScale` stored units per voxel of the fit volume `volume`.
-// `uuid` is the store object once saved, and `version` the object version
-// that save wrote: the one this edit started from (0: unknown). `remove`
+// `uuid` is the store object once saved, and `reference` its complete selected
+// identity (owner, lineage, UUID and version). `remove`
 // retires it.
 struct BrushPatchSave {
     std::string uuid;  // empty: create a new surface
-    int64_t version = 0;  // required with `uuid`
+    vc::objects::ObjectVersion reference;  // required with `uuid`
     std::string name;
     std::shared_ptr<QuadSurface> surface;
     bool remove = false;
 };
 
-// A saved patch: its object and the version the save wrote (0 when it was
+// A saved patch: its object and the reference the save wrote (empty when it was
 // retired), which the next edit of it starts from, and the request UUID of
 // the commit that wrote it (its receipt).
 struct SavedBrushPatch {
     std::string uuid;
-    int64_t version = 0;
+    vc::objects::ObjectVersion reference;
     std::string requestUuid;
 };
 
 // A save refused because another editor saved the object after the version
-// the edit started from; `current` is their version (0 when it is gone).
+// the edit started from; `current` is their complete reference (empty when gone).
 // Nothing was written: saving again from `current` replaces theirs.
 struct StoreObjectChanged : std::runtime_error {
-    StoreObjectChanged(const std::string& message, std::string uuid, int64_t current)
+    StoreObjectChanged(const std::string& message, std::string uuid, vc::objects::ObjectVersion current)
         : std::runtime_error(message), uuid(std::move(uuid)), current(current) {}
     std::string uuid;
-    int64_t current = 0;
+    vc::objects::ObjectVersion current;
 };
 
 // Save brush patches in one checked commit each: a new one becomes a surface
@@ -72,8 +72,8 @@ std::vector<SavedBrushPatch> saveBrushPatches(vc::objects::ObjectStoreSession&, 
 
 // A point-collection draft as the store keeps it, in reference-volume voxels:
 // every point at its source position ("p" of its payload), kept points with
-// their source ids (stable in the store), appended points with fresh ids
-// after the highest id the source had, and each point's other payload fields
+// their source ids (stable in the store), appended points marked for the shared
+// retained-ID allocator at save time, and each point's other payload fields
 // (wind_a, creation_time) as its annotation. `source` is the object's current
 // meta.source (empty for a new collection); winding_is_absolute is set from
 // the draft's collection metadata and point_attributes dropped (annotations
@@ -87,26 +87,22 @@ std::optional<std::string> pointCollectionObject(const EditablePclDraft& draft);
 
 // The key of the object version (in the attached store) a fit
 // point-collection document was read at: what an edit of it starts from.
-inline constexpr const char* kLocalObjectVersionKey = "local_object_version";
+inline constexpr const char* kLocalObjectReferenceKey = "local_object_reference";
 
 // Name the store object (and the version of it) a draft edits: a new
 // collection saved once is replaced, not created again, by its next save.
-void setPointCollectionObject(EditablePclDraft& draft, const std::string& uuid, int64_t version);
+void setPointCollectionObject(EditablePclDraft& draft, const vc::objects::ObjectVersion& reference);
 
-// A saved draft: its object and the version the save wrote (0 when it was
+// A saved draft: its object and the reference the save wrote (empty when it was
 // retired, or when a deleted draft had no object), and the request UUID of
 // the commit that wrote it (its receipt; every draft of one save shares it).
-struct SavedPointCollection {
-    std::string uuid;
-    int64_t version = 0;
-    std::string requestUuid;
-};
+using SavedPointCollection = SavedBrushPatch;
 
 // Save point-collection drafts and deletions in one checked commit (the
 // store's writeVolumeCollections in the fit volume's voxels): replaced
 // collections keep their identity and their points' ids, new ones are
 // created, deleted ones retired. A replaced or deleted collection is expected
-// at the version its draft was read at (metadata.local_object_version): when
+// at the full identity its draft was read at (metadata.local_object_reference): when
 // another editor changed or retired it since, the commit is refused
 // (StoreObjectChanged) instead of overwriting their edit. Returns one result
 // per draft, in order.

@@ -73,6 +73,7 @@ struct FiberBranchRef {
 struct FiberVolumeFrame {
     vc::objects::VolumeVoxels volume;
     vc::objects::VolumeAffine storedToVolume;
+    bool operator==(const FiberVolumeFrame&) const = default;
 };
 
 struct StoredFiber {

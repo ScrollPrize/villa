@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_object_store/objects/ResidentSurface.hpp>
 
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "ObjectStoreRegions.hpp"
@@ -19,13 +20,12 @@ class CState;
 class PlaneSurface;
 class QuadSurface;
 
-// Where surfaces cross each viewer, from the object store (stored surfaces and
-// the session's drafts; no surface is materialized or indexed here):
+// Where surfaces cross each viewer, using the store's shared intersection kernels:
 //  - plane viewers: the surface list's visible surfaces and the viewer's
 //    intersect targets (the active surface, workspace surfaces), queried per
 //    view region;
-//  - surface viewers: where the viewer's intersect planes ("seg xy/xz/yz") cut
-//    its surface, drawn on the surface through each crossing's grid position.
+//  - surface viewers: intersect the displayed immutable grid (current, historical
+//    or draft) through the same resident/store intersection kernel.
 // Drafts change while they are edited, so their lines are cut on the spot;
 // stored surfaces are read on the thread pool. Catalog placeholders reached
 // are fetched one at a time in the background and drawn as each arrives.
@@ -97,8 +97,10 @@ private:
         // Surface viewers: the planes' cuts of a stored surface.
         std::vector<PlaneCut> cuts;
         std::map<std::string, std::vector<Run>> planeRuns;
-        std::uint64_t cutRevision{0};
-        bool cutsBusy{false};
+        vc3d::store::RegionRequests cutRequests;
+        std::string cutObject;
+        const QuadSurface* cutDisplayed = nullptr;
+        std::shared_ptr<const vc::objects::ResidentSurface> cutSurface;
         bool cutsStale{false};
     };
     void request(VolumeViewerBase* viewer, const vc3d::store::Region& region, const std::vector<std::string>& uuids);

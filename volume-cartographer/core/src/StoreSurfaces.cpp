@@ -62,12 +62,12 @@ int64_t StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
     const auto& session = objects_.session();
     auto request = session->newRequest(objects_.attachment());
     request.generation = pin.writeGeneration;
-    request.expectedObjects = {{canonical, pin.version}};
+    vc::objects::expectObject(request, pin.reference());
     session->readStore(objects_.attachment(), [&](const vc::objects::StoreReader& reader, const auto&) {
         const auto view = vc::objects::GeometrySnapshot(reader).viewStored(canonical, pin.geometryRevision);
         if (auto edit = quad_rect_edit(view, surface, cv::Rect(0, 0, points.cols, points.rows)))
             request.operations.push_back(std::move(*edit));
-        vc::objects::expectRelationshipEndpoints(reader, request.expectedObjects);
+        vc::objects::expectRelationshipEndpoints(reader, request);
     });
     if (request.operations.empty()) return pin.version;
     const auto receipt = session->submit(objects_.attachment(), request);

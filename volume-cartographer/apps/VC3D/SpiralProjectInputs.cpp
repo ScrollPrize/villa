@@ -282,6 +282,7 @@ QJsonObject projectBlock(const std::string& name,
                 QJsonArray points;
                 for (const auto& [x, y, z] : umbilicus->points) points.append(QJsonArray{z, y, x});
                 entry[QStringLiteral("umbilicus")] = QJsonObject{
+                    {QStringLiteral("store"), QString::fromStdString(umbilicus->version.storeUuid)},
                     {QStringLiteral("uuid"), QString::fromStdString(umbilicus->uuid)},
                     {QStringLiteral("generation"), QString::fromStdString(umbilicus->version.generation)},
                     {QStringLiteral("version"), QJsonValue(qint64(umbilicus->version.version))},
