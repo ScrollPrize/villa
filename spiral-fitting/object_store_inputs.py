@@ -2666,11 +2666,10 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, head, in
     # those versions, at the links' commit.
     objects = dict(pins.objects)
     references = {ref['object']: ref for ref in pins.refs()}
+    from vc_object_store import receipt_object_reference
     for uuid, version in (receipt.get('objects') or {}).items():
         if uuid in objects and version is not None:
-            if int(version) != objects[uuid]:
-                references[uuid] = {'store': receipt['store_uuid'], 'generation': receipt['generation'],
-                                    'object': uuid, 'version': int(version)}
+            references[uuid] = receipt_object_reference(receipt, uuid)
             objects[uuid] = int(version)
     lines.append(f'links committed at commit {receipt["commit_sequence"]} (linked at {head})')
     return LinkResult(lines, plan, receipt, dataclasses.replace(
