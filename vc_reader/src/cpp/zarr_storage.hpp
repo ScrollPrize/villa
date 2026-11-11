@@ -3,6 +3,7 @@
 #include "chunk_io.hpp"
 #include "http.hpp"
 #include "shard_index.hpp"
+#include "channel_decode.hpp"
 #include <array>
 #include <atomic>
 #include <limits>
@@ -27,8 +28,8 @@ public:
 
     bool read(const std::string& key, std::vector<std::uint8_t>& body)
     {
+        const auto [path, position] = location(key);
         if (layout_.ratios.empty()) {
-            const auto path = root_ + "/" + prefix_ + key;
             if (http_) {
                 ++requests_;
                 auto result = http_->get_stream(path, [&] { body.clear(); }, [&](const char* p, std::size_t n) {
@@ -40,6 +41,93 @@ public:
             }
             return local_read(path, body, std::nullopt, 0, layout_.maxPayload);
         }
+        if (!http_) return LocalShard(path, layout_).readEntry(*position, body);
+        auto index = shard_index(path);
+        if (!index) return false;
+        const auto entry = layout_.entry(index->bytes, *position, index->total);
+        if (!entry) return false;
+        const auto [offset, length] = *entry;
+        ++requests_;
+        auto response = http_->get_range(path, body, std::to_string(offset)+"-"+std::to_string(offset+length-1),
+                                         length, index->etag);
+        bytes_ += response.bytes;
+        if (response.status == 404) throw std::runtime_error("shard disappeared after index read");
+        validate_range(response, offset, length, index->total);
+        return true;
+    }
+
+    std::optional<ChannelDecodeResult> read_channels(const std::string& key, const ChunkCodec& codec,
+        std::size_t decodedBytes, std::size_t channelBytes, std::span<const std::size_t> requested,
+        std::span<const std::size_t> relevant)
+    {
+        const auto [path, position] = location(key);
+        if (!http_) {
+            if (position) {
+                LocalShard shard(path, layout_);
+                if (shard.index.empty()) return std::nullopt;
+                const auto entry = layout_.entry(shard.index, *position, shard.total);
+                if (!entry) return std::nullopt;
+                return decode_channels(codec, decodedBytes, channelBytes, requested, relevant, entry->second,
+                    [&](auto offset, auto length, auto dst) { shard.readRange(entry->first+offset, length, dst); });
+            }
+            File file = File::open_read(path);
+            if (!file) return std::nullopt;
+            platform::FileStat stat;
+            if (platform::fstat(file.fd(), stat) != 0)
+                throw std::system_error(errno, std::generic_category(), "stat " + path);
+            if (stat.size < 0 || std::uint64_t(stat.size) > layout_.maxPayload)
+                throw std::runtime_error("oversized channel payload: " + path);
+            return decode_channels(codec, decodedBytes, channelBytes, requested, relevant, std::size_t(stat.size),
+                [&](auto offset, auto length, auto dst) { pread_exact(file.fd(), dst, length, offset, path); });
+        }
+        std::uint64_t base = 0, length = 0, total = 0;
+        std::string etag;
+        std::vector<std::uint8_t> prefix;
+        if (position) {
+            auto index = shard_index(path);
+            if (!index) return std::nullopt;
+            const auto entry = layout_.entry(index->bytes, *position, index->total);
+            if (!entry) return std::nullopt;
+            base = entry->first; length = entry->second; total = index->total; etag = index->etag;
+        } else {
+            // Discover size and revision without a HEAD request. For Blosc this
+            // is also the complete codec header, reused by the range planner.
+            const std::size_t probe = codec == Codec::Blosc ? BLOSC_MIN_HEADER_LENGTH : 1;
+            ++requests_;
+            auto response = http_->get_range(path, prefix, "0-"+std::to_string(probe-1), probe);
+            bytes_ += response.bytes;
+            if (response.status == 404) return std::nullopt;
+            unsigned long long first = 0, last = 0, size = 0;
+            if (std::sscanf(response.content_range.c_str(), "bytes %llu-%llu/%llu", &first, &last, &size) != 3 ||
+                first != 0 || last != probe-1 || size < probe || size > layout_.maxPayload)
+                throw std::runtime_error("invalid channel object Content-Range");
+            length = total = size; etag = response.etag;
+        }
+        return decode_channels(codec, decodedBytes, channelBytes, requested, relevant, length,
+            [&](std::size_t offset, std::size_t size, std::uint8_t* dst) {
+                if (offset < prefix.size()) {
+                    const auto reused = std::min(size, prefix.size()-offset);
+                    std::memcpy(dst, prefix.data()+offset, reused);
+                    dst += reused; offset += reused; size -= reused;
+                }
+                if (!size) return;
+                std::vector<std::uint8_t> body;
+                ++requests_;
+                auto response = http_->get_range(path, body, std::to_string(base+offset)+"-"+
+                    std::to_string(base+offset+size-1), size, etag);
+                bytes_ += response.bytes;
+                if (response.status == 404) throw std::runtime_error("channel object disappeared during ranged read");
+                validate_range(response, base+offset, size, total);
+                if (!etag.empty() && !response.etag.empty() && etag != response.etag)
+                    throw std::runtime_error("channel object changed during ranged read");
+                std::memcpy(dst, body.data(), size);
+            });
+    }
+
+private:
+    std::pair<std::string, std::optional<std::size_t>> location(const std::string& key) const
+    {
+        if (layout_.ratios.empty()) return {joinLocation(root_, prefix_ + key), std::nullopt};
         Index coordinates;
         std::size_t begin = 0;
         for (std::size_t axis = 0; axis < layout_.ratios.size(); ++axis) {
@@ -53,23 +141,8 @@ public:
             if (!shard_key.empty()) shard_key += separator_;
             shard_key += std::to_string(coordinate);
         }
-        const auto path = root_ + "/" + prefix_ + shard_key;
-        if (!http_) return LocalShard(path, layout_).readEntry(position, body);
-        auto index = shard_index(path);
-        if (!index) return false;
-        const auto entry = layout_.entry(index->bytes, position, index->total);
-        if (!entry) return false;
-        const auto [offset, length] = *entry;
-        ++requests_;
-        auto response = http_->get_range(path, body, std::to_string(offset)+"-"+std::to_string(offset+length-1),
-                                         length, index->etag);
-        bytes_ += response.bytes;
-        if (response.status == 404) throw std::runtime_error("shard disappeared after index read");
-        validate_range(response, offset, length, index->total);
-        return true;
+        return {joinLocation(root_, prefix_ + shard_key), position};
     }
-
-private:
     static void validate_range(const HttpResponse& response, std::uint64_t offset,
                                std::uint64_t length, std::uint64_t total)
     {
