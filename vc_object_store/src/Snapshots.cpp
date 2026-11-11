@@ -79,27 +79,33 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
         if (!seen.insert(uuid).second)
             throw std::runtime_error("object store: duplicate snapshot UUID: " + uuid);
     };
+    // Imports reserve deleted UUIDs through the same scoped resolver as
+    // geometry ingestion; only explicit recreation/restore may revive them.
     for (const auto& j : root.at("objects")) {
         auto object = objectFromJson(j);
         checkIdentity(object.uuid);
         commonFromJson(j, object);
-        if (edgeByUuid(txn, object.uuid))
+        if (edgeSource(db, object.uuid, false, true))
             throw std::runtime_error("object store: snapshot UUID belongs to an edge: " + object.uuid);
         if (auto existing = objectByUuid(txn, object.uuid)) {
             if (recordContent(objectToJson(*existing)) == recordContent(objectToJson(object))) continue;
             throw std::runtime_error("object store: snapshot conflicts with existing object: " + object.uuid);
         }
+        if (objectSource(db, object.uuid, false, true))
+            throw std::runtime_error("object store: snapshot UUID is reserved by a deleted object: " + object.uuid);
         upsertObjectImpl(db, author(), impl_->hostname, object, true);
     }
     for (const auto& j : root.at("edges")) {
         auto e = edgeFromJson(j);
         checkIdentity(e.uuid);
-        if (objectByUuid(txn, e.uuid))
+        if (objectSource(db, e.uuid, false, true))
             throw std::runtime_error("object store: snapshot UUID belongs to an object: " + e.uuid);
         if (auto existing = edgeByUuid(txn, e.uuid)) {
             if (recordContent(edgeToJson(*existing)) == recordContent(edgeToJson(e))) continue;
             throw std::runtime_error("object store: snapshot conflicts with existing edge: " + e.uuid);
         }
+        if (edgeSource(db, e.uuid, false, true))
+            throw std::runtime_error("object store: snapshot UUID is reserved by a deleted edge: " + e.uuid);
         addEdgeImpl(db, author(), impl_->hostname, e, true);
         recordRelationshipValidation(db, *edgeByUuid(txn, e.uuid));
     }
