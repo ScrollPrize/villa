@@ -234,6 +234,8 @@ document how to use them and how they’re validated.
 
 ### 4.4 vcobj readers and writers (including consumers outside `vc_object_store/`)
 
+Use the [single versioned-reference contract](vc_object_store/docs/versioned-reference-contract.md): carry the shared reference unchanged. Consumer-specific tuples or flattened reference fields are not an internal API; extra application data wraps the reference instead.
+
 Read `vc_object_store/docs/reading.md` and the contract in `vc_object_store/docs/coherent-store-api-cleanup.md` before changing vcobj handling. Physical placement (local, referenced, sharded or packed) is resolved by the store layer, never by consumer-specific SQL or fallback branches.
 
 For reviews, use the [vcobj review contract](vc_object_store/docs/review-contract.md): trace each invariant through all sibling entry points and test the same case at their boundaries. Python bindings adapt Python types; the shared native implementation owns schema interpretation and validation.

@@ -1,0 +1,11 @@
+# Spiral P-002 / P-003 implementation evidence
+
+Baseline: `38c72d972`. No schema change; database schema stays 21.
+
+P-002: `InputPins` and `SelectedObjects` retain only complete-reference maps. Selector capture returns those maps directly rather than numbered maps with reference side channels. `StoredObject` derives UUID/version from its retained reference. Exact reads no longer rebuild or normalize pins. The two persisted pin boundaries share one decoder; legacy numeric evidence uses its original recorded store/generation, immediately validated by the native scalar codec, never current-owner discovery. New provenance writes only the reference map. Existing command-v2 `expected_object_references` guards link writes and receipt references repin changed/unchanged inputs; no new native command format/API was added. Removed the unused outer-shell tuple-selector wrapper (repository search found no callers).
+
+P-003: `ProjectUmbilicus` retains a standard reference beside materialized points. Project mapping, per-volume manifest, service commit context and committed source metadata preserve that component. Old flattened full identities decode once through the native scalar codec. Ownerless legacy point snapshots remain explicit `legacy_source` values; no attachment owner is inferred and no exact reference is fabricated. Materialized control-point JSON now retains the source component and uses a reference-and-points content hash for its filename. Native project producers are migrated in the native review lane. Updated `spiral-fitting/README.md` documents these transport/compatibility rules.
+
+Production Python delta (three Spiral files, excluding native sibling, tests and docs): 106 additions, 113 removals, net −7 at this checkpoint. The boundary validation and explicit old-input compatibility cost lines; gross duplicate-map/adapter removal is not represented as net savings. Recount against the baseline after integrated edits.
+
+The integrated approved runner completed the original Spiral store suites with 124 passed and one optional real-data skip after the shared conflict-classification fix. Additional service/headless coverage and baseline-control results are recorded in [validation](validation.md); earlier focused runs are not used to claim full validation. No macOS/full GUI/GPU validation is claimed.
