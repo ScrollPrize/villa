@@ -10,6 +10,11 @@ point are written as invalid (-1); the points keep riding the curve, so they rea
 again. Tracing stops after ``--steps``, at the first row with no confident point connected to the surface traced
 so far, or when the front leaves the volume.
 
+``--piece-points N``: a seed row of more than N points is traced as overlapping N-point pieces that start every
+``--piece-stride`` points (the last piece ends at the last point), each traced on its own, and the pieces are merged
+column by column (``trace_in_pieces``). For a checkpoint trained on 7-point fronts, ``--piece-points 7`` keeps a long
+row at the front length the model saw in training.
+
 ``--checkpoint``: a local file, or a Hugging Face model repo ``ORG/NAME[@REVISION]`` holding it (``shared/hub.py``:
 ``last.pt``, else its only ``.pt``); default ``DEFAULT_CHECKPOINT``. A checkpoint records the CT volume it was trained
 on; ``--volume`` reads another (e.g. a local copy of that scan), ``--path-map`` rewrites recorded path prefixes.
@@ -153,6 +158,61 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
     return np.stack(rows), np.stack(confs)
 
 
+def piece_starts(points: int, piece: int, stride: int) -> list:
+    """First point of each piece: every ``stride`` points, the last piece ending at the last point."""
+    if not 1 <= stride < piece:
+        raise ValueError('the stride must be at least 1 and less than the piece length')
+    if points <= piece:
+        return [0]
+    starts = list(range(0, points-piece+1, stride))
+    if starts[-1] != points-piece:
+        starts.append(points-piece)
+    return starts
+
+
+def merge_pieces(pieces: list, offsets: list, columns: int) -> tuple:
+    """One trace from per-piece ``(rows, confs)`` placed at column ``offsets`` of a front with ``columns`` columns.
+
+    At each step a column comes from the piece that is still tracing and holds it closest to its own centre; a column
+    no piece covers any more keeps its last position with confidence 0. The result is as long as the longest piece.
+    """
+    T = max(len(r) for r, _ in pieces)
+    rows = np.zeros((T, columns, 3), pieces[0][0].dtype)
+    confs = np.zeros((T, columns), pieces[0][1].dtype)
+    best = np.full((T, columns), np.inf)
+    for (r, c), off in zip(pieces, offsets):
+        width = r.shape[1]
+        cols = np.arange(off, off+width)
+        central = np.abs(np.arange(width)-(width-1)/2.)
+        for t in range(len(r)):
+            take = central < best[t, cols]
+            rows[t, cols[take]] = r[t, take]
+            confs[t, cols[take]] = c[t, take]
+            best[t, cols[take]] = central[take]
+    if not np.all(np.isfinite(best[0])):
+        raise ValueError('the pieces do not cover every column of the seed row')
+    for t in range(1, T):
+        gone = ~np.isfinite(best[t])
+        rows[t, gone] = rows[t-1, gone]
+        confs[t, gone] = 0
+    return rows, confs
+
+
+def trace_in_pieces(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, device, piece_points: int = 7,
+                    piece_stride: int = 2, **kwargs):
+    """``trace`` for a long seed row: overlapping ``piece_points``-point pieces every ``piece_stride`` points, each
+    traced with ``trace(**kwargs)``, merged by ``merge_pieces``. A row of ``piece_points`` points or fewer is traced
+    whole. Same return value as ``trace``; pass the result to ``connected_keep`` as usual."""
+    n = len(seed)
+    if n <= piece_points:
+        return trace(model, cfg, seed, direction, steps, device, **kwargs)
+    starts = piece_starts(n, piece_points, piece_stride)
+    pieces = [trace(model, cfg, seed[s:s+piece_points], direction[s:s+piece_points], steps, device, **kwargs)
+              for s in starts]
+    samples = cfg.trace.spline_samples
+    return merge_pieces(pieces, [s*samples for s in starts], (n-1)*samples+1)
+
+
 def surface_area_vx2(xyz: np.ndarray) -> float:
     """Area (voxels^2) of a tifxyz grid (R, C, 3), invalid nodes -1: each grid quad with four valid corners as the
     triangles (r, c)-(r, c+1)-(r+1, c+1) and (r, c)-(r+1, c+1)-(r+1, c), as VC3D's SurfaceAreaCalculator counts it."""
@@ -274,10 +334,16 @@ def main(argv=None):
     ap.add_argument('--path-map', action='append', default=[], metavar='OLD=NEW',
                     help='replace the path prefix OLD by NEW in the checkpoint\'s data paths (volumes, patch '
                          'directories), e.g. for a checkpoint trained on another machine; repeatable')
+    ap.add_argument('--piece-points', type=int, metavar='N',
+                    help='trace a seed row of more than N points as overlapping N-point pieces (off by default)')
+    ap.add_argument('--piece-stride', type=int, default=2, metavar='S',
+                    help='with --piece-points: a piece starts every S points (default 2)')
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--voxel-size', type=float, help="level-0 voxel size (um) of --volume for area_cm2 (default: "
                                                      "its meta.json voxelsize, else the checkpoint's)")
     args = ap.parse_args(argv)
+    if args.piece_points and not 1 <= args.piece_stride < args.piece_points:
+        ap.error('--piece-stride must be at least 1 and less than --piece-points')
     path = resolve_checkpoint(args.checkpoint)
     model, cfg, _ = load_checkpoint(path, args.device)
     C.path_mapper(args.path_map)(cfg)
@@ -300,7 +366,11 @@ def main(argv=None):
     seed = resample(points, cfg.data.point_spacing)
     direction = np.stack([np.interp(np.linspace(0, len(points)-1, len(seed)), np.arange(len(points)), direction[:, i])
                           for i in range(3)], 1)
-    rows, confs = trace(model, cfg, seed, direction, args.steps, args.device)
+    if args.piece_points:
+        rows, confs = trace_in_pieces(model, cfg, seed, direction, args.steps, args.device, args.piece_points,
+                                      args.piece_stride)
+    else:
+        rows, confs = trace(model, cfg, seed, direction, args.steps, args.device)
     out = Path(args.out)
     write_trace(out, rows, confs, cfg, cfg.trace.confidence_threshold,
                 dict(vars(args), checkpoint=checkpoint_source(args.checkpoint, path), volume=cfg.data.volume,
