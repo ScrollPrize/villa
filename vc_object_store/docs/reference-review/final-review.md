@@ -1,5 +1,7 @@
 # Final independent source review
 
+Historical report: partial-identity compatibility decisions below are superseded by [legacy removal](legacy-removal.md) and the current [reference contract](../versioned-reference-contract.md).
+
 Baseline: `38c72d972`. Reviewed the working-tree implementation separately from the baseline findings. This review concerns the single-reference contract, not a new schema-21 or general solver audit. No tests were executed by this reviewer; runtime results must be reported separately by the implementation lanes.
 
 ## Verdict

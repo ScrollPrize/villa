@@ -105,13 +105,16 @@ read — the view keeps reading its pinned revision afterwards:
 
 ```python
 import struct
+from vc_object_store import object_reference
 
+selected = store.current_object_revision(collection_uuid)
+reference = object_reference(selected["record"])
 with store.geometry_snapshot() as snapshot:
-    collection = snapshot.point_collection(collection_uuid)
-    with store.write(expected_versions={collection_uuid: collection.version}) as tx:
+    collection = snapshot.point_collection(collection_uuid, selected["geometry_revision"])
+    with store.write(expected_versions={collection_uuid: reference}) as tx:
         revision = tx.edit_geometry(collection_uuid, [dict(
             array="points", element_offset=0, data=struct.pack("<3d", 10, 20, 30)
-        )], collection.version)
+        )], reference["version"])
 ```
 
 The version check applies even to no-ops. Affected relationships need

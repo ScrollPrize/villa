@@ -122,7 +122,7 @@ const auto attachment = session.attach("objects.vcobj", options);
 auto request = session.newRequest(attachment);
 session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto& cancel) {
     if (cancel.load()) return;
-    request.expectedObjects[objectUuid] = reader.currentObject(objectUuid)->version;
+    request.expectedObjects[objectUuid] = reader.currentObject(objectUuid)->reference();
 });
 request.operations.push_back(vc::objects::SetMetaOp{objectUuid, "review_note", R"("checked")"});
 session.submit(attachment, request); // TransactionConflict when the object moved on

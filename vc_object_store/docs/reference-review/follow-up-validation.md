@@ -1,5 +1,7 @@
 # Follow-up unification: implementation and verification
 
+Historical report: the compatibility choices below are superseded by [legacy removal](legacy-removal.md). Current commands use format 3 only, with full-reference guards; incomplete manifests no longer receive weaker comparison.
+
 Baseline: `5920625cc`. Astra [adjudicated](follow-up-astra.md) all four [finding groups](follow-up.md), with F-02 classified as consolidation and F-03 qualified for legacy requests and deletion semantics. Its [implementation review](follow-up-implementation-review.md) has no remaining source blocker after the mixed-case command-2 and current-tombstone selection fixes. Runtime results below are implementation-owner evidence, not tests executed by that reviewer.
 
 ## Completed implementation

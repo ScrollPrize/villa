@@ -31,8 +31,8 @@ These hold across every document:
   `{store, generation, object, version}` dict (C++ `ObjectVersion`).
   Revision UUIDs seen in geometry APIs identify immutable geometry payloads;
   they are not the public way to name an object state — use numbered versions.
-- **Checked writes.** A write expects the numbered versions it read
-  (`expected_versions` / `expectedObjects`; `None` means "must not exist").
+- **Checked writes.** A write expects the complete references it read
+  (`expected_versions` / `expectedObjects`; `None` means "no live record").
   A stale expectation conflicts (`TransactionConflict` in C++, `RuntimeError`
   in Python) and writes nothing. Unchecked convenience calls
   (`store.set_meta(...)`, `store.put_geometry(...)`) run their own transaction

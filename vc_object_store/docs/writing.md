@@ -3,7 +3,7 @@
 New content enters a store three ways: objects and geometry created directly
 in code, native files ([ingestion](ingestion.md)), and files attached to an
 object version ([artifacts](#artifacts)). All of it publishes through the same
-checked transaction model: a write names the numbered versions it read, and a
+checked transaction model: a write names the complete references it read, and a
 stale expectation conflicts without writing anything. Exports and project
 records are covered here too. Changing existing geometry is
 [editing](editing.md).
@@ -11,7 +11,9 @@ records are covered here too. Changing existing geometry is
 ## Checked transactions
 
 ```python
-observed = {u: store.current_version(u) for u in (a, b)}
+from vc_object_store import object_reference
+
+observed = {u: object_reference(store.object(u)) for u in (a, b)}
 with store.write(expected_versions=observed) as tx:
     tx.set_meta(a, "review_note", "checked")
     tx.set_meta(edge, "confidence", 0.9)
@@ -22,9 +24,9 @@ print(tx.receipt["commit_sequence"], tx.receipt["objects"])
 
 | Argument | Meaning |
 | --- | --- |
-| `expected_versions` | `{uuid: version}` for every object changed; `None` expects absence (creation — preselect the UUID) |
+| `expected_versions` | `{uuid: complete_reference}` for every object changed; `None` expects no live record (creation — preselect the UUID) |
 | `expected_relationships` | Same, for relationships |
-| `read_dependencies` | Versions of records read but not changed; checked, never versioned |
+| `read_dependencies` | Complete references of records read but not changed; checked, never versioned |
 | `expected_commit_sequence` | Guards a query's complete membership/absence; any intervening commit conflicts |
 | `request_uuid`, `author` | Retry identity and attribution (see [typed requests](#typed-requests-submit)) |
 
@@ -44,9 +46,11 @@ transaction.
 
 For a loaded object in a collection, use `expectObject(request, selected.reference())`: it carries the complete store/lineage/object/version identity and checks it under the writer lock. Equal numeric versions from different owners are not interchangeable. `expectRead(request, reference)` guards a read without requesting a write; `expectRelationship(request, relationship.reference())` guards the selected relationship identity. All three use one `RecordSelection` representation, including preparations and fetch callbacks. `expectObject(request, selectedRevision)` also distinguishes an exact deleted version from the weaker `nullopt` expectation of no live record. `currentObjectExpectation(reader, uuid)` selects that winning state without a history fallback; `reader.currentObject(uuid, true)` explicitly includes tombstones while ordinary current reads hide them.
 
-Command encoding 3 carries full references directly in `expected_objects`, `expected_relationships` and `read_dependencies`. An exact tombstone is `{reference: <shared reference>, deleted: true}`; a null value means no live record. Object references use `{store,generation,object,version}`; relationship references use `{store,generation,relationship,version}`. Existing object-only guards retain command encoding 2 (`expected_object_references` derived at serialization); ordinary number-only requests retain encoding 1. Their previous canonical wire forms and retry digests are preserved. All three encodings are read, and older servers reject unsupported encodings rather than silently ignoring stronger guards. This is a command-format change, not a database-schema change.
+Command encoding 3 carries full references directly in `expected_objects`, `expected_relationships` and `read_dependencies`. An exact tombstone is `{reference: <shared reference>, deleted: true}`; a null value means no live record. Object references use `{store,generation,object,version}`; relationship references use `{store,generation,relationship,version}`. There is no automatic format selection or parallel numeric/reference map.
 
-Python checked writes accept full reference dictionaries as values of `expected_versions`, `expected_relationships` and `read_dependencies`; numeric legacy input remains supported at this external boundary. Native consumers should not create numeric guards from already selected records. For artifact writes, `session.publish_artifacts(attachment, reference, files, author="")` retains the selected source identity across upload and submission. Native editors additionally retain loaded coordinate-mapping/write-lineage guards through `PinnedObject`.
+Python checked writes accept full reference dictionaries as values of `expected_versions`, `expected_relationships` and `read_dependencies`, or null for no live record. Numeric guards are not a second request format. Explicit manual numeric selection uses `store.select_expected_versions(numbers, relationships=False)` (C++ `selectCurrentExpectations` or `writeNumbered`): it checks the live counters in one snapshot and immediately returns full references. Already selected consumers must retain their original references instead. For artifact writes, `session.publish_artifacts(attachment, reference, files, author="")` retains the selected source identity across upload and submission. Native editors additionally retain loaded coordinate-mapping/write-lineage guards through `PinnedObject`.
+
+Serialized transaction commands use format 3 only, with the same complete references in every guard map. Formats 1 and 2, numeric-only guards and the former separate reference map are rejected. An old unresolved durable request might already have committed: reconcile its outcome before explicitly regenerating it; never silently upgrade or resubmit it under the same request UUID. Incomplete saved application pins/manifests likewise require regeneration, not inferred ownership. This does not change the database schema or the explicit upstream store-conversion workflow.
 
 Editable `AttachedCollection` values carry both the loaded reference and the coordinate mapping used to display their points. Preserve both through UI edits. `writeVolumeCollections` checks both before applying inverse coordinate edits; reloading is required if either the object or its registration changed. Unrelated store commits do not invalidate the mapping.
 
