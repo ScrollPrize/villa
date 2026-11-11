@@ -206,9 +206,9 @@ def trace_in_pieces(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: 
     traced with ``trace(**kwargs)``, merged by ``merge_pieces``. A row of ``piece_points`` points or fewer is traced
     whole. Same return value as ``trace``; pass the result to ``connected_keep`` as usual."""
     n = len(seed)
+    starts = piece_starts(n, piece_points, piece_stride)
     if n <= piece_points:
         return trace(model, cfg, seed, direction, steps, device, **kwargs)
-    starts = piece_starts(n, piece_points, piece_stride)
     pieces = [trace(model, cfg, seed[s:s+piece_points], direction[s:s+piece_points], steps, device, **kwargs)
               for s in starts]
     samples = cfg.trace.spline_samples
@@ -344,9 +344,9 @@ def main(argv=None):
     ap.add_argument('--voxel-size', type=float, help="level-0 voxel size (um) of --volume for area_cm2 (default: "
                                                      "its meta.json voxelsize, else the checkpoint's)")
     args = ap.parse_args(argv)
-    if args.piece_points and args.piece_points < 3:
+    if args.piece_points is not None and args.piece_points < 3:
         ap.error('--piece-points must be at least 3')
-    if args.piece_points and not 1 <= args.piece_stride < args.piece_points:
+    if args.piece_points is not None and not 1 <= args.piece_stride < args.piece_points:
         ap.error('--piece-stride must be at least 1 and less than --piece-points')
     path = resolve_checkpoint(args.checkpoint)
     model, cfg, _ = load_checkpoint(path, args.device)
