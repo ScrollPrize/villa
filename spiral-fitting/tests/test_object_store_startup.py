@@ -4,6 +4,7 @@ import hashlib
 import dataclasses
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -38,11 +39,13 @@ def test_umbilicus_owner_survives_request_manifest_and_commit(tmp_path):
 
     manifests = []
     for owner in (str(uuid.uuid4()), str(uuid.uuid4())):
-        selected = dict(UMBILICUS, store=owner)
+        selected = dict(reference=dict(store=owner, generation=UMBILICUS['generation'],
+                                       object=UMBILICUS['uuid'], version=UMBILICUS['version']),
+                        points_zyx=UMBILICUS['points_zyx'])
         parsed = SpiralProject.from_mapping(project(umbilicus=selected))
         assert parsed.to_mapping()['volumes'][VOLUME]['umbilicus'] == selected
         manifest = parsed.record(VOLUME)
-        assert manifest['umbilicus']['store'] == owner
+        assert manifest['umbilicus']['reference']['store'] == owner
         manifests.append(manifest)
         input_path = tmp_path / 'inputs.json'
         input_path.write_text(json.dumps({'manifest': {'volume_uuid': VOLUME}}))
@@ -52,8 +55,34 @@ def test_umbilicus_owner_survives_request_manifest_and_commit(tmp_path):
                                 session_request={'project': dict(umbilicus=selected)},
                                 object_store=SimpleNamespace(author='test'))
         context = ServiceState._commit_context(state, 's', 1, 'hash')
-        assert context.umbilicus == {key: selected[key] for key in ('store', 'uuid', 'generation', 'version')}
+        assert context.umbilicus == {'reference': selected['reference']}
     assert manifests[0] != manifests[1]
+
+
+def test_umbilicus_legacy_boundary_and_materialized_source(tmp_path):
+    from fit_session import SpiralProject, write_project_umbilicus
+    from service_project import project, UMBILICUS
+
+    selected = SpiralProject.from_mapping(project()).volumes[VOLUME].umbilicus
+    assert selected.reference == dict(store=UMBILICUS['store'], object=UMBILICUS['uuid'],
+                                      generation=UMBILICUS['generation'], version=UMBILICUS['version'])
+    first = write_project_umbilicus(tmp_path, VOLUME, selected)
+    assert json.loads(Path(first).read_text())['source']['reference'] == selected.reference
+    other = dataclasses.replace(selected, reference=dict(selected.reference, store=selected.reference['object']))
+    second = write_project_umbilicus(tmp_path, VOLUME, other)
+    assert first != second
+    assert json.loads(Path(first).read_text())['source']['reference'] == selected.reference
+    legacy = dict(UMBILICUS)
+    legacy.pop('store')
+    old = SpiralProject.from_mapping(project(umbilicus=legacy))
+    assert old.volumes[VOLUME].umbilicus.reference is None
+    mapping = old.to_mapping()
+    assert 'legacy_source' in mapping['volumes'][VOLUME]['umbilicus']
+    assert SpiralProject.from_mapping(mapping).to_mapping() == mapping
+    materialized = write_project_umbilicus(tmp_path, VOLUME, old.volumes[VOLUME].umbilicus)
+    source = json.loads(Path(materialized).read_text())['source']
+    assert 'reference' not in source
+    assert source['legacy_source'] == {key: UMBILICUS[key] for key in ('uuid', 'generation', 'version')}
 
 
 def test_default_refresh_writes_links_and_freezes_the_inputs(store_path):

@@ -85,7 +85,7 @@ def test_links_and_pins_through_the_endpoint_as_through_the_file(served, tmp_pat
     assert prepared.head == before
     assert prepared.position.commit_sequence == before + 1 == head(path)
     assert len(edges(path)) == 3
-    assert set(prepared.pins.objects) == set(names(path).values())
+    assert set(prepared.pins.references) == set(names(path).values())
     assert any('links committed at commit' in line for line in prepared.lines)
     # Served: one stage, no detector progress; the strip cache is the server's.
     with osi.open_store(fit_config(endpoint, 'service'), read_only=True) as store:

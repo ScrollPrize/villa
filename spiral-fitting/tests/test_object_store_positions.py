@@ -45,7 +45,7 @@ def test_prepare_links_commits_and_pins_a_position(shared):
     assert any('links committed at commit' in line for line in prepared.lines)
     assert prepared.position.commit_sequence == head(shared)
     # The pins hold every selected object at the version the links left it.
-    assert set(prepared.pins.objects) == set(names(shared).values())
+    assert set(prepared.pins.references) == set(names(shared).values())
     # Later commits do not change N: every reader reads the same inputs at it.
     request = pinned(shared, prepared.pins)
     before = read(shared, request)
@@ -62,7 +62,7 @@ def test_prepare_links_commits_and_pins_a_position(shared):
     # A position alone (no versions) reads the same state from the history.
     by_position = read(shared, pinned(shared, osi.InputPins(prepared.position)))
     assert by_position.digest() == before.digest()
-    assert by_position.request.pins.objects == prepared.pins.objects
+    assert by_position.request.pins.references == prepared.pins.references
     # The edit of a selected object relinks: the marker's commit follows the
     # head. Then nothing is new: the links are current, N = H.
     again = prepare(shared)
@@ -78,25 +78,25 @@ def test_a_commit_while_reading_the_selection_rereads_it(shared, monkeypatch):
     original = osi.resolve_selector
     edits = []
 
-    def racing(store, kind, selector, records=None, references=None):
+    def racing(store, kind, selector, records=None):
         if not edits:  # after the head is read, before the objects are
             edits.append(shared_edit(shared, lambda db: db.set_meta(walk, 'review_note', 'mid-read')))
-        return original(store, kind, selector, records, references=references)
+        return original(store, kind, selector, records)
     monkeypatch.setattr(osi, 'resolve_selector', racing)
     request = osi.request_from_config(fit_config(shared, 'service'))
     with ObjectStore.open(shared, read_only=True) as db:
         selected = osi.resolve_selection(db, request)
         assert edits and selected.position.commit_sequence == edits[0] == head(shared)
-        assert selected.versions[walk] == osi.current_record(db, walk)['version']
+        assert selected.references[walk]['version'] == osi.current_record(db, walk)['version']
         # The position alone reads the same versions from the history.
         by_position = osi.resolve_selection(
             db, dataclasses.replace(request, pins=osi.InputPins(selected.position)))
-        assert by_position.versions == selected.versions
+        assert by_position.references == selected.references
     # With link refresh off the pins are that capture, nothing later.
     config = fit_config(shared, 'service', object_store_refresh_links=False)
     prepared = prepare(shared, config)
     assert prepared.position.commit_sequence == head(shared)
-    assert prepared.pins.objects[walk] == selected.versions[walk]
+    assert prepared.pins.references[walk] == selected.references[walk]
 
 
 def test_a_refresh_survives_another_run_moving_the_marker(shared, monkeypatch):
@@ -114,7 +114,7 @@ def test_a_refresh_survives_another_run_moving_the_marker(shared, monkeypatch):
         return original(store, request, version)
     monkeypatch.setattr(osi, '_link_marker_at', racing)
     prepared = prepare(shared)
-    assert prepared.attempts == 1 and len(prepared.pins.objects) == len(names(shared))
+    assert prepared.attempts == 1 and len(prepared.pins.references) == len(names(shared))
     assert prepared.position.commit_sequence < moved[1] == head(shared)
     with ObjectStore.open(shared, read_only=True) as db:
         assert osi.read_link_marker(db)['commit_sequence'] == moved[1]

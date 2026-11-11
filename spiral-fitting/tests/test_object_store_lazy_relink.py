@@ -279,4 +279,4 @@ def test_a_position_overtaken_by_a_write_is_read_from_history(shared, during_rea
         snapshot = osi.read_snapshot(store, request)
         assert writes and store.history_reads > 0
     assert 'review_note' not in snapshot.objects[near].meta
-    assert snapshot.request.pins.objects == prepared.pins.objects
+    assert snapshot.request.pins.references == prepared.pins.references

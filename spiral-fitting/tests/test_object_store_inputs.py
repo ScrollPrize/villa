@@ -114,8 +114,45 @@ def test_selection_preserves_inherited_source_identity_and_manifest_pins(db):
     with pytest.raises(osi.ObjectStoreInputError, match='Cannot replay inherited relationship membership'):
         osi.read_snapshot(attachment, dataclasses.replace(request(), pins=pins))
     # Legacy same-store pins remain supported; they must not affect new captures.
-    legacy = osi.InputPins(osi.InputPosition.of_status(db.status()), {fiber: source['version']})
+    legacy = osi.InputPins.from_provenance(dict(position=osi.InputPosition.of_status(db.status()).provenance(),
+                                               objects={fiber: source['version']}))
     assert legacy.refs() == [source]
+    assert 'objects' not in vars(legacy)
+    assert 'objects' not in legacy.provenance()
+    original = dict(source)
+    # Legacy numeric pins use their recorded owner, not a later lookup.
+    ownerless = osi.InputPins.from_provenance(dict(position=dict(store=owner, generation=generation,
+                                                               commit_sequence=0), objects={fiber: 1}))
+    assert ownerless.refs() == [dict(store=owner, generation=generation, object=fiber, version=1)]
+    assert source == original
+
+
+def test_reference_only_pins_validate_boundary_and_carry_reference_unchanged(db):
+    from vc_object_store import object_reference, TransactionConflict
+    fiber = put_fiber(db, _line(), [0, 5])
+    reference = object_reference(db.object(fiber))
+    value = dict(position=osi.InputPosition.of_status(db.status()).provenance(),
+                 references={fiber: reference}, selection={'fiber': [fiber]})
+    pins = osi.InputPins.from_provenance(value)
+    assert pins.refs()[0] is pins.references[fiber]
+    assert pins.provenance()['references'] is pins.references
+    assert 'objects' not in pins.provenance()
+    assert osi.InputPins.from_provenance(pins.provenance()).refs() == [reference]
+    command = osi.link_request(db.status(), {}, author='test', read_references=pins.refs())
+    assert command['command_version'] == 2
+    assert command['expected_object_references'][0] is pins.references[fiber]
+    assert command['read_dependencies'] == {}
+    command['operations'] = []
+    db.submit(command)
+    assert object_reference(db.object(fiber)) == reference
+    wrong_owner = osi.link_request(db.status(), {}, author='test', read_references=[dict(reference, store=fiber)])
+    wrong_owner['operations'] = []
+    with pytest.raises(TransactionConflict):
+        db.submit(wrong_owner)
+    with pytest.raises(ValueError, match='inconsistent exact input reference'):
+        osi.InputPins.from_provenance(dict(value, references={VOLUME: reference}))
+    with pytest.raises(ValueError):
+        osi.InputPins.from_provenance(dict(value, references={fiber: dict(reference, version=0)}))
 
 
 def test_explicit_selectors_tags_and_empty_matches(db):

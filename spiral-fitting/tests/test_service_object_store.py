@@ -537,8 +537,9 @@ def test_the_build_reads_the_project_of_its_fit_volume(host, store_path, tmp_pat
     assert request['project'] == {
         'name': 's1', 'volume': VOLUME, 'voxel_size_um': 9.6,
         'z_direction_is_top_to_bottom': False, 'left_handed_coordinates': False,
-        'umbilicus': {'uuid': UMBILICUS['uuid'], 'generation': UMBILICUS['generation'],
-                      'version': UMBILICUS['version'], 'points': 2}}
+        'umbilicus': {'reference': dict(store=UMBILICUS['store'], object=UMBILICUS['uuid'],
+                                        generation=UMBILICUS['generation'], version=UMBILICUS['version']),
+                      'points': 2}}
     assert request['scroll']['umbilicus_coordinate_scale'] == 1.0
     assert request['paths']['volume_uuid'] == VOLUME
     assert 'dataset_root' not in request['paths']
