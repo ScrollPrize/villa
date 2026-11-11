@@ -4,6 +4,8 @@ Current reference/command contract: [one versioned reference representation](ver
 
 Selected-value consumer follow-up: [BV-01–07 implementation and validation](reference-review/bound-consumers/README.md). This consolidates loaded selected state and shared graph capture without changing schema 21 or its history/placement rules.
 
+Subsequent [API fusion and runtime legacy removal](reference-review/api-fusion.md), independently [reviewed by Astra](reference-review/api-fusion-astra.md), supersedes the earlier selected-value Mapping interface, late metadata-override transform method and acceptance of ownerless saved inputs/receipts. Current usage is in [reading](reading.md); historical reports below are not compatibility promises.
+
 Latest completed follow-up: [R4 fixes and validation](review-r4/fixes.md); previous [R3 fixes](review-r3-summary.md) and [21-finding tracker](coherent-store-fix-tasks.md). The dated review sections below retain their historical evidence.
 
 ## Open findings from review of `557a6f925`
