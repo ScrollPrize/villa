@@ -1031,14 +1031,16 @@ Use `.venv/bin/python` (or `uv run --no-sync`) afterwards: a plain `uv sync`
 or `uv run` would reinstall the CUDA build of torch and the `cuda` group.
 
 On macOS, `vc_object_store` links Homebrew's OpenCV, which links OpenBLAS, which
-loads Homebrew's `libomp.dylib`; torch loads its own copy, so `import torch,
-vc_object_store` stops with `OMP: Error #15` unless Python starts with
-`KMP_DUPLICATE_LIB_OK=TRUE`. Spiral's own modules use no OpenMP on macOS, so the
-second runtime only serves OpenBLAS calls inside OpenCV:
-
-```sh
-KMP_DUPLICATE_LIB_OK=TRUE .venv/bin/python fit_spiral.py ...
-```
+loads Homebrew's `libomp.dylib`, and torch loads its own copy. The two copies share
+symbols, and whichever loads first serves both, which crashes torch's threads when
+`vc_object_store` is imported first. So on macOS, when torch is installed,
+importing `vc_object_store` loads torch's `libomp.dylib` first, keeps the copy it
+brings itself to one thread, and sets `KMP_DUPLICATE_LIB_OK=TRUE`, without which two
+runtimes stop Python with `OMP: Error #15` (a value you set wins). torch and
+`vc_object_store` can then be imported in either order. Other wheels that bundle a
+`libomp.dylib` are not covered: pykdtree's (which `import kimimaro` loads) and torch's
+crash when both run threads in one process, whichever is imported first. Spiral's own
+modules use no OpenMP on macOS.
 
 ### Resident sparse field pools
 

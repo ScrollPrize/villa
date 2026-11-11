@@ -132,6 +132,12 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python 
   /path/to/python -m pytest vc_object_store/tests/python -q
 ```
 
+On macOS the Python module links Homebrew's OpenCV, whose OpenBLAS loads Homebrew's
+`libomp.dylib`, while torch's wheels bring their own copy. When torch is installed,
+`import vc_object_store` loads torch's copy first, keeps the copy `_native` brings to
+one thread and sets `KMP_DUPLICATE_LIB_OK=TRUE` unless it is set, so torch and
+`vc_object_store` can be imported in either order (`python/vc_object_store/__init__.py`).
+
 Older stores (schema 16–19; the runtime opens schema 20) convert with
 `vc_object_convert old.vcobj new.vcobj`, which also writes a revision mapping
 and a report beside the destination. Native directory export currently
