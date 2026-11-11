@@ -54,6 +54,23 @@ def _source_surface(path: Path, *, scale_factor: float = 1.0, history_enabled: b
 	return uid, points
 
 
+class SurfaceReferenceDispatchTest(unittest.TestCase):
+	def test_one_rule_distinguishes_vcobj_inputs_from_paths_and_artifacts(self) -> None:
+		reference = dict(store=VOLUME, generation=VOLUME, object=VOLUME, version=1)
+		for value in (reference, {"reference": reference}, {"type": "surface", "uuid": VOLUME},
+					  {"uuid": VOLUME}, f"vcobj:{VOLUME}", f"vcobj:{VOLUME}@{VOLUME}/{VOLUME}/1",
+					  {"type": "surface"}, {"object": "malformed"}):
+			with self.subTest(value=value):
+				self.assertTrue(stored_surfaces.is_surface_ref(value))
+		for value in (None, {}, "/data/surface.tifxyz", Path("surface.tifxyz"),
+					  {"path": "/data/surface.tifxyz"},
+					  {"type": "lasagna_model", "name": "model.pt", "hash": "md5:" + "0" * 32},
+					  {"type": "lasagna_model", "uuid": VOLUME, "name": "model.pt", "hash": "md5:" + "0" * 32},
+					  {"type": "atlas-base", "name": "base", "hash": "md5:" + "0" * 32}):
+			with self.subTest(value=value):
+				self.assertFalse(stored_surfaces.is_surface_ref(value))
+
+
 @unittest.skipIf(ObjectStore is None, "vc_object_store is not importable")
 class StoredSurfaceReadTest(unittest.TestCase):
 	def test_shared_reference_survives_fit_config_argument_defaults(self) -> None:
@@ -307,6 +324,8 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		with self.assertRaisesRegex(ValueError, "no Lasagna model"):
 			fit_service._body_with_resolved_job_spec({"job_spec": {
 				"model": {"type": "surface", "uuid": self.source}, "config": {}}})
+		with self.assertRaisesRegex(ValueError, f"surface {self.source} has no Lasagna model"):
+			fit_service._stored_model_path(f"vcobj:{self.source}")
 		checkpoint = Path(self._td.name) / "checkpoint.pt"
 		checkpoint.write_bytes(b"checkpoint")
 		receipt = fit_service._store.publish_artifacts(self.source, {"model.pt": checkpoint})
@@ -324,6 +343,19 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		model = Path(resolved["model_input"])
 		self.assertEqual(model.read_bytes(), b"checkpoint")
 		self.assertNotEqual(model, checkpoint)  # a cached copy of the published bytes
+		for model_ref in (reference, {"reference": reference}, {"uuid": self.source}, f"vcobj:{self.source}"):
+			with self.subTest(model_ref=model_ref):
+				resolved = fit_service._body_with_resolved_job_spec({"job_spec": {"model": model_ref, "config": {}}})
+				self.assertEqual(Path(resolved["model_input"]).read_bytes(), b"checkpoint")
+
+	def test_content_addressed_artifacts_and_path_configs_keep_their_own_route(self) -> None:
+		payload = b"content-addressed model"
+		artifact = dict(type="lasagna_model", name="model.pt", hash=fit_service._hash_bytes(payload))
+		fit_service._store_uploaded_object({"object": artifact, "data": fit_service.base64.b64encode(payload).decode("ascii")})
+		config = {"external_surfaces": [{"path": "/data/surface.tifxyz"}]}
+		resolved = fit_service._body_with_resolved_job_spec({"job_spec": {"model": artifact, "config": config}})
+		self.assertEqual(Path(resolved["model_input"]).read_bytes(), payload)
+		self.assertEqual(resolved["config"]["external_surfaces"], config["external_surfaces"])
 
 	def test_a_shared_store_is_written_through_short_lived_connections(self) -> None:
 		shared = stored_surfaces.StoreSession(self.store_path, author="service", shared=True)

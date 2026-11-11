@@ -24,8 +24,15 @@ REF_PREFIX = "vcobj:"
 
 
 def is_surface_ref(value: object) -> bool:
-	"""Dispatch structured references and external vcobj locators, not filesystem paths."""
-	return isinstance(value, dict) or isinstance(value, str) and value.startswith(REF_PREFIX)
+	"""Dispatch explicit vcobj inputs, not paths or Lasagna's type/name/hash artifacts.
+
+	This recognizes intent, not validity: the native decoder validates the
+	reference, including malformed or incomplete vcobj-shaped requests.
+	"""
+	return (isinstance(value, str) and value.startswith(REF_PREFIX)
+			or isinstance(value, dict) and (value.get("type") == "surface"
+				or "reference" in value or "object" in value
+				or "uuid" in value and "type" not in value))
 
 
 def next_free_name(store: str | Path, root: str, mode: str) -> str:

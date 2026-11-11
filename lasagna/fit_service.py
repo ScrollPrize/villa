@@ -659,24 +659,20 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
         raise
 
 
-def _is_surface_ref(ref: Any) -> bool:
-    """A stored surface: {"type": "surface", "uuid": ...}, at a numbered version with "generation" and "version"."""
-    return isinstance(ref, dict) and (ref.get("type") == "surface" or "reference" in ref or "object" in ref)
-
-
 def _require_store() -> stored_surfaces.StoreSession:
     if _store is None:
         raise ValueError("stored surface references need a service started with --store")
     return _store
 
 
-def _stored_model_path(ref: dict[str, Any]) -> Path:
+def _stored_model_path(ref: dict[str, Any] | str) -> Path:
     """The model checkpoint a fit published with a stored surface (its ``model.pt`` artifact), as a local copy in
     the service's object cache."""
     store = _require_store()
-    path = store.artifact_file(store.decode_reference(ref), "model.pt", _object_store_root() / "artifacts")
+    reference = store.decode_reference(ref)
+    path = store.artifact_file(reference, "model.pt", _object_store_root() / "artifacts")
     if path is None:
-        raise ValueError(f"surface {ref.get('uuid')} has no Lasagna model")
+        raise ValueError(f"surface {reference['object']} has no Lasagna model")
     return path
 
 
@@ -744,7 +740,7 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
     base = resolved.get("base")
     if not isinstance(base, dict) or not isinstance(base.get("ref"), dict):
         raise ValueError("atlas JSON requires base.ref")
-    base["path"] = (_require_store().decode_reference(base["ref"]) if _is_surface_ref(base["ref"])
+    base["path"] = (_require_store().decode_reference(base["ref"]) if stored_surfaces.is_surface_ref(base["ref"])
                     else str(_resolve_object_ref(base["ref"])))
 
     objects = resolved.get("objects")
@@ -1036,7 +1032,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(surface_raw, dict):
                 raise ValueError(f"job_spec.config.external_surfaces[{i}] must be an object")
             surface = dict(surface_raw)
-            if _is_surface_ref(surface):
+            if stored_surfaces.is_surface_ref(surface):
                 surface["path"] = _require_store().decode_reference(surface)
             elif all(k in surface for k in ("type", "name", "hash")):
                 surface["path"] = str(_resolve_object_ref(surface))
@@ -1054,7 +1050,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     model_object_refs: dict[str, Any] | None = None
     if model_ref not in (None, {}, ""):
         resolved_model_path = str(
-            _stored_model_path(model_ref) if _is_surface_ref(model_ref) else _resolve_object_ref(model_ref))
+            _stored_model_path(model_ref) if stored_surfaces.is_surface_ref(model_ref) else _resolve_object_ref(model_ref))
         resolved["model_input"] = resolved_model_path
         model_object_refs = _checkpoint_object_refs(resolved_model_path)
 
@@ -2478,7 +2474,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             tmp_dir = tempfile.mkdtemp(prefix="fit_vis_")
 
-            if _is_surface_ref(body.get("model")):
+            if stored_surfaces.is_surface_ref(body.get("model")):
                 model_input = str(_stored_model_path(body["model"]))
             elif model_data:
                 model_bytes = base64.b64decode(model_data)
