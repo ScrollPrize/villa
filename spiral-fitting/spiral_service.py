@@ -3532,8 +3532,7 @@ class ServiceState:
                         if checkpoint.get("model_state_sha256") == model_state_sha256
                         else None),
             base_shape_zyx=project.get("base_shape_zyx"),
-            umbilicus=({key: umbilicus[key] for key in ("reference", "legacy_source") if key in umbilicus}
-                       if umbilicus else None),
+            umbilicus=({'reference': umbilicus['reference']} if umbilicus else None),
             api_version=API_VERSION)
 
     def _require_session(self):
