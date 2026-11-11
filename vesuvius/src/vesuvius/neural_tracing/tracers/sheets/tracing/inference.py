@@ -160,6 +160,8 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
 
 def piece_starts(points: int, piece: int, stride: int) -> list:
     """First point of each piece: every ``stride`` points, the last piece ending at the last point."""
+    if piece < 3:
+        raise ValueError('a piece needs at least 3 points')
     if not 1 <= stride < piece:
         raise ValueError('the stride must be at least 1 and less than the piece length')
     if points <= piece:
@@ -342,6 +344,8 @@ def main(argv=None):
     ap.add_argument('--voxel-size', type=float, help="level-0 voxel size (um) of --volume for area_cm2 (default: "
                                                      "its meta.json voxelsize, else the checkpoint's)")
     args = ap.parse_args(argv)
+    if args.piece_points and args.piece_points < 3:
+        ap.error('--piece-points must be at least 3')
     if args.piece_points and not 1 <= args.piece_stride < args.piece_points:
         ap.error('--piece-stride must be at least 1 and less than --piece-points')
     path = resolve_checkpoint(args.checkpoint)

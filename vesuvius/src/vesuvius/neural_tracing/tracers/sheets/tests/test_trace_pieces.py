@@ -41,6 +41,8 @@ def test_piece_starts():
     for stride in (0, -1, 7):
         with pytest.raises(ValueError):
             inference.piece_starts(15, 7, stride)
+    with pytest.raises(ValueError):
+        inference.piece_starts(15, 2, 1)
 
 
 def test_short_row_is_traced_whole(monkeypatch):
