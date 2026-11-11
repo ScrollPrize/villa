@@ -2,6 +2,8 @@
 
 Frozen source: `de3afb065`, following separately committed extension decoding (`b1f242597`), shell refresh (`59910fb54`) and provenance (`75f9b7d88`) fixes. This pass is read-only for production code. Review by the existing invariant/caller contract, with separate core, consumer, root binding/facade and independent Astra lanes; no finding quotas.
 
+Subsequent status: these three findings are implemented in [the fix tracker](fixes.md), followed by [another source review](../iteration-next/README.md). The original pre-fix evidence below is retained rather than retroactively called passing.
+
 ## Confirmed remaining issues
 
 | Area | Severity | Evidence / bounded impact |
