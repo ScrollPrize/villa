@@ -942,6 +942,39 @@ _OBJECT_STORE_FROZEN_KEYS = OBJECT_STORE_PCL_KEYS | {
 }
 
 
+PATCH_SAMPLING_KEYS = frozenset({
+    'patch_sampling_area_exponent', 'patch_sampling_name_weights',
+    'patch_sampling_core_radius', 'patch_sampling_core_weight'})
+
+
+def _median_umbilicus_distance(patch, z_to_umbilicus_yx):
+    """Median distance of a patch's valid vertices from the umbilicus."""
+    zyxs = patch.zyxs.reshape(-1, 3)[patch.valid_vertex_mask.reshape(-1)]
+    zyxs = zyxs.detach().cpu().numpy().astype(np.float64)
+    if not len(zyxs):
+        return float('inf')
+    return float(np.median(np.linalg.norm(
+        zyxs[:, 1:] - z_to_umbilicus_yx(zyxs[:, 0]), axis=1)))
+
+
+def patch_sampling_factors(patches, config):
+    """Per-patch draw-weight factors from the patch name and its distance to
+    the umbilicus: the longest matching patch_sampling_name_weights prefix
+    (1 when none matches), times patch_sampling_core_weight for patches whose
+    median umbilicus distance is under patch_sampling_core_radius."""
+    names = config['patch_sampling_name_weights'] or {}
+    prefixes = sorted(names, key=len, reverse=True)
+    radius = config['patch_sampling_core_radius']
+    factors = np.ones(len(patches), dtype=np.float32)
+    for index, patch in enumerate(patches):
+        name = getattr(patch, 'name', '') or ''
+        factor = next((names[p] for p in prefixes if name.startswith(p)), 1.0)
+        if getattr(patch, '_umbilicus_distance', float('inf')) < radius:
+            factor *= config['patch_sampling_core_weight']
+        factors[index] = factor
+    return factors
+
+
 class FitContext:
     """Owner of all mutable state and resources for one spiral fit.
 
@@ -1130,6 +1163,16 @@ class FitContext:
             for patch in patches
         ], dtype=np.float32)
         weights = areas ** self.config['patch_sampling_area_exponent']
+        if self.config['patch_sampling_core_radius'] > 0:
+            z_to_yx = None
+            for patch in patches:
+                if not hasattr(patch, '_umbilicus_distance'):
+                    z_to_yx = z_to_yx or self.umbilicus_z_to_yx()
+                    patch._umbilicus_distance = _median_umbilicus_distance(
+                        patch, z_to_yx)
+        weights = weights * patch_sampling_factors(patches, self.config)
+        if not weights.sum() > 0:
+            raise ValueError('every patch has sampling weight 0')
         return weights / weights.sum()
 
     def _rebuild_pcl_sampling_strata(self):
@@ -3407,7 +3450,7 @@ class FitContext:
                     [pcl['sampling_group'] for pcl in self.cross_patch_pcls]
                     + list(self.unattached_strip_sampling_groups),
                     self.config)
-            if 'patch_sampling_area_exponent' in changed:
+            if changed & PATCH_SAMPLING_KEYS:
                 self.patch_sampling_probabilities = self._patch_sampling_probabilities(
                     self.verified_patches_list)
 

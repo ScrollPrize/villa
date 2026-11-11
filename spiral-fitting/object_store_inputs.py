@@ -1095,7 +1095,7 @@ def materialize_outer_shell(store, snapshot):
 
 
 def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
-                        erode_cells_default):
+                        erode_cells_default, exclude_uuids=()):
     """Fit-frame patches of the snapshot, keyed by UUID; and drop counts.
 
     Grid rows and columns are the stored ones: nothing is cropped or
@@ -1103,7 +1103,9 @@ def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
     vertices keep the -1 sentinel. A patch's own erosion request is
     ``meta.source.spiral_patch_erode_cells``, as in its tifxyz metadata.
     Each patch carries its loss sampling mask (``z_margin`` is the fit's
-    patch_loss_z_margin), so attachments can be checked against it.
+    patch_loss_z_margin), so attachments can be checked against it, and its
+    object name (``name``) for the name-keyed sampling weights. Patches in
+    ``exclude_uuids`` are left out like patches outside the z window.
     """
     import torch
     from spiral_helpers import (patch_intersects_z_roi, patch_sampling_quad_mask,
@@ -1111,7 +1113,11 @@ def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
     from tifxyz import Patch
 
     patches, counts = {}, Counter()
+    exclude_uuids = frozenset(exclude_uuids)
     for obj in snapshot.objects_of('surface'):
+        if obj.uuid in exclude_uuids:
+            counts['patches excluded'] += 1
+            continue
         zyxs, invalid, scale = _surface_zyxs(store, obj, 'patch')
         valid_quads = (~invalid[:-1, :-1] & ~invalid[1:, :-1]
                        & ~invalid[:-1, 1:] & ~invalid[1:, 1:])
@@ -1121,6 +1127,7 @@ def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
         erosion = (obj.meta.get('source') or {}).get('spiral_patch_erode_cells')
         patch = Patch(torch.from_numpy(zyxs), torch.tensor(scale),
                       None, None, obj.uuid, erosion)
+        patch.name = obj.name
         if not patch_intersects_z_roi(patch, z_begin, z_end):
             counts['patches outside z ROI'] += 1
             continue
@@ -1712,7 +1719,8 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end):
 
 def materialize(store, snapshot, *, z_begin, z_end, z_margin,
                 erode_cells_default, fiber_min_point_spacing=0.0,
-                overlap_pair_spacing=8.0, overlap_max_pairs=16, patch_overlaps=True):
+                overlap_pair_spacing=8.0, overlap_max_pairs=16, patch_overlaps=True,
+                exclude_patch_uuids=()):
     """Every runtime input of a frozen snapshot.
 
     Fibers are decimated to ``fiber_min_point_spacing`` (the fitter's
@@ -1723,7 +1731,7 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
     """
     patches, counts = materialize_patches(
         store, snapshot, z_begin=z_begin, z_end=z_end, z_margin=z_margin,
-        erode_cells_default=erode_cells_default)
+        erode_cells_default=erode_cells_default, exclude_uuids=exclude_patch_uuids)
     dropped = []
     point_collections, pcl_counts = materialize_point_collections(
         store, snapshot, patches, dropped=dropped)
@@ -1760,7 +1768,8 @@ def materialize_from_config(store, snapshot, config):
         fiber_min_point_spacing=config['pcl_fiber_min_point_spacing'],
         overlap_pair_spacing=config['pcl_patch_overlap_pair_spacing'],
         overlap_max_pairs=config['pcl_patch_overlap_max_pairs'],
-        patch_overlaps=bool(config['input_use_patch_overlaps']))
+        patch_overlaps=bool(config['input_use_patch_overlaps']),
+        exclude_patch_uuids=config['object_store_patch_exclude_uuids'] or ())
 
 
 @dataclasses.dataclass

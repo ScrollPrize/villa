@@ -29,6 +29,8 @@ _ENUMS = {
 
 _NULL_TYPES = {
     "pcl_sampling_weights": "dictionary",
+    "patch_sampling_name_weights": "dictionary",
+    "object_store_patch_exclude_uuids": "strings",
     "track_length_bin_weights": "vector",
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
@@ -290,6 +292,7 @@ OBJECT_STORE_INPUT_KEYS = frozenset({
     "object_store_allow_changed_inputs",
     "object_store_patch_uuids",
     "object_store_patch_tags",
+    "object_store_patch_exclude_uuids",
     "object_store_pcl_uuids",
     "object_store_pcl_tags",
     "object_store_fiber_uuids",
@@ -517,6 +520,12 @@ class Config:
         # Exponent applied to patch areas when building patch sampling
         # probabilities: 0 = uniform, 1 = proportional to area.
         self.patch_sampling_area_exponent = 0.5
+        # Draw-weight factors on top of the area weights: {patch-name prefix:
+        # factor} (longest prefix wins, 1 otherwise), times core_weight for
+        # patches whose median umbilicus distance is under core_radius.
+        self.patch_sampling_name_weights = None
+        self.patch_sampling_core_radius = 0.0
+        self.patch_sampling_core_weight = 1.0
         self.patch_erode_patches = 1
         # Rebuild-scoped supervision-source switches. A false value is a hard
         # participation gate: the source is not loaded, prepared, sampled, or
@@ -694,6 +703,9 @@ class Config:
         # listed tag (an empty list selects nothing).
         self.object_store_patch_uuids = None
         self.object_store_patch_tags = None
+        # Selected patches left out of the fit entirely (e.g. an evaluation
+        # hold-out): no draws, attachments, overlaps or trusted geometry.
+        self.object_store_patch_exclude_uuids = None
         self.object_store_pcl_uuids = None
         self.object_store_pcl_tags = None
         self.object_store_fiber_uuids = None
