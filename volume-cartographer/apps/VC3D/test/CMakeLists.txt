@@ -200,6 +200,7 @@ target_include_directories(test_spiral_point_collection_edit PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 target_link_libraries(test_spiral_point_collection_edit PRIVATE
+    vc_object_store::vc_objects
     Qt6::Core
     Qt6::Gui
     Qt6::Test

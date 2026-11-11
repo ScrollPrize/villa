@@ -40,6 +40,7 @@ import time
 from collections import Counter
 
 import numpy as np
+from vc_object_store.selected import SelectedObject, SelectedRecord
 
 KINDS = ('surface', 'point_collection', 'fiber', 'track')
 # The tag of the scroll's outer shell: a surface the fit reads on its own
@@ -329,25 +330,10 @@ def adapter_metadata(kind, meta, fiber=None, track=None):
     return read
 
 
-@dataclasses.dataclass
-class StoredObject:
-    kind: str
-    name: str
-    meta: dict
-    tags: list
-    reference: dict
-    geometry_revision: str
-    frame: ObjectFrame = None
-    fiber: dict = None
-    track: dict = None
-
-    @property
-    def uuid(self):
-        return self.reference['object']
-
-    @property
-    def version(self):
-        return self.reference['version']
+class StoredObject(SelectedObject):
+    def __init__(self, revision, frame=None):
+        super().__init__(revision)
+        self.frame = frame
 
     @property
     def metadata_sha256(self):
@@ -498,19 +484,15 @@ def resolve_selector(store, kind, selector, records=None):
     committed Spiral fits; naming any of them by UUID is an error. ``records``
     ({UUID: record} of every pinned object, retired ones included) replaces
     the store's current objects."""
-    def remember(record):
-        from vc_object_store import object_reference
-        return object_reference(record)
-
     def matching(tag=None):
         if records is not None:
-            return {uuid: remember(record) for uuid, record in records.items()
+            return {uuid: record.reference for uuid, record in records.items()
                     if record['kind'] == kind and not record.get('retired')
                     and (tag is None or tag in (record.get('tags') or ()))
                     and fit_input(record)}
         query = {} if tag is None else {'tag': tag}
-        return {record['uuid']: remember(record) for record in store.select_objects(
-            object_kind=kind, fields=['uuid', 'kind', 'meta', 'tags'], **query)
+        return {record.uuid: record.reference for record in map(SelectedRecord, store.select_objects(
+            object_kind=kind, fields=['uuid', 'kind', 'meta', 'tags'], **query))
             if fit_input(record)}
 
     if selector.is_default:
@@ -536,7 +518,7 @@ def resolve_selector(store, kind, selector, records=None):
             problems.append(f'selected {kind} {uuid} is a committed Spiral fit (tagged '
                             f'{SPIRAL_FIT_TAG}), not a fit input')
         else:
-            selected[record['uuid']] = remember(record)
+            selected[record.uuid] = record.reference
     if problems:
         raise ObjectStoreInputError(problems)
     for tag in selector.tags or ():
@@ -550,7 +532,7 @@ def current_record(store, uuid):
     revision = store.current_object_revision(uuid)
     if revision is None or revision.get('deleted'):
         return None
-    return {**revision['record'], 'version': revision['version']}
+    return SelectedObject(revision)
 
 
 def declared_coordinates(meta):
@@ -697,7 +679,7 @@ def _records_at_position(store, position):
     for revision in store.objects_at_versions(refs):
         if revision is None or revision.get('deleted'):
             continue
-        records[revision['object_uuid']] = {**revision['record'], 'version': revision['version']}
+        records[revision['object_uuid']] = SelectedObject(revision)
     return records
 
 
@@ -711,7 +693,7 @@ def _pinned_records(store, pins):
                 f'pinned object {ref["object"]} has no version {ref["version"]} in this store'])
         if revision.get('deleted'):
             continue
-        records[revision['object_uuid']] = {**revision['record'], 'version': revision['version']}
+        records[revision['object_uuid']] = SelectedObject(revision)
     return records
 
 
@@ -728,13 +710,12 @@ def _capture_current(store, request):
     between would label versions of a later commit with an earlier head,
     and the capture is repeated from the new head (CAPTURE_ATTEMPTS)."""
     for _ in range(CAPTURE_ATTEMPTS):
-        from vc_object_store import object_reference
         status = store.status()
         selected = {kind: resolve_selector(store, kind, request.selector(kind)) for kind in KINDS}
         shells = []
         if request.outer_shell != 'off':
-            for record in store.select_objects(object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid']):
-                shells.append(object_reference(record))
+            for record in map(SelectedRecord, store.select_objects(object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])):
+                shells.append(record.reference)
         after = store.status()
         if (after['generation'], after['commit_sequence']) == (status['generation'], status['commit_sequence']):
             return status, selected, shells
@@ -749,8 +730,7 @@ def _shells_among(request, records, uuid=None):
         return []
     if uuid is not None:
         records = {uuid: records[uuid]} if uuid in records else {}
-    from vc_object_store import object_reference
-    return [object_reference(record) for record in records.values()
+    return [record.reference for record in records.values()
             if outer_shell(record) and not record.get('retired')]
 
 
@@ -833,19 +813,9 @@ def read_snapshot(store, request, selected=None):
     position = selected.position
     pins = selected.pins()
     refs = pins.refs()
-    refs_by_uuid = {ref['object']: ref for ref in refs}
-    revisions = {}
-    for ref, revision in zip(refs, store.objects_at_versions(refs)):
-        if revision is None or revision.get('deleted'):
-            raise ObjectStoreInputError([
-                f'selected object {ref["object"]} is not at version {ref["version"]} of this store'])
-        revisions[revision['object_uuid']] = revision
-    inherited = any(ref['store'] != position.store for ref in refs)
-    if inherited and InputPosition.of_status(store.status()) != position:
-        raise ObjectStoreInputError(['Cannot replay inherited relationship membership after the store changed'])
-    relationships_read = store.relationships_at_versions(refs)
-    if inherited and InputPosition.of_status(store.status()) != position:
-        raise ObjectStoreInputError(['The store changed while inherited relationships were read; retry'])
+    captured = store.selected_inputs(refs, position.provenance())
+    revisions = {revision['object_uuid']: revision for revision in captured['objects']}
+    relationships_read = captured['relationships']
 
     notes, problems = [], []
     usable = []
@@ -884,12 +854,7 @@ def read_snapshot(store, request, selected=None):
             problems.append(f'{record["kind"]} {record["uuid"]} '
                             f'({record["name"]!r}): {error}')
             return None
-        return StoredObject(
-            kind=record['kind'], name=record['name'],
-            meta=record['meta'] or {}, tags=list(record.get('tags') or ()),
-            geometry_revision=revision['geometry_revision'], frame=frame,
-            fiber=record.get('fiber'), track=record.get('track'),
-            reference=refs_by_uuid[record['uuid']])
+        return StoredObject(revision, frame)
 
     objects = {}
     for revision in usable:
@@ -1266,8 +1231,7 @@ def materialize_point_collections(store, snapshot, patches, first_id=0,
                 'winding_is_absolute': absolute,
                 'input_role': 'absolute' if absolute else 'object_store',
                 'resident_collection_id': cid,
-                'object_uuid': obj.uuid,
-                'object_version': obj.version,
+                'reference': obj.reference,
                 'geometry_revision': obj.geometry_revision,
             },
         }
@@ -1413,8 +1377,7 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
             'color': [0.0, 0.0, 0.0], 'source_file': None,
             'metadata': {
                 'hv_classification': hv,
-                'object_version': obj.version,
-                'object_uuid': obj.uuid,
+                'reference': obj.reference,
                 'geometry_revision': obj.geometry_revision,
                 'fiber_num_control_points': len(controls),
             },

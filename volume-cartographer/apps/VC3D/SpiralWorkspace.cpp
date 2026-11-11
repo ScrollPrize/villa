@@ -2040,8 +2040,7 @@ void SpiralWorkspace::rebuildFitPclDocuments()
             {QStringLiteral("name"), QString::fromStdString(entry.pin.name)},
             {QStringLiteral("points"), points},
             {QStringLiteral("metadata"), QJsonObject{
-                {QStringLiteral("object_uuid"), QString::fromStdString(entry.pin.uuid)},
-                {QLatin1String(vc3d::spiral::kLocalObjectReferenceKey), QJsonDocument::fromJson(
+                {QLatin1String(vc3d::spiral::kObjectReferenceKey), QJsonDocument::fromJson(
                     QByteArray::fromStdString(vc::objects::objectVersionToJson(entry.reference))).object()},
                 {QStringLiteral("winding_is_absolute"), entry.absolute}}}};
     }

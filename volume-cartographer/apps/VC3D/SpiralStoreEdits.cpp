@@ -95,10 +95,7 @@ std::vector<SavedBrushPatch> saveBrushPatches(vc::objects::ObjectStoreSession& s
 
 std::optional<std::string> pointCollectionObject(const EditablePclDraft& draft)
 {
-    const QString uuid = draft.sourceCollection.value(QStringLiteral("metadata")).toObject()
-                             .value(QStringLiteral("object_uuid")).toString();
-    if (uuid.isEmpty() || !vc::objects::util::isUuid(uuid.toStdString())) return std::nullopt;
-    return vc::objects::util::canonicalUuid(uuid.toStdString());
+    return draft.reference ? std::optional(draft.reference->objectUuid) : std::nullopt;
 }
 
 vc::objects::AttachedCollection storedPointCollection(const EditablePclDraft& draft, const std::string& uuid,
@@ -127,11 +124,7 @@ vc::objects::AttachedCollection storedPointCollection(const EditablePclDraft& dr
 
 void setPointCollectionObject(EditablePclDraft& draft, const vc::objects::ObjectVersion& reference)
 {
-    QJsonObject metadata = draft.sourceCollection.value(QStringLiteral("metadata")).toObject();
-    metadata[QStringLiteral("object_uuid")] = QString::fromStdString(reference.objectUuid);
-    metadata[QLatin1String(kLocalObjectReferenceKey)] = QJsonDocument::fromJson(
-        QByteArray::fromStdString(vc::objects::objectVersionToJson(reference))).object();
-    draft.sourceCollection[QStringLiteral("metadata")] = metadata;
+    draft.reference = reference;
 }
 
 std::vector<SavedPointCollection> savePointCollections(vc::objects::ObjectStoreSession& session,
@@ -148,14 +141,7 @@ std::vector<SavedPointCollection> savePointCollections(vc::objects::ObjectStoreS
         const auto object = pointCollectionObject(drafts[i]);
         if (object) saved[i].uuid = *object;
         if (object) {
-            const auto value = drafts[i].sourceCollection.value(QStringLiteral("metadata")).toObject()
-                                    .value(QLatin1String(kLocalObjectReferenceKey));
-            if (!value.isObject())
-                throw refused(session, attachment, changedSince("point collection", *object), *object);
-            expected[*object] = vc::objects::objectVersionFromJson(
-                QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact).toStdString());
-            if (expected[*object].objectUuid != *object)
-                throw std::invalid_argument("point collection reference names another object");
+            expected[*object] = *drafts[i].reference;
         }
         if (drafts[i].deleted) {
             if (object) removed.push_back(*object);

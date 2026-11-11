@@ -82,12 +82,8 @@ vc::objects::AttachedCollection storedPointCollection(const EditablePclDraft& dr
                                                       const nlohmann::json& source);
 
 // The store object a draft's source collection was read from
-// (metadata.object_uuid of the fit's point-collection documents), if any.
+// (the reference retained when its document was loaded), if any.
 std::optional<std::string> pointCollectionObject(const EditablePclDraft& draft);
-
-// The key of the object version (in the attached store) a fit
-// point-collection document was read at: what an edit of it starts from.
-inline constexpr const char* kLocalObjectReferenceKey = "local_object_reference";
 
 // Name the store object (and the version of it) a draft edits: a new
 // collection saved once is replaced, not created again, by its next save.
@@ -102,7 +98,7 @@ using SavedPointCollection = SavedBrushPatch;
 // store's writeVolumeCollections in the fit volume's voxels): replaced
 // collections keep their identity and their points' ids, new ones are
 // created, deleted ones retired. A replaced or deleted collection is expected
-// at the full identity its draft was read at (metadata.local_object_reference): when
+// at the full typed identity its draft was read at: when
 // another editor changed or retired it since, the commit is refused
 // (StoreObjectChanged) instead of overwriting their edit. Returns one result
 // per draft, in order.

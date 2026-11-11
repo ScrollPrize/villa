@@ -33,9 +33,9 @@ QJsonDocument fitDocument(const QString& objectUuid, bool absolute, const Object
                                                   {QStringLiteral("wind_a"), wind},
                                                   {QStringLiteral("creation_time"), 0}};
     QJsonObject metadata{{QStringLiteral("winding_is_absolute"), absolute}};
-    if (!objectUuid.isEmpty()) metadata[QStringLiteral("object_uuid")] = objectUuid;
+    if (!objectUuid.isEmpty() && reference.version == 0) metadata[QStringLiteral("object_uuid")] = objectUuid;
     if (reference.version != 0)
-        metadata[QLatin1String(vc3d::spiral::kLocalObjectReferenceKey)] = QJsonDocument::fromJson(
+        metadata[QLatin1String(vc3d::spiral::kObjectReferenceKey)] = QJsonDocument::fromJson(
             QByteArray::fromStdString(objectVersionsRequestToJson({reference}))).object()["versions"].toArray().first();
     return QJsonDocument(QJsonObject{
         {QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
@@ -147,13 +147,9 @@ private slots:
         QVERIFY(read(uuid)["ids"] == Json({10, 20, 30, 31}));
         // A save whose version could not be read back (the store detached
         // after its commit) is refused with the current one, not duplicated.
-        fresh.front().sourceCollection["metadata"] = QJsonObject{{"object_uuid", QString::fromStdString(uuid)}};
-        try {
-            vc3d::spiral::savePointCollections(session, attachment, kVolume, fresh);
-            QFAIL("a save from an unknown version was not refused");
-        } catch (const vc3d::spiral::StoreObjectChanged& changed) {
-            QVERIFY(changed.uuid == uuid && changed.current == again.front().reference);
-        }
+        QVERIFY_EXCEPTION_THROWN(vc3d::spiral::importEditablePcls(
+            fitDocument(QString::fromStdString(uuid), true), 1.0, {}, true,
+            vc3d::spiral::PclRole::Relative), std::invalid_argument);
         std::size_t collections = 0;
         readStore(session, attachment, [&](const StoreReader& reader) {
             ObjectSelection selection; selection.kind = "point_collection";

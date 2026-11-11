@@ -4,7 +4,7 @@ The store's ``vc_object_store.surfaces`` does the reading (in a volume's voxels,
 writing; this adapts its xyz grids to ``tifxyz.Surface`` and zyx arrays.
 """
 import numpy as np
-from vc_object_store import object_reference, surfaces
+from vc_object_store import surfaces
 from vc_reader import tifxyz
 
 
@@ -18,7 +18,7 @@ def read_surface(path, surface_uuid, *, volume, version=None, generation=None, r
     grid = surfaces.read_surface(path, surface_uuid, volume=volume, version=version, generation=generation,
                                  reference=reference)
     extra = dict(grid.record['meta'])
-    extra['store_version'] = object_reference(grid.record)
+    extra['store_version'] = grid.reference
     return tifxyz.Surface(grid.points, mask=grid.valid, scale=tuple(grid.scale), uuid=surface_uuid, extra=extra)
 
 

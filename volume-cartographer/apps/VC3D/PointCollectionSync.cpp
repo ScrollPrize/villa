@@ -106,19 +106,22 @@ bool PointCollectionSync::flush()
         vc::objects::RecordSelection expected;
         std::vector<vc::objects::ObjectVersion> references;
         for (auto& collection : changed) {
-            const auto found = revisions_.find(collection.uuid);
-            if (found != revisions_.end()) collection.reference = found->second;
-            else expected[collection.uuid] = std::nullopt;
-            if (const auto mapping = mappings_.find(collection.uuid); mapping != mappings_.end())
-                collection.mapping = mapping->second;
+            const auto found = selected_.find(collection.uuid);
+            if (found != selected_.end()) {
+                collection.reference = found->second.reference;
+                collection.mapping = found->second.mapping;
+            } else expected[collection.uuid] = std::nullopt;
         }
         for (const auto& uuid : removed)
-            if (const auto found = revisions_.find(uuid); found != revisions_.end()) references.push_back(found->second);
+            if (const auto found = selected_.find(uuid); found != selected_.end()) references.push_back(found->second.reference.value());
             else expected[uuid] = std::nullopt;
         const auto receipt = vc::objects::writeVolumeCollections(*state_->objectStoreSession(), *attachment_, volume_,
                                                                  changed, removed, expected, references);
-        for (const auto& uuid : removed) { revisions_.erase(uuid); mappings_.erase(uuid); }
-        for (const auto& collection : changed) revisions_[collection.uuid] = receipt.objectReference(collection.uuid).value();
+        for (const auto& uuid : removed) selected_.erase(uuid);
+        for (auto& collection : changed) {
+            collection.reference = receipt.objectReference(collection.uuid).value();
+            selected_[collection.uuid] = std::move(collection);
+        }
         changed_.clear();
         removed_.clear();
         return true;
@@ -134,6 +137,7 @@ void PointCollectionSync::unload()
     attachment_.reset();
     volume_ = {};
     uuids_.clear();
+    selected_.clear();
     installing_ = true;
     state_->pointCollection()->replaceUnanchoredCollections({});
     installing_ = false;
@@ -173,11 +177,10 @@ void PointCollectionSync::reload()
             uuids_[id] = collection.uuid;
             ids[collection.uuid] = id;
         }
-    revisions_.clear();
-    mappings_.clear();
-    for (const auto& collection : stored) {
-        revisions_[collection.uuid] = collection.reference.value();
-        if (collection.mapping) mappings_[collection.uuid] = *collection.mapping;
+    selected_.clear();
+    for (auto& collection : stored) {
+        const auto uuid = collection.uuid;
+        selected_[uuid] = std::move(collection);
     }
     for (const auto& [uuid, others] : linked) {
         std::vector<uint64_t> otherIds;
@@ -211,9 +214,9 @@ void PointCollectionSync::onStoreEvent(const vc::objects::StoreSessionEvent& eve
     state_->objectStoreSession()->readStore(*attachment_, [&](const vc::objects::StoreReader& reader, const auto&) {
         for (const auto& uuid : touched) {
             const auto head = reader.currentObject(uuid);
-            const auto known = revisions_.find(uuid);
-            if (head.has_value() != (known != revisions_.end()) ||
-                (head && known->second != head->reference()))
+            const auto known = selected_.find(uuid);
+            if (head.has_value() != (known != selected_.end()) ||
+                (head && known->second.reference != head->reference()))
                 external = true;
         }
     });

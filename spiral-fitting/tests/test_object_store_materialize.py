@@ -169,7 +169,7 @@ def test_absolute_role_comes_from_metadata_not_names(db):
     edges = {uid: pcl_patch_edge(db, uid, 0, patch, (1.0, 1.0))
              for uid in (absolute, relative, unannotated)}
     inputs = materialize(db)
-    by_uuid = {pcl['metadata']['object_uuid']: pcl
+    by_uuid = {pcl['metadata']['reference']['object']: pcl
                for pcl in inputs.point_collections.values()}
     assert by_uuid[absolute]['metadata']['winding_is_absolute']
     assert by_uuid[absolute]['sampling_group'] == osi.ABSOLUTE_PCL_GROUP

@@ -169,7 +169,7 @@ def test_materialization_errors_and_stale_geometry_are_reported(db):
                               if rel.uuid == edge['uuid']]
     patches, _ = osi.materialize_patches(
         db, snapshot, z_begin=0, z_end=64, z_margin=0, erode_cells_default=1)
-    snapshot.objects[b].geometry_revision = '00000000-0000-4000-8000-0000000000aa'
+    snapshot.objects[b].revision['geometry_revision'] = '00000000-0000-4000-8000-0000000000aa'
     with pytest.raises(osi.ObjectStoreInputError, match="other than the snapshot's"):
         osi.materialize_patch_overlaps(db, snapshot, patches, pair_spacing=8.0,
                                        max_pairs=16)

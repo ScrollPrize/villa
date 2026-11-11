@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <QObject>
@@ -56,8 +57,7 @@ private:
     std::set<uint64_t> changed_;
     std::set<std::string> removed_;
     // The complete version loaded or returned by a checked save.
-    std::map<std::string, vc::objects::ObjectVersion> revisions_;
-    std::map<std::string, vc::objects::CheckVolumeMappingOp> mappings_;
+    std::map<std::string, vc::objects::AttachedCollection> selected_;
     // Installing from the store: the collection's change hooks are not edits.
     bool installing_ = false;
 };

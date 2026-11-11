@@ -111,24 +111,29 @@ class StoredSurface:
 	meta: the record meta plus ``uuid``, ``name`` and the grid
 	``scale``; reference is the unchanged shared selected identity; channel(name) reads a per-vertex channel (None when absent)."""
 
-	def __init__(self, store, reference, grid):
+	def __init__(self, store, grid):
 		self._store = store
-		self.uuid = reference["object"]
-		self.reference = reference
-		self._geometry = grid.geometry_revision
+		self._grid = grid
 		self.xyz = grid.points
 		self.valid = grid.valid
-		self._channels = grid.channels
 		record = grid.record
 		self.meta = {**(record.get("meta") or {}), "uuid": self.uuid, "name": record.get("name") or self.uuid,
 					 "scale": list(grid.scale)}
 
+	@property
+	def reference(self):
+		return self._grid.reference
+
+	@property
+	def uuid(self):
+		return self.reference["object"]
+
 	def channel(self, name: str) -> np.ndarray | None:
-		if name not in self._channels:
+		if name not in self._grid.channels:
 			return None
 		from vc_object_store.locations import attached
 		with attached(self._store, read_only=True) as (session, attachment):
-			return np.array(session.read_geometry_arrays(attachment, [self._geometry], name).values)
+			return np.array(session.read_geometry_arrays(attachment, [self._grid.geometry_revision], name).values)
 
 
 def read_surface(store: str | Path, ref: dict | str, *, volume: str | None, target_scale: float = 1.0) -> StoredSurface:
@@ -143,4 +148,4 @@ def read_surface(store: str | Path, ref: dict | str, *, volume: str | None, targ
 		# locators and external legacy selectors need the shared decoder.
 		reference = ref if isinstance(ref, dict) and "object" in ref else session.decode_object_reference(attachment, ref)
 		grid = session.read_surface_grid(attachment, reference["object"], str(volume), float(target_scale), reference=reference)
-	return StoredSurface(store, reference, surface_grid(grid))
+	return StoredSurface(store, surface_grid(grid))

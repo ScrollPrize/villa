@@ -762,8 +762,8 @@ void FiberCollectionController::navigate(int index)
                 // The fiber's point in the volume's voxels, through the store's mapping.
                 const auto selected=reader.selectedObject(pin.reference().objectUuid, {}, {}, pin.reference());
                 if (!selected || !selected->geometryRevision) throw std::runtime_error("Selected fiber is no longer retained");
-                const auto fiber=vc::objects::GeometrySnapshot(reader).fiber(pin.reference().objectUuid, *selected->geometryRevision);
-                const auto shown=fiber.viewTransformedAt(*selected,volume.volume,volume.scale);
+                const auto fiber=vc::objects::GeometrySnapshot(reader).fiber(*selected);
+                const auto shown=fiber.viewTransformedAt(volume.volume,volume.scale);
                 const auto name=fiber.linePointCount()>0 ? "line_points" : "control_points";
                 point=shown.points(name,index,1).front();
             });return point;
