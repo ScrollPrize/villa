@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
 import tempfile
 import unittest
@@ -55,6 +56,16 @@ def _source_surface(path: Path, *, scale_factor: float = 1.0, history_enabled: b
 
 @unittest.skipIf(ObjectStore is None, "vc_object_store is not importable")
 class StoredSurfaceReadTest(unittest.TestCase):
+	def test_shared_reference_survives_fit_config_argument_defaults(self) -> None:
+		import fit
+		import cli_json
+		ref = dict(store=VOLUME, generation=VOLUME, object=VOLUME, version=1)
+		for option in ("tifxyz-init", "approval-inpaint-tifxyz"):
+			with tempfile.TemporaryDirectory() as td:
+				config = Path(td) / "fit.json"
+				config.write_text(json.dumps(dict(args={option: ref})))
+				parsed = cli_json.parse_args(fit._build_parser(), [str(config)])
+				self.assertEqual(getattr(parsed, option.replace("-", "_")), ref)
 	def test_transformed_validity_survives_all_fit_loaders_and_scaling(self) -> None:
 		for history in (False, True):
 			with self.subTest(history=history), tempfile.TemporaryDirectory() as td:
@@ -62,9 +73,9 @@ class StoredSurfaceReadTest(unittest.TestCase):
 				uid, points = _source_surface(store, history_enabled=history)
 				with ObjectStore.open(str(store), author="test") as db:
 					db.register_volume_transform(VOLUME, "target", [[1, 0, 0, -11], [0, 1, 0, 0], [0, 0, 1, 0]])
-				current_ref = stored_surfaces.surface_ref(uid)
+				current_ref = f"vcobj:{uid}"
 				first = stored_surfaces.read_surface(store, current_ref, volume="target")
-				refs = [current_ref, stored_surfaces.surface_ref(uid, first.version)]
+				refs = [current_ref, first.reference]
 				if history:
 					with ObjectStore.open(str(store), author="test") as db:
 						record = db.object(uid)
@@ -90,7 +101,7 @@ class StoredSurfaceReadTest(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as td:
 			store = Path(td) / "objects.vcobj"
 			uid, points = _source_surface(store, scale_factor=2.0)
-			ref = stored_surfaces.surface_ref(uid)
+			ref = f"vcobj:{uid}"
 			xyz, valid, meta = tifxyz_io.load_tifxyz(ref, store=store, volume=VOLUME)
 			self.assertEqual(tuple(xyz.shape), (5, 6, 3))
 			self.assertFalse(bool(valid[0, 0]) or bool(valid[4, 5]))
@@ -120,7 +131,7 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			xyz[0, 0] = (5, -1, 30)
 			xyz[0, 1] = (6, 7, 0)
 			uid = create_surface(store, xyz, name="s", scale=1.0, volume=VOLUME, tool="test")
-			surface = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
+			surface = stored_surfaces.read_surface(store, f"vcobj:{uid}", volume=VOLUME)
 			self.assertEqual(surface.xyz[0, 0].tolist(), [-1.0, -1.0, -1.0])
 			self.assertEqual(surface.xyz[0, 1].tolist(), [-1.0, -1.0, -1.0])
 
@@ -130,31 +141,30 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			ObjectStore.create(str(store), author="test").close()
 			xyz = np.full((2, 2, 3), 30.0, "<f4")
 			uid = create_surface(store, xyz, name="s", scale=1.0, volume=VOLUME, tool="test")
-			first = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
+			first = stored_surfaces.read_surface(store, f"vcobj:{uid}", volume=VOLUME)
 			with ObjectStore.open(str(store), author="test") as db:
 				with db.write(expected_versions={uid: 1}) as tx:
 					tx.put_geometry(uid, Surface.from_arrays(np.ascontiguousarray(xyz + 1), [1.0, 1.0]),
 									expected_version=1)
-			ref = stored_surfaces.surface_ref(uid, first.version)
-			self.assertEqual(stored_surfaces.parse_surface_ref(ref), (uid, first.version))
-			self.assertEqual(first.version[1], 1)
-			self.assertEqual(len(first.version), 3)
-			legacy = stored_surfaces.surface_ref(uid, first.version[:2])
+			ref = first.reference
+			self.assertEqual(ref["version"], 1)
+			self.assertEqual(set(ref), {"store", "generation", "object", "version"})
+			legacy = f"vcobj:{uid}@{ref['generation']}/01"
 			np.testing.assert_array_equal(stored_surfaces.read_surface(store, legacy, volume=VOLUME).xyz, xyz)
 			older = stored_surfaces.read_surface(store, ref, volume=VOLUME)
-			current = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
-			self.assertEqual((older.version, current.version[1]), (first.version, 2))
+			current = stored_surfaces.read_surface(store, f"vcobj:{uid}", volume=VOLUME)
+			self.assertEqual((older.reference, current.reference["version"]), (first.reference, 2))
 			np.testing.assert_array_equal(older.xyz, xyz)
 			np.testing.assert_array_equal(current.xyz, xyz + 1)
 			for bad in (f"vcobj:{uid}@r1", f"vcobj:{uid}@g/0", f"vcobj:{uid}@/3"):
-				with self.assertRaisesRegex(ValueError, "generation"):
-					stored_surfaces.parse_surface_ref(bad)
+				with self.assertRaises(ValueError):
+					stored_surfaces.read_surface(store, bad, volume=VOLUME)
 
 	def test_approval_surface_scales_in_memory(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
 			store = Path(td) / "objects.vcobj"
 			uid, points = _source_surface(store)
-			surface = approval_inpaint.load_approval_surface(stored_surfaces.surface_ref(uid), store=store, volume=VOLUME)
+			surface = approval_inpaint.load_approval_surface(f"vcobj:{uid}", store=store, volume=VOLUME)
 			scaled = surface.scaled(2.0, base_shape_zyx=(8, 8, 8))
 			np.testing.assert_allclose(scaled.xyz[1, 1], points[1, 1] * 2)
 			self.assertTrue(np.all(scaled.xyz[0, 0] == -1.0))
@@ -227,8 +237,9 @@ class StoredExportTest(unittest.TestCase):
 			session = stored_surfaces.StoreSession(store, author="test", shared=True)
 			try:
 				cache = root / "artifact-cache"
-				self.assertEqual(session.artifact_file(surface_uuid, "model.pt", cache).read_bytes(), ckpt.read_bytes())
-				self.assertTrue(session.artifact_file(surface_uuid, "model_params.json", cache).is_file())
+				ref = session.decode_reference(dict(uuid=surface_uuid))
+				self.assertEqual(session.artifact_file(ref, "model.pt", cache).read_bytes(), ckpt.read_bytes())
+				self.assertTrue(session.artifact_file(ref, "model_params.json", cache).is_file())
 			finally:
 				session.close()
 			self.assertFalse(Path(str(store) + ".artifacts", surface_uuid).exists())
@@ -300,11 +311,12 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		checkpoint.write_bytes(b"checkpoint")
 		receipt = fit_service._store.publish_artifacts(self.source, {"model.pt": checkpoint})
 		self.assertEqual(len(receipt["objects"]), 1)
+		reference = fit_service._store.decode_reference(dict(uuid=self.source))
 		resolved = fit_service._body_with_resolved_job_spec({"job_spec": {
 			"model": {"type": "surface", "uuid": self.source},
-			"config": {"external_surfaces": [{"type": "surface", "uuid": self.source, "generation": "g1", "version": 2}]},
+			"config": {"external_surfaces": [{"type": "surface", "reference": reference}]},
 		}})
-		self.assertEqual(resolved["config"]["external_surfaces"][0]["path"], f"vcobj:{self.source}@g1/2")
+		self.assertEqual(resolved["config"]["external_surfaces"][0]["path"], reference)
 		with self.assertRaisesRegex(ValueError, "numbered version"):
 			fit_service._body_with_resolved_job_spec({"job_spec": {
 				"model": {"type": "surface", "uuid": self.source},
@@ -320,7 +332,8 @@ class ServiceStoreRequestTest(unittest.TestCase):
 			checkpoint = Path(self._td.name) / "shared.pt"
 			checkpoint.write_bytes(b"shared")
 			shared.publish_artifacts(self.source, {"model.pt": checkpoint})  # read-only session, written anyway
-			cached = fit_service._store.artifact_file(self.source, "model.pt", Path(self._td.name) / "cache")
+			ref = fit_service._store.decode_reference(dict(uuid=self.source))
+			cached = fit_service._store.artifact_file(ref, "model.pt", Path(self._td.name) / "cache")
 			self.assertEqual(cached.read_bytes(), b"shared")
 			created = create_surface(
 				shared.location, np.zeros((2, 2, 3), np.float32), name="written", scale=1.0, volume=VOLUME, tool="test")
@@ -375,7 +388,7 @@ class HostedStoreTest(unittest.TestCase):
 		self._td.cleanup()
 
 	def test_fit_reads_and_export_writes_through_the_endpoint(self) -> None:
-		ref = stored_surfaces.surface_ref(self.source)
+		ref = f"vcobj:{self.source}"
 		xyz, valid, meta = tifxyz_io.load_tifxyz(ref, store=self.endpoint, volume=VOLUME)
 		np.testing.assert_allclose(xyz[1, 1].numpy(), self.points[1, 1])
 		self.assertFalse(bool(valid[0, 0]))

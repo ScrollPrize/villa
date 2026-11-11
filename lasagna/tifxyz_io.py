@@ -69,11 +69,11 @@ def load_tifxyz(path: str | Path, *, device: torch.device | str = "cpu",
 	  meta: dict from meta.json (or empty if missing); for a stored surface its record meta with
 	    uuid, name and the grid scale
 	"""
-	from stored_surfaces import parse_surface_ref, read_surface
-	if parse_surface_ref(path) is not None:
+	from stored_surfaces import is_surface_ref, read_surface
+	if is_surface_ref(path):
 		if store is None:
 			raise ValueError(f"stored surface {path} needs a store")
-		stored = read_surface(store, str(path), volume=volume, target_scale=target_scale)
+		stored = read_surface(store, path, volume=volume, target_scale=target_scale)
 		xyz = stored.xyz
 		valid = stored.valid
 		meta = stored.meta

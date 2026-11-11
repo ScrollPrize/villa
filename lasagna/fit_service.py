@@ -661,7 +661,7 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
 
 def _is_surface_ref(ref: Any) -> bool:
     """A stored surface: {"type": "surface", "uuid": ...}, at a numbered version with "generation" and "version"."""
-    return isinstance(ref, dict) and ref.get("type") == "surface"
+    return isinstance(ref, dict) and (ref.get("type") == "surface" or "reference" in ref or "object" in ref)
 
 
 def _require_store() -> stored_surfaces.StoreSession:
@@ -670,30 +670,11 @@ def _require_store() -> stored_surfaces.StoreSession:
     return _store
 
 
-def _stored_surface_version(ref: dict[str, Any]) -> tuple | None:
-    """Keep the same selected identity for a surface and its model checkpoint."""
-    if "revision" in ref:
-        raise ValueError("stored surface references select a numbered version (generation and version), not a revision")
-    version = ref.get("version")
-    if version is None:
-        return None
-    selected = (str(ref.get("generation") or ""), int(version))
-    if ref.get("store"):
-        selected += (str(ref["store"]),)
-    return selected
-
-
-def _stored_surface_path(ref: dict[str, Any]) -> str:
-    """The fit's reference to a stored surface (read from the service store)."""
-    _require_store()
-    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), _stored_surface_version(ref))
-
-
 def _stored_model_path(ref: dict[str, Any]) -> Path:
     """The model checkpoint a fit published with a stored surface (its ``model.pt`` artifact), as a local copy in
     the service's object cache."""
-    path = _require_store().artifact_file(str(ref.get("uuid") or ""), "model.pt", _object_store_root() / "artifacts",
-                                         version=_stored_surface_version(ref))
+    store = _require_store()
+    path = store.artifact_file(store.decode_reference(ref), "model.pt", _object_store_root() / "artifacts")
     if path is None:
         raise ValueError(f"surface {ref.get('uuid')} has no Lasagna model")
     return path
@@ -763,7 +744,7 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
     base = resolved.get("base")
     if not isinstance(base, dict) or not isinstance(base.get("ref"), dict):
         raise ValueError("atlas JSON requires base.ref")
-    base["path"] = (_stored_surface_path(base["ref"]) if _is_surface_ref(base["ref"])
+    base["path"] = (_require_store().decode_reference(base["ref"]) if _is_surface_ref(base["ref"])
                     else str(_resolve_object_ref(base["ref"])))
 
     objects = resolved.get("objects")
@@ -961,7 +942,7 @@ def _set_snap_surf_map_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
                     map_args["debug_obj_dir"] = out_dir
 
 
-def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str:
+def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str | dict:
     external_surfaces = cfg.get("external_surfaces")
     if not isinstance(external_surfaces, list) or len(external_surfaces) != 1:
         count = len(external_surfaces) if isinstance(external_surfaces, list) else 0
@@ -969,7 +950,7 @@ def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str:
     surface = external_surfaces[0]
     if not isinstance(surface, dict) or not surface.get("path"):
         raise ValueError(f"{consumer} external_surfaces[0] requires path")
-    return str(surface["path"])
+    return surface["path"]
 
 
 def _wire_external_surface_for_request(
@@ -1056,7 +1037,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"job_spec.config.external_surfaces[{i}] must be an object")
             surface = dict(surface_raw)
             if _is_surface_ref(surface):
-                surface["path"] = _stored_surface_path(surface)
+                surface["path"] = _require_store().decode_reference(surface)
             elif all(k in surface for k in ("type", "name", "hash")):
                 surface["path"] = str(_resolve_object_ref(surface))
             external_surfaces.append(surface)
