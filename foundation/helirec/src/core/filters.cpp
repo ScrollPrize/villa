@@ -6,10 +6,13 @@
 #include <atomic>
 #include <cmath>
 #include <complex>
+#include <fstream>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <vector>
+
+#include "../io/json.hpp"
 
 namespace helirec {
 
@@ -493,6 +496,164 @@ class MtfPaganin final : public ProjectionFilter {
     mutable int dmargin_ = -1;
 };
 
+// ------------------------------------------------------------------ wiener
+// The minimum-error linear estimate of the object from measured tables, in place of paganin + unsharp or mtf_paganin.
+// A recorded frame is the object's projection through the system's transfer T (detector blur x phase contrast x
+// whatever the gridding does), plus noise; with S the signal-to-noise power ratio of the recording the estimate is
+//     W = (1 / T) g,   g = S / (S + weight)           (weight 1: the Wiener filter)
+// so the output shows the object through g: all of it where the data carry it, none where they do not. T and S are
+// tables over the frequency magnitude nu (cycles per pixel) and, optionally, the frequency's angle theta from the
+// row axis (degrees: 0 = along the rows of a frame, the scan's z; 90 = along the columns), read from a JSON file:
+//     {"nu": [...], "theta": [...], "transfer": [[per theta] per nu], "snr": [[...]]}     ("theta" absent: radial,
+//     "transfer": [per nu]). Linear between entries (give smooth, finely sampled tables: a kink is a long kernel);
+//     below the first nu towards T = 1, g = 1 at nu = 0, as nu^2; held beyond the last nu and outside the thetas.
+//     Several snr tables may be kept in one file (snr=NAME picks one).
+// A filter of the frames that depends on (nu, theta) only is a filter of the volume that is symmetric about z, at
+// the same frequencies: the tables can be measured in either (evaluation/wiener_table.py).
+// target > 0: g x the MTF of a Gaussian of `target` pixels (a gentler cut-off: less ringing at edges).
+// Like paganin's, the kernel is fixed: computed on its own grid, truncated to [-m, m] rows, unit sum.
+class Wiener final : public ProjectionFilter {
+  public:
+    explicit Wiener(const FilterParams& p) : weight_(p.num("weight", 1)), target_(p.num("target", 0)) {
+        if (!(weight_ >= 0)) throw Error("wiener: weight must be >= 0");
+        if (!(target_ >= 0)) throw Error("wiener: target must be >= 0");
+        const std::string path = p.str("table", ""), snr_name = p.str("snr", "snr");
+        if (path.empty()) throw Error("wiener: table=FILE (JSON: nu, [theta,] transfer, snr) is required");
+        std::ifstream in(path);
+        if (!in) throw Error("wiener: cannot read the table '" + path + "'");
+        std::stringstream text;
+        text << in.rdbuf();
+        const Json j = Json::parse(text.str());
+        const auto numbers = [&](const Json* a, const std::string& what) {
+            if (!a || !a->is(Json::Array)) throw Error("wiener: '" + what + "' (an array) is missing in " + path);
+            std::vector<double> v;
+            for (const auto& e : a->array) {
+                if (!e.is(Json::Number)) throw Error("wiener: '" + what + "' must hold numbers");
+                v.push_back(e.number);
+            }
+            return v;
+        };
+        nu_ = numbers(j.find("nu"), "nu");
+        if (j.find("theta")) theta_ = numbers(j.find("theta"), "theta");
+        const std::size_t nn = nu_.size(), nt = theta_.empty() ? 1 : theta_.size();
+        if (nn == 0) throw Error("wiener: empty table");
+        for (std::size_t i = 0; i < nn; ++i)
+            if (!(nu_[i] > 0) || (i && nu_[i] <= nu_[i - 1])) throw Error("wiener: nu must be > 0 and increasing");
+        for (std::size_t i = 0; i < theta_.size(); ++i)
+            if (!(theta_[i] >= 0 && theta_[i] <= 90) || (i && theta_[i] <= theta_[i - 1]))
+                throw Error("wiener: theta must be within 0..90 degrees and increasing");
+        const auto grid = [&](const std::string& what) {
+            const Json* a = j.find(what);
+            if (!a || !a->is(Json::Array) || a->array.size() != nn)
+                throw Error("wiener: '" + what + "' needs one entry per nu in " + path);
+            std::vector<double> v;
+            for (const auto& row : a->array) {
+                if (theta_.empty() && row.is(Json::Number)) { v.push_back(row.number); continue; }
+                const auto r = numbers(&row, what);
+                if (r.size() != nt) throw Error("wiener: '" + what + "' needs one value per theta at every nu");
+                v.insert(v.end(), r.begin(), r.end());
+            }
+            return v;
+        };
+        transfer_ = grid("transfer");
+        const auto snr = grid(snr_name);
+        gain_.resize(snr.size());
+        for (std::size_t k = 0; k < snr.size(); ++k) {
+            if (!(transfer_[k] > 0)) throw Error("wiener: the transfer must be > 0");
+            if (!(snr[k] >= 0)) throw Error("wiener: the snr must be >= 0");
+            gain_[k] = snr[k] + weight_ > 0 ? snr[k] / (snr[k] + weight_) : 1.0;
+        }
+    }
+    bool fourier() const override { return true; }
+    // W at the frequency (f0 along the rows, f1 along the columns), cycles per pixel
+    double response_at(double f0, double f1) const {
+        const double nu = std::hypot(f0, f1);
+        if (nu <= 0) return 1.0;
+        const std::size_t nt = theta_.empty() ? 1 : theta_.size();
+        // theta: two columns of the tables and their weights
+        std::size_t t0 = 0, t1 = 0;
+        double wt = 0;
+        if (nt > 1) {
+            const double th = std::atan2(std::abs(f1), std::abs(f0)) * 180.0 / M_PI;
+            if (th >= theta_.back()) t0 = t1 = nt - 1;
+            else if (th > theta_.front()) {
+                t1 = static_cast<std::size_t>(std::upper_bound(theta_.begin(), theta_.end(), th) - theta_.begin());
+                t0 = t1 - 1;
+                wt = (th - theta_[t0]) / (theta_[t1] - theta_[t0]);
+            }
+        }
+        const auto at = [&](const std::vector<double>& v, std::size_t i) { return v[i * nt + t0] * (1 - wt) + v[i * nt + t1] * wt; };
+        double T, g;
+        if (nu >= nu_.back()) {
+            T = at(transfer_, nu_.size() - 1);
+            g = at(gain_, nu_.size() - 1);
+        } else if (nu < nu_.front()) {
+            const double w = (nu / nu_.front()) * (nu / nu_.front());   // even in nu: no cusp at 0 (a long kernel)
+            T = 1 + (at(transfer_, 0) - 1) * w;
+            g = 1 + (at(gain_, 0) - 1) * w;
+        } else {
+            const std::size_t i1 = static_cast<std::size_t>(std::upper_bound(nu_.begin(), nu_.end(), nu) - nu_.begin());
+            const double w = (nu - nu_[i1 - 1]) / (nu_[i1] - nu_[i1 - 1]);
+            T = at(transfer_, i1 - 1) * (1 - w) + at(transfer_, i1) * w;
+            g = at(gain_, i1 - 1) * (1 - w) + at(gain_, i1) * w;
+        }
+        if (target_ > 0) g *= std::exp(-2 * M_PI * M_PI * target_ * target_ * nu * nu);
+        return g / T;
+    }
+    std::vector<cplx> response(int n0, int n1) const {
+        std::vector<cplx> R(static_cast<std::size_t>(n0) * n1);
+        for (int i = 0; i < n0; ++i) {
+            const double f0 = static_cast<double>(signed_index(i, n0)) / n0;
+            for (int j = 0; j < n1; ++j)
+                R[static_cast<std::size_t>(i) * n1 + j] = response_at(f0, static_cast<double>(signed_index(j, n1)) / n1);
+        }
+        return R;
+    }
+    // Rows of context. At a frequency f1 along the columns the kernel's profile over the rows is the transform of
+    // W(., f1); m is where what is left of every such profile beyond +-m rows (in absolute value; six f1 from 0 to
+    // Nyquist) falls below 2 % of the largest profile's sum, at most 64 rows. For a Paganin-like response that is
+    // Paganin's own margin; where W does not vanish at the rows' Nyquist frequency the kernel has a slow alternating
+    // tail, and the truncation leaves the response within about 2 % of its largest value near that frequency
+    // (exact to a fraction of a percent below 0.1 cycles per pixel).
+    int margin_rows() const override {
+        if (margin_ >= 0) return margin_;
+        const int n = 1024, lines = 6;
+        std::vector<std::vector<double>> prof(lines, std::vector<double>(n));
+        std::vector<double> w(n);
+        double largest = 0;
+        for (int line = 0; line < lines; ++line) {
+            for (int i = 0; i < n; ++i) w[i] = response_at(static_cast<double>(signed_index(i, n)) / n, 0.1 * line);
+            const auto k = dft1(w);                   // (W is even in f0: the forward transform is the kernel x n)
+            double total = 0;
+            for (int r = 0; r < n; ++r) total += prof[line][r] = std::abs(k[r].real());
+            largest = std::max(largest, total);
+        }
+        int margin = 1;
+        for (int line = 0; line < lines; ++line) {
+            double tail = 0;
+            for (int r = 1; r < n; ++r) tail += prof[line][r];
+            int m = 0;
+            while (m < 64 && tail > 2e-2 * largest) {
+                ++m;
+                tail -= prof[line][m] + prof[line][n - m];
+            }
+            margin = std::max(margin, m);
+        }
+        return margin_ = margin;
+    }
+    void multiply_response(std::vector<cplx>& K, int N0, int N1, int) const override {
+        const int m = margin_rows(), Nr = next_smooth_power(std::max(64, 16 * m));
+        if (N0 < 2 * m + 1) throw Error("wiener: padded stack height below the kernel support 2 x margin + 1");
+        const auto Q = fixed_kernel_spectrum(response(Nr, N1), Nr, N0, N1, m);
+        for (std::size_t k = 0; k < K.size(); ++k) K[k] *= Q[k];
+    }
+
+  private:
+    double weight_, target_;
+    std::vector<double> nu_, theta_, transfer_, gain_;   // tables (nu, theta), row-major
+    mutable int margin_ = -1;
+};
+
 // ------------------------------------------------------------------ unsharp, gaussian
 class Unsharp final : public ProjectionFilter {
   public:
@@ -565,6 +726,10 @@ std::map<std::string, FilterFactory>& registry() {
         {"mtf_paganin", [](const FilterParams& p, const FilterContext& c) -> std::unique_ptr<ProjectionFilter> {
              check_keys("mtf_paganin", p, {"delta_beta", "sigma", "mtf", "nsr", "target", "gain"});
              return std::make_unique<MtfPaganin>(p, c);
+         }},
+        {"wiener", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
+             check_keys("wiener", p, {"table", "snr", "weight", "target"});
+             return std::make_unique<Wiener>(p);
          }},
         {"unsharp", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
              check_keys("unsharp", p, {"sigma", "coeff", "method"});

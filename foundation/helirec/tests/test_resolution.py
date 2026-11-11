@@ -1,5 +1,7 @@
 """Resolution corrections: the fused MTF / Paganin Wiener filter, the vertical kernel (z_interp), nearest-bin angular
 gridding at the measured angles (angle_interp) and the exposure-arc deconvolution."""
+import json
+
 import h5py
 import numpy as np
 import pytest
@@ -89,6 +91,74 @@ def test_mtf_paganin_cpu_cuda_agree(chain):
     m = helirec.filter_margin([chain], **PH)
     np.testing.assert_allclose(helirec.apply_filters(a, [chain], m, device="cuda", **PH),
                                helirec.apply_filters(a, [chain], m, device="cpu", **PH), rtol=0, atol=5e-5)
+
+
+# ------------------------------------------------------------------ wiener (measured tables)
+def wiener_table(path, nu, transfer, theta=None, **snr):
+    path.write_text(json.dumps(dict(nu=list(map(float, nu)), transfer=np.asarray(transfer).tolist(),
+                                    **({"theta": list(map(float, theta))} if theta is not None else {}),
+                                    **{k: np.asarray(v).tolist() for k, v in snr.items()})))
+    return {"type": "wiener", "table": str(path)}
+
+
+def test_wiener_table_filter(tmp_path):
+    sigma, nsr = 1.06, 0.01
+    nu = np.arange(1, 161) / 200.0
+    M = np.exp(-2 * np.pi ** 2 * sigma ** 2 * nu ** 2)
+    # a Gaussian MTF and white noise as tables: mtf_paganin's Wiener form without phase retrieval
+    w = wiener_table(tmp_path / "radial.json", nu, M, snr=M ** 2 / nsr, half=M ** 2 / (2 * nsr))
+    assert helirec.filter_describe([w], **PH).startswith("fft[wiener]@intensity m")
+    R = response([w])
+    f0, f1 = np.meshgrid(np.fft.fftfreq(R.shape[0]), np.fft.fftfreq(R.shape[1]), indexing="ij")
+    Mg = np.exp(-2 * np.pi ** 2 * sigma ** 2 * (f0 ** 2 + f1 ** 2))
+    D = (1 + nsr) * Mg / (Mg ** 2 + nsr)
+    tol = 0.03 * D.max()                                   # (the kernel is truncated to its margin rows)
+    np.testing.assert_allclose(R, D, atol=tol)
+    np.testing.assert_allclose(R, response([dict(MTF, delta_beta=0)]), atol=tol)
+    # (unit DC; this table's gain is 0.99 from the first frequency on, a step the impulse's small frame cuts short)
+    assert abs(R[0, 0] - 1) < 2e-4 and 1 <= helirec.filter_margin([w], **PH) <= 64
+    # weight scales the noise; snr=NAME picks another table of the file; target is a Gaussian on top
+    np.testing.assert_allclose(response([dict(w, weight=2)]), (1 + 2 * nsr) * Mg / (Mg ** 2 + 2 * nsr), atol=tol)
+    np.testing.assert_allclose(response([dict(w, snr="half")]), response([dict(w, weight=2)]), atol=1e-6)
+    T = np.exp(-2 * np.pi ** 2 * 0.7 ** 2 * (f0 ** 2 + f1 ** 2))
+    np.testing.assert_allclose(response([dict(w, target=0.7)]), T * D, atol=tol)
+    # weight 0: the plain inverse of the transfer (a mild one: the inverse of a strong blur has no usable kernel)
+    Ms = np.exp(-2 * np.pi ** 2 * 0.4 ** 2 * nu ** 2)
+    w0 = wiener_table(tmp_path / "mild.json", nu, Ms, snr=np.full(len(nu), 3.0))
+    np.testing.assert_allclose(response([dict(w0, weight=0)]), np.exp(2 * np.pi ** 2 * 0.4 ** 2 * (f0 ** 2 + f1 ** 2)), rtol=0.03)
+    # a table over the angle too: the rows' own transfer and noise along the row axis, the columns' along theirs
+    # (as measured tables are: the signal-to-noise ratio large at low frequencies, falling smoothly)
+    def mz(v):
+        return np.exp(-2 * np.pi ** 2 * 0.6 ** 2 * v ** 2)
+
+    def mx(v):
+        return np.exp(-2 * np.pi ** 2 * sigma ** 2 * v ** 2)
+
+    def snr_of(m, v):
+        return m ** 2 / 0.2 * (1 + (0.15 / np.maximum(v, 1e-9)) ** 4)
+    w2 = wiener_table(tmp_path / "polar.json", nu, np.stack([mz(nu), mx(nu)], 1), theta=[0, 90],
+                      snr=np.stack([snr_of(mz(nu), nu), snr_of(mx(nu), nu)], 1))
+    R2 = response([w2])
+    v0, v1 = np.abs(f0[1:, 0]), np.abs(f1[0, 1:])
+    along_rows = snr_of(mz(v0), v0) / (snr_of(mz(v0), v0) + 1) / mz(v0)
+    along_cols = snr_of(mx(v1), v1) / (snr_of(mx(v1), v1) + 1) / mx(v1)
+    np.testing.assert_allclose(R2[1:, 0], along_rows, atol=0.05)
+    np.testing.assert_allclose(R2[0, 1:], along_cols, atol=0.08)
+    assert abs(along_rows.max() - along_cols.max()) > 0.1 and abs(R2[0, 0] - 1) < 1e-5    # (the two axes do differ)
+    # a constant stays a constant
+    flat = helirec.apply_filters(np.full((2, 151, 192), 3.0, np.float32), [w2], helirec.filter_margin([w2], **PH), **PH)
+    np.testing.assert_allclose(flat, 3.0, rtol=2e-6)
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(dict(nu=[0.2, 0.1], transfer=[1, 1], snr=[1, 1])))
+    for chain in (dict(w, weight=-1), dict(w, target=-1), dict(w, snr="none"), {"type": "wiener"},
+                  {"type": "wiener", "table": str(tmp_path / "missing.json")}, {"type": "wiener", "table": str(bad)}):
+        with pytest.raises(Exception, match="wiener"):
+            helirec.filter_margin([chain], **PH)
+    if helirec.cuda_available():
+        a = np.random.default_rng(0).uniform(0.5, 1.5, (3, 151, 200)).astype(np.float32)
+        m = helirec.filter_margin([w2], **PH)
+        np.testing.assert_allclose(helirec.apply_filters(a, [w2], m, device="cuda", **PH),
+                                   helirec.apply_filters(a, [w2], m, device="cpu", **PH), rtol=0, atol=5e-5)
 
 
 # ------------------------------------------------------------------ z_interp

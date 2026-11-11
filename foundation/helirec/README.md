@@ -194,7 +194,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   is `filters.REFERENCE_CHAIN` (Paganin δ/β 1000 + unsharp σ 1.2, coefficient 4), also used by the standard
   Paganin baseline recipes. Explicit chains are literal: omit `unsharp` for Paganin alone, or set
   `unsharp.coeff=0` to disable sharpening. Built-in types: `paganin`,
-  `epr`, `mtf_paganin`, `unsharp`, `gaussian`, `median`, `python`; register more in C++ (`register_filter`, `filters.hpp`) or Python
+  `epr`, `mtf_paganin`, `wiener`, `unsharp`, `gaussian`, `median`, `python`; register more in C++ (`register_filter`, `filters.hpp`) or Python
   (`helirec.filters.register`). Each filter runs at `stage=intensity` (before −log, default) or `stage=log` and
   declares the margin rows it needs. Consecutive linear shift-invariant filters of one stage fuse into one FFT
   filter. Command line: `--set "filters=paganin(delta_beta=2000)+median(radius=1,stage=log)"`, or override one
@@ -235,6 +235,38 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   `delta_beta` matters more once the blur is removed: a blur alone cannot undershoot, yet Paganin alone leaves a
   4 % dip outside the wrap at δ/β 1000, 1 % at 1250 and none at 1500 (the residual phase fringe, which the
   deblurring amplifies). Recipes: `evaluation/343p_v5_resolution.json`.
+* **Wiener filter from measured tables** (`wiener(table=FILE, snr=snr, weight=1, target=0)`, in place of
+  `paganin + unsharp` or `mtf_paganin`): the minimum-error linear estimate of the object when the system's transfer
+  `T` (detector blur × phase contrast × what the gridding does) and the signal-to-noise power ratio `S` of the scan
+  have been measured: `W = g / T`, `g = S / (S + weight)`. The output shows the object through `g`: flat where the
+  data carry it, falling where they do not; no δ/β and no sharpening strength to choose. `T` and `S` are tables
+  over the frequency magnitude ν (cycles per pixel) and, optionally, its angle θ from the row axis of a frame (the
+  scan's z), in a JSON file `{"nu", ["theta",] "transfer", "snr"}` (several `snr` tables may be kept; `snr=NAME`
+  picks one). A filter of the frames that depends on (ν, θ) only is a filter of the volume symmetric about z at the
+  same frequencies, so the tables can be measured in the volume. `weight` scales the noise (1: Wiener), `target`
+  multiplies `g` by the MTF of a Gaussian of that many pixels. Fixed unit-DC kernel as `paganin`'s; the margin is
+  where the kernel's rows beyond it hold less than 2 % of it (18 rows for the table below, against 31 for
+  `paganin + unsharp`): no more cost. Give smooth, finely sampled tables (a kink is a long kernel).
+  `evaluation/wiener_table.py` builds the file from an in-plane transfer measured on a thin film of the sample
+  (optionally also where the detector is sharpest, which separates a smear along the columns) and the two half
+  reconstructions' shell correlation. By default no direction gets more signal-to-noise ratio than the in-plane
+  one, and the loss of the interpolation between detector rows is not undone (`--snr_direction measured`,
+  `--row_response restore` do otherwise: on PHerc0343P that left a ridge of power at the slices' Nyquist
+  frequency, alternating slices). Inputs: the film's transfer and the halves' shell correlation (`angle_subset=0/2`, `1/2`;
+  `evaluation/shell_correlation.py --pair`):
+  ```bash
+  .venv/bin/python evaluation/wiener_table.py wiener.json --transfer film_transfer.json --sharp ta_nophase 1250 1400 \
+      --curves RUN/fsc_halves --pair half0 half1 [--filtered base]
+  helirec-slices PROJ --set backprojector=fbp --set "filters=wiener(table=wiener.json)" ...
+  ```
+  On PHerc0343P (8.64 µm, glare correction 0.6 / 400) the Teflon wrap is reproduced through 1.00 ± 0.03 up to
+  0.28 cycles per pixel and through the designed `g` beyond (0.84 at 0.36, 0.56 at 0.45), where
+  `paganin(1000) + unsharp(1.2, 4)` passes 1.5–1.9 at 0.06–0.25 and 0.39 at 0.45, and `paganin(1000)` alone 0.33 at
+  0.25. Solid nylon reads 0.1730 cm⁻¹ (Paganin: 0.1731; with the unsharp mask 0.1789); noise in air 0.0128 cm⁻¹
+  (Paganin + unsharp: 0.0129; with `snr=snr_mean, target=0.3`: 0.0086). The correlation with a finer scan of the
+  sample is unchanged in every band and direction, as for any linear filter. The result is quantitative and has
+  no rims around sheets; it is flatter than Paganin + unsharp, whose emphasis of 4–16 px structure it does not
+  have. Check a new table on a vertical reslice and on the power spectrum along z before using it.
 * **Eikonal phase retrieval** (`epr(delta_beta=…, iters=3, relax=0.75, max_shift=12.5)`, in place of `paganin`):
   the local second-order closure of Mirone et al. (*J. Synchrotron Rad.* 32, 2025; arXiv:2601.22793, eq. 1) for a
   homogeneous object. Paganin inverts the first-order (TIE) model `I_det = I − A ∇²I`, with

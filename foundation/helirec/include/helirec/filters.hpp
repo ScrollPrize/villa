@@ -33,6 +33,14 @@
 //                                            ~gain. With nsr: the Wiener form D = (1 + nsr) M / (M^2 + nsr) (sharper
 //                                            cut-off: rings at edges, band-limited noise). Fixed unit-DC kernel as
 //                                            paganin's.
+//   wiener   table=FILE, snr=snr,            the minimum-error linear estimate from measured tables, in place of
+//            weight=1, target=0              paganin + unsharp: W = g / T, g = S / (S + weight), T the measured
+//                                            transfer of the system (detector blur x phase contrast) and S the
+//                                            measured signal-to-noise power ratio, tables over the frequency
+//                                            magnitude and (optionally) its angle from the row axis, in a JSON file
+//                                            ("nu", ["theta",] "transfer", "snr"; evaluation/wiener_table.py).
+//                                            target: g x the MTF of a Gaussian of that many pixels. Fixed unit-DC
+//                                            kernel as paganin's.
 // Every filter accepts stage=intensity|log.
 #include <complex>
 #include <functional>
