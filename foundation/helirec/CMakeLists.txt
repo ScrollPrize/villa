@@ -65,7 +65,7 @@ if(HELIREC_DELTA3D)
 endif()
 
 # ---------------------------------------------------------------- core library
-file(GLOB HELIREC_CPU_SOURCES CONFIGURE_DEPENDS src/core/*.cpp src/cpu/*.cpp src/io/*.cpp)
+file(GLOB HELIREC_CPU_SOURCES CONFIGURE_DEPENDS src/core/*.cpp src/cpu/*.cpp src/io/*.cpp src/calibration/*.cpp)
 add_library(helirec STATIC ${HELIREC_CPU_SOURCES})
 target_include_directories(helirec PUBLIC include PRIVATE src)
 target_compile_options(helirec PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wextra -ffp-contract=off>)
@@ -87,6 +87,20 @@ if(HELIREC_WITH_CUDA)
   target_compile_options(helirec PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo --extended-lambda>)
   set_target_properties(helirec PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
   target_link_libraries(helirec PUBLIC CUDA::cudart PRIVATE CUDA::cufft)
+endif()
+
+# ---------------------------------------------------------------- tools
+# helirec-calibration: checks an acquisition record against itself and against the raw frames (src/calibration)
+option(HELIREC_TOOLS "Build the command-line tools" ON)
+if(HELIREC_TOOLS)
+  add_executable(helirec-calibration tools/helirec_calibration.cpp)
+  target_link_libraries(helirec-calibration PRIVATE helirec)
+  target_compile_options(helirec-calibration PRIVATE -O2 -Wall -Wextra)
+  install(TARGETS helirec-calibration RUNTIME DESTINATION bin)
+  include(CTest)
+  if(BUILD_TESTING)
+    add_test(NAME calibration_selftest COMMAND helirec-calibration selftest)
+  endif()
 endif()
 
 # ---------------------------------------------------------------- python module
