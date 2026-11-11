@@ -1,9 +1,0 @@
-# R4 copy, report and packaging fixes
-
-- S-002: the direct object-copy API uses the existing shared operation savepoint around metadata and geometry writes. The regression catches invalid geometry, commits its surrounding transaction, and requires no partial copied object, with history on/off.
-- S-006: AFV report paths are checked before source import against config/source/constraints, filesystem aliases and the future output tree. Linked geometry-store protection delegates to the shared store-closure export-destination validator. After import, that same validator protects the completed backing-file namespace. Reports use the existing atomic-file writer, so failures do not truncate an old report or follow a substituted destination symlink into input data. The batch-import API itself is unchanged; closure checks belong only to the optional CLI report workflow.
-- S-007: installed packages provision Boost only when the server target was built. No zstd alias change: that allegation was disproved in review. The regression stages a self-cleaning package installation, configures a fresh downstream using only `find_package(vc_object_store)`, and links the exported server target.
-
-Regressions include report source/constraint/config collisions, hard/symbolic aliases, linked geometry backing files, plain output and sharded-member paths. Existing report success cases now cover replacing an ordinary previous report. The full suite passed, including the actual staged-package downstream link test and direct-copy failure rollback under both history policies; exact results are in `fixes.md`. No full-volume or performance claim.
-
-No schema change, persistent table, proxy row, per-object directory or referenced payload copy. Destination safety reuses the shared store validator instead of implementing a second collection resolver.

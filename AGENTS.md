@@ -232,13 +232,15 @@ If you add:
 - new benchmark harnesses
 document how to use them and how they’re validated.
 
+Keep committed documentation focused on current usage, supported formats, contracts and design intentions. Do not commit task trackers, implementation plans, review/audit reports, finding inventories, agent adjudications or one-off validation logs. Keep those working artifacts under ignored `local/` storage; promote only their durable conclusions into the relevant documentation. Do not link permanent docs to local or historical review artifacts.
+
 ### 4.4 vcobj readers and writers (including consumers outside `vc_object_store/`)
 
 Use the [single versioned-reference contract](vc_object_store/docs/versioned-reference-contract.md): carry the shared reference unchanged. Consumer-specific tuples or flattened reference fields are not an internal API; extra application data wraps the reference instead.
 
-Read `vc_object_store/docs/reading.md` and the contract in `vc_object_store/docs/coherent-store-api-cleanup.md` before changing vcobj handling. Physical placement (local, referenced, sharded or packed) is resolved by the store layer, never by consumer-specific SQL or fallback branches.
+Read `vc_object_store/docs/reading.md` and `vc_object_store/docs/store-api-contract.md` before changing vcobj handling. Physical placement (local, referenced, sharded or packed) is resolved by the store layer, never by consumer-specific SQL or fallback branches.
 
-For reviews, use the [vcobj review contract](vc_object_store/docs/review-contract.md): trace each invariant through all sibling entry points and test the same case at their boundaries. Python bindings adapt Python types; the shared native implementation owns schema interpretation and validation.
+Follow the [validation requirements](vc_object_store/docs/store-api-contract.md#validation-requirements): trace each invariant through all sibling entry points and test the same case at their boundaries. Python bindings adapt Python types; the shared native implementation owns schema interpretation and validation.
 
 - Resolve once, then carry the complete `ObjectRevision`/`ObjectVersion` through geometry, transforms, adapters and caches. Never replace its metadata with a fresh current-object lookup or infer its owner from the attachment. Exact reads must not require a live current object. Compare complete identities, not just version numbers.
 - Transaction preparations, fetch callbacks, artifact uploads and deferred edit accumulators carry the same full references. Use `RecordSelection` and shared expectation helpers; numeric counters are storage projections or explicit current-selection inputs, never internal guards. Transaction commands use format 3 only: do not restore automatic format selection or numeric/full sidechannels. Reject incomplete saved identities rather than infer owners. Preserve the distinction between no live record and an exact selected tombstone, as well as loaded mapping/membership and active-write-lineage guards.

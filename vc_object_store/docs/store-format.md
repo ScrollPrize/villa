@@ -2,7 +2,7 @@
 
 The current SQLite schema is 21 and the application ID is `0x56434f42`. There is no independent “v2” logical format family. An ordinary store is a plain SQLite file. Optional [collections](collections.md) compose independent databases, and optional [packed files](packed-stores.md) put them in an immutable VFS container with its own physical format version. SQLite 3.37 or later is required for reliable table versus virtual-table-shadow catalog discovery. The normal runtime accepts only the current schema. Never change `user_version` manually.
 
-The [schema integration contract](schema-integration.md) supersedes the old experimental plan. Its lazy/delta history redesign remains deferred.
+The [shared API contract](store-api-contract.md) defines resolution and consumer responsibilities. The lazy/delta history redesign is not part of schema 21.
 
 ## Identities and versions
 
@@ -86,7 +86,7 @@ Store references (`store_reference`) pin a sealed dependency's store UUID, linea
 
 A shard import is one unpublished state with a shared lineage and commit token. Independent writers directly create object/edge keys and descriptors. The final coordinator writes known routing metadata, without reopening shards to rediscover or validate records. All data tables follow ownership; metadata remains small and local. No cross-database transaction is claimed.
 
-The optional `uuid-hash-routing-v1` feature maps UUIDs using FNV-1a64 over their 16 canonical bytes, modulo shard count. This requires only per-shard metadata. The [collection API](collections.md) implements direct routing, overlays and dependency precedence; ordinary `ObjectStore` rejects a collection root rather than silently exposing one shard. `physicalPartitionOnly` is explicit low-level access.
+The optional `uuid-hash-routing-v1` feature maps UUIDs using FNV-1a64 over their 16 canonical bytes, modulo shard count. This requires only per-shard metadata. Ordinary `ObjectStore` uses the same logical-store resolver as the [collection API](collections.md), including direct routing, overlays and dependency precedence. `physicalPartitionOnly` is explicit low-level maintenance access, not the consumer read path.
 
 Geometry hashes resolve through pinned dependencies without local placeholder rows. Missing payloads/resolvers fail, never returning empty substitute data. Unchanged borrowed chunks stay in their original database. Packed containers have separate physical framing and do not change the logical SQLite schema.
 

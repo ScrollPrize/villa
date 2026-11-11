@@ -10,6 +10,4 @@ Transaction/preparation guards carry one `RecordSelection` of shared object/rela
 
 Only an external input/output boundary may parse or serialize a reference, using shared native codecs. Explicit CLI selectors and textual locators resolve once in the store layer. Internal calls do not reparse or normalize already-selected references. Transaction commands have one representation: format 3 with full references. Old command formats, array references and incomplete application pins/manifests are rejected rather than reconstructed. Resolve uncertain prior request outcomes before regenerating requests; a failed decode does not prove that the original request never committed.
 
-## Review and implementation task
-
-Baseline: `38c72d972`. Follow the [review contract](review-contract.md) across producers and sibling consumers, not only the Lasagna example. Log concrete alternate representations, duplicated field interpretation and unnecessary conversions, and distinguish legitimate wire serialization from internal policy. Astra independently adjudicates the candidates before implementation. Fix by sharing native handling and deleting local adapters; do not redesign schema 21, add persistent identity tables, or broaden this into an unrelated model/solver audit. Record production additions/removals separately from tests/docs and run the existing approved test runners.
+Resolution, editing, evidence and validation requirements are defined in the [shared store API contract](store-api-contract.md).
