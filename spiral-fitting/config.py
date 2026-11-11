@@ -314,7 +314,8 @@ NEW_FIT_KEYS = frozenset(
     | OBJECT_STORE_PCL_KEYS
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
-    | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
+    | {"optimizer_random_seed", "track_inner_exclusion_radius",
+       "pcl_vertical_fiber_min_auto_certainty",
        "pcl_vertical_fiber_min_z_fraction", "spiral_outward_sense"}
 )
 
@@ -608,6 +609,9 @@ class Config:
         self.track_crossing_precompute_max = 8
         self.track_max_track_crossing_per_step = 2
         self.track_exclusion_radius = 16.0
+        # Tracks with both endpoints closer than this to the umbilicus axis
+        # are dropped at load; 0 keeps every track.
+        self.track_inner_exclusion_radius = 0.0
         self.track_radius_target = "mean"
         self.track_radius_loss_margin = 0.025
         self.track_radius_within_norm_p = 6.0

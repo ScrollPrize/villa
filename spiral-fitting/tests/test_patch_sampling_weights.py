@@ -28,3 +28,14 @@ def test_excluded_patches_are_left_out_of_the_fit(store_path):
     assert near in kept.patches and near not in inputs.patches
     assert inputs.counts['patches excluded'] == 1
     assert inputs.counts['pcl attachments'] < kept.counts['pcl attachments']
+
+
+def test_tracks_with_both_endpoints_inside_the_core_are_dropped():
+    import numpy as np
+    from tracks import filter_tracks_inside_umbilicus_radius
+    centre = lambda z: np.zeros((len(z), 2))  # noqa: E731
+    tracks = [np.array([[0, 10, 0], [1, 20, 0]], np.float32),    # both inside 50
+              np.array([[0, 10, 0], [1, 80, 0]], np.float32),    # one outside
+              np.array([[0, 90, 0], [1, 0, 95]], np.float32)]    # both outside
+    kept, families = filter_tracks_inside_umbilicus_radius(tracks, centre, 50.0, ['a', 'b', 'c'])
+    assert families == ['b', 'c'] and len(kept) == 2

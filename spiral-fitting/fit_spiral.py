@@ -85,6 +85,7 @@ from dt_targets import (
 from tracks import (
     PackedTrackCollection,
     configure_prepared_track_sampling,
+    filter_tracks_inside_umbilicus_radius,
     filter_tracks_to_outer_shell,
     get_track_satisfied_counts_in_chunks,
     iter_track_losses,
@@ -1514,6 +1515,12 @@ class FitContext:
                     detail=f'{len(tracks):,} tracks')
                 tracks, track_families, kept_track_indices = filter_tracks_to_outer_shell(
                     tracks, shell_envelope, track_families, return_indices=True)
+                if track_source_ids is not None:
+                    track_source_ids = track_source_ids[kept_track_indices]
+            if self.config['track_inner_exclusion_radius'] > 0:
+                tracks, track_families, kept_track_indices = filter_tracks_inside_umbilicus_radius(
+                    tracks, umbilicus, self.config['track_inner_exclusion_radius'],
+                    track_families, return_indices=True)
                 if track_source_ids is not None:
                     track_source_ids = track_source_ids[kept_track_indices]
             print(f'loaded {len(tracks)} tracks within z-roi [{self.z_begin}, {self.z_end})')
