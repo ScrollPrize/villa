@@ -1,5 +1,6 @@
 """Selection, frames and relationship filtering of object-store fit inputs."""
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -303,7 +304,7 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
     for read in (osi.InputPins.from_manifest, osi.manifest_digest):
         with pytest.raises(ValueError, match='regenerate'):
             read(incomplete)
-    osi.validate_relationship_references({'relationships': []})
+    assert osi.validated_manifest_references({'relationships': []}) == {}
     # A position-only request is current/position discovery, not partial pins.
     discovery = osi.InputPins.from_provenance({'position': snapshot.position.provenance()})
     assert not discovery.pinned
@@ -316,6 +317,24 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
     written = json.loads(report.read_text())
     assert written['manifest']['volume_uuid'] == VOLUME
     assert any('pcl_patch 1' in line for line in written['report'])
+
+
+def test_manifest_validation_reuses_decoded_references(db, monkeypatch):
+    put_patch(db, _grid())
+    snapshot = osi.read_snapshot(db, request())
+    manifest = snapshot.manifest()
+    decode = osi.InputPins._decode_reference
+    decoded = []
+    def counted(uuid, reference, version=None):
+        decoded.append(uuid)
+        return decode(uuid, reference, version)
+    monkeypatch.setattr(osi.InputPins, '_decode_reference', staticmethod(counted))
+    pins = osi.InputPins.from_manifest(manifest)
+    assert decoded == [entry['uuid'] for entry in manifest['objects']]
+    assert pins.references == {entry['uuid']: entry['reference'] for entry in manifest['objects']}
+    decoded.clear()
+    assert osi.resume_problems({'object_store': manifest}, SimpleNamespace(manifest=manifest)) == []
+    assert len(decoded) == 2 * len(manifest['objects'])
 
 
 def test_the_outer_shell_is_read_on_its_own_never_as_a_patch(db):

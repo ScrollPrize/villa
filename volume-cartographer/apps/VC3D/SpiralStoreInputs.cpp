@@ -6,6 +6,7 @@
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/RelationshipInputs.hpp>
 
 #include <algorithm>
 #include <map>
@@ -31,63 +32,10 @@ std::vector<cv::Vec3d> scaledPoints(const std::vector<vc::geometry::Point>& poin
     return result;
 }
 
-// The fitter's supported input-kind order (shared with its input protocol).
-int kindIndex(const std::string& kind)
-{
-    constexpr const char* kinds[] = {"surface", "point_collection", "fiber", "track"};
-    for (int i = 0; i < 4; ++i)
-        if (kind == kinds[i]) return i;
-    return 4;
-}
-
-std::string relationshipFamily(const std::string& edgeKind, const std::string& first,
-                               const std::string& second)
-{
-    if (edgeKind == "point-surface" && first == "surface" && second == "point_collection") return "pcl_patch";
-    if (edgeKind == "same-surface" && first == "surface" && second == "fiber") return "fiber_patch";
-    if (edgeKind == "same-surface" && first == "surface" && second == "surface") return "patch_overlap";
-    if (edgeKind == "fiber_branch" && first == "fiber" && second == "fiber") return "fiber_branch";
-    if (edgeKind == "crossing" && first == "track" && second == "track") return "track_crossing";
-    return {};
-}
-
 struct ConsumedRelationshipIdentity {
     vc::objects::RelationshipVersion reference;
-    Json content;
+    std::string family, a, b;
 };
-
-// The identity fields of StoredRelationship.provenance() for a relationship
-// version the adapter would consume (filter_relationships); nullopt when it
-// would not be consumed. The complete reference identifies its publication;
-// the projected fields retain the adapter's application-specific comparison.
-std::optional<ConsumedRelationshipIdentity> consumedIdentity(const vc::objects::SelectedRelationship& selected,
-                                     const std::map<std::string, std::string>& kinds,
-                                     bool approvedLinksOnly)
-{
-    const auto& version = selected.relationship;
-    const auto& record = version.record;
-    const auto aKind = kinds.find(record.aUuid), bKind = kinds.find(record.bUuid);
-    if (aKind == kinds.end() || bKind == kinds.end() || !selected.applicable) return std::nullopt;
-    struct End {
-        std::string uuid, kind;
-        std::optional<std::string> geometry;
-    };
-    End ends[2] = {{record.aUuid, aKind->second, version.aGeometryRevision},
-                   {record.bUuid, bKind->second, version.bGeometryRevision}};
-    // Ordered by kind, then UUID; a stable sort keeps stored order otherwise.
-    if (std::pair(kindIndex(ends[1].kind), ends[1].uuid) < std::pair(kindIndex(ends[0].kind), ends[0].uuid))
-        std::swap(ends[0], ends[1]);
-    const auto family = relationshipFamily(record.kind, ends[0].kind, ends[1].kind);
-    if (family.empty()) return std::nullopt;
-    if (record.approvalState == "rejected") return std::nullopt;
-    if (approvedLinksOnly && record.approvalState != "approved") return std::nullopt;
-    const auto geometry = [](const auto& revision) { return revision ? Json(*revision) : Json(nullptr); };
-    return ConsumedRelationshipIdentity{version.reference(),
-                Json{{"uuid", record.uuid}, {"kind", record.kind}, {"family", family},
-                {"approval_state", record.approvalState},
-                {"a", ends[0].uuid}, {"a_geometry_revision", geometry(ends[0].geometry)},
-                {"b", ends[1].uuid}, {"b_geometry_revision", geometry(ends[1].geometry)}}};
-}
 
 // The manifest's consumed relationships against the ones the current heads
 // of the fitted objects give, by record UUID. With `scope`, only those
@@ -124,9 +72,13 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
         const bool approvedOnly = manifest.value("approved_links_only", false);
         if (!heads.empty())
             for (const auto& selected : reader.relationshipsAt(heads))
-                if (inScope(selected.relationship.record.uuid))
-                    if (auto identity = consumedIdentity(selected, kinds, approvedOnly))
-                        consumed[selected.relationship.record.uuid] = std::move(*identity);
+                if (inScope(selected.relationship.record.uuid)) {
+                    const auto& edge = selected.relationship.record;
+                    const auto decision = vc::objects::fittingRelationshipInput(edge, selected.applicable, kinds, approvedOnly);
+                    if (decision.exclusion.empty())
+                        consumed[edge.uuid] = {selected.relationship.reference(), decision.family,
+                            decision.reversed ? edge.bUuid : edge.aUuid, decision.reversed ? edge.aUuid : edge.bUuid};
+                }
     } catch (const std::exception& error) {
         result.problems.push_back(std::string("relationships: ") + error.what());
         return;
@@ -139,17 +91,12 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
             link.state = LinkState::Fitted;
             if (references.at(link.uuid) != local->second.reference)
                 link.state = LinkState::Changed;
-            if (entry.contains("version") && entry.at("version") != local->second.reference.version)
-                link.state = LinkState::Changed;
-            for (const auto& [key, value] : local->second.content.items())
-                if (entry.contains(key) && entry.at(key) != value) link.state = LinkState::Changed;
             consumed.erase(local);
         }
         result.relationships.push_back(std::move(link));
     }
     for (const auto& [uuid, identity] : consumed)
-        result.addedRelationships.push_back({uuid, identity.content.at("family").get<std::string>(), LinkState::Added,
-                                             identity.content.at("a").get<std::string>(), identity.content.at("b").get<std::string>()});
+        result.addedRelationships.push_back({uuid, identity.family, LinkState::Added, identity.a, identity.b});
 }
 
 // Read one manifest object as the store holds it now into `result`.

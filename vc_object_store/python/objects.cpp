@@ -5,6 +5,7 @@
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/RelationshipInputs.hpp"
 #include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "vc_object_store/objects/SurfaceGrid.hpp"
@@ -987,6 +988,22 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
 
 NB_MODULE(_native, m)
 {
+    m.def("fitting_relationship_inputs", [](const nb::list& entries, const std::map<std::string, std::string>& kinds, bool approvedOnly) {
+        nb::list selected; std::map<std::string, int64_t> exclusions;
+        for (size_t index = 0; index < entries.size(); ++index) {
+            const auto entry = nb::cast<nb::dict>(entries[index]);
+            const auto record = nb::cast<nb::dict>(entry["record"]);
+            vo::EdgeRecord edge; edge.kind = nb::cast<std::string>(record["kind"]);
+            edge.aUuid = nb::cast<std::string>(record["a"]); edge.bUuid = nb::cast<std::string>(record["b"]);
+            edge.approvalState = nb::cast<std::string>(record["approval_state"]);
+            const auto decision = vo::fittingRelationshipInput(edge,
+                nb::cast<bool>(entry["applicable"]), kinds, approvedOnly);
+            if (!decision.exclusion.empty()) { ++exclusions[decision.exclusion]; continue; }
+            nb::dict item; item["index"] = index; item["family"] = decision.family; item["reversed"] = decision.reversed;
+            selected.append(item);
+        }
+        return nb::make_tuple(selected, exclusions);
+    }, nb::arg("relationships"), nb::arg("endpoint_kinds"), nb::arg("approved_only") = false);
     m.def("canonical_uuid", &vo::util::canonicalUuid, nb::arg("uuid"));
     m.def("object_version_from_json", [](const std::string& text) {
         return jsonLoads(vo::objectVersionToJson(vo::objectVersionFromJson(text)));

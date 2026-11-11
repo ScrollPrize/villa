@@ -51,20 +51,6 @@ SPIRAL_FIT_TAG = 'spiral-fit'
 KIND_LABELS = {'surface': 'surfaces', 'point_collection': 'point collections',
                'fiber': 'fibers', 'track': 'tracks'}
 
-# Relationship families the fitter consumes, keyed by (edge kind, endpoint
-# kinds in KINDS order). Surface overlaps and fiber-surface contacts share the
-# detectors' 'same-surface' edge kind and differ by endpoint kinds. Family
-# names are Spiral's roles and keep the fitter's "patch" vocabulary. Track
-# crossings feed the track graph; track-surface edges ('same-surface' between
-# a surface and a track) constrain nothing in the fit and are excluded.
-FAMILIES = {
-    ('point-surface', ('surface', 'point_collection')): 'pcl_patch',
-    ('same-surface', ('surface', 'fiber')): 'fiber_patch',
-    ('same-surface', ('surface', 'surface')): 'patch_overlap',
-    ('fiber_branch', ('fiber', 'fiber')): 'fiber_branch',
-    ('crossing', ('track', 'track')): 'track_crossing',
-}
-
 # The coordinates the fitter works in, recorded with every provenance.
 FIT_UNITS = 'reference-volume voxels (ZYX)'
 
@@ -223,15 +209,12 @@ class InputPins:
     def from_manifest(cls, manifest):
         """The pins an input manifest (InputSnapshot.manifest) records, or
         None when it contains no position."""
-        validate_relationship_references(manifest or {})
+        references = validated_manifest_references(manifest or {})
         position = InputPosition.from_provenance((manifest or {}).get('position'))
         if position is None:
             return None
         shell = manifest.get('outer_shell') or None
         entries = manifest.get('objects') or ()
-        references = {entry['uuid']: cls._decode_reference(entry['uuid'], entry.get('reference'),
-                                                         entry.get('version'))
-                      for entry in [*entries, *([shell] if shell else [])]}
         return cls(position, references,
                    {kind: sorted(entry['uuid'] for entry in entries if entry['kind'] == kind) for kind in KINDS},
                    shell['uuid'] if shell else None)
@@ -616,12 +599,6 @@ def object_frame(meta, volume_uuid, fit_scale=1):
                        float(geometry_scale_to_frame(meta, volume_uuid)) / fit_scale)
 
 
-def _relationship_family(record, kinds):
-    endpoint_kinds = tuple(sorted((kinds[record['a']], kinds[record['b']]),
-                                  key=KINDS.index))
-    return FAMILIES.get((record['kind'], endpoint_kinds))
-
-
 def adjacent_winding_offset(fiber_a, fiber_b):
     """W_b - W_a an adjacent-winding branch between two fiber objects
     asserts: the vertical fiber lies one winding inside the horizontal one.
@@ -630,16 +607,6 @@ def adjacent_winding_offset(fiber_a, fiber_b):
     adjacentWindingOffset)."""
     families = tuple((fiber.fiber or {}).get('family') for fiber in (fiber_a, fiber_b))
     return {('H', 'V'): -1, ('V', 'H'): 1}.get(families)
-
-
-def _ordered_endpoints(entry, kinds):
-    """(a, a_anchor, a geometry pin, b, b_anchor, b geometry pin) of a view
-    relationship, ordered by kind, then UUID."""
-    record = entry['record']
-    ends = [(record[side], record[f'{side}_anchor'],
-             entry.get(f'{side}_geometry_revision')) for side in ('a', 'b')]
-    ends.sort(key=lambda end: (KINDS.index(kinds[end[0]]), end[0]))
-    return (*ends[0], *ends[1])
 
 
 def filter_relationships(view_relationships, objects, approved_links_only):
@@ -651,39 +618,25 @@ def filter_relationships(view_relationships, objects, approved_links_only):
     approved-only mode). Adjacent-winding fiber branches are consumed like
     ordinary ones; materialize_fibers signs them.
     """
-    from vc_object_store import relationship_reference
+    from vc_object_store import relationship_reference, fitting_relationship_inputs
 
     kinds = {uuid: obj.kind for uuid, obj in objects.items()}
-    consumed, exclusions = [], Counter()
-    for entry in view_relationships:
+    selected, exclusions = fitting_relationship_inputs(view_relationships, kinds, approved_links_only)
+    consumed = []
+    for selection in selected:
+        entry = view_relationships[selection['index']]
         record = entry['record']
-        if record['a'] not in kinds or record['b'] not in kinds:
-            exclusions['endpoint outside selection'] += 1
-            continue
-        if not entry['applicable']:
-            exclusions['inapplicable'] += 1
-            continue
-        family = _relationship_family(record, kinds)
-        if family is None:
-            exclusions[f'unused kind {record["kind"]}'] += 1
-            continue
-        state = record['approval_state']
-        if state == 'rejected':
-            exclusions['rejected'] += 1
-            continue
-        if approved_links_only and state != 'approved':
-            exclusions[f'{state} (approved-only)'] += 1
-            continue
-        a, a_anchor, a_geometry, b, b_anchor, b_geometry = _ordered_endpoints(entry, kinds)
+        a, b = ('b', 'a') if selection['reversed'] else ('a', 'b')
         consumed.append(StoredRelationship(
             reference=relationship_reference(entry), kind=record['kind'],
-            family=family, approval_state=state,
-            a=a, b=b, a_anchor=a_anchor,
-            b_anchor=b_anchor, meta=record['meta'] or {},
-            a_geometry_revision=a_geometry, b_geometry_revision=b_geometry,
+            family=selection['family'], approval_state=record['approval_state'],
+            a=record[a], b=record[b], a_anchor=record[f'{a}_anchor'],
+            b_anchor=record[f'{b}_anchor'], meta=record['meta'] or {},
+            a_geometry_revision=entry.get(f'{a}_geometry_revision'),
+            b_geometry_revision=entry.get(f'{b}_geometry_revision'),
             stored_order=(record['a'], record['b'])))
     consumed.sort(key=lambda rel: (rel.family, rel.a, rel.b, rel.uuid))
-    return consumed, exclusions
+    return consumed, Counter(exclusions)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2927,14 +2880,14 @@ def stale_link_reasons(manifest, config, normal_source):
     return reasons
 
 
-def validate_relationship_references(manifest):
-    """Reject unqualified saved evidence before any partial/content comparison."""
+def validated_manifest_references(manifest):
+    """Validate saved evidence once and retain the decoded object references."""
     from vc_object_store import relationship_version_from_json
     entries = list(manifest.get('objects') or ())
     if manifest.get('outer_shell'):
         entries.append(manifest['outer_shell'])
-    for entry in entries:
-        InputPins._decode_reference(entry['uuid'], entry.get('reference'), entry.get('version'))
+    references = {entry['uuid']: InputPins._decode_reference(
+        entry['uuid'], entry.get('reference'), entry.get('version')) for entry in entries}
     seen = set()
     for entry in manifest.get('relationships') or ():
         if 'reference' not in entry:
@@ -2944,6 +2897,7 @@ def validate_relationship_references(manifest):
                 ('version' in entry and reference['version'] != entry['version']) or entry['uuid'] in seen):
             raise ValueError('inconsistent relationship manifest reference; regenerate the fit inputs')
         seen.add(entry['uuid'])
+    return references
 
 
 def _compared(manifest):
@@ -2952,7 +2906,7 @@ def _compared(manifest):
     links were refreshed (their results are recorded) and the position they
     were read at (equal inputs at two positions are equal). A copy of a
     store holding the same inputs compares equal."""
-    validate_relationship_references(manifest)
+    validated_manifest_references(manifest)
     manifest = dict(manifest)
     manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
     manifest.pop('link_refresh', None)
@@ -3038,7 +2992,6 @@ def resume_problems(checkpoint_input_manifest, inputs, allow_changed=False, log=
         problem = 'checkpoint records no object-store inputs'
     else:
         current = inputs.manifest
-        validate_relationship_references(recorded)
         differences = manifest_differences(recorded, current)
         if not differences:
             return []

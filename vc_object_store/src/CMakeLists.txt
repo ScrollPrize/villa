@@ -100,6 +100,7 @@ add_library(vc_objects ${_vc_store_library_type}
     geometry/GeometryDelta.cpp
     geometry/GeometryReader.cpp
     relationships/Edges.cpp
+    relationships/RelationshipInputs.cpp
     relationships/Traversal.cpp
     relationships/EdgeGeometry.cpp
 )

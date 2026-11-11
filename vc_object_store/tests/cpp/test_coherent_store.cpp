@@ -16,6 +16,7 @@
 #include "vc_object_store/objects/ObjectCopy.hpp"
 #include "vc_object_store/objects/ToolObjects.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
+#include "vc_object_store/objects/RelationshipInputs.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "internal/Database.hpp"
 #include "imports/SourceIdentityIndex.hpp"
@@ -916,7 +917,33 @@ void unifiedExpectations(HistoryMode mode)
     { auto w = overlay.write(context); w.commit(); }
 }
 
+void fittingRelationshipPolicy()
+{
+    const std::map<std::string, std::string> kinds{{"s", "surface"}, {"p", "point_collection"},
+        {"f", "fiber"}, {"g", "fiber"}, {"t", "track"}, {"u", "track"}};
+    EdgeRecord edge; edge.aUuid = "p"; edge.bUuid = "s"; edge.kind = "point-surface"; edge.approvalState = "pending";
+    auto decision = fittingRelationshipInput(edge, true, kinds, false);
+    require(decision.family == "pcl_patch" && decision.reversed && decision.exclusion.empty(), "shared kind ordering");
+    require(fittingRelationshipInput(edge, true, kinds, true).exclusion == "pending (approved-only)", "shared approval gate");
+    edge.approvalState = "rejected";
+    require(fittingRelationshipInput(edge, true, kinds, false).exclusion == "rejected", "rejected input is never consumed");
+    require(fittingRelationshipInput(edge, false, kinds, false).exclusion == "inapplicable", "inapplicability precedes approval");
+    edge.aUuid = "missing";
+    require(fittingRelationshipInput(edge, false, kinds, false).exclusion == "endpoint outside selection", "selection precedes applicability");
+    edge.approvalState = "approved";
+    for (const auto& example : std::vector<std::array<std::string, 4>>{
+        {"same-surface", "s", "f", "fiber_patch"}, {"same-surface", "s", "s", "patch_overlap"},
+        {"fiber_branch", "g", "f", "fiber_branch"}, {"crossing", "t", "u", "track_crossing"}}) {
+        edge.kind = example[0]; edge.aUuid = example[1]; edge.bUuid = example[2];
+        decision = fittingRelationshipInput(edge, true, kinds, true);
+        require(decision.exclusion.empty() && decision.family == example[3], "shared supported families");
+    }
+    edge.kind = "same-surface";
+    require(fittingRelationshipInput(edge, true, kinds, false).exclusion == "unused kind same-surface", "unsupported endpoint pair excluded");
+}
+
 int main()try{
+    fittingRelationshipPolicy();
     for (const auto mode : {HistoryMode::Off, HistoryMode::On}) unifiedExpectations(mode);
     duplicateStatementLease();
     regionPrecedenceRefill();
