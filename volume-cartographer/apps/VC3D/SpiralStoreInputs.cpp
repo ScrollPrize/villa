@@ -4,6 +4,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
 
 #include <algorithm>
@@ -50,11 +51,16 @@ std::string relationshipFamily(const std::string& edgeKind, const std::string& f
     return {};
 }
 
+struct ConsumedRelationshipIdentity {
+    vc::objects::RelationshipVersion reference;
+    Json content;
+};
+
 // The identity fields of StoredRelationship.provenance() for a relationship
 // version the adapter would consume (filter_relationships); nullopt when it
-// would not be consumed. The numbered relationship version detects changes
-// to its anchors and metadata without a second per-record generation counter.
-std::optional<Json> consumedIdentity(const vc::objects::SelectedRelationship& selected,
+// would not be consumed. The complete reference identifies its publication;
+// the projected fields retain the adapter's application-specific comparison.
+std::optional<ConsumedRelationshipIdentity> consumedIdentity(const vc::objects::SelectedRelationship& selected,
                                      const std::map<std::string, std::string>& kinds,
                                      bool approvedLinksOnly)
 {
@@ -76,10 +82,11 @@ std::optional<Json> consumedIdentity(const vc::objects::SelectedRelationship& se
     if (record.approvalState == "rejected") return std::nullopt;
     if (approvedLinksOnly && record.approvalState != "approved") return std::nullopt;
     const auto geometry = [](const auto& revision) { return revision ? Json(*revision) : Json(nullptr); };
-    return Json{{"uuid", record.uuid}, {"kind", record.kind}, {"family", family},
-                {"approval_state", record.approvalState}, {"version", version.version},
+    return ConsumedRelationshipIdentity{version.reference(),
+                Json{{"uuid", record.uuid}, {"kind", record.kind}, {"family", family},
+                {"approval_state", record.approvalState},
                 {"a", ends[0].uuid}, {"a_geometry_revision", geometry(ends[0].geometry)},
-                {"b", ends[1].uuid}, {"b_geometry_revision", geometry(ends[1].geometry)}};
+                {"b", ends[1].uuid}, {"b_geometry_revision", geometry(ends[1].geometry)}}};
 }
 
 // The manifest's consumed relationships against the ones the current heads
@@ -112,7 +119,7 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
         if (const auto current = reader.currentObject(uuid); current && !current->deleted)
             heads.push_back(current->reference());
     }
-    std::map<std::string, Json> consumed;
+    std::map<std::string, ConsumedRelationshipIdentity> consumed;
     try {
         const bool approvedOnly = manifest.value("approved_links_only", false);
         if (!heads.empty())
@@ -130,15 +137,22 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
         if (!inScope(link.uuid)) continue;
         if (const auto local = consumed.find(link.uuid); local != consumed.end()) {
             link.state = LinkState::Fitted;
-            for (const auto& [key, value] : local->second.items())
+            // Older manifests have only the weaker numeric/content projection.
+            // Never invent their historical owner from the current selection.
+            if (entry.contains("reference") &&
+                vc::objects::relationshipVersionFromJson(entry.at("reference").dump()) != local->second.reference)
+                link.state = LinkState::Changed;
+            if (entry.contains("version") && entry.at("version") != local->second.reference.version)
+                link.state = LinkState::Changed;
+            for (const auto& [key, value] : local->second.content.items())
                 if (entry.contains(key) && entry.at(key) != value) link.state = LinkState::Changed;
             consumed.erase(local);
         }
         result.relationships.push_back(std::move(link));
     }
     for (const auto& [uuid, identity] : consumed)
-        result.addedRelationships.push_back({uuid, identity.at("family").get<std::string>(), LinkState::Added,
-                                             identity.at("a").get<std::string>(), identity.at("b").get<std::string>()});
+        result.addedRelationships.push_back({uuid, identity.content.at("family").get<std::string>(), LinkState::Added,
+                                             identity.content.at("a").get<std::string>(), identity.content.at("b").get<std::string>()});
 }
 
 // Read one manifest object as the store holds it now into `result`.

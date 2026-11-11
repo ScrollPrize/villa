@@ -74,7 +74,7 @@ FIT_UNITS = 'reference-volume voxels (ZYX)'
 # selected object), so versions resolve the inputs exactly but are left out
 # of the digest. Geometry revisions, record UUIDs, consumed content and
 # approval states define them.
-VERSION_FIELDS = {'objects': ('version', 'reference'), 'relationships': ('version',)}
+VERSION_FIELDS = {'objects': ('version', 'reference'), 'relationships': ('version', 'reference')}
 
 
 class ObjectStoreInputError(ValueError):
@@ -377,8 +377,7 @@ class StoredObject:
 class StoredRelationship:
     """A consumed relationship with endpoints ordered by kind (KINDS order;
     UUID order between objects of one kind), not by stored order."""
-    uuid: str
-    version: int
+    reference: dict
     kind: str
     family: str
     approval_state: str
@@ -391,11 +390,19 @@ class StoredRelationship:
     b_geometry_revision: str = None
     stored_order: tuple = None  # (a, b) as the record stores them
 
+    @property
+    def uuid(self):
+        return self.reference['relationship']
+
+    @property
+    def version(self):
+        return self.reference['version']
+
     def provenance(self):
         """Identity by content: the shared record, its endpoints' geometry
         and a hash of the anchors and metadata materialization reads.
-        ``version`` (its numbered version) only pins it."""
-        return {'uuid': self.uuid, 'version': self.version,
+        The complete reference pins the publication independently of content."""
+        return {'uuid': self.uuid, 'version': self.version, 'reference': self.reference,
                 'kind': self.kind, 'family': self.family,
                 'approval_state': self.approval_state,
                 'a': self.a, 'a_geometry_revision': self.a_geometry_revision,
@@ -635,6 +642,8 @@ def filter_relationships(view_relationships, objects, approved_links_only):
     approved-only mode). Adjacent-winding fiber branches are consumed like
     ordinary ones; materialize_fibers signs them.
     """
+    from vc_object_store import relationship_reference
+
     kinds = {uuid: obj.kind for uuid, obj in objects.items()}
     consumed, exclusions = [], Counter()
     for entry in view_relationships:
@@ -658,7 +667,7 @@ def filter_relationships(view_relationships, objects, approved_links_only):
             continue
         a, a_anchor, a_geometry, b, b_anchor, b_geometry = _ordered_endpoints(entry, kinds)
         consumed.append(StoredRelationship(
-            uuid=record['uuid'], version=int(entry['version']), kind=record['kind'],
+            reference=relationship_reference(entry), kind=record['kind'],
             family=family, approval_state=state,
             a=a, b=b, a_anchor=a_anchor,
             b_anchor=b_anchor, meta=record['meta'] or {},
@@ -1572,7 +1581,7 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
                     'input_role': 'patch_overlap',
                     'resident_collection_id': cid,
                     'edge_uuid': rel.uuid,
-                    'edge_version': rel.version,
+                    'edge_reference': rel.reference,
                     'pair_distance': float(pair['distance']) / fit_scale,
                 },
             }

@@ -10,6 +10,7 @@
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 
 #include <QCoreApplication>
 #include <QTemporaryDir>
@@ -180,7 +181,8 @@ struct Fixture {
                 const auto& version = selected.relationship;
                 const bool stored = version.record.aUuid == surface;
                 relationships.push_back(
-                    {{"uuid", version.record.uuid}, {"kind", version.record.kind},
+                    {{"reference", Json::parse(relationshipVersionToJson(version.reference()))},
+                     {"uuid", version.record.uuid}, {"kind", version.record.kind},
                      {"family", "pcl_patch"}, {"approval_state", version.record.approvalState},
                      {"version", version.version}, {"a", surface},
                      {"a_geometry_revision", *(stored ? version.aGeometryRevision : version.bGeometryRevision)},
@@ -272,6 +274,15 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     const auto document = fixture.manifest();
     auto inputs = fixture.read(document);
     require(inputs.unchanged(), "the fixture holds its inputs as fitted");
+    auto legacy = document;
+    legacy["manifest"]["relationships"][0].erase("reference");
+    require(fixture.read(legacy).unchanged(), "legacy relationship manifests retain their weaker comparison");
+    for (const auto* field : {"store", "generation"}) {
+        auto otherIdentity = document;
+        otherIdentity["manifest"]["relationships"][0]["reference"][field] = util::newUuid();
+        require(fixture.read(otherIdentity).relationships.at(0).state == vc3d::spiral::LinkState::Changed,
+                "same relationship counter with another owner or lineage is changed");
+    }
     require(inputs.count(InputState::Fitted) == 3, "every input is as fitted");
     require(!inputs.outerShell, "a fit that read no outer shell has none");
     // The manifest's outer shell is read as a surface, apart from the patches.

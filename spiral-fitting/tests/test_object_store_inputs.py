@@ -41,7 +41,7 @@ def test_dense_fiber_without_synthetic_controls_materializes_whole_line(db):
 
 @pytest.mark.parametrize('history_enabled', [False, True])
 def test_snapshot_uses_numbered_relationship_versions_without_record_generations(tmp_path, history_enabled):
-    from vc_object_store import ObjectStore
+    from vc_object_store import ObjectStore, relationship_reference
 
     with ObjectStore.create(str(tmp_path / 'input.vcobj'), author='test',
                             history_enabled=history_enabled) as store:
@@ -52,6 +52,10 @@ def test_snapshot_uses_numbered_relationship_versions_without_record_generations
         [relationship] = snapshot.relationships
         assert relationship.uuid == edge
         assert relationship.version == store.edge(edge)['version']
+        selected = store.relationships_at_versions(snapshot.request.pins.refs())[0]
+        assert relationship.reference == relationship_reference(selected)
+        assert relationship.provenance()['reference'] == relationship.reference
+        assert relationship.reference['store'] == store.status()['store']
         assert 'generation' not in relationship.provenance()
         assert snapshot.manifest()['position']['generation'] == store.status()['generation']
         # A pinned current snapshot works even without historical storage.
@@ -59,6 +63,14 @@ def test_snapshot_uses_numbered_relationship_versions_without_record_generations
         again = osi.read_snapshot(store, dataclasses.replace(
             request(), pins=snapshot.request.pins))
         assert again.digest() == snapshot.digest()
+        changed_reference = dict(relationship.reference, store='11111111-1111-4111-8111-111111111111')
+        changed = dataclasses.replace(relationship, reference=changed_reference)
+        assert changed.provenance()['reference'] != relationship.provenance()['reference']
+        assert changed.provenance()['content_sha256'] == relationship.provenance()['content_sha256']
+        # Publication provenance does not redefine consumed-content identity.
+        manifest = snapshot.manifest()
+        manifest['relationships'] = [changed.provenance()]
+        assert osi.manifest_digest(manifest) == snapshot.digest()
 
 
 def test_default_selection_reads_every_active_object_in_uuid_order(db):
