@@ -86,10 +86,10 @@ std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session
     auto edge = attachmentEdge(uuid, annotation.surfaceUuid, "growth_annotation");
     edge.uuid = util::newUuid();
     auto request = session.newRequest(attachment);
-    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+    if (!editor) session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         const auto surface = reader.currentObject(annotation.surfaceUuid);
         if (!surface) throw std::runtime_error("surface not found: " + annotation.surfaceUuid);
-        request.expectedObjects[surface->objectUuid] = surface->version;
+        expectObject(request, *surface);
     });
     request.expectedObjects[uuid] = std::nullopt;
     request.operations = {CreateObjectOp{objectRecordJson(record)}, PutGeometryOp{uuid, vc::geometry::encode(geometry), {}},

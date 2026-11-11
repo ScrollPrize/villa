@@ -39,20 +39,63 @@ std::string sha256(const uint8_t* data, size_t size)
 
 std::string canonical(const std::string& uuid) { return util::canonicalUuid(uuid); }
 
-Json selectionJson(const VersionSelection& selection)
+Json selectionJson(const RecordSelection& selection, bool full = false, bool relationships = false)
 {
     auto result = Json::object();
-    for (const auto& [uuid, version] : selection) result[canonical(uuid)] = version ? Json(*version) : Json(nullptr);
+    for (const auto& [uuid, expected] : selection) {
+        if ((expected.deleted && !expected.complete()) || (expected.number() && *expected.number() <= 0))
+            throw std::invalid_argument("invalid expected record state");
+        Json value = expected.number() ? Json(*expected.number()) : Json(nullptr);
+        if (expected.complete()) {
+            if (relationships) {
+                const auto* ref = std::get_if<RelationshipVersion>(&expected.selected);
+                if (!ref || canonical(ref->relationshipUuid) != canonical(uuid))
+                    throw std::invalid_argument("expected reference names another relationship");
+                value = Json::parse(relationshipVersionToJson(*ref));
+            } else {
+                const auto* ref = std::get_if<ObjectVersion>(&expected.selected);
+                if (!ref || canonical(ref->objectUuid) != canonical(uuid))
+                    throw std::invalid_argument("expected reference names another object");
+                value = Json::parse(objectVersionToJson(*ref));
+            }
+            if (expected.deleted) value = Json{{"reference", value}, {"deleted", true}};
+            if (!full) value = expected.number() ? Json(*expected.number()) : Json(nullptr);
+        }
+        const auto id = canonical(uuid);
+        if (result.contains(id)) throw std::invalid_argument("duplicate expected record identity");
+        result[id] = std::move(value);
+    }
     return result;
 }
 
-VersionSelection selectionFrom(const Json& j)
+RecordSelection selectionFrom(const Json& j, bool full = false, bool relationships = false)
 {
-    VersionSelection result;
-    for (const auto& [uuid, version] : j.items()) {
-        if (!version.is_null() && (!version.is_number_integer() || version.get<int64_t>() <= 0))
-            throw std::invalid_argument("transaction: versions are positive integers");
-        result.emplace(canonical(uuid), version.is_null() ? std::nullopt : std::optional(version.get<int64_t>()));
+    if (!j.is_object()) throw std::invalid_argument("transaction: expected versions must be a map");
+    RecordSelection result;
+    for (const auto& [uuid, value] : j.items()) {
+        RecordExpectation expected;
+        if (value.is_object() && full) {
+            const bool deleted = value.contains("reference");
+            const auto& reference = deleted ? value.at("reference") : value;
+            if (deleted && (!value.at("deleted").is_boolean() || !value.at("deleted").get<bool>() || value.size() != 2))
+                throw std::invalid_argument("transaction: invalid tombstone expectation");
+            if (relationships) {
+                auto ref = relationshipVersionFromJson(reference.dump());
+                if (ref.relationshipUuid != canonical(uuid)) throw std::invalid_argument("expected reference names another relationship");
+                expected = ref;
+            } else {
+                auto ref = objectVersionFromJson(reference.dump());
+                if (ref.objectUuid != canonical(uuid)) throw std::invalid_argument("expected reference names another object");
+                expected = ref;
+            }
+            expected.deleted = deleted;
+        } else if (!value.is_null()) {
+            if (!value.is_number_integer() || (value.is_number_unsigned() && value.get<uint64_t>() > uint64_t(INT64_MAX)) ||
+                value.get<int64_t>() <= 0) throw std::invalid_argument("transaction: versions are positive integers");
+            expected = value.get<int64_t>();
+        }
+        if (!result.emplace(canonical(uuid), std::move(expected)).second)
+            throw std::invalid_argument("duplicate expected record identity");
     }
     return result;
 }
@@ -194,22 +237,29 @@ Json requestJson(const TransactionRequest& request, TransactionPayloads* payload
     Encoder encode(payloads);
     auto operations = Json::array();
     for (const auto& op : request.operations) operations.push_back(std::visit(encode, op));
-    Json j{{"command_version", request.expectedObjectReferences.empty() ? 1 : kTransactionCommandVersion}, {"store", canonical(request.storeUuid)},
+    const auto complete = [](const RecordSelection& selection) {
+        return std::any_of(selection.begin(), selection.end(), [](const auto& entry) { return entry.second.complete(); });
+    };
+    const bool modern = complete(request.readDependencies) || complete(request.expectedRelationships) ||
+        std::any_of(request.expectedObjects.begin(), request.expectedObjects.end(), [](const auto& entry) { return entry.second.deleted; });
+    const int command = modern ? 3 : complete(request.expectedObjects) ? 2 : 1;
+    Json j{{"command_version", command}, {"store", canonical(request.storeUuid)},
            {"generation", canonical(request.generation)}, {"author", request.author},
-           {"expected_objects", selectionJson(request.expectedObjects)},
-           {"expected_relationships", selectionJson(request.expectedRelationships)},
-           {"read_dependencies", selectionJson(request.readDependencies)},
+           {"expected_objects", selectionJson(request.expectedObjects, modern)},
+           {"expected_relationships", selectionJson(request.expectedRelationships, modern, true)},
+           {"read_dependencies", selectionJson(request.readDependencies, modern)},
            {"expected_commit_sequence", request.expectedCommitSequence ? Json(*request.expectedCommitSequence) : Json(nullptr)},
            {"operations", operations}};
     if (withRequestUuid) j["request"] = canonical(request.requestUuid);
-    if (!request.expectedObjectReferences.empty()) {
+    // Preserve existing command-1/2 digests. Their redundant wire fields are
+    // decoded once into the single selection, never synchronized internally.
+    if (command == 2) {
         std::vector<ObjectVersion> refs;
-        for (const auto& [uuid, ref] : request.expectedObjectReferences) {
-            if (canonical(uuid) != canonical(ref.objectUuid)) throw std::invalid_argument("expected reference names another object");
-            if (const auto expected = request.expectedObjects.find(canonical(uuid)); expected != request.expectedObjects.end() && expected->second != ref.version)
-                throw std::invalid_argument("conflicting numeric and complete expected object versions");
-            refs.push_back({canonical(ref.storeUuid), canonical(ref.generation), canonical(ref.objectUuid), ref.version});
-        }
+        for (const auto& [uuid, expected] : request.expectedObjects)
+            if (const auto* ref = std::get_if<ObjectVersion>(&expected.selected)) {
+                if (canonical(uuid) != canonical(ref->objectUuid)) throw std::invalid_argument("expected reference names another object");
+                refs.push_back(canonicalObjectVersion(*ref));
+            }
         j["expected_object_references"] = Json::parse(objectVersionsRequestToJson(refs)).at("versions");
     }
     return j;
@@ -399,8 +449,12 @@ void expectObject(TransactionRequest& request, const ObjectVersion& reference)
 {
     ObjectVersion ref{canonical(reference.storeUuid), canonical(reference.generation), canonical(reference.objectUuid), reference.version};
     if (ref.version <= 0) throw std::invalid_argument("expected object version must be positive");
-    request.expectedObjects[ref.objectUuid] = ref.version;
-    request.expectedObjectReferences[ref.objectUuid] = std::move(ref);
+    request.expectedObjects[ref.objectUuid] = ref;
+}
+
+RecordSelection recordSelectionFromJson(const std::string& text, bool relationships)
+{
+    return selectionFrom(Json::parse(text), true, relationships);
 }
 
 std::string transactionRequestToJson(const TransactionRequest& request, TransactionPayloads* payloads)
@@ -411,20 +465,24 @@ std::string transactionRequestToJson(const TransactionRequest& request, Transact
 TransactionRequest transactionRequestFromJson(const std::string& text, const TransactionPayloads& payloads)
 {
     const auto j = Json::parse(text);
-    if (const auto version = j.at("command_version").get<int>(); version != 1 && version != kTransactionCommandVersion)
+    if (const auto version = j.at("command_version").get<int>(); version < 1 || version > kTransactionCommandVersion)
         throw std::invalid_argument("transaction: unsupported command version");
     TransactionRequest request;
     request.requestUuid = canonical(j.at("request").get<std::string>());
     request.storeUuid = canonical(j.at("store").get<std::string>());
     request.generation = canonical(j.at("generation").get<std::string>());
     request.author = j.at("author").get<std::string>();
-    request.expectedObjects = selectionFrom(j.at("expected_objects"));
-    request.expectedRelationships = selectionFrom(j.at("expected_relationships"));
-    request.readDependencies = selectionFrom(j.value("read_dependencies", Json::object()));
-    for (const auto& ref : objectVersionsRequestFromJson(Json{{"versions", j.value("expected_object_references", Json::array())}}.dump())) {
-        if (j.at("command_version").get<int>() < 2 || request.expectedObjectReferences.contains(canonical(ref.objectUuid)))
+    const bool modern = j.at("command_version").get<int>() >= 3;
+    request.expectedObjects = selectionFrom(j.at("expected_objects"), modern);
+    request.expectedRelationships = selectionFrom(j.at("expected_relationships"), modern, true);
+    request.readDependencies = selectionFrom(j.value("read_dependencies", Json::object()), modern);
+    std::set<std::string> seen;
+    for (const auto& value : objectVersionsRequestFromJson(Json{{"versions", j.value("expected_object_references", Json::array())}}.dump())) {
+        const auto ref = canonicalObjectVersion(value);
+        if (j.at("command_version").get<int>() != 2 || !seen.insert(ref.objectUuid).second)
             throw std::invalid_argument("invalid or duplicate expected object reference");
-        if (const auto expected = request.expectedObjects.find(canonical(ref.objectUuid)); expected != request.expectedObjects.end() && expected->second != ref.version)
+        if (const auto expected = request.expectedObjects.find(ref.objectUuid);
+            expected != request.expectedObjects.end() && expected->second.number() != ref.version)
             throw std::invalid_argument("conflicting numeric and complete expected object versions");
         expectObject(request, ref);
     }
@@ -670,17 +728,48 @@ void validateRequest(const TransactionRequest& request)
 // Merge a preparation's versions into the request's: the same record with
 // another version means the caller and preparation read different snapshots.
 // Treat it as the same retryable conflict as a change after preparation.
-void mergeVersions(VersionSelection& into, const VersionSelection& from, const char* what)
+} // namespace
+
+VersionSelection numberedSelection(const RecordSelection& selected)
 {
-    for (const auto& [uuid, version] : from) {
+    VersionSelection result;
+    for (const auto& [uuid, expected] : selected) result.emplace(uuid, expected.number());
+    return result;
+}
+
+void mergeExpectations(RecordSelection& into, const RecordSelection& from, const char* what)
+{
+    for (const auto& [uuid, expected] : from) {
         const auto id = canonical(uuid);
-        const auto [found, inserted] = into.emplace(id, version);
-        if (!inserted && found->second != version)
-            throw TransactionConflict(TransactionConflict::Reason::Version, {{"object", id, found->second, version}},
-                std::string("transaction conflict: ") + what + " of " + id + " differ between the request and its preparation");
+        const auto [found, inserted] = into.emplace(id, expected);
+        if (inserted || found->second == expected) continue;
+        if (found->second.number() == expected.number() && !found->second.deleted && !expected.deleted &&
+            (!found->second.complete() || !expected.complete())) {
+            if (expected.complete()) found->second = expected;
+            continue; // legacy number may strengthen, never replace a full identity
+        }
+        throw TransactionConflict(TransactionConflict::Reason::Version, {{"object", id, found->second.number(), expected.number()}},
+            std::string("transaction conflict: ") + what + " of " + id + " differ between the request and its preparation");
     }
 }
-} // namespace
+
+void expectObject(TransactionRequest& request, const ObjectRevision& revision)
+{
+    expectObject(request, revision.reference());
+    request.expectedObjects.at(revision.objectUuid).deleted = revision.deleted;
+}
+void expectRead(TransactionRequest& request, const ObjectVersion& reference)
+{
+    const auto ref = canonicalObjectVersion(reference);
+    if (ref.version <= 0) throw std::invalid_argument("expected object version must be positive");
+    request.readDependencies[ref.objectUuid] = ref;
+}
+void expectRelationship(TransactionRequest& request, const RelationshipVersion& reference)
+{
+    const RelationshipVersion ref{canonical(reference.storeUuid), canonical(reference.generation), canonical(reference.relationshipUuid), reference.version};
+    if (ref.version <= 0) throw std::invalid_argument("expected relationship version must be positive");
+    request.expectedRelationships[ref.relationshipUuid] = ref;
+}
 
 void registerOperationPreparer(const std::string& operationName, OperationPreparer preparer)
 {
@@ -688,17 +777,17 @@ void registerOperationPreparer(const std::string& operationName, OperationPrepar
     preparers()[operationName] = std::move(preparer);
 }
 
-VersionSelection PreparedOperations::expectedObjects() const
+RecordSelection PreparedOperations::expectedObjects() const
 {
-    VersionSelection result;
-    for (const auto& [index, preparation] : operations_) mergeVersions(result, preparation.expectedObjects, "expected versions");
+    RecordSelection result;
+    for (const auto& [index, preparation] : operations_) mergeExpectations(result, preparation.expectedObjects, "expected versions");
     return result;
 }
 
-VersionSelection PreparedOperations::readDependencies() const
+RecordSelection PreparedOperations::readDependencies() const
 {
-    VersionSelection result;
-    for (const auto& [index, preparation] : operations_) mergeVersions(result, preparation.readDependencies, "read dependencies");
+    RecordSelection result;
+    for (const auto& [index, preparation] : operations_) mergeExpectations(result, preparation.readDependencies, "read dependencies");
     return result;
 }
 
@@ -760,7 +849,6 @@ TransactionReceipt ObjectStore::submit(const TransactionRequest& request, const 
     TransactionContext context;
     context.storeUuid = request.storeUuid; context.generation = request.generation;
     context.expectedObjects = request.expectedObjects; context.expectedRelationships = request.expectedRelationships;
-    context.expectedObjectReferences = request.expectedObjectReferences;
     context.readDependencies = request.readDependencies; context.expectedCommitSequence = request.expectedCommitSequence;
     if (!prepared.empty()) {
         // A preparation publishes only for the request whose detection it
@@ -774,8 +862,8 @@ TransactionReceipt ObjectStore::submit(const TransactionRequest& request, const 
     for (const auto& [index, preparation] : prepared.operations_) {
         if (index >= request.operations.size() || !preparedOperationName(request.operations[index]))
             throw std::invalid_argument("transaction: preparation " + std::to_string(index) + " names no prepared operation");
-        mergeVersions(context.expectedObjects, preparation.expectedObjects, "expected versions");
-        mergeVersions(context.readDependencies, preparation.readDependencies, "read dependencies");
+        mergeExpectations(context.expectedObjects, preparation.expectedObjects, "expected versions");
+        mergeExpectations(context.readDependencies, preparation.readDependencies, "read dependencies");
     }
     // A record both written and read-guarded at the same version is just
     // expected; a read dependency at another version is a stale read the
@@ -788,8 +876,8 @@ TransactionReceipt ObjectStore::submit(const TransactionRequest& request, const 
     RevisionSelection expected;
     prepareCheckedWrite(db, context, expected);
     txn.expectedRevisions_ = expected;
-    txn.expectedObjectVersions_ = context.expectedObjects;
-    txn.expectedRelationshipVersions_ = request.expectedRelationships;
+    txn.expectedObjectVersions_ = numberedSelection(context.expectedObjects);
+    txn.expectedRelationshipVersions_ = numberedSelection(request.expectedRelationships);
     Executor apply{*this, txn, prepared.operations_};
     for (apply.index = 0; apply.index < request.operations.size(); ++apply.index)
         std::visit(apply, request.operations[apply.index]);

@@ -102,7 +102,7 @@ void copyCollectionProject(bool packed,bool sharded)
         {ObjectStoreSession session;const auto attachment=session.attach(base,options);
             addProjectResource(session,attachment,kVolumeResource,"/volume/base");
             session.readStore(attachment,[&](const StoreReader& reader,const auto&){artifactOwner=projectRecord(reader)->uuid;});
-            session.publishArtifacts(attachment,artifactOwner,session.currentObject(attachment,artifactOwner)->version,{{"note.txt",payload}},"copy-test");}
+            session.publishArtifacts(attachment,session.currentObject(attachment,artifactOwner)->reference(),{{"note.txt",payload}},"copy-test");}
         {auto store=ObjectStore::open(base,options);auto w=store.write();store.seal(w);w.commit();}
         {auto collection=ObjectCollection::create(source,{base},options);}
         {ObjectStoreSession session;const auto attachment=session.attach(source,options);
@@ -444,7 +444,7 @@ int main() try
             recordUuid = projectRecord(reader)->uuid;
             version = reader.currentObject(recordUuid)->version;
         });
-        aliceSession.publishArtifacts(alice, recordUuid, version, {{"notes.txt", file}});
+        aliceSession.publishArtifacts(alice, aliceSession.currentObject(alice, recordUuid)->reference(), {{"notes.txt", file}});
         const auto copyPath = directory.path / "with-artifacts.vcobj";
         copyProject(aliceSession, alice, copyPath, "with artifacts", as("alice"));
         ObjectStoreSession copied;

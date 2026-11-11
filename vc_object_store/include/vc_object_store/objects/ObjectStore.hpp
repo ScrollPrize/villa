@@ -183,6 +183,7 @@ struct RelationshipRevision {
     std::string generation;
     // Resolved endpoint identities for consumers; no parsing of internal revision tokens.
     ObjectVersion aReference, bReference;
+    RelationshipVersion reference() const;
 };
 
 struct SelectedRelationship {
@@ -511,7 +512,7 @@ public:
     // write(TransactionContext) with only expectedObjects. Every changed
     // object/endpoint must be expected. Commit publishes one revision per changed
     // object. Missing expectations or conflicts abort the whole transaction, even if caught.
-    WriteTxn write(const VersionSelection& expectedObjects);
+    WriteTxn write(const RecordSelection& expectedObjects);
     // Numbered checked write (see TransactionContext). A request UUID already
     // committed is rejected here; use receipt() or submit() to recover it.
     WriteTxn write(const TransactionContext&);

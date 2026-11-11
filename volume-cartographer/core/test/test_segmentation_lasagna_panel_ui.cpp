@@ -226,7 +226,7 @@ int main(int argc, char** argv)
     const auto noModelUuid = addSurface("sheet_no_model", nlohmann::json::object());
     const auto modelFile = std::filesystem::path(storePath).parent_path() / "model.pt";
     writeFile(QString::fromStdString(modelFile.string()), QByteArrayLiteral("model"));
-    session->publishArtifacts(attachment, fittedUuid, session->currentObject(attachment, fittedUuid)->version,
+    session->publishArtifacts(attachment, session->currentObject(attachment, fittedUuid)->reference(),
                               {{"model.pt", modelFile}});
     LasagnaServiceManager::instance().setObjectStore(session, attachment);
     SurfaceCatalog catalog(session);

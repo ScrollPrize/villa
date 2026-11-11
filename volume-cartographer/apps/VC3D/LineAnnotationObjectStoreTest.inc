@@ -258,10 +258,10 @@ int runObjectStoreControllerTests()
                     "the fiber map status names the stored umbilicus");
             const auto snapshot = controller.umbilicusForSnapshot(state.annotationVolume()->volume);
             require(snapshot.message.isEmpty() && snapshot.centers.size() == 2, "the fiber map reads the stored umbilicus");
-            const auto token = controller.umbilicusFingerprint();
+            const auto token = controller.umbilicusDependency();
             add("second");
             require(controller.umbilicusStatus().text.contains("several") &&
-                    controller.umbilicusFingerprint() != token,
+                    controller.umbilicusDependency() != token,
                     "several umbilici bound to one volume are refused");
             state.closeProject();
         }

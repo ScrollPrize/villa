@@ -321,7 +321,7 @@ try {
         const auto file = directory.path / "weights.bin";
         { std::ofstream(file, std::ios::binary) << "weights for " << object; }
         const auto version = session.currentObject(attachment, object)->version;
-        const auto published = session.publishArtifacts(attachment, object, version, {{"model/weights.bin", file}}, "session-test");
+        const auto published = session.publishArtifacts(attachment, session.currentObject(attachment, object)->reference(), {{"model/weights.bin", file}}, "session-test");
         require(published.objects.at(object) == version + 1, "artifacts published");
         if (attachment == hosted) session.refresh(hosted);
         const auto files = session.artifacts(attachment, object);
@@ -469,7 +469,7 @@ try {
             const auto report = ingestGeometrySource(session, attachment, "fiber", file);
             require(report.ingested == 1 && report.problems.empty(), "file ingested through the session");
             auto request = ingest({source(linked, existing)});
-            require(request.expectedObjects.at(linked) == std::nullopt && request.expectedObjects.at(existing) == 1,
+            require(request.expectedObjects.at(linked).number() == std::nullopt && request.expectedObjects.at(existing).number() == 1,
                     "ingestion expects new objects absent and linked fibers at their versions");
             TransactionPayloads payloads;
             const auto text = transactionRequestToJson(request, &payloads);
@@ -511,7 +511,7 @@ try {
             const auto model = directory.path / "model.pt", empty = directory.path / "empty.bin";
             const auto content = "model of " + object;
             { std::ofstream(model, std::ios::binary) << content; std::ofstream(empty, std::ios::binary); }
-            session.publishArtifacts(from, object, 1, {{"model.pt", model}, {"nested/model.pt", model}, {"empty.bin", empty}});
+            session.publishArtifacts(from, session.currentObject(from, object)->reference(), {{"model.pt", model}, {"nested/model.pt", model}, {"empty.bin", empty}});
             const auto manifest = artifactManifestJson(session.artifacts(from, object));
             for (const auto& to : {another, second}) {
                 for (int attempt = 0; attempt < (importing ? 1 : 2); ++attempt) {

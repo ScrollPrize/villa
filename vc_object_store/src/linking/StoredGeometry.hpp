@@ -45,7 +45,7 @@ public:
     // The numbered version of every object selected so far: what a checked
     // write publishing links over them expects (every endpoint of a published
     // relationship must be expected).
-    objects::VersionSelection expectations() const;
+    objects::RecordSelection expectations() const;
     // Stored (conservative) bounds of an object's current geometry in working
     // voxels: the params' volume, else source XYZ * explicitScale. nullopt
     // when the store records none.
@@ -61,7 +61,7 @@ public:
 private:
     objects::ObjectStore& db_;
     std::optional<objects::ReadTxn> read_;
-    std::map<std::string, int64_t> versions_;
+    objects::RecordSelection versions_;
     std::map<std::string, std::string> revisions_;
 };
 

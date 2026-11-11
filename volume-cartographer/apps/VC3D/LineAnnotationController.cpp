@@ -5477,16 +5477,14 @@ LineAnnotationController::storedUmbilicus(const vc::objects::VolumeVoxels& voxel
     return stored;
 }
 
-QString LineAnnotationController::umbilicusFingerprint() const
+vc3d::fiber_map::UmbilicusDependency LineAnnotationController::umbilicusDependency() const
 {
-    // Changes whenever the answer does: uuid@generation/version, else why there is none.
     if (!_state || !_state->storeFor("umbilicus") || !_state->annotationVolume()) {
         return {};
     }
     const auto& stored = storedUmbilicus(*_state->annotationVolume());
-    return stored.umbilicus ? QString::fromStdString(stored.umbilicus->uuid + "@" + stored.umbilicus->version.generation + "/" +
-                                                     std::to_string(stored.umbilicus->version.version))
-                            : stored.problem;
+    if (stored.umbilicus) return {stored.umbilicus->version, {}};
+    return {std::nullopt, stored.problem};
 }
 
 LineAnnotationController::UmbilicusStatus
@@ -15482,17 +15480,16 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     vc3d::line_annotation::canonicalizeFiberSaveSnapshots(edits);
     vc3d::line_annotation::validateFiberSaveSnapshots(edits);
     auto request = connection->newRequest(*attachment);
-    VersionSelection expected;
+    RecordSelection expected;
     auto expect = [&](const StoredFiber& fiber) {
         if (fiber.storePin && fiber.storePin->attachment != *attachment)
             throw std::runtime_error("The fiber belongs to a previous object store attachment");
         // The request expects each fiber at its pinned version.
-        std::optional<int64_t> version;
+        RecordExpectation version;
         if (fiber.storePin && fiber.storePin->stored()) {
             if (fiber.storePin->writeGeneration != request.generation)
                 throw std::runtime_error("The fiber's pinned version is not in its object store's current history; reopen it");
-            version = fiber.storePin->reference().version;
-            expectObject(request, fiber.storePin->reference());
+            version = fiber.storePin->reference();
             if (!fiber.graphCommit) throw std::runtime_error("The fiber has no loaded graph baseline; reopen it");
             if (request.expectedCommitSequence && request.expectedCommitSequence != fiber.graphCommit)
                 throw std::runtime_error("The edited fibers have different graph baselines; reopen them together");

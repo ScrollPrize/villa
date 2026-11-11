@@ -130,7 +130,7 @@ void setPointCollectionObject(EditablePclDraft& draft, const vc::objects::Object
     QJsonObject metadata = draft.sourceCollection.value(QStringLiteral("metadata")).toObject();
     metadata[QStringLiteral("object_uuid")] = QString::fromStdString(reference.objectUuid);
     metadata[QLatin1String(kLocalObjectReferenceKey)] = QJsonDocument::fromJson(
-        QByteArray::fromStdString(vc::objects::objectVersionsRequestToJson({reference}))).object()["versions"].toArray().first();
+        QByteArray::fromStdString(vc::objects::objectVersionToJson(reference))).object();
     draft.sourceCollection[QStringLiteral("metadata")] = metadata;
 }
 
@@ -152,8 +152,8 @@ std::vector<SavedPointCollection> savePointCollections(vc::objects::ObjectStoreS
                                     .value(QLatin1String(kLocalObjectReferenceKey));
             if (!value.isObject())
                 throw refused(session, attachment, changedSince("point collection", *object), *object);
-            expected[*object] = vc::objects::objectVersionsRequestFromJson(
-                QJsonDocument(QJsonObject{{"versions", QJsonArray{value}}}).toJson(QJsonDocument::Compact).toStdString()).at(0);
+            expected[*object] = vc::objects::objectVersionFromJson(
+                QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact).toStdString());
             if (expected[*object].objectUuid != *object)
                 throw std::invalid_argument("point collection reference names another object");
         }

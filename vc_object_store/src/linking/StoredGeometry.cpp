@@ -103,13 +103,13 @@ std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kin
         throw std::invalid_argument("requested objects are missing or not of kind " + kind);
     for (const auto& object : objects) {
         if (!object.version) throw std::runtime_error("object " + object.uuid + " has no numbered version");
-        versions_[object.uuid] = *object.version;
+        versions_[object.uuid] = object.reference();
     }
     return objects;
 }
-objects::VersionSelection StoredGeometry::expectations() const
+objects::RecordSelection StoredGeometry::expectations() const
 {
-    objects::VersionSelection result;
+    objects::RecordSelection result;
     for (const auto& [uuid, version] : versions_) result.emplace(uuid, version);
     return result;
 }
@@ -158,7 +158,7 @@ void StoredGeometry::validate(const objects::WriteTxn& txn) const
 {
     for (const auto& [uuid, version] : versions_) {
         const auto object = db_.objectByUuid(txn, uuid);
-        if (!object || object->version != version)
+        if (!object || objects::RecordExpectation(object->reference()) != version)
             throw std::runtime_error("object changed during discovery; retry: " + uuid);
     }
     for (const auto& [uuid, revision] : revisions_) {

@@ -38,13 +38,13 @@ std::string projectViewUuid(const std::string& author)
     return util::nameUuid(std::string(kProjectViewKind) + "/" + author);
 }
 
-std::optional<int64_t> currentRevision(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+RecordExpectation selectedExpectation(ObjectStoreSession& session, const AttachmentIdentity& attachment,
                                        const std::string& uuid, std::optional<ObjectRecord>* record = nullptr)
 {
-    std::optional<int64_t> version;
+    RecordExpectation version;
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         const auto head = reader.currentObject(uuid);
-        version = head ? std::optional(head->version) : currentVersionOf(reader, uuid);
+        version = currentObjectExpectation(reader, uuid);
         if (record) *record = head ? std::optional(head->record) : std::nullopt;
     });
     return version;
@@ -98,18 +98,17 @@ ResourceWrite prepareResourceWrite(const StoreReader& reader, ObjectRecord recor
 // Write `record` over the object's current version `version` (created when
 // it is not in the store; restored first when `restore`), in one checked request.
 void appendRecordWrite(TransactionRequest& request, const ObjectRecord& record,
-                       const std::optional<int64_t>& version, const std::optional<ObjectRecord>& existing,
+                       const RecordExpectation& version, const std::optional<ObjectRecord>& existing,
                        bool restore)
 {
     request.expectedObjects[util::canonicalUuid(record.uuid)] = version;
-    if (existing) expectObject(request, existing->reference());
     if (restore) request.operations.push_back(RestoreObjectOp{record.uuid, std::nullopt});
     if (existing) request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
     else request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
 }
 
 void writeRecord(ObjectStoreSession& session, const AttachmentIdentity& attachment, const ObjectRecord& record,
-                 const std::optional<int64_t>& version, const std::optional<ObjectRecord>& existing, bool restore = false)
+                 const RecordExpectation& version, const std::optional<ObjectRecord>& existing, bool restore = false)
 {
     auto request = session.newRequest(attachment);
     appendRecordWrite(request, record, version, existing, restore);
@@ -129,7 +128,7 @@ void createProject(const std::filesystem::path& path, const std::string& name, c
     auto store = ObjectStore::create(path, options);
     ObjectRecord record;
     record.uuid = util::newUuid();
-    auto txn = store.write(VersionSelection{{record.uuid, std::nullopt}});
+    auto txn = store.write(RecordSelection{{record.uuid, std::nullopt}});
     record.kind = kProjectKind;
     record.name = name;
     record.meta = meta.is_object() ? meta.dump() : "{}";
@@ -179,7 +178,7 @@ void setProjectName(ObjectStoreSession& session, const AttachmentIdentity& attac
         record->kind = kProjectKind;
     }
     record->name = name;
-    writeRecord(session, attachment, *record, existing ? existing->version : std::nullopt, existing);
+    writeRecord(session, attachment, *record, existing ? RecordExpectation(existing->reference()) : RecordExpectation{}, existing);
 }
 
 std::vector<ProjectResource> projectResources(const StoreReader& reader, const std::string& kind,
@@ -256,8 +255,7 @@ std::string addProjectResource(ObjectStore& db, ObjectRecord record)
         request.storeUuid = status.storeUuid;
         request.generation = status.generation;
         request.author = db.author();
-        appendRecordWrite(request, write.record, write.existing ? write.existing->version :
-                          currentVersionOf(reader, uuid), write.existing, write.restore());
+        appendRecordWrite(request, write.record, currentObjectExpectation(reader, uuid), write.existing, write.restore());
     }
     db.submit(request);
     return uuid;
@@ -268,10 +266,10 @@ bool addProjectResource(ObjectStoreSession& session, const AttachmentIdentity& a
                         const std::string& owner)
 {
     ResourceWrite write;
-    std::optional<int64_t> revision;
+    RecordExpectation revision;
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         write = prepareResourceWrite(reader, projectResourceRecord(kind, location, tags, meta, owner));
-        revision = write.existing ? write.existing->version : currentVersionOf(reader, write.record.uuid);
+        revision = currentObjectExpectation(reader, write.record.uuid);
     });
     if (write.unchanged()) return false;
     writeRecord(session, attachment, write.record, revision, write.existing, write.restore());
@@ -294,7 +292,7 @@ void updateProjectResourceMeta(ObjectStoreSession& session, const AttachmentIden
         throw std::invalid_argument("project resource owner is part of its identity");
     if (merged == before) return;
     record->meta = merged.dump();
-    writeRecord(session, attachment, *record, record->version, record);
+    writeRecord(session, attachment, *record, record->reference(), record);
 }
 
 bool removeProjectResource(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& uuid)
@@ -329,7 +327,7 @@ void setProjectView(ObjectStoreSession& session, const AttachmentIdentity& attac
     record.name = author;
     record.meta = (view.is_object() ? view : Json::object()).dump();
     std::optional<ObjectRecord> existing;
-    const auto revision = currentRevision(session, attachment, record.uuid, &existing);
+    const auto revision = selectedExpectation(session, attachment, record.uuid, &existing);
     if (existing && Json::parse(existing->meta) == Json::parse(record.meta)) return;
     writeRecord(session, attachment, record, revision, existing);
 }

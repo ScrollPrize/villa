@@ -394,12 +394,10 @@ std::optional<std::filesystem::path> ObjectStoreSession::artifactFile(const Atta
     return target;
 }
 
-TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
-                                                        int64_t expectedVersion,
+TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity& identity, const ObjectVersion& reference,
                                                         const std::vector<std::pair<std::string, std::filesystem::path>>& files,
                                                         const std::string& author)
 {
-    const auto uuid = util::canonicalUuid(objectUuid);
     TransactionRequest request;
     if (author.empty()) {
         request = newRequest(identity);
@@ -413,12 +411,13 @@ TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity
     // Read the manifest from the expected head, whose publication generation
     // can predate the active history. The request still guards both the head
     // version and the active generation across the uploads below.
-    const auto head = currentObject(identity, uuid);
-    const auto actual = head && !head->deleted ? std::optional(head->version) : std::nullopt;
-    if (actual != expectedVersion)
-        throw TransactionConflict(TransactionConflict::Reason::Version, {{"object", uuid, expectedVersion, actual}},
-                                  "artifact publication: expected version changed for " + uuid);
-    request.expectedObjects = {{uuid, expectedVersion}};
+    expectObject(request, reference);
+    const auto& expected = std::get<ObjectVersion>(request.expectedObjects.at(util::canonicalUuid(reference.objectUuid)).selected);
+    const auto head = currentObject(identity, expected.objectUuid);
+    if (!head || head->deleted || head->reference() != expected)
+        throw TransactionConflict(TransactionConflict::Reason::Version,
+            {{"object", expected.objectUuid, expected.version, head ? std::optional(head->version) : std::nullopt}},
+            "artifact publication: selected reference changed");
     return publishArtifactManifest(identity, std::move(request), *head, files);
 }
 
@@ -680,7 +679,7 @@ void ObjectStoreSession::startFetching(Attachment& attachment)
                     if (!fetch && meta.is_object() && meta.contains(key)) fetch = fetcher;
             }
             if (!fetch) throw std::runtime_error("no geometry fetcher for " + uuid);
-            fetch(held->store(), uuid, [&](const VersionSelection& expected, const Action& action) {
+            fetch(held->store(), uuid, [&](const RecordSelection& expected, const Action& action) {
                 return fetchWrite(identity, expected, action);
             });
         } catch (...) { release(*held, false); throw; }
@@ -688,7 +687,7 @@ void ObjectStoreSession::startFetching(Attachment& attachment)
     });
 }
 
-TransactionReceipt ObjectStoreSession::fetchWrite(const AttachmentIdentity& identity, const VersionSelection& expected,
+TransactionReceipt ObjectStoreSession::fetchWrite(const AttachmentIdentity& identity, const RecordSelection& expected,
                                                   const Action& callback)
 {
     TransactionReceipt committed;

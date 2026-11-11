@@ -36,7 +36,7 @@ nb::list collectionsToPy(const std::vector<vo::AttachedCollection>& collections)
         item["annotations"] = jsonLoads(collection.annotations.dump());
         item["source"] = jsonLoads(collection.source.dump());
         item["reference"] = collection.reference
-            ? jsonLoads(vo::objectVersionsRequestToJson({*collection.reference}))["versions"][0] : nb::none();
+            ? jsonLoads(vo::objectVersionToJson(*collection.reference)) : nb::none();
         out.append(item);
     }
     return out;
@@ -933,14 +933,15 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("name"), nb::arg("cache_directory"),
            nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt, nb::arg("reference") = nb::none(),
            "One artifact as a local file under cache_directory/<sha256>/ (written unless there); None without it.")
-        .def("publish_artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
-                                      int64_t expectedVersion, const std::map<std::string, std::filesystem::path>& files,
+        .def("publish_artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const nb::dict& reference,
+                                      const std::map<std::string, std::filesystem::path>& files,
                                       const std::string& author) {
             const std::vector<std::pair<std::string, std::filesystem::path>> list(files.begin(), files.end());
+            const auto selected = vo::objectVersionFromJson(jsonDumps(reference));
             vo::TransactionReceipt receipt;
-            { nb::gil_scoped_release release; receipt = self.publishArtifacts(attachment, uuid, expectedVersion, list, author); }
+            { nb::gil_scoped_release release; receipt = self.publishArtifacts(attachment, selected, list, author); }
             return receiptPy(receipt);
-        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("expected_version"), nb::arg("files"), nb::arg("author") = "",
+        }, nb::arg("attachment"), nb::arg("reference"), nb::arg("files"), nb::arg("author") = "",
            "Store {name: local path} durably and name them in the object's manifest in one checked request.")
         .def("use_draft_directory", [](Session& self, const std::filesystem::path& directory) {
             vo::DraftRecovery recovery;
@@ -992,7 +993,7 @@ NB_MODULE(_native, m)
     }, nb::arg("json"), "Decode an external exact reference with the shared native codec.");
     m.def("receipt_object_reference", [](const nb::dict& receipt,const std::string& uuid) -> nb::object {
         const auto ref=vo::transactionReceiptFromJson(jsonDumps(receipt)).objectReference(uuid);
-        return ref?nb::object(objectVersionsToPy({*ref})[0]):nb::none();
+        return ref?jsonLoads(vo::objectVersionToJson(*ref)):nb::none();
     },nb::arg("receipt"),nb::arg("object_uuid"),"Exact committed reference, including unchanged inherited inputs.");
     m.def("object_reference", [](const nb::dict& record) {
         vo::ObjectRecord value;
@@ -1000,8 +1001,17 @@ NB_MODULE(_native, m)
         value.version=nb::cast<int64_t>(record["version"]);
         value.versionGeneration=nb::cast<std::string>(record["version_generation"]);
         value.versionStoreUuid=nb::cast<std::string>(record["version_store"]);
-        return nb::cast<nb::dict>(objectVersionsToPy({value.reference()})[0]);
+        return nb::cast<nb::dict>(jsonLoads(vo::objectVersionToJson(value.reference())));
     }, nb::arg("record"), "Complete exact-version reference of a listed or revision record; never infer its owner from an attachment.");
+    m.def("relationship_reference", [](const nb::dict& value) {
+        vo::RelationshipRevision revision;
+        const auto record = nb::cast<nb::dict>(value["record"]);
+        revision.record.uuid = nb::cast<std::string>(record["uuid"]);
+        revision.record.versionStoreUuid = nb::cast<std::string>(record["version_store"]);
+        revision.generation = nb::cast<std::string>(value["generation"]);
+        revision.version = nb::cast<int64_t>(value["version"]);
+        return jsonLoads(vo::relationshipVersionToJson(revision.reference()));
+    }, nb::arg("revision"), "Complete selected relationship identity.");
     m.def("geometry_coordinates", [](const nb::dict& value) {
         return jsonLoads(vo::geometryCoordinates(nlohmann::json::parse(jsonDumps(value))).dump());
     }, nb::arg("coordinates"));
@@ -1274,7 +1284,7 @@ NB_MODULE(_native, m)
                 }
                 return vo::exportGeometry(db, read, object, destination, selected, overwrite, validOnly);
             });
-            return nb::cast<nb::dict>(objectVersionsToPy({exported})[0]);
+            return nb::cast<nb::dict>(jsonLoads(vo::objectVersionToJson(exported)));
         }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("version") = std::nullopt,
            nb::arg("generation") = std::nullopt, nb::arg("overwrite") = false, nb::arg("valid_only") = false,
            nb::arg("reference") = nb::none(),
@@ -1618,17 +1628,17 @@ NB_MODULE(_native, m)
            "microseconds), by object UUID; read them with objects_at_versions and relationships_at_versions.")
         .def(
             "write",
-            [](PyObjectStore& self, const std::optional<vo::VersionSelection>& objects,
-               const std::optional<vo::VersionSelection>& relationships, const std::optional<vo::VersionSelection>& reads,
+            [](PyObjectStore& self, const nb::object& objects,
+               const nb::object& relationships, const nb::object& reads,
                const std::optional<int64_t>& commitSequence, const std::optional<std::string>& requestUuid,
                const std::optional<std::string>& author) {
                 PyObjectWriteTxn w;
                 w.owner = &self;
-                if (objects || relationships || reads || commitSequence || requestUuid || author) {
+                if (!objects.is_none() || !relationships.is_none() || !reads.is_none() || commitSequence || requestUuid || author) {
                     vo::TransactionContext context;
-                    if (objects) context.expectedObjects = *objects;
-                    if (relationships) context.expectedRelationships = *relationships;
-                    if (reads) context.readDependencies = *reads;
+                    if (!objects.is_none()) context.expectedObjects = vo::recordSelectionFromJson(jsonDumps(objects));
+                    if (!relationships.is_none()) context.expectedRelationships = vo::recordSelectionFromJson(jsonDumps(relationships), true);
+                    if (!reads.is_none()) context.readDependencies = vo::recordSelectionFromJson(jsonDumps(reads));
                     context.expectedCommitSequence = commitSequence;
                     context.requestUuid = requestUuid;
                     context.author = author;
@@ -1636,11 +1646,11 @@ NB_MODULE(_native, m)
                 }
                 return w;
             },
-            nb::arg("expected_versions") = std::nullopt, nb::arg("expected_relationships") = std::nullopt,
-            nb::arg("read_dependencies") = std::nullopt, nb::arg("expected_commit_sequence") = std::nullopt,
+            nb::arg("expected_versions") = nb::none(), nb::arg("expected_relationships") = nb::none(),
+            nb::arg("read_dependencies") = nb::none(), nb::arg("expected_commit_sequence") = std::nullopt,
             nb::arg("request_uuid") = std::nullopt, nb::arg("author") = std::nullopt, nb::keep_alive<0, 1>(),
             "Batch write transaction context manager: 'with db.write() as w: w.upsert_object(...)'. Checked when "
-            "given expectations: {uuid: version, or None for absent} of every object (and relationship) the write "
+            "given expectations: {uuid: complete_reference, or None for no live record} of every object (and relationship) the write "
             "changes, versions of records it only read, and/or the store commit sequence; a conflict raises "
             "RuntimeError and commits nothing. After the block, w.receipt is the commit's numbered receipt.");
 

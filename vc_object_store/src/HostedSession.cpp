@@ -783,10 +783,10 @@ std::vector<EdgeRecord> HostedAttachment::selectEdges(const EdgeSelection& selec
     return selection.limit ? client_.selectEdges(selection, fields) : client_.selectAllEdges(selection, fields);
 }
 
-std::optional<ObjectRevision> HostedStoreReader::currentObject(const std::string& objectUuid) const
+std::optional<ObjectRevision> HostedStoreReader::currentObject(const std::string& objectUuid, bool includeDeleted) const
 {
     auto revision = attachment_->currentObject(objectUuid);
-    if (revision && revision->deleted) return std::nullopt;
+    if (revision && revision->deleted && !includeDeleted) return std::nullopt;
     return revision;
 }
 

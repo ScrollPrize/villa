@@ -97,6 +97,6 @@ std::vector<AttachedCollection> pointCollections(const StoreReader&, const std::
 TransactionReceipt writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume,
                                           const std::vector<AttachedCollection>& changed,
                                           const std::vector<std::string>& removed,
-                                          const VersionSelection& expected = {},
+                                          const RecordSelection& expected = {},
                                           const std::vector<ObjectVersion>& references = {});
 }

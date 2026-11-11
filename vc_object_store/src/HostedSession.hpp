@@ -131,7 +131,7 @@ public:
     explicit HostedStoreReader(HostedAttachment& attachment) : attachment_(&attachment) {}
     bool active() const override { return true; }
     StoreStatus status() const override { return attachment_->status(); }
-    std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const override;
+    std::optional<ObjectRevision> currentObject(const std::string& objectUuid, bool includeDeleted = false) const override;
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, bool ifRetained = false) const override;
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>& references) const override
     {

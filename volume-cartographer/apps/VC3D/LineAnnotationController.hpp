@@ -36,6 +36,7 @@
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationStoredFiber.hpp"
 #include "FiberMapAutoLink.hpp"
+#include "FiberMapStaleness.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/fiber_tracer/FiberSideStripIntersections.hpp"
@@ -389,9 +390,8 @@ public:
     // Default-constructed (no voxel size, zero extent) when no volume is loaded.
     // Holders of derived geometry compare it to know whether what they built is
     // still in a frame that means anything.
-    // The stored umbilicus of the current volume as uuid@revision, or why there
-    // is none: changes whenever the umbilicus derived views depend on does.
-    [[nodiscard]] QString umbilicusFingerprint() const;
+    // Complete selected identity, with unavailable status kept separately.
+    [[nodiscard]] vc3d::fiber_map::UmbilicusDependency umbilicusDependency() const;
     // The catalog volume the current volume shows and its orientation
     // (catalogVolumeSense); cheap enough for dependency checks.
     [[nodiscard]] std::optional<vc3d::opendata::CatalogVolumeSense> fiberMapCatalogVolume() const;

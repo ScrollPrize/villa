@@ -50,6 +50,7 @@ std::string objectRecordJson(const ObjectRecord&);
 std::string edgeRecordJson(const EdgeRecord&);
 
 std::string transactionReceiptToJson(const TransactionReceipt&);
+RecordSelection recordSelectionFromJson(const std::string&, bool relationships = false);
 TransactionReceipt transactionReceiptFromJson(const std::string&);
 std::string storeStatusToJson(const StoreStatus&);
 std::string changePageToJson(const ChangePage&);
@@ -123,6 +124,8 @@ std::vector<ObjectRevision> objectHistoryFromJson(const std::string&, StoreStatu
 // reads at versions send them in this form.
 std::string objectVersionToJson(const ObjectVersion&);
 ObjectVersion objectVersionFromJson(const std::string&);
+std::string relationshipVersionToJson(const RelationshipVersion&);
+RelationshipVersion relationshipVersionFromJson(const std::string&);
 std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>&);
 std::vector<ObjectVersion> objectVersionsRequestFromJson(const std::string&);
 // Batched reads at versions: one entry per reference, null where not recorded.

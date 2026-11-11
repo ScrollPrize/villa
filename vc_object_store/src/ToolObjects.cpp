@@ -30,7 +30,7 @@ TransactionReceipt ToolObjects::publishArtifacts(const std::string& uuid,
     if (!pin) {
         const auto current = session_->currentObject(attachment_, uuid);
         if (!current) throw std::runtime_error("no object " + uuid + " to publish artifacts of");
-        return session_->publishArtifacts(attachment_, uuid, current->version, files);
+        return session_->publishArtifacts(attachment_, current->reference(), files);
     }
     return session_->publishArtifacts(*pin, files, {}, mapping);
 }

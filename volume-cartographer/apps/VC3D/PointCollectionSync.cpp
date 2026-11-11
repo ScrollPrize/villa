@@ -103,7 +103,7 @@ bool PointCollectionSync::flush()
     }
     const std::vector<std::string> removed(removed_.begin(), removed_.end());
     try {
-        vc::objects::VersionSelection expected;
+        vc::objects::RecordSelection expected;
         std::vector<vc::objects::ObjectVersion> references;
         for (auto& collection : changed) {
             const auto found = revisions_.find(collection.uuid);

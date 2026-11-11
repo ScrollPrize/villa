@@ -300,12 +300,12 @@ try {
         auto txn = db.read();
         const auto dependencies = transformDependencies(LocalStoreReader(db, txn));
         require(!dependencies.empty() && std::all_of(dependencies.begin(), dependencies.end(),
-                [](const auto& d) { return d.second && *d.second > 0; }), "transform dependencies");
+                [](const auto& d) { return d.second.complete() && d.second.number().value_or(0) > 0; }), "transform dependencies retain complete identities");
     }
     {
         auto edits = ObjectStore::create(directory.path / "edits.vcobj", options);
         const auto at = [&] { auto txn = edits.read(); return edits.status(txn); };
-        auto make = [&](VersionSelection expected, std::vector<TransactionOperation> operations) {
+        auto make = [&](RecordSelection expected, std::vector<TransactionOperation> operations) {
             TransactionRequest r;
             r.requestUuid = util::newUuid(); r.storeUuid = at().storeUuid; r.generation = at().generation;
             r.author = "carol"; r.expectedObjects = std::move(expected); r.operations = std::move(operations);
@@ -333,12 +333,12 @@ try {
         std::memcpy(moved.data(), xyz, 12);
         // Without a decision the affected relationship refuses the edit.
         mustFail([&] { edits.submit(make({{surface, 2}, {other, 2}}, {EditGeometryOp{surface, {{"points", 0, moved}}, {}}})); });
-        VersionSelection expected{{surface, 2}};
+        RecordSelection expected{{surface, 2}};
         {
             auto txn = edits.read();
             expectRelationshipEndpoints(LocalStoreReader(edits, txn), expected);
         }
-        require(expected == VersionSelection{{surface, 2}, {other, 2}}, "relationship endpoints expected");
+        require(expected.size() == 2 && expected.at(surface).complete() && expected.at(other).complete(), "relationship endpoints retain complete identities");
         auto keep = make(expected, {EditGeometryOp{surface, {{"points", 0, moved}}, {}, true}});
         const auto plain = transactionRequestToJson(make(expected, {EditGeometryOp{surface, {{"points", 0, moved}}, {}}}));
         TransactionPayloads payloads;

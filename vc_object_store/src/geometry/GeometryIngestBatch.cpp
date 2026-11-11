@@ -118,7 +118,7 @@ void addIngestOperation(TransactionRequest& request, const StoreReader& reader, 
     auto expect = [&](const std::string& uuid) {
         if (request.expectedObjects.contains(uuid)) return;
         const auto current = reader.currentObject(uuid);
-        request.expectedObjects[uuid] = current && !current->deleted ? std::optional(current->version) : std::nullopt;
+        request.expectedObjects[uuid] = currentObjectExpectation(reader, uuid);
     };
     // Fiber branches name their existing endpoints; links resolved by source
     // identity (point and winding links) stay within the batch.

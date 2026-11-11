@@ -518,7 +518,7 @@ void inventoryIdentityAndSources() {
     auto request=session.newRequest(attachment);auto other=f.av;other.storeUuid=util::newUuid();expectObject(request,other);
     request.operations.push_back(SetMetaOp{f.a,"note","true"});
     const auto wire=transactionRequestToJson(request);const auto roundtrip=transactionRequestFromJson(wire,{});
-    require(roundtrip.expectedObjectReferences==request.expectedObjectReferences,"full write expectations survive transport");
+    require(roundtrip.expectedObjects==request.expectedObjects,"full write expectations survive transport");
     auto inconsistent=nlohmann::json::parse(wire);inconsistent["expected_objects"][f.a]=other.version+1;
     mustFail([&]{transactionRequestFromJson(inconsistent.dump(),{});});
     inconsistent=nlohmann::json::parse(wire);inconsistent["command_version"]=1;
@@ -818,7 +818,109 @@ void foreignPointIdentity(HistoryMode mode, bool referenced)
         GeometrySequencePart part;part.revision=original;part.count=1;edit.parts={part};store.editGeometrySequence(w,target,edit,empty);w.commit();}
 }
 
+void unifiedExpectations(HistoryMode mode)
+{
+    Fixture f(mode, mode);
+    auto store = ObjectStore::open(f.overlay, options(mode));
+    auto request = [&] {
+        auto r = store.read(); const auto status = store.status(r);
+        TransactionRequest q;
+        q.requestUuid = util::newUuid(); q.storeUuid = status.storeUuid;
+        q.generation = status.generation; q.author = "shared-expectations";
+        return q;
+    };
+    auto q = request(); expectObject(q, f.av); expectRead(q, f.bv);
+    RelationshipVersion relationship;
+    { auto r = store.read(); relationship = store.relationshipsAt(r, {f.av, f.bv}).front().relationship.reference(); }
+    expectRelationship(q, relationship);
+    const auto encoded = transactionRequestToJson(q);
+    require(nlohmann::json::parse(encoded).at("command_version") == 3, "new dependency guards are version gated");
+    const auto decoded = transactionRequestFromJson(encoded, {});
+    require(decoded.expectedObjects == q.expectedObjects && decoded.readDependencies == q.readDependencies &&
+            decoded.expectedRelationships == q.expectedRelationships, "one handle survives every guard wire path");
+    (void)store.submit(q);
+    require(store.submit(q).replayed, "complete dependency guards replay through the ordinary saved-receipt path");
+    auto wrong = request(); auto other = f.bv; other.storeUuid = util::newUuid(); expectRead(wrong, other);
+    mustFail([&] { store.submit(wrong); });
+    wrong = request(); auto wrongEdge = relationship; wrongEdge.storeUuid = util::newUuid(); expectRelationship(wrong, wrongEdge);
+    mustFail([&] { store.submit(wrong); });
+    RecordSelection merged{{f.b, f.bv.version}};
+    mergeExpectations(merged, {{f.b, f.bv}}, "guard strengthening");
+    require(merged.at(f.b) == RecordExpectation(f.bv), "legacy projection strengthens to shared identity");
+    mergeExpectations(merged, {{f.b, f.bv.version}}, "no downgrade");
+    require(merged.at(f.b) == RecordExpectation(f.bv), "legacy projection never erases shared identity");
+    mustFail([&] { mergeExpectations(merged, {{f.b, other}}, "different owner"); });
+    auto numbered = request(); numbered.expectedObjects[f.a] = f.av.version;
+    const auto oldWire = transactionRequestToJson(numbered);
+    require(transactionRequestToJson(transactionRequestFromJson(oldWire, {})) == oldWire &&
+            transactionRequestDigest(transactionRequestFromJson(oldWire, {})) == transactionRequestDigest(numbered),
+            "legacy numbered command roundtrip preserves retry digest");
+    auto oldFull = request(); expectObject(oldFull, f.av);
+    const auto oldFullWire = transactionRequestToJson(oldFull);
+    // Frozen command-1/2 field layout from the pre-unification serializer.
+    // This does not derive the expected wire form through the new encoder.
+    nlohmann::json baseline{{"command_version", 1}, {"store", oldFull.storeUuid}, {"generation", oldFull.generation},
+        {"author", oldFull.author}, {"expected_objects", {{f.a, f.av.version}}},
+        {"expected_relationships", nlohmann::json::object()}, {"read_dependencies", nlohmann::json::object()},
+        {"expected_commit_sequence", nullptr}, {"operations", nlohmann::json::array()}};
+    for (const auto* legacy : {&numbered, &oldFull}) {
+        baseline["command_version"] = legacy == &numbered ? 1 : 2;
+        if (legacy == &oldFull) baseline["expected_object_references"] = nlohmann::json::array({
+            {{"store", f.av.storeUuid}, {"generation", f.av.generation}, {"object", f.a}, {"version", f.av.version}}});
+        const auto digestInput = baseline.dump();
+        require(transactionRequestDigest(*legacy) == payloadHash(std::vector<uint8_t>(digestInput.begin(), digestInput.end())),
+                "legacy retry digest matches frozen baseline layout");
+        auto withRequest = baseline; withRequest["request"] = legacy->requestUuid;
+        require(transactionRequestToJson(*legacy) == withRequest.dump(), "legacy wire matches frozen baseline layout");
+    }
+    require(nlohmann::json::parse(oldFullWire).at("command_version") == 2 &&
+            transactionRequestToJson(transactionRequestFromJson(oldFullWire, {})) == oldFullWire,
+            "existing complete-object wire and digest remain stable");
+    auto upper = f.a;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return std::toupper(c); });
+    auto mixed = nlohmann::json::parse(oldFullWire);
+    mixed["expected_object_references"][0]["object"] = upper;
+    mixed["expected_objects"][f.a] = f.av.version + 1;
+    mustFail([&] { (void)transactionRequestFromJson(mixed.dump(), {}); });
+    mixed = nlohmann::json::parse(oldFullWire);
+    auto duplicate = mixed["expected_object_references"][0]; duplicate["object"] = upper;
+    mixed["expected_object_references"].push_back(duplicate);
+    mustFail([&] { (void)transactionRequestFromJson(mixed.dump(), {}); });
+    const auto id = util::newUuid();
+    { auto w = store.write(); ObjectRecord record; record.uuid = id; record.kind = "note"; store.upsertObject(w, record); w.commit(); }
+    { auto w = store.write(); store.deleteObject(w, id); w.commit(); }
+    ObjectRevision deleted;
+    { auto r = store.read(); deleted = *store.currentObjectRevision(r, id); }
+    require(deleted.deleted, "selected tombstone fixture");
+    { auto r = store.read(); LocalStoreReader reader(store, r);
+        require(!reader.currentObject(id) && reader.currentObject(id, true)->reference() == deleted.reference() &&
+                currentObjectExpectation(reader, id).deleted, "ordinary reads hide tombstones; explicit guards retain their identity"); }
+    auto absent = request(); absent.expectedObjects[id] = std::nullopt; (void)store.submit(absent);
+    auto exact = request(); expectObject(exact, deleted);
+    exact = transactionRequestFromJson(transactionRequestToJson(exact), {}); (void)store.submit(exact);
+    auto live = request(); expectObject(live, deleted.reference()); mustFail([&] { store.submit(live); });
+    auto bad = request(); bad.expectedObjects[f.a] = relationship;
+    mustFail([&] { (void)transactionRequestToJson(bad); });
+    { auto w = store.write(); store.setMeta(w, f.b, "unrelated", "1"); w.commit(); }
+    require(store.submit(q).replayed, "saved complete-guard request replays even after its selected inputs change");
+    const auto basePath = f.dir.path / "deleted-base", overlayPath = f.dir.path / "deleted-overlay";
+    const auto inheritedId = util::newUuid();
+    { auto base = ObjectStore::create(basePath, options(mode));
+        { auto w = base.write(); ObjectRecord record; record.uuid = inheritedId; record.kind = "note";
+            base.upsertObject(w, record); w.commit(); }
+        { auto w = base.write(); base.deleteObject(w, inheritedId); base.seal(w); w.commit(); } }
+    { auto collection = ObjectCollection::create(overlayPath, {basePath}, options(mode)); }
+    auto overlay = ObjectStore::open(overlayPath, options(mode));
+    TransactionContext context;
+    { auto r = overlay.read(); LocalStoreReader reader(overlay, r);
+        context.expectedObjects[inheritedId] = currentObjectExpectation(reader, inheritedId);
+        require(context.expectedObjects.at(inheritedId).deleted && !reader.currentObject(inheritedId),
+                "inherited tombstone retains the winning owner without a live-object fallback"); }
+    { auto w = overlay.write(context); w.commit(); }
+}
+
 int main()try{
+    for (const auto mode : {HistoryMode::Off, HistoryMode::On}) unifiedExpectations(mode);
     duplicateStatementLease();
     regionPrecedenceRefill();
     for(const auto mode:{HistoryMode::Off,HistoryMode::On})for(bool referenced:{false,true})foreignPointIdentity(mode,referenced);

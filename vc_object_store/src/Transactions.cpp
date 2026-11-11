@@ -151,7 +151,7 @@ WriteTxn ObjectStore::write()
     return txn;
 }
 
-WriteTxn ObjectStore::write(const VersionSelection& expectedObjects)
+WriteTxn ObjectStore::write(const RecordSelection& expectedObjects)
 {
     TransactionContext context;
     context.expectedObjects = expectedObjects;
@@ -175,8 +175,8 @@ WriteTxn ObjectStore::write(const TransactionContext& context)
     RevisionSelection expected;
     prepareCheckedWrite(db, context, expected);
     txn.expectedRevisions_ = expected;
-    txn.expectedObjectVersions_ = context.expectedObjects;
-    txn.expectedRelationshipVersions_ = context.expectedRelationships;
+    txn.expectedObjectVersions_ = numberedSelection(context.expectedObjects);
+    txn.expectedRelationshipVersions_ = numberedSelection(context.expectedRelationships);
     return txn;
 }
 

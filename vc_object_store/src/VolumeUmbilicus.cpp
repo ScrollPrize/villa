@@ -79,7 +79,7 @@ void setVolumeUmbilicusRequest(const StoreReader& reader, TransactionRequest& re
     if (!request.expectedCommitSequence) request.expectedCommitSequence = reader.status().commitSequence;
     requireUmbilicusFor(reader.volumeTransforms(), record, volume);
     for (const auto& existing : volumeUmbilici(reader, volume)) {
-        request.expectedObjects[existing.uuid] = existing.version;
+        expectObject(request, existing.reference());
         request.operations.push_back(RetireObjectOp{existing.uuid});
     }
     request.expectedObjects[record.uuid] = std::nullopt;

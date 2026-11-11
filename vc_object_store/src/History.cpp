@@ -93,7 +93,7 @@ bool borrowedObject(sqlite3* db,const std::string& uuid)
     const auto source=objectSource(db,uuid);
     return source&&source!=db;
 }
-std::optional<ObjectRevisionKey> head(sqlite3* db,const std::string& object)
+std::optional<ObjectRevisionKey> head(sqlite3* db,const std::string& object,bool includeDeleted=false)
 {
     // Publication must still see the preceding head after deleting its current
     // record. Visible-object resolution intentionally hides tombstones.
@@ -101,15 +101,15 @@ std::optional<ObjectRevisionKey> head(sqlite3* db,const std::string& object)
         Statement local(db,"SELECT revision_uuid FROM object_heads WHERE object_uuid=?",parseUuid(object));
         if(local.row())return local.uuid(0);
     }
-    const auto source=objectSource(db,object);
+    const auto source=objectSource(db,object,false,includeDeleted);
     if(!source)return {};
     if(historyEnabled(source)){
         Statement row(source,"SELECT revision_uuid FROM object_heads WHERE object_uuid=?",parseUuid(object));
         if(row.row())return row.uuid(0);
-        return {};
+        if(!includeDeleted)return {};
     }
-    const auto resolved=resolveObject(db,object);
-    return resolved?std::optional<ObjectRevisionKey>(objectVersion(*resolved)):std::nullopt;
+    Statement row(source,"SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)) FROM objects WHERE uuid=?",parseUuid(object));
+    return row.row()?std::optional<ObjectRevisionKey>(ObjectVersion{storeUuidText(source),row.uuid(1),object,row.i64(0)}):std::nullopt;
 }
 
 std::optional<ObjectRevisionKey> publicationBase(sqlite3* db,const std::string& object)
@@ -800,11 +800,12 @@ std::optional<ResolvedObjectVersion> detail::resolveObjectVersion(sqlite3* db,co
     resolveReference(db,[&](sqlite3* source){
         if(storeUuidText(source)!=store)return false;
         if(!historyEnabled(source)){
-            Statement row(source,std::string("SELECT ")+kObjectCols+" FROM objects WHERE uuid=? AND state<>2",parseUuid(reference.objectUuid));
+            Statement row(source,std::string("SELECT ")+kObjectCols+",state FROM objects WHERE uuid=?",parseUuid(reference.objectUuid));
             if(!row.row())return false;
             auto record=readObjectRow(source,row);
             if(record.version!=reference.version||record.versionGeneration!=generation)return false;
             ObjectRevision revision;
+            revision.deleted = row.i64(sqlite3_column_count(row.value)-1) == 2;
             revision.storeUuid=store;
             revision.objectUuid=record.uuid;
             revision.version=reference.version;revision.generation=generation;revision.metadataComplete=true;
@@ -838,7 +839,7 @@ std::vector<std::optional<ObjectRevision>> ObjectStore::objectsAtVersions(const 
 std::optional<ObjectRevision> ObjectStore::currentObjectRevision(const Txn& txn, const std::string& uuid) const
 {
     auto* db=static_cast<sqlite3*>(connection(txn));
-    const auto revision = head(db, formatUuid(parseUuid(uuid)));
+    const auto revision = head(db, formatUuid(parseUuid(uuid)), true);
     const auto selected = revision ? resolveObjectRevisionKey(db, *revision) : std::nullopt;
     return selected ? std::optional(selected->revision) : std::nullopt;
 }

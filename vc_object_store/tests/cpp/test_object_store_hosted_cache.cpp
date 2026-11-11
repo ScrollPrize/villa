@@ -407,7 +407,7 @@ void persistentObjects()
         ObjectStoreSession local;
         auto attachment = local.attach(path, options);
         const auto head = local.currentObject(attachment, uuid);
-        local.publishArtifacts(attachment, uuid, head->version,
+        local.publishArtifacts(attachment, head->reference(),
             {{"source/x.tif", std::filesystem::path(VC_REAL_SURFACE) / "x.tif"}});
     }
     server::Server server(path, {}); server.start();

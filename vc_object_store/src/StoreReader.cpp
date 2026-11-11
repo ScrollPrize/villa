@@ -215,7 +215,7 @@ void expectRelationshipEndpoints(const StoreReader& reader, TransactionRequest& 
     EdgeSelection edges;
     edges.endpointUuids.emplace();
     for (const auto& [uuid, version] : expected)
-        if (version) edges.endpointUuids->push_back(uuid);
+        if (version.number()) edges.endpointUuids->push_back(uuid);
     if (edges.endpointUuids->empty()) return;
     edges.includeRetired = true;
     std::set<std::string> endpoints(edges.endpointUuids->begin(), edges.endpointUuids->end());
@@ -223,15 +223,15 @@ void expectRelationshipEndpoints(const StoreReader& reader, TransactionRequest& 
         for (const auto& endpoint : {edge.aUuid, edge.bUuid})
             if (!expected.contains(endpoint)) endpoints.insert(endpoint);
     for (const auto& endpoint : endpoints) {
-        if (request.expectedObjectReferences.contains(endpoint)) continue;
+        if (const auto guard = expected.find(endpoint); guard != expected.end() && guard->second.complete()) continue;
         const auto head = reader.currentObject(endpoint);
-        const auto entry = expected.emplace(endpoint, head ? std::optional(head->version) : std::nullopt).first;
+        const auto [entry, inserted] = expected.emplace(endpoint, std::nullopt);
         // Never replace a stale caller expectation with a newer snapshot.
-        if (head && entry->second == head->version) expectObject(request, head->reference());
+        if (head && (inserted || entry->second.number() == head->version)) expectObject(request, *head);
     }
 }
 
-void expectRelationshipEndpoints(const StoreReader& reader, VersionSelection& expected)
+void expectRelationshipEndpoints(const StoreReader& reader, RecordSelection& expected)
 {
     TransactionRequest request;
     request.expectedObjects = expected;
@@ -287,16 +287,16 @@ void buildCurrentEditRequest(const StoreReader& reader, TransactionRequest& requ
         }
 }
 
-VersionSelection transformDependencies(const StoreReader& reader)
+RecordSelection transformDependencies(const StoreReader& reader)
 {
-    VersionSelection result;
+    RecordSelection result;
     for (const auto* kind : {"volume_transform", "volume_transform_choice"}) {
         ObjectSelection selection;
         selection.kind = kind;
         selection.includeRetired = true;
         for (const auto& record : reader.selectObjects(selection)) {
             if (!record.version) throw std::runtime_error("transform record without a numbered version: " + record.uuid);
-            result.emplace(record.uuid, record.version);
+            result.emplace(record.uuid, record.reference());
         }
     }
     return result;
@@ -307,6 +307,15 @@ std::optional<int64_t> currentVersionOf(const StoreReader& reader, const std::st
     if (const auto head = reader.currentObject(objectUuid)) return head->version;
     const auto history = reader.objectHistory(objectUuid, true);
     return history.empty() ? std::nullopt : std::optional(history.back().version);
+}
+
+RecordExpectation currentObjectExpectation(const StoreReader& reader, const std::string& objectUuid)
+{
+    const auto current = reader.currentObject(objectUuid, true);
+    if (!current) return {};
+    RecordExpectation expected{current->reference()};
+    expected.deleted = current->deleted;
+    return expected;
 }
 
 std::vector<EdgeRecord> attachments(const StoreReader& reader, const std::string& ownerUuid,
@@ -362,10 +371,10 @@ ChangePage LocalStoreReader::changesSince(const FeedCursor& cursor, int64_t maxC
     return store_->changesSince(*txn_, cursor, maxChanges);
 }
 
-std::optional<ObjectRevision> LocalStoreReader::currentObject(const std::string& objectUuid) const
+std::optional<ObjectRevision> LocalStoreReader::currentObject(const std::string& objectUuid, bool includeDeleted) const
 {
     auto revision = store_->currentObjectRevision(*txn_, objectUuid);
-    if (revision && revision->deleted) return std::nullopt;
+    if (revision && revision->deleted && !includeDeleted) return std::nullopt;
     return revision;
 }
 

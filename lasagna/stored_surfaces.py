@@ -89,7 +89,8 @@ class StoreSession:
 			current = session.current_object(attachment, object_uuid)
 			if current is None:
 				raise ValueError(f"no object {object_uuid} to publish artifacts of")
-			return session.publish_artifacts(attachment, object_uuid, current["version"],
+			from vc_object_store import object_reference
+			return session.publish_artifacts(attachment, object_reference(current["record"]),
 											 {name: str(path) for name, path in files.items()}, self.author)
 
 	def close(self) -> None:

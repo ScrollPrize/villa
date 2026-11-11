@@ -408,32 +408,41 @@ void detail::checkTransactionContext(sqlite3* db, const TransactionContext& cont
             {{"store", storeUuidText(db), context.expectedCommitSequence, commitSequence(db)}},
             "object store: commit sequence changed since the guarded query");
     std::vector<ConflictDetail> conflicts;
-    for (const auto& [uuid, ref] : context.expectedObjectReferences) {
-        const auto id = canonical(uuid);
-        const ObjectVersion expected{canonical(ref.storeUuid), canonical(ref.generation), canonical(ref.objectUuid), ref.version};
-        if (id != expected.objectUuid || expected.version <= 0) throw std::invalid_argument("invalid expected object reference");
-        const auto current = resolveObject(db, id);
-        if (!current || objectVersion(*current) != expected)
-            conflicts.push_back({"object", id, ref.version, current ? current->record.version : std::nullopt});
-    }
-    for (const auto& [uuid, expected] : context.expectedObjects) {
-        const auto id = canonical(uuid);
-        const auto actual = headVersion(db, id);
-        if (actual != expected) conflicts.push_back({"object", id, expected, actual});
-    }
-    for (const auto& [uuid, expected] : context.expectedRelationships) {
-        const auto id = canonical(uuid);
-        const auto actual = relationshipHeadVersion(db, id);
-        if (actual != expected) conflicts.push_back({"relationship", id, expected, actual});
-    }
+    // All guards share the same winning-record resolution, including selected
+    // tombstones. Numbers are checked only for legacy numbered boundary inputs.
+    auto check = [&](const RecordSelection& selection, bool relationships) {
+        for (const auto& [uuid, expected] : selection) {
+            const auto id = canonical(uuid);
+            const auto* object = std::get_if<ObjectVersion>(&expected.selected);
+            const auto* edge = std::get_if<RelationshipVersion>(&expected.selected);
+            if ((relationships && object) || (!relationships && edge) ||
+                (object && (canonical(object->objectUuid) != id || object->version <= 0)) ||
+                (edge && (canonical(edge->relationshipUuid) != id || edge->version <= 0)) ||
+                (expected.deleted && !expected.complete()) || (expected.number() && *expected.number() <= 0))
+                throw std::invalid_argument("invalid expected record reference");
+            RecordExpectation wanted = expected, actual;
+            if (object) wanted.selected = canonicalObjectVersion(*object);
+            if (edge) wanted.selected = RelationshipVersion{canonical(edge->storeUuid), canonical(edge->generation), id, edge->version};
+            auto* source = relationships ? edgeSource(db, id, false, true) : objectSource(db, id, false, true);
+            if (source) {
+                Statement row(source, std::string("SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)),state=2 FROM ") +
+                    (relationships ? "edges" : "objects") + " WHERE uuid=?", parseUuid(id));
+                if (row.row()) {
+                    if (relationships) actual.selected = RelationshipVersion{storeUuidText(source), row.uuid(1), id, row.i64(0)};
+                    else actual.selected = ObjectVersion{storeUuidText(source), row.uuid(1), id, row.i64(0)};
+                    actual.deleted = row.i64(2) != 0;
+                }
+            }
+            if (wanted.complete() ? actual != wanted : actual.number() != wanted.number())
+                conflicts.push_back({relationships ? "relationship" : "object", id, wanted.number(), actual.number()});
+        }
+    };
+    check(context.expectedObjects, false);
+    check(context.expectedRelationships, true);
     if (!conflicts.empty())
         throw TransactionConflict(Reason::Version, conflicts,
             "object history: expected version conflict for " + conflicts.front().recordKind + " " + conflicts.front().uuid);
-    for (const auto& [uuid, expected] : context.readDependencies) {
-        const auto id = canonical(uuid);
-        const auto actual = headVersion(db, id);
-        if (actual != expected) conflicts.push_back({"object", id, expected, actual});
-    }
+    check(context.readDependencies, false);
     if (!conflicts.empty())
         throw TransactionConflict(Reason::ReadDependency, conflicts,
             "object history: read dependency changed: " + conflicts.front().uuid);
@@ -451,7 +460,7 @@ void detail::prepareCheckedWrite(sqlite3* db, const TransactionContext& context,
     if (historyEnabled(db)) expectHistory(db, expected);
     else pool.checkedAction = true;
     for (const auto& [uuid, version] : context.expectedObjects)
-        pool.checkedObjects.emplace(util::canonicalUuid(uuid), version);
+        pool.checkedObjects.emplace(util::canonicalUuid(uuid), version.number());
     if (pool.requestUuid) {
         Statement receipts(db, "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='transaction_receipts'");
         if (!receipts.row()) {
@@ -514,6 +523,13 @@ ObjectVersion ObjectRecord::reference() const
     if(!version||*version<=0||versionStoreUuid.empty()||versionGeneration.empty())
         throw std::invalid_argument("object reference: selected record lacks its published identity");
     return {versionStoreUuid,versionGeneration,uuid,*version};
+}
+
+RelationshipVersion RelationshipRevision::reference() const
+{
+    if (version <= 0 || record.versionStoreUuid.empty() || generation.empty() || record.uuid.empty())
+        throw std::invalid_argument("relationship reference: missing published identity");
+    return {record.versionStoreUuid, generation, record.uuid, version};
 }
 
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectVersion>& versions) const

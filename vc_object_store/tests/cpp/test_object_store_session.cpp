@@ -30,13 +30,13 @@ void referencedArtifacts(HistoryMode sourceMode, HistoryMode overlayMode)
         record.uuid=uuid;record.kind="note";db.upsertObject(txn,record);txn.commit();}
     ObjectVersion original;
     {ObjectStoreSession session;const auto attachment=session.attach(base,options);
-        session.publishArtifacts(attachment,uuid,1,{{"model.pt",oldFile}});
+        session.publishArtifacts(attachment,session.currentObject(attachment,uuid)->reference(),{{"model.pt",oldFile}});
         original=session.currentObject(attachment,uuid)->reference();}
     {auto db=ObjectStore::open(base,options);auto txn=db.write();db.seal(txn);txn.commit();}
     options.history=overlayMode;
     {auto collection=ObjectCollection::create(overlay,{base},options);}
     ObjectStoreSession session;const auto attachment=session.attach(overlay,options);
-    session.publishArtifacts(attachment,uuid,original.version,{{"model.pt",newFile}});
+    session.publishArtifacts(attachment,original,{{"model.pt",newFile}});
     const auto latest=session.currentObject(attachment,uuid)->reference();
     require(latest.storeUuid!=original.storeUuid,"artifact edit creates an overlay-owned version");
     const auto expected=session.artifacts(attachment,uuid,{}, {},original);
@@ -505,7 +505,7 @@ int main() try
             session.readStore(replacement, [&](const StoreReader& reader, const auto&) {
                 request.expectedObjects[sheet] = reader.currentObject(sheet)->version;
                 expectRelationshipEndpoints(reader, request);
-                require(request.expectedObjectReferences.at(marker) == reader.currentObject(marker)->reference(),
+                require(request.expectedObjects.at(marker) == RecordExpectation(reader.currentObject(marker)->reference()),
                         "relationship peers have complete snapshot expectations");
             });
             std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);

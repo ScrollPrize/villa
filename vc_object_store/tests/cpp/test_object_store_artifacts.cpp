@@ -187,6 +187,8 @@ try {
         ObjectStoreSession session;
         const auto attachment = session.attach(path, options);
         const auto before = session.currentObject(attachment, object);
+        auto wrongOwner = before->reference(); wrongOwner.storeUuid = util::newUuid();
+        mustFail([&] { session.publishArtifacts(attachment, wrongOwner, {}); });
         const auto oldPin = pinOf(attachment, *before, session.status(attachment).generation);
         ToolObjects tool(path, "loaded-artifact-test");
         tool.noteRead(pinOf(tool.attachment(), *tool.session()->currentObject(tool.attachment(), object),
@@ -202,7 +204,7 @@ try {
         require(session.artifacts(attachment, object, before->version, before->generation) ==
                     std::vector<ArtifactFile>{files[1]}, "historical artifacts after reset");
         mustFail([&] { (void)session.artifacts(attachment, object, before->version, generation); });
-        const auto receipt = session.publishArtifacts(attachment, object, before->version, {{"more.txt", directory.path / "more"}});
+        const auto receipt = session.publishArtifacts(attachment, before->reference(), {{"more.txt", directory.path / "more"}});
         require(receipt.generation == generation && session.artifacts(attachment, object).size() == 2,
                 "publication preserves the old manifest across generations");
         session.materializeArtifacts(attachment, object, directory.path / "old", before->version, before->generation);
@@ -210,7 +212,7 @@ try {
         require(session.artifactFile(attachment, object, "log.txt", directory.path / "cache", before->version,
                                      before->generation).has_value(), "cache old-generation artifact");
         bool conflict = false;
-        try { session.publishArtifacts(attachment, object, before->version, {}); }
+        try { session.publishArtifacts(attachment, before->reference(), {}); }
         catch (const TransactionConflict& e) { conflict = e.reason() == TransactionConflict::Reason::Version; }
         require(conflict && session.artifacts(attachment, object).size() == 2, "stale artifact publisher cannot overwrite manifest");
     }

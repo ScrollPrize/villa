@@ -119,7 +119,7 @@ std::string chooseVolumeTransformRequest(const StoreReader& reader,TransactionRe
     if(!request.expectedCommitSequence)request.expectedCommitSequence=reader.status().commitSequence;
     ObjectRecord record;
     (void)reader.volumeTransforms().graph.resolve(source,target,path).resolved();
-    request.readDependencies.merge(transformDependencies(reader));
+    mergeExpectations(request.readDependencies, transformDependencies(reader), "transform dependencies");
     if(const auto existing=volumeTransformChoice(reader,source,target)) {
         record=*existing;
         request.readDependencies.erase(record.uuid);

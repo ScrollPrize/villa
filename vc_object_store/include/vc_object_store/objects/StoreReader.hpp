@@ -26,8 +26,8 @@ public:
     virtual StoreStatus status() const = 0;
     // The change feed after `cursor` (ObjectStore::changesSince).
     virtual ChangePage changesSince(const FeedCursor& cursor, int64_t maxChanges = 4096) const = 0;
-    // The live (or retired) current revision; nullopt when absent or deleted.
-    virtual std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const = 0;
+    // The live (or retired) current revision; optionally retain the winning tombstone.
+    virtual std::optional<ObjectRevision> currentObject(const std::string& objectUuid, bool includeDeleted = false) const = 0;
     // External input boundary only: decode a standard reference, a wrapped
     // reference, or a legacy UUID/numbered locator. Legacy current-owner
     // selectors resolve once; complete references never require a live head.
@@ -125,16 +125,17 @@ std::vector<EdgeRecord> attachments(const StoreReader&, const std::string& owner
 // the winning record's owner retains history. Missing/deleted objects return
 // nullopt without retained history, independent of the attachment's policy.
 std::optional<int64_t> currentVersionOf(const StoreReader&, const std::string& objectUuid);
+// Retain the winning state, including an exact tombstone; no state means no live record.
+RecordExpectation currentObjectExpectation(const StoreReader&, const std::string& objectUuid);
 
 // Request expectations read through a reader (objects/Transactions.hpp).
 // Adds every endpoint of the relationships (retired included) of the objects
 // `expected` expects present, at its current version (absent: nullopt), so a
 // geometry change that keeps or edits those relationships is checked against
 // both ends. Existing entries are kept. The request overload also guards the
-// complete selected owner/lineage identity; use it for writes. The numeric-only
-// overload remains for callers explicitly requesting numeric expectations.
+// complete selected owner/lineage identity; both overloads retain it.
 void expectRelationshipEndpoints(const StoreReader&, TransactionRequest&);
-void expectRelationshipEndpoints(const StoreReader&, VersionSelection& expected);
+void expectRelationshipEndpoints(const StoreReader&, RecordSelection& expected);
 // The typed form of an edit of existing objects that keeps their
 // relationships as recorded (ObjectStoreSession::editCurrent): expects each of
 // `objectUuids` at its current version (throws when one is absent) and every
@@ -159,7 +160,7 @@ SetMetaOp bindCoordinatesOperation(const ObjectRecord&, const std::string& volum
 // The current versions of the recorded volume transforms and route choices:
 // read dependencies of a write computed through a transformed view, so a
 // changed registration conflicts instead of mapping the edit wrongly.
-VersionSelection transformDependencies(const StoreReader&);
+RecordSelection transformDependencies(const StoreReader&);
 // Whether commits after `since` may have changed records of `kinds`: true when
 // one did, when a change's kind cannot be learned (a removed relationship) or
 // when the feed position is gone. A cheap guard for caches keyed by such records.
@@ -175,7 +176,7 @@ public:
     bool active() const override { return txn_->active(); }
     StoreStatus status() const override;
     ChangePage changesSince(const FeedCursor& cursor, int64_t maxChanges = 4096) const override;
-    std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const override;
+    std::optional<ObjectRevision> currentObject(const std::string& objectUuid, bool includeDeleted = false) const override;
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, bool ifRetained = false) const override;
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&) const override;
     std::vector<ObjectVersion> versionsAt(const ObjectVersion&) const override;

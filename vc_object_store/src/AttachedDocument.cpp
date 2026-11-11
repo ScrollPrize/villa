@@ -75,7 +75,7 @@ void writeCollection(const StoreReader& reader, TransactionRequest& request, con
     if (wanted.mapping) operations.push_back(*wanted.mapping);
     auto points = wanted.points;
     const auto current = reader.currentObject(uuid);
-    request.expectedObjects[uuid] = currentVersionOf(reader, uuid);
+    request.expectedObjects[uuid] = currentObjectExpectation(reader, uuid);
     if (current) expectObject(request, current->reference());
     if (wanted.reference) {
         if (util::canonicalUuid(wanted.reference->objectUuid) != uuid) throw std::invalid_argument("collection reference names another object");
@@ -142,7 +142,7 @@ std::string attachDocument(ObjectStoreSession& session, const AttachmentIdentity
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         const auto object = reader.currentObject(objectUuid);
         if (!object || object->deleted) throw std::invalid_argument("object not found: " + objectUuid);
-        request.expectedObjects[object->record.uuid] = object->version;
+        expectObject(request, *object);
         writeCollection(reader, request, collection.uuid, collection, {{"coordinates", coordinates}, {"role", layout.role}},
                         std::nullopt);
         auto edge = attachmentEdge(collection.uuid, object->record.uuid, layout.role);
@@ -252,7 +252,7 @@ TransactionReceipt replaceAttachedCollections(ObjectStoreSession& session, const
         const auto linked = attachedEdges(reader, objectUuid, role);
         const auto object = reader.currentObject(objectUuid);
         if (!object) throw std::runtime_error("object not found: " + objectUuid);
-        request.expectedObjects[object->record.uuid] = object->version;
+        expectObject(request, *object);
         for (const auto& [uuid, wanted] : desired) {
             // New points are already expressed in the displayed frame.
             const auto createdCoordinates = frame ? volumeCoordinates(frame->volume, frame->scale) : coordinates;
@@ -265,7 +265,7 @@ TransactionReceipt replaceAttachedCollections(ObjectStoreSession& session, const
         }
         for (const auto& [uuid, edge] : linked) {
             if (desired.contains(uuid)) continue;
-            request.expectedObjects[uuid] = currentVersionOf(reader, uuid);
+            request.expectedObjects[uuid] = currentObjectExpectation(reader, uuid);
             request.operations.push_back(RemoveEdgeOp{edge.uuid});
             request.operations.push_back(RetireObjectOp{uuid});
         }
@@ -280,7 +280,6 @@ TransactionReceipt replaceAttachedCollections(ObjectStoreSession& session, const
         }
         for (const auto& [uuid, unused] : desired) if (!loaded.contains(uuid)) {
             request.expectedObjects[uuid] = std::nullopt;
-            request.expectedObjectReferences.erase(uuid);
         }
     });
     const auto receipt = session.submit(attachment, request);
@@ -334,7 +333,7 @@ std::vector<AttachedCollection> volumeCollections(ObjectStoreSession& session, c
 
 TransactionReceipt writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment,
                                           const VolumeVoxels& volume, const std::vector<AttachedCollection>& changed,
-                                          const std::vector<std::string>& removed, const VersionSelection& expected,
+                                          const std::vector<std::string>& removed, const RecordSelection& expected,
                                           const std::vector<ObjectVersion>& references)
 {
     auto request = session.newRequest(attachment);
@@ -344,7 +343,7 @@ TransactionReceipt writeVolumeCollections(ObjectStoreSession& session, const Att
                             {{"coordinates", volumeCoordinates(volume)}}, ViewFrame{volume.volume, volume.scale});
         for (const auto& removedUuid : removed) {
             const auto uuid = util::canonicalUuid(removedUuid);
-            request.expectedObjects[uuid] = currentVersionOf(reader, uuid);
+            request.expectedObjects[uuid] = currentObjectExpectation(reader, uuid);
             if (const auto object = reader.currentObject(uuid); object && !object->record.retired)
                 request.operations.push_back(RetireObjectOp{uuid});
         }
