@@ -82,7 +82,7 @@ TransactionConflict transactionConflictFromJson(const std::string& text)
 {
     const auto j = Json::parse(text);
     std::vector<ConflictDetail> details;
-    for (const auto& d : j.at("details"))
+    for (const auto& d : jsonArrayField(j, "details"))
         details.push_back({d.at("kind").get<std::string>(), d.at("uuid").get<std::string>(), intFrom(d.at("expected")),
                            intFrom(d.at("actual"))});
     return TransactionConflict(reasonFrom(j.at("reason").get<std::string>()), std::move(details),
@@ -127,7 +127,7 @@ ChangePage changePageFromJson(const std::string& text)
     page.cursorValid = j.at("cursor_valid").get<bool>();
     page.more = j.at("more").get<bool>();
     page.next = cursorFrom(j.at("next"));
-    for (const auto& c : j.at("commits")) {
+    for (const auto& c : jsonArrayField(j, "commits")) {
         FeedCommit commit;
         commit.sequence = c.at("sequence").get<int64_t>();
         commit.requestUuid = textFrom(c.at("request_uuid"));
@@ -135,7 +135,7 @@ ChangePage changePageFromJson(const std::string& text)
         commit.host = c.at("host").get<std::string>();
         commit.publishedAtUs = c.at("published_at_us").get<int64_t>();
         commit.complete = c.at("complete").get<bool>();
-        for (const auto& change : c.at("changes"))
+        for (const auto& change : jsonArrayField(c, "changes"))
             commit.changes.push_back({change.at("kind").get<std::string>(), change.at("uuid").get<std::string>(),
                                       change.at("version").get<int64_t>(), change.at("deleted").get<bool>()});
         page.commits.push_back(std::move(commit));
@@ -216,7 +216,7 @@ GeometryRevision geometryRevisionFromJson(const std::string& text)
     g.createdBy = j.at("created_by").get<std::string>();
     g.createdAt = j.at("created_at").get<std::string>();
     g.createdHost = j.at("created_host").get<std::string>();
-    for (const auto& a : j.at("arrays"))
+    for (const auto& a : jsonArrayField(j, "arrays"))
         g.arrays.push_back({a.at("name").get<std::string>(), a.at("dtype").get<std::string>(),
                             a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length").get<int64_t>()});
     g.gridOrigin = j.at("grid_origin").get<std::array<int64_t, 2>>();
@@ -265,6 +265,13 @@ Json unwrap(const std::string& text, StoreStatus* asOf, const char* key)
     auto j = Json::parse(text);
     if (asOf) *asOf = storeStatusFrom(j.at("status"));
     return std::move(j.at(key));
+}
+
+Json unwrapArray(const std::string& text, StoreStatus* asOf, const char* key)
+{
+    auto value = unwrap(text, asOf, key);
+    jsonArray(value, key);
+    return value;
 }
 
 void refuseTransforms(bool explicitTransforms, const char* what)
@@ -350,10 +357,8 @@ RelationshipRevision relationshipFrom(const Json& j)
     r.generation = j.at("generation").get<std::string>();
     r.aReference = objectVersionFrom(j.at("a_reference"));
     r.bReference = objectVersionFrom(j.at("b_reference"));
-    // Older servers emitted encoded exact refs in these archive UUID fields.
-    // Complete endpoint refs above already carry that identity.
-    if (!r.aRevision.empty() && r.aRevision.front() == '[') r.aRevision.clear();
-    if (!r.bRevision.empty() && r.bRevision.front() == '[') r.bRevision.clear();
+    if (!r.aRevision.empty()) r.aRevision = util::canonicalUuid(r.aRevision);
+    if (!r.bRevision.empty()) r.bRevision = util::canonicalUuid(r.bRevision);
     return r;
 }
 
@@ -424,7 +429,7 @@ std::string objectQueryResultToJson(const StoreStatus& status, const std::vector
 std::vector<ObjectRecord> objectQueryResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<ObjectRecord> result;
-    for (const auto& j : unwrap(text, asOf, "objects")) {
+    for (const auto& j : unwrapArray(text, asOf, "objects")) {
         auto record = exactMetaFrom(j, objectFromJson(j));
         presentCommonFromJson(j, record);
         read(j, "volume_length", record.volumeLength);
@@ -463,7 +468,7 @@ std::string edgeQueryResultToJson(const StoreStatus& status, const std::vector<E
 std::vector<EdgeRecord> edgeQueryResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<EdgeRecord> result;
-    for (const auto& j : unwrap(text, asOf, "edges")) {
+    for (const auto& j : unwrapArray(text, asOf, "edges")) {
         auto edge = exactMetaFrom(j, edgeFromJson(j, true));
         versionFromJson(j, edge);
         result.push_back(std::move(edge));
@@ -560,7 +565,7 @@ std::string objectHistoryToJson(const StoreStatus& status, const std::vector<Obj
 std::vector<ObjectRevision> objectHistoryFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<ObjectRevision> result;
-    for (const auto& j : unwrap(text, asOf, "revisions")) result.push_back(revisionFrom(j));
+    for (const auto& j : unwrapArray(text, asOf, "revisions")) result.push_back(revisionFrom(j));
     return result;
 }
 
@@ -591,7 +596,7 @@ std::string objectsAtVersionsResultToJson(const StoreStatus& status, const std::
 std::vector<std::optional<ObjectRevision>> objectsAtVersionsResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<std::optional<ObjectRevision>> result;
-    for (const auto& j : unwrap(text, asOf, "revisions"))
+    for (const auto& j : unwrapArray(text, asOf, "revisions"))
         result.push_back(j.is_null() ? std::nullopt : std::optional(revisionFrom(j)));
     return result;
 }
@@ -607,7 +612,7 @@ std::string relationshipQueryResultToJson(const StoreStatus& status, const std::
 std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<SelectedRelationship> result;
-    for (const auto& j : unwrap(text, asOf, "relationships"))
+    for (const auto& j : unwrapArray(text, asOf, "relationships"))
         result.push_back({relationshipFrom(j.at("relationship")), j.at("applicable").get<bool>()});
     orderRelationships(result);
     return result;
@@ -637,8 +642,8 @@ SelectedInputs selectedInputsFromJson(const std::string& text)
 {
     const auto data = unwrap(text, nullptr, "inputs");
     SelectedInputs result;
-    for (const auto& object : data.at("objects")) result.objects.push_back(revisionFrom(object));
-    for (const auto& edge : data.at("relationships"))
+    for (const auto& object : jsonArrayField(data, "objects")) result.objects.push_back(revisionFrom(object));
+    for (const auto& edge : jsonArrayField(data, "relationships"))
         result.relationships.push_back({relationshipFrom(edge.at("relationship")), edge.at("applicable").get<bool>()});
     orderRelationships(result.relationships);
     return result;
@@ -712,7 +717,7 @@ RegionResult regionQueryResultFromJson(const std::string& text, StoreStatus* asO
 {
     const auto j = unwrap(text, asOf, "result");
     RegionResult r;
-    for (const auto& run : j.at("runs"))
+    for (const auto& run : jsonArrayField(j, "runs"))
         r.runs.push_back({run.at("object").get<std::string>(), run.at("revision").get<std::string>(),
                           run.at("array").get<std::string>(), run.at("family").get<std::string>(),
                           run.at("first_segment").get<int64_t>(),
@@ -764,7 +769,7 @@ std::string proximityQueryResultToJson(const StoreStatus& status, const std::vec
 std::vector<SurfaceProximityHit> proximityQueryResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<SurfaceProximityHit> result;
-    for (const auto& h : unwrap(text, asOf, "hits"))
+    for (const auto& h : unwrapArray(text, asOf, "hits"))
         result.push_back({h.at("object").get<std::string>(), h.at("revision").get<std::string>(),
                           h.at("grid").get<std::array<double, 2>>(), h.at("point").get<std::array<double, 3>>(),
                           h.at("distance").get<double>()});

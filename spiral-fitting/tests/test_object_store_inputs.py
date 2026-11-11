@@ -177,6 +177,36 @@ def test_reference_only_pins_validate_boundary_and_carry_reference_unchanged(db)
         osi.InputPins.from_provenance(dict(value, references={fiber: dict(reference, version=0)}))
 
 
+@pytest.mark.parametrize('bad', [[], None, '', 1, True])
+def test_saved_pin_maps_are_not_coerced_to_empty(db, bad):
+    base = dict(position=osi.InputPosition.of_status(db.status()).provenance())
+    for field in ('references', 'selection'):
+        with pytest.raises(ValueError, match='maps'):
+            osi.InputPins.from_provenance(dict(base, **{field: bad}))
+
+
+@pytest.mark.parametrize('bad', [{}, None, '', 1, True])
+def test_saved_pin_selection_arrays_are_validated_once(db, bad):
+    value = dict(position=osi.InputPosition.of_status(db.status()).provenance(),
+                 references={}, selection={'fiber': bad})
+    with pytest.raises(ValueError, match='arrays'):
+        osi.InputPins.from_provenance(value)
+    assert osi.InputPins.from_provenance(dict(value, selection={'fiber': []})).refs() == []
+
+
+def test_marker_read_passes_complete_receipt_reference_unchanged():
+    reference = dict(store='11111111-1111-4111-8111-111111111111',
+                     generation='22222222-2222-4222-8222-222222222222',
+                     object='33333333-3333-4333-8333-333333333333', version=7)
+    class Reader:
+        def objects_at_versions(self, refs):
+            assert refs == [reference]
+            assert refs[0] is reference
+            return [dict(record=dict(meta=dict(commit_sequence=9)))]
+    assert osi._link_marker_at(Reader(), reference) == dict(commit_sequence=9)
+    assert osi._link_marker_at(Reader(), None) is None
+
+
 def test_explicit_selectors_tags_and_empty_matches(db):
     a = put_patch(db, _grid(10.0), tags=['keep'])
     b = put_patch(db, _grid(20.0))

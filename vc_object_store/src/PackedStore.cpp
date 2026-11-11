@@ -4,6 +4,7 @@
 #include "internal/Artifacts.hpp"
 #include "internal/Sqlite.hpp"
 #include "internal/DatabaseCopy.hpp"
+#include "internal/JsonFields.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include <vc_reader/native/platform_io.hpp>
 #include <sqlite3.h>
@@ -190,7 +191,7 @@ Published readDirectory(const std::filesystem::path& path)
     if (out.extent < 1024u * 1024u || out.extent > 1024u * 1024u * 1024u || (out.extent & (out.extent - 1)))
         throw std::runtime_error("invalid packed extent size");
     std::vector<std::pair<std::uint64_t, std::uint64_t>> occupied;
-    for (const auto& value : json.at("databases")) {
+    for (const auto& value : detail::jsonArrayField(json, "databases")) {
         const auto uuid = util::canonicalUuid(value.at("uuid").get<std::string>());
         Member member;
         member.size = value.at("size").get<std::uint64_t>();

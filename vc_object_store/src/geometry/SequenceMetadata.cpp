@@ -1,5 +1,6 @@
 #include "geometry/SequenceMetadata.hpp"
 #include "internal/ReferenceResolver.hpp"
+#include "internal/JsonFields.hpp"
 #include "geometry/SequenceIdentity.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 
@@ -153,7 +154,7 @@ SharedJson packAnnotation(sqlite3* db,const SharedJson& value) {
 SharedJson unpackAnnotation(sqlite3* db,const SharedJson& value) {
     if(value.contains("inline"))return value.at("inline");
     std::vector<uint8_t> bytes;
-    for(const auto& hash:value.at("annotation_chunks")) {const auto part=readSharedPayload(db,"@annotations",hash);bytes.insert(bytes.end(),part.begin(),part.end());}
+    for(const auto& hash:jsonArrayField(value,"annotation_chunks")) {const auto part=readSharedPayload(db,"@annotations",hash);bytes.insert(bytes.end(),part.begin(),part.end());}
     if(bytes.size()!=value.at("byte_length").get<size_t>())throw std::runtime_error("invalid annotation length");
     return SharedJson::parse(bytes);
 }
@@ -165,7 +166,7 @@ void metadataPayloads(sqlite3* source,const SharedJson& root,const std::function
         const auto bucket=load(source,hash);
         for(const auto& value:bucket) {
             const auto& annotation=value.is_object()&&value.contains("annotation")?value.at("annotation"):value;
-            if(annotation.is_object()&&annotation.contains("annotation_chunks"))for(const auto& chunk:annotation.at("annotation_chunks"))transfer(chunk);
+            if(annotation.is_object()&&annotation.contains("annotation_chunks"))for(const auto& chunk:jsonArrayField(annotation,"annotation_chunks"))transfer(chunk);
         }
         transfer(hash);
     }

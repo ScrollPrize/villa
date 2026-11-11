@@ -89,12 +89,8 @@ SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
         record.generation = position.generation;
         record.commitSequence = position.commitSequence;
         record.queryJson = header.at("query").dump();
-        for (const auto& t : header.at("transforms")) {
-            const auto reference = detail::objectVersionFrom(t);
-            if (reference.version <= 0) throw bad("transform version must be positive");
-            record.transforms.push_back(reference);
-        }
-        for(const auto& origin:header.at("origins")) {
+        record.transforms = detail::objectVersionsFrom(header.at("transforms"));
+        for(const auto& origin:detail::jsonArrayField(header,"origins")) {
             if(!origin.is_array()||origin.size()!=2)throw bad("invalid origin");
             origins.emplace_back(formatUuid(parseUuid(origin.at(0).get<std::string>())),formatUuid(parseUuid(origin.at(1).get<std::string>())));
         }

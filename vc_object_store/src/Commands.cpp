@@ -103,11 +103,30 @@ RecordSelection selectionFrom(const Json& j, bool relationships = false)
     return result;
 }
 
+// This schema admission is shared by materialization, payload discovery,
+// preparation and saved-receipt replay, even when payload bytes are unavailable.
+void admitCommandCollections(const Json& request)
+{
+    for (const auto& op : jsonArrayField(request, "operations")) {
+        const auto name = op.at("op").get<std::string>();
+        if (name == "put_geometry" || name == "update_geometry_arrays")
+            jsonArrayField(op.at("data"), "arrays");
+        if (name == "put_geometry" || name == "edit_geometry" || name == "edit_geometry_rectangle" || name == "set_surface_channels")
+            jsonArrayField(op, "relationships");
+        if (name == "edit_geometry") jsonArrayField(op, "edits");
+        if (name == "set_surface_channels") jsonArrayField(op, "channels");
+        if (name == "record_catalog_transforms") jsonArrayField(op, "registrations");
+        if (name == "ingest_geometry")
+            for (const auto& item : jsonArrayField(op, "items")) jsonArrayField(item.at("data"), "arrays");
+    }
+}
+
 // Validate identity and guards independently of payload availability, including
 // saved-receipt retries whose geometry bytes have already been released.
 TransactionRequest requestHeader(const Json& j)
 {
     requireCurrentCommand(j);
+    admitCommandCollections(j);
     if (j.contains("expected_object_references"))
         throw std::invalid_argument("transaction: obsolete reference side-channel; use complete expected_objects values");
     TransactionRequest request;

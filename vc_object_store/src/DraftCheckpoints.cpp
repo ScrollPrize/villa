@@ -117,7 +117,7 @@ DraftDirectory::Loaded DraftDirectory::load()
         draft.submittedAsStored = d.at("submitted_as_stored");
         loaded.drafts.push_back(std::move(draft));
     }
-    for (const auto& p : manifest.at("pending"))
+    for (const auto& p : jsonArrayField(manifest, "pending"))
         loaded.pending.push_back({p.at("request"), p.at("store"), p.at("drafts").get<std::map<std::string, uint64_t>>()});
     return loaded;
 }

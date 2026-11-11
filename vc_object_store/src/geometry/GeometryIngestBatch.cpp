@@ -14,6 +14,7 @@ namespace {
 using Json = nlohmann::json;
 void normalizeMetadata(GeometrySource& p, const std::string& coordinateContext)
 {
+    detail::validateSourceTopology(p.object.kind, p.source);
     auto source = p.source;
     auto metadata = Json::parse(p.object.meta);
     const auto coordinates = mergeGeometryCoordinates(

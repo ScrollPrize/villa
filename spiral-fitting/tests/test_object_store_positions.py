@@ -106,12 +106,12 @@ def test_a_refresh_survives_another_run_moving_the_marker(shared, monkeypatch):
     original = osi._link_marker_at
     moved = []
 
-    def racing(store, request, version):
+    def racing(store, reference):
         if not moved:
-            moved.append(version)
+            moved.append(reference)
             shared_edit(shared, lambda db: db.set_meta(walk, 'review_note', 'relinked'))
             moved.append(prepare(shared).position.commit_sequence)
-        return original(store, request, version)
+        return original(store, reference)
     monkeypatch.setattr(osi, '_link_marker_at', racing)
     prepared = prepare(shared)
     assert prepared.attempts == 1 and len(prepared.pins.references) == len(names(shared))

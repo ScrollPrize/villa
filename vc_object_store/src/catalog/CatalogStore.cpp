@@ -4,6 +4,7 @@
 #include "formats/GeometryInput.hpp"
 #include "formats/RemoteSource.hpp"
 #include "geometry/ArrayLayout.hpp"
+#include "internal/JsonFields.hpp"
 #include <vc_reader/native/http.hpp>
 #include <vc_reader/native/atomic_file.hpp>
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
@@ -127,7 +128,7 @@ std::optional<CatalogReference> catalogReference(const ObjectRecord& record)
     reference.artifact = catalog->value("artifact", "");
     reference.volume = catalog->value("volume", "");
     reference.url = catalog->value("url", "");
-    for (const auto& file : catalog->value("files", Json::array()))
+    for (const auto& file : detail::jsonArrayField(*catalog, "files", true))
         reference.files.push_back({file.value("name", ""), file.value("label", ""), file.value("url", "")});
     return reference;
 }

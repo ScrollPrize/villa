@@ -236,9 +236,11 @@ Json selectionToJson(const VersionSelection& selection)
 
 VersionSelection selectionFromJson(const Json& j)
 {
+    if (!j.is_object()) throw std::invalid_argument("receipt versions must be a map");
     VersionSelection result;
     for (const auto& [uuid, version] : j.items())
-        result.emplace(uuid, version.is_null() ? std::nullopt : std::optional(version.get<int64_t>()));
+        if (!result.emplace(util::canonicalUuid(uuid), version.is_null() ? std::nullopt : std::optional(versionNumberFrom(version))).second)
+            throw std::invalid_argument("receipt has duplicate UUIDs in a version map");
     return result;
 }
 
@@ -265,15 +267,17 @@ TransactionReceipt detail::receiptFromJson(const Json& j)
     if (!j.at("request_uuid").is_null()) r.requestUuid = j.at("request_uuid").get<std::string>();
     r.storeUuid = j.at("store_uuid").get<std::string>();
     r.generation = j.at("generation").get<std::string>();
-    if (!j.at("commit_sequence").is_null()) r.commitSequence = j.at("commit_sequence").get<int64_t>();
+    if (!j.at("commit_sequence").is_null()) r.commitSequence = commitSequenceFrom(j.at("commit_sequence"));
     r.objects = selectionFromJson(j.at("objects"));
     r.relationships = selectionFromJson(j.at("relationships"));
     r.created = j.at("created").get<std::vector<std::string>>();
     if(!j.contains("object_references") || !j.at("object_references").is_object())
         throw std::invalid_argument("receipt requires complete object_references; reload legacy receipts");
     for(const auto& [uuid,value]:j.at("object_references").items()){
-        r.objectReferences.emplace(canonical(uuid),objectVersionFrom(value));
-        (void)r.objectReference(uuid);
+        if (!r.objectReferences.emplace(canonical(uuid),objectVersionFrom(value)).second)
+            throw std::invalid_argument("receipt has duplicate object reference UUIDs");
+        if (!r.objectReference(uuid))
+            throw std::invalid_argument("receipt reference has no live object result");
     }
     for (const auto& [uuid, version] : r.objects) if (version) (void)r.objectReference(uuid);
     return r;

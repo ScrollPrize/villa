@@ -389,9 +389,9 @@ def _stored_sources(job_spec: dict | None) -> tuple[str, ...]:
 		return ()
 	if "input_references" not in job_spec:
 		raise ValueError("checkpoint has no selected input references; regenerate its input provenance")
-	from vc_object_store import object_version_from_json
-	return tuple(dict.fromkeys(object_version_from_json(json.dumps(ref))["object"]
-							  for ref in job_spec["input_references"]))
+	from vc_object_store import object_versions_from_json
+	return tuple(dict.fromkeys(ref["object"] for ref in
+		object_versions_from_json(json.dumps(job_spec["input_references"]))))
 
 
 def _mark_segment_vertices(

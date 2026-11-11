@@ -14,6 +14,8 @@ Commit mapping: import `56dc9c792`, shared scalar validation `395e86ace`, stale 
 
 All three predate this implementation patch. They remain open for the next requested fix pass; they were not silently changed during this review. No new regression in the inspected fixes was confirmed. This does not imply absence of other undiscovered issues.
 
+Follow-up: the requested failure-class sweep expanded the container-admission sites; the subsequent implementation fixes NX-A01/NX-C01/NX-P01 and those sibling sites. See [the shared-decoder fix tracker](../class-sweep/fixes.md) for current status and validation; the table above records the pre-fix review.
+
 ## Coverage and obligations
 
 - [Native core](core.md): full enumerated per-file ledger, current/exact, read/write, identity/retention/placement and scalar-ingress obligations; source-only and numerical exclusions are explicit.

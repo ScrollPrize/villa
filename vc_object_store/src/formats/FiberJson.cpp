@@ -6,6 +6,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "geometry/Dependencies.hpp"
 #include "geometry/GeometrySnapshot.hpp"
+#include "imports/SourceRelationships.hpp"
 #include <algorithm>
 #include <set>
 
@@ -65,6 +66,7 @@ GeometrySource decodeFiberJson(const std::string& text)
         throw std::runtime_error("Fiber transfer requires version 1, 3 or 4");
     if (version == 1) version1Fields(root);
     if (version < 4) version3Coordinates(root);
+    detail::validateSourceTopology("fiber", root);
     GeometrySource p;
     p.object.uuid = util::canonicalUuid(root.at("uuid").get<std::string>());
     p.object.kind = "fiber";
@@ -118,6 +120,7 @@ std::vector<std::string> fiberBatchEndpoints(const std::vector<GeometrySource>& 
     for (const auto& entry : batch) inBatch.insert(entry.object.uuid);
     for (const auto& entry : batch) {
         if (entry.object.kind != "fiber") continue;
+        detail::validateSourceTopology(entry.object.kind, entry.source);
         for (const auto* key : {"branches", "adjacent_branches"})
             for (const auto& branch : entry.source.value(key, Json::array()))
                 targets.insert(util::canonicalUuid(branch.at("target_uuid").get<std::string>()));

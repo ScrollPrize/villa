@@ -90,3 +90,98 @@ def test_selection_artifacts_share_strict_position_ingress(db, value):
         malformed = encoded[:8] + struct.pack('<I', len(changed)) + changed + encoded[12 + length:]
         with pytest.raises(ValueError, match='commit_sequence' if field == 'commit_sequence' else 'entry count'):
             decode_selection_record(malformed)
+
+
+@pytest.mark.parametrize('field', ['transforms', 'origins'])
+@pytest.mark.parametrize('value', [{}, None, '', 1, True])
+def test_selection_artifact_validates_declared_arrays(db, field, value):
+    import struct
+    from vc_object_store import encode_selection_record, decode_selection_record
+    encoded = encode_selection_record(dict(db.status(), query={}, transforms=[], objects=[]))
+    length, = struct.unpack('<I', encoded[8:12])
+    header = json.loads(encoded[12:12 + length])
+    header[field] = value
+    changed = json.dumps(header).encode()
+    malformed = encoded[:8] + struct.pack('<I', len(changed)) + changed + encoded[12 + length:]
+    with pytest.raises(ValueError, match='array'):
+        decode_selection_record(malformed)
+
+
+@pytest.mark.parametrize('value', [{}, None, '', 1, True])
+def test_reference_list_uses_native_container_and_scalar_codecs(db, value):
+    from vc_object_store import object_versions_from_json
+    ref = object_reference(db.object(db.upsert_object(dict(kind='note'))))
+    assert object_versions_from_json(json.dumps([ref, ref])) == [ref, ref]
+    assert object_versions_from_json('[]') == []
+    with pytest.raises(ValueError, match='array'):
+        object_versions_from_json(json.dumps(value))
+    with pytest.raises(ValueError):
+        object_versions_from_json(json.dumps([dict(ref, version=True)]))
+
+
+@pytest.fixture(params=[False, True], ids=['history-off', 'history-on'])
+def receipt_case(tmp_path, request):
+    uid = 'aabbccdd-1122-4334-8556-778899aabbcc'
+    absent = 'aabbccdd-1122-4334-8556-778899aabbdd'
+    with ObjectStore.create(str(tmp_path / 'receipt.vcobj'), author='test', history_enabled=request.param) as store:
+        store.upsert_object(dict(uuid=uid, kind='note'))
+        reference = object_reference(store.object(uid))
+        status = store.status()
+        command = dict(command_version=3, request='abcdef01-2345-4678-89ab-cdef01234567',
+                       store=status['store'], generation=status['generation'], author='test',
+                       expected_objects={uid: reference, absent: None}, expected_relationships={absent: None},
+                       read_dependencies={}, expected_commit_sequence=None, operations=[])
+        receipt = store.submit(command)
+        assert store.submit(command)['replayed']
+    return receipt, uid, reference, absent
+
+
+@pytest.mark.parametrize('field', ['objects', 'relationships', 'object_references'])
+@pytest.mark.parametrize('bad', [[], None, '', 1, True])
+def test_receipt_requires_maps_at_the_native_boundary(receipt_case, field, bad):
+    from vc_object_store import ReceiptDecodeError, receipt_object_reference
+    receipt, uid, _, _ = receipt_case
+    with pytest.raises(ReceiptDecodeError, match='preserve the pending request'):
+        receipt_object_reference(dict(receipt, **{field: bad}), uid)
+
+
+@pytest.mark.parametrize('bad', [True, 1.5, '1', -1, 0, 2**63])
+def test_receipt_version_projections_share_strict_integer_codec(receipt_case, bad):
+    from vc_object_store import ReceiptDecodeError, receipt_object_reference
+    receipt, uid, _, _ = receipt_case
+    for field in ('objects', 'relationships'):
+        changed = dict(receipt, **{field: {**receipt[field], uid: bad}})
+        with pytest.raises(ReceiptDecodeError, match='version'):
+            receipt_object_reference(changed, uid)
+
+
+@pytest.mark.parametrize('bad', [True, 1.5, '1', -1, 2**63])
+def test_receipt_sequence_shares_native_position_codec(receipt_case, bad):
+    from vc_object_store import ReceiptDecodeError, receipt_object_reference
+    receipt, uid, _, _ = receipt_case
+    with pytest.raises(ReceiptDecodeError, match='commit_sequence'):
+        receipt_object_reference(dict(receipt, commit_sequence=bad), uid)
+
+
+def test_receipt_canonical_keys_null_values_and_exact_reference_consistency(receipt_case):
+    from vc_object_store import ReceiptDecodeError, receipt_object_reference
+    receipt, uid, reference, absent = receipt_case
+    for sequence in (None, 0, 2**63 - 1):
+        assert receipt_object_reference(dict(receipt, commit_sequence=sequence), uid) == reference
+    assert receipt_object_reference(receipt, absent) is None
+    for field in ('objects', 'relationships', 'object_references'):
+        upper = {key.upper(): value for key, value in receipt[field].items()}
+        assert receipt_object_reference(dict(receipt, **{field: upper}), uid.upper()) == reference
+        # Canonically equal keys must not silently overwrite each other.
+        duplicates = {**receipt[field], **upper}
+        with pytest.raises(ReceiptDecodeError, match='duplicate'):
+            receipt_object_reference(dict(receipt, **{field: duplicates}), uid)
+        with pytest.raises(ReceiptDecodeError):
+            receipt_object_reference(dict(receipt, **{field: {'not-a-uuid': 1}}), uid)
+    for numbers in ({}, {uid: None}):
+        with pytest.raises(ReceiptDecodeError, match='no live object result'):
+            receipt_object_reference(dict(receipt, objects=numbers), uid)
+    with pytest.raises(ReceiptDecodeError, match='lacks complete'):
+        receipt_object_reference(dict(receipt, object_references={}), uid)
+    with pytest.raises(ReceiptDecodeError, match='inconsistent'):
+        receipt_object_reference(dict(receipt, object_references={uid: dict(reference, object=absent)}), uid)

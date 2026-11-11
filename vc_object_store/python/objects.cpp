@@ -1047,6 +1047,9 @@ NB_MODULE(_native, m)
     m.def("object_version_from_json", [](const std::string& text) {
         return jsonLoads(vo::objectVersionToJson(vo::objectVersionFromJson(text)));
     }, nb::arg("json"), "Decode an external exact reference with the shared native codec.");
+    m.def("object_versions_from_json", [](const std::string& text) {
+        return jsonLoads(vo::detail::objectVersionsJson(vo::detail::objectVersionsFrom(nlohmann::json::parse(text))).dump());
+    }, nb::arg("json"), "Decode an array of exact references with the shared native codec.");
     m.def("relationship_version_from_json", [](const std::string& text) {
         return jsonLoads(vo::relationshipVersionToJson(vo::relationshipVersionFromJson(text)));
     }, nb::arg("json"), "Decode a complete selected relationship reference.");

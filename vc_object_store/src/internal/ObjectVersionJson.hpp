@@ -1,6 +1,7 @@
 #pragma once
 #include "vc_object_store/objects/Transactions.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "internal/JsonFields.hpp"
 #include <nlohmann/json.hpp>
 #include <limits>
 
@@ -55,9 +56,8 @@ inline nlohmann::json objectVersionsJson(const std::vector<ObjectVersion>& refs)
 }
 inline std::vector<ObjectVersion> objectVersionsFrom(const nlohmann::json& refs)
 {
-    if (!refs.is_array()) throw std::invalid_argument("object references must be an array");
     std::vector<ObjectVersion> result;
-    for (const auto& ref : refs) result.push_back(objectVersionFrom(ref));
+    for (const auto& ref : jsonArray(refs, "object references")) result.push_back(objectVersionFrom(ref));
     return result;
 }
 // StoreStatus also carries the position of a read snapshot. FeedCursor is only

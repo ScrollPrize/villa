@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "internal/Artifacts.hpp"
+#include "internal/JsonFields.hpp"
 
 #include <nlohmann/json.hpp>
 #include <vc_reader/native/atomic_file.hpp>
@@ -146,7 +147,7 @@ TransactionReceipt HostedStore::submit(const TransactionRequest& request)
         const auto answer = Json::parse(response.body);  // the loop reads into it
         if (!answer.contains("missing"))
             throw PreparationFailed("hosted store: submit " + request.requestUuid + ": " + serverError(response));
-        for (const auto& hash : answer.at("missing")) {
+        for (const auto& hash : detail::jsonArrayField(answer, "missing")) {
             const auto name = hash.get<std::string>();
             if (!payloads.contains(name)) throw std::runtime_error("hosted store: server asked for an unknown payload " + name);
             upload(name);

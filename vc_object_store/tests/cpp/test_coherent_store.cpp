@@ -410,6 +410,18 @@ void completeReceipts(HistoryMode mode){
     {auto r=store.read();require(store.objectAtVersion(r,*receipt.objectReference(f.a)).has_value(),"committed reference resolves");}
     const auto decoded=transactionReceiptFromJson(transactionReceiptToJson(receipt));
     require(decoded.objectReferences==receipt.objectReferences,"receipt transport preserves complete identities");
+    auto upper=nlohmann::json::parse(transactionReceiptToJson(receipt));
+    for(const auto* field:{"objects","object_references"}) {
+        auto entries=nlohmann::json::object();
+        for(const auto& [key,value]:upper.at(field).items()) {
+            auto canonicalKey=key;for(auto& c:canonicalKey)if(c>='a'&&c<='f')c=char(c-'a'+'A');
+            entries[canonicalKey]=value;
+        }
+        upper[field]=std::move(entries);
+    }
+    const auto canonical=transactionReceiptFromJson(upper.dump());
+    require(canonical.objectReferences==receipt.objectReferences&&canonical.objects==receipt.objects,
+        "receipt key normalization retains both committing and inherited owners");
     auto invalid=nlohmann::json::parse(transactionReceiptToJson(receipt));
     invalid["object_references"][f.a]=nlohmann::json::object();
     mustFail([&]{transactionReceiptFromJson(invalid.dump());});

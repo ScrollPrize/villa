@@ -333,6 +333,9 @@ class ServiceStoreRequestTest(unittest.TestCase):
 
 	def test_export_sources_require_captured_references(self) -> None:
 		self.assertEqual(fit2tifxyz._stored_sources({"input_references": []}), ())
+		for bad in ({}, None, "", 1, True):
+			with self.subTest(container=bad), self.assertRaisesRegex(ValueError, "array"):
+				fit2tifxyz._stored_sources({"input_references": bad})
 		with self.assertRaisesRegex(ValueError, "regenerate"):
 			fit2tifxyz._stored_sources({"config": {"surfaces": [{"type": "surface", "uuid": self.source}]}})
 

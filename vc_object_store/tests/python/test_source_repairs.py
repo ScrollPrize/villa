@@ -1,8 +1,37 @@
 """Opt-in ingest repairs for dataset defects: dangling fiber branches and colliding PCL point IDs."""
 import json
+import pytest
 
 from test_derived_uuids import NAMESPACE, derived, edit_v3_fiber, write_v3_fibers
 from vc_object_store import ObjectStore
+
+
+@pytest.mark.parametrize('field', ['branches', 'adjacent_branches'])
+@pytest.mark.parametrize('bad', [{}, None, '', 1, True])
+def test_fiber_topology_array_is_validated_before_normalization(tmp_path, field, bad):
+    directory = tmp_path / 'fibers'
+    names = write_v3_fibers(directory)
+    path = directory / (names[0] + '.json')
+    document = json.loads(path.read_text())
+    document[field] = bad
+    path.write_text(json.dumps(document))
+    with ObjectStore.create(str(tmp_path / 'bad.vcobj'), author='test') as store:
+        report = store.ingest_geometry_source('fiber', directory, uuid_namespace=NAMESPACE)
+        assert report['ingested'] == 0 and 'array' in ' '.join(report['problems']), report
+
+
+@pytest.mark.parametrize('field', ['links', 'windings_linked'])
+@pytest.mark.parametrize('bad', [{}, None, '', 1, True])
+def test_collection_topology_arrays_are_validated_at_ingress(tmp_path, field, bad):
+    point = {'p': [0, 0, 0]}
+    collection = {'name': 'test', 'points': {'0': point}}
+    (point if field == 'links' else collection)[field] = bad
+    source = tmp_path / 'points.json'
+    source.write_text(json.dumps({'vc_pointcollections_json_version': '1', 'collections': {'1': collection}}))
+    with ObjectStore.create(str(tmp_path / 'bad.vcobj'), author='test') as store:
+        report = store.ingest_geometry_source('point_collection', source, uuid_namespace=NAMESPACE)
+        assert report['ingested'] == 0 and 'array' in ' '.join(report['problems']), report
+        assert store.object_count('point_collection') == 0
 
 
 def add_dangling_branch(directory, name, target="missing.json"):

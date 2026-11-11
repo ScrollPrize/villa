@@ -1,6 +1,19 @@
 #include "internal/JsonFields.hpp"
 
 namespace vc::objects::detail {
+const nlohmann::json& jsonArray(const nlohmann::json& value, const char* context)
+{
+    if (!value.is_array()) throw std::invalid_argument(std::string(context) + " must be an array");
+    return value;
+}
+
+const nlohmann::json& jsonArrayField(const nlohmann::json& record, const char* key, bool optional)
+{
+    static const auto empty = nlohmann::json::array();
+    if (!record.is_object()) throw std::invalid_argument(std::string("record containing ") + key + " must be an object");
+    return optional && !record.contains(key) ? empty : jsonArray(record.at(key), key);
+}
+
 std::optional<std::array<double, 6>> bboxFromJson(const nlohmann::json& j)
 {
     if (!j.is_array() || j.size() != 6) return std::nullopt;

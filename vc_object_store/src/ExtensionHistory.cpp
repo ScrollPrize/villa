@@ -5,6 +5,7 @@
 #include "internal/History.hpp"
 #include "internal/ReferenceResolver.hpp"
 #include "internal/RecordOverrides.hpp"
+#include "internal/JsonFields.hpp"
 #include "geometry/SharedGeometry.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include <nlohmann/json.hpp>
@@ -99,7 +100,7 @@ std::vector<ExtensionRow> readSnapshot(sqlite3* db, const ExtensionTableInfo& ta
         throw std::runtime_error("extension: historical snapshot schema mismatch");
     const auto expectedBytes = descriptor.at("bytes").get<uint64_t>();
     std::vector<uint8_t> bytes;
-    for (const auto& hash : descriptor.at("chunks")) {
+    for (const auto& hash : jsonArrayField(descriptor, "chunks")) {
         const auto chunk = readSharedPayload(db, snapshotDomain, hash.get<std::string>());
         if (chunk.empty() || chunk.size() > geometryChunkSize ||
             bytes.size() > expectedBytes || chunk.size() > expectedBytes - bytes.size())

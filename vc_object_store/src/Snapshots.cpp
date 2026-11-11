@@ -4,6 +4,7 @@
 #include "internal/Extensions.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/JsonFields.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -65,7 +66,9 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
     if (version != 2)
         throw std::runtime_error("object store: unsupported export version");
     if (root.value("projected", false)) throw std::runtime_error("projected exports are for inspection, not import");
-    for (const auto& object : root.at("objects")) {
+    const auto& objects = jsonArrayField(root, "objects");
+    const auto& edges = jsonArrayField(root, "edges");
+    for (const auto& object : objects) {
         if (object.contains("geometry")) throw std::runtime_error("metadata export references stored geometry; use synchronize to transfer it");
         if (object.value("retired", false) || !object.value("lifecycle_epoch", "").empty())
             throw std::runtime_error("metadata export contains lifecycle state; use synchronize to preserve relationship bindings");
@@ -81,7 +84,7 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
     };
     // Imports reserve deleted UUIDs through the same scoped resolver as
     // geometry ingestion; only explicit recreation/restore may revive them.
-    for (const auto& j : root.at("objects")) {
+    for (const auto& j : objects) {
         auto object = objectFromJson(j);
         checkIdentity(object.uuid);
         commonFromJson(j, object);
@@ -95,7 +98,7 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
             throw std::runtime_error("object store: snapshot UUID is reserved by a deleted object: " + object.uuid);
         upsertObjectImpl(db, author(), impl_->hostname, object, true);
     }
-    for (const auto& j : root.at("edges")) {
+    for (const auto& j : edges) {
         auto e = edgeFromJson(j);
         checkIdentity(e.uuid);
         if (objectSource(db, e.uuid, false, true))

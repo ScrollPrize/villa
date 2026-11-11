@@ -1,4 +1,5 @@
 #include "internal/Anchors.hpp"
+#include "internal/JsonFields.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <algorithm>
 #include <cmath>
@@ -92,9 +93,8 @@ void dependenciesFromJson(Anchor& anchor, const nlohmann::json& value)
     anchor.channels = value.value("channels", std::vector<std::string>{});
     anchor.wholeGeometry = value.value("whole_geometry", false);
     anchor.metadataKeys = value.value("metadata_keys", std::vector<std::string>{});
-    for (const auto& point : value.value("points", nlohmann::json::array())) {
-        const auto& index = point.at("index");
-        if (!index.is_array()) throw std::invalid_argument("anchor point index must be an array");
+    for (const auto& point : jsonArrayField(value, "points", true)) {
+        const auto& index = jsonArrayField(point, "index");
         std::vector<int64_t> indices;
         for (const auto& coordinate : index) {
             if (!coordinate.is_number_integer() ||

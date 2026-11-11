@@ -5,6 +5,7 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
+#include "internal/JsonFields.hpp"
 #include <cmath>
 #include <map>
 
@@ -129,7 +130,7 @@ std::string attachDocument(ObjectStoreSession& session, const AttachmentIdentity
     AttachedCollection collection;
     collection.uuid = util::newUuid();
     collection.name = name;
-    for (const auto& record : document.value(layout.listKey, nlohmann::json::array())) {
+    for (const auto& record : detail::jsonArrayField(document, layout.listKey.c_str(), true)) {
         if (!record.is_object()) continue;
         collection.points.ids.push_back(geometry::PointId(collection.points.ids.size()));
         collection.points.points.push_back(position(record.value(layout.positionKey, nlohmann::json())));

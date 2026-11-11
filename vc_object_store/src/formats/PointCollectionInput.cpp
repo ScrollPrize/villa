@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/geometry/PointMap.hpp"
+#include "imports/SourceRelationships.hpp"
 #include <algorithm>
 #include <iterator>
 #include <map>
@@ -81,6 +82,7 @@ std::vector<Prepared> collections(const fs::path& source, const SourceIngestOpti
             decoded.points.ids[i] = ++largestId;
         }
         attributes["point_attributes"] = std::move(decoded.annotations);
+        detail::validateSourceTopology("point_collection", attributes);
         p.geometry = vc::geometry::encode(decoded.points);
         p.source = std::move(attributes);
         result.push_back(std::move(p));

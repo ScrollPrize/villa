@@ -1,5 +1,6 @@
 #include "geometry/GeometryDelta.hpp"
 #include "internal/ReferenceResolver.hpp"
+#include "internal/JsonFields.hpp"
 #include <zstd.h>
 
 namespace vc::objects::detail {
@@ -30,6 +31,7 @@ nlohmann::json loadGeometryManifest(sqlite3* db, const std::string& revision,
     if (geometryWork) geometryWork->manifestBytesRead += text.size();
     auto manifest = nlohmann::json::parse(text);
     if (!manifest.contains("delta")) return verifiedGeometryManifest(text, contentHash);
+    jsonArrayField(manifest.at("delta"), "chunks");
     Statement checksum(db, "SELECT manifest_hash FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
     if (!checksum.row() || hashText(text) != readDigest(checksum,0) ||
         manifest.at("delta").at("version") != 1 || manifest.at("delta").at("result_hash") != contentHash)

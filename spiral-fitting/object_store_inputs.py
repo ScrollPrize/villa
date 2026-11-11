@@ -189,13 +189,19 @@ class InputPins:
         if value is None:
             return None
         position = InputPosition.from_provenance(value)
+        # This application-owned saved schema has maps of native references and
+        # per-kind UUID arrays. Do not normalize malformed containers to empties.
+        if not isinstance(value.get('references', {}), dict) or not isinstance(value.get('selection', {}), dict):
+            raise ValueError('input pin references and selection must be maps')
+        if any(not isinstance(uuids, list) for uuids in value.get('selection', {}).values()):
+            raise ValueError('input pin selection values must be arrays')
         if 'objects' in value:
             raise ValueError('numeric input pins are unsupported; regenerate the input pins')
         if 'references' not in value:
             if value.get('selection') or value.get('outer_shell'):
                 raise ValueError('selected inputs have no complete references; regenerate the input pins')
             return cls(position)
-        references = value.get('references') or {}
+        references = value['references']
         references = {uuid: cls._decode_reference(uuid, reference)
                       for uuid, reference in references.items()}
         selected = {uuid for values in value.get('selection', {}).values() for uuid in values}
@@ -2256,7 +2262,7 @@ def submit_link_plan(store, planned, author=None, progress=None, log=None, read_
             progress.clear()
     # The marker as this commit wrote it (the receipt versions it): another
     # link run may have moved the current marker on already.
-    marker = _link_marker_at(store, request, (receipt.get('objects') or {}).get(vos.link_marker_uuid()))
+    marker = _link_marker_at(store, vos.receipt_object_reference(receipt, vos.link_marker_uuid()))
     reports = [step['report'] for step in (marker or {}).get('detectors') or ()]
     committed = receipt['commit_sequence']
     if marker is None:
@@ -2308,16 +2314,11 @@ def read_link_marker(store):
     return None if record is None else dict(record.meta)
 
 
-def _link_marker_at(store, request, version):
-    """The link marker's metadata at a numbered ``version`` of the store
-    ``request`` (a checked request) names, or None when the version is
-    None or absent."""
-    from vc_object_store import link_marker_uuid
-    if version is None:
+def _link_marker_at(store, reference):
+    """Read exactly the marker selected by the committing receipt."""
+    if reference is None:
         return None
-    [revision] = store.objects_at_versions([{
-        'store': request['store'], 'generation': request['generation'],
-        'object': link_marker_uuid(), 'version': int(version)}])
+    [revision] = store.objects_at_versions([reference])
     if revision is None or revision.get('deleted'):
         return None
     return dict(revision['record'].get('meta') or {})
