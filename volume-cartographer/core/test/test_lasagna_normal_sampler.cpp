@@ -132,6 +132,7 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
         "channels":["presence","nx","ny","width","sheet_nx","sheet_ny","sheet_grad_mag"]}}}})");
     auto prediction=vc::lasagna::LasagnaDataset::open(dir);
     auto normals=vc::lasagna::fiberSheetNormalDataset(prediction);
+    CHECK(normals.manifest().groups.size()==1);
     CHECK_NOTHROW(vc::lasagna::validateLasagnaNormalDatasetStructure(normals));
     vc::lasagna::LasagnaNormalSampler sampler(normals);
     CHECK(sampler.masksInvalidCorners());
@@ -154,6 +155,52 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
     CHECK(doubles[0].sample.valid);
     CHECK(doubles[0].sample.normal[1]==doctest::Approx(1));
     CHECK_FALSE(doubles[1].sample.valid);
+    // Policy sampling must preserve the corner-buffer reference exactly, with
+    // channel chunking, replicated volume edges, invalid corners and bad points.
+    vc::lasagna::LasagnaNormalSamplerOptions fusedOptions;
+    fusedOptions.channelCache=true;
+    fusedOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
+    vc::lasagna::LasagnaNormalSampler fused(normals,fusedOptions);
+    auto referenceOptions=fusedOptions;
+    referenceOptions.pointInterpolation=false;
+    referenceOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
+    vc::lasagna::LasagnaNormalSampler reference(normals,referenceOptions);
+    const std::vector<cv::Vec3f> locations{{0,0,0},{2,2,2},{4,0,0},{4,4,4},
+        {-1,0,0},{8,0,0},{NAN,0,0},{INFINITY,0,0},{1,2,3},{2,2,2}};
+    std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> policyValues,cornerValues;
+    (void)fused.sampleNormalBatch(locations,1,policyValues);
+    (void)reference.sampleNormalBatch(locations,1,cornerValues);
+    REQUIRE(policyValues.size()==cornerValues.size());
+    for(size_t i=0;i<locations.size();++i) {
+        CHECK(policyValues[i].valid==cornerValues[i].valid);
+        CHECK(policyValues[i].normal==cornerValues[i].normal);
+    }
+    CHECK(fusedOptions.memoryCache->nbytes()==24);
+    CHECK(fusedOptions.memoryCache->size()==3);
+    CHECK((fused.regionChannels()[0].array->cache_channels()==std::vector<int64_t>{4,5,6}));
+    auto floatPacked=vcr::zarr::Writer::create(dir/"float",{
+        .shape={7,2,2,2},.chunks={4,2,2,2},.dtype="<f4",.compressor="",.fillValue=0.});
+    for(size_t c=0;c<2;++c) {
+        std::vector<float> bytes(32);
+        for(size_t k=0;k<4;++k)
+            std::fill(bytes.begin()+8*k,bytes.begin()+8*(k+1),float(values[4*c+k]));
+        if(c==1)for(size_t k=0;k<3;++k)
+            std::fill(bytes.begin()+8*k+1,bytes.begin()+8*(k+1),0.f);
+        floatPacked.writeChunk({int64_t(c),0,0,0},reinterpret_cast<const uint8_t*>(bytes.data()),bytes.size()*sizeof(float));
+    }
+    auto floatManifest=normals.manifest();
+    for(auto& group:floatManifest.groups)group.relativeZarrKey=(dir/"float").string();
+    const vc::lasagna::LasagnaDataset floatDataset(floatManifest);
+    fusedOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
+    referenceOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
+    vc::lasagna::LasagnaNormalSampler floatFused(floatDataset,fusedOptions),floatReference(floatDataset,referenceOptions);
+    (void)floatFused.sampleNormalBatch(locations,1,policyValues);
+    (void)floatReference.sampleNormalBatch(locations,1,cornerValues);
+    for(size_t i=0;i<locations.size();++i) {
+        CHECK(policyValues[i].valid==cornerValues[i].valid);
+        CHECK(policyValues[i].normal==cornerValues[i].normal);
+    }
+    CHECK(fusedOptions.memoryCache->nbytes()==96);
     vc::lasagna::LasagnaGroupArrays arrays(0);
     const auto direction=vc::lasagna::bindLasagnaChannel(prediction.manifest(),"nx",arrays);
     CHECK(vc::lasagna::sampleLasagnaChannel(direction,cv::Vec3d{2,2,2}).value()==255);

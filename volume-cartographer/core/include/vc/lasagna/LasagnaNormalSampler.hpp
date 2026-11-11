@@ -26,6 +26,7 @@ struct LasagnaNormalSamplerOptions {
     std::shared_ptr<vcr::MemoryCache> memoryCache;
     std::optional<double> autoCacheFraction;
     bool channelCache = false;
+    bool pointInterpolation = true;
 };
 
 class LasagnaNormalSampler final : public NormalSampler

@@ -9,6 +9,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
+#include <stdexcept>
 #include <map>
 #include <memory>
 #include <optional>
@@ -24,6 +26,14 @@ namespace vcr { class Array; }
 namespace vcr::reader_cuda { class Reader; }
 
 namespace vc::lasagna {
+
+// Encoded byte channels may also be stored as float32 integer values.
+inline uint8_t encodedLasagnaByteValue(double value)
+{
+    if(!std::isfinite(value)||value<0||value>255)
+        throw std::runtime_error("invalid packed encoded byte value");
+    return static_cast<uint8_t>(std::lround(value));
+}
 
 // The channel-group arrays of one dataset, each opened once through vc_reader
 // (openLasagnaGroupArray) and sharing one memory cache. Channels of one packed

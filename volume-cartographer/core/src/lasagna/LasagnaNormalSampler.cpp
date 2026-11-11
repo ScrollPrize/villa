@@ -1,6 +1,7 @@
 #include <vc_reader/sampling.hpp>
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/lasagna/NormalInterpolation.hpp"
 
 #include <algorithm>
 #include <array>
@@ -158,6 +159,10 @@ public:
         ny_ = bindLasagnaChannel(manifest, "ny", arrays_);
         gradMag_ = bindLasagnaChannel(manifest, "grad_mag", arrays_);
         sharedGrid_ = sameLasagnaSamplingGrid(gradMag_, nx_) && sameLasagnaSamplingGrid(gradMag_, ny_);
+        pointInterpolation_=options.pointInterpolation && sharedGrid_ &&
+            gradMag_.packed && nx_.packed && ny_.packed &&
+            !gradMag_.cuda && !nx_.cuda && !ny_.cuda &&
+            gradMag_.array==nx_.array && gradMag_.array==ny_.array;
         if (maskInvalidCorners_ && !sharedGrid_) {
             throw std::invalid_argument("masked normal channels must share the validity sampling grid");
         }
@@ -511,6 +516,12 @@ public:
         }
 
         const auto start = Clock::now();
+        if(pointInterpolation_) {
+            sampleLasagnaInterpolatedNormals(regionChannels(),volumePoints,maskInvalidCorners_,
+                [&](size_t i,const auto& value){samples[i]={value.normal,value.status==NormalInterpolationStatus::Valid};});
+            report.materializeMs=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
+            return report;
+        }
         LasagnaCornerBatch corners;
         sampleLasagnaChannelCornerBatch({&gradMag_, &nx_, &ny_}, volumePoints, corners);
         materializeGroupedCorners(corners, 0, parallelThreads, samples);
@@ -536,6 +547,20 @@ public:
         }
         const size_t workers = normalBatchWorkerCount(volumePoints.size(), parallelThreads);
         const auto start = Clock::now();
+        if(pointInterpolation_ && !scalarEquivalent) {
+            const std::vector<cv::Vec3f> points(volumePoints.begin(),volumePoints.end());
+            sampleLasagnaInterpolatedNormals(regionChannels(),points,maskInvalidCorners_,[&](size_t i,const auto& value){
+                switch(value.status) {
+                case NormalInterpolationStatus::Missing:samples[i]=invalidNormal("missing Lasagna grad_mag sample");break;
+                case NormalInterpolationStatus::ZeroDensity:samples[i]=invalidNormal("Lasagna grad_mag sample is zero");break;
+                case NormalInterpolationStatus::Degenerate:samples[i]=invalidNormal("degenerate Lasagna normal sample");break;
+                case NormalInterpolationStatus::Valid:
+                    samples[i]={{{value.normal[0],value.normal[1],value.normal[2]},true,{}},cv::Matx33d::zeros(),false};break;
+                }
+            });
+            report.materializeMs=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
+            return report;
+        }
         // Float corners only when the caller did not ask for sampleNormal's arithmetic.
         if (sharedGrid_ && !scalarEquivalent) {
             const std::vector<cv::Vec3f> floatPoints(volumePoints.begin(), volumePoints.end());
@@ -601,6 +626,7 @@ private:
     LasagnaChannelBinding ny_;
     LasagnaChannelBinding gradMag_;
     bool sharedGrid_ = false;
+    bool pointInterpolation_ = false;
     bool maskInvalidCorners_ = false;
     double gradMagDecodeScale_ = 1000.0;
 };

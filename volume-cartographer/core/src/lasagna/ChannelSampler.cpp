@@ -172,13 +172,7 @@ decodedCompactNormalTable()
     return axis;
 }
 
-// A byte channel's value: uint8, or float32 holding an integer in [0, 255].
-[[nodiscard]] uint8_t byteValue(double value)
-{
-    if (!std::isfinite(value) || value < 0 || value > 255)
-        throw std::runtime_error("invalid packed encoded byte value");
-    return static_cast<uint8_t>(std::lround(value));
-}
+using vc::lasagna::encodedLasagnaByteValue;
 
 // The distinct cubes (lower corners x, y, z) of a batch and each point's cube:
 // nearby candidate points share few cubes, which are read once.
@@ -291,7 +285,7 @@ void readCorners(const LasagnaChannelBinding& binding,
         std::vector<float> values(n);
         binding.array->sample_nearest_coordinates(coords, n, reinterpret_cast<uint8_t*>(values.data()));
         for (size_t i = 0; i < n; ++i)
-            out[i] = std::is_same_v<T, uint8_t> ? T(byteValue(values[i])) : T(values[i]);
+            out[i] = std::is_same_v<T, uint8_t> ? T(encodedLasagnaByteValue(values[i])) : T(values[i]);
     } else {
         std::vector<uint8_t> values(n);
         if (!(binding.cuda && readCornersOnDevice(binding, coords, n, values.data())))
@@ -491,7 +485,7 @@ void sampleLasagnaChannelCornerBatch(
                 std::vector<float> floats(count);
                 binding.array->sample_nearest_coordinates(coords, count,
                     reinterpret_cast<uint8_t*>(floats.data()));
-                for (size_t i = 0; i < count; ++i) values[i] = byteValue(floats[i]);
+                for (size_t i = 0; i < count; ++i) values[i] = encodedLasagnaByteValue(floats[i]);
             } else {
                 binding.array->sample_nearest_coordinates(coords, count, values.data());
             }
@@ -543,7 +537,7 @@ void readLasagnaChannelBox(
             floats.resize(voxels);
             binding.array->read_many({start}, {size}, {reinterpret_cast<uint8_t*>(floats.data())}, vcr::Array::Bounds::Strict);
             for (size_t i = 0; i < voxels; ++i)
-                interleaved[i * bindings.size() + b] = byteValue(floats[i]);
+                interleaved[i * bindings.size() + b] = encodedLasagnaByteValue(floats[i]);
         } else {
             bytes.resize(voxels);
             binding.array->read_many({start}, {size}, {bytes.data()}, vcr::Array::Bounds::Strict);
@@ -627,8 +621,8 @@ LasagnaCompactTensor accumulateCompactTensor(
         if (weight <= 0.0 || skip(k))
             continue;
         const auto& decoded =
-            normalTable[(static_cast<size_t>(byteValue(nxValues[k])) << 8) |
-                        static_cast<size_t>(byteValue(nyValues[k]))];
+            normalTable[(static_cast<size_t>(encodedLasagnaByteValue(nxValues[k])) << 8) |
+                        static_cast<size_t>(encodedLasagnaByteValue(nyValues[k]))];
         if (!decoded.valid)
             continue;
         const double nx = decoded.x;
@@ -668,7 +662,7 @@ std::optional<cv::Vec3d> lasagnaCompactAxisCube(
     const std::array<double, 8>* validity)
 {
     return finalizeLasagnaCompactTensor(accumulateCompactTensor(nxValues, nyValues, fraction,
-        [&](size_t k) { return validity && byteValue((*validity)[k]) == 0; }));
+        [&](size_t k) { return validity && encodedLasagnaByteValue((*validity)[k]) == 0; }));
 }
 
 LasagnaCompactTensor accumulateLasagnaCompactTensorCorners(
@@ -750,7 +744,7 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
         auto& vector = vectors[i];
         if (validity && !mask.valid[i]) continue;
         const bool masked = validity && std::any_of(mask.values[i].begin(), mask.values[i].end(),
-                                                    [](double v) { return byteValue(v) == 0; });
+                                                    [](double v) { return encodedLasagnaByteValue(v) == 0; });
         double norm2 = 0;
         for (size_t c = 0; c < channels.size(); ++c) {
             if (!cubes[c].valid[i]) { vector.clear(); break; }
@@ -759,7 +753,7 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
             std::optional<double> value = vcr::sampling::trilinear(values, f.val);
             if (masked) {
                 std::array<uint8_t, 8> valid{};
-                for (size_t k = 0; k < 8; ++k) valid[k] = byteValue(mask.values[i][k]) != 0;
+                for (size_t k = 0; k < 8; ++k) valid[k] = encodedLasagnaByteValue(mask.values[i][k]) != 0;
                 double sampled;
                 value = vcr::sampling::maskedTrilinear(values, valid, f.val, sampled, vcr::sampling::Accumulation::Weighted)
                     ? std::optional<double>(sampled) : std::nullopt;
