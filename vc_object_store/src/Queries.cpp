@@ -6,6 +6,7 @@
 #include "internal/TransformedLength.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/VisibleRows.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -282,6 +283,15 @@ std::vector<ObjectRecord> selectPhysicalObjects(sqlite3* db, const ObjectSelecti
     if (published) attachObjectVersions(db, records);
     return records;
 }
+
+bool restrictConnected(const ObjectStore& store,const Txn& txn,ObjectSelection& selection)
+{
+    if(!selection.connectedTo)return true;
+    auto component=store.componentOf(txn,*selection.connectedTo,selection.edgeKinds,nullptr,selection.includeRetired);
+    if(!selection.uuids.empty())std::erase_if(component,[&](const auto& id){return std::none_of(selection.uuids.begin(),selection.uuids.end(),[&](const auto& u){return formatUuid(parseUuid(u))==id;});});
+    selection.uuids=std::move(component);selection.connectedTo.reset();
+    return !selection.uuids.empty();
+}
 }
 
 std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const ObjectSelection& requested,
@@ -292,29 +302,17 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     if(selection.offset<0||(selection.limit&&*selection.limit<0))throw std::invalid_argument("selection limit and offset must be nonnegative");
     if(selection.volume&&!selection.transforms)selection.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     const ObjectFields fields=projection?ObjectFields(std::in_place,projection->begin(),projection->end()):std::nullopt;
-    const auto sources=querySources(db);
-    if(sources.size()==1)return selectPhysicalObjects(db,selection,fields,!txn.write_);
-    if(selection.connectedTo){
-        auto component=componentOf(txn,*selection.connectedTo,selection.edgeKinds,nullptr,selection.includeRetired);
-        if(!selection.uuids.empty())std::erase_if(component,[&](const auto& id){return std::none_of(selection.uuids.begin(),selection.uuids.end(),[&](const auto& u){return formatUuid(parseUuid(u))==id;});});
-        if(component.empty())return {};
-        selection.uuids=std::move(component);selection.connectedTo.reset();
-    }
+    if(querySources(db).size()==1)return selectPhysicalObjects(db,selection,fields,!txn.write_);
+    if(!restrictConnected(*this,txn,selection))return {};
     auto physical=selection;physical.limit.reset();physical.offset=0;
-    std::vector<ObjectRecord> records;
-    for(auto* source:sources)for(auto& record:selectPhysicalObjects(source,physical,fields,!txn.write_))
-        if(objectSource(db,record.uuid)==source)records.push_back(std::move(record));
-    std::sort(records.begin(),records.end(),[&](const auto& a,const auto& b){
+    return selectVisibleRecords(db,[&](auto* source){return selectPhysicalObjects(source,physical,fields,!txn.write_);},
+        [&](const auto& record,auto* source){return objectSource(db,record.uuid)==source;},[&](const auto& a,const auto& b){
         if(selection.orderBy=="length_desc"){
             const auto x=a.volumeLength,y=b.volumeLength;
             if(x!=y)return x>y;
         }
         return a.uuid<b.uuid;
-    });
-    const auto begin=std::min(records.size(),size_t(selection.offset));
-    const auto end=selection.limit?begin+std::min(records.size()-begin,size_t(*selection.limit)):records.size();
-    std::vector<ObjectRecord> result(std::make_move_iterator(records.begin()+begin),std::make_move_iterator(records.begin()+end));
-    return result;
+    },selection.offset,selection.limit);
 }
 
 int64_t ObjectStore::unboundObjectCount(const Txn& txn, const std::string& kind, const std::string& volume) const
@@ -397,24 +395,13 @@ std::vector<SpatialRegion> ObjectStore::spatialRegions(const Txn& txn,const Obje
     auto selection=requested;
     if(selection.offset<0||(selection.limit&&*selection.limit<0))throw std::invalid_argument("selection limit and offset must be nonnegative");
     if(selection.volume&&!selection.transforms)selection.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
-    const auto sources=querySources(db);
-    if(sources.size()==1)return selectPhysicalRegions(db,selection);
-    if(selection.connectedTo){
-        auto connected=componentOf(txn,*selection.connectedTo,selection.edgeKinds,nullptr,selection.includeRetired);
-        if(!selection.uuids.empty())std::erase_if(connected,[&](const auto& id){return std::none_of(selection.uuids.begin(),selection.uuids.end(),[&](const auto& u){return formatUuid(parseUuid(u))==id;});});
-        if(connected.empty())return {};
-        selection.uuids=std::move(connected);selection.connectedTo.reset();
-    }
+    if(querySources(db).size()==1)return selectPhysicalRegions(db,selection);
+    if(!restrictConnected(*this,txn,selection))return {};
     auto physical=selection;physical.offset=0;physical.limit.reset();
-    std::vector<SpatialRegion> regions;
-    for(auto* source:sources)for(auto& region:selectPhysicalRegions(source,physical))
-        if(objectSource(db,region.objectUuid)==source)regions.push_back(std::move(region));
-    std::sort(regions.begin(),regions.end(),[](const auto& a,const auto& b){
+    return selectVisibleRecords(db,[&](auto* source){return selectPhysicalRegions(source,physical);},
+        [&](const auto& region,auto* source){return objectSource(db,region.objectUuid)==source;},[](const auto& a,const auto& b){
         return std::tie(a.objectUuid,a.arrayName,a.start)<std::tie(b.objectUuid,b.arrayName,b.start);
-    });
-    const auto begin=std::min(regions.size(),size_t(selection.offset));
-    const auto end=selection.limit?begin+std::min(regions.size()-begin,size_t(*selection.limit)):regions.size();
-    return {std::make_move_iterator(regions.begin()+begin),std::make_move_iterator(regions.begin()+end)};
+    },selection.offset,selection.limit);
 }
 
 } // namespace vc::objects

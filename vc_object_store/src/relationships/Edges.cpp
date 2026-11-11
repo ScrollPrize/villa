@@ -7,6 +7,7 @@
 #include "internal/ExtensionHistory.hpp"
 #include "internal/RecordResolver.hpp"
 #include "internal/RecordOverrides.hpp"
+#include "internal/VisibleRows.hpp"
 #include <nlohmann/json.hpp>
 #include <variant>
 
@@ -199,27 +200,21 @@ std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelec
     auto* db = static_cast<sqlite3*>(connection(txn));
     const ObjectFields fields = projection ? ObjectFields(std::in_place, projection->begin(), projection->end()) : std::nullopt;
     const auto columns = projectedEdgeColumns(fields);
-    const auto sources=querySources(db);
-    if(sources.size()>1){
+    if(querySources(db).size()>1){
         validateEdgeSelection(selection);
         if(selection.applicableOnly)requirePublishedGraphRead(txn);
         auto physical=selection;physical.limit.reset();physical.applicableOnly=false;physical.includeRetired=true;
-        std::vector<EdgeRecord> records;
-        for(auto* source:sources){
+        return selectVisibleRecords(db,[&](auto* source){
             auto rows=edgeSelectionQuery(source,physical,columns);
             auto selected=readEdgeRows(source,*rows,fields);
             if(!txn.write_)attachRelationshipVersions(source,selected);
-            for(auto& edge:selected){
-                if(edgeSource(db,edge.uuid)!=source)continue;
+            return selected;
+            },[&](const auto& edge,auto* source){
+                if(edgeSource(db,edge.uuid)!=source)return false;
                 const auto a=resolveObject(db,edge.aUuid),b=resolveObject(db,edge.bUuid);
-                if(!a||!b||(!selection.includeRetired&&(a->record.retired||b->record.retired)))continue;
-                if(selection.applicableOnly&&!currentRelationshipApplicable(*this,txn,edge.uuid))continue;
-                records.push_back(std::move(edge));
-            }
-        }
-        std::sort(records.begin(),records.end(),[](const auto& a,const auto& b){return a.uuid<b.uuid;});
-        if(selection.limit&&records.size()>size_t(*selection.limit))records.resize(size_t(*selection.limit));
-        return records;
+                return a&&b&&(selection.includeRetired||(!a->record.retired&&!b->record.retired))&&
+                    (!selection.applicableOnly||currentRelationshipApplicable(*this,txn,edge.uuid));
+            },[](const auto& a,const auto& b){return a.uuid<b.uuid;},0,selection.limit);
     }
     if (selection.applicableOnly) {
         validateEdgeSelection(selection);

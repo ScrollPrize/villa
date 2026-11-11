@@ -56,14 +56,14 @@ nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
     d["store"] = revision.storeUuid;
     d["commit_sequence"] = revision.commitSequence;
 
-    d["record"] = objectToPy(revision.record);
+    d["record"] = recordToPy(revision.record);
     return d;
 }
 
 nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
 {
     nb::dict d;
-    d["uuid"] = revision.uuid; d["record"] = edgeToPy(revision.record);
+    d["uuid"] = revision.uuid; d["record"] = recordToPy(revision.record);
     d["a_revision"] = revision.aRevision; d["b_revision"] = revision.bRevision;
     d["a_geometry_revision"] = revision.aGeometryRevision; d["b_geometry_revision"] = revision.bGeometryRevision;
     d["version"] = revision.version; d["generation"] = revision.generation;
@@ -170,8 +170,21 @@ nb::bytes bytesToPy(const std::vector<uint8_t>& value)
     return nb::bytes(reinterpret_cast<const char*>(value.data()), value.size());
 }
 
-nb::object toPy(const vo::ObjectRecord& value) { return objectToPy(value); }
-nb::object toPy(const vo::EdgeRecord& value) { return edgeToPy(value); }
+vo::TransactionRequest requestFromPy(const nb::object& request,const nb::dict& payloads)
+{
+    vo::TransactionPayloads bytes;
+    for(const auto& [hash,value]:payloads) {
+        const auto data=nb::cast<nb::bytes>(value);
+        const auto* begin=reinterpret_cast<const uint8_t*>(data.c_str());
+        bytes.emplace(nb::cast<std::string>(hash),std::vector<uint8_t>(begin,begin+data.size()));
+    }
+    return vo::transactionRequestFromJson(nb::isinstance<nb::str>(request)?nb::cast<std::string>(request):jsonDumps(request),bytes);
+}
+
+nb::object toPy(const vo::StoreStatus& value) { return jsonLoads(vo::storeStatusToJson(value)); }
+nb::object toPy(const vo::TransactionReceipt& value) { return jsonLoads(vo::transactionReceiptToJson(value)); }
+nb::object toPy(const vo::ObjectRecord& value) { return recordToPy(value); }
+nb::object toPy(const vo::EdgeRecord& value) { return recordToPy(value); }
 nb::object toPy(const vo::GeometryRevision& value) { return geometryToPy(value); }
 nb::object toPy(const vo::ObjectRevision& value) { return objectRevisionToPy(value); }
 nb::object toPy(const vo::RelationshipRevision& value) { return relationshipRevisionToPy(value); }
@@ -449,27 +462,14 @@ void bindMutations(nb::class_<T>& cls)
 void bindHostedStore(nb::module_& m)
 {
     using Hosted = vo::HostedStore;
-    auto statusPy = [](const vo::StoreStatus& status) { return jsonLoads(vo::storeStatusToJson(status)); };
-    auto answer = [statusPy](nb::object result, const vo::StoreStatus& status, bool withStatus) -> nb::object {
-        return withStatus ? nb::make_tuple(result, statusPy(status)) : result;
+    auto answer = [](nb::object result, const vo::StoreStatus& status, bool withStatus) -> nb::object {
+        return withStatus ? nb::make_tuple(result, toPy(status)) : result;
     };
     auto objectQuery = [](const nb::object& query, std::optional<std::vector<std::string>>& fields) {
         return vo::objectQueryRequestFromJson(nb::isinstance<nb::str>(query) ? nb::cast<std::string>(query) : jsonDumps(query), &fields);
     };
     auto edgeQuery = [](const nb::object& query, std::optional<std::vector<std::string>>& fields) {
         return vo::edgeQueryRequestFromJson(nb::isinstance<nb::str>(query) ? nb::cast<std::string>(query) : jsonDumps(query), &fields);
-    };
-    auto objectsPy = [](const std::vector<vo::ObjectRecord>& records, const std::optional<std::vector<std::string>>& fields) {
-        const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
-        nb::list result;
-        for (const auto& record : records) result.append(objectToPy(record, fields ? &selected : nullptr));
-        return result;
-    };
-    auto edgesPy = [](const std::vector<vo::EdgeRecord>& records, const std::optional<std::vector<std::string>>& fields) {
-        const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
-        nb::list result;
-        for (const auto& record : records) result.append(edgeToPy(record, fields ? &selected : nullptr));
-        return result;
     };
     nb::class_<Hosted>(m, "HostedStore")
         .def("__init__", [](Hosted* self, const std::string& endpoint, int connections, long connectTimeoutMs,
@@ -484,10 +484,10 @@ void bindHostedStore(nb::module_& m)
            "link_timeout_s: how long a link_objects request may take to be answered (its detection runs on the "
            "service); set it with the service's --request-deadline.")
         .def_prop_ro("endpoint", &Hosted::endpoint)
-        .def("status", [statusPy](Hosted& self) {
+        .def("status", [](Hosted& self) {
             vo::StoreStatus status;
             { nb::gil_scoped_release release; status = self.status(); }
-            return statusPy(status);
+            return toPy(status);
         })
         .def("service_report", [](Hosted& self) {
             std::string text;
@@ -495,23 +495,16 @@ void bindHostedStore(nb::module_& m)
             return jsonLoads(text);
         })
         .def("submit", [](Hosted& self, const nb::object& request, const nb::dict& payloads) {
-            vo::TransactionPayloads bytes;
-            for (const auto& [hash, value] : payloads) {
-                const auto data = nb::cast<nb::bytes>(value);
-                const auto* begin = reinterpret_cast<const uint8_t*>(data.c_str());
-                bytes.emplace(nb::cast<std::string>(hash), std::vector<uint8_t>(begin, begin + data.size()));
-            }
-            const auto parsed = vo::transactionRequestFromJson(
-                nb::isinstance<nb::str>(request) ? nb::cast<std::string>(request) : jsonDumps(request), bytes);
+            const auto parsed = requestFromPy(request,payloads);
             vo::TransactionReceipt receipt;
             { nb::gil_scoped_release release; receipt = self.submit(parsed); }
-            return jsonLoads(vo::transactionReceiptToJson(receipt));
+            return toPy(receipt);
         }, nb::arg("request"), nb::arg("payloads") = nb::dict(),
            "Stage payloads and submit; an unknown outcome is recovered by receipt() or the identical request.")
         .def("receipt", [](Hosted& self, const std::string& request) -> nb::object {
             std::optional<vo::TransactionReceipt> receipt;
             { nb::gil_scoped_release release; receipt = self.receipt(request); }
-            return receipt ? jsonLoads(vo::transactionReceiptToJson(*receipt)) : nb::none();
+            return toPy(receipt);
         }, nb::arg("request_uuid"))
         .def("changes_since", [](Hosted& self, const nb::dict& cursor, int64_t maxChanges) {
             const vo::FeedCursor c{nb::cast<std::string>(cursor["store"]), nb::cast<std::string>(cursor["generation"]),
@@ -558,14 +551,14 @@ void bindHostedStore(nb::module_& m)
             const auto selection = objectQuery(query, fields);
             vo::StoreStatus status; std::vector<vo::ObjectRecord> records;
             { nb::gil_scoped_release release; records = self.selectObjects(selection, fields, &status); }
-            return answer(objectsPy(records, fields), status, withStatus);
+            return answer(recordsToPy(records, fields), status, withStatus);
         }, nb::arg("query"), nb::arg("with_status") = false, "One page; the query (wire form) needs a limit.")
         .def("select_all_objects", [=](Hosted& self, const nb::object& query, int64_t pageSize, int maxRestarts, bool withStatus) {
             std::optional<std::vector<std::string>> fields;
             const auto selection = objectQuery(query, fields);
             vo::StoreStatus status; std::vector<vo::ObjectRecord> records;
             { nb::gil_scoped_release release; records = self.selectAllObjects(selection, fields, pageSize, maxRestarts, &status); }
-            return answer(objectsPy(records, fields), status, withStatus);
+            return answer(recordsToPy(records, fields), status, withStatus);
         }, nb::arg("query"), nb::arg("page_size") = 1000, nb::arg("max_restarts") = 3, nb::arg("with_status") = false,
            "Every match, exact as of one commit; raises StoreBusy when commits never settle.")
         .def("select_edges", [=](Hosted& self, const nb::object& query, bool withStatus) {
@@ -573,14 +566,14 @@ void bindHostedStore(nb::module_& m)
             const auto selection = edgeQuery(query, fields);
             vo::StoreStatus status; std::vector<vo::EdgeRecord> records;
             { nb::gil_scoped_release release; records = self.selectEdges(selection, fields, &status); }
-            return answer(edgesPy(records, fields), status, withStatus);
+            return answer(recordsToPy(records, fields), status, withStatus);
         }, nb::arg("query"), nb::arg("with_status") = false)
         .def("select_all_edges", [=](Hosted& self, const nb::object& query, int64_t pageSize, int maxRestarts, bool withStatus) {
             std::optional<std::vector<std::string>> fields;
             const auto selection = edgeQuery(query, fields);
             vo::StoreStatus status; std::vector<vo::EdgeRecord> records;
             { nb::gil_scoped_release release; records = self.selectAllEdges(selection, fields, pageSize, maxRestarts, &status); }
-            return answer(edgesPy(records, fields), status, withStatus);
+            return answer(recordsToPy(records, fields), status, withStatus);
         }, nb::arg("query"), nb::arg("page_size") = 1000, nb::arg("max_restarts") = 3, nb::arg("with_status") = false)
         .def("record_selection", [](Hosted& self, const nb::object& query, int64_t pageSize, int maxRestarts) {
             std::optional<std::vector<std::string>> fields;
@@ -651,17 +644,6 @@ void bindHostedStore(nb::module_& m)
 void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
 {
     using Session = vo::ObjectStoreSession;
-    auto statusPy = [](const vo::StoreStatus& status) { return jsonLoads(vo::storeStatusToJson(status)); };
-    auto requestFromPy = [](const nb::object& request, const nb::dict& payloads) {
-        vo::TransactionPayloads bytes;
-        for (const auto& [hash, value] : payloads) {
-            const auto data = nb::cast<nb::bytes>(value);
-            const auto* begin = reinterpret_cast<const uint8_t*>(data.c_str());
-            bytes.emplace(nb::cast<std::string>(hash), std::vector<uint8_t>(begin, begin + data.size()));
-        }
-        return vo::transactionRequestFromJson(nb::isinstance<nb::str>(request) ? nb::cast<std::string>(request) : jsonDumps(request), bytes);
-    };
-    auto receiptPy = [](const vo::TransactionReceipt& receipt) { return jsonLoads(vo::transactionReceiptToJson(receipt)); };
     auto filesPy = [](const std::vector<vo::ArtifactFile>& files) {
         nb::list result;
         for (const auto& f : files) { nb::dict d; d["name"] = f.name; d["sha256"] = f.sha256; d["length"] = f.length; result.append(d); }
@@ -721,7 +703,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             d["points"] = ownedArray(std::move(grid.points), {rows, columns, 3});
             d["valid"] = ownedArray(std::move(grid.valid), {rows, columns});
             d["scale"] = nb::make_tuple(grid.scale[0], grid.scale[1]);
-            d["record"] = objectToPy(grid.record);
+            d["record"] = recordToPy(grid.record);
             d["version"] = grid.reference().version; d["generation"] = grid.reference().generation;
             d["geometry_revision"] = grid.geometryRevision; d["channels"] = grid.channels;
             return d;
@@ -739,10 +721,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
                 nb::gil_scoped_release release;
                 self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { records = reader.selectObjects(selection, fields); });
             }
-            const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
-            nb::list result;
-            for (const auto& record : records) result.append(objectToPy(record, fields ? &selected : nullptr));
-            return result;
+            return recordsToPy(records,fields);
         }, nb::arg("attachment"), nb::arg("query"),
            "Every record the query (wire form, as HostedStore.select_objects; complete without a limit) selects in one read.")
         .def("read_geometry_arrays", [](Session& self, const vo::AttachmentIdentity& attachment,
@@ -826,10 +805,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
                 nb::gil_scoped_release release;
                 self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { records = reader.selectEdges(selection, fields); });
             }
-            const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
-            nb::list result;
-            for (const auto& record : records) result.append(edgeToPy(record, fields ? &selected : nullptr));
-            return result;
+            return recordsToPy(records,fields);
         }, nb::arg("attachment"), nb::arg("query"),
            "Every edge the query (wire form, as HostedStore.select_edges; complete without a limit) selects in one read.")
         .def("overlap_correspondences_at", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& edges,
@@ -890,31 +866,31 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
            "Point collections by UUID (any role), in the volume's voxels at target_scale: uuid, name, ids, points, "
            "annotations, source.")
         .def("hosted", &Session::hosted, nb::arg("attachment"))
-        .def("freshness", [statusPy](const Session& self, const vo::AttachmentIdentity& attachment) -> nb::object {
+        .def("freshness", [](const Session& self, const vo::AttachmentIdentity& attachment) -> nb::object {
             const auto fresh = self.freshness(attachment);
             if (!fresh) return nb::none();
             nb::dict d;
-            d["status"] = fresh->status ? statusPy(*fresh->status) : nb::none();
+            d["status"] = toPy(fresh->status);
             d["checked_at_us"] = fresh->checkedAtUs ? nb::cast(*fresh->checkedAtUs) : nb::none();
             d["error"] = fresh->error;
             return d;
         }, nb::arg("attachment"))
         .def("refresh", &Session::refresh, nb::arg("attachment"), nb::call_guard<nb::gil_scoped_release>())
-        .def("status", [statusPy](Session& self, const vo::AttachmentIdentity& attachment) {
+        .def("status", [](Session& self, const vo::AttachmentIdentity& attachment) {
             vo::StoreStatus status;
             { nb::gil_scoped_release release; status = self.status(attachment); }
-            return statusPy(status);
+            return toPy(status);
         }, nb::arg("attachment"))
         .def("submit", [=](Session& self, const vo::AttachmentIdentity& attachment, const nb::object& request, const nb::dict& payloads) {
             const auto parsed = requestFromPy(request, payloads);
             vo::TransactionReceipt receipt;
             { nb::gil_scoped_release release; receipt = self.submit(attachment, parsed); }
-            return receiptPy(receipt);
+            return toPy(receipt);
         }, nb::arg("attachment"), nb::arg("request"), nb::arg("payloads") = nb::dict())
         .def("receipt", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& requestUuid) -> nb::object {
             std::optional<vo::TransactionReceipt> receipt;
             { nb::gil_scoped_release release; receipt = self.receipt(attachment, requestUuid); }
-            return receipt ? receiptPy(*receipt) : nb::none();
+            return toPy(receipt);
         }, nb::arg("attachment"), nb::arg("request_uuid"))
         .def("current_object", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid) {
             std::optional<vo::ObjectRevision> revision;
@@ -970,7 +946,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             const auto selected = vo::objectVersionFromJson(jsonDumps(reference));
             vo::TransactionReceipt receipt;
             { nb::gil_scoped_release release; receipt = self.publishArtifacts(attachment, selected, list, author); }
-            return receiptPy(receipt);
+            return toPy(receipt);
         }, nb::arg("attachment"), nb::arg("reference"), nb::arg("files"), nb::arg("author") = "",
            "Store {name: local path} durably and name them in the object's manifest in one checked request.")
         .def("use_draft_directory", [](Session& self, const std::filesystem::path& directory) {
@@ -1003,7 +979,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             save.keepDrafts = keepDrafts;
             vo::TransactionReceipt receipt;
             { nb::gil_scoped_release release; receipt = self.submitDurably(attachment, parsed, save); }
-            return receiptPy(receipt);
+            return toPy(receipt);
         }, nb::arg("attachment"), nb::arg("request"), nb::arg("payloads") = nb::dict(), nb::arg("drafts") = std::vector<std::string>{},
            nb::arg("keep_drafts") = false,
            "A checked save that survives a crash (request written before it is sent). keep_drafts: the saved "
@@ -1011,7 +987,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         .def("resolve_pending", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& requestUuid) {
             vo::TransactionReceipt receipt;
             { nb::gil_scoped_release release; receipt = self.resolvePending(attachment, requestUuid); }
-            return receiptPy(receipt);
+            return toPy(receipt);
         }, nb::arg("attachment"), nb::arg("request_uuid"));
 }
 
@@ -1375,8 +1351,7 @@ NB_MODULE(_native, m)
            "annotations, source.")
         .def("attachments", [](PyObjectStore& self, const std::string& owner, const std::optional<std::string>& role) {
             const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.attachments(txn, owner, role); });
-            nb::list out; for (const auto& record : records) out.append(edgeToPy(record));
-            return out;
+            return recordsToPy(records);
         }, nb::arg("owner_uuid"), nb::arg("role") = std::nullopt,
            "Attachment relationships of owner (in role when given); the attached object is the other endpoint.")
         .def("select_edges", [](PyObjectStore& self, const std::optional<std::string>& kind,
@@ -1388,9 +1363,7 @@ NB_MODULE(_native, m)
             selection.tag = tag; selection.limit = limit; selection.afterUuid = after; selection.includeRetired = includeRetired;
             selection.adjacent = adjacent; selection.applicableOnly = applicableOnly;
             const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.selectEdges(txn, selection, fields); });
-            const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
-            nb::list out; for (const auto& record : records) out.append(edgeToPy(record, fields ? &projection : nullptr));
-            return out;
+            return recordsToPy(records,fields);
         }, nb::arg("edge_kind") = std::nullopt, nb::arg("approval_states") = std::vector<std::string>{},
            nb::arg("endpoint_uuids") = std::nullopt, nb::arg("both_endpoints") = false,
            nb::arg("tag") = std::nullopt, nb::arg("limit") = std::nullopt,
@@ -1435,10 +1408,7 @@ NB_MODULE(_native, m)
             selection.afterUuid = afterUuid; selection.afterLength = afterLength; selection.includeRetired = includeRetired;
             selection.volume = volume; selection.includeUnbound = includeUnbound; selection.targetScale = targetScale;
             const auto records = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields); });
-            const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
-            nb::list result;
-            for (const auto& record : records) result.append(objectToPy(record, fields ? &selected : nullptr));
-            return result;
+            return recordsToPy(records,fields);
         }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
@@ -1590,9 +1560,8 @@ NB_MODULE(_native, m)
              nb::arg("object_uuid"))
         .def("object_history", readMethod<&vo::ObjectStore::objectHistory>(),
              nb::arg("object_uuid"), nb::arg("if_retained") = false)
-        .def("status", [](PyObjectStore& self) {
-            return jsonLoads(vo::storeStatusToJson(self.withRead([](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.status(txn); })));
-        }, "Store UUID, lineage generation, commit sequence, feed start and history_enabled policy.")
+        .def("status", readMethod<&vo::ObjectStore::status>(),
+             "Store UUID, lineage generation, commit sequence, feed start and history_enabled policy.")
         .def("current_version", readMethod<&vo::ObjectStore::currentVersion>(), nb::arg("object_uuid"))
         .def("current_relationship_version", readMethod<&vo::ObjectStore::currentRelationshipVersion>(),
              nb::arg("relationship_uuid"))
@@ -1611,21 +1580,11 @@ NB_MODULE(_native, m)
                 return db.changesSince(txn, c, maxChanges);
             })));
         }, nb::arg("cursor"), nb::arg("max_changes") = 4096)
-        .def("receipt", [](PyObjectStore& self, const std::string& request) -> nb::object {
-            const auto receipt = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.receipt(txn, request); });
-            return receipt ? jsonLoads(vo::transactionReceiptToJson(*receipt)) : nb::none();
-        }, nb::arg("request_uuid"))
+        .def("receipt", readMethod<&vo::ObjectStore::receipt>(), nb::arg("request_uuid"))
         .def("submit", [](PyObjectStore& self, const nb::object& request, const nb::dict& payloads, const nb::object& progress) {
             // The canonical JSON form (transaction_request_json); binary
             // payloads keyed by SHA-256, as on the wire.
-            vo::TransactionPayloads bytes;
-            for (const auto& [hash, value] : payloads) {
-                const auto data = nb::cast<nb::bytes>(value);
-                const auto* begin = reinterpret_cast<const uint8_t*>(data.c_str());
-                bytes.emplace(nb::cast<std::string>(hash), std::vector<uint8_t>(begin, begin + data.size()));
-            }
-            const auto text = nb::isinstance<nb::str>(request) ? nb::cast<std::string>(request) : jsonDumps(request);
-            const auto parsed = vo::transactionRequestFromJson(text, bytes);
+            const auto parsed = requestFromPy(request,payloads);
             vo::PrepareOptions options;
             if (!progress.is_none()) {
                 options.progress = [progress](const vo::util::ProgressUpdate& update) {
@@ -1733,7 +1692,7 @@ NB_MODULE(_native, m)
     // A store as a project (objects/Project.hpp).
     store.def("project_record",[](PyObjectStore& self)->nb::object{
         const auto record=self.withRead([&](auto& db,auto& txn){return vo::projectRecord(vo::LocalStoreReader(db,txn));});
-        return record?nb::object(objectToPy(*record)):nb::none();
+        return record?nb::object(recordToPy(*record)):nb::none();
     },"The store's project record, or None.");
     store.def("project_resources",[](PyObjectStore& self,const std::string& kind,const std::optional<std::string>& viewer){
         nb::list resources;

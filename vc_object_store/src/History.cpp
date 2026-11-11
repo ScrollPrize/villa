@@ -404,16 +404,13 @@ void detail::recordRelationshipValidation(sqlite3* db, const EdgeRecord& edge, b
     }
 }
 
-namespace {
-CurrentWriteState& mutableCurrentWrite(sqlite3* db)
+CurrentWriteState& detail::mutableCurrentWrite(sqlite3* db)
 {
     auto& state=activeStatementPools.at(db)->currentWrite;
     if(!state)state=std::make_shared<CurrentWriteState>();
     else if(state.use_count()!=1)state=std::make_shared<CurrentWriteState>(*state);
     return *state;
 }
-}
-
 void detail::beginCurrentWrite(sqlite3* db)
 {
     if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end())
@@ -443,14 +440,7 @@ void detail::validateCurrentRelationships(sqlite3* db)
     std::set<std::string> seen;
     for(const auto& [uuid,before]:state->before) {
         const auto current=resolveObject(db,uuid);
-        if(current) {
-            const auto meta=Json::parse(current->record.meta);
-            if(meta.is_object()&&meta.contains(kArtifactsMetaKey)) {
-                const auto old=before.value("meta",Json::object());
-                if(!old.contains(kArtifactsMetaKey)||old.at(kArtifactsMetaKey)!=meta.at(kArtifactsMetaKey))
-                    checkArtifactReferences(db,uuid,meta.at(kArtifactsMetaKey));
-            }
-        }
+        if(current)checkChangedArtifactReferences(db,uuid,Json::parse(current->record.meta),[&]{return before.value("meta",Json::object());});
         for(const auto& edge:incidentEdges(db,uuid)) {
             if(!seen.insert(edge.uuid).second)continue;
             const auto validated=state->validated.find(edge.uuid);
@@ -525,15 +515,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
         // temporary sibling filename is not the published artifact location.
         if (baseline) break;
         if (!p.exists || !p.changed) continue;
-        const auto& meta = p.record.at("meta");
-        if (!meta.is_object() || !meta.contains(kArtifactsMetaKey)) continue;
-        const auto& manifest = meta.at(kArtifactsMetaKey);
-        if (p.parent) {
-            const auto before = metadata(db, *p.parent).at("meta");
-            if (before.is_object() && before.contains(kArtifactsMetaKey) && before.at(kArtifactsMetaKey) == manifest)
-                continue;
-        }
-        checkArtifactReferences(db, object, manifest);
+        checkChangedArtifactReferences(db,object,p.record.at("meta"),[&]{return p.parent?metadata(db,*p.parent).at("meta"):Json();});
     }
     // Ordinary metadata is independent unless the relationship declares a
     // dependency. Check the final state, not the order of earlier API calls.

@@ -107,7 +107,7 @@ void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::stri
         d["version_store"] = r.versionStoreUuid; }
 }
 
-nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fields = nullptr)
+nb::dict recordToPy(const vo::ObjectRecord& r, const std::set<std::string>* fields = nullptr)
 {
     auto include = [&](const char* name) { return !fields || fields->contains(name); };
     nb::dict d;
@@ -150,7 +150,7 @@ vo::ObjectRecord objectFromPy(const nb::dict& d)
     return r;
 }
 
-nb::dict edgeToPy(const vo::EdgeRecord& e, const std::set<std::string>* fields = nullptr)
+nb::dict recordToPy(const vo::EdgeRecord& e, const std::set<std::string>* fields = nullptr)
 {
     nb::dict d;
     commonToPy(d, e, fields);
@@ -159,6 +159,15 @@ nb::dict edgeToPy(const vo::EdgeRecord& e, const std::set<std::string>* fields =
     if (!fields || fields->contains("a_anchor")) d["a_anchor"] = anchorToPy(e.aAnchor);
     if (!fields || fields->contains("b_anchor")) d["b_anchor"] = anchorToPy(e.bAnchor);
     return d;
+}
+
+template<class Record> nb::list recordsToPy(const std::vector<Record>& records,
+    const std::optional<std::vector<std::string>>& fields=std::nullopt)
+{
+    const std::set<std::string> selected=fields?std::set<std::string>(fields->begin(),fields->end()):std::set<std::string>{};
+    nb::list result;
+    for(const auto& record:records)result.append(recordToPy(record,fields?&selected:nullptr));
+    return result;
 }
 
 vo::EdgeRecord edgeFromPy(const nb::dict& d)

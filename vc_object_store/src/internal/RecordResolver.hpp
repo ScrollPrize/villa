@@ -12,14 +12,18 @@ struct ResolvedObject {
 // Inherited lookup is for an overlay's before-state only; ordinary consumers
 // use visible lookup, where a tombstone stops fallback.
 // includeDeleted returns the winning tombstone's owner, never an older live row.
-inline sqlite3* objectSource(sqlite3* db,const std::string& uuid,bool inherited=false,bool includeDeleted=false)
+inline sqlite3* recordSource(sqlite3* db,const std::string& uuid,bool object,bool inherited,bool includeDeleted)
 {
-    if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end()&&pool->second->objectSource)
-        return pool->second->objectSource(uuid,inherited,includeDeleted);
+    if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end()) {
+        const auto& source=object?pool->second->objectSource:pool->second->edgeSource;
+        if(source)return source(uuid,inherited,includeDeleted);
+    }
     if(inherited)return nullptr;
-    Statement row(db,"SELECT state FROM objects WHERE uuid=?",parseUuid(uuid));
+    Statement row(db,object?"SELECT state FROM objects WHERE uuid=?":"SELECT state FROM edges WHERE uuid=?",parseUuid(uuid));
     return row.row()&&(includeDeleted||row.i64(0)!=2)?db:nullptr;
 }
+inline sqlite3* objectSource(sqlite3* db,const std::string& uuid,bool inherited=false,bool includeDeleted=false)
+{return recordSource(db,uuid,true,inherited,includeDeleted);}
 inline std::optional<ResolvedObject> resolveObject(sqlite3* db,const std::string& uuid,bool inherited=false)
 {
     auto* source=objectSource(db,uuid,inherited);
@@ -29,13 +33,7 @@ inline std::optional<ResolvedObject> resolveObject(sqlite3* db,const std::string
     return ResolvedObject{source,readObjectRow(source,row)};
 }
 inline sqlite3* edgeSource(sqlite3* db,const std::string& uuid,bool inherited=false,bool includeDeleted=false)
-{
-    if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end()&&pool->second->edgeSource)
-        return pool->second->edgeSource(uuid,inherited,includeDeleted);
-    if(inherited)return nullptr;
-    Statement row(db,"SELECT state FROM edges WHERE uuid=?",parseUuid(uuid));
-    return row.row()&&(includeDeleted||row.i64(0)!=2)?db:nullptr;
-}
+{return recordSource(db,uuid,false,inherited,includeDeleted);}
 struct ResolvedEdge {sqlite3* source;EdgeRecord record;};
 inline std::optional<ResolvedEdge> resolveEdge(sqlite3* db,const std::string& uuid)
 {

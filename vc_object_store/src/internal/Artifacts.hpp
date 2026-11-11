@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/objects/Artifacts.hpp"
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -14,6 +15,15 @@ namespace vc::objects::detail {
 // is held by the store at `storePath` with the stated length.
 void checkArtifactReferences(sqlite3*, const std::string& objectUuid,
                              const nlohmann::json& manifest);
+template<class Previous> void checkChangedArtifactReferences(sqlite3* db,const std::string& uuid,
+    const nlohmann::json& meta,Previous previous)
+{
+    if(!meta.is_object()||!meta.contains(kArtifactsMetaKey))return;
+    const auto& manifest=meta.at(kArtifactsMetaKey);
+    const auto before=previous();
+    if(before.is_object()&&before.contains(kArtifactsMetaKey)&&before.at(kArtifactsMetaKey)==manifest)return;
+    checkArtifactReferences(db,uuid,manifest);
+}
 std::optional<uint64_t> resolvedArtifactLength(sqlite3*,const std::string& hash);
 std::vector<uint8_t> readResolvedArtifact(sqlite3*,const std::string& hash,uint64_t offset,
                                         const std::optional<uint64_t>& count);

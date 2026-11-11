@@ -187,11 +187,6 @@ void CommitPublisher::begin()
         parseOptionalUuid(request), author, host, publishedAtUs_);
 }
 
-int64_t CommitPublisher::nextObject(const std::string& objectUuid)
-{
-    return writeObjectVersion(db_, objectUuid);
-}
-
 int64_t CommitPublisher::object(const std::string& objectUuid, const std::string& revisionUuid, bool deleted)
 {
     if (baseline_) {
@@ -201,7 +196,7 @@ int64_t CommitPublisher::object(const std::string& objectUuid, const std::string
         return row.i64(0);
     }
     begin();
-    const auto version = nextObject(objectUuid);
+    const auto version = writeObjectVersion(db_, objectUuid);
     execute(db_, "INSERT INTO object_versions VALUES(?,?,?,?,?)", parseUuid(objectUuid), version, parseUuid(generation_),
         *sequence_, parseUuid(revisionUuid));
     execute(db_, "INSERT INTO store_changes VALUES(?,(SELECT count(*) FROM store_changes WHERE seq=?),'object',?,?,?)",
@@ -301,9 +296,7 @@ void detail::recordCurrentChange(sqlite3* db, const std::array<unsigned char,16>
     const auto found=activeStatementPools.find(db);
     if(found==activeStatementPools.end() || found->second->immutableInitial) return;
     auto& pool=*found->second;
-    auto& state=pool.currentWrite;
-    if(!state) state=std::make_shared<CurrentWriteState>();
-    else if(state.use_count()!=1) state=std::make_shared<CurrentWriteState>(*state);
+    auto& state=mutableCurrentWrite(db);
     const auto uuid=formatUuid(key);
     const auto expectObject=[&](const std::string& object) {
         if(pool.checkedAction && !pool.checkedObjects.contains(object)) {
@@ -314,23 +307,23 @@ void detail::recordCurrentChange(sqlite3* db, const std::array<unsigned char,16>
     Statement object(db,"SELECT version,state FROM objects WHERE uuid=?",key);
     if(object.row()) {
         expectObject(uuid);
-        state->changedObjects.insert(uuid);
+        state.changedObjects.insert(uuid);
         const auto expected=pool.checkedObjects.find(uuid);
         if(object.i64(1)!=2 && (object.i64(0)==1 ||
-           (expected!=pool.checkedObjects.end() && !expected->second))) state->created.insert(uuid);
+           (expected!=pool.checkedObjects.end() && !expected->second))) state.created.insert(uuid);
         return;
     }
     Statement edge(db,"SELECT a_uuid,b_uuid,state FROM edges WHERE uuid=?",key);
     if(!edge.row()) throw std::logic_error("object store: changed record is absent: "+uuid);
-    state->changedRelationships.insert(uuid);
-    if(edge.i64(2)!=2 && std::string_view(changeKind)=="add_edge") state->created.insert(uuid);
+    state.changedRelationships.insert(uuid);
+    if(edge.i64(2)!=2 && std::string_view(changeKind)=="add_edge") state.created.insert(uuid);
     for(const auto column:{0,1}) {
         const auto endpoint=edge.uuid(column);
         // An immutable dependency cannot be versioned by this overlay.
         if(objectSource(db,endpoint)!=db) continue;
         expectObject(endpoint);
         writeObjectVersion(db,endpoint);
-        state->changedObjects.insert(endpoint);
+        state.changedObjects.insert(endpoint);
     }
 }
 

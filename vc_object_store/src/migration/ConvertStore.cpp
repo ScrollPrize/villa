@@ -1,5 +1,6 @@
 #include "vc_object_store/migration/ConvertStore.hpp"
 #include "internal/Database.hpp"
+#include "internal/DatabaseCopy.hpp"
 #include "internal/Sqlite.hpp"
 #include "internal/Versions.hpp"
 #include "internal/RecordJson.hpp"
@@ -890,11 +891,7 @@ ConversionResult convertStoreImpl(const std::filesystem::path& source, const std
         // scratch file beside the destination; the source is never written.
         staged.db = openRaw(stage, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
         created = true;
-        sqlite3_backup* backup = sqlite3_backup_init(staged.db, "main", input, "main");
-        if (!backup) fail(staged.db, "convert: backup");
-        const int rc = sqlite3_backup_step(backup, -1);
-        sqlite3_backup_finish(backup);
-        if (rc != SQLITE_DONE) fail(staged.db, "convert: snapshot copy");
+        backupSqliteSnapshot(input,staged.db);
         in = {};
         report["source_bytes"] = int64_t(std::filesystem::file_size(source));
 

@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/StoreConversion.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include "internal/Database.hpp"
+#include "internal/DatabaseCopy.hpp"
 #include "internal/Schema.hpp"
 #include "internal/History.hpp"
 #include "internal/ExtensionHistory.hpp"
@@ -100,10 +101,7 @@ Db exclusive(const std::filesystem::path& path, int version)
 Db backupTo(sqlite3* source, const std::filesystem::path& path)
 {
     Db target(openConnection(path,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,{},false),sqlite3_close_v2);
-    auto* backup=sqlite3_backup_init(target.get(),"main",source,"main");
-    if (!backup) fail(target.get(),"maintenance backup");
-    const int step=sqlite3_backup_step(backup,-1), finish=sqlite3_backup_finish(backup);
-    if (step!=SQLITE_DONE || finish!=SQLITE_OK) fail(target.get(),"maintenance backup failed");
+    backupSqliteSnapshot(source,target.get());
     return target;
 }
 

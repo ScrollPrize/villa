@@ -5,6 +5,14 @@
 #include <functional>
 
 namespace vc::objects::detail {
+inline void backupSqliteSnapshot(sqlite3* source, sqlite3* destination)
+{
+    auto* backup=sqlite3_backup_init(destination,"main",source,"main");
+    if(!backup)fail(destination,"initialize database copy");
+    const int step=sqlite3_backup_step(backup,-1), finished=sqlite3_backup_finish(backup);
+    if(step!=SQLITE_DONE)check(step,destination,"copy database snapshot");
+    check(finished,destination,"finish database copy");
+}
 // Copy the caller's pinned SQLite snapshot, not a separately opened connection.
 // Used by ordinary collection exports and packed imports alike.
 inline void copySqliteSnapshot(sqlite3* source, const std::filesystem::path& destination)
@@ -14,12 +22,7 @@ inline void copySqliteSnapshot(sqlite3* source, const std::filesystem::path& des
         SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE, isPackedDatabasePath(destination)?packedStoreVfs():nullptr);
     std::unique_ptr<sqlite3,decltype(&sqlite3_close_v2)> output(raw,sqlite3_close_v2);
     check(opened,raw,"open database copy destination");
-    auto* backup=sqlite3_backup_init(raw,"main",source,"main");
-    if(!backup)fail(raw,"initialize database copy");
-    const int step=sqlite3_backup_step(backup,-1);
-    const int finished=sqlite3_backup_finish(backup);
-    if(step!=SQLITE_DONE)check(step,raw,"copy database snapshot");
-    check(finished,raw,"finish database copy");
+    backupSqliteSnapshot(source,raw);
     check(sqlite3_close(raw),raw,"close database copy destination");
     output.release();
 }

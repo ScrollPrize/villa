@@ -117,7 +117,7 @@ void bindGraphReadView(nb::module_& m) {
             for (size_t i = 0; i < records.size(); ++i) positions.emplace(records[i].uuid, i);
             const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
             nb::list out;
-            for (const auto& id : self.graph->objectUuids) out.append(objectToPy(records.at(positions.at(id)), fields ? &projection : nullptr));
+            for (const auto& id : self.graph->objectUuids) out.append(recordToPy(records.at(positions.at(id)), fields ? &projection : nullptr));
             return out;
         }, nb::arg("fields") = std::nullopt)
         .def("edges", [](PyGraphReadView& self, const std::optional<std::vector<std::string>>& fields) {
@@ -128,10 +128,7 @@ void bindGraphReadView(nb::module_& m) {
             if (self.graph->selectedRelationships) {
                 for (const auto& relationship : *self.graph->selectedRelationships) records.push_back(relationship.record);
             } else { nb::gil_scoped_release release; records = self.store->selectEdges(*self.txn, selection, fields); }
-            const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
-            nb::list out;
-            for (const auto& record : records) out.append(edgeToPy(record, fields ? &projection : nullptr));
-            return out;
+            return recordsToPy(records,fields);
         }, nb::arg("fields") = std::nullopt)
         .def("read_geometry_arrays", [](PyGraphReadView& self, const std::string& name,
                                         const std::optional<std::vector<size_t>>& nodes) {

@@ -1,7 +1,24 @@
 #pragma once
 #include "internal/RecordResolver.hpp"
+#include <algorithm>
 
 namespace vc::objects::detail {
+// Physical readers retain their indexed execution plans. Logical visibility
+// precedes global ordering/pagination, for objects, regions and relationships.
+template<class Read,class Visible,class Less>
+auto selectVisibleRecords(sqlite3* db,Read read,Visible visible,Less less,
+                          int64_t offset=0,std::optional<int64_t> limit=std::nullopt)
+{
+    decltype(read(db)) result;
+    for(auto* source:querySources(db))for(auto& record:read(source))
+        if(visible(record,source))result.push_back(std::move(record));
+    std::sort(result.begin(),result.end(),less);
+    const auto begin=std::min(result.size(),size_t(offset));
+    const auto end=limit?begin+std::min(result.size()-begin,size_t(*limit)):result.size();
+    result.erase(result.begin()+end,result.end());
+    result.erase(result.begin(),result.begin()+begin);
+    return result;
+}
 // Merge indexed physical queries in UUID order. Column zero is the object
 // UUID; rows within each object retain their physical query's ordering. All
 // shadowing/deletion decisions use the same resolver as point lookups.

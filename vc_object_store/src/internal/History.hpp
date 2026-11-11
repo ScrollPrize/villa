@@ -10,6 +10,7 @@ std::optional<int64_t> retainedCreationPublication(sqlite3*, const std::string& 
 void transformArchivedObjectRecords(sqlite3*,
     const std::function<void(const std::string& revision, nlohmann::json&)>&);
 void beginCurrentWrite(sqlite3*);
+CurrentWriteState& mutableCurrentWrite(sqlite3*);
 void publishHistory(sqlite3*, bool baseline = false);
 void expectHistory(sqlite3*, const RevisionSelection&);
 [[noreturn]] void historyConflict(sqlite3*, const std::string&);
