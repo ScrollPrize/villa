@@ -1,0 +1,7 @@
+# PF-C01: Bound-only fiber volume discovery uses a broader registration-aware check
+
+Consumer: `vesuvius/src/vesuvius/neural_tracing/tracers/shared/annotations/fiber_store.py`. `fiber_volume` chooses the first fiber's directly declared volume, then `unbound_object_count('fiber', volume)` certifies that all fibers belong there. Native volume queries/counts include fibers reachable through registered affine transforms. `_catalog` uses that same broad volume selection, but `_read_rows` accepts only `geometry_scale_to_volume(record.meta, volume)` and skips a differently bound record when it returns None.
+
+Counterexample: fibers bound separately to A and B, with a B-to-A registration. The native count reports no unbound fibers. `fiber_volume` reports A instead of rejecting mixed bindings, and default catalog/polyline reading silently omits B-bound fibers. Explicitly requested fibers fail rather than silently disappear, so behavior differs across entry points.
+
+Astra narrowed the original candidate: the module explicitly documents scalar, directly bound coordinates; arbitrary-affine support is not itself promised. Correct consolidation may be strict bound-only discovery and selection/rejection, not adding affine functionality. Densification, repair and trace-grid scaling are legitimate application work. This is an older omission; no fusion regression attribution. Runtime verification pending.
