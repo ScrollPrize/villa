@@ -1,5 +1,7 @@
 # Single-reference review and simplification
 
+Follow-up over `5920625cc`: [remaining consumer/transaction findings](follow-up.md), [Astra adjudication](follow-up-astra.md), [implementation review](follow-up-implementation-review.md) and [unification/validation tracker](follow-up-validation.md). This extends the earlier representation cleanup to complete transaction/preparation/dependency handles and relationship provenance; the baseline evidence below remains historical.
+
 Baseline: `38c72d972`. The [specification](../versioned-reference-contract.md) requires one complete reference throughout internal calls, with extra application state beside it. This pass reviews that representation invariant only; it does not reopen unrelated solver or storage features.
 
 Discovery ledgers: [native](native.md), [Python consumers](python.md). [Astra adjudication](adjudication.md) distinguishes internal alternate formats from necessary external/schema serialization. Candidate files retain their original evidence; this tracker records implementation and actual verification.

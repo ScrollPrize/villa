@@ -42,7 +42,11 @@ the writer lock, but cannot protect a read made before it. Standalone Python
 mutations (`store.set_meta`, `store.put_geometry`, ...) each commit their own
 transaction.
 
-For a loaded object in a collection, use `expectObject(request, selected.reference())`: it carries the complete store/lineage/object/version identity and checks it under the writer lock. Equal numeric versions from different owners are not interchangeable. Typed requests with these guards use command encoding 2 (`expected_object_references`); ordinary number-only requests retain encoding 1, including their retry digest. Both encodings are read, and an older server rejects encoding 2 rather than silently ignoring its guards. This is a command-format change, not a database-schema change.
+For a loaded object in a collection, use `expectObject(request, selected.reference())`: it carries the complete store/lineage/object/version identity and checks it under the writer lock. Equal numeric versions from different owners are not interchangeable. `expectRead(request, reference)` guards a read without requesting a write; `expectRelationship(request, relationship.reference())` guards the selected relationship identity. All three use one `RecordSelection` representation, including preparations and fetch callbacks. `expectObject(request, selectedRevision)` also distinguishes an exact deleted version from the weaker `nullopt` expectation of no live record. `currentObjectExpectation(reader, uuid)` selects that winning state without a history fallback; `reader.currentObject(uuid, true)` explicitly includes tombstones while ordinary current reads hide them.
+
+Command encoding 3 carries full references directly in `expected_objects`, `expected_relationships` and `read_dependencies`. An exact tombstone is `{reference: <shared reference>, deleted: true}`; a null value means no live record. Object references use `{store,generation,object,version}`; relationship references use `{store,generation,relationship,version}`. Existing object-only guards retain command encoding 2 (`expected_object_references` derived at serialization); ordinary number-only requests retain encoding 1. Their previous canonical wire forms and retry digests are preserved. All three encodings are read, and older servers reject unsupported encodings rather than silently ignoring stronger guards. This is a command-format change, not a database-schema change.
+
+Python checked writes accept full reference dictionaries as values of `expected_versions`, `expected_relationships` and `read_dependencies`; numeric legacy input remains supported at this external boundary. Native consumers should not create numeric guards from already selected records. For artifact writes, `session.publish_artifacts(attachment, reference, files, author="")` retains the selected source identity across upload and submission. Native editors additionally retain loaded coordinate-mapping/write-lineage guards through `PinnedObject`.
 
 Editable `AttachedCollection` values carry both the loaded reference and the coordinate mapping used to display their points. Preserve both through UI edits. `writeVolumeCollections` checks both before applying inverse coordinate edits; reloading is required if either the object or its registration changed. Unrelated store commits do not invalidate the mapping.
 
@@ -222,7 +226,7 @@ manifest = vos.artifact_manifest_json(
 The shared commit path refuses a changed manifest that is malformed or names
 bytes the store does not hold, whichever API wrote it. Through a session the
 same works on any attachment: `artifacts(attachment, object, version)`,
-`publish_artifacts(attachment, object, expected_version, {name: path}, author)`
+`publish_artifacts(attachment, reference, {name: path}, author)`
 (bytes stored durably, then named in one checked request),
 `materialize_artifacts` (write a version's files under a local directory,
 each atomic and verified), and `artifact_file` (one artifact as a cached local

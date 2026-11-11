@@ -6,6 +6,8 @@ Extra application data belongs beside the reference: for example `{reference: <O
 
 Current-object discovery is an explicit UUID-based selection, not an incomplete historical reference. Resolve it once when an operation needs a stable version and carry the resulting reference to all associated reads. Do not infer an exact owner from the attached store or from a later current-object lookup.
 
+Transaction/preparation guards carry one `RecordSelection` of shared object/relationship references. Numeric counters are boundary/storage projections, not a second synchronized handle map. `RecordExpectation` distinguishes no live record, an exact live reference and an exact tombstone reference; explicitly numbered legacy requests retain their original meaning until shared validation. Full-reference merges never downgrade to numbers, and equal counters do not make different owners/lineages equivalent. Deferred editing retains the loaded reference alongside draft, mapping and pending-submission state.
+
 Only an external input/output boundary may parse or serialize a reference, using shared native codecs. This includes JSON requests, persisted older formats, CLI selectors and textual locators. Decode legacy inputs once into the shared representation; keep any unavoidable legacy selection resolution in the store layer. Internal calls do not reparse or normalize already-selected references. Existing external data compatibility is not a reason to preserve a second internal representation.
 
 ## Review and implementation task
