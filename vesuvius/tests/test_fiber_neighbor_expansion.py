@@ -70,6 +70,7 @@ def test_conditional_fit_freezes_old_anchors_and_widths():
 def test_paired_neighbor_publishes_verified_baseline_manifest(tmp_path, monkeypatch):
     import json
     import numpy as np
+    import pytest
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_neighbor_pair as pair
     from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
 
@@ -84,7 +85,7 @@ def test_paired_neighbor_publishes_verified_baseline_manifest(tmp_path, monkeypa
     root=tmp_path/'pair'
     pin={'store':'saved-store','commit_sequence':7}
     def verify(path,digest,version):
-        assert (path,digest,version)==('original','saved',None)
+        assert (path,digest,version)==('original','saved',pin)
         return pin
     monkeypatch.setattr(fiber_store,'verify_fiber_source',verify)
     monkeypatch.setattr(fiber_store,'fibers_digest',lambda path:'selected')
@@ -105,8 +106,12 @@ def test_paired_neighbor_publishes_verified_baseline_manifest(tmp_path, monkeypa
         done.parent.mkdir(parents=True,exist_ok=True)
         done.write_text('{}')
     monkeypatch.setattr(pair.subprocess,'run',execute)
-    pair.run(dict(dataset=str(dataset),output_root=str(root),base_config=str(base),
-                  gt_root='fixture',devices=['0','1']))
+    settings=dict(dataset=str(dataset),output_root=str(root),base_config=str(base),
+                  gt_root='fixture',devices=['0','1'])
+    with pytest.raises(ValueError,match='regenerate the expansion'):
+        pair.run(settings)
+    (dataset/'inputs.json').write_text(json.dumps(dict(fibers='saved',fiber_source=pin)))
+    pair.run(settings)
 
 
 def test_expansion_checks_parent_evidence_before_sampling(tmp_path, monkeypatch):

@@ -36,7 +36,10 @@ def run(settings):
     dataset_input=dataset/'inputs.json'
     evidence=json.loads(dataset_input.read_text())
     digest=evidence['fibers']
-    pin=verify_fiber_source(cfg['fibers'],digest,evidence.get('fiber_source'))
+    pin=evidence.get('fiber_source')
+    if not pin:
+        raise ValueError('Neighbor dataset predates verified parent source evidence; regenerate the expansion')
+    verify_fiber_source(cfg['fibers'],digest,pin)
     paths.append(dataset_input)
     signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},
                    selected_fibers=fibers_digest(dataset/'selected.vcobj'))
