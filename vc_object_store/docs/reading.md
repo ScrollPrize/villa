@@ -60,6 +60,10 @@ Geometry-fitting consumers share `fittingRelationshipInput` (`objects/Relationsh
 
 Carry that reference unchanged inside applications; additional application data wraps it. Do not turn it into consumer-specific tuples, strings or flattened fields. At an external request boundary, `StoreReader::decodeObjectReference(json)` or `session.decode_object_reference(attachment, input)` accepts a standard reference, a `{reference: ...}` wrapper, current UUID discovery, or saved numbered locator/selector and returns the standard reference. Complete exact inputs do not require a live current head; legacy ownerless selectors resolve through the current owner's history. The shared scalar `objectVersionToJson/fromJson` codec (Python `object_version_from_json`) validates external exact references without selecting current data.
 
+Python consumers can retain a native selected answer with `vc_object_store.selected.SelectedObject(revision)` instead of copying its record fields and keeping a separate reference map. It exposes `record`, `revision`, `reference`, `geometry_revision`, and record properties; `SelectedRecord(record)` provides the metadata-only listing equivalent. These are value facades, not new reference formats or alternative resolution paths: their identities come from the native reference codec. Application-specific data (for example a fitter's frame) belongs beside the selected value.
+
+For a solver's selected objects and relationship membership together, use `StoreReader::selectedInputs(refs, position)` or local/hosted Python `store.selected_inputs(refs, position)`. Python positions contain `store`, `generation`, and `commit_sequence`; the result contains native `objects` and `relationships` answers with complete identities. Root-local numbered history can replay retained records. Inherited endpoints do not encode historical root membership, so those captures require the requested root commit still to be current; otherwise `StoreBusy` requires reselecting, not a current-head fallback. Hosted captures run in one server read transaction, including when called through a session reader. This API does not claim historical collection membership can be reconstructed from immutable endpoint pins alone.
+
 For repinning after a write, use `TransactionReceipt::objectReference(uuid)` or Python `receipt_object_reference(receipt, uuid)`. Receipts retain complete identities for every live expected/changed object, including unchanged inherited inputs. Do not combine the receipt's store/generation with its numeric `objects` entries: those entries also include unchanged referenced objects. Saved receipts retain their original references on replay. Older receipts without `object_references` remain readable but cannot safely repin an editor; the helper requires reloading rather than guessing ownership. Durable drafts preserve their data and record that reload requirement.
 
 `object_history(uuid)` follows the winning record even when it is a deletion marker in a referenced store. It does not fall through that deletion to older live records. Ingestion also reserves deleted identities across the same scope: re-import is not a restore operation.
@@ -91,12 +95,11 @@ with store.geometry_snapshot() as snapshot:
     owned = snapshot.track(track_uuid).load()     # -> vc_object_store.Track
 ```
 
-- Factories: `snapshot.surface/fiber/track/point_collection/umbilicus(uuid)`,
-  or `snapshot.geometry(uuid)` for the matching view. A kind mismatch or an
+- Factories: `snapshot.surface/fiber/track/point_collection/umbilicus(uuid_or_reference)`,
+  or `snapshot.geometry(uuid_or_reference)` for the matching view. C++ accepts an already-selected `ObjectRevision`. A kind mismatch or an
   object without stored geometry raises.
 - Views expose counts and dimensions from the pinned geometry revision (not
-  import summaries), plus `view.version` — the numbered object version read,
-  for [checked edits](editing.md).
+  import summaries), plus `view.reference` — the complete selected object identity. `view.version` is derived from it, not separately synchronized. Metadata-only versions sharing one payload keep their own coordinate binding. A payload-only `snapshot.track(uuid, geometry_revision)` (likewise other kinds) has no reference and cannot authorize inverse edits; use a selected object for [checked edits](editing.md).
 - A tile holds `points` and validity; other surface channels are read with
   `read_geometry_rectangle`. Point lookup loads the ID array once per view,
   not the coordinates.

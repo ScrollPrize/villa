@@ -2,6 +2,8 @@
 
 Current reference/command contract: [one versioned reference representation](versioned-reference-contract.md) and [legacy-removal tracker](reference-review/legacy-removal.md). Earlier review reports below are dated evidence; their command-1/2 and partial-identity compatibility decisions are superseded. Current transactions accept format 3 with complete references only.
 
+Selected-value consumer follow-up: [BV-01–07 implementation and validation](reference-review/bound-consumers/README.md). This consolidates loaded selected state and shared graph capture without changing schema 21 or its history/placement rules.
+
 Latest completed follow-up: [R4 fixes and validation](review-r4/fixes.md); previous [R3 fixes](review-r3-summary.md) and [21-finding tracker](coherent-store-fix-tasks.md). The dated review sections below retain their historical evidence.
 
 ## Open findings from review of `557a6f925`
