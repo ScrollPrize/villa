@@ -241,11 +241,33 @@ class ZarrReader:
         return reader
 
     def __getstate__(self):
+        self._check_process()
         return {"settings": dict(self._settings, attrs=self._attrs, store_metadata=self._metadata),
-                "memory_cache": self.memory_cache}
+                "memory_cache": self.memory_cache,
+                "cache_channels": (self._array.cache_channels if self._array.channel_cache_enabled else None)
+                    if self._array is not None else getattr(self, "_requested_cache_channels", None)}
 
     def __setstate__(self, state):
         self.__init__(state["settings"], state["memory_cache"])
+        if state.get("cache_channels") is not None:
+            self.request_channel_cache(state["cache_channels"])
+
+    def request_channel_cache(self, channels):
+        """Opt into leading-axis channel caching for this volume in this process.
+
+        Relevant channels accumulate across readers. Use read_many with several
+        channel regions to combine their reads into one physical-chunk operation.
+        The existing memory_cache budget is used; fixed-byte caching remains default.
+        """
+        self._check_process()
+        channels = [operator.index(c) for c in channels]
+        self._array.request_channel_cache(channels)
+        self._requested_cache_channels = self._array.cache_channels
+
+    @property
+    def cache_channels(self):
+        self._check_process()
+        return self._array.cache_channels
 
     @property
     def metadata(self) -> StoreMetadata:
@@ -276,8 +298,13 @@ class ZarrReader:
         """After a fork, rebuild the C++ engine in this process (see the module docstring)."""
         if self._pid == os.getpid() or self._array is None:
             return
+        # Snapshot the effective shared registration, not this wrapper's last
+        # request. Native registration snapshots never lock inherited mutexes.
+        channels = self._array.cache_channels if self._array.channel_cache_enabled else None
         self._abandon_inherited()
         self.__init__(dict(self._settings, attrs=self._attrs, store_metadata=self._metadata), self.memory_cache)
+        if channels is not None:
+            self.request_channel_cache(channels)
 
     def _abandon_inherited(self) -> None:
         self._finalizer.detach()  # the parent flushes and closes its own engine
