@@ -874,6 +874,16 @@ std::vector<ObjectRevision> ObjectStore::objectHistory(const Txn& txn, const std
     return result;
 }
 
+std::optional<int64_t> detail::retainedCreationPublication(sqlite3* owner, const std::string& object)
+{
+    if (!historyEnabled(owner)) return std::nullopt;
+    Statement row(owner, "SELECT r.published_at_us FROM object_versions v "
+                         "JOIN object_revisions r ON r.uuid=v.revision_uuid "
+                         "WHERE v.object_uuid=? AND v.version=1", parseUuid(object));
+    if (row.row() && !row.isNull(0)) return row.i64(0);
+    return std::nullopt;
+}
+
 RevisionSelection ObjectStore::revisionSelectionAt(const Txn& txn, int64_t publishedAtUs, bool includeRetired) const
 {
     auto* db=static_cast<sqlite3*>(connection(txn));

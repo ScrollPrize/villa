@@ -3,6 +3,7 @@
 
 namespace vc::objects::detail {
 void createHistorySchema(sqlite3*);
+std::optional<int64_t> retainedCreationPublication(sqlite3*, const std::string& object);
 // Private conversion/export only: transform complete archived states, then
 // rebuild their deltas and cached heads without changing revision identities.
 // The caller owns the transaction and suspends mutation/immutability triggers.

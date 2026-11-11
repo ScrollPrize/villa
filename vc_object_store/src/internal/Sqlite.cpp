@@ -89,9 +89,8 @@ std::string formatUuid(const std::array<unsigned char, 16>& bytes)
     return out;
 }
 
-std::string nowIsoUtc(bool fractional)
+static std::string isoUtc(std::chrono::system_clock::time_point now, bool fractional)
 {
-    const auto now = std::chrono::system_clock::now();
     const auto second = std::chrono::floor<std::chrono::seconds>(now);
     const std::time_t t = std::chrono::system_clock::to_time_t(second);
     std::tm tm{};
@@ -105,6 +104,20 @@ std::string nowIsoUtc(bool fractional)
     if (!fractional) return std::string(buf) + "Z";
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now-second).count();
     return std::string(buf) + "." + std::to_string(1000000 + micros).substr(1) + "Z";
+}
+
+std::string nowIsoUtc(bool fractional)
+{
+    return isoUtc(std::chrono::system_clock::now(), fractional);
+}
+
+std::string refineLegacyCreationStamp(const std::string& created, std::optional<int64_t> publicationUs)
+{
+    if (created.size() != 20 || !publicationUs) return created;
+    const auto publication = isoUtc(std::chrono::system_clock::time_point(
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::microseconds(*publicationUs))), true);
+    return publication.compare(0, 19, created, 0, 19) == 0 ? publication : created;
 }
 
 std::string detectHostname()

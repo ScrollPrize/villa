@@ -79,6 +79,8 @@ bool createRecordOverride(sqlite3* db,const char* table,const std::string& uuid)
     RecordCommon common;
     if(object){
         auto record=resolveObject(db,uuid)->record;common=record;
+        if (record.createdAt.size() == 20 && preciseObjectTimestamp(record.kind))
+            record.createdAt = refineLegacyCreationStamp(record.createdAt, retainedCreationPublication(source, uuid));
         prepareOverrideReferences(source,db,record);
         Statement descriptor(source,"SELECT geometry_manifest FROM objects WHERE uuid=?",parseUuid(uuid));
         descriptor.row();const auto text=descriptor.optText(0);

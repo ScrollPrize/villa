@@ -2,6 +2,7 @@
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
+#include "internal/Sqlite.hpp"
 #include <algorithm>
 #include <map>
 #include <tuple>
@@ -15,16 +16,16 @@ void sortByAdded(const StoreReader& reader, std::vector<ObjectRecord>& records)
     // Creation time is independent of the selected record's owner. For legacy
     // rows tied in the same second, retain first-publication order where the
     // actual creation revision still belongs to that owner.
-    std::map<std::string, std::optional<int64_t>> published;
+    std::map<std::string, std::string> legacy;
     for (const auto& record : records) if (record.createdAt.size() == 20) {
         const auto history = reader.objectHistory(record.uuid, true);
-        published.emplace(record.uuid, !history.empty() && history.front().version == 1 ?
-                          history.front().publishedAtUs : std::nullopt);
+        legacy.emplace(record.uuid, detail::refineLegacyCreationStamp(record.createdAt,
+            !history.empty() && history.front().version == 1 ? history.front().publishedAtUs : std::nullopt));
     }
     const auto key = [&](const auto& record) {
-        const auto it = published.find(record.uuid);
-        return std::tuple(record.createdAt.empty(), std::string_view(record.createdAt),
-                          it != published.end() ? it->second.value_or(INT64_MAX) : INT64_MAX,
+        const auto it = legacy.find(record.uuid);
+        return std::tuple(record.createdAt.empty(),
+                          std::string_view(it != legacy.end() ? it->second : record.createdAt),
                           std::string_view(record.uuid));
     };
     std::sort(records.begin(), records.end(), [&](const auto& a, const auto& b) {
