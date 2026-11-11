@@ -401,7 +401,7 @@ void versionedObject(HistoryMode history)
     first.front()[4] = std::vector<uint8_t>{};
     first.back()[4] = std::monostate{};
     {
-        auto txn = store.write(VersionSelection{{firstUuid, emptyHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, emptyHead.version}});
         store.replaceExtensionRows(txn, spec.name, firstUuid, first); txn.commit();
     }
     const auto firstHead = objectHead(store, firstUuid);
@@ -418,14 +418,14 @@ void versionedObject(HistoryMode history)
                 "manual snapshot participates in the owning object's metadata history");
     }
     {
-        auto txn = store.write(VersionSelection{{firstUuid, firstHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, firstHead.version}});
         const std::vector<ExtensionRow> reversed{first.back(), first.front()};
         store.replaceExtensionRows(txn, spec.name, firstUuid, reversed); txn.commit();
     }
     require(objectHead(store, firstUuid) == firstHead && sequence(store) == 2,
             "identical manual replacement in a different input order neither versions the owner nor publishes a commit");
     {
-        auto txn = store.write(VersionSelection{{firstUuid, firstHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, firstHead.version}});
         const std::vector<ExtensionRow> duplicate{first.front(), first.front()};
         mustFail([&] { store.replaceExtensionRows(txn, spec.name, firstUuid, duplicate); });
         const std::vector<ExtensionRow> wrongOwner{sample(secondUuid, 1)};
@@ -441,7 +441,7 @@ void versionedObject(HistoryMode history)
     for (size_t i = 0; i < payload.size(); ++i) payload[i] = uint8_t(i % 251);
     changed.front()[3] = std::string("large binary manual value");
     {
-        auto txn = store.write(VersionSelection{{firstUuid, firstHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, firstHead.version}});
         store.replaceExtensionRows(txn, spec.name, firstUuid, {});
         store.replaceExtensionRows(txn, spec.name, firstUuid, changed); txn.commit();
     }
@@ -465,9 +465,9 @@ void versionedObject(HistoryMode history)
             mustFail([&] { historicalRows(store, txn, spec.name, firstHead); });
         }
     }
-    mustFail([&] { auto txn = store.write(VersionSelection{{firstUuid, firstHead.version}}); });
+    mustFail([&] { auto txn = store.writeNumbered(VersionSelection{{firstUuid, firstHead.version}}); });
     {
-        auto txn = store.write(VersionSelection{{firstUuid, changedHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, changedHead.version}});
         store.replaceExtensionRows(txn, spec.name, firstUuid, first);
     }
     require(objectHead(store, firstUuid) == changedHead && sequence(store) == 3,
@@ -477,7 +477,7 @@ void versionedObject(HistoryMode history)
         require(rows(store, txn, spec.name) == changed, "transaction rollback also restores typed rows");
     }
     {
-        auto txn = store.write(VersionSelection{{firstUuid, changedHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, changedHead.version}});
         mustFail([&] { store.setMeta(txn, firstUuid, "vcobj_extensions", "{}"); });
         mustFail([&] { store.removeMeta(txn, firstUuid, "vcobj_extensions"); });
         auto object = *store.objectByUuid(txn, firstUuid); object.meta = "{}";
@@ -487,7 +487,7 @@ void versionedObject(HistoryMode history)
     require(sequence(store) == 3, "generic metadata edits cannot detach library-managed manual snapshots");
     if (history == HistoryMode::On) {
         {
-            auto txn = store.write(VersionSelection{{firstUuid, changedHead.version}});
+            auto txn = store.writeNumbered(VersionSelection{{firstUuid, changedHead.version}});
             store.restoreObject(txn, firstUuid, firstHead); txn.commit();
         }
         {
@@ -496,7 +496,7 @@ void versionedObject(HistoryMode history)
             require(store.currentVersion(txn, firstUuid) == 4, "restore creates a new ordinary owner version");
         }
         {
-            auto txn = store.write(VersionSelection{{firstUuid, int64_t(4)}});
+            auto txn = store.writeNumbered(VersionSelection{{firstUuid, int64_t(4)}});
             store.restoreObject(txn, firstUuid, emptyHead); txn.commit();
         }
         auto txn = store.read();
@@ -521,7 +521,7 @@ void versionedRelationship(HistoryMode history)
         txn.commit();
     }
     {
-        auto txn = store.write(VersionSelection{{firstUuid, int64_t(1)}, {secondUuid, int64_t(1)}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, int64_t(1)}, {secondUuid, int64_t(1)}});
         EdgeRecord edge; edge.uuid = edgeUuid; edge.kind = "test_link"; edge.aUuid = firstUuid; edge.bUuid = secondUuid;
         edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
         store.addEdge(txn, edge); txn.commit();
@@ -531,8 +531,8 @@ void versionedRelationship(HistoryMode history)
     const RelationshipVersion emptyHead{status.storeUuid, status.generation, edgeUuid, 1};
     const std::vector<ExtensionRow> first{sample(edgeUuid, 1)};
     TransactionContext expected;
-    expected.expectedObjects = {{firstUuid, int64_t(2)}, {secondUuid, int64_t(2)}};
-    expected.expectedRelationships = {{edgeUuid, int64_t(1)}};
+    expected.expectedObjects = testNumberedGuards(store, {{firstUuid, int64_t(2)}, {secondUuid, int64_t(2)}});
+    expected.expectedRelationships = testNumberedGuards(store, {{edgeUuid, int64_t(1)}}, true);
     {
         auto txn = store.write(expected); store.replaceExtensionRows(txn, spec.name, edgeUuid, first); txn.commit();
     }
@@ -545,8 +545,8 @@ void versionedRelationship(HistoryMode history)
         require(historicalRows(store, txn, spec.name, firstHead) == first,
                 "relationship-version references retrieve typed manual fields");
     }
-    expected.expectedObjects = {{firstUuid, int64_t(3)}, {secondUuid, int64_t(3)}};
-    expected.expectedRelationships = {{edgeUuid, int64_t(2)}};
+    expected.expectedObjects = testNumberedGuards(store, {{firstUuid, int64_t(3)}, {secondUuid, int64_t(3)}});
+    expected.expectedRelationships = testNumberedGuards(store, {{edgeUuid, int64_t(2)}}, true);
     const auto beforeNoop = sequence(store);
     {
         auto txn = store.write(expected); store.replaceExtensionRows(txn, spec.name, edgeUuid, first); txn.commit();
@@ -568,9 +568,9 @@ void versionedRelationship(HistoryMode history)
             mustFail([&] { historicalRows(store, txn, spec.name, firstHead); });
         }
     }
-    expected.expectedObjects = {{firstUuid, int64_t(4)}, {secondUuid, int64_t(4)}};
+    expected.expectedObjects = testNumberedGuards(store, {{firstUuid, int64_t(4)}, {secondUuid, int64_t(4)}});
     mustFail([&] { auto txn = store.write(expected); }); // stale relationship expectation
-    expected.expectedRelationships = {{edgeUuid, int64_t(3)}};
+    expected.expectedRelationships = testNumberedGuards(store, {{edgeUuid, int64_t(3)}}, true);
     {
         auto txn = store.write(expected); store.replaceExtensionRows(txn, spec.name, edgeUuid, {});
     }
@@ -595,7 +595,7 @@ void versionedHistoryPolicy()
         }
         oldHead = objectHead(store, firstUuid);
         {
-            auto txn = store.write(VersionSelection{{firstUuid, oldHead.version}});
+            auto txn = store.writeNumbered(VersionSelection{{firstUuid, oldHead.version}});
             store.replaceExtensionRows(txn, spec.name, firstUuid, second); txn.commit();
         }
     }
@@ -613,7 +613,7 @@ void versionedHistoryPolicy()
         auto store = ObjectStore::open(path, OpenOptions{.author = "extension-test"});
         const auto baseline = objectHead(store, firstUuid);
         {
-            auto txn = store.write(VersionSelection{{firstUuid, baseline.version}});
+            auto txn = store.writeNumbered(VersionSelection{{firstUuid, baseline.version}});
             store.replaceExtensionRows(txn, spec.name, firstUuid, first); txn.commit();
         }
         auto txn = store.read();

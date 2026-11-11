@@ -189,7 +189,7 @@ void requireWritable(const std::filesystem::path& path, const std::string& objec
       const auto revision = *db.currentObjectRevision(txn, object);
       oldRecord = Json::parse(objectRevisionToJson(revision)).at("record"); publicationGeneration = revision.generation; }
     TransactionRequest r; r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
-    r.author = "convert-test"; r.expectedObjects = {{object, before}};
+    r.author = "convert-test"; r.expectedObjects = testNumberedGuards(db, {{object, before}});
     r.operations = {SetMetaOp{object, "after_conversion", std::to_string(*before + 1)}};
     const auto receipt = db.submit(r);
     require(receipt.objects.at(object) == *before + 1, "edit after conversion");

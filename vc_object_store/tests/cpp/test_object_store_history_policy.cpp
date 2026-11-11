@@ -212,7 +212,7 @@ void leanDependencies(HistoryMode history)
         {auto txn=store.read();for(const auto& id:{a,b})pins[id]=store.currentVersion(txn,id);}
         return pins;
     };
-    const auto write=[&]{return store.write(checked());};
+    const auto write=[&]{return store.writeNumbered(checked());};
     {auto txn=write();store.retireObject(txn,a);txn.commit();}
     {auto txn=store.read();const auto full=objectToJson(*store.objectByUuid(txn,a));
      require(currentDependencyMetadata(ObjectStoreImplAccess::conn(txn),a,Anchor{})==dependencyMetadata(full,Anchor{}),"retired state and lifecycle epoch retained even without metadata keys");}

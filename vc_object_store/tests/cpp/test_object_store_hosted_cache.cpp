@@ -162,7 +162,7 @@ void referencedGraphCache()
         cached.refresh();require(cached.relationshipsAt(refs).size()==1,"refresh invalidates inherited graph disk cache");
         detail::HostedAttachment reopened(endpoint,settings);
         require(reopened.relationshipsAt(refs).size()==1,"reopened cache retains current graph membership");
-        auto remove=request();remove.expectedRelationships[edge.uuid]=added.relationships.at(edge.uuid);
+        auto remove=request();remove.expectedRelationships=testNumberedGuards(writer, {{edge.uuid, added.relationships.at(edge.uuid)}}, true);
         remove.operations.push_back(RemoveEdgeOp{edge.uuid});cached.submit(remove);
         require(cached.relationshipsAt(refs).empty(),"own submit invalidates graph without explicit refresh");
         // An empty response already in flight must not outlive a refresh that
@@ -212,7 +212,7 @@ void selectedHeadAndCanonicalCache()
     require(attachment.currentObject(upper)->version==2&&attachment.currentObject(id)->version==2,"both UUID spellings select the updated head");
     const auto status=writer.status();TransactionRequest update;
     update.requestUuid=util::newUuid();update.storeUuid=status.storeUuid;update.generation=status.generation;update.author="cache-test";
-    update.expectedObjects={{id,2}};update.operations={SetMetaOp{id,"label","true"}};
+    update.expectedObjects=testNumberedGuards(writer, {{id,2}});update.operations={SetMetaOp{id,"label","true"}};
     attachment.submit(update);
     require(attachment.currentObject(upper)->version==3&&attachment.currentObject(id)->version==3,"canonical invalidation clears all UUID spellings");
 }
@@ -243,7 +243,7 @@ void invalidationDuringRead(bool poll)
         TransactionRequest request;
         request.requestUuid = util::newUuid(); request.storeUuid = status.storeUuid;
         request.generation = status.generation; request.author = "cache-test";
-        request.expectedObjects = {{registration.uuid, 1}};
+        request.expectedObjects = testNumberedGuards(writer, {{registration.uuid, 1}});
         request.operations = {UpdateObjectOp{objectRecordJson(registration)}};
         if (poll) {
             writer.submit(request);
@@ -292,7 +292,7 @@ void multiPageCommitInvalidatesHeads()
     request.requestUuid = util::newUuid(); request.storeUuid = before.storeUuid;
     request.generation = before.generation; request.author = "bulk-editor";
     for (const auto& uuid : uuids) {
-        request.expectedObjects[uuid] = 1;
+        request.expectedObjects[uuid] = writer.currentObjectRevision(uuid)->reference();
         request.operations.push_back(SetMetaOp{uuid, "edited", "true"});
     }
     const auto receipt = writer.submit(request);
@@ -484,7 +484,7 @@ void persistentObjects()
         TransactionRequest edit;
         edit.requestUuid = util::newUuid(); edit.storeUuid = status.storeUuid;
         edit.generation = status.generation; edit.author = "cache-test";
-        edit.expectedObjects = {{uuid, head->version}};
+        edit.expectedObjects = {{uuid, head->reference()}};
         edit.operations = {SetMetaOp{uuid, "during_prefetch", "true"}};
         writer.submit(edit);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

@@ -216,7 +216,7 @@ int main() try
                 mustFail([&] { readObjectCopy(LocalStoreReader(store, txn), project->uuid); });
             }
             {
-                auto txn = store.write(VersionSelection{{owner, sourceFirst.version}});
+                auto txn = store.writeNumbered(VersionSelection{{owner, sourceFirst.version}});
                 store.replaceExtensionRows(txn, manual.name, owner, second); txn.commit();
             }
         }
@@ -253,7 +253,7 @@ int main() try
         auto sourceRequest = direct.newRequest(attached);
         direct.readStore(attached, [&](const StoreReader& reader, const auto&) {
             const auto record = projectRecord(reader);
-            sourceRequest.expectedObjects[record->uuid] = record->version;
+            sourceRequest.expectedObjects[record->uuid] = record->reference();
             sourceRequest.operations.push_back(SetMetaOp{record->uuid, "copy_test", "true"});
         });
         direct.submit(attached, sourceRequest);

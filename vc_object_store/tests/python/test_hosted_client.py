@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+from object_helpers import fixture_guards
 import numpy as np
 
 import vc_object_store as vos
@@ -35,8 +36,8 @@ def hosted(tmp_path):
 
 
 def request(status, operations, expected, author="py"):
-    return dict(command_version=1, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
-                author=author, expected_objects=expected, expected_relationships={}, read_dependencies={},
+    return dict(command_version=3, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
+                author=author, expected_objects=fixture_guards(status, expected), expected_relationships={}, read_dependencies={},
                 expected_commit_sequence=None, operations=operations)
 
 

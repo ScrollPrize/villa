@@ -45,7 +45,7 @@ try {
     auto request = [&](VersionSelection expected, std::vector<TransactionOperation> operations, std::string author = "alice") {
         TransactionRequest r;
         r.requestUuid = util::newUuid(); r.storeUuid = initial.storeUuid; r.generation = status().generation;
-        r.author = std::move(author); r.expectedObjects = std::move(expected); r.operations = std::move(operations);
+        r.author = std::move(author); r.expectedObjects = testNumberedGuards(db, expected); r.operations = std::move(operations);
         return r;
     };
 
@@ -87,8 +87,7 @@ try {
                 "standard receipt reference round trip");
         wire["object_references"][a] = nlohmann::json::array(
             {reference.storeUuid, reference.generation, reference.objectUuid, reference.version});
-        require(transactionReceiptFromJson(wire.dump()).objectReference(a) == reference,
-                "legacy receipt array decoded only at receipt boundary");
+        mustFail([&] { (void)transactionReceiptFromJson(wire.dump()); });
         auto bad = created; bad.objectReferences.at(a).version = 0;
         mustFail([&] { (void)transactionReceiptToJson(bad); });
         wire.erase("object_references");
@@ -131,10 +130,10 @@ try {
 
     // Read dependencies and query guards: checking never versions a record.
     require(conflictOf([&] {
-        auto r = request({{a, 2}}, {SetMetaOp{a, "derived", "1"}}); r.readDependencies = {{b, 7}}; db.submit(r);
+        auto r = request({{a, 2}}, {SetMetaOp{a, "derived", "1"}}); r.readDependencies = testNumberedGuards(db, {{b, 7}}); db.submit(r);
     }) == TransactionConflict::Reason::ReadDependency, "changed read dependency");
     {
-        auto r = request({{a, 2}}, {SetMetaOp{a, "derived", "1"}}); r.readDependencies = {{b, 1}};
+        auto r = request({{a, 2}}, {SetMetaOp{a, "derived", "1"}}); r.readDependencies = testNumberedGuards(db, {{b, 1}});
         const auto receipt = db.submit(r);
         require(receipt.objects.at(a) == 3 && !receipt.objects.contains(b), "read dependency only checked");
         auto txn = db.read();
@@ -163,7 +162,7 @@ try {
     // takes its observed state from the checked snapshot.
     {
         auto r = request({{a, 4}, {b, 2}}, {EditGeometryOp{a, {{"points", 0, int32Bytes(9)}}, {{edge, "retain", "{}", "{}"}}}});
-        r.expectedRelationships = {{edge, 1}};
+        r.expectedRelationships = testNumberedGuards(db, {{edge, 1}}, true);
         const auto receipt = db.submit(r);
         // The retained relationship's new state versions both endpoints once.
         require(receipt.objects.at(a) == 5 && receipt.objects.at(b) == 3 && receipt.relationships.at(edge) == 2,
@@ -195,7 +194,7 @@ try {
     {
         VersionSelection expected;
         { auto txn = db.read(); expected[a] = db.currentVersion(txn, a); }
-        auto txn = db.write(expected);
+        auto txn = db.writeNumbered(expected);
         db.setMeta(txn, a, "legacy", "true");
         txn.commit();
         require(txn.receipt() && txn.receipt()->objects.at(a) == 7, "legacy receipt");
@@ -317,10 +316,10 @@ try {
                                                   {"versions-test", {}, {}}, {{"format", "tifxyz"}, {"note", 1}},
                                                   vc::geometry::encode(grid));
         operations.push_back(CreateObjectOp{objectRecordJson(trackRecord(other))});
-        edits.submit(make({{surface, std::nullopt}, {other, std::nullopt}}, operations));
+        edits.submit(make(testNumberedGuards(edits, {{surface, std::nullopt}, {other, std::nullopt}}), operations));
         EdgeRecord link; link.uuid = relation; link.kind = "test_link"; link.aUuid = surface; link.bUuid = other;
         link.aAnchor.wholeGeometry = link.bAnchor.wholeGeometry = true;
-        edits.submit(make({{surface, 1}, {other, 1}}, {AddEdgeOp{edgeRecordJson(link)}}));
+        edits.submit(make(testNumberedGuards(edits, {{surface, 1}, {other, 1}}), {AddEdgeOp{edgeRecordJson(link)}}));
         {
             auto txn = edits.read();
             const auto record = edits.objectByUuid(txn, surface);
@@ -332,8 +331,8 @@ try {
         const float xyz[3] = {5, 0, 1};
         std::memcpy(moved.data(), xyz, 12);
         // Without a decision the affected relationship refuses the edit.
-        mustFail([&] { edits.submit(make({{surface, 2}, {other, 2}}, {EditGeometryOp{surface, {{"points", 0, moved}}, {}}})); });
-        RecordSelection expected{{surface, 2}};
+        mustFail([&] { edits.submit(make(testNumberedGuards(edits, {{surface, 2}, {other, 2}}), {EditGeometryOp{surface, {{"points", 0, moved}}, {}}})); });
+        RecordSelection expected = testNumberedGuards(edits, {{surface, 2}});
         {
             auto txn = edits.read();
             expectRelationshipEndpoints(LocalStoreReader(edits, txn), expected);
@@ -357,7 +356,7 @@ try {
         }
         // Channels through a typed operation, deciding the relationship the same way.
         const GeometryArray ink{"ink", "|u1", {2, 2}, {1, 2, 3, 4}};
-        auto channels = make({{surface, 3}, {other, 2}}, {SetSurfaceChannelsOp{surface, {ink}, {}, {}, true}});
+        auto channels = make(testNumberedGuards(edits, {{surface, 3}, {other, 2}}), {SetSurfaceChannelsOp{surface, {ink}, {}, {}, true}});
         payloads.clear();
         require(transactionRequestDigest(transactionRequestFromJson(transactionRequestToJson(channels, &payloads), payloads)) ==
                 transactionRequestDigest(channels), "channel operation round trip");
@@ -380,16 +379,16 @@ try {
              CreateObjectOp{objectRecordJson(trackRecord(marker))}}));
         EdgeRecord pointLink; pointLink.uuid = anchored; pointLink.kind = "test_link"; pointLink.aUuid = collection;
         pointLink.bUuid = marker; pointLink.aAnchor.points = {{"point_ids", {0}}}; pointLink.bAnchor.wholeGeometry = true;
-        edits.submit(make({{collection, 1}, {marker, 1}}, {AddEdgeOp{edgeRecordJson(pointLink)}}));
+        edits.submit(make(testNumberedGuards(edits, {{collection, 1}, {marker, 1}}), {AddEdgeOp{edgeRecordJson(pointLink)}}));
         points.points[0] = {1, 1, 3};
-        auto update = make({{collection, 2}, {marker, 2}}, {UpdateGeometryArraysOp{collection, vc::geometry::encode(points),
+        auto update = make(testNumberedGuards(edits, {{collection, 2}, {marker, 2}}), {UpdateGeometryArraysOp{collection, vc::geometry::encode(points),
             {{"points", R"([{"n":5},{"n":6}])"}}, "retain"}});
         payloads.clear();
         const auto updateText = transactionRequestToJson(update, &payloads);
         require(!payloads.empty() && transactionJsonPayloadHashes(updateText).size() == payloads.size(), "update payloads listed");
         require(transactionRequestDigest(transactionRequestFromJson(updateText, payloads)) == transactionRequestDigest(update),
                 "update round trip");
-        mustFail([&] { edits.submit(make({{collection, 2}, {marker, 2}}, {UpdateGeometryArraysOp{collection,
+        mustFail([&] { edits.submit(make(testNumberedGuards(edits, {{collection, 2}, {marker, 2}}), {UpdateGeometryArraysOp{collection,
             vc::geometry::encode(points), {}, "update"}})); });
         const auto retained = edits.submit(update);
         int64_t relationshipVersion = 0;
@@ -404,7 +403,7 @@ try {
             relationshipVersion = *edits.currentRelationshipVersion(txn, anchored);
         }
         points.points[0] = {1, 1, 4};
-        edits.submit(make({{collection, 3}, {marker, retained.objects.at(marker).value()}},
+        edits.submit(make(testNumberedGuards(edits, {{collection, 3}, {marker, retained.objects.at(marker).value()}}),
             {UpdateGeometryArraysOp{collection, vc::geometry::encode(points), {}, "keep_recorded"}}));
         {
             auto txn = edits.read();

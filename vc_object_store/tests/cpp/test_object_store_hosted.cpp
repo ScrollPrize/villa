@@ -131,8 +131,10 @@ try {
     struct Pair { TransactionRequest local, hosted; };
     auto request = [&](VersionSelection expected, std::vector<TransactionOperation> operations, std::string author = "alice") {
         TransactionRequest r;
-        r.author = std::move(author); r.expectedObjects = std::move(expected); r.operations = std::move(operations);
+        r.author = std::move(author); r.operations = std::move(operations);
         Pair p{r, r};
+        p.local.expectedObjects = testNumberedGuards(local, expected);
+        p.hosted.expectedObjects = testNumberedGuards(hosted, expected);
         p.local.requestUuid = util::newUuid(); p.local.storeUuid = localInitial.storeUuid; p.local.generation = localInitial.generation;
         p.hosted.requestUuid = util::newUuid(); p.hosted.storeUuid = hostedInitial.storeUuid; p.hosted.generation = hostedInitial.generation;
         return p;
@@ -215,7 +217,7 @@ try {
 
     both(request({{a, 1}}, {SetMetaOp{a, "reviewed", "true"}}, "bob"), "metadata parity");
     {
-        auto p = request({{a, 2}}, {SetMetaOp{a, "derived", "1"}}); p.local.readDependencies = p.hosted.readDependencies = {{b, 1}};
+        auto p = request({{a, 2}}, {SetMetaOp{a, "derived", "1"}}); p.local.readDependencies = testNumberedGuards(local, {{b, 1}}); p.hosted.readDependencies = testNumberedGuards(hosted, {{b, 1}});
         both(p, "read dependency parity");
     }
     const auto edge = util::newUuid();
@@ -595,7 +597,7 @@ try {
             auto request = session.newRequest(attachment);
             session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
                 const auto head = reader.currentObject(uuid);
-                request.expectedObjects[uuid] = head->version;
+                request.expectedObjects[uuid] = head->reference();
                 const auto view = GeometrySnapshot(reader).surface(uuid, *head->geometryRevision).viewTransformedAt("mapping-b");
                 auto desired = view.readTile(0, 0, 1, 1).points.front();
                 desired[0] += 2;
@@ -652,7 +654,7 @@ try {
     // The shared JSON path behaves the same in process.
     {
         TransactionPayloads payloads;
-        const auto local1 = request({{a, 5}, {b, 3}}, {EditGeometryOp{a, {{"points", 0, int32Bytes(11)}}, {{edge, "retain", "{}", "{}"}}}}).local;
+        const auto local1 = later.local;
         const auto text = transactionRequestToJson(local1, &payloads);
         bool missing = false;
         try { (void)local.submit(text, {}); } catch (const MissingPayloads& e) { missing = e.hashes().size() == 1; }

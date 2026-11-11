@@ -114,7 +114,7 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
     fills = [array('points', np.full((1, 1, 3), -1, '<f4')), array('extra', np.ones((1, 1), 'u1')),
              array('ink', np.zeros((1, 1), '<f4'))]
     expected = versions(db, uid)
-    with db.write(expected_versions=expected) as tx:
+    with db.write(expected_versions=db.select_expected_versions(expected)) as tx:
         grown = tx.resize_surface(uid, dict(row=-1, column=-1, rows=37, columns=39, fill=fills), expected[uid])
     assert db.read_geometry_rectangle(grown, 'points', 1, 1, 35, 37) == values.tobytes()
     assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
@@ -122,7 +122,7 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
     assert db.read_geometry_rectangle(grown, 'ink', 0, 0, 2, 117) == bytes(2 * 117 * 4)
     with pytest.raises(RuntimeError, match='finer channels'):
         expected = versions(db, uid)
-        with db.write(expected_versions=expected) as tx:
+        with db.write(expected_versions=db.select_expected_versions(expected)) as tx:
             tx.resize_surface(uid, dict(row=0, column=0, rows=0, columns=39, fill=fills), expected[uid])
     grown = db.update_surface_channels(uid, [], ['ink'], db.current_version(uid))
     assert db.geometry_revision(grown)['grid_origin'] == [-1, -1]
@@ -233,7 +233,7 @@ def test_checked_relationships_lifecycle_and_graph(db):
     assert db.neighbours(a) == [b] and db.edges_by_kind('fiber_branch')[0]['uuid'] == edge
     before = db.journal_since()
     with pytest.raises(RuntimeError, match='missing or conflicting expected revision'):
-        with db.write(expected_versions={a: db.current_version(a)}) as tx:
+        with db.write(expected_versions=db.select_expected_versions({a: db.current_version(a)})) as tx:
             tx.set_meta(a, 'rollback', True)
             tx.remove_edge(edge)  # b is also modified, but has no expectation
     assert db.journal_since() == before and db.edge(edge)
@@ -252,11 +252,11 @@ def test_checked_relationships_lifecycle_and_graph(db):
         assert graph.component(a) == [a, b]
     assert db.component(a, applicable_only=True) == [a]
     assert db.relationships_at_versions(selected)[0]['applicable']
-    with db.write(expected_versions=versions(db, a, b)) as tx:
+    with db.write(expected_versions=db.select_expected_versions(versions(db, a, b))) as tx:
         tx.retain_relationship(edge)
     assert db.component(a, applicable_only=True) == [a, b]
     for action in ('retire_object', 'restore_object'):
-        with db.write(expected_versions=versions(db, a, b)) as tx:
+        with db.write(expected_versions=db.select_expected_versions(versions(db, a, b))) as tx:
             getattr(tx, action)(a)
         assert db.current_geometry(a)['uuid'] == second
         assert db.component(b, applicable_only=True) == [b]
@@ -266,12 +266,12 @@ def test_checked_relationships_lifecycle_and_graph(db):
     assert pinned['geometry_revision'] == first
     assert db.versions_at(pinned['published_at_us']) == sorted(selected, key=lambda ref: ref['object'])
     restored = db.current_version(a)
-    with db.write(expected_versions=versions(db, a, b)) as tx:
+    with db.write(expected_versions=db.select_expected_versions(versions(db, a, b))) as tx:
         tx.restore_object(a, source_reference=selected[0])
     assert db.current_geometry(a)['uuid'] == first and db.current_version(a) == restored + 1
     assert db.edge(edge) is None
     with pytest.raises(ValueError):
-        with db.write(expected_versions=versions(db, a, b)) as tx:
+        with db.write(expected_versions=db.select_expected_versions(versions(db, a, b))) as tx:
             tx.restore_object(a, source_version=99)
 
 
@@ -281,7 +281,7 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
         'point_attributes': [label, {'label': 'B'}]}}))
     db.put_geometry(uid, PointCollection([10, 20], [[1, 2, 3], [4, 5, 6]]))
     expected = versions(db, uid)
-    with db.write(expected_versions=expected) as tx:
+    with db.write(expected_versions=db.select_expected_versions(expected)) as tx:
         second = tx.edit_geometry_sequence(uid, dict(array='points', start=1, erase_count=0,
             parts=[dict(count=1, ids=[30], data=struct.pack('<3d', 7, 8, 9), annotations=[{'label': 'C'}])]), expected[uid])
         tx.set_meta(uid, 'coordinates', {'scale_factor': 4})
@@ -291,7 +291,7 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
     with db.geometry_snapshot() as snapshot:
         view = snapshot.point_collection(uid)
         assert view.point(30) == [7, 8, 9]
-        with db.write(expected_versions={uid: view.version}) as tx:
+        with db.write(expected_versions=db.select_expected_versions({uid: view.version})) as tx:
             third = tx.edit_geometry(uid, [dict(array="points", element_offset=3,
                 data=struct.pack("<3d", 10, 11, 12))], view.version)
         assert view.point(30) == [7, 8, 9]
@@ -477,7 +477,7 @@ def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path
         documents.append(json.loads(output.read_text()))
     db.upsert_object(dict(kind="fiber", name="unrelated pending geometry"))
     historical_pin = db.current_version(a)
-    with db.write(expected_versions=versions(db, a, b)) as tx:
+    with db.write(expected_versions=db.select_expected_versions(versions(db, a, b))) as tx:
         tx.remove_edge(documents[0]['branches'][0]['edge_uuid'])
     historical = tmp_path / 'historical-graph.json'
     assert db.export_geometry(a, historical, version=historical_pin)['version'] == historical_pin
@@ -656,7 +656,7 @@ def test_attachments_by_role(db):
     owner, _ = put(db, Surface(1, 1, [1, 1], [[1, 2, 3]]), 'surface')
     results, _ = put(db, PointCollection([1], [[1, 2, 3]]), 'point_collection')
     corrections, _ = put(db, PointCollection([1], [[4, 5, 6]]), 'point_collection')
-    with db.write(expected_versions=versions(db, owner, results, corrections)) as tx:
+    with db.write(expected_versions=db.select_expected_versions(versions(db, owner, results, corrections))) as tx:
         tx.attach(results, owner, 'fit_results')
         tx.attach(corrections, owner, 'corrections')
     other = lambda edge: edge['b'] if edge['a'] == owner else edge['a']

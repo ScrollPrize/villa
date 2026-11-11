@@ -15,10 +15,11 @@ namespace {
 std::vector<ObjectVersion> versionsOf(const StoreReader& reader, const VersionSelection& pins)
 {
     std::vector<ObjectVersion> result;
-    const auto status = reader.status();
     for (const auto& [uuid, pin] : pins) {
         if (!pin) throw std::runtime_error("pin without a recorded version");
-        result.push_back({status.storeUuid, status.generation, uuid, *pin});
+        const auto selected = reader.selectedObject(uuid, *pin);
+        if (!selected) throw std::runtime_error("pin version is not available");
+        result.push_back(selected->reference());
     }
     return result;
 }
@@ -73,7 +74,7 @@ int main() try {
     });
     require(receipt.size() == 1 && receipt.at(uuid).has_value(), "commit returns exact new pin");
     auto external = ObjectStore::open(path, options);
-    { auto txn = external.write(receipt); external.setMeta(txn,uuid,"external","true");
+    { auto txn = external.writeNumbered(receipt); external.setMeta(txn,uuid,"external","true");
       auto changed = source; changed["control_points_attributes"][0]["tags"] = {"changed"};
       mustFail([&] { external.setMeta(txn, uuid, "source", changed.dump()); }); txn.commit();
       require(txn.receipt()->objects.at(uuid) != receipt.at(uuid), "external commit produces different pin"); }

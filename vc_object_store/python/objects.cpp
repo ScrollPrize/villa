@@ -991,6 +991,9 @@ NB_MODULE(_native, m)
     m.def("object_version_from_json", [](const std::string& text) {
         return jsonLoads(vo::objectVersionToJson(vo::objectVersionFromJson(text)));
     }, nb::arg("json"), "Decode an external exact reference with the shared native codec.");
+    m.def("relationship_version_from_json", [](const std::string& text) {
+        return jsonLoads(vo::relationshipVersionToJson(vo::relationshipVersionFromJson(text)));
+    }, nb::arg("json"), "Decode a complete selected relationship reference.");
     m.def("receipt_object_reference", [](const nb::dict& receipt,const std::string& uuid) -> nb::object {
         const auto ref=vo::transactionReceiptFromJson(jsonDumps(receipt)).objectReference(uuid);
         return ref?jsonLoads(vo::objectVersionToJson(*ref)):nb::none();
@@ -1654,6 +1657,13 @@ NB_MODULE(_native, m)
             "changes, versions of records it only read, and/or the store commit sequence; a conflict raises "
             "RuntimeError and commits nothing. After the block, w.receipt is the commit's numbered receipt.");
 
+    store.def("select_expected_versions", [](PyObjectStore& self, const vo::VersionSelection& numbers, bool relationships) {
+        const auto selected = self.withRead([&](auto& db, auto& txn) {
+            return vo::selectCurrentExpectations(vo::LocalStoreReader(db, txn), numbers, relationships);
+        });
+        return jsonLoads(vo::recordSelectionToJson(selected, relationships));
+    }, nb::arg("versions"), nb::arg("relationships") = false,
+       "Explicitly select and check current-owner counters, returning full handles for subsequent APIs.");
     store.def("available_transforms",[](PyObjectStore& self,const std::string& uuid){
         return volumeTransformsToPy(self.withRead([&](auto& db,auto& txn){return db.availableTransforms(txn,uuid);}));
     },nb::arg("object_uuid"));

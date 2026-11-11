@@ -153,7 +153,7 @@ int main() try
         const std::vector<std::string> retire{ids["a10"], ids["b72"], ids["b60"], ids["loose1"]};
         VersionSelection expected;
         for (const auto& uuid : retire) expected[uuid] = store.currentVersion(txn, uuid);
-        auto write = store.write(expected);
+        auto write = store.writeNumbered(expected);
         for (const auto& uuid : retire) store.retireObject(write, uuid);
         write.commit();
     }

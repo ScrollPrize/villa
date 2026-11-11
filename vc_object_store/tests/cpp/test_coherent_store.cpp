@@ -21,9 +21,13 @@
 #include "imports/SourceIdentityIndex.hpp"
 #include <fstream>
 #include <iostream>
+#include <type_traits>
 
 using namespace vc::objects;
 using namespace vc::objects::detail;
+static_assert(!std::is_constructible_v<RecordExpectation, int64_t>);
+static_assert(!std::is_constructible_v<RecordExpectation, std::optional<int64_t>>);
+static_assert(!std::is_convertible_v<VersionSelection, RecordSelection>);
 namespace {
 OpenOptions options(HistoryMode mode){OpenOptions o;o.author="coherent-api";o.history=mode;o.spatialIndex=false;return o;}
 ObjectRecord track(const std::string& id){ObjectRecord r;r.uuid=id;r.kind="track";r.track.emplace();r.track->externalKey="0";r.track->datasetRef=id;r.meta=R"({"quality":7})";return r;}
@@ -105,7 +109,7 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
     {auto w=store.write();const std::array<ExtensionRow,1> rows{ExtensionRow{extensionUuid(f.edge),int64_t(9)}};
         store.replaceExtensionRows(w,extension().name,f.edge,rows);w.commit();}
     {auto r=store.read();require(store.currentRelationshipVersion(r,f.edge)==f.edgeVersion+1,"edge override continues inherited version");}
-    {auto w=store.write(VersionSelection{{f.a,f.av.version}});store.setMeta(w,f.a,"note","true");w.commit();}
+    {auto w=store.writeNumbered(VersionSelection{{f.a,f.av.version}});store.setMeta(w,f.a,"note","true");w.commit();}
     {
         auto r=store.read();const auto exact=store.objectAtVersion(r,f.av);require(bool(exact),"exact source version survives shadowing");
         const auto ref=exact->reference();
@@ -143,7 +147,7 @@ void geometryEdit(HistoryMode baseHistory,HistoryMode overlayHistory,const std::
     const std::vector<GeometryArrayEdit> edits{{"points",0,scalarBytes<int32_t>(xyz)}};
     // Failure must not leave a partial override in the transaction or on disk.
     mustFail([&]{auto w=store.write();store.editGeometry(w,f.a,edits,f.geometry);w.commit();});
-    {auto w=store.write(VersionSelection{{f.a,f.av.version},{f.b,f.bv.version}});
+    {auto w=store.writeNumbered(VersionSelection{{f.a,f.av.version},{f.b,f.bv.version}});
         store.editGeometry(w,f.a,edits,f.geometry,{decision});w.commit();}
     {auto r=store.read();
         require(store.currentGeometry(r,f.a)->uuid!=f.geometry,"ordinary geometry edit overrides inherited descriptor");
@@ -166,7 +170,7 @@ void queries(){
         require(json.at("objects").size()==3&&json.at("edges").size()==1,"export follows same visible graph");}
     VersionSelection expected;
     {auto r=store.read();for(const auto& id:{f.a,f.b})expected[id]=store.currentVersion(r,id);}
-    {auto w=store.write(expected);store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
+    {auto w=store.writeNumbered(expected);store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
     {auto r=store.read();require(store.objectCount(r,"track")==1&&store.selectEdges(r,{}).empty(),"tombstones suppress inherited records across APIs");}
 }
 
@@ -244,7 +248,7 @@ void followupRegressions(){
         {auto w=store.write();const std::array<double,6> xyz{0,0,0,20,0,0};
             newGeometry=store.editGeometry(w,a,{{"line_points",0,scalarBytes<double>(xyz)}},oldGeometry);w.commit();}
         {auto r=store.read();newVersion=store.currentObjectRevision(r,a)->reference();}
-        {auto w=store.write(VersionSelection{{retired,1},{a,newVersion.version},{b,1}});store.retireObject(w,retired);
+        {auto w=store.writeNumbered(VersionSelection{{retired,1},{a,newVersion.version},{b,1}});store.retireObject(w,retired);
             EdgeRecord e;e.kind="related";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
             edge=store.addEdge(w,e);store.seal(w);w.commit();}
     }
@@ -281,9 +285,9 @@ void followupRegressions(){
     }
     for(bool retire:{false,true}){auto store=overlay(retire?"restore-retired.vcobj":"restore-active.vcobj");
         if(retire){int64_t current;{auto r=store.read();current=*store.currentVersion(r,a);}
-            auto w=store.write(VersionSelection{{a,current}});store.retireObject(w,a);w.commit();}
+            auto w=store.writeNumbered(VersionSelection{{a,current}});store.retireObject(w,a);w.commit();}
         int64_t version;{auto r=store.read();version=*store.currentVersion(r,a);}
-        {auto w=store.write(VersionSelection{{a,version}});store.restoreObject(w,a,oldVersion);w.commit();}
+        {auto w=store.writeNumbered(VersionSelection{{a,version}});store.restoreObject(w,a,oldVersion);w.commit();}
         auto r=store.read();const auto current=store.currentObjectRevision(r,a);
         require(!current->record.retired&&current->version==version+1,"restore publishes once, preserving version continuity");
         require(store.currentGeometry(r,a)->uuid==oldGeometry,"restore installs requested inherited archived geometry");
@@ -293,7 +297,7 @@ void followupRegressions(){
     }
     {auto store=overlay("restore-default.vcobj");int64_t version;
         {auto r=store.read();version=*store.currentVersion(r,retired);}
-        {auto w=store.write(VersionSelection{{retired,version}});store.restoreObject(w,retired);w.commit();}
+        {auto w=store.writeNumbered(VersionSelection{{retired,version}});store.restoreObject(w,retired);w.commit();}
         auto r=store.read();require(!store.objectByUuid(r,retired)->retired,"default restore finds inherited owner's last active revision");
     }
     {const auto path=dir.path/"policy.vcobj";
@@ -313,7 +317,7 @@ void restoreFileReference(){
     Fixture f(HistoryMode::On,HistoryMode::On);
     auto store=ObjectStore::open(f.overlay,options(HistoryMode::On));ObjectVersion original;
     {auto r=store.read();original=store.currentObjectRevision(r,f.file)->reference();}
-    {auto w=store.write(VersionSelection{{f.file,original.version}});store.restoreObject(w,f.file,original);w.commit();}
+    {auto w=store.writeNumbered(VersionSelection{{f.file,original.version}});store.restoreObject(w,f.file,original);w.commit();}
     auto r=store.read();require(store.resolveStoragePath(r,f.file)==f.base.parent_path()/"fiber.json",
         "restore rebases metadata file references through the ordinary override helper");
 }
@@ -386,7 +390,7 @@ void completeReceipts(HistoryMode mode){
     auto store=ObjectStore::open(f.overlay,options(mode));
     TransactionRequest request;request.requestUuid=util::newUuid();request.author="receipt-test";
     {auto r=store.read();const auto status=store.status(r);request.storeUuid=status.storeUuid;request.generation=status.generation;}
-    request.expectedObjects={{f.a,f.av.version},{f.b,f.bv.version}};
+    request.expectedObjects={{f.a,f.av},{f.b,f.bv}};
     request.operations.push_back(SetMetaOp{f.a,"note","true"});
     const auto receipt=store.submit(request);
     require(receipt.objectReference(f.b)==f.bv,"unchanged inherited receipt identity stays source-owned");
@@ -403,12 +407,12 @@ void completeReceipts(HistoryMode mode){
     mustFail([&]{legacy.objectReference(f.a);});
     const auto replay=store.submit(request);
     require(replay.replayed&&replay.objectReferences==receipt.objectReferences,"durable replay preserves reference identities");
-    request.requestUuid=util::newUuid();request.expectedObjects=receipt.objects;
+    request.requestUuid=util::newUuid();request.expectedObjects.clear(); for (const auto& [id, ref] : receipt.objectReferences) expectObject(request, ref);
     const auto noop=store.submit(request);
     require(!noop.commitSequence&&noop.objectReferences==receipt.objectReferences,"no-op receipt retains both owners");
     VersionSelection expected;
     {auto r=store.read();for(const auto& id:{f.a,f.b})expected[id]=store.currentVersion(r,id);}
-    {auto w=store.write(expected);store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
+    {auto w=store.writeNumbered(expected);store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
     require(store.submit(request).objectReferences==noop.objectReferences,"later deletion cannot change a saved receipt");
 }
 void retainedPointAllocation(HistoryMode overlayMode){
@@ -418,16 +422,16 @@ void retainedPointAllocation(HistoryMode overlayMode){
     {auto store=ObjectStore::create(base,options(HistoryMode::On));
         {auto w=store.write();ObjectRecord r;r.uuid=id;r.kind="fiber";store.upsertObject(w,r);store.putGeometry(w,id,vc::geometry::encode(shape));w.commit();}
         {auto r=store.read();initial=store.currentObjectRevision(r,id)->reference();}
-        {auto w=store.write(VersionSelection{{id,initial.version}});auto extended=shape;extended.controlPointIds.push_back(2);extended.controlPoints.push_back({2,0,0});
+        {auto w=store.writeNumbered(VersionSelection{{id,initial.version}});auto extended=shape;extended.controlPointIds.push_back(2);extended.controlPoints.push_back({2,0,0});
             updateGeometryArrays(store,w,id,vc::geometry::encode(extended),store.currentGeometry(w,id)->uuid);w.commit();}
-        {auto w=store.write(VersionSelection{{id,initial.version+1}});store.restoreObject(w,id,initial);store.seal(w);w.commit();}}
+        {auto w=store.writeNumbered(VersionSelection{{id,initial.version+1}});store.restoreObject(w,id,initial);store.seal(w);w.commit();}}
     {auto c=ObjectCollection::create(overlay,{base},options(overlayMode));}
     auto store=ObjectStore::open(overlay,options(overlayMode));int64_t version;
     {auto r=store.read();LocalStoreReader reader(store,r);version=*store.currentVersion(r,id);
         require(reader.assignGeometryPointIds(id,"control_points",{0,1,-1,1})==std::vector<int64_t>{0,1,3,4},
             "restored-away IDs stay allocated across store policies");
         require(reader.assignGeometryPointIds(id,"control_points",{1,0})==std::vector<int64_t>{1,0},"reordering preserves IDs");}
-    {auto w=store.write(VersionSelection{{id,version}});LocalStoreReader reader(store,w);
+    {auto w=store.writeNumbered(VersionSelection{{id,version}});LocalStoreReader reader(store,w);
         shape.controlPointIds=reader.assignGeometryPointIds(id,"control_points",{0,1,-1});shape.controlPoints.push_back({2,0,0});
         updateGeometryArrays(store,w,id,vc::geometry::encode(shape),store.currentGeometry(w,id)->uuid);w.commit();}
     {auto r=store.read();require(store.nextGeometryPointId(r,id,"control_points")==4,"accepted allocation advances retained high-water mark");}
@@ -438,7 +442,7 @@ void allocationWithoutCurrentGeometry(){
     {auto w=store.write();ObjectRecord object;object.uuid=id;object.kind="fiber";store.upsertObject(w,object);w.commit();}
     {auto r=store.read();first=store.currentObjectRevision(r,id)->reference();}
     {auto w=store.write();store.putGeometry(w,id,vc::geometry::encode(vc::geometry::Fiber{{{0,0,0}},{},{7}}));w.commit();}
-    {auto w=store.write(VersionSelection{{id,first.version+1}});store.restoreObject(w,id,first);w.commit();}
+    {auto w=store.writeNumbered(VersionSelection{{id,first.version+1}});store.restoreObject(w,id,first);w.commit();}
     {auto r=store.read();require(!store.currentGeometry(r,id),"restored version predates geometry");
         require(store.nextGeometryPointId(r,id,"control_points")==8,"absent current geometry does not erase retained allocations");}
 }
@@ -457,7 +461,7 @@ void inventoryCore(HistoryMode baseMode, HistoryMode overlayMode) {
         store.setMeta(w,f.a,"quality","7");store.removeMeta(w,f.a,"absent");store.setApproval(w,f.a,"pending");
         store.setApproval(w,f.edge,"pending");store.removeMeta(w,f.edge,"absent");
         sqlite3_update_hook(db,nullptr,nullptr);require(mutations==0,"metadata no-ops must not create transient overrides");w.commit();}
-    {auto w=store.write(VersionSelection{{f.a,f.av.version}});GeometrySequenceEdit edit;edit.array="points";
+    {auto w=store.writeNumbered(VersionSelection{{f.a,f.av.version}});GeometrySequenceEdit edit;edit.array="points";
         require(store.editGeometrySequence(w,f.a,edit,f.geometry)==f.geometry,"empty splice keeps geometry identity");w.commit();}
     {auto r=store.read();require(store.currentObjectRevision(r,f.a)->reference()==f.av,"empty splice keeps source owner");
         const auto exact=store.relationshipAtVersion(r,{store.edgeByUuid(r,f.edge)->versionStoreUuid,
@@ -480,7 +484,7 @@ void inventoryCore(HistoryMode baseMode, HistoryMode overlayMode) {
 #endif
     VersionSelection expected;
     {auto r=store.read();for(const auto& id:{f.a,f.b})expected[id]=store.currentVersion(r,id);}
-    {auto w=store.write(expected);store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
+    {auto w=store.writeNumbered(expected);store.removeEdge(w,f.edge);store.deleteObject(w,f.a);w.commit();}
 #ifdef VC_TEST_NATIVE_EXPORT
     exportGeometry(store,f.a,f.dir.path/"exported-deleted",f.av);
 #endif
@@ -490,18 +494,18 @@ void inventoryCore(HistoryMode baseMode, HistoryMode overlayMode) {
 void inventoryRestore(HistoryMode baseMode,HistoryMode overlayMode) {
     Fixture f(baseMode,overlayMode);
     auto store=ObjectStore::open(f.overlay,options(overlayMode));
-    {auto w=store.write(VersionSelection{{f.a,f.av.version},{f.b,f.bv.version}});store.retireObject(w,f.a);w.commit();}
+    {auto w=store.writeNumbered(VersionSelection{{f.a,f.av.version},{f.b,f.bv.version}});store.retireObject(w,f.a);w.commit();}
     int64_t version;{auto r=store.read();version=*store.currentVersion(r,f.a);}
-    {auto w=store.write(VersionSelection{{f.a,version}});store.restoreObject(w,f.a,f.av);w.commit();}
+    {auto w=store.writeNumbered(VersionSelection{{f.a,version}});store.restoreObject(w,f.a,f.av);w.commit();}
     {auto r=store.read();require(!store.objectByUuid(r,f.a)->retired,"explicit retained source restores independent destination history");}
     // Retired current-only source can be reactivated in a history-on overlay.
     const auto next=f.dir.path/"next.vcobj";
     {auto r=store.read();version=*store.currentVersion(r,f.a);}
-    {auto w=store.write(VersionSelection{{f.a,version}});store.retireObject(w,f.a);store.seal(w);w.commit();}
+    {auto w=store.writeNumbered(VersionSelection{{f.a,version}});store.retireObject(w,f.a);store.seal(w);w.commit();}
     {auto collection=ObjectCollection::create(next,{f.overlay},options(HistoryMode::On));}
     auto child=ObjectStore::open(next,options(HistoryMode::On));
     {auto r=child.read();version=*child.currentVersion(r,f.a);}
-    {auto w=child.write(VersionSelection{{f.a,version}});child.restoreObject(w,f.a);w.commit();}
+    {auto w=child.writeNumbered(VersionSelection{{f.a,version}});child.restoreObject(w,f.a);w.commit();}
     {auto r=child.read();require(!child.objectByUuid(r,f.a)->retired,"default reactivation uses source retention");}
 }
 
@@ -551,7 +555,7 @@ void inventorySelectedMembership() {
 void inventoryRevalidatedPeer(HistoryMode baseMode, HistoryMode overlayMode) {
     Fixture f(baseMode,overlayMode);
     auto store=ObjectStore::open(f.overlay,options(overlayMode));
-    {auto w=store.write(VersionSelection{{f.a,f.av.version},{f.b,f.bv.version}});
+    {auto w=store.writeNumbered(VersionSelection{{f.a,f.av.version},{f.b,f.bv.version}});
         store.setMeta(w,f.b,"quality","8");store.retainRelationship(w,f.edge);w.commit();}
     auto r=store.read();
     require(store.currentObjectRevision(r,f.a)->reference()==f.av,"revalidation leaves the borrowed endpoint unchanged");
@@ -625,7 +629,7 @@ void inventoryPackedAndCoordinates() {
     {auto w=store.write();store.setMeta(w,id,"note","true");w.commit();}
     {auto r=store.read();require(store.resolveStoragePath(r,id)==dir.path/"tracks","track path survives metadata override");}
     std::string geometry;{auto r=store.read();geometry=store.currentGeometry(r,surface)->uuid;}
-    {auto w=store.write(VersionSelection{{surface,ref.version}});GeometrySurfaceResize resize;resize.rows=resize.columns=2;
+    {auto w=store.writeNumbered(VersionSelection{{surface,ref.version}});GeometrySurfaceResize resize;resize.rows=resize.columns=2;
         resize.fill={scalarArray<float>("points","<f4",{1,1,3},std::array<float,3>{-1,-1,-1})};
         require(store.resizeSurface(w,surface,resize,geometry)==geometry,"identity resize preserves geometry");w.commit();}
     {auto r=store.read();require(store.currentObjectRevision(r,surface)->reference()==ref,"identity resize preserves owner/version");}
@@ -643,11 +647,11 @@ void followupAtomicityAndPolicy()
         std::optional<std::filesystem::path> originalPath;
         {auto r=store.read();originalPath=store.resolveStoragePath(r,f.a);}
         previous.name="renamed";
-        {auto w=store.write(VersionSelection{{f.a,f.av.version}});store.upsertObject(w,previous);w.commit();}
+        {auto w=store.writeNumbered(VersionSelection{{f.a,f.av.version}});store.upsertObject(w,previous);w.commit();}
         ObjectVersion after;
         {auto r=store.read();require(store.resolveStoragePath(r,f.a)==originalPath,"full-record override keeps the unchanged relative track dataset target");
             previous=*store.objectByUuid(r,f.a);after=store.currentObjectRevision(r,f.a)->reference();}
-        {auto w=store.write(VersionSelection{{f.a,after.version}});store.upsertObject(w,previous);w.commit();}
+        {auto w=store.writeNumbered(VersionSelection{{f.a,after.version}});store.upsertObject(w,previous);w.commit();}
         {auto r=store.read();require(store.currentObjectRevision(r,f.a)->reference()==after,"full-record local no-op preserves the version");}
         TransactionRequest request;
         {auto r=store.read();const auto status=store.status(r);
@@ -670,7 +674,7 @@ void followupAtomicityAndPolicy()
         auto store=ObjectStore::create(dir.path/"spatial",opt);std::string retired,deleted;
         {auto w=store.write();for(auto* id:{&retired,&deleted}){ObjectRecord r;r.kind="track";r.track.emplace();
             *id=store.upsertObject(w,r);store.putGeometry(w,*id,shape());}w.commit();}
-        {auto w=store.write(VersionSelection{{retired,1},{deleted,1}});store.retireObject(w,retired);store.deleteObject(w,deleted);w.commit();}
+        {auto w=store.writeNumbered(VersionSelection{{retired,1},{deleted,1}});store.retireObject(w,retired);store.deleteObject(w,deleted);w.commit();}
         auto r=store.read();ObjectSelection selection;selection.bbox=std::array<double,6>{0,0,0,100,100,100};selection.includeRetired=true;
         const auto regions=store.spatialRegions(r,selection);
         require(regions.size()==1&&regions.front().objectUuid==retired,"spatial queries include retired but never deleted objects, with or without cache");
@@ -808,7 +812,7 @@ void foreignPointIdentity(HistoryMode mode, bool referenced)
         if(id==target)original=revision;else source=revision;}if(referenced)store.seal(w);w.commit();}
     if(referenced){auto collection=ObjectCollection::create(path,{base},options(mode));}
     auto store=ObjectStore::open(path,options(mode));
-    const auto checked=[&]{auto r=store.read();return store.write({{target,store.currentVersion(r,target)},{foreign,store.currentVersion(r,foreign)}});};
+    const auto checked=[&]{auto r=store.read();return store.writeNumbered({{target,store.currentVersion(r,target)},{foreign,store.currentVersion(r,foreign)}});};
     std::string empty;{auto w=checked();GeometrySequenceEdit edit;edit.array="points";edit.eraseCount=1;
         empty=store.editGeometrySequence(w,target,edit,original);w.commit();}
     {auto w=checked();GeometrySequenceEdit edit;edit.array="points";GeometrySequencePart part;part.revision=source;part.count=1;edit.parts={part};
@@ -844,48 +848,41 @@ void unifiedExpectations(HistoryMode mode)
     mustFail([&] { store.submit(wrong); });
     wrong = request(); auto wrongEdge = relationship; wrongEdge.storeUuid = util::newUuid(); expectRelationship(wrong, wrongEdge);
     mustFail([&] { store.submit(wrong); });
-    RecordSelection merged{{f.b, f.bv.version}};
-    mergeExpectations(merged, {{f.b, f.bv}}, "guard strengthening");
-    require(merged.at(f.b) == RecordExpectation(f.bv), "legacy projection strengthens to shared identity");
-    mergeExpectations(merged, {{f.b, f.bv.version}}, "no downgrade");
-    require(merged.at(f.b) == RecordExpectation(f.bv), "legacy projection never erases shared identity");
+    RecordSelection merged{{f.b, f.bv}};
+    mergeExpectations(merged, {{f.b, f.bv}}, "same identity");
+    require(merged.at(f.b) == RecordExpectation(f.bv), "merge retains the shared identity");
     mustFail([&] { mergeExpectations(merged, {{f.b, other}}, "different owner"); });
-    auto numbered = request(); numbered.expectedObjects[f.a] = f.av.version;
-    const auto oldWire = transactionRequestToJson(numbered);
-    require(transactionRequestToJson(transactionRequestFromJson(oldWire, {})) == oldWire &&
-            transactionRequestDigest(transactionRequestFromJson(oldWire, {})) == transactionRequestDigest(numbered),
-            "legacy numbered command roundtrip preserves retry digest");
-    auto oldFull = request(); expectObject(oldFull, f.av);
-    const auto oldFullWire = transactionRequestToJson(oldFull);
-    // Frozen command-1/2 field layout from the pre-unification serializer.
-    // This does not derive the expected wire form through the new encoder.
-    nlohmann::json baseline{{"command_version", 1}, {"store", oldFull.storeUuid}, {"generation", oldFull.generation},
-        {"author", oldFull.author}, {"expected_objects", {{f.a, f.av.version}}},
-        {"expected_relationships", nlohmann::json::object()}, {"read_dependencies", nlohmann::json::object()},
-        {"expected_commit_sequence", nullptr}, {"operations", nlohmann::json::array()}};
-    for (const auto* legacy : {&numbered, &oldFull}) {
-        baseline["command_version"] = legacy == &numbered ? 1 : 2;
-        if (legacy == &oldFull) baseline["expected_object_references"] = nlohmann::json::array({
-            {{"store", f.av.storeUuid}, {"generation", f.av.generation}, {"object", f.a}, {"version", f.av.version}}});
-        const auto digestInput = baseline.dump();
-        require(transactionRequestDigest(*legacy) == payloadHash(std::vector<uint8_t>(digestInput.begin(), digestInput.end())),
-                "legacy retry digest matches frozen baseline layout");
-        auto withRequest = baseline; withRequest["request"] = legacy->requestUuid;
-        require(transactionRequestToJson(*legacy) == withRequest.dump(), "legacy wire matches frozen baseline layout");
+    auto unsupported = nlohmann::json::parse(encoded);
+    for (int version : {1, 2}) {
+        unsupported["command_version"] = version;
+        mustFail([&] { (void)transactionRequestFromJson(unsupported.dump(), {}); });
+        mustFail([&] { (void)store.submit(unsupported.dump(), {}); });
     }
-    require(nlohmann::json::parse(oldFullWire).at("command_version") == 2 &&
-            transactionRequestToJson(transactionRequestFromJson(oldFullWire, {})) == oldFullWire,
-            "existing complete-object wire and digest remain stable");
+    unsupported = nlohmann::json::parse(encoded);
+    unsupported["expected_object_references"] = nlohmann::json::array();
+    mustFail([&] { (void)transactionRequestFromJson(unsupported.dump(), {}); });
+    unsupported = nlohmann::json::parse(encoded);
+    unsupported["expected_objects"][f.a] = f.av.version;
+    mustFail([&] { (void)transactionRequestFromJson(unsupported.dump(), {}); });
+    mustFail([&] { (void)transactionJsonPayloadHashes(unsupported.dump()); });
+    mustFail([&] { (void)transactionJsonHasPreparedOperations(unsupported.dump()); });
+    mustFail([&] { (void)store.submit(unsupported.dump(), {}); });
+    auto withPayload = q;
+    withPayload.operations.push_back(EditGeometryOp{f.a, {{"points", 0, {1}}}, {}});
+    unsupported = nlohmann::json::parse(transactionRequestToJson(withPayload));
+    unsupported["expected_objects"][f.a] = f.av.version;
+    bool lookedUpPayload = false;
+    mustFail([&] { (void)store.submit(unsupported.dump(), [&](const auto&) -> std::optional<std::vector<uint8_t>> {
+        lookedUpPayload = true; return std::nullopt;
+    }); });
+    require(!lookedUpPayload, "invalid guards fail before payload lookup or saved-receipt recovery");
     auto upper = f.a;
     std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return std::toupper(c); });
-    auto mixed = nlohmann::json::parse(oldFullWire);
-    mixed["expected_object_references"][0]["object"] = upper;
-    mixed["expected_objects"][f.a] = f.av.version + 1;
-    mustFail([&] { (void)transactionRequestFromJson(mixed.dump(), {}); });
-    mixed = nlohmann::json::parse(oldFullWire);
-    auto duplicate = mixed["expected_object_references"][0]; duplicate["object"] = upper;
-    mixed["expected_object_references"].push_back(duplicate);
-    mustFail([&] { (void)transactionRequestFromJson(mixed.dump(), {}); });
+    auto duplicate = nlohmann::json::parse(encoded);
+    duplicate["expected_objects"][upper] = duplicate["expected_objects"][f.a];
+    mustFail([&] { (void)transactionRequestFromJson(duplicate.dump(), {}); });
+    { auto r = store.read(); LocalStoreReader reader(store, r);
+        mustFail([&] { (void)selectCurrentExpectations(reader, {{upper, f.av.version}, {f.a, std::nullopt}}); }); }
     const auto id = util::newUuid();
     { auto w = store.write(); ObjectRecord record; record.uuid = id; record.kind = "note"; store.upsertObject(w, record); w.commit(); }
     { auto w = store.write(); store.deleteObject(w, id); w.commit(); }

@@ -115,7 +115,7 @@ void editCurrentLifecycle(HistoryMode history)
         bc = makeEdge(b, c);
         VersionSelection expected;
         { auto txn = store.read(); expected = {{b, store.currentVersion(txn, b)}, {c, store.currentVersion(txn, c)}}; }
-        { auto txn = store.write(expected); store.addEdge(txn, bc); txn.commit(); }
+        { auto txn = store.writeNumbered(expected); store.addEdge(txn, bc); txn.commit(); }
     }
     // The standalone request helper must also omit an explicitly removed edge.
     auto removal = session.newRequest(attachment);
@@ -209,7 +209,7 @@ int main() try
     auto metaRequest = [&](const AttachmentIdentity& attachment, const VersionSelection& expected,
                            const std::vector<std::tuple<std::string, std::string, std::string>>& values) {
         auto request = session.newRequest(attachment);
-        request.expectedObjects = expected;
+        request.expectedObjects = testNumberedGuards(session, attachment, expected);
         for (const auto& [uuid, key, value] : values) request.operations.push_back(SetMetaOp{uuid, key, value});
         return request;
     };
@@ -255,7 +255,7 @@ int main() try
     require(heads(identity) == committed && session.takeEvents().empty(), "operation rollback");
     {
         auto request = session.newRequest(identity);
-        request.expectedObjects = {{a, committed.at(a)}};
+        request.expectedObjects = testNumberedGuards(session, identity, {{a, committed.at(a)}});
         request.operations.push_back(RemoveEdgeOp{edge});
         mustFail([&] { session.submit(identity, request); });
     }
@@ -456,7 +456,7 @@ int main() try
         auto record = imported->record;
         record.name = "edited";
         auto request = session.newRequest(replacement);
-        request.expectedObjects[surface] = imported->version;
+        request.expectedObjects[surface] = imported->reference();
         request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
         request.operations.push_back(PutGeometryOp{surface,
             vc::geometry::encode(vc::geometry::Surface{1, 2, {1, 1}, {{9, 9, 9}, {4, 5, 6}}, {255, 255}}), {}});
@@ -466,7 +466,7 @@ int main() try
     require(*edited->geometryRevision != importedGeometry, "edits make new versions");
     {
         auto request = session.newRequest(replacement);
-        request.expectedObjects[surface] = edited->version;
+        request.expectedObjects[surface] = edited->reference();
         request.operations.push_back(RestoreObjectOp{surface,
             ObjectVersion{replacement.storeUuid, imported->generation, surface, imported->version}});
         session.submit(replacement, request);
@@ -503,7 +503,7 @@ int main() try
         auto edit = [&](bool keepRecorded) {
             auto request = session.newRequest(replacement);
             session.readStore(replacement, [&](const StoreReader& reader, const auto&) {
-                request.expectedObjects[sheet] = reader.currentObject(sheet)->version;
+                request.expectedObjects[sheet] = reader.currentObject(sheet)->reference();
                 expectRelationshipEndpoints(reader, request);
                 require(request.expectedObjects.at(marker) == RecordExpectation(reader.currentObject(marker)->reference()),
                         "relationship peers have complete snapshot expectations");
@@ -602,7 +602,7 @@ int main() try
                 "history-off changes from another handle invalidate session consumers");
         // A checked current-only write must not silently edit an undeclared object.
         mustFail([&] {
-            auto write = direct.write(VersionSelection{});
+            auto write = direct.writeNumbered(VersionSelection{});
             direct.setMeta(write, uuid, "unguarded", "true");
             write.commit();
         });
@@ -610,7 +610,7 @@ int main() try
         ObjectRecord peerRecord; peerRecord.uuid = peer; peerRecord.kind = "fiber";
         session.submit(directAttachment, create(directAttachment, {peerRecord}));
         auto link = session.newRequest(directAttachment);
-        link.expectedObjects = {{uuid, 3}, {peer, 1}};
+        link.expectedObjects = testNumberedGuards(session, directAttachment, {{uuid, 3}, {peer, 1}});
         EdgeRecord edge; edge.uuid = util::newUuid(); edge.kind = "test_link";
         edge.aUuid = uuid; edge.bUuid = peer;
         edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
@@ -621,18 +621,18 @@ int main() try
                 "history-off relationship edits number both endpoints and the relationship");
         require(linked.created == std::vector<std::string>{edge.uuid}, "relationship creation is included in the receipt");
         auto missingEndpoint = session.newRequest(directAttachment);
-        missingEndpoint.expectedObjects = {{uuid, 4}};
+        missingEndpoint.expectedObjects = testNumberedGuards(session, directAttachment, {{uuid, 4}});
         missingEndpoint.operations.push_back(RemoveEdgeOp{edge.uuid});
         mustFail([&] { session.submit(directAttachment, missingEndpoint); });
         auto remove = session.newRequest(directAttachment);
-        remove.expectedObjects = {{uuid, 4}, {peer, 2}};
+        remove.expectedObjects = testNumberedGuards(session, directAttachment, {{uuid, 4}, {peer, 2}});
         remove.operations.push_back(RemoveEdgeOp{edge.uuid});
         const auto removed = session.submit(directAttachment, remove);
         require(removed.objects.at(uuid) == 5 && removed.objects.at(peer) == 3 &&
                 removed.relationships.contains(edge.uuid) && !removed.relationships.at(edge.uuid),
                 "history-off relationship deletion reports absence and endpoint versions");
         auto noop = session.newRequest(directAttachment);
-        noop.expectedObjects = {{uuid, 5}};
+        noop.expectedObjects = testNumberedGuards(session, directAttachment, {{uuid, 5}});
         const auto sequence = session.status(directAttachment).commitSequence;
         const auto nochange = session.submit(directAttachment, noop);
         require(!nochange.commitSequence && nochange.objects.at(uuid) == 5 &&

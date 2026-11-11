@@ -40,7 +40,7 @@ Json versionJson(const std::optional<ObjectVersion>& v)
 std::optional<ObjectVersion> versionFrom(const Json& j)
 {
     if (j.is_null()) return std::nullopt;
-    return objectVersionFrom(j, false);
+    return objectVersionFrom(j);
 }
 
 template <class T> Json nullable(const std::optional<T>& value) { return value ? Json(*value) : Json(nullptr); }

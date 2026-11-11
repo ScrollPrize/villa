@@ -49,7 +49,7 @@ void transactionAuthors(HistoryMode history)
         auto txn = store.read(); const auto status = store.status(txn);
         request.requestUuid = util::newUuid(); request.storeUuid = status.storeUuid;
         request.generation = status.generation; request.author = "edge-author";
-        request.expectedObjects = {{a, store.currentVersion(txn, a)}, {b, store.currentVersion(txn, b)}};
+        request.expectedObjects = {{a, store.currentObjectRevision(txn, a)->reference()}, {b, store.currentObjectRevision(txn, b)->reference()}};
     }
     request.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});
     store.submit(request);
@@ -60,7 +60,7 @@ void transactionAuthors(HistoryMode history)
         auto txn = store.read(); const auto record = store.edgeByUuid(txn, edge.uuid);
         require(record && record->createdBy == "edge-author" && record->changedBy == "edge-author",
                 "checked request author stamps new relationships");
-        deletion.expectedObjects = {{a, store.currentVersion(txn, a)}, {b, store.currentVersion(txn, b)}};
+        deletion.expectedObjects = {{a, store.currentObjectRevision(txn, a)->reference()}, {b, store.currentObjectRevision(txn, b)->reference()}};
         snapshot = store.exportJson(txn);
         if (history == HistoryMode::On) {
             const auto events = store.journalSince(txn, 0);
@@ -277,7 +277,7 @@ void deletedGeometryRevival(HistoryMode history)
         geometry=store.putGeometry(txn,uuid,vc::geometry::encode(vc::geometry::Fiber{{},{{0,0,0},{1,0,0}},{}}));txn.commit();}
     VersionSelection selected;
     {auto txn=store.read();selected[uuid]=store.currentVersion(txn,uuid);}
-    {auto txn=store.write(selected);store.retireObject(txn,uuid);txn.commit();}
+    {auto txn=store.writeNumbered(selected);store.retireObject(txn,uuid);txn.commit();}
     {auto txn=store.write();store.deleteObject(txn,uuid);txn.commit();}
     {auto txn=store.write();store.upsertObject(txn,fiber(uuid));txn.commit();}
     auto txn=store.read();const auto revived=store.objectByUuid(txn,uuid);

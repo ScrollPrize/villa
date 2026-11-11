@@ -38,7 +38,7 @@ struct Fixture {
     bool hasEdge(){auto r=db.read();return db.edgeByUuid(r,e).has_value();}
     WriteTxn checkedWrite(){VersionSelection expected;
         {auto r=db.read();for(const auto& id:{a,b})expected[id]=db.objectByUuid(r,id)->version;}
-        return db.write(expected);}
+        return db.writeNumbered(expected);}
 };
 void metadataAndSavepoints(){
     TemporaryDirectory dir;Fixture f(dir.path/"current");

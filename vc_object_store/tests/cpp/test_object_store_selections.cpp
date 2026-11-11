@@ -49,7 +49,7 @@ try {
     auto request = [&](VersionSelection expected, std::vector<TransactionOperation> operations) {
         TransactionRequest r;
         r.requestUuid = util::newUuid(); r.storeUuid = initial.storeUuid; r.generation = initial.generation;
-        r.author = "alice"; r.expectedObjects = std::move(expected); r.operations = std::move(operations);
+        r.author = "alice"; r.expectedObjects = testNumberedGuards(*store, expected); r.operations = std::move(operations);
         return r;
     };
 
@@ -187,7 +187,7 @@ try {
                     next.matrix = vcr::catalog::Affine::scale(i % 2 == 0 ? 3 : 2);
                     TransactionRequest r;
                     r.requestUuid = util::newUuid(); r.storeUuid = initial.storeUuid; r.generation = initial.generation;
-                    r.author = "flipper"; r.expectedObjects[transformUuid] = client.currentVersion(transformUuid);
+                    r.author = "flipper"; r.expectedObjects[transformUuid] = client.currentObjectRevision(transformUuid)->reference();
                     r.operations.push_back(RecordCatalogTransformsOp{{next}});
                     client.submit(r);
                     std::this_thread::sleep_for(std::chrono::milliseconds(3));

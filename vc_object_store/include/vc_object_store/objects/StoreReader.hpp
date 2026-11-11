@@ -127,6 +127,9 @@ std::vector<EdgeRecord> attachments(const StoreReader&, const std::string& owner
 std::optional<int64_t> currentVersionOf(const StoreReader&, const std::string& objectUuid);
 // Retain the winning state, including an exact tombstone; no state means no live record.
 RecordExpectation currentObjectExpectation(const StoreReader&, const std::string& objectUuid);
+// Explicit current-owner numeric selector. Check the requested live counters
+// in this snapshot and immediately return full handles; null remains no-live.
+RecordSelection selectCurrentExpectations(const StoreReader&, const VersionSelection&, bool relationships = false);
 
 // Request expectations read through a reader (objects/Transactions.hpp).
 // Adds every endpoint of the relationships (retired included) of the objects

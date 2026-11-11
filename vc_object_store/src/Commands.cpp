@@ -39,27 +39,32 @@ std::string sha256(const uint8_t* data, size_t size)
 
 std::string canonical(const std::string& uuid) { return util::canonicalUuid(uuid); }
 
-Json selectionJson(const RecordSelection& selection, bool full = false, bool relationships = false)
+void requireCurrentCommand(const Json& value)
+{
+    if (!value.at("command_version").is_number_integer() || value.at("command_version") != kTransactionCommandVersion)
+        throw std::invalid_argument("transaction: unsupported command version; regenerate using complete references and reconcile unresolved old requests before retrying");
+}
+
+Json selectionJson(const RecordSelection& selection, bool relationships = false)
 {
     auto result = Json::object();
     for (const auto& [uuid, expected] : selection) {
         if ((expected.deleted && !expected.complete()) || (expected.number() && *expected.number() <= 0))
             throw std::invalid_argument("invalid expected record state");
-        Json value = expected.number() ? Json(*expected.number()) : Json(nullptr);
+        Json value = nullptr;
         if (expected.complete()) {
             if (relationships) {
                 const auto* ref = std::get_if<RelationshipVersion>(&expected.selected);
                 if (!ref || canonical(ref->relationshipUuid) != canonical(uuid))
                     throw std::invalid_argument("expected reference names another relationship");
-                value = Json::parse(relationshipVersionToJson(*ref));
+                value = relationshipVersionJson(*ref);
             } else {
                 const auto* ref = std::get_if<ObjectVersion>(&expected.selected);
                 if (!ref || canonical(ref->objectUuid) != canonical(uuid))
                     throw std::invalid_argument("expected reference names another object");
-                value = Json::parse(objectVersionToJson(*ref));
+                value = objectVersionJson(canonicalObjectVersion(*ref));
             }
             if (expected.deleted) value = Json{{"reference", value}, {"deleted", true}};
-            if (!full) value = expected.number() ? Json(*expected.number()) : Json(nullptr);
         }
         const auto id = canonical(uuid);
         if (result.contains(id)) throw std::invalid_argument("duplicate expected record identity");
@@ -68,36 +73,53 @@ Json selectionJson(const RecordSelection& selection, bool full = false, bool rel
     return result;
 }
 
-RecordSelection selectionFrom(const Json& j, bool full = false, bool relationships = false)
+RecordSelection selectionFrom(const Json& j, bool relationships = false)
 {
     if (!j.is_object()) throw std::invalid_argument("transaction: expected versions must be a map");
     RecordSelection result;
     for (const auto& [uuid, value] : j.items()) {
         RecordExpectation expected;
-        if (value.is_object() && full) {
+        if (value.is_object()) {
             const bool deleted = value.contains("reference");
             const auto& reference = deleted ? value.at("reference") : value;
             if (deleted && (!value.at("deleted").is_boolean() || !value.at("deleted").get<bool>() || value.size() != 2))
                 throw std::invalid_argument("transaction: invalid tombstone expectation");
             if (relationships) {
-                auto ref = relationshipVersionFromJson(reference.dump());
+                auto ref = relationshipVersionFrom(reference);
                 if (ref.relationshipUuid != canonical(uuid)) throw std::invalid_argument("expected reference names another relationship");
                 expected = ref;
             } else {
-                auto ref = objectVersionFromJson(reference.dump());
+                auto ref = objectVersionFrom(reference);
                 if (ref.objectUuid != canonical(uuid)) throw std::invalid_argument("expected reference names another object");
                 expected = ref;
             }
             expected.deleted = deleted;
         } else if (!value.is_null()) {
-            if (!value.is_number_integer() || (value.is_number_unsigned() && value.get<uint64_t>() > uint64_t(INT64_MAX)) ||
-                value.get<int64_t>() <= 0) throw std::invalid_argument("transaction: versions are positive integers");
-            expected = value.get<int64_t>();
+            throw std::invalid_argument("transaction expectations require a complete reference or null; select a reference before submission");
         }
         if (!result.emplace(canonical(uuid), std::move(expected)).second)
             throw std::invalid_argument("duplicate expected record identity");
     }
     return result;
+}
+
+// Validate identity and guards independently of payload availability, including
+// saved-receipt retries whose geometry bytes have already been released.
+TransactionRequest requestHeader(const Json& j)
+{
+    requireCurrentCommand(j);
+    if (j.contains("expected_object_references"))
+        throw std::invalid_argument("transaction: obsolete reference side-channel; use complete expected_objects values");
+    TransactionRequest request;
+    request.requestUuid = canonical(j.at("request").get<std::string>());
+    request.storeUuid = canonical(j.at("store").get<std::string>());
+    request.generation = canonical(j.at("generation").get<std::string>());
+    request.author = j.at("author").get<std::string>();
+    request.expectedObjects = selectionFrom(j.at("expected_objects"));
+    request.expectedRelationships = selectionFrom(j.at("expected_relationships"), true);
+    request.readDependencies = selectionFrom(j.value("read_dependencies", Json::object()));
+    if (const auto& s = j.at("expected_commit_sequence"); !s.is_null()) request.expectedCommitSequence = s.get<int64_t>();
+    return request;
 }
 
 class Encoder {
@@ -237,31 +259,14 @@ Json requestJson(const TransactionRequest& request, TransactionPayloads* payload
     Encoder encode(payloads);
     auto operations = Json::array();
     for (const auto& op : request.operations) operations.push_back(std::visit(encode, op));
-    const auto complete = [](const RecordSelection& selection) {
-        return std::any_of(selection.begin(), selection.end(), [](const auto& entry) { return entry.second.complete(); });
-    };
-    const bool modern = complete(request.readDependencies) || complete(request.expectedRelationships) ||
-        std::any_of(request.expectedObjects.begin(), request.expectedObjects.end(), [](const auto& entry) { return entry.second.deleted; });
-    const int command = modern ? 3 : complete(request.expectedObjects) ? 2 : 1;
-    Json j{{"command_version", command}, {"store", canonical(request.storeUuid)},
+    Json j{{"command_version", kTransactionCommandVersion}, {"store", canonical(request.storeUuid)},
            {"generation", canonical(request.generation)}, {"author", request.author},
-           {"expected_objects", selectionJson(request.expectedObjects, modern)},
-           {"expected_relationships", selectionJson(request.expectedRelationships, modern, true)},
-           {"read_dependencies", selectionJson(request.readDependencies, modern)},
+           {"expected_objects", selectionJson(request.expectedObjects)},
+           {"expected_relationships", selectionJson(request.expectedRelationships, true)},
+           {"read_dependencies", selectionJson(request.readDependencies)},
            {"expected_commit_sequence", request.expectedCommitSequence ? Json(*request.expectedCommitSequence) : Json(nullptr)},
            {"operations", operations}};
     if (withRequestUuid) j["request"] = canonical(request.requestUuid);
-    // Preserve existing command-1/2 digests. Their redundant wire fields are
-    // decoded once into the single selection, never synchronized internally.
-    if (command == 2) {
-        std::vector<ObjectVersion> refs;
-        for (const auto& [uuid, expected] : request.expectedObjects)
-            if (const auto* ref = std::get_if<ObjectVersion>(&expected.selected)) {
-                if (canonical(uuid) != canonical(ref->objectUuid)) throw std::invalid_argument("expected reference names another object");
-                refs.push_back(canonicalObjectVersion(*ref));
-            }
-        j["expected_object_references"] = Json::parse(objectVersionsRequestToJson(refs)).at("versions");
-    }
     return j;
 }
 
@@ -314,7 +319,7 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
     if (op == "restore_object") {
         RestoreObjectOp result{uuid(), std::nullopt};
         if (const auto& s = j.at("source"); !s.is_null())
-            result.source = canonicalObjectVersion(objectVersionFrom(s, false));
+            result.source = canonicalObjectVersion(objectVersionFrom(s));
         return result;
     }
     if (op == "delete_object") return DeleteObjectOp{uuid()};
@@ -454,7 +459,11 @@ void expectObject(TransactionRequest& request, const ObjectVersion& reference)
 
 RecordSelection recordSelectionFromJson(const std::string& text, bool relationships)
 {
-    return selectionFrom(Json::parse(text), true, relationships);
+    return selectionFrom(Json::parse(text), relationships);
+}
+std::string recordSelectionToJson(const RecordSelection& selection, bool relationships)
+{
+    return selectionJson(selection, relationships).dump();
 }
 
 std::string transactionRequestToJson(const TransactionRequest& request, TransactionPayloads* payloads)
@@ -465,28 +474,7 @@ std::string transactionRequestToJson(const TransactionRequest& request, Transact
 TransactionRequest transactionRequestFromJson(const std::string& text, const TransactionPayloads& payloads)
 {
     const auto j = Json::parse(text);
-    if (const auto version = j.at("command_version").get<int>(); version < 1 || version > kTransactionCommandVersion)
-        throw std::invalid_argument("transaction: unsupported command version");
-    TransactionRequest request;
-    request.requestUuid = canonical(j.at("request").get<std::string>());
-    request.storeUuid = canonical(j.at("store").get<std::string>());
-    request.generation = canonical(j.at("generation").get<std::string>());
-    request.author = j.at("author").get<std::string>();
-    const bool modern = j.at("command_version").get<int>() >= 3;
-    request.expectedObjects = selectionFrom(j.at("expected_objects"), modern);
-    request.expectedRelationships = selectionFrom(j.at("expected_relationships"), modern, true);
-    request.readDependencies = selectionFrom(j.value("read_dependencies", Json::object()), modern);
-    std::set<std::string> seen;
-    for (const auto& value : objectVersionsRequestFromJson(Json{{"versions", j.value("expected_object_references", Json::array())}}.dump())) {
-        const auto ref = canonicalObjectVersion(value);
-        if (j.at("command_version").get<int>() != 2 || !seen.insert(ref.objectUuid).second)
-            throw std::invalid_argument("invalid or duplicate expected object reference");
-        if (const auto expected = request.expectedObjects.find(ref.objectUuid);
-            expected != request.expectedObjects.end() && expected->second.number() != ref.version)
-            throw std::invalid_argument("conflicting numeric and complete expected object versions");
-        expectObject(request, ref);
-    }
-    if (const auto& s = j.at("expected_commit_sequence"); !s.is_null()) request.expectedCommitSequence = s.get<int64_t>();
+    auto request = requestHeader(j);
     for (const auto& op : j.at("operations")) request.operations.push_back(operationFrom(op, payloads));
     return request;
 }
@@ -743,11 +731,6 @@ void mergeExpectations(RecordSelection& into, const RecordSelection& from, const
         const auto id = canonical(uuid);
         const auto [found, inserted] = into.emplace(id, expected);
         if (inserted || found->second == expected) continue;
-        if (found->second.number() == expected.number() && !found->second.deleted && !expected.deleted &&
-            (!found->second.complete() || !expected.complete())) {
-            if (expected.complete()) found->second = expected;
-            continue; // legacy number may strengthen, never replace a full identity
-        }
         throw TransactionConflict(TransactionConflict::Reason::Version, {{"object", id, found->second.number(), expected.number()}},
             std::string("transaction conflict: ") + what + " of " + id + " differ between the request and its preparation");
     }
@@ -916,11 +899,17 @@ std::vector<std::string> payloadHashesIn(const Json& request)
 }
 } // namespace
 
-std::vector<std::string> transactionJsonPayloadHashes(const std::string& text) { return payloadHashesIn(Json::parse(text)); }
+std::vector<std::string> transactionJsonPayloadHashes(const std::string& text)
+{
+    const auto request = Json::parse(text);
+    (void)requestHeader(request);
+    return payloadHashesIn(request);
+}
 
 bool transactionJsonHasPreparedOperations(const std::string& text)
 {
     const auto request = Json::parse(text); // the loop reads into it
+    (void)requestHeader(request);
     for (const auto& op : request.at("operations"))
         if (op.at("op").get<std::string>() == kLinkObjectsOperation) return true;
     return false;
@@ -929,13 +918,17 @@ bool transactionJsonHasPreparedOperations(const std::string& text)
 TransactionReceipt ObjectStore::submit(const std::string& text, const PayloadLookup& lookup)
 {
     auto j = Json::parse(text);
+    auto request = requestHeader(j);
     TransactionPayloads payloads;
     std::vector<std::string> missing;
     for (const auto& hash : payloadHashesIn(j)) {
         if (auto bytes = lookup ? lookup(hash) : std::nullopt) payloads.emplace(hash, std::move(*bytes));
         else missing.push_back(hash);
     }
-    if (missing.empty()) return submit(transactionRequestFromJson(text, payloads));
+    if (missing.empty()) {
+        for (const auto& op : j.at("operations")) request.operations.push_back(operationFrom(op, payloads));
+        return submit(request);
+    }
     // Without the bytes only the saved receipt of this exact request can
     // answer. The digest of canonical JSON text equals the digest of its
     // decoded request; a non-canonical text just has to re-stage.

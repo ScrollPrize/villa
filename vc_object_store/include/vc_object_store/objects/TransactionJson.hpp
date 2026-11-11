@@ -51,6 +51,7 @@ std::string edgeRecordJson(const EdgeRecord&);
 
 std::string transactionReceiptToJson(const TransactionReceipt&);
 RecordSelection recordSelectionFromJson(const std::string&, bool relationships = false);
+std::string recordSelectionToJson(const RecordSelection&, bool relationships = false);
 TransactionReceipt transactionReceiptFromJson(const std::string&);
 std::string storeStatusToJson(const StoreStatus&);
 std::string changePageToJson(const ChangePage&);

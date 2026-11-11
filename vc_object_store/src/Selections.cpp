@@ -95,7 +95,7 @@ SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
         for (const auto& t : header.at("transforms")) {
             auto value = t;
             if (bytes[6] == 1) value["store"] = record.storeUuid;
-            const auto reference = detail::canonicalObjectVersion(detail::objectVersionFrom(value, false));
+            const auto reference = detail::canonicalObjectVersion(detail::objectVersionFrom(value));
             if (reference.version <= 0) throw bad("transform version must be positive");
             record.transforms.push_back(reference);
         }

@@ -67,18 +67,6 @@ inline ObjectVersion objectVersion(const ResolvedObject& object)
 {
     return {storeUuidText(object.source),object.record.versionGeneration,object.record.uuid,object.record.version.value_or(0)};
 }
-// Legacy external receipts/revision selectors used arrays. Decode once at
-// those boundaries; native history carries ObjectVersion, never encoded text.
-inline std::optional<ObjectVersion> parseLegacyVersionReference(const std::string& text)
-{
-    if(text.empty()||text.front()!='[')return std::nullopt;
-    const auto value=nlohmann::json::parse(text);
-    if(!value.is_array()||value.size()!=4)throw std::invalid_argument("object reference: invalid fields");
-    ObjectVersion ref{value.at(0),value.at(1),value.at(2),value.at(3)};
-    if(ref.version<=0)throw std::invalid_argument("object reference: invalid version");
-    (void)parseUuid(ref.storeUuid); (void)parseUuid(ref.generation); (void)parseUuid(ref.objectUuid);
-    return ref;
-}
 inline std::array<uint8_t,56> versionReferenceBytes(const ObjectVersion& ref)
 {
     if(ref.version<=0)throw std::invalid_argument("object reference: invalid version");

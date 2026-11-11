@@ -271,10 +271,7 @@ TransactionReceipt detail::receiptFromJson(const Json& j)
     if(j.contains("object_references")){
         if(!j.at("object_references").is_object())throw std::invalid_argument("receipt object references must be a map");
         for(const auto& [uuid,value]:j.at("object_references").items()){
-            // Older persisted receipts used arrays. Normalize only here.
-            const auto ref=value.is_array()?parseLegacyVersionReference(value.dump()):std::optional(objectVersionFrom(value));
-            if(!ref || ref->version <= 0)throw std::invalid_argument("invalid receipt object reference");
-            r.objectReferences.emplace(canonical(uuid),canonicalObjectVersion(*ref));
+            r.objectReferences.emplace(canonical(uuid),objectVersionFrom(value));
             (void)r.objectReference(uuid);
         }
     }
@@ -408,8 +405,7 @@ void detail::checkTransactionContext(sqlite3* db, const TransactionContext& cont
             {{"store", storeUuidText(db), context.expectedCommitSequence, commitSequence(db)}},
             "object store: commit sequence changed since the guarded query");
     std::vector<ConflictDetail> conflicts;
-    // All guards share the same winning-record resolution, including selected
-    // tombstones. Numbers are checked only for legacy numbered boundary inputs.
+    // All guards use the same complete winning-record resolution, including tombstones.
     auto check = [&](const RecordSelection& selection, bool relationships) {
         for (const auto& [uuid, expected] : selection) {
             const auto id = canonical(uuid);
@@ -433,7 +429,7 @@ void detail::checkTransactionContext(sqlite3* db, const TransactionContext& cont
                     actual.deleted = row.i64(2) != 0;
                 }
             }
-            if (wanted.complete() ? actual != wanted : actual.number() != wanted.number())
+            if (wanted.complete() ? actual != wanted : actual.number().has_value())
                 conflicts.push_back({relationships ? "relationship" : "object", id, wanted.number(), actual.number()});
         }
     };
@@ -530,6 +526,13 @@ RelationshipVersion RelationshipRevision::reference() const
     if (version <= 0 || record.versionStoreUuid.empty() || generation.empty() || record.uuid.empty())
         throw std::invalid_argument("relationship reference: missing published identity");
     return {record.versionStoreUuid, generation, record.uuid, version};
+}
+
+RelationshipVersion EdgeRecord::reference() const
+{
+    if (!version || *version <= 0 || versionStoreUuid.empty() || versionGeneration.empty())
+        throw std::invalid_argument("relationship reference: missing published identity");
+    return {versionStoreUuid, versionGeneration, uuid, *version};
 }
 
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectVersion>& versions) const

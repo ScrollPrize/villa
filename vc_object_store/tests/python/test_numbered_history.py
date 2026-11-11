@@ -9,7 +9,7 @@ import vc_object_store as vos
 
 def create(db, name, status):
     obj = str(uuid.uuid4())
-    request = dict(command_version=1, request=str(uuid.uuid4()), store=status["store"],
+    request = dict(command_version=3, request=str(uuid.uuid4()), store=status["store"],
                    generation=status["generation"], author="py", expected_objects={obj: None},
                    expected_relationships={}, read_dependencies={}, expected_commit_sequence=None,
                    operations=[dict(op="create_object", record=dict(uuid=obj, kind="note", name=name))])
@@ -58,13 +58,13 @@ def test_artifacts_named_by_manifest(db, tmp_path):
     assert db.artifact_length(digest) == 3000 and db.artifact_length("0" * 64) is None
     assert db.read_artifact(digest, 3, 3) == b"abc"
     manifest = vos.artifact_manifest_json([dict(name="w/weights.bin", sha256=digest, length=3000)])
-    request = dict(command_version=1, request=str(uuid.uuid4()), store=status["store"],
-                   generation=status["generation"], author="py", expected_objects={obj: 1},
+    request = dict(command_version=3, request=str(uuid.uuid4()), store=status["store"],
+                   generation=status["generation"], author="py", expected_objects={obj: vos.object_reference(db.object(obj))},
                    expected_relationships={}, read_dependencies={}, expected_commit_sequence=None,
                    operations=[dict(op="set_meta", uuid=obj, key=vos.ARTIFACTS_META_KEY, value=__import__("json").loads(manifest))])
     db.submit(request)
     assert db.current_object_revision(obj)["record"]["meta"]["artifacts"][0]["sha256"] == digest
-    unheld = dict(request, request=str(uuid.uuid4()), expected_objects={obj: 2},
+    unheld = dict(request, request=str(uuid.uuid4()), expected_objects={obj: vos.object_reference(db.object(obj))},
                   operations=[dict(op="set_meta", uuid=obj, key="artifacts",
                                    value=[dict(name="x", sha256="1" * 64, length=1)])])
     with pytest.raises(Exception):

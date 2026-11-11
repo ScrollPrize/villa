@@ -527,39 +527,10 @@ std::vector<ObjectRevision> objectHistoryFromJson(const std::string& text, Store
     return result;
 }
 
-std::string objectVersionToJson(const ObjectVersion& reference)
-{
-    if (reference.version <= 0) throw std::invalid_argument("object version must be positive");
-    return objectVersionJson(canonicalObjectVersion(reference)).dump();
-}
-std::string relationshipVersionToJson(const RelationshipVersion& reference)
-{
-    auto value = Json::parse(objectVersionToJson({reference.storeUuid, reference.generation, reference.relationshipUuid, reference.version}));
-    value["relationship"] = value.at("object");
-    value.erase("object");
-    return value.dump();
-}
-RelationshipVersion relationshipVersionFromJson(const std::string& text)
-{
-    auto value = Json::parse(text);
-    if (!value.is_object() || value.contains("object")) throw std::invalid_argument("invalid relationship reference");
-    value["object"] = value.at("relationship");
-    value.erase("relationship");
-    const auto ref = objectVersionFromJson(value.dump());
-    return {ref.storeUuid, ref.generation, ref.objectUuid, ref.version};
-}
-ObjectVersion objectVersionFromJson(const std::string& text)
-{
-    const auto value = Json::parse(text);
-    if (!value.is_object() || !value.contains("version") || !value.at("version").is_number_integer() ||
-        (value.at("version").is_number_unsigned() &&
-         value.at("version").get<uint64_t>() > uint64_t(std::numeric_limits<int64_t>::max())))
-        throw std::invalid_argument("object version must be a positive integer");
-    auto reference = canonicalObjectVersion(objectVersionFrom(value));
-    if (reference.version <= 0)
-        throw std::invalid_argument("object version must be a positive integer");
-    return reference;
-}
+std::string objectVersionToJson(const ObjectVersion& reference) { return objectVersionJson(reference).dump(); }
+std::string relationshipVersionToJson(const RelationshipVersion& reference) { return relationshipVersionJson(reference).dump(); }
+RelationshipVersion relationshipVersionFromJson(const std::string& text) { return relationshipVersionFrom(Json::parse(text)); }
+ObjectVersion objectVersionFromJson(const std::string& text) { return objectVersionFrom(Json::parse(text)); }
 
 std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>& versions)
 {

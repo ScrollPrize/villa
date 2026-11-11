@@ -54,23 +54,18 @@ struct RelationshipVersion {
 // RecordSelection below; do not drop their owner/lineage into this map.
 using VersionSelection = std::map<std::string, std::optional<int64_t>>;
 
-// One selected identity per guard. Numeric guards are retained only for legacy
-// external requests and the explicitly numbered write API; selected producers
-// must supply the complete shared reference. NoLive does not mean never seen:
+// One selected identity per guard. NoLive does not mean never seen:
 // a deleted record also has no live head. A selected tombstone retains its
 // reference with deleted=true instead.
 struct RecordExpectation {
-    std::variant<std::monostate, int64_t, ObjectVersion, RelationshipVersion> selected;
+    std::variant<std::monostate, ObjectVersion, RelationshipVersion> selected;
     bool deleted = false;
     RecordExpectation() = default;
     RecordExpectation(std::nullopt_t) {}
-    RecordExpectation(int64_t legacyNumber) : selected(legacyNumber) {}
-    RecordExpectation(std::optional<int64_t> legacyNumber) { if (legacyNumber) selected = *legacyNumber; }
     RecordExpectation(ObjectVersion ref) : selected(std::move(ref)) {}
     RecordExpectation(RelationshipVersion ref) : selected(std::move(ref)) {}
     std::optional<int64_t> number() const {
         if (deleted) return {};
-        if (const auto* n = std::get_if<int64_t>(&selected)) return *n;
         if (const auto* r = std::get_if<ObjectVersion>(&selected)) return r->version;
         if (const auto* r = std::get_if<RelationshipVersion>(&selected)) return r->version;
         return {};
@@ -79,12 +74,7 @@ struct RecordExpectation {
     bool operator==(const RecordExpectation&) const = default;
 };
 
-struct RecordSelection : std::map<std::string, RecordExpectation> {
-    using std::map<std::string, RecordExpectation>::map;
-    RecordSelection() = default;
-    // Compatibility boundary for the explicitly numbered API, not a second map.
-    RecordSelection(const VersionSelection& legacy) { for (const auto& [id, n] : legacy) emplace(id, n); }
-};
+using RecordSelection = std::map<std::string, RecordExpectation>;
 VersionSelection numberedSelection(const RecordSelection&); // storage/wire projection only
 void mergeExpectations(RecordSelection&, const RecordSelection&, const char* description);
 

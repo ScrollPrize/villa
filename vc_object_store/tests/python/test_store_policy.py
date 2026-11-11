@@ -20,16 +20,17 @@ def test_same_object_write_guard_does_not_hide_a_stale_read(tmp_path, history_en
                             history_enabled=history_enabled) as store:
         obj = store.upsert_object(dict(kind="note"))
         state = store.status()
-        request = dict(command_version=1, request=str(uuid.uuid4()), store=state["store"],
+        request = dict(command_version=3, request=str(uuid.uuid4()), store=state["store"],
                        generation=state["generation"], author="test",
-                       expected_objects={obj: 1}, read_dependencies={obj: 2},
+                       expected_objects={obj: dict(store=state['store'], generation=state['generation'], object=obj, version=1)},
+                       read_dependencies={obj: dict(store=state['store'], generation=state['generation'], object=obj, version=2)},
                        expected_relationships={}, expected_commit_sequence=None,
                        operations=[dict(op="set_meta", uuid=obj, key="derived", value=True)])
         with pytest.raises(TransactionConflict):
             store.submit(request)
         assert store.status()["commit_sequence"] == state["commit_sequence"]
         assert "derived" not in store.object(obj)["meta"]
-        request["read_dependencies"] = {obj: 1}
+        request["read_dependencies"] = dict(request["expected_objects"])
         store.submit(request)
         assert store.object(obj)["meta"]["derived"] is True
 

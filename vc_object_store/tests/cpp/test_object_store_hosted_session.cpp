@@ -62,7 +62,7 @@ TransactionRequest request(ObjectStoreSession& session, const AttachmentIdentity
     const auto status = session.status(attachment);
     TransactionRequest r;
     r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
-    r.author = "session-test"; r.expectedObjects = std::move(expected); r.operations = std::move(operations);
+    r.author = "session-test"; r.expectedObjects = testNumberedGuards(session, attachment, expected); r.operations = std::move(operations);
     return r;
 }
 
@@ -276,7 +276,7 @@ try {
         HostedStore other(endpoint);
         const auto status = other.status();
         TransactionRequest r; r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
-        r.author = "other"; r.expectedObjects = {{track, 2}}; r.operations = {SetMetaOp{track, "note", "\"two\""}};
+        r.author = "other"; r.expectedObjects = testNumberedGuards(other, {{track, 2}}); r.operations = {SetMetaOp{track, "note", "\"two\""}};
         other.submit(r);
     }
     require(session.currentObject(hosted, track)->version == 2, "cached until the next check");
@@ -592,7 +592,7 @@ try {
             change.operations = {CreateObjectOp{objectRecordJson(volumeTransformChoiceRecord(choice, source, target, {key}))}};
         } else {
             const auto head = other.currentObjectRevision(registration);
-            change.expectedObjects[registration] = head->version;
+            change.expectedObjects[registration] = head->reference();
             change.operations = {UpdateObjectOp{objectRecordJson(
                 volumeTransformRecord(head->record, source, target, VolumeAffine::scale(10), "updated"))}};
         }
@@ -628,7 +628,7 @@ try {
                     TransactionRequest change;
                     change.storeUuid = status.storeUuid; change.generation = status.generation;
                     change.requestUuid = util::newUuid(); change.author = "atomic-transform-test";
-                    change.expectedObjects = {{a, ar->version}, {b, br->version}};
+                    change.expectedObjects = {{a, ar->reference()}, {b, br->reference()}};
                     const auto scale = VolumeAffine::scale(2 + i % 2);
                     change.operations = {UpdateObjectOp{objectRecordJson(volumeTransformRecord(ar->record, source, middle, scale, "a"))},
                                          UpdateObjectOp{objectRecordJson(volumeTransformRecord(br->record, middle, target, scale, "b"))}};

@@ -777,7 +777,6 @@ void setRecord(ObjectRevision& revision, const Json& record)
 
 std::optional<ResolvedObjectVersion> detail::resolveObjectRevision(sqlite3* db,const std::string& uuid)
 {
-    if(const auto ref=parseLegacyVersionReference(uuid))return resolveObjectVersion(db,*ref);
     const auto canonical=formatUuid(parseUuid(uuid));
     db=resolveReference(db,[&](sqlite3* source){
         if(!historyEnabled(source))return false;

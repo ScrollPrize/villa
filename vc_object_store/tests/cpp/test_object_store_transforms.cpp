@@ -175,7 +175,7 @@ int main() try {
     }
     {
         GeometrySnapshot snapshot(db);const auto view=snapshot.surface(surface).viewTransformedAt("b");
-        auto txn=db.write({{surface,objectVersion}});view.validateForWrite(db,txn);
+        auto txn=db.writeNumbered({{surface,objectVersion}});view.validateForWrite(db,txn);
         db.editGeometry(txn,surface,changes,geometryRevision);txn.commit();
     }
     GeometrySnapshot pinned(db);const auto stale=pinned.surface(surface).viewTransformedAt("b");
@@ -199,10 +199,10 @@ int main() try {
         {auto read=db.read();for(const auto& c:db.volumeTransforms(read).graph.resolve("a","b").candidates)paths.push_back(c.path);}
         require(paths.size()==2,"two candidate routes");
         const auto choice=vc::objects::util::newUuid();
-        {auto txn=db.write({{choice,std::nullopt}});require(db.chooseVolumeTransform(txn,"a","b",paths[1],choice)==choice,"choice takes the given uuid");txn.commit();}
+        {auto txn=db.writeNumbered({{choice,std::nullopt}});require(db.chooseVolumeTransform(txn,"a","b",paths[1],choice)==choice,"choice takes the given uuid");txn.commit();}
         {auto read=db.read();require(db.volumeTransforms(read).resolve("a","b").status==vcr::catalog::TransformStatus::Resolved,"a choice resolves the pair");}
         {auto read=db.read();const auto head=db.currentVersion(read,choice);
-         auto txn=db.write({{choice,head}});require(db.chooseVolumeTransform(txn,"a","b",paths[0])==choice,"choosing again updates the choice");txn.commit();}
+         auto txn=db.writeNumbered({{choice,head}});require(db.chooseVolumeTransform(txn,"a","b",paths[0])==choice,"choosing again updates the choice");txn.commit();}
         auto read=db.read();
         require(db.volumeTransforms(read).resolve("a","b").resolved().path==paths[0],"the latest choice wins");
         // One choice settles both directions: b -> a follows the chosen route backwards.
@@ -231,7 +231,7 @@ int main() try {
         require(context.resolve("a","b").resolved().path!=other,"the forward choice is unchanged");
         const auto choice=volumeTransformChoice(db,read,"b","a");
         require(choice.has_value(),"the explicit reverse choice is stored");
-        {auto txn=db.write({{choice->uuid,db.currentVersion(read,choice->uuid)}});db.retireObject(txn,choice->uuid);txn.commit();}
+        {auto txn=db.writeNumbered({{choice->uuid,db.currentVersion(read,choice->uuid)}});db.retireObject(txn,choice->uuid);txn.commit();}
         {auto after=db.read();require(db.volumeTransforms(after).resolve("b","a").resolved().path==implied,"retiring it restores the implied choice");}
         // A b -> a registration equal to the chosen route's inverse folds the
         // implied route into it; the related listing names the listed route.
@@ -250,7 +250,7 @@ int main() try {
         ObjectRecord first;first.kind="umbilicus";first.name="first";first.uuid=vc::objects::util::newUuid();
         first.meta=R"({"coordinates":{"volume_uuid":"c","scale_factor":2}})";
         vc::geometry::Umbilicus u;u.points={{2,4,6},{4,6,8}};
-        {auto txn=db.write({{first.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",first,u);txn.commit();}
+        {auto txn=db.writeNumbered({{first.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",first,u);txn.commit();}
         {
             auto read=db.read();const auto found=volumeUmbilicus(LocalStoreReader(db,read),{"c"});
             require(found&&found->uuid==first.uuid&&found->points.front()==std::array<double,3>{1,2,3},
@@ -264,7 +264,7 @@ int main() try {
         {
             auto read=db.read();const auto replaced=volumeUmbilici(LocalStoreReader(db,read),"c");
             require(replaced.size()==1&&replaced[0].uuid==first.uuid,"the replacement expects the umbilicus it replaces");
-            pins.expectedObjects={{first.uuid,db.currentVersion(read,first.uuid)},{second.uuid,std::nullopt}};
+            pins.expectedObjects={{first.uuid,db.currentObjectRevision(read,first.uuid)->reference()},{second.uuid,std::nullopt}};
         }
         {auto txn=db.write(pins);setVolumeUmbilicus(db,txn,"c",second,u);txn.commit();}
         {
@@ -275,7 +275,7 @@ int main() try {
         auto elsewhere=first;elsewhere.uuid=vc::objects::util::newUuid();
         elsewhere.meta=R"({"coordinates":{"volume_uuid":"d","scale_factor":1}})";
         bool refused=false;
-        try{auto txn=db.write({{elsewhere.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",elsewhere,u);}
+        try{auto txn=db.writeNumbered({{elsewhere.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",elsewhere,u);}
         catch(const std::invalid_argument&){refused=true;}
         require(refused,"an umbilicus bound elsewhere is not made a volume's umbilicus");
         auto extra=first;extra.uuid=vc::objects::util::newUuid();

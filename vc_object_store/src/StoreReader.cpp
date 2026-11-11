@@ -318,6 +318,28 @@ RecordExpectation currentObjectExpectation(const StoreReader& reader, const std:
     return expected;
 }
 
+RecordSelection selectCurrentExpectations(const StoreReader& reader, const VersionSelection& numbers, bool relationships)
+{
+    RecordSelection result;
+    for (const auto& [key, number] : numbers) {
+        const auto uuid = util::canonicalUuid(key);
+        if (result.contains(uuid)) throw std::invalid_argument("duplicate expected record identity");
+        if (!number) { result[uuid] = std::nullopt; continue; }
+        RecordExpectation selected;
+        if (relationships) {
+            EdgeSelection query; query.uuids = {uuid}; query.includeRetired = true;
+            const auto edges = reader.selectEdges(query);
+            if (!edges.empty()) selected = edges.front().reference();
+        } else if (const auto current = reader.currentObject(uuid)) selected = current->reference();
+        if (selected.number() != number)
+            throw TransactionConflict(TransactionConflict::Reason::Version,
+                {{relationships ? "relationship" : "object", uuid, number, selected.number()}},
+                "current-owner selection: requested version is not the live selected version");
+        result.emplace(uuid, std::move(selected));
+    }
+    return result;
+}
+
 std::vector<EdgeRecord> attachments(const StoreReader& reader, const std::string& ownerUuid,
                                     const std::optional<std::string>& role)
 {

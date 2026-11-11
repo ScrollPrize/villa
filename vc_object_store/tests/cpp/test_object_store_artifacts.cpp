@@ -84,7 +84,7 @@ try {
     auto request = [&](VersionSelection expected, std::vector<TransactionOperation> operations) {
         TransactionRequest r;
         r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
-        r.author = "alice"; r.expectedObjects = std::move(expected); r.operations = std::move(operations);
+        r.author = "alice"; r.expectedObjects = testNumberedGuards(db, expected); r.operations = std::move(operations);
         return r;
     };
 

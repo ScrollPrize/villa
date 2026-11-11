@@ -160,10 +160,10 @@ void retainedPointIdentities()
         {auto w=base.write();ObjectRecord record;record.uuid=id;record.kind="point_collection";
             base.upsertObject(w,record);base.putGeometry(w,id,vc::geometry::encode(vc::geometry::PointCollection{{10,20},{{0,1,2},{1,2,3}}}));w.commit();}
         {auto r=base.read();original=base.currentObjectRevision(r,id)->reference();}
-        {auto w=base.write(VersionSelection{{id,1}});base.editGeometrySequence(w,id,append(30),base.currentGeometry(w,id)->uuid);w.commit();}
-        {auto w=base.write(VersionSelection{{id,2}});base.restoreObject(w,id,original);w.commit();}
-        {auto w=base.write(VersionSelection{{id,3}});base.editGeometrySequence(w,id,append(40),base.currentGeometry(w,id)->uuid);w.commit();}
-        {auto w=base.write(VersionSelection{{id,4}});base.restoreObject(w,id,original);w.commit();}
+        {auto w=base.writeNumbered(VersionSelection{{id,1}});base.editGeometrySequence(w,id,append(30),base.currentGeometry(w,id)->uuid);w.commit();}
+        {auto w=base.writeNumbered(VersionSelection{{id,2}});base.restoreObject(w,id,original);w.commit();}
+        {auto w=base.writeNumbered(VersionSelection{{id,3}});base.editGeometrySequence(w,id,append(40),base.currentGeometry(w,id)->uuid);w.commit();}
+        {auto w=base.writeNumbered(VersionSelection{{id,4}});base.restoreObject(w,id,original);w.commit();}
         auto w=base.write();base.seal(w);w.commit();
     }
     for(const auto mode:{HistoryMode::Off,HistoryMode::On}) {
@@ -171,10 +171,10 @@ void retainedPointIdentities()
         {auto overlay=ObjectCollection::create(path,{basePath},config);auto w=overlay.write();overlay.setMeta(w,{{},id},"label","true");w.commit();}
         config.physicalPartitionOnly=true;auto overlay=ObjectStore::open(path,config);
         int64_t version;{auto r=overlay.read();version=*overlay.objectByUuid(r,id)->version;}
-        for(const auto used:{30,40})mustFail([&]{auto w=overlay.write(VersionSelection{{id,version}});
+        for(const auto used:{30,40})mustFail([&]{auto w=overlay.writeNumbered(VersionSelection{{id,version}});
             auto scope=attachCollectionReferenceResolver(ObjectStoreImplAccess::conn(w),path);
             overlay.editGeometrySequence(w,id,append(used),overlay.currentGeometry(w,id)->uuid);w.commit();});
-        {auto w=overlay.write(VersionSelection{{id,version}});auto scope=attachCollectionReferenceResolver(ObjectStoreImplAccess::conn(w),path);
+        {auto w=overlay.writeNumbered(VersionSelection{{id,version}});auto scope=attachCollectionReferenceResolver(ObjectStoreImplAccess::conn(w),path);
             overlay.editGeometrySequence(w,id,append(50),overlay.currentGeometry(w,id)->uuid);w.commit();}
     }
 }
@@ -191,7 +191,7 @@ void restoreArchivedGeometry()
     const auto geometryRevision=head();
     const auto restore=[&](const ObjectVersion& revision) {
         const auto current=head();
-        auto w=store.write(VersionSelection{{id,current.version}});store.restoreObject(w,id,revision);w.commit();
+        auto w=store.writeNumbered(VersionSelection{{id,current.version}});store.restoreObject(w,id,revision);w.commit();
     };
     const auto check=[&] {
         auto r=store.read();require(store.currentGeometry(r,id)->uuid==geometryToken,"restoration selects archived geometry directly");
@@ -250,7 +250,7 @@ void restoreBorrowedDelta()
         auto opt=options();opt.history=mode;const auto overlay=dir.path/ std::to_string(int(mode));
         {auto collection=ObjectCollection::create(overlay,{path},opt);}
         auto store=ObjectStore::open(overlay,opt);
-        {auto w=store.write(VersionSelection{{id,3}});store.restoreObject(w,id,selected);w.commit();}
+        {auto w=store.writeNumbered(VersionSelection{{id,3}});store.restoreObject(w,id,selected);w.commit();}
         auto r=store.read();const auto revision=store.currentGeometry(r,id)->uuid;
         const auto bytes=store.readGeometryArray(r,revision,"points");
         int32_t first=0;std::memcpy(&first,bytes.data(),sizeof(first));

@@ -22,7 +22,7 @@ ObjectRecord object(const std::string& kind="note")
 WriteTxn editObject(ObjectStore& store,const std::string& object)
 {
     std::optional<int64_t> version;{auto read=store.read();version=store.currentVersion(read,object);}
-    return store.write(VersionSelection{{object,version}});
+    return store.writeNumbered(VersionSelection{{object,version}});
 }
 void sourceIndex(HistoryMode history)
 {
@@ -128,7 +128,7 @@ void lifecycle(HistoryMode history)
     if(history==HistoryMode::On){auto read=store.read();original=store.currentObjectRevision(read,a.uuid)->reference();}
     auto write=[&]{
         VersionSelection selected;if(history==HistoryMode::On){auto read=store.read();for(const auto& r:{a,b})selected[r.uuid]=store.currentVersion(read,r.uuid);}
-        return history==HistoryMode::On?store.write(selected):store.write();
+        return history==HistoryMode::On?store.writeNumbered(selected):store.write();
     };
     {auto txn=write();store.retireObject(txn,a.uuid);require(!store.edgeByUuid(txn,relation),"retire removes current edge");}
     {auto read=store.read();require(store.edgeByUuid(read,relation).has_value()&&!store.objectByUuid(read,a.uuid)->retired,"retire rollback restores relationships and state");}

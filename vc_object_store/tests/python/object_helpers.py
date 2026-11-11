@@ -7,6 +7,15 @@ import pytest
 
 
 VOLUME = "20260411134726"
+def fixture_guards(status, numbers):
+    """Synthetic local fixture guards, including deliberately stale counters.
+
+    These tests own their fixture store/lineage. This is not a production
+    resolver or a recipe for reconstructing a lost selected reference.
+    """
+    return {key: None if number is None else dict(store=status['store'], generation=status['generation'], object=key, version=number)
+            for key, number in numbers.items()}
+
 LINE_OPTIONS = dict(volume_uuid=VOLUME, strip_spacing=2, strip_march_step=1,
                     anchor_contact=10, contact_gap=10, strip_margin=0)
 

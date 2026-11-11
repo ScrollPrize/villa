@@ -3,6 +3,7 @@
 #include "internal/Versions.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include "internal/CollectionReads.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -160,8 +161,23 @@ WriteTxn ObjectStore::write(const RecordSelection& expectedObjects)
 
 WriteTxn ObjectStore::write(const TransactionContext& context)
 {
-    if (context.author && context.author->empty()) throw std::invalid_argument("object store: empty transaction author");
     auto txn = write();
+    configureWrite(txn, context);
+    return txn;
+}
+
+WriteTxn ObjectStore::writeNumbered(const VersionSelection& numbers)
+{
+    auto txn = write();
+    TransactionContext context;
+    context.expectedObjects = selectCurrentExpectations(LocalStoreReader(*this, txn), numbers);
+    configureWrite(txn, context);
+    return txn;
+}
+
+void ObjectStore::configureWrite(WriteTxn& txn, const TransactionContext& context)
+{
+    if (context.author && context.author->empty()) throw std::invalid_argument("object store: empty transaction author");
     auto* db = static_cast<sqlite3*>(connection(txn));
     auto& pool = *activeStatementPools.at(db);
     if (context.requestUuid) {
@@ -177,7 +193,6 @@ WriteTxn ObjectStore::write(const TransactionContext& context)
     txn.expectedRevisions_ = expected;
     txn.expectedObjectVersions_ = numberedSelection(context.expectedObjects);
     txn.expectedRelationshipVersions_ = numberedSelection(context.expectedRelationships);
-    return txn;
 }
 
 std::string ObjectStore::author() const

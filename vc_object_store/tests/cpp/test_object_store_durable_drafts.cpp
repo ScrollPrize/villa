@@ -44,7 +44,7 @@ TransactionRequest save(ObjectStoreSession& session, const AttachmentIdentity& a
     const auto status = session.status(attachment);
     TransactionRequest r;
     r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
-    r.author = "draft-test"; r.expectedObjects = {{uuid, expected}};
+    r.author = "draft-test"; r.expectedObjects = testNumberedGuards(session, attachment, {{uuid, expected}});
     r.operations = {PutGeometryOp{uuid, vc::geometry::encode(flat(z)), {}}};
     return r;
 }
@@ -93,7 +93,7 @@ try {
         session.useDraftDirectory(root/"drafts");
         const auto ref=session.currentObject(attachment,uuid)->reference();
         session.setDraft(uuid,flat(1),coordinates,attachment,ref);
-        auto request=session.newRequest(attachment);request.expectedObjects={{uuid,ref.version}};
+        auto request=session.newRequest(attachment);request.expectedObjects={{uuid,ref}};
         const DurableSave keep{{{uuid,session.draftRevision(uuid)}},true};
         const auto receipt=session.submitDurably(attachment,request,keep);
         require(!receipt.commitSequence&&receipt.objectReference(uuid)==ref,"no-op receipt keeps referenced owner");

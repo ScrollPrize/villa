@@ -121,6 +121,7 @@ struct Anchor {
 };
 
 struct EdgeRecord : RecordCommon {
+    RelationshipVersion reference() const;
     std::string aUuid, bUuid;  // endpoint order is normalised by addEdge
     Anchor aAnchor, bAnchor;
     // Canonical opposite endpoint; rejects UUIDs not incident to this edge.
@@ -513,6 +514,8 @@ public:
     // object/endpoint must be expected. Commit publishes one revision per changed
     // object. Missing expectations or conflicts abort the whole transaction, even if caught.
     WriteTxn write(const RecordSelection& expectedObjects);
+    // Explicit numeric input convenience; resolves under this write lock.
+    WriteTxn writeNumbered(const VersionSelection&);
     // Numbered checked write (see TransactionContext). A request UUID already
     // committed is rejected here; use receipt() or submit() to recover it.
     WriteTxn write(const TransactionContext&);
@@ -862,6 +865,7 @@ private:
     // selects the latest head (unlike write(), where null expects absence).
     std::vector<SelectedRelationship> relationshipsAtSelected(const Txn&, const std::vector<ObjectRevision>&) const;
     struct Impl;
+    void configureWrite(WriteTxn&, const TransactionContext&);
     static std::unique_ptr<Impl> openImpl(const std::filesystem::path&, const OpenOptions&, bool create, bool immutableInitial = false);
     explicit ObjectStore(std::unique_ptr<Impl>);
     void* connection(const Txn&) const;
