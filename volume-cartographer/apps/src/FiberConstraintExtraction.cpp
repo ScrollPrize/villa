@@ -4,6 +4,7 @@
 #include <vc_object_store/geometry/SegmentClip.hpp>
 #include <vc_object_store/geometry/ArrayBytes.hpp>
 #include "FiberConstraintDatabase.hpp"
+#include "FiberNormalSamplingBenchmark.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
 #include <vc_reader/zarr.hpp>
 #include "vc/core/util/Umbilicus.hpp"
@@ -270,7 +271,16 @@ int runFiberConstraintExtraction(int argc, char** argv)
     mappings.resize(ids.size());
     progress({"load",lines.size(),ids.size()});
     const double loadSeconds=seconds(loadStart);
-    const vc::lasagna::LasagnaNormalSampler normals(dataset);
+    vc::lasagna::LasagnaNormalSamplerOptions samplerOptions;
+    samplerOptions.pointInterpolation=cfg.value("normal_point_interpolation",true);
+    const vc::lasagna::LasagnaNormalSampler normals(dataset,samplerOptions);
+    if(cfg.contains("normal_sampling_benchmark")) {
+        const auto timings=benchmarkFiberNormalSampling(cfg.at("normal_sampling_benchmark"),lines,dataset,samplerOptions);
+        const Json benchmark={{"normal_sampling_benchmark",timings},{"query_seconds",querySeconds},
+            {"load_seconds",loadSeconds},{"wall_seconds",seconds(started)},{"resources",processResources()}};
+        vcr::zarr::atomicWrite(std::filesystem::path(cfg.at("output").get<std::string>()),benchmark.dump(2)+"\n");
+        std::cout<<benchmark.dump()<<std::endl;return 0;
+    }
     vc::lasagna::LasagnaGroupArrays arrays(0);
     const double spacing=vc::lasagna::bindLasagnaChannel(dataset.manifest(),"nx",arrays).spacing;
     std::cout<<"selected fibers="<<lines.size()<<" points="<<totalPoints<<" arc_base="<<totalArc
