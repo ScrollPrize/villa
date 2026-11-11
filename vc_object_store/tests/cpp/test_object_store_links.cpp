@@ -173,6 +173,80 @@ void callerCanCommitAfterFailedCandidateBatch(const TemporaryDirectory& director
     require(db.edgeByUuid(read,old).has_value(),"failed candidate batch restores its stale edge before caller commits");
 }
 
+void staleScopesUseCanonicalIds(const TemporaryDirectory& directory)
+{
+    for (const auto history : {HistoryMode::On, HistoryMode::Off})
+        for (const bool callerOwned : {false, true})
+            for (const bool referenced : {false, true}) {
+                const auto name = std::string("scope-") + (history == HistoryMode::On ? "history" : "current") +
+                    (callerOwned ? "-caller" : "-standalone") + (referenced ? "-referenced" : "-local");
+                OpenOptions options; options.author = "scope-test"; options.history = history;
+                const auto path = directory.path / (name + ".vcobj");
+                std::string a, b;
+                {
+                    auto source = ObjectStore::create(path, options);
+                    auto txn = source.write();
+                    ObjectRecord object; object.kind = "surface";
+                    object.uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+                    a = source.upsertObject(txn, object);
+                    object.uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+                    b = source.upsertObject(txn, object);
+                    txn.commit();
+                    if (referenced) { auto seal = source.write(); source.seal(seal); seal.commit(); }
+                }
+                const auto overlay = directory.path / (name + "-overlay.vcobj");
+                if (referenced) { auto collection = ObjectCollection::create(overlay, {path}, options); }
+                auto db = ObjectStore::open(referenced ? overlay : path, options);
+                links::LinkCandidate candidate;
+                candidate.kind = "scope-link"; candidate.aUuid = a; candidate.bUuid = b;
+                candidate.aAnchor.wholeGeometry = candidate.bAnchor.wholeGeometry = true;
+                const auto add = [&] {
+                    require(links::commitCandidates(db,"scope-test",1,{candidate},false).edgesCreated == 1,
+                            "scope fixture creates one pending detector link");
+                    return edgesOf(db,a).front().uuid;
+                };
+                const auto remove = [&](const links::StaleEdgeScope& scope) {
+                    if (!callerOwned) return links::commitCandidates(db,"scope-test",1,{},true,&scope);
+                    auto txn = db.write();
+                    auto report = links::commitCandidates(db,txn,"scope-test",1,{},true,&scope);
+                    txn.commit(); return report;
+                };
+                auto edge = add();
+                links::StaleEdgeScope scope{{candidate.kind}, {}, {}};
+                require(remove(scope).staleRemoved == 0, "empty object scope removes nothing");
+                scope = {{}, {upper(a),upper(b)}, {}};
+                require(remove(scope).staleRemoved == 0, "empty kind scope removes nothing");
+                scope = {{candidate.kind}, {upper(a),upper(b),a}, {}};
+                require(remove(scope).staleRemoved == 1 && edgesOf(db,a).empty(),
+                        "uppercase object scope and empty touching remove the same link");
+                edge = add();
+                scope = {{candidate.kind}, {a,b}, {upper(a)}};
+                require(remove(scope).staleRemoved == 1 && edgesOf(db,a).empty(),
+                        "uppercase touching selects a canonical stored endpoint");
+                edge = add();
+                // Validation failures must not poison a caller's surrounding transaction.
+                for (const bool badTouching : {false, true}) {
+                    auto invalid = links::StaleEdgeScope{{candidate.kind}, {upper(a),upper(b)}, {}};
+                    (badTouching ? invalid.touching : invalid.objectUuids).push_back("not-a-uuid");
+                    auto txn = db.write();
+                    const auto before = db.status(txn).commitSequence;
+                    mustFail([&] { links::commitCandidates(db,txn,"scope-test",1,{},true,&invalid); });
+                    require(db.edgeByUuid(txn,edge).has_value(), "malformed scope preserves existing links");
+                    txn.commit();
+                    auto read = db.read();
+                    require(db.status(read).commitSequence == before && db.edgeByUuid(read,edge).has_value(),
+                            "caught malformed scope leaves no partial publication after outer commit");
+                }
+                scope = {{candidate.kind}, {upper(a),upper(b)}, {upper(b)}};
+                for (const auto* state : {"approved", "rejected"}) {
+                    { auto txn = db.write(); db.setApproval(txn,edge,state); txn.commit(); }
+                    const auto before = edgesOf(db,a).front().reference();
+                    require(remove(scope).staleRemoved == 0 && edgesOf(db,a).front().reference() == before,
+                            "canonical scope never removes or revises reviewed detector links");
+                }
+            }
+}
+
 void surfaceSelectionMissingGeometryAndStaleScope(const TemporaryDirectory& directory)
 {
     auto db = create(directory, "selection.vcobj");
@@ -339,6 +413,7 @@ try {
     TemporaryDirectory directory;
     surfaceDiscoveryUsesCurrentRevisionsAndPreservesReview(directory);
     callerCanCommitAfterFailedCandidateBatch(directory);
+    staleScopesUseCanonicalIds(directory);
     surfaceSelectionMissingGeometryAndStaleScope(directory);
     storedTrackCrossingsSelectionAndAtomicFailure(directory);
     referencedTrackDatasets(directory);
