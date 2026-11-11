@@ -20,6 +20,20 @@ def row(owner, run=1):
     return [extension_uuid(owner), run, 1.25, "UTF-8 \u03b1\x00 text", b"", None]
 
 
+def assert_reference_validation(db, table, ref):
+    malformed = [(dict(ref, unexpected=1), ValueError, "unknown key")]
+    malformed += [(dict(ref, version=value), ValueError, "positive integer")
+                  for value in (True, 1.5, "2", -1, 2**63)]
+    malformed += [({key: value for key, value in ref.items() if key != "generation"},
+                   RuntimeError, "generation")]
+    for invalid, error, message in malformed:
+        with pytest.raises(error, match=message):
+            db.extension_rows_at_version(table, invalid)
+        with db.write() as txn:
+            with pytest.raises(error, match=message):
+                txn.extension_rows_at_version(table, invalid)
+
+
 def test_typed_rows_and_transactional_registration(db):
     spec = definition()
     assert db.status()["extensions_present"] is False
@@ -74,6 +88,7 @@ def test_manual_fields_follow_owner_versions(tmp_path, history, owner_kind):
         status = db.status()
         ref = dict(store=status["store"], generation=status["generation"], object=owner, version=2)
         assert db.extension_rows_at_version(spec["name"], ref) == expected
+        assert_reference_validation(db, spec["name"], ref)
         with db.write(expected_versions=db.select_expected_versions({owner: 2})) as txn:
             txn.replace_extension_rows(spec["name"], owner, expected)
         assert db.current_version(owner) == 2 and db.status() == status
@@ -115,6 +130,7 @@ def test_manual_relationship_reference(db):
     ref = dict(store=selected["store"], generation=selected["generation"], relationship=edge, version=selected["version"])
     assert ref["version"] == 2 and selected["record"]["version_store"] == ref["store"]
     assert db.extension_rows_at_version(spec["name"], ref) == first
+    assert_reference_validation(db, spec["name"], ref)
     with db.write(expected_versions=db.select_expected_versions({a: db.current_version(a), b: db.current_version(b)}),
                   expected_relationships=db.select_expected_versions({edge: 2}, relationships=True)) as txn:
         txn.replace_extension_rows(spec["name"], edge, [])

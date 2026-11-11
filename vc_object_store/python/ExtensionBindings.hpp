@@ -189,7 +189,7 @@ void bindExtensionApi(nb::class_<T>& cls)
             if (object) db.scanExtensionRowsAtVersion(txn, table,
                 vo::objectVersionFromJson(jsonDumps(ref)), visitor);
             else db.scanExtensionRowsAtVersion(txn, table,
-                vo::RelationshipVersion{getStr(ref, "store"), getStr(ref, "generation"), getStr(ref, "relationship"), getInt(ref, "version")}, visitor);
+                vo::relationshipVersionFromJson(jsonDumps(ref)), visitor);
         });
         return result;
     }, nb::arg("table"), nb::arg("reference"));
