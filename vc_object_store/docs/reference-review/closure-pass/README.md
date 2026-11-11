@@ -2,6 +2,8 @@
 
 Frozen source: `69ba26311`, containing implementation commit `878525dd1`. The implementation and preceding review evidence were committed before this review. This pass is read-only for production code; the findings below are open, not silently fixed.
 
+Subsequent implementation status: all three findings are addressed in the [fix tracker](fixes.md), with [Astra delta review](fix-astra.md). The original review evidence below remains unchanged as the pre-fix record.
+
 ## Adjudicated findings
 
 | ID | Priority | Finding | Disposition |
