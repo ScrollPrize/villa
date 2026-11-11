@@ -481,7 +481,7 @@ int main() try {
                     second.points == std::vector<float>{1, 2, 3, 4, 5, 6}, "historical coordinate metadata");
             require(first.scale == std::array<double, 2>{1, 1} && second.scale == std::array<double, 2>{2, 2},
                     "historical grid scale");
-            require(first.geometryRevision == second.geometryRevision && first.version == 1 && second.version == 2,
+            require(first.geometryRevision == second.geometryRevision && first.reference().version == 1 && second.reference().version == 2,
                     "metadata-only versions share geometry");
             require(nlohmann::json::parse(first.record.meta).at("coordinates").at("volume_uuid") == "a",
                     "record and geometry use the same numbered version");

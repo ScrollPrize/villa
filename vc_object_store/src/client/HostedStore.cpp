@@ -683,6 +683,15 @@ std::vector<SelectedRelationship> HostedStore::relationshipsAt(const std::vector
     return relationshipQueryResultFromJson(expectOk(response, "relationship query").body, asOf);
 }
 
+SelectedInputs HostedStore::selectedInputs(const std::vector<ObjectVersion>& refs, const FeedCursor& position)
+{
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/selected-inputs",
+        selectedInputsRequestToJson(refs, position), {{"Content-Type", "application/json"}});
+    if (response.status == 409 && Json::parse(response.body).value("store_busy", false))
+        throw StoreBusy(serverError(response));
+    return selectedInputsFromJson(expectOk(response, "selected input query").body);
+}
+
 RegionResult HostedStore::geometryRegion(const RegionSlice& slice, const RegionOptions& options, StoreStatus* asOf)
 {
     const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/region",

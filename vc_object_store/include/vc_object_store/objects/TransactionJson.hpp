@@ -134,6 +134,10 @@ std::string objectsAtVersionsResultToJson(const StoreStatus&, const std::vector<
 std::vector<std::optional<ObjectRevision>> objectsAtVersionsResultFromJson(const std::string&, StoreStatus* asOf);
 std::string relationshipQueryResultToJson(const StoreStatus&, const std::vector<SelectedRelationship>&);
 std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::string&, StoreStatus* asOf);
+std::string selectedInputsToJson(const StoreStatus&, const SelectedInputs&);
+SelectedInputs selectedInputsFromJson(const std::string&);
+std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>&, const FeedCursor&);
+std::pair<std::vector<ObjectVersion>, FeedCursor> selectedInputsRequestFromJson(const std::string&);
 
 std::string regionQueryRequestToJson(const RegionSlice&, const RegionOptions&);
 std::pair<RegionSlice, RegionOptions> regionQueryRequestFromJson(const std::string&);

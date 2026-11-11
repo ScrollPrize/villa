@@ -579,6 +579,40 @@ std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::str
     return result;
 }
 
+std::string selectedInputsToJson(const StoreStatus& status, const SelectedInputs& inputs)
+{
+    auto records = Json::array(), relationships = Json::array();
+    for (const auto& object : inputs.objects) records.push_back(revisionJson(object));
+    for (const auto& edge : inputs.relationships)
+        relationships.push_back({{"relationship", relationshipJson(edge.relationship)}, {"applicable", edge.applicable}});
+    return envelope(status, "inputs", Json{{"objects", records}, {"relationships", relationships}}).dump();
+}
+std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>& refs, const FeedCursor& position)
+{
+    auto request = Json::parse(objectVersionsRequestToJson(refs));
+    request["position"] = {{"store", position.storeUuid}, {"generation", position.generation}, {"sequence", position.sequence}};
+    return request.dump();
+}
+std::pair<std::vector<ObjectVersion>, FeedCursor> selectedInputsRequestFromJson(const std::string& text)
+{
+    auto request = Json::parse(text);
+    requireKeys(request, {"versions", "position"}, "selected inputs request");
+    const auto position = request.at("position");
+    requireKeys(position, {"store", "generation", "sequence"}, "selected inputs position");
+    request.erase("position");
+    return {objectVersionsRequestFromJson(request.dump()), {util::canonicalUuid(position.at("store").get<std::string>()),
+        util::canonicalUuid(position.at("generation").get<std::string>()), position.at("sequence").get<int64_t>()}};
+}
+SelectedInputs selectedInputsFromJson(const std::string& text)
+{
+    const auto data = unwrap(text, nullptr, "inputs");
+    SelectedInputs result;
+    for (const auto& object : data.at("objects")) result.objects.push_back(revisionFrom(object));
+    for (const auto& edge : data.at("relationships"))
+        result.relationships.push_back({relationshipFrom(edge.at("relationship")), edge.at("applicable").get<bool>()});
+    return result;
+}
+
 std::string regionQueryRequestToJson(const RegionSlice& slice, const RegionOptions& o)
 {
     refuseTransforms(o.transforms || o.toTarget, "region query");

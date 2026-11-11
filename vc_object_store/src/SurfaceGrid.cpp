@@ -8,7 +8,7 @@ SurfaceGrid surfaceGrid(const StoreReader& reader, const ObjectRevision& selecte
 {
     if (!selected.geometryRevision) throw std::invalid_argument("surface has no geometry");
     // The geometry this version names, so record and grid come from one read.
-    const auto canonical = GeometrySnapshot(reader).surface(selected.objectUuid, selected.geometryRevision);
+    const auto canonical = GeometrySnapshot(reader).surface(selected);
     try {
         const auto view = canonical.viewTransformedAt(selected, volume, targetScale);
         return readSurfaceGrid(reader,selected,&view);
@@ -37,7 +37,7 @@ SurfaceGrid readSurfaceGrid(const StoreReader& reader,const ObjectRevision& sele
 {
     if(selected.deleted||selected.record.kind!="surface"||!selected.geometryRevision)
         throw std::invalid_argument("selected object is not a stored surface");
-    const auto canonical=GeometrySnapshot(reader).surface(selected.objectUuid,selected.geometryRevision);
+    const auto canonical=GeometrySnapshot(reader).surface(selected);
     if(transformed&&transformed->revision().uuid!=canonical.revision().uuid)
         throw std::invalid_argument("transformed view revision differs from surface");
     SurfaceGrid grid;
@@ -52,8 +52,6 @@ SurfaceGrid readSurfaceGrid(const StoreReader& reader,const ObjectRevision& sele
     if(transformed)copy(transformed->readTile(0,0,canonical.rows(),canonical.columns()));
     else copy(canonical.readTile(0,0,canonical.rows(),canonical.columns()));
     grid.record = selected.record;
-    grid.version = selected.version;
-    grid.generation = selected.generation;
     grid.geometryRevision = *selected.geometryRevision;
     for (const auto& array : canonical.revision().arrays)
         if (array.name != "points" && array.name != "valid") grid.channels.push_back(array.name);

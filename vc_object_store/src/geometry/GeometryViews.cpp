@@ -32,7 +32,7 @@ struct GeometryReadState {
 struct GeometryViewState {
     std::shared_ptr<GeometryReadState> read;
     GeometryRevision revision;
-    std::optional<ObjectVersion> reference;
+    std::optional<ObjectRevision> object;
     std::optional<std::map<int64_t, int64_t>> pointIndex;
     void requireCurrent() const {
         read->require();
@@ -117,9 +117,7 @@ TransformedGeometryView GeometrySnapshot::viewTransformedAt(const ObjectRevision
     const auto local=context?VolumeTransforms{}:state_->reader->volumeTransforms();
     const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(object.record.meta),target,targetScale);
     if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
-    auto selected=geometry(object.objectUuid,object.geometryRevision);
-    if(const auto current=state_->reader->currentObject(object.objectUuid); current && current->reference()==object.reference())
-        std::visit([&](auto& view){view.state_->reference=object.reference();},selected);
+    auto selected=geometry(object);
     return TransformedGeometryView(std::move(selected),*mapping,target,targetScale);
 }
 
@@ -132,7 +130,7 @@ TransformedGeometryView GeometrySnapshot::viewStored(const std::string& uuid,
 TransformedGeometryView GeometryView::viewTransformedAt(const std::string& target,double scale) const {
     state_->read->require();
     const auto& reader=*state_->read->reader;
-    const auto record=reader.objectAtGeometry(state_->revision.uuid);
+    const auto record=state_->object ? state_->object : reader.objectAtGeometry(state_->revision.uuid);
     if(!record)throw std::invalid_argument("geometry revision has no recorded coordinate metadata");
     return viewTransformedAt(*record,target,scale);
 }
@@ -142,14 +140,14 @@ TransformedGeometryView GeometryView::viewTransformedAt(const ObjectRevision& ob
     if(object.objectUuid!=state_->revision.objectUuid||object.geometryRevision!=state_->revision.uuid||!object.metadataComplete)
         throw std::invalid_argument("object revision does not name this geometry and its coordinate metadata");
     auto result=GeometrySnapshot(state_->read).viewTransformedAt(object,target,scale);
-    if(state_->reference!=object.reference())
-        std::visit([](auto& view){view.state_->reference.reset();},result.source_);
+    if(reference()!=object.reference())
+        std::visit([](auto& view){view.state_->object.reset();},result.source_);
     return result;
 }
 
 std::vector<vcr::catalog::TransformResolution> GeometryView::availableTransforms() const {
     state_->read->require();
-    const auto record=state_->read->reader->objectAtGeometry(state_->revision.uuid);
+    const auto record=state_->object ? state_->object : state_->read->reader->objectAtGeometry(state_->revision.uuid);
     if(!record)throw std::invalid_argument("geometry revision has no recorded coordinate metadata");
     return state_->read->reader->availableTransforms(*record);
 }
@@ -178,7 +176,7 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
         throw std::invalid_argument("unsupported geometry version or coordinate system");
     auto result = std::make_shared<State>();
     result->read = state_; result->revision = *revision;
-    if (!geometryRevision) result->reference = object->reference();
+    if (!geometryRevision) result->object = object;
     if (revision->kind == "point_collection") {
         result->require("points", "<f8", 2);
         result->require("point_ids", "<i8", 1);
@@ -200,7 +198,31 @@ UmbilicusView GeometrySnapshot::umbilicus(const std::string& id, const std::opti
 SurfaceView GeometrySnapshot::surface(const std::string& id, const std::optional<std::string>& revision) const { return SurfaceView(view(id, "surface", revision)); }
 TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::optional<std::string>& revision) const
 {
-    auto s = view(id, "", revision);
+    return typed(view(id, "", revision));
+}
+ObjectRevision GeometrySnapshot::selected(const ObjectVersion& reference) const
+{
+    state_->require();
+    const auto selected = state_->reader->selectedObject(reference.objectUuid, {}, {}, reference);
+    if (!selected) throw std::invalid_argument("selected object is not retained");
+    return *selected;
+}
+std::shared_ptr<State> GeometrySnapshot::view(const ObjectRevision& object, const std::string& kind) const
+{
+    if (object.deleted || !object.metadataComplete || !object.geometryRevision)
+        throw std::invalid_argument("selected object has no geometry or coordinate metadata");
+    auto result = view(object.objectUuid, kind, object.geometryRevision);
+    result->object = object;
+    return result;
+}
+PointCollectionView GeometrySnapshot::pointCollection(const ObjectRevision& object) const { return PointCollectionView(view(object, "point_collection")); }
+FiberView GeometrySnapshot::fiber(const ObjectRevision& object) const { return FiberView(view(object, "fiber")); }
+TrackView GeometrySnapshot::track(const ObjectRevision& object) const { return TrackView(view(object, "track")); }
+UmbilicusView GeometrySnapshot::umbilicus(const ObjectRevision& object) const { return UmbilicusView(view(object, "umbilicus")); }
+SurfaceView GeometrySnapshot::surface(const ObjectRevision& object) const { return SurfaceView(view(object, "surface")); }
+TypedGeometryView GeometrySnapshot::geometry(const ObjectRevision& object) const { return typed(view(object, "")); }
+TypedGeometryView GeometrySnapshot::typed(std::shared_ptr<State> s) const
+{
     if (s->revision.kind == "point_collection") return PointCollectionView(s);
     if (s->revision.kind == "fiber") return FiberView(s);
     if (s->revision.kind == "track") return TrackView(s);
@@ -210,8 +232,8 @@ TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::o
 
 GeometryView::GeometryView(std::shared_ptr<State> state) : state_(std::move(state)) {}
 const GeometryRevision& GeometryView::revision() const { state_->requireCurrent(); return state_->revision; }
-std::optional<int64_t> GeometryView::version() const { state_->read->require(); return state_->reference?std::optional(state_->reference->version):std::nullopt; }
-std::optional<ObjectVersion> GeometryView::reference() const { state_->read->require(); return state_->reference; }
+std::optional<int64_t> GeometryView::version() const { const auto ref = reference(); return ref ? std::optional(ref->version) : std::nullopt; }
+std::optional<ObjectVersion> GeometryView::reference() const { state_->read->require(); return state_->object ? std::optional(state_->object->reference()) : std::nullopt; }
 geometry::Geometry GeometryView::loadGeometry() const
 {
     state_->requireCurrent();

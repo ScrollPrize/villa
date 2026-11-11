@@ -19,8 +19,7 @@ struct SurfaceGrid {
     std::vector<uint8_t> valid;
     std::array<double, 2> scale{1, 1};  // grid scale in the read volume's voxels
     ObjectRecord record;                // the record of the version read
-    int64_t version = 0;
-    std::string generation;
+    ObjectVersion reference() const { return record.reference(); }
     // Payload identity of its geometry (its channels read through it).
     std::string geometryRevision;
     std::vector<std::string> channels;  // per-vertex arrays other than points and valid

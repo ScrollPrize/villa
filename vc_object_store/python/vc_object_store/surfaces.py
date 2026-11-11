@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from ._native import Surface
+from ._native import Surface, object_reference
 from .locations import attached
 
 INVALID = -1.0
@@ -21,10 +21,20 @@ class SurfaceGrid(NamedTuple):
     valid: np.ndarray  # (rows, columns) bool
     scale: tuple  # grid scale in the read volume's voxels
     record: dict
-    version: int  # the numbered object version read, in ``generation``
-    generation: str
     geometry_revision: str  # payload identity of its geometry (reads its channels)
     channels: frozenset  # names of the per-vertex channels (not points or valid)
+
+    @property
+    def reference(self):
+        return object_reference(self.record)
+
+    @property
+    def version(self):
+        return self.reference["version"]
+
+    @property
+    def generation(self):
+        return self.reference["generation"]
 
 
 def read_surface(store, surface_uuid, *, volume, version=None, generation=None, reference=None, target_scale=1.0) -> SurfaceGrid:
@@ -43,7 +53,7 @@ def read_surface(store, surface_uuid, *, volume, version=None, generation=None, 
 def surface_grid(grid: dict) -> SurfaceGrid:
     """A ``SurfaceGrid`` from ``ObjectStoreSession.read_surface_grid``'s answer."""
     return SurfaceGrid(np.asarray(grid["points"], dtype=np.float32), np.asarray(grid["valid"]).astype(bool),
-                       tuple(float(s) for s in grid["scale"]), grid["record"], grid["version"], grid["generation"],
+                       tuple(float(s) for s in grid["scale"]), grid["record"],
                        grid["geometry_revision"], frozenset(grid["channels"]))
 
 

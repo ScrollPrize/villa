@@ -193,6 +193,12 @@ struct SelectedRelationship {
     bool applicable = false;
 };
 
+// One selected graph input: exact records plus the relationships between them.
+struct SelectedInputs {
+    std::vector<ObjectRevision> objects;
+    std::vector<SelectedRelationship> relationships;
+};
+
 struct JournalEntry {
     int64_t seq = 0;
     std::string recordUuid;

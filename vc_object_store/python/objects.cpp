@@ -72,6 +72,28 @@ nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
     return d;
 }
 
+nb::list relationshipsToPy(const std::vector<vo::SelectedRelationship>& selected)
+{
+    nb::list result;
+    for (const auto& edge : selected) {
+        auto row = relationshipRevisionToPy(edge.relationship);
+        row["applicable"] = edge.applicable; result.append(row);
+    }
+    return result;
+}
+nb::dict selectedInputsToPy(const vo::SelectedInputs& selected)
+{
+    nb::list objects;
+    for (const auto& object : selected.objects) objects.append(objectRevisionToPy(object));
+    nb::dict result; result["objects"] = objects; result["relationships"] = relationshipsToPy(selected.relationships);
+    return result;
+}
+vo::FeedCursor inputPositionFromPy(const nb::dict& value)
+{
+    return {nb::cast<std::string>(value["store"]), nb::cast<std::string>(value["generation"]),
+        nb::cast<int64_t>(value["commit_sequence"])};
+}
+
 // Convert native results after the transaction (and any GIL release) ends.
 // Numbered references as dicts {store, generation, object, version}, through
 // the shared wire codec.
@@ -567,17 +589,17 @@ void bindHostedStore(nb::module_& m)
             { nb::gil_scoped_release release; history = self.objectHistory(uuid, nullptr, ifRetained); }
             return toPy(history);
         }, nb::arg("object_uuid"), nb::arg("if_retained") = false)
+        .def("selected_inputs", [](Hosted& self, const nb::list& refs, const nb::dict& position) {
+            const auto versions = objectVersionsFromPy(refs); const auto cursor = inputPositionFromPy(position);
+            vo::SelectedInputs result;
+            { nb::gil_scoped_release release; result = self.selectedInputs(versions, cursor); }
+            return selectedInputsToPy(result);
+        }, nb::arg("refs"), nb::arg("position"))
         .def("relationships_at_versions", [](Hosted& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             std::vector<vo::SelectedRelationship> revisions;
             { nb::gil_scoped_release release; revisions = self.relationshipsAt(versions); }
-            nb::list result;
-            for (const auto& revision : revisions) {
-                auto d = relationshipRevisionToPy(revision.relationship);
-                d["applicable"] = revision.applicable;
-                result.append(d);
-            }
-            return result;
+            return relationshipsToPy(revisions);
         }, nb::arg("refs"))
         .def("geometry_region", [answer](Hosted& self, const vo::RegionSlice& slice, const vo::RegionOptions& options, bool withStatus) {
             const auto view = slice; const auto request = options;
@@ -694,7 +716,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             d["valid"] = ownedArray(std::move(grid.valid), {rows, columns});
             d["scale"] = nb::make_tuple(grid.scale[0], grid.scale[1]);
             d["record"] = objectToPy(grid.record);
-            d["version"] = grid.version; d["generation"] = grid.generation;
+            d["version"] = grid.reference().version; d["generation"] = grid.reference().generation;
             d["geometry_revision"] = grid.geometryRevision; d["channels"] = grid.channels;
             return d;
         }, nb::arg("attachment"), nb::arg("surface_uuid"), nb::arg("volume"), nb::arg("target_scale") = 1.0,
@@ -762,6 +784,15 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             return jsonLoads(annotations.dump());
         }, nb::arg("attachment"), nb::arg("revision_uuid"), nb::arg("array_name"),
            "Per-point annotations of a sequence array (as ObjectStore.geometry_point_annotations).")
+        .def("selected_inputs", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs, const nb::dict& position) {
+            const auto versions = objectVersionsFromPy(refs); const auto cursor = inputPositionFromPy(position);
+            vo::SelectedInputs result;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { result = reader.selectedInputs(versions, cursor); });
+            }
+            return selectedInputsToPy(result);
+        }, nb::arg("attachment"), nb::arg("refs"), nb::arg("position"))
         .def("relationships_at_versions", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             std::vector<vo::SelectedRelationship> revisions;
@@ -769,13 +800,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
                 nb::gil_scoped_release release;
                 self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { revisions = reader.relationshipsAt(versions); });
             }
-            nb::list result;
-            for (const auto& revision : revisions) {
-                auto d = relationshipRevisionToPy(revision.relationship);
-                d["applicable"] = revision.applicable;
-                result.append(d);
-            }
-            return result;
+            return relationshipsToPy(revisions);
         }, nb::arg("attachment"), nb::arg("refs"), "Relationships recorded between these numbered object versions.")
         .def("changes_since", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::dict& cursor, int64_t maxChanges) {
             const vo::FeedCursor c{nb::cast<std::string>(cursor["store"]), nb::cast<std::string>(cursor["generation"]),
@@ -1608,16 +1633,16 @@ NB_MODULE(_native, m)
             const auto versions = objectVersionsFromPy(refs);
             return toPy(self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectsAtVersions(txn, versions); }));
         }, nb::arg("refs"), "Numbered references {store, generation, object, version}, answered in order (None where not recorded).")
+        .def("selected_inputs", [](PyObjectStore& self, const nb::list& refs, const nb::dict& position) {
+            const auto versions = objectVersionsFromPy(refs); const auto cursor = inputPositionFromPy(position);
+            return selectedInputsToPy(self.withRead<true>([&](auto& db, auto& txn) {
+                return vo::LocalStoreReader(db, txn).selectedInputs(versions, cursor);
+            }));
+        }, nb::arg("refs"), nb::arg("position"))
         .def("relationships_at_versions", [](PyObjectStore& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             const auto revisions = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.relationshipsAt(txn, versions); });
-            nb::list result;
-            for (const auto& revision : revisions) {
-                auto d = relationshipRevisionToPy(revision.relationship);
-                d["applicable"] = revision.applicable;
-                result.append(d);
-            }
-            return result;
+            return relationshipsToPy(revisions);
         }, nb::arg("refs"), "Relationships recorded between these numbered object versions.")
         .def("record_selection", [](PyObjectStore& self, const nb::object& query) {
             const auto text = nb::isinstance<nb::str>(query) ? nb::cast<std::string>(query) : jsonDumps(query);

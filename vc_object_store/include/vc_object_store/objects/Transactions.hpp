@@ -32,6 +32,11 @@
 #include <vc_reader/registrations.hpp>
 
 namespace vc::objects {
+// A coherent read could not retain the requested snapshot. Retry or reselect.
+class StoreBusy : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct ObjectRecord;
 struct EdgeRecord;

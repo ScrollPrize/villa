@@ -26,13 +26,6 @@
 
 namespace vc::objects {
 
-// A paged listing kept seeing new commits between its pages and gave up
-// rather than combine snapshots. Retry later or page a pinned selection.
-class StoreBusy : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
-
 struct HostedStoreOptions {
     int connections = 4;
     long connectTimeoutMs = 10000;
@@ -139,6 +132,7 @@ public:
     // Every recorded revision of an object (empty when it never existed).
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr, bool ifRetained = false);
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&, StoreStatus* asOf = nullptr);
+    SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const FeedCursor&);
     // Budgets above the server's limits are clamped; the result's stop reason
     // reports a budget stop (complete() is false).
     RegionResult geometryRegion(const RegionSlice&, const RegionOptions& = {}, StoreStatus* asOf = nullptr);

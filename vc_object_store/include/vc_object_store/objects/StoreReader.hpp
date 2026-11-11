@@ -51,6 +51,10 @@ public:
         const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;
     // The relationships among objects at these versions (ObjectStore::relationshipsAt).
     virtual std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const = 0;
+    // Capture exact objects and their relationship membership together. Root-local
+    // history can replay numbered records; inherited membership requires the
+    // requested root commit still to be current. Otherwise fail closed.
+    virtual SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const FeedCursor& position) const;
     GraphReadView graphReadViewAt(const std::vector<ObjectVersion>&, const EdgeSelection& = {}) const;
     // Expand through recorded relationship endpoints, without current-head reads.
     // Explicit selections win. Other endpoints use the newest referenced version

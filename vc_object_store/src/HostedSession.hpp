@@ -141,6 +141,10 @@ public:
     {
         return attachment_->relationshipsAt(versions);
     }
+    SelectedInputs selectedInputs(const std::vector<ObjectVersion>& versions, const FeedCursor& position) const override
+    {
+        return attachment_->client().selectedInputs(versions, position);
+    }
     std::vector<ObjectVersion> versionsAt(const ObjectVersion& anchor) const override
     { return attachment_->client().versionsAt(anchor); }
     std::optional<std::filesystem::path> resolveStoragePath(const std::string& objectUuid,

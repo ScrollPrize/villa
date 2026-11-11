@@ -41,6 +41,20 @@ def request(status, operations, expected, author="py"):
                 expected_commit_sequence=None, operations=operations)
 
 
+def test_selected_input_capture_uses_server_snapshot(hosted):
+    store, _ = hosted
+    status = store.status()
+    uid = str(uuid.uuid4())
+    store.submit(request(status, [dict(op="create_object", record=dict(uuid=uid, kind="note"))], {uid: None}))
+    position = store.status()
+    reference = vos.object_reference(store.current_object_revision(uid)["record"])
+    selected = store.selected_inputs([reference], position)
+    assert vos.object_reference(selected["objects"][0]["record"]) == reference
+    assert selected["relationships"] == []
+    with pytest.raises(vos.StoreBusy, match="position"):
+        store.selected_inputs([reference], dict(position, store=str(uuid.uuid4())))
+
+
 @pytest.mark.parametrize("cache_bytes", [1 << 20, 8 << 20])
 def test_copy_transfers_each_geometry_byte_once(hosted, tmp_path, cache_bytes):
     from vc_object_store.surfaces import create_surface, read_surface

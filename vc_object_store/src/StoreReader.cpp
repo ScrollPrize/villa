@@ -11,6 +11,26 @@
 #include <set>
 
 namespace vc::objects {
+SelectedInputs StoreReader::selectedInputs(const std::vector<ObjectVersion>& refs, const FeedCursor& position) const
+{
+    const auto before = status();
+    const bool inherited = std::any_of(refs.begin(), refs.end(), [&](const auto& ref) { return util::canonicalUuid(ref.storeUuid) != before.storeUuid; });
+    const auto matches = [&](const StoreStatus& state) {
+        return position.sequence >= 0 && state.commitSequence >= position.sequence &&
+            state.storeUuid == util::canonicalUuid(position.storeUuid) && state.generation == util::canonicalUuid(position.generation) &&
+            (!inherited || state.commitSequence == position.sequence);
+    };
+    if (!matches(before)) throw StoreBusy("selected inputs: requested graph position is no longer available");
+    SelectedInputs result;
+    const auto records = objectsAtVersions(refs);
+    for (size_t i = 0; i < refs.size(); ++i) {
+        if (!records[i] || records[i]->deleted) throw std::invalid_argument("selected object is not retained: " + refs[i].objectUuid);
+        result.objects.push_back(*records[i]);
+    }
+    result.relationships = relationshipsAt(refs);
+    if (!matches(status())) throw StoreBusy("selected inputs: store changed during graph capture; retry");
+    return result;
+}
 
 ObjectVersion StoreReader::decodeObjectReference(const std::string& json) const
 {

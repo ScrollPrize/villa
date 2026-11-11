@@ -942,7 +942,39 @@ void fittingRelationshipPolicy()
     require(fittingRelationshipInput(edge, true, kinds, false).exclusion == "unused kind same-surface", "unsupported endpoint pair excluded");
 }
 
+void selectedGraphCapture(HistoryMode mode)
+{
+    Fixture f(mode, mode);
+    auto store = ObjectStore::open(f.overlay, options(mode));
+    FeedCursor position;
+    {
+        auto r = store.read(); LocalStoreReader reader(store, r);
+        const auto status = reader.status(); position = {status.storeUuid, status.generation, status.commitSequence};
+        const auto selected = reader.selectedInputs({f.av, f.bv}, position);
+        require(selected.objects.size() == 2 && selected.objects.front().reference() == f.av,
+                "selected graph keeps inherited complete references");
+        require(selected.relationships.size() == 1 && selected.relationships.front().applicable,
+                "selected graph captures applicable inherited membership");
+        const auto decoded = selectedInputsFromJson(selectedInputsToJson(status, selected));
+        require(decoded.objects.front().reference() == f.av && decoded.relationships.front().relationship.reference() ==
+                selected.relationships.front().relationship.reference(), "selected graph wire keeps full identities");
+        GeometrySnapshot snapshot(reader);
+        require(snapshot.track(selected.objects.front()).reference() == f.av, "selected geometry retains inherited ownership");
+    }
+    { auto w = store.write(); store.setMeta(w, f.file, "changed", "true"); w.commit(); }
+    {
+        auto r = store.read(); LocalStoreReader reader(store, r);
+        bool refused = false;
+        try { reader.selectedInputs({f.av, f.bv}, position); } catch (const StoreBusy&) { refused = true; }
+        require(refused, "an inherited endpoint pin does not prove old relationship membership");
+        const auto status = reader.status();
+        require(reader.selectedInputs({f.av, f.bv}, {status.storeUuid, status.generation, status.commitSequence}).relationships.size() == 1,
+                "current graph capture remains available after an unrelated overlay edit");
+    }
+}
+
 int main()try{
+    selectedGraphCapture(HistoryMode::On); selectedGraphCapture(HistoryMode::Off);
     fittingRelationshipPolicy();
     for (const auto mode : {HistoryMode::Off, HistoryMode::On}) unifiedExpectations(mode);
     duplicateStatementLease();

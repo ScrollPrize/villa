@@ -34,12 +34,14 @@ def test_created_surface_reads_back_through_registrations(db_path):
         assert "area_vx2" not in record["meta"] and "format" not in record["meta"] and "uuid" not in record["meta"]
         assert record["surface"]["area"] == 0 and record["surface"]["grid_width"] == 2
         db.register_volume_transform("a", "b", [[2, 0, 0, 10], [0, 1, 0, 0], [0, 0, 1, 0]])
-    points, valid, scale, _, version, generation, revision, channels = read_surface(db_path, uid, volume="a")
-    assert channels == {"approval"} and revision and version == 1 and generation
+    grid = read_surface(db_path, uid, volume="a")
+    points, valid, scale = grid.points, grid.valid, grid.scale
+    assert grid.channels == {"approval"} and grid.geometry_revision and grid.version == 1 and grid.generation
     np.testing.assert_array_equal(valid, [[True, True], [False, False]])
     np.testing.assert_array_equal(points[0], xyz[0])
     assert (points[1] == -1).all() and scale == (0.05, 0.05)
-    points, valid, *_ = read_surface(db_path, uid, volume="b")
+    grid = read_surface(db_path, uid, volume="b")
+    points, valid = grid.points, grid.valid
     np.testing.assert_array_equal(points[0], [[12, 2, 3], [18, 5, 6]])
     assert (points[1] == -1).all()
 

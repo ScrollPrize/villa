@@ -8,6 +8,7 @@
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #if VC_OBJECT_SERVER_LINKING
 #include "vc_object_store/object_links/LinkObjects.hpp"
@@ -753,6 +754,13 @@ struct ServerState {
         return jsonReply(relationshipQueryResultToJson(store->status(txn), store->relationshipsAt(txn, versions)));
     }
 
+    Reply querySelectedInputs(const std::string& body)
+    {
+        const auto [versions, position] = selectedInputsRequestFromJson(body);
+        auto txn = store->read();
+        return jsonReply(selectedInputsToJson(store->status(txn), LocalStoreReader(*store, txn).selectedInputs(versions, position)));
+    }
+
     Reply queryVersions(const std::string& body)
     {
         const auto versions = objectVersionsRequestFromJson(body);
@@ -844,6 +852,8 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryEdges(*body); }};
         if (method == http::verb::post && is({"v1", "query", "relationships"}))
             return {readers.get(), [this, body] { return queryRelationships(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "selected-inputs"}))
+            return {readers.get(), [this, body] { return querySelectedInputs(*body); }};
         if (method == http::verb::post && is({"v1", "query", "count"}))
             return {readers.get(), [this, body] { return queryCount(*body); }};
         if (method == http::verb::post && is({"v1", "query", "graph"}))
@@ -901,6 +911,8 @@ struct ServerState {
             return work();
         } catch (const TransactionConflict& conflict) {
             return jsonReply(transactionConflictToJson(conflict), http::status::conflict);
+        } catch (const StoreBusy& e) {
+            return jsonReply(Json{{"error", e.what()}, {"store_busy", true}}.dump(), http::status::conflict);
         } catch (const MissingPayloads& missing) {
             return jsonReply(Json{{"error", missing.what()}, {"missing", missing.hashes()}}.dump(),
                              http::status::unprocessable_entity);
