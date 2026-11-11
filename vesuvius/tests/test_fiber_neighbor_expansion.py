@@ -107,3 +107,25 @@ def test_paired_neighbor_publishes_verified_baseline_manifest(tmp_path, monkeypa
     monkeypatch.setattr(pair.subprocess,'run',execute)
     pair.run(dict(dataset=str(dataset),output_root=str(root),base_config=str(base),
                   gt_root='fixture',devices=['0','1']))
+
+
+def test_expansion_checks_parent_evidence_before_sampling(tmp_path, monkeypatch):
+    import json
+    import pytest
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_neighbor_expansion as expansion
+    from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
+
+    seed=tmp_path/'seed'
+    seed.mkdir()
+    (seed/'config.json').write_text('{}')
+    parent=tmp_path/'tensors.npz'
+    saved=dict(fibers='old',fiber_source=dict(commit_sequence=1))
+    parent.with_suffix('.json').write_text(json.dumps(dict(signature=saved)))
+    def verify(path,signature):
+        assert path=='source' and signature==saved
+        raise ValueError('Saved fiber source differs')
+    monkeypatch.setattr(fiber_store,'verify_fiber_signature',verify)
+    monkeypatch.setattr(fiber_store,'fiber_catalog',lambda *args,**kwargs:pytest.fail('Sampled stale source'))
+    with pytest.raises(ValueError,match='Saved fiber source differs'):
+        expansion.run(dict(seed_solve=str(seed),parent_tensors=str(parent),
+                           fibers='source',output_root=str(tmp_path/'output')))

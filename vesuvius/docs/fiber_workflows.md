@@ -68,6 +68,9 @@ tensors. A new joint solve also needs that layout's `summary.json` with the
 saved tensor source signature and the prepared baseline's `inputs.json` with its
 source digest, alongside `tensors.npz` and `gt_events.json`. Paired-neighbor
 preparation emits the manifest after validating the dataset's saved source.
+Neighbor expansion verifies the parent `tensors.json` signature before reading
+its source curves, so the exported source digest describes the original tensor
+evidence rather than whichever geometry is current at expansion time.
 Regenerate old preparation artifacts that never recorded this evidence; do not
 stamp them with current geometry. Existing report-only runs do not need new input
 manifests. These schemas are also checked by the
