@@ -170,10 +170,11 @@ ObjectRevision revisionFrom(const Json& j)
     r.metadataComplete = j.at("metadata_complete").get<bool>();
     r.publishedAtUs = intFrom(j.at("published_at_us"));
     r.deleted = j.at("deleted").get<bool>();
-    r.version = j.at("version").get<int64_t>();
+    r.version = versionNumberFrom(j.at("version"));
     r.generation = j.at("generation").get<std::string>();
     r.storeUuid = j.at("store").get<std::string>();
-    r.commitSequence = intFrom(j.at("commit_sequence"));
+    r.commitSequence = j.at("commit_sequence").is_null() ? std::nullopt :
+        std::optional(commitSequenceFrom(j.at("commit_sequence")));
     const auto& record = j.at("record");
     r.record = exactMetaFrom(record, objectFromJson(record));
     commonFromJson(record, r.record);
@@ -345,7 +346,7 @@ RelationshipRevision relationshipFrom(const Json& j)
     r.bRevision = j.at("b_revision").get<std::string>();
     r.aGeometryRevision = textFrom(j.at("a_geometry_revision"));
     r.bGeometryRevision = textFrom(j.at("b_geometry_revision"));
-    r.version = j.at("version").get<int64_t>();
+    r.version = versionNumberFrom(j.at("version"));
     r.generation = j.at("generation").get<std::string>();
     r.aReference = objectVersionFrom(j.at("a_reference"));
     r.bReference = objectVersionFrom(j.at("b_reference"));
@@ -401,7 +402,7 @@ static void versionToJson(const RecordCommon& record, Json& j)
 static void versionFromJson(const Json& j, RecordCommon& record)
 {
     if (!j.contains("version")) return;
-    record.version = j.at("version").get<int64_t>();
+    record.version = versionNumberFrom(j.at("version"));
     record.versionGeneration = j.at("version_generation").get<std::string>();
     record.versionStoreUuid = j.at("version_store").get<std::string>();
 }

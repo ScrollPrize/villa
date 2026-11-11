@@ -145,8 +145,9 @@ nb::dict selectionRecordToPy(const vo::SelectionRecord& r)
 vo::SelectionRecord selectionRecordFromPy(const nb::dict& d)
 {
     vo::SelectionRecord r;
-    r.storeUuid = nb::cast<std::string>(d["store"]); r.generation = nb::cast<std::string>(d["generation"]);
-    r.commitSequence = nb::cast<int64_t>(d["commit_sequence"]);
+    const auto position = vo::detail::storePositionFrom(nlohmann::json::parse(jsonDumps(d)));
+    r.storeUuid = position.storeUuid; r.generation = position.generation;
+    r.commitSequence = position.commitSequence;
     r.queryJson = nb::isinstance<nb::str>(d["query"]) ? nb::cast<std::string>(d["query"]) : jsonDumps(d["query"]);
     r.transforms = objectVersionsFromPy(d["transforms"]);
     r.objects = objectVersionsFromPy(d["objects"]);

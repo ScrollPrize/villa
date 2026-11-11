@@ -35,10 +35,6 @@ uint32_t getU32(const uint8_t* p)
     return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
 }
 
-std::string uuidField(const Json& j, const char* key)
-{
-    return formatUuid(parseUuid(j.at(key).get<std::string>()));
-}
 } // namespace
 
 std::vector<uint8_t> encodeSelectionRecord(const SelectionRecord& record)
@@ -53,10 +49,11 @@ std::vector<uint8_t> encodeSelectionRecord(const SelectionRecord& record)
     }
     auto transforms = Json::array();
     for (const auto& transform : record.transforms) transforms.push_back(detail::objectVersionJson(transform));
-    const auto header = Json{{"store", record.storeUuid}, {"generation", record.generation},
-                             {"commit_sequence", record.commitSequence}, {"query", Json::parse(record.queryJson)},
-                             {"transforms", std::move(transforms)}, {"origins", origins},
-                             {"count", record.objects.size()}}.dump();
+    auto headerValue = detail::storePositionJson(detail::storePositionFrom(
+        {{"store", record.storeUuid}, {"generation", record.generation}, {"commit_sequence", record.commitSequence}}));
+    headerValue.update({{"query", Json::parse(record.queryJson)}, {"transforms", std::move(transforms)},
+                        {"origins", origins}, {"count", record.objects.size()}});
+    const auto header = headerValue.dump();
     if (header.size() > std::numeric_limits<uint32_t>::max())
         throw std::invalid_argument("selection record: header too large");
     std::vector<uint8_t> out(kMagic, kMagic + sizeof kMagic);
@@ -84,12 +81,13 @@ SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
     if (headerBytes > bytes.size() - sizeof kMagic - 4) throw bad("truncated header");
     SelectionRecord record;
     std::vector<std::pair<std::string,std::string>> origins;
-    uint64_t count = 0;
+    const auto count = (bytes.size() - entriesAt) / kEntryBytes;
     try {
         const auto header = Json::parse(bytes.begin() + sizeof kMagic + 4, bytes.begin() + entriesAt);
-        record.storeUuid = uuidField(header, "store");
-        record.generation = uuidField(header, "generation");
-        record.commitSequence = header.at("commit_sequence").get<int64_t>();
+        const auto position = detail::storePositionFrom(header);
+        record.storeUuid = position.storeUuid;
+        record.generation = position.generation;
+        record.commitSequence = position.commitSequence;
         record.queryJson = header.at("query").dump();
         for (const auto& t : header.at("transforms")) {
             const auto reference = detail::objectVersionFrom(t);
@@ -100,11 +98,12 @@ SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
             if(!origin.is_array()||origin.size()!=2)throw bad("invalid origin");
             origins.emplace_back(formatUuid(parseUuid(origin.at(0).get<std::string>())),formatUuid(parseUuid(origin.at(1).get<std::string>())));
         }
-        count = header.at("count").get<uint64_t>();
+        if (!header.at("count").is_number_integer() || header.at("count") != count)
+            throw bad("entry count does not match its length");
     } catch (const Json::exception& e) {
         throw bad(std::string("malformed header: ") + e.what());
     }
-    if ((bytes.size() - entriesAt) % kEntryBytes != 0 || (bytes.size() - entriesAt) / kEntryBytes != count)
+    if ((bytes.size() - entriesAt) % kEntryBytes != 0)
         throw bad("entry count does not match its length");
     record.objects.reserve(count);
     for (std::size_t at = entriesAt; at < bytes.size(); at += kEntryBytes) {

@@ -73,3 +73,20 @@ def test_manifest_membership_uses_complete_native_references(db):
                     {'objects': [dict(entry, version=True)]}, {'objects': [dict(entry, version=1.5)]}):
         with pytest.raises((ValueError, RuntimeError)):
             manifest_references(invalid)
+
+
+@pytest.mark.parametrize('value', [True, 1.5, -0.5, '1', -1, 2**63])
+def test_selection_artifacts_share_strict_position_ingress(db, value):
+    import struct
+    from vc_object_store import encode_selection_record, decode_selection_record
+    record = dict(db.status(), query={}, transforms=[], objects=[])
+    encoded = encode_selection_record(record)
+    with pytest.raises(ValueError, match='commit_sequence'):
+        encode_selection_record(dict(record, commit_sequence=value))
+    length, = struct.unpack('<I', encoded[8:12])
+    header = json.loads(encoded[12:12 + length])
+    for field in ('commit_sequence', 'count'):
+        changed = json.dumps(dict(header, **{field: value})).encode()
+        malformed = encoded[:8] + struct.pack('<I', len(changed)) + changed + encoded[12 + length:]
+        with pytest.raises(ValueError, match='commit_sequence' if field == 'commit_sequence' else 'entry count'):
+            decode_selection_record(malformed)

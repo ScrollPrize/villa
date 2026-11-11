@@ -46,6 +46,30 @@ try {
     OpenOptions options; options.author = "selections-test";
     auto store = std::make_unique<ObjectStore>(ObjectStore::create(path, options));
     const auto initial = [&] { auto txn = store->read(); return store->status(txn); }();
+    {
+        ObjectRecord sample; sample.uuid = util::newUuid(); sample.kind = "note";
+        sample.version = 1; sample.versionGeneration = initial.generation; sample.versionStoreUuid = initial.storeUuid;
+        ObjectRevision selected; selected.objectUuid = sample.uuid; selected.storeUuid = initial.storeUuid;
+        selected.generation = initial.generation; selected.version = 1; selected.record = sample;
+        const auto revision = nlohmann::json::parse(objectRevisionToJson(selected));
+        for (const auto* field : {"commit_sequence", "version", "approved_version"}) {
+            const std::vector<nlohmann::json> malformed{true, 1.5, "1", -1, uint64_t(INT64_MAX) + 1};
+            for (const auto& value : malformed) {
+                auto snapshot = revision; snapshot["record"][field] = value;
+                require(rejects([&] { objectRevisionFromJson(snapshot.dump()); }),
+                        (std::string("snapshot scalar rejects coercion: ") + field).c_str());
+                auto projected = nlohmann::json::parse(objectQueryResultToJson(initial, {sample}, std::nullopt));
+                projected["objects"][0][field] = value;
+                require(rejects([&] { objectQueryResultFromJson(projected.dump(), nullptr); }),
+                        (std::string("projected record scalar rejects coercion: ") + field).c_str());
+                if (std::string_view(field) != "approved_version") {
+                    auto envelope = revision; envelope[field] = value;
+                    require(rejects([&] { objectRevisionFromJson(envelope.dump()); }),
+                            (std::string("selected record envelope rejects coercion: ") + field).c_str());
+                }
+            }
+        }
+    }
     auto request = [&](VersionSelection expected, std::vector<TransactionOperation> operations) {
         TransactionRequest r;
         r.requestUuid = util::newUuid(); r.storeUuid = initial.storeUuid; r.generation = initial.generation;
@@ -105,6 +129,20 @@ try {
         for (int i = 0; i < 4; ++i) header |= uint32_t(bytes[8 + i]) << (8 * i);
         require(bytes.size() == 12 + header + 24 * captured.objects.size(), "24 bytes per entry");
         require(decodeSelectionRecord(bytes) == captured, "round trip");
+        auto negative = captured; negative.commitSequence = -1;
+        require(rejects([&] { encodeSelectionRecord(negative); }), "native encoder rejects negative position");
+        for (const auto* field : {"commit_sequence", "count"})
+        for (const nlohmann::json invalid : {nlohmann::json(true), nlohmann::json(1.5), nlohmann::json(-0.5),
+                                           nlohmann::json("1"), nlohmann::json(-1), nlohmann::json(uint64_t(INT64_MAX) + 1)}) {
+            auto document = nlohmann::json::parse(bytes.begin() + 12, bytes.begin() + 12 + header);
+            document[field] = invalid;
+            const auto text = document.dump();
+            std::vector<uint8_t> malformed(bytes.begin(), bytes.begin() + 8);
+            for (int i = 0; i < 4; ++i) malformed.push_back(uint8_t(text.size() >> (8 * i)));
+            malformed.insert(malformed.end(), text.begin(), text.end());
+            malformed.insert(malformed.end(), bytes.begin() + 12 + header, bytes.end());
+            require(rejects([&] { decodeSelectionRecord(malformed); }), "artifact counters reject coercion");
+        }
         auto corrupt = bytes; corrupt[0] = 'X';
         require(rejects([&] { decodeSelectionRecord(corrupt); }), "bad magic");
         require(rejects([&] { decodeSelectionRecord(std::span(bytes).first(bytes.size() - 1)); }), "truncated entries");
