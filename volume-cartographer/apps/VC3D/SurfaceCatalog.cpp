@@ -282,6 +282,24 @@ void SurfaceCatalog::Crossings::requireComplete() const
         throw std::runtime_error("Incomplete surface intersections; fetch the missing surfaces or narrow the selection before deriving annotations");
 }
 
+SurfaceCatalog::Crossings SurfaceCatalog::RegionInput::region(const RegionSlice& slice,
+                                                             const std::function<bool()>& cancelled) const
+{
+    auto remaining = options;
+    auto& selected = remaining.uuids.value();
+    std::erase_if(selected, [&](const auto& uuid) { return displayed.contains(uuid); });
+    Crossings result;
+    // A resident-only selection needs no store query.
+    if (!selected.empty()) result = SurfaceCatalog::region(*session, sources, volume, slice, remaining, cancelled);
+    for (const auto& [uuid, surface] : displayed) {
+        if (cancelled && cancelled()) { result.complete = false; break; }
+        auto crossings = surface->region(uuid, slice, [&](const auto&) { return cancelled && cancelled(); }, options.outputByteBudget);
+        result.complete = result.complete && crossings.complete();
+        for (auto& run : crossings.runs) result.runs.push_back(std::move(run));
+    }
+    return result;
+}
+
 SurfaceCatalog::Crossings SurfaceCatalog::region(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources,
                                                  const VolumeVoxels& volume, const RegionSlice& slice, RegionOptions options,
                                                  const std::function<bool()>& cancelled)

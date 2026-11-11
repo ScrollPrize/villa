@@ -422,7 +422,8 @@ int runViewerRegressionTests()
             PlaneSurface plane({8, 8, 8}, {1, 0, 0});
             const auto slab = StoreSurfaceOverlayController::planeSlab(plane);
             require(slab.has_value(), "the plane slab is valid");
-            const auto crossings = overlay.draftRuns({scaled->id}, *slab);
+            const auto crossings = SurfaceCatalog::RegionInput{state.objectStoreSession(), {}, VolumeVoxels(voxels),
+                RegionOptions{.uuids = std::vector<std::string>{scaled->id}}, {}}.region(vc3d::store::regionSlice(*slab)).runs;
             require(!crossings.empty() && std::abs(crossings.front().points.front()[2] - 8) < 1e-5,
                     "the selected surface has plane intersections");
             state.objectStoreSession()->clearDraft(scaled->id);
@@ -431,10 +432,9 @@ int runViewerRegressionTests()
             StoreSurfaceOverlayController::OverlayBuilder selectedLines(idle);
             overlay.collectPrimitives(idle, selectedLines);
             const auto& selectedView = *overlay._views.at(idle);
-            pump([&] { return !selectedView.cutRequests.busy && !selectedView.residentRuns.empty(); },
+            pump([&] { return !selectedView.region.busy && selectedView.runs.contains("") && !selectedView.runs.at("").empty(); },
                  "displayed plane intersections complete asynchronously");
-            require(selectedView.targets.empty() && !selectedView.residentRuns.empty() &&
-                    std::abs(selectedView.residentRuns.front().points.front()[2] - 8) < 1e-5,
+            require(std::abs(selectedView.runs.at("").front().points.front()[2] - 8) < 1e-5,
                     "plane overlays use the displayed grid rather than querying the UUID's current head");
             auto anotherSelection = std::make_shared<QuadSurface>(scaled->rawPoints().clone(), scaled->scale());
             anotherSelection->id = scaled->id;
@@ -442,10 +442,9 @@ int runViewerRegressionTests()
             state.setSurface("segmentation", anotherSelection, false, true);
             StoreSurfaceOverlayController::OverlayBuilder switchedLines(idle);
             overlay.collectPrimitives(idle, switchedLines);
-            pump([&] { return !selectedView.cutRequests.busy && !selectedView.residentRuns.empty(); },
+            pump([&] { return !selectedView.region.busy && selectedView.runs.contains("") && !selectedView.runs.at("").empty(); },
                  "changed displayed plane intersections complete asynchronously");
-            require(!selectedView.residentRuns.empty() &&
-                    std::abs(selectedView.residentRuns.front().points.front()[2] - 6) < 1e-5,
+            require(std::abs(selectedView.runs.at("").front().points.front()[2] - 6) < 1e-5,
                     "same-UUID selection changes replace orthogonal-plane intersections");
             viewer->quiesceForClose();
         }

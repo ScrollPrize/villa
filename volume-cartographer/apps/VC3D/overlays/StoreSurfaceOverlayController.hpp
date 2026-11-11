@@ -1,8 +1,7 @@
 #pragma once
-#include <vc_object_store/objects/ResidentSurface.hpp>
-
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "ObjectStoreRegions.hpp"
+#include "SurfaceCatalog.hpp"
 
 #include <QPolygonF>
 #include <QString>
@@ -26,8 +25,7 @@ class QuadSurface;
 //    view region;
 //  - surface viewers: intersect the displayed immutable grid (current, historical
 //    or draft) through the same resident/store intersection kernel.
-// Drafts change while they are edited, so their lines are cut on the spot;
-// stored surfaces are read on the thread pool. Catalog placeholders reached
+// All selected geometry is cut on the thread pool. Catalog placeholders reached
 // are fetched one at a time in the background and drawn as each arrives.
 class StoreSurfaceOverlayController : public ViewerOverlayControllerBase
 {
@@ -58,7 +56,7 @@ protected:
 
 private:
     struct Listing {
-        std::vector<Run> runs;
+        std::map<std::string, std::vector<Run>> runs;
         bool complete = true;
         std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> remote;
     };
@@ -66,28 +64,22 @@ private:
     struct PlaneCut {
         std::string plane;
         vc3d::store::Region slab;
+        bool operator==(const PlaneCut&) const = default;
     };
     struct View {
-        // Plane viewers: stored targets in the view's region.
+        // One request lifecycle and result set for every geometry source.
         vc3d::store::RegionRequests region;
         std::optional<vc3d::store::Region> displayed;
         QRectF displayedRect;
         std::vector<std::string> targets;
-        std::vector<Run> runs;
+        std::map<std::string, std::vector<Run>> runs;
         std::uint64_t runsVersion{0};
         // Stored lines are a group of their own, drawn for this camera and
         // style: a pan only moves them.
-        // Drafts cut over the whole plane, at their revisions.
-        std::optional<vc3d::store::Region> draftSlab;
-        std::vector<std::string> drafted;
         std::vector<std::uint64_t> draftRevisions;
-        std::vector<Run> draftRuns;
-        std::map<std::string, std::shared_ptr<QuadSurface>> displayedSurfaces;
-        std::vector<Run> residentRuns;
-        std::optional<vc3d::store::Region> residentSlab;
+        std::map<std::string, std::shared_ptr<const vc::objects::ResidentSurface>> displayedSurfaces;
         struct Drawn {
             std::uint64_t runsVersion{0}, styleVersion{0};
-            std::vector<std::uint64_t> draftRevisions;
             QPointF origin, axisU, axisV;
             cv::Vec3f planeOrigin, planeNormal;
             std::vector<float> offsets;
@@ -98,18 +90,10 @@ private:
         std::optional<Drawn> drawn;
         bool dirty{true};
         bool refreshPending{false};
-        // Surface viewers: the planes' cuts of a stored surface.
+        // Cutting planes; plane viewers use an unnamed viewport cut.
         std::vector<PlaneCut> cuts;
-        std::map<std::string, std::vector<Run>> planeRuns;
-        vc3d::store::RegionRequests cutRequests;
-        std::string cutObject;
-        const QuadSurface* cutDisplayed = nullptr;
-        std::shared_ptr<const vc::objects::ResidentSurface> cutSurface;
-        bool cutsStale{false};
     };
-    void request(VolumeViewerBase* viewer, const vc3d::store::Region& region, const std::vector<std::string>& uuids);
-    using ResidentSurfaces = std::map<std::string, std::shared_ptr<const vc::objects::ResidentSurface>>;
-    void requestCuts(VolumeViewerBase* viewer, const ResidentSurfaces& surfaces, const std::vector<PlaneCut>& cuts, bool planeViewer = false);
+    void request(VolumeViewerBase* viewer, const SurfaceCatalog::RegionInput& input, const std::vector<PlaneCut>& cuts);
     // Fetch placeholders' geometry (not already fetching or failed); each
     // arrival is a commit, which reads the views again.
     void fetch(const std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>>& remote);
@@ -135,8 +119,6 @@ private:
     LineStyle lineStyle(VolumeViewerBase* viewer) const;
     void addLines(VolumeViewerBase* viewer, const std::vector<Run>& runs, const LineStyle& style,
                   OverlayBuilder& builder) const;
-    // Drafts among `uuids`, cut synchronously.
-    std::vector<Run> draftRuns(const std::vector<std::string>& uuids, const vc3d::store::Region& slab) const;
     void drawPlaneViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder);
     void drawSurfaceViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder);
     std::shared_ptr<vc::objects::ResidentSurface> residentSurface(QuadSurface& surface);

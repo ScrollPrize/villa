@@ -57,6 +57,53 @@ void storeSurface(ObjectStoreSession& session, const AttachmentIdentity& attachm
     session.submit(attachment, request);
 }
 
+void checkSelectedRegionInput(const fs::path& directory)
+{
+    const auto path = directory / "selected-region.vcobj";
+    OpenOptions open; open.author = "selected-region-test";
+    { auto store = ObjectStore::create(path, open); }
+    auto session = std::make_shared<ObjectStoreSession>();
+    const auto attachment = session->attach(path, open);
+    const auto grid = [](float z) {
+        return vc::geometry::Surface{2, 2, {1, 1}, {{0,0,z}, {2,0,z}, {0,2,z}, {2,2,z}}};
+    };
+    ObjectRecord a; a.uuid = util::newUuid(); a.kind = "surface";
+    a.meta = nlohmann::json{{"coordinates", volumeCoordinates("vol", 1)}}.dump();
+    ObjectRecord b = a; b.uuid = util::newUuid();
+    storeSurface(*session, attachment, a, vc::geometry::encode(grid(1)));
+    storeSurface(*session, attachment, b, vc::geometry::encode(grid(2)));
+    session->setDraft(a.uuid, grid(4), volumeCoordinates("vol", 1));
+    session->setDraft(b.uuid, grid(6), volumeCoordinates("vol", 1));
+    RegionSlice slice;
+    slice.origin = {0, 1, 0}; slice.u = {1, 0, 0}; slice.v = {0, 0, 1}; slice.normal = {0, 1, 0};
+    slice.localBounds = {-1, -1, -1, 3, 10, 1};
+    RegionOptions options; options.uuids = {a.uuid, b.uuid};
+    SurfaceCatalog::RegionInput input{session, {attachment}, {"vol", 1}, options,
+        {{a.uuid, std::make_shared<ResidentSurface>(grid(8))}}};
+    const auto zFor = [](const auto& result, const auto& uuid, double z) {
+        return std::any_of(result.runs.begin(), result.runs.end(), [&](const auto& run) {
+            return run.objectUuid == uuid && !run.points.empty() && std::abs(run.points.front()[2] - z) < 1e-5;
+        });
+    };
+    auto result = input.region(slice);
+    require(result.complete && result.runs.size() == 2 && zFor(result, a.uuid, 8) && zFor(result, b.uuid, 6),
+            "one query preserves displayed geometry over drafts, and drafts over stored heads");
+    session->clearDraft(b.uuid);
+    result = input.region(slice);
+    require(result.runs.size() == 2 && zFor(result, b.uuid, 2), "the same input queries stored geometry without a draft");
+    input.options.uuids = {a.uuid};
+    result = input.region(slice);
+    require(result.runs.size() == 1 && zFor(result, a.uuid, 8), "resident-only input never queries all stored surfaces");
+    auto changed = input;
+    changed.displayed[a.uuid] = std::make_shared<ResidentSurface>(grid(9));
+    require(zFor(changed.region(slice), a.uuid, 9) && zFor(input.region(slice), a.uuid, 8),
+            "same-UUID selection changes do not mutate an in-flight input's displayed geometry");
+    result = input.region(slice, [] { return true; });
+    require(!result.complete && result.runs.empty(), "cancelled selected queries cannot install geometry");
+    input.displayed.clear(); input.options.uuids = std::vector<std::string>{};
+    require(input.region(slice).runs.empty(), "an empty selection stays empty");
+}
+
 void checkCorrectionSnapshots(const fs::path& directory)
 {
     SurfaceCatalog::Crossings crossings;
@@ -478,6 +525,7 @@ int main(int argc, char** argv)
         checkReferencedSurfaceSelections(fs::path(dir.path().toStdString()));
         checkCorrectionSnapshots(fs::path(dir.path().toStdString()));
         checkToolMappingGuards(fs::path(dir.path().toStdString()));
+        checkSelectedRegionInput(fs::path(dir.path().toStdString()));
         if (argc > 1) checkDraftRecovery(argv[1], fs::path(dir.path().toStdString()));
         const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
         const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
