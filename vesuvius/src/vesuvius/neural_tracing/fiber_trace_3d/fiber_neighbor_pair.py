@@ -32,7 +32,12 @@ def run(settings):
     paths=[Path(settings['base_config']),dataset/'summary.json',
            dataset/'tensors.npz',dataset/'cross/cross_events.json',Path(__file__)]
     if settings.get('optimum'):paths.append(Path(settings['optimum']))
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest,verify_fiber_source
+    dataset_input=dataset/'inputs.json'
+    evidence=json.loads(dataset_input.read_text())
+    digest=evidence['fibers']
+    pin=verify_fiber_source(cfg['fibers'],digest,evidence.get('fiber_source'))
+    paths.append(dataset_input)
     signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},
                    selected_fibers=fibers_digest(dataset/'selected.vcobj'))
     manifest=root/'inputs.json'
@@ -48,6 +53,7 @@ def run(settings):
     events=remap_events(json.loads((dataset/'cross/cross_events.json').read_text())['events'],d)
     atomic_write(prepared/'gt_events.json',events,durable=False)
     atomic_write(prepared/'selection.json',audit,durable=False)
+    atomic_write(prepared/'inputs.json',dict(fibers=digest,fiber_source=pin),durable=False)
     def execute(name,request,done):
         path=root/(name+'.json');atomic_write(path,request,durable=False)
         if not done.exists():

@@ -110,7 +110,7 @@ def run(settings):
     if width_source and settings.get('initialization_stages'):
         raise ValueError('Width diagnostic requires fresh fiber state')
     if width_source.get('solution'):paths.append(Path(width_source['solution']))
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},fiber_source=source_version,
                    fibers=dict(selected=fibers_digest(dataset/'selected.vcobj'),
                                source=fibers_digest(config['fibers'],source_version=source_version)))
     stamp=root/'inputs.json'

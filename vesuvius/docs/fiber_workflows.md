@@ -64,8 +64,13 @@ Minimal selected-set job:
 `base.json` wraps the solver config under `fiber_implicit_winding`. The selected
 dataset contains `selected.vcobj`, `tensors.npz` and `cross/cross_events.json`.
 `gt_root/uv_whole` contains the trusted `config.json`, `solution.npz` and referenced
-tensors. Joint evaluation uses a prepared baseline's `tensors.npz` and
-`gt_events.json`. These schemas are also checked by the
+tensors. A new joint solve also needs that layout's `summary.json` with the
+saved tensor source signature and the prepared baseline's `inputs.json` with its
+source digest, alongside `tensors.npz` and `gt_events.json`. Paired-neighbor
+preparation emits the manifest after validating the dataset's saved source.
+Regenerate old preparation artifacts that never recorded this evidence; do not
+stamp them with current geometry. Existing report-only runs do not need new input
+manifests. These schemas are also checked by the
 [three-arm replay benchmark](fiber_layout_benchmark.md).
 Editable samples: [selected-set evaluation](examples/fiber_workflows/selected_dataset.json),
 [GT inclusion](examples/fiber_workflows/joint_gt.json), and

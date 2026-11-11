@@ -66,7 +66,10 @@ def run(settings):
     cfg=json.loads(Path(settings['base_config']).read_text())['fiber_implicit_winding']
     cfg.update(settings.get('execution_parameters',{}))
     forced=settings.get('force_gt_enabled',True)
-    gt_summary=json.loads((gt/'uv_whole/summary.json').read_text())
+    gt_evidence=gt/'uv_whole/summary.json'
+    if not gt_evidence.exists():
+        raise ValueError('GT tensors have no saved run summary; regenerate the GT layout before a new joint solve')
+    gt_summary=json.loads(gt_evidence.read_text())
     gc=gt_summary['config']
     gt_digest,gt_version=verify_fiber_signature(gc['fibers'],gt_summary.get('input',{}).get('signature',{}))
     if cfg.get('optimizer_kind')!='scaled_lbfgs':raise ValueError('Forced subset currently supported by scaled L-BFGS only')
@@ -74,6 +77,8 @@ def run(settings):
     events=remap_events(json.loads((baseline/'gt_events.json').read_text()),d)
     merged,ids,filtered=combine(d,gd,events,cfg)
     inputs=baseline/'inputs.json'
+    if not inputs.exists():
+        raise ValueError('Baseline tensors have no saved input manifest; regenerate the prepared baseline')
     parent=json.loads(inputs.read_text())
     baseline_digest=parent.get('fibers')
     if isinstance(baseline_digest,dict):
@@ -81,7 +86,7 @@ def run(settings):
     if not baseline_digest:
         raise ValueError('Baseline tensors have no saved fiber source; regenerate frozen evidence')
     baseline_version=verify_fiber_source(cfg['fibers'],baseline_digest,parent.get('fiber_source'))
-    paths=[Path(settings['base_config']),inputs,baseline/'tensors.npz',baseline/'gt_events.json',Path(gc['tensor_cache'])]
+    paths=[Path(settings['base_config']),inputs,baseline/'tensors.npz',baseline/'gt_events.json',gt_evidence,Path(gc['tensor_cache'])]
     signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},
                    baseline_fibers=baseline_digest,baseline_source=baseline_version,
                    gt_fibers=gt_digest,gt_source=gt_version)
