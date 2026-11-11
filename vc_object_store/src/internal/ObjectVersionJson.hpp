@@ -43,4 +43,42 @@ inline ObjectVersion canonicalObjectVersion(ObjectVersion ref)
     ref.objectUuid = util::canonicalUuid(ref.objectUuid);
     return ref;
 }
+inline nlohmann::json objectVersionsJson(const std::vector<ObjectVersion>& refs)
+{
+    auto result = nlohmann::json::array();
+    for (const auto& ref : refs) result.push_back(objectVersionJson(ref));
+    return result;
+}
+inline std::vector<ObjectVersion> objectVersionsFrom(const nlohmann::json& refs)
+{
+    if (!refs.is_array()) throw std::invalid_argument("object references must be an array");
+    std::vector<ObjectVersion> result;
+    for (const auto& ref : refs) result.push_back(objectVersionFrom(ref));
+    return result;
+}
+// StoreStatus also carries the position of a read snapshot. FeedCursor is only
+// for change-feed pagination, never a second spelling of that position.
+inline nlohmann::json storePositionJson(const StoreStatus& status)
+{ return {{"store", status.storeUuid}, {"generation", status.generation}, {"commit_sequence", status.commitSequence}}; }
+inline StoreStatus storePositionFrom(const nlohmann::json& value)
+{
+    const auto& sequence = value.at("commit_sequence");
+    if (!sequence.is_number_integer() || (sequence.is_number_unsigned() && sequence.get<uint64_t>() > uint64_t(INT64_MAX)) || sequence.get<int64_t>() < 0)
+        throw std::invalid_argument("commit_sequence must be a nonnegative int64");
+    return {util::canonicalUuid(value.at("store").get<std::string>()), util::canonicalUuid(value.at("generation").get<std::string>()), sequence.get<int64_t>()};
+}
+inline nlohmann::json storeStatusJson(const StoreStatus& status)
+{
+    auto value = storePositionJson(status);
+    value.update({{"feed_start", status.feedStart}, {"history_enabled", status.historyEnabled}, {"extensions_present", status.extensionsPresent}});
+    return value;
+}
+inline StoreStatus storeStatusFrom(const nlohmann::json& value)
+{
+    auto status = storePositionFrom(value);
+    status.feedStart = value.at("feed_start").get<int64_t>();
+    status.historyEnabled = value.at("history_enabled").get<bool>();
+    status.extensionsPresent = value.at("extensions_present").get<bool>();
+    return status;
+}
 }

@@ -10,7 +10,7 @@ SurfaceGrid surfaceGrid(const StoreReader& reader, const ObjectRevision& selecte
     // The geometry this version names, so record and grid come from one read.
     const auto canonical = GeometrySnapshot(reader).surface(selected);
     try {
-        const auto view = canonical.viewTransformedAt(selected, volume, targetScale);
+        const auto view = canonical.viewTransformedAt(volume, targetScale);
         return readSurfaceGrid(reader,selected,&view);
     } catch (const std::runtime_error& error) {
         throw std::invalid_argument("surface " + selected.objectUuid + " does not map to volume " + volume + ": " + error.what());

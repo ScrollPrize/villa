@@ -330,10 +330,9 @@ def adapter_metadata(kind, meta, fiber=None, track=None):
     return read
 
 
+@dataclasses.dataclass
 class StoredObject(SelectedObject):
-    def __init__(self, revision, frame=None):
-        super().__init__(revision)
-        self.frame = frame
+    frame: ObjectFrame = None
 
     @property
     def metadata_sha256(self):
@@ -455,20 +454,20 @@ def attached_data(record):
     """Whether an object is data attached to another (``meta.role``, e.g. fit
     results) rather than a fit input. The store's PCL-surface detector refuses
     such collections, so they are never selected as inputs."""
-    return record['kind'] == 'point_collection' and 'role' in (record.get('meta') or {})
+    return record.kind == 'point_collection' and 'role' in record.meta
 
 
 def outer_shell(record):
     """Whether an object is the scroll's outer shell (OUTER_SHELL_TAG): read
     on its own, never as a patch."""
-    return record['kind'] == 'surface' and OUTER_SHELL_TAG in (record.get('tags') or ())
+    return record.kind == 'surface' and OUTER_SHELL_TAG in record.tags
 
 
 def spiral_fit(record):
     """Whether an object is a committed Spiral fit (SPIRAL_FIT_TAG). Taking
     one in would make a fit's own output its next input, and change the input
     digest the commit recorded."""
-    return record['kind'] == 'surface' and SPIRAL_FIT_TAG in (record.get('tags') or ())
+    return record.kind == 'surface' and SPIRAL_FIT_TAG in record.tags
 
 
 def fit_input(record):
@@ -487,8 +486,8 @@ def resolve_selector(store, kind, selector, records=None):
     def matching(tag=None):
         if records is not None:
             return {uuid: record.reference for uuid, record in records.items()
-                    if record['kind'] == kind and not record.get('retired')
-                    and (tag is None or tag in (record.get('tags') or ()))
+                    if record.kind == kind and not record.retired
+                    and (tag is None or tag in record.tags)
                     and fit_input(record)}
         query = {} if tag is None else {'tag': tag}
         return {record.uuid: record.reference for record in map(SelectedRecord, store.select_objects(
@@ -504,13 +503,13 @@ def resolve_selector(store, kind, selector, records=None):
         if record is None:
             problems.append(f'selected {kind} {uuid} does not exist'
                             + ('' if records is None else ' at this position'))
-        elif record['kind'] != kind:
-            problems.append(f'selected {kind} {uuid} is a {record["kind"]}')
-        elif record.get('retired'):
+        elif record.kind != kind:
+            problems.append(f'selected {kind} {uuid} is a {record.kind}')
+        elif record.retired:
             problems.append(f'selected {kind} {uuid} is retired')
         elif attached_data(record):
             problems.append(f'selected {kind} {uuid} is attached data with role '
-                            f'{record["meta"]["role"]!r}, not a fit input')
+                            f'{record.meta["role"]!r}, not a fit input')
         elif outer_shell(record):
             problems.append(f'selected {kind} {uuid} is the outer shell (tagged '
                             f'{OUTER_SHELL_TAG}), not a patch')
@@ -731,7 +730,7 @@ def _shells_among(request, records, uuid=None):
     if uuid is not None:
         records = {uuid: records[uuid]} if uuid in records else {}
     return [record.reference for record in records.values()
-            if outer_shell(record) and not record.get('retired')]
+            if outer_shell(record) and not record.retired]
 
 
 def _one_shell(shells):
@@ -2305,7 +2304,7 @@ def read_link_marker(store):
     links' commit_sequence and each detector's report), or None."""
     from vc_object_store import link_marker_uuid
     record = current_record(store, link_marker_uuid())
-    return None if record is None else dict(record.get('meta') or {})
+    return None if record is None else dict(record.meta)
 
 
 def _link_marker_at(store, request, version):

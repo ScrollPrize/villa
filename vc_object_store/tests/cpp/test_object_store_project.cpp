@@ -371,9 +371,14 @@ int main() try
     }
     const auto legacyProject = session.attach(legacyPath, as("alice"));
     const auto newKey = projectResourceUuid(kVolumeResource, "/legacy");
-    updateProjectResourceMeta(session, legacyProject, newKey, {{"checked", true}});
+    bool rejectedAlias = false;
+    try { updateProjectResourceMeta(session, legacyProject, newKey, {{"checked", true}}); }
+    catch (const std::runtime_error&) { rejectedAlias = true; }
+    require(rejectedAlias, "unstored identity aliases are rejected");
+    updateProjectResourceMeta(session, legacyProject, legacy.uuid, {{"checked", true}});
     require(resources(session, legacyProject, kVolumeResource).front().uuid == legacy.uuid, "legacy UUID retained");
-    require(removeProjectResource(session, legacyProject, newKey), "new deterministic key addresses legacy resource");
+    require(!removeProjectResource(session, legacyProject, newKey), "new deterministic key is not an alias");
+    require(removeProjectResource(session, legacyProject, legacy.uuid), "stored UUID remains editable");
 
     // A resource of one owner (a path on their disk) is theirs alone, even at a path another uses.
     const std::string onDisk = "/home/user/predictions.zarr";

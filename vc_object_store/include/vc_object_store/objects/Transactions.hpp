@@ -37,6 +37,12 @@ class StoreBusy : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
+// An unreadable success/replay receipt does not prove the request failed.
+// Keep its pending identity; never resubmit under a fresh request UUID.
+class ReceiptDecodeError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct ObjectRecord;
 struct EdgeRecord;

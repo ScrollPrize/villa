@@ -683,7 +683,7 @@ std::vector<SelectedRelationship> HostedStore::relationshipsAt(const std::vector
     return relationshipQueryResultFromJson(expectOk(response, "relationship query").body, asOf);
 }
 
-SelectedInputs HostedStore::selectedInputs(const std::vector<ObjectVersion>& refs, const FeedCursor& position)
+SelectedInputs HostedStore::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position)
 {
     const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/selected-inputs",
         selectedInputsRequestToJson(refs, position), {{"Content-Type", "application/json"}});

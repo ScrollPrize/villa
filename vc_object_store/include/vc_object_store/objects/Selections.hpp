@@ -17,8 +17,8 @@
 //                  origins ([store, generation] pairs entries use), count
 //   count x 24 B   object UUID (16 bytes), u32 index into origins,
 //                  u32 version (little-endian)
-// Version 1 (single-store generation dictionary) remains readable. Version 2
-// transforms also include their owning store, independent of the query store.
+// Only version 2 is supported; every reference carries its owning store,
+// independent of the query store. Regenerate obsolete version-1 artifacts.
 
 #include <cstdint>
 #include <span>

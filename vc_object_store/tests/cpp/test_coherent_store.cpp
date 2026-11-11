@@ -403,9 +403,7 @@ void completeReceipts(HistoryMode mode){
     invalid["object_references"][f.a]=nlohmann::json::object();
     mustFail([&]{transactionReceiptFromJson(invalid.dump());});
     invalid.erase("object_references");
-    const auto legacy=transactionReceiptFromJson(invalid.dump());
-    require(legacy.objects==receipt.objects,"legacy receipts remain readable");
-    mustFail([&]{legacy.objectReference(f.a);});
+    mustFail([&]{transactionReceiptFromJson(invalid.dump());});
     const auto replay=store.submit(request);
     require(replay.replayed&&replay.objectReferences==receipt.objectReferences,"durable replay preserves reference identities");
     request.requestUuid=util::newUuid();request.expectedObjects.clear(); for (const auto& [id, ref] : receipt.objectReferences) expectObject(request, ref);
@@ -946,16 +944,42 @@ void selectedGraphCapture(HistoryMode mode)
 {
     Fixture f(mode, mode);
     auto store = ObjectStore::open(f.overlay, options(mode));
-    FeedCursor position;
+    StoreStatus position;
     {
         auto r = store.read(); LocalStoreReader reader(store, r);
-        const auto status = reader.status(); position = {status.storeUuid, status.generation, status.commitSequence};
+        const auto status = reader.status(); position = status;
         const auto selected = reader.selectedInputs({f.av, f.bv}, position);
+        const auto request = selectedInputsRequestToJson({f.av, f.bv}, position);
+        const auto [references, decodedPosition] = selectedInputsRequestFromJson(request);
+        require(references == std::vector{f.av, f.bv} && decodedPosition.commitSequence == status.commitSequence,
+                "capture uses one snapshot position, not a feed cursor");
+        auto obsolete = nlohmann::json::parse(request);
+        obsolete["position"]["sequence"] = status.commitSequence;
+        mustFail([&] { selectedInputsRequestFromJson(obsolete.dump()); });
         require(selected.objects.size() == 2 && selected.objects.front().reference() == f.av,
                 "selected graph keeps inherited complete references");
         require(selected.relationships.size() == 1 && selected.relationships.front().applicable,
                 "selected graph captures applicable inherited membership");
         const auto decoded = selectedInputsFromJson(selectedInputsToJson(status, selected));
+        for (const auto* family : {"objects", "relationships"}) {
+            auto malformed = nlohmann::json::parse(selectedInputsToJson(status, selected));
+            auto& item = malformed["inputs"][family][0];
+            auto& record = std::string_view(family) == "objects" ? item["record"] : item["relationship"]["record"];
+            record["meta"] = nlohmann::json::object();
+            mustFail([&] { selectedInputsFromJson(malformed.dump()); });
+        }
+        const auto objectQuery = objectQueryResultToJson(status, {selected.objects.front().record}, std::nullopt);
+        auto malformedObject = nlohmann::json::parse(objectQuery);
+        malformedObject["objects"][0]["meta"] = nlohmann::json::object();
+        mustFail([&] { objectQueryResultFromJson(malformedObject.dump(), nullptr); });
+        const auto edgeQuery = edgeQueryResultToJson(status, {selected.relationships.front().relationship.record}, std::nullopt);
+        auto malformedEdge = nlohmann::json::parse(edgeQuery);
+        malformedEdge["edges"][0]["meta"] = nlohmann::json::object();
+        mustFail([&] { edgeQueryResultFromJson(malformedEdge.dump(), nullptr); });
+        const auto projected = std::vector<std::string>{"uuid"};
+        require(objectQueryResultFromJson(objectQueryResultToJson(status, {selected.objects.front().record}, projected), nullptr).size() == 1 &&
+                edgeQueryResultFromJson(edgeQueryResultToJson(status, {selected.relationships.front().relationship.record}, projected), nullptr).size() == 1,
+                "projected wire metadata omission remains supported");
         require(decoded.objects.front().reference() == f.av && decoded.relationships.front().relationship.reference() ==
                 selected.relationships.front().relationship.reference(), "selected graph wire keeps full identities");
         GeometrySnapshot snapshot(reader);

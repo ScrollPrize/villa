@@ -29,8 +29,8 @@ public:
     // The live (or retired) current revision; optionally retain the winning tombstone.
     virtual std::optional<ObjectRevision> currentObject(const std::string& objectUuid, bool includeDeleted = false) const = 0;
     // External input boundary only: decode a standard reference, a wrapped
-    // reference, or a legacy UUID/numbered locator. Legacy current-owner
-    // selectors resolve once; complete references never require a live head.
+    // reference, current UUID discovery, or a store-qualified numbered locator.
+    // Ownerless saved selectors are rejected; exact inputs need no live head.
     ObjectVersion decodeObjectReference(const std::string& json) const;
     // One selector for geometry, artifacts and other versioned payloads. Number
     // selectors use the current owner; complete references need no current row.
@@ -54,7 +54,7 @@ public:
     // Capture exact objects and their relationship membership together. Root-local
     // history can replay numbered records; inherited membership requires the
     // requested root commit still to be current. Otherwise fail closed.
-    virtual SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const FeedCursor& position) const;
+    virtual SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus& position) const = 0;
     GraphReadView graphReadViewAt(const std::vector<ObjectVersion>&, const EdgeSelection& = {}) const;
     // Expand through recorded relationship endpoints, without current-head reads.
     // Explicit selections win. Other endpoints use the newest referenced version
@@ -191,6 +191,7 @@ public:
     std::optional<std::filesystem::path> resolveStoragePath(const std::string&,
         const std::optional<std::filesystem::path>& = std::nullopt) const override;
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const override;
+    SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus&) const override;
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override;
     std::optional<ObjectRevision> objectAtGeometry(const std::string& revisionUuid) const override;

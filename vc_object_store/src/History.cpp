@@ -67,8 +67,8 @@ namespace {
 using Json = nlohmann::json;
 
 // Archived revision UUIDs and ordinary four-field ObjectVersion references.
-// Both forms are binary in SQLite; only public/legacy boundaries use text.
-using SqlReference=std::variant<std::array<unsigned char,16>,std::array<uint8_t,56>,std::string>;
+// Both forms are binary in SQLite; public APIs use canonical text UUIDs.
+using SqlReference=std::variant<std::array<unsigned char,16>,std::array<uint8_t,56>>;
 SqlReference sqlReference(const ObjectRevisionKey& value)
 {
     if(const auto* ref=std::get_if<ObjectVersion>(&value))return versionReferenceBytes(*ref);
@@ -125,7 +125,7 @@ std::optional<std::string> optionalUuid(Statement& s, int column)
     return s.isNull(column) ? std::nullopt : std::optional(formatUuid(s.blob16(column)));
 }
 
-Json metadata(sqlite3* db, const ObjectRevisionKey& key, bool legacyTextUuid=false)
+Json metadata(sqlite3* db, const ObjectRevisionKey& key)
 {
     if(const auto* ref=std::get_if<ObjectVersion>(&key)) {
         const auto value=resolveObjectVersion(db,*ref);
@@ -133,15 +133,13 @@ Json metadata(sqlite3* db, const ObjectRevisionKey& key, bool legacyTextUuid=fal
         return objectToJson(value->revision.record);
     }
     const auto& revision = std::get<std::string>(key);
-    if(!legacyTextUuid){
-        db=resolveReference(db,[&](sqlite3* source){
-            if(!historyEnabled(source))return false;
-            Statement row(source,"SELECT 1 FROM object_revisions WHERE uuid=?",parseUuid(revision));return row.row();
-        });
-        if(!db)throw std::runtime_error("history: unavailable object revision");
-    }
+    db=resolveReference(db,[&](sqlite3* source){
+        if(!historyEnabled(source))return false;
+        Statement row(source,"SELECT 1 FROM object_revisions WHERE uuid=?",parseUuid(revision));return row.row();
+    });
+    if(!db)throw std::runtime_error("history: unavailable object revision");
     // Common case: the materialized head, without any history replay.
-    const SqlReference sqlKey=legacyTextUuid?SqlReference{revision}:SqlReference{parseUuid(revision)};
+    const auto sqlKey=parseUuid(revision);
     Statement current(db, "SELECT record FROM object_head_records WHERE revision_uuid=?", sqlKey);
     if (current.row()) return Json::parse(current.text(0));
     Statement chain(db,
@@ -234,11 +232,6 @@ Json currentRecord(sqlite3* db, const std::string& object)
     if (!row.row()) throw std::runtime_error("object history: endpoint missing");
     return objectToJson(readObjectRow(db, row));
 }
-}
-
-nlohmann::json detail::historicalDependencyMetadata(sqlite3* db,const std::string& revision,const Anchor& anchor,bool legacyTextUuid)
-{
-    return dependencyMetadata(metadata(db,revision,legacyTextUuid),anchor);
 }
 
 std::optional<ObjectRevisionKey> detail::currentObjectReference(sqlite3* db,const std::string& object)
@@ -592,7 +585,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
         Statement row(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=? AND state=0", parseUuid(e.uuid));
         if (row.row()) {
             e.record = readEdgeRow(db, row);
-            // Legacy snapshots can retain a different endpoint side order.
+            // Retained relationships can have a different endpoint side order.
             // Compare their historical pins in the current record's order.
             if(previous && previous->record.aUuid==e.record->bUuid && previous->record.bUuid==e.record->aUuid &&
                 previous->record.aUuid!=previous->record.bUuid){

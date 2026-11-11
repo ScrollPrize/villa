@@ -13,19 +13,19 @@ using Json = nlohmann::json;
 
 void sortByAdded(const StoreReader& reader, std::vector<ObjectRecord>& records)
 {
-    // Creation time is independent of the selected record's owner. For legacy
+    // Creation time is independent of the selected record's owner. For
     // rows tied in the same second, retain first-publication order where the
     // actual creation revision still belongs to that owner.
-    std::map<std::string, std::string> legacy;
+    std::map<std::string, std::string> precise;
     for (const auto& record : records) if (record.createdAt.size() == 20) {
         const auto history = reader.objectHistory(record.uuid, true);
-        legacy.emplace(record.uuid, detail::refineLegacyCreationStamp(record.createdAt,
+        precise.emplace(record.uuid, detail::refineCreationStamp(record.createdAt,
             !history.empty() && history.front().version == 1 ? history.front().publishedAtUs : std::nullopt));
     }
     const auto key = [&](const auto& record) {
-        const auto it = legacy.find(record.uuid);
+        const auto it = precise.find(record.uuid);
         return std::tuple(record.createdAt.empty(),
-                          std::string_view(it != legacy.end() ? it->second : record.createdAt),
+                          std::string_view(it != precise.end() ? it->second : record.createdAt),
                           std::string_view(record.uuid));
     };
     std::sort(records.begin(), records.end(), [&](const auto& a, const auto& b) {
@@ -50,28 +50,6 @@ RecordExpectation selectedExpectation(ObjectStoreSession& session, const Attachm
     return version;
 }
 
-std::string legacyResourceUuid(const ObjectRecord& record, const std::string& owner)
-{
-    return util::nameUuid("vc_project_resource/" + record.kind + "/" + record.storageRef +
-        (owner.empty() ? "" : "/owner/" + owner));
-}
-
-std::optional<ObjectRecord> resourceForEdit(const StoreReader& reader, const std::string& uuid)
-{
-    if (auto head = reader.currentObject(uuid)) return std::move(head->record);
-    if (currentVersionOf(reader, uuid)) return std::nullopt;
-    // The deterministic key for new resources can also address an exact legacy
-    // resource in this API; generic object lookups always require a stored UUID.
-    for (const auto* kind : {kVolumeResource, kNormalGridResource, kLasagnaDatasetResource})
-        for (const auto& resource : projectResources(reader, kind))
-            if (projectResourceUuid(kind, resource.location, resource.owner) == uuid) {
-                auto head = reader.currentObject(resource.uuid);
-                if (head && head->record.uuid == legacyResourceUuid(head->record, resource.owner))
-                    return std::move(head->record);
-            }
-    return std::nullopt;
-}
-
 struct ResourceWrite {
     ObjectRecord record;
     std::optional<ObjectRecord> existing;
@@ -84,7 +62,6 @@ struct ResourceWrite {
 
 ResourceWrite prepareResourceWrite(const StoreReader& reader, ObjectRecord record)
 {
-    record = resolveProjectResourceIdentity(reader, std::move(record));
     auto existing = reader.currentObject(record.uuid);
     if (existing && (existing->record.kind != record.kind ||
         existing->record.storageKind != record.storageKind ||
@@ -227,19 +204,6 @@ ObjectRecord projectResourceRecord(const std::string& kind, const std::string& l
     return record;
 }
 
-ObjectRecord resolveProjectResourceIdentity(const StoreReader& reader, ObjectRecord record)
-{
-    const auto owner = Json::parse(record.meta).value("owner", std::string{});
-    if (currentVersionOf(reader, record.uuid)) return record;
-    const auto legacy = legacyResourceUuid(record, owner);
-    if (const auto existing = reader.currentObject(legacy); existing &&
-        existing->record.kind == record.kind && existing->record.storageKind == record.storageKind &&
-        existing->record.storageRef == record.storageRef &&
-        Json::parse(existing->record.meta).value("owner", std::string{}) == owner)
-        record.uuid = legacy;
-    return record;
-}
-
 std::string addProjectResource(ObjectStore& db, ObjectRecord record)
 {
     TransactionRequest request;
@@ -279,10 +243,8 @@ bool addProjectResource(ObjectStoreSession& session, const AttachmentIdentity& a
 void updateProjectResourceMeta(ObjectStoreSession& session, const AttachmentIdentity& attachment,
                                const std::string& uuid, const Json& meta)
 {
-    std::optional<ObjectRecord> record;
-    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
-        record = resourceForEdit(reader, util::canonicalUuid(uuid));
-    });
+    const auto selected = session.currentObject(attachment, uuid);
+    auto record = selected ? std::optional(selected->record) : std::nullopt;
     if (!record || record->retired || !isProjectResourceKind(record->kind))
         throw std::runtime_error("not a project resource: " + uuid);
     auto merged = Json::parse(record->meta);
@@ -297,10 +259,8 @@ void updateProjectResourceMeta(ObjectStoreSession& session, const AttachmentIden
 
 bool removeProjectResource(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& uuid)
 {
-    std::optional<ObjectRecord> record;
-    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
-        record = resourceForEdit(reader, util::canonicalUuid(uuid));
-    });
+    const auto selected = session.currentObject(attachment, uuid);
+    auto record = selected ? std::optional(selected->record) : std::nullopt;
     if (!record || record->retired || !isProjectResourceKind(record->kind)) return false;
     auto request = session.newRequest(attachment);
     expectObject(request, record->reference());

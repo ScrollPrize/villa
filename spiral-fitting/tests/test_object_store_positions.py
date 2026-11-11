@@ -87,7 +87,7 @@ def test_a_commit_while_reading_the_selection_rereads_it(shared, monkeypatch):
     with ObjectStore.open(shared, read_only=True) as db:
         selected = osi.resolve_selection(db, request)
         assert edits and selected.position.commit_sequence == edits[0] == head(shared)
-        assert selected.references[walk]['version'] == osi.current_record(db, walk)['version']
+        assert selected.references[walk]['version'] == osi.current_record(db, walk).version
         # The position alone reads the same versions from the history.
         by_position = osi.resolve_selection(
             db, dataclasses.replace(request, pins=osi.InputPins(selected.position)))

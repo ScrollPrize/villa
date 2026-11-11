@@ -8,7 +8,7 @@ separately (``--store`` / ``--volume-uuid``). A store is a location: a store fil
 ``vc_object_server`` (``http://...``) for a store on another machine. Geometry is a ``points`` array (rows x columns x 3, xyz, -1 for a
 missing vertex), an optional ``valid`` array and per-vertex channels (``d``, ``approval``, ...), as VC3D stores
 surfaces; coordinates are bound to a volume by ``meta.coordinates`` ({volume_uuid, scale_factor}).
-Legacy ``vcobj:<uuid>@<generation>/<version>`` references still select history from the current owner.
+Exact locators include the owning store: ``vcobj:<uuid>@<store>/<generation>/<version>``. Ownerless saved locators are rejected.
 
 Surfaces are created with ``vc_object_store.surfaces.create_surface``; fit results (correspondence and
 atlas-control results) are attached to them with ``vc_object_store.documents.attach_document``.
@@ -145,7 +145,7 @@ def read_surface(store: str | Path, ref: dict | str, *, volume: str | None, targ
 		raise ValueError("reading a stored surface needs the volume its coordinates are in")
 	with attached(store, read_only=True) as (session, attachment):
 		# Already-selected references are carried through unchanged. Only CLI
-		# locators and external legacy selectors need the shared decoder.
+		# locators and current discovery need the shared decoder.
 		reference = ref if isinstance(ref, dict) and "object" in ref else session.decode_object_reference(attachment, ref)
 		grid = session.read_surface_grid(attachment, reference["object"], str(volume), float(target_scale), reference=reference)
 	return StoredSurface(store, surface_grid(grid))

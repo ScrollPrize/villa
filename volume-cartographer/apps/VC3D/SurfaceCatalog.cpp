@@ -226,8 +226,7 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
         }
         if (!revision->geometryRevision) throw NoGeometry("The surface has no geometry");
         const GeometrySnapshot snapshot(reader);
-        const auto view = snapshot.surface(revision->objectUuid,revision->geometryRevision)
-                             .viewTransformedAt(*revision,volume.volume,volume.scale);
+        const auto view = snapshot.surface(*revision).viewTransformedAt(volume.volume,volume.scale);
         opened.surface = load_quad_from_store(reader,*revision,true,&view);
         opened.view = view.frame();
         opened.pin = pinOf(attachment, *revision, activeGeneration);

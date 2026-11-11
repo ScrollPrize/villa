@@ -111,7 +111,7 @@ std::string nowIsoUtc(bool fractional)
     return isoUtc(std::chrono::system_clock::now(), fractional);
 }
 
-std::string refineLegacyCreationStamp(const std::string& created, std::optional<int64_t> publicationUs)
+std::string refineCreationStamp(const std::string& created, std::optional<int64_t> publicationUs)
 {
     if (created.size() != 20 || !publicationUs) return created;
     const auto publication = isoUtc(std::chrono::system_clock::time_point(

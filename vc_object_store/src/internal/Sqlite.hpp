@@ -25,7 +25,7 @@ using HashKey = std::array<unsigned char, 32>;
 HashKey parseHash(const std::string& hex);
 std::string formatHash(const unsigned char* bytes);
 std::string nowIsoUtc(bool fractional = false);
-std::string refineLegacyCreationStamp(const std::string&, std::optional<int64_t> publicationUs);
+std::string refineCreationStamp(const std::string&, std::optional<int64_t> publicationUs);
 std::string detectHostname();
 void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly);
 sqlite3* openConnection(const std::filesystem::path& path, int flags, const OpenOptions& options, bool queryOnly);

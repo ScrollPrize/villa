@@ -15,11 +15,8 @@ public:
     // In `targetVolume`'s voxels, with the selected object's coordinate metadata.
     // A payload-only selector uses the latest retained record holding that payload;
     // it carries no object reference and does not authorize inverse edits.
-    TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1) const;
-    // Use this numbered revision's coordinate metadata, even when later
-    // object revisions share the same geometry. The revision must name this view.
-    TransformedGeometryView viewTransformedAt(const ObjectRevision&, const std::string& targetVolume,
-                                             double targetScale=1) const;
+    TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1,
+                                             const VolumeTransforms* context=nullptr) const;
     std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
     // Derived from the selected reference; nullopt for a payload-only view.
@@ -212,6 +209,8 @@ private:
     std::shared_ptr<detail::GeometryViewState> view(const std::string&, const std::string& kind,
                                                     const std::optional<std::string>& geometryRevision) const;
     std::shared_ptr<detail::GeometryViewState> view(const ObjectRevision&, const std::string& kind) const;
+    std::shared_ptr<detail::GeometryViewState> payload(const std::string& object, const std::string& kind,
+                                                    const std::string& geometry) const;
     TypedGeometryView typed(std::shared_ptr<detail::GeometryViewState>) const;
     std::shared_ptr<detail::GeometryReadState> state_;
 };

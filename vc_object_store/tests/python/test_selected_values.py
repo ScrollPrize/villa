@@ -44,6 +44,9 @@ def test_selected_input_capture_validates_position(tmp_path, history):
         assert result["relationships"] == []
         with pytest.raises(StoreBusy, match="position"):
             db.selected_inputs([reference], dict(position, store=str(uuid.uuid4())))
+        for invalid in (True, 1.5, -1, 2**63, 2**64):
+            with pytest.raises((ValueError, RuntimeError), match="commit_sequence"):
+                db.selected_inputs([reference], dict(position, commit_sequence=invalid))
         db.set_meta(uid, "changed", True)
         if history:
             assert db.selected_inputs([reference], position)["objects"][0]["record"]["name"] == "selected"

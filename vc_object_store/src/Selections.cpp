@@ -77,8 +77,7 @@ std::vector<uint8_t> encodeSelectionRecord(const SelectionRecord& record)
 SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
 {
     auto bad = [](const std::string& why) { return std::invalid_argument("selection record: " + why); };
-    if (bytes.size() < sizeof kMagic + 4 || std::memcmp(bytes.data(), kMagic, 6) != 0 ||
-        (bytes[6]!=1&&bytes[6]!=2) || bytes[7]!=kMagic[7])
+    if (bytes.size() < sizeof kMagic + 4 || std::memcmp(bytes.data(), kMagic, sizeof kMagic) != 0)
         throw bad("not a selection record (or an unknown format version)");
     const std::size_t headerBytes = getU32(bytes.data() + sizeof kMagic);
     const std::size_t entriesAt = sizeof kMagic + 4 + headerBytes;
@@ -93,15 +92,11 @@ SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
         record.commitSequence = header.at("commit_sequence").get<int64_t>();
         record.queryJson = header.at("query").dump();
         for (const auto& t : header.at("transforms")) {
-            auto value = t;
-            if (bytes[6] == 1) value["store"] = record.storeUuid;
-            const auto reference = detail::canonicalObjectVersion(detail::objectVersionFrom(value));
+            const auto reference = detail::objectVersionFrom(t);
             if (reference.version <= 0) throw bad("transform version must be positive");
             record.transforms.push_back(reference);
         }
-        if(bytes[6]==1) {
-            for(const auto& g:header.at("generations"))origins.emplace_back(record.storeUuid,formatUuid(parseUuid(g.get<std::string>())));
-        } else for(const auto& origin:header.at("origins")) {
+        for(const auto& origin:header.at("origins")) {
             if(!origin.is_array()||origin.size()!=2)throw bad("invalid origin");
             origins.emplace_back(formatUuid(parseUuid(origin.at(0).get<std::string>())),formatUuid(parseUuid(origin.at(1).get<std::string>())));
         }

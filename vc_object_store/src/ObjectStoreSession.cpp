@@ -1105,6 +1105,8 @@ TransactionReceipt ObjectStoreSession::sendPending(const AttachmentIdentity& att
     TransactionReceipt result;
     try {
         result = submit(attachment, request);
+    } catch (const ReceiptDecodeError&) {
+        throw; // May already be committed, including a local saved replay.
     } catch (const TransactionConflict& conflict) {
         conclude(requestUuid, nullptr, conflict.what());
         throw;
@@ -1151,15 +1153,9 @@ void ObjectStoreSession::conclude(const std::string& requestUuid, const Transact
                 draftChanged(uuid, attachment);
                 continue;
             }
-            try {
-                if (const auto reference = receipt->objectReference(uuid)) {
-                    meta->second.base = *reference;
-                    meta->second.conflict.clear();
-                }
-            } catch (const std::exception& error) {
-                // Older durable receipts lack owning identities. The commit
-                // succeeded, but this draft must reload instead of inventing a pin.
-                meta->second.conflict = error.what();
+            if (const auto reference = receipt->objectReference(uuid)) {
+                meta->second.base = *reference;
+                meta->second.conflict.clear();
             }
             if (unchanged) meta->second.savedRevision = submitted;
         }

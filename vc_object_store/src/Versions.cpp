@@ -1,4 +1,5 @@
 #include "internal/Versions.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "internal/History.hpp"
 #include "internal/Extensions.hpp"
 #include "internal/RecordResolver.hpp"
@@ -268,13 +269,13 @@ TransactionReceipt detail::receiptFromJson(const Json& j)
     r.objects = selectionFromJson(j.at("objects"));
     r.relationships = selectionFromJson(j.at("relationships"));
     r.created = j.at("created").get<std::vector<std::string>>();
-    if(j.contains("object_references")){
-        if(!j.at("object_references").is_object())throw std::invalid_argument("receipt object references must be a map");
-        for(const auto& [uuid,value]:j.at("object_references").items()){
-            r.objectReferences.emplace(canonical(uuid),objectVersionFrom(value));
-            (void)r.objectReference(uuid);
-        }
+    if(!j.contains("object_references") || !j.at("object_references").is_object())
+        throw std::invalid_argument("receipt requires complete object_references; reload legacy receipts");
+    for(const auto& [uuid,value]:j.at("object_references").items()){
+        r.objectReferences.emplace(canonical(uuid),objectVersionFrom(value));
+        (void)r.objectReference(uuid);
     }
+    for (const auto& [uuid, version] : r.objects) if (version) (void)r.objectReference(uuid);
     return r;
 }
 
@@ -387,7 +388,7 @@ std::optional<TransactionReceipt> detail::savedReceipt(sqlite3* db, const std::s
     Statement s(db, "SELECT receipt,digest FROM transaction_receipts WHERE request_uuid=?", parseUuid(requestUuid));
     if (!s.row()) return std::nullopt;
     if (digest) *digest = s.text(1);
-    return receiptFromJson(Json::parse(s.text(0)));
+    return transactionReceiptFromJson(s.text(0));
 }
 
 void detail::checkTransactionContext(sqlite3* db, const TransactionContext& context, RevisionSelection& expectedRevisions)

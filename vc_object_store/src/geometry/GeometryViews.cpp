@@ -104,21 +104,12 @@ GeometrySnapshot::GeometrySnapshot(const StoreReader& reader)
 TransformedGeometryView GeometrySnapshot::viewTransformedAt(const std::string& uuid,const std::string& target,
     double targetScale,const VolumeTransforms* context) const
 {
-    state_->require();
-    const auto object=state_->reader->currentObject(uuid);
-    if(!object)throw std::invalid_argument("object not found");
-    return viewTransformedAt(*object, target, targetScale, context);
+    return std::visit([&](const auto& view) { return view.viewTransformedAt(target, targetScale, context); }, geometry(uuid));
 }
 TransformedGeometryView GeometrySnapshot::viewTransformedAt(const ObjectRevision& object,const std::string& target,
     double targetScale,const VolumeTransforms* context) const
 {
-    state_->require();
-    if(!object.geometryRevision || !object.metadataComplete)throw std::invalid_argument("selected object has no geometry or coordinate metadata");
-    const auto local=context?VolumeTransforms{}:state_->reader->volumeTransforms();
-    const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(object.record.meta),target,targetScale);
-    if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
-    auto selected=geometry(object);
-    return TransformedGeometryView(std::move(selected),*mapping,target,targetScale);
+    return std::visit([&](const auto& view) { return view.viewTransformedAt(target, targetScale, context); }, geometry(object));
 }
 
 TransformedGeometryView GeometrySnapshot::viewStored(const std::string& uuid,
@@ -127,22 +118,17 @@ TransformedGeometryView GeometrySnapshot::viewStored(const std::string& uuid,
     return TransformedGeometryView(geometry(uuid,geometryRevision),VolumeAffine::identity(),std::string{},1);
 }
 
-TransformedGeometryView GeometryView::viewTransformedAt(const std::string& target,double scale) const {
+TransformedGeometryView GeometryView::viewTransformedAt(const std::string& target,double scale,const VolumeTransforms* context) const {
     state_->read->require();
     const auto& reader=*state_->read->reader;
     const auto record=state_->object ? state_->object : reader.objectAtGeometry(state_->revision.uuid);
     if(!record)throw std::invalid_argument("geometry revision has no recorded coordinate metadata");
-    return viewTransformedAt(*record,target,scale);
-}
-
-TransformedGeometryView GeometryView::viewTransformedAt(const ObjectRevision& object,const std::string& target,double scale) const {
-    state_->read->require();
-    if(object.objectUuid!=state_->revision.objectUuid||object.geometryRevision!=state_->revision.uuid||!object.metadataComplete)
+    if(record->objectUuid!=state_->revision.objectUuid||record->geometryRevision!=state_->revision.uuid||!record->metadataComplete)
         throw std::invalid_argument("object revision does not name this geometry and its coordinate metadata");
-    auto result=GeometrySnapshot(state_->read).viewTransformedAt(object,target,scale);
-    if(reference()!=object.reference())
-        std::visit([](auto& view){view.state_->object.reset();},result.source_);
-    return result;
+    const auto local=context?VolumeTransforms{}:reader.volumeTransforms();
+    const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(record->record.meta),target,scale);
+    if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
+    return TransformedGeometryView(GeometrySnapshot(state_->read).typed(state_),*mapping,target,scale);
 }
 
 std::vector<vcr::catalog::TransformResolution> GeometryView::availableTransforms() const {
@@ -164,10 +150,16 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
                                               const std::optional<std::string>& geometryRevision) const
 {
     state_->require();
-    const auto object = geometryRevision ? std::optional<ObjectRevision>{} : state_->reader->currentObject(id);
-    if (!geometryRevision && !object) throw std::invalid_argument("object not found");
-    const auto selected = geometryRevision ? geometryRevision : object->geometryRevision;
-    const auto revision = selected ? state_->reader->geometryRevision(*selected) : std::nullopt;
+    if (geometryRevision) return payload(id, kind, *geometryRevision);
+    const auto object = state_->reader->currentObject(id);
+    if (!object) throw std::invalid_argument("object not found");
+    return view(*object, kind);
+}
+std::shared_ptr<State> GeometrySnapshot::payload(const std::string& id, const std::string& kind,
+                                               const std::string& geometry) const
+{
+    state_->require();
+    const auto revision = state_->reader->geometryRevision(geometry);
     if (!revision) throw std::invalid_argument("object has no stored geometry");
     if (revision->objectUuid != util::canonicalUuid(id))
         throw std::invalid_argument("geometry revision belongs to another object");
@@ -176,7 +168,6 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
         throw std::invalid_argument("unsupported geometry version or coordinate system");
     auto result = std::make_shared<State>();
     result->read = state_; result->revision = *revision;
-    if (!geometryRevision) result->object = object;
     if (revision->kind == "point_collection") {
         result->require("points", "<f8", 2);
         result->require("point_ids", "<i8", 1);
@@ -211,7 +202,7 @@ std::shared_ptr<State> GeometrySnapshot::view(const ObjectRevision& object, cons
 {
     if (object.deleted || !object.metadataComplete || !object.geometryRevision)
         throw std::invalid_argument("selected object has no geometry or coordinate metadata");
-    auto result = view(object.objectUuid, kind, object.geometryRevision);
+    auto result = payload(object.objectUuid, kind, *object.geometryRevision);
     result->object = object;
     return result;
 }

@@ -55,7 +55,7 @@ Json withExactMeta(Json j, const RecordCommon& r)
 }
 template<class Record> Record exactMetaFrom(const Json& j, Record r)
 {
-    if (j.contains("meta") && j.at("meta").is_string()) r.meta = j.at("meta").get<std::string>();
+    if (j.contains("meta")) r.meta = j.at("meta").get<std::string>();
     return r;
 }
 
@@ -88,10 +88,7 @@ TransactionConflict transactionConflictFromJson(const std::string& text)
 
 StoreStatus storeStatusFromJson(const std::string& text)
 {
-    const auto j = Json::parse(text);
-    return {j.at("store").get<std::string>(), j.at("generation").get<std::string>(),
-            j.at("commit_sequence").get<int64_t>(), j.at("feed_start").get<int64_t>(),
-            j.value("history_enabled", true), j.value("extensions_present", false)};
+    return storeStatusFrom(Json::parse(text));
 }
 
 ChangePage changePageFromJson(const std::string& text)
@@ -146,7 +143,7 @@ ObjectRevision revisionFrom(const Json& j)
     r.deleted = j.at("deleted").get<bool>();
     r.version = j.at("version").get<int64_t>();
     r.generation = j.at("generation").get<std::string>();
-    r.storeUuid = j.value("store", std::string{});
+    r.storeUuid = j.at("store").get<std::string>();
     r.commitSequence = intFrom(j.at("commit_sequence"));
     const auto& record = j.at("record");
     r.record = exactMetaFrom(record, objectFromJson(record));
@@ -229,14 +226,14 @@ std::optional<std::set<std::string>> fieldSet(const std::optional<std::vector<st
 
 Json envelope(const StoreStatus& status, const char* key, Json value)
 {
-    return Json{{"status", Json::parse(storeStatusToJson(status))}, {key, std::move(value)}};
+    return Json{{"status", storeStatusJson(status)}, {key, std::move(value)}};
 }
 
 // The `key` member of an answer; `asOf` receives its snapshot status.
 Json unwrap(const std::string& text, StoreStatus* asOf, const char* key)
 {
     auto j = Json::parse(text);
-    if (asOf) *asOf = storeStatusFromJson(j.at("status").dump());
+    if (asOf) *asOf = storeStatusFrom(j.at("status"));
     return std::move(j.at(key));
 }
 
@@ -367,7 +364,7 @@ static void versionFromJson(const Json& j, RecordCommon& record)
     if (!j.contains("version")) return;
     record.version = j.at("version").get<int64_t>();
     record.versionGeneration = j.at("version_generation").get<std::string>();
-    record.versionStoreUuid = j.value("version_store", std::string());
+    record.versionStoreUuid = j.at("version_store").get<std::string>();
 }
 
 std::string objectQueryResultToJson(const StoreStatus& status, const std::vector<ObjectRecord>& objects,
@@ -534,18 +531,14 @@ ObjectVersion objectVersionFromJson(const std::string& text) { return objectVers
 
 std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>& versions)
 {
-    auto array = Json::array();
-    for (const auto& v : versions) array.push_back(objectVersionJson(v));
-    return Json{{"versions", std::move(array)}}.dump();
+    return Json{{"versions", objectVersionsJson(versions)}}.dump();
 }
 
 std::vector<ObjectVersion> objectVersionsRequestFromJson(const std::string& text)
 {
     const auto j = Json::parse(text);
     requireKeys(j, {"versions"}, "object versions request");
-    std::vector<ObjectVersion> result;
-    for (const auto& v : j.at("versions")) result.push_back(objectVersionFrom(v));
-    return result;
+    return objectVersionsFrom(j.at("versions"));
 }
 
 std::string objectsAtVersionsResultToJson(const StoreStatus& status, const std::vector<std::optional<ObjectRevision>>& revisions)
@@ -587,21 +580,17 @@ std::string selectedInputsToJson(const StoreStatus& status, const SelectedInputs
         relationships.push_back({{"relationship", relationshipJson(edge.relationship)}, {"applicable", edge.applicable}});
     return envelope(status, "inputs", Json{{"objects", records}, {"relationships", relationships}}).dump();
 }
-std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>& refs, const FeedCursor& position)
+std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>& refs, const StoreStatus& position)
 {
-    auto request = Json::parse(objectVersionsRequestToJson(refs));
-    request["position"] = {{"store", position.storeUuid}, {"generation", position.generation}, {"sequence", position.sequence}};
-    return request.dump();
+    return Json{{"versions", objectVersionsJson(refs)}, {"position", storePositionJson(position)}}.dump();
 }
-std::pair<std::vector<ObjectVersion>, FeedCursor> selectedInputsRequestFromJson(const std::string& text)
+std::pair<std::vector<ObjectVersion>, StoreStatus> selectedInputsRequestFromJson(const std::string& text)
 {
     auto request = Json::parse(text);
     requireKeys(request, {"versions", "position"}, "selected inputs request");
     const auto position = request.at("position");
-    requireKeys(position, {"store", "generation", "sequence"}, "selected inputs position");
-    request.erase("position");
-    return {objectVersionsRequestFromJson(request.dump()), {util::canonicalUuid(position.at("store").get<std::string>()),
-        util::canonicalUuid(position.at("generation").get<std::string>()), position.at("sequence").get<int64_t>()}};
+    requireKeys(position, {"store", "generation", "commit_sequence"}, "selected inputs position");
+    return {objectVersionsFrom(request.at("versions")), storePositionFrom(position)};
 }
 SelectedInputs selectedInputsFromJson(const std::string& text)
 {

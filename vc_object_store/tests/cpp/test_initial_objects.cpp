@@ -33,9 +33,9 @@ void parity(bool spatial){
             initial.objectByUuid(b,records.back().record.uuid)->createdAt.size()==27,
             "project creation is precise in both ordinary and immutable initial inserts");
     const std::string legacy="1970-01-01T00:00:01Z";
-    require(refineLegacyCreationStamp(legacy,1234567)=="1970-01-01T00:00:01.234567Z" &&
-            refineLegacyCreationStamp(legacy,2234567)==legacy &&
-            refineLegacyCreationStamp(legacy,std::nullopt)==legacy,
+    require(refineCreationStamp(legacy,1234567)=="1970-01-01T00:00:01.234567Z" &&
+            refineCreationStamp(legacy,2234567)==legacy &&
+            refineCreationStamp(legacy,std::nullopt)==legacy,
             "only a same-second retained publication refines legacy creation");
     if(spatial)require(scalar(ObjectStoreImplAccess::conn(a),"SELECT count(*) FROM object_bounds")==scalar(ObjectStoreImplAccess::conn(b),"SELECT count(*) FROM object_bounds"),"bounds parity");
 }

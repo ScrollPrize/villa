@@ -1,4 +1,5 @@
 #include "StorageBindings.hpp"
+#include "internal/ObjectVersionJson.hpp"
 #include "AfvBindings.hpp"
 #include "ExtensionBindings.hpp"
 #include "ObjectReadBindings.hpp"
@@ -88,19 +89,22 @@ nb::dict selectedInputsToPy(const vo::SelectedInputs& selected)
     nb::dict result; result["objects"] = objects; result["relationships"] = relationshipsToPy(selected.relationships);
     return result;
 }
-vo::FeedCursor inputPositionFromPy(const nb::dict& value)
-{
-    return {nb::cast<std::string>(value["store"]), nb::cast<std::string>(value["generation"]),
-        nb::cast<int64_t>(value["commit_sequence"])};
-}
-
 // Convert native results after the transaction (and any GIL release) ends.
 // Numbered references as dicts {store, generation, object, version}, through
 // the shared wire codec.
 std::vector<vo::ObjectVersion> objectVersionsFromPy(const nb::handle& refs)
 {
-    nb::dict request; request["versions"] = refs;
-    return vo::objectVersionsRequestFromJson(jsonDumps(request));
+    return vo::detail::objectVersionsFrom(nlohmann::json::parse(jsonDumps(refs)));
+}
+
+template<class Read>
+nb::dict readSelectedInputs(const nb::list& refs, const nb::dict& position, Read&& read)
+{
+    const auto versions = objectVersionsFromPy(refs);
+    const auto snapshot = vo::detail::storePositionFrom(nlohmann::json::parse(jsonDumps(position)));
+    vo::SelectedInputs result;
+    { nb::gil_scoped_release release; result = read(versions, snapshot); }
+    return selectedInputsToPy(result);
 }
 
 std::optional<vo::ObjectVersion> optionalObjectVersionFromPy(const nb::object& reference)
@@ -590,10 +594,7 @@ void bindHostedStore(nb::module_& m)
             return toPy(history);
         }, nb::arg("object_uuid"), nb::arg("if_retained") = false)
         .def("selected_inputs", [](Hosted& self, const nb::list& refs, const nb::dict& position) {
-            const auto versions = objectVersionsFromPy(refs); const auto cursor = inputPositionFromPy(position);
-            vo::SelectedInputs result;
-            { nb::gil_scoped_release release; result = self.selectedInputs(versions, cursor); }
-            return selectedInputsToPy(result);
+            return readSelectedInputs(refs, position, [&](const auto& versions, const auto& snapshot) { return self.selectedInputs(versions, snapshot); });
         }, nb::arg("refs"), nb::arg("position"))
         .def("relationships_at_versions", [](Hosted& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
@@ -638,6 +639,7 @@ void bindHostedStore(nb::module_& m)
             self.fetchArtifact(f, destination);
         }, nb::arg("file"), nb::arg("destination"), "Write one manifest entry {name, sha256, length} atomically, verified.");
     nb::exception<vo::StoreBusy>(m, "StoreBusy", PyExc_RuntimeError);
+    nb::exception<vo::ReceiptDecodeError>(m, "ReceiptDecodeError", PyExc_RuntimeError);
     nb::exception<vo::PreparationFailed>(m, "PreparationFailed", PyExc_RuntimeError);
     nb::exception<vo::TransactionConflict>(m, "TransactionConflict", PyExc_RuntimeError);
 }
@@ -785,13 +787,11 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         }, nb::arg("attachment"), nb::arg("revision_uuid"), nb::arg("array_name"),
            "Per-point annotations of a sequence array (as ObjectStore.geometry_point_annotations).")
         .def("selected_inputs", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs, const nb::dict& position) {
-            const auto versions = objectVersionsFromPy(refs); const auto cursor = inputPositionFromPy(position);
-            vo::SelectedInputs result;
-            {
-                nb::gil_scoped_release release;
-                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { result = reader.selectedInputs(versions, cursor); });
-            }
-            return selectedInputsToPy(result);
+            return readSelectedInputs(refs, position, [&](const auto& versions, const auto& snapshot) {
+                vo::SelectedInputs result;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { result = reader.selectedInputs(versions, snapshot); });
+                return result;
+            });
         }, nb::arg("attachment"), nb::arg("refs"), nb::arg("position"))
         .def("relationships_at_versions", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
@@ -923,7 +923,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             { nb::gil_scoped_release release; reference = self.decodeObjectReference(attachment, json); }
             return jsonLoads(vo::objectVersionToJson(reference));
         }, nb::arg("attachment"), nb::arg("input"),
-           "External input decoder: resolve current/legacy selectors once, retaining complete exact references.")
+           "External input decoder: current discovery or complete exact references; ownerless saved selectors are rejected.")
         .def("objects_at_versions", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             std::vector<std::optional<vo::ObjectRevision>> revisions;
@@ -1634,10 +1634,12 @@ NB_MODULE(_native, m)
             return toPy(self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectsAtVersions(txn, versions); }));
         }, nb::arg("refs"), "Numbered references {store, generation, object, version}, answered in order (None where not recorded).")
         .def("selected_inputs", [](PyObjectStore& self, const nb::list& refs, const nb::dict& position) {
-            const auto versions = objectVersionsFromPy(refs); const auto cursor = inputPositionFromPy(position);
-            return selectedInputsToPy(self.withRead<true>([&](auto& db, auto& txn) {
-                return vo::LocalStoreReader(db, txn).selectedInputs(versions, cursor);
-            }));
+            return self.withStore([&](auto& db) {
+                return readSelectedInputs(refs, position, [&](const auto& versions, const auto& snapshot) {
+                    auto txn = db.read();
+                    return vo::LocalStoreReader(db, txn).selectedInputs(versions, snapshot);
+                });
+            });
         }, nb::arg("refs"), nb::arg("position"))
         .def("relationships_at_versions", [](PyObjectStore& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);

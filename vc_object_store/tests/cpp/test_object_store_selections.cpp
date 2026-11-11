@@ -127,7 +127,7 @@ try {
         for(int i=0;i<4;++i)legacy.push_back(uint8_t(text.size()>>(8*i)));
         legacy.insert(legacy.end(),text.begin(),text.end());
         legacy.insert(legacy.end(),bytes.begin()+12+header,bytes.end());
-        require(decodeSelectionRecord(legacy)==captured,"existing v1 artifacts remain readable");
+        require(rejects([&] { decodeSelectionRecord(legacy); }), "obsolete v1 artifacts must be regenerated");
     }
 
     // Kept as an artifact, and read back at its versions after edits.

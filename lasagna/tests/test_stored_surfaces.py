@@ -16,7 +16,7 @@ if ROOT not in sys.path:
 	sys.path.insert(0, ROOT)
 
 try:
-	from vc_object_store import ObjectStore, Surface, object_reference
+	from vc_object_store import ObjectStore, Surface, object_reference, receipt_object_reference
 	from vc_object_store.documents import attached_document
 	from vc_object_store.surfaces import create_surface
 except ImportError:  # pragma: no cover - the store bindings are an optional dependency
@@ -167,7 +167,8 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			self.assertEqual(ref["version"], 1)
 			self.assertEqual(set(ref), {"store", "generation", "object", "version"})
 			legacy = f"vcobj:{uid}@{ref['generation']}/01"
-			np.testing.assert_array_equal(stored_surfaces.read_surface(store, legacy, volume=VOLUME).xyz, xyz)
+			with self.assertRaisesRegex(ValueError, "ownerless"):
+				stored_surfaces.read_surface(store, legacy, volume=VOLUME)
 			older = stored_surfaces.read_surface(store, ref, volume=VOLUME)
 			current = stored_surfaces.read_surface(store, f"vcobj:{uid}", volume=VOLUME)
 			self.assertEqual((older.reference, current.reference["version"]), (first.reference, 2))
@@ -393,8 +394,7 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		checkpoint = Path(self._td.name) / "checkpoint.pt"
 		checkpoint.write_bytes(b"original model")
 		first = fit_service._store.publish_artifacts(self.source, {"model.pt": checkpoint})
-		ref = dict(type="surface", uuid=self.source, store=first["store_uuid"],
-				   generation=first["generation"], version=first["objects"][self.source])
+		ref = receipt_object_reference(first, self.source)
 		checkpoint.write_bytes(b"new model")
 		fit_service._store.publish_artifacts(self.source, {"model.pt": checkpoint})
 		self.assertEqual(fit_service._stored_model_path(ref).read_bytes(), b"original model")

@@ -518,18 +518,21 @@ std::string transactionReceiptToJson(const TransactionReceipt& receipt)
 }
 
 TransactionReceipt transactionReceiptFromJson(const std::string& text)
+try
 {
     const auto j = Json::parse(text);
     auto receipt = receiptFromJson(j);
     receipt.replayed = j.value("replayed", false);
     return receipt;
 }
+catch (const std::exception& error)
+{
+    throw ReceiptDecodeError(std::string("unreadable transaction receipt; preserve the pending request: ") + error.what());
+}
 
 std::string storeStatusToJson(const StoreStatus& status)
 {
-    return Json{{"store", status.storeUuid}, {"generation", status.generation},
-                {"commit_sequence", status.commitSequence}, {"feed_start", status.feedStart},
-                {"history_enabled", status.historyEnabled}, {"extensions_present", status.extensionsPresent}}.dump();
+    return storeStatusJson(status).dump();
 }
 
 std::string changePageToJson(const ChangePage& page) { return pageJson(page).dump(); }

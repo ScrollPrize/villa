@@ -65,16 +65,14 @@ void setProjectName(ObjectStoreSession&, const AttachmentIdentity&, const std::s
 // precise stamps within their second, with UUID as the last tie-breaker.
 std::vector<ProjectResource> projectResources(const StoreReader&, const std::string& kind,
                                               const std::optional<std::string>& viewer = std::nullopt);
-// Deterministic UUID for a new resource. An existing legacy resource keeps
-// its stored UUID; use the listed or returned UUID for generic object APIs.
+// Deterministic UUID for a new resource. Reads/edits always use the actual
+// stored UUID; no implicit identity aliases are supported.
 std::string projectResourceUuid(const std::string& kind, const std::string& location, const std::string& owner = {});
-// Candidate record for a new resource, before resolving any legacy identity.
+// Candidate record for a new resource.
 ObjectRecord projectResourceRecord(const std::string& kind, const std::string& location,
                                    const std::vector<std::string>& tags = {},
                                    const nlohmann::json& meta = nlohmann::json::object(),
                                    const std::string& owner = {});
-// Preserve an existing legacy UUID only when it names this exact resource.
-ObjectRecord resolveProjectResourceIdentity(const StoreReader&, ObjectRecord);
 // Direct-store counterpart of the checked session helper, with the same
 // identity and retirement rules. Returns the actual stored UUID.
 std::string addProjectResource(ObjectStore&, ObjectRecord);
@@ -83,8 +81,7 @@ std::string addProjectResource(ObjectStore&, ObjectRecord);
 bool addProjectResource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& kind,
                         const std::string& location, const std::vector<std::string>& tags = {},
                         const nlohmann::json& meta = nlohmann::json::object(), const std::string& owner = {});
-// Merge metadata without changing the resource's owner. The deterministic
-// new-resource UUID also resolves to a matching legacy record here.
+// Merge metadata at its stored UUID without changing the resource's owner.
 void updateProjectResourceMeta(ObjectStoreSession&, const AttachmentIdentity&, const std::string& uuid,
                                const nlohmann::json& meta);
 // Retire a resource; false when it is not there.

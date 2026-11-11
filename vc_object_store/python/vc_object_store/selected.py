@@ -1,20 +1,11 @@
 """Selected native objects with their record, geometry and complete identity together."""
-from collections.abc import Mapping
 from ._native import object_reference
+from dataclasses import dataclass
 
 
-class SelectedRecord(Mapping):
+class SelectedRecord:
     def __init__(self, record):
         self.record = record
-
-    def __getitem__(self, key):
-        return self.record[key]
-
-    def __iter__(self):
-        return iter(self.record)
-
-    def __len__(self):
-        return len(self.record)
 
     @property
     def reference(self):
@@ -22,11 +13,15 @@ class SelectedRecord(Mapping):
 
     @property
     def uuid(self):
-        return self.reference['object']
+        return self.record['uuid']
 
     @property
     def version(self):
-        return self.reference['version']
+        return self.record['version']
+
+    @property
+    def retired(self):
+        return self.record.get('retired', False)
 
     @property
     def kind(self):
@@ -53,10 +48,13 @@ class SelectedRecord(Mapping):
         return self.record.get('track')
 
 
+@dataclass
 class SelectedObject(SelectedRecord):
-    def __init__(self, revision):
-        super().__init__(revision['record'])
-        self.revision = revision
+    revision: dict
+
+    @property
+    def record(self):
+        return self.revision['record']
 
     @property
     def geometry_revision(self):

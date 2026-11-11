@@ -141,7 +141,7 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
             if (!scale) throw std::runtime_error("it declares no frame in volume " + volume);
         }
         if (geometry && pin.kind == "surface") {
-            const auto view=vc::objects::GeometrySnapshot(reader).surface(pin.uuid,geometry->uuid).viewTransformedAt(*current,volume);
+            const auto view=vc::objects::GeometrySnapshot(reader).surface(*current).viewTransformedAt(volume);
             surface.surface = std::shared_ptr<QuadSurface>(load_quad_from_store(reader,*current,true,&view));
         } else if (geometry && pin.kind == "point_collection") {
             collection.absolute = valueOrNull(valueOrNull(meta, "source"), "winding_is_absolute") == Json(true);

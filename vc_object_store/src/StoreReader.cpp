@@ -3,6 +3,7 @@
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "internal/TransformedLength.hpp"
+#include "internal/ObjectVersionJson.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -11,16 +12,14 @@
 #include <set>
 
 namespace vc::objects {
-SelectedInputs StoreReader::selectedInputs(const std::vector<ObjectVersion>& refs, const FeedCursor& position) const
+SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position) const
 {
     const auto before = status();
     const bool inherited = std::any_of(refs.begin(), refs.end(), [&](const auto& ref) { return util::canonicalUuid(ref.storeUuid) != before.storeUuid; });
-    const auto matches = [&](const StoreStatus& state) {
-        return position.sequence >= 0 && state.commitSequence >= position.sequence &&
-            state.storeUuid == util::canonicalUuid(position.storeUuid) && state.generation == util::canonicalUuid(position.generation) &&
-            (!inherited || state.commitSequence == position.sequence);
-    };
-    if (!matches(before)) throw StoreBusy("selected inputs: requested graph position is no longer available");
+    if (position.commitSequence < 0 || before.commitSequence < position.commitSequence ||
+        before.storeUuid != util::canonicalUuid(position.storeUuid) || before.generation != util::canonicalUuid(position.generation) ||
+        (inherited && before.commitSequence != position.commitSequence))
+        throw StoreBusy("selected inputs: requested graph position is no longer available");
     SelectedInputs result;
     const auto records = objectsAtVersions(refs);
     for (size_t i = 0; i < refs.size(); ++i) {
@@ -28,7 +27,6 @@ SelectedInputs StoreReader::selectedInputs(const std::vector<ObjectVersion>& ref
         result.objects.push_back(*records[i]);
     }
     result.relationships = relationshipsAt(refs);
-    if (!matches(status())) throw StoreBusy("selected inputs: store changed during graph capture; retry");
     return result;
 }
 
@@ -44,48 +42,32 @@ ObjectVersion StoreReader::decodeObjectReference(const std::string& json) const
         if (at != std::string::npos) {
             const auto suffix = text.substr(at + 1);
             const auto slash = suffix.find('/'), last = suffix.rfind('/');
-            if (slash == std::string::npos || slash == 0 || last == suffix.size()-1)
-                throw std::invalid_argument("stored reference requires [store/]generation/version");
+            if (slash == std::string::npos || slash == last || slash == 0 || last == suffix.size()-1)
+                throw std::invalid_argument("stored reference requires store/generation/version; regenerate ownerless locators");
             const auto number = suffix.substr(last+1);
             int64_t version = 0;
             const auto [end, error] = std::from_chars(number.data(), number.data()+number.size(), version);
             if (error != std::errc{} || end != number.data()+number.size() || version <= 0)
                 throw std::invalid_argument("stored reference requires a numbered version");
-            if (slash != last) input["store"] = suffix.substr(0,slash);
-            input["generation"] = suffix.substr(slash == last ? 0 : slash+1,
-                                                slash == last ? slash : last-slash-1);
-            input["version"] = version;
+            input = detail::objectVersionJson({suffix.substr(0,slash), suffix.substr(slash+1,last-slash-1), input.at("uuid").get<std::string>(), version});
         }
     }
     if (!input.is_object()) throw std::invalid_argument("object reference input must be an object or locator");
     if (input.contains("revision"))
         throw std::invalid_argument("stored references select a numbered version, not a revision");
     if (input.contains("reference")) {
-        const auto ref = objectVersionFromJson(input.at("reference").dump());
+        const auto ref = detail::objectVersionFrom(input.at("reference"));
         if (input.contains("uuid") && util::canonicalUuid(input.at("uuid").get<std::string>()) != ref.objectUuid)
             throw std::invalid_argument("reference names a different object");
         if (input.contains("version") || input.contains("generation") || input.contains("store"))
-            throw std::invalid_argument("reference cannot be combined with legacy version fields");
+            throw std::invalid_argument("reference cannot be combined with separate version fields");
         return ref;
     }
-    if (input.contains("object")) return objectVersionFromJson(input.dump());
+    if (input.contains("object")) return detail::objectVersionFrom(input);
     const auto uuid = util::canonicalUuid(input.at("uuid").get<std::string>());
-    if (input.contains("store")) {
-        return objectVersionFromJson(Json{{"object",uuid},{"store",input.at("store")},
-            {"generation",input.at("generation")},{"version",input.at("version")}}.dump());
-    }
-    std::optional<int64_t> version;
-    std::optional<std::string> generation;
-    if (input.contains("version")) {
-        const auto& number = input.at("version");
-        if (!number.is_number_integer() || (number.is_number_unsigned() && number.get<uint64_t>() > INT64_MAX) ||
-            number.get<int64_t>() <= 0) throw std::invalid_argument("stored reference requires a positive numbered version");
-        version = number.get<int64_t>();
-        if (input.contains("generation")) generation = util::canonicalUuid(input.at("generation").get<std::string>());
-    } else if (input.contains("generation")) {
-        throw std::invalid_argument("generation requires a numbered version");
-    }
-    const auto selected = selectedObject(uuid, version, generation);
+    if (input.contains("store") || input.contains("generation") || input.contains("version"))
+        throw std::invalid_argument("numbered selections require a complete reference; regenerate legacy selectors");
+    const auto selected = selectedObject(uuid);
     if (!selected) throw std::invalid_argument("stored object selection is unavailable");
     return selected->reference();
 }
