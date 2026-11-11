@@ -234,26 +234,7 @@ document how to use them and how they’re validated.
 
 Keep committed documentation focused on current usage, supported formats, contracts and design intentions. Do not commit task trackers, implementation plans, review/audit reports, finding inventories, agent adjudications or one-off validation logs. Keep those working artifacts under ignored `local/` storage; promote only their durable conclusions into the relevant documentation. Do not link permanent docs to local or historical review artifacts.
 
-### 4.4 vcobj readers and writers (including consumers outside `vc_object_store/`)
-
-Use the [single versioned-reference contract](vc_object_store/docs/versioned-reference-contract.md): carry the shared reference unchanged. Consumer-specific tuples or flattened reference fields are not an internal API; extra application data wraps the reference instead.
-
-Read `vc_object_store/docs/reading.md` and `vc_object_store/docs/store-api-contract.md` before changing vcobj handling. Physical placement (local, referenced, sharded or packed) is resolved by the store layer, never by consumer-specific SQL or fallback branches.
-
-Follow the [validation requirements](vc_object_store/docs/store-api-contract.md#validation-requirements): trace each invariant through all sibling entry points and test the same case at their boundaries. Python bindings adapt Python types; the shared native implementation owns schema interpretation and validation.
-
-- Resolve once, then carry the complete `ObjectRevision`/`ObjectVersion` through geometry, transforms, adapters and caches. Never replace its metadata with a fresh current-object lookup or infer its owner from the attachment. Exact reads must not require a live current object. Compare complete identities, not just version numbers.
-- Transaction preparations, fetch callbacks, artifact uploads and deferred edit accumulators carry the same full references. Use `RecordSelection` and shared expectation helpers; numeric counters are storage projections or explicit current-selection inputs, never internal guards. Transaction commands use format 3 only: do not restore automatic format selection or numeric/full sidechannels. Reject incomplete saved identities rather than infer owners. Preserve the distinction between no live record and an exact selected tombstone, as well as loaded mapping/membership and active-write-lineage guards.
-- Geometry-fitting relationship consumers use the shared `fittingRelationshipInput` policy (Python `fitting_relationship_inputs`) for supported families, eligibility and endpoint ordering. Do not maintain parallel native/Python family tables or reconstruct content projections merely to compare complete publication references. Validate saved manifest references at ingress and retain the decoded handles rather than decoding them again during construction.
-- Use shared identity, endpoint and tombstone resolution for writes as well as reads. Local SQL uniqueness checks do not enforce collection-wide identity. Canonicalize UUIDs through the shared API, not ad-hoc string comparisons.
-- For edits of loaded data, use `expectObject(request, selected.reference())`, not a freshly read numeric version. Retain the loaded coordinate-mapping guard with editable points; an unchanged object reference does not imply unchanged volume registrations.
-- Decide whether an edit changes anything before creating an override. No-op edits must preserve ownership and versions; required relationship revalidation must still run.
-- Repin edits with the receipt's complete object references, not its committing store plus numeric versions: receipts also contain unchanged inherited inputs. Allocate structural point IDs through the shared retained-allocation API, never a restorable metadata counter.
-- Use shared selection for geometry and artifacts from the same version. Query optional history through the owning record's policy, not the attachment's history flag. Copy/export collections through the shared closure APIs rather than backing up only their physical root.
-- History policy controls retention, not identity or routing. Do not add history-off alternatives, proxy rows, per-object directories or copies of referenced payloads.
-- Persisted caches and solved evidence must identify the selected source revision, not just its UUID or row ordinals. Geometry-derived counts, lengths and bounds come from the selected geometry, not ingestion summaries. Editors retain the loaded membership and transform baseline as well as object references.
-- Public batch writes must roll back the entire operation even if the caller catches an error and commits its surrounding transaction. Physical copy/pack/conversion must preserve external locator targets through the shared relocation helper, including retained historical records.
-- Extend a shared API when it lacks a capability; migrate existing callers instead of adding another partial resolver. Test local and referenced cases, history on/off, retained exact reads after override/deletion, and no-op writes. Keep production-code growth separate from regression-test/documentation growth when reporting refactors.
+For changes involving vcobj stores or their consumers, read the [store API contract](vc_object_store/docs/store-api-contract.md), [reading guide](vc_object_store/docs/reading.md), and [versioned-reference contract](vc_object_store/docs/versioned-reference-contract.md).
 
 ---
 
