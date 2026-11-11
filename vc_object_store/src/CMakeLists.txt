@@ -152,7 +152,9 @@ if(NOT TARGET vc_reader::reader)
 endif()
 add_library(vc_track_crossings STATIC TrackCrossings.cpp)
 target_include_directories(vc_track_crossings PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>")
-target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
+if(VC_OBJECT_STORE_USE_OPENMP)
+    target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
 add_library(vc_object_links STATIC
     CtSheetNormal.cpp

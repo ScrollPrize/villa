@@ -35,7 +35,16 @@ if(VC_OBJECT_STORE_BUILD_LINKING)
     if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
         message(FATAL_ERROR "Relationship detectors require adapters")
     endif()
-    find_package(OpenMP REQUIRED)
+    if(APPLE AND VC_OBJECT_STORE_BUILD_PYTHON)
+        # The Python module is imported next to torch, whose macOS wheels load
+        # their own libomp.dylib; linking Homebrew's libomp here would put a
+        # second OpenMP runtime in the process (OMP Error #15 at import).
+        # TrackCrossings.cpp has a serial path for builds without OpenMP.
+        set(VC_OBJECT_STORE_USE_OPENMP OFF)
+    else()
+        find_package(OpenMP REQUIRED)
+        set(VC_OBJECT_STORE_USE_OPENMP ON)
+    endif()
 endif()
 add_subdirectory(src)
 if(VC_OBJECT_STORE_BUILD_TESTS)
