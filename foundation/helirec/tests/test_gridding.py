@@ -241,3 +241,26 @@ def test_frame_registration_lateral(tmp_path, device):
     assert np.abs(sino(scan(True, False)) - plain).max() > 0.03
     # only where the columns are shifted exactly
     np.testing.assert_array_equal(sino(scan(True, True), x_interp="lanczos3"), sino(scan(True, False), x_interp="lanczos3"))
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+def test_rolling_shutter_turns_the_slices_angles(tmp_path, device):
+    """rolling_shutter = s: a slice read at row v of a projection lies s x (the angular step) x (v - middle row) /
+    (rows - 1) from the projection's angle; a bin holding several projections takes their mean"""
+    ngrid, rows, h = 64, 12, 7
+    angles = lambda s, **kw: recon(pattern_scan(tmp_path, 0.0), device, backprojector="fbp", rolling_shutter=s, **kw).reconstruct(h, h + 1, debug=True)["angles"][0]
+    base = angles(0.0)
+    np.testing.assert_allclose(base, np.arange(ngrid) * (2 * np.pi / ngrid), atol=1e-6)
+    # pattern_scan: projection p at angle p steps, 0.06 row further each: the slice is at row h - 0.06 p of it
+    p = np.arange(193)
+    row = h - 0.06 * p
+    ok = (row >= 0) & (row <= rows - 2)
+    mean_row = np.array([row[ok & (p % ngrid == b)].mean() for b in range(ngrid)])
+    for s in (0.5, -1.0):
+        expect = s * (2 * np.pi / ngrid) * (mean_row - 0.5 * (rows - 1)) / (rows - 1)
+        np.testing.assert_allclose(angles(s) - base, expect, atol=2e-5)
+    # gridding that takes one angle per bin: nothing is applied, and the reconstructor says so
+    for kw in (dict(backprojector="ghbp", grid_size=0, rot_center=11.5), dict(backprojector="fbp", angle_interp="linear")):
+        r = recon(pattern_scan(tmp_path, 0.0), device, **{"rolling_shutter": 0.5, **kw})
+        assert r.info["rolling_shutter"] == 0.0
+    assert recon(pattern_scan(tmp_path, 0.0), device, backprojector="fbp", rolling_shutter=0.5).info["rolling_shutter"] == 0.5

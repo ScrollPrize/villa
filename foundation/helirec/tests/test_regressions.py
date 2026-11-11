@@ -178,6 +178,87 @@ def test_z_translation_scale_parameter():
         r.z_translation_scale()
 
 
+# ---------------------------------------------------------------- a scan's frames against themselves
+def turning_texture(rows, cols, axis, per_turn, travel, turns=3, rest_offsets=(0.0, 0.0), seed=7):
+    """A texture seen through a detector by a scan with a turn at rest before and after `turns` turns of helix:
+    views half a turn apart are mirrored about `axis`; the sample travels `travel` rows per turn, and during the
+    turns at rest it really lies rest_offsets rows from where the recorded z says. -> (line(p), angles, recorded)"""
+    rng = np.random.default_rng(seed)
+    g = lambda a, ax: _core.gaussian_filter1d(np.ascontiguousarray(a, np.float32), ax, 1.5, "reflect")
+    tex = g(g(rng.standard_normal((1, int(turns * travel) + 3 * rows, cols)), 1), 2)[0]
+    n = (turns + 2) * per_turn
+    angles = np.arange(n) * (360.0 / per_turn)
+    moving = np.clip(np.arange(n) - per_turn, 0, turns * per_turn)
+    recorded = -moving * (travel / per_turn)
+    real = recorded + np.where(np.arange(n) <= per_turn, rest_offsets[0], 0.0) + np.where(np.arange(n) >= (turns + 1) * per_turn, rest_offsets[1], 0.0)
+    u = np.arange(cols) - axis
+
+    def line(p):
+        v = turns * travel + rows + real[p] + np.arange(rows)                        # what is at row v: this height
+        i = np.floor(v).astype(int)
+        img = tex[i] * (1 - (v - i))[:, None] + tex[i + 1] * (v - i)[:, None]
+        if int(round(angles[p] / 180.0)) % 2:                                        # the opposite view: mirrored
+            x = axis - u
+            j = np.clip(np.floor(x).astype(int), 0, cols - 2)
+            img = img[:, j] * (1 - (x - j)) + img[:, j + 1] * (x - j)
+        return np.ascontiguousarray(img, np.float32)
+    return line, angles, recorded
+
+
+def test_axis_refinement_from_opposite_views():
+    rows, cols, true_axis = 200, 300, 171.37
+    line, angles, recorded = turning_texture(rows, cols, true_axis, 200, 60.0)
+    for searched in (171.25, 171.5):                                                 # the search's quarter-pixel grid
+        res = calibration.axis_from_pairs(line, angles, recorded, searched, (rows, cols), n_pairs=16, tile=64)
+        assert res["n_pairs"] >= 8 and abs(searched + res["refinement"] - true_axis) < 0.03, res
+    edge = calibration.axis_from_pairs(line, angles, recorded, 290.0, (rows, cols), tile=64)
+    assert edge["refinement"] == 0.0 and edge["measured"] is None and "mirrored" in edge["reason"]
+    far = calibration.axis_from_pairs(line, angles, recorded, true_axis - 2.0, (rows, cols), n_pairs=16, tile=64)
+    assert far["refinement"] == 0.0 and far["reason"] == "implausible refinement" and abs(far["measured"] - 2.0) < 0.1
+
+
+def test_stationary_turns_against_the_helix():
+    rows, cols = 200, 300
+    line, angles, recorded = turning_texture(rows, cols, 150.0, 200, 60.0, rest_offsets=(-0.2, 1.1))
+    res = calibration.stationary_from_pairs(line, angles, recorded, (rows, cols), n_pairs=12, tile=64)
+    assert [t["applied"] for t in res["turns"]] == [True, True]
+    (a0, a1, first), (b0, b1, last) = res["segments"]
+    assert (a0, a1) == (0, 201) and (b0, b1) == (800, 1000) and abs(first + 0.2) < 0.03 and abs(last - 1.1) < 0.03
+    rows_add = calibration.stationary_arrays(dict(segments=res["segments"]), len(angles))
+    assert rows_add[0] == np.float32(first) and rows_add[500] == 0 and rows_add[-1] == np.float32(last)
+    # turns where the recorded z is right: measured, nothing applied; no helix: nothing measured
+    line, angles, recorded = turning_texture(rows, cols, 150.0, 200, 60.0)
+    res = calibration.stationary_from_pairs(line, angles, recorded, (rows, cols), n_pairs=12, tile=64)
+    assert res["segments"] == [] and len(res["turns"]) == 2 and all(abs(t["offset"]) < 0.03 for t in res["turns"])
+    assert calibration.stationary_arrays({}, 10) is None
+    still = calibration.stationary_from_pairs(line, angles, 0 * recorded, (rows, cols), tile=64)
+    assert still["segments"] == [] and "helix" in still["reason"]
+
+
+def test_axis_shutter_and_stationary_parameters():
+    r = bare_recon()
+    assert (DEFAULTS["axis_refinement"], DEFAULTS["rolling_shutter"], DEFAULTS["stationary_registration"]) == ("auto", "off", "auto")
+    assert (LEGACY_REFERENCE["axis_refinement"], LEGACY_REFERENCE["rolling_shutter"], LEGACY_REFERENCE["stationary_registration"]) == ("off", "off", "off")
+    r.cal = SimpleNamespace(rot_center=100.25, axis_refinement=0.1, rolling_shutter=-0.7)
+    assert r.rot_center() == pytest.approx(100.35) and r.rolling_shutter() == 0.0 and not r._wants_rolling_shutter()
+    r.params["rolling_shutter"] = "auto"
+    assert r.rolling_shutter() == -0.7 and r._wants_rolling_shutter()
+    r.params.update(axis_refinement="off", rolling_shutter=0)
+    assert r.rot_center() == 100.25 and r.rolling_shutter() == 0.0
+    r.params.update(axis_refinement=-0.05, rolling_shutter="0.5")
+    assert r.rot_center() == pytest.approx(100.2) and r.rolling_shutter() == 0.5
+    r.params["axis_refinement"] = "0.139"                                          # (as the command line gives it)
+    assert r.rot_center() == pytest.approx(100.389)
+    r.params.update(axis_refinement="auto", rolling_shutter="auto")
+    r.cal = SimpleNamespace(rot_center=100.25, axis_refinement=None, rolling_shutter=None)     # (not measured)
+    assert r.rot_center() == 100.25 and r.rolling_shutter() == 0.0
+    r.params.update(axis_refinement="refined", rolling_shutter="rolling")
+    with pytest.raises(ValueError):
+        r.rot_center()
+    with pytest.raises(ValueError):
+        r.rolling_shutter()
+
+
 # ---------------------------------------------------------------- output scale (attenuation)
 @pytest.mark.parametrize("device", DEVICES)
 def test_ramp_scale_attenuation(device):
@@ -353,7 +434,7 @@ def test_legacy_mode_pins_parameters():
     with pytest.raises(ValueError, match="pins"):
         bare_recon()._update({"mode": "legacy_reference", "filters": "paganin(delta_beta=500)"})
     r._update({"mode": "corrected"})
-    assert r.params["filters"] == [] and r.params["mode"] == "corrected"
+    assert r.params["filters"] == [] and r.params["mode"] == "corrected" and r.params["backprojector"] == "fbp"
     with pytest.raises(ValueError):
         r._update({"mode": "nabu"})
     r._update({"mode": "legacy_reference"})

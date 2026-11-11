@@ -16,7 +16,9 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
   (`exposure_arc=auto`); the helical pitch measured from the frames (`z_translation_scale=auto`); the companion
   scan's frames placed as they register on the main scan's, row offset and roll per projection
   (`companion_registration=auto`); recordings of a ray combined with band-dependent weights where the detector's
-  sharpness depends on the place (`detector_smear=auto`). No projection filters by default.
+  sharpness depends on the place (`detector_smear=auto`); the turns recorded with the z stage at rest placed against
+  the helix as the frames register them (`stationary_registration=auto`); the rotation axis refined from the scan's
+  opposite views (`axis_refinement=auto`). No projection filters by default.
 * `legacy_reference`: the reference workflow's conventions (half-attenuation units, its rebalance endpoints,
   integer padding reflection, mending bounds, chunk-dependent Paganin and luminosity window, two-column splat of
   fractional column offsets, linear rows, two-bin angular splat, no exposure-arc correction) with every parameter pinned (GHBP, Paganin 1000 + unsharp 1.2/4, …); overriding one
@@ -30,8 +32,8 @@ Outputs record the mode, its conventions and every resolved parameter (`manifest
 helirec-slices PROJ -n 8 --tag unfiltered                                    # 8 slices, default mode
 helirec-slices PROJ -n 8 --set mode=legacy_reference --tag reference         # the reference workflow
 helirec-slices PROJ --fractions 0.4 0.5 --set "filters=paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)" --tag db500
-helirec-slices PROJ -n 4 --set backprojector=fbp --device cpu --tag exact_fbp
-helirec-slices PROJ -n 8 --set backprojector=fbp --set "filters=mtf_paganin(delta_beta=1000,sigma=1.06)" \
+helirec-slices PROJ -n 4 --device cpu --tag cpu
+helirec-slices PROJ -n 8 --set "filters=mtf_paganin(delta_beta=1000,sigma=1.06)" \
     --set sld=fraction=0.6,length=400 --tag mtf        # fused phase retrieval + detector deblur, calibrated glare
 ```
 
@@ -146,9 +148,9 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
 
 ### Reconstruction methods (`--set backprojector=SPEC`)
 
-* `ghbp`: the reference hierarchical backprojector (default).
-* `fbp(interp=linear|cubic|lanczos3|bspline3|bspline5, oversample=1..8)`: exact pixel-driven backprojector;
-  `oversample` FFT-upsamples the filtered rows before interpolating (default bspline3, 2×).
+* `fbp(interp=linear|cubic|lanczos3|bspline3|bspline5, oversample=1..8)` (default): exact pixel-driven
+  backprojector; `oversample` FFT-upsamples the filtered rows before interpolating (default bspline3, 2×).
+* `ghbp`: the reference hierarchical backprojector (pinned by `mode=legacy_reference`); keeps the two-bin angular splat.
 * `ghbp` and `fbp` take the ramp filter as `filter_name` (default `ramlak`) and `filter_par=p0:p1` (defaults 0.5, 8),
   e.g. `fbp(filter_name=hann,filter_par=1)`: the windows of gridrec (`sino.hpp` `ramp_windowed`) on the band-limited
   Ram-Lak ramp. `p0` is the cutoff in cycles per pixel (default 0.5, Nyquist) and `p1` the Butterworth order;
@@ -372,6 +374,46 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     are. The volume's slice indices (z = view height − first doable height) and the sample's place in them change
     with the scale: compare runs by view height (`--heights`). The rotation-axis and overlap searches still use
     the recorded translations.
+  * `stationary_registration=auto|off` (default `auto`): a scan may begin and end with a turn recorded with the z
+    stage at rest. Its recorded z joins the helix's by what the motor record says, which need not be where the
+    sample was while the stage started or stopped. The calibration compares projections of such a turn with those
+    a whole turn away in the helix (the same rays, displaced along the rows by the travel in between; 24 pairs per
+    turn, tiles registered by `calib::tile_shifts`; `calibration.stationary_from_pairs`) and adds the turn's
+    offset to the vertical position of its projections, in both scans (`ScanTrajectory::row_offset`; the
+    companion's own registration is on the main scan's frames). PHerc0343P: the recorded helix is a line that starts
+    0.79 row behind the first stationary position and stops 0.73 row short of the last; the first turn really lies
+    −0.16 row from where that puts it, the last **+1.09 rows**. Slices that both the last turn and the helix
+    record (the last ~1200 of 5409) averaged two copies a voxel apart along z: against the 2.215 µm volume, at
+    slices 912–1167 (with the axis refinement below), correlation along z 0.751 → 0.895 at 0.36, 0.563 → 0.839 at
+    0.42, 0.455 → 0.789 at 0.45 cycles/voxel, in plane 0.736 → 0.836 at 0.42 and 0.635 → 0.756 at 0.45. 5 s once
+    per scan (cached); nothing per chunk. The first and last doable view heights move with the offsets, and with
+    them the volume's slice indices (PHerc0343P: 5409 slices where there were 5411, the same sample one index
+    lower): compare runs by view height (`--heights`). `off`: the recorded z as it is.
+  * `axis_refinement=auto|off|PIXELS` (default `auto`): the rotation-axis search works on a grid of a quarter
+    pixel. A projection and the one half a turn on are mirror images about the axis: for 48 pairs along the scan
+    the one is registered on the mirrored other (`calibration.axis_from_pairs`), and half the median lateral
+    displacement is added to the searched axis. The slice grid stays that of the searched axis, so the volume
+    keeps its shape and place. PHerc0343P: +0.096 px (0.04 … 0.14 along the scan; the two halves of the detector's
+    data, see `rolling_shutter`, put the axis within 0.01 px of that). In-plane correlation with the 2.215 µm
+    volume at 0.42 / 0.45 / 0.48 cycles/voxel: centre block 0.736 / 0.620 / 0.487 → 0.753 / 0.646 / 0.519, 730 px
+    right of the axis 0.694 / 0.581 / 0.455 → 0.717 / 0.610 / 0.486, 670 px left 0.742 / 0.636 / 0.508 →
+    0.753 / 0.652 / 0.530; along z unchanged within 0.005. 4 s once per scan (cached). `off`: the searched axis;
+    a number: that many pixels added. With `--cor` the given axis is used as it is.
+  * `rolling_shutter=off|auto|S` (default `off`): a camera that reads its rows one after another while the sample
+    turns records each row at another angle. S is the time from the read-out of the first row to that of the last,
+    in frame periods (negative when the last row is read first); a slice, read at one row of every projection, is
+    then backprojected at that row's angle (the angles of each slice: `angle_interp=nearest`, not GHBP). `auto`
+    measures it on first use (`recon.measure_rolling_shutter`, a minute on a GPU, cached): a slab reconstructed
+    from the upper rows of the main scan's detector alone and from the lower rows alone (each half a turn) is
+    turned against itself by the shutter; the same fit gives the axis's remaining error, a shear of the rows and
+    the change of magnification between the halves (logged, not applied). PHerc0343P: the halves are turned
+    −0.277 mrad against each other, S = −0.75 (0.59 mrad between the first and the last row; about 10 µs per sensor
+    line), and with it the rotation is gone on every side of the axis. **Not a default**: against the 2.215 µm
+    volume the in-plane correlation at 0.45 cycles/voxel rises 730 px right of the axis (0.610 → 0.640), stays at
+    the centre (0.646 → 0.644) and falls 670 px left of it (0.652 → 0.634), with or without the band-dependent
+    weights, the exposure-arc correction, the companion scan or the rows where two turns overlap. What is left
+    between the two halves is a magnification that differs by 0.03 % (a keystone of the detector's image, not
+    corrected), of the same size as the rotation.
   * `angle_subset=I/N` (default: every projection): subset I of N interleaved subsets of the projections, chosen
     by angle (the same angles in every scan) and reconstructed on a grid of 1 / N of the angles. `0/2` and `1/2`
     are two reconstructions of one scan with independent noise and everything else in common
@@ -432,9 +474,11 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     per chunk on the PHerc0343P pair).
 * **Geometry**: `--cor` / `--vector` override the calibration for one run (never cached; not allowed in
   `legacy_reference`).
-* **Calibration cache** (`--cache_dir`): darks/flats reduction and the measured calibration (rotation axis,
-  overlap vector, helical pitch), keyed by a fingerprint of the acquisition and the calibration version; written
-  atomically. A cache written before the pitch measurement existed gets it added on its next use.
+* **Calibration cache** (`--cache_dir`): darks/flats reduction and the measured calibration (rotation axis and its
+  refinement, overlap vector, helical pitch, detector smear, the companion's and the stationary turns'
+  registration, the rolling shutter once asked for), keyed by a fingerprint of the acquisition and the calibration
+  version; written atomically. A cache written before one of these measurements existed gets it added on its
+  next use.
 * **New kernels**: add a function with the same signature in `src/cpu` and `src/cuda`; shared per-element
   arithmetic lives in `src/common/*_core.hpp` so the backends cannot drift apart.
 
@@ -619,6 +663,8 @@ These raise explicit errors:
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.
 
-The calibration kernels are CPU-only (they are cheap). The helical pitch is one scale for the whole scan: a
-stage that comes to rest away from its recorded position is not corrected (PHerc0343P: the projection pairs that
-reach into the final stationary turn sit about one row off the scale).
+The calibration kernels are CPU-only (they are cheap); the rolling-shutter measurement reconstructs and uses the
+reconstruction's device. The helical pitch is one scale for the helix; the turns at rest before and after it get
+an offset each (`stationary_registration`), the few projections in which the stage starts and stops do not. The
+detector's image is taken to be undistorted: PHerc0343P's is not (a keystone and a bend towards one side, up to
+1.2 px in the first 400 columns), which is what remains between its two scans beyond 1000 px from the axis.

@@ -393,8 +393,7 @@ def main(argv=None):
     # ================================================================ from the projections (band reconstruction)
     from .band import BandComposite
     from .recon import HelicalRecon
-    if params.get("mode") != "legacy_reference":   # (the legacy mode pins ghbp)
-        params.setdefault("backprojector", "fbp")  # composites: the exact backprojector at the band pixels (fast path)
+    # (the default backprojector, fbp, is the fast path: the exact backprojector at the band pixels)
     r = HelicalRecon(a.projections, cache_dir=a.cache_dir, device=a.device, params=params, log=lambda *x: None)
     N = r.info["grid_size"]
     z0, z1 = a.z if a.z else (0, r.hi - r.lo)

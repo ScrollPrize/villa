@@ -509,6 +509,7 @@ int SliceReconstructor::merged_width() const { return impl_->NX; }
 std::pair<int, int> SliceReconstructor::mend_domain() const { return {impl_->mend_x0, impl_->mend_x1}; }
 const ReconConfig& SliceReconstructor::config() const { return impl_->cfg; }
 double SliceReconstructor::exposure_arc_bins() const { return impl_->arc_bins; }
+double SliceReconstructor::rolling_shutter() const { return impl_->nearest ? impl_->cfg.rolling_shutter : 0.0; }
 std::string SliceReconstructor::angle_interp() const { return impl_->nearest ? "nearest" : "linear"; }
 std::string SliceReconstructor::z_interp() const {
     return impl_->z_kernel == interp_core::Lanczos3 ? "lanczos3" : impl_->z_kernel == interp_core::Cubic ? "cubic" : "linear";
@@ -518,8 +519,13 @@ std::string SliceReconstructor::z_interp() const {
 // residual of the projections it holds, each weighted as the gridding weighs it in that slice's row (the mean
 // detector weight of the rows it is interpolated from, times its current factor). A bin no projection reaches takes
 // the residual of the nearest filled bin before it (the first filled one's, for those ahead of it).
+// Rolling shutter (ReconConfig::rolling_shutter): the row a slice is read at was recorded at another angle than the
+// projection's by shutter_bins x (row - middle row), which is added to the projection's residual.
 void SliceReconstructor::Impl::set_slice_angles(const std::vector<ChunkScan*>& cs, int DY, int m) {
     const int NG = n_grid;
+    // (bins per detector row: the scan's signed angular step, in bins, over the frame's rows)
+    const auto& a0 = scans[0].traj.angles_deg;
+    const double shutter_bins = cfg.rolling_shutter * (a0.back() >= a0.front() ? recorded_step : -recorded_step) * NG / 360.0;
     slice_fbp_angles.resize(static_cast<std::size_t>(DY) * NG);
     std::vector<double> sw(NG), sd(NG);
     for (int y = 0; y < DY; ++y) {
@@ -536,7 +542,7 @@ void SliceReconstructor::Impl::set_slice_angles(const std::vector<ChunkScan*>& c
                 const double w = ((1 - a) * prof[r] + (a > 0 ? a * prof[r + 1] : 0.0)) * c.weight_factor[k];
                 if (!(w > 0)) continue;
                 sw[c.j0[k]] += w;
-                sd[c.j0[k]] += w * bins[s].residual[c.p0 + k];
+                sd[c.j0[k]] += w * (bins[s].residual[c.p0 + k] + (rows > 1 ? shutter_bins * (r + a - 0.5 * (rows - 1)) / (rows - 1) : 0.0));
             }
         }
         int first = -1;

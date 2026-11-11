@@ -46,6 +46,9 @@ class FakeRecon:
         self.regions = FakeRecon.regions = []
         self.main = SimpleNamespace(pixel_size_m=8.64e-6)
 
+    def rot_center(self):   # (the axis in use: the calibration's, refined)
+        return self.cal.rot_center
+
     def set_params(self, **kw):
         HelicalRecon._update(self, kw)
 

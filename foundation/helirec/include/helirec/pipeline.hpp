@@ -74,6 +74,14 @@ struct ReconConfig {
     // continuous rotation: fraction of the angular step between projections swept during one exposure (0: none, or
     // step scans). > 0: that box blur along the angle is deconvolved in every sinogram (sino.hpp angular_fir).
     double exposure_arc = 0;
+    // Rolling shutter: the detector's rows are read one after another while the sample turns, so the angle of a
+    // recording depends on its row. rolling_shutter = the time from the read-out of the first row to that of the
+    // last, in frame periods (signed: negative when the last row is read first): the row v of a projection was
+    // recorded rolling_shutter x (the angular step) x (v - middle row) / (rows - 1) from the projection's angle.
+    // A slice lies at one row of every projection, so the correction is an angle per slice and bin: applied with
+    // the angles of each slice (angle_interp "nearest" and a backprojector that takes them; not ghbp, not the
+    // legacy reference mode: SliceReconstructor::rolling_shutter() tells what is in use). 0: one angle per frame.
+    double rolling_shutter = 0;
     // Split reconstructions: with angle_subsets > 1 only subset number angle_subset of that many interleaved subsets
     // of the projections is used (helical.hpp angle_subset: by angle, the same angles in every scan), on a grid of
     // 1 / angle_subsets of the angles (unless n_grid says otherwise). The subsets of a scan have independent noise
@@ -85,9 +93,9 @@ struct ReconConfig {
     int block_angles = 500;
     // reconstruction
     float rot_center = 0.f;             // in the merged frame
-    // backprojector: "ghbp" (reference), "fbp" (exact pixel-driven: bp_interp, bp_oversample), "sirt" / "mlem" /
-    // "gridrec" (tomo_params: whole-slice methods, tomo.hpp) or "external"
-    std::string backprojector = "ghbp";
+    // backprojector: "fbp" (default; exact pixel-driven: bp_interp, bp_oversample), "ghbp" (the reference's), "sirt" /
+    // "mlem" / "gridrec" (tomo_params: whole-slice methods, tomo.hpp) or "external"
+    std::string backprojector = "fbp";
     // fbp row interpolation: linear | cubic | lanczos3 | bspline3 | bspline5; rows upsampled (band-limited, FFT) by
     // bp_oversample first. Default oversample 2 + bspline3: within 0.1 % of ideal (sinc) interpolation for ~7 % more
     // time (linear alone loses ~10 % of the high-frequency contrast)
@@ -196,6 +204,7 @@ class SliceReconstructor {
     int merged_width() const;
     std::pair<int, int> mend_domain() const;   // [x0, x1) merged columns the mending works on
     double exposure_arc_bins() const;          // the deconvolved exposure arc in grid angles (0: none)
+    double rolling_shutter() const;            // the rolling shutter in use (frame periods over the rows; 0: none)
     std::string angle_interp() const;          // the angular gridding in use: "nearest" or "linear"
     std::string z_interp() const;              // the vertical kernel in use
     std::vector<int> projection_counts() const;   // projections in use, per scan (a subset: fewer than recorded)

@@ -663,6 +663,7 @@ class PySliceReconstructor {
         f("z_interp", cfg.z_interp);
         f("angle_interp", cfg.angle_interp);
         f("exposure_arc", cfg.exposure_arc);
+        f("rolling_shutter", cfg.rolling_shutter);
         f("angle_subsets", cfg.angle_subsets);
         f("angle_subset", cfg.angle_subset);
         f("mend_threshold", cfg.mend_threshold);
@@ -701,6 +702,7 @@ class PySliceReconstructor {
         d["mend_domain"] = nb::make_tuple(mx0, mx1);
         d["legacy_reference"] = impl_->config().legacy_reference;
         d["exposure_arc_bins"] = impl_->exposure_arc_bins();
+        d["rolling_shutter"] = impl_->rolling_shutter();
         d["angle_interp"] = impl_->angle_interp();
         d["z_interp"] = impl_->z_interp();
         d["angle_subsets"] = impl_->config().angle_subsets;

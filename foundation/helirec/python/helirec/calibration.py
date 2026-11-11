@@ -575,6 +575,16 @@ class Calibration:
     # stretches they are interpolated within, slope_col, slope_row). {}: measured, nothing usable.
     # None: not measured yet (an older cache; one without the lateral knots is measured again).
     companion_registration: dict | None = None
+    # Refinement of the rotation axis (axis_from_pairs; details["axis"]): pixels to add to cor_main_detector and
+    # rot_center, which keep the search's value (on its grid of a quarter pixel). None: not measured yet.
+    axis_refinement: float | None = None
+    # The turns recorded with the z stage at rest against the helix (stationary_from_pairs; details["stationary"]):
+    # dict(segments=[[first projection, end, rows], ...]): rows to add to the vertical position of those projections
+    # of the main scan (and of the companion's of the same angles). {}: measured, nothing to apply. None: not measured.
+    stationary_registration: dict | None = None
+    # Rolling shutter (recon.measure_rolling_shutter; details["rolling_shutter"]): the time from the read-out of the
+    # detector's first row to its last, in frame periods (pipeline.hpp). None: not measured yet.
+    rolling_shutter: float | None = None
     source: str = "measured"          # measured | override (cor and / or vector given by the caller; never cached)
     fingerprint: str = ""             # acquisition_fingerprint() of the scan pair it was computed from
     version: int = CALIBRATION_VERSION
@@ -685,6 +695,12 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
             # (a cache from before the frame registration, or from before its lateral part)
             _add_registration(cal, main, companion, arrays, log, progress)
             _save_calibration(cache_dir, cal)
+        if cal.axis_refinement is None:             # (a cache from before the axis refinement)
+            _add_axis(cal, main, arrays, log, progress)
+            _save_calibration(cache_dir, cal)
+        if cal.stationary_registration is None:     # (a cache from before the stationary turns' registration)
+            _add_stationary(cal, main, arrays, log, progress)
+            _save_calibration(cache_dir, cal)
         return cal, {**arrays, **_scan_weights(arrays["weight_map"], main, cal)}
     t0 = time.time()
     if arrays is None:
@@ -753,6 +769,14 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
     else:
         _add_smear(cal, main, arrays, log)
     _add_registration(cal, main, companion, arrays, log, progress)
+    if cor_override is not None:
+        cal.axis_refinement = 0.0                    # (the caller's axis is used as given)
+    else:
+        _add_axis(cal, main, arrays, log, progress)
+    _add_stationary(cal, main, arrays, log, progress)
+    if override and cached_cal is not None and cached_cal.get("rolling_shutter") is not None:
+        cal.rolling_shutter = float(cached_cal["rolling_shutter"])     # (the camera's: not the caller's geometry's)
+        cal.details["rolling_shutter"] = cached_cal.get("details", {}).get("rolling_shutter")
     log(f"calibration ({cal.source}) done in {time.time() - t0:.0f}s: COR {cor_main:.3f} (detector), vector {vector}, "
         f"rotation axis {rot_center:.3f} in a {width}-px merged frame")
     if cache_dir and not override:
@@ -947,6 +971,219 @@ def measure_registration(main, companion, arrays, cal, n_pairs=240, tile=240, lo
                                segments=segments,
                                slope_col=float(cal.rot_center - (pb.shift_x - pb.x_readjustment)),
                                slope_row=0.5 * (rows - 1))
+    return out
+
+
+# ============================================================================ one scan's frames against themselves
+AXIS_MAX_REFINEMENT = 1.0          # pixels: a larger correction of the searched axis is taken for a failed measurement
+STATIONARY_MIN_ROWS = 0.05         # rows: a smaller offset of a stationary turn is not applied
+STATIONARY_MAX_SCATTER = 0.35      # rows: scatter of the pairs above which nothing is applied
+STATIONARY_RAMP = 40               # projections next to a change of the stage's motion that are not used as partners
+
+
+def _line_integrals(ext, p):
+    """flat-fielded line integrals of projection p, float32 (rows, cols)"""
+    raw = ext.src.frames(np.array([p]))[0].astype(np.float32)
+    sig = ((raw - ext.dark) / ext.cd[p]) / np.maximum(ext._flat(p), FLT_MIN)
+    return np.ascontiguousarray(-np.log(np.clip(sig, 1e-6, None)), np.float32)
+
+
+def _high_pass(im, sigma=6.0):
+    im = np.ascontiguousarray(im, np.float32)
+    return im - _core.gaussian_filter1d(_core.gaussian_filter1d(im, 0, sigma, "reflect"), 1, sigma, "reflect")
+
+
+def _partner(ang, p, turn_deg):
+    """the projection turn_deg (signed, in the scan's sense of rotation) from projection p, or -1"""
+    step = float(np.median(np.abs(np.diff(ang))))
+    sense = 1.0 if ang[-1] >= ang[0] else -1.0
+    target = ang[p] + sense * turn_deg
+    order = np.argsort(ang)
+    i = int(np.clip(np.searchsorted(ang[order], target), 1, len(ang) - 1))
+    q = order[i - 1] if abs(ang[order[i - 1]] - target) <= abs(ang[order[i]] - target) else order[i]
+    return int(q) if abs(ang[q] - target) <= 0.5 * step + 1e-9 else -1
+
+
+def _row_registered(a, b, s, tile):
+    """Tiles of frame a on frame b whose content lies s rows further down (the whole rows of s are cropped):
+    _core.tile_shifts rows [row, col, dv - (s - round(s)), du, corr] of the tiles that correlate, or None when the
+    frames share too few rows."""
+    rows = a.shape[0]
+    si = int(np.rint(s))
+    n = rows - abs(si)
+    if n < tile + 16:
+        return None
+    a, b = (a[:n], b[si:]) if si >= 0 else (a[-si:], b[:n])
+    t = _core.tile_shifts(np.ascontiguousarray(a), np.ascontiguousarray(b), tile, tile // 2, 4, 6)
+    t = t[np.isfinite(t[:, 2]) & (t[:, 4] > 0.3)]
+    t[:, 2] -= s - si
+    return t
+
+
+def axis_from_pairs(line, angles_deg, z_pix, axis, shape, n_pairs=48, tile=240, progress=None):
+    """Refinement of the rotation axis from a scan's own opposite views.
+
+    A projection and the one half a turn on are mirror images about the rotation axis (displaced along the rows by
+    the travel in between). For n_pairs pairs spread over the scan the high-passed line integrals of the one are
+    registered on the mirrored other on tiles (_core.tile_shifts) over the columns that have a mirror partner; the
+    median lateral displacement is twice the error of `axis` (the scan's columns). The axis search works on a grid
+    of a quarter pixel; this measures the remainder.
+
+    line(p): the (rows, cols) float32 line integrals of projection p; z_pix: the rows the sample has travelled.
+    Returns a dict: refinement (pixels to add to the axis; 0.0 when nothing could be measured or the result is
+    implausible), measured, scatter, n_pairs, range (the least and largest refinement along the scan, over runs of
+    pairs), reason, pairs [[p, q, tiles, refinement of the pair], ...]."""
+    out = dict(refinement=0.0, measured=None, scatter=None, n_pairs=0, range=None, reason=None, pairs=[])
+    rows, cols = shape
+    flip = int(math.floor(2 * axis))               # column c of the mirrored frame = column flip - c of the frame
+    frac = 2 * axis - flip
+    c0, c1 = max(0, flip - (cols - 1)), min(cols - 1, flip)     # columns with a mirror partner on the detector
+    if c1 - c0 + 1 < tile + 40:
+        return dict(out, reason=f"rotation axis at column {axis:.1f}: only {max(c1 - c0 + 1, 0)} mirrored columns")
+    ang = np.asarray(angles_deg, np.float64)
+    z = np.asarray(z_pix, np.float64)
+    picks = np.unique(np.linspace(0, len(ang) - 1, n_pairs + 2)[1:-1].round().astype(int))
+    pairs = []
+    for p in picks:
+        p = int(p)
+        q = _partner(ang, p, 180.0)
+        if q < 0:
+            q = _partner(ang, p, -180.0)
+        if q >= 0:
+            a = _high_pass(line(p)[:, c0:c1 + 1])
+            b = _high_pass(line(q)[:, flip - c1:flip - c0 + 1][:, ::-1])
+            t = _row_registered(a, b, z[p] - z[q], tile)
+            if t is not None and len(t) >= 6:
+                # a feature at column x of the frame is at flip - (2 axis_true - x) of the mirrored one:
+                # du = flip - 2 axis_true
+                pairs.append([p, q, int(len(t)), float(-0.5 * (np.median(t[:, 3]) + frac))])
+        if progress:
+            progress(1)
+    out["pairs"] = pairs
+    if len(pairs) < max(8, len(picks) // 3):
+        return dict(out, reason=f"only {len(pairs)} of {len(picks)} pairs of opposite views register")
+    d = np.array([r[3] for r in pairs])
+    measured = float(np.median(d))
+    scatter = float(1.4826 * np.median(np.abs(d - measured)))
+    runs = [float(np.median(c)) for c in np.array_split(d, min(6, len(d) // 4))]
+    out.update(measured=measured, scatter=scatter, n_pairs=len(pairs), range=[min(runs), max(runs)])
+    if abs(measured) > AXIS_MAX_REFINEMENT:
+        return dict(out, reason="implausible refinement")
+    out["refinement"] = measured
+    return out
+
+
+def _scan_rows(scan, z_scale):
+    """rows the sample has travelled at each projection (recorded z x the pitch scale)"""
+    return (np.asarray(scan.z_translation_m, np.float64) - scan.z_translation_m[0]) / scan.pixel_size_m * z_scale
+
+
+def _add_axis(cal, main, arrays, log, progress):
+    """refine the rotation axis from the main scan's opposite views and record it in the calibration"""
+    ext = Extractor(main, arrays["main_dark"], arrays["main_flats"], arrays["weight_map"])
+    with _bar(progress, 48, "rotation axis (opposite views)", "pair") as bar:
+        res = axis_from_pairs(lambda p: _line_integrals(ext, p), main.unwrapped_angles_deg,
+                              _scan_rows(main, cal.z_translation_scale or 1.0), cal.cor_main_detector, main.frame_shape,
+                              progress=bar.update)
+    cal.axis_refinement = float(res["refinement"])
+    cal.details["axis"] = res
+    if res["measured"] is None:
+        log(f"rotation axis: not refined ({res['reason']})")
+    else:
+        log(f"rotation axis: the opposite views of {main.name} put it {res['measured']:+.3f} px from the search's "
+            f"{cal.cor_main_detector:.3f} ({res['n_pairs']} pairs, scatter {res['scatter']:.3f}; "
+            f"{res['range'][0]:+.3f} .. {res['range'][1]:+.3f} along the scan)"
+            + ("" if res["reason"] is None else f": {res['reason']}, not applied"))
+
+
+def stationary_from_pairs(line, angles_deg, z_pix, shape, n_pairs=24, tile=240, progress=None):
+    """Where the turns recorded with the z stage at rest lie against the helix, from a scan's own frames.
+
+    A scan may begin and end with a turn at rest. Its recorded z joins the helix's by what the motor record says,
+    which need not be where the sample was while the stage started or stopped. A projection of such a turn and the
+    one a whole turn away in the helix see the same rays, displaced along the rows by the travel in between: the
+    high-passed line integrals of n_pairs such pairs per turn are registered on tiles (_core.tile_shifts) and the
+    median residual against the recorded travel is the turn's offset: rows to add to the vertical position of its
+    projections. Partners within STATIONARY_RAMP projections of the helix's ends are not used.
+
+    line(p): the (rows, cols) float32 line integrals of projection p; z_pix: the rows the sample has travelled, as
+    recorded (x the pitch scale).
+    Returns a dict: segments [[first projection, end, rows], ...] (only offsets that are significant, at least
+    STATIONARY_MIN_ROWS and whose pairs scatter by less than STATIONARY_MAX_SCATTER), turns [dict(first, end,
+    offset, stderr, scatter, n_pairs, applied)], pairs [[p, q, lag, tiles, residual], ...], reason."""
+    out = dict(segments=[], turns=[], pairs=[], reason=None)
+    rows, cols = shape
+    ang = np.asarray(angles_deg, np.float64)
+    z = np.asarray(z_pix, np.float64)
+    n = len(ang)
+    moving = np.flatnonzero(np.abs(np.diff(z)) > 0.01)
+    if len(moving) < 2 * STATIONARY_RAMP + 8:
+        return dict(out, reason="the scan has no helix")
+    h0, h1 = int(moving[0]) + 1, int(moving[-1]) + 1          # the helix: projections [h0, h1)
+    step = float(np.median(np.abs(np.diff(ang))))
+    per_turn = 360.0 / step
+    stretches = [(0, h0, 360.0), (h1, n, -360.0)]             # (first, end, the turn to the partner in the helix)
+    for s0, s1, turn in stretches:
+        if s1 - s0 < 0.25 * per_turn:
+            continue
+        cand = []
+        for p in range(s0, s1):
+            q = _partner(ang, p, turn)
+            if q < h0 + STATIONARY_RAMP or q >= h1 - STATIONARY_RAMP:
+                continue
+            if rows - abs(z[p] - z[q]) >= tile + 60:
+                cand.append((p, q))
+        if len(cand) < 8:
+            continue
+        picks = [cand[i] for i in np.unique(np.linspace(0, len(cand) - 1, n_pairs).round().astype(int))]
+        res = []
+        for p, q in picks:
+            t = _row_registered(_high_pass(line(p)), _high_pass(line(q)), z[p] - z[q], tile)
+            if t is not None and len(t) >= 6:
+                # what is at row v of p is at v + (z[p] - z[q]) + dv of q: the turn really lies dv further
+                res.append([p, q, float(z[p] - z[q]), int(len(t)), float(np.median(t[:, 2]))])
+            if progress:
+                progress(1)
+        out["pairs"] += res
+        if len(res) < 6:
+            continue
+        d = np.array([r[4] for r in res])
+        off = float(np.median(d))
+        scatter = float(1.4826 * np.median(np.abs(d - off)))
+        stderr = scatter / math.sqrt(len(d))
+        applied = bool(abs(off) >= max(STATIONARY_MIN_ROWS, 3 * stderr) and scatter <= STATIONARY_MAX_SCATTER)
+        out["turns"].append(dict(first=s0, end=s1, offset=off, stderr=stderr, scatter=scatter, n_pairs=len(res), applied=applied))
+        if applied:
+            out["segments"].append([s0, s1, off])
+    if not out["turns"]:
+        out["reason"] = "no turn at rest that shares rows with the helix a turn away"
+    return out
+
+
+def _add_stationary(cal, main, arrays, log, progress):
+    """place the main scan's stationary turns against its helix and record it in the calibration"""
+    ext = Extractor(main, arrays["main_dark"], arrays["main_flats"], arrays["weight_map"])
+    with _bar(progress, 48, "stationary turns against the helix", "pair") as bar:
+        res = stationary_from_pairs(lambda p: _line_integrals(ext, p), main.unwrapped_angles_deg,
+                                    _scan_rows(main, cal.z_translation_scale or 1.0), main.frame_shape, progress=bar.update)
+    cal.stationary_registration = dict(segments=res["segments"]) if res["segments"] else {}
+    cal.details["stationary"] = res
+    if not res["turns"]:
+        log(f"stationary turns: none measured ({res['reason']})")
+    for t in res["turns"]:
+        log(f"stationary turn (projections {t['first']} .. {t['end'] - 1}) of {main.name}: {t['offset']:+.3f} rows from "
+            f"where the recorded z puts it against the helix ({t['n_pairs']} pairs, scatter {t['scatter']:.3f})"
+            + ("" if t["applied"] else ": not applied"))
+
+
+def stationary_arrays(reg, n_proj):
+    """Calibration.stationary_registration -> rows to add to the vertical position of each of the main scan's
+    projections (float32 (n_proj,)), or None when there is nothing to apply"""
+    if not reg or not reg.get("segments"):
+        return None
+    out = np.zeros(n_proj, np.float32)
+    for s0, s1, off in reg["segments"]:
+        out[int(s0):int(s1)] = off
     return out
 
 

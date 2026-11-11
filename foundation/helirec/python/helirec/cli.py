@@ -410,7 +410,7 @@ def main(argv=None):
         from .recon import display_window
         a.u8_window = display_window(r.params["mode"])
     print(f"setup {time.time() - t0:.1f}s: doable view heights [{r.lo}, {r.hi}) (z 0..{r.hi - r.lo - 1}), "
-          f"rotation axis {r.cal.rot_center}, grid {r.info['grid_size']}, margin {r.info['margin']}")
+          f"rotation axis {r.rot_center():.3f}, grid {r.info['grid_size']}, margin {r.info['margin']}")
     a.reference = reference_mask(a, r)
     N = r.info["grid_size"]
     if a.bbox and not (0 <= a.bbox[0] < a.bbox[1] <= N and 0 <= a.bbox[2] < a.bbox[3] <= N):

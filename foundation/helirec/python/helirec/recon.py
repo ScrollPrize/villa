@@ -32,15 +32,29 @@ from .filters import DEFAULT_CHAIN, REFERENCE_CHAIN, is_filter_key, override, pa
 MODES = ("corrected", "legacy_reference")
 
 # default reconstruction parameters: the reference workflow's (Night Rail BM18 defaults) with the corrected conventions
-# (mode "corrected") and no projection filters
+# (mode "corrected"), no projection filters, and fbp (it takes each slice's angles: angle_interp, rolling_shutter)
 DEFAULTS = dict(
     mode="corrected", filters=DEFAULT_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
-    backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
+    backprojector="fbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
     axis_source_meters=1e9, sld="", x_interp="sinc", z_interp="lanczos3", angle_interp="nearest", exposure_arc="auto",
     angle_subset="", z_translation_scale="auto", detector_smear="auto", sharp_f=0.35, sharp_band="0.15:0.30",
-    companion_registration="auto",
+    companion_registration="auto", stationary_registration="auto", axis_refinement="auto", rolling_shutter="off",
 )
+# rolling_shutter: the time from the read-out of the detector's first row to its last, in frame periods (negative when
+#   the last row is read first): the rows of a frame were recorded at different angles while the sample turned, and a
+#   slice, read at one row of every frame, is backprojected at those angles. "off" (default): one angle per frame;
+#   "auto": what the calibration measures (measure_rolling_shutter: two reconstructions of a slab, from the upper and
+#   from the lower rows of the detector, are turned against each other by the shutter; measured on first use, a
+#   minute on a GPU, then cached); a number: that value. Applied with the angles of each slice (angle_interp nearest;
+#   not ghbp): info["rolling_shutter"] is what is in use. Not a default: on PHerc0343P it removes the rotation
+#   between the two halves of the detector's data, and against a finer scan of the sample it gains on one side of the
+#   axis and loses on the other (README).
+# axis_refinement: "auto" (the rotation axis the search found on its quarter-pixel grid, plus what the scan's opposite
+#   views say is left: calibration.axis_from_pairs) | "off" (the search's value) | a number of pixels to add.
+# stationary_registration: "auto" (the turns recorded with the z stage at rest are placed against the helix as the
+#   frames register them: a row offset per turn, calibration.stationary_from_pairs, for both scans) | "off" (the
+#   recorded z as it is).
 # companion_registration: "auto" (the companion's frames are placed on the main scan's as the calibration registered
 #   them: a row offset and a roll (rows by the column, columns by the row), per projection:
 #   calibration.measure_registration) | "off" (the calibrated vector alone)
@@ -72,7 +86,7 @@ LEGACY_REFERENCE = dict(
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
     axis_source_meters=1e9, sld="", x_interp="linear", z_interp="linear", angle_interp="linear", exposure_arc=0.0,
     angle_subset="", z_translation_scale=1.0, detector_smear="", sharp_f=0.35, sharp_band="0.15:0.30",
-    companion_registration="off",
+    companion_registration="off", stationary_registration="off", axis_refinement="off", rolling_shutter="off",
 )
 assert set(LEGACY_REFERENCE) == set(DEFAULTS) - {"mode"}
 
@@ -143,8 +157,8 @@ def legacy_reference_config():
 def backprojector_config(spec):
     """Backprojector spec -> reconstructor config keys. Specs (text or dict):
       ghbp                                  the reference hierarchical backprojector
-      fbp(interp=linear|cubic|lanczos3|bspline3|bspline5, oversample=1..8)   exact pixel-driven backprojector
-                                            (default interp=bspline3, oversample=2: ~ideal interpolation)
+      fbp(interp=linear|cubic|lanczos3|bspline3|bspline5, oversample=1..8)   exact pixel-driven backprojector: the
+                                            default (interp=bspline3, oversample=2: ~ideal interpolation)
                                             (oversample: FFT upsampling of the filtered rows before interpolating)
                                             ghbp and fbp also take the ramp filter, as gridrec:
                                             filter_name=ramlak (default)|shepp|cosine|hann|hamming|parzen|butterworth|none,
@@ -224,7 +238,13 @@ class HelicalRecon:
                                                       log=self.log, cor_override=self.cor_override,
                                                       vector_override=self.vector_override)
         self._check_calibration()
+        if self._wants_rolling_shutter() and self.cal.rolling_shutter is None:
+            measure_rolling_shutter(self)      # (a calibration from before the measurement: measured once, cached)
         self._build()
+
+    def _wants_rolling_shutter(self) -> bool:
+        v = self.params["rolling_shutter"]
+        return isinstance(v, str) and v.strip().lower() == "auto" and not self.legacy
 
     # ------------------------------------------------------------------ setup
     def _scan_data(self, scan, tag):
@@ -243,27 +263,88 @@ class HelicalRecon:
 
     def _registration(self, scan, tag) -> dict:
         """make_scan_data's registration arguments: the companion's frames on the main scan's
-        (params["companion_registration"]: "auto" = what the calibration measured, "off")"""
-        v = self.params["companion_registration"]
-        v = v.strip().lower() if isinstance(v, str) else v
-        if v not in ("auto", "off", "", None):
-            raise ValueError("companion_registration must be 'auto' or 'off'")
-        if tag != "companion" or v != "auto" or self.params["mode"] == "legacy_reference":
-            return {}
-        arr = calibration.registration_arrays(getattr(self.cal, "companion_registration", None), len(scan.projections))
-        if arr is None:
-            return {}
-        self._registered = True
-        return {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in arr.items()}
+        (params["companion_registration"]: "auto" = what the calibration measured, "off"), and both scans' turns at
+        rest against the helix (params["stationary_registration"])"""
+        opt = {}
+        for key in ("companion_registration", "stationary_registration"):
+            v = self.params[key]
+            v = v.strip().lower() if isinstance(v, str) else v
+            if v not in ("auto", "off", "", None):
+                raise ValueError(f"{key} must be 'auto' or 'off'")
+            opt[key] = v == "auto" and self.params["mode"] != "legacy_reference"
+        arr = None
+        if tag == "companion" and opt["companion_registration"]:
+            arr = calibration.registration_arrays(getattr(self.cal, "companion_registration", None), len(scan.projections))
+            self._registered = arr is not None or getattr(self, "_registered", False)
+        out = {} if arr is None else dict(arr)
+        if opt["stationary_registration"]:
+            rows = self._stationary_rows(scan, tag)
+            if rows is not None:
+                out["row_offset"] = (out["row_offset"] + rows if "row_offset" in out else rows).astype(np.float32)
+                self._stationary = True
+        return {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in out.items()}
+
+    def _stationary_rows(self, scan, tag):
+        """rows to add to the vertical position of each projection of `scan`: the main scan's turns at rest against
+        its helix (Calibration.stationary_registration); the companion's projections take the main scan's of the same
+        angle, since its own registration is on the main scan's frames"""
+        rows = calibration.stationary_arrays(getattr(self.cal, "stationary_registration", None), len(self.main.projections))
+        if rows is None or tag == "main":
+            return rows
+        am = np.asarray(self.main.unwrapped_angles_deg, np.float64)
+        ac = np.asarray(scan.unwrapped_angles_deg, np.float64)
+        if len(am) == len(ac) and np.allclose(am, ac, atol=0.5 * float(np.median(np.abs(np.diff(am))))):
+            return rows
+        order = np.argsort(am)
+        i = np.clip(np.searchsorted(am[order], ac), 1, len(am) - 1)
+        near = np.where(np.abs(am[order[i - 1]] - ac) <= np.abs(am[order[i]] - ac), order[i - 1], order[i])
+        return rows[near]
+
+    def rot_center(self) -> float:
+        """the rotation axis in the merged frame: the calibration's, refined (params["axis_refinement"])"""
+        v = self.params["axis_refinement"]
+        t = v.strip().lower() if isinstance(v, str) else v
+        if t in ("auto", "off", "", None):
+            d = float(getattr(self.cal, "axis_refinement", None) or 0.0) if t == "auto" and not self.legacy else 0.0
+        else:
+            try:
+                d = float(t)
+            except (TypeError, ValueError):
+                raise ValueError("axis_refinement must be 'auto', 'off' or a number of pixels") from None
+        return float(self.cal.rot_center) + d
+
+    def rolling_shutter(self) -> float:
+        """params["rolling_shutter"] resolved: "off" = 0, "auto" = the calibration's (0 if not measured), or a
+        number of frame periods"""
+        v = self.params["rolling_shutter"]
+        t = v.strip().lower() if isinstance(v, str) else v
+        if t in ("off", "", None):
+            return 0.0
+        if t == "auto":
+            return float(getattr(self.cal, "rolling_shutter", None) or 0.0)
+        try:
+            return float(t)
+        except (TypeError, ValueError):
+            raise ValueError("rolling_shutter must be 'off', 'auto' or a number of frame periods") from None
 
     def _build(self):
+        self.rec = self._new_reconstructor()
+        self.info = self.rec.info
+        self.lo, self.hi = self.info["doable"]
+
+    def _new_reconstructor(self):
+        """a SliceReconstructor of the current params, arrays and calibration"""
         p = dict(self.params)
         m = self.main
         mode = p.pop("mode")
         cfg = dict(p, device=self.device, energy_kev=m.energy_kev, distance_m=m.distance_m,
-                   pixel_size_m=m.pixel_size_m, rot_center=self.cal.rot_center,
+                   pixel_size_m=m.pixel_size_m, rot_center=self.rot_center(),
                    legacy_reference=mode == "legacy_reference")
         cfg.update(backprojector_config(p["backprojector"]))
+        if not cfg.get("grid_size"):
+            # the slice grid of the axis the search found (the reconstructor's rule, 2 x axis rounded to even, + 1):
+            # a refinement of the axis by a fraction of a pixel must not change the volume's shape or shift it
+            cfg["grid_size"] = int(round(2.0 * float(self.cal.rot_center))) + 1
         self._resolved_sld = sld_config(cfg.pop("sld"))
         cfg.update(self._resolved_sld)
         cfg["exposure_arc"] = self.exposure_arc()
@@ -271,10 +352,11 @@ class HelicalRecon:
         cfg["angle_subset"], cfg["angle_subsets"] = angle_subset_config(cfg.pop("angle_subset"))
         cfg.pop("z_translation_scale")   # (of the scans: _scan_data)
         cfg.pop("companion_registration")
+        cfg.pop("stationary_registration")
+        cfg.pop("axis_refinement")       # (in rot_center)
+        cfg["rolling_shutter"] = 0.0 if mode == "legacy_reference" else self.rolling_shutter()
         scans = [self._scan_data(self.main, "main"), self._scan_data(self.companion, "companion")]
-        self.rec = _core.SliceReconstructor(scans, cfg)
-        self.info = self.rec.info
-        self.lo, self.hi = self.info["doable"]
+        return _core.SliceReconstructor(scans, cfg)
 
     def exposure_arc(self) -> float:
         """params["exposure_arc"] resolved: a number, or "auto" = the main scan's recorded fraction (0 if unknown)"""
@@ -353,10 +435,14 @@ class HelicalRecon:
                     calibration=dict(source=self.cal.source, fingerprint=self.cal.fingerprint,
                                      version=self.cal.version, rot_center=self.cal.rot_center,
                                      vector=list(self.cal.vector), cor_main_detector=self.cal.cor_main_detector,
-                                     z_translation_scale=getattr(self.cal, "z_translation_scale", None)),
+                                     z_translation_scale=getattr(self.cal, "z_translation_scale", None),
+                                     axis_refinement=getattr(self.cal, "axis_refinement", None),
+                                     rolling_shutter=getattr(self.cal, "rolling_shutter", None)),
                     resolved_z_translation_scale=self.z_translation_scale(),
                     resolved_detector_smear=self.detector_smear(),
                     companion_registration=bool(getattr(self, "_registered", False)),
+                    stationary_registration=bool(getattr(self, "_stationary", False)),
+                    resolved_rot_center=self.rot_center(), resolved_rolling_shutter=self.rolling_shutter(),
                     reconstructor=dict(self.info), pixel_size_m=self.main.pixel_size_m,
                     energy_kev=self.main.energy_kev, distance_m=self.main.distance_m,
                     helirec=_build_identity())
@@ -415,6 +501,173 @@ class HelicalRecon:
             si = self.slice_info(f)
             out.append(self.reconstruct_heights(si.view_height, si.view_height + 1)[0])
         return np.stack(out)
+
+
+# ---------------------------------------------------------------------- the two halves of the detector
+SHUTTER_SLICES = 128          # slices of the slab the two half-turn reconstructions are made of (one layer of blocks)
+SHUTTER_PROBE = 1.0           # frame periods: the second value the rotation between the halves is measured at
+AXIS_PROBE = 0.2              # pixels: the second axis the translation between the halves is measured at
+SHUTTER_MIN_RADIUS = 256      # pixels around the axis the main scan must see from both sides
+SHUTTER_MIN_BLOCKS = 40
+SHUTTER_MAX = 1.5             # frame periods: a larger |value| is taken for a failed measurement
+HALF_TURN_MAX_AXIS = 0.5      # pixels: a larger correction of the axis is taken for a failed measurement
+
+
+def _half_turn_field(r, h0, roi, shutter, axis):
+    """How the slab reconstructed from the lower rows of the main scan's detector lies on the one from its upper
+    rows, at rolling_shutter = shutter and axis_refinement = axis: the similarity fitted to the shifts of blocks
+    -> dict(rotation (radians), shift (dx, dy at the rotation axis, px), scale, blocks, rms (px)), or None when
+    fewer than SHUTTER_MIN_BLOCKS blocks register (then `blocks` is all the caller gets: (None, n))."""
+    rows = r.main.frame_shape[0]
+    v = np.arange(rows, dtype=np.float64) - 0.5 * (rows - 1)
+    ramp = 0.5 * (1 + np.tanh(v / 6.0))                       # 0 over the upper rows, 1 over the lower
+    vols = []
+    keep_params, keep_arrays = r.params, r.arrays
+    try:
+        for part in (1 - ramp, ramp):
+            r.params = dict(keep_params, backprojector="fbp", filters=[], sld="", detector_smear="off", angle_subset="",
+                            rolling_shutter=float(shutter), axis_refinement=float(axis))
+            r.arrays = dict(keep_arrays,
+                            main_weight=(keep_arrays["main_weight"] * np.maximum(part, 1e-9)[:, None]).astype(np.float32),
+                            companion_weight=(keep_arrays["companion_weight"] * 1e-6).astype(np.float32))
+            rec = r._new_reconstructor()
+            out = [rec.reconstruct(h, min(h + 32, h0 + SHUTTER_SLICES), False, False, roi, None, None, True, None, None,
+                                   None, None, None, 0) for h in range(h0, h0 + SHUTTER_SLICES, 32)]
+            vols.append(np.concatenate(out))
+            del rec, out
+    finally:
+        r.params, r.arrays = keep_params, keep_arrays
+    N = SHUTTER_SLICES
+    bc = _core.BlockCorrelator(N, 1, 16, 6, True, 0.25, 4, r.device)
+    a, b = vols
+    # block centres from the rotation axis: the slice's centre, pixel (grid_size - 1) / 2 (the grid _new_reconstructor pins)
+    centre = 0.5 * int(round(2.0 * float(r.cal.rot_center)))
+    x0, y0 = roi[0] - centre, roi[2] - centre
+    t = []
+    for y in range(0, a.shape[1] - N + 1, N // 2):
+        for x in range(0, a.shape[2] - N + 1, N // 2):
+            m = bc.compute(np.ascontiguousarray(a[:, y:y + N, x:x + N]), np.ascontiguousarray(b[:, y:y + N, x:x + N]))
+            if m["var_a"] > 0 and m["peak"] >= 0.3:
+                t.append((x0 + x + 0.5 * (N - 1), y0 + y + 0.5 * (N - 1), m["shift"][2], m["shift"][1]))
+    if len(t) < SHUTTER_MIN_BLOCKS:
+        return None, len(t)
+    t = np.array(t)
+    G = np.stack([np.ones(len(t)), t[:, 0], t[:, 1]], -1)
+    keep = np.ones(len(t), bool)
+    for _ in range(3):   # dx = a0 + a1 x + a2 y, dy = b0 + b1 x + b2 y; blocks far off the fit are left out
+        cx = np.linalg.lstsq(G[keep], t[keep, 2], rcond=None)[0]
+        cy = np.linalg.lstsq(G[keep], t[keep, 3], rcond=None)[0]
+        res = np.hypot(t[:, 2] - G @ cx, t[:, 3] - G @ cy)
+        keep = res <= 3 * 1.4826 * np.median(res) + 0.05
+    return dict(rotation=0.5 * (cy[1] - cx[2]), shift=np.array([cx[0], cy[0]]), scale=0.5 * (cx[1] + cy[2]),
+                blocks=int(keep.sum()), rms=float(np.sqrt((res[keep] ** 2).mean()))), len(t)
+
+
+def measure_rolling_shutter(r: "HelicalRecon"):
+    """The rolling shutter of the scan's camera, from the scan (Calibration.rolling_shutter, cached with it), and
+    beside it what the same measurement says is left of the rotation axis's error (recorded: a check of
+    Calibration.axis_refinement, which comes from the opposite views).
+
+    A slice of a helical scan passes over every row of the detector. Reconstructed from the upper rows alone and
+    from the lower rows alone (each half a turn: complete within the radius the main scan sees from both sides of the
+    axis), the two volumes must coincide. What they do instead, measured on blocks (BlockCorrelator; a similarity
+    fitted to the block shifts), says what is wrong with the geometry both were made with:
+      * turned against each other: the rows were recorded at different angles, a rolling shutter;
+      * shifted against each other: the rotation axis is off (the two halves see it from opposite sides), or the
+        detector's image is sheared along the rows (recorded, not applied);
+      * of different size: the magnification depends on the row (a keystone; recorded, not applied).
+    Rotation and shift are linear in the shutter and in the axis: each is measured again with a probe value
+    (SHUTTER_PROBE frame periods, AXIS_PROBE pixels) and the values at which they vanish are taken; of the shift,
+    the part along the direction the axis moves it. The two are separate terms of one fit, so the shutter is not
+    tuned against an error of the axis (with the axis off, the shift cancels the rotation on one side of the slice
+    and adds to it on the other: a shutter judged by one side alone would come out wrong).
+    Nothing is applied when the main scan does not see enough of both sides of the axis, there is no helix, too few
+    blocks register, or a result is implausible."""
+    cal, main, log = r.cal, r.main, r.log
+    res = dict(rolling_shutter=0.0, measured=None, reason=None, axis=None)
+    axis0 = float(cal.axis_refinement or 0.0)
+    def finish(reason=None):
+        res["reason"] = reason
+        cal.rolling_shutter = float(res["rolling_shutter"])
+        cal.details["rolling_shutter"] = res
+        if res["measured"] is None:
+            log(f"rolling shutter: not measured ({reason}): one angle per frame")
+        else:
+            f, ax = res["field_mrad_px"], res["axis"]
+            log(f"the two halves of the detector ({res['blocks']} blocks): turned {f[0]:+.3f} mrad against each other "
+                f"({f[1]:+.3f} with a shutter of {SHUTTER_PROBE:g}): rolling shutter {res['measured']:+.3f} frame periods "
+                f"from the first row to the last" + ("" if reason is None else f" ({reason}: not applied)")
+                + f"; shifted by ({f[2]:+.3f}, {f[3]:+.3f}) px: the rotation axis {ax['residual']:+.3f} px from the "
+                f"refined one, a shear of {ax['row_shear']:+.2f} px per 1000 rows; magnification {1e2 * res['scale']:+.3f} % "
+                f"between the halves (these three: recorded, not applied)  [{res['seconds']:.0f}s]")
+        if cal.source == "measured" and r.cache_dir:
+            calibration._save_calibration(r.cache_dir, cal)
+        return res
+    import time
+    t0 = time.time()
+    rows, cols = main.frame_shape
+    axis = float(cal.cor_main_detector)
+    radius = (int(min(axis, cols - 1 - axis)) - 48) // 64 * 64
+    if radius < SHUTTER_MIN_RADIUS:
+        return finish(f"the main scan sees {max(radius, 0)} px on both sides of the axis")
+    ang = np.asarray(main.unwrapped_angles_deg, np.float64)
+    z = np.asarray(main.z_translation_m, np.float64) / main.pixel_size_m
+    moving = np.flatnonzero(np.abs(np.diff(z)) > 0.01)
+    if len(moving) < 8:
+        return finish("no helix")
+    per_turn = abs(z[moving[-1] + 1] - z[moving[0]]) / max(abs(ang[moving[-1] + 1] - ang[moving[0]]) / 360.0, 1e-9)
+    if not 0.05 * rows <= per_turn <= rows:
+        return finish(f"travel of {per_turn:.0f} rows per turn")
+    keep_params = r.params
+    r.params = dict(keep_params, backprojector="fbp", filters=[], sld="", detector_smear="off", angle_subset="", rolling_shutter=0.0)
+    try:
+        probe = r._new_reconstructor()
+        info = probe.info
+        del probe
+    finally:
+        r.params = keep_params
+    if info["angle_interp"] != "nearest":
+        return finish("the gridding in use takes one angle per bin")
+    lo, hi = info["doable"]
+    # the slab: the middle of the heights the helix alone records
+    zs = (z - z[0]) * r.z_translation_scale()
+    h_a, h_b = sorted((zs[moving[0]], zs[moving[-1] + 1]))
+    h_lo, h_hi = max(lo, int(h_a) + rows), min(hi, int(h_b))
+    if h_hi - h_lo < SHUTTER_SLICES:
+        h_lo, h_hi = lo, hi
+    if h_hi - h_lo < SHUTTER_SLICES:
+        return finish("fewer slices than the measurement's slab")
+    h0 = (h_lo + h_hi - SHUTTER_SLICES) // 2
+    c = info["grid_size"] // 2
+    roi = (c - radius, c + radius, c - radius, c + radius)
+    f0, n0 = _half_turn_field(r, h0, roi, 0.0, axis0)
+    if f0 is None:
+        return finish(f"only {n0} blocks of the two half-turn reconstructions register")
+    f1, _ = _half_turn_field(r, h0, roi, SHUTTER_PROBE, axis0)
+    f2, _ = _half_turn_field(r, h0, roi, 0.0, axis0 + AXIS_PROBE)
+    res.update(seconds=time.time() - t0, blocks=f0["blocks"], heights=[h0, h0 + SHUTTER_SLICES], roi=list(roi),
+               rms_px=f0["rms"], scale=float(f0["scale"]))
+    if f1 is None or abs(f1["rotation"] - f0["rotation"]) < 2e-5:
+        return finish("the rotation does not answer to the shutter")
+    res.update(measured=float(-f0["rotation"] * SHUTTER_PROBE / (f1["rotation"] - f0["rotation"])),
+               field_mrad_px=[1e3 * f0["rotation"], 1e3 * f1["rotation"], float(f0["shift"][0]), float(f0["shift"][1])])
+    # the axis: the shift's part along the direction the axis moves it; across it, a shear of the rows
+    ax = dict(residual=0.0, measured=None, row_shear=0.0)
+    res["axis"] = ax
+    if f2 is not None:
+        s = (f2["shift"] - f0["shift"]) / AXIS_PROBE
+        if float(s @ s) > 0.25:
+            d = float(-(f0["shift"] @ s) / (s @ s))
+            perp = f0["shift"] + d * s
+            k = per_turn / (2 * np.pi)                                 # rows per radian of rotation
+            shear = float(np.sign(s[0] * perp[1] - s[1] * perp[0]) * np.hypot(*perp) / (np.sqrt(s @ s) * k) * 1e3)
+            ax.update(measured=d, row_shear=shear, sensitivity=[float(s[0]), float(s[1])])
+            if abs(d) <= HALF_TURN_MAX_AXIS:
+                ax.update(residual=d)
+    if abs(res["measured"]) > SHUTTER_MAX:
+        return finish("implausible value")
+    res["rolling_shutter"] = res["measured"]
+    return finish()
 
 
 def _build_identity():
