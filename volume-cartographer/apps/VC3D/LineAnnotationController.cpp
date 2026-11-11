@@ -15481,7 +15481,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     vc3d::line_annotation::validateFiberSaveSnapshots(edits);
     auto request = connection->newRequest(*attachment);
     RecordSelection expected;
-    auto expect = [&](const StoredFiber& fiber) {
+    auto expect = [&](const StoredFiber& fiber, bool loadedGraph = true) {
         if (fiber.storePin && fiber.storePin->attachment != *attachment)
             throw std::runtime_error("The fiber belongs to a previous object store attachment");
         // The request expects each fiber at its pinned version.
@@ -15490,10 +15490,12 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             if (fiber.storePin->writeGeneration != request.generation)
                 throw std::runtime_error("The fiber's pinned version is not in its object store's current history; reopen it");
             version = fiber.storePin->reference();
-            if (!fiber.graphCommit) throw std::runtime_error("The fiber has no loaded graph baseline; reopen it");
-            if (request.expectedCommitSequence && request.expectedCommitSequence != fiber.graphCommit)
-                throw std::runtime_error("The edited fibers have different graph baselines; reopen them together");
-            request.expectedCommitSequence = fiber.graphCommit;
+            if (loadedGraph) {
+                if (!fiber.graphCommit) throw std::runtime_error("The fiber has no loaded graph baseline; reopen it");
+                if (request.expectedCommitSequence && request.expectedCommitSequence != fiber.graphCommit)
+                    throw std::runtime_error("The edited fibers have different graph baselines; reopen them together");
+                request.expectedCommitSequence = fiber.graphCommit;
+            }
         }
         const auto [it, inserted] = expected.emplace(fiber.uuid, version);
         if (!inserted && it->second != version) throw std::runtime_error("Conflicting fiber version expectations");
@@ -15513,7 +15515,9 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     for (const auto& edit : edits) {
         if (edit.fiber.readOnly) throw std::runtime_error(edit.fiber.editorError.empty() ? "Object store is attached read-only" : edit.fiber.editorError);
         expect(edit.fiber);
-        for (const auto& branch : edit.fiber.branches) expect(findFiber(branch.branchFiberId));
+        // Current branch targets contribute object expectations, not a new
+        // baseline for the editor's loaded relationship membership.
+        for (const auto& branch : edit.fiber.branches) expect(findFiber(branch.branchFiberId), false);
     }
     for (const auto& fiber : retired) expect(fiber);
     request.expectedObjects = expected;

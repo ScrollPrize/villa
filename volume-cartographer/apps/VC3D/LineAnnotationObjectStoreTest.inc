@@ -532,6 +532,9 @@ int runObjectStoreControllerTests()
             a = batch.front().fiber;
             require(a.storePin->reference().version == publication.version + 2, "subsequent fiber saves use the new pin");
         }
+        // The preceding saves advanced the graph baseline of a only. Reopen
+        // both endpoints before the independent link-creation action.
+        a=resolve(a.uuid);b=resolve(b.uuid);
         Controller::FiberBranchRef link;
         link.controlPointIndex=0;link.branchControlPointIndex=0;link.branchFiberId=b.id;link.branchFileName=b.fileName;
         link.controlPointPosition=a.controlPoints[0];link.branchControlPointPosition=b.controlPoints[0];
@@ -656,6 +659,7 @@ int runObjectStoreControllerTests()
         }
         {
             // Approval clears the mark on the shared edge.
+            a = resolve(a.uuid);
             auto approved = a;
             approved.branches[0].pending = false;
             const auto generation = controller._fiberDataGeneration;

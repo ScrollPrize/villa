@@ -446,9 +446,11 @@ int main(int argc, char** argv)
         require(links.size() == 1 && external.size() == 1, "The imported surface should link to itself");
         for (const auto& value : {links[0], external[0]}) {
             const auto ref = value.toObject();
-            require(ref[QStringLiteral("uuid")].toString() == QString::fromStdString(referenceUuid) &&
-                        ref[QStringLiteral("generation")].toString() == QString::fromStdString(reference->generation) &&
-                        ref[QStringLiteral("version")].toInteger() == reference->version &&
+            const auto selected = vc::objects::objectVersionFromJson(
+                QJsonDocument(ref[QStringLiteral("reference")].toObject()).toJson().toStdString());
+            require(selected == reference->reference() &&
+                        !ref.contains(QStringLiteral("generation")) &&
+                        !ref.contains(QStringLiteral("version")) &&
                         !ref.contains(QStringLiteral("revision")),
                     "Lasagna references must pin the selected object's numbered version and its own generation");
         }
