@@ -22,7 +22,7 @@ from cpu_service import wait_until  # noqa: E402
 from fit_session import SessionState, SpiralInputPaths  # noqa: E402
 from object_store_fixture import VOLUME  # noqa: E402
 from service_http import ApiError  # noqa: E402
-from service_project import FACTS, UMBILICUS, project, with_project  # noqa: E402
+from service_project import FACTS, UMBILICUS, SELECTED_UMBILICUS, project, with_project  # noqa: E402
 
 # The project has no Lasagna stores and the store no shell, so runs turn off
 # the losses that would need them.
@@ -588,7 +588,7 @@ def test_the_fit_volume_must_be_a_project_volume_with_an_umbilicus(host, store_p
     assert 'has no umbilicus for any of its volumes' in refusal(
         state.initialize, initialize_body() | {'project': project(umbilicus=None)})
     body = initialize_body(fit_volume_uuid=VOLUME) | {'project': project(umbilicus=None)}
-    body['project']['volumes']['other-volume'] = {**FACTS, 'umbilicus': UMBILICUS}
+    body['project']['volumes']['other-volume'] = {**FACTS, 'umbilicus': SELECTED_UMBILICUS}
     assert f'has no umbilicus for the fit volume {VOLUME}' in refusal(state.initialize, body)
     assert not state._building
 
@@ -823,7 +823,9 @@ def test_a_changed_project_volume_rebuilds_everything(host, store_path):
     _built(state, initialize_body())
     state.session = SimpleNamespace(status=lambda: {'state': SessionState.Idle,
                                                     'input_generation': 0})
-    changed = {**UMBILICUS, 'version': UMBILICUS['version'] + 1}
+    from service_project import SELECTED_UMBILICUS
+    changed = {**SELECTED_UMBILICUS,
+               'reference': {**SELECTED_UMBILICUS['reference'], 'version': UMBILICUS['version'] + 1}}
     for request, stage in ((initialize_body(), 'model'),
                            (initialize_body() | {'project': project(umbilicus=changed)}, 'all'),
                            (initialize_body() | {'project': project(name='renamed')}, 'all')):

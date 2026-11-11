@@ -125,17 +125,13 @@ def test_selection_preserves_inherited_source_identity_and_manifest_pins(db):
     db.upsert_object(dict(kind='note', name='new overlay commit'))
     with pytest.raises(osi.ObjectStoreInputError, match='Cannot replay inherited relationship membership'):
         osi.read_snapshot(attachment, dataclasses.replace(request(), pins=pins))
-    # Legacy same-store pins remain supported; they must not affect new captures.
-    legacy = osi.InputPins.from_provenance(dict(position=osi.InputPosition.of_status(db.status()).provenance(),
-                                               objects={fiber: source['version']}))
-    assert legacy.refs() == [source]
-    assert 'objects' not in vars(legacy)
-    assert 'objects' not in legacy.provenance()
+    with pytest.raises(ValueError, match='regenerate'):
+        osi.InputPins.from_provenance(dict(position=osi.InputPosition.of_status(db.status()).provenance(),
+                                          objects={fiber: source['version']}))
     original = dict(source)
-    # Legacy numeric pins use their recorded owner, not a later lookup.
-    ownerless = osi.InputPins.from_provenance(dict(position=dict(store=owner, generation=generation,
-                                                               commit_sequence=0), objects={fiber: 1}))
-    assert ownerless.refs() == [dict(store=owner, generation=generation, object=fiber, version=1)]
+    with pytest.raises(ValueError, match='regenerate'):
+        osi.InputPins.from_provenance(dict(position=dict(store=owner, generation=generation,
+                                                       commit_sequence=0), objects={fiber: 1}))
     assert source == original
 
 
@@ -151,9 +147,9 @@ def test_reference_only_pins_validate_boundary_and_carry_reference_unchanged(db)
     assert 'objects' not in pins.provenance()
     assert osi.InputPins.from_provenance(pins.provenance()).refs() == [reference]
     command = osi.link_request(db.status(), {}, author='test', read_references=pins.refs())
-    assert command['command_version'] == 2
-    assert command['expected_object_references'][0] is pins.references[fiber]
-    assert command['read_dependencies'] == {}
+    assert command['command_version'] == 3
+    assert command['read_dependencies'][fiber] is pins.references[fiber]
+    assert 'expected_object_references' not in command
     command['operations'] = []
     db.submit(command)
     assert object_reference(db.object(fiber)) == reference
@@ -302,6 +298,15 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
     assert {obj['uuid']: obj['scale_factor'] for obj in manifest['objects']} == {
         patch: 2, pcl: 1}
     assert manifest['relationships'][0]['uuid'] == edge
+    incomplete = json.loads(json.dumps(manifest))
+    incomplete['relationships'][0].pop('reference')
+    for read in (osi.InputPins.from_manifest, osi.manifest_digest):
+        with pytest.raises(ValueError, match='regenerate'):
+            read(incomplete)
+    osi.validate_relationship_references({'relationships': []})
+    # A position-only request is current/position discovery, not partial pins.
+    discovery = osi.InputPins.from_provenance({'position': snapshot.position.provenance()})
+    assert not discovery.pinned
     assert snapshot.digest() == osi.read_snapshot(db, request()).digest()
     db.set_approval(edge, 'approved')
     assert snapshot.digest() != osi.read_snapshot(db, request()).digest()
@@ -333,7 +338,8 @@ def test_the_outer_shell_is_read_on_its_own_never_as_a_patch(db):
     legacy['outer_shell'].pop('reference')
     for entry in legacy['objects']:
         entry.pop('reference')
-    assert osi._compared(manifest) == osi._compared(legacy)
+    with pytest.raises(ValueError, match='regenerate'):
+        osi._compared(legacy)
     assert any(line.startswith('outer shell: ') and shell in line
                for line in osi.snapshot_report(snapshot))
     moved = _grid(31.0, size=8)[..., ::-1].astype('<f4')

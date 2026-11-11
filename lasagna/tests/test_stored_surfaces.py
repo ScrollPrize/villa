@@ -143,7 +143,7 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			uid = create_surface(store, xyz, name="s", scale=1.0, volume=VOLUME, tool="test")
 			first = stored_surfaces.read_surface(store, f"vcobj:{uid}", volume=VOLUME)
 			with ObjectStore.open(str(store), author="test") as db:
-				with db.write(expected_versions={uid: 1}) as tx:
+				with db.write(expected_versions={uid: first.reference}) as tx:
 					tx.put_geometry(uid, Surface.from_arrays(np.ascontiguousarray(xyz + 1), [1.0, 1.0]),
 									expected_version=1)
 			ref = first.reference

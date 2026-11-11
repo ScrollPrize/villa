@@ -86,7 +86,7 @@ struct Fixture {
     {
         OpenOptions options; options.author = "spiral-store-inputs-test";
         auto db = ObjectStore::open(path, options);
-        auto txn = db.write(expected);
+        auto txn = db.writeNumbered(expected);
         fn(db, txn);
         txn.commit();
     }
@@ -276,7 +276,11 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     require(inputs.unchanged(), "the fixture holds its inputs as fitted");
     auto legacy = document;
     legacy["manifest"]["relationships"][0].erase("reference");
-    require(fixture.read(legacy).unchanged(), "legacy relationship manifests retain their weaker comparison");
+    require(!fixture.read(legacy).problems.empty(), "unqualified relationship manifests require regeneration");
+    fixture.session->readStore(fixture.attachment, [&](const StoreReader& reader, const auto&) {
+        require(!vc3d::spiral::readFitInputChanges(reader, legacy, {}, {}).inputs.problems.empty(),
+                "incomplete out-of-scope manifest is refused");
+    });
     for (const auto* field : {"store", "generation"}) {
         auto otherIdentity = document;
         otherIdentity["manifest"]["relationships"][0]["reference"][field] = util::newUuid();

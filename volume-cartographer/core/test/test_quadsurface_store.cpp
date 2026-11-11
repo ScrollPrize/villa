@@ -52,7 +52,7 @@ struct Store {
     template<class Build> void edit(const std::string& uuid, Build&& build) {
         auto request = session->newRequest(attachment);
         session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
-            request.expectedObjects = {{uuid, reader.currentObject(uuid)->version}};
+            request.expectedObjects = {{uuid, reader.currentObject(uuid)->reference()}};
             build(reader, request.operations);
         });
         session->submit(attachment, request);

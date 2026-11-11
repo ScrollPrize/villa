@@ -168,8 +168,8 @@ class InputPins:
     store's head when the head is that position, else read from the
     store's history at the position's publication (local stores).
     ``references`` retains each selected version's actual source owner, which
-    may differ from the attached store. Legacy numeric pins are decoded at
-    the provenance boundary with their recorded single-store identity."""
+    may differ from the attached store. Unqualified numeric pins must be
+    regenerated; the attached store cannot recover their original owner."""
     position: InputPosition
     references: dict = dataclasses.field(default_factory=dict)  # {uuid: complete reference}
     selection: dict = dataclasses.field(default_factory=dict)  # {kind: sorted UUIDs}
@@ -186,11 +186,11 @@ class InputPins:
                 'outer_shell': self.outer_shell, 'references': self.references}
 
     @staticmethod
-    def _decode_reference(position, uuid, reference, version=None):
-        """Decode new or original single-store legacy pin evidence once."""
+    def _decode_reference(uuid, reference, version=None):
+        """Validate a complete selected reference at the provenance boundary."""
         from vc_object_store import object_version_from_json
         if reference is None:
-            reference = dict(store=position.store, generation=position.generation, object=uuid, version=version)
+            raise ValueError(f'input {uuid} has no complete reference; regenerate the input pins')
         reference = object_version_from_json(json.dumps(reference))
         if reference['object'] != uuid or (version is not None and reference['version'] != version):
             raise ValueError(f'inconsistent exact input reference for {uuid}')
@@ -201,12 +201,20 @@ class InputPins:
         if value is None:
             return None
         position = InputPosition.from_provenance(value)
-        if 'objects' not in value and 'references' not in value:
+        if 'objects' in value:
+            raise ValueError('numeric input pins are unsupported; regenerate the input pins')
+        if 'references' not in value:
+            if value.get('selection') or value.get('outer_shell'):
+                raise ValueError('selected inputs have no complete references; regenerate the input pins')
             return cls(position)
-        old = value.get('objects') or {}
         references = value.get('references') or {}
-        references = {uuid: cls._decode_reference(position, uuid, references.get(uuid), old.get(uuid))
-                      for uuid in dict.fromkeys([*old, *references])}
+        references = {uuid: cls._decode_reference(uuid, reference)
+                      for uuid, reference in references.items()}
+        selected = {uuid for values in value.get('selection', {}).values() for uuid in values}
+        if value.get('outer_shell'):
+            selected.add(value['outer_shell'])
+        if not selected.issubset(references):
+            raise ValueError('selected inputs have no complete references; regenerate the input pins')
         return cls(position, references,
                    {kind: sorted(value.get('selection', {}).get(kind, ())) for kind in KINDS},
                    value.get('outer_shell'))
@@ -215,12 +223,13 @@ class InputPins:
     def from_manifest(cls, manifest):
         """The pins an input manifest (InputSnapshot.manifest) records, or
         None when it contains no position."""
+        validate_relationship_references(manifest or {})
         position = InputPosition.from_provenance((manifest or {}).get('position'))
         if position is None:
             return None
         shell = manifest.get('outer_shell') or None
         entries = manifest.get('objects') or ()
-        references = {entry['uuid']: cls._decode_reference(position, entry['uuid'], entry.get('reference'),
+        references = {entry['uuid']: cls._decode_reference(entry['uuid'], entry.get('reference'),
                                                          entry.get('version'))
                       for entry in [*entries, *([shell] if shell else [])]}
         return cls(position, references,
@@ -2272,11 +2281,16 @@ def link_request(status, plan, author=None, read_references=None):
     that read and the commit conflicts too, and the pins stay exact."""
     import uuid as uuid_module
     import vc_object_store as vos
-    request = {'command_version': 2, 'request': str(uuid_module.uuid4()),
+    dependencies = {}
+    for reference in read_references or ():
+        uuid = reference['object']
+        if uuid in dependencies and dependencies[uuid] != reference:
+            raise ValueError(f'conflicting selected input references for {uuid}')
+        dependencies[uuid] = reference
+    request = {'command_version': 3, 'request': str(uuid_module.uuid4()),
                'store': status['store'], 'generation': status['generation'],
                'expected_objects': {}, 'expected_relationships': {},
-               'expected_object_references': list(read_references or ()),
-               'read_dependencies': {},
+               'read_dependencies': dependencies,
                'expected_commit_sequence': None,
                'operations': [{'op': vos.LINK_OBJECTS_OPERATION, 'plan': plan}]}
     if author:
@@ -2913,12 +2927,32 @@ def stale_link_reasons(manifest, config, normal_source):
     return reasons
 
 
+def validate_relationship_references(manifest):
+    """Reject unqualified saved evidence before any partial/content comparison."""
+    from vc_object_store import relationship_version_from_json
+    entries = list(manifest.get('objects') or ())
+    if manifest.get('outer_shell'):
+        entries.append(manifest['outer_shell'])
+    for entry in entries:
+        InputPins._decode_reference(entry['uuid'], entry.get('reference'), entry.get('version'))
+    seen = set()
+    for entry in manifest.get('relationships') or ():
+        if 'reference' not in entry:
+            raise ValueError('relationship manifest has no complete reference; regenerate the fit inputs')
+        reference = relationship_version_from_json(json.dumps(entry['reference']))
+        if (reference['relationship'] != entry['uuid'] or
+                ('version' in entry and reference['version'] != entry['version']) or entry['uuid'] in seen):
+            raise ValueError('inconsistent relationship manifest reference; regenerate the fit inputs')
+        seen.add(entry['uuid'])
+
+
 def _compared(manifest):
     """The manifest without what does not define the inputs: the store's
     location and history generation, the version pins (VERSION_FIELDS), how
     links were refreshed (their results are recorded) and the position they
     were read at (equal inputs at two positions are equal). A copy of a
     store holding the same inputs compares equal."""
+    validate_relationship_references(manifest)
     manifest = dict(manifest)
     manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
     manifest.pop('link_refresh', None)
@@ -2926,44 +2960,11 @@ def _compared(manifest):
     if manifest.get('outer_shell'):
         manifest['outer_shell'] = {key: value for key, value in manifest['outer_shell'].items()
                                    if key != 'reference'}
-    # Schema-20 checkpoints also recorded a relationship generation. Its
-    # content hash already identifies the consumed data; schema 21 has no
-    # equivalent counter. Do not discard it from older, hash-less manifests:
-    # those cannot establish unchanged relationships across the conversion.
     for section, fields in VERSION_FIELDS.items():
         if section in manifest:
             manifest[section] = [
-                {key: value for key, value in entry.items()
-                 if key not in fields and not (
-                     section == 'relationships' and key == 'generation'
-                     and 'content_sha256' in entry)}
+                {key: value for key, value in entry.items() if key not in fields}
                 for entry in manifest[section] or ()]
-    return manifest
-
-
-# Identities a manifest recorded before objects carried metadata hashes and
-# relationships their content: geometry revisions, relationship generations
-# and approval states only.
-_GEOMETRY_IDENTITY = {
-    'objects': ('uuid', 'kind', 'name', 'geometry_revision', 'scale_factor'),
-    'relationships': ('uuid', 'kind', 'family', 'approval_state', 'generation'),
-}
-
-
-def records_content_identity(manifest):
-    """Whether a manifest identifies objects and relationships by content
-    (metadata hashes, relationship content), as every manifest written since
-    replica-independent digests does."""
-    objects = (manifest or {}).get('objects') or ()
-    return all('metadata_sha256' in entry for entry in objects)
-
-
-def _geometry_identity(manifest):
-    manifest = dict(manifest)
-    for section, fields in _GEOMETRY_IDENTITY.items():
-        if section in manifest:
-            manifest[section] = [{key: entry.get(key) for key in fields}
-                                 for entry in manifest[section] or ()]
     return manifest
 
 
@@ -3037,18 +3038,9 @@ def resume_problems(checkpoint_input_manifest, inputs, allow_changed=False, log=
         problem = 'checkpoint records no object-store inputs'
     else:
         current = inputs.manifest
-        legacy = not records_content_identity(recorded)
-        if legacy:
-            # Written before inputs were identified by content: its object
-            # revisions name another copy's (or this store's older) records,
-            # and it holds no metadata hashes, so compare what it does hold.
-            recorded, current = _geometry_identity(recorded), _geometry_identity(current)
+        validate_relationship_references(recorded)
         differences = manifest_differences(recorded, current)
         if not differences:
-            if legacy:
-                log('WARNING: the checkpoint predates content-identified object-store '
-                    'inputs (metadata hashes, relationship content); compared on '
-                    'geometry revisions and relationship generations only')
             return []
         problem = ('checkpoint object-store inputs differ from this fit\'s in '
                    + ', '.join(differences))

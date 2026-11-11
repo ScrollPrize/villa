@@ -94,7 +94,7 @@ std::optional<ConsumedRelationshipIdentity> consumedIdentity(const vc::objects::
 // relationships are compared, from the heads of their fitted endpoints.
 void compareRelationships(const StoreReader& reader, const Json& manifest,
                           const std::vector<StoreInputPin>& pins, const std::set<std::string>* scope,
-                          FitInputs& result)
+                          const std::map<std::string, vc::objects::RelationshipVersion>& references, FitInputs& result)
 {
     std::map<std::string, std::string> kinds;
     for (const auto& pin : pins) kinds[pin.uuid] = pin.kind;
@@ -137,10 +137,7 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
         if (!inScope(link.uuid)) continue;
         if (const auto local = consumed.find(link.uuid); local != consumed.end()) {
             link.state = LinkState::Fitted;
-            // Older manifests have only the weaker numeric/content projection.
-            // Never invent their historical owner from the current selection.
-            if (entry.contains("reference") &&
-                vc::objects::relationshipVersionFromJson(entry.at("reference").dump()) != local->second.reference)
+            if (references.at(link.uuid) != local->second.reference)
                 link.state = LinkState::Changed;
             if (entry.contains("version") && entry.at("version") != local->second.reference.version)
                 link.state = LinkState::Changed;
@@ -243,9 +240,25 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
 }
 
 // The manifest's store and volume; false (with the problem) for another store.
-bool sameStore(const StoreReader& reader, const Json& document, FitInputs& result)
+bool sameStore(const StoreReader& reader, const Json& document, FitInputs& result,
+               std::map<std::string, vc::objects::RelationshipVersion>& references)
 {
     const auto& manifest = document.at("manifest");
+    // Validate every saved relationship before partial refresh or current-head
+    // filtering. A dropped/out-of-scope link must not hide incomplete evidence.
+    for (const auto& entry : manifest.value("relationships", Json::array())) {
+        if (!entry.contains("reference")) {
+            result.problems.push_back("relationship manifest has no complete reference; regenerate the fit inputs");
+            return false;
+        }
+        const auto ref = vc::objects::relationshipVersionFromJson(entry.at("reference").dump());
+        const auto uuid = entry.at("uuid").get<std::string>();
+        if (ref.relationshipUuid != uuid || (entry.contains("version") && entry.at("version") != ref.version) ||
+            !references.emplace(uuid, ref).second) {
+            result.problems.push_back("inconsistent relationship manifest reference; regenerate the fit inputs");
+            return false;
+        }
+    }
     result.digest = document.value("digest", std::string());
     result.storeUuid = manifest.at("store").at("uuid").get<std::string>();
     result.volumeUuid = manifest.at("volume_uuid").get<std::string>();
@@ -357,7 +370,8 @@ Json adapterMetadata(const std::string& kind, const Json& meta,
 FitInputs readFitInputs(const StoreReader& reader, const Json& document)
 {
     FitInputs result;
-    if (!sameStore(reader, document, result)) return result;
+    std::map<std::string, vc::objects::RelationshipVersion> references;
+    if (!sameStore(reader, document, result, references)) return result;
     const auto pins = manifestPins(document);
     for (const auto& pin : pins) readObject(reader, pin, result.volumeUuid, result);
     // The outer shell: read as a surface, held apart from the patches.
@@ -373,7 +387,7 @@ FitInputs readFitInputs(const StoreReader& reader, const Json& document)
         else
             result.outerShell = std::move(read.surfaces.front());
     }
-    compareRelationships(reader, document.at("manifest"), pins, nullptr, result);
+    compareRelationships(reader, document.at("manifest"), pins, nullptr, references, result);
     return result;
 }
 
@@ -382,7 +396,8 @@ FitInputChanges readFitInputChanges(const StoreReader& reader, const Json& docum
                                     const std::set<std::string>& relationshipUuids)
 {
     FitInputChanges changes;
-    if (!sameStore(reader, document, changes.inputs)) return changes;
+    std::map<std::string, vc::objects::RelationshipVersion> references;
+    if (!sameStore(reader, document, changes.inputs, references)) return changes;
     const auto pins = manifestPins(document);
     for (const auto& pin : pins)
         if (objectUuids.contains(pin.uuid)) readObject(reader, pin, changes.inputs.volumeUuid, changes.inputs);
@@ -400,7 +415,7 @@ FitInputChanges readFitInputChanges(const StoreReader& reader, const Json& docum
     if (!incident.endpointUuids->empty())
         for (const auto& edge : reader.selectEdges(incident, std::vector<std::string>{"uuid"}))
             changes.checkedRelationships.insert(edge.uuid);
-    compareRelationships(reader, document.at("manifest"), pins, &changes.checkedRelationships, changes.inputs);
+    compareRelationships(reader, document.at("manifest"), pins, &changes.checkedRelationships, references, changes.inputs);
     return changes;
 }
 

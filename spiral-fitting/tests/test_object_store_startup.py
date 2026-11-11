@@ -59,8 +59,8 @@ def test_umbilicus_owner_survives_request_manifest_and_commit(tmp_path):
     assert manifests[0] != manifests[1]
 
 
-def test_umbilicus_legacy_boundary_and_materialized_source(tmp_path):
-    from fit_session import SpiralProject, write_project_umbilicus
+def test_umbilicus_requires_reference_and_preserves_materialized_source(tmp_path):
+    from fit_session import SpiralProject, ScrollSpecError, write_project_umbilicus
     from service_project import project, UMBILICUS
 
     selected = SpiralProject.from_mapping(project()).volumes[VOLUME].umbilicus
@@ -74,15 +74,10 @@ def test_umbilicus_legacy_boundary_and_materialized_source(tmp_path):
     assert json.loads(Path(first).read_text())['source']['reference'] == selected.reference
     legacy = dict(UMBILICUS)
     legacy.pop('store')
-    old = SpiralProject.from_mapping(project(umbilicus=legacy))
-    assert old.volumes[VOLUME].umbilicus.reference is None
-    mapping = old.to_mapping()
-    assert 'legacy_source' in mapping['volumes'][VOLUME]['umbilicus']
-    assert SpiralProject.from_mapping(mapping).to_mapping() == mapping
-    materialized = write_project_umbilicus(tmp_path, VOLUME, old.volumes[VOLUME].umbilicus)
-    source = json.loads(Path(materialized).read_text())['source']
-    assert 'reference' not in source
-    assert source['legacy_source'] == {key: UMBILICUS[key] for key in ('uuid', 'generation', 'version')}
+    with pytest.raises(ScrollSpecError, match='regenerate'):
+        SpiralProject.from_mapping(project(umbilicus=legacy))
+    with pytest.raises(ScrollSpecError, match='regenerate'):
+        SpiralProject.from_mapping(project(umbilicus=UMBILICUS))
 
 
 def test_default_refresh_writes_links_and_freezes_the_inputs(store_path):
@@ -372,19 +367,19 @@ def test_digest_covers_the_metadata_the_adapter_reads(store_path):
     assert 'objects' in problem
 
 
-def test_schema20_content_identity_does_not_require_obsolete_generations(store_path):
+def test_unrecognized_relationship_content_is_not_silently_discarded(store_path):
     inputs = load(store_path)
     recorded = json.loads(json.dumps(inputs.manifest))
     assert recorded['relationships']
     for entry in recorded['relationships']:
         entry['generation'] = 7
-    assert osi.resume_problems({'object_store': recorded}, inputs) == []
+    assert 'relationships' in osi.resume_problems({'object_store': recorded}, inputs)[0]
     recorded['relationships'][0]['content_sha256'] = 'different-content'
     [problem] = osi.resume_problems({'object_store': recorded}, inputs)
     assert 'relationships' in problem
 
 
-def test_a_checkpoint_without_relationship_content_requires_explicit_override(store_path):
+def test_a_checkpoint_without_relationship_references_requires_regeneration(store_path):
     inputs = load(store_path)
     legacy = json.loads(json.dumps(inputs.manifest))
     # The manifest such a checkpoint recorded: no metadata hashes, no
@@ -397,17 +392,9 @@ def test_a_checkpoint_without_relationship_content_requires_explicit_override(st
         {key: entry[key] for key in ('uuid', 'kind', 'family', 'approval_state')}
         | {'generation': 1, 'revision': 'another'}
         for entry in legacy['relationships']]
-    warnings = []
-    # The old numeric generation cannot be compared to a numbered version.
-    # Do not silently accept potentially changed relationship content.
-    [problem] = osi.resume_problems({'object_store': legacy}, inputs)
-    assert 'relationships' in problem
-    assert osi.resume_problems({'object_store': legacy}, inputs, allow_changed=True,
-                               log=warnings.append) == []
-    assert 'resuming anyway' in warnings[0]
-    legacy['objects'][0]['geometry_revision'] = 'older-geometry'
-    [problem] = osi.resume_problems({'object_store': legacy}, inputs)
-    assert 'objects' in problem
+    for allow_changed in (False, True):
+        with pytest.raises(ValueError, match='regenerate'):
+            osi.resume_problems({'object_store': legacy}, inputs, allow_changed=allow_changed)
 
 
 def test_checkpoint_preflight_checks_the_object_store_inputs(store_path):

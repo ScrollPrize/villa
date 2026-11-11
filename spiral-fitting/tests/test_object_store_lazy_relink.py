@@ -105,7 +105,7 @@ def _retire_far(db):
     far = _names_in(db)['far']
     for edge in db.edges_of(far):
         db.remove_edge(edge['uuid'])
-    with db.write(expected_versions={far: db.current_version(far)}) as write:
+    with db.write(expected_versions=db.select_expected_versions({far: db.current_version(far)})) as write:
         write.retire_object(far)
 
 

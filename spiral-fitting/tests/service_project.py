@@ -15,7 +15,12 @@ FACTS = {"voxel_size_um": 9.6, "z_direction_is_top_to_bottom": False,
          "left_handed_coordinates": False}
 
 
-def project(volume=VOLUME, *, name="s1", umbilicus=UMBILICUS, lasagna=None,
+SELECTED_UMBILICUS = {"reference": {"store": UMBILICUS["store"], "generation": UMBILICUS["generation"],
+                                    "object": UMBILICUS["uuid"], "version": UMBILICUS["version"]},
+                      "points_zyx": UMBILICUS["points_zyx"]}
+
+
+def project(volume=VOLUME, *, name="s1", umbilicus=SELECTED_UMBILICUS, lasagna=None,
             fiber_inference=None, **facts):
     entry = {**FACTS, **facts}
     entry = {key: value for key, value in entry.items() if value is not None}

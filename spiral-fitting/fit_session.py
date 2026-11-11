@@ -987,16 +987,14 @@ class ProjectUmbilicus:
     its owning store, numbered version and history generation, and its points
     in the volume's own voxels (ZYX)."""
 
-    reference: dict | None
+    reference: dict
     points_zyx: tuple[tuple[float, float, float], ...]
-    legacy_source: dict | None = None  # point-only old requests have no recoverable owner
 
     def manifest(self) -> dict[str, Any]:
         return {**self.source(), "points": len(self.points_zyx)}
 
     def source(self) -> dict[str, Any]:
-        return ({"reference": self.reference} if self.reference is not None
-                else {"legacy_source": self.legacy_source})
+        return {"reference": self.reference}
 
     def to_mapping(self) -> dict[str, Any]:
         return {**self.source(), "points_zyx": [list(point) for point in self.points_zyx]}
@@ -1239,17 +1237,10 @@ def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
     if not isinstance(value, Mapping):
         raise ScrollSpecError(f"{source}: umbilicus must be an object")
     reference = value.get("reference")
-    legacy = value.get("legacy_source") or value
-    uuid = str(legacy.get("uuid") or "").strip()
-    generation = str(legacy.get("generation") or "").strip()
-    version = legacy.get("version")
-    if reference is None and (not uuid or type(version) is not int or version <= 0):
-        raise ScrollSpecError(f"{source}: umbilicus needs its uuid and numbered version")
-    if reference is None and legacy.get("store"):
-        reference = dict(store=legacy["store"], generation=generation, object=uuid, version=version)
-    if reference is not None:
-        from vc_object_store import object_version_from_json
-        reference = object_version_from_json(json.dumps(reference))
+    if reference is None:
+        raise ScrollSpecError(f"{source}: umbilicus needs a complete reference; regenerate the project inputs")
+    from vc_object_store import object_version_from_json
+    reference = object_version_from_json(json.dumps(reference))
     points = value.get("points_zyx")
     try:
         points = tuple(tuple(float(coordinate) for coordinate in point) for point in points)
@@ -1260,9 +1251,7 @@ def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
                               for point in points):
         raise ScrollSpecError(
             f"{source}: umbilicus points_zyx must be two or more finite ZYX points")
-    return ProjectUmbilicus(reference=reference, points_zyx=points,
-                            legacy_source=None if reference is not None else
-                            dict(uuid=uuid, generation=generation, version=version))
+    return ProjectUmbilicus(reference=reference, points_zyx=points)
 
 
 @dataclass(frozen=True)

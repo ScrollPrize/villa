@@ -784,9 +784,9 @@ int main(int argc, char** argv)
             remoteSession.setGeometryFetcher("published",
                 [&](ObjectStore& store, const std::string& uuid, const ObjectStoreSession::FetchWrite& write) {
                     if (uuid == ids[2]) throw std::runtime_error("test fetch failure");
-                    const auto version = store.currentVersion(store.read(), uuid);
+                    const auto selected = store.currentObjectRevision(store.read(), uuid)->reference();
                     ++fetchCount;
-                    write({{uuid, version}}, [&](auto& db, auto& txn) {
+                    write({{uuid, selected}}, [&](auto& db, auto& txn) {
                         db.putGeometry(txn, uuid, quad_surface_geometry(grid));
                     });
                 });
