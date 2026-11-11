@@ -104,13 +104,9 @@ void bindGraphReadView(nb::module_& m) {
         }, nb::arg("node"))
         .def("objects", [](PyGraphReadView& self, const std::optional<std::vector<std::string>>& fields) {
             self.require();
+            vo::validateObjectFields(fields);
             std::vector<vo::ObjectRecord> records;
             if (self.graph->selectedObjects) {
-                if (fields) {
-                    vo::ObjectSelection validation; validation.limit = 0;
-                    nb::gil_scoped_release release;
-                    (void)self.store->selectObjects(*self.txn, validation, fields);
-                }
                 for (const auto& object : *self.graph->selectedObjects) records.push_back(object.record);
             } else if (!self.graph->objectUuids.empty()) {
                 vo::ObjectSelection selection; selection.includeRetired = true; selection.uuids = self.graph->objectUuids;
@@ -126,14 +122,10 @@ void bindGraphReadView(nb::module_& m) {
         }, nb::arg("fields") = std::nullopt)
         .def("edges", [](PyGraphReadView& self, const std::optional<std::vector<std::string>>& fields) {
             self.require();
+            vo::validateEdgeFields(fields);
             vo::EdgeSelection selection; selection.includeRetired = true; selection.uuids = self.graph->edgeUuids;
             std::vector<vo::EdgeRecord> records;
             if (self.graph->selectedRelationships) {
-                if (fields) {
-                    vo::EdgeSelection validation; validation.limit = 0;
-                    nb::gil_scoped_release release;
-                    (void)self.store->selectEdges(*self.txn, validation, fields);
-                }
                 for (const auto& relationship : *self.graph->selectedRelationships) records.push_back(relationship.record);
             } else { nb::gil_scoped_release release; records = self.store->selectEdges(*self.txn, selection, fields); }
             const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};

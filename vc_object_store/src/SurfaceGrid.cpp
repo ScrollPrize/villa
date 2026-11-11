@@ -38,8 +38,9 @@ SurfaceGrid readSurfaceGrid(const StoreReader& reader,const ObjectRevision& sele
     if(selected.deleted||selected.record.kind!="surface"||!selected.geometryRevision)
         throw std::invalid_argument("selected object is not a stored surface");
     const auto canonical=GeometrySnapshot(reader).surface(selected);
-    if(transformed&&transformed->revision().uuid!=canonical.revision().uuid)
-        throw std::invalid_argument("transformed view revision differs from surface");
+    if(transformed && (transformed->revision().uuid != canonical.revision().uuid ||
+        std::visit([](const auto& view){return view.reference();}, transformed->canonical()) != selected.reference()))
+        throw std::invalid_argument("transformed view must retain the selected surface reference");
     SurfaceGrid grid;
     const auto copy=[&](const auto& tile){
         grid.rows=tile.rows;grid.columns=tile.columns;grid.valid=tile.validity;grid.scale=tile.scale;

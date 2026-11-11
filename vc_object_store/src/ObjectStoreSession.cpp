@@ -369,6 +369,10 @@ void ObjectStoreSession::writeArtifact(const AttachmentIdentity& identity, const
                                        const std::filesystem::path& target)
 {
     withAttachment(identity, false, [&](Attachment& attachment) {
+        if (!attachment.remote) {
+            auto& store = attachment.store();
+            auto txn = store.read(); store.validateExportDestination(txn, target);
+        }
         std::filesystem::create_directories(target.parent_path());
         if (attachment.remote) { attachment.remote->writeArtifact(file, target); return 0; }
         auto& store = attachment.store();

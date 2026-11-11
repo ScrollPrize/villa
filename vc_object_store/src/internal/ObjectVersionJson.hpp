@@ -15,6 +15,14 @@ inline nlohmann::json referenceJson(const std::string& store, const std::string&
 }
 inline nlohmann::json objectVersionJson(const ObjectVersion& ref)
 { return referenceJson(ref.storeUuid, ref.generation, "object", ref.objectUuid, ref.version); }
+inline int64_t versionNumberFrom(const nlohmann::json& number)
+{
+    if (!number.is_number_integer() ||
+        (number.is_number_unsigned() && number.get<uint64_t>() > uint64_t(std::numeric_limits<int64_t>::max())) ||
+        number.get<int64_t>() <= 0)
+        throw std::invalid_argument("version must be a positive integer");
+    return number.get<int64_t>();
+}
 template<class Reference>
 Reference referenceFrom(const nlohmann::json& value, const char* key)
 {
@@ -22,13 +30,9 @@ Reference referenceFrom(const nlohmann::json& value, const char* key)
     for (const auto& item : value.items())
         if (item.key() != "store" && item.key() != "generation" && item.key() != key && item.key() != "version")
             throw std::invalid_argument("version reference: unknown key " + item.key());
-    const auto& number = value.at("version");
-    if (!number.is_number_integer() ||
-        (number.is_number_unsigned() && number.get<uint64_t>() > uint64_t(std::numeric_limits<int64_t>::max())) ||
-        number.get<int64_t>() <= 0)
-        throw std::invalid_argument("version must be a positive integer");
+    const auto version = versionNumberFrom(value.at("version"));
     return {util::canonicalUuid(value.at("store").get<std::string>()), util::canonicalUuid(value.at("generation").get<std::string>()),
-            util::canonicalUuid(value.at(key).get<std::string>()), number.get<int64_t>()};
+            util::canonicalUuid(value.at(key).get<std::string>()), version};
 }
 inline ObjectVersion objectVersionFrom(const nlohmann::json& value)
 { return referenceFrom<ObjectVersion>(value, "object"); }
@@ -60,12 +64,15 @@ inline std::vector<ObjectVersion> objectVersionsFrom(const nlohmann::json& refs)
 // for change-feed pagination, never a second spelling of that position.
 inline nlohmann::json storePositionJson(const StoreStatus& status)
 { return {{"store", status.storeUuid}, {"generation", status.generation}, {"commit_sequence", status.commitSequence}}; }
-inline StoreStatus storePositionFrom(const nlohmann::json& value)
+inline int64_t commitSequenceFrom(const nlohmann::json& sequence)
 {
-    const auto& sequence = value.at("commit_sequence");
     if (!sequence.is_number_integer() || (sequence.is_number_unsigned() && sequence.get<uint64_t>() > uint64_t(INT64_MAX)) || sequence.get<int64_t>() < 0)
         throw std::invalid_argument("commit_sequence must be a nonnegative int64");
-    return {util::canonicalUuid(value.at("store").get<std::string>()), util::canonicalUuid(value.at("generation").get<std::string>()), sequence.get<int64_t>()};
+    return sequence.get<int64_t>();
+}
+inline StoreStatus storePositionFrom(const nlohmann::json& value)
+{
+    return {util::canonicalUuid(value.at("store").get<std::string>()), util::canonicalUuid(value.at("generation").get<std::string>()), commitSequenceFrom(value.at("commit_sequence"))};
 }
 inline nlohmann::json storeStatusJson(const StoreStatus& status)
 {

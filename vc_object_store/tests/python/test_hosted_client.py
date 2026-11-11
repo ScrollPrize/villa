@@ -55,6 +55,25 @@ def test_selected_input_capture_uses_server_snapshot(hosted):
         store.selected_inputs([reference], dict(position, store=str(uuid.uuid4())))
 
 
+def test_server_rejects_fractional_commit_guard_before_writing(hosted):
+    store, _ = hosted
+    status = store.status()
+    uid = str(uuid.uuid4())
+    body = request(status, [dict(op='create_object', record=dict(uuid=uid, kind='note'))], {uid: None})
+    body['expected_commit_sequence'] = status['commit_sequence'] + 0.5
+    endpoint = urlsplit(store.endpoint)
+    connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=10)
+    try:
+        connection.request('POST', '/v1/transactions', json.dumps(body), {'Content-Type': 'application/json'})
+        response = connection.getresponse()
+        assert response.status == 400
+        assert 'commit_sequence' in response.read().decode()
+    finally:
+        connection.close()
+    assert store.current_object_revision(uid) is None
+    assert store.status()['commit_sequence'] == status['commit_sequence']
+
+
 @pytest.mark.parametrize("cache_bytes", [1 << 20, 8 << 20])
 def test_copy_transfers_each_geometry_byte_once(hosted, tmp_path, cache_bytes):
     from vc_object_store.surfaces import create_surface, read_surface

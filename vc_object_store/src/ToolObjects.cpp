@@ -3,7 +3,6 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 
 #include <cstdlib>
-#include <set>
 #include <stdexcept>
 
 namespace vc::objects {
@@ -46,27 +45,31 @@ void ToolObjects::noteRead(const PinnedObject& pin, const std::optional<VolumeVo
 CoordinateJson ToolObjects::coordinatesFor(const std::vector<std::string>& sources, const std::optional<VolumeVoxels>& volume)
 {
     if (volume) return volumeCoordinates(*volume);
-    std::set<std::optional<VolumeVoxels>> frames;
-    std::optional<ObjectVersion> reference;
+    std::map<std::string, Read> reads;
     {
         std::lock_guard lock(mutex_);
         for (const auto& source : sources)
-            if (const auto found = read_.find(util::canonicalUuid(source)); found != read_.end()) {
-                frames.insert(found->second.volume);
-                if (&source == &sources.front()) reference = found->second.pin.reference();
-            }
+            if (const auto found = read_.find(util::canonicalUuid(source)); found != read_.end())
+                reads.emplace(found->first, found->second);
     }
-    if (frames.size() > 1) throw std::runtime_error("sources were loaded in different frames");
-    if (!frames.empty() && *frames.begin()) return volumeCoordinates(**frames.begin());
-    auto coordinates = CoordinateJson::object();
+    std::optional<CoordinateJson> coordinates;
     if (!sources.empty())
         session_->readStore(attachment_, [&](const StoreReader& reader, const auto&) {
-            const auto source = reader.selectedObject(sources.front(), {}, {}, reference);
-            if (!source) throw std::runtime_error("source object not found: " + sources.front());
-            const auto meta = nlohmann::json::parse(source->record.meta);
-            if (meta.contains("coordinates")) coordinates = meta.at("coordinates");
+            for (const auto& id : sources) {
+                const auto read = reads.find(util::canonicalUuid(id));
+                CoordinateJson frame;
+                if (read != reads.end() && read->second.volume) frame = volumeCoordinates(*read->second.volume);
+                else {
+                    const auto source = reader.selectedObject(id, {}, {}, read == reads.end() ?
+                        std::nullopt : std::optional(read->second.pin.reference()));
+                    if (!source) throw std::runtime_error("source object not found: " + id);
+                    frame = geometryCoordinates(CoordinateJson::parse(source->record.meta).value("coordinates", CoordinateJson::object()));
+                }
+                if (coordinates && *coordinates != frame) throw std::runtime_error("sources were loaded in different frames");
+                coordinates = std::move(frame);
+            }
         });
-    return coordinates;
+    return coordinates.value_or(CoordinateJson::object());
 }
 
 PinnedObject ToolObjects::writable(const std::string& uuid, TransactionRequest& request)

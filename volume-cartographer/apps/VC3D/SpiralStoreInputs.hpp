@@ -42,6 +42,7 @@ struct StoreInputPin {
     // null in manifests that do not record it, which then compare on
     // geometry only.
     nlohmann::json metadata;
+    vc::objects::ObjectVersion reference;
 };
 
 struct FitSurface {

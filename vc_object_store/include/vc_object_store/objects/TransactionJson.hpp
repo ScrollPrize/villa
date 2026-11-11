@@ -68,6 +68,8 @@ ChangePage changePageFromJson(const std::string&);
 std::string feedCursorQuery(const FeedCursor&); // URL query parameters
 std::string objectRevisionToJson(const ObjectRevision&);
 ObjectRevision objectRevisionFromJson(const std::string&);
+std::string currentObjectResultToJson(const StoreStatus&, const ObjectRevision&);
+ObjectRevision currentObjectResultFromJson(const std::string&, StoreStatus* asOf = nullptr);
 std::string geometryRevisionToJson(const GeometryRevision&);
 GeometryRevision geometryRevisionFromJson(const std::string&);
 

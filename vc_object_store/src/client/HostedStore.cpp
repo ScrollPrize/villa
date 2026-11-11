@@ -171,9 +171,7 @@ std::optional<ObjectRevision> HostedStore::currentObjectRevision(const std::stri
 {
     const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/objects/" + objectUuid);
     if (response.status == 404) return std::nullopt;
-    const auto j = Json::parse(expectOk(response, "object").body);
-    if (asOf) *asOf = storeStatusFromJson(j.at("status").dump());
-    return objectRevisionFromJson(j.at("revision").dump());
+    return currentObjectResultFromJson(expectOk(response, "object").body, asOf);
 }
 
 std::optional<int64_t> HostedStore::currentVersion(const std::string& objectUuid)

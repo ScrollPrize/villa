@@ -7,6 +7,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/RelationshipInputs.hpp"
+#include "vc_object_store/objects/ManifestReferences.hpp"
 #include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "vc_object_store/objects/SurfaceGrid.hpp"
@@ -697,8 +698,10 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
            "cache_directory: persistent cache of numbered records, geometry and annotations across processes "
            "(HostedSessionOptions::cacheDirectory), within disk_cache_bytes and keeping min_free_bytes free.")
         .def("read_surface_grid", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
-                                     const std::string& volume, double targetScale, std::optional<int64_t> version,
+                                     const std::string& volume, double targetScale, const nb::object& versionValue,
                                      const std::optional<std::string>& generation, const nb::object& reference) {
+            const auto version = versionValue.is_none() ? std::optional<int64_t>{} :
+                std::optional(vo::detail::versionNumberFrom(nlohmann::json::parse(jsonDumps(versionValue))));
             const auto exact = optionalObjectVersionFromPy(reference);
             if(exact) {
                 if(exact->objectUuid!=vo::util::canonicalUuid(uuid)||version||generation)
@@ -1030,6 +1033,16 @@ NB_MODULE(_native, m)
         return nb::make_tuple(selected, exclusions);
     }, nb::arg("relationships"), nb::arg("endpoint_kinds"), nb::arg("approved_only") = false);
     m.def("canonical_uuid", &vo::util::canonicalUuid, nb::arg("uuid"));
+    m.def("manifest_references", [](const nb::dict& manifest) {
+        const auto selected=vo::manifestReferences(nlohmann::json::parse(jsonDumps(manifest)));
+        nb::dict objects,relationships,result;
+        for(const auto& [uuid,ref]:selected.objects)objects[nb::str(uuid.c_str())]=jsonLoads(vo::objectVersionToJson(ref));
+        for(const auto& [uuid,ref]:selected.relationships)relationships[nb::str(uuid.c_str())]=jsonLoads(vo::relationshipVersionToJson(ref));
+        result["objects"]=objects;result["relationships"]=relationships;return result;
+    },nb::arg("manifest"),"Validate saved manifest membership with native complete-reference codecs.");
+    m.def("store_position_from_json", [](const std::string& text) {
+        return jsonLoads(vo::detail::storePositionJson(vo::detail::storePositionFrom(nlohmann::json::parse(text))).dump());
+    }, nb::arg("json"), "Decode a snapshot position with the shared native codec.");
     m.def("object_version_from_json", [](const std::string& text) {
         return jsonLoads(vo::objectVersionToJson(vo::objectVersionFromJson(text)));
     }, nb::arg("json"), "Decode an external exact reference with the shared native codec.");

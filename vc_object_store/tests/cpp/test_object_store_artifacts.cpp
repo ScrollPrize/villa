@@ -57,6 +57,29 @@ void referencedArtifacts()
         }
         require(!std::filesystem::exists(artifactBlobDirectory(overlayPath))&&!std::filesystem::exists(artifactBlobDirectory(middlePath)),
             "metadata overrides never copy artifact payloads");
+        {
+            ObjectStoreSession session;
+            const auto attachment=session.attach(overlayPath,options);
+            const auto publish=[&](const std::string& name){
+                session.publishArtifacts(attachment,session.currentObject(attachment,id)->reference(),{{name,directory.path/"bytes"}});
+            };
+            for(const auto& protectedFile:{basePath,middlePath,overlayPath,std::filesystem::path(overlayPath.string()+"-wal")}){
+                publish(protectedFile.filename().string());
+                mustFail([&]{session.materializeArtifacts(attachment,id,protectedFile.parent_path());});
+            }
+            publish("safe.bin");
+            mustFail([&]{session.materializeArtifacts(attachment,id,artifactBlobDirectory(overlayPath));});
+            const auto safe=directory.path/"output";
+            session.materializeArtifacts(attachment,id,safe);
+            require(std::filesystem::file_size(safe/"safe.bin")==24,"safe artifact destinations still materialize");
+            // Cache writes use the same checked writer, including symlink aliases.
+            const auto cache=directory.path/"cache";
+            std::filesystem::create_directories(cache);
+            std::error_code error;
+            std::filesystem::create_directory_symlink(artifactBlobDirectory(overlayPath),cache/hash,error);
+            if(!error)mustFail([&]{session.artifactFile(attachment,id,"safe.bin",cache);});
+            require(session.currentObject(attachment,id).has_value(),"protected database remains readable");
+        }
         mustFail([&]{auto w=overlay.write();overlay.setMeta(w,{{},id},kArtifactsMetaKey,
             artifactManifestJson({{"missing",std::string(64,'e'),5}}));w.commit();});
         {

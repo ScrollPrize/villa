@@ -16,6 +16,7 @@
 #include <vc_object_store/server/Server.hpp>
 #endif
 #include "vc/core/PointCollections.hpp"
+#include "vc/core/StoredCollection.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
@@ -294,6 +295,12 @@ void checkHistoryGenerationSaves(const fs::path& directory)
 
 void checkToolMappingGuards(const fs::path& directory)
 {
+    for(const auto& points:{R"({"1":{"p":[1,2,3]},"01":{"p":[4,5,6]}})",R"({"1junk":{"p":[1,2,3]}})"}){
+        bool rejected=false;
+        try{vc::storedCollection({{"uuid",util::newUuid()},{"points",nlohmann::json::parse(points)}});}
+        catch(const std::exception&){rejected=true;}
+        require(rejected,"GUI collection adapter shares strict point-map decoding");
+    }
     for (bool history : {false, true}) for (bool referenced : {false, true}) {
         OpenOptions options; options.author = "tool-mapping"; options.history = history ? HistoryMode::On : HistoryMode::Off;
         const auto base = directory / ("tool-mapping-" + std::to_string(history) + std::to_string(referenced) + ".vcobj");
@@ -318,10 +325,22 @@ void checkToolMappingGuards(const fs::path& directory)
         const auto registration = registerVolumeTransform(*tool.objects().session(), attachment,
             "source", "target", VolumeAffine::identity(), "identity");
         auto loaded = tool.load(surface.uuid, true, VolumeVoxels{"target", 1});
+        std::optional<StoreStatus> before,after;
+        tool.objects().session()->readStore(attachment,[&](const StoreReader& reader,const auto&){before=reader.status();});
+        const auto unchanged=tool.update(surface.uuid,*loaded);
+        tool.objects().session()->readStore(attachment,[&](const StoreReader& reader,const auto&){after=reader.status();});
+        require(before->commitSequence==after->commitSequence,"checked no-op preserves commit sequence and ownership");
+        tool.objects().session()->editCurrent(attachment,{surface.uuid},[&](const auto&,const auto&){
+            return std::vector<TransactionOperation>{SetMetaOp{surface.uuid,"external","true"}};
+        });
+        bool staleRejected=false;
+        try{tool.update(surface.uuid,*loaded);}catch(const TransactionConflict&){staleRejected=true;}
+        require(staleRejected,"unchanged tool grid still validates its loaded object reference");
+        loaded=tool.load(surface.uuid,true,VolumeVoxels{"target",1});
+        require(tool.update(surface.uuid,*loaded)==unchanged+1,"reloaded no-op returns the selected version");
         (*loaded->rawPointsPtr())(0,0)[2] += 1;
         tool.update(surface.uuid, *loaded);
         loaded = tool.load(surface.uuid, true, VolumeVoxels{"target", 1});
-        (*loaded->rawPointsPtr())(0,0)[2] += 1;
         VolumeAffine moved; moved(0,3) = 10;
         tool.objects().session()->editCurrent(attachment, {registration}, [&](const StoreReader& reader, const std::string& uuid) {
             return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(

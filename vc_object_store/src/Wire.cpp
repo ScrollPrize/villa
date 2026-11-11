@@ -1,11 +1,14 @@
 // JSON forms of conflicts, status, feed pages and historical reads, shared by
 // the hosted service and its clients.
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/ManifestReferences.hpp"
 #include "internal/RecordJson.hpp"
 #include "internal/ObjectVersionJson.hpp"
+#include "internal/RelationshipOrder.hpp"
 
 #include <set>
 #include <limits>
+#include <type_traits>
 
 namespace vc::objects {
 using namespace detail;
@@ -89,6 +92,32 @@ TransactionConflict transactionConflictFromJson(const std::string& text)
 StoreStatus storeStatusFromJson(const std::string& text)
 {
     return storeStatusFrom(Json::parse(text));
+}
+
+ManifestReferences manifestReferences(const Json& manifest)
+{
+    if(!manifest.is_object())throw std::invalid_argument("input manifest must be an object; regenerate the fit inputs");
+    ManifestReferences result;
+    const auto add=[&]<class Map>(const Json& entry,Map& references,const char* kind){
+        const auto fail=[&](const char* reason){throw std::invalid_argument(std::string(reason)+" "+kind+" manifest reference; regenerate the fit inputs");};
+        if(!entry.contains("reference"))fail("missing complete");
+        typename Map::mapped_type ref;
+        if constexpr(std::is_same_v<typename Map::mapped_type,ObjectVersion>) ref=objectVersionFrom(entry.at("reference"));
+        else ref=relationshipVersionFrom(entry.at("reference"));
+        const auto& uuid=entry.at("uuid").get_ref<const std::string&>();
+        const auto id=[&]{if constexpr(std::is_same_v<typename Map::mapped_type,ObjectVersion>)return ref.objectUuid;else return ref.relationshipUuid;}();
+        if(id!=uuid||(entry.contains("version")&&versionNumberFrom(entry.at("version"))!=ref.version))fail("inconsistent");
+        if(!references.emplace(uuid,std::move(ref)).second)fail("duplicate");
+    };
+    for(const auto* key:{"objects","relationships"})if(manifest.contains(key)&&!manifest.at(key).is_null()){
+        const auto& entries=manifest.at(key);
+        if(!entries.is_array())throw std::invalid_argument(std::string(key)+" manifest must be an array; regenerate the fit inputs");
+        for(const auto& entry:entries)
+            if(std::string_view(key)=="objects")add(entry,result.objects,"object");
+            else add(entry,result.relationships,"relationship");
+    }
+    if(manifest.contains("outer_shell")&&!manifest.at("outer_shell").is_null())add(manifest.at("outer_shell"),result.objects,"object");
+    return result;
 }
 
 ChangePage changePageFromJson(const std::string& text)
@@ -337,6 +366,16 @@ RegionStop regionStopFrom(const std::string& name)
 }
 } // namespace
 
+std::string currentObjectResultToJson(const StoreStatus& status, const ObjectRevision& revision)
+{
+    return envelope(status, "revision", revisionJson(revision)).dump();
+}
+
+ObjectRevision currentObjectResultFromJson(const std::string& text, StoreStatus* asOf)
+{
+    return revisionFrom(unwrap(text, asOf, "revision"));
+}
+
 std::string objectQueryRequestToJson(const ObjectSelection& selection, const std::optional<std::vector<std::string>>& fields)
 {
     return Json{{"selection", selectionJson(selection)}, {"fields", fieldsJson(fields)}}.dump();
@@ -569,6 +608,7 @@ std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::str
     std::vector<SelectedRelationship> result;
     for (const auto& j : unwrap(text, asOf, "relationships"))
         result.push_back({relationshipFrom(j.at("relationship")), j.at("applicable").get<bool>()});
+    orderRelationships(result);
     return result;
 }
 
@@ -599,6 +639,7 @@ SelectedInputs selectedInputsFromJson(const std::string& text)
     for (const auto& object : data.at("objects")) result.objects.push_back(revisionFrom(object));
     for (const auto& edge : data.at("relationships"))
         result.relationships.push_back({relationshipFrom(edge.at("relationship")), edge.at("applicable").get<bool>()});
+    orderRelationships(result.relationships);
     return result;
 }
 

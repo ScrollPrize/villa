@@ -7,6 +7,7 @@
 #include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/RelationshipInputs.hpp>
+#include <vc_object_store/objects/ManifestReferences.hpp>
 
 #include <algorithm>
 #include <map>
@@ -188,24 +189,11 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
 
 // The manifest's store and volume; false (with the problem) for another store.
 bool sameStore(const StoreReader& reader, const Json& document, FitInputs& result,
-               std::map<std::string, vc::objects::RelationshipVersion>& references)
+               vc::objects::ManifestReferences& references)
 {
     const auto& manifest = document.at("manifest");
-    // Validate every saved relationship before partial refresh or current-head
-    // filtering. A dropped/out-of-scope link must not hide incomplete evidence.
-    for (const auto& entry : manifest.value("relationships", Json::array())) {
-        if (!entry.contains("reference")) {
-            result.problems.push_back("relationship manifest has no complete reference; regenerate the fit inputs");
-            return false;
-        }
-        const auto ref = vc::objects::relationshipVersionFromJson(entry.at("reference").dump());
-        const auto uuid = entry.at("uuid").get<std::string>();
-        if (ref.relationshipUuid != uuid || (entry.contains("version") && entry.at("version") != ref.version) ||
-            !references.emplace(uuid, ref).second) {
-            result.problems.push_back("inconsistent relationship manifest reference; regenerate the fit inputs");
-            return false;
-        }
-    }
+    try { references=vc::objects::manifestReferences(manifest); }
+    catch(const std::exception& error){result.problems.push_back(error.what());return false;}
     result.digest = document.value("digest", std::string());
     result.storeUuid = manifest.at("store").at("uuid").get<std::string>();
     result.volumeUuid = manifest.at("volume_uuid").get<std::string>();
@@ -267,7 +255,7 @@ std::size_t FitInputs::count(LinkState state) const
 }
 
 namespace {
-StoreInputPin objectPin(const Json& object)
+StoreInputPin objectPin(const Json& object,const vc::objects::ManifestReferences& references)
 {
     StoreInputPin pin;
     pin.uuid = object.at("uuid").get<std::string>();
@@ -275,16 +263,21 @@ StoreInputPin objectPin(const Json& object)
     pin.name = object.value("name", std::string());
     pin.geometryRevision = object.at("geometry_revision").get<std::string>();
     pin.metadata = valueOrNull(object, "metadata");
+    pin.reference=references.objects.at(pin.uuid);
     return pin;
+}
+std::vector<StoreInputPin> objectPins(const Json& document,const vc::objects::ManifestReferences& references)
+{
+    std::vector<StoreInputPin> pins;
+    for (const auto& object : document.at("manifest").value("objects", Json::array()))
+        pins.push_back(objectPin(object,references));
+    return pins;
 }
 }
 
 std::vector<StoreInputPin> manifestPins(const Json& document)
 {
-    std::vector<StoreInputPin> pins;
-    for (const auto& object : document.at("manifest").value("objects", Json::array()))
-        pins.push_back(objectPin(object));
-    return pins;
+    return objectPins(document,vc::objects::manifestReferences(document.at("manifest")));
 }
 
 // Spiral input-protocol projection, mirrored by object_store_inputs.adapter_metadata.
@@ -317,14 +310,14 @@ Json adapterMetadata(const std::string& kind, const Json& meta,
 FitInputs readFitInputs(const StoreReader& reader, const Json& document)
 {
     FitInputs result;
-    std::map<std::string, vc::objects::RelationshipVersion> references;
+    vc::objects::ManifestReferences references;
     if (!sameStore(reader, document, result, references)) return result;
-    const auto pins = manifestPins(document);
+    const auto pins = objectPins(document,references);
     for (const auto& pin : pins) readObject(reader, pin, result.volumeUuid, result);
     // The outer shell: read as a surface, held apart from the patches.
     if (const Json shell = valueOrNull(document.at("manifest"), "outer_shell"); shell.is_object()) {
         FitInputs read;
-        const auto pin = objectPin(shell);
+        const auto pin = objectPin(shell,references);
         readObject(reader, pin, result.volumeUuid, read);
         // Only a surface pin lands among the surfaces: anything else the
         // manifest names as its shell is a problem, not a shell.
@@ -334,7 +327,7 @@ FitInputs readFitInputs(const StoreReader& reader, const Json& document)
         else
             result.outerShell = std::move(read.surfaces.front());
     }
-    compareRelationships(reader, document.at("manifest"), pins, nullptr, references, result);
+    compareRelationships(reader, document.at("manifest"), pins, nullptr, references.relationships, result);
     return result;
 }
 
@@ -343,9 +336,9 @@ FitInputChanges readFitInputChanges(const StoreReader& reader, const Json& docum
                                     const std::set<std::string>& relationshipUuids)
 {
     FitInputChanges changes;
-    std::map<std::string, vc::objects::RelationshipVersion> references;
+    vc::objects::ManifestReferences references;
     if (!sameStore(reader, document, changes.inputs, references)) return changes;
-    const auto pins = manifestPins(document);
+    const auto pins = objectPins(document,references);
     for (const auto& pin : pins)
         if (objectUuids.contains(pin.uuid)) readObject(reader, pin, changes.inputs.volumeUuid, changes.inputs);
     // A changed object's links: the fitted ones, and the ones it has now.
@@ -362,7 +355,7 @@ FitInputChanges readFitInputChanges(const StoreReader& reader, const Json& docum
     if (!incident.endpointUuids->empty())
         for (const auto& edge : reader.selectEdges(incident, std::vector<std::string>{"uuid"}))
             changes.checkedRelationships.insert(edge.uuid);
-    compareRelationships(reader, document.at("manifest"), pins, &changes.checkedRelationships, references, changes.inputs);
+    compareRelationships(reader, document.at("manifest"), pins, &changes.checkedRelationships, references.relationships, changes.inputs);
     return changes;
 }
 

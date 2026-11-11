@@ -9,6 +9,15 @@
 
 namespace vc::objects {
 using namespace detail;
+void validateObjectFields(const std::optional<std::vector<std::string>>& fields)
+{
+    (void)projectedObjectColumns(fields ? ObjectFields(std::set<std::string>(fields->begin(), fields->end())) : std::nullopt);
+}
+void validateEdgeFields(const std::optional<std::vector<std::string>>& fields)
+{
+    (void)projectedEdgeColumns(fields ? ObjectFields(std::set<std::string>(fields->begin(), fields->end())) : std::nullopt);
+}
+
 void detail::beginSpatialRead(StatementPool& pool, size_t budget, int version)
 {
     if (!budget) { pool.spatialCache.reset(); return; }

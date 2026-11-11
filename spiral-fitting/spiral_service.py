@@ -1527,13 +1527,12 @@ class ServiceState:
         if not self._positioned():
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "This service's object store records no positions")
-        if not isinstance(value, dict) or type(value.get("commit_sequence")) is not int \
-                or value["commit_sequence"] < 0 or not value.get("store") \
-                or not value.get("generation"):
+        from vc_object_store import store_position_from_json
+        try:
+            position = InputPosition.of_status(store_position_from_json(json.dumps(value)))
+        except (ValueError, TypeError, RuntimeError) as error:
             raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "inputs_position must be {store, generation, commit_sequence}")
-        position = InputPosition(str(value["store"]), str(value["generation"]),
-                                 int(value["commit_sequence"]))
+                           "inputs_position must be {store, generation, commit_sequence}") from error
         store = self.object_store
         if position.store != store.uuid or position.generation != store.generation:
             raise ApiError(

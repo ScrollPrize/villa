@@ -59,6 +59,7 @@ struct RelationshipVersion {
     std::string storeUuid, generation, relationshipUuid;
     int64_t version = 0;
     bool operator==(const RelationshipVersion&) const = default;
+    auto operator<=>(const RelationshipVersion&) const = default;
 };
 
 // Numbered wire/receipt and storage projection only. Native selected guards use

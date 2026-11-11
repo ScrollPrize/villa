@@ -46,7 +46,7 @@ def read_surface(store, surface_uuid, *, volume, version=None, generation=None, 
     with version/generation selectors, which select within the current owner's history."""
     with attached(store, read_only=True) as (session, attachment):
         grid = session.read_surface_grid(attachment, str(surface_uuid), str(volume), float(target_scale),
-                                         None if version is None else int(version), generation, reference)
+                                         version, generation, reference)
     return surface_grid(grid)
 
 

@@ -587,8 +587,7 @@ struct ServerState {
         auto txn = store->read();
         const auto revision = store->currentObjectRevision(txn, uuidSegment(uuid));
         if (!revision) return errorReply(http::status::not_found, "no object " + uuid);
-        return jsonReply(Json{{"status", Json::parse(storeStatusToJson(store->status(txn)))},
-                              {"revision", Json::parse(objectRevisionToJson(*revision))}}.dump());
+        return jsonReply(currentObjectResultToJson(store->status(txn), *revision));
     }
 
     Reply objectVersion(const std::string& uuid, const std::string& version, const Target& target)

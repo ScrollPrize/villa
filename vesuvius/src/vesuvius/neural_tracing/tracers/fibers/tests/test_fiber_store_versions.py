@@ -3,10 +3,10 @@ import uuid
 
 import numpy as np
 import pytest
-from vc_object_store import ObjectStore, extension_uuid, remove_history_and_disable
+from vc_object_store import ObjectStore, extension_uuid, object_reference, remove_history_and_disable
 
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
-    FiberStore, _references_digest, fiber_catalog, fibers_digest, fiber_source_version, read_polylines, write_fibers,
+    FiberStore, _references_digest, fiber_catalog, fiber_volume, fibers_digest, fiber_source_version, read_polylines, write_fibers,
 )
 
 
@@ -32,12 +32,30 @@ def test_uuid_normalization_and_digest_owner(tmp_path):
     assert _references_digest([ref]) != _references_digest([dict(ref, store=str(uuid.uuid4()))])
 
 
+@pytest.mark.parametrize('history', [False, True])
+def test_direct_volume_discovery_rejects_mixed_registered_frames(tmp_path, history):
+    path, ids = source(tmp_path)
+    with ObjectStore.open(str(path), author='editor') as store:
+        store.set_meta(ids[1], 'coordinates', dict(volume_uuid='other', scale_factor=1))
+        store.register_volume_transform('other', 'vol', [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]])
+    if not history:
+        remove_history_and_disable(path)
+    with pytest.raises(ValueError, match='several volumes'):
+        fiber_volume(path)
+    with pytest.raises(ValueError, match='several volumes'):
+        read_polylines(path)
+    assert [row['id'] for row in fiber_catalog(path, 'vol')] == [ids[0]]
+    assert [row['id'] for row, _ in read_polylines(path, volume='vol')] == [ids[0]]
+    with pytest.raises(ValueError, match='not bound'):
+        read_polylines(path, [ids[1]], volume='vol')
+
+
 def test_catalog_measures_selected_geometry_not_ingestion_summary(tmp_path):
     path, ids = source(tmp_path)
     xyz = np.array([[10., 20., 30.], [10., 24., 30.], [13., 24., 30.]])
     with ObjectStore.open(str(path), author='editor') as store:
         version = store.current_version(ids[0])
-        with store.write(expected_versions={ids[0]: version}) as tx:
+        with store.write(expected_versions={ids[0]: object_reference(store.object(ids[0]))}) as tx:
             tx.edit_geometry_sequence(ids[0], dict(array='line_points', start=0, erase_count=32,
                                       parts=[dict(count=3, data=xyz.tobytes())]), version)
     row = next(r for r in fiber_catalog(path, 'vol') if r['id'] == ids[0])
@@ -200,7 +218,7 @@ def test_managed_payloads_require_explicit_derived_geometry_policy(tmp_path, mon
                     columns=[dict(name='owner', type='blob'), dict(name='label', type='integer')],
                     primary_key=['owner'])
         store.create_extension_table(spec)
-        with store.write(expected_versions={fid: store.current_version(fid)}) as tx:
+        with store.write(expected_versions={fid: object_reference(store.object(fid))}) as tx:
             tx.replace_extension_rows(spec['name'], fid, [[extension_uuid(fid), 7]])
         payload = tmp_path / 'notes.txt'
         payload.write_text('manual notes')

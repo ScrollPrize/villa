@@ -30,6 +30,17 @@ def request(**selectors):
         volume, approved)
 
 
+@pytest.mark.parametrize('value', [True, 1.5, '1', -1, 2**63])
+def test_saved_positions_use_native_validation(db, value):
+    position = dict(db.status(), commit_sequence=value)
+    for decode in (osi.InputPosition.from_provenance, osi.InputPins.from_provenance):
+        with pytest.raises((ValueError, RuntimeError), match='commit_sequence'):
+            decode({'position': position})
+    with pytest.raises((ValueError, RuntimeError), match='commit_sequence'):
+        osi.InputPins.from_manifest({'position': position})
+    assert osi.InputPosition.from_provenance(dict(db.status(), commit_sequence=0)).commit_sequence == 0
+
+
 def test_dense_fiber_without_synthetic_controls_materializes_whole_line(db):
     fid = put_fiber(db, _line(), [])
     snapshot = osi.read_snapshot(db, request())
@@ -307,6 +318,19 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
         with pytest.raises(ValueError, match='regenerate'):
             read(incomplete)
     assert osi.validated_manifest_references({'relationships': []}) == {}
+    original = manifest['objects'][0]
+    conflicting = dict(original, version=original['version'] + 1,
+                       reference=dict(original['reference'], version=original['version'] + 1))
+    for duplicate in (original, conflicting):
+        repeated = json.loads(json.dumps(manifest))
+        repeated['objects'].append(duplicate)
+        for read in (osi.InputPins.from_manifest, osi.manifest_digest):
+            with pytest.raises(ValueError, match='regenerate'):
+                read(repeated)
+    repeated = json.loads(json.dumps(manifest))
+    repeated['outer_shell'] = repeated['objects'][0]
+    with pytest.raises(ValueError, match='duplicate object'):
+        osi.validated_manifest_references(repeated)
     # A position-only request is current/position discovery, not partial pins.
     discovery = osi.InputPins.from_provenance({'position': snapshot.position.provenance()})
     assert not discovery.pinned
@@ -322,21 +346,23 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
 
 
 def test_manifest_validation_reuses_decoded_references(db, monkeypatch):
+    import vc_object_store
     put_patch(db, _grid())
     snapshot = osi.read_snapshot(db, request())
     manifest = snapshot.manifest()
-    decode = osi.InputPins._decode_reference
+    decode = vc_object_store.manifest_references
     decoded = []
-    def counted(uuid, reference, version=None):
-        decoded.append(uuid)
-        return decode(uuid, reference, version)
-    monkeypatch.setattr(osi.InputPins, '_decode_reference', staticmethod(counted))
+    def counted(value):
+        result = decode(value)
+        decoded.append(result['objects'])
+        return result
+    monkeypatch.setattr(vc_object_store, 'manifest_references', counted)
     pins = osi.InputPins.from_manifest(manifest)
-    assert decoded == [entry['uuid'] for entry in manifest['objects']]
+    assert len(decoded) == 1 and pins.references is decoded[0]
     assert pins.references == {entry['uuid']: entry['reference'] for entry in manifest['objects']}
     decoded.clear()
     assert osi.resume_problems({'object_store': manifest}, SimpleNamespace(manifest=manifest)) == []
-    assert len(decoded) == 2 * len(manifest['objects'])
+    assert len(decoded) == 2
 
 
 def test_the_outer_shell_is_read_on_its_own_never_as_a_patch(db):

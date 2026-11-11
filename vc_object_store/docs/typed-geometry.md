@@ -130,3 +130,7 @@ consumed into that revision, read with `geometry_point_annotations`, and
 edited through sequence operations alongside the points they describe.
 Import-summary counts and lengths stay historical annotations; view counts
 and owned measurements describe current geometry.
+
+## Point-map boundaries
+
+Native `geometry/PointMap.hpp` provides `pointIdFromString` and `decodePointMap` for VC point maps (`{numeric_id: {p: [x,y,z], ...annotations}}`). File imports and GUI-to-store collection adapters share full-consumption, nonnegative int64 ID validation, numeric-alias rejection, finite XYZ validation, numeric ordering and annotation extraction. File-level collection collision/renumbering rules remain in the importer. This does not narrow unrelated standalone formats' uint64 ID domains.

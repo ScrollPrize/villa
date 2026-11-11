@@ -118,7 +118,7 @@ TransactionRequest requestHeader(const Json& j)
     request.expectedObjects = selectionFrom(j.at("expected_objects"));
     request.expectedRelationships = selectionFrom(j.at("expected_relationships"), true);
     request.readDependencies = selectionFrom(j.value("read_dependencies", Json::object()));
-    if (const auto& s = j.at("expected_commit_sequence"); !s.is_null()) request.expectedCommitSequence = s.get<int64_t>();
+    if (const auto& s = j.at("expected_commit_sequence"); !s.is_null()) request.expectedCommitSequence = commitSequenceFrom(s);
     return request;
 }
 

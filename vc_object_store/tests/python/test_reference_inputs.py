@@ -41,3 +41,35 @@ def test_exact_input_does_not_depend_on_current_head(tmp_path):
     with pytest.raises(ValueError, match="complete reference"):
         session.decode_object_reference(attached, dict(uuid=uuid, generation=ref["generation"], version=1))
     session.detach(attached)
+
+
+@pytest.mark.parametrize('value', [True, 1.5, '1', -1, 2**63])
+def test_native_position_and_surface_selector_reject_coercion(db_path, value):
+    from vc_object_store import Surface, store_position_from_json
+    from vc_object_store.surfaces import read_surface
+    with ObjectStore.create(db_path, author='test') as store:
+        uuid = store.upsert_object(dict(kind='surface', meta={'coordinates': {'volume_uuid': 'vol', 'scale_factor': 1}}))
+        store.put_geometry(uuid, Surface(1, 1, [1, 1], [[2, 4, 6]]))
+        status = store.status()
+    with pytest.raises((ValueError, RuntimeError), match='commit_sequence'):
+        store_position_from_json(json.dumps(dict(status, commit_sequence=value)))
+    with pytest.raises((ValueError, RuntimeError), match='version'):
+        read_surface(db_path, uuid, volume='vol', version=value)
+    session = ObjectStoreSession()
+    attachment = session.attach(db_path, 'test', read_only=True)
+    with pytest.raises((ValueError, RuntimeError), match='version'):
+        session.read_surface_grid(attachment, uuid, 'vol', 1, value)
+    session.detach(attachment)
+
+
+def test_manifest_membership_uses_complete_native_references(db):
+    from vc_object_store import manifest_references
+    uuid = db.upsert_object(dict(kind='note'))
+    reference = object_reference(db.object(uuid))
+    entry = dict(uuid=uuid, reference=reference, version=reference['version'])
+    assert manifest_references({'objects': [entry]})['objects'] == {uuid: reference}
+    for invalid in ({'objects': [entry, entry]}, {'objects': [entry], 'outer_shell': entry},
+                    {'objects': [dict(entry, reference=dict(reference, object='11111111-2222-4333-8444-555555555555'))]},
+                    {'objects': [dict(entry, version=True)]}, {'objects': [dict(entry, version=1.5)]}):
+        with pytest.raises((ValueError, RuntimeError)):
+            manifest_references(invalid)

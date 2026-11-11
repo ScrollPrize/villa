@@ -17,6 +17,8 @@
 #include "vc_object_store/objects/ToolObjects.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/objects/RelationshipInputs.hpp"
+#include "vc_object_store/geometry/PointMap.hpp"
+#include "vc_object_store/objects/ManifestReferences.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "internal/Database.hpp"
 #include "imports/SourceIdentityIndex.hpp"
@@ -350,11 +352,20 @@ void deletedAndExactReads(HistoryMode baseMode,HistoryMode overlayMode){
         require(bool(reader.objectsAtVersions({current}).front()),"new owner reference resolves after edit");
         const auto grid=readSurfaceGrid(reader,original,"test-volume");
         require(grid.record.reference().storeUuid==original.storeUuid&&!nlohmann::json::parse(grid.record.meta).contains("changed"),
-            "exact grid reads original metadata and geometry despite newer overlay");}
+            "exact grid reads original metadata and geometry despite newer overlay");
+        GeometrySnapshot snapshot(reader);
+        const auto selected=*reader.objectsAtVersions({original}).front();
+        const auto moving=snapshot.viewTransformedAt(*reader.currentObject(live),"test-volume");
+        mustFail([&]{readSurfaceGrid(reader,selected,&moving);});
+        const auto retained=snapshot.viewTransformedAt(selected,"test-volume");
+        require(readSurfaceGrid(reader,selected,&retained).points==grid.points,"referenced selected metadata/view pair remains valid");}
     {auto w=store.write();store.deleteObject(w,live);w.commit();}
     {auto r=store.read();LocalStoreReader reader(store,r);GeometrySnapshot snapshot(reader);
         require(snapshot.surface(live,geometry).rows()==2,"exact typed geometry survives current deletion");
         require(readSurfaceGrid(reader,original,"test-volume").rows==2,"exact grid survives current deletion");
+        const auto selected=*reader.objectsAtVersions({original}).front();
+        const auto view=snapshot.viewTransformedAt(selected,"test-volume");
+        require(readSurfaceGrid(reader,selected,&view).rows==2,"selected transformed grid survives current deletion");
         const auto retained=reader.objectAtGeometry(geometry);
         require(retained&&retained->geometryRevision==geometry,"geometry metadata resolves through deleted overlay");
         if(overlayMode==HistoryMode::Off)require(retained->reference()==original,"current-only overlay resolves retained source metadata");
@@ -839,6 +850,11 @@ void unifiedExpectations(HistoryMode mode)
     const auto encoded = transactionRequestToJson(q);
     require(nlohmann::json::parse(encoded).at("command_version") == 3, "new dependency guards are version gated");
     const auto decoded = transactionRequestFromJson(encoded, {});
+    for(const auto& invalid:std::vector<nlohmann::json>{true,1.5,-1,uint64_t(INT64_MAX)+1,"1"}) {
+        auto malformed=nlohmann::json::parse(encoded);malformed["expected_commit_sequence"]=invalid;
+        mustFail([&]{transactionRequestFromJson(malformed.dump(),{});});
+        mustFail([&]{transactionJsonPayloadHashes(malformed.dump());});
+    }
     require(decoded.expectedObjects == q.expectedObjects && decoded.readDependencies == q.readDependencies &&
             decoded.expectedRelationships == q.expectedRelationships, "one handle survives every guard wire path");
     (void)store.submit(q);
@@ -961,6 +977,13 @@ void selectedGraphCapture(HistoryMode mode)
         require(selected.relationships.size() == 1 && selected.relationships.front().applicable,
                 "selected graph captures applicable inherited membership");
         const auto decoded = selectedInputsFromJson(selectedInputsToJson(status, selected));
+        auto reordered=selected.relationships;
+        auto extra=reordered.front();extra.relationship.record.uuid="ffffffff-ffff-4fff-8fff-ffffffffffff";
+        reordered.front().relationship.record.uuid="00000000-0000-4000-8000-000000000001";
+        reordered.insert(reordered.begin(),extra);
+        const auto ordered=relationshipQueryResultFromJson(relationshipQueryResultToJson(status,reordered),nullptr);
+        require(ordered.front().relationship.record.uuid=="00000000-0000-4000-8000-000000000001"&&
+                ordered.back().relationship.reference()==extra.relationship.reference(),"wire and reopened graph-cache values use complete-reference order");
         for (const auto* family : {"objects", "relationships"}) {
             auto malformed = nlohmann::json::parse(selectedInputsToJson(status, selected));
             auto& item = malformed["inputs"][family][0];
@@ -997,7 +1020,71 @@ void selectedGraphCapture(HistoryMode mode)
     }
 }
 
+void postFusionSelectedState(HistoryMode mode) {
+    TemporaryDirectory directory;
+    const auto path=directory.path/"selected.vcobj";
+    const auto a=util::newUuid(),b=util::newUuid();
+    auto store=ObjectStore::create(path,options(mode));
+    {auto w=store.write();for(const auto& id:{a,b}){
+        ObjectRecord rec;rec.uuid=id;rec.kind="surface";
+        rec.meta=R"({"coordinates":{"volume_uuid":"vol","scale_factor":1}})";
+        store.upsertObject(w,rec);
+        store.putGeometry(w,id,vc::geometry::encode(vc::geometry::Surface{1,1,{1,1},{{2,4,6}}}));
+    }w.commit();}
+    ToolObjects tool(path,"selected-frame");
+    tool.session()->readStore(tool.attachment(),[&](const StoreReader& reader,const auto&){
+        for(const auto& id:{a,b})tool.noteRead(pinOf(tool.attachment(),*reader.currentObject(id),reader.status().generation),{},true);
+    });
+    require(tool.coordinatesFor({a,b},{})==volumeCoordinates("vol",1),"identical native source frames are accepted");
+    {auto w=store.write();store.setMeta(w,a,"coordinates",R"({"volume_uuid":"vol","scale_factor":2})");w.commit();}
+    if(mode==HistoryMode::On)
+        require(tool.coordinatesFor({a,b},{})==volumeCoordinates("vol",1),"output frame uses selected metadata, not moving head");
+    else mustFail([&]{tool.coordinatesFor({a,b},{});}); // Old current-only metadata is no longer retained.
+    tool.session()->readStore(tool.attachment(),[&](const StoreReader& reader,const auto&){
+        tool.noteRead(pinOf(tool.attachment(),*reader.currentObject(a),reader.status().generation),{},true);
+    });
+    mustFail([&]{tool.coordinatesFor({a,b},{});});
+    require(tool.coordinatesFor({a,b},VolumeVoxels{"target",1})==volumeCoordinates("target",1),"explicit output frame remains supported");
+    auto r=store.read();LocalStoreReader reader(store,r);
+    const auto current=*reader.currentObject(a);
+    mustFail([&]{reader.selectedObject(a,{},util::newUuid());});
+    mustFail([&]{reader.selectedObject(a,{},"invalid");});
+    require(reader.selectedObject(a)->reference()==current.reference(),"current discovery is unchanged");
+    require(reader.selectedObject(a,current.version,current.generation)->reference()==current.reference(),"numbered selection is unchanged");
+    GeometrySnapshot snapshot(reader);
+    const auto view=snapshot.viewTransformedAt(current,"vol");
+    require(readSurfaceGrid(reader,current,&view).points.front()==1,"matching selected metadata/view is accepted");
+    const auto anonymous=snapshot.surface(a,*current.geometryRevision).viewTransformedAt("vol");
+    mustFail([&]{readSurfaceGrid(reader,current,&anonymous);});
+    auto mismatched=current; // Same geometry, different complete selected identity.
+    mismatched.storeUuid=util::newUuid();
+    mustFail([&]{readSurfaceGrid(reader,mismatched,&view);});
+    if(mode==HistoryMode::On){
+        const auto old=*reader.selectedObject(a,current.version-1,current.generation);
+        mustFail([&]{readSurfaceGrid(reader,old,&view);});
+        const auto oldView=snapshot.viewTransformedAt(old,"vol");
+        require(readSurfaceGrid(reader,old,&oldView).points.front()==2,"retained metadata/view pair reads its own frame");
+    }
+    const auto encoded=currentObjectResultToJson(reader.status(),current);
+    StoreStatus status;
+    const auto decoded=currentObjectResultFromJson(encoded,&status);
+    require(decoded.reference()==current.reference()&&decoded.record.meta==current.record.meta&&status.commitSequence==reader.status().commitSequence,
+        "current-object envelope preserves complete identity, exact metadata and status");
+    validateObjectFields(std::vector<std::string>{"meta","surface"});
+    validateEdgeFields(std::vector<std::string>{"a_anchor","tags"});
+    mustFail([&]{validateObjectFields(std::vector<std::string>{"invalid"});});
+    mustFail([&]{validateEdgeFields(std::vector<std::string>{"invalid"});});
+}
+
 int main()try{
+    {
+        const auto points=vc::geometry::decodePointMap(nlohmann::json::parse(R"({"9":{"p":[1,2,3],"note":true},"2":{"p":[4,5,6]}})"));
+        require(points.points.ids==std::vector<int64_t>{2,9}&&points.annotations[1].at("note")==true,"point-map decoding preserves numeric order and annotations");
+        for(const auto& json:{R"({"1":{"p":[1,2,3]},"01":{"p":[4,5,6]}})",R"({"1junk":{"p":[1,2,3]}})",
+            R"({"-1":{"p":[1,2,3]}})",R"({"9223372036854775808":{"p":[1,2,3]}})",R"({"1":{"p":[true,2,3]}})",R"({"1":{"p":[1,2,3,4]}})"})
+            mustFail([&]{vc::geometry::decodePointMap(nlohmann::json::parse(json));});
+    }
+    for(const auto mode:{HistoryMode::Off,HistoryMode::On})postFusionSelectedState(mode);
     selectedGraphCapture(HistoryMode::On); selectedGraphCapture(HistoryMode::Off);
     fittingRelationshipPolicy();
     for (const auto mode : {HistoryMode::Off, HistoryMode::On}) unifiedExpectations(mode);

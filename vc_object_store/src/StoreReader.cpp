@@ -92,6 +92,7 @@ std::optional<ObjectRevision> StoreReader::selectedObject(const std::string& obj
             throw std::invalid_argument("reference must name this object and cannot be combined with version/generation");
         return objectsAtVersions({*reference}).front();
     }
+    if(generation&&!version)throw std::invalid_argument("generation requires a version");
     const auto current=currentObject(uuid);
     return version&&current?objectsAtVersions({current->reference(version,generation)}).front():current;
 }

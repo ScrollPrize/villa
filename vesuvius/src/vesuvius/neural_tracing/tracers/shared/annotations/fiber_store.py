@@ -34,13 +34,15 @@ def open_store(path):
 def fiber_volume(path):
     """The one volume every fiber of the store is bound to; raises when they are unbound or bound to several."""
     with open_store(path) as store:
-        first = store.select_objects(object_kind='fiber', limit=1, fields=['meta'])
-        if not first:
+        records = store.select_objects(object_kind='fiber', fields=['meta'])
+        if not records:
             raise ValueError(f'No fibers in {path}')
-        volume = (first[0]['meta'].get('coordinates') or {}).get('volume_uuid')
+        volume = (records[0]['meta'].get('coordinates') or {}).get('volume_uuid')
         if volume is None:
             raise ValueError(f'Fibers in {path} are not bound to a volume')
-        if store.unbound_object_count('fiber', volume):
+        # Registrations make native volume queries broader than this direct,
+        # scalar-bound reader. Certify exactly the frames it can read.
+        if any(geometry_scale_to_volume(row['meta'], volume) is None for row in records):
             raise ValueError(f'Fibers in {path} are bound to several volumes; name one')
     return volume
 

@@ -139,7 +139,8 @@ class InputPosition:
             return None
         if 'position' in value and 'commit_sequence' not in value:
             value = value['position']
-        return cls(str(value['store']), str(value['generation']), int(value['commit_sequence']))
+        from vc_object_store import store_position_from_json
+        return cls.of_status(store_position_from_json(json.dumps(value)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -173,13 +174,13 @@ class InputPins:
                 'outer_shell': self.outer_shell, 'references': self.references}
 
     @staticmethod
-    def _decode_reference(uuid, reference, version=None):
+    def _decode_reference(uuid, reference):
         """Validate a complete selected reference at the provenance boundary."""
         from vc_object_store import object_version_from_json
         if reference is None:
             raise ValueError(f'input {uuid} has no complete reference; regenerate the input pins')
         reference = object_version_from_json(json.dumps(reference))
-        if reference['object'] != uuid or (version is not None and reference['version'] != version):
+        if reference['object'] != uuid:
             raise ValueError(f'inconsistent exact input reference for {uuid}')
         return reference
 
@@ -2844,22 +2845,8 @@ def stale_link_reasons(manifest, config, normal_source):
 
 def validated_manifest_references(manifest):
     """Validate saved evidence once and retain the decoded object references."""
-    from vc_object_store import relationship_version_from_json
-    entries = list(manifest.get('objects') or ())
-    if manifest.get('outer_shell'):
-        entries.append(manifest['outer_shell'])
-    references = {entry['uuid']: InputPins._decode_reference(
-        entry['uuid'], entry.get('reference'), entry.get('version')) for entry in entries}
-    seen = set()
-    for entry in manifest.get('relationships') or ():
-        if 'reference' not in entry:
-            raise ValueError('relationship manifest has no complete reference; regenerate the fit inputs')
-        reference = relationship_version_from_json(json.dumps(entry['reference']))
-        if (reference['relationship'] != entry['uuid'] or
-                ('version' in entry and reference['version'] != entry['version']) or entry['uuid'] in seen):
-            raise ValueError('inconsistent relationship manifest reference; regenerate the fit inputs')
-        seen.add(entry['uuid'])
-    return references
+    from vc_object_store import manifest_references
+    return manifest_references(manifest)['objects']
 
 
 def _compared(manifest):

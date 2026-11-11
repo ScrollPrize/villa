@@ -33,6 +33,20 @@ def test_selected_geometry_keeps_metadata_for_shared_payload(db):
         assert snapshot.track(first).view_transformed_at("a").points("points", 0, 1) == [[2, 4, 6]]
 
 
+def test_exact_graph_projection_uses_native_field_policy(db):
+    uid = db.upsert_object(dict(kind="track", name="selected", meta={"original": True}))
+    db.put_geometry(uid, Track([[2, 4, 6]]))
+    reference = object_reference(db.object(uid))
+    db.set_meta(uid, "original", False)
+    with db.graph_read(versions=[reference]) as graph:
+        row, = graph.objects(["name", "meta"])
+        assert row["name"] == "selected" and row["meta"]["original"] is True
+        for method in (graph.objects, graph.edges):
+            with pytest.raises(ValueError, match="projection field"):
+                method(["unknown_field"])
+        assert graph.edges(["a_anchor"]) == []
+
+
 @pytest.mark.parametrize("history", [False, True])
 def test_selected_input_capture_validates_position(tmp_path, history):
     with ObjectStore.create(str(tmp_path / "inputs.vcobj"), author="test", history_enabled=history) as db:

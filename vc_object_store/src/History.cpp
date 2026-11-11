@@ -1,4 +1,5 @@
 #include "internal/History.hpp"
+#include "internal/RelationshipOrder.hpp"
 #include "internal/Artifacts.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "internal/Versions.hpp"
@@ -947,9 +948,11 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
     DependencyScope dependencies;
     auto* db = static_cast<sqlite3*>(connection(txn));
     std::map<std::string, ObjectRevision> revisions;
-    std::map<std::string, std::map<std::string, std::string>> memberships;
-    std::set<std::string> versions;
-    std::map<std::string,RelationshipRevision> currentOnly;
+    using Membership=std::map<std::string,RelationshipVersion>;
+    std::map<std::string,Membership> memberships;
+    std::set<RelationshipVersion> versions;
+    std::map<RelationshipVersion,RelationshipRevision> bindings;
+    std::map<std::string,RelationshipVersion> archives;
     for (const auto& revision : selection) {
         if (revision.deleted)
             throw std::invalid_argument("object history: selection revision does not belong to object");
@@ -963,7 +966,8 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
     for (const auto& revision : selection) {
         const auto& uuid=revision.objectUuid;
         const auto* value=&revisions.at(uuid);
-        auto selected = value->uuid.empty() ? std::map<std::string,std::string>{} : members(db, value->uuid);
+        const auto archived=value->uuid.empty()?std::map<std::string,std::string>{}:members(db,value->uuid);
+        Membership selected;
         // Include bindings created in overlays or other shards only when they
         // actually record this exact endpoint. Never replace archived membership
         // using a newer endpoint merely because the attachment has no history.
@@ -978,17 +982,28 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
                 if(!matchesSelectedEndpoint(binding->record.aUuid,binding->aReference)||
                    !matchesSelectedEndpoint(binding->record.bUuid,binding->bReference))continue;
                 if(!seenBindings.insert(visible.uuid).second)continue;
-                const auto key=binding->uuid.empty()?Json::array({visible.uuid,binding->generation,binding->version}).dump():binding->uuid;
+                const auto key=binding->reference();
                 selected[visible.uuid]=key;
-                currentOnly.insert_or_assign(key,*binding);
+                bindings.insert_or_assign(key,*binding);
             }
+        }
+        // Resolve only surviving physical memberships, after current bindings
+        // have taken precedence. Each distinct archive is decoded once.
+        for(const auto& [edge,archive]:archived)if(!selected.contains(edge)){
+            auto known=archives.find(archive);
+            if(known==archives.end()){
+                auto binding=relationship(db,archive);
+                known=archives.emplace(archive,binding.reference()).first;
+                bindings.try_emplace(known->second,std::move(binding));
+            }
+            selected.emplace(edge,known->second);
         }
         for (const auto& [edge, version] : selected) versions.insert(version);
         memberships.emplace(uuid, std::move(selected));
     }
     std::vector<SelectedRelationship> result;
     for (const auto& version : versions) {
-        auto edge = currentOnly.contains(version)?currentOnly.at(version):relationship(db, version);
+        auto edge = bindings.at(version);
         auto endpoint = [&](const std::string& object, const Anchor& anchor, const std::optional<std::string>& geometry,
                             const ObjectVersion& pinned) {
             const auto found = revisions.find(object);
@@ -1003,6 +1018,7 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
                                 endpoint(edge.record.bUuid, edge.record.bAnchor, edge.bGeometryRevision, edge.bReference);
         result.push_back({std::move(edge), applicable});
     }
+    orderRelationships(result);
     return result;
 }
 

@@ -162,6 +162,7 @@ struct Fixture {
                                                     std::tuple{fiber, "fiber", 4.0}}) {
                 const auto current = reader.currentObject(uuid);
                 objects.push_back({{"uuid", uuid}, {"kind", kind}, {"name", current->record.name},
+                                   {"reference", Json::parse(objectVersionToJson(current->reference()))},
                                    {"generation", current->generation}, {"version", current->version},
                                    {"geometry_revision", *current->geometryRevision},
                                    {"metadata", vc3d::spiral::adapterMetadata(
@@ -274,6 +275,19 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     const auto document = fixture.manifest();
     auto inputs = fixture.read(document);
     require(inputs.unchanged(), "the fixture holds its inputs as fitted");
+    for(int variant=0;variant<5;++variant){
+        auto invalid=document;auto& objects=invalid["manifest"]["objects"];
+        if(variant==0)objects[0].erase("reference");
+        if(variant==1)objects[0]["reference"]["object"]=util::newUuid();
+        if(variant==2)objects.push_back(objects[0]);
+        if(variant==3)invalid["manifest"]["outer_shell"]=objects[0];
+        if(variant==4)objects[0]["version"]=1.5;
+        bool rejected=false;
+        try{vc3d::spiral::manifestPins(invalid);}catch(const std::exception&){rejected=true;}
+        require(rejected,"public manifest selection rejects malformed object evidence");
+        require(!fixture.read(invalid).problems.empty(),"full comparison rejects malformed object evidence");
+        require(!fixture.changes(invalid,{},{}).inputs.problems.empty(),"partial refresh validates before filtering");
+    }
     auto legacy = document;
     legacy["manifest"]["relationships"][0].erase("reference");
     require(!fixture.read(legacy).problems.empty(), "unqualified relationship manifests require regeneration");
@@ -292,15 +306,18 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     // The manifest's outer shell is read as a surface, apart from the patches.
     auto withShell = document;
     withShell["manifest"]["outer_shell"] = document["manifest"]["objects"][0];
+    withShell["manifest"]["objects"].erase(withShell["manifest"]["objects"].begin());
     const auto shelled = fixture.read(withShell);
     require(shelled.outerShell && shelled.outerShell->state == InputState::Fitted
-                && shelled.outerShell->surface && shelled.surfaces.size() == 1,
-            "the outer shell is read beside the patches");
+                && shelled.outerShell->surface && shelled.surfaces.empty(),
+            "the outer shell is read separately from the patches");
     // A manifest naming something other than a surface as its shell is
     // reported, not read as one.
     auto misnamed = document;
     for (const auto& object : document["manifest"]["objects"])
         if (object["kind"] == "point_collection") misnamed["manifest"]["outer_shell"] = object;
+    auto& misnamedObjects=misnamed["manifest"]["objects"];
+    misnamedObjects.erase(std::find_if(misnamedObjects.begin(),misnamedObjects.end(),[](const auto& object){return object["kind"]=="point_collection";}));
     const auto misread = fixture.read(misnamed);
     require(!misread.outerShell && misread.problems.size() == 1 && misread.surfaces.size() == 1
                 && misread.problems[0].find("not a surface") != std::string::npos,
@@ -388,6 +405,7 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     // An object this store does not hold is missing and shows nothing.
     auto missing = document;
     missing["manifest"]["objects"][0]["uuid"] = util::newUuid();
+    missing["manifest"]["objects"][0]["reference"]["object"] = missing["manifest"]["objects"][0]["uuid"];
     inputs = fixture.read(missing);
     require(inputs.surfaces.at(0).state == InputState::Missing && !inputs.surfaces.at(0).surface,
             "a missing object has no geometry");

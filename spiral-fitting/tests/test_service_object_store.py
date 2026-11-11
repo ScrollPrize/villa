@@ -405,7 +405,8 @@ def test_an_unreachable_served_store_has_no_summary_and_caches_none(host, monkey
         raise ConnectionRefusedError('connection refused')
     monkeypatch.setattr(spiral_service.ObjectStoreBinding, 'open', refused)
     binding = spiral_service.ObjectStoreBinding(
-        'http://127.0.0.1:1', 'store-uuid', 'generation-1', 'svc', served=True)
+        'http://127.0.0.1:1', '11111111-2222-4333-8444-555555555555',
+        '11111111-2222-4333-8444-666666666666', 'svc', served=True)
     assert binding.head() == (None, 'ConnectionRefusedError: connection refused')
     state = spiral_service.ServiceState(
         bindings=host.bindings, object_store=binding,
@@ -418,7 +419,7 @@ def test_an_unreachable_served_store_has_no_summary_and_caches_none(host, monkey
     assert state._startup_inputs is None and state._startup_inputs_reading is None
     assert 'cannot be read' in refusal(state.startup_inputs)
     assert 'cannot be read' in refusal(state._inputs_position, {
-        'store': 'store-uuid', 'generation': 'generation-1', 'commit_sequence': 1})
+        'store': binding.uuid, 'generation': binding.generation, 'commit_sequence': 1})
 
 
 def test_bindings_never_wait_for_the_store_to_be_read(host, filled_store,

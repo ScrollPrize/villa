@@ -291,6 +291,11 @@ struct OpenOptions {
     std::vector<std::filesystem::path> storeReferenceDirectories;
 };
 
+// Validate projected top-level field names without selecting data. Exact graph
+// materializers and SQL selections use the same native field policy.
+void validateObjectFields(const std::optional<std::vector<std::string>>&);
+void validateEdgeFields(const std::optional<std::vector<std::string>>&);
+
 struct ObjectSelection {
     std::optional<std::string> kind, tag, connectedTo;
     std::vector<std::string> uuids, edgeKinds;
@@ -577,7 +582,8 @@ public:
     std::vector<ObjectVersion> versionsAt(const Txn&, const ObjectVersion& anchor) const;
     // Relationships recorded between the selected objects, each at an exact
     // recorded version of this store (one per object; omitted endpoints are
-    // not selected; deleted versions and unknown references fail).
+    // not selected; deleted versions and unknown references fail). Results are
+    // ordered by relationship UUID, then complete publication reference.
     std::vector<SelectedRelationship> relationshipsAt(const Txn&, const std::vector<ObjectVersion>&) const;
     // After endpoint edits, validate anchors/metadataKeys and retain the relationship.
     // The caller decides domain meaning.

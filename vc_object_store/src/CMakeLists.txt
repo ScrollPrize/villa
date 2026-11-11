@@ -19,10 +19,10 @@ else()
 endif()
 
 # Shared owned geometry and operations; no SQLite, OpenCV or application types.
-add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp)
+add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp geometry/PointMap.cpp)
 target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json vc_reader::catalog)
+target_link_libraries(vc_geometry PUBLIC nlohmann_json::nlohmann_json PRIVATE vc_reader::catalog)
 target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
