@@ -25,6 +25,17 @@ AttachedCollection toStore(uint64_t id, const nlohmann::json& collection)
     stored.source["source_collection_id"] = std::to_string(id);
     return stored;
 }
+
+std::map<uint64_t, Json> fromStore(const std::vector<AttachedCollection>& collections)
+{
+    std::map<uint64_t, Json> result;
+    for (auto stored : collections) {
+        const auto id = std::stoull(stored.source.value("source_collection_id", std::string("0")));
+        stored.source.erase("source_collection_id");
+        result[id] = vc::collectionJson(stored);
+    }
+    return result;
+}
 }
 
 vc3d::corrections::Snapshot vc3d::corrections::read(ObjectStoreSession& session, const AttachmentIdentity& attachment,
@@ -32,11 +43,7 @@ vc3d::corrections::Snapshot vc3d::corrections::read(ObjectStoreSession& session,
 {
     Snapshot result;
     result.baseline = attachedCollections(session, attachment, surfaceUuid, kRole, view);
-    for (auto stored : result.baseline.collections) {
-        const auto id = std::stoull(stored.source.value("source_collection_id", std::string("0")));
-        stored.source.erase("source_collection_id");
-        result.collections[id] = vc::collectionJson(stored);
-    }
+    result.collections = fromStore(result.baseline.collections);
     return result;
 }
 
@@ -44,8 +51,10 @@ void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdent
                               const std::map<uint64_t, nlohmann::json>& collections, const vc::objects::VolumeVoxels& volume,
                               SurfaceStoreEdit* editor)
 {
-    // No UI edit requests no write; keep the original optimistic baseline.
-    if (collections == snapshot.collections) return;
+    // Compare with the retained baseline, not the editable presentation map:
+    // callers can edit snapshot.collections in place. A genuine no-op neither
+    // submits a stale edit nor advances its baseline.
+    if (collections == fromStore(snapshot.baseline.collections)) return;
     std::vector<AttachedCollection> stored;
     for (const auto& [id, json] : collections) stored.push_back(toStore(id, json));
     if (editor) editor->saveAttachedCollections(snapshot.baseline, stored, vc::objects::volumeCoordinates(volume));
