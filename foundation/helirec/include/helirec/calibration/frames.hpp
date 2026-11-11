@@ -2,7 +2,8 @@
 // Raw frames of a scan, addressed as the record addresses them (stretch, frame), and the one value conversion
 // the checks use: line integrals from a dark subtraction and a division by the mean flat.
 //
-// Nothing else is applied: no distortion map, no defect map, no beam normalisation, no geometry.
+// Nothing else is applied: no defect map, no beam normalisation, no geometry, and no distortion map unless the
+// caller hands one over to be tested (DetectorMap, line_integrals_mapped).
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -63,5 +64,28 @@ FlatField make_flat_field(Frames& frames);
 // raw: (n, nrows, cols) as returned by Frames::read_rows; out: (n, nrows, ncols). `flip_cols`: columns reversed.
 void line_integrals(const FlatField& ff, const std::uint16_t* raw, const std::int32_t* row0, std::size_t n, int nrows,
                     int col0, int ncols, bool flip_cols, float* out);
+
+// A detector map to be tested: pixel (c, v) looks along the ray at the ideal position (c + Eu(c, v), v + Ev(c, v)),
+// Eu = sum_k eu[k] x^i[k] y^j[k] and Ev likewise, x = (c - c0) / cs, y = (v - v0) / vs.
+struct DetectorMap {
+    double c0 = 0, cs = 1, v0 = 0, vs = 1;
+    std::vector<int> i, j;
+    std::vector<double> eu, ev;
+    bool empty() const { return i.empty(); }
+    void displacement(double c, double v, double& du, double& dv) const;
+    // the detector position (c, v) whose ray is the ideal position (x, y)
+    void source(double x, double y, double& c, double& v) const;
+};
+
+// The line integrals on the ideal grid of `map`: out(i, r, c) is the value at ideal row row0 + r and ideal column
+// col0 + c (col0 + ncols - 1 - c with flip_cols) of frame frame[i], read from the detector position the map puts
+// there by cubic convolution (Keys, a = -1/2) of the line integrals; positions are held inside the detector.
+// With an empty map this is read_rows followed by line_integrals.
+void line_integrals_mapped(Frames& frames, const FlatField& ff, const DetectorMap& map, int stretch, const std::int64_t* frame,
+                           int row0, std::size_t n, int nrows, int col0, int ncols, bool flip_cols, float* out);
+
+// b(q, r, c) <- b(q + shear (c - (ncols - 1) / 2), r, c), cubic along the frames (held inside the block): frames of
+// a block read at an angle that changes with the column, as the divergence of the beam makes opposite views do.
+void shear_frames(float* block, std::size_t n, int nrows, int ncols, double shear);
 
 }  // namespace helirec::calibration

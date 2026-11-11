@@ -840,6 +840,7 @@ class PySliceReconstructor {
 
 void bind_calib(nb::module_& m);  // bindings/calib_bindings.cpp
 void bind_spectra(nb::module_& m);  // bindings/spectra_bindings.cpp
+void bind_calibration(nb::module_& m);  // bindings/calibration_bindings.cpp
 
 NB_MODULE(_core, m) {
     register_filter("python", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
@@ -848,6 +849,7 @@ NB_MODULE(_core, m) {
 
     bind_calib(m);
     bind_spectra(m);
+    bind_calibration(m);
     m.doc() = "helirec C++/CUDA kernels";
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {

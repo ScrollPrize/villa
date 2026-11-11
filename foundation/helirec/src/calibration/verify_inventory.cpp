@@ -101,7 +101,7 @@ Inventory check_inventory(const Record& rec, Frames& frames, Report& rep) {
         f.stated = "sum, min, max and mean of each frame over the statistics rectangle";
         f.found = fmt("%lld frames read, %lld compared, %lld differ", static_cast<long long>(frames_read), static_cast<long long>(compared), static_cast<long long>(mismatched));
         if (!first_bad.empty()) f.found += ": " + join(first_bad);
-        f.verdict = compared == 0 ? "open" : mismatched == 0 ? "holds" : "fails";
+        f.verdict = compared == 0 ? "unverified" : mismatched == 0 ? "verified" : "fails";
         f.note = "the sums are integers and are compared exactly: frame k of the record is the frame the detector software saw as k, unaltered. "
                  "This does not show that the camera delivered a frame for every trigger";
         f.numbers = {{"frames", static_cast<double>(frames_read)}, {"compared", static_cast<double>(compared)}, {"mismatched", static_cast<double>(mismatched)}};
@@ -118,32 +118,43 @@ Inventory check_inventory(const Record& rec, Frames& frames, Report& rep) {
             int lowest = 0, highest = 65535;
             while (lowest < 65535 && !hgram[lowest]) ++lowest;
             while (highest > 0 && !hgram[highest]) --highest;
-            // the top of the continuous distribution: the highest value below which no run of 64 values is empty
-            int bulk = lowest, empty = 0;
-            for (int v = lowest; v <= highest; ++v) {
+            // the continuous distribution: from the most frequent value outwards until 64 values in a row are empty
+            int mode = lowest;
+            for (int v = lowest; v <= highest; ++v)
+                if (hgram[v] > hgram[mode]) mode = v;
+            int bulk = mode, bulk_low = mode, empty = 0;
+            for (int v = mode; v <= highest; ++v) {
                 if (hgram[v]) bulk = v, empty = 0;
                 else if (++empty >= 64) break;
             }
-            std::int64_t above = 0;
+            empty = 0;
+            for (int v = mode; v >= lowest; --v) {
+                if (hgram[v]) bulk_low = v, empty = 0;
+                else if (++empty >= 64) break;
+            }
+            std::int64_t above = 0, below = 0;
             for (int v = bulk + 1; v <= 65535; ++v) above += hgram[v];
+            for (int v = 0; v < bulk_low; ++v) below += hgram[v];
             std::int64_t frames_top = 0, first = -1;
             for (std::size_t k = 0; k < inv.stretches[si].frame_max.size(); ++k)
                 if (inv.stretches[si].frame_max[k] == 65535) {
                     ++frames_top;
                     if (first < 0) first = static_cast<std::int64_t>(k);
                 }
-            std::string part = fmt("%s %s: %d to %d; continuous up to %d, %lld values above it; %lld values at 65535", s.entry.c_str(), role_name(s.role), lowest, highest,
-                                   bulk, static_cast<long long>(above), static_cast<long long>(hgram[65535]));
+            std::string part = fmt("%s %s: %d to %d; continuous from %d to %d, %lld values below and %lld above; %lld values at 65535", s.entry.c_str(), role_name(s.role),
+                                   lowest, highest, bulk_low, bulk, static_cast<long long>(below), static_cast<long long>(above), static_cast<long long>(hgram[65535]));
             if (frames_top) part += fmt(" in %lld frames (first: %lld)", static_cast<long long>(frames_top), static_cast<long long>(first));
             parts.push_back(part);
             f.numbers.push_back({"max_" + s.entry, static_cast<double>(highest)});
             f.numbers.push_back({"bulk_max_" + s.entry, static_cast<double>(bulk)});
             f.numbers.push_back({"above_bulk_" + s.entry, static_cast<double>(above)});
+            f.numbers.push_back({"bulk_min_" + s.entry, static_cast<double>(bulk_low)});
+            f.numbers.push_back({"below_bulk_" + s.entry, static_cast<double>(below)});
             (void)total;
         }
         f.stated = "16-bit values; the saturation flag of the detector software is off";
         f.found = join(parts);
-        f.note = "values above the continuous distribution are isolated outliers (8.1.7). A value is the mean of binned sensor pixels: one saturated sensor pixel does not reach 65535";
+        f.note = "values outside the continuous distribution are isolated outliers (8.1.7). A value is the mean of binned sensor pixels: one saturated sensor pixel does not reach 65535";
     }
     return inv;
 }
@@ -240,8 +251,8 @@ void check_series(const Record& rec, Frames& frames, const FlatField& ff, Report
         f.found = fmt("%lld frames; level %.3f counts (pixel means %.1f to %.1f, spread %.2f rms); noise of one pixel from frame to frame %.2f counts rms; "
                       "frame means %.3f to %.3f, first 50 frames %.3f, last 50 %.3f; %lld pixels differ from the level by more than ten times the noise",
                       static_cast<long long>(dark->n), level.mean, level.min, level.max, level.sd, noise, fm.min, fm.max, head.mean, tail.mean, static_cast<long long>(odd));
-        f.verdict = level.mean < 2000 && fm.max - fm.min < 5 ? "holds" : "fails";
-        f.note = "verdict: the frames are darks (a constant low level, no beam)";
+        f.verdict = "unverified";
+        f.note = "Low levels support the dark-frame role. The measured temporal and spatial variations still need a detector offset/noise model; no dark was acquired during the projections";
         f.numbers = {{"level", level.mean}, {"noise_rms", noise}, {"odd_pixels", static_cast<double>(odd)}};
     }
     // ---- flats: 4.2, 8.2.2, 8.2.5
@@ -263,7 +274,6 @@ void check_series(const Record& rec, Frames& frames, const FlatField& ff, Report
             proj_text = fmt("for comparison, projection 0 of %s over the mean flat: %.3f to %.3f, %.0f %% of the blocks below 0.9", rec.stretches[proj[0]].entry.c_str(),
                             sp.min, sp.max, 100.0 * low / bm.size());
         }
-        bool ok = true;
         for (std::size_t k = 0; k < flats.size(); ++k) {
             std::vector<double> ratio(np);
             for (std::size_t p = 0; p < np; ++p) ratio[p] = (flats[k]->mean[p] - dark->mean[p]) / ff.gain[p];
@@ -275,14 +285,12 @@ void check_series(const Record& rec, Frames& frames, const FlatField& ff, Report
             for (std::size_t p = 0; p < np; ++p) level += flats[k]->mean[p] - dark->mean[p];
             parts.push_back(fmt("%s: mean %.1f counts above dark; over the mean of all flats, in %dx%d blocks: %.4f to %.4f (%.4f rms about %.4f); frame mean changes by %+.2f %% through the series",
                                 flat_entries[k].c_str(), static_cast<double>(level / np), size, size, sp.min, sp.max, sp.sd, sp.mean, (tail.mean - head.mean) / (head.mean - spread(dark->mean).mean) * 100));
-            ok &= sp.min > 0.9 && sp.max < 1.1;
         }
         Finding& f = rep.add("4.2 8.2.2 8.2.5", scan, "flat frames");
         f.stated = "the flat stretches, taken with the sample moved out sideways";
         f.found = join(parts) + (proj_text.empty() ? "" : "; " + proj_text);
-        f.verdict = ok ? "holds" : "fails";
-        f.note = "verdict: the flat series agree with each other to within 10 % everywhere, so none of them holds something the others do not. "
-                 "Something that stays in the beam in every flat cannot be seen this way";
+        f.verdict = "unverified";
+        f.note = "These are 32x32 block averages, not bounds on every pixel. Differences between and within the series require a time-dependent beam/flat model and residual noise validation; a 10 percent agreement is not verification. Something present in every flat is not excluded";
     }
     // ---- 8.1.2: the dark of the other scan
     if (dark && other && other_ff) {
@@ -305,8 +313,8 @@ void check_series(const Record& rec, Frames& frames, const FlatField& ff, Report
             f.stated = "a dark series at the start of each scan, none at the end";
             f.found = fmt("second minus first: %+.3f counts on average; %.3f counts rms from pixel to pixel where the noise of the two means gives %.3f; %lld pixels changed by more than six times their noise",
                           d.mean, d.sd, sigma, static_cast<long long>(moved));
-            f.verdict = std::fabs(d.mean) < 1.0 && d.sd < 2 * sigma ? "holds" : "fails";
-            f.note = "verdict: the offset is the same in both scans to within a count. Nothing shows the offset during a scan";
+            f.verdict = "unverified";
+            f.note = "The mean shift, excess pixel scatter and changed pixels must be explained by an offset/noise model. Agreement within one count or twice the expected noise does not establish stability; nothing measures the dark offset during a scan";
             f.numbers = {{"mean_difference", d.mean}, {"rms_difference", d.sd}, {"noise_expected", sigma}};
         }
     }
@@ -361,18 +369,22 @@ void check_beam(const Record& rec, const Inventory& inv, const FlatField& ff, Re
             const double count = static_cast<double>(std::max(1, b - a)) * s.stat_h;
             dark[k] = d / count, gain[k] = g / count;
         }
-        // strips that stay in air through the whole stretch: transmission never below 0.9
+        // strips that stay in air through the whole stretch: in every frame within 5 % of the frame's brightest
+        // strip (the beam's level may change through the stretch; the sample's edge absorbs far more than that)
+        std::vector<double> brightest(n, 0.0);
+        for (std::size_t f = 0; f < n; ++f)
+            for (int k = 0; k < ns; ++k) brightest[f] = std::max(brightest[f], (data.strips[f * ns + k] - dark[k]) / gain[k]);
         std::vector<int> air;
         for (int k = 0; k < ns; ++k) {
-            double lo = 1e30;
-            for (std::size_t f = 0; f < n; ++f) lo = std::min(lo, (data.strips[f * ns + k] - dark[k]) / gain[k]);
-            if (lo >= 0.9) air.push_back(k);
+            bool in_air = true;
+            for (std::size_t f = 0; f < n && in_air; ++f) in_air = (data.strips[f * ns + k] - dark[k]) / gain[k] >= 0.95 * brightest[f];
+            if (in_air) air.push_back(k);
         }
         Finding& f = rep.add("4.7 8.2.1 8.2.3 8.2.4 8.2.5", scan, "level of the air beside the sample, stretch " + s.entry);
         f.stated = fmt("flats before and after the scan (mean ring current %.3f mA) and the ring current through the stretch", flat_current);
         if (air.empty()) {
-            f.found = "no column strip stays above a transmission of 0.9 through the stretch";
-            f.verdict = "open";
+            f.found = "no column strip stays in air through the stretch";
+            f.verdict = "unverified";
             continue;
         }
         std::vector<double> level(n), current(n), ratio(n), index(n);
@@ -391,34 +403,47 @@ void check_beam(const Record& rec, const Inventory& inv, const FlatField& ff, Re
         const double jitter = std::sqrt(static_cast<double>(dd / (n - 1)) / 2);
         const std::size_t m = std::min<std::size_t>(200, n / 4);
         const double l0 = spread(level, 0, m).mean, l1 = spread(level, n - m, n).mean, c0 = spread(current, 0, m).mean, c1 = spread(current, n - m, n).mean;
-        f.found = fmt("air = columns %d..%d of the statistics rows (%zu strips of %d columns that never fall below 0.9); transmission %.4f on average, %.4f to %.4f; "
+        f.found = fmt("air = columns %d..%d of the statistics rows (%zu strips of %d columns that stay within 5 %% of the brightest strip in every frame); level over the mean flat %.4f on average, %.4f to %.4f; "
                       "from frame to frame %.4f rms; first %zu frames %.4f, last %.4f (%+.2f %%) while the ring current goes %.3f -> %.3f mA (%+.2f %%); "
                       "air level over (current / current of the flats): %.4f on average, %.4f to %.4f",
                       air.front() * inv.strip_cols, std::min(cols, (air.back() + 1) * inv.strip_cols) - 1, air.size(), inv.strip_cols, lv.mean, lv.min, lv.max, jitter, m, l0, l1,
                       (l1 / l0 - 1) * 100, c0, c1, (c1 / c0 - 1) * 100, rt.mean, rt.min, rt.max);
         f.numbers = {{"air_mean", lv.mean}, {"air_min", lv.min}, {"air_max", lv.max}, {"air_over_current_mean", rt.mean}, {"air_over_current_min", rt.min},
                      {"air_over_current_max", rt.max}, {"air_strips", static_cast<double>(air.size())}};
-        // a rise of the beam: where the air level steps up, and the monitor's delay that best explains it
+        // a refill: where the ring current rises by more than 1 mA, the frames in which the air level steps up,
+        // and the delay of the monitor that explains the step best
         std::size_t rise0 = n, rise1 = 0;
-        {
-            // smoothed level over 15 frames; a rise is where it exceeds the running minimum of the past by 2 %
-            const std::size_t win = 15;
-            std::vector<double> smooth(n);
-            for (std::size_t fr = 0; fr < n; ++fr) smooth[fr] = spread(level, fr >= win / 2 ? fr - win / 2 : 0, std::min(n, fr + win / 2 + 1)).mean;
-            for (std::size_t fr = 400; fr < n; ++fr) {
-                const double before = smooth[fr - 400];
-                if (smooth[fr] > 1.02 * before) {
-                    rise0 = std::min(rise0, fr - 400);
-                    rise1 = std::max(rise1, fr);
+        if (s.epoch_trig.size() == n) {
+            const Monitor& mon = s.monitor;
+            double low = INFINITY, t0 = NAN, t1 = NAN;
+            for (std::size_t k = 0; k < mon.current.size() && k < mon.epoch.size(); ++k) {
+                if (!std::isfinite(mon.current[k])) continue;
+                if (mon.current[k] > low + 1.0) {
+                    if (!std::isfinite(t0)) t0 = mon.epoch[k];
+                    t1 = mon.epoch[k];
+                } else if (!std::isfinite(t0)) {
+                    low = std::min(low, mon.current[k]);
                 }
+            }
+            if (std::isfinite(t0)) {
+                // from 30 s before the current first exceeds its minimum by 1 mA to 30 s after it stops rising
+                double last_rise = t0, prev = NAN;
+                for (std::size_t k = 0; k < mon.current.size() && k < mon.epoch.size(); ++k) {
+                    if (!std::isfinite(mon.current[k])) continue;
+                    if (mon.epoch[k] >= t0 && std::isfinite(prev) && mon.current[k] > prev + 0.05) last_rise = mon.epoch[k];
+                    prev = mon.current[k];
+                }
+                rise0 = static_cast<std::size_t>(std::lower_bound(s.epoch_trig.begin(), s.epoch_trig.end(), t0 - 30.0) - s.epoch_trig.begin());
+                rise1 = std::min(n - 1, static_cast<std::size_t>(std::lower_bound(s.epoch_trig.begin(), s.epoch_trig.end(), last_rise + 30.0) - s.epoch_trig.begin()));
+                (void)t1;
             }
         }
         if (rise0 < rise1 && s.epoch_trig.size() == n) {
-            // narrow to where the level actually changes: first and last frame at 2 % and 98 % of the step
+            // narrow to where the level actually changes: first and last frame at 10 % and 90 % of the step
             const double base = spread(level, rise0 > 100 ? rise0 - 100 : 0, rise0 + 1).mean, top = spread(level, rise1, std::min(n, rise1 + 100)).mean;
             std::size_t a = rise0, b = rise1;
-            while (a < rise1 && level[a] < base + 0.02 * (top - base)) ++a;
-            while (b > a && level[b] > base + 0.98 * (top - base)) --b;
+            while (a < rise1 && level[a] < base + 0.10 * (top - base)) ++a;
+            while (b > a && level[b] > base + 0.90 * (top - base)) --b;
             // delay: the level is modelled as alpha * current(t - delay) + beta over the frames around the rise
             const std::size_t w0 = a > 300 ? a - 300 : 0, w1 = std::min(n, b + 300);
             double best_delay = NAN, best_rms = 1e30, best_alpha = NAN;
@@ -428,7 +453,7 @@ void check_beam(const Record& rec, const Inventory& inv, const FlatField& ff, Re
                 const Line l = fit_line(x, y, 0, x.size());
                 if (l.rms < best_rms) best_rms = l.rms, best_delay = delay, best_alpha = l.slope;
             }
-            f.found += fmt("; the air level rises by %+.1f %% between projections %zu and %zu (2 %% and 98 %% of the step); modelled as a multiple of the ring current read %.2f s %s the frame "
+            f.found += fmt("; around the refill the air level rises by %+.1f %% between projections %zu and %zu (10 %% and 90 %% of the step); modelled as a multiple of the ring current read %.2f s %s the frame "
                            "(residual %.4f rms, %.2f %% of the level per %% of current)",
                            (top / base - 1) * 100, a, b, std::fabs(best_delay), best_delay >= 0 ? "after" : "before", best_rms, best_alpha * spread(current, w0, w1).mean / spread(level, w0, w1).mean);
             f.numbers.push_back({"rise_first_frame", static_cast<double>(a)});

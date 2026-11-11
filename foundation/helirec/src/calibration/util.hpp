@@ -81,30 +81,4 @@ Spread spread(const V& v) {
     return spread(v, 0, v.size());
 }
 
-// ---- what the record states per frame
-
-// rotation angle at the middle of each exposure, cumulative [deg]: the latched angle at the start of the exposure
-// plus half the arc latched during it. (The record's own "center" may be wrapped to one turn.)
-inline std::vector<double> stated_angle(const Stretch& s) {
-    std::vector<double> a(s.rot_trig.size());
-    for (std::size_t i = 0; i < a.size(); ++i) a[i] = s.rot_trig[i] + 0.5 * s.rot_delta[i];
-    return a;
-}
-
-inline double positioner(const Stretch& s, const std::string& name, bool end = false) {
-    const auto& m = end ? s.positioners_end : s.positioners_start;
-    const auto it = m.find(name);
-    if (it == m.end()) throw Error("stretch " + s.entry + " records no position of " + name);
-    return it->second;
-}
-
-// position along the axis at the middle of each exposure [mm]: the latched encoder where the stretch has one,
-// otherwise the stage's position at the start of the stretch (a stretch at rest).
-inline std::vector<double> stated_height(const Record& rec, const Stretch& s) {
-    if (!s.z_center.empty()) return s.z_center;
-    return std::vector<double>(static_cast<std::size_t>(s.n_frames), positioner(s, rec.translation_z[1]));
-}
-
-inline double pixel_um(const Record& rec) { return rec.technique.number("scan/sample_pixel_size"); }
-
 }  // namespace helirec::calibration

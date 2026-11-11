@@ -56,9 +56,9 @@ double recorded_dark_level(const Record& rec) {
 
 }  // namespace
 
-void check_record(const Record& rec, Report& rep) {
+void check_record(const Record& rec, Report& rep, double eps) {
     const std::string scan = rec.label;
-    const Tolerances tol = tolerances(rec);
+    const Tolerances tol = tolerances(rec, eps);
     const double px_mm = pixel_um(rec) * 1e-3;
     const Values& T = rec.technique;
     const std::string det = "detector/" + rec.detector + "/";
@@ -89,10 +89,12 @@ void check_record(const Record& rec, Report& rep) {
             ok &= s.end_reason == "SUCCESS";
         }
         f.found = join(parts) + fmt("; %lld frames in all, every stretch ended with SUCCESS: %s", static_cast<long long>(total), ok ? "yes" : "NO");
-        f.verdict = ok ? "holds" : "fails";
+        f.verdict = ok ? "verified" : "fails";
         const double turns = static_cast<double>(n_proj) / T.number("scan/tomo_n");
-        if (T.has_number("scan/nb_turns") && turns != T.number("scan/nb_turns"))
-            f.note = fmt("the projection stretches hold %g turns of frames where the sequence states nb_turns %g", turns, T.number("scan/nb_turns"));
+        if (T.has_number("scan/nb_turns") && turns != T.number("scan/nb_turns")) {
+            f.note = fmt("the projection stretches hold %g turns of frames where the sequence states nb_turns %g; the acquisition software's definition must be established", turns, T.number("scan/nb_turns"));
+            if (ok) f.verdict = "unverified";
+        }
         f.numbers = {{"frames", static_cast<double>(total)}, {"projection_frames", static_cast<double>(n_proj)}};
     }
     // ------------------------------------------------------------------ 4.1 frame -> file map
@@ -120,7 +122,7 @@ void check_record(const Record& rec, Report& rep) {
         f.stated = fmt("%lld frames mapped onto %lld files", static_cast<long long>(total), static_cast<long long>(files));
         f.found = fmt("%lld files missing, %lld breaks in the map", static_cast<long long>(missing), static_cast<long long>(gaps));
         if (have_counts) f.found += fmt("; the files hold %lld frames", static_cast<long long>(on_disk));
-        f.verdict = (missing == 0 && gaps == 0 && (!have_counts || on_disk == total)) ? "holds" : "fails";
+        f.verdict = (missing == 0 && gaps == 0 && (!have_counts || on_disk == total)) ? "verified" : "fails";
     }
     // ------------------------------------------------------------------ 4.1, 4.5, 4.6 the hardware timer
     {
@@ -142,7 +144,7 @@ void check_record(const Record& rec, Report& rep) {
         const bool ok = periods.size() == 1 && gates.size() == 1 && n > 0 &&
                         std::fabs(gates.begin()->first * 1e-3 - T.number("scan/exposure_time")) < 1e-9 &&
                         std::fabs((periods.begin()->first - gates.begin()->first) * 1e-3 - T.number("scan/latency_time")) < 1e-9;
-        f.verdict = ok ? "holds" : "fails";
+        f.verdict = ok ? "verified" : "fails";
         f.note = "one period for every trigger means the timer latched no gap; it does not show that the camera delivered a frame for every trigger";
     }
     // ------------------------------------------------------------------ 4.1 arrival times in the frame files
@@ -167,9 +169,9 @@ void check_record(const Record& rec, Report& rep) {
         }
         f.stated = "not part of the master file: time_of_frame in each frame file, a software time";
         f.found = have ? join(parts) : std::string("frame files not read");
-        f.verdict = !have ? "open" : (ok ? "holds" : "open");
-        f.note = have ? fmt("a lost frame would leave a gap of two periods between arrivals; the longest gap in the projection stretches is %.2f periods", worst)
-                      : std::string();
+        f.verdict = !have || ok ? "unverified" : "fails";
+        f.note = have ? fmt("longest projection arrival gap %.2f periods. These are software arrival times; even regular arrivals do not establish one exposure per trigger. Camera frame identifiers or an independent exposure correspondence remain required", worst)
+                      : "No complete frame arrival series was checked";
     }
     // ------------------------------------------------------------------ 4.2 roles
     {
@@ -188,7 +190,7 @@ void check_record(const Record& rec, Report& rep) {
         }
         f.stated = "image_key 2 dark, 1 flat, 0 projection; a title and a sequence type per stretch";
         f.found = join(parts);
-        f.verdict = ok ? "holds" : "fails";
+        f.verdict = ok ? "verified" : "fails";
         if (absent) f.note = "a stretch without image_key in the master file has its role only from the sequence's list, its title and its frame files";
     }
     // ------------------------------------------------------------------ 4.4 the stretches
@@ -230,7 +232,7 @@ void check_record(const Record& rec, Report& rep) {
         }
         f.stated = "epoch_trig and timer_trig per projection";
         f.found = join(parts) + (monotonic ? "; times increase through all stretches" : "; times do NOT increase monotonically");
-        f.verdict = ok && monotonic ? "holds" : "fails";
+        f.verdict = ok && monotonic ? "verified" : "fails";
         f.note = "a double holds a Unix time of 1.7e9 s to 0.24 us; the agreement is at that limit";
     }
     // ------------------------------------------------------------------ 4.7 monitors
@@ -292,7 +294,7 @@ void check_record(const Record& rec, Report& rep) {
         }
         f.found = have ? found + (ok ? "binning, region, flips and size agree with the master file in every stretch" : "the frame files DISAGREE with the master file")
                        : std::string("frame files not read");
-        f.verdict = !have ? "open" : ok ? "holds" : "fails";
+        f.verdict = !have ? "unverified" : ok ? "verified" : "fails";
         f.note = "the frame files state the sensor's full size and how the binning is computed (bin_mode); the order of region and flip, and the camera's exposure mode (4.9), are stated nowhere";
     }
     // ------------------------------------------------------------------ 5.1.1, 5.1.2, 5.2.1 pixel size and distances
@@ -308,7 +310,7 @@ void check_record(const Record& rec, Report& rep) {
         const double mag = (ss + sd) / ss;
         f.found = fmt("optics pixel / sample pixel = %.9f; (source to detector) / (source to sample) = %.9f; binned sensor pixel %.6g um, which is %.6f of the optics pixel; sd / magnification = %.6f mm",
                       optics / sample, mag, sensor, sensor / optics, sd / mag);
-        f.verdict = std::fabs(optics / sample - mag) < 1e-9 ? "holds" : "fails";
+        f.verdict = std::fabs(optics / sample - mag) < 1e-9 ? "verified" : "fails";
         f.note = "the optics pixel is the sample pixel times the beam's magnification: the record holds one statement of the pixel size, not two";
         f.numbers = {{"sample_pixel_um", sample}, {"magnification", mag}};
     }
@@ -360,8 +362,8 @@ void check_record(const Record& rec, Report& rep) {
                       "step %.7f deg per frame, departure from a uniform step at most %.2e deg (rms %.2e); counting frames at %.6g deg is off by %.4f deg at the end of the stretch (%.2f px at R)",
                       counts.max_abs, arc_err, center_err, std::fabs(counts.slope), 360.0 / std::fabs(counts.slope), steps.slope, steps.max_abs, steps.rms,
                       nominal, end_error, std::fabs(end_error) / 57.29577951308232 * tol.R);
-        f.verdict = counts.max_abs < 1e-6 && arc_err < 1e-6 && center_err < 1e-6 ? "holds" : "fails";
-        f.note = fmt("verdict: the derived angles are the raw encoder counts. Tolerance on the angle itself: %.4f deg", tol.angle_deg());
+        f.verdict = counts.max_abs < 1e-6 && arc_err < 1e-6 && center_err < 1e-6 ? "verified" : "fails";
+        f.note = fmt("verdict: the derived angles are the raw encoder counts. Diagnostic target on the angle itself: %.6g deg", tol.angle_deg());
         f.numbers = {{"step_deg", steps.slope}, {"deg_per_count", counts.slope}, {"nonuniform_max_deg", steps.max_abs}, {"count_error_end_deg", end_error},
                      {"first_deg", angle.front()}, {"last_deg", angle.back()}};
     }
@@ -408,7 +410,7 @@ void check_record(const Record& rec, Report& rep) {
             f.stated = fmt("%s_trig, %s_center, %s_delta per projection [mm]", rec.translation_z[0].c_str(), rec.translation_z[0].c_str(), rec.translation_z[0].c_str());
             f.found = fmt("derived heights reproduce the raw counts to %.1e mm; %.6g mm per count = %.4f rows at %.4g um; travel during an exposure %.3f um = %.4f rows",
                           counts.max_abs, std::fabs(counts.slope), std::fabs(counts.slope) / px_mm, px_mm * 1e3, dz.mean * 1e3, dz.mean / px_mm);
-            f.verdict = counts.max_abs < 1e-9 ? "holds" : "fails";
+            f.verdict = counts.max_abs < 1e-9 ? "verified" : "fails";
             f.note = "verdict: the derived heights are the raw encoder counts. Rows follow only through the stated pixel size";
         }
         {
@@ -417,7 +419,7 @@ void check_record(const Record& rec, Report& rep) {
             f.found = fmt("encoder against encoder: %.5f mm per turn = %.3f rows at %.4g um (commanded: %.3f rows); difference %.3f rows per turn against a tolerance of %.4f",
                           travel.slope, travel.slope / px_mm, px_mm * 1e3, commanded / px_mm, (travel.slope - commanded) / px_mm,
                           tol.eps * std::fabs(travel.slope / px_mm) / tol.H);
-            f.verdict = std::fabs((travel.slope - commanded) / px_mm) <= tol.eps * std::fabs(travel.slope / px_mm) / tol.H ? "holds" : "fails";
+            assess_residuals(f, {(travel.slope - commanded) / px_mm}, tol.eps * std::fabs(travel.slope / px_mm) / tol.H, "rows/turn");
             f.note = "verdict: commanded against recorded travel. Whether the recorded travel is the sample's, in rows, is for the frames to show";
             f.numbers = {{"mm_per_turn", travel.slope}, {"rows_per_turn", travel.slope / px_mm}, {"commanded_mm_per_turn", commanded}};
         }
@@ -427,6 +429,8 @@ void check_record(const Record& rec, Report& rep) {
             f.found = fmt("against a constant travel per turn (fitted from frame %zu on): frames 0-99 %+.3f rows, frames 200-299 %+.3f rows, last 100 frames %+.3f rows; "
                           "scatter %.3f rows rms (%.3f to %+.3f), of which %.3f rows rms repeat once per turn",
                           settle, r0.mean, r1.mean, r_end.mean, r_all.sd, r_all.min, r_all.max, once);
+            assess_residuals(f, res, tol.rows(), "rows");
+            f.note = "Residuals test a constant-pitch model, not the validity of the per-frame encoders. Startup transients, periodic structure and scatter all require an explicit trajectory and uncertainty model";
         }
     }
     // ------------------------------------------------------------------ 5.4.6 boundaries between stretches
@@ -558,9 +562,9 @@ void check_record(const Record& rec, Report& rep) {
     }
 }
 
-void check_record_pair(const Record& a, const Record& b, Report& rep) {
+void check_record_pair(const Record& a, const Record& b, Report& rep, double eps) {
     const std::string scan = a.label + "+" + b.label;
-    const Tolerances tol = tolerances(a);
+    const Tolerances tol = tolerances(a, eps);
     const double px_mm = pixel_um(a) * 1e-3;
     const auto pa = a.stretches_with(Role::Projection), pb = b.stretches_with(Role::Projection);
 
@@ -591,8 +595,8 @@ void check_record_pair(const Record& a, const Record& b, Report& rep) {
         for (int i : pa) constant &= positioner(a.stretches[i], y) == ya && positioner(a.stretches[i], y, true) == ya;
         for (int i : pb) constant &= positioner(b.stretches[i], y) == yb && positioner(b.stretches[i], y, true) == yb;
         f.stated = fmt("%s %.4f mm and %.4f mm", y.c_str(), ya, yb);
-        f.found = fmt("move %.4f mm = %.3f px at %.4g um; the reading is %s at the start and end of every projection stretch; 0.1 px is %.1e of the move", yb - ya,
-                      (yb - ya) / px_mm, px_mm * 1e3, constant ? "the same" : "NOT the same", tol.eps / std::fabs((yb - ya) / px_mm));
+        f.found = fmt("move %.4f mm = %.3f px at %.4g um; the reading is %s at the start and end of every projection stretch; %.4g px is %.1e of the move", yb - ya,
+                      (yb - ya) / px_mm, px_mm * 1e3, constant ? "the same" : "NOT the same", tol.eps, tol.eps / std::fabs((yb - ya) / px_mm));
         f.numbers = {{"move_mm", yb - ya}, {"move_px", (yb - ya) / px_mm}};
     }
     // ------------------------------------------------------------------ per stretch: 6.1.2, 6.2.1 - 6.2.4
@@ -609,8 +613,8 @@ void check_record_pair(const Record& a, const Record& b, Report& rep) {
             Finding& f = rep.add("6.2.1", scan, "angle of the two scans at equal projection index, stretch " + sa.entry);
             f.stated = "the encoder angles of both scans";
             const double worst = std::max(std::fabs(sda.min), std::fabs(sda.max));
-            f.found = fmt("difference %+.2e deg on average, at most %.2e deg (%.3f px at R); tolerance %.4f deg", sda.mean, worst, worst / 57.29577951308232 * tol.R, tol.angle_deg());
-            f.verdict = worst <= tol.angle_deg() ? "holds" : "fails";
+            f.found = fmt("difference %+.2e deg on average, at most %.2e deg (%.3f px at R); target %.6g deg", sda.mean, worst, worst / 57.29577951308232 * tol.R, tol.angle_deg());
+            assess_residuals(f, da, tol.angle_deg(), "deg");
             f.note = "a statement about the stage's encoder. The sample's angle against the beam in each scan (6.1.6) is for the frames to show";
             f.numbers = {{"mean_deg", sda.mean}, {"max_abs_deg", worst}};
         }

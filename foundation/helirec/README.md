@@ -630,10 +630,83 @@ isolated slice uploads 8.7 GB of raw rows (0.4 s), and with SLD reads 12 GB of w
 disk rather than the page cache that read dominates. The first chunk of a process also page-locks its raw buffers
 (1.4 s).
 
+## Checking an acquisition record (`helirec-calibration`)
+
+`helirec::calibration` (`include/helirec/calibration/`, `src/calibration/`) checks what the acquisition record of
+a scan states, first against itself and then against the raw frames. It shares nothing with the calibration the
+reconstruction uses (`helirec/calib.hpp`, `helirec.calibration`): it reads the BLISS master file and the frame
+files directly, and the only processing is a dark subtraction and a division by the mean flat of the scan.
+
+```bash
+cmake --build build/<tree> --target helirec-calibration
+helirec-calibration selftest [--device cpu|cuda]          # the registration estimator on synthetic data
+helirec-calibration record <scan.h5> [<second scan.h5>]   # the record against itself; no frame is read
+helirec-calibration verify <scan.h5> [<second scan.h5>] --out DIR [--checks record,inventory,series,beam,views]
+```
+
+Of two scans of one acquisition, the scan with the rotation axis inside the detector's field comes first. `verify`
+prints one finding per check (what the record states, what was found, and `verified`, `fails`, `unverified` or `note`) and
+writes `report.txt`, `report.json` and `views.tsv` (every registered block) to `DIR`.
+
+The geometry target is **0.01 pixel** (`--position-target PX`, Python `position_target=...`, C++
+`VerifyOptions::view.eps`); angle, axis and pitch targets follow from their geometric lever arms. Every accepted
+block is checked: any residual above target fails, even if the mean is small or its uncertainty overlaps zero.
+Reports retain min/max, RMS, maximum absolute residual, counts above target, and the descriptive block SEM.
+Smaller discrepancies remain visible and require explanation; sampled agreement alone is `unverified`.
+`verified` is restricted to the specific record or identity check performed. Other findings carry
+`requires_follow_up: true`, including measured facts without a validated model and rejected/unsampled views.
+These verdicts assess the evidence and model; they do not identify the physical cause of a discrepancy.
+The report schema replaces the former `holds`/`open` labels; clients should use the new labels and follow-up flag.
+The CLI returns zero when it successfully writes a report, not when the acquisition meets every requirement.
+
+`helirec::calibration::assess_residuals` and Python `calibration_assess_residuals` expose the same per-sample
+assessment for other checks. They operate on small measurement summaries; the image registration and its
+CPU/CUDA arithmetic are unchanged by the reporting policy.
+
+The checks:
+
+* `record`: frame counts, the map from frame to file, the trigger timer, clocks, the derived angles and heights
+  against the raw encoder counts, commanded against recorded travel, the two scans against each other;
+* `inventory`: every frame is read once and its sum, minimum and maximum are compared with the statistics the
+  detector software recorded for it (`--inventory DIR` reuses the pass of an earlier `--out DIR`);
+* `series`: the dark and flat frames; `beam`: the level of the air beside the sample against the ring current;
+* `views`: blocks of frames that recorded the same lines are registered to a fraction of a pixel, row and frame
+  (`helirec/calibration/registration.hpp`): opposite views of a turn at rest (axis column, angle over half a
+  turn), a turn at rest against the helix and the helix a turn apart (travel per turn in rows, offsets between the
+  stretches), and the second scan against the first (lateral move, height, angle).
+
+The registration exists for the CPU (FFTW) and for CUDA (cuFFT, `src/cuda/registration.cu`), one estimator on
+two implementations of its array work; `--device cpu|cuda|auto` chooses (`auto`, the default, takes the GPU when
+there is one). On the 428 blocks of the 343P pair (32 frames × up to 256 rows × up to 2500 columns) a registration
+takes 0.151 s on the CPU (8 FFT threads) and 0.016 s on an RTX 5090, uploads included; the two agree to 1e-5 of a
+sample on every block.
+
+The same is available from Python as `helirec._core.calibration_verify(...)` (the report as JSON),
+`calibration_register_blocks` and `calibration_selftest`, each with a `device` argument.
+
+For measurements the fixed checks do not make, `helirec._core.CalibrationSession(scans)` keeps the scans of an
+acquisition open: `stretches`, `series` (the record's per-frame angles, heights and times), `read_rows` (raw
+frames as stored), `line_integrals` (the scan's own dark and mean flat, nothing else), and
+`measure(requests, row_sign, device)`, which registers pairs of blocks placed by the caller exactly as the view
+checks cut and register theirs (C++: `helirec::calibration::Session`, `ViewRequest`, `ViewMeasurement`).
+`CalibrationRegistrar(shape, margin)` keeps one registration geometry for many pairs of blocks. The experiments
+under `development_notes/calibration/04_experiments/` are written on these; none of them uses the
+reconstruction's calibration.
+
+For measurement-support diagnostics, `--columns N --column-fraction F` selects a narrower
+window within each overlap (`N=0` keeps the full overlap; `F=0`, `0.5`, `1` selects left,
+centre, right in the first image). Python uses `columns` and `column_fraction`; C++ uses
+the corresponding `ViewOptions` fields. Mirrored comparisons crop corresponding rays,
+and direction probes retain the full overlap. `views.tsv` includes the actual `columns`
+count, which can be rounded down to a suitable FFT size. These options change only the
+measurement support; they apply no geometric correction. Narrow windows may lack sample
+texture, so compare accepted matches and retain rejected attempts.
+
 ## Tests
 
 `pytest` runs the unit tests: CPU vs CUDA vs NumPy references for every kernel, projector adjointness, the
 whole-slice methods, and regression checks of the corrected conventions (`tests/test_regressions.py`).
+`tests/test_calibration.py` covers `helirec::calibration` on synthetic blocks and a synthetic acquisition record.
 
 ## Build
 
