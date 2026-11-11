@@ -15,6 +15,7 @@
 // ordered feed. A transaction that changes nothing advances nothing.
 
 #include <atomic>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -40,6 +41,7 @@ struct ObjectVersion {
     std::string storeUuid, generation, objectUuid;
     int64_t version = 0;
     bool operator==(const ObjectVersion&) const = default;
+    auto operator<=>(const ObjectVersion&) const = default;
 };
 
 struct RelationshipVersion {

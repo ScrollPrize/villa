@@ -716,7 +716,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
             const auto& row = result.value.row;
             // Region queries rank the selected fiber first; re-selecting the
             // same fiber (after a commit) leaves them as they are.
-            const bool reselected = selectedPin_ && selectedPin_->object == result.value.pin.object;
+            const bool reselected = selectedPin_ && selectedPin_->identity() == result.value.pin.identity();
             selectedPin_ = result.value.pin;
             selectedBound_ = row.mapping.has_value();
             emit fiberRevealed(row);
@@ -760,9 +760,9 @@ void FiberCollectionController::navigate(int index)
             Point point{};
             connection->readStore(pin.attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
                 // The fiber's point in the volume's voxels, through the store's mapping.
-                const auto selected=reader.selectedObject(pin.object.objectUuid, {}, {}, pin.reference());
+                const auto selected=reader.selectedObject(pin.reference().objectUuid, {}, {}, pin.reference());
                 if (!selected || !selected->geometryRevision) throw std::runtime_error("Selected fiber is no longer retained");
-                const auto fiber=vc::objects::GeometrySnapshot(reader).fiber(pin.object.objectUuid, *selected->geometryRevision);
+                const auto fiber=vc::objects::GeometrySnapshot(reader).fiber(pin.reference().objectUuid, *selected->geometryRevision);
                 const auto shown=fiber.viewTransformedAt(*selected,volume.volume,volume.scale);
                 const auto name=fiber.linePointCount()>0 ? "line_points" : "control_points";
                 point=shown.points(name,index,1).front();
@@ -826,7 +826,7 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
         },
         [connection=state_->objectStoreSession(),attachment=*displayedStore(),
          volume=vc::objects::VolumeVoxels(state_->annotationVolume().value_or(vc::project::AnnotationVolume{})),
-         selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{},min,maximum,family,linked,
+         selectedUuid=selectedPin_ ? selectedPin_->reference().objectUuid : std::string{},min,maximum,family,linked,
          none=noFamilies()](const Slice& query, const std::atomic_bool& cancel) {
             RegionResult result;
             if (none || volume.volume.empty()) return result;

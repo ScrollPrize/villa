@@ -126,10 +126,10 @@ int runSurfacePanelStoreTests()
         require(panel.activateSurfaceById(plain, &error), "activating a bound surface opens it");
         require(activated.size() == 1 && activated.back() && (*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(2, 1, 2),
                 "activation hands out the stored geometry");
-        require(panel.opened() && panel.opened()->editable && panel.opened()->pin.object.objectUuid == plain,
+        require(panel.opened() && panel.opened()->editable && panel.opened()->pin.reference().objectUuid == plain,
                 "the opened surface is pinned and editable");
         panel.setSelectionChangeGuard([] { return false; });
-        require(!panel.activateSurfaceById(approved, &error) && panel.opened()->pin.object.objectUuid == plain && activated.size() == 1,
+        require(!panel.activateSurfaceById(approved, &error) && panel.opened()->pin.reference().objectUuid == plain && activated.size() == 1,
                 "failed pending saves veto selection before replacing the displayed surface");
         panel.setSelectionChangeGuard({});
         require(!panel.activateSurfaceById(unbound, &error), "unbound surfaces do not open");

@@ -68,7 +68,7 @@ void roundTrip(size_t shards,bool packed)
         require(native.componentOf(read,reference.objectUuid).size()==shards+1,
             "ordinary traversal reaches sibling-shard edges");
         std::vector<ObjectVersion> versions;
-        for(const auto& uuid:graph.objectUuids)versions.push_back(native.versionReference(read,*native.currentObjectRevision(read,uuid)));
+        for(const auto& uuid:graph.objectUuids)versions.push_back(native.currentObjectRevision(read,uuid)->reference());
         require(native.graphReadViewAt(read,versions).edgeUuids.size()==shards,
             "exact current-only graph retains cross-shard relationships");
     }

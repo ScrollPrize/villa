@@ -641,6 +641,7 @@ void SurfacePanelController::showHistory(const std::string& id)
     list->setHeaderLabels({tr("Published"), tr("Author"), tr("Name"), tr("Geometry")});
     list->setRootIsDecorated(false);
     std::optional<std::string> previousGeometry;
+    std::map<const QTreeWidgetItem*, vc::objects::ObjectVersion> references;
     for (const auto& revision : history) {
         if (revision.deleted) {
             continue;
@@ -651,10 +652,7 @@ void SurfacePanelController::showHistory(const std::string& id)
         auto* item = new QTreeWidgetItem(list, {published, QString::fromStdString(revision.record.changedBy),
                                                 QString::fromStdString(revision.record.name),
                                                 revision.geometryRevision == previousGeometry ? QString() : tr("changed")});
-        item->setData(0, Qt::UserRole, QString::fromStdString(revision.uuid));
-        item->setData(1, Qt::UserRole, QVariant::fromValue<qlonglong>(revision.version));
-        item->setData(2, Qt::UserRole, QString::fromStdString(revision.generation));
-        item->setData(3, Qt::UserRole, QString::fromStdString(revision.reference().storeUuid));
+        references.emplace(item, revision.reference());
         previousGeometry = revision.geometryRevision;
     }
     if (list->topLevelItemCount() > 0) {
@@ -665,11 +663,10 @@ void SurfacePanelController::showHistory(const std::string& id)
     auto* view = buttons->addButton(tr("View"), QDialogButtonBox::ActionRole);
     auto* restore = buttons->addButton(tr("Restore"), QDialogButtonBox::ActionRole);
     restore->setEnabled(_catalog->session()->writable(attachment));
-    auto selected = [list, &id]() -> std::optional<vc::objects::ObjectVersion> {
+    auto selected = [list, &references]() -> std::optional<vc::objects::ObjectVersion> {
         const auto* item = list->currentItem();
         if (!item) return std::nullopt;
-        return vc::objects::ObjectVersion{item->data(3, Qt::UserRole).toString().toStdString(), item->data(2, Qt::UserRole).toString().toStdString(), id,
-                                          item->data(1, Qt::UserRole).toLongLong()};
+        return references.at(item);
     };
     connect(view, &QPushButton::clicked, &dialog, [&]() {
         const auto* item = list->currentItem();

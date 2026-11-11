@@ -2,6 +2,7 @@
 
 #include "internal/Sqlite.hpp"
 #include "internal/History.hpp"
+#include "internal/ObjectVersionJson.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 
@@ -34,11 +35,6 @@ uint32_t getU32(const uint8_t* p)
     return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
 }
 
-Json versionJson(const ObjectVersion& v)
-{
-    return Json{{"store", v.storeUuid}, {"generation", v.generation}, {"object", v.objectUuid}, {"version", v.version}};
-}
-
 std::string uuidField(const Json& j, const char* key)
 {
     return formatUuid(parseUuid(j.at(key).get<std::string>()));
@@ -56,7 +52,7 @@ std::vector<uint8_t> encodeSelectionRecord(const SelectionRecord& record)
             origins.push_back(origin);
     }
     auto transforms = Json::array();
-    for (const auto& transform : record.transforms) transforms.push_back(versionJson(transform));
+    for (const auto& transform : record.transforms) transforms.push_back(detail::objectVersionJson(transform));
     const auto header = Json{{"store", record.storeUuid}, {"generation", record.generation},
                              {"commit_sequence", record.commitSequence}, {"query", Json::parse(record.queryJson)},
                              {"transforms", std::move(transforms)}, {"origins", origins},
@@ -97,9 +93,11 @@ SelectionRecord decodeSelectionRecord(std::span<const uint8_t> bytes)
         record.commitSequence = header.at("commit_sequence").get<int64_t>();
         record.queryJson = header.at("query").dump();
         for (const auto& t : header.at("transforms")) {
-            const auto version = t.at("version").get<int64_t>();
-            if (version <= 0) throw bad("transform version must be positive");
-            record.transforms.push_back({bytes[6]==1?record.storeUuid:uuidField(t,"store"), uuidField(t, "generation"), uuidField(t, "object"), version});
+            auto value = t;
+            if (bytes[6] == 1) value["store"] = record.storeUuid;
+            const auto reference = detail::canonicalObjectVersion(detail::objectVersionFrom(value, false));
+            if (reference.version <= 0) throw bad("transform version must be positive");
+            record.transforms.push_back(reference);
         }
         if(bytes[6]==1) {
             for(const auto& g:header.at("generations"))origins.emplace_back(record.storeUuid,formatUuid(parseUuid(g.get<std::string>())));

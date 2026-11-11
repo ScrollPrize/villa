@@ -173,11 +173,6 @@ struct ObjectStoreImplAccess {
     {
         return store.revisionSelectionAt(txn, publishedAtUs, includeRetired);
     }
-    static std::vector<SelectedRelationship> relationshipsAt(const ObjectStore& store, const Txn& txn,
-                                                             const RevisionSelection& selection)
-    {
-        return store.relationshipsAt(txn, selection);
-    }
 };
 
 } // namespace vc::objects

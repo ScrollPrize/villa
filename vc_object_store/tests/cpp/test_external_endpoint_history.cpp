@@ -17,8 +17,8 @@ void check(HistoryMode history) {
         auto base=ObjectStore::create(basePath,options);auto w=base.write();
         for(const auto& id:{a,b}){ObjectRecord r;r.uuid=id;r.kind="fiber";r.meta=R"({"quality":7})";base.upsertObject(w,r);}
         base.seal(w);w.commit();auto r=base.read();
-        aVersion=base.versionReference(r,*base.currentObjectRevision(r,a));
-        bVersion=base.versionReference(r,*base.currentObjectRevision(r,b));
+        aVersion=base.currentObjectRevision(r,a)->reference();
+        bVersion=base.currentObjectRevision(r,b)->reference();
     }
     options.history=HistoryMode::On;
     std::string edge;
@@ -39,7 +39,7 @@ void check(HistoryMode history) {
         require(count.i64(0)==0&&count.i64(1)==0,"relations do not fabricate endpoint objects or history");
         const auto selected=store.relationshipsAt(txn,std::vector<ObjectVersion>{aVersion,bVersion});
         require(selected.size()==1&&selected[0].relationship.record.uuid==edge&&selected[0].applicable,"normal exact-version selection resolves pinned endpoints");
-        require(bool(resolveObjectRevision(db,selected[0].relationship.aRevision)),"endpoint references resolve through the normal exact-version reader");
+        require(bool(resolveObjectVersion(db,selected[0].relationship.aReference)),"endpoint references resolve through the normal exact-version reader");
         auto invalid=aVersion;++invalid.version;
         require(!store.objectAtVersion(txn,invalid),"unavailable versions cannot become current versions");
         invalid=aVersion;invalid.generation=util::newUuid();

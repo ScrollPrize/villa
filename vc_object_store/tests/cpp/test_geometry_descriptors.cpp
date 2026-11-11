@@ -159,7 +159,7 @@ void retainedPointIdentities()
         auto base=ObjectStore::create(basePath,options());
         {auto w=base.write();ObjectRecord record;record.uuid=id;record.kind="point_collection";
             base.upsertObject(w,record);base.putGeometry(w,id,vc::geometry::encode(vc::geometry::PointCollection{{10,20},{{0,1,2},{1,2,3}}}));w.commit();}
-        {auto r=base.read();original=base.versionReference(r,*base.currentObjectRevision(r,id));}
+        {auto r=base.read();original=base.currentObjectRevision(r,id)->reference();}
         {auto w=base.write(VersionSelection{{id,1}});base.editGeometrySequence(w,id,append(30),base.currentGeometry(w,id)->uuid);w.commit();}
         {auto w=base.write(VersionSelection{{id,2}});base.restoreObject(w,id,original);w.commit();}
         {auto w=base.write(VersionSelection{{id,3}});base.editGeometrySequence(w,id,append(40),base.currentGeometry(w,id)->uuid);w.commit();}
@@ -184,7 +184,7 @@ void restoreArchivedGeometry()
     TemporaryDirectory dir;auto store=ObjectStore::create(dir.path/"restore",options());
     const auto id=util::newUuid();const auto geometry=shape();
     {auto w=store.write();store.upsertObject(w,track(id));w.commit();}
-    const auto head=[&]{auto r=store.read();return store.versionReference(r,*store.currentObjectRevision(r,id));};
+    const auto head=[&]{auto r=store.read();return store.currentObjectRevision(r,id)->reference();};
     const auto metadataRevision=head();
     std::string geometryToken;
     {auto w=store.write();geometryToken=store.putGeometry(w,id,geometry);w.commit();}

@@ -5704,8 +5704,8 @@ void LineAnnotationController::refreshChangedStoreFibers()
     connection->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
         auto stale = [&](const auto& pin) {
             if (pin->attachment != *attachment) return true;
-            const auto head = reader.currentObject(pin->object.objectUuid);
-            return !head || head->version != pin->version || head->generation != pin->generation || head->record.retired;
+            const auto head = reader.currentObject(pin->reference().objectUuid);
+            return !head || head->reference() != pin->reference() || head->record.retired;
         };
         // A fiber not yet committed (no revision) has nothing to be stale against.
         for (const auto& pane : _panes) if (pane.session && pane.session->storePin &&
@@ -10829,7 +10829,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         const auto store = _state->objectStoreSession();
         currentStoreRevision = store->current(pin.attachment);
         if (currentStoreRevision) store->readStore(pin.attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-            const auto head=reader.currentObject(pin.object.objectUuid);
+            const auto head=reader.currentObject(pin.reference().objectUuid);
             // A local completed edit already advanced the session pin and epoch;
             // let the superseded-result path requeue its work without closing it.
             const auto& expected = session.storePin ? *session.storePin : pin;
@@ -12249,7 +12249,7 @@ std::map<std::string, fs::path> LineAnnotationController::fiberTransportPaths(
         const auto pin = fiberPin(id);
         if (!pin || pin->attachment != *attachment)
             throw std::runtime_error("Fiber is not in the attached object store");
-        roots.push_back(pin->object.objectUuid);
+        roots.push_back(pin->reference().objectUuid);
     }
     std::map<std::string, std::string> documents;
     connection->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
@@ -12485,7 +12485,7 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
                 try {
                     StoredFiber fiber;
                     fiber.id = nextFiberId();
-                    fiber.storePin = vc::objects::PinnedObject{*attachment,{attachment->storeUuid,fiber.uuid},{},0,{}};
+                    fiber.storePin = vc::objects::PinnedObject{*attachment,{attachment->storeUuid,{},fiber.uuid,0},{}};
                     fiber.username = currentFiberUsername();
                     fiber.startedAt = currentFiberDateTimeString();
                     fiber.sequence = nextFiberSequenceForUsername(fiber.username);
@@ -12675,7 +12675,7 @@ void LineAnnotationController::ensureSessionFiberIdentity(LineAnnotationSession&
     if (!session.storePin && _state) {
         const auto attachment = _state->storeFor("fiber");
         if (!attachment) throw std::runtime_error("Open a project (or choose a fiber store) before editing fibers");
-        session.storePin = vc::objects::PinnedObject{*attachment, {attachment->storeUuid, session.fiberUuid}, {}, 0, {}};
+        session.storePin = vc::objects::PinnedObject{*attachment, {attachment->storeUuid, {}, session.fiberUuid, 0}, {}};
     }
     if (!session.fiberFileName.empty()) {
         if (session.fiberUsername.empty()) {
@@ -15491,7 +15491,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         if (fiber.storePin && fiber.storePin->stored()) {
             if (fiber.storePin->writeGeneration != request.generation)
                 throw std::runtime_error("The fiber's pinned version is not in its object store's current history; reopen it");
-            version = fiber.storePin->version;
+            version = fiber.storePin->reference().version;
             expectObject(request, fiber.storePin->reference());
             if (!fiber.graphCommit) throw std::runtime_error("The fiber has no loaded graph baseline; reopen it");
             if (request.expectedCommitSequence && request.expectedCommitSequence != fiber.graphCommit)

@@ -41,7 +41,7 @@ void metadataOverrides()
             { auto r = base.read(); bytes = base.readGeometryArray(r, reference, "line_points"); checksum = base.currentGeometry(r, managed.objectUuid)->contentHash;
                 Statement stored(ObjectStoreImplAccess::conn(r),"SELECT geometry_manifest FROM objects WHERE uuid=?",parseUuid(managed.objectUuid));
                 stored.row(); descriptor=stored.text(0);
-                baseVersion=base.versionReference(r,*base.currentObjectRevision(r,managed.objectUuid)); }
+                baseVersion=base.currentObjectRevision(r,managed.objectUuid)->reference(); }
             auto seal = base.write(); base.seal(seal); seal.commit();
         }
         options.history = overlayHistory;

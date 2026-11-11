@@ -970,8 +970,7 @@ private:
                                  const std::optional<std::string>& revision)
     {
         const auto object = edge.object(uuid);
-        const auto key = std::tuple{object.versionStoreUuid, object.versionGeneration,
-            object.uuid, object.version, revision};
+        const auto key = std::pair{object.reference(), revision};
         if (const auto found = surfaces_.find(key); found != surfaces_.end()) return found->second;
         double scale;
         try {
@@ -997,7 +996,7 @@ private:
     detail::GeometryLoader load_;
     const OverlapCorrespondenceParams& params_;
     SurfaceOverlapParams loading_;
-    std::map<std::tuple<std::string,std::string,std::string,std::optional<int64_t>,std::optional<std::string>>, LoadedSurface> surfaces_;
+    std::map<std::pair<objects::ObjectVersion,std::optional<std::string>>, LoadedSurface> surfaces_;
 };
 
 template <typename Edge>

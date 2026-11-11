@@ -2017,14 +2017,16 @@ void SpiralPanel::applySessionScroll(const QJsonObject& request)
 {
     const QJsonObject scroll = request.value(QStringLiteral("scroll")).toObject();
     const QJsonObject project = request.value(QStringLiteral("project")).toObject();
+    const auto umbilicus = project.value(QStringLiteral("umbilicus")).toObject();
+    const auto umbilicusSource = umbilicus.value(umbilicus.contains(QStringLiteral("reference"))
+        ? QStringLiteral("reference") : QStringLiteral("legacy_source")).toObject();
     _scrollSummary->setText(
         tr("%1 — volume %2, %3 µm/voxel, outward %4; umbilicus version %5")
             .arg(scroll.value(QStringLiteral("name")).toString(),
                  project.value(QStringLiteral("volume")).toString())
             .arg(scroll.value(QStringLiteral("voxel_size_um")).toDouble(), 0, 'g', 4)
             .arg(scroll.value(QStringLiteral("spiral_outward_sense")).toString(),
-                 QString::number(project.value(QStringLiteral("umbilicus")).toObject()
-                                     .value(QStringLiteral("version")).toInteger())));
+                 QString::number(umbilicusSource.value(QStringLiteral("version")).toInteger())));
     const QJsonObject lasagna = project.value(QStringLiteral("lasagna")).toObject();
     _lasagnaSummary->setText(
         lasagna.isEmpty()

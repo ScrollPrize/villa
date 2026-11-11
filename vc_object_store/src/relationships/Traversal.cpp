@@ -361,17 +361,6 @@ GraphReadView StoreReader::graphReadViewAround(const std::vector<ObjectVersion>&
     return graphReadViewAt(closure, edges);
 }
 
-GraphReadView ObjectStore::graphReadViewAt(const Txn& txn,const RevisionSelection& selection,const EdgeSelection& edges) const
-{
-    std::vector<ObjectVersion> versions;
-    for(const auto& [object,revision]:selection){
-        const auto value=revision?objectRevision(txn,*revision):currentObjectRevision(txn,object);
-        if(!value||value->objectUuid!=formatUuid(parseUuid(object)))throw std::invalid_argument("object history: selection revision does not belong to object");
-        versions.push_back(versionReference(txn,*value));
-    }
-    return graphReadViewAt(txn,versions,edges);
-}
-
 std::vector<std::string> GraphReadView::reachableWithin(const std::string& objectUuid, int maxDepth,
                                                        const std::atomic_bool* cancel) const
 {

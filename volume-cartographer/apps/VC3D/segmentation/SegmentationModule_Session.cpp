@@ -490,11 +490,11 @@ void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
     } else {
         if (!state->base)
             text += QStringLiteral("\n\n") + tr("The version they were made on is not known; restoring them replaces "
-                                                 "the surface's current geometry (version %1).").arg(pin.version);
+                                                 "the surface's current geometry (version %1).").arg(pin.reference().version);
         else if (*state->base != pin.reference())
             text += QStringLiteral("\n\n") + tr("The surface was saved since they were made (version %1, now %2); "
                                                  "restoring them replaces those changes.")
-                                                  .arg(state->base->version).arg(pin.version);
+                                                  .arg(state->base->version).arg(pin.reference().version);
         if (!state->conflict.empty())
             text += QStringLiteral("\n\n") + tr("Their last save conflicted: %1").arg(QString::fromStdString(state->conflict));
         restore = box.addButton(tr("Restore"), QMessageBox::AcceptRole);

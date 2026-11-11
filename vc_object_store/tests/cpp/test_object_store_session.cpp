@@ -107,7 +107,7 @@ void editCurrentLifecycle(HistoryMode history)
     }
     if (history == HistoryMode::On) {
         ObjectVersion source;
-        { auto txn = store.read(); source = store.versionReference(txn, *store.currentObjectRevision(txn, b)); }
+        { auto txn = store.read(); source = store.currentObjectRevision(txn, b)->reference(); }
         session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
             return std::vector<TransactionOperation>{RestoreObjectOp{b, source}};
         });
@@ -424,11 +424,11 @@ int main() try
     {
         // Editing starts from the version on screen.
         const auto pin = pinOf(replacement, *session.currentObject(replacement, named), session.status(replacement).generation);
-        require(pin.stored() && pin.reference() == ObjectVersion{replacement.storeUuid, pin.generation, named, pin.version},
+        require(pin.stored() && pin.reference() == ObjectVersion{replacement.storeUuid, pin.reference().generation, named, pin.reference().version},
                 "pin of the current revision");
         session.requireCurrent(pin);
         auto stale = pin;
-        ++stale.version;
+        ++stale.selected.version;
         bool refused = false;
         try { session.requireCurrent(stale); } catch (const std::runtime_error&) { refused = true; }
         require(refused, "a stale pin cannot be edited");

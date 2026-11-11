@@ -70,7 +70,7 @@ int64_t StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
             request.operations.push_back(std::move(*edit));
         vc::objects::expectRelationshipEndpoints(reader, request);
     });
-    if (request.operations.size() == guards) return pin.version;
+    if (request.operations.size() == guards) return pin.reference().version;
     const auto receipt = session->submit(objects_.attachment(), request);
     return *receipt.objects.at(canonical);
 }

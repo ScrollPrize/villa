@@ -64,7 +64,7 @@ nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
     d["a_revision"] = revision.aRevision; d["b_revision"] = revision.bRevision;
     d["a_geometry_revision"] = revision.aGeometryRevision; d["b_geometry_revision"] = revision.bGeometryRevision;
     d["version"] = revision.version; d["generation"] = revision.generation;
-    d["a_version"] = revision.aVersion; d["b_version"] = revision.bVersion;
+    d["a_version"] = revision.aReference.version; d["b_version"] = revision.bReference.version;
     d["store"] = revision.record.versionStoreUuid;
     const auto refs = nb::cast<nb::list>(jsonLoads(vo::objectVersionsRequestToJson({revision.aReference, revision.bReference}))["versions"]);
     d["a_reference"] = refs[0]; d["b_reference"] = refs[1];
@@ -83,8 +83,7 @@ std::vector<vo::ObjectVersion> objectVersionsFromPy(const nb::handle& refs)
 std::optional<vo::ObjectVersion> optionalObjectVersionFromPy(const nb::object& reference)
 {
     if (reference.is_none()) return std::nullopt;
-    nb::list refs; refs.append(reference);
-    return objectVersionsFromPy(refs).front();
+    return vo::objectVersionFromJson(jsonDumps(reference));
 }
 
 std::vector<vc::object_links::OverlapEdgeAt> overlapEdgesFromPy(const nb::list& edges)
@@ -892,6 +891,13 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             { nb::gil_scoped_release release; revision = self.currentObject(attachment, uuid); }
             return toPy(revision);
         }, nb::arg("attachment"), nb::arg("object_uuid"))
+        .def("decode_object_reference", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::object& input) {
+            const auto json = jsonDumps(input);
+            vo::ObjectVersion reference;
+            { nb::gil_scoped_release release; reference = self.decodeObjectReference(attachment, json); }
+            return jsonLoads(vo::objectVersionToJson(reference));
+        }, nb::arg("attachment"), nb::arg("input"),
+           "External input decoder: resolve current/legacy selectors once, retaining complete exact references.")
         .def("objects_at_versions", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             std::vector<std::optional<vo::ObjectRevision>> revisions;
@@ -981,6 +987,9 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
 NB_MODULE(_native, m)
 {
     m.def("canonical_uuid", &vo::util::canonicalUuid, nb::arg("uuid"));
+    m.def("object_version_from_json", [](const std::string& text) {
+        return jsonLoads(vo::objectVersionToJson(vo::objectVersionFromJson(text)));
+    }, nb::arg("json"), "Decode an external exact reference with the shared native codec.");
     m.def("receipt_object_reference", [](const nb::dict& receipt,const std::string& uuid) -> nb::object {
         const auto ref=vo::transactionReceiptFromJson(jsonDumps(receipt)).objectReference(uuid);
         return ref?nb::object(objectVersionsToPy({*ref})[0]):nb::none();

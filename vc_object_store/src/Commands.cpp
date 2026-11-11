@@ -6,6 +6,7 @@
 #include "internal/RecordJson.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/Versions.hpp"
+#include "internal/ObjectVersionJson.hpp"
 #include "vc_object_store/objects/GeometryEdits.hpp"
 #include "geometry/GeometryIngestBatch.hpp"
 
@@ -86,8 +87,7 @@ public:
     {
         Json j{{"op", "restore_object"}, {"uuid", canonical(op.uuid)}, {"source", nullptr}};
         if (op.source)
-            j["source"] = {{"store", canonical(op.source->storeUuid)}, {"generation", canonical(op.source->generation)},
-                           {"object", canonical(op.source->objectUuid)}, {"version", op.source->version}};
+            j["source"] = objectVersionJson(canonicalObjectVersion(*op.source));
         return j;
     }
     Json operator()(const DeleteObjectOp& op) { return {{"op", "delete_object"}, {"uuid", canonical(op.uuid)}}; }
@@ -264,8 +264,7 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
     if (op == "restore_object") {
         RestoreObjectOp result{uuid(), std::nullopt};
         if (const auto& s = j.at("source"); !s.is_null())
-            result.source = ObjectVersion{canonical(s.at("store").get<std::string>()), canonical(s.at("generation").get<std::string>()),
-                                          canonical(s.at("object").get<std::string>()), s.at("version").get<int64_t>()};
+            result.source = canonicalObjectVersion(objectVersionFrom(s, false));
         return result;
     }
     if (op == "delete_object") return DeleteObjectOp{uuid()};
@@ -669,14 +668,16 @@ void validateRequest(const TransactionRequest& request)
 }
 
 // Merge a preparation's versions into the request's: the same record with
-// another version is the request contradicting what its preparation read.
+// another version means the caller and preparation read different snapshots.
+// Treat it as the same retryable conflict as a change after preparation.
 void mergeVersions(VersionSelection& into, const VersionSelection& from, const char* what)
 {
     for (const auto& [uuid, version] : from) {
         const auto id = canonical(uuid);
         const auto [found, inserted] = into.emplace(id, version);
         if (!inserted && found->second != version)
-            throw std::invalid_argument(std::string("transaction: ") + what + " of " + id + " differ between the request and its preparation");
+            throw TransactionConflict(TransactionConflict::Reason::Version, {{"object", id, found->second, version}},
+                std::string("transaction conflict: ") + what + " of " + id + " differ between the request and its preparation");
     }
 }
 } // namespace

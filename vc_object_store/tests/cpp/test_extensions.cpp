@@ -364,7 +364,7 @@ ExtensionTable manualDefinition(const std::string& keySpace = "objects")
 ObjectVersion objectHead(ObjectStore& store, const std::string& id)
 {
     auto txn = store.read();
-    return store.versionReference(txn, *store.currentObjectRevision(txn, id));
+    return store.currentObjectRevision(txn, id)->reference();
 }
 
 template<class Version>
@@ -659,7 +659,7 @@ void storeReferenceVersionedFields(HistoryMode history)
         base.appendExtensionRows(txn, immutableTable.name, immutable);
         base.seal(txn); txn.commit();
         auto read=base.read();
-        baseObjectVersion=base.versionReference(read,*base.currentObjectRevision(read,firstUuid));
+        baseObjectVersion=base.currentObjectRevision(read,firstUuid)->reference();
         const auto sourceEdge=*base.edgeByUuid(read,edgeUuid);
         baseEdgeVersion={baseUuid,sourceEdge.versionGeneration,edgeUuid,*sourceEdge.version};
     }

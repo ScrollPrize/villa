@@ -338,7 +338,7 @@ void oldMetadataCacheDoesNotShadowConvertedStore()
         auto txn = store.read();
         status = store.status(txn);
         const auto current = store.currentObjectRevision(txn, uuid);
-        reference = store.versionReference(txn, *current);
+        reference = current->reference();
         oldObject = nlohmann::json::parse(objectRevisionToJson(*current));
         auto& record = oldObject["record"];
         record["generation"] = 2; record["approved_generation"] = nullptr;

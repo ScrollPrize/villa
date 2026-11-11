@@ -37,13 +37,12 @@ struct AttachmentIdentity {
 // which may differ from the generation that published an unchanged head.
 struct PinnedObject {
     AttachmentIdentity attachment;
-    ObjectIdentity object;
-    std::string generation;
-    int64_t version = 0;
+    ObjectVersion selected;
     std::optional<std::string> geometryRevision;
     std::string writeGeneration;
-    bool stored() const { return version > 0; }
-    ObjectVersion reference() const { return {object.storeUuid, generation, object.objectUuid, version}; }
+    bool stored() const { return selected.version > 0; }
+    const ObjectVersion& reference() const { return selected; }
+    ObjectIdentity identity() const { return {selected.storeUuid, selected.objectUuid}; }
     bool operator==(const PinnedObject&) const = default;
 };
 // The pin of a revision read from `attachment`.
@@ -266,6 +265,7 @@ public:
     std::optional<TransactionReceipt> receipt(const AttachmentIdentity&, const std::string& requestUuid);
     // Hosted: current as of the last check (or a newer read).
     std::optional<ObjectRevision> currentObject(const AttachmentIdentity&, const std::string& objectUuid);
+    ObjectVersion decodeObjectReference(const AttachmentIdentity&, const std::string& json);
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const AttachmentIdentity&, const std::vector<ObjectVersion>&);
     std::optional<GeometryRevision> geometryRevision(const AttachmentIdentity&, const std::string& revisionUuid);
     std::vector<uint8_t> readGeometryArray(const AttachmentIdentity&, const std::string& revisionUuid, const std::string& arrayName);

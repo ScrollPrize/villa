@@ -205,7 +205,7 @@ int main() try
             }
             {
                 auto txn = store.read();
-                sourceFirst = store.versionReference(txn, *store.currentObjectRevision(txn, owner));
+                sourceFirst = store.currentObjectRevision(txn, owner)->reference();
                 for (const auto& info : store.extensionTables(txn)) if (info.name == manual.name) sourceTable = info.tableUuid;
                 const auto status = store.status(txn);
                 require(status.extensionsPresent && storeStatusFromJson(storeStatusToJson(status)).extensionsPresent,

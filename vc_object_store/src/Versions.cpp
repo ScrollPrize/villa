@@ -2,6 +2,7 @@
 #include "internal/History.hpp"
 #include "internal/Extensions.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/ObjectVersionJson.hpp"
 
 #include <limits>
 
@@ -246,7 +247,10 @@ std::string canonical(const std::string& uuid) { return formatUuid(parseUuid(uui
 Json detail::receiptToJson(const TransactionReceipt& r)
 {
     Json references=Json::object();
-    for(const auto& [uuid,ref]:r.objectReferences)references[uuid]=Json::parse(versionReferenceText(ref));
+    for(const auto& [uuid,ref]:r.objectReferences){
+        if(ref.version<=0)throw std::invalid_argument("object reference: invalid version");
+        references[uuid]=objectVersionJson(canonicalObjectVersion(ref));
+    }
     return Json{{"request_uuid", r.requestUuid ? Json(*r.requestUuid) : Json(nullptr)},
                 {"store_uuid", r.storeUuid}, {"generation", r.generation},
                 {"commit_sequence", r.commitSequence ? Json(*r.commitSequence) : Json(nullptr)},
@@ -267,9 +271,10 @@ TransactionReceipt detail::receiptFromJson(const Json& j)
     if(j.contains("object_references")){
         if(!j.at("object_references").is_object())throw std::invalid_argument("receipt object references must be a map");
         for(const auto& [uuid,value]:j.at("object_references").items()){
-            const auto ref=parseVersionReference(value.dump());
-            if(!ref)throw std::invalid_argument("invalid receipt object reference");
-            r.objectReferences.emplace(canonical(uuid),*ref);
+            // Older persisted receipts used arrays. Normalize only here.
+            const auto ref=value.is_array()?parseLegacyVersionReference(value.dump()):std::optional(objectVersionFrom(value));
+            if(!ref || ref->version <= 0)throw std::invalid_argument("invalid receipt object reference");
+            r.objectReferences.emplace(canonical(uuid),canonicalObjectVersion(*ref));
             (void)r.objectReference(uuid);
         }
     }
@@ -495,20 +500,6 @@ std::optional<ObjectRevision> ObjectStore::objectAtVersion(const Txn& txn, const
     return std::move(objectsAtVersions(txn, {ref}).front());
 }
 
-ObjectVersion ObjectStore::versionReference(const Txn& txn, const ObjectRevision& revision) const
-{
-    if (revision.version <= 0) throw std::invalid_argument("object history: revision has no numbered version");
-    if(!revision.storeUuid.empty()) {
-        const auto reference=revision.reference();
-        if(!resolveObjectVersion(static_cast<sqlite3*>(connection(txn)),reference))
-            throw std::invalid_argument("object history: exact version is unavailable");
-        return reference;
-    }
-    const auto resolved=resolveObjectRevision(static_cast<sqlite3*>(connection(txn)),revision.uuid);
-    if(!resolved)throw std::invalid_argument("object history: revision is unavailable");
-    return {storeUuidText(resolved->source), resolved->revision.generation, resolved->revision.objectUuid, resolved->revision.version};
-}
-
 ObjectVersion ObjectRevision::reference(std::optional<int64_t> selectedVersion,
                                        const std::optional<std::string>& selectedGeneration) const
 {
@@ -527,16 +518,18 @@ ObjectVersion ObjectRecord::reference() const
 
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectVersion>& versions) const
 {
-    RevisionSelection selection;
+    std::vector<ObjectRevision> selection;
+    std::set<std::string> selected;
     for (const auto& reference : versions) {
         const auto revision = objectAtVersion(txn, reference);
         if (!revision)
             throw std::invalid_argument("object history: version " + std::to_string(reference.version) + " of " +
                                         reference.objectUuid + " is not recorded in this store and generation");
-        if (!selection.emplace(revision->objectUuid, versionReferenceText(reference)).second)
+        if (!selected.insert(revision->objectUuid).second)
             throw std::invalid_argument("object history: object selected twice: " + revision->objectUuid);
+        selection.push_back(*revision);
     }
-    return relationshipsAt(txn, selection);
+    return relationshipsAtSelected(txn, selection);
 }
 
 ChangePage ObjectStore::changesSince(const Txn& txn, const FeedCursor& cursor, int64_t maxChanges) const

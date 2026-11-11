@@ -3,6 +3,7 @@
 
 #include <QFutureWatcher>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QPointer>
 #include <QtConcurrent>
 
@@ -27,6 +28,7 @@
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/GeometryExport.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_reader/zarr.hpp>
 
 // Object stores of the open project (importing source files into them,
@@ -318,10 +320,8 @@ QJsonObject AgentBridgeServer::handleObjectsExport(const QJsonValue& params)
                 {"uuid", QString::fromStdString(uuid)},
                 {"kind", QString::fromStdString(target.kind)},
                 {"store", QString::fromStdString(target.store)},
-                {"version", QJsonObject{{"store", QString::fromStdString(result.version.storeUuid)},
-                                        {"generation", QString::fromStdString(result.version.generation)},
-                                        {"object", QString::fromStdString(result.version.objectUuid)},
-                                        {"version", qint64(result.version.version)}}},
+                {"version", QJsonDocument::fromJson(QByteArray::fromStdString(
+                    vc::objects::objectVersionToJson(result.version))).object()},
                 {"geometryRevision", QString::fromStdString(result.geometryRevision)},
             };
         }

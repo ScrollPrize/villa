@@ -28,6 +28,10 @@ public:
     virtual ChangePage changesSince(const FeedCursor& cursor, int64_t maxChanges = 4096) const = 0;
     // The live (or retired) current revision; nullopt when absent or deleted.
     virtual std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const = 0;
+    // External input boundary only: decode a standard reference, a wrapped
+    // reference, or a legacy UUID/numbered locator. Legacy current-owner
+    // selectors resolve once; complete references never require a live head.
+    ObjectVersion decodeObjectReference(const std::string& json) const;
     // One selector for geometry, artifacts and other versioned payloads. Number
     // selectors use the current owner; complete references need no current row.
     std::optional<ObjectRevision> selectedObject(const std::string& objectUuid,

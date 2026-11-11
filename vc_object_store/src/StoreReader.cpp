@@ -1,14 +1,74 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "internal/TransformedLength.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <set>
 
 namespace vc::objects {
+
+ObjectVersion StoreReader::decodeObjectReference(const std::string& json) const
+{
+    using Json = nlohmann::json;
+    auto input = Json::parse(json);
+    if (input.is_string()) {
+        auto text = input.get<std::string>();
+        if (text.starts_with("vcobj:")) text.erase(0, 6);
+        const auto at = text.find('@');
+        input = Json{{"uuid", text.substr(0, at)}};
+        if (at != std::string::npos) {
+            const auto suffix = text.substr(at + 1);
+            const auto slash = suffix.find('/'), last = suffix.rfind('/');
+            if (slash == std::string::npos || slash == 0 || last == suffix.size()-1)
+                throw std::invalid_argument("stored reference requires [store/]generation/version");
+            const auto number = suffix.substr(last+1);
+            int64_t version = 0;
+            const auto [end, error] = std::from_chars(number.data(), number.data()+number.size(), version);
+            if (error != std::errc{} || end != number.data()+number.size() || version <= 0)
+                throw std::invalid_argument("stored reference requires a numbered version");
+            if (slash != last) input["store"] = suffix.substr(0,slash);
+            input["generation"] = suffix.substr(slash == last ? 0 : slash+1,
+                                                slash == last ? slash : last-slash-1);
+            input["version"] = version;
+        }
+    }
+    if (!input.is_object()) throw std::invalid_argument("object reference input must be an object or locator");
+    if (input.contains("revision"))
+        throw std::invalid_argument("stored references select a numbered version, not a revision");
+    if (input.contains("reference")) {
+        const auto ref = objectVersionFromJson(input.at("reference").dump());
+        if (input.contains("uuid") && util::canonicalUuid(input.at("uuid").get<std::string>()) != ref.objectUuid)
+            throw std::invalid_argument("reference names a different object");
+        if (input.contains("version") || input.contains("generation") || input.contains("store"))
+            throw std::invalid_argument("reference cannot be combined with legacy version fields");
+        return ref;
+    }
+    if (input.contains("object")) return objectVersionFromJson(input.dump());
+    const auto uuid = util::canonicalUuid(input.at("uuid").get<std::string>());
+    if (input.contains("store")) {
+        return objectVersionFromJson(Json{{"object",uuid},{"store",input.at("store")},
+            {"generation",input.at("generation")},{"version",input.at("version")}}.dump());
+    }
+    std::optional<int64_t> version;
+    std::optional<std::string> generation;
+    if (input.contains("version")) {
+        const auto& number = input.at("version");
+        if (!number.is_number_integer() || (number.is_number_unsigned() && number.get<uint64_t>() > INT64_MAX) ||
+            number.get<int64_t>() <= 0) throw std::invalid_argument("stored reference requires a positive numbered version");
+        version = number.get<int64_t>();
+        if (input.contains("generation")) generation = util::canonicalUuid(input.at("generation").get<std::string>());
+    } else if (input.contains("generation")) {
+        throw std::invalid_argument("generation requires a numbered version");
+    }
+    const auto selected = selectedObject(uuid, version, generation);
+    if (!selected) throw std::invalid_argument("stored object selection is unavailable");
+    return selected->reference();
+}
 
 std::vector<ObjectVersion> StoreReader::versionsAt(const ObjectVersion&) const
 {

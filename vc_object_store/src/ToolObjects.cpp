@@ -40,7 +40,7 @@ void ToolObjects::noteRead(const PinnedObject& pin, const std::optional<VolumeVo
 {
     std::lock_guard lock(mutex_);
     if (volume && !mapping) throw std::invalid_argument("a loaded volume view requires its mapping guard");
-    read_[util::canonicalUuid(pin.object.objectUuid)] = {pin, volume, !volume || identity, mapping};
+    read_[util::canonicalUuid(pin.reference().objectUuid)] = {pin, volume, !volume || identity, mapping};
 }
 
 CoordinateJson ToolObjects::coordinatesFor(const std::vector<std::string>& sources, const std::optional<VolumeVoxels>& volume)

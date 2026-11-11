@@ -43,8 +43,8 @@ try {
     const auto selected = heads();
     const auto pinned = [&] {
         auto txn = db.read();
-        return std::vector<ObjectVersion>{db.versionReference(txn, *db.currentObjectRevision(txn, a)),
-                                          db.versionReference(txn, *db.currentObjectRevision(txn, b))};
+        return std::vector<ObjectVersion>{db.currentObjectRevision(txn, a)->reference(),
+                                          db.currentObjectRevision(txn, b)->reference()};
     }();
     require(component(a, false, true) == std::vector<std::string>{a, b}, "same-winding component");
     require(component(a, true, false) == std::vector<std::string>{a}, "adjacent filter");

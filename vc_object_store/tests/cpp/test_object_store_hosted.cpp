@@ -406,18 +406,18 @@ try {
                 {{hostedInitial.storeUuid, hostedInitial.generation, a, va}, {hostedInitial.storeUuid, hostedInitial.generation, b, vb}});
             require(l.size() == 1 && h.size() == 1 && h[0].relationship.record.uuid == edge &&
                 h[0].relationship.version == l[0].relationship.version && h[0].applicable == l[0].applicable &&
-                h[0].relationship.aVersion == (h[0].relationship.record.aUuid == a ? va : vb) &&
-                h[0].relationship.bVersion == (h[0].relationship.record.bUuid == b ? vb : va), "numbered relationship parity");
+                h[0].relationship.aReference.version == (h[0].relationship.record.aUuid == a ? va : vb) &&
+                h[0].relationship.bReference.version == (h[0].relationship.record.bUuid == b ? vb : va), "numbered relationship parity");
             require(h[0].relationship.record.versionStoreUuid == hostedInitial.storeUuid &&
                 h[0].relationship.record.versionGeneration == h[0].relationship.generation &&
                 h[0].relationship.record.version == h[0].relationship.version,
                 "relationship wire preserves complete owner identity");
             require(h[0].relationship.aReference.storeUuid == hostedInitial.storeUuid &&
                 h[0].relationship.aReference.objectUuid == h[0].relationship.record.aUuid &&
-                h[0].relationship.aReference.version == h[0].relationship.aVersion &&
+                h[0].relationship.aReference.generation == hostedInitial.generation &&
                 h[0].relationship.bReference.storeUuid == hostedInitial.storeUuid &&
                 h[0].relationship.bReference.objectUuid == h[0].relationship.record.bUuid &&
-                h[0].relationship.bReference.version == h[0].relationship.bVersion,
+                h[0].relationship.bReference.generation == hostedInitial.generation,
                 "relationship wire preserves complete selected endpoint references");
         }
         mustFail([&] { (void)hosted.relationshipsAt({{hostedInitial.storeUuid, hostedInitial.generation, a, 99}}); });

@@ -129,7 +129,8 @@ struct EdgeRecord : RecordCommon {
 
 // Object UUID -> internal object revision UUID (storage keys; public history
 // references are numbered ObjectVersions). null means no object.
-using RevisionSelection = std::map<std::string, std::optional<std::string>>;
+using ObjectRevisionKey = std::variant<std::string, ObjectVersion>;
+using RevisionSelection = std::map<std::string, std::optional<ObjectRevisionKey>>;
 
 struct ObjectRevision {
     std::string uuid, objectUuid;
@@ -171,16 +172,15 @@ inline constexpr const char* kAttachmentEdgeKind = "attachment";
 EdgeRecord attachmentEdge(const std::string& dataUuid, const std::string& ownerUuid, const std::string& role);
 
 // Edge changes revise both endpoints atomically; unchanged membership is inherited.
-// Endpoint pins are immutable object revisions (aVersion/bVersion), never moving heads.
+// Endpoint pins are complete immutable references, never moving heads.
 struct RelationshipRevision {
     std::string uuid;
     EdgeRecord record;
-    std::string aRevision, bRevision;
+    std::string aRevision, bRevision; // archive storage UUIDs only; empty for current-only endpoints
     std::optional<std::string> aGeometryRevision, bGeometryRevision;
     // Numbered history of the relationship and of its pinned endpoint states.
     int64_t version = 0;
     std::string generation;
-    int64_t aVersion = 0, bVersion = 0;
     // Resolved endpoint identities for consumers; no parsing of internal revision tokens.
     ObjectVersion aReference, bReference;
 };
@@ -553,7 +553,6 @@ public:
     // where a reference is not recorded). Versions that are still the head
     // read the materialized head record without replaying history.
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const Txn&, const std::vector<ObjectVersion>&) const;
-    ObjectVersion versionReference(const Txn&, const ObjectRevision&) const;
     // Restore tooling: start a fresh, never reused history generation for new
     // writes. Recorded versions keep their publication generations.
     std::string startHistoryGeneration(const std::string& reason);
@@ -860,8 +859,7 @@ private:
     RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired) const;
     // Explicit, closed selection: omitted endpoints are not selected. null
     // selects the latest head (unlike write(), where null expects absence).
-    std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
-    GraphReadView graphReadViewAt(const Txn&, const RevisionSelection&, const EdgeSelection&) const;
+    std::vector<SelectedRelationship> relationshipsAtSelected(const Txn&, const std::vector<ObjectRevision>&) const;
     struct Impl;
     static std::unique_ptr<Impl> openImpl(const std::filesystem::path&, const OpenOptions&, bool create, bool immutableInitial = false);
     explicit ObjectStore(std::unique_ptr<Impl>);

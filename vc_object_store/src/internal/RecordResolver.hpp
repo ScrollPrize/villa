@@ -67,26 +67,21 @@ inline ObjectVersion objectVersion(const ResolvedObject& object)
 {
     return {storeUuidText(object.source),object.record.versionGeneration,object.record.uuid,object.record.version.value_or(0)};
 }
-// Internal string transport uses the same four fields as public ObjectVersion.
-// Persistent references encode these UUIDs as binary, not JSON/text.
-inline std::string versionReferenceText(const ObjectVersion& ref)
-{
-    if(ref.version<=0)throw std::invalid_argument("object reference: invalid version");
-    return nlohmann::json::array({formatUuid(parseUuid(ref.storeUuid)),formatUuid(parseUuid(ref.generation)),
-        formatUuid(parseUuid(ref.objectUuid)),ref.version}).dump();
-}
-inline std::optional<ObjectVersion> parseVersionReference(const std::string& text)
+// Legacy external receipts/revision selectors used arrays. Decode once at
+// those boundaries; native history carries ObjectVersion, never encoded text.
+inline std::optional<ObjectVersion> parseLegacyVersionReference(const std::string& text)
 {
     if(text.empty()||text.front()!='[')return std::nullopt;
     const auto value=nlohmann::json::parse(text);
     if(!value.is_array()||value.size()!=4)throw std::invalid_argument("object reference: invalid fields");
     ObjectVersion ref{value.at(0),value.at(1),value.at(2),value.at(3)};
-    (void)versionReferenceText(ref);
+    if(ref.version<=0)throw std::invalid_argument("object reference: invalid version");
+    (void)parseUuid(ref.storeUuid); (void)parseUuid(ref.generation); (void)parseUuid(ref.objectUuid);
     return ref;
 }
 inline std::array<uint8_t,56> versionReferenceBytes(const ObjectVersion& ref)
 {
-    (void)versionReferenceText(ref);
+    if(ref.version<=0)throw std::invalid_argument("object reference: invalid version");
     std::array<uint8_t,56> bytes{};
     const std::array<std::string,3> ids{ref.storeUuid,ref.generation,ref.objectUuid};
     for(size_t i=0;i<ids.size();++i){const auto id=parseUuid(ids[i]);std::copy(id.begin(),id.end(),bytes.begin()+16*i);}
@@ -105,4 +100,9 @@ inline ObjectVersion versionReferenceFromBytes(std::span<const uint8_t> bytes)
 struct ResolvedObjectVersion {sqlite3* source;ObjectRevision revision;};
 std::optional<ResolvedObjectVersion> resolveObjectVersion(sqlite3*,const ObjectVersion&);
 std::optional<ResolvedObjectVersion> resolveObjectRevision(sqlite3*,const std::string&);
+inline std::optional<ResolvedObjectVersion> resolveObjectRevisionKey(sqlite3* db, const ObjectRevisionKey& key)
+{
+    if (const auto* version = std::get_if<ObjectVersion>(&key)) return resolveObjectVersion(db, *version);
+    return resolveObjectRevision(db, std::get<std::string>(key));
+}
 }

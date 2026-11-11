@@ -66,6 +66,34 @@ try {
     const auto created = db.submit(decoded);
     require(created.commitSequence == 1 && !created.replayed, "first commit");
     require(created.objects.at(a) == 1 && created.objects.at(b) == 1, "versions start at 1");
+    {
+        const auto reference = *created.objectReference(a);
+        const auto scalar = objectVersionToJson(reference);
+        require(objectVersionFromJson(scalar) == reference, "scalar reference round trip");
+        auto invalid = nlohmann::json::parse(scalar);
+        invalid["version"] = 1.5;
+        mustFail([&] { (void)objectVersionFromJson(invalid.dump()); });
+        invalid["version"] = 1e100;
+        mustFail([&] { (void)objectVersionFromJson(invalid.dump()); });
+        invalid["version"] = std::numeric_limits<uint64_t>::max();
+        mustFail([&] { (void)objectVersionFromJson(invalid.dump()); });
+        invalid["version"] = 0;
+        mustFail([&] { (void)objectVersionFromJson(invalid.dump()); });
+        invalid["version"] = 1; invalid["store"] = "not-a-uuid";
+        mustFail([&] { (void)objectVersionFromJson(invalid.dump()); });
+        auto wire = nlohmann::json::parse(transactionReceiptToJson(created));
+        require(wire["object_references"][a].is_object(), "receipt emits standard reference objects");
+        require(transactionReceiptFromJson(wire.dump()).objectReference(a) == reference,
+                "standard receipt reference round trip");
+        wire["object_references"][a] = nlohmann::json::array(
+            {reference.storeUuid, reference.generation, reference.objectUuid, reference.version});
+        require(transactionReceiptFromJson(wire.dump()).objectReference(a) == reference,
+                "legacy receipt array decoded only at receipt boundary");
+        auto bad = created; bad.objectReferences.at(a).version = 0;
+        mustFail([&] { (void)transactionReceiptToJson(bad); });
+        wire.erase("object_references");
+        mustFail([&] { (void)transactionReceiptFromJson(wire.dump()).objectReference(a); });
+    }
     require(created.created == std::vector<std::string>({a, b}) || created.created == std::vector<std::string>({b, a}),
         "created records");
 
@@ -126,7 +154,8 @@ try {
         auto txn = db.read();
         const auto rel = db.relationshipAtVersion(txn, {initial.storeUuid, initial.generation, edge, 1});
         require(rel && rel->version == 1 && rel->record.uuid == edge, "relationship reference");
-        require((rel->aVersion == 4 && rel->bVersion == 2) || (rel->aVersion == 2 && rel->bVersion == 4), "endpoint pins");
+        require((rel->aReference.version == 4 && rel->bReference.version == 2) ||
+                (rel->aReference.version == 2 && rel->bReference.version == 4), "endpoint pins");
         require(db.currentRelationshipVersion(txn, edge) == 1, "relationship head");
     }
 
@@ -143,7 +172,7 @@ try {
         const auto old = db.objectAtVersion(txn, {initial.storeUuid, initial.generation, a, 1});
         const auto now = db.currentObjectRevision(txn, a);
         require(old && now && old->geometryRevision != now->geometryRevision, "historical geometry retained");
-        require(db.versionReference(txn, *now) == ObjectVersion{initial.storeUuid, initial.generation, a, 5}, "reference");
+        require(now->reference() == ObjectVersion{initial.storeUuid, initial.generation, a, 5}, "reference");
     }
 
     // Removal and deletion are numbered tombstones; recreation continues the

@@ -121,6 +121,8 @@ std::vector<ObjectRevision> objectHistoryFromJson(const std::string&, StoreStatu
 
 // Lists of numbered object references: relationship queries and batched
 // reads at versions send them in this form.
+std::string objectVersionToJson(const ObjectVersion&);
+ObjectVersion objectVersionFromJson(const std::string&);
 std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>&);
 std::vector<ObjectVersion> objectVersionsRequestFromJson(const std::string&);
 // Batched reads at versions: one entry per reference, null where not recorded.

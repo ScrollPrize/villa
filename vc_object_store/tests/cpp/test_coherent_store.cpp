@@ -54,8 +54,8 @@ struct Fixture {
             if(extensions)for(int64_t value=1;value<=4;++value){auto w=store.write();
                 const std::array<ExtensionRow,1> rows{ExtensionRow{extensionUuid(edge),value}};
                 store.replaceExtensionRows(w,extension().name,edge,rows);w.commit();}
-            {auto r=store.read();av=store.versionReference(r,*store.currentObjectRevision(r,a));
-                bv=store.versionReference(r,*store.currentObjectRevision(r,b));edgeVersion=*store.currentRelationshipVersion(r,edge);}
+            {auto r=store.read();av=store.currentObjectRevision(r,a)->reference();
+                bv=store.currentObjectRevision(r,b)->reference();edgeVersion=*store.currentRelationshipVersion(r,edge);}
             {auto w=store.write();store.seal(w);w.commit();}
         }
         {auto store=ObjectCollection::create(overlay,{base},options(overlayHistory));}
@@ -108,7 +108,7 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
     {auto w=store.write(VersionSelection{{f.a,f.av.version}});store.setMeta(w,f.a,"note","true");w.commit();}
     {
         auto r=store.read();const auto exact=store.objectAtVersion(r,f.av);require(bool(exact),"exact source version survives shadowing");
-        const auto ref=store.versionReference(r,*exact);
+        const auto ref=exact->reference();
         require(ref.storeUuid==f.av.storeUuid&&ref.generation==f.av.generation&&ref.version==f.av.version,"reference reconstruction preserves original source identity");
         require(store.currentGeometry(r,f.a)->uuid==f.geometry,"metadata override retains geometry identity");
         Statement count(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM geometry_chunks");count.row();
@@ -462,7 +462,7 @@ void inventoryCore(HistoryMode baseMode, HistoryMode overlayMode) {
     {auto r=store.read();require(store.currentObjectRevision(r,f.a)->reference()==f.av,"empty splice keeps source owner");
         const auto exact=store.relationshipAtVersion(r,{store.edgeByUuid(r,f.edge)->versionStoreUuid,
             store.edgeByUuid(r,f.edge)->versionGeneration,f.edge,f.edgeVersion});
-        require(exact&& !exact->aRevision.empty()&&!exact->bRevision.empty(),"all retention policies return endpoint references");
+        require(exact&& exact->aReference.version>0&&exact->bReference.version>0,"all retention policies return endpoint references");
         require(exact->record.versionStoreUuid==f.av.storeUuid,"relationship history retains its own owner");}
     // Exact borrowed geometry still exports after a metadata override or deletion.
     {auto w=store.write();store.setMeta(w,f.a,"note","true");w.commit();}
@@ -514,7 +514,7 @@ void inventoryIdentityAndSources() {
     PinnedObject pin;
     session.readStore(attachment,[&](const StoreReader& reader,const auto&){pin=pinOf(attachment,*reader.currentObject(f.a),reader.status().generation);});
     session.requireCurrent(pin);
-    auto wrong=pin;wrong.object.storeUuid=util::newUuid();mustFail([&]{session.requireCurrent(wrong);});
+    auto wrong=pin;wrong.selected.storeUuid=util::newUuid();mustFail([&]{session.requireCurrent(wrong);});
     auto request=session.newRequest(attachment);auto other=f.av;other.storeUuid=util::newUuid();expectObject(request,other);
     request.operations.push_back(SetMetaOp{f.a,"note","true"});
     const auto wire=transactionRequestToJson(request);const auto roundtrip=transactionRequestFromJson(wire,{});

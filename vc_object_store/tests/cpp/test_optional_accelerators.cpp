@@ -125,7 +125,7 @@ void lifecycle(HistoryMode history)
     auto edge=[&]{EdgeRecord e;e.kind="test";e.aUuid=a.uuid;e.bUuid=b.uuid;e.aAnchor.wholeGeometry=true;e.bAnchor.wholeGeometry=true;return e;};
     {auto txn=store.write();store.upsertObject(txn,a);store.upsertObject(txn,b);relation=store.addEdge(txn,edge());txn.commit();}
     std::optional<ObjectVersion> original;
-    if(history==HistoryMode::On){auto read=store.read();original=store.versionReference(read,*store.currentObjectRevision(read,a.uuid));}
+    if(history==HistoryMode::On){auto read=store.read();original=store.currentObjectRevision(read,a.uuid)->reference();}
     auto write=[&]{
         VersionSelection selected;if(history==HistoryMode::On){auto read=store.read();for(const auto& r:{a,b})selected[r.uuid]=store.currentVersion(read,r.uuid);}
         return history==HistoryMode::On?store.write(selected):store.write();

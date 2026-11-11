@@ -2,8 +2,10 @@
 // the hosted service and its clients.
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "internal/RecordJson.hpp"
+#include "internal/ObjectVersionJson.hpp"
 
 #include <set>
+#include <limits>
 
 namespace vc::objects {
 using namespace detail;
@@ -13,16 +15,6 @@ static void versionFromJson(const Json&, RecordCommon&);
 
 namespace {
 void requireKeys(const Json&, std::initializer_list<const char*>, const char*);
-Json objectVersionJson(const ObjectVersion& v)
-{
-    return {{"store", v.storeUuid}, {"generation", v.generation}, {"object", v.objectUuid}, {"version", v.version}};
-}
-ObjectVersion objectVersionFrom(const Json& v)
-{
-    requireKeys(v, {"store", "generation", "object", "version"}, "object version");
-    return {v.at("store").get<std::string>(), v.at("generation").get<std::string>(),
-        v.at("object").get<std::string>(), v.at("version").get<int64_t>()};
-}
 const char* reasonName(TransactionConflict::Reason reason)
 {
     switch (reason) {
@@ -313,7 +305,7 @@ Json relationshipJson(const RelationshipRevision& r)
     return Json{{"uuid", r.uuid}, {"record", std::move(record)}, {"a_revision", r.aRevision},
                 {"b_revision", r.bRevision}, {"a_geometry_revision", optionalText(r.aGeometryRevision)},
                 {"b_geometry_revision", optionalText(r.bGeometryRevision)}, {"version", r.version},
-                {"generation", r.generation}, {"a_version", r.aVersion}, {"b_version", r.bVersion},
+                {"generation", r.generation}, {"a_version", r.aReference.version}, {"b_version", r.bReference.version},
                 {"a_reference", objectVersionJson(r.aReference)}, {"b_reference", objectVersionJson(r.bReference)}};
 }
 
@@ -329,10 +321,12 @@ RelationshipRevision relationshipFrom(const Json& j)
     r.bGeometryRevision = textFrom(j.at("b_geometry_revision"));
     r.version = j.at("version").get<int64_t>();
     r.generation = j.at("generation").get<std::string>();
-    r.aVersion = j.at("a_version").get<int64_t>();
-    r.bVersion = j.at("b_version").get<int64_t>();
     r.aReference = objectVersionFrom(j.at("a_reference"));
     r.bReference = objectVersionFrom(j.at("b_reference"));
+    // Older servers emitted encoded exact refs in these archive UUID fields.
+    // Complete endpoint refs above already carry that identity.
+    if (!r.aRevision.empty() && r.aRevision.front() == '[') r.aRevision.clear();
+    if (!r.bRevision.empty() && r.bRevision.front() == '[') r.bRevision.clear();
     return r;
 }
 
@@ -531,6 +525,20 @@ std::vector<ObjectRevision> objectHistoryFromJson(const std::string& text, Store
     std::vector<ObjectRevision> result;
     for (const auto& j : unwrap(text, asOf, "revisions")) result.push_back(revisionFrom(j));
     return result;
+}
+
+std::string objectVersionToJson(const ObjectVersion& reference) { return objectVersionJson(reference).dump(); }
+ObjectVersion objectVersionFromJson(const std::string& text)
+{
+    const auto value = Json::parse(text);
+    if (!value.is_object() || !value.contains("version") || !value.at("version").is_number_integer() ||
+        (value.at("version").is_number_unsigned() &&
+         value.at("version").get<uint64_t>() > uint64_t(std::numeric_limits<int64_t>::max())))
+        throw std::invalid_argument("object version must be a positive integer");
+    auto reference = canonicalObjectVersion(objectVersionFrom(value));
+    if (reference.version <= 0)
+        throw std::invalid_argument("object version must be a positive integer");
+    return reference;
 }
 
 std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>& versions)

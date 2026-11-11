@@ -254,8 +254,7 @@ StoreStatus ObjectStoreSession::status(const AttachmentIdentity& identity)
 
 PinnedObject pinOf(const AttachmentIdentity& attachment, const ObjectRevision& revision, const std::string& activeGeneration)
 {
-    return {attachment, {revision.reference().storeUuid, revision.objectUuid}, revision.generation, revision.version,
-            revision.geometryRevision, activeGeneration};
+    return {attachment, revision.reference(), revision.geometryRevision, activeGeneration};
 }
 
 TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& identity)
@@ -269,6 +268,13 @@ TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& iden
     request.generation = current.generation;
     request.author = author;
     return request;
+}
+
+ObjectVersion ObjectStoreSession::decodeObjectReference(const AttachmentIdentity& attachment, const std::string& json)
+{
+    ObjectVersion result;
+    readStore(attachment, [&](const StoreReader& reader, const auto&) { result = reader.decodeObjectReference(json); });
+    return result;
 }
 
 TransactionReceipt ObjectStoreSession::submit(const AttachmentIdentity& identity, const TransactionRequest& request)
@@ -1438,7 +1444,7 @@ bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) c
 void ObjectStoreSession::requireCurrent(const PinnedObject& pin)
 {
     readStore(pin.attachment, [&](const StoreReader& reader, const auto&) {
-        const auto head = reader.currentObject(pin.object.objectUuid);
+        const auto head = reader.currentObject(pin.reference().objectUuid);
         if (reader.status().generation != pin.writeGeneration ||
             !head || head->reference() != pin.reference())
             throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");

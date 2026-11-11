@@ -6,6 +6,7 @@
 #include "vc/lasagna/Manifest.hpp"
 
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_reader/zarr.hpp>
 
 #include <QCryptographicHash>
@@ -282,10 +283,8 @@ QJsonObject projectBlock(const std::string& name,
                 QJsonArray points;
                 for (const auto& [x, y, z] : umbilicus->points) points.append(QJsonArray{z, y, x});
                 entry[QStringLiteral("umbilicus")] = QJsonObject{
-                    {QStringLiteral("store"), QString::fromStdString(umbilicus->version.storeUuid)},
-                    {QStringLiteral("uuid"), QString::fromStdString(umbilicus->uuid)},
-                    {QStringLiteral("generation"), QString::fromStdString(umbilicus->version.generation)},
-                    {QStringLiteral("version"), QJsonValue(qint64(umbilicus->version.version))},
+                    {QStringLiteral("reference"), QJsonDocument::fromJson(QByteArray::fromStdString(
+                        vc::objects::objectVersionToJson(umbilicus->version))).object()},
                     {QStringLiteral("points_zyx"), points}};
             }
         }

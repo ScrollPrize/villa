@@ -71,7 +71,7 @@ int main() try
     });
     session.requireCurrent(pin);
     auto request=session.newRequest(attached);
-    request.expectedObjects[fiber]=pin.version;
+    request.expectedObjects[fiber]=pin.reference().version;
     request.operations.push_back(SetMetaOp{fiber,"direct","true"});
     session.submit(attached,request);
     mustFail([&]{session.requireCurrent(pin);});
@@ -80,7 +80,7 @@ int main() try
             "current-only commits invalidate without a fabricated history journal");
     require(events[0].touches({"fiber"})&&events[0].touches({"surface"}),"whole-store invalidation reaches every cache");
     auto stale=session.newRequest(attached);
-    stale.expectedObjects[fiber]=pin.version;
+    stale.expectedObjects[fiber]=pin.reference().version;
     stale.operations.push_back(SetMetaOp{fiber,"stale","true"});
     mustFail([&]{session.submit(attached,stale);});
     require(session.takeEvents().empty(),"stale record version rejects without a commit");

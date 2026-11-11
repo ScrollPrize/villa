@@ -264,7 +264,7 @@ void checkHistoryGenerationSaves(const fs::path& directory)
     require(rejected, "surface opened before reset rejects edits");
 
     opened = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
-    require(opened.pin.generation != opened.pin.writeGeneration, "reopened surface retains its publication generation");
+    require(opened.pin.reference().generation != opened.pin.writeGeneration, "reopened surface retains its publication generation");
     SurfaceStoreEdit current(session, opened.pin);
     const auto publication = opened.pin.reference();
     // An explicit unchanged channel submits a no-op transaction and exercises repinning.
@@ -272,11 +272,11 @@ void checkHistoryGenerationSaves(const fs::path& directory)
     require(current.pin().reference() == publication, "no-op save preserves the historical reference");
     (*opened.surface->rawPointsPtr())(0, 0)[2] = 3;
     current.save(*opened.surface, {0, 0, 2, 2}, {});
-    require(current.pin().version == publication.version + 1 &&
-            current.pin().generation == current.pin().writeGeneration, "reopened surface saves in the active generation");
+    require(current.pin().reference().version == publication.version + 1 &&
+            current.pin().reference().generation == current.pin().writeGeneration, "reopened surface saves in the active generation");
     (*opened.surface->rawPointsPtr())(0, 0)[2] = 4;
     current.save(*opened.surface, {0, 0, 2, 2}, {});
-    require(current.pin().version == publication.version + 2, "subsequent surface saves use the new pin");
+    require(current.pin().reference().version == publication.version + 2, "subsequent surface saves use the new pin");
 
     StoreSurfaces tool(path, "generation-test");
     auto loaded = tool.load(record.uuid);
@@ -545,7 +545,7 @@ int main(int argc, char** argv)
             auto& grid = *edited.surface->rawPointsPtr();
             grid(1, 1) = {5.f, 5.f, 5.f};
             edit.save(*edited.surface, cv::Rect(1, 1, 1, 1));
-            require(edit.pin().version == edited.pin.version + 1 && edit.pin().geometryRevision != edited.pin.geometryRevision,
+            require(edit.pin().reference().version == edited.pin.reference().version + 1 && edit.pin().geometryRevision != edited.pin.geometryRevision,
                     "saves re-pin from the receipt");
             require((*catalog.open(native).surface->rawPointsPtr())(1, 1) == cv::Vec3f(5, 5, 5), "vertex edits reach the store");
             // The mask brush: validity 0 and the sentinel in memory; stored coordinates survive.
@@ -861,7 +861,7 @@ int main(int argc, char** argv)
                 edit.save(surface, cv::Rect(1, 0, 1, 1), {}, durable->draftRevision(native));
                 saved = edit.pin().reference();
                 const auto state = durable->draftState(native);
-                require(saved.version == pin.version + 1 && state && state->saved && state->base == saved &&
+                require(saved.version == pin.reference().version + 1 && state && state->saved && state->base == saved &&
                         drafts.checkpointNow(), "the save keeps the draft as saved");
                 const auto files = [&] {
                     std::size_t n = 0;
@@ -942,7 +942,7 @@ int main(int argc, char** argv)
             }
             require(hostedCatalog.rows().size() == 1 && hostedCatalog.row(uuid), "hosted surfaces are listed");
             auto opened = hostedCatalog.open(uuid);
-            require(opened.editable && opened.pin.version == 1, "hosted surfaces open editable");
+            require(opened.editable && opened.pin.reference().version == 1, "hosted surfaces open editable");
             SurfaceStoreEdit edit(hostedSession, opened.pin);
             auto& points = *opened.surface->rawPointsPtr();
             const auto vertexAt = [&](int row, int column) {
@@ -955,7 +955,7 @@ int main(int argc, char** argv)
             };
             points(1, 1) = {4.f, 4.f, 4.f};
             edit.save(*opened.surface, cv::Rect(1, 1, 1, 1));
-            require(edit.pin().version == 2 && vertexAt(1, 1) == cv::Vec3f(4, 4, 4), "hosted save");
+            require(edit.pin().reference().version == 2 && vertexAt(1, 1) == cv::Vec3f(4, 4, 4), "hosted save");
 
             // The service goes away: the check reports it, a save fails before
             // sending anything (its reads need the service), and nothing is pending.
@@ -965,7 +965,7 @@ int main(int argc, char** argv)
             points(0, 0) = {6.f, 6.f, 6.f};
             bool failed = false;
             try { edit.save(*opened.surface, cv::Rect(0, 0, 1, 1)); } catch (const std::exception&) { failed = true; }
-            require(failed && hostedSession->pendingSubmissions().empty() && edit.pin().version == 2,
+            require(failed && hostedSession->pendingSubmissions().empty() && edit.pin().reference().version == 2,
                     "a save without the service fails cleanly");
             service = std::make_unique<server::Server>(hostedPath, serverOptions);
             service->start();
@@ -973,7 +973,7 @@ int main(int argc, char** argv)
             require(hostedSession->freshness(hosted)->error.empty(), "current again");
             points(2, 2) = {9.f, 9.f, 9.f};
             edit.save(*opened.surface, cv::Rect(0, 0, 3, 3));
-            require(edit.pin().version == 3 && vertexAt(0, 0) == cv::Vec3f(6, 6, 6) && vertexAt(2, 2) == cv::Vec3f(9, 9, 9),
+            require(edit.pin().reference().version == 3 && vertexAt(0, 0) == cv::Vec3f(6, 6, 6) && vertexAt(2, 2) == cv::Vec3f(9, 9, 9),
                     "the next save carries the edits");
             hostedSession->detach(hosted);
         }

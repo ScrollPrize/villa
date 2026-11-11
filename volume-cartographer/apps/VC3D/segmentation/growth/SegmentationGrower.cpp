@@ -1,5 +1,6 @@
 #include "SegmentationGrower.hpp"
 #include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 
 
 #include "../../NeuralTraceServiceManager.hpp"
@@ -320,7 +321,7 @@ struct CopyDisplacementJob
     // new surfaces there.
     QString store;
     std::string surfaceUuid, volumeUuid;
-    nlohmann::json surfaceReference;
+    vc::objects::ObjectVersion surfaceReference;
     QString volumeZarrPath;
     int volumeScale{0};
     QString checkpointPath;
@@ -344,7 +345,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     request["request_type"] = "displacement_copy_grow";
     request["store"] = job.store.toStdString();
     request["surface_uuid"] = job.surfaceUuid;
-    request["surface_reference"] = job.surfaceReference;
+    request["surface_reference"] = nlohmann::json::parse(vc::objects::objectVersionToJson(job.surfaceReference));
     request["volume_uuid"] = job.volumeUuid;
     request["volume_path"] = job.volumeZarrPath.toStdString();
     request["volume_scale"] = std::max(0, job.volumeScale);
@@ -870,10 +871,8 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     CopyDisplacementJob copyJob;
     copyJob.socketPath = socketPath;
     copyJob.store = QString::fromStdString(toolStore.store.string());
-    copyJob.surfaceUuid = pin->object.objectUuid;
-    const auto reference = pin->reference();
-    copyJob.surfaceReference = {{"store", reference.storeUuid}, {"generation", reference.generation},
-                                {"object", reference.objectUuid}, {"version", reference.version}};
+    copyJob.surfaceUuid = pin->reference().objectUuid;
+    copyJob.surfaceReference = pin->reference();
     // The service works in level-0 voxels of the zarr it is given, not in the
     // open volume's working level: the store volume's own voxels.
     copyJob.volumeUuid = toolStore.volume.volume;
@@ -1148,7 +1147,7 @@ void SegmentationGrower::onFutureFinished()
         _context.state && _context.state->currentVolume() && _context.module->saveSurface(annotated)) {
         if (const auto afterPin = _context.module->storePin(annotated)) {
             vc3d::corrections::GrowthAnnotation annotation;
-            annotation.surfaceUuid = afterPin->object.objectUuid;
+            annotation.surfaceUuid = afterPin->reference().objectUuid;
             annotation.beforeGeometry = request.beforePin->geometryRevision.value_or("");
             annotation.afterGeometry = afterPin->geometryRevision.value_or("");
             annotation.volumeUsed = request.growthVolumeId;
