@@ -7,11 +7,28 @@ local artifacts ignored by Git. Input fixtures remain versioned.
 
 | Suite | Measures |
 | --- | --- |
+| [`run_cache_suite.py`](run_cache_suite.py) | Complete C++ cache contention suite: 13 workloads, synchronous versus sampled/background eviction, worker scaling and raw accounting |
+| [`pre_reader/`](pre_reader/README.md) | The same virtual-capacity workload suite against VC's historical decoded cache, compiled from a supplied checkout |
 | [`bench_pipeline.py`](bench_pipeline.py) | CPU/CUDA reading, sampling, normalization and transforms |
 | [`bench_transforms.py`](bench_transforms.py) | Individual transform recipes, including transfers and resident CUDA arrays |
 | [`bench_torch.py`](bench_torch.py) | Per-sample processing, CUDA batches and loader prefetch |
 | [`bench_reference_libraries.py`](bench_reference_libraries.py) | Image-processing operations against SciPy, scikit-image and OpenCV |
+| [`channel_decode.cpp`](channel_decode.cpp) | Whole versus selective channel decoding, bytes read and decoded; raw/Blosc and optional existing compound chunks |
 | [`fiber_training/bench_fiber_trainer.py`](fiber_training/bench_fiber_trainer.py) | Full model and optimizer updates with the fiber trainer |
+
+## Cache contention
+
+The [full virtual-capacity suite](cache-scale.md#full-workload-suite-at-virtual-capacities) runs all thirteen workload types at 0.25, 64 and 512 GiB equivalent capacity. Use `run_cache_suite.py --virtual --binary build/bench_cache_scale --output /path/to/new/results`. It retains the full case table, window progression, latency, hit rates and accounting for future comparisons. The [small-fixture suite](cache-contention.md) is a separate diagnostic for worker-count scaling; it is not representative of those larger caches.
+
+## Channel decoding
+
+With native tests enabled in an existing Release build, build and run `bench_channel_decode`. It compares all seven planes against channels 4–6 in a `[7,64,64,64]` uint8 compound chunk, validates exact output bytes, and reports mean/p50/p95/min/max milliseconds plus encoded bytes read and decoded bytes. Synthetic raw and Blosc/Zstd inputs are generated in memory. Supplying existing Blosc chunk filenames instead measures range `pread` calls on those files; opening files and the initial reference decode are outside the timed region, so these are warm-cache codec/read measurements, not cold-store import timings. Each case runs up to 30 repetitions; the complete benchmark has a 25-second time budget.
+
+```bash
+cmake --build build --target bench_channel_decode -j 4
+build/bench_channel_decode
+build/bench_channel_decode /path/to/compound/chunk1 /path/to/compound/chunk2
+```
 
 ## Fiber trainer comparison
 
@@ -422,3 +439,21 @@ With Python enabled, build `_thinning` and `_transforms` and run
 `VC_READER_BUILD_DIR=$PWD/build-thinning python -m pytest tests/test_thinning.py`.
 The tests cover CPU/CUDA values, device buffers, 2D/3D component connectivity,
 Manhattan distance, pruning, and chained resident/batched transforms.
+
+## Decoded-cache contention baseline
+
+For full-size LRU entry counts with shared dummy payloads, see [the cache capacity/steady-pressure benchmark](cache-scale.md).
+
+With `VC_READER_BUILD_NATIVE_TESTS=ON`, build `bench_cache_contention` in Release mode. Run `bench_cache_contention cores` to discover CPUs available to the process, then `bench_cache_contention WORKERS REPEATS SECONDS [CASE] [SHARDS]`. For example, `bench_cache_contention 32 3 0.25 mixed_shrink 192`. Omit SHARDS for the production default (hardware concurrency); use 1 for a single-lock control. Workers are supported up to ten times the available logical CPU count. Use a process timeout when sweeping oversubscribed workloads. `test_cache_contention_smoke` and `test_cache_contention_concurrent` exercise the benchmark's invariants through CTest.
+
+Cases: `hits` (uniform over 65,536 cached keys), `hot` (16 cached keys), `miss` (absent keys), `insert` (65,536 unique insertions without eviction), `replace` (existing-key updates), `evict` (random updates over 65,536 keys in a 4,096-entry cache), `allocate_evict` (same pressure with freshly allocated payloads), `mixed` (80% reads from a 1,024-key hot set, 20% updates), and `mixed_shrink` (mixed workload plus alternating low/high synthetic memory availability). `shrink_only`, with one worker, measures 32 isolated budget shrinks that each evict half of 4,096 entries; refill is outside those timing intervals. Omitting CASE runs all applicable cases.
+
+Payloads are 256 bytes and generated before timing, with external references retained to isolate cache bookkeeping from large allocation/deallocation costs. Only `allocate_evict` creates and releases payloads in the timed loop. No source reads, decompression, SQLite, or lock profiling occurs. Auto-mode shrink tests use a synthetic availability provider and zero EMA time constant to exercise immediate eviction, not OS memory pressure or gradual smoothing. The production cache implementation is otherwise unchanged.
+
+CSV reports elapsed seconds, completed chunk-entry operations, operations/s, operations/s/worker, hits and refresh counts for every repetition. These are **cache operations**, not end-to-end decoded-chunk throughput. Insert runs finish the finite insertion workload rather than stopping at the time limit. Worker creation and data preparation are excluded; start notification, scheduling and thread completion are included. Timed cases check the deadline every 64 operations, so oversubscription can extend actual duration. Joint shrink requests come from worker zero, at most once per 10 ms; report achieved refresh counts because contention/scheduling can delay them. Isolated shrink throughput counts evicted entries rather than refresh calls. Workload seeds are fixed, but concurrent interleaving and cache hit rates are necessarily scheduling-dependent. Aggregate repetitions using mean, median and min/max; retain all raw rows.
+
+An optional final `OPERATIONS` argument replaces the duration stop with a fixed total operation count, distributed evenly across workers. For example, `bench_cache_contention 64 3 .25 mixed 192 1000000` performs one million operations per repetition. Use the same count and worker count with `SHARDS=1` to compare cache retention after equivalent work; fixed-duration mixed tests process different amounts of eviction traffic when throughput changes.
+
+For background-eviction experiments, the full command is `bench_cache_contention WORKERS REPEATS SECONDS CASE SHARDS OPERATIONS MAINTENANCE_WORKERS [OPS_PER_SECOND]`. Use `OPERATIONS=0` for duration-based runs and `MAINTENANCE_WORKERS=0` for the synchronous control. Positive pacing limits total foreground operations, distributing deadlines among workers. For example, `bench_cache_contention 64 3 1 mixed 192 0 4 1000000` offers about one million operations/s with four maintenance threads. The `burst` case changes write probability from 20% to 90% and back over three equal time intervals, recording headroom/resident-byte/eviction traces to stderr. It can also be paced to test adaptation rather than unlimited overload.
+
+CSV additionally records read/put counts, skipped oversized admissions, admitted and evicted bytes, end headroom, sampled put p50/p95/p99 latency (one in 64 puts), sampled budget excess, post-workload drain time, total eviction batches, and foreground-assisted puts/bytes/batches. Candidate-array scans, prefix byte claims and evicted entry counts expose effective batching; a release batch can combine several shards. Successful admission can immediately be followed by ordinary eviction, so accepted puts are not a retention guarantee. Compare read-hit rates as well as throughput: coarse epoch batching can trade retention for speed. Non-pressure hit/replacement/insert cases now use twice the payload footprint as their budget in both synchronous and asynchronous modes, so configured headroom does not invalidate the all-hit invariant. Compare the same binary/configuration for these controls; historical timings without latency sampling are not exact like-for-like controls. Isolated `shrink_only` remains a synchronous microbenchmark; use `mixed_shrink` to exercise asynchronous budget reduction.
