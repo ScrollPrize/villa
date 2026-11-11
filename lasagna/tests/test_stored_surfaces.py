@@ -16,7 +16,7 @@ if ROOT not in sys.path:
 	sys.path.insert(0, ROOT)
 
 try:
-	from vc_object_store import ObjectStore, Surface
+	from vc_object_store import ObjectStore, Surface, object_reference
 	from vc_object_store.documents import attached_document
 	from vc_object_store.surfaces import create_surface
 except ImportError:  # pragma: no cover - the store bindings are an optional dependency
@@ -189,7 +189,7 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			self.assertEqual(scaled.meta["base_shape_zyx"], [8, 8, 8])
 
 
-def _checkpoint(source_uuid: str) -> dict:
+def _checkpoint(reference: dict) -> dict:
 	rows, cols = np.indices((3, 4), dtype=np.float32)
 	mesh = np.stack([cols + 5, rows + 6, np.full((3, 4), 7.0, np.float32)], axis=0)[:, None]
 	return {
@@ -198,7 +198,8 @@ def _checkpoint(source_uuid: str) -> dict:
 			"mesh_step": 1, "winding_step": 1, "subsample_mesh": 1, "subsample_winding": 1, "scaledown": 1.0,
 			"z_step_eff": 1, "volume_extent": None, "pyramid_d": False, "depth_windings": [0],
 		},
-		"_job_spec_": {"model": None, "config": {"external_surfaces": [{"type": "surface", "uuid": source_uuid}]}},
+		"_job_spec_": {"input_references": [reference], "model": None,
+			"config": {"external_surfaces": [{"reference": reference}]}},
 		"_corr_points_results_": {
 			"points_list": [
 				{"collection_id": 7, "point_id": 1, "valid": True, "p": [5.0, 6.0, 7.0], "winding_err": 0.25},
@@ -222,7 +223,8 @@ class StoredExportTest(unittest.TestCase):
 			store = root / "objects.vcobj"
 			source, _ = _source_surface(store)
 			ckpt = root / "model.pt"
-			torch.save(_checkpoint(source), ckpt)
+			with ObjectStore.open(str(store), read_only=True) as db:
+				torch.save(_checkpoint(object_reference(db.object(source))), ckpt)
 			created: list[str] = []
 			fit2tifxyz.main(["--input", str(ckpt), "--store", str(store), "--volume-uuid", VOLUME,
 							 "--output-name", "fitted.tifxyz", "--single-segment", "--tag", "lasagna"],
@@ -319,6 +321,19 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		collection = config["corr_points"]["collections"]["1"]
 		self.assertEqual((collection["uuid"], collection["name"], collection["color"]), (uid, "seeds", [1, 0, 0]))
 		self.assertEqual(collection["points"]["7"], {"wind_a": 2.0, "p": [4.0, 5.0, 6.0]})
+		with ObjectStore.open(str(self.store_path), author="test") as db:
+			selected = object_reference(db.object(uid))
+			self.assertEqual(collection["reference"], selected)
+			self.assertEqual(resolved["_job_spec_"]["input_references"], [selected])
+			db.set_meta(uid, "edited_after_materialization", True)
+		# Export uses the saved selections, never today's correction head.
+		self.assertEqual(resolved["_job_spec_"]["input_references"], [selected])
+		self.assertEqual(fit2tifxyz._stored_sources(resolved["_job_spec_"]), (uid,))
+
+	def test_export_sources_require_captured_references(self) -> None:
+		self.assertEqual(fit2tifxyz._stored_sources({"input_references": []}), ())
+		with self.assertRaisesRegex(ValueError, "regenerate"):
+			fit2tifxyz._stored_sources({"config": {"surfaces": [{"type": "surface", "uuid": self.source}]}})
 
 	def test_surface_and_model_refs_resolve_through_the_store(self) -> None:
 		with self.assertRaisesRegex(ValueError, "no Lasagna model"):
@@ -429,7 +444,8 @@ class HostedStoreTest(unittest.TestCase):
 		self.assertEqual(stored_surfaces.next_free_name(self.endpoint, "source", "version"), "source_v001")
 
 		ckpt = self.root / "model.pt"
-		torch.save(_checkpoint(self.source), ckpt)
+		with ObjectStore.open(str(self.store_path), read_only=True) as db:
+			torch.save(_checkpoint(object_reference(db.object(self.source))), ckpt)
 		created: list[str] = []
 		fit2tifxyz.main(["--input", str(ckpt), "--store", self.endpoint, "--volume-uuid", VOLUME,
 						 "--output-name", "fitted.tifxyz", "--single-segment"], created_surfaces=created)

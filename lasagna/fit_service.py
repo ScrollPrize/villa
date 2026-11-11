@@ -689,6 +689,7 @@ def _stored_corr_points(uuids: list[Any], volume: str | None, target_scale: floa
         collection = dict(stored["source"])
         collection["uuid"] = stored["uuid"]
         collection["name"] = stored["name"]
+        collection["reference"] = stored["reference"]
         collection["points"] = {
             str(point_id): {**(annotation if isinstance(annotation, dict) else {}), "p": list(point)}
             for point_id, point, annotation in zip(stored["ids"], stored["points"], stored["annotations"])}
@@ -1023,6 +1024,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("job_spec.config must be an object")
     resolved = dict(body)
     resolved_cfg = dict(cfg)
+    input_references = []
     external_surfaces_raw = resolved_cfg.get("external_surfaces")
     if external_surfaces_raw is not None:
         if not isinstance(external_surfaces_raw, list):
@@ -1034,6 +1036,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             surface = dict(surface_raw)
             if stored_surfaces.is_surface_ref(surface):
                 surface["path"] = _require_store().decode_reference(surface)
+                input_references.append(surface["path"])
             elif all(k in surface for k in ("type", "name", "hash")):
                 surface["path"] = str(_resolve_object_ref(surface))
             external_surfaces.append(surface)
@@ -1045,10 +1048,14 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("job_spec.config.corr_point_collections must be a list of UUIDs")
         resolved_cfg["corr_points"] = _stored_corr_points(
             collection_uuids, _request_store_volume(body), _request_voxel_scale(body))
+        input_references.extend(collection["reference"] for collection in resolved_cfg["corr_points"]["collections"].values())
 
     model_ref = spec.get("model")
     model_object_refs: dict[str, Any] | None = None
     if model_ref not in (None, {}, ""):
+        if stored_surfaces.is_surface_ref(model_ref):
+            model_ref = _require_store().decode_reference(model_ref)
+            input_references.append(model_ref)
         resolved_model_path = str(
             _stored_model_path(model_ref) if stored_surfaces.is_surface_ref(model_ref) else _resolve_object_ref(model_ref))
         resolved["model_input"] = resolved_model_path
@@ -1067,6 +1074,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         atlas_ref = model_atlas_ref
 
     effective_job_spec = {
+        "input_references": input_references,
         "model": spec.get("model"),
         "atlas": atlas_ref,
         "linked_surfaces": spec.get("linked_surfaces", []),
@@ -1079,6 +1087,8 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
 
     if atlas_ref not in (None, {}, ""):
         resolved_cfg["atlas"] = _resolve_lasagna_atlas_ref(atlas_ref)
+        if stored_surfaces.is_surface_ref(resolved_cfg["atlas"]["base"]["path"]):
+            input_references.append(resolved_cfg["atlas"]["base"]["path"])
 
     linked_refs = spec.get("linked_surfaces", [])
     if linked_refs is None:
