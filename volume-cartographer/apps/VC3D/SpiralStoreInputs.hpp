@@ -43,6 +43,7 @@ struct StoreInputPin {
     // geometry only.
     nlohmann::json metadata;
     vc::objects::ObjectVersion reference;
+    bool outerShell = false;  // displayed input, not a fitting patch/endpoint
 };
 
 struct FitSurface {
@@ -116,14 +117,15 @@ struct FitInputs {
     // Every input and relationship is as the fit read it.
     bool unchanged() const
     {
-        return problems.empty() && (!outerShell || outerShell->state == InputState::Fitted)
+        return problems.empty()
             && count(InputState::Fitted) == surfaces.size() + pointCollections.size()
-                                                                   + fibers.size() + tracks.size()
+                                           + fibers.size() + tracks.size() + outerShell.has_value()
             && count(LinkState::Fitted) == relationships.size() && addedRelationships.empty();
     }
 };
 
-// The objects of an input manifest document ({"digest", "manifest"}).
+// All objects of an input manifest document ({"digest", "manifest"}),
+// including its separately displayed outer shell, identified by its role.
 std::vector<StoreInputPin> manifestPins(const nlohmann::json& document);
 
 // The metadata the fit's object-store adapter reads from one object, as

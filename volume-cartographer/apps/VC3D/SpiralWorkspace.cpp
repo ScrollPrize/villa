@@ -1989,12 +1989,8 @@ void SpiralWorkspace::installFitInputs(
     _fitInputs = inputs;
     _installedFitInputGeneration = generation;
     updateInputFreshness();
-    InputSurfaceLoadResult surfaces;
+    auto surfaces = fitSurfaceChanges(*inputs);
     surfaces.categories = {QStringLiteral("verified"), QStringLiteral("shell")};
-    for (const auto& entry : inputs->surfaces)
-        if (entry.surface) surfaces.surfaces.push_back(fitSurfaceEntry(entry));
-    if (inputs->outerShell && inputs->outerShell->surface)
-        surfaces.surfaces.push_back(fitSurfaceEntry(*inputs->outerShell, QStringLiteral("shell")));
     installInputSurfaces(surfaces, _inputSurfaceGeneration);
     rebuildFitPclDocuments();
     rebuildFitFibers();
@@ -2003,17 +1999,23 @@ void SpiralWorkspace::installFitInputs(
     if (!_pendingObjectChanges.empty() || !_pendingLinkChanges.empty()) _fitInputReload->start();
 }
 
-SpiralWorkspace::InputSurfaceEntry SpiralWorkspace::fitSurfaceEntry(const vc3d::spiral::FitSurface& entry,
-                                                                    const QString& category) const
+SpiralWorkspace::InputSurfaceLoadResult SpiralWorkspace::fitSurfaceChanges(const vc3d::spiral::FitInputs& inputs) const
 {
-    const QString uuid = QString::fromStdString(entry.pin.uuid);
-    // Keyed and coloured by object UUID, which survives renames.
-    const QString id = QStringLiteral("spiral/%1/%2/%3")
-                           .arg(category, QString::fromStdString(_fitInputs->digest).left(12), uuid);
-    // The CState key is display-specific, but store queries need the actual
-    // object UUID. Do not turn a committed input into a session draft.
-    entry.surface->id = entry.pin.uuid;
-    return {category, id, uuid, entry.surface};
+    InputSurfaceLoadResult result;
+    const auto add = [&](const vc3d::spiral::FitSurface& entry) {
+        const QString category = entry.pin.outerShell ? QStringLiteral("shell") : QStringLiteral("verified");
+        const QString uuid = QString::fromStdString(entry.pin.uuid);
+        const QString id = QStringLiteral("spiral/%1/%2/%3")
+                               .arg(category, QString::fromStdString(inputs.digest).left(12), uuid);
+        if (entry.surface) {
+            // The display key differs from the UUID used by store queries.
+            entry.surface->id = entry.pin.uuid;
+            result.surfaces.push_back({category, id, uuid, entry.surface});
+        } else result.removedIds << id;
+    };
+    for (const auto& entry : inputs.surfaces) add(entry);
+    if (inputs.outerShell) add(*inputs.outerShell);
+    return result;
 }
 
 void SpiralWorkspace::rebuildFitPclDocuments()
@@ -2080,6 +2082,8 @@ void SpiralWorkspace::showFitInputProblems(const vc3d::spiral::FitInputs& inputs
     add(inputs.surfaces);
     add(inputs.pointCollections);
     add(inputs.fibers);
+    if (inputs.outerShell && !inputs.outerShell->problem.empty())
+        notes << QString::fromStdString(inputs.outerShell->problem);
     if (!notes.isEmpty()) statusBar()->showMessage(notes.join(QStringLiteral("; ")), 15000);
 }
 
@@ -2127,16 +2131,7 @@ void SpiralWorkspace::installFitInputChanges(vc3d::spiral::FitInputChanges chang
 {
     // Only what changed is replaced: one surface, the PCL overlays when a
     // collection changed, the fiber overlay when a fiber did.
-    InputSurfaceLoadResult surfaces;
-    for (const auto& entry : changes.inputs.surfaces) {
-        if (entry.surface) {
-            surfaces.surfaces.push_back(fitSurfaceEntry(entry));
-        } else {
-            surfaces.removedIds << QStringLiteral("spiral/verified/%1/%2")
-                                       .arg(QString::fromStdString(_fitInputs->digest).left(12),
-                                            QString::fromStdString(entry.pin.uuid));
-        }
-    }
+    const auto surfaces = fitSurfaceChanges(changes.inputs);
     const bool collectionsChanged = !changes.inputs.pointCollections.empty();
     const bool fibersChanged = !changes.inputs.fibers.empty();
     showFitInputProblems(changes.inputs);

@@ -182,8 +182,7 @@ private:
     // replace only their overlays (vc3d::spiral::readFitInputChanges).
     void loadFitInputChanges();
     void installFitInputChanges(vc3d::spiral::FitInputChanges changes);
-    InputSurfaceEntry fitSurfaceEntry(const vc3d::spiral::FitSurface& entry,
-                                      const QString& category = QStringLiteral("verified")) const;
+    InputSurfaceLoadResult fitSurfaceChanges(const vc3d::spiral::FitInputs& inputs) const;
     void rebuildFitPclDocuments();
     void rebuildFitFibers();
     void showFitInputProblems(const vc3d::spiral::FitInputs& inputs);

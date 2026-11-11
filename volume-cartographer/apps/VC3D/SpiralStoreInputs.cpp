@@ -46,7 +46,7 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
                           const std::map<std::string, vc::objects::RelationshipVersion>& references, FitInputs& result)
 {
     std::map<std::string, std::string> kinds;
-    for (const auto& pin : pins) kinds[pin.uuid] = pin.kind;
+    for (const auto& pin : pins) if (!pin.outerShell) kinds[pin.uuid] = pin.kind;
     const auto inScope = [&](const std::string& uuid) { return !scope || scope->contains(uuid); };
     const auto fitted = manifest.value("relationships", Json::array());
     std::set<std::string> endpoints;
@@ -104,6 +104,10 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
 void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::string& volume,
                 FitInputs& result)
 {
+    if (pin.outerShell && pin.kind != "surface") {
+        result.problems.push_back("the fit's outer shell " + pin.uuid + " is a " + pin.kind + ", not a surface");
+        return;
+    }
     const auto current = reader.currentObject(pin.uuid);
     const bool present = current && !current->deleted && current->geometryRevision;
     auto state = InputState::Missing;
@@ -177,7 +181,8 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
     }
     if (pin.kind == "surface") {
         surface.problem = problem;
-        result.surfaces.push_back(std::move(surface));
+        if (pin.outerShell) result.outerShell = std::move(surface);
+        else result.surfaces.push_back(std::move(surface));
     } else if (pin.kind == "point_collection") {
         collection.problem = problem;
         result.pointCollections.push_back(std::move(collection));
@@ -240,7 +245,7 @@ const char* linkStateName(LinkState state)
 
 std::size_t FitInputs::count(InputState state) const
 {
-    std::size_t total = 0;
+    std::size_t total = outerShell && outerShell->state == state;
     for (const auto& entry : surfaces) total += entry.state == state;
     for (const auto& entry : pointCollections) total += entry.state == state;
     for (const auto& entry : fibers) total += entry.state == state;
@@ -271,6 +276,10 @@ std::vector<StoreInputPin> objectPins(const Json& document,const vc::objects::Ma
     std::vector<StoreInputPin> pins;
     for (const auto& object : document.at("manifest").value("objects", Json::array()))
         pins.push_back(objectPin(object,references));
+    if (const auto shell = valueOrNull(document.at("manifest"), "outer_shell"); !shell.is_null()) {
+        pins.push_back(objectPin(shell, references));
+        pins.back().outerShell = true;
+    }
     return pins;
 }
 }
@@ -314,19 +323,6 @@ FitInputs readFitInputs(const StoreReader& reader, const Json& document)
     if (!sameStore(reader, document, result, references)) return result;
     const auto pins = objectPins(document,references);
     for (const auto& pin : pins) readObject(reader, pin, result.volumeUuid, result);
-    // The outer shell: read as a surface, held apart from the patches.
-    if (const Json shell = valueOrNull(document.at("manifest"), "outer_shell"); shell.is_object()) {
-        FitInputs read;
-        const auto pin = objectPin(shell,references);
-        readObject(reader, pin, result.volumeUuid, read);
-        // Only a surface pin lands among the surfaces: anything else the
-        // manifest names as its shell is a problem, not a shell.
-        if (read.surfaces.empty())
-            result.problems.push_back("the fit's outer shell " + pin.uuid + " is a " + pin.kind
-                                      + ", not a surface");
-        else
-            result.outerShell = std::move(read.surfaces.front());
-    }
     compareRelationships(reader, document.at("manifest"), pins, nullptr, references.relationships, result);
     return result;
 }
@@ -350,7 +346,7 @@ FitInputChanges readFitInputChanges(const StoreReader& reader, const Json& docum
     vc::objects::EdgeSelection incident;
     incident.endpointUuids = std::vector<std::string>();
     for (const auto& pin : pins)
-        if (objectUuids.contains(pin.uuid)) incident.endpointUuids->push_back(pin.uuid);
+        if (!pin.outerShell && objectUuids.contains(pin.uuid)) incident.endpointUuids->push_back(pin.uuid);
     incident.includeRetired = true;
     if (!incident.endpointUuids->empty())
         for (const auto& edge : reader.selectEdges(incident, std::vector<std::string>{"uuid"}))
@@ -372,6 +368,7 @@ void applyFitInputChanges(FitInputs& inputs, FitInputChanges changes)
     replaceByUuid(inputs.pointCollections, changes.inputs.pointCollections);
     replaceByUuid(inputs.fibers, changes.inputs.fibers);
     replaceByUuid(inputs.tracks, changes.inputs.tracks);
+    if (changes.inputs.outerShell) inputs.outerShell = std::move(changes.inputs.outerShell);
     for (auto& link : changes.inputs.relationships) {
         const auto found = std::find_if(inputs.relationships.begin(), inputs.relationships.end(),
                                         [&](const auto& old) { return old.uuid == link.uuid; });
