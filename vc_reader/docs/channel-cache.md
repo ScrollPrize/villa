@@ -52,6 +52,8 @@ Hits, misses and replacements that preserve the byte count require no shared ato
 
 Equal-size replacements update the existing entry in place and release the old payload outside the shard lock. Aggregate statistics visit the shards and are not a globally atomic snapshot during concurrent operations. Clear also visits shards, so callers requiring an empty cache must stop concurrent insertions first.
 
+Effective channel registrations are published as immutable snapshots. A forked Python reader copies that shared snapshot before reopening its engine, including channels registered only by other readers; this never takes a mutex inherited from the parent.
+
 ## Background maintenance and caller assistance
 
 Fixed-size and auto-sized caches start four maintenance workers by default; zero-byte fixed caches need none. Each writer can try one sampled batch inline when it crosses the eviction watermark and no other reclaimer is active. If it encounters contention or doesn't reclaim enough, the background workers take over. Selection is based on pressure and contention, not the number of callers. Native callers can construct `MemoryCache(budget_or_options, shards, false)` for synchronous eviction, or enable a custom maintenance policy on that cache before concurrent use. Injected auto-budget callbacks must support access from the maintenance thread. Construct native caches after forking; do not use or destroy inherited caches in the child. Python reader wrappers rebuild their cache on first use in a child process. Destruction stops and joins the maintenance threads.

@@ -412,15 +412,23 @@ public:
         std::lock_guard lock(channel_policy_->mutex);
         for (auto c : channels)
             if (c < 0 || c >= spec_.shape[0]) throw std::out_of_range("cache channel outside array");
+        const auto previous_count=channel_policy_->relevant.size();
         channel_policy_->relevant.insert(channels.begin(), channels.end());
+        if (previous_count==channel_policy_->relevant.size() &&
+            channel_policy_->enabled.load(std::memory_order_relaxed)) return;
         if (!channel_policy_->reads) channel_policy_->reads = std::make_unique<std::array<std::mutex,256>>();
+        auto registration=std::make_unique<const ChannelPolicy::Channels>(
+            channel_policy_->relevant.begin(),channel_policy_->relevant.end());
+        const auto* published=registration.get();
+        channel_policy_->registrations.push_back(std::move(registration));
+        channel_policy_->registration.store(published,std::memory_order_release);
         channel_policy_->enabled.store(true, std::memory_order_release);
     }
     bool channel_cache_enabled() const noexcept { return channel_policy_->enabled.load(std::memory_order_acquire); }
     Index cache_channels() const
     {
-        std::lock_guard lock(channel_policy_->mutex);
-        return {channel_policy_->relevant.begin(), channel_policy_->relevant.end()};
+        const auto* registration=channel_policy_->registration.load(std::memory_order_acquire);
+        return registration ? *registration : Index{};
     }
     void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn) { pool_->parallel_for(n,fn); }
     std::size_t itemsize() const noexcept { return spec_.itemsize; }

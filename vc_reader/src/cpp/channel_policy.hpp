@@ -15,6 +15,11 @@ struct ChannelPolicy {
     std::atomic<bool> enabled{false};
     std::mutex mutex;
     std::set<std::int64_t> relevant;
+    // Immutable registrations remain alive for this policy's lifetime. A child
+    // can copy the published value without taking an inherited mutex.
+    using Channels = std::vector<std::int64_t>;
+    std::vector<std::unique_ptr<const Channels>> registrations;
+    std::atomic<const Channels*> registration{nullptr};
     // Coalesce concurrent reads of the same physical chunk, not unrelated I/O.
     std::unique_ptr<std::array<std::mutex, 256>> reads;
     static std::shared_ptr<ChannelPolicy> for_array(const std::string& identity)

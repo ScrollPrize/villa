@@ -1,10 +1,21 @@
 """Selective channel transport uses the existing range/ETag fixtures."""
 import numpy as np
 import pickle
+import multiprocessing
+import unittest
 
 from test_source_storage import RemoteFixtureCase
 from vc_reader.reader import MemoryCache, ZarrReader
 from vc_reader.reader.writer import ZarrWriter
+
+
+def fork_channel_registration(reader, connection):
+    try:
+        connection.send((reader.cache_channels, int(reader[5, 0, 0, 0])))
+    except BaseException as error:
+        connection.send(error)
+    finally:
+        connection.close()
 
 
 class ChannelStorageHttpTests(RemoteFixtureCase):
@@ -71,3 +82,33 @@ class ChannelStorageHttpTests(RemoteFixtureCase):
             reader.request_channel_cache([4])
             with self.assertRaisesRegex(RuntimeError, '412|changed'):
                 reader[4]
+
+    @unittest.skipUnless('fork' in multiprocessing.get_all_start_methods(), 'fork is unavailable')
+    def test_fork_preserves_shared_and_later_channel_requests(self):
+        data = self.make_volume('fork-policy', 3)
+        url = self.url+'/fork-policy'
+        with ZarrReader.open(url, threads=1) as first, \
+             ZarrReader.open(url, threads=1) as stale, \
+             ZarrReader.open(url, threads=1) as passive:
+            stale.request_channel_cache([4])
+            first.request_channel_cache([5])
+            # passive never requested channels; stale's own snapshot is only [4].
+            for reader in (passive, stale):
+                context = multiprocessing.get_context('fork')
+                parent, child = context.Pipe()
+                process = context.Process(target=fork_channel_registration, args=(reader, child))
+                process.start()
+                child.close()
+                try:
+                    self.assertTrue(parent.poll(20), 'forked channel reader did not return')
+                    result = parent.recv()
+                    if isinstance(result, BaseException):
+                        raise result
+                    self.assertEqual(result, ([4, 5], int(data[5, 0, 0, 0])))
+                finally:
+                    parent.close()
+                    process.join(5)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join()
+                self.assertEqual(process.exitcode, 0)

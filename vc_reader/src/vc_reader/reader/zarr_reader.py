@@ -298,10 +298,13 @@ class ZarrReader:
         """After a fork, rebuild the C++ engine in this process (see the module docstring)."""
         if self._pid == os.getpid() or self._array is None:
             return
+        # Snapshot the effective shared registration, not this wrapper's last
+        # request. Native registration snapshots never lock inherited mutexes.
+        channels = self._array.cache_channels if self._array.channel_cache_enabled else None
         self._abandon_inherited()
         self.__init__(dict(self._settings, attrs=self._attrs, store_metadata=self._metadata), self.memory_cache)
-        if getattr(self, "_requested_cache_channels", None) is not None:
-            self._array.request_channel_cache(self._requested_cache_channels)
+        if channels is not None:
+            self.request_channel_cache(channels)
 
     def _abandon_inherited(self) -> None:
         self._finalizer.detach()  # the parent flushes and closes its own engine
