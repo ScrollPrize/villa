@@ -2042,7 +2042,7 @@ class _StoredSurfaces:
             volume=self.volume,
             tool="vesuvius-displacement-copy",
             parameters={"checkpoint": str(source),
-                        "input": {"surface": self.loaded_source, **self.loaded_version}},
+                        "input": {"reference": self.loaded_version}},
             sources=[self.loaded_source],
             meta={"area_vx2": area_vx2, "area_cm2": area_cm2, **metadata_out},
         )

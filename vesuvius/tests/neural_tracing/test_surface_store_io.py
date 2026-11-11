@@ -96,7 +96,7 @@ def test_copy_store_mode_reads_the_pinned_version_and_creates_sourced_outputs(tm
         record = db.object(created)
         meta = record['meta']
         assert meta['provenance']['sources'] == [source]
-        assert meta['provenance']['parameters']['input'] == {'surface': source, **exact}
+        assert meta['provenance']['parameters']['input'] == {'reference': exact}
         assert meta['surface_role'] == 'front'
         assert 'area_vx2' not in meta
         assert record['surface']['area'] > 0
@@ -109,7 +109,7 @@ def test_copy_store_mode_reads_the_pinned_version_and_creates_sourced_outputs(tm
     with ObjectStore.open(str(store), read_only=True) as db:
         provenance = db.object(following)['meta']['provenance']
         assert provenance['sources'] == [created]
-        assert provenance['parameters']['input'] == {'surface': created, **previous}
+        assert provenance['parameters']['input'] == {'reference': previous}
         assert previous['object'] != exact['object']
 
 
