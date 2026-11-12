@@ -49,17 +49,20 @@ def metrics(u, v, a, i, j, dot):
                     uncertain_signs_percent=float(100*((u.sigmoid()>.1)&(u.sigmoid()<.9)).float().mean()))
 
 
-def prepare(config):
+def prepare(config, *, graph=None):
     """Convert fixed evidence once; no geometry or model evaluation in optimization."""
     started = time.monotonic()
     db_path, prior_path = Path(config['database']), Path(config['priors'])
-    signature = dict(version=2, database_sha256=store_digest(db_path), priors_sha256=sha256_file(prior_path))
+    signature = dict(version=3, database_sha256=store_digest(db_path), priors_sha256=sha256_file(prior_path))
     cache = Path(config['tensor_cache'])
     stamp = cache.with_suffix('.json')
     if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature'] == signature:
         return cache
     prior = json.loads(prior_path.read_text())
-    graph = FiberGraph(db_path)
+    graph = FiberGraph(db_path) if graph is None else graph
+    from .fiber_graph_store import snapshot_digest
+    if snapshot_digest(graph.source) != signature['database_sha256']:
+        raise ValueError('Prepared graph belongs to another snapshot')
     if prior['format'] != 'fiber-outward-priors' or prior.get('source_store') != graph.source:
         raise ValueError('Priors were generated from another store snapshot')
     ids = graph.ids
@@ -68,7 +71,7 @@ def prepare(config):
     a = np.asarray(prior['agreement'], dtype=np.float32)
     if len(a) != len(ids) or not np.isfinite(a).all() or np.any(abs(a) > 1.000001):
         raise ValueError('Invalid radial priors')
-    eligible = graph.perpendicular_score > graph.parallel_score
+    eligible = ~graph.parallel
     valid = eligible & graph.valid_a & graph.valid_b
     total = int(eligible.sum())
     event_ids = graph.event_ids[valid]
@@ -80,7 +83,7 @@ def prepare(config):
     dot=np.clip(dot,-1,1)
     cache.parent.mkdir(parents=True,exist_ok=True)
     temporary=cache.with_suffix('.partial.npz')
-    np.savez(temporary,ids=ids,prior=a,i=indices[:,0],j=indices[:,1],dot=dot,event_ids=event_ids)
+    np.savez(temporary,ids=ids,lengths=graph.lengths,prior=a,i=indices[:,0],j=indices[:,1],dot=dot,event_ids=event_ids)
     temporary.replace(cache)
     degree=np.bincount(indices.ravel(),minlength=len(ids))
     stats=dict(signature=signature,fibers=len(ids),perpendicular_events=total,
@@ -93,6 +96,9 @@ def prepare(config):
 
 
 def solve(config):
+    if config.get('optimizer')=='wrapped_irls':
+        from .fiber_wrapped_stages import solve_stage
+        return solve_stage(config,'normal_sign')
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA required for production sign solve; no CPU fallback')
@@ -146,12 +152,13 @@ def solve(config):
                      normal_sign=torch.where(u>=0,1,-1).cpu().numpy().astype(np.int8),
                      broken=(v>=0).cpu().numpy(),sign_logit=u.cpu().numpy(),broken_logit=v.cpu().numpy()))
             np.savez(root/f'solution_{label}.npz',**saved)
-        write_results(root/f'solution_{label}.vcobj',[config['database']], 'normal_sign', method,
-            {'fibers':[dict(fiber_uuid=str(fid),normal_sign=int(sign),enabled=int(not broken),
-                            sign_probability=float(p),p_broken=float(pb))
-                for fid,sign,broken,p,pb in zip(saved['ids'],saved['normal_sign'],saved['broken'],
-                                               saved['sign_probability'],saved['broken_probability'])]},
-            settings=dict(broken_penalty=float(penalty),steps=steps,lr=float(lr)))
+        if config.get('write_result_store',True):
+            write_results(root/f'solution_{label}.vcobj',[config['database']], 'normal_sign', method,
+                {'fibers':[dict(fiber_uuid=str(fid),normal_sign=int(sign),enabled=int(not broken),
+                                sign_probability=float(p),p_broken=float(pb))
+                    for fid,sign,broken,p,pb in zip(saved['ids'],saved['normal_sign'],saved['broken'],
+                                                   saved['sign_probability'],saved['broken_probability'])]},
+                settings=dict(broken_penalty=float(penalty),steps=steps,lr=float(lr)))
         summaries.append(dict(broken_penalty=penalty,initial=history[0],final=history[-1],
                               all_broken_objective=penalty+weak*(1-float(a.abs().mean()))/2))
     summary=dict(config=config,baselines=baselines,runs=summaries,
@@ -248,6 +255,9 @@ def launch_tensor_solve(config,module,source):
     config=dict(config,code_provenance=dict(
         revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),
         optimizer_sha256=sha256_file(source)))
+    if config.get('optimizer')=='wrapped_irls':
+        for name in ('fiber_wrapped_irls','fiber_wrapped_stages'):
+            config['code_provenance'][name+'_sha256']=sha256_file(Path(__file__).with_name(name+'.py'))
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     frozen=root/'config.json'
     if (root/'summary.json').exists(): raise FileExistsError('Completed output exists')

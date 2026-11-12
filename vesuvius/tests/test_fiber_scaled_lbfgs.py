@@ -138,6 +138,33 @@ def test_squared_cache_preserves_trajectory(matched):
     assert b['evaluations']<a['evaluations'] and b['cache_hits']>0
 
 
+def test_first_gradient_profile_logs_once_without_extra_evaluations(capsys):
+    import json
+    def run(profile):
+        state=torch.tensor([[2.,0.,0.,100.]],dtype=torch.float64,requires_grad=True)
+        raw=torch.tensor([1500.,.1,.2],dtype=torch.float64,requires_grad=True)
+        history=[]
+        def objective():
+            return ((raw[0]-2000)/100).square()+((raw[1:]-.3)/.1).square().sum()+state[:,0].square().sum(),{}
+        result=scaled_joint(objective,state,raw,torch.nn.Module(),10,
+            callback=lambda i:history.append(torch.cat((state.detach().flatten(),raw.detach())).clone()),
+            monotone_widths=True,relative_widths=True,optimizer_kind='torch_lbfgs',
+            profile_first_gradient=profile,optimizer_progress_every=1 if profile else 0)
+        return torch.stack(history),result
+    reference,a=run(False)
+    assert not capsys.readouterr().out
+    measured,b=run(True)
+    rows=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    first=[row for row in rows if row['stage']=='optimizer_first_gradient']
+    progress=[row for row in rows if row['stage']=='optimizer_progress']
+    assert len(first)==1
+    assert first[0]['parameters']==4 and first[0]['seconds']>=0 and first[0]['peak_vram_bytes']==0
+    assert [row['iteration'] for row in progress]==list(range(1,b['iterations']+1))
+    assert progress[-1]['evaluations']==b['evaluations']
+    assert a['evaluations']==b['evaluations'] and a['iterations']==b['iterations'] and a['cache_hits']==b['cache_hits']
+    torch.testing.assert_close(measured,reference,atol=0,rtol=0)
+
+
 @pytest.mark.parametrize('name',['width_coordinate_scale','phase_coordinate_scale'])
 @pytest.mark.parametrize('value',[0.,-1.,float('nan'),float('inf')])
 def test_invalid_coordinate_scale(name,value):

@@ -15,12 +15,11 @@ def validate(original, oriented):
     before, after = FiberGraph(original), FiberGraph(oriented)
     assert np.array_equal(before.ids, after.ids), 'Fiber identities changed'
     assert fibers_digest(original, before.ids) == fibers_digest(oriented, after.ids), 'Fiber geometry changed'
-    for name in ('event_ids', 'edge_uuid', 'fiber_a', 'fiber_b', 'arc_a', 'arc_b', 'point_a', 'point_b',
-                 'parallel_score', 'perpendicular_score', 'distance', 'parallel_distance', 'evidence_weight',
-                 'valid_a', 'valid_b'):
+    for name in ('event_ids', 'edge_uuid', 'fiber_a', 'fiber_b', 'arc_a', 'arc_b',
+                 'parallel', 'distance', 'connector', 'valid_connector', 'valid_a', 'valid_b'):
         assert np.array_equal(getattr(before, name), getattr(after, name)), name
-    # Check all typed diagnostic fields, not just columns consumed by the solve.
-    excluded = {f'normal_{side}_{axis}' for side in ('a', 'b') for axis in ('x', 'y', 'z')}
+    # Format 4 stores each endpoint normal as one compact three-byte BLOB.
+    excluded = {'normal_a', 'normal_b'}
     table = PREFIX+'constraints'
     with CollectionReader(str(original)) as a, CollectionReader(str(oriented)) as b:
         ac = [c['name'] for c in before.measurement_info['columns']]

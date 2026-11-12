@@ -9,7 +9,7 @@ import time
 import numpy as np
 
 from .fiber_min_flow_experiment import arrays,write,digest
-from .fiber_min_flow_full import PackedPaths,event_batches,parallel_stage
+from .fiber_min_flow_full import PackedPaths,event_batches,parallel_stage,constraint_jobs
 from .fiber_graph_store import FiberGraph
 
 
@@ -71,9 +71,8 @@ def prepare(settings,config):
     if not (root/'tensors.npz').exists():
         native=dict(parent,output_root=str(root),workers=settings.get('workers',32))
         columns=FiberGraph.cached(parent['database'],root/'constraint_columns')
-        lo,hi=map(int,columns.event_ids[[0,-1]])
         batch=parent.get('constraint_batch',500000)
-        jobs=[(a,min(a+batch,hi+1)) for a in range(lo,hi+1,batch)]
+        jobs=constraint_jobs(columns.event_ids,batch)
         parallel_stage(native,'events',jobs,event_job)
         write(root/'progress.json',dict(stage='assemble_tensors'))
         parts=sorted((root/'events').glob('*.npz'))

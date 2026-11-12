@@ -1,7 +1,8 @@
 """Native, immutable measured-graph fixtures shared by workflow regression tests."""
 import uuid
 import numpy as np
-from vc_object_store import import_initial_records, fiber_constraint_extension
+from vc_object_store import (import_initial_records, fiber_constraint_extension,
+                             encode_fiber_arc,encode_fiber_direction,encode_fiber_winding)
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_initial_fibers
 
 
@@ -17,7 +18,7 @@ def measured_store(root, events, *, workers=2, packed=True, isolated_ids=(), fie
         [(dict(id=uid(i),family='H' if i%2 else 'V'),
           np.asarray(curves[i]) if curves is not None else np.array([[0.,0.,0.],[10.,0.,0.]])) for i in ids],
         volume=volume or uid(999),workers=workers,packed=packed)['path']
-    table=fiber_constraint_extension('')
+    table=fiber_constraint_extension('',coordinate_space='fixture/'+(volume or uid(999)))
     edges=[]
     for eid,a,b,parallel,distance in events:
         edge_uuid=uid(1000+eid)
@@ -31,10 +32,23 @@ def measured_store(root, events, *, workers=2, packed=True, isolated_ids=(), fie
         pa,pb=([0.,0.,0.],[1.,0.,0.]) if a<b else ([1.,0.,0.],[0.,0.,0.])
         if point_overrides is not None and eid in point_overrides:
             pa,pb=point_overrides[eid]
+        na=[fields['normal_a_'+k] for k in 'xyz'] if fields['normal_a_valid'] else [0.,0.,0.]
+        nb=[fields['normal_b_'+k] for k in 'xyz'] if fields['normal_b_valid'] else [0.,0.,0.]
+        aa,ab=fields['arc_a'],fields['arc_b']
+        if a>b:aa,ab=ab,aa;na,nb=nb,na
+        compact=dict(edge_uuid=uuid.UUID(edge_uuid).bytes,arc_a=encode_fiber_arc(aa),arc_b=encode_fiber_arc(ab),
+                     normal_a=encode_fiber_direction(na),normal_b=encode_fiber_direction(nb),
+                     connector=encode_fiber_direction((np.asarray(pb)-pa).tolist()),
+                     winding_distance=encode_fiber_winding(fields['parallel_las_winding'] if parallel else fields['las_winding']),extra=None)
+        if compact['winding_distance'] is None:continue
+        # New-format overrides can deliberately provide malformed compact values
+        # to test reader validation; legacy input conveniences above are not stored.
+        compact.update({k:v for k,v in (field_overrides or {}).get(eid,{}).items() if k in compact and k not in ('arc_a','arc_b')})
         edges.append(dict(record=dict(uuid=edge_uuid,a=uid(min(a,b)),b=uid(max(a,b)),
                           kind='parallel' if parallel else 'perpendicular',
-                          a_anchor=dict(position=pa),b_anchor=dict(position=pb)),
-                          extensions=[dict(table=table['name'],values=[fields.get(c['name']) for c in table['columns']])]))
+                          a_anchor={},b_anchor={}),
+                          extensions=[dict(table=table['name'],values=[compact[c['name']] for c in table['columns']])]))
     graph=import_initial_records(root/'graph.vcobj',[],edges=edges,extensions=[table],
-                                 dependencies=[fibers],workers=workers,packed=packed)['path']
+                                 dependencies=[fibers],workers=workers,packed=packed,
+                                 edge_columns=[],edge_adjacency_index=False)['path']
     return graph

@@ -14,6 +14,7 @@ import numpy as np
 
 from .fiber_min_flow_experiment import arrays, digest, write
 from .fiber_graph_store import write_winding_result
+from .fiber_linear_irls import round_components
 
 
 def load_solver(path, expected_hash):
@@ -23,13 +24,6 @@ def load_solver(path, expected_hash):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.solve_l1
-
-
-def round_components(x, component):
-    """Upstream component circular-phase removal, then nearest integer."""
-    phase = np.arctan2(np.bincount(component, np.sin(2*np.pi*x)),
-                       np.bincount(component, np.cos(2*np.pi*x))) / (2*np.pi)
-    return np.rint(x-phase[component]).astype(np.int64)
 
 
 def metrics(q, truth, events, enabled):

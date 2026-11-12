@@ -15,7 +15,7 @@ from .fiber_min_flow_experiment import arrays, write
 from .fiber_geometry_cache import width_boundaries
 
 
-def saved_assignment_inputs(data, solution):
+def saved_assignment_inputs(data, solution, component_selection='largest'):
     """Adapt the saved graph solver's largest component, preserving its labels.
 
     Input endpoint arcs may use aligned signs; the flow UV staging format uses
@@ -25,7 +25,10 @@ def saved_assignment_inputs(data, solution):
     np.testing.assert_array_equal(data['source_id'],solution['source_id'])
     if len(data['links']) or np.any(data['start']!=0):
         raise ValueError('Fixed-label UV expects whole unsplit fibers')
-    comp=solution['component'];keep=comp==np.bincount(comp).argmax()
+    comp=solution['component']
+    if component_selection not in ('all','largest'):
+        raise ValueError('component_selection must be all or largest')
+    keep=np.ones(len(comp),bool) if component_selection=='all' else comp==np.bincount(comp).argmax()
     d=subset_minimal(data,keep)
     direction=np.sign(d['node_ds'][:,-1])
     if np.any(direction==0):raise ValueError('Missing endpoint arc direction')
@@ -47,7 +50,8 @@ def run_saved(config):
     manifest=stage/'binding.json'
     if manifest.exists() and json.loads(manifest.read_text())!=binding:
         raise ValueError('Saved assignment inputs changed; choose a new output root')
-    d,labels=saved_assignment_inputs(arrays(config['tensor_cache']),arrays(config['solution']))
+    d,labels=saved_assignment_inputs(arrays(config['tensor_cache']),arrays(config['solution']),
+                                   config.get('component_selection','largest'))
     np.savez(stage/'selected_tensors.npz',**d)
     np.savez(stage/'selected_solution.npz',winding=labels)
     fibers=stage/'selected_with_gt.vcobj'
@@ -75,10 +79,21 @@ def prepare(config):
     parent=Path(config['flow_root']);original=arrays(parent/'selected_tensors.npz')
     sol=arrays(parent/'selected_solution.npz');d,keep,edge=supported(original)
     if not keep.any():raise ValueError('No perpendicular-supported fibers')
-    paths=Paths(dict(fibers=str(parent/'selected_with_gt.vcobj'),umbilicus=config['umbilicus'],
-                     working_volume=config.get('working_volume')),d)
-    directions=[];phase=[];z=[];radii=[];sample_owner=[];sample_arc=[];sample_phase=[];sample_z=[]
-    for i,sid in enumerate(d['source_id']):
+    if config.get('packed_geometry'):
+        from .fiber_min_flow_full import PackedPaths
+        from .fiber_packed_priors import geometry_priors
+        paths=PackedPaths(config['packed_geometry'],d)
+        prior=geometry_priors(paths,d['source_id'],d['family'],config.get('prior_spacing',1000))
+        directions,phase,z,radii=(prior[k] for k in ('directions','phase','z','radii'))
+        sample_owner,sample_arc,sample_phase,sample_z=(prior[k] for k in
+            ('sample_owner','sample_arc','sample_phase','sample_z'))
+        minimum_turn,maximum_turn=prior['minimum_turn'],prior['maximum_turn']
+    else:
+        paths=Paths(dict(fibers=str(parent/'selected_with_gt.vcobj'),umbilicus=config['umbilicus'],
+                         working_volume=config.get('working_volume')),d)
+    if not config.get('packed_geometry'):
+        directions=[];phase=[];z=[];radii=[];sample_owner=[];sample_arc=[];sample_phase=[];sample_z=[]
+    for i,sid in enumerate(d['source_id'] if not config.get('packed_geometry') else []):
         arc,xyz,transport=paths.paths[str(sid)];rel=paths.seam.relative(xyz)
         p=((np.arctan2(rel[:,1],rel[:,0])-paths.seam.angle)%(2*np.pi))/(2*np.pi)
         direction=np.sign((transport[-1]+p[-1]-p[0]) if d['family'][i]==0 else xyz[-1,2]-xyz[0,2])
@@ -88,14 +103,21 @@ def prepare(config):
         pos,_=paths.at_many(np.full(len(at),sid),at);rel=paths.seam.relative(pos)
         sample_owner.extend([i]*len(at));sample_arc.extend(at)
         sample_phase.extend(((np.arctan2(rel[:,1],rel[:,0])-paths.seam.angle)%(2*np.pi))/(2*np.pi));sample_z.extend(pos[:,2])
+    if not config.get('packed_geometry'):
+        minimum_turn=np.array([paths.paths[str(s)][2].min() for s in d['source_id']])
+        maximum_turn=np.array([paths.paths[str(s)][2].max() for s in d['source_id']])
     # All targets are read from the flow solution, never from rounded SGD values.
-    a,ta=paths.ends('a');b,tb=paths.ends('b');connector=paths.seam.segments(a,b)
     labels=sol['winding'][keep].copy()
-    shift=2-int(min(labels[i]+paths.paths[str(s)][2].min() for i,s in enumerate(d['source_id'])))
+    shift=2-int(np.min(labels+minimum_turn))
     labels+=shift
-    target=labels[d['j']]-labels[d['i']]+tb-ta-connector
+    if config.get('packed_geometry'):
+        from .fiber_packed_priors import fixed_targets
+        target=fixed_targets(paths,d,labels,int(config.get('preparation_batch_size',65536)))
+    else:
+        a,ta=paths.ends('a');b,tb=paths.ends('b');connector=paths.seam.segments(a,b)
+        target=labels[d['j']]-labels[d['i']]+tb-ta-connector
     if not ((target==0)&~d['parallel']).any():raise ValueError('No fixed same-sheet perpendicular meetings')
-    maximum=max(labels[i]+paths.paths[str(s)][2].max()+1 for i,s in enumerate(d['source_id']))
+    maximum=np.max(labels+maximum_turn+1)
     bins=np.arange(int(maximum)+3)
     # Radius supplies INITIALIZATION ONLY; there is no radius/width prior loss.
     known=np.unique(labels);width=np.array([np.median(np.asarray(radii)[labels==k])*2*np.pi for k in known])
@@ -140,40 +162,10 @@ def solve(config):
             state.copy_(tensor(saved['state']))
             raw.copy_(soft.encode_widths(tensor(saved['widths']),config))
             curve.u.copy_(tensor(saved['shared_u']));curve.v.copy_(tensor(saved['shared_v']))
-    i=tensor(d['i'],torch.long);j=tensor(d['j'],torch.long);par=tensor(d['parallel'],torch.bool)
-    family=tensor(d['family'],torch.long);target=tensor(d['fixed_target'])
-    same=(target==0)&~par
-    plans={k:(tensor(ids,torch.long),tensor(ds),None,None,None) for k,ids,ds in
-        [('a',d['i'],d['ds_a']),('b',d['j'],d['ds_b']),('samples',d['sample_owner'],d['sample_ds'])]}
-    sample_p=tensor(d['sample_phase']);sample_z=tensor(d['sample_z'])
-    sample_weight=1/tensor(np.bincount(d['sample_owner'])[d['sample_owner']])
-    from .fiber_uv_layout import constraint_class_weights
-    weights=tensor(constraint_class_weights(d['parallel'],dict(config,constraint_class_balance=True)))
-    def evaluate(key,widths):
-        plan=plans[key];labels=state[plan[0],0,None]
-        return tuple(x[:,0] for x in curve.hypothesis_queries(state,widths,plan,labels))
-    def objective():
-        widths=soft.decode_widths(raw,config)
-        qa,_,va=evaluate('a',widths);qb,_,vb=evaluate('b',widths)
-        du=qb-qa-target;dv=vb-va
-        use_u=(~par)|(family[i]==1);use_v=(~par)|(family[i]==0)
-        # Conditional on ONE label per fiber, there are no probability tails,
-        # gating decisions, or measured-distance target re-selections.
-        u=((weights*use_u*du.square()).mean())*config.get('distance_weight',1.)
-        v=(weights*use_v*(dv/config.get('v_pair_scale',1000.)).square()).mean()*config.get('metric_weight',1.)
-        bounds=width_boundaries(widths)
-        xa=soft.uv.q_to_u(qa,widths,bounds);xb=soft.uv.q_to_u(qb,widths,bounds)
-        meeting=((xa[same]-xb[same]).square()+(va[same]-vb[same]).square()).mean()/config.get('meeting_scale',128.)**2
-        _,phase,zz=evaluate('samples',widths)
-        phase_prior=(soft.circular(phase-sample_p).square()*sample_weight).sum()/n
-        z_prior=(((zz-sample_z)/1000.).square()*sample_weight).sum()/n
-        terms=dict(winding=u,vertical=v,meeting=config.get('meeting_weight',1.)*meeting,
-            phase_prior=config.get('prior_weight',.000625)*phase_prior,
-            z_prior=config.get('v_prior_weight',.01)*z_prior)
-        terms.update(soft.width_regularization(raw,widths,initial_width,config))
-        return sum(terms.values()),terms
+    from .fiber_flow_uv_objective import FixedFlowObjective
+    objective=FixedFlowObjective(curve,state,raw,d,initial_width,config)
     def stats(x):
-        x=abs(x.detach().cpu().numpy())
+        x=abs(x)
         return dict(mean=float(x.mean()),median=float(np.median(x)),p95=float(np.quantile(x,.95)),maximum=float(x.max()))
     history=[]
     def save(name):
@@ -182,19 +174,17 @@ def solve(config):
             **{k:d[k] for k in ('source_id','start','end','family','direction','fixed_winding','fixed_target')})
     def record(step):
         with torch.no_grad():
-            loss,terms=objective();w=soft.decode_widths(raw,config)
-            qa,_,va=evaluate('a',w);qb,_,vb=evaluate('b',w)
-            bounds=width_boundaries(w)
-            xa=soft.uv.q_to_u(qa,w,bounds);xb=soft.uv.q_to_u(qb,w,bounds)
+            loss,terms=objective()
+            same_u,same_v,same_q,all_q=objective.errors()
             row=dict(iteration=step,seconds=time.monotonic()-started,loss=float(loss),terms={k:float(v) for k,v in terms.items()},
-                same_sheet_u_vx=stats((xb-xa)[same]),same_sheet_v_vx=stats((vb-va)[same]),
-                same_sheet_winding=stats((qb-qa)[same]),all_winding_residual=stats(qb-qa-target),
+                same_sheet_u_vx=stats(same_u),same_sheet_v_vx=stats(same_v),
+                same_sheet_winding=stats(same_q),all_winding_residual=stats(all_q),
                 winding_assignments_changed=int((state[:,0]!=tensor(d['fixed_winding'])).sum()))
         history.append(row);write(root/'history.json',history);print(json.dumps(row),flush=True)
     record(0);save('initial.npz')
     result=uncertainty_joint(objective,state,raw,extension,config.get('steps',1000),{},config,
         lambda step:record(step) if step%config.get('log_every',100)==0 else None,
-        freeze_winding=True,optimize_rejection=False)
+        freeze_winding=True,optimize_rejection=False,objective_parts=objective.parts)
     if history[-1]['iteration']!=result['iterations']:record(result['iterations'])
     save('solution.npz')
     assert np.array_equal(state[:,0].detach().cpu().numpy(),d['fixed_winding'])
@@ -203,23 +193,24 @@ def solve(config):
     # use the same fixed hypothesis and width map as the optimized objective.
     with torch.no_grad():
         widths=soft.decode_widths(raw,config)
-        q,_,v=evaluate('samples',widths)
-        x=soft.uv.q_to_u(q,widths,width_boundaries(widths))
-        q,x,v=[a.detach().cpu().numpy() for a in (q,x,v)]
+        q,x,v=objective.samples()
         positions=[];node_index=np.zeros(n,np.int64)
         for k,owner in enumerate(d['sample_owner']):
-            positions.append(dict(fiber_uuid=str(d['source_id'][owner]),layer=0,
+            positions.append(dict(fiber_uuid=str(d['source_id'][owner]),layer=3,
                 hypothesis=int(d['fixed_winding'][owner]),node_index=int(node_index[owner]),
                 arc=float(d['sample_ds'][k]*d['direction'][owner]),
-                u_turns=float(q[k]),u_vx=float(x[k]),v_vx=float(v[k])))
+                u_turns=float(q[k]-d['fixed_winding'][owner]),u_vx=float(x[k]),v_vx=float(v[k])))
             node_index[owner]+=1
-        write_results(root/'solution.vcobj',[Path(config['flow_root'])/'selected_with_gt.vcobj'],
+        run_uuid=write_results(config.get('result_store',root/'solution.vcobj'),[Path(config['flow_root'])/'selected_with_gt.vcobj'],
             'fixed_winding_uv',config.get('optimizer','torch_lbfgs'),
             dict(positions=positions,
                  widths=[dict(winding=i,width_vx=float(w)) for i,w in enumerate(widths.cpu().numpy())],
                  fibers=[dict(fiber_uuid=str(fid),enabled=1,family=int(d['family'][i]),
-                              selected_winding=int(d['fixed_winding'][i])) for i,fid in enumerate(d['source_id'])]))
-    summary=dict(optimizer=result,initial=history[0],final=history[-1],seconds=time.monotonic()-started,
+                              selected_winding=int(d['fixed_winding'][i])) for i,fid in enumerate(d['source_id'])]),
+            input_runs=[config.get('input_run_uuid')],
+            settings=dict(global_integer_shift=json.loads((root/'selection.json').read_text())['global_integer_shift'],
+                          batch_size=objective.batch,assignments_fixed=True))
+    summary=dict(run_uuid=run_uuid,optimizer=result,initial=history[0],final=history[-1],seconds=time.monotonic()-started,
         retained=n,assignments_fixed=True,disablement_possible=False,peak_vram_bytes=torch.cuda.max_memory_allocated())
     write(root/'summary.json',summary)
     return summary
@@ -273,8 +264,8 @@ def run(config):
     else:
         prepare(config)
         result=launch_tensor_solve(config,__name__,Path(__file__))
-    visualize(config)
-    if not (root/'fibers.vcobj').exists():
+    if config.get('visualize',True):visualize(config)
+    if config.get('write_geometry_store',True) and not (root/'fibers.vcobj').exists():
         source=Path(config['flow_root'])/'selected_with_gt.vcobj'
         d=arrays(root/'tensors.npz')
         volume=workflow_volume(dict(fibers=str(source),working_volume=config.get('working_volume')))

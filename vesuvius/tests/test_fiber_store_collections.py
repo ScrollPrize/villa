@@ -11,6 +11,43 @@ from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
 )
 
 
+def test_implicit_volume_catalog_loads_records_once_and_matches_explicit(monkeypatch):
+    from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
+    volume=str(uuid.UUID(int=900));calls=[]
+    records=[dict(uuid=str(uuid.UUID(int=1)),name='fiber',
+                  meta=dict(coordinates=dict(volume_uuid=volume,scale_factor=2.)),
+                  fiber=dict(family='H',length=10.,line_point_count=3,bbox=[0.,0.,0.,4.,6.,8.]))]
+    class Reader:
+        def __init__(self,path):pass
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def objects(self,kind):calls.append(kind);return records
+    monkeypatch.setattr(fiber_store,'CollectionReader',Reader)
+    expected=fiber_store.fiber_catalog('source',volume)
+    assert calls==['fiber'];calls.clear()
+    assert fiber_store.fiber_catalog('source')==expected
+    assert calls==['fiber'];calls.clear()
+    assert fiber_store.fiber_volume('source')==volume
+    assert calls==['fiber']
+    assert expected[0]['length']==5. and expected[0]['point_count']==3
+
+
+@pytest.mark.parametrize('resolver',[fiber_catalog,fiber_volume])
+def test_implicit_volume_rejects_mixed_source_frames_once(monkeypatch,resolver):
+    from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
+    calls=[]
+    class Reader:
+        def __init__(self,path):pass
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def objects(self,kind):
+            calls.append(kind)
+            return [dict(meta=dict(coordinates=dict(volume_uuid=str(uuid.UUID(int=i))))) for i in (1,2)]
+    monkeypatch.setattr(fiber_store,'CollectionReader',Reader)
+    with pytest.raises(ValueError,match='must be bound to one volume'):resolver('source')
+    assert calls==['fiber']
+
+
 @pytest.mark.parametrize('workers,packed', [(1, False), (4, False), (4, True)])
 def test_initial_collection_geometry_and_identity(tmp_path, workers, packed):
     volume = str(uuid.UUID(int=900))

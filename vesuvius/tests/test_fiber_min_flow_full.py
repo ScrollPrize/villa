@@ -8,6 +8,57 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_benchmark import Path
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_full import PackedPaths,KEY_DTYPE,PACKED_GEOMETRY_FORMAT
 
 
+def test_sparse_source_ids_partition_rows_exactly_once():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_full import constraint_jobs
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
+    maximum=np.iinfo(np.int64).max
+    ids=np.array([0,2**32+3,2**40,2**48,maximum-1,maximum],np.int64)
+    jobs=constraint_jobs(ids,2)
+    assert len(jobs)==3
+    assert jobs[-1][1]==int(maximum)+1
+    graph=object.__new__(FiberGraph);graph.event_ids=ids
+    read=[]
+    for first,last in jobs:
+        for batch in graph.batches(1,first,last):read.extend(range(batch.start,batch.stop))
+    assert read==list(range(len(ids)))
+    assert list(graph.batches(1,maximum,maximum+1))==[slice(5,6)]
+
+
+def test_constraint_job_rejects_stale_interval_marker(tmp_path,monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_min_flow_full as full
+    parts=tmp_path/'graph_parts';parts.mkdir()
+    (parts/'0000000000.json').write_text(json.dumps(dict(first=0,last=500000,read=0)))
+    np.savez(parts/'0000000000.npz',a=[],b=[],target=[],weight=[])
+    calls=[]
+    def events(config,paths,db,first,last):
+        calls.append((first,last))
+        yield 2,dict(i=np.array([],np.int64))
+    monkeypatch.setattr(full,'event_batches',events)
+    monkeypatch.setattr(full,'_worker',(dict(output_root=str(tmp_path)),None,None))
+    result=full.constraint_job((0,2**32+4))
+    assert calls==[(0,2**32+4)] and result['read']==2
+    assert result['last']==2**32+4
+    calls.clear()
+    assert full.constraint_job((0,2**32+4))==result
+    assert calls==[]
+
+
+def test_legacy_sgd_preparation_uses_sparse_row_jobs(tmp_path,monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_flow_sgd_full as sgd
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_full import constraint_jobs
+    source=tmp_path/'source';source.mkdir();(source/'geometry').mkdir()
+    (source/'request.json').write_text(json.dumps(dict(config=dict(database='graph',constraint_batch=2))))
+    ids=np.array([0,2**32+1,2**40,2**48,np.iinfo(np.int64).max],np.int64)
+    monkeypatch.setattr(sgd,'PackedPaths',lambda _:SimpleNamespace(ids=np.array(['fiber'])))
+    monkeypatch.setattr(sgd.FiberGraph,'cached',lambda *args:SimpleNamespace(event_ids=ids))
+    def scheduled(config,stage,jobs,worker):
+        assert stage=='events' and jobs==constraint_jobs(ids,2) and len(jobs)==3
+        raise RuntimeError('stop after scheduling')
+    monkeypatch.setattr(sgd,'parallel_stage',scheduled)
+    with pytest.raises(RuntimeError,match='stop after scheduling'):
+        sgd.prepare(dict(output_root=str(tmp_path/'output'),source_root=str(source)),{})
+
+
 def test_packed_matches_scalar_paths_with_zero_segments_and_axis_knots(tmp_path):
     axis=np.array([[0,0,-10],[.2,.1,0],[0,0,10]])
     seam=Seam(axis)
@@ -92,9 +143,8 @@ def test_full_prepare_records_working_frame_but_counts_source_points(tmp_path,mo
     np.savez(comparison,ids=np.array([sid]),labels=np.array([0]))
     np.savez(normal,ids=np.array([sid]),normal_sign=np.array([1]),normal_convention='inward')
     monkeypatch.setattr(mod,'workflow_volume',lambda _:target)
-    monkeypatch.setattr(mod,'fiber_volume',lambda _:source)
-    def catalog(path,volume):
-        assert path=='source' and volume==source
+    def catalog(path,volume=None):
+        assert path=='source' and volume is None
         return [dict(id=sid,point_count=2)]
     def axis(path,volume):
         assert path=='axis' and volume==target
@@ -102,9 +152,12 @@ def test_full_prepare_records_working_frame_but_counts_source_points(tmp_path,mo
     monkeypatch.setattr(mod,'fiber_catalog',catalog)
     monkeypatch.setattr(normals,'load_umbilicus_frame',axis)
     monkeypatch.setattr(mod,'parallel_stage',lambda *args:[])
-    monkeypatch.setattr(mod.FiberGraph,'cached',lambda *args:SimpleNamespace(event_ids=np.array([0])))
+    def cached(database,root):
+        assert database=='graph' and root==tmp_path/'shared-columns'
+        return SimpleNamespace(event_ids=np.array([0]))
+    monkeypatch.setattr(mod.FiberGraph,'cached',cached)
     config=dict(fibers='source',database='graph',umbilicus='axis',comparison=str(comparison),
-                normal_solution=str(normal),output_root=str(tmp_path/'out'))
+                normal_solution=str(normal),output_root=str(tmp_path/'out'),graph_cache=str(tmp_path/'shared-columns'))
     result=mod.prepare(config)
     assert result['volume'].item()==target
     assert result['point_offset'].tolist()==[0,2]

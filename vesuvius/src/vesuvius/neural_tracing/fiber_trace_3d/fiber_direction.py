@@ -110,9 +110,9 @@ def prepare(config):
     if not len(active):raise ValueError('No retained family fibers')
     graph=FiberGraph(config['database'])
     axis=load_umbilicus_frame(config['umbilicus'],graph.volume)
-    records=[r[:5] for r in graph.endpoint_rows() if r[11]>r[12]]
-    rows=np.asarray([(r[0],r[3],r[4]) for r in records],dtype=float).reshape(-1,3)
-    ends=np.asarray([r[1:3] for r in records],dtype=str).reshape(-1,2)
+    records=[r for r in graph.endpoint_rows() if r['parallel']]
+    rows=np.asarray([(r['event_id'],r['arc_a'],r['arc_b']) for r in records],dtype=float).reshape(-1,3)
+    ends=np.asarray([(r['fiber_a'],r['fiber_b']) for r in records],dtype=str).reshape(-1,2)
     idx=np.searchsorted(ids,ends)
     if np.any(idx>=len(ids)) or not np.array_equal(ids[idx],ends):raise ValueError('Unknown event fiber')
     mask=(labels[idx]==label).all(1);original_parallel=len(rows);rows=rows[mask];idx=idx[mask]

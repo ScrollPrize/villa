@@ -27,6 +27,15 @@ def test_preparation_freezes_stage1_and_active_degree(tmp_path):
         np.testing.assert_array_equal(data['inherited'],[False,True,False,False])
         assert data['ids'].dtype.kind=='U' and list(data['ids'])==ids
     before=cache.stat().st_mtime_ns;prepare(config);assert cache.stat().st_mtime_ns==before
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
+    graph=FiberGraph(dbpath)
+    reused=dict(config,tensor_cache=str(tmp_path/'reused.npz'))
+    prepare(reused,graph=graph)
+    with np.load(cache) as original, np.load(reused['tensor_cache']) as shared:
+        for name in original.files:np.testing.assert_array_equal(original[name],shared[name])
+    graph.source=dict(graph.source,commit_sequence=-1)
+    with pytest.raises(ValueError,match='another snapshot'):
+        prepare(dict(config,tensor_cache=str(tmp_path/'wrong.npz')),graph=graph)
     feature.write_text(json.dumps(dict(payload,fibers_digest='wrong snapshot')))
     with pytest.raises(ValueError,match='content mismatch'):prepare(config)
     feature.write_text(json.dumps(dict(payload,source_ids=ids[::-1])))
@@ -45,6 +54,21 @@ def test_feature_export_records_store_identity(tmp_path,monkeypatch):
     monkeypatch.setattr(native,'run_native_constraints',lambda path,settings:calls.append(json.loads(Path(path).read_text())))
     run_features(dict(native_config=str(tmp_path/'native.json'),output_root=str(tmp_path/'out')))
     assert calls[0]['fibers_digest']==fibers_digest(store) and len(calls[0]['umbilicus_sha256'])==64
+
+
+def test_preparation_does_not_require_prior_sign_stage(tmp_path):
+    import json
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_hv_stage import prepare
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+    database=measured_store(tmp_path,[(0,10,20,False,.5)],isolated_ids=[30])
+    ids=list(map(uid,[10,20,30]));features=tmp_path/'features.json'
+    features.write_text(json.dumps(dict(format='fiber-axial-priors',version=1,source_ids=ids,
+        agreement=[-1,1,0],fibers_digest=fibers_digest(database),umbilicus_sha256='test')))
+    cache=tmp_path/'hvb.npz'
+    prepare(dict(database=str(database),features=str(features),tensor_cache=str(cache)))
+    with np.load(cache) as data:
+        np.testing.assert_array_equal(data['active'],[0,1,2])
+        assert not data['inherited'].any()
 
 
 def test_scalar_objective_and_gradients():

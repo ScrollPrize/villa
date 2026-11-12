@@ -80,6 +80,14 @@ def test_cached_tensor_identity_and_invalid_edges(tmp_path):
     stats=json.loads(cache.with_suffix('.json').read_text())
     assert stats['invalid_events_skipped']==1 and stats['isolated_fibers']==1
     assert prepare(config)==cache
+    reused=dict(config,tensor_cache=str(tmp_path/'reused.npz'))
+    prepare(reused,graph=graph)
+    with np.load(cache) as original, np.load(reused['tensor_cache']) as shared:
+        for name in original.files:np.testing.assert_array_equal(original[name],shared[name])
+    graph.source=dict(graph.source,commit_sequence=-1)
+    with pytest.raises(ValueError,match='another snapshot'):
+        prepare(dict(config,tensor_cache=str(tmp_path/'wrong.npz')),graph=graph)
+    graph.source=payload['source_store']
     prior.write_text(json.dumps(dict(payload,source_store=dict(graph.source,commit_sequence=-1))))
     with pytest.raises(ValueError,match='another store snapshot'):
         prepare(config)

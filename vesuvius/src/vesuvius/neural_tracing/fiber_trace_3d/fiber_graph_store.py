@@ -12,14 +12,14 @@ import numpy as np
 from vc_object_store import CollectionReader, fiber_graph_solve_table, fiber_graph_solve_row, write_extension_store, geometry_scale_to_volume
 
 PREFIX = 'ext_fiber_graph_solve_'
-CACHE_FORMAT = 1
+CACHE_FORMAT = 2
 
 
 def workflow_volume(config):
     """The measurement frame, or an explicit frame for already-prepared inputs.
 
-    Legacy format-1 measurements use the source geometry's volume. Format 2
-    names its frame explicitly; a registered source volume is not equivalent.
+    Compact measurements name their frame explicitly; a registered source
+    volume is not equivalent.
     Only metadata is read here, not the constraint or geometry payloads.
     """
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume
@@ -29,9 +29,9 @@ def workflow_volume(config):
             table=next((t for t in store.extension_tables() if t['name']==PREFIX+'constraints'),None)
         if table is None:raise ValueError('Store has no fiber constraint measurements')
         frame=table['provisioning'].get('coordinate_space')
-        if table['format_version']==2 and not frame:
-            raise ValueError('Format-2 measurements must name their coordinate space')
-        measured=frame.rsplit('/',1)[-1] if frame else fiber_volume(config['database'])
+        if table['format_version']!=4 or not frame:
+            raise ValueError('Compact format-4 measurements must name their coordinate space; convert older inputs explicitly')
+        measured=frame.rsplit('/',1)[-1]
         if volume is not None and volume!=measured:
             raise ValueError('Working volume differs from constraint measurement frame')
         volume=measured
@@ -41,6 +41,10 @@ def workflow_volume(config):
 def store_digest(path):
     with CollectionReader(str(path)) as store:
         source = store.source
+    return snapshot_digest(source)
+
+
+def snapshot_digest(source):
     return hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
 
 
@@ -65,12 +69,9 @@ class FiberGraph:
         self.ids = np.asarray([r['uuid'] for r in records], dtype='U36')
         volumes = {(r['meta'].get('coordinates') or {}).get('volume_uuid') for r in records}
         frame=self.measurement_info['provisioning'].get('coordinate_space')
-        if frame:
-            self.volume=frame.rsplit('/',1)[-1]
-        else:
-            if len(volumes) != 1 or None in volumes:
-                raise ValueError('Extracted graph must name its measurement volume')
-            self.volume=volumes.pop()
+        if self.measurement_info['format_version']!=4 or not frame:
+            raise ValueError('Compact format-4 graph must explicitly name its measurement volume')
+        self.volume=frame.rsplit('/',1)[-1]
         scales=[geometry_scale_to_volume(r['meta'],self.volume) for r in records]
         self.lengths=np.zeros(len(records),np.float64)
         mapped=[]
@@ -87,15 +88,21 @@ class FiberGraph:
         self.edge_uuid = np.asarray(data['edge_uuid'], dtype='U36')
         self.fiber_a = np.asarray(data['fiber_a'], dtype='U36')
         self.fiber_b = np.asarray(data['fiber_b'], dtype='U36')
-        values = np.frombuffer(data['values'], dtype='=f8').reshape(-1, 21)
+        values = np.frombuffer(data['values'], dtype='=f8').reshape(-1, 16)
         self.arc_a, self.arc_b = values[:, 0], values[:, 1]
-        self.point_a, self.point_b = values[:, 2:5], values[:, 5:8]
-        self.parallel_score, self.perpendicular_score = values[:, 8], values[:, 9]
-        self.parallel = self.parallel_score > self.perpendicular_score
-        self.distance, self.parallel_distance, self.evidence_weight = values[:, 10], values[:, 11], values[:, 12]
-        self.normal_a, self.normal_b = values[:, 13:16], values[:, 16:19]
-        self.valid_a, self.valid_b = values[:, 19].astype(bool), values[:, 20].astype(bool)
+        self.normal_a, self.normal_b = values[:, 2:5], values[:, 5:8]
+        self.connector = values[:, 8:11]
+        self.distance, self.parallel = values[:, 11], values[:, 12].astype(bool)
+        self.valid_a, self.valid_b, self.valid_connector = (values[:, k].astype(bool) for k in (13,14,15))
         self.i, self.j = self.indices(self.fiber_a), self.indices(self.fiber_b)
+
+    @property
+    def point_a(self):
+        raise ValueError('Compact winding constraints do not store endpoint XYZ; request the source fiber geometry explicitly')
+
+    @property
+    def point_b(self):
+        raise ValueError('Compact winding constraints do not store endpoint XYZ; request the source fiber geometry explicitly')
 
     def save_cache(self, root):
         """Decode once; worker processes share read-only memory-mapped columns."""
@@ -121,8 +128,7 @@ class FiberGraph:
         if info.get('format_version') != CACHE_FORMAT:
             raise ValueError('Constraint cache format changed; rebuild the graph cache')
         required={'ids','lengths','event_ids','edge_uuid','fiber_a','fiber_b','arc_a','arc_b',
-                  'point_a','point_b','parallel_score','perpendicular_score','parallel','distance',
-                  'parallel_distance','evidence_weight','normal_a','normal_b','valid_a','valid_b','i','j'}
+                  'parallel','distance','normal_a','normal_b','connector','valid_a','valid_b','valid_connector','i','j'}
         if set(info['columns']) != required:
             raise ValueError('Constraint cache columns differ; rebuild the graph cache')
         if info['source'] != source:
@@ -140,27 +146,35 @@ class FiberGraph:
         return index
 
     def endpoint_rows(self):
-        """Source-ordered endpoint records for small diagnostic traversals.
+        """Canonical endpoint records for small diagnostic traversals.
 
         Large preparation jobs use the numeric columns/batches directly.
         Normal records are decoded values, never serialized JSON.
         """
         for k, eid in enumerate(self.event_ids):
-            yield (int(eid), self.fiber_a[k], self.fiber_b[k], float(self.arc_a[k]), float(self.arc_b[k]),
-                   *self.point_a[k].tolist(), *self.point_b[k].tolist(),
-                   float(self.parallel_score[k]), float(self.perpendicular_score[k]),
-                   float(self.distance[k]), float(self.parallel_distance[k]),
-                   dict(valid=bool(self.valid_a[k]), xyz=self.normal_a[k].tolist()),
-                   dict(valid=bool(self.valid_b[k]), xyz=self.normal_b[k].tolist()))
+            yield dict(event_id=int(eid),edge_uuid=self.edge_uuid[k],fiber_a=self.fiber_a[k],fiber_b=self.fiber_b[k],
+                       arc_a=float(self.arc_a[k]),arc_b=float(self.arc_b[k]),parallel=bool(self.parallel[k]),
+                       distance=float(self.distance[k]),connector=self.connector[k].tolist(),
+                       valid_connector=bool(self.valid_connector[k]),
+                       normal_a=dict(valid=bool(self.valid_a[k]),xyz=self.normal_a[k].tolist()),
+                       normal_b=dict(valid=bool(self.valid_b[k]),xyz=self.normal_b[k].tolist()))
 
     def batches(self, size=65536, first=None, last=None):
-        lo = 0 if first is None else np.searchsorted(self.event_ids, first)
-        hi = len(self.event_ids) if last is None else np.searchsorted(self.event_ids, last)
+        # Bound before casting: a final exclusive endpoint may be INT64_MAX+1.
+        # Passing that Python int directly to NumPy can promote comparisons to
+        # float64 and lose the low source-ID bits near the integer limit.
+        def position(value, default):
+            if value is None:return default
+            if not len(self.event_ids) or value<=int(self.event_ids[0]):return 0
+            if value>int(self.event_ids[-1]):return len(self.event_ids)
+            return int(np.searchsorted(self.event_ids,np.int64(value)))
+        lo = position(first,0)
+        hi = position(last,len(self.event_ids))
         for begin in range(lo, hi, size):
             yield slice(begin, min(begin+size, hi))
 
 
-def write_results(path, dependencies, stage, method, tables, *, settings=None, run_uuid=None):
+def write_results(path, dependencies, stage, method, tables, *, settings=None, run_uuid=None, input_runs=None):
     """Write only typed result rows in a sealed overlay; input geometry is shared.
 
     Each supplied row is a dictionary without run_uuid. Settings are explicit
@@ -171,6 +185,8 @@ def write_results(path, dependencies, stage, method, tables, *, settings=None, r
         raise ValueError('Run settings must contain scalar metadata, not data arrays or configurations')
     definitions, payload = [], {}
     sources = []
+    if input_runs is not None and len(input_runs)!=len(dependencies):
+        raise ValueError('Expected one selected input run per dependency')
     for source in dependencies:
         with CollectionReader(str(source)) as store:
             sources.append(store.source)
@@ -179,6 +195,9 @@ def write_results(path, dependencies, stage, method, tables, *, settings=None, r
     rows_by_role['inputs'] = [dict(role=f'input_{i}', store_uuid=uuid.UUID(s['store_uuid']).bytes,
                                   generation_uuid=uuid.UUID(s['generation']).bytes,
                                   commit_sequence=s['commit_sequence']) for i, s in enumerate(sources)]
+    if input_runs is not None:
+        for row, selected in zip(rows_by_role['inputs'],input_runs):
+            if selected is not None:row['input_run_uuid']=str(selected)
     for role, rows in rows_by_role.items():
         definition = fiber_graph_solve_table(role)
         definition['based_on'] = sources

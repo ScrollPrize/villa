@@ -16,7 +16,7 @@ from .fiber_min_flow import Seam,aggregate_l1_edges,solve
 from .fiber_min_flow_benchmark import graph
 from .fiber_min_flow_experiment import arrays,write
 from .fiber_graph_store import FiberGraph, store_digest, write_winding_result, workflow_volume
-from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines, fiber_catalog, fiber_volume
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines, fiber_catalog
 
 KEY_DTYPE=np.dtype([('source','<i8'),('arc','<f8')])
 PACKED_GEOMETRY_FORMAT=3
@@ -56,7 +56,7 @@ class PackedPaths:
 
     def ends(self,side):
         d=self.data;pick=d['i' if side=='a' else 'j']
-        return self.at_many(self.ids[pick],d['ds_'+side])
+        return self.at_many(d.get('source_id',self.ids)[pick],d['ds_'+side])
 
     def at(self,source,arc):
         xyz,turns=self.at_many(np.array([source]),np.array([arc]))
@@ -68,7 +68,8 @@ def _init(config,stage):
     from threadpoolctl import threadpool_limits
     threadpool_limits(1)
     paths=PackedPaths(Path(config['output_root'])/'geometry',mode='r+' if stage=='geometry' else 'r')
-    _worker=(config,paths,None if stage=='geometry' else FiberGraph.cached(config['database'], Path(config['output_root'])/'constraint_columns'))
+    _worker=(config,paths,None if stage=='geometry' else FiberGraph.cached(config['database'],
+        Path(config.get('graph_cache',Path(config['output_root'])/'constraint_columns'))))
 
 
 def geometry_job(job):
@@ -98,15 +99,15 @@ def event_batches(config,paths,db,first,last):
         a=np.searchsorted(ids,sa); b=np.searchsorted(ids,sb)
         valid=(a<len(ids))&(b<len(ids))
         a=np.minimum(a,len(ids)-1); b=np.minimum(b,len(ids)-1)
-        valid&=(ids[a]==sa)&(ids[b]==sb)&db.valid_a[sl]&db.valid_b[sl]
+        valid&=(ids[a]==sa)&(ids[b]==sb)&db.valid_a[sl]&db.valid_b[sl]&db.valid_connector[sl]
         par=db.parallel[sl]
         valid&=par==(catalog['family'][a]==catalog['family'][b])
         a=a[valid]; b=b[valid]; par=par[valid]
-        sign=signed_order((db.point_b[sl]-db.point_a[sl])[valid],
+        sign=signed_order(db.connector[sl][valid],
             db.normal_a[sl][valid]*catalog['normal_sign'][a,None],
             db.normal_b[sl][valid]*catalog['normal_sign'][b,None])
         d=dict(i=a,j=b,ds_a=db.arc_a[sl][valid],ds_b=db.arc_b[sl][valid],family=catalog['family'],
-               parallel=par,sign=sign,distance=np.where(par,db.parallel_distance[sl][valid],db.distance[sl][valid]),
+               parallel=par,sign=sign,distance=db.distance[sl][valid],
                event_ids=db.event_ids[sl][valid])
         yield sl.stop-sl.start,d
 
@@ -115,7 +116,9 @@ def constraint_job(job):
     config,paths,db=_worker
     first,last=job;root=Path(config['output_root'])/'graph_parts';root.mkdir(exist_ok=True)
     marker=root/f'{first:010d}.json';out=root/f'{first:010d}.npz'
-    if marker.exists() and out.exists():return json.loads(marker.read_text())
+    if marker.exists() and out.exists():
+        saved=json.loads(marker.read_text())
+        if saved.get('first')==first and saved.get('last')==last:return saved
     started=time.monotonic();chunks=[];read=0;used=0;expanded=0
     for count,d in event_batches(config,paths,db,first,last):
         read+=count
@@ -155,7 +158,14 @@ def parallel_stage(config,stage,jobs,worker):
     return results
 
 
-def prepare(config):
+def constraint_jobs(event_ids, batch):
+    """Partition measured rows, never the potentially sparse source-ID space."""
+    if batch<1:raise ValueError('constraint_batch must be positive')
+    return [(int(event_ids[first]),int(event_ids[min(first+batch,len(event_ids))-1])+1)
+            for first in range(0,len(event_ids),batch)]
+
+
+def prepare(config, *, build_graph=True):
     from .fiber_normal_convention import inward_solution
     from .fiber_normal_sign_visualization import load_umbilicus_frame
     root=Path(config['output_root']);geo=root/'geometry';geo.mkdir(parents=True,exist_ok=True)
@@ -166,7 +176,7 @@ def prepare(config):
     volume=workflow_volume(config)
     # Only point counts/identity come from the source binding. Coordinates,
     # arc lengths and seam transport are computed in the measured graph frame.
-    rows=fiber_catalog(config['fibers'],fiber_volume(config['fibers']))
+    rows=fiber_catalog(config['fibers'])
     catalog_ids=np.asarray([r['id'] for r in rows])
     p=np.searchsorted(catalog_ids,ids)
     if np.any(p>=len(rows)) or not np.array_equal(catalog_ids[p],ids):raise ValueError('Fiber identity differs')
@@ -185,11 +195,11 @@ def prepare(config):
     batch=config.get('geometry_batch',4096)
     jobs=[(i,min(i+batch,len(ids))) for i in range(0,len(ids),batch)]
     parallel_stage(config,'geometry',jobs,geometry_job)
-    columns=FiberGraph.cached(config['database'],root/'constraint_columns')
+    if not build_graph:return catalog
+    columns=FiberGraph.cached(config['database'],Path(config.get('graph_cache',root/'constraint_columns')))
     if not len(columns.event_ids): raise ValueError('Empty constraint graph')
-    first,last=map(int,columns.event_ids[[0,-1]])
     batch=config.get('constraint_batch',500000)
-    jobs=[(i,min(i+batch,last+1)) for i in range(first,last+1,batch)]
+    jobs=constraint_jobs(columns.event_ids,batch)
     parallel_stage(config,'constraints',jobs,constraint_job)
     return catalog
 

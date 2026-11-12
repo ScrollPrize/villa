@@ -116,7 +116,7 @@ def prepare(config):
     from .fiber_graph_store import workflow_volume
     started=time.monotonic();cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
     signature={key:(fibers_digest if key=='fibers' else store_digest if key=='database' else sha256_file)(config[key]) for key in ('database','features','stage1','hv_solution','fibers','umbilicus')}
-    signature.update(version=2,minimum_length_mm=config.get('minimum_length_mm',10.),
+    signature.update(version=2,measurement_format=4,minimum_length_mm=config.get('minimum_length_mm',10.),
                      sign_cosine_min=config.get('sign_cosine_min',.1),pilot_fibers=config.get('pilot_fibers',0))
     signature['working_volume']=workflow_volume(config)
     signature['keep_whole_fibers']=bool(config.get('keep_whole_fibers',False))
@@ -163,15 +163,14 @@ def prepare(config):
         ia,ib=graph.i[pick],graph.j[pick]
         na=graph.normal_a[pick].copy();nb=graph.normal_b[pick].copy()
         na[~graph.valid_a[pick]]=np.nan;nb[~graph.valid_b[pick]]=np.nan
-        sign=signed_order(graph.point_b[pick]-graph.point_a[pick],
+        sign=signed_order(graph.connector[pick],
                           na*normal['normal_sign'][ia,None],nb*normal['normal_sign'][ib,None],
                           config.get('sign_cosine_min',.1))
         par=graph.parallel[pick]
-        distance=np.where(par,graph.parallel_distance[pick],graph.distance[pick])
+        distance=graph.distance[pick]
         if not np.isfinite(distance).all() or np.any(distance<0):raise ValueError('Invalid distance measurement')
         event_id_batches.append(graph.event_ids[pick])
-        batches.append(np.column_stack((ia,ib,graph.arc_a[pick],graph.arc_b[pick],
-                                       graph.point_a[pick],graph.point_b[pick],par,distance,sign)))
+        batches.append(np.column_stack((ia,ib,graph.arc_a[pick],graph.arc_b[pick],par,distance,sign)))
     events=np.concatenate(batches);del batches
     event_ids=np.concatenate(event_id_batches);del event_id_batches
     if not len(events):raise ValueError('Empty induced graph')
@@ -193,7 +192,7 @@ def prepare(config):
         ep=order[positions[idx]:last[idx]];ea=endpoint_arcs[ep]
         if not np.isfinite(ea).all() or np.any(ea<0) or np.any(ea>arc[-1]+1e-5):
             raise ValueError(f'Constraint arc outside original fiber {row["id"]}')
-        perp=ea[events[ep%ecount,10]==0]
+        perp=ea[events[ep%ecount,4]==0]
         bounds=(np.array([0.,arc[-1]]) if config.get('keep_whole_fibers',False)
                 else split_bounds(arc[-1],perp,minimum));first=len(pieces)
         middle=(bounds[:-1]+bounds[1:])/2
@@ -224,8 +223,8 @@ def prepare(config):
         start=p[:,1],end=p[:,2],family=p[:,3].astype(np.int64),phase=p[:,5]%1,z=p[:,6],radius=r,
         lengths=lengths,degree=degree,initial_k=initial_k.astype(np.float32),width_initial=width_initial.astype(np.float32),
         i=i,j=j,ds_a=ds_a,ds_b=ds_b,phase_a=phi_a,phase_b=phi_b,phase_delta=phase_delta,
-        distance=events[:,11].astype(np.float32),sign=events[:,12].astype(np.float32),
-        parallel=events[:,10].astype(bool),event_ids=event_ids,
+        distance=events[:,5].astype(np.float32),sign=events[:,6].astype(np.float32),
+        parallel=events[:,4].astype(bool),event_ids=event_ids,
         links=np.asarray(links,dtype=np.float64).reshape(-1,4),node_ds=nodes[:,0].astype(np.float32),
         node_phase=nodes[:,1].astype(np.float32),node_z=nodes[:,2].astype(np.float32))
     if config.get('initialization_geometry_cache'):
@@ -236,11 +235,11 @@ def prepare(config):
     np.savez(temporary,**arrays);temporary.replace(cache)
     stats=dict(signature=signature,original_fibers=len(ids),earlier_rejected=int((labels==2).sum()),
         active_fibers=int(kept.sum()),pieces=len(p),continuations=len(links),original_events=original,events=ecount,
-        known_sign_percent=float(100*np.mean(events[:,12]!=0)),parallel_events=int(events[:,10].sum()),
+        known_sign_percent=float(100*np.mean(events[:,6]!=0)),parallel_events=int(events[:,4].sum()),
         minimum_piece_base=minimum,additional_pieces=int(len(p)-len(geometry)),
         split_fibers=int(np.sum(np.bincount(p[:,0].astype(int),minlength=len(ids))>1)),seconds=time.monotonic()-started,
         width_initial_range=[float(width_initial.min()),float(width_initial.max())],
-        distance_quantiles=np.quantile(events[:,11],[0,.5,.95,.99,1]).tolist())
+        distance_quantiles=np.quantile(events[:,5],[0,.5,.95,.99,1]).tolist())
     atomic_write(stamp,stats,durable=False);print('UV prepared '+json.dumps(stats),flush=True)
 
 

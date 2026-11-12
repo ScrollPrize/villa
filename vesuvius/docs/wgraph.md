@@ -1,0 +1,81 @@
+# `vc_wgraph`: reusable winding-graph stages
+
+`vc_wgraph` exposes the shared importer, extractor and solver stages. It does not embed datasets, host paths or alternative solver implementations. Install the normal `vesuvius` package to receive the console command; an existing development environment can also run `python -m vesuvius.wgraph` or `python vesuvius/scripts/vc_wgraph`.
+
+```sh
+vc_wgraph import import-settings.json -i fibers.afv -o fibers.vcobj
+vc_wgraph extract extraction.json -i fibers.vcobj -o constraints.vcobj
+vc_wgraph hvb solve-settings.json -i constraints.vcobj -o classes.vcobj
+vc_wgraph sign solve-settings.json -i classes.vcobj -o signs.vcobj
+vc_wgraph winding solve-settings.json -i signs.vcobj -o windings.vcobj
+vc_wgraph uv solve-settings.json -i windings.vcobj -o uv.vcobj
+```
+
+Each stage accepts an optional profile name or arbitrary JSON configuration file; omission selects `default`. `-i/--input` and `-o/--output` override the actual input/output store paths. They never silently replace a separately configured report or working directory. JSON paths retain the existing native convention: relative paths are relative to the process's working directory, not the profile's directory.
+
+| Stage | Input configuration key | Output store key | Other outputs |
+|---|---|---|---|
+| `import` | `source` | `output` | `report`, default `<output-stem>.import.json` |
+| `extract` | `fibers` | `database` | `output` report, default `<output-stem>.extraction.json`; `normal_prior_output`, default `<output-stem>.outward-priors.json` |
+| `hvb`, `sign`, `winding`, `uv` | `database` | `result_store` | Stage work artifacts under `output_root` |
+
+If not configured, `output_root` is `<output-store>.work`. Native stages reuse the existing workflow supervisor for frozen configurations, progress logs and run timing. Import/extraction JSON retains its normal native settings, including source provenance/coordinate binding and prediction locations. The CLI does not invent these dataset-specific values. If an umbilicus file is configured without its checksum, the native-stage adapter computes the checksum using the existing shared helper.
+
+## Profiles
+
+Use `vc_wgraph profiles` to list names and their source files. Names resolve in the following order:
+
+1. Directories passed with repeatable global `--profile-dir DIRECTORY` options.
+2. Directories in `VC_WGRAPH_PROFILE_PATH`, separated by the platform's path separator.
+3. `$XDG_CONFIG_HOME/vc_wgraph/profiles` (normally `~/.config/vc_wgraph/profiles`).
+4. Packaged profiles.
+
+For example, a local `example.json` in one of these directories is selected by `vc_wgraph extract example -i fibers.vcobj -o constraints.vcobj`. Local profiles and paths need not be checked into the repository. Packaged `default` contains only generic algorithm/transport settings; runtime compute-core selection remains native, and there is no fixed host CPU count.
+
+A JSON file can be a flat native/stage configuration, or a workflow profile combining common and stage-specific settings:
+
+```json
+{
+  "version": 1,
+  "common": {"seed": 0},
+  "stages": {
+    "import": {"volume_id": "catalog-volume-id", "packed": true},
+    "extract": {"coordinate_space": "sample/volume", "normal_manifest": "prediction.zarr", "normal_provenance": "inference.json"},
+    "hvb": {},
+    "sign": {},
+    "winding": {},
+    "uv": {}
+  }
+}
+```
+
+Packaged stage defaults are merged first, then the selected common and stage settings, then input/output overrides. Nested JSON objects are merged rather than replacing unrelated keys. Workflow-profile root keys are restricted to `version`, `common` and `stages` to catch misspelled settings instead of ignoring them. Each individual stage still receives its ordinary flattened configuration.
+
+`vc_wgraph extract example -i fibers.vcobj -o constraints.vcobj --print-config` prints resolved settings without accessing volumes, importing GPU solvers or running the stage. The local no-argument approval runner used in experiments is separate from this public CLI; it imposes no limitation on normal input/output selection.
+
+## Output and reuse
+
+Stages produce new stores rather than mutating inputs. Derived result stores reference their chosen upstream stores; classification, sign, winding and UV results can therefore be rerun independently of extraction. The native extraction stage publishes normal-aligned standard measurement data; staging internals are not a public graph format. See [fiber workflows](fiber_workflows.md) for the graph schemas and detailed stage output fields.
+
+The store chain is `import → extract → hvb → sign → winding → uv`. `winding` consumes typed classification and normal-sign runs from its input store references, builds the existing fractional-target L1 graph, and runs the historic linear GPU IRLS solver (15 reweighting rounds, 500 CG iterations, epsilon .05 unless explicitly overridden). It records integer readout, continuous potential, connected component and residual metrics. These are point estimates, not calibrated winding probabilities. No GT labels, spiral reference solution or external solver-source file is required. The measured geometry and umbilicus working-coordinate binding remain required inputs for seam transport.
+
+`uv` consumes a selected saved winding run, fixes those integer assignments, and invokes the existing straight fixed-length UV optimizer. It records evaluated sampled UV positions, widths and fiber assignments in a referenced result store, without copying geometry. Generic `vc_wgraph` UV uses `component_selection: "all"`; explicitly choose `"largest"` to reproduce the historical largest-component experiment. Fibers without perpendicular support are excluded by the existing fixed-length model rather than assigned fallback geometry. Work arrays and packed geometry are disposable caches, not additional public inputs. Exact packed-path prior preparation reuses the same measured geometry and interpolation as winding preparation; solver weights and GPU-manager settings can be provided under `parameters` and `gpu_manager` respectively.
+
+To reuse the winding stage's packed coordinates, set UV's optional `geometry_cache` to its `output_root/geometry` directory. The adapter verifies the exact base-store snapshot and selected classification/sign runs, then verifies the packed catalog's working-coordinate frame, umbilicus axis, IDs, point counts and labels before reuse. This is only a cache hint: omitting it rebuilds geometry from the referenced input store, without needing a saved solver checkpoint.
+
+`graph_cache` selects the shared memory-mapped measurement columns across H/V/B, sign, winding and UV stages. By default it is `<base-measurement-store>.graph-cache`. Packed-preparation workers validate and reuse this base-store snapshot rather than creating another full copy of the graph under each stage's work directory.
+
+`constraint_batch` counts measured rows per preparation task, not the numeric width of a source-ID interval. Sparse chunk-stable IDs therefore do not create empty tasks. Resume markers must match the complete task interval before their graph part is reused.
+
+For example, after configuring the source volume, prediction channels and umbilicus in a profile:
+
+```sh
+vc_wgraph hvb settings.json -i measurements.vcobj -o classified.vcobj
+vc_wgraph sign settings.json -i classified.vcobj -o signed.vcobj
+vc_wgraph winding settings.json -i signed.vcobj -o winding.vcobj
+vc_wgraph uv settings.json -i winding.vcobj -o uv.vcobj
+```
+
+When multiple terminal input runs exist, select the appropriate run explicitly (`normal_sign_run_uuid` for winding, and UV's `input_run_uuid` for its winding run). Ancestor classification/sign runs are resolved from the selected run's pinned inputs; optional explicit `classification_run_uuid` or `normal_sign_run_uuid` selectors must agree with those pins. Inconsistent combinations fail before graph preparation. Ambiguity is an error; the workflow does not silently choose the latest result. CUDA solves use the existing managed launcher; `devices` selects the GPU(s), defaulting to device 1. Grants default to non-exclusive; an explicit `gpu_manager.exclusive` setting is preserved. Any host-specific GPU reservations belong in local profiles, not the reusable API.
+
+The final console marker is `WGRAPH_STAGE_COMPLETE` followed by JSON with the stage, actual input/output paths and overall stage wall time, plus the persisted `run_uuid` for result stages. Native reports retain the separate ingestion and final-persistence timings; do not add overlapping worker timings or confuse final flush with extraction. Tests in `vesuvius/tests/test_fiber_wgraph.py` cover all six mappings, profile precedence, JSON validation, explicit overrides, dry inspection and dispatch through the existing native supervisor.

@@ -35,8 +35,8 @@ def cross_rows(graph, target_ids, reference_ids, included):
         else:
             raise ValueError('Not a bipartite cross graph')
         if included[ia]:
-            rows.append((ia, ib, aa, ab, graph.parallel_score[k], graph.perpendicular_score[k],
-                         graph.distance[k], graph.parallel_distance[k]))
+            rows.append((ia, ib, aa, ab, float(graph.parallel[k]), float(not graph.parallel[k]),
+                         graph.distance[k], graph.distance[k]))
     return np.asarray(rows, dtype=float).reshape(-1, 8)
 
 

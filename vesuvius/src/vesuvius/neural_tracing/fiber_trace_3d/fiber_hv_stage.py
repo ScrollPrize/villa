@@ -46,7 +46,8 @@ def hard_metrics(probs,a,i,j,relation,lengths):
 
 def run_features(config):
     from .constraint_extraction import run_native_constraints
-    native=json.loads(Path(config['native_config']).read_text())
+    native=(dict(config['native_config']) if isinstance(config['native_config'],dict)
+            else json.loads(Path(config['native_config']).read_text()))
     identity=lambda:dict(fibers_digest=fibers_digest(native['fibers']),umbilicus_sha256=sha256_file(native['umbilicus']))
     native.update(identity())
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
@@ -57,9 +58,12 @@ def run_features(config):
         raise RuntimeError('Feature input changed during export')
 
 
-def verify_feature_source(database,feature):
+def verify_feature_source(database,feature, *, graph=None):
     """Bind cached scores to the actual fiber store used by the immutable constraint DB."""
-    graph = FiberGraph(database)
+    graph = FiberGraph(database) if graph is None else graph
+    from .fiber_graph_store import snapshot_digest
+    if snapshot_digest(graph.source) != store_digest(database):
+        raise ValueError('Prepared graph belongs to another snapshot')
     if fibers_digest(database) != feature['fibers_digest']:
         raise ValueError('Axial/source fiber store content mismatch')
     if not np.array_equal(graph.ids, feature['source_ids']):
@@ -67,26 +71,30 @@ def verify_feature_source(database,feature):
     return dict(fibers_digest=feature['fibers_digest'], fibers_checked=len(graph.ids))
 
 
-def prepare(config):
-    start=time.monotonic();database=Path(config['database']);features=Path(config['features']);stage1=Path(config['stage1'])
-    signature=dict(version=1,database=store_digest(database),features=sha256_file(features),stage1=sha256_file(stage1))
+def prepare(config, *, graph=None):
+    start=time.monotonic();database=Path(config['database']);features=Path(config['features'])
+    stage1=Path(config['stage1']) if config.get('stage1') else None
+    signature=dict(version=1,database=store_digest(database),features=sha256_file(features),stage1=sha256_file(stage1) if stage1 else None)
     cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
     feature=json.loads(features.read_text())
     if feature['format']!='fiber-axial-priors' or feature['version']!=1:raise ValueError('Wrong axial features')
-    verify_feature_source(database,feature)
     if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
-    graph = FiberGraph(database)
-    prior_summary=json.loads((stage1.parent/'summary.json').read_text())
-    if prior_summary['input']['signature']['database_sha256']!=signature['database']:raise ValueError('Stage1/DB mismatch')
+    graph = FiberGraph(database) if graph is None else graph
+    verify_feature_source(database,feature,graph=graph)
+    if stage1:
+        prior_summary=json.loads((stage1.parent/'summary.json').read_text())
+        if prior_summary['input']['signature']['database_sha256']!=signature['database']:raise ValueError('Stage1/DB mismatch')
     ids, lengths = graph.ids, graph.lengths
     if not len(ids) or not np.all(ids[1:]>ids[:-1]):raise ValueError('Expected nonempty ascending source IDs')
-    with np.load(stage1,allow_pickle=False) as initial:
-        if not np.array_equal(ids,initial['ids']):raise ValueError('Stage1 IDs mismatch')
-        inherited=initial['broken'].copy()
+    inherited=np.zeros(len(ids),dtype=bool)
+    if stage1:
+        with np.load(stage1,allow_pickle=False) as initial:
+            if not np.array_equal(ids,initial['ids']):raise ValueError('Stage1 IDs mismatch')
+            inherited=initial['broken'].copy()
     if not np.array_equal(ids,feature['source_ids']):raise ValueError('Axial IDs mismatch')
     a=np.asarray(feature['agreement'],np.float32)
     if a.shape!=ids.shape or not np.isfinite(a).all() or np.any(abs(a)>1.00001):raise ValueError('Invalid axial scores')
-    relation=np.sign(graph.parallel_score-graph.perpendicular_score)
+    relation=np.where(graph.parallel,1.,-1.)
     ties=int((relation==0).sum());original_parallel=int((relation>0).sum());original_perp=int((relation<0).sum())
     keep=~inherited[graph.i]&~inherited[graph.j]&(relation!=0)
     chunks=[np.column_stack((graph.i[keep],graph.j[keep],relation[keep]))]
@@ -108,7 +116,20 @@ def prepare(config):
     atomic_write(stamp,stats,durable=False);print('H/V preparation '+json.dumps(stats),flush=True)
 
 
+def readout_metrics(probs,data,stats):
+    m=hard_metrics(probs,data['a'],data['i'],data['j'],data['relation'],data['lengths'])
+    m['total_broken']=stats['inherited_broken']+m['newly_broken']
+    m['total_broken_percent']=100*m['total_broken']/stats['all_fibers']
+    for name in ('parallel','perpendicular'):
+        original=stats['original_'+name]
+        m[name]['retained_of_pre_stage1_percent']=100*m[name]['retained']/original if original else None
+    return m
+
+
 def solve(config):
+    if config.get('optimizer')=='wrapped_irls':
+        from .fiber_wrapped_stages import solve_stage
+        return solve_stage(config,'classification')
     import torch
     if not torch.cuda.is_available():raise RuntimeError('Production H/V optimization requires CUDA')
     torch.set_num_threads(4);torch.manual_seed(config.get('seed',0));torch.use_deterministic_algorithms(True)
@@ -119,12 +140,7 @@ def solve(config):
     initial=torch.where(a==0,torch.full_like(a,.001),2*a)
     stats=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text())
     def readout(p):
-        m=hard_metrics(p,d['a'],d['i'],d['j'],d['relation'],d['lengths'])
-        m['total_broken']=stats['inherited_broken']+m['newly_broken'];m['total_broken_percent']=100*m['total_broken']/stats['all_fibers']
-        for name in ('parallel','perpendicular'):
-            original=stats['original_'+name]
-            m[name]['retained_of_pre_stage1_percent']=100*m[name]['retained']/original if original else None
-        return m
+        return readout_metrics(p,d,stats)
     baseline=readout(probabilities(initial,torch.full_like(a,-30)).cpu().numpy())
     runs=[];steps=int(config.get('steps',10000));every=int(config.get('log_every',1000))
     for cost_mode in config.get('cost_modes',['uniform','degree_mix']):
@@ -153,11 +169,12 @@ def solve(config):
         labels=np.argmax(full,axis=1).astype(np.uint8)
         np.savez(root/f'solution_{name}.npz',ids=d['ids'],probabilities=full,labels=labels,
                  inherited_broken=d['inherited'],hv_logit=h.detach().cpu().numpy(),broken_logit=b.detach().cpu().numpy(),active=d['active'])
-        write_results(root/f'solution_{name}.vcobj',[config['database']], 'classification', 'adam',
-            {'fibers':[dict(fiber_uuid=str(fid),family=int(label),enabled=int(label!=2),
-                            p_h=float(p[0]),p_v=float(p[1]),p_broken=float(p[2]))
-                       for fid,label,p in zip(d['ids'],labels,full)]},
-            settings=dict(broken_penalty=float(penalty),entropy_weight=float(entropy_max),steps=steps))
+        if config.get('write_result_store',True):
+            write_results(root/f'solution_{name}.vcobj',[config['database']], 'classification', 'adam',
+                {'fibers':[dict(fiber_uuid=str(fid),family=int(label),enabled=int(label!=2),
+                                p_h=float(p[0]),p_v=float(p[1]),p_broken=float(p[2]))
+                           for fid,label,p in zip(d['ids'],labels,full)]},
+                settings=dict(broken_penalty=float(penalty),entropy_weight=float(entropy_max),steps=steps))
         runs.append(dict(name=name,cost_mode=cost_mode,penalty=penalty,entropy_max=entropy_max,final=history[-1]))
     summary=dict(config=config,input=stats,baseline=baseline,runs=runs,gpu=torch.cuda.get_device_name(),
                  peak_allocated_bytes=torch.cuda.max_memory_allocated(),labels=['H','V','broken'],

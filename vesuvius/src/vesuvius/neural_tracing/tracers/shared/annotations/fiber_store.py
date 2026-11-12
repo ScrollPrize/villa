@@ -35,6 +35,11 @@ def fiber_volume(path):
     """The one volume every fiber is bound to, across the complete collection."""
     with CollectionReader(str(path)) as store:
         records = store.objects('fiber')
+    return _fiber_records_volume(records,path)
+
+
+def _fiber_records_volume(records, path):
+    """Resolve the unique source frame from an already-loaded record snapshot."""
     if not records:
         raise ValueError(f'No fibers in {path}')
     volumes = {(r['meta'].get('coordinates') or {}).get('volume_uuid') for r in records}
@@ -43,10 +48,15 @@ def fiber_volume(path):
     return volumes.pop()
 
 
-def fiber_catalog(path, volume):
-    """UUID-ordered catalog, including shards/references; geometry is not decoded."""
+def fiber_catalog(path, volume=None):
+    """UUID-ordered catalog; omitted volume uses the unique source frame.
+
+    Shards/references are included, geometry is not decoded, and source-frame
+    inference reuses the same loaded record snapshot rather than rescanning.
+    """
     with CollectionReader(str(path)) as store:
         records = store.objects('fiber')
+    if volume is None:volume=_fiber_records_volume(records,path)
     rows = []
     for record in records:
         fiber = record.get('fiber') or {}

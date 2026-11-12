@@ -228,10 +228,10 @@ def audit_measurements(config, data, sources):
         raise ValueError('Source graph fiber missing from normal solution')
     ends = np.array([[lookup[str(s)] for s in pair] for pair in ids])
     par = graph.parallel[take]
-    distance = np.where(par, graph.parallel_distance[take], graph.distance[take])
+    distance = graph.distance[take]
     def normals(values, valid, side):
         return np.where(valid[take,None], values[take], np.nan)*normal['normal_sign'][ends[:,side],None]
-    sign = signed_order(graph.point_b[take]-graph.point_a[take],
+    sign = signed_order(graph.connector[take],
         normals(graph.normal_a, graph.valid_a, 0), normals(graph.normal_b, graph.valid_b, 1),
         sources.get('sign_cosine_min', .1))
     if not np.array_equal(sign, data['sign']) or not np.array_equal(par, data['parallel']) or not np.allclose(distance, data['distance'], rtol=1e-7, atol=1e-8):

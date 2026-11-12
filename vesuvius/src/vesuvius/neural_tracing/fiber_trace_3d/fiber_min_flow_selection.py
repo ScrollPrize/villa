@@ -117,16 +117,16 @@ class EdgeStore:
             if a not in self.eligible or b not in self.eligible:continue
             if self.groups is not None and self.groups[a]==self.groups[b]:continue
             if g.parallel[e] != (self.labels[a]==self.labels[b]):continue
-            if g.valid_a[e] and g.valid_b[e]:accepted.append(e)
+            if g.valid_a[e] and g.valid_b[e] and g.valid_connector[e]:accepted.append(e)
         use = np.asarray(accepted,np.int64)
         if len(use):
             a,b=g.fiber_a[use],g.fiber_b[use]
-            signs=signed_order(g.point_b[use]-g.point_a[use],
+            signs=signed_order(g.connector[use],
                 g.normal_a[use]*np.asarray([self.normal[x] for x in a])[:,None],
                 g.normal_b[use]*np.asarray([self.normal[x] for x in b])[:,None])
             part=np.empty((len(use),7),object)
             part[:,0]=a;part[:,1]=b;part[:,2]=g.arc_a[use];part[:,3]=g.arc_b[use]
-            part[:,4]=np.where(g.parallel[use],g.parallel_distance[use],g.distance[use])
+            part[:,4]=g.distance[use]
             part[:,5]=signs;part[:,6]=g.parallel[use]
             self.parts.append(part)
         self.read.update(pending)

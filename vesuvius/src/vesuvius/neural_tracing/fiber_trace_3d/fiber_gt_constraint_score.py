@@ -312,10 +312,14 @@ def run(settings):
     gauge_flips=0
     from .fiber_graph_store import FiberGraph
     for r in FiberGraph(root/'orient.vcobj').endpoint_rows():
-        ida,idb=r[1],r[2];ka,sa=kinds[ida],ida;kb,sb=kinds[idb],idb
+        ida,idb=r['fiber_a'],r['fiber_b'];ka,sa=kinds[ida],ida;kb,sb=kinds[idb],idb
         if ka==kb:excluded['non_cross']+=1;continue
-        if ka=='test':ti,gi,ts,gid,ta,ga,tx,gx,normal=ida,idb,sa,sb,r[3],r[4],r[5:8],r[8:11],r[16]
-        else:ti,gi,ts,gid,ta,ga,tx,gx,normal=idb,ida,sb,sa,r[4],r[3],r[8:11],r[5:8],r[15]
+        if ka=='test':
+            ti,gi,ts,gid,ta,ga,normal=ida,idb,sa,sb,r['arc_a'],r['arc_b'],r['normal_b']
+            connector=np.asarray(r['connector'])
+        else:
+            ti,gi,ts,gid,ta,ga,normal=idb,ida,sb,sa,r['arc_b'],r['arc_a'],r['normal_a']
+            connector=-np.asarray(r['connector'])
         tp=piece_at(d,ts,ta);gp=piece_at(gd,gid,ga)
         if tp is None:excluded['outside_test_piece']+=1;continue
         if gp is None:raise ValueError('GT event outside intact curve')
@@ -327,13 +331,13 @@ def run(settings):
         if not valid[0] or abs(agreement)<.5:excluded['invalid_gt_normal']+=1;continue
         inward=raw*(1 if agreement>=0 else -1)
         gauge_flips+=bool((agreement>=0)!=(normal_sign[gid]>=0))
-        connector=np.asarray(gx)-tx;length=np.linalg.norm(connector)
+        length=np.linalg.norm(connector)
         cosine=-float(np.dot(connector,inward))/max(length,1e-30)
         if length==0 or abs(cosine)<.1:excluded['tangent_connector']+=1;continue
         sign=1 if cosine>0 else -1
         at=float(np.interp(ta,*angles[ti]));ag=float(np.interp(ga,*angles[gi]))
-        pd=(ag-at+.5)%1-.5;parallel=r[11]>r[12];distance=float(r[14] if parallel else r[13])
-        events.append(dict(event_id=int(r[0]),test_source=ts,test_piece=tp,gt_source=gid,gt_piece=gp,
+        pd=(ag-at+.5)%1-.5;parallel=r['parallel'];distance=float(r['distance'])
+        events.append(dict(event_id=int(r['event_id']),test_source=ts,test_piece=tp,gt_source=gid,gt_piece=gp,
             test_arc=ta,gt_arc=ga,test_angle=at,gt_angle=ag,phase_delta=pd,
             family_delta=int(gd['family'][gp]-d['family'][tp]),parallel=bool(parallel),
             signed_distance=sign*distance,normal_cosine=cosine,
