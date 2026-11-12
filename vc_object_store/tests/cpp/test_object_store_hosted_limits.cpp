@@ -190,6 +190,42 @@ try {
         require(client.readGeometryArray(descriptor->uuid, array.name) ==
                     inspect.readGeometryArray(txn, descriptor->uuid, array.name), "client-side ranges");
     }
+    // The batched geometry query under the 1 MiB response limit: a revision
+    // whose arrays alone exceed it is answered without its data (read by
+    // ranges instead); after an answered small revision an oversized one waits
+    // for the next request; every answered small revision carries its bytes.
+    {
+        const auto small = util::newUuid();
+        vc::geometry::Track few; few.points = {{1, 2, 3}, {4, 5, 6}};
+        hosted.submit(request({{small, std::nullopt}},
+            {CreateObjectOp{objectRecordJson(trackRecord(small))}, PutGeometryOp{small, vc::geometry::encode(few), {}}}, "uploader"));
+        const auto smallRevision = *hosted.currentObjectRevision(small)->geometryRevision;
+        std::vector<std::string> names;
+        for (const auto& array : descriptor->arrays) names.push_back(array.name);
+        const auto bigFirst = hosted.geometryBatch({descriptor->uuid, smallRevision}, names, {});
+        require(bigFirst && bigFirst->size() == 2 && (*bigFirst)[0].descriptor && (*bigFirst)[0].arrays.empty() &&
+                    !(*bigFirst)[1].arrays.empty(),
+                "an oversized revision is answered without its arrays; the small one after it still fits");
+        const auto smallFirst = hosted.geometryBatch({smallRevision, descriptor->uuid}, names, {});
+        require(smallFirst && smallFirst->size() == 1 && !(*smallFirst)[0].arrays.empty(),
+                "a small revision keeps its arrays and the oversized one waits");
+        auto txn = inspect.read();
+        for (const auto& [name, bytes] : (*smallFirst)[0].arrays)
+            require(bytes == inspect.readGeometryArray(txn, smallRevision, name), "batched bytes under the limit");
+    }
+    // A host whose response limit cannot fit even one compact entry refuses
+    // the batched query (413), which the client treats as unsupported.
+    {
+        const auto tinyPath = directory.path / "tiny.vcobj";
+        { (void)ObjectStore::create(tinyPath, options); }
+        auto tinyOptions = o;
+        tinyOptions.maxResponseBytes = 64;
+        tinyOptions.stagingDirectory = directory.path / "tiny-staging";
+        server::Server tiny(tinyPath, tinyOptions);
+        tiny.start();
+        HostedStore client("http://127.0.0.1:" + std::to_string(tiny.port()));
+        require(!client.geometryBatch({util::newUuid()}, {"points"}, {}), "a too-small response limit refuses the batch");
+    }
     {
         HostedStoreOptions larger; larger.rangeBytes = 2 * o.maxResponseBytes;
         HostedStore client(endpoint, larger);

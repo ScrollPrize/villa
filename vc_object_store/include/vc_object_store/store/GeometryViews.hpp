@@ -1,9 +1,17 @@
 #pragma once
+#include <stdexcept>
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 namespace vc::objects {
 class TransformedGeometryView;
+// The object's recorded coordinates have no unambiguous transform to the
+// requested volume (a registration removed or made ambiguous): a property of
+// the store's state, not a transport failure.
+class MappingUnavailable : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 class StoreReader;
 namespace detail { struct GeometryReadState; struct GeometryViewState; }
 
@@ -187,6 +195,11 @@ public:
     PointCollectionView pointCollection(const std::string& objectUuid,
                                         const std::optional<std::string>& geometryRevision = std::nullopt) const;
     FiberView fiber(const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt) const;
+    // The geometry of an object revision the caller already holds (e.g. from
+    // objectsAtVersions): the same checks as fiber(uuid, head.geometryRevision)
+    // without reading the object's current head, which is a network round trip
+    // on a hosted attachment. Like any pinned view it has no version().
+    FiberView fiber(const ObjectRevision& head) const;
     TrackView track(const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt) const;
     UmbilicusView umbilicus(const std::string& objectUuid,
                             const std::optional<std::string>& geometryRevision = std::nullopt) const;
@@ -199,6 +212,9 @@ private:
     explicit GeometrySnapshot(std::shared_ptr<detail::GeometryReadState> state) : state_(std::move(state)) {}
     std::shared_ptr<detail::GeometryViewState> view(const std::string&, const std::string& kind,
                                                     const std::optional<std::string>& geometryRevision) const;
+    std::shared_ptr<detail::GeometryViewState> viewOf(const std::string& objectUuid, const GeometryRevision& revision,
+                                                      const std::string& kind) const;
+    TypedGeometryView typedView(std::shared_ptr<detail::GeometryViewState>) const;
     std::shared_ptr<detail::GeometryReadState> state_;
 };
 

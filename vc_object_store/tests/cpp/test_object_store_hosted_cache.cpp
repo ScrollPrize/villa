@@ -2,6 +2,8 @@
 // The late read must neither return nor cache the invalidated mapping.
 #include "TestSupport.hpp"
 #include "../../src/HostedSession.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include <thread>
 #include "vc_object_store/server/Server.hpp"
 #include <vc_reader/http.hpp>
 #include <boost/asio.hpp>
@@ -40,6 +42,14 @@ public:
     }
     std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(port_); }
     std::atomic<size_t> payloadRequests{0}, payloadBytes{0};
+    // Transaction payload uploads (PUT /v1/payloads/...): concurrency seen,
+    // an optional delay each, and refusal on demand; transactions forwarded.
+    std::atomic<int> uploadsInFlight{0}, maxUploadsInFlight{0}, transactions{0};
+    std::atomic<int> uploadDelayMs{0};
+    std::atomic_bool refuseUploads{false};
+    // Answered 404 without forwarding (a host that predates a route).
+    std::atomic_bool notFoundGeometryQuery{false};
+    std::atomic<int> geometryQueries{0};
     void wait()
     {
         std::unique_lock lock(mutex_);
@@ -64,6 +74,33 @@ private:
                     boost::beast::flat_buffer buffer;
                     http::request<http::string_body> request;
                     http::read(socket, buffer, request);
+                    const std::string requested(request.target());
+                    if (requested.starts_with("/v1/payloads/")) {
+                        const int now = ++uploadsInFlight;
+                        for (int seen = maxUploadsInFlight; now > seen && !maxUploadsInFlight.compare_exchange_weak(seen, now);) {}
+                        std::this_thread::sleep_for(std::chrono::milliseconds(uploadDelayMs.load()));
+                        --uploadsInFlight;
+                        if (refuseUploads) {
+                            http::response<http::string_body> refused{http::status::internal_server_error, 11};
+                            refused.body() = "{\"error\":\"refused by the test\"}";
+                            refused.keep_alive(false);
+                            refused.prepare_payload();
+                            http::write(socket, refused);
+                            return;
+                        }
+                    }
+                    if (requested == "/v1/transactions") ++transactions;
+                    if (requested == "/v1/query/geometry") {
+                        ++geometryQueries;
+                        if (notFoundGeometryQuery) {
+                            http::response<http::string_body> missing{http::status::not_found, 11};
+                            missing.body() = "{\"error\":\"no such route\"}";
+                            missing.keep_alive(false);
+                            missing.prepare_payload();
+                            http::write(socket, missing);
+                            return;
+                        }
+                    }
                     vcr::http::Options options; options.retries = 0; options.requestTimeoutMs = 10000;
                     vcr::http::Session transport(options);
                     const auto reply = transport.request(std::string(request.method_string()).c_str(),
@@ -115,7 +152,9 @@ void invalidationDuringRead(bool poll)
     server::Server server(path, {}); server.start();
     const auto endpoint = "http://127.0.0.1:" + std::to_string(server.port());
     HostedStore writer(endpoint);
-    PausingProxy proxy(endpoint, "/v1/objects/" + registration.uuid);
+    // The registration heads are read by version (one batched request) after
+    // the listing: hold that response while the registration changes.
+    PausingProxy proxy(endpoint, "/v1/query/versions");
     HostedSessionOptions hosted; hosted.client.retries = 0; hosted.client.requestTimeoutMs = 10000;
     detail::HostedAttachment attachment(proxy.endpoint(), hosted);
     auto read = std::async(std::launch::async, [&] { return attachment.volumeTransforms(); });
@@ -359,8 +398,101 @@ void persistentObjects()
 
 }
 
+// A transaction's payloads upload at most four at a time, all before the
+// transaction; a failed upload stops it from being sent.
+void boundedPayloadUploads()
+{
+    TemporaryDirectory directory;
+    const auto path = directory.path / "uploads.vcobj";
+    OpenOptions options; options.author = "upload-test";
+    { (void)ObjectStore::create(path, options); }
+    server::Server server(path, {}); server.start();
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(server.port());
+    PausingProxy proxy(endpoint, "/never-paused");
+    proxy.uploadDelayMs = 100;
+    HostedStoreOptions clientOptions; clientOptions.retries = 0;
+    HostedStore client(proxy.endpoint(), clientOptions);
+    const auto submitTracks = [&](int count, int seed) {
+        const auto status = client.status();
+        TransactionRequest request;
+        request.requestUuid = util::newUuid(); request.storeUuid = status.storeUuid;
+        request.generation = status.generation; request.author = "upload-test";
+        for (int i = 0; i < count; ++i) {
+            const auto uuid = util::newUuid();
+            ObjectRecord record; record.uuid = uuid; record.kind = "track";
+            vc::geometry::Track track; track.points = {{double(seed), double(i), 1}, {double(seed), double(i), 2}};
+            request.expectedObjects[uuid] = std::nullopt;
+            request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
+            request.operations.push_back(PutGeometryOp{uuid, vc::geometry::encode(track), {}});
+        }
+        return client.submit(request);
+    };
+    (void)submitTracks(10, 1);
+    require(proxy.maxUploadsInFlight >= 2 && proxy.maxUploadsInFlight <= 4,
+            "payloads upload concurrently, at most four at a time");
+    require(proxy.transactions == 1, "one transaction after its uploads");
+    proxy.refuseUploads = true;
+    bool failed = false;
+    try { (void)submitTracks(6, 2); } catch (const std::exception&) { failed = true; }
+    require(failed && proxy.transactions == 1, "a failed upload stops the transaction from being sent");
+}
+
+// A prefetch with the disk cache answers the following reads with no
+// per-array requests; a host without the batched query (404) falls back to
+// per-array reads, which stay correct.
+void batchedGeometryPrefetch()
+{
+    TemporaryDirectory directory;
+    const auto path = directory.path / "batch.vcobj";
+    OpenOptions options; options.author = "batch-test";
+    std::vector<std::string> uuids;
+    {
+        auto store = ObjectStore::create(path, options);
+        auto txn = store.write();
+        for (int i = 0; i < 3; ++i) {
+            ObjectRecord object; object.kind = "track";
+            const auto uuid = store.upsertObject(txn, object);
+            vc::geometry::Track track; track.points = {{double(i), 1, 2}, {double(i), 3, 4}, {double(i), 5, 6}};
+            store.putGeometry(txn, uuid, vc::geometry::encode(track));
+            uuids.push_back(uuid);
+        }
+        txn.commit();
+    }
+    server::Server server(path, {}); server.start();
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(server.port());
+    OpenOptions readOnly; readOnly.readOnly = true;
+    auto inspect = ObjectStore::open(path, readOnly);
+    for (const bool olderHost : {false, true}) {
+        PausingProxy proxy(endpoint, "/never-paused");
+        proxy.notFoundGeometryQuery = olderHost;
+        ObjectStoreSession session;
+        HostedSessionOptions hosted; hosted.pollInterval = std::chrono::hours(1);
+        hosted.cacheDirectory = directory.path / (olderHost ? "cache-old" : "cache-new");
+        const auto attachment = session.attachHosted(proxy.endpoint(), hosted);
+        session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            std::vector<std::string> revisions;
+            for (const auto& uuid : uuids) revisions.push_back(*reader.currentObject(uuid)->geometryRevision);
+            reader.prefetchGeometry(revisions, {"points"}, {});
+            const auto afterPrefetch = proxy.payloadRequests.load();
+            auto txn = inspect.read();
+            for (const auto& revision : revisions)
+                require(reader.readGeometryArray(revision, "points") == inspect.readGeometryArray(txn, revision, "points"),
+                        "reads after a prefetch return the stored bytes");
+            require(proxy.geometryQueries >= 1, "the prefetch asked the batched query");
+            if (!olderHost)
+                require(proxy.payloadRequests == afterPrefetch, "a prefetch leaves no per-array requests to the reads");
+            else
+                require(proxy.payloadRequests == afterPrefetch + revisions.size(), "an older host: per-array reads");
+            reader.prefetchGeometry(revisions, {"points"}, {});
+            require(!olderHost || proxy.geometryQueries == 1, "an older host is not asked again");
+        });
+    }
+}
+
 int main()
 try {
+    boundedPayloadUploads();
+    batchedGeometryPrefetch();
 #ifdef VC_REAL_SURFACE
     persistentObjects();
 #endif

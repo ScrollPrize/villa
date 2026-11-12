@@ -272,6 +272,64 @@ try {
                     hosted.readGeometryArray(hg->uuid, array.name), "geometry bytes parity");
         }
         require(!hosted.geometryRevision(util::newUuid()), "unknown geometry");
+
+        // Bounded annotation reads check each value's packed size before
+        // loading it: one large (chunked) value and the per-row defaults.
+        {
+            auto local = ObjectStore::create(directory.path / "annotations.vcobj", options);
+            const auto annotated = util::newUuid();
+            vc::geometry::Fiber geometry; geometry.controlPoints = {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}};
+            ObjectRecord record; record.uuid = annotated; record.kind = "fiber";
+            const auto status = [&] { auto t = local.read(); return local.status(t); }();
+            TransactionRequest create;
+            create.requestUuid = util::newUuid(); create.storeUuid = status.storeUuid; create.generation = status.generation;
+            create.author = "alice"; create.expectedObjects = {{annotated, std::nullopt}};
+            create.operations = {CreateObjectOp{objectRecordJson(record)}, PutGeometryOp{annotated, vc::geometry::encode(geometry), {}}};
+            local.submit(create);
+            const nlohmann::json values = nlohmann::json::array({nlohmann::json{{"note", std::string(5000, 'x')}},
+                                                                  nlohmann::json::object(), nlohmann::json{{"tag", 1}}});
+            TransactionRequest annotate;
+            annotate.requestUuid = util::newUuid(); annotate.storeUuid = status.storeUuid; annotate.generation = status.generation;
+            annotate.author = "alice"; annotate.expectedObjects = {{annotated, 1}};
+            annotate.operations = {UpdateGeometryArraysOp{annotated, vc::geometry::encode(geometry), {{"control_points", values.dump()}}}};
+            local.submit(annotate);
+            auto txn = local.read();
+            const auto revision = local.currentObjectRevision(txn, annotated)->geometryRevision.value();
+            const auto full = local.geometryPointAnnotations(txn, revision, "control_points");
+            require(full.size() == 3 && full[0].at("note").get<std::string>().size() == 5000, "annotated fixture");
+            require(local.geometryPointAnnotationsWithin(txn, revision, "control_points", 1 << 20) == full,
+                    "a bounded read within its budget returns every value");
+            require(!local.geometryPointAnnotationsWithin(txn, revision, "control_points", 4000),
+                    "a chunked value larger than the budget is refused before it is loaded");
+            require(!local.geometryPointAnnotationsWithin(txn, revision, "control_points", 8),
+                    "the per-row defaults count against the budget");
+        }
+
+        // The batched geometry query answers the same descriptors and bytes as
+        // the per-revision reads, in request order, with unknown revisions null.
+        {
+            std::vector<std::string> revisions;
+            for (int64_t version : {1, 5})
+                revisions.push_back(*hosted.objectAtVersion({hostedInitial.storeUuid, hostedInitial.generation, a, version})->geometryRevision);
+            const auto unknown = util::newUuid();
+            revisions.push_back(unknown);
+            std::vector<std::string> names;
+            for (const auto& array : hosted.geometryRevision(revisions[0])->arrays) names.push_back(array.name);
+            names.push_back("no-such-array");
+            const auto batch = hosted.geometryBatch(revisions, names, {});
+            require(batch && batch->size() == revisions.size(), "geometry batch answers every revision");
+            for (size_t i = 0; i < 2; ++i) {
+                const auto& entry = (*batch)[i];
+                const auto single = hosted.geometryRevision(revisions[i]);
+                require(entry.descriptor && entry.descriptor->uuid == single->uuid &&
+                        entry.descriptor->contentHash == single->contentHash, "geometry batch descriptor parity");
+                require(!entry.arrays.contains("no-such-array"), "geometry batch skips absent arrays");
+                for (const auto& array : single->arrays)
+                    require(entry.arrays.at(array.name) == hosted.readGeometryArray(single->uuid, array.name),
+                            "geometry batch bytes parity");
+            }
+            require(!(*batch)[2].descriptor && (*batch)[2].uuid == unknown, "geometry batch unknown revision");
+        }
     }
 
     // Queries answer from one server snapshot and match the local store.

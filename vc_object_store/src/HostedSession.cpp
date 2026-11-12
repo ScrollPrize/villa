@@ -369,7 +369,16 @@ void HostedAttachment::check()
         deliver = deliver_;
     }
     std::vector<StoreSessionEvent> events;
+    // A stop (detach, shutdown) abandons the check between its requests: the
+    // cursor and freshness stay as they were, nothing is delivered, and stop()
+    // waits for at most the one request in flight.
+    struct Stopped {};
+    const auto stopPoint = [this] {
+        std::lock_guard lock(stateMutex_);
+        if (stopping_) throw Stopped{};
+    };
     try {
+        stopPoint();
         const auto status = client_.status();
         if (status.storeUuid != storeUuid_)
             throw std::runtime_error("hosted store: " + client_.endpoint() + " now serves another store");
@@ -379,6 +388,7 @@ void HostedAttachment::check()
         std::vector<FeedCommit> commits;
         bool revalidate = false;
         while (cursor.generation != status.generation || cursor.sequence < status.commitSequence || cursor.offset) {
+            stopPoint();
             auto page = client_.changesSince(cursor);
             if (!page.cursorValid) {
                 revalidate = true;
@@ -414,12 +424,14 @@ void HostedAttachment::check()
                     edges.push_back(change.uuid);
                 }
             }
+            stopPoint();
             invalidate(touched);
             const auto revisions = objectsAtVersions(objects);
             std::map<std::string, std::string> kinds;
             for (const auto& revision : revisions)
                 if (revision) kinds[revision->objectUuid] = revision->record.kind;
             if (!edges.empty()) {
+                stopPoint();
                 EdgeSelection selection;
                 selection.uuids = edges;
                 selection.includeRetired = true;
@@ -432,6 +444,7 @@ void HostedAttachment::check()
                     if (const auto found = edgeKinds_.find(edge); found != edgeKinds_.end()) kinds[edge] = found->second;
             }
             StoreSessionEvent event{StoreSessionEvent::Kind::Committed, identity, cursor.sequence, {}};
+            if (cursor.offset == 0) event.feedPosition = cursor;
             bool transformsChanged = false;
             for (const auto& commit : commits) for (const auto& change : commit.changes) {
                 JournalEntry entry;
@@ -456,6 +469,8 @@ void HostedAttachment::check()
         freshness_.status = status;
         freshness_.checkedAtUs = nowUs();
         freshness_.error.clear();
+    } catch (const Stopped&) {
+        return;
     } catch (const std::exception& error) {
         std::lock_guard lock(stateMutex_);
         freshness_.error = error.what();
@@ -467,8 +482,33 @@ void HostedAttachment::check()
 
 StoreStatus HostedAttachment::status() { return client_.status(); }
 
+HostedWriteState HostedAttachment::writeState() const
+{
+    std::lock_guard lock(writeMutex_);
+    return writeState_;
+}
+
+void HostedAttachment::noteWrite()
+{
+    std::lock_guard lock(writeMutex_);
+    ++writeState_.generation;
+}
+
 TransactionReceipt HostedAttachment::submit(const TransactionRequest& request)
 {
+    {
+        std::lock_guard lock(writeMutex_);
+        ++writeState_.generation;
+        ++writeState_.active;
+    }
+    struct Ended {
+        HostedAttachment& self;
+        ~Ended() {
+            std::lock_guard lock(self.writeMutex_);
+            ++self.writeState_.generation;
+            --self.writeState_.active;
+        }
+    } ended{*this};
     auto receipt = client_.submit(request);
     std::vector<std::string> touched;
     for (const auto& [uuid, version] : receipt.objects) touched.push_back(uuid);
@@ -706,6 +746,100 @@ std::shared_ptr<const nlohmann::json> HostedAttachment::geometryPointAnnotations
     return json;
 }
 
+void HostedAttachment::prefetchGeometry(const std::vector<std::string>& revisionUuids,
+                                        const std::vector<std::string>& arrays,
+                                        const std::vector<std::string>& annotations)
+{
+    if (prefetchAudit || batchUnsupported_.load()) return;
+    // Only with the disk cache, best effort: it usually keeps what a batch
+    // fetched until the reads that follow consume it (it may decline or evict
+    // entries; those reads then fetch individually, with the same bytes). A
+    // memory-only cache would evict batches far more often, so its reads stay
+    // per-array.
+    if (!disk_) return;
+    const auto descriptorKey = [&](const std::string& revision) { return payloadKey("geometry/" + revision); };
+    const auto annotationKey = [&](const std::string& revision, const std::string& name) {
+        return payloadKey("annotations/" + revision + "/" + name);
+    };
+    const auto blockKey = [&](const std::string& revision, const std::string& name, int64_t size, int64_t start) {
+        return payloadKey("block/" + revision + "/" + name + "/" + std::to_string(size) + "/" + std::to_string(start));
+    };
+    const auto onDisk = [&](const std::string& key) {
+        std::error_code error;
+        return std::filesystem::exists(diskRoot_ / payloadHash(bytesOf(key)), error);
+    };
+    // What a later read would still fetch: the descriptor, an array or an
+    // annotation in neither cache.
+    const auto complete = [&](const std::string& revision) {
+        std::optional<GeometryRevision> descriptor;
+        {
+            std::lock_guard lock(cacheMutex_);
+            if (const auto* entry = cache_.get(descriptorKey(revision)); entry && entry->geometry) descriptor = entry->geometry;
+        }
+        if (!descriptor) {
+            if (!onDisk(descriptorKey(revision))) return false;
+            const auto bytes = readCachedPayload(descriptorKey(revision), std::nullopt);
+            if (!bytes || textOf(*bytes) == "null") return false;
+            descriptor = geometryRevisionFromJson(textOf(*bytes));
+        }
+        for (const auto& name : arrays) {
+            const auto info = std::find_if(descriptor->arrays.begin(), descriptor->arrays.end(),
+                                           [&](const auto& a) { return a.name == name; });
+            if (info == descriptor->arrays.end()) continue;
+            for (int64_t start = 0; start < info->byteLength; start += payloadBlockBytes)
+                if (!onDisk(blockKey(revision, name, info->byteLength, start))) return false;
+        }
+        for (const auto& name : annotations) {
+            if (std::none_of(descriptor->arrays.begin(), descriptor->arrays.end(), [&](const auto& a) { return a.name == name; }))
+                continue;
+            {
+                std::lock_guard lock(cacheMutex_);
+                if (const auto* entry = cache_.get(annotationKey(revision, name)); entry && entry->json) continue;
+            }
+            if (!onDisk(annotationKey(revision, name))) return false;
+        }
+        return true;
+    };
+    std::vector<std::string> missing;
+    std::set<std::string> seen;
+    for (const auto& revision : revisionUuids)
+        if (seen.insert(revision).second && !complete(revision)) missing.push_back(revision);
+    for (size_t next = 0; next < missing.size();) {
+        const std::vector<std::string> part(missing.begin() + std::ptrdiff_t(next),
+                                            missing.begin() + std::ptrdiff_t(std::min(missing.size(), next + 256)));
+        const auto answered = client_.geometryBatch(part, arrays, annotations);
+        if (!answered) {
+            batchUnsupported_ = true;
+            return;
+        }
+        for (const auto& entry : *answered) {
+            if (!entry.descriptor) continue;
+            const auto& revision = entry.descriptor->uuid;
+            publishPayload(descriptorKey(revision), bytesOf(geometryRevisionToJson(*entry.descriptor)));
+            {
+                std::lock_guard lock(cacheMutex_);
+                cache_.put(descriptorKey(revision), Entry{std::nullopt, entry.descriptor, nullptr}, cost(*entry.descriptor));
+            }
+            for (const auto& [name, bytes] : entry.arrays) {
+                const auto size = int64_t(bytes.size());
+                for (int64_t start = 0; start < size; start += payloadBlockBytes) {
+                    const auto length = std::min(payloadBlockBytes, size - start);
+                    publishPayload(blockKey(revision, name, size, start),
+                                   std::vector<uint8_t>(bytes.begin() + start, bytes.begin() + start + length));
+                }
+            }
+            for (const auto& [name, value] : entry.annotations) {
+                publishPayload(annotationKey(revision, name), bytesOf(value.dump()));
+                auto json = std::make_shared<const nlohmann::json>(value);
+                const auto jsonCost = 1024 + 512 * json->size();
+                std::lock_guard lock(cacheMutex_);
+                cache_.put(annotationKey(revision, name), Entry{std::nullopt, std::nullopt, nullptr, json}, jsonCost);
+            }
+        }
+        next += answered->size();
+    }
+}
+
 VolumeTransforms HostedAttachment::volumeTransforms()
 {
     for (int attempt = 0; attempt < 4; ++attempt) {
@@ -720,10 +854,21 @@ VolumeTransforms HostedAttachment::volumeTransforms()
         ObjectSelection registrations;
         registrations.kind = "volume_transform";
         std::vector<std::pair<ObjectRecord, std::string>> recorded;
-        for (auto& record : client_.selectAllObjects(registrations)) {
-            const auto head = client_.currentObjectRevision(record.uuid);
-            if (!head) continue; // removed since the listing; the next check invalidates
-            recorded.emplace_back(std::move(record), head->uuid);
+        // Each listed record names the numbered head it was read from; their
+        // revisions come in one batched (and cached: numbered revisions are
+        // immutable) request instead of one current-head request each.
+        auto listed = client_.selectAllObjects(registrations);
+        std::vector<ObjectVersion> references;
+        references.reserve(listed.size());
+        for (const auto& record : listed) {
+            if (!record.version) throw std::runtime_error("hosted store: transform listing without versions");
+            references.push_back({storeUuid_, record.versionGeneration, record.uuid, *record.version});
+        }
+        const auto heads = references.empty() ? std::vector<std::optional<ObjectRevision>>{}
+                                              : objectsAtVersions(references);
+        for (std::size_t i = 0; i < listed.size(); ++i) {
+            if (!heads.at(i)) continue; // not recorded at that version; the next check invalidates
+            recorded.emplace_back(std::move(listed[i]), heads[i]->uuid);
         }
         ObjectSelection choices;
         choices.kind = "volume_transform_choice";

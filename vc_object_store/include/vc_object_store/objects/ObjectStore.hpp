@@ -601,6 +601,10 @@ public:
     // JSON array with one value per point.
     nlohmann::json geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName) const;
+    // The same, or nullopt as soon as the values read exceed maxBytes encoded
+    // (reading stops there: at most one value beyond the budget is unpacked).
+    std::optional<nlohmann::json> geometryPointAnnotationsWithin(const Txn&, const std::string& revisionUuid,
+        const std::string& arrayName, size_t maxBytes) const;
 
     // Dense row-major rectangle from any aligned surface array. Exact
     // bytes; handles tiled and linear layouts. Coordinates/counts are vertices.

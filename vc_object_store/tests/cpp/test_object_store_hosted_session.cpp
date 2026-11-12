@@ -182,6 +182,30 @@ try {
             mustFail([&] { (void)reader.readGeometryArray(revision, "points", 7201, 0); });
             mustFail([&] { (void)reader.readGeometryArray(revision, "points", 0, -1); });
         });
+        // A prefetch fills the caches with what the reads then return (same
+        // bytes), for revisions it knows, and ignores unknown ones; a second
+        // prefetch of complete revisions is a no-op.
+        for (const bool withCache : {true, false}) {
+            ObjectStoreSession fresh;
+            auto options = hostedOptions;
+            if (!withCache) options.cacheBytes = 0;
+            const auto remote = fresh.attachHosted(endpoint, options);
+            fresh.readStore(remote, [&](const StoreReader& reader, const auto&) {
+                const auto strand = *reader.currentObject(fiber)->geometryRevision;
+                const auto sheet = *reader.currentObject(surface)->geometryRevision;
+                const std::vector<std::string> revisions{strand, sheet, util::newUuid()};
+                reader.prefetchGeometry(revisions, {"control_points", "control_point_ids", "points"}, {"control_points"});
+                reader.prefetchGeometry(revisions, {"control_points", "control_point_ids", "points"}, {"control_points"});
+                require(reader.geometryRevision(strand)->contentHash == expected.geometryRevision(strand)->contentHash,
+                        "prefetched descriptor");
+                require(reader.readGeometryArray(strand, "control_points") == expected.readGeometryArray(strand, "control_points"),
+                        "prefetched array");
+                require(reader.readGeometryArray(sheet, "points", 12, 24) == expected.readGeometryArray(sheet, "points", 12, 24),
+                        "prefetched range");
+                require(reader.geometryPointAnnotations(strand, "control_points") ==
+                        expected.geometryPointAnnotations(strand, "control_points"), "prefetched annotations");
+            });
+        }
         bool ran = false;
         session.readStore(hosted, [&](const StoreReader& reader, const auto&) {
             const auto head = reader.currentObject(surface);
@@ -216,6 +240,13 @@ try {
             mustFail([&] { (void)reader.readGeometryArrays({strand, revision}, "control_points"); });
             require(reader.geometryPointAnnotations(strand, "control_points") ==
                     expected.geometryPointAnnotations(strand, "control_points"), "reader point annotations");
+            {
+                const auto full = direct.geometryPointAnnotations(txn, strand, "control_points");
+                require(!full.empty() && direct.geometryPointAnnotationsWithin(txn, strand, "control_points", 1 << 20) == full,
+                        "a bounded annotation read within its budget returns the values");
+                require(!direct.geometryPointAnnotationsWithin(txn, strand, "control_points", 0),
+                        "a bounded annotation read stops when its budget is exceeded");
+            }
             require(reader.geometryLengthInVolume(fiber, volume, 2) == expected.geometryLengthInVolume(fiber, volume, 2) &&
                     expected.geometryLengthInVolume(fiber, volume, 2) == 34, "reader fiber length");
             require(reader.objectTags() == std::vector<std::string>{"probe"} && reader.objectTags() == expected.objectTags() && reader.objectTags("track") == expected.objectTags("track"),
@@ -260,6 +291,13 @@ try {
     require(events.size() == 1 && events[0].changes.size() == 1 && events[0].changes[0].recordUuid == track &&
             events[0].changes[0].kind == "track" && events[0].touches({"track"}) && !events[0].touches({"surface"}) &&
             events[0].journalPosition == *receipt.commitSequence, "commit event with kind");
+    {
+        const auto now = session.status(hosted);
+        require(events[0].feedPosition && events[0].feedPosition->storeUuid == now.storeUuid &&
+                    events[0].feedPosition->generation == now.generation &&
+                    events[0].feedPosition->sequence == *receipt.commitSequence && events[0].feedPosition->offset == 0,
+                "a hosted commit event carries its completed feed cursor");
+    }
     require(session.receipt(hosted, receipt.requestUuid.value())->commitSequence == receipt.commitSequence, "receipt");
     mustFail([&] { (void)session.submit(hosted, request(session, hosted, {{track, 1}}, {SetMetaOp{track, "note", "\"stale\""}})); });
 

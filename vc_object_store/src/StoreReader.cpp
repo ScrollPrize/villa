@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <map>
 #include <set>
 
 namespace vc::objects {
@@ -107,9 +108,20 @@ void expectRelationshipEndpoints(const StoreReader& reader, VersionSelection& ex
     for (const auto& edge : reader.selectEdges(edges))
         for (const auto& endpoint : {edge.aUuid, edge.bUuid})
             if (!expected.contains(endpoint)) endpoints.insert(endpoint);
+    if (endpoints.empty()) return;
+    // currentObject's membership (retired included, deleted not) and head
+    // versions, from one listing instead of one head read per endpoint.
+    ObjectSelection heads;
+    heads.uuids.assign(endpoints.begin(), endpoints.end());
+    heads.includeRetired = true;
+    std::map<std::string, int64_t> versions;
+    for (const auto& record : reader.selectObjects(heads, std::vector<std::string>{"generation"})) {
+        if (!record.version) throw std::runtime_error("object listing without versions");
+        versions.emplace(record.uuid, *record.version);
+    }
     for (const auto& endpoint : endpoints) {
-        const auto head = reader.currentObject(endpoint);
-        expected.emplace(endpoint, head ? std::optional(head->version) : std::nullopt);
+        const auto found = versions.find(endpoint);
+        expected.emplace(endpoint, found == versions.end() ? std::nullopt : std::optional(found->second));
     }
 }
 

@@ -642,6 +642,131 @@ struct ServerState {
         return {http::status::ok, "application/octet-stream", std::string(bytes.begin(), bytes.end())};
     }
 
+    // Many geometry revisions in one reply (hosted decodes of many fibers):
+    // request {"revisions": [uuid], "arrays": [name], "annotations": [name]};
+    // reply = 8-byte little-endian header length, the JSON header, then the
+    // arrays' bytes in header order. Revisions are answered in request order
+    // until the response limit; "answered" says how many (at least one, unless
+    // that one alone exceeds the limit: then its arrays are left out and the
+    // client reads them by range).
+    Reply queryGeometry(const std::string& body)
+    {
+        const auto request = Json::parse(body);
+        const auto revisions = request.at("revisions").get<std::vector<std::string>>();
+        const auto unique = [](std::vector<std::string> names) {
+            std::sort(names.begin(), names.end());
+            names.erase(std::unique(names.begin(), names.end()), names.end());
+            return names;
+        };
+        const auto arrays = unique(request.value("arrays", std::vector<std::string>{}));
+        const auto annotations = unique(request.value("annotations", std::vector<std::string>{}));
+        if (revisions.size() > size_t(options.maxQueryResults))
+            throw std::invalid_argument("geometry query: at most " + std::to_string(options.maxQueryResults) + " revisions");
+        auto txn = store->read();
+        Json header = Json::object();
+        header["revisions"] = Json::array();
+        std::string data;
+        size_t answered = 0;
+        // Bounded: each entry's arrays are sized from its descriptor before any
+        // array is read, annotations are estimated (per point) before they are
+        // loaded, and the entry's actual encoded size is checked before it is
+        // added. An entry that alone would exceed the limit is answered without
+        // data (or, when even its descriptor is too large, as {"uuid",
+        // "oversized": true}); the client reads those individually.
+        const size_t limit = size_t(options.maxResponseBytes);
+        const size_t headerOverhead = 64;
+        size_t used = 8 + headerOverhead;
+        // The smallest answer (one compact entry) must fit, or nothing can.
+        if (!revisions.empty()) {
+            const auto compact = Json{{"uuid", revisions.front()}, {"descriptor", nullptr}, {"oversized", true},
+                                      {"arrays", Json::object()}, {"annotations", Json::object()}}.dump().size() + 2;
+            if (used + compact > limit)
+                return errorReply(http::status::payload_too_large, "geometry query: the response limit is smaller than one entry");
+        }
+        const auto annotationEstimate = [](const GeometryArrayInfo& info) {
+            return size_t(info.shape.empty() ? 0 : std::max<int64_t>(info.shape.front(), 0)) * 512 + 64;
+        };
+        for (const auto& requested : revisions) {
+            Json entry = Json::object();
+            entry["uuid"] = requested;
+            const auto revision = store->geometryRevision(txn, uuidSegment(requested));
+            std::string arrayBytes;
+            if (!revision) {
+                entry["descriptor"] = nullptr;
+            } else {
+                entry["descriptor"] = Json::parse(geometryRevisionToJson(*revision));
+                const auto infoOf = [&](const std::string& name) -> const GeometryArrayInfo* {
+                    const auto found = std::find_if(revision->arrays.begin(), revision->arrays.end(),
+                                                    [&](const GeometryArrayInfo& a) { return a.name == name; });
+                    return found == revision->arrays.end() ? nullptr : &*found;
+                };
+                const size_t base = entry.dump().size() + 64;
+                size_t planned = base;
+                for (const auto& name : arrays)
+                    if (const auto* info = infoOf(name)) planned += size_t(info->byteLength) + name.size() + 64;
+                for (const auto& name : annotations)
+                    if (const auto* info = infoOf(name)) planned += annotationEstimate(*info);
+                if (answered > 0 && used + planned > limit) break;
+                Json arrayIndex = Json::object();
+                Json annotationValues = Json::object();
+                if (used + planned <= limit) {
+                    // Annotations only for arrays of at most kBatchAnnotationPoints
+                    // points (fibers' control points), read with a byte budget
+                    // checked against each value's packed size before it is
+                    // loaded; otherwise left for the client's own read.
+                    constexpr int64_t kBatchAnnotationPoints = 4096;
+                    for (const auto& name : annotations) {
+                        const auto* info = infoOf(name);
+                        if (!info || info->shape.empty() || info->shape.front() > kBatchAnnotationPoints) continue;
+                        // Read only up to what the response can still carry
+                        // (one budget shared by this entry's annotation arrays).
+                        const size_t spent = annotationValues.dump().size();
+                        const size_t room = limit > used + base + spent ? limit - used - base - spent : 0;
+                        auto value = store->geometryPointAnnotationsWithin(txn, revision->uuid, name, room);
+                        if (!value) continue;
+                        annotationValues[name] = std::move(*value);
+                    }
+                    for (const auto& name : arrays) {
+                        if (!infoOf(name)) continue;
+                        const auto bytes = store->readGeometryArray(txn, revision->uuid, name, 0, std::nullopt);
+                        arrayIndex[name] = {{"offset", data.size() + arrayBytes.size()}, {"length", bytes.size()}};
+                        arrayBytes.append(bytes.begin(), bytes.end());
+                    }
+                }
+                entry["arrays"] = std::move(arrayIndex);
+                entry["annotations"] = std::move(annotationValues);
+            }
+            if (!entry.contains("arrays")) entry["arrays"] = Json::object();
+            if (!entry.contains("annotations")) entry["annotations"] = Json::object();
+            size_t actual = entry.dump().size() + 2 + arrayBytes.size();
+            if (used + actual > limit) {
+                if (answered > 0) break;
+                // Alone too large after all (an estimate fell short): no data.
+                arrayBytes.clear();
+                entry["arrays"] = Json::object();
+                entry["annotations"] = Json::object();
+                actual = entry.dump().size() + 2;
+                if (used + actual > limit) {
+                    entry = Json{{"uuid", requested}, {"descriptor", nullptr}, {"oversized", true},
+                                 {"arrays", Json::object()}, {"annotations", Json::object()}};
+                    actual = entry.dump().size() + 2;
+                }
+            }
+            used += actual;
+            data += arrayBytes;
+            header["revisions"].push_back(std::move(entry));
+            ++answered;
+        }
+        header["answered"] = answered;
+        const auto headerText = header.dump();
+        std::string reply(8, '\0');
+        uint64_t length = headerText.size();
+        for (int i = 0; i < 8; ++i) reply[size_t(i)] = char((length >> (8 * i)) & 0xff);
+        reply += headerText;
+        reply += data;
+        return {http::status::ok, "application/octet-stream", std::move(reply)};
+    }
+
     Reply artifactInfo(const std::string& hash)
     {
         if (!isArtifactHash(hash)) return errorReply(http::status::bad_request, "not a lowercase SHA-256: " + hash);
@@ -834,6 +959,10 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryRegion(*body); }};
         if (method == http::verb::post && is({"v1", "query", "nearest_surfaces"}))
             return {readers.get(), [this, body] { return queryNearestSurfaces(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "geometry"})) {
+            if (responseBytes.load() > options.maxResponseBytesInFlight) return {nullptr, nullptr, true};
+            return {readers.get(), [this, body] { return queryGeometry(*body); }};
+        }
         if (method == http::verb::get && is({"v1", "geometry", "*"}))
             return {readers.get(), [this, target] { return geometry(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "artifacts", "*", "info"}))

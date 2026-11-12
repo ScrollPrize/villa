@@ -232,6 +232,18 @@ std::optional<HostedFreshness> ObjectStoreSession::freshness(const AttachmentIde
     return attachment->remote ? std::optional(attachment->remote->freshness()) : std::nullopt;
 }
 
+std::optional<HostedWriteState> ObjectStoreSession::hostedWriteState(const AttachmentIdentity& identity) const
+{
+    std::shared_ptr<Attachment> attachment;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& a : attached_)
+            if (a->identity == identity && a->accepting) attachment = a;
+    }
+    if (!attachment) throw std::runtime_error("object-store attachment is missing or superseded");
+    return attachment->remote ? std::optional(attachment->remote->writeState()) : std::nullopt;
+}
+
 void ObjectStoreSession::refresh(const AttachmentIdentity& identity)
 {
     withAttachment(identity, false, [](Attachment& attachment) {
@@ -1048,6 +1060,9 @@ TransactionReceipt ObjectStoreSession::resolvePending(const AttachmentIdentity& 
             throw std::invalid_argument("pending submission " + uuid + " belongs to store " + found->second.storeUuid);
     }
     if (const auto saved = receipt(attachment, uuid)) {
+        // Committed by an earlier send: a write of this session the attachment
+        // learns about only now.
+        withAttachment(attachment, false, [](Attachment& a) { if (a.remote) a.remote->noteWrite(); });
         conclude(uuid, &*saved, "");
         return *saved;
     }
@@ -1070,6 +1085,11 @@ TransactionReceipt ObjectStoreSession::sendPending(const AttachmentIdentity& att
         conclude(requestUuid, nullptr, conflict.what());
         throw;
     } catch (const std::invalid_argument&) {
+        conclude(requestUuid, nullptr, "");
+        throw;
+    } catch (const PreparationFailed&) {
+        // The host refused to prepare it (deterministic): nothing committed and
+        // sending it again would be refused again.
         conclude(requestUuid, nullptr, "");
         throw;
     } catch (...) {

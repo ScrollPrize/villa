@@ -22,7 +22,15 @@ std::vector<int64_t> idsOf(GeometryReader& reader,const std::string& ids,int64_t
     if (geometryWork) geometryWork->identityRows+=values.size();
     return values;
 }
+// maxBytes (when set): stop with std::nullopt as soon as the encoded values
+// read so far exceed it (at most one entry beyond the budget is unpacked).
+std::optional<Json> annotationsWithin(const Txn& txn,const GeometryRevision& revision,GeometryReader& reader,
+                                      const std::string& name,std::optional<size_t> maxBytes);
 Json annotations(const Txn& txn,const GeometryRevision& revision,GeometryReader& reader,const std::string& name) {
+    return *annotationsWithin(txn,revision,reader,name,std::nullopt);
+}
+std::optional<Json> annotationsWithin(const Txn& txn,const GeometryRevision& revision,GeometryReader& reader,
+                                      const std::string& name,std::optional<size_t> maxBytes) {
     const auto count=reader.manifest().at("arrays").at(name).at("shape").at(0).get<int64_t>();
     auto result=Json(std::vector<Json>(count,Json::object()));
     const auto& state = reader.manifest().at("sequences").at(name);
@@ -31,13 +39,33 @@ Json annotations(const Txn& txn,const GeometryRevision& revision,GeometryReader&
     MetadataSnapshot snapshot(db, state.at(ids.empty() ? "annotations" : "identities"));
     const auto values = ids.empty() ? std::vector<int64_t>() : idsOf(reader, ids, count);
     std::vector<bool> seen(count);
-    snapshot.entries([&](int64_t id, const auto& value) {
-        const int64_t row = ids.empty() ? id : value.at("row").template get<int64_t>();
-        if (row < 0 || row >= count || seen[row] || (!ids.empty() && values[row] != id))
-            throw std::runtime_error("invalid annotation row");
-        seen[row] = true;
-        result[row] = unpackAnnotation(db, ids.empty() ? value : value.at("annotation"));
-    });
+    // The encoded array: brackets, a separator and "{}" per row as the
+    // default; each value replaces its row's default.
+    size_t bytes = 2 + size_t(count) * 3;
+    if (maxBytes && bytes > *maxBytes) return std::nullopt;
+    bool exceeded = false;
+    struct Exceeded {};
+    try {
+        snapshot.entries([&](int64_t id, const auto& value) {
+            const int64_t row = ids.empty() ? id : value.at("row").template get<int64_t>();
+            if (row < 0 || row >= count || seen[row] || (!ids.empty() && values[row] != id))
+                throw std::runtime_error("invalid annotation row");
+            seen[row] = true;
+            const auto& packed = ids.empty() ? value : value.at("annotation");
+            if (maxBytes) {
+                // The packed form states its size: checked before anything is
+                // loaded or parsed.
+                const size_t size = packed.contains("inline") ? packed.at("inline").dump().size()
+                                                              : packed.at("byte_length").template get<size_t>();
+                bytes += size;
+                if (bytes > *maxBytes) throw Exceeded{};
+            }
+            result[row] = unpackAnnotation(db, packed);
+        });
+    } catch (const Exceeded&) {
+        exceeded = true;
+    }
+    if (exceeded) return std::nullopt;
     if (!ids.empty() && std::find(seen.begin(), seen.end(), false) != seen.end())
         throw std::runtime_error("missing point identity");
     return result;
@@ -62,6 +90,14 @@ nlohmann::json ObjectStore::geometryPointAnnotations(const Txn& txn,const std::s
     if (!r) throw std::invalid_argument("geometry revision not found");
     GeometryReader reader(txn,revision);
     return annotations(txn,*r,reader,name);
+}
+std::optional<nlohmann::json> ObjectStore::geometryPointAnnotationsWithin(const Txn& txn,const std::string& revision,
+                                                                          const std::string& name,size_t maxBytes) const {
+    MetadataCacheScope cache;
+    const auto r=geometryRevision(txn,revision);
+    if (!r) throw std::invalid_argument("geometry revision not found");
+    GeometryReader reader(txn,revision);
+    return annotationsWithin(txn,*r,reader,name,maxBytes);
 }
 std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& objectId,const GeometrySequenceEdit& edit,
     const std::string& expected,const std::vector<GeometryEdgeEdit>& edges)

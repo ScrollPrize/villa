@@ -1,5 +1,6 @@
 #include "vc_object_store/client/HostedStore.hpp"
 
+#include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "internal/Artifacts.hpp"
 
@@ -18,6 +19,9 @@
 #include <set>
 #include <map>
 #include <functional>
+#include <atomic>
+#include <future>
+#include <mutex>
 #include <iterator>
 
 namespace vc::objects {
@@ -99,7 +103,38 @@ TransactionReceipt HostedStore::submit(const TransactionRequest& request)
             {{"Content-Type", "application/octet-stream"}});
         expectOk(response, "stage payload " + hash);
     };
-    for (const auto& [hash, bytes] : payloads) upload(hash);
+    // Independent uploads overlap (the session's HTTP client is shared by
+    // threads already), at most kParallelUploads at a time; every upload
+    // finishes or fails before the transaction is sent, and a failure stops it.
+    {
+        constexpr std::size_t kParallelUploads = 4;
+        std::vector<std::string> hashes;
+        hashes.reserve(payloads.size());
+        for (const auto& [hash, bytes] : payloads) hashes.push_back(hash);
+        std::atomic<std::size_t> next{0};
+        std::mutex failureMutex;
+        std::exception_ptr failure;
+        const auto drain = [&] {
+            for (std::size_t i; (i = next.fetch_add(1)) < hashes.size();) {
+                {
+                    std::lock_guard lock(failureMutex);
+                    if (failure) return;
+                }
+                try {
+                    upload(hashes[i]);
+                } catch (...) {
+                    std::lock_guard lock(failureMutex);
+                    if (!failure) failure = std::current_exception();
+                }
+            }
+        };
+        std::vector<std::future<void>> workers;
+        for (std::size_t w = 1; w < std::min(kParallelUploads, hashes.size()); ++w)
+            workers.push_back(std::async(std::launch::async, drain));
+        drain();
+        for (auto& worker : workers) worker.get();
+        if (failure) std::rethrow_exception(failure);
+    }
     bool prepared = false;
     for (const auto& op : request.operations) prepared = prepared || std::holds_alternative<LinkObjectsOp>(op);
     auto& http = prepared ? impl_->linkHttp : impl_->http;
@@ -286,8 +321,10 @@ private:
         StoreStatus first, status;
         int64_t high = 0;
         std::optional<std::string> cursor;
+        int pages = 0;
         for (bool start = true;; start = false) {
             auto records = page(cursor, start ? &first : &status);
+            ++pages;
             if (start) status = first;
             if (!sameLineage(first, status)) return std::nullopt;
             high = std::max(high, status.commitSequence);
@@ -295,6 +332,16 @@ private:
             if (!records.empty()) cursor = records.back().uuid;
             for (auto& record : records) found.insert_or_assign(record.uuid, std::move(record));
             if (last) break;
+        }
+        // One short page came from one server read snapshot, so it is already
+        // exact as of that snapshot: no change-feed catch-up (a network round
+        // trip per listing). Transform-guarded listings keep the catch-up.
+        if (pages == 1 && !restartFor) {
+            if (asOf) *asOf = first;
+            std::vector<Record> result;
+            result.reserve(found.size());
+            for (auto& [uuid, record] : found) result.push_back(std::move(record));
+            return result;
         }
         FeedCursor feed{first.storeUuid, first.generation, first.commitSequence, 0};
         for (int round = 0; round < maxRounds; ++round) {
@@ -572,6 +619,44 @@ nlohmann::json HostedStore::geometryPointAnnotations(const std::string& revision
     const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/geometry/" + revisionUuid + "/annotations/" + arrayPathSegment(arrayName));
     if (response.status == 404) throw std::invalid_argument("geometry revision not found: " + revisionUuid);
     return Json::parse(expectOk(response, "point annotations").body);
+}
+
+std::optional<std::vector<HostedStore::GeometryBatchEntry>> HostedStore::geometryBatch(
+    const std::vector<std::string>& revisions, const std::vector<std::string>& arrays,
+    const std::vector<std::string>& annotations)
+{
+    const Json request{{"revisions", revisions}, {"arrays", arrays}, {"annotations", annotations}};
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/geometry", request.dump(),
+                                              {{"Content-Type", "application/json"}});
+    if (response.status == 404 || response.status == 413) return std::nullopt;
+    const auto& body = expectOk(response, "geometry query").body;
+    if (body.size() < 8) throw std::runtime_error("hosted store: geometry query answer is truncated");
+    uint64_t headerLength = 0;
+    for (int i = 0; i < 8; ++i) headerLength |= uint64_t(uint8_t(body[size_t(i)])) << (8 * i);
+    if (headerLength > body.size() - 8) throw std::runtime_error("hosted store: geometry query header is truncated");
+    const auto header = Json::parse(body.substr(8, headerLength));
+    const size_t dataStart = 8 + headerLength;
+    std::vector<GeometryBatchEntry> result;
+    for (const auto& entry : header.at("revisions")) {
+        GeometryBatchEntry answer;
+        answer.uuid = entry.at("uuid").get<std::string>();
+        if (!entry.at("descriptor").is_null()) answer.descriptor = geometryRevisionFromJson(entry.at("descriptor").dump());
+        for (const auto& [name, range] : entry.at("arrays").items()) {
+            const auto offset = range.at("offset").get<uint64_t>(), length = range.at("length").get<uint64_t>();
+            if (offset > body.size() - dataStart || length > body.size() - dataStart - offset)
+                throw std::runtime_error("hosted store: geometry query array outside the answer");
+            const auto* begin = reinterpret_cast<const uint8_t*>(body.data()) + dataStart + offset;
+            answer.arrays.emplace(name, std::vector<uint8_t>(begin, begin + length));
+        }
+        for (const auto& [name, value] : entry.at("annotations").items()) answer.annotations.emplace(name, value);
+        result.push_back(std::move(answer));
+    }
+    if (result.empty() && !revisions.empty()) throw std::runtime_error("hosted store: geometry query answered nothing");
+    if (result.size() > revisions.size()) throw std::runtime_error("hosted store: geometry query answered too much");
+    for (size_t i = 0; i < result.size(); ++i)
+        if (util::canonicalUuid(result[i].uuid) != util::canonicalUuid(revisions[i]))
+            throw std::runtime_error("hosted store: geometry query answered out of order");
+    return result;
 }
 
 std::vector<std::string> HostedStore::traverse(const GraphQuery& query, StoreStatus* asOf)

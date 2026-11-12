@@ -98,7 +98,7 @@ TransformedGeometryView GeometrySnapshot::viewTransformedAt(const std::string& u
     if(!object)throw std::invalid_argument("object not found");
     const auto local=context?VolumeTransforms{}:state_->reader->volumeTransforms();
     const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(object->record.meta),target,targetScale);
-    if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
+    if(!mapping)throw MappingUnavailable("object has no unambiguous transform to volume "+target);
     return TransformedGeometryView(geometry(uuid),*mapping,target,targetScale);
 }
 
@@ -128,8 +128,13 @@ TransformedGeometryView GeometryView::viewTransformedAt(const ObjectRevision& ob
     if(object.objectUuid!=state_->revision.objectUuid||object.geometryRevision!=state_->revision.uuid||!object.metadataComplete)
         throw std::invalid_argument("object revision does not name this geometry and its coordinate metadata");
     const auto mapping=state_->read->reader->volumeTransforms().toVolume(nlohmann::json::parse(object.record.meta),target,scale);
-    if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
-    return TransformedGeometryView(GeometrySnapshot(state_->read).geometry(object.objectUuid,state_->revision.uuid),*mapping,target,scale);
+    if(!mapping)throw MappingUnavailable("object has no unambiguous transform to volume "+target);
+    // This view already holds exactly that geometry revision, checked against
+    // `object` above: wrap it rather than looking the object up again (a
+    // current-head read; a network round trip on a hosted attachment).
+    // Pinned, like geometry(uuid, revision): no version().
+    auto pinned = std::make_shared<State>(State{state_->read, state_->revision, std::nullopt, state_->pointIndex});
+    return TransformedGeometryView(GeometrySnapshot(state_->read).typedView(std::move(pinned)),*mapping,target,scale);
 }
 
 std::vector<vcr::catalog::TransformResolution> GeometryView::availableTransforms() const {
@@ -154,14 +159,21 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
     const auto revision = geometryRevision ? state_->reader->geometryRevision(*geometryRevision)
                                            : state_->reader->currentGeometry(id);
     if (!revision) throw std::invalid_argument("object has no stored geometry");
-    if (revision->objectUuid != object->objectUuid)
+    auto result = viewOf(object->objectUuid, *revision, kind);
+    if (!geometryRevision) result->version = object->version;
+    return result;
+}
+std::shared_ptr<State> GeometrySnapshot::viewOf(const std::string& objectUuid, const GeometryRevision& found,
+                                                const std::string& kind) const
+{
+    const auto* revision = &found;
+    if (revision->objectUuid != objectUuid)
         throw std::invalid_argument("geometry revision belongs to another object");
     if (!kind.empty() && revision->kind != kind) throw std::invalid_argument("geometry kind mismatch: expected " + kind);
     if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
         throw std::invalid_argument("unsupported geometry version or coordinate system");
     auto result = std::make_shared<State>();
     result->read = state_; result->revision = *revision;
-    if (!geometryRevision) result->version = object->version;
     if (revision->kind == "point_collection") {
         result->require("points", "<f8", 2);
         result->require("point_ids", "<i8", 1);
@@ -178,12 +190,23 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
 }
 PointCollectionView GeometrySnapshot::pointCollection(const std::string& id, const std::optional<std::string>& revision) const { return PointCollectionView(view(id, "point_collection", revision)); }
 FiberView GeometrySnapshot::fiber(const std::string& id, const std::optional<std::string>& revision) const { return FiberView(view(id, "fiber", revision)); }
+FiberView GeometrySnapshot::fiber(const ObjectRevision& head) const
+{
+    state_->require();
+    if (!head.geometryRevision) throw std::invalid_argument("object has no stored geometry");
+    const auto revision = state_->reader->geometryRevision(*head.geometryRevision);
+    if (!revision) throw std::invalid_argument("object has no stored geometry");
+    return FiberView(viewOf(head.objectUuid, *revision, "fiber"));
+}
 TrackView GeometrySnapshot::track(const std::string& id, const std::optional<std::string>& revision) const { return TrackView(view(id, "track", revision)); }
 UmbilicusView GeometrySnapshot::umbilicus(const std::string& id, const std::optional<std::string>& revision) const { return UmbilicusView(view(id, "umbilicus", revision)); }
 SurfaceView GeometrySnapshot::surface(const std::string& id, const std::optional<std::string>& revision) const { return SurfaceView(view(id, "surface", revision)); }
 TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::optional<std::string>& revision) const
 {
-    auto s = view(id, "", revision);
+    return typedView(view(id, "", revision));
+}
+TypedGeometryView GeometrySnapshot::typedView(std::shared_ptr<State> s) const
+{
     if (s->revision.kind == "point_collection") return PointCollectionView(s);
     if (s->revision.kind == "fiber") return FiberView(s);
     if (s->revision.kind == "track") return TrackView(s);

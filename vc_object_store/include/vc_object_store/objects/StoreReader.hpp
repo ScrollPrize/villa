@@ -50,6 +50,13 @@ public:
                                                        int64_t columns) const = 0;
     // Per-point annotations of a sequence array (ObjectStore::geometryPointAnnotations).
     virtual nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const = 0;
+    // A hint: these revisions' descriptors, arrays and point annotations are
+    // about to be read. A hosted reader fetches what it has not cached in a
+    // few batched requests; a local reader does nothing. Never changes what
+    // the reads return.
+    virtual void prefetchGeometry(const std::vector<std::string>& /*revisionUuids*/,
+                                  const std::vector<std::string>& /*arrays*/,
+                                  const std::vector<std::string>& /*annotations*/) const {}
     virtual VolumeTransforms volumeTransforms() const = 0;
     // Complete listings (every page when the selection has no limit), with
     // the projections of ObjectStore::selectObjects/selectEdges.

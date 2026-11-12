@@ -16,6 +16,7 @@
 #include <vc_reader/native/lru.hpp>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -53,6 +54,9 @@ public:
 
     StoreStatus status();
     TransactionReceipt submit(const TransactionRequest&);
+    // See HostedWriteState. noteWrite: a pending transaction was found committed.
+    HostedWriteState writeState() const;
+    void noteWrite();
     std::optional<ObjectRevision> currentObject(const std::string& objectUuid);
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&);
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&);
@@ -61,6 +65,10 @@ public:
     std::vector<uint8_t> geometryArrayRange(const std::string& revisionUuid, const std::string& array,
                                            int64_t offset, const std::optional<int64_t>& count);
     std::shared_ptr<const nlohmann::json> geometryPointAnnotations(const std::string& revisionUuid, const std::string& array);
+    // Fill the caches for these revisions' descriptors, arrays and point
+    // annotations with batched requests (StoreReader::prefetchGeometry).
+    void prefetchGeometry(const std::vector<std::string>& revisionUuids, const std::vector<std::string>& arrays,
+                          const std::vector<std::string>& annotations);
     std::vector<uint8_t> artifactRange(const ArtifactFile&, uint64_t offset, uint64_t count);
     void writeArtifact(const ArtifactFile&, const std::filesystem::path&);
     void prefetch(ObjectPrefetchJob&, const std::atomic_bool& detached);
@@ -110,6 +118,10 @@ private:
     // one is not cached.
     uint64_t invalidations_ = 0;
     uint64_t transformInvalidations_ = 0;
+    // The host answered 404 to the batched geometry query (an older server).
+    std::atomic<bool> batchUnsupported_{false};
+    mutable std::mutex writeMutex_;
+    HostedWriteState writeState_;
 
     // Poller state.
     mutable std::mutex stateMutex_;
@@ -167,6 +179,11 @@ public:
     nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override
     {
         return *attachment_->geometryPointAnnotations(revisionUuid, arrayName);
+    }
+    void prefetchGeometry(const std::vector<std::string>& revisionUuids, const std::vector<std::string>& arrays,
+                          const std::vector<std::string>& annotations) const override
+    {
+        attachment_->prefetchGeometry(revisionUuids, arrays, annotations);
     }
     std::vector<std::string> componentOf(const std::string& objectUuid, const std::vector<std::string>& edgeKinds = {},
                                          const std::atomic_bool* = nullptr) const override
