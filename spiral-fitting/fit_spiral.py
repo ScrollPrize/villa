@@ -92,7 +92,7 @@ from tracks import (
     validate_track_sampling_config,
 )
 from track_graph import TrackGraph
-from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
+from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx, smooth_umbilicus_z_to_yx
 from sample_spiral import (
     get_radial_normal_stretch,
     get_spiral_points,
@@ -1352,7 +1352,9 @@ class FitContext:
         np.random.seed(self.config['optimizer_random_seed'])
         torch.random.manual_seed(self.config['optimizer_random_seed'])
         progress.begin('loading', 'Loading umbilicus')
-        umbilicus = self.umbilicus_z_to_yx()
+        umbilicus = smooth_umbilicus_z_to_yx(
+            self.umbilicus_z_to_yx(), self.z_begin, self.z_end,
+            self.config['umbilicus_smoothing_sigma'])
         if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
@@ -2090,7 +2092,7 @@ class FitContext:
                 verify=os.environ.get(
                     'FIT_SPIRAL_VERIFY_WINDING_INFERENCE', '1') != '0',
                 z_range=(self.z_begin, self.z_end),
-                z_to_umbilicus_yx=self.umbilicus_z_to_yx(),
+                z_to_umbilicus_yx=self.umbilicus,
             )
             print(
                 'loaded winding inference: '

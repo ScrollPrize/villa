@@ -37,7 +37,7 @@ from checkpoint_io import load_checkpoint_cpu
 from sample_spiral import get_spiral_yxs
 from tifxyz import save_combined_tifxyz
 from transforms import SpiralAndTransform
-from umbilicus import json_umbilicus_z_to_yx
+from umbilicus import json_umbilicus_z_to_yx, smooth_umbilicus_z_to_yx
 
 
 MODEL_CONFIG_KEYS = (
@@ -145,8 +145,9 @@ def _build_model(
         raise ValueError("checkpoint has an invalid model z range or state")
 
     z_values = np.arange(z_begin, z_end)
-    centre = json_umbilicus_z_to_yx(
-        str(umbilicus_path), coordinate_scale=1.0)
+    centre = smooth_umbilicus_z_to_yx(
+        json_umbilicus_z_to_yx(str(umbilicus_path), coordinate_scale=1.0),
+        z_begin, z_end, config.get("umbilicus_smoothing_sigma", 75.0))
     umbilicus_zyx = torch.from_numpy(np.concatenate([
         z_values[:, None], centre(z_values),
     ], axis=-1).astype(np.float32)).to(device)
