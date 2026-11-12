@@ -24,7 +24,8 @@ it) and conventions. The default uint8 window is the reference one in the run's 
 Note: in mode legacy_reference chunked slices carry the chunk-height dependence of the reference Paganin kernel (a
 uniform ~+1.4e-4 offset vs single-slice reconstruction for chunks >= 16, as in the reference's full-volume runs); the
 default mode's Paganin kernel does not depend on the chunk height.
-Calibration (darks/flats, weights, rotation axis, HA/TA vector) is computed once and cached (--cache_dir).
+Calibration is computed once and cached (--cache_dir): the darks / flats and weights, and the geometry calibration
+(geometry.json: helirec-geometry, about 13 minutes on PHerc0343P; --set geometry=PATH names one made before).
 """
 from __future__ import annotations
 
@@ -361,10 +362,10 @@ def main(argv=None):
                          "unsharp.coeff=0, filters='paganin(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)'; "
                          "mode=legacy_reference reproduces the reference workflow (every other parameter pinned)")
     rc.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
-    rc.add_argument("--cache_dir", default=None, help="calibration cache (default: OUT_ROOT/_calibration)")
-    rc.add_argument("--cor", type=float, default=None, help="override the main scan's rotation axis (detector px)")
-    rc.add_argument("--vector", nargs=2, type=float, default=None, metavar=("DY", "DX"),
-                    help="override the main -> companion vector")
+    rc.add_argument("--cache_dir", default=None,
+                    help="calibration cache (default: OUT_ROOT/_calibration): the darks / flats reduction, and "
+                         "geometry.json, the geometry calibration, made there on first use (helirec-geometry) unless "
+                         "--set geometry=PATH names one")
     a = p.parse_args(argv)
     if a.config:
         with open(a.config) as fh:
@@ -404,8 +405,7 @@ def main(argv=None):
         json.dump(effective, fh, indent=2, default=_json_default)
     cache = a.cache_dir or os.path.join(a.out_root, "_calibration")
     t0 = time.time()
-    r = HelicalRecon(a.projections, cache_dir=cache, device=a.device, params=parse_set(a.set),
-                     cor_override=a.cor, vector_override=tuple(a.vector) if a.vector else None)
+    r = HelicalRecon(a.projections, cache_dir=cache, device=a.device, params=parse_set(a.set))
     if a.u8_window is None:
         from .recon import display_window
         a.u8_window = display_window(r.params["mode"])

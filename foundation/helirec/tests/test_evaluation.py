@@ -8,7 +8,7 @@ import pytest
 
 from evaluation import compare_methods as compare
 from helirec import cli, to_uint8
-from helirec.recon import DEFAULTS, HelicalRecon, LEGACY_REFERENCE
+from helirec.recon import CALIBRATION_KEYS, DEFAULTS, HelicalRecon, LEGACY_REFERENCE
 
 
 @pytest.mark.parametrize("recipe", ["343p_baselines.json", "343p_corrected_baselines.json"])
@@ -29,7 +29,7 @@ def test_legacy_method_pins_settings_and_corrected_method_resets_them():
     r.params = dict(DEFAULTS)
     shared = {"mode": "corrected", "filters": [], "luminosity_repartition": 0}
     r._update(compare.method_params(shared, {"mode": "legacy_reference", "backprojector": "ghbp"}))
-    assert r.params == {"mode": "legacy_reference", **LEGACY_REFERENCE}
+    assert r.params == {"mode": "legacy_reference", **LEGACY_REFERENCE, **{k: DEFAULTS[k] for k in CALIBRATION_KEYS}}
     r._update(compare.method_params(shared, {"backprojector": "sirt"}))
     assert r.params["mode"] == "corrected"
     assert r.params["filters"] == []

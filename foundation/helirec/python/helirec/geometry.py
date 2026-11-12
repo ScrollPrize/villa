@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -885,6 +886,29 @@ def reconstruction_terms(pose, heights_rows, layout, rot_center, column_offset, 
                 row_scale=pose["row_scale"].astype(np.float32), scale_row=0.0)
 
 
+def merged_layout(cal, poses, heights_rows, quantum=0.25):
+    """The frame the two scans are merged in, from the poses (frame_poses): one rotation axis in the first scan's
+    columns and the second scan's place against the first, as the reconstruction lays its merged frame out
+    (calibration.placement_from_vector) -> dict(cor_main_detector, vector=(rows, columns), measured=...).
+
+    They are the medians over the helix of the axis' column in each scan and of the second scan's rows against the
+    first's at equal frames, rounded to `quantum` pixels. The frame is a nominal one: every projection's own axis
+    and row are in its terms (reconstruction_terms), which are counted from this frame, so the rounding moves
+    nothing; it fixes the slices' grid, and it is what mode legacy_reference, which has no terms per projection,
+    places the scans by (one axis and one vector, on the grid the reference's searches had)."""
+    L = cal["layout"]["frames"][0]
+    helix = slice(L["rest1"], L["rest1"] + L["helix"])
+    sign = cal["layout"]["row_sign"]
+    H = [np.asarray(h_, float) for h_ in heights_rows]
+    axis = [float(np.median(p_["axis"][helix])) for p_ in poses]
+    # the row a slice is read at beyond what the record alone gives (z_pix: the record's height from the scan's first frame)
+    beyond = [p_["row"][helix] + sign * (h_[helix] - h_[0]) for p_, h_ in zip(poses, H)]
+    rows = float(np.median(beyond[1] - beyond[0]))
+    q = lambda v: float(round(v / quantum) * quantum)
+    return dict(cor_main_detector=q(axis[0]), vector=(q(-rows), q(axis[0] - axis[1])),
+                measured=dict(axis_first_scan=axis[0], axis_second_scan=axis[1], second_scan_rows=rows, quantum=quantum))
+
+
 def rolling_shutter_of(cal):
     """The rows' timing as the reconstruction takes it: the time from the first stored row to the last, in frame periods."""
     period = cal["row_time"].get("frame_period_s") or (cal["row_time"].get("measured") or {}).get("period_s")
@@ -969,9 +993,11 @@ def calibrate_geometry(scans, row_time=None, device="auto", order=3, passes=6, t
 
 
 def save(cal, path):
-    with open(path, "w") as fh:
+    tmp = f"{path}.tmp{os.getpid()}"       # (written whole or not at all: a reconstruction may be reading the cache)
+    with open(tmp, "w") as fh:
         json.dump(cal, fh, indent=2, default=float)
         fh.write("\n")
+    os.replace(tmp, path)
 
 
 def main(argv=None):

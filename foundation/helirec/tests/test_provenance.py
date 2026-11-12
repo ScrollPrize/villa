@@ -11,8 +11,12 @@ class ProvenanceTests(unittest.TestCase):
         r = object.__new__(HelicalRecon)
         r.params = {**DEFAULTS, "backprojector": "fbp",
                     "filters": [{"type": "paganin", "delta_beta": 1000.0}]}
-        r.cal = SimpleNamespace(source="measured", fingerprint="test", version=2,
-                                rot_center=32.0, vector=(0.0, -8.0), cor_main_detector=24.0)
+        r.cal = SimpleNamespace(fingerprint="test", version=2, rot_center=32.0, vector=(0.0, -8.0), cor_main_detector=24.0,
+                                detector_blur_field=[])
+        r._geometry_data = dict(cal=dict(scans=["a.h5", "b.h5"], map={k: [] for k in ("c0", "cs", "v0", "vs", "i", "j", "eu", "ev")},
+                                         row_time=dict(seconds_per_row=-2e-5)),
+                                path="geometry.json", sha256="", layout=dict(cor_main_detector=24.0, vector=(0.0, -8.0)),
+                                not_applied={}, rolling_shutter=-0.7)
         r.info = {"grid_size": 65}
         r.main = SimpleNamespace(pixel_size_m=8.64e-6, energy_kev=116.0, distance_m=1.19)
         r._resolved_sld = {"sld_bm18": True, "sld_fractions": [0.12, 0.08], "sld_lengths": [40., 200.]}

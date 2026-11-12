@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 import helirec
-from helirec import _core, calibration
+from helirec import _core
 from test_sirt_pipeline import helical_scan, recon
 
 NU = 0.25   # cycles / pixel of the column pattern
@@ -122,35 +122,6 @@ def test_angle_subsets(tmp_path, device):
         recon(scan, device, angle_subsets=2, angle_subset=2, **kw)
     with pytest.raises(Exception):
         recon(scan, device, angle_subsets=2, angle_subset=0, legacy_reference=True, **kw)
-
-
-def test_rotation_axis_drift_is_an_error():
-    msgs = []
-    calibration.check_cor_drift((1684.75, 1684.75), log=msgs.append)
-    assert not msgs
-    calibration.check_cor_drift((1684.75, 1684.875), log=msgs.append)     # one search step: noted, accepted
-    assert len(msgs) == 1
-    with pytest.raises(NotImplementedError, match="drifts by \\+0.500 px"):
-        calibration.check_cor_drift((1684.75, 1685.25), log=msgs.append)
-
-
-def test_overlap_cross_check_flags_noise_locked_offsets():
-    """noisy stripes at a whole-pixel offset: the L1 search against the bilinearly interpolated companion locks to
-    half pixels; the smoothed search does not, and the guard reports the disagreement"""
-    rng = np.random.default_rng(0)
-    g = lambda a, s: _core.gaussian_filter1d(_core.gaussian_filter1d(a, 1, s, "reflect"), 2, s, "reflect")
-    texture = g(rng.standard_normal((6, 81, 400)), 1.2)
-    texture /= texture.std()
-    w = np.ones_like(texture)
-    for noise, flagged in ((0.05, False), (1.0, True)):
-        a = texture + noise * rng.standard_normal(texture.shape)
-        b = texture + noise * rng.standard_normal(texture.shape)
-        res = _core.find_offset(a, w, b, w, 0, 0, 3, 3)
-        msgs = []
-        check = calibration.overlap_cross_check(a, w, b, w, res, log=msgs.append)
-        assert check["sub"] == (0.0, 0.0)
-        assert check["differs"] is flagged and len(msgs) == int(flagged)
-        assert (tuple(res["best_sub"]) != (0.0, 0.0)) is flagged
 
 
 def rolled_scan(tmp_path, offset, slope, nu=0.2, nr=40, nd=48, c0=20.25):

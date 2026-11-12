@@ -9,7 +9,7 @@ import pytest
 
 import helirec
 from helirec import _core, calibration
-from helirec.recon import DEFAULTS, LEGACY_REFERENCE, HelicalRecon, legacy_reference_config
+from helirec.recon import CALIBRATION_KEYS, DEFAULTS, LEGACY_REFERENCE, HelicalRecon, legacy_reference_config
 
 DEVICES = helirec.devices()
 
@@ -111,152 +111,67 @@ def test_calibration_cache_fingerprint(tmp_path):
     arrays = {k: np.zeros(3, np.float32) for k in calibration.REDUCTION_KEYS}
     with open(cache / "calibration_arrays.npz", "wb") as fh:
         np.savez(fh, _fingerprint=np.array(fp), **arrays)
-    meas = dict(source="measured", fingerprint=fp, version=calibration.CALIBRATION_VERSION, rot_center=2528.25)
+    meas = dict(fingerprint=fp, version=calibration.CALIBRATION_VERSION, rot_center=2528.25)
     (cache / "calibration.json").write_text(json.dumps(meas))
     log = []
     cal, arr = calibration._load_cache(str(cache), fp, log.append)
     assert cal is not None and arr is not None
     cal, arr = calibration._load_cache(str(cache), fp2, log.append)     # another acquisition: nothing reused
     assert cal is None and arr is None
-    (cache / "calibration.json").write_text(json.dumps(dict(meas, source="override")))
-    cal, arr = calibration._load_cache(str(cache), fp, log.append)      # an override is never a calibration
+    (cache / "calibration.json").write_text(json.dumps(dict(meas, version=calibration.CALIBRATION_VERSION + 1)))
+    cal, arr = calibration._load_cache(str(cache), fp, log.append)      # another version of the calibration
     assert cal is None and arr is not None
     (cache / "calibration.json").write_text(json.dumps({k: v for k, v in meas.items() if k != "fingerprint"}))
     assert calibration._load_cache(str(cache), fp, log.append)[0] is None   # pre-fingerprint caches are stale
 
 
-# ---------------------------------------------------------------- helical pitch from opposite projections
-def test_pitch_scale_from_opposite_projections():
-    """a texture seen by projections half a turn apart, mirrored about the axis and displaced by the true travel"""
-    rng = np.random.default_rng(5)
-    rows, cols, axis, per_turn = 160, 300, 171.25, 200
-    g = lambda a, ax: _core.gaussian_filter1d(np.ascontiguousarray(a, np.float32), ax, 1.5, "reflect")
-    tex = g(g(rng.standard_normal((1, 1400, cols)), 1), 2)[0]                       # (height, mirrored column)
-    angles = np.arange(5 * per_turn) * (360.0 / per_turn)
-    moving = np.clip(np.arange(len(angles)) - per_turn, 0, 3 * per_turn)             # a stationary turn at each end
-    recorded = -moving * (80.0 / (per_turn / 2))                                     # 80 rows per half turn
-    u = np.arange(cols) - axis
-
-    def frames(true_scale):
-        def line(p):
-            top = 1300 + recorded[p] * true_scale - rows                             # what is at row v: height top + v
-            v = top + np.arange(rows)
-            i = np.floor(v).astype(int)
-            img = tex[i] * (1 - (v - i))[:, None] + tex[i + 1] * (v - i)[:, None]
-            if int(round(angles[p] / 180.0)) % 2:                                    # the opposite view: mirrored
-                x = axis - u
-                j = np.clip(np.floor(x).astype(int), 0, cols - 2)
-                img = img[:, j] * (1 - (x - j)) + img[:, j + 1] * (x - j)
-            return np.ascontiguousarray(img, np.float32)
-        return line
-
-    shift, corr, edge = _core.mirror_row_shift(frames(1.004)(300), frames(1.004)(400), axis, 100, 80.0, 8)
-    assert not edge and corr > 0.8 and abs(shift - 80.32) < 0.05
-    for true in (1.004, 1.0):
-        res = calibration.pitch_scale_from_pairs(frames(true), angles, recorded, axis, (rows, cols), n_pairs=12,
-                                                 log=lambda *a: None)
-        assert res["n_pairs"] >= 8 and abs(res["measured"] - true) < 3e-4
-        assert res["significant"] is (true != 1.0) and res["scale"] == (res["measured"] if true != 1.0 else 1.0)
-    # nothing to measure: a scan that does not move, or an axis at the detector's edge
-    still = calibration.pitch_scale_from_pairs(frames(1.0), angles, 0 * recorded, axis, (rows, cols), log=lambda *a: None)
-    edge = calibration.pitch_scale_from_pairs(frames(1.0), angles, recorded, 290.0, (rows, cols), log=lambda *a: None)
-    assert still["scale"] == 1.0 and still["measured"] is None and "helical" in still["reason"]
-    assert edge["scale"] == 1.0 and edge["measured"] is None and "mirrored" in edge["reason"]
+# ---------------------------------------------------------------- the merged frame
+def test_merged_frame_from_the_geometry_calibration():
+    """the frame the scans are merged in: one axis and one vector from the poses (medians over the helix, on a
+    quarter-pixel grid), and the placement that follows"""
+    from helirec import geometry
+    n = 40
+    cal = dict(layout=dict(frames=[dict(rest1=10, helix=20, rest2=10)] * 2, row_sign=-1.0))
+    H = [np.linspace(0, 30, n), np.linspace(0, 30, n) + 0.5]                 # (the record: the second scan half a row on)
+    z_pix = [-(h - h[0]) for h in H]
+    poses = [dict(axis=np.full(n, 1684.81), row=-z_pix[0] + 0.02 * np.arange(n)),
+             dict(axis=np.full(n, 2528.28), row=-z_pix[1] + 0.02 * np.arange(n) - 0.97)]
+    for p_ in poses:                                                         # (the rest turns are not what it is taken from)
+        p_["axis"][:10] += 3.0
+        p_["row"][30:] -= 2.0
+    lay = geometry.merged_layout(cal, poses, H)
+    assert lay["cor_main_detector"] == 1684.75 and lay["vector"] == (1.0, -843.5)
+    assert abs(lay["measured"]["second_scan_rows"] + 0.97) < 1e-9 and abs(lay["measured"]["axis_second_scan"] - 2528.28) < 1e-9
+    pl, width, anchor = calibration.placement_from_vector(lay["vector"], 2528)
+    assert (pl[0].shift_x, pl[0].x_readjustment, pl[0].z_readjustment) == (843, -0.5, 0.0)
+    assert (pl[1].shift_x, pl[1].x_readjustment, pl[1].z_readjustment) == (0, 0.0, 1.0)
+    assert width == 3372 and lay["cor_main_detector"] + anchor == 2528.25
+    assert geometry.merged_layout(cal, poses, H, quantum=0.5)["vector"] == (1.0, -843.5)
 
 
-def test_z_translation_scale_parameter():
+def test_calibration_parameters():
+    """the geometry calibration is named by parameters every mode keeps; those of the calibration it replaced are
+    refused by name"""
     r = bare_recon()
-    assert DEFAULTS["z_translation_scale"] == "auto" and LEGACY_REFERENCE["z_translation_scale"] == 1.0
-    r.cal = SimpleNamespace(z_translation_scale=1.003)
-    assert r.z_translation_scale() == 1.003
-    r.cal = SimpleNamespace(z_translation_scale=None)                               # (not measured)
-    assert r.z_translation_scale() == 1.0
-    r.params["z_translation_scale"] = "1.002"
-    assert r.z_translation_scale() == 1.002
-    r.params["z_translation_scale"] = 0
-    with pytest.raises(ValueError):
-        r.z_translation_scale()
-
-
-# ---------------------------------------------------------------- a scan's frames against themselves
-def turning_texture(rows, cols, axis, per_turn, travel, turns=3, rest_offsets=(0.0, 0.0), seed=7):
-    """A texture seen through a detector by a scan with a turn at rest before and after `turns` turns of helix:
-    views half a turn apart are mirrored about `axis`; the sample travels `travel` rows per turn, and during the
-    turns at rest it really lies rest_offsets rows from where the recorded z says. -> (line(p), angles, recorded)"""
-    rng = np.random.default_rng(seed)
-    g = lambda a, ax: _core.gaussian_filter1d(np.ascontiguousarray(a, np.float32), ax, 1.5, "reflect")
-    tex = g(g(rng.standard_normal((1, int(turns * travel) + 3 * rows, cols)), 1), 2)[0]
-    n = (turns + 2) * per_turn
-    angles = np.arange(n) * (360.0 / per_turn)
-    moving = np.clip(np.arange(n) - per_turn, 0, turns * per_turn)
-    recorded = -moving * (travel / per_turn)
-    real = recorded + np.where(np.arange(n) <= per_turn, rest_offsets[0], 0.0) + np.where(np.arange(n) >= (turns + 1) * per_turn, rest_offsets[1], 0.0)
-    u = np.arange(cols) - axis
-
-    def line(p):
-        v = turns * travel + rows + real[p] + np.arange(rows)                        # what is at row v: this height
-        i = np.floor(v).astype(int)
-        img = tex[i] * (1 - (v - i))[:, None] + tex[i + 1] * (v - i)[:, None]
-        if int(round(angles[p] / 180.0)) % 2:                                        # the opposite view: mirrored
-            x = axis - u
-            j = np.clip(np.floor(x).astype(int), 0, cols - 2)
-            img = img[:, j] * (1 - (x - j)) + img[:, j + 1] * (x - j)
-        return np.ascontiguousarray(img, np.float32)
-    return line, angles, recorded
-
-
-def test_axis_refinement_from_opposite_views():
-    rows, cols, true_axis = 200, 300, 171.37
-    line, angles, recorded = turning_texture(rows, cols, true_axis, 200, 60.0)
-    for searched in (171.25, 171.5):                                                 # the search's quarter-pixel grid
-        res = calibration.axis_from_pairs(line, angles, recorded, searched, (rows, cols), n_pairs=16, tile=64)
-        assert res["n_pairs"] >= 8 and abs(searched + res["refinement"] - true_axis) < 0.03, res
-    edge = calibration.axis_from_pairs(line, angles, recorded, 290.0, (rows, cols), tile=64)
-    assert edge["refinement"] == 0.0 and edge["measured"] is None and "mirrored" in edge["reason"]
-    far = calibration.axis_from_pairs(line, angles, recorded, true_axis - 2.0, (rows, cols), n_pairs=16, tile=64)
-    assert far["refinement"] == 0.0 and far["reason"] == "implausible refinement" and abs(far["measured"] - 2.0) < 0.1
-
-
-def test_stationary_turns_against_the_helix():
-    rows, cols = 200, 300
-    line, angles, recorded = turning_texture(rows, cols, 150.0, 200, 60.0, rest_offsets=(-0.2, 1.1))
-    res = calibration.stationary_from_pairs(line, angles, recorded, (rows, cols), n_pairs=12, tile=64)
-    assert [t["applied"] for t in res["turns"]] == [True, True]
-    (a0, a1, first), (b0, b1, last) = res["segments"]
-    assert (a0, a1) == (0, 201) and (b0, b1) == (800, 1000) and abs(first + 0.2) < 0.03 and abs(last - 1.1) < 0.03
-    rows_add = calibration.stationary_arrays(dict(segments=res["segments"]), len(angles))
-    assert rows_add[0] == np.float32(first) and rows_add[500] == 0 and rows_add[-1] == np.float32(last)
-    # turns where the recorded z is right: measured, nothing applied; no helix: nothing measured
-    line, angles, recorded = turning_texture(rows, cols, 150.0, 200, 60.0)
-    res = calibration.stationary_from_pairs(line, angles, recorded, (rows, cols), n_pairs=12, tile=64)
-    assert res["segments"] == [] and len(res["turns"]) == 2 and all(abs(t["offset"]) < 0.03 for t in res["turns"])
-    assert calibration.stationary_arrays({}, 10) is None
-    still = calibration.stationary_from_pairs(line, angles, 0 * recorded, (rows, cols), tile=64)
-    assert still["segments"] == [] and "helix" in still["reason"]
-
-
-def test_axis_shutter_and_stationary_parameters():
+    assert DEFAULTS["geometry"] == "" and set(CALIBRATION_KEYS) == {"geometry", "row_time_us"}
+    assert not set(CALIBRATION_KEYS) & set(LEGACY_REFERENCE)
+    r._update({"geometry": "/somewhere/geometry.json", "row_time_us": "-19.87"})
+    r._update({"mode": "legacy_reference"})
+    assert r.params["geometry"] == "/somewhere/geometry.json" and r.params["row_time_us"] == "-19.87"
+    r._update({"mode": "corrected"})
+    assert r.params["geometry"] == "/somewhere/geometry.json" and r.params["backprojector"] == "fbp"
+    r.cal = SimpleNamespace(rot_center=100.25)
+    r._geometry_data = dict(rolling_shutter=-0.72)
+    assert r.rot_center() == 100.25 and r.rolling_shutter() == -0.72
+    r._update({"mode": "legacy_reference"})
+    assert r.rolling_shutter() == 0.0                                        # (one angle per frame, as the reference)
+    for gone in ("z_translation_scale", "companion_registration", "stationary_registration", "axis_refinement", "rolling_shutter"):
+        with pytest.raises(KeyError, match="geometry calibration"):
+            bare_recon()._update({gone: "auto"})
     r = bare_recon()
-    assert (DEFAULTS["axis_refinement"], DEFAULTS["rolling_shutter"], DEFAULTS["stationary_registration"]) == ("auto", "off", "auto")
-    assert (LEGACY_REFERENCE["axis_refinement"], LEGACY_REFERENCE["rolling_shutter"], LEGACY_REFERENCE["stationary_registration"]) == ("off", "off", "off")
-    r.cal = SimpleNamespace(rot_center=100.25, axis_refinement=0.1, rolling_shutter=-0.7)
-    assert r.rot_center() == pytest.approx(100.35) and r.rolling_shutter() == 0.0 and not r._wants_rolling_shutter()
-    r.params["rolling_shutter"] = "auto"
-    assert r.rolling_shutter() == -0.7 and r._wants_rolling_shutter()
-    r.params.update(axis_refinement="off", rolling_shutter=0)
-    assert r.rot_center() == 100.25 and r.rolling_shutter() == 0.0
-    r.params.update(axis_refinement=-0.05, rolling_shutter="0.5")
-    assert r.rot_center() == pytest.approx(100.2) and r.rolling_shutter() == 0.5
-    r.params["axis_refinement"] = "0.139"                                          # (as the command line gives it)
-    assert r.rot_center() == pytest.approx(100.389)
-    r.params.update(axis_refinement="auto", rolling_shutter="auto")
-    r.cal = SimpleNamespace(rot_center=100.25, axis_refinement=None, rolling_shutter=None)     # (not measured)
-    assert r.rot_center() == 100.25 and r.rolling_shutter() == 0.0
-    r.params.update(axis_refinement="refined", rolling_shutter="rolling")
-    with pytest.raises(ValueError):
-        r.rot_center()
-    with pytest.raises(ValueError):
-        r.rolling_shutter()
+    r.cache_dir = None
+    with pytest.raises(ValueError, match="geometry"):
+        r._geometry_file()
 
 
 # ---------------------------------------------------------------- output scale (attenuation)
@@ -437,10 +352,6 @@ def test_legacy_mode_pins_parameters():
     assert r.params["filters"] == [] and r.params["mode"] == "corrected" and r.params["backprojector"] == "fbp"
     with pytest.raises(ValueError):
         r._update({"mode": "nabu"})
-    r._update({"mode": "legacy_reference"})
-    r.cal = SimpleNamespace(source="override")
-    with pytest.raises(ValueError, match="measured"):
-        r._check_calibration()
     cfg = legacy_reference_config()
     assert cfg["legacy_reference"] is True and cfg["backprojector"] == "ghbp" and len(cfg["filters"]) == 2
 
@@ -448,37 +359,6 @@ def test_legacy_mode_pins_parameters():
 def test_default_params_are_corrected():
     assert DEFAULTS["mode"] == "corrected" and DEFAULTS["filters"] == []
     assert os.path.basename(_core.__file__).startswith("_core")
-
-
-# ---------------------------------------------------------------- registration of frames on tiles
-def test_tile_shifts_recover_an_offset_and_a_roll():
-    """b is a displaced along the rows by 0.4 + 0.9 rows per 1000 columns and along the columns by -0.3"""
-    rng = np.random.default_rng(3)
-    rows, cols, d0, slope, du = 360, 1400, 0.4, 0.9e-3, -0.3
-    waves = [(rng.uniform(-0.12, 0.12), rng.uniform(-0.12, 0.12), rng.uniform(0, 2 * np.pi)) for _ in range(120)]
-    r, c = np.mgrid[:rows, :cols].astype(np.float64)
-    image = lambda rr, cc: sum(np.cos(2 * np.pi * (fy * rr + fx * cc) + ph) for fy, fx, ph in waves).astype(np.float32)
-    a = image(r, c)
-    b = image(r - (d0 + slope * c), c - du)             # what is at (r, c) of a is at (r + dv, c + du) of b
-    t = _core.tile_shifts(a, b, 120, 60, 10, 6)
-    assert t.shape[1] == 5 and len(t) > 60 and np.isfinite(t).all() and t[:, 4].min() > 0.8
-    fit = np.linalg.lstsq(np.stack([np.ones(len(t)), t[:, 1]], -1), t[:, 2], rcond=None)[0]
-    assert abs(fit[0] - d0) < 0.03 and abs(fit[1] - slope) < 5e-5
-    assert abs(np.median(t[:, 3]) - du) < 0.03
-    # nothing in common: no shift is reported for most tiles, and none with a high correlation
-    n = _core.tile_shifts(a, rng.standard_normal(a.shape).astype(np.float32), 120, 60, 10, 6)
-    assert (n[:, 4] < 0.3).all()
-    # the knots of a calibration become per-projection arrays within their stretches
-    reg = dict(projection=[10, 30, 60, 90], row_offset=[1.0, 1.0, -2.0, -2.0], row_slope=[1e-3, 3e-3, 0.0, 0.0],
-               segments=[[0, 50], [50, 100]], slope_col=7.5)
-    arr = calibration.registration_arrays(reg, 100)
-    off, slope_p = arr["row_offset"], arr["row_slope"]
-    assert off[0] == 1.0 and off[49] == 1.0 and off[50] == -2.0 and off[99] == -2.0 and arr["slope_col"] == 7.5
-    assert abs(slope_p[20] - 2e-3) < 1e-9 and slope_p[49] == np.float32(3e-3) and slope_p[50] == 0
-    assert "col_slope" not in arr and "slope_row" not in arr            # (a registration without the lateral part)
-    lat = calibration.registration_arrays(dict(reg, col_slope=[0.0, 0.0, 5e-4, 5e-4], slope_row=3.5), 100)
-    assert lat["col_slope"][60] == np.float32(5e-4) and lat["col_slope"][20] == 0 and lat["slope_row"] == 3.5
-    assert calibration.registration_arrays({}, 100) is None and calibration.registration_arrays(None, 100) is None
 
 
 # ---------------------------------------------------------------- detector blur from the noise of flats

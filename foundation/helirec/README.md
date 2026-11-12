@@ -379,10 +379,14 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     the doubled views measure (1.7 % over all directions), and by a third at 1000–1500 px (outside the sample
     there). Where the last rest turn and the helix both record: 5–6 % over all directions at 0.25–0.35 cycles/px
     and 10–25 % at 0.35–0.5 at 520–1080 px, the split-half correlation 0.691 → 0.718 and 0.880 → 0.889 at
-    0.25–0.35. Cost: the sinogram has 9523 rows for 8000 (helix) and about 2.2 times as many with a rest turn; a
-    chunk of 32 whole slices without projection filters takes 8.6 s for 7.5 s (the backprojection's rows), the
-    device holds 15.3 GB for 13.4 GB. It needs the exact backprojector (FBP, bands; at most 16 turns of rows);
-    the whole-slice methods use `nearest`. The exposure arc is not deconvolved with it (below).
+    0.25–0.35 (`development_notes/calibration/05_experiments/exp34_views.py`). Cost: the sinogram has 9523 rows
+    for 8000 (helix) and about 2.2 times as many with a rest turn; a chunk of 32 whole slices without projection
+    filters takes 8.7 s for 7.6 s (the backprojection's rows) and the device holds 15.3 GB for 13.4 GB, with
+    `sharpness_weighting=auto` 9.2 s for 8.0 s and 22.7 GB for 19.7 GB; the slab of 256 slices with Paganin and
+    unsharp, masked uint8, 46–47 s for 44 s, with the weighting 54 s for 50–51 s (18.4 and 27.3 GB at most on the
+    device). `nearest` itself is unchanged: the slab is the same bytes as before. It needs the exact backprojector
+    (FBP, bands; at most 16 turns of rows); the whole-slice methods use `nearest`. The exposure arc is not
+    deconvolved with it (below).
   * `exposure_arc=auto|F` (default `0`: off): in a continuous scan the detector integrates while the sample turns, a
     box blur along the angle of F angular steps (tangential, growing with the radius: 0.7 px at r = 1000 px for
     PHerc0343P). `auto` takes F from the scan (the recorded rotation swept per exposure / per period, 0.91 here;
