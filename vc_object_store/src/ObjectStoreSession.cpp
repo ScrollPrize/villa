@@ -279,6 +279,19 @@ TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& iden
     return request;
 }
 
+TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& identity, const std::string& storeUuid,
+                                                  const std::string& generation)
+{
+    const auto author = withAttachment(identity, false, [](Attachment& attachment) { return attachment.author; });
+    if (author.empty()) throw std::invalid_argument("object store attachment has no author for its requests");
+    TransactionRequest request;
+    request.requestUuid = util::newUuid();
+    request.storeUuid = storeUuid;
+    request.generation = generation;
+    request.author = author;
+    return request;
+}
+
 TransactionReceipt ObjectStoreSession::submit(const AttachmentIdentity& identity, const TransactionRequest& request)
 {
     return withAttachment(identity, true, [&](Attachment& attachment) {

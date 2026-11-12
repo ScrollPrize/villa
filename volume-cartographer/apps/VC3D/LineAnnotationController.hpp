@@ -1123,7 +1123,7 @@ private:
     void onActiveVolumeChanged();
     // Pushes _umbilicusNotice to every open pane's dialog.
     void publishUmbilicusNotice();
-    void finishOptimization(const std::string& surfaceName);
+    void finishOptimization(const std::string& surfaceName, bool join = true);
     // Loads the stored umbilicus into the session frame on first use and caches
     // the (possibly empty) result; reloaded when the volume, frame or stored
     // umbilicus changes.
@@ -1267,7 +1267,8 @@ private:
         const std::vector<vc3d::line_annotation::LineControlPoint>* previousControlPoints = nullptr,
         const std::vector<FiberBranchRef>* previousBranches = nullptr);
     void scheduleBranchMetadataSaves(const std::vector<uint64_t>& fiberIds,
-                                     uint64_t excludedFiberId = 0);
+                                     uint64_t excludedFiberId = 0,
+                                     bool background = false);
     // Hook internals; do not call directly from mutation sites.
     void syncReciprocalBranchControlPointReferences(const LineAnnotationSession& session);
     [[nodiscard]] bool confirmLinkedControlPointEdit(const LineAnnotationSession& session,
@@ -1373,7 +1374,10 @@ private:
     [[nodiscard]] StoredFiberSessionSnapshot makeStoredFiberSessionSnapshot(
         LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
-    void saveSessionAsFiber(LineAnnotationSession& session, bool finalize = true);
+    // background: a save made by a placement or its landing. While a
+    // background publication is running it is queued behind it instead of
+    // waiting for it (every other save waits).
+    void saveSessionAsFiber(LineAnnotationSession& session, bool finalize = true, bool background = false);
     // Debounced autosave after a solve landing: consecutive landings coalesce
     // into one saveSessionAsFiber (with its no-op probe, fiber summary
     // rebuild, and linked-fiber sync) instead of paying it per landing. The
@@ -1382,8 +1386,8 @@ private:
     // close paths (which finalize+save directly and supersede the pending
     // flush). Cross-fiber operations and package switches flush explicitly
     // so nothing reads a fiber whose newest geometry is still session-only.
-    void scheduleSessionAutoSave(LineAnnotationSession& session);
-    void flushSessionAutoSave(const std::string& surfaceName);
+    void scheduleSessionAutoSave(LineAnnotationSession& session, bool background = false);
+    void flushSessionAutoSave(const std::string& surfaceName, bool background = false);
     [[nodiscard]] static nlohmann::json fiberSourceMetadata(const StoredFiber& fiber);
     friend int runObjectStoreControllerTests();
     friend struct ::FiberMapSnapshotDecodeState;
@@ -1423,6 +1427,69 @@ private:
     static void readSavedFiberHeads(const FiberCommitJob& job, vc::objects::ObjectStoreSession& connection,
                                     FiberCommitResult& result);
     void installFiberCommit(FiberCommitJob& job, const FiberCommitResult& result);
+    // A placement's (or its landing's) publication on a hosted fiber store
+    // runs off the GUI thread: the commit and the decodes of what it changed
+    // happen on a worker, and the GUI installs the result when it is done.
+    // At most one runs at a time. While it runs, the session state it was
+    // prepared from is not changed and nothing else is published:
+    // - placements, solve landings, solve dispatches, background saves and
+    //   the fiber store's commit events are queued and run, in order, after
+    //   the install;
+    // - every other save (and anything that snapshots a session for one)
+    //   first waits for it and installs it (joinPublication), as if it had
+    //   been made synchronously.
+    struct FiberPublication;
+    std::shared_ptr<FiberPublication> _publication;
+    struct DeferredWork {
+        std::string surfaceName;  // the pane it is for (its dialog shows it pending); may be empty
+        std::function<void()> work;
+        // A save: one per key is queued (it saves the session as it is when
+        // it runs), and saves run before the rest of the queue so a solve
+        // dispatched behind them starts from the published session.
+        std::string saveKey;
+    };
+    std::vector<DeferredWork> _afterPublication;
+    // Tag and span-tag edits (break, kollesis termination, gap, damaged)
+    // requested while their session is still being published or solved: they
+    // are applied, in order, once it is neither, to the controls they named
+    // (found again by position; an edit whose control is gone is dropped
+    // with a message).
+    struct DeferredControlEdit {
+        std::string surfaceName;
+        std::vector<cv::Vec3d> controls;
+        std::function<void(const std::vector<size_t>&)> replay;
+    };
+    std::vector<DeferredControlEdit> _deferredControlEdits;
+    bool _deferredControlEditDrainQueued = false;
+    [[nodiscard]] bool sessionAwaitsLanding(const LineAnnotationSession& session) const;
+    bool deferControlEdit(const LineAnnotationSession& session, const std::vector<size_t>& controlIndices,
+                          std::function<void(const std::vector<size_t>&)> replay);
+    void scheduleDeferredControlEdits();
+    void drainDeferredControlEdits();
+    [[nodiscard]] bool hasDeferredWork(const std::string& surfaceName) const;
+    std::vector<vc::objects::StoreSessionEvent> _eventsDuringPublication;
+    bool _publicationDrainQueued = false;
+    // Commit sequences of installed background publications: their events
+    // bring nothing the install did not already do.
+    std::set<int64_t> _installedPublicationSequences;
+    // The fiber tag list as of a store view position (asked for by every
+    // pane refresh; it can only change with the position).
+    mutable std::optional<std::pair<vc::objects::FeedCursor, std::vector<std::string>>> _knownFiberTagsAtView;
+    // Off (VC3D_BACKGROUND_PUBLICATION=0, or the tests' seam): every
+    // publication is synchronous.
+    static inline bool s_backgroundPublicationDefault =
+        qEnvironmentVariable("VC3D_BACKGROUND_PUBLICATION") != QLatin1String("0");
+    bool _backgroundPublication = s_backgroundPublicationDefault;
+    // True (and the snapshots are taken) when the publication was started.
+    bool publishInBackground(std::vector<FiberSaveSnapshot>& snapshots);
+    // Queues `work` behind the running publication; false when none runs.
+    bool deferDuringPublication(std::function<void()> work, const std::string& surfaceName = {},
+                                const std::string& saveKey = {});
+    void finishPublication(bool drainNow);
+    void joinPublication();
+    void drainAfterPublication();
+    void abandonPublication();
+    void handleFiberStoreCommitEvent(const vc::objects::StoreSessionEvent& event);
     // The fiber and umbilicus attachments the controller last reset for;
     // true (and updated) when either route changed since.
     std::optional<vc::objects::AttachmentIdentity> _observedFiberStore, _observedUmbilicusStore;
@@ -1430,7 +1497,7 @@ private:
     void commitFiberStoreAction(std::vector<FiberSaveSnapshot>& snapshots,
                                const std::vector<StoredFiber>& retired = {});
     void commitFibers(std::initializer_list<StoredFiber*> fibers);
-    void applyCommittedFibers(const std::vector<FiberSaveSnapshot>& snapshots);
+    void applyCommittedFibers(const std::vector<FiberSaveSnapshot>& snapshots, bool supersedeSolves = true);
     void waitForFiberSaves();
     [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
 
@@ -1653,9 +1720,9 @@ private:
     // decode's pinned version. Unset until the attachment's first completed
     // check, after a revalidation, and for local attachments.
     mutable std::optional<vc::objects::FeedCursor> _fiberStoreView;
-    // Test seam: off, every validation reads the store's status (the path
-    // workers and local attachments use).
-    static inline bool s_fiberStoreViewDefault = true;
+    // Off (VC3D_FIBER_STORE_VIEW=0, or the tests' seam): every validation
+    // reads the store's status (the path workers and local attachments use).
+    static inline bool s_fiberStoreViewDefault = qEnvironmentVariable("VC3D_FIBER_STORE_VIEW") != QLatin1String("0");
     bool _fiberStoreViewEnabled = s_fiberStoreViewDefault;
     mutable std::optional<vc::objects::AttachmentIdentity> _fiberStoreViewAttachment;
     [[nodiscard]] std::optional<vc::objects::FeedCursor> fiberStoreView(
@@ -1797,4 +1864,6 @@ private:
     // can solve concurrently; solves within one session are serialized by the
     // per-session coalescing queue.
     QThreadPool _lineSolvePool;
+    // Its own thread: a publication never waits behind a running solve.
+    QThreadPool _publicationPool;
 };

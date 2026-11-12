@@ -433,6 +433,149 @@
                         "both are current once the events arrive");
             }
         }
+        // Background publication: a placement's save runs on a worker; saves
+        // made meanwhile queue behind it (one per session), a synchronous save
+        // first takes its result, and tag edits queued behind it still run.
+        {
+            Controller publishing(&state, nullptr, nullptr, nullptr);
+            publishing._errorDialogsSuppressed = true;
+            publishing._backgroundPublication = true;
+            auto* session = state.objectStoreSession().get();
+            session->refresh(hosted); state.pollObjectStoreChanges();
+            const auto stored = [&] {
+                return publishing.readStoredFibers(std::vector<std::string>{cUuid}, true).at(0);
+            };
+            const auto original = stored();
+            auto live = std::make_shared<Controller::LineAnnotationSession>();
+            live->surfaceName = "publication-test";
+            live->fiberId = original.id; live->fiberUuid = original.uuid;
+            live->fiberFileName = original.fileName; live->fiberUsername = original.username;
+            live->fiberStartedAt = original.startedAt; live->fiberSequence = original.sequence;
+            live->storePin = original.storePin; live->coordinateIdentity = original.coordinateIdentity;
+            live->frame = original.frame; live->fiberOptimizationMode = original.optimizationMode;
+            live->fiberTags = original.tags; live->fiberManualHvTag = original.manualHvTag;
+            live->fiberWidth = original.width; live->fiberWidthGapFraction = original.widthGapFraction;
+            live->modelOnly = original.modelOnly; live->branches = original.branches;
+            live->suppressGeneratedViews = true; live->suppressErrorDialogs = true;
+            for (size_t i = 0; i < original.controlPoints.size(); ++i) {
+                const auto& cp = original.controlPoints[i];
+                vc3d::line_annotation::LineControlPoint control(double(i), cp, i == 0, int(i));
+                control.storeId = cp.storeId; control.segmentToNext = cp.segmentToNext;
+                control.tags = cp.tags; control.direction = cp.direction;
+                control.displayNormal = cp.displayNormal; control.displayNormalSource = cp.displayNormalSource;
+                live->controlPoints.push_back(control);
+            }
+            for (const auto& position : original.linePoints) {
+                vc::lasagna::LinePoint point; point.position = position;
+                live->optimizedLine.points.push_back(point);
+            }
+            Controller::PaneRecord pane; pane.surfaceName = live->surfaceName; pane.session = live;
+            publishing._panes.push_back(pane);
+            const auto settle = [&](const char* what) {
+                QElapsedTimer waited; waited.start();
+                while ((publishing._publication || !publishing._afterPublication.empty() ||
+                        publishing._publicationDrainQueued || !publishing._deferredControlEdits.empty()) &&
+                       waited.elapsed() < 20000)
+                    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                require(!publishing._publication && publishing._afterPublication.empty() &&
+                        publishing._deferredControlEdits.empty(), what);
+            };
+            const auto failures = publishing._fiberSaveFailureCount;
+            // One runs; two more saves of the same session queue as one.
+            auto pin = live->storePin;
+            live->fiberWidth += .25;
+            publishing.saveSessionAsFiber(*live, false, true);
+            require(publishing._publication && live->storePin == pin, "a background save returns before it is stored");
+            live->fiberWidth += .25;
+            publishing.saveSessionAsFiber(*live, false, true);
+            live->fiberWidth += .25;
+            publishing.saveSessionAsFiber(*live, false, true);
+            require(publishing._afterPublication.size() == 1, "saves behind a publication queue once per session");
+            settle("the publication and the queued save finish");
+            require(publishing._fiberSaveFailureCount == failures && live->storePin != pin &&
+                    stored().width == live->fiberWidth && stored().storePin == live->storePin,
+                    "the queued save stored the session as it was when it ran, at the pin the session holds");
+            // A synchronous save while one runs takes its pin first (the
+            // closing save's case): no version conflict.
+            pin = live->storePin;
+            live->fiberWidth += .25;
+            publishing.saveSessionAsFiber(*live, false, true);
+            require(bool(publishing._publication), "a second background save starts");
+            live->fiberWidth += .25;
+            publishing.saveSessionAsFiber(*live, false);
+            require(!publishing._publication && publishing._fiberSaveFailureCount == failures &&
+                    stored().width == live->fiberWidth && stored().storePin == live->storePin && live->storePin != pin,
+                    "a synchronous save joins the running publication and saves on top of it");
+            settle("nothing is left queued after the join");
+            // A tag edit queued behind a publication that a synchronous save
+            // then joins is still applied.
+            {
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "a third background save starts");
+                int replayed = 0;
+                std::vector<size_t> at;
+                require(publishing.deferControlEdit(*live, {size_t(1)}, [&](const std::vector<size_t>& indices) {
+                            ++replayed; at = indices;
+                        }), "a tag edit during a publication is queued");
+                publishing.joinPublication();
+                require(!publishing._publication && replayed == 0, "the join does not run it inside the caller");
+                settle("the queued tag edit drains from the event loop");
+                require(replayed == 1 && at == std::vector<size_t>{1}, "and is applied once to the control it named");
+            }
+            // The install gives a published control its id by position when a
+            // control placed meanwhile shifted the order.
+            {
+                require(live->controlPoints.size() >= 2 && live->optimizedLine.points.size() >= 2, "C has a line");
+                const auto last = live->controlPoints.back();
+                const int lineEnd = int(live->optimizedLine.points.size());
+                const cv::Vec3d step = last.volumePoint - live->controlPoints[live->controlPoints.size() - 2].volumePoint;
+                const auto addControl = [&](double linePosition, const cv::Vec3d& where, int optimizedIndex) {
+                    vc3d::line_annotation::LineControlPoint control(linePosition, where, false, optimizedIndex);
+                    control.storeId = -1;
+                    live->controlPoints.push_back(control);
+                };
+                vc::lasagna::LinePoint p1; p1.position = last.volumePoint + step * .5;
+                vc::lasagna::LinePoint p2; p2.position = last.volumePoint + step;
+                live->optimizedLine.points.push_back(p1);
+                live->optimizedLine.points.push_back(p2);
+                addControl(last.linePosition + 2, p2.position, lineEnd + 1);
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "the placement's background save starts");
+                addControl(last.linePosition + 1, p1.position, lineEnd);  // placed before it, while it publishes
+                settle("the placement is published");
+                const auto idOf = [&](const cv::Vec3d& where) -> int64_t {
+                    for (const auto& control : live->controlPoints) if (control.volumePoint == where) return control.storeId;
+                    return int64_t(-2);
+                };
+                const int64_t published = idOf(p2.position);
+                require(published >= 0 && idOf(p1.position) < 0,
+                        "the published control has its id; the one placed since has none yet");
+                publishing.saveSessionAsFiber(*live, false);
+                const auto after = stored();
+                const auto kept = std::find_if(after.controlPoints.begin(), after.controlPoints.end(),
+                                               [&](const auto& control) { return control == p2.position; });
+                require(publishing._fiberSaveFailureCount == failures && kept != after.controlPoints.end() &&
+                        kept->storeId == published && idOf(p1.position) >= 0 && idOf(p1.position) != published,
+                        "the next save keeps the published control's identity and gives the new one its own");
+            }
+            // A publication that fails (another client changed the fiber): it
+            // is counted, and what was queued behind it does not stay queued.
+            {
+                submitOther({SetMetaOp{cUuid, "publication_test", "true"}}, cUuid);
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "the conflicting background save starts");
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                settle("a failed publication ends and its queue drains");
+                require(publishing._fiberSaveFailureCount > failures, "the failed publication is counted");
+                QCoreApplication::processEvents();
+            }
+            publishing._panes.clear();
+            session->refresh(hosted); state.pollObjectStoreChanges();
+            QCoreApplication::processEvents();
+        }
         writer.detach(other);
         state.closeProject();
 

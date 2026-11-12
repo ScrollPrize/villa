@@ -277,6 +277,10 @@ public:
     // generation, by the attachment's author (OpenOptions::author, or
     // HostedSessionOptions::author).
     TransactionRequest newRequest(const AttachmentIdentity&);
+    // The same for a caller that already knows the store's uuid and history
+    // generation (from a status it read or an event it was delivered): no
+    // status read. A request for another generation is refused by the store.
+    TransactionRequest newRequest(const AttachmentIdentity&, const std::string& storeUuid, const std::string& generation);
     // Checked atomic request (objects/Transactions.hpp); conflicts throw
     // TransactionConflict. Hosted: transport failures leave the outcome
     // unknown; recover it with receipt() or submit the identical request again.
