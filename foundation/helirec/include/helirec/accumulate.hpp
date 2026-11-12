@@ -12,7 +12,7 @@
 // pixel: a [1/2, 1/2] box, response cos(pi nu)). With AccumScanView::x_taps > 0 its value is instead interpolated
 // across x_taps columns (the weight stays the splat's), wherever all of them are measured columns; next to the
 // detector edges and to unmeasured columns the splat is kept. A kernel of a few columns still loses the top of the
-// band (lanczos3 at half a pixel: 0.83 at 0.36 cycles per pixel, 0.33 at 0.45, 0 at Nyquist). With
+// band (lanczos3 at half a pixel: 0.82 at 0.36 cycles per pixel, 0.35 at 0.45, 0 at Nyquist). With
 // AccumScanView::x_exact the rows of the block's projections are instead delayed by the offset exactly
 // (shift_rows, sino.hpp) before they are gathered; gridding of measured pixels only (iterative data) keeps the
 // kernel.
