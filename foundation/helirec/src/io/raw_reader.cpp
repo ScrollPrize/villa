@@ -11,10 +11,18 @@
 #include <map>
 #include <mutex>
 
+#include "io/j2k_chunk.hpp"
+
 namespace helirec {
 
 struct RawReader::FileInfo {
-    std::vector<std::int64_t> frame_offset;  // byte offset of each frame in the file
+    std::vector<std::int64_t> frame_offset;  // byte offset of each frame in the file (plain values)
+    // Compressed frames (io/j2k_chunk.hpp): chunks of chunk_rows rows, each one JPEG 2000 codestream.
+    int chunk_rows = 0;                      // 0: plain values
+    int chunks_per_frame = 0;
+    std::vector<std::int64_t> chunk_offset;  // (frame, chunk)
+    std::vector<std::uint32_t> chunk_bytes;
+    std::size_t frames() const { return chunk_rows ? chunk_offset.size() / static_cast<std::size_t>(chunks_per_frame) : frame_offset.size(); }
 };
 
 struct RawReader::Sync {
@@ -35,6 +43,9 @@ struct H5Handle {
 };
 
 }  // namespace
+
+bool jpeg2000_frames_supported() { return j2k::available(); }
+std::vector<std::uint8_t> jpeg2000_chunk(const std::uint16_t* values, int rows, int cols) { return j2k::encode_chunk(values, cols, rows); }
 
 RawReader::RawReader(std::vector<std::string> files, std::string dataset, int rows, int cols)
     : files_(std::move(files)), dataset_(std::move(dataset)), rows_(rows), cols_(cols), sync_(std::make_unique<Sync>()) {
@@ -71,8 +82,35 @@ const RawReader::FileInfo& RawReader::info(int file) {
         const haddr_t base = H5Dget_offset(d.id);
         if (base == HADDR_UNDEF) throw Error("RawReader: " + path + ": contiguous dataset without storage");
         for (hsize_t k = 0; k < dims[0]; ++k) fi->frame_offset[k] = static_cast<std::int64_t>(base) + k * frame_bytes;
+    } else if (layout == H5D_CHUNKED && H5Pget_nfilters(plist.id) != 0) {
+        // one JPEG 2000 codestream per chunk, through the blosc2 filter; nothing else compressed is read
+        unsigned flags = 0;
+        std::size_t n_values = 0;
+        hsize_t cdims[3];
+        H5Pget_chunk(plist.id, 3, cdims);
+        if (H5Pget_nfilters(plist.id) != 1 || H5Pget_filter2(plist.id, 0, &flags, &n_values, nullptr, 0, nullptr, nullptr) != static_cast<H5Z_filter_t>(j2k::kBlosc2FilterId))
+            throw Error("RawReader: " + path + ": compressed data is not supported, but for JPEG 2000 chunks of the blosc2 filter (32026)");
+        if (cdims[0] != 1 || cdims[1] < 1 || static_cast<int>(cdims[2]) != cols_)
+            throw Error("RawReader: " + path + ": compressed chunks must be whole rows of one frame");
+        if (!j2k::available())
+            throw Error("RawReader: " + path + ": the frames are stored as JPEG 2000; build helirec with OpenJPEG (libopenjp2 >= 2.5: apt install libopenjp2-7-dev, brew install openjpeg)");
+        fi->chunk_rows = static_cast<int>(cdims[1]);
+        fi->chunks_per_frame = (rows_ + fi->chunk_rows - 1) / fi->chunk_rows;
+        fi->chunk_offset.resize(dims[0] * fi->chunks_per_frame);
+        fi->chunk_bytes.resize(dims[0] * fi->chunks_per_frame);
+        for (hsize_t k = 0; k < dims[0]; ++k)
+            for (int c = 0; c < fi->chunks_per_frame; ++c) {
+                hsize_t off[3] = {k, static_cast<hsize_t>(c) * fi->chunk_rows, 0};
+                unsigned mask = 0;
+                haddr_t addr = HADDR_UNDEF;
+                hsize_t size = 0;
+                if (H5Dget_chunk_info_by_coord(d.id, off, &mask, &addr, &size) < 0 || addr == HADDR_UNDEF)
+                    throw Error("RawReader: " + path + ": frame " + std::to_string(k) + " not written");
+                if (mask != 0) throw Error("RawReader: " + path + ": a chunk of frame " + std::to_string(k) + " was stored without its filter");
+                fi->chunk_offset[k * fi->chunks_per_frame + c] = static_cast<std::int64_t>(addr);
+                fi->chunk_bytes[k * fi->chunks_per_frame + c] = static_cast<std::uint32_t>(size);
+            }
     } else if (layout == H5D_CHUNKED) {
-        if (H5Pget_nfilters(plist.id) != 0) throw Error("RawReader: " + path + ": compressed data is not supported");
         hsize_t cdims[3];
         H5Pget_chunk(plist.id, 3, cdims);
         if (cdims[0] != 1 || static_cast<int>(cdims[1]) != rows_ || static_cast<int>(cdims[2]) != cols_)
@@ -111,7 +149,56 @@ void pread_all(int fd, void* buf, std::size_t n, std::int64_t off, const std::st
     }
 }
 
+// rows [k chunk_rows, (k + 1) chunk_rows) of frame `frame`, decoded -> tile (chunk_rows, cols)
+void decode_chunk(int fd, const std::string& path, std::int64_t offset, std::size_t bytes, int chunk_rows, int cols, std::vector<std::uint8_t>& raw,
+                  std::uint16_t* tile) {
+    raw.resize(bytes);
+    pread_all(fd, raw.data(), bytes, offset, path);
+    j2k::decode(j2k::codestream_of_chunk(raw.data(), bytes, static_cast<std::size_t>(chunk_rows) * cols * 2), cols, chunk_rows, tile);
+}
+
+// the reading threads of the compressed paths keep one file open each
+struct OpenFile {
+    int fd = -1, file = -1;
+    ~OpenFile() {
+        if (fd >= 0) ::close(fd);
+    }
+    int get(int f, const std::string& path) {
+        if (f == file) return fd;
+        if (fd >= 0) ::close(fd);
+        file = f;
+        fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            file = -1;
+            throw Error("RawReader: cannot open " + path);
+        }
+        return fd;
+    }
+};
+
 }  // namespace
+
+RawReader::Storage RawReader::storage(int file) {
+    const FileInfo& fi = info(file);
+    Storage st;
+    st.frames = static_cast<std::int64_t>(fi.frames());
+    st.bytes_per_frame = static_cast<double>(rows_) * cols_ * 2;
+    if (!fi.chunk_rows || fi.chunk_offset.empty()) return st;
+    st.compressed = true;
+    st.chunk_rows = fi.chunk_rows;
+    double total = 0;
+    for (std::uint32_t b : fi.chunk_bytes) total += b;
+    st.bytes_per_frame = total / static_cast<double>(st.frames);
+    const std::string& path = files_[file];
+    std::vector<std::uint8_t> raw(fi.chunk_bytes[0]);
+    OpenFile of;
+    pread_all(of.get(file, path), raw.data(), raw.size(), fi.chunk_offset[0], path);
+    const j2k::Info ji = j2k::info(j2k::codestream_of_chunk(raw.data(), raw.size(), static_cast<std::size_t>(fi.chunk_rows) * cols_ * 2));
+    st.reversible = ji.reversible;
+    st.bit_depth = ji.bit_depth;
+    st.codec = ji.high_throughput ? "JPEG 2000 (HTJ2K)" : "JPEG 2000";
+    return st;
+}
 
 void RawReader::read_rows(const int32_t* file_index, const int32_t* frame_index, const int32_t* row0, std::size_t n,
                           int nrows, uint16_t* out, int n_threads, std::size_t out_stride) {
@@ -127,10 +214,55 @@ void RawReader::read_rows(const int32_t* file_index, const int32_t* frame_index,
     const std::size_t row_bytes = static_cast<std::size_t>(cols_) * 2;
     const int nt = n_threads > 0 ? n_threads : std::min(32, omp_get_max_threads());
     std::string error;
+    // compressed files: one task per chunk a request touches, decoded in parallel
+    struct Task {
+        std::size_t i;
+        int chunk;
+    };
+    std::vector<Task> tasks;
+    for (auto& [f, v] : by_file) {
+        const FileInfo& fi = *infos_[f];
+        if (!fi.chunk_rows) continue;
+        for (std::size_t i : v) {
+            const int k = frame_index[i];
+            if (k < 0 || static_cast<std::size_t>(k) >= fi.frames()) throw Error("RawReader: frame index out of range in " + files_[f]);
+            const int a = std::max(0, row0[i]), b = std::min(rows_, row0[i] + nrows);
+            if (a > row0[i] || b < row0[i] + nrows) std::memset(out + i * out_stride, 0, static_cast<std::size_t>(nrows) * row_bytes);
+            for (int c = a / fi.chunk_rows; b > a && c <= (b - 1) / fi.chunk_rows; ++c) tasks.push_back({i, c});
+        }
+    }
+    if (!tasks.empty()) {
+#pragma omp parallel num_threads(nt)
+        {
+            OpenFile of;
+            std::vector<std::uint8_t> raw;
+            std::vector<uint16_t> tile;
+#pragma omp for schedule(dynamic, 1)
+            for (std::ptrdiff_t t = 0; t < static_cast<std::ptrdiff_t>(tasks.size()); ++t) {
+                try {
+                    const std::size_t i = tasks[t].i;
+                    const int f = file_index[i], c = tasks[t].chunk;
+                    const FileInfo& fi = *infos_[f];
+                    const std::size_t at = static_cast<std::size_t>(frame_index[i]) * fi.chunks_per_frame + c;
+                    tile.resize(static_cast<std::size_t>(fi.chunk_rows) * cols_);
+                    decode_chunk(of.get(f, files_[f]), files_[f], fi.chunk_offset[at], fi.chunk_bytes[at], fi.chunk_rows, cols_, raw, tile.data());
+                    const int a = std::max({0, row0[i], c * fi.chunk_rows}), b = std::min({rows_, row0[i] + nrows, (c + 1) * fi.chunk_rows});
+                    if (b > a)
+                        std::memcpy(out + i * out_stride + static_cast<std::size_t>(a - row0[i]) * cols_,
+                                    tile.data() + static_cast<std::size_t>(a - c * fi.chunk_rows) * cols_, static_cast<std::size_t>(b - a) * row_bytes);
+                } catch (const std::exception& e) {
+#pragma omp critical(helirec_reader_error)
+                    if (error.empty()) error = e.what();
+                }
+            }
+        }
+        if (!error.empty()) throw Error(error);
+    }
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nt)
     for (std::ptrdiff_t g = 0; g < static_cast<std::ptrdiff_t>(groups.size()); ++g) {
         const int f = groups[g].first;
         const std::string& path = files_[f];
+        if (infos_[f]->chunk_rows) continue;  // done above
         try {
             const int fd = ::open(path.c_str(), O_RDONLY);
             if (fd < 0) throw Error("RawReader: cannot open " + path);
@@ -174,6 +306,41 @@ void RawReader::visit_frames(const int32_t* file_index, const int32_t* frame_ind
     const std::size_t row_bytes = static_cast<std::size_t>(cols_) * 2;
     const int nt = n_threads > 0 ? n_threads : std::min(32, omp_get_max_threads());
     std::string error;
+    // compressed files: one task per frame, the whole frame decoded and handed over in pieces
+    std::vector<std::size_t> packed;
+    for (auto& [f, v] : by_file)
+        if (infos_[f]->chunk_rows) {
+            for (std::size_t i : v)
+                if (frame_index[i] < 0 || static_cast<std::size_t>(frame_index[i]) >= infos_[f]->frames()) throw Error("RawReader: frame index out of range in " + files_[f]);
+            packed.insert(packed.end(), v.begin(), v.end());
+        }
+    if (!packed.empty()) {
+#pragma omp parallel num_threads(nt)
+        {
+            OpenFile of;
+            std::vector<std::uint8_t> raw;
+            std::vector<uint16_t> frame;
+#pragma omp for schedule(dynamic, 1)
+            for (std::ptrdiff_t t = 0; t < static_cast<std::ptrdiff_t>(packed.size()); ++t) {
+                try {
+                    const std::size_t i = packed[t];
+                    const int f = file_index[i];
+                    const FileInfo& fi = *infos_[f];
+                    frame.resize(static_cast<std::size_t>(fi.chunks_per_frame) * fi.chunk_rows * cols_);
+                    for (int c = 0; c < fi.chunks_per_frame; ++c) {
+                        const std::size_t at = static_cast<std::size_t>(frame_index[i]) * fi.chunks_per_frame + c;
+                        decode_chunk(of.get(f, files_[f]), files_[f], fi.chunk_offset[at], fi.chunk_bytes[at], fi.chunk_rows, cols_, raw,
+                                     frame.data() + static_cast<std::size_t>(c) * fi.chunk_rows * cols_);
+                    }
+                    for (int r0 = 0; r0 < rows_; r0 += nrows) visit(i, r0, std::min(nrows, rows_ - r0), frame.data() + static_cast<std::size_t>(r0) * cols_);
+                } catch (const std::exception& e) {
+#pragma omp critical(helirec_reader_error)
+                    if (error.empty()) error = e.what();
+                }
+            }
+        }
+        if (!error.empty()) throw Error(error);
+    }
 #pragma omp parallel num_threads(nt)
     {
         std::vector<uint16_t> buf(static_cast<std::size_t>(nrows) * cols_);
@@ -181,6 +348,7 @@ void RawReader::visit_frames(const int32_t* file_index, const int32_t* frame_ind
         for (std::ptrdiff_t g = 0; g < static_cast<std::ptrdiff_t>(groups.size()); ++g) {
             const int f = groups[g].first;
             const std::string& path = files_[f];
+            if (infos_[f]->chunk_rows) continue;  // done above
             try {
                 const int fd = ::open(path.c_str(), O_RDONLY);
                 if (fd < 0) throw Error("RawReader: cannot open " + path);

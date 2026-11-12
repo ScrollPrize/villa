@@ -116,14 +116,14 @@ std::string Report::text() const {
     return o.str();
 }
 
-Tolerances tolerances(const Record& rec, double eps) {
+Tolerances tolerances(const Record& rec, double eps, double radius_px) {
     if (!std::isfinite(eps) || eps <= 0) throw Error("position target must be finite and positive");
     Tolerances t;
     t.eps = eps;
     const auto& size = rec.technique.numbers("detector/" + rec.detector + "/size");
     if (size.size() != 2) throw Error("the record does not state the detector's size");
     // the largest radius: a second scan with its axis at the edge of the field spans the detector's full width
-    t.R = size[0];
+    t.R = radius_px > 0 ? radius_px : size[0];
     t.H = size[1];
     t.step_deg = rec.technique.number("scan/scan_range") / rec.technique.number("scan/tomo_n");
     return t;

@@ -48,6 +48,14 @@ find_package(ZLIB REQUIRED)   # zlib chunks of Zarr arrays (zarr.hpp)
 
 find_package(CURL REQUIRED)   # Zarr arrays at http(s):// and s3:// locations (reference volumes)
 
+# OpenJPEG: frames stored as JPEG 2000 (HTJ2K) chunks, as ESRF BM18 writes projections (src/io/j2k_chunk.hpp).
+# Optional: without it such scans are refused with a message that names the package.
+option(HELIREC_OPENJPEG "Read frames stored as JPEG 2000 (needs libopenjp2 >= 2.5)" ON)
+if(HELIREC_OPENJPEG)
+  pkg_check_modules(OPENJP2 IMPORTED_TARGET libopenjp2>=2.5)
+endif()
+message(STATUS "helirec: JPEG 2000 frames (OpenJPEG) ${OPENJP2_FOUND}")
+
 # vc-delta3d (lossless uint8 chunk codec of vc_reader / VC3D), pinned to the revision vc_reader uses
 # so that everything helirec writes is readable there. Offline builds: -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>
 option(HELIREC_DELTA3D "Build the vc-delta3d chunk codec (uint8 OME-Zarr output)" ON)
@@ -78,6 +86,10 @@ target_link_libraries(helirec
 if(HELIREC_DELTA3D)
   target_link_libraries(helirec PRIVATE vc_delta3d::vc_delta3d)
   target_compile_definitions(helirec PRIVATE HELIREC_WITH_DELTA3D=1)
+endif()
+if(HELIREC_OPENJPEG AND OPENJP2_FOUND)
+  target_link_libraries(helirec PRIVATE PkgConfig::OPENJP2)
+  target_compile_definitions(helirec PRIVATE HELIREC_WITH_OPENJPEG=1)
 endif()
 
 if(HELIREC_WITH_CUDA)

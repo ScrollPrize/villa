@@ -638,12 +638,13 @@ files directly, and the only processing is a dark subtraction and a division by 
 ```bash
 cmake --build build/<tree> --target helirec-calibration
 helirec-calibration selftest [--device cpu|cuda]          # the registration estimator on synthetic data
-helirec-calibration record <scan.h5> [<second scan.h5>]   # the record against itself; no frame is read
-helirec-calibration verify <scan.h5> [<second scan.h5>] --out DIR [--checks record,inventory,series,beam,views]
+helirec-calibration record <scan.h5> [<more scans.h5> ...]   # the record against itself; no frame is read
+helirec-calibration verify <scan.h5> [<more scans.h5> ...] --out DIR [--checks record,inventory,series,beam,views]
 ```
 
-Of two scans of one acquisition, the scan with the rotation axis inside the detector's field comes first. `verify`
-prints one finding per check (what the record states, what was found, and `verified`, `fails`, `unverified` or `note`) and
+The scans are one scan; two scans of one acquisition that differ in the lateral stage of the rotation axis, the
+one with the axis inside the detector's field first; or the tiles of a mosaic (below), the reference tile first.
+`verify` prints one finding per check (what the record states, what was found, and `verified`, `fails`, `unverified` or `note`) and
 writes `report.txt`, `report.json` and `views.tsv` (every registered block) to `DIR`.
 
 The geometry target is **0.01 pixel** (`--position-target PX`, Python `position_target=...`, C++
@@ -664,9 +665,13 @@ CPU/CUDA arithmetic are unchanged by the reporting policy.
 The checks:
 
 * `record`: frame counts, the map from frame to file, the trigger timer, clocks, the derived angles and heights
-  against the raw encoder counts, commanded against recorded travel, the two scans against each other;
-* `inventory`: every frame is read once and its sum, minimum and maximum are compared with the statistics the
-  detector software recorded for it (`--inventory DIR` reuses the pass of an earlier `--out DIR`);
+  against the raw encoder counts, commanded against recorded travel, the scans against each other;
+* `inventory`: every frame on disk is read once and its sum, minimum and maximum are compared with the statistics
+  the detector software recorded for it (`--inventory DIR` reuses the pass of an earlier `--out DIR`).
+  `--inventory-step N` reads one frame in N; by default every frame is read, except in a stretch that is stored
+  compressed and has no recorded statistics, where nothing can be compared with a frame and decoding is what
+  takes the time: there one frame in 16 is read and every chunk of every frame is located in its file. The
+  finding says what was read;
 * `series`: the dark and flat frames; `beam`: the level of the air beside the sample against the ring current;
 * `views`: blocks of frames that recorded the same lines are registered to a fraction of a pixel, row and frame
   (`helirec/calibration/registration.hpp`): opposite views of a turn at rest (axis column, angle over half a
@@ -690,6 +695,35 @@ checks cut and register theirs (C++: `helirec::calibration::Session`, `ViewReque
 `CalibrationRegistrar(shape, margin)` keeps one registration geometry for many pairs of blocks. The experiments
 under `development_notes/calibration/04_experiments/` are written on these; none of them uses the
 reconstruction's calibration.
+
+**Partial copies.** Frame files that are not on disk are reported (`map from frame to file`, with the frames
+that are there) and their frames are never read: the master file's virtual dataset would return zeros for them.
+Reading such a frame through `CalibrationSession` or `Frames` is an error; `stretches(scan)[i]["on_disk"]` lists
+the ranges that can be read.
+
+**Frames stored as JPEG 2000.** Projections written as one JPEG 2000 (HTJ2K) codestream per chunk of rows through
+the blosc2 HDF5 filter (id 32026), as ESRF BM18 writes them, are read by `RawReader` when helirec is built with
+OpenJPEG (see Build); only the chunks a request touches are decoded, in parallel (about 140 whole frames of
+2368 × 4416 per second on 24 cores; a block of 56 frames × 300 rows in 0.1 s). The container is parsed by helirec
+itself, so neither the blosc2 library nor the HDF5 filter plugin is needed. Such frames are usually compressed
+irreversibly: the inventory reports the codec, the transform and the bits per value of each stretch
+(`how the frames are stored`), the decoded values are OpenJPEG's (another decoder may differ by a count), and
+their noise is not the detector's.
+
+**Mosaics.** Scans that differ in where the sample sits on the rotation stage (the tomo configuration's
+`sample_u`, `sample_v`) and not in the lateral stage of the axis are checked as tiles, any number of them:
+which motors differ, the place of each tile and its agreement with the laboratory pseudo-motors, which lines
+each pair records at equal angle and in opposite views and how often the lines of the merged acquisition are
+recorded, and the angles, heights and times of the tiles at equal projection index. The lever arm of the angle
+targets is then the farthest a tile's rays pass from its own axis inside the mosaic (`--radius PX` overrides
+it), not the detector's width. The `views` checks do not cover a mosaic; its comparisons are placed through the
+session. A sample displaced by `d` on the rotation stage is seen at angle θ and column `c` along the sample's
+line `s = c − axis − n(θ)·d`, so two tiles record the same lines at equal angle on columns `n(θ)·(d_j − d_k)`
+apart: a sinusoid once per turn. A request to `measure` states it as `sway_px`, `sway_phase_deg` (tile B's
+frames are read `sway_px cos(angle − sway_phase_deg)` columns further on, in B's own columns, resampled per
+frame by cubic convolution) and the registration returns what is left of it. With `mirror` and
+`angle_offset_deg=180` the same request compares one tile with the opposite views of another. The geometry
+calibration step and the reconstruction do not take mosaics yet (see Limitations).
 
 For measurement-support diagnostics, `--columns N --column-fraction F` selects a narrower
 window within each overlap (`N=0` keeps the full overlap; `F=0`, `0.5`, `1` selects left,
@@ -786,7 +820,9 @@ the transform plans).
 ## Build
 
 Requirements: CMake ≥ 3.24, a C++20 compiler, FFTW3 (float + double), HDF5 (C), zlib, libcurl, Python ≥ 3.10, and
-optionally the CUDA toolkit. The vc-delta3d codec is fetched at configure time (offline:
+optionally the CUDA toolkit and OpenJPEG ≥ 2.5 (`apt install libopenjp2-7-dev`, `brew install openjpeg`; found
+through pkg-config, `-DHELIREC_OPENJPEG=OFF` to build without). OpenJPEG is needed only for frames stored as
+JPEG 2000 (see `helirec-calibration`); without it such scans are refused with a message that names the package. The vc-delta3d codec is fetched at configure time (offline:
 `-DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>`). CUDA code is compiled for the build machine's GPU (`native`); override with
 `-DCMAKE_CUDA_ARCHITECTURES=...`. `HELIREC_CUDA=AUTO` (default) builds CUDA only if `nvcc` is found, so put it on
 `PATH` (or pass `-C cmake.define.HELIREC_CUDA=ON`); check with `helirec.devices()`.
@@ -808,6 +844,8 @@ These raise explicit errors:
 * both scans moving in the same z direction;
 * an acquisition the geometry calibration step can read: a helix whose travel per turn is less than the
   detector's height, a turn at rest before and after it, two scans of equally long stretches;
+* a mosaic (tiles that differ in the sample's place on the rotation stage) is checked by `helirec-calibration`
+  and measured through `CalibrationSession`, and not yet taken by `helirec-geometry` or the reconstruction;
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.
 

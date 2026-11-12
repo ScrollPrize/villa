@@ -125,13 +125,39 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
     for (int pass = 0; pass < 8; ++pass) {
         if (extra[0] && !plan_block_at(*P.ta, *P.tb, plan.p0, n[0], mg[0], J0 + extra[0], P.angle_offset, plan)) return false;
         if (plan.max_row_shift + 3 > mg[1]) return false;  // the margin of rows cannot take the pre-alignment
-        const int col_b = (P.mirror ? cut.col_b - extra[2] : cut.col_b + extra[2]) - mg[2];
-        const int row_b = cut.row_a + plan.row_offset + extra[1] - mg[1];
-        if (col_b < 0 || col_b + L[2] > cols || row_b < 0 || row_b + L[1] > rows) return false;
         if (plan.j0 - mg[0] < 0 || plan.j0 + n[0] + mg[0] > nb) return false;
+        // a sway of B's content along the columns: whole columns go into the cut, the rest is resampled per frame
+        std::vector<double> sway;
+        int sway_whole = 0, pad = 0;
+        if (P.sway_px != 0.0) {
+            sway.resize(static_cast<std::size_t>(L[0]));
+            for (int q = 0; q < L[0]; ++q)
+                sway[q] = P.sway_px * std::cos((P.tb->angle_deg[static_cast<std::size_t>(plan.j0 - mg[0] + q)] - P.sway_phase_deg) * (M_PI / 180.0));
+            sway_whole = static_cast<int>(std::lround(sway[static_cast<std::size_t>(mg[0] + n[0] / 2)]));
+            double largest = 0;
+            for (double& v : sway) v -= sway_whole, largest = std::max(largest, std::fabs(v));
+            pad = static_cast<int>(std::ceil(largest)) + 3;
+        }
+        const int col_b = (P.mirror ? cut.col_b - extra[2] : cut.col_b + extra[2]) - mg[2] + sway_whole;
+        const int row_b = cut.row_a + plan.row_offset + extra[1] - mg[1];
+        if (col_b - pad < 0 || col_b + L[2] + pad > cols || row_b < 0 || row_b + L[1] > rows) return false;
         for (int q = 0; q < L[0]; ++q) frame[q] = plan.j0 - mg[0] + q, row0[q] = row_b;
         t0 = std::chrono::steady_clock::now();
-        if (modelled_b) {
+        if (pad) {
+            static std::vector<float> wide;  // kept between blocks
+            const int nw = L[2] + 2 * pad;
+            wide.resize(static_cast<std::size_t>(L[0]) * L[1] * nw);
+            if (modelled_b) {
+                line_integrals_mapped(*P.B.frames, *P.B.ff, *map_b, P.sb, frame.data(), row_b, L[0], L[1], col_b - pad, nw, false, wide.data());
+            } else {
+                raw.resize(static_cast<std::size_t>(L[0]) * L[1] * cols);
+                P.B.frames->read_rows(P.sb, frame.data(), row0.data(), L[0], L[1], raw.data());
+                view_timing().read += seconds_since(t0);
+                t0 = std::chrono::steady_clock::now();
+                line_integrals(*P.B.ff, raw.data(), row0.data(), L[0], L[1], col_b - pad, nw, false, wide.data());
+            }
+            shift_columns(wide.data(), L[0], L[1], L[2], pad, sway.data(), P.mirror, b);
+        } else if (modelled_b) {
             line_integrals_mapped(*P.B.frames, *P.B.ff, *map_b, P.sb, frame.data(), row_b, L[0], L[1], col_b, L[2], P.mirror, b);
         } else {
             P.B.frames->read_rows(P.sb, frame.data(), row0.data(), L[0], L[1], raw.data());
@@ -235,7 +261,7 @@ std::vector<ViewMeasurement> Session::measure(const std::vector<ViewRequest>& re
         const Pairing P{{&record(q.scan_a), &frames(q.scan_a), &flat_field(q.scan_a)},
                         {&record(q.scan_b), &frames(q.scan_b), &flat_field(q.scan_b)},
                         q.stretch_a, q.stretch_b, &ta, &tb, q.angle_offset_deg, q.mirror, &impl_->maps[static_cast<std::size_t>(q.scan_a)],
-                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear};
+                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear, q.sway_px, q.sway_phase_deg};
         const int rows = P.A.frames->rows();
         const Size fsize = pick_size(q.frames + 24, q.frames, 8);
         BlockPlan plan;

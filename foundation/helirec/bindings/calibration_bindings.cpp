@@ -9,6 +9,7 @@
 
 #include "helirec/calibration/registration.hpp"
 #include "helirec/calibration/verify.hpp"
+#include "helirec/raw_reader.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -129,6 +130,11 @@ struct PySession {
             d["latched"] = st.latched();
             d["helical"] = !st.z_center.empty();
             d["title"] = st.title;
+            // the frames whose files are on disk, as [first, end) ranges: no other frame can be read
+            nb::list held;
+            for (const auto& [a, b] : st.frames_on_disk()) held.append(nb::make_tuple(a, b));
+            d["on_disk"] = held;
+            d["n_on_disk"] = st.n_on_disk();
             out.append(d);
         }
         return out;
@@ -251,6 +257,8 @@ struct PySession {
             q.col_a = static_cast<int>(get_int("col_a", 0));
             q.col_b = static_cast<int>(get_int("col_b", q.col_a));
             q.frame_shear = d.contains("frame_shear") ? nb::cast<double>(d["frame_shear"]) : 0.0;
+            q.sway_px = d.contains("sway_px") ? nb::cast<double>(d["sway_px"]) : 0.0;
+            q.sway_phase_deg = d.contains("sway_phase_deg") ? nb::cast<double>(d["sway_phase_deg"]) : 0.0;
             req.push_back(q);
         }
         std::vector<ViewMeasurement> res;
@@ -368,6 +376,12 @@ void bind_calibration(nb::module_& m) {
         .def("gain", [](PySession& p, int scan) { return p.flat(scan, false); }, "scan"_a, "Mean of all the scan's flat frames minus the dark (rows, cols).")
         .def("measure", &PySession::measure, "requests"_a, "row_sign"_a, "device"_a = "auto",
              "Register pairs of blocks placed by the caller, exactly as the view checks cut and register theirs. Each request is a dict: stretch_a, frame_a, and "
-             "optionally label, scan_a, scan_b, stretch_b, frame_hint, angle_offset_deg, mirror, frames, rows, cols, row_a (-1: centred), col_a, col_b, frame_shear. Returns one dict "
-             "per request with the columns of views.tsv, `planned` and `ok`. row_sign: +1 if a larger axis-stage position puts the sample on higher rows.");
+             "optionally label, scan_a, scan_b, stretch_b, frame_hint, angle_offset_deg, mirror, frames, rows, cols, row_a (-1: centred), col_a, col_b, frame_shear, "
+             "sway_px, sway_phase_deg (B's frames read sway_px cos(angle_b - sway_phase_deg) columns further on: a sample displaced on the rotation stage, tile against tile). "
+             "Returns one dict per request with the columns of views.tsv, `planned` and `ok`. row_sign: +1 if a larger axis-stage position puts the sample on higher rows.");
+    m.def("jpeg2000_frames_supported", &jpeg2000_frames_supported, "Whether this build reads frames stored as JPEG 2000 chunks (built with OpenJPEG).");
+    m.def("jpeg2000_chunk", [](nb::ndarray<const std::uint16_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> values) {
+        const std::vector<std::uint8_t> bytes = jpeg2000_chunk(values.data(), static_cast<int>(values.shape(0)), static_cast<int>(values.shape(1)));
+        return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }, "values"_a, "The bytes of one HDF5 chunk for (rows, cols) uint16 values as the blosc2 filter (32026) stores JPEG 2000 frames, with a reversible codestream: for tests and synthetic records.");
 }

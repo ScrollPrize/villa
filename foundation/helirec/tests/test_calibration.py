@@ -61,9 +61,32 @@ def _frames(rng, n, level):
     return (level + rng.integers(0, 50, size=(n, ROWS, COLS))).astype(np.uint16)
 
 
-def _write_record(tmp_path, rng):
-    """one scan: darks, flats, a turn at rest, a helix of two turns, a turn at rest, flats"""
-    master = tmp_path / "sample_XX_0001.h5"
+def _write_frames(path, data, chunk_rows=None):
+    """One Lima frame file. chunk_rows: the frames stored as JPEG 2000, one codestream per chunk of that many rows
+    through the blosc2 filter (id 32026), as ESRF BM18 writes projections; otherwise one plain chunk per frame."""
+    n, rows, cols = data.shape
+    with h5py.File(path, "w") as g:
+        g["/entry_0000/instrument/det3/acquisition/nb_frames"] = np.int32(n)
+        if chunk_rows is None:
+            g.create_dataset("/entry_0000/instrument/det3/data", data=data, chunks=(1, rows, cols))
+            return
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_chunk((1, chunk_rows, cols))
+        dcpl.set_filter(32026, h5py.h5z.FLAG_OPTIONAL, (1, 0, 2, chunk_rows * cols * 2, 5, 1, 0, 3, 1, chunk_rows, cols))
+        d = h5py.h5d.create(g["/entry_0000/instrument/det3"].id, b"data", h5py.h5t.STD_U16LE, h5py.h5s.create_simple(data.shape), dcpl)
+        for k in range(n):
+            for r0 in range(0, rows, chunk_rows):
+                tile = np.zeros((chunk_rows, cols), np.uint16)      # the last chunk reaches beyond the frame
+                piece = data[k, r0:r0 + chunk_rows]
+                tile[:piece.shape[0]] = piece
+                d.write_direct_chunk((k, r0, 0), _core.jpeg2000_chunk(tile))
+
+
+def _write_record(tmp_path, rng, name="sample_XX", place=None, compressed=(), frames=None):
+    """one scan: darks, flats, a turn at rest, a helix of two turns, a turn at rest, flats.
+    place: (sx, sy) [mm], the sample's place on the rotation stage (a tile of a mosaic); compressed: the entries
+    whose frames are stored as JPEG 2000; frames: {entry: (n, ROWS, COLS) uint16} to use instead of noise."""
+    master = tmp_path / (name + "_0001.h5")
     stretches = [  # entry, title, image_key (None: absent), type, frames, level
         ("2.1", "dark images", 2, "tomo:dark", 4, 290),
         ("3.1", "flat images 1", 1, "tomo:flat", 4, 20000),
@@ -76,7 +99,7 @@ def _write_record(tmp_path, rng):
     with h5py.File(master, "w") as f:
         t = f.create_group("1.1/technique")
         f["1.1/title"] = "tomo:helical"
-        f["1.1/sample/name"] = "sample_XX"
+        f["1.1/sample/name"] = name
         f["1.1/start_time"] = "2025-01-01T00:00:00"
         f["1.1/end_time"] = "2025-01-01T00:10:00"
         f["1.1/end_reason"] = "SUCCESS"
@@ -97,16 +120,19 @@ def _write_record(tmp_path, rng):
         t["tomoconfig/translation_z"] = ["mrsz", "sz"]
         t["tomoconfig/translation_y"] = ["mryrot", "yrot"]
         t["tomoconfig/rotation_is_clockwise"] = np.True_
+        if place is not None:
+            t["tomoconfig/sample_u"] = ["mrsx", "sx"]
+            t["tomoconfig/sample_v"] = ["mrsy", "sy"]
+            t["tomoconfig/sample_x"] = ["mrpsx", "psx"]
+            t["tomoconfig/sample_y"] = ["mrpsy", "psy"]
         f["1.1/instrument/det3_optic/data_axes"] = ["z", "-y"]
         angle0, z0, clock = 0.0, -10.0, 1000.0
         for k, (entry, title, key, kind, n, level) in enumerate(stretches):
             t[f"subscans/scan{k}/type"] = kind
-            data = _frames(rng, n, level)
+            data = _frames(rng, n, level) if frames is None or entry not in frames else frames[entry]
             scan_dir = tmp_path / f"scan{k + 2:04d}"
             scan_dir.mkdir()
-            with h5py.File(scan_dir / "det3_0000.h5", "w") as g:
-                g.create_dataset("/entry_0000/instrument/det3/data", data=data, chunks=(1, ROWS, COLS))
-                g["/entry_0000/instrument/det3/acquisition/nb_frames"] = np.int32(n)
+            _write_frames(scan_dir / "det3_0000.h5", data, 10 if entry in compressed else None)
             e = f.create_group(entry)
             e["title"] = title
             e["start_time"] = "2025-01-01T00:00:00"
@@ -133,6 +159,11 @@ def _write_record(tmp_path, rng):
             for where, z in (("positioners_start", z0), ("positioners_end", z_end)):
                 i[where + "/sz"] = z
                 i[where + "/yrot"] = 1.0
+                if place is not None:
+                    turned = np.radians(angle0 + (n * step if where.endswith("end") and kind == "tomo:continuous" else 0.0))
+                    i[where + "/sx"], i[where + "/sy"], i[where + "/srot"] = place[0], place[1], np.degrees(turned)
+                    i[where + "/psx"] = place[0] * np.cos(turned) + place[1] * np.sin(turned)
+                    i[where + "/psy"] = -place[0] * np.sin(turned) + place[1] * np.cos(turned)
             i["machine/current"] = 80.0
             if kind == "tomo:continuous":
                 index = np.arange(n)
@@ -427,3 +458,153 @@ def test_session_detector_map_per_scan(tmp_path, monkeypatch):
     s.set_detector_map([], [], [], [])
     r = s.measure(req, -1.0, "cpu")[0]
     assert abs(r["du"]) < 1e-3 and abs(r["D"]) < 1e-3
+
+
+def test_frames_stored_as_jpeg2000(tmp_path):
+    """Projections stored as one JPEG 2000 codestream per chunk of rows (blosc2 filter 32026): read back exactly
+    from a reversible codestream, whatever rows are asked for, and reported by the inventory."""
+    if not _core.jpeg2000_frames_supported():
+        pytest.skip("built without OpenJPEG")
+    master = _write_record(tmp_path, np.random.default_rng(21), compressed=("4.1", "5.1"))
+    with h5py.File(tmp_path / "scan0004" / "det3_0000.h5") as f:
+        d = f["/entry_0000/instrument/det3/data"]
+        assert d.chunks == (1, 10, COLS) and d.id.get_create_plist().get_filter(0)[0] == 32026
+        assert len(d.id.read_direct_chunk((0, 20, 0))[1]) < 10 * COLS * 2
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    _write_record(plain, np.random.default_rng(21))
+    with h5py.File(plain / "scan0004" / "det3_0000.h5") as f:
+        stored = f["/entry_0000/instrument/det3/data"][:]
+    s = _core.CalibrationSession([str(master)])
+    frames = np.array([0, 7, 15], dtype=np.int64)
+    for row0, nrows in ((0, ROWS), (3, 5), (8, 14), (19, 5), (-2, 6), (ROWS - 3, 6)):   # within a chunk, across chunks, beyond the frame
+        got = s.read_rows(0, 2, frames, row0, nrows)
+        want = np.zeros((3, nrows, COLS), np.uint16)
+        a, b = max(0, row0), min(ROWS, row0 + nrows)
+        want[:, a - row0:b - row0] = stored[frames, a:b]
+        assert np.array_equal(got, want), (row0, nrows)
+    report = json.loads(_core.calibration_verify([str(master)], checks="record,inventory"))
+    f = _by_quantity(report, "every frame on disk")[0]
+    assert f["verdict"] == "verified" and f["numbers"]["mismatched"] == 0, f       # the recorded sums are of these values
+    f_all = f["numbers"]["frames"]
+    how = _by_quantity(report, "how the frames are stored")[0]
+    assert how["verdict"] == "note" and "4.1: JPEG 2000, reversible" in how["found"] and "chunks of 10 rows" in how["found"]
+    assert "2.1" not in how["found"]
+    # with no statistics recorded for a compressed stretch there is nothing to compare its frames with: one frame
+    # in 16 is decoded, every chunk is located, and the report says so
+    with h5py.File(master, "r+") as f:
+        del f["5.1/instrument/det3_full"]
+    sparse = _by_quantity(json.loads(_core.calibration_verify([str(master)], checks="inventory")), "every frame on disk")[0]
+    assert sparse["verdict"] == "unverified" and "5.1: one frame in 16 (2 of 32 on disk)" in sparse["found"], sparse
+    assert sparse["numbers"]["located"] == 2 * PER_TURN and sparse["numbers"]["frames"] == f_all - 2 * PER_TURN + 2 and sparse["numbers"]["mismatched"] == 0
+    # a container that is not what is read is refused, not guessed at
+    with h5py.File(tmp_path / "scan0004" / "det3_0000.h5", "r+") as f:
+        d = f["/entry_0000/instrument/det3/data"]
+        raw = bytearray(d.id.read_direct_chunk((2, 0, 0))[1])
+        raw[2:9] = b"nothing"
+        d.id.write_direct_chunk((2, 0, 0), bytes(raw))
+    with pytest.raises(Exception, match="not a blosc2 frame"):
+        _core.CalibrationSession([str(master)]).read_rows(0, 2, np.array([2], dtype=np.int64), 0, 4)
+
+
+def test_frames_not_on_disk(tmp_path):
+    """A partial copy of an acquisition: frame files that are absent are reported, and their frames are never
+    read (the master's virtual dataset would give zeros for them)."""
+    master = _write_record(tmp_path, np.random.default_rng(22))
+    (tmp_path / "scan0006" / "det3_0000.h5").unlink()
+    with h5py.File(master) as f:
+        assert not f["6.1/instrument/det3/image"][0].any()                           # what must not be used
+    report = json.loads(_core.calibration_verify([str(master)], checks="record,inventory,series"))
+    f = _by_quantity(report, "map from frame to file")[0]
+    assert f["verdict"] == "unverified" and f["requires_follow_up"] and "6.1: none" in f["found"] and "5.1: 0-31" in f["found"]
+    assert f["numbers"]["frames_on_disk"] == f["numbers"]["frames"] - PER_TURN and f["numbers"]["files_missing"] == 1
+    f = _by_quantity(report, "every frame on disk")[0]
+    assert f["verdict"] == "verified" and f["numbers"]["absent"] == PER_TURN and f["numbers"]["compared"] == f["numbers"]["frames"]
+    assert "6.1 projection: no frame on disk" in _by_quantity(report, "range of the raw values")[0]["found"]
+    s = _core.CalibrationSession([str(master)])
+    st = s.stretches(0)
+    assert st[4]["on_disk"] == [] and st[4]["n_on_disk"] == 0 and st[3]["on_disk"] == [(0, 2 * PER_TURN)]
+    assert s.read_rows(0, 3, np.array([5], dtype=np.int64), 0, 4).shape == (1, 4, COLS)
+    with pytest.raises(Exception, match="not on disk"):
+        s.read_rows(0, 4, np.array([5], dtype=np.int64), 0, 4)
+    with pytest.raises(Exception, match="not on disk"):
+        s.line_integrals(0, 4, np.array([5], dtype=np.int64), np.array([0], dtype=np.int32), 4, 0, 8)
+
+
+def test_tiles_of_a_mosaic(tmp_path):
+    """Scans that differ in where the sample sits on the rotation stage: any number of them, checked as tiles."""
+    places = {"T0": (1.0, 2.0), "T1": (1.4, 2.0), "T2": (1.2, 2.3)}
+    masters = []
+    for k, (label, place) in enumerate(places.items()):
+        d = tmp_path / label
+        d.mkdir()
+        masters.append(str(_write_record(d, np.random.default_rng(30 + k), name="sample_" + label, place=place)))
+    report = json.loads(_core.calibration_verify(masters, checks="record"))
+    which = _by_quantity(report, "the scans of the acquisition and what differs between them")[0]
+    assert which["scan"] == "T0+2" and which["numbers"] == {"scans": 3, "mosaic": 1} and "tiles of a mosaic" in which["found"]
+    where = _by_quantity(report, "place of the sample on the rotation stage")[0]
+    px = 8.0e-3
+    assert where["numbers"]["u_px_T1"] == pytest.approx(0.4 / px) and where["numbers"]["v_px_T2"] == pytest.approx(0.3 / px)
+    assert where["numbers"]["lab_sense"] == 1 and where["numbers"]["lab_worst_mm"] < 1e-9 and "the same at the start and end" in where["found"]
+    lines = _by_quantity(report, "which lines the scans record")[0]
+    assert lines["numbers"]["pairs"] == 3 and lines["numbers"]["uncovered_percent"] == 0
+    assert lines["numbers"]["lever_px"] == pytest.approx(0.4 / px + lines["numbers"]["reach_px"])
+    for text in ("angle of the scans at equal projection index", "height of the scans at equal projection index", "time between corresponding projections"):
+        assert len(_by_quantity(report, text)) == 3                      # one per projection stretch
+    assert all(f["residuals"]["max_abs"] == 0 for f in _by_quantity(report, "angle of the scans at equal projection index"))
+    # two scans that differ in the lateral stage are still the pair
+    with h5py.File(masters[1], "r+") as f:
+        for e in ("4.1", "5.1", "6.1"):
+            for where_ in ("positioners_start", "positioners_end"):
+                f[f"{e}/instrument/{where_}/yrot"][...] = 3.0
+    pair = json.loads(_core.calibration_verify(masters[:2], checks="record"))
+    assert _by_quantity(pair, "lateral move between the scans")[0]["numbers"]["move_mm"] == 2.0
+
+
+def test_sway_between_tiles(tmp_path, monkeypatch):
+    """One tile of a mosaic against another: the same lines at equal angle, on columns that differ by a sinusoid of
+    the angle. With the sway stated, the registration returns what is left of it."""
+    import sys
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "ROWS", 48)
+    monkeypatch.setattr(module, "COLS", 128)
+    monkeypatch.setattr(module, "PER_TURN", 40)
+    rng = np.random.default_rng(41)
+    n, amplitude, phase, left = 40, 3.3, 25.0, 0.3
+    k = np.meshgrid(np.fft.fftfreq(n), np.fft.fftfreq(ROWS), np.fft.fftfreq(COLS), indexing="ij")
+    spectrum = np.fft.fftn(rng.standard_normal((n, ROWS, COLS))) * np.exp(-((k[0] / 0.12) ** 2 + (k[1] / 0.08) ** 2 + (k[2] / 0.08) ** 2))
+    field = np.fft.ifftn(spectrum).real
+    field *= 0.2 / field.std()
+
+    def counts(f):
+        return np.round(300 + 15000 * np.exp(-f)).astype(np.uint16)
+
+    a_dir, b_dir = tmp_path / "A", tmp_path / "B"
+    a_dir.mkdir(), b_dir.mkdir()
+    ma = _write_record(a_dir, np.random.default_rng(1), name="sample_A", place=(0.0, 0.0), frames={"4.1": counts(field)})
+    # the stated angle of each frame, as the record of B will hold it (the same trajectory)
+    with h5py.File(ma) as f:
+        angle = f["4.1/instrument/mrsrot_trig/data"][:] + f["4.1/instrument/mrsrot_delta/data"][:] / 2
+    sway = amplitude * np.cos(np.radians(angle - phase)) + left
+    # B(q, x) = A(q, x - sway(q)): B read sway columns further on is A
+    moved = np.fft.ifft(np.fft.fft(field, axis=2) * np.exp(-2j * np.pi * k[2][:1] * sway[:, None, None]), axis=2).real
+    mb = _write_record(b_dir, np.random.default_rng(1), name="sample_B", place=(0.1, 0.0), frames={"4.1": counts(moved)})
+    s = _core.CalibrationSession([str(ma), str(mb)])
+    base = dict(scan_a=0, scan_b=1, stretch_a=2, stretch_b=2, frame_a=12, frames=16, rows=16, cols=32, row_a=14, col_a=44, col_b=44)
+    with_sway, without = s.measure([dict(base, sway_px=amplitude, sway_phase_deg=phase), base], -1.0, "cpu")
+    assert with_sway["planned"] and with_sway["ok"] and with_sway["correlation"] > 0.98, with_sway
+    assert with_sway["du"] == pytest.approx(left, abs=0.01) and abs(with_sway["dq"]) < 0.02 and abs(with_sway["D"]) < 0.01, with_sway
+    assert without["correlation"] < with_sway["correlation"] - 0.03, without       # unstated, the sway blurs the match
+    # B's columns reversed (as for opposite views): the sway is stated in B's own columns, before the reversal.
+    # C(q, y) = A(q, K - y) read sway columns further on, K the sum of the two blocks' end columns
+    K = base["col_a"] + base["col_b"] + base["cols"] - 1
+    flipped = field[:, :, (K - np.arange(COLS)) % COLS]
+    moved = np.fft.ifft(np.fft.fft(flipped, axis=2) * np.exp(-2j * np.pi * k[2][:1] * sway[:, None, None]), axis=2).real
+    c_dir = tmp_path / "C"
+    c_dir.mkdir()
+    mc = _write_record(c_dir, np.random.default_rng(1), name="sample_C", place=(0.1, 0.0), frames={"4.1": counts(moved)})
+    s = _core.CalibrationSession([str(ma), str(mc)])
+    mirrored = s.measure([dict(base, mirror=True, sway_px=amplitude, sway_phase_deg=phase)], -1.0, "cpu")[0]
+    assert mirrored["ok"] and mirrored["cols"] == base["cols"] and mirrored["correlation"] > 0.98, mirrored
+    assert abs(mirrored["du"]) == pytest.approx(left, abs=0.01), mirrored
+

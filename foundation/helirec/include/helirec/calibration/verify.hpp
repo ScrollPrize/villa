@@ -72,17 +72,30 @@ struct Tolerances {
     double rows() const { return eps; }
     double travel_scale() const { return eps / H; }
 };
-Tolerances tolerances(const Record& rec, double eps = default_position_target_px);
+// radius_px > 0: the largest distance from the axis at which a ray of the scan is used, where that is not the
+// detector's width (a mosaic: a tile's rays cross the whole merged volume).
+Tolerances tolerances(const Record& rec, double eps = default_position_target_px, double radius_px = 0);
 
 // ---- the record against itself
-void check_record(const Record& rec, Report& report, double eps = default_position_target_px);
+void check_record(const Record& rec, Report& report, double eps = default_position_target_px, double radius_px = 0);
+// Two scans that differ in the lateral stage of the rotation axis (axis inside the field, then moved sideways)
 void check_record_pair(const Record& first, const Record& second, Report& report, double eps = default_position_target_px);
+bool lateral_stage_differs(const Record& first, const Record& second);
+// Two or more scans that differ in where the sample sits on the rotation stage (the tiles of a mosaic): what
+// differs, the place of each (6.1.1), which lines each records (6.3.1), and angles, heights and times at equal
+// projection index (6.2). radius_px 0: the lever arm is taken from the layout.
+void check_record_tiles(const std::vector<Record>& scans, Report& report, double eps = default_position_target_px, double radius_px = 0);
 
 // ---- the record against the frames
 
-// Every frame of every stretch is read once: the detector software's per-frame statistics are recomputed and
-// compared (4.1), the raw value range and outliers are collected (8.1.4, 8.1.7), and the mean level of column
+// Every frame on disk of every stretch is read once: the detector software's per-frame statistics are recomputed
+// and compared (4.1), the raw value range and outliers are collected (8.1.4, 8.1.7), and the mean level of column
 // strips is kept per frame for the beam checks (8.2).
+//
+// step: 1 reads every frame. N > 1 reads one frame in N of a stretch. 0 (the default) reads every frame, but for
+// a stretch that is stored compressed and has no recorded statistics: there nothing recorded can be compared
+// with a frame, decoding is what takes the time, and one frame in 16 is read. Every chunk of every frame on
+// disk is located in its file whatever the step. The report says what was read.
 struct Inventory {
     int strip_cols = 32;
     struct PerStretch {
@@ -90,16 +103,21 @@ struct Inventory {
         std::vector<float> strips;           // (n_frames, n_strips): mean raw value of each column strip in the rectangle
         std::vector<std::uint16_t> frame_max;  // over the whole frame
         std::vector<std::int64_t> histogram;   // of every raw value of the stretch (65536 bins)
+        // a frame that was not read (not on disk, or skipped by the step) holds zeros everywhere
+        bool was_read(std::size_t frame) const { return frame_max[frame] != 0 || sum[frame] != 0; }
     };
     std::vector<PerStretch> stretches;
 };
-Inventory check_inventory(const Record& rec, Frames& frames, Report& report);
+inline constexpr int default_inventory_sparse_step = 16;
+Inventory check_inventory(const Record& rec, Frames& frames, Report& report, int step = 0);
 void save_inventory(const Inventory& inv, const Record& rec, const std::string& path);  // <path>.bin + <path>.json
 Inventory load_inventory(const Record& rec, int cols, const std::string& path);         // what save_inventory wrote
 
 // Darks and flats: their roles, levels and noise (4.2, 8.1.1, 8.1.2 with a second scan, 8.2.5)
 void check_series(const Record& rec, Frames& frames, const FlatField& ff, Report& report,
                   const Record* other = nullptr, Frames* other_frames = nullptr, const FlatField* other_ff = nullptr);
+// The dark of a second scan against the first's, per pixel (8.1.2): what check_series does when given `other`.
+void check_dark_pair(const Record& rec, const FlatField& ff, const Record& other, const FlatField& other_ff, Report& report);
 
 // The beam against the record: air level per frame from the inventory's strips (4.7, 8.2.1 - 8.2.5)
 void check_beam(const Record& rec, const Inventory& inv, const FlatField& ff, Report& report);
@@ -138,6 +156,11 @@ struct ViewRequest {
     // B's frames read at an angle that changes with the block's column, in frames per column (frames.hpp,
     // shear_frames): what the beam's divergence does to opposite views. 0: as stored.
     double frame_shear = 0;
+    // B's content displaced along the columns by a course of B's angle: frame q of B is read
+    // sway_px cos(angle_b(q) - sway_phase_deg) columns further on (in B's own columns, before any reversal).
+    // What the sample's place on the rotation stage does between two tiles of a mosaic: tiles k and j record the
+    // same lines at equal angle on columns n(angle).(d_j - d_k) apart. The measured du is what is left of it.
+    double sway_px = 0, sway_phase_deg = 0;
 };
 // What view.tsv holds per registration (same meaning), and the plan behind it. planned: the record holds such a
 // pair and the blocks fit the detector; ok: the registration converged inside its search window.
@@ -190,9 +213,13 @@ struct VerifyOptions {
     int threads = 0;            // reading threads (0: automatic)
     ViewOptions view;
     bool print = false;         // print the findings to stdout as each group of checks finishes
+    double radius_px = 0;       // lever arm of the angle targets; 0: the detector's width, or the layout of the tiles
+    int inventory_step = 0;     // see Inventory: 0 automatic, 1 every frame, N one frame in N
 };
-// scans: the master file of one scan, or of two scans of one acquisition, the scan with the rotation axis inside
-// the detector's field first.
+// scans: the master file of one scan; of two scans of one acquisition that differ in the lateral stage of the
+// rotation axis, the scan with the axis inside the detector's field first; or of any number of scans that differ
+// in where the sample sits on the rotation stage (the tiles of a mosaic), the reference tile first. The view
+// checks cover the first two cases; the comparisons of a mosaic are placed by the caller (Session::measure).
 Report verify(const std::vector<std::string>& scans, const VerifyOptions& opt);
 
 }  // namespace helirec::calibration

@@ -43,6 +43,7 @@ void Frames::locate(int stretch, std::int64_t frame, std::int32_t& file, std::in
     if (it == s.pieces.begin()) throw Error("stretch " + s.entry + ": frame " + std::to_string(frame) + " is in no file");
     --it;
     if (frame >= it->first + it->count) throw Error("stretch " + s.entry + ": frame " + std::to_string(frame) + " is in no file");
+    if (!it->present) throw Error("stretch " + s.entry + ": frame " + std::to_string(frame) + " is not on disk (" + it->file + ")");
     file = piece_file_[stretch][it - s.pieces.begin()];
     idx = static_cast<std::int32_t>(it->source_first + (frame - it->first));
 }
@@ -67,6 +68,36 @@ void Frames::visit(int stretch, std::int64_t first, std::int64_t count,
     reader_->visit_frames(file.data(), idx.data(), static_cast<std::size_t>(count), rows_,
                           [&](std::size_t i, int, int, const std::uint16_t* data) { visit(first + static_cast<std::int64_t>(i), data); },
                           n_threads_);
+}
+
+Frames::Stored Frames::stored(int stretch) {
+    const Stretch& s = rec_->stretches.at(stretch);
+    Stored out;
+    for (std::size_t i = 0; i < s.pieces.size(); ++i) {
+        if (!s.pieces[i].present) continue;
+        const RawReader::Storage st = reader_->storage(piece_file_[stretch][i]);
+        out.on_disk = true;
+        out.compressed = st.compressed;
+        out.chunk_rows = st.chunk_rows;
+        out.codec = st.codec;
+        out.reversible = st.reversible;
+        out.bit_depth = st.bit_depth;
+        out.bytes_per_frame = st.bytes_per_frame;
+        break;
+    }
+    return out;
+}
+
+std::int64_t Frames::locate_all(int stretch) {
+    const Stretch& s = rec_->stretches.at(stretch);
+    std::int64_t n = 0;
+    for (std::size_t i = 0; i < s.pieces.size(); ++i) {
+        if (!s.pieces[i].present) continue;
+        const RawReader::Storage st = reader_->storage(piece_file_[stretch][i]);
+        if (s.pieces[i].source_first + s.pieces[i].count > st.frames) throw Error("stretch " + s.entry + ": " + s.pieces[i].file + " holds fewer frames than the record maps onto it");
+        n += s.pieces[i].count;
+    }
+    return n;
 }
 
 SeriesStats series_stats(Frames& frames, int stretch) {
@@ -273,6 +304,26 @@ void shear_frames(float* block, std::size_t n, int nrows, int ncols, double shea
                 float sum = 0;
                 for (int a = 0; a < 4; ++a)
                     sum += w[a] * copy[static_cast<std::size_t>(std::clamp<std::ptrdiff_t>(k - 1 + a, 0, last)) * plane + static_cast<std::size_t>(r) * ncols + c];
+                dst[c] = sum;
+            }
+        }
+}
+
+void shift_columns(const float* wide, std::size_t n, int nrows, int ncols, int pad, const double* shift, bool flip_cols, float* out) {
+    const int nw = ncols + 2 * pad;
+#pragma omp parallel for collapse(2) schedule(static)
+    for (std::ptrdiff_t q = 0; q < static_cast<std::ptrdiff_t>(n); ++q)
+        for (int r = 0; r < nrows; ++r) {
+            const double whole = std::floor(shift[q]);
+            float w[4];
+            cubic_weights(static_cast<float>(shift[q] - whole), w);
+            const int k = pad + static_cast<int>(whole);
+            const float* src = wide + (static_cast<std::size_t>(q) * nrows + r) * nw;
+            float* dst = out + (static_cast<std::size_t>(q) * nrows + r) * ncols;
+            for (int c = 0; c < ncols; ++c) {
+                const int at = k + (flip_cols ? ncols - 1 - c : c);
+                float sum = 0;
+                for (int a = 0; a < 4; ++a) sum += w[a] * src[std::clamp(at - 1 + a, 0, nw - 1)];
                 dst[c] = sum;
             }
         }

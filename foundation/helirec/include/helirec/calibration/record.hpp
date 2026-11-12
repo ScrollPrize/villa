@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "helirec/common.hpp"
@@ -47,6 +48,9 @@ struct FramePiece {
     std::string file;  // absolute path
     std::string dataset;
     std::int64_t first = 0, count = 0, source_first = 0;
+    // false: the file is not on disk (a partial copy of the acquisition). Such frames are never read: the
+    // master's virtual dataset would return zeros for them.
+    bool present = true;
 };
 
 // Sampling counters (ring current and others), each with the software time of its reading.
@@ -96,6 +100,10 @@ struct Stretch {
     FrameFiles files;
 
     bool latched() const { return !rot_trig.empty(); }
+    // the frames whose files are on disk: [first, end) ranges in order, and their number
+    std::vector<std::pair<std::int64_t, std::int64_t>> frames_on_disk() const;
+    std::int64_t n_on_disk() const;
+    bool on_disk(std::int64_t frame) const;
 };
 
 struct Record {
@@ -114,7 +122,8 @@ struct Record {
     const Stretch& stretch(const std::string& entry) const;
 };
 
-// `frame_files`: also open every frame file and read what Lima wrote there (a few hundred small reads).
+// `frame_files`: also open every frame file that is on disk and read what Lima wrote there (a few hundred small
+// reads). Frame files that are absent are marked in the pieces (FramePiece::present), not an error.
 Record read_record(const std::string& h5_path, bool frame_files = true);
 
 // ---- what the record states per frame

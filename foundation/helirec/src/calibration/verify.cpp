@@ -29,10 +29,13 @@ void write_file(const std::string& path, const std::string& text) {
 }  // namespace
 
 Report verify(const std::vector<std::string>& scans, const VerifyOptions& opt) {
-    if (scans.empty() || scans.size() > 2) throw Error("verify: one scan, or the two scans of one acquisition");
+    if (scans.empty()) throw Error("verify: no scan");
     std::vector<Record> records;
     for (const std::string& path : scans) records.push_back(read_record(path));
-    const bool pair = records.size() == 2;
+    // two scans that differ in the lateral stage of the rotation axis are the pair this was first written for;
+    // anything else of two scans or more is checked as tiles (scans that differ in where the sample sits)
+    const bool pair = records.size() == 2 && lateral_stage_differs(records[0], records[1]);
+    const bool tiles = records.size() >= 2 && !pair;
     Report report;
     report.position_target_px = tolerances(records[0], opt.view.eps).eps;
     std::size_t printed = 0;
@@ -51,8 +54,9 @@ Report verify(const std::vector<std::string>& scans, const VerifyOptions& opt) {
     };
 
     if (has(opt.checks, "record")) {
-        for (const Record& r : records) check_record(r, report, opt.view.eps);
+        for (const Record& r : records) check_record(r, report, opt.view.eps, opt.radius_px);
         if (pair) check_record_pair(records[0], records[1], report, opt.view.eps);
+        if (tiles) check_record_tiles(records, report, opt.view.eps, opt.radius_px);
         flush();
     }
     const bool frames_needed = has(opt.checks, "inventory") || has(opt.checks, "series") || has(opt.checks, "beam") || has(opt.checks, "views");
@@ -69,7 +73,7 @@ Report verify(const std::vector<std::string>& scans, const VerifyOptions& opt) {
         have_inventory = true;
     } else if (has(opt.checks, "inventory")) {
         for (std::size_t k = 0; k < records.size(); ++k) {
-            inventories[k] = check_inventory(records[k], *frames[k], report);
+            inventories[k] = check_inventory(records[k], *frames[k], report, opt.inventory_step);
             if (!opt.out_dir.empty()) save_inventory(inventories[k], records[k], opt.out_dir + "/inventory_" + records[k].label);
             flush();
         }
@@ -84,13 +88,20 @@ Report verify(const std::vector<std::string>& scans, const VerifyOptions& opt) {
             check_series(records[k], *frames[k], flats[k], report, with_other ? &records[1] : nullptr, with_other ? frames[1].get() : nullptr,
                          with_other ? &flats[1] : nullptr);
         }
+        // tiles: the dark of every scan against the first's (8.1.2)
+        for (std::size_t k = 1; tiles && k < records.size(); ++k) check_dark_pair(records[0], flats[0], records[k], flats[k], report);
         flush();
     }
     if (has(opt.checks, "beam") && have_inventory) {
         for (std::size_t k = 0; k < records.size(); ++k) check_beam(records[k], inventories[k], flats[k], report);
         flush();
     }
-    if (has(opt.checks, "views")) {
+    if (has(opt.checks, "views") && tiles) {
+        Finding& f = report.add("5 6", records[0].label + "+" + std::to_string(records.size() - 1), "views that record the same lines");
+        f.found = "not checked here: the comparisons of a mosaic (one tile against another, opposite views and a turn apart within a tile) are placed by the caller (Session::measure)";
+        f.verdict = "unverified";
+        flush();
+    } else if (has(opt.checks, "views")) {
         ViewOptions view = opt.view;
         if (view.table.empty() && !opt.out_dir.empty()) view.table = opt.out_dir + "/views.tsv";
         check_views(records[0], *frames[0], flats[0], pair ? &records[1] : nullptr, pair ? frames[1].get() : nullptr, pair ? &flats[1] : nullptr, view, report);

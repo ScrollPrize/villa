@@ -23,13 +23,6 @@ std::string join(const std::vector<std::string>& v, const char* sep = "; ") {
     return s;
 }
 
-template <class K>
-std::string counts_text(const std::map<K, std::int64_t>& m, const char* unit) {
-    std::vector<std::string> parts;
-    for (const auto& [value, count] : m) parts.push_back(fmt("%lld %s x %lld", static_cast<long long>(value), unit, static_cast<long long>(count)));
-    return join(parts, ", ");
-}
-
 double mean_finite(const std::vector<double>& v) {
     long double s = 0;
     std::size_t n = 0;
@@ -56,9 +49,9 @@ double recorded_dark_level(const Record& rec) {
 
 }  // namespace
 
-void check_record(const Record& rec, Report& rep, double eps) {
+void check_record(const Record& rec, Report& rep, double eps, double radius_px) {
     const std::string scan = rec.label;
-    const Tolerances tol = tolerances(rec, eps);
+    const Tolerances tol = tolerances(rec, eps, radius_px);
     const double px_mm = pixel_um(rec) * 1e-3;
     const Values& T = rec.technique;
     const std::string det = "detector/" + rec.detector + "/";
@@ -100,8 +93,9 @@ void check_record(const Record& rec, Report& rep, double eps) {
     // ------------------------------------------------------------------ 4.1 frame -> file map
     {
         Finding& f = rep.add("4.1", scan, "map from frame to file");
-        std::int64_t files = 0, missing = 0, gaps = 0, on_disk = 0;
+        std::int64_t files = 0, missing = 0, gaps = 0, on_disk = 0, mapped_on_disk = 0;
         bool have_counts = true;
+        std::vector<std::string> held;
         for (const Stretch& s : rec.stretches) {
             std::int64_t next = 0;
             std::set<std::string> seen;
@@ -114,8 +108,12 @@ void check_record(const Record& rec, Report& rep, double eps) {
                 }
             }
             if (next != s.n_frames) ++gaps;
-            if (s.files.frames_in_file.empty()) have_counts = false;
+            mapped_on_disk += s.n_on_disk();
+            if (s.files.frames_in_file.empty() && s.n_on_disk() > 0) have_counts = false;
             for (std::int64_t n : s.files.frames_in_file) on_disk += n;
+            std::vector<std::string> ranges;
+            for (const auto& [a, b] : s.frames_on_disk()) ranges.push_back(fmt("%lld-%lld", static_cast<long long>(a), static_cast<long long>(b - 1)));
+            held.push_back(s.entry + ": " + (ranges.empty() ? std::string("none") : join(ranges, ", ")));
         }
         std::int64_t total = 0;
         for (const Stretch& s : rec.stretches) total += s.n_frames;
@@ -123,27 +121,75 @@ void check_record(const Record& rec, Report& rep, double eps) {
         f.found = fmt("%lld files missing, %lld breaks in the map", static_cast<long long>(missing), static_cast<long long>(gaps));
         if (have_counts) f.found += fmt("; the files hold %lld frames", static_cast<long long>(on_disk));
         f.verdict = (missing == 0 && gaps == 0 && (!have_counts || on_disk == total)) ? "verified" : "fails";
+        if (missing > 0) {
+            // a partial copy: what is not on disk cannot be checked, and is never read (the virtual dataset
+            // of the master file would return zeros for it)
+            f.found += fmt("; %lld of the %lld frames are on disk (%s)", static_cast<long long>(mapped_on_disk), static_cast<long long>(total), join(held).c_str());
+            f.verdict = gaps == 0 && (!have_counts || on_disk == mapped_on_disk) ? "unverified" : "fails";
+            f.note = "this copy of the acquisition is partial. Every check on frames covers the frames on disk only; no frame that is absent is read";
+            f.numbers = {{"frames", static_cast<double>(total)}, {"frames_on_disk", static_cast<double>(mapped_on_disk)}, {"files_missing", static_cast<double>(missing)}};
+        }
     }
     // ------------------------------------------------------------------ 4.1, 4.5, 4.6 the hardware timer
     {
+        // counts of the timer between the edges of the gates, in ns. The counter is 32 bits wide and may wrap
+        // within a stretch (differences are taken modulo 2^32); its tick is 1 us unless the latched times say
+        // otherwise (the stretch's own timer_delta against its first gate, to the nearest power of ten).
         std::map<std::int64_t, std::int64_t> periods, gates;
         std::int64_t n = 0;
+        double coarsest_tick_us = 0;
+        std::vector<std::string> ticks;
         for (int i : proj) {
             const Stretch& s = rec.stretches[i];
             if (s.timer_raw.size() != 2 * static_cast<std::size_t>(s.n_frames) + 1) continue;
+            const auto counts = [&](std::size_t a, std::size_t b) {
+                return static_cast<std::int64_t>(static_cast<std::uint32_t>(s.timer_raw[a]) - static_cast<std::uint32_t>(s.timer_raw[b]));
+            };
+            double tick_us = 1;
+            if (!s.timer_delta.empty() && s.n_frames > 0 && counts(1, 0) > 0) {
+                const double t = s.timer_delta[0] * 1e6 / static_cast<double>(counts(1, 0));
+                if (t > 0) tick_us = std::pow(10.0, std::round(std::log10(t)));
+            }
+            if (tick_us != 1) ticks.push_back(fmt("%s counts every %g us", s.entry.c_str(), tick_us));
+            coarsest_tick_us = std::max(coarsest_tick_us, tick_us);
             for (std::int64_t k = 0; k < s.n_frames; ++k) {
-                ++periods[static_cast<std::int64_t>(s.timer_raw[2 * k + 2]) - s.timer_raw[2 * k]];
-                ++gates[static_cast<std::int64_t>(s.timer_raw[2 * k + 1]) - s.timer_raw[2 * k]];
+                ++periods[std::llround(static_cast<double>(counts(2 * k + 2, 2 * k)) * tick_us * 1e3)];
+                ++gates[std::llround(static_cast<double>(counts(2 * k + 1, 2 * k)) * tick_us * 1e3)];
                 ++n;
             }
         }
+        const auto text = [](const std::map<std::int64_t, std::int64_t>& m) {
+            std::vector<std::string> parts;
+            for (const auto& [ns, count] : m) parts.push_back(fmt("%.10g us x %lld", static_cast<double>(ns) * 1e-3, static_cast<long long>(count)));
+            return join(parts, ", ");
+        };
         Finding& f = rep.add("4.1 4.6", scan, "hardware timer: trigger period and gate length of every projection");
         f.stated = fmt("exposure %g ms, latency %g ms", T.number("scan/exposure_time"), T.number("scan/latency_time"));
-        f.found = fmt("%lld projections; periods: %s; gates: %s", static_cast<long long>(n), counts_text(periods, "us").c_str(),
-                      counts_text(gates, "us").c_str());
-        const bool ok = periods.size() == 1 && gates.size() == 1 && n > 0 &&
-                        std::fabs(gates.begin()->first * 1e-3 - T.number("scan/exposure_time")) < 1e-9 &&
-                        std::fabs((periods.begin()->first - gates.begin()->first) * 1e-3 - T.number("scan/latency_time")) < 1e-9;
+        f.found = fmt("%lld projections; periods: %s; gates: %s", static_cast<long long>(n), text(periods).c_str(), text(gates).c_str());
+        const double gate_us = T.number("scan/exposure_time") * 1e3, period_us = gate_us + T.number("scan/latency_time") * 1e3;
+        bool ok = periods.size() == 1 && gates.size() == 1 && n > 0 && std::fabs(gates.begin()->first * 1e-3 - gate_us) < 1e-6 &&
+                  std::fabs(periods.begin()->first * 1e-3 - period_us) < 1e-6;
+        if (!ok && n > 0) {
+            // two questions kept apart: is there one period and one gate (to a count of the timer), and are they the stated ones
+            const auto commonest = [](const std::map<std::int64_t, std::int64_t>& m) {
+                std::int64_t best = 0, most = -1;
+                for (const auto& [ns, count] : m)
+                    if (count > most) most = count, best = ns;
+                return best * 1e-3;
+            };
+            const double period = commonest(periods), gate = commonest(gates);
+            bool uniform = true;
+            for (const auto& [ns, count] : periods) uniform &= std::fabs(ns * 1e-3 - period) <= coarsest_tick_us * (1 + 1e-9);
+            for (const auto& [ns, count] : gates) uniform &= std::fabs(ns * 1e-3 - gate) <= coarsest_tick_us * (1 + 1e-9);
+            const bool as_stated = std::fabs(period - period_us) <= coarsest_tick_us * (1 + 1e-9) && std::fabs(gate - gate_us) <= coarsest_tick_us * (1 + 1e-9);
+            ok = uniform && as_stated;
+            f.found += uniform ? fmt("; every period lies within one count of the timer (%g us) of %.10g us and every gate of %.10g us", coarsest_tick_us, period, gate)
+                               : fmt("; periods or gates differ by more than one count of the timer (%g us) from the commonest, %.10g us and %.10g us", coarsest_tick_us, period, gate);
+            if (!as_stated)
+                f.found += fmt("; the stated exposure plus latency is %.10g us: the period is %+.10g us from it, the gate %+.10g us from the stated exposure", period_us, period - period_us,
+                               gate - gate_us);
+        }
+        if (!ticks.empty()) f.found += "; " + join(ticks);
         f.verdict = ok ? "verified" : "fails";
         f.note = "one period for every trigger means the timer latched no gap; it does not show that the camera delivered a frame for every trigger";
     }
@@ -155,7 +201,25 @@ void check_record(const Record& rec, Report& rep, double eps) {
         double worst = 0;
         for (const Stretch& s : rec.stretches) {
             const auto& t = s.files.time_of_frame;
-            if (t.size() != static_cast<std::size_t>(s.n_frames) || t.size() < 2) continue;
+            const bool whole = t.size() == static_cast<std::size_t>(s.n_frames);
+            if ((!whole && t.size() != static_cast<std::size_t>(s.n_on_disk())) || t.size() < 2) continue;
+            bool increasing = true;
+            for (std::size_t i = 1; i < t.size() && increasing; ++i) increasing = t[i] > t[i - 1];
+            if (!increasing) {
+                // this detector software stores the time since the previous frame, not a time of arrival
+                have = true;
+                double lo = 1e30, hi = -1e30, sum = 0;
+                for (std::size_t i = 1; i < t.size(); ++i) lo = std::min(lo, t[i]), hi = std::max(hi, t[i]), sum += t[i];
+                parts.push_back(fmt("%s: stored as the time since the previous frame%s: mean %.4f ms, %.2f to %.2f ms", s.entry.c_str(),
+                                    whole ? "" : " (frames on disk)", sum / (t.size() - 1) * 1e3, lo * 1e3, hi * 1e3));
+                if (s.role == Role::Projection && !s.timer_period.empty()) {
+                    const double period = s.timer_period[0];
+                    worst = std::max(worst, hi / period);
+                    ok &= hi < 1.5 * period && lo > 0;
+                }
+                continue;
+            }
+            if (!whole) continue;
             have = true;
             double lo = 1e30, hi = -1e30;
             for (std::size_t i = 1; i < t.size(); ++i) lo = std::min(lo, t[i] - t[i - 1]), hi = std::max(hi, t[i] - t[i - 1]);
@@ -460,13 +524,14 @@ void check_record(const Record& rec, Report& rep, double eps) {
         const Stretch& s = rec.stretches[proj.empty() ? 0 : proj[0]];
         const double y = positioner(s, rec.translation_y[1]);
         f.stated = fmt("%s = %.4f mm at the start of %s", rec.translation_y[1].c_str(), y, s.entry.c_str());
+        const double middle = T.numbers(det + "size").at(0) / 2;
         f.found = fmt("%.2f px at %.4g um; with the assumption that %s = 0 puts the axis on the middle column (%.1f): column %.2f", y / px_mm, px_mm * 1e3,
-                      rec.translation_y[1].c_str(), tol.R / 2, tol.R / 2 + y / px_mm);
+                      rec.translation_y[1].c_str(), middle, middle + y / px_mm);
         f.note = "the assumption is stated nowhere in the record, nor is the sign";
         bool moved = false;
         for (int i : proj) moved |= positioner(rec.stretches[i], rec.translation_y[1]) != y || positioner(rec.stretches[i], rec.translation_y[1], true) != y;
         if (moved) f.note += "; the stage's position CHANGES between the projection stretches";
-        f.numbers = {{"yrot_mm", y}, {"nominal_axis_column", tol.R / 2 + y / px_mm}};
+        f.numbers = {{"yrot_mm", y}, {"nominal_axis_column", middle + y / px_mm}};
     }
     // ------------------------------------------------------------------ 8.1 recorded levels
     {
@@ -489,6 +554,11 @@ void check_record(const Record& rec, Report& rep, double eps) {
         f.stated = fmt("avg, min, max, std, sum per frame over columns %d..%d, rows %d..%d", s0.stat_x, s0.stat_x + s0.stat_w - 1, s0.stat_y, s0.stat_y + s0.stat_h - 1);
         f.found = join(parts);
         f.note = "the statistics cover the middle of the frame only; the frames themselves are checked by the inventory";
+        if (parts.empty()) {
+            f.stated = "nothing: the record holds no per-frame statistics of the detector software";
+            f.verdict = "unverified";
+            f.note = "without them no frame on disk can be shown to be the frame the detector software saw (4.1), and the levels come from the frames alone";
+        }
     }
     // ------------------------------------------------------------------ 8.2.3 flats against the ring current
     {
@@ -516,6 +586,10 @@ void check_record(const Record& rec, Report& rep, double eps) {
             f.numbers = {{"per_mA_spread_percent", (p.max / p.min - 1) * 100}};
         }
         f.note = "if the ring current were proportional to the beam at the detector, the level per mA would be one number";
+        if (parts.empty()) {
+            f.found = "no flat series has recorded statistics: see the flat frames themselves (series)";
+            f.verdict = "unverified";
+        }
     }
     // ------------------------------------------------------------------ 8.2.4 refills
     {
@@ -638,6 +712,272 @@ void check_record_pair(const Record& a, const Record& b, Report& rep, double eps
         f.stated = "per-frame mean of the dark frames (middle rows)";
         f.found = fmt("%.3f and %.3f counts: %+.3f", da, db, db - da);
         f.numbers = {{"first", da}, {"second", db}};
+    }
+}
+
+bool lateral_stage_differs(const Record& a, const Record& b) {
+    const auto pa = a.stretches_with(Role::Projection), pb = b.stretches_with(Role::Projection);
+    if (pa.empty() || pb.empty()) return false;
+    return std::fabs(positioner(a.stretches[pa[0]], a.translation_y[1]) - positioner(b.stretches[pb[0]], b.translation_y[1])) > 1e-6;
+}
+
+namespace {
+
+// the first and second name of a motor of the tomo configuration ("sample_u" -> {"mrsx", "sx"}); "" if absent
+std::string config_motor(const Record& rec, const std::string& key) {
+    const auto& v = rec.technique.texts("tomoconfig/" + key);
+    return v.empty() ? std::string() : v.back();
+}
+
+struct Placement {
+    bool have = false;
+    double u = 0, v = 0;  // mm, the stages on the rotation
+    bool constant = true;
+};
+
+Placement placement_of(const Record& rec) {
+    Placement p;
+    const std::string mu = config_motor(rec, "sample_u"), mv = config_motor(rec, "sample_v");
+    const auto proj = rec.stretches_with(Role::Projection);
+    if (mu.empty() || mv.empty() || proj.empty()) return p;
+    const Stretch& s0 = rec.stretches[proj[0]];
+    if (!s0.positioners_start.count(mu) || !s0.positioners_start.count(mv)) return p;
+    p.have = true;
+    p.u = positioner(s0, mu), p.v = positioner(s0, mv);
+    for (int i : proj)
+        for (bool end : {false, true}) p.constant &= positioner(rec.stretches[i], mu, end) == p.u && positioner(rec.stretches[i], mv, end) == p.v;
+    return p;
+}
+
+}  // namespace
+
+// Scans that differ in where the sample sits on the rotation stage (a mosaic), or any number of scans above two.
+// A sample displaced by d on the rotation stage is seen at angle t and column c along the sample's line
+// s = c - axis - n(t).d: two tiles record the same lines at the same angle on columns n(t).(d_j - d_k) apart.
+void check_record_tiles(const std::vector<Record>& recs, Report& rep, double eps, double radius_px) {
+    if (recs.size() < 2) return;
+    const Record& first = recs[0];
+    const std::string all = first.label + "+" + std::to_string(recs.size() - 1);
+    const double px_mm = pixel_um(first) * 1e-3;
+    const auto& size = first.technique.numbers("detector/" + first.detector + "/size");
+    const double cols = size.at(0);
+    std::vector<std::vector<int>> proj;
+    for (const Record& r : recs) proj.push_back(r.stretches_with(Role::Projection));
+
+    // ------------------------------------------------------------------ 4.3 which is which
+    {
+        Finding& f = rep.add("4.3", all, "the scans of the acquisition and what differs between them");
+        std::map<std::string, std::vector<double>> values;
+        bool comparable = true;
+        std::vector<std::string> names;
+        for (std::size_t k = 0; k < recs.size(); ++k) {
+            names.push_back(fmt("'%s' (%s)", recs[k].sample_name.c_str(), recs[k].start_time.c_str()));
+            comparable &= pixel_um(recs[k]) == pixel_um(first) && recs[k].stretches.size() == first.stretches.size() && !proj[k].empty();
+        }
+        if (comparable) {
+            const auto& m0 = first.stretches[proj[0][0]].positioners_start;
+            for (const auto& [name, value] : m0) {
+                bool differs = false;
+                std::vector<double> v;
+                for (std::size_t k = 0; k < recs.size(); ++k) {
+                    const auto& mk = recs[k].stretches[proj[k][0]].positioners_start;
+                    const auto it = mk.find(name);
+                    v.push_back(it == mk.end() ? NAN : it->second);
+                    differs |= it != mk.end() && std::fabs(it->second - value) > 1e-6;
+                }
+                if (differs) values[name] = v;
+            }
+        }
+        std::vector<std::string> diff;
+        for (const auto& [name, v] : values) {
+            std::vector<std::string> each;
+            for (double x : v) each.push_back(fmt("%.4f", x));
+            diff.push_back(name + " " + join(each, ", "));
+        }
+        f.stated = join(names, ", ");
+        f.found = "motor positions that differ at the start of the first projection stretch: " + (diff.empty() ? std::string("none") : join(diff));
+        const std::string mu = config_motor(first, "sample_u"), mv = config_motor(first, "sample_v");
+        const bool lateral = values.count(first.translation_y[1]) > 0, sample = values.count(mu) > 0 || values.count(mv) > 0;
+        f.found += lateral ? "; the lateral stage of the rotation axis differs: scans at different places of the axis against the detector"
+                 : sample ? "; the sample's stages on the rotation differ and the axis stays: tiles of a mosaic"
+                          : "; neither the lateral stage nor the sample's stages differ";
+        f.verdict = comparable ? "note" : "fails";
+        f.numbers = {{"scans", static_cast<double>(recs.size())}, {"mosaic", sample && !lateral ? 1.0 : 0.0}};
+    }
+
+    // ------------------------------------------------------------------ 6.1.1 where the sample sits in each scan
+    std::vector<Placement> place;
+    for (const Record& r : recs) place.push_back(placement_of(r));
+    bool placed = true;
+    for (const Placement& p : place) placed &= p.have;
+    // the nominal axis column (the assumption of 5.3.1) and the farthest a tile sees from its axis
+    const double y_mm = proj[0].empty() ? 0.0 : positioner(first.stretches[proj[0][0]], first.translation_y[1]);
+    const double axis = cols / 2 + y_mm / px_mm;
+    const double reach = std::max(axis, cols - 1 - axis);
+    double lever = reach;
+    if (placed) {
+        Finding& f = rep.add("6.1.1", all, "place of the sample on the rotation stage in each scan (stage readings)");
+        const std::string mu = config_motor(first, "sample_u"), mv = config_motor(first, "sample_v");
+        std::vector<std::string> parts;
+        bool constant = true;
+        for (std::size_t k = 0; k < recs.size(); ++k) {
+            const double du = (place[k].u - place[0].u) / px_mm, dv = (place[k].v - place[0].v) / px_mm;
+            parts.push_back(fmt("%s: %.4f, %.4f mm = (%+.2f, %+.2f) px from %s", recs[k].label.c_str(), place[k].u, place[k].v, du, dv, first.label.c_str()));
+            constant &= place[k].constant;
+            f.numbers.push_back({"u_px_" + recs[k].label, du});
+            f.numbers.push_back({"v_px_" + recs[k].label, dv});
+            for (std::size_t j = 0; j < recs.size(); ++j)
+                lever = std::max(lever, std::hypot(place[k].u - place[j].u, place[k].v - place[j].v) / px_mm + reach);
+        }
+        f.stated = fmt("%s and %s per scan", mu.c_str(), mv.c_str());
+        f.found = join(parts) + fmt("; the readings are %s at the start and end of every projection stretch; %.4g px is %.1e of the distance between neighbours",
+                                    constant ? "the same" : "NOT the same", eps, eps / std::max(1.0, lever - reach));
+        // the stage's own statement of the sample's place in the laboratory: the pseudo-motors, which turn with the rotation
+        const std::string mx = config_motor(first, "sample_x"), my = config_motor(first, "sample_y"), rot = first.rotation[1];
+        double worst[2] = {0, 0};
+        bool have_lab = !mx.empty() && !my.empty();
+        for (std::size_t k = 0; k < recs.size() && have_lab; ++k)
+            for (int i : proj[k]) {
+                const Stretch& s = recs[k].stretches[i];
+                if (!s.positioners_start.count(mx) || !s.positioners_start.count(my) || !s.positioners_start.count(rot)) { have_lab = false; break; }
+                const double a = positioner(s, rot) * M_PI / 180, x = positioner(s, mx), y = positioner(s, my);
+                for (int sense = 0; sense < 2; ++sense) {
+                    const double sn = (sense ? -1 : 1) * std::sin(a), cs = std::cos(a);
+                    worst[sense] = std::max({worst[sense], std::fabs(x - (place[k].u * cs + place[k].v * sn)), std::fabs(y - (-place[k].u * sn + place[k].v * cs))});
+                }
+            }
+        if (have_lab) {
+            const int sense = worst[1] < worst[0] ? 1 : 0;
+            f.found += fmt("; %s = %s cos(%s) %s %s sin(%s) and %s = %s %s sin(%s) + %s cos(%s) at the start of every projection stretch to %.2g um", mx.c_str(), mu.c_str(), rot.c_str(),
+                           sense ? "-" : "+", mv.c_str(), rot.c_str(), my.c_str(), sense ? "" : "-", mu.c_str(), rot.c_str(), mv.c_str(), rot.c_str(), worst[sense] * 1e3);
+            f.numbers.push_back({"lab_sense", sense ? -1.0 : 1.0});
+            f.numbers.push_back({"lab_worst_mm", worst[sense]});
+        }
+        f.note = "stage readings. Where the sample was is for the frames to show: two scans record the same lines at equal angle on columns n(angle).(d_j - d_k) apart";
+    }
+    Tolerances tol = tolerances(first, eps, radius_px > 0 ? radius_px : lever);
+
+    // ------------------------------------------------------------------ 6.3.1 which lines each scan records
+    if (placed) {
+        Finding& f = rep.add("6.3.1 5.3.1", all, "which lines the scans record, from the stage readings and the nominal axis column");
+        const int window = 1024, steps = 720;
+        std::vector<std::string> parts;
+        int pairs = 0;
+        for (std::size_t k = 0; k < recs.size(); ++k)
+            for (std::size_t j = k + 1; j < recs.size(); ++j) {
+                const double du = (place[j].u - place[k].u) / px_mm, dv = (place[j].v - place[k].v) / px_mm, D = std::hypot(du, dv);
+                if (D >= 2 * reach) continue;
+                int equal = 0, opposite = 0;
+                double narrowest = 1e30;
+                for (int t = 0; t < steps; ++t) {
+                    const double a = 2 * M_PI * t / steps, delta = du * std::cos(a) + dv * std::sin(a);
+                    const double w_equal = cols - std::fabs(delta);
+                    // one scan at this angle against the other half a turn on, either way round
+                    const auto opp = [&](double d) { return std::min(cols - 1 - axis, d + axis) - std::max(-axis, d - (cols - 1 - axis)); };
+                    const double w_opp = std::max(opp(delta), opp(-delta));
+                    equal += w_equal >= window;
+                    opposite += w_opp >= window;
+                    narrowest = std::min(narrowest, std::max(w_equal, w_opp));
+                }
+                ++pairs;
+                parts.push_back(fmt("%s-%s %.1f px apart: %.0f %% of the angles at equal angle, %.0f %% in opposite views, narrowest %.0f columns", recs[k].label.c_str(),
+                                    recs[j].label.c_str(), D, 100.0 * equal / steps, 100.0 * opposite / steps, narrowest));
+            }
+        // how many scans record a line (either view), over the lines between the outermost any scan records
+        std::int64_t count[3] = {0, 0, 0}, total = 0;
+        double hull_min = 1e30, hull_max = 0;
+        for (int t = 0; t < steps; ++t) {
+            const double a = 2 * M_PI * t / steps;
+            std::vector<double> centre;
+            for (const Placement& p : place) centre.push_back((p.u * std::cos(a) + p.v * std::sin(a)) / px_mm);
+            const double lo = *std::min_element(centre.begin(), centre.end()) - reach, hi = *std::max_element(centre.begin(), centre.end()) + reach;
+            hull_min = std::min(hull_min, (hi - lo) / 2), hull_max = std::max(hull_max, (hi - lo) / 2);
+            for (double sline = lo + 4; sline < hi; sline += 8) {
+                int n = 0;
+                for (double c : centre) n += std::fabs(sline - c) <= reach;
+                ++count[std::min(n, 2)];
+                ++total;
+            }
+        }
+        f.stated = fmt("axis on column %.1f of %.0f (nominal): a scan records the lines within %.1f px of its axis, from one side or from both", axis, cols, reach);
+        f.found = fmt("%d pairs of scans closer than twice that; lines both record, in windows of at least %d columns: %s; of the lines between the outermost any scan records "
+                      "(%.0f to %.0f px wide, half): %.1f %% by no scan, %.1f %% by one, %.1f %% by two or more; the farthest a scan's rays pass from its own axis inside that: %.0f px",
+                      pairs, window, join(parts).c_str(), hull_min, hull_max, 100.0 * count[0] / total, 100.0 * count[1] / total, 100.0 * count[2] / total, lever);
+        f.note = "nominal: the stage readings, the stated pixel size and the assumed axis column. The lever arm of every angle is the last number, not the detector's width";
+        f.numbers = {{"pairs", static_cast<double>(pairs)}, {"reach_px", reach}, {"lever_px", lever}, {"uncovered_percent", 100.0 * count[0] / total}};
+    }
+
+    // ------------------------------------------------------------------ per stretch: 6.1.2, 6.2.1 - 6.2.4
+    for (std::size_t k = 0; k < proj[0].size(); ++k) {
+        const Stretch& sa = first.stretches[proj[0][k]];
+        if (!sa.latched()) continue;
+        const auto aa = stated_angle(sa);
+        const auto za = stated_height(first, sa);
+        std::vector<double> all_da;
+        std::vector<std::string> angle_parts, height_parts, time_parts;
+        double worst_angle = 0;
+        std::vector<std::pair<std::string, double>> numbers;
+        for (std::size_t r = 1; r < recs.size(); ++r) {
+            if (k >= proj[r].size()) continue;
+            const Stretch& sb = recs[r].stretches[proj[r][k]];
+            if (!sb.latched() || sb.n_frames != sa.n_frames) continue;
+            const auto ab = stated_angle(sb);
+            const auto zb = stated_height(recs[r], sb);
+            std::vector<double> da(aa.size()), dz(aa.size());
+            for (std::size_t i = 0; i < aa.size(); ++i) da[i] = ab[i] - aa[i], dz[i] = zb[i] - za[i];
+            const Spread sda = spread(da), sdz = spread(dz);
+            const double worst = std::max(std::fabs(sda.min), std::fabs(sda.max));
+            worst_angle = std::max(worst_angle, worst);
+            all_da.insert(all_da.end(), da.begin(), da.end());
+            angle_parts.push_back(fmt("%s %+.2e (at most %.2e)", recs[r].label.c_str(), sda.mean, worst));
+            height_parts.push_back(fmt("%s %+.2f um = %+.3f rows (rms %.2f um, %+.2f to %+.2f)", recs[r].label.c_str(), sdz.mean * 1e3, sdz.mean / px_mm, sdz.sd * 1e3, sdz.min * 1e3, sdz.max * 1e3));
+            time_parts.push_back(fmt("%s %.1f s", recs[r].label.c_str(), sb.epoch_trig.empty() || sa.epoch_trig.empty() ? NAN : sb.epoch_trig[0] - sa.epoch_trig[0]));
+            numbers.push_back({"height_mean_mm_" + recs[r].label, sdz.mean});
+            numbers.push_back({"angle_mean_deg_" + recs[r].label, sda.mean});
+        }
+        if (angle_parts.empty()) continue;
+        {
+            Finding& f = rep.add("6.2.1", all, "angle of the scans at equal projection index, stretch " + sa.entry);
+            f.stated = "the encoder angles of every scan";
+            f.found = fmt("against %s [deg]: %s; at most %.2e deg = %.3f px at the lever arm of %.0f px; target %.6g deg", first.label.c_str(), join(angle_parts).c_str(), worst_angle,
+                          worst_angle / 57.29577951308232 * tol.R, tol.R, tol.angle_deg());
+            assess_residuals(f, all_da, tol.angle_deg(), "deg");
+            f.note = "a statement about the stage's encoder. The sample's angle against the beam in each scan (6.1.6) is for the frames to show";
+            f.numbers = numbers;
+        }
+        {
+            Finding& f = rep.add("6.1.2 6.2.2 6.2.3", all, "height of the scans at equal projection index, stretch " + sa.entry);
+            f.stated = sa.z_center.empty() ? "the stage's position at rest in every scan" : "the latched heights of every scan";
+            f.found = fmt("minus %s: %s", first.label.c_str(), join(height_parts).c_str());
+        }
+        {
+            Finding& f = rep.add("6.2.4", all, "time between corresponding projections, stretch " + sa.entry);
+            f.stated = "epoch_trig of every scan";
+            f.found = fmt("after %s: %s", first.label.c_str(), join(time_parts).c_str());
+        }
+    }
+
+    // ------------------------------------------------------------------ 6.3.5 the beam through the scans
+    {
+        Finding& f = rep.add("6.3.5 8.2.3", all, "ring current through the scans");
+        std::vector<std::string> parts;
+        for (const Record& r : recs) {
+            double lo = 1e30, hi = -1e30, flats = 0, n_flats = 0, start = NAN, end = NAN;
+            for (const Stretch& s : r.stretches) {
+                for (double c : s.monitor.current) {
+                    if (!std::isfinite(c)) continue;
+                    if (s.role == Role::Flat) flats += c, n_flats += 1;
+                    if (s.role != Role::Projection) continue;
+                    if (!std::isfinite(start)) start = c;
+                    end = c;
+                    lo = std::min(lo, c), hi = std::max(hi, c);
+                }
+            }
+            parts.push_back(fmt("%s: %.2f -> %.2f mA through the projections (%.2f to %.2f), flats at %.2f mA", r.label.c_str(), start, end, lo, hi, n_flats ? flats / n_flats : NAN));
+        }
+        f.stated = "ring current read through every stretch; each scan has its own darks and flats";
+        f.found = join(parts);
+        f.note = "the level of one scan against another where they record the same lines is for the frames to show";
     }
 }
 

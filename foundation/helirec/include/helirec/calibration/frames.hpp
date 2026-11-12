@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "helirec/calibration/record.hpp"
@@ -34,6 +35,22 @@ class Frames {
     // visit(frame, data): every frame in [first, first + count), whole, from the reading threads in any order
     void visit(int stretch, std::int64_t first, std::int64_t count,
                const std::function<void(std::int64_t, const std::uint16_t*)>& visit);
+
+    // How the frames of a stretch are stored, from its first file on disk (helirec/raw_reader.hpp). A frame not
+    // on disk is never read: read_rows, read and visit throw for it.
+    struct Stored {
+        bool on_disk = false;       // false: no file of the stretch is on disk
+        bool compressed = false;
+        int chunk_rows = 0;
+        std::string codec;
+        bool reversible = true;     // false: the stored values are not the detector's
+        int bit_depth = 16;
+        double bytes_per_frame = 0;
+    };
+    Stored stored(int stretch);
+    // Every chunk of every frame on disk of the stretch located in its file, without reading the values: the
+    // number of frames found. Throws if a frame of a file on disk was not written.
+    std::int64_t locate_all(int stretch);
 
   private:
     void locate(int stretch, std::int64_t frame, std::int32_t& file, std::int32_t& index) const;
@@ -87,5 +104,11 @@ void line_integrals_mapped(Frames& frames, const FlatField& ff, const DetectorMa
 // b(q, r, c) <- b(q + shear (c - (ncols - 1) / 2), r, c), cubic along the frames (held inside the block): frames of
 // a block read at an angle that changes with the column, as the divergence of the beam makes opposite views do.
 void shear_frames(float* block, std::size_t n, int nrows, int ncols, double shear);
+
+// out(q, r, c) <- wide(q, r, pad + c + shift[q]) (pad + ncols - 1 - c + shift[q] with flip_cols), cubic along the
+// columns: a block cut `pad` columns wider on both sides, each frame read `shift[q]` columns further on. What a
+// sample displaced on the rotation stage does to a tile of a mosaic against another: its content sways along the
+// columns once per turn. |shift| must stay below pad - 2.
+void shift_columns(const float* wide, std::size_t n, int nrows, int ncols, int pad, const double* shift, bool flip_cols, float* out);
 
 }  // namespace helirec::calibration

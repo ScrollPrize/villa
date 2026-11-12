@@ -1,5 +1,7 @@
 #include "helirec/calibration/record.hpp"
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <cstdlib>
 
@@ -50,6 +52,28 @@ std::vector<int> Record::stretches_with(Role role) const {
         if (stretches[i].role == role) out.push_back(static_cast<int>(i));
     return out;
 }
+std::vector<std::pair<std::int64_t, std::int64_t>> Stretch::frames_on_disk() const {
+    std::vector<std::pair<std::int64_t, std::int64_t>> out;
+    for (const FramePiece& p : pieces) {
+        if (!p.present || p.count <= 0) continue;
+        if (!out.empty() && out.back().second == p.first) out.back().second = p.first + p.count;
+        else out.push_back({p.first, p.first + p.count});
+    }
+    return out;
+}
+std::int64_t Stretch::n_on_disk() const {
+    std::int64_t n = 0;
+    for (const FramePiece& p : pieces)
+        if (p.present) n += p.count;
+    return n;
+}
+bool Stretch::on_disk(std::int64_t frame) const {
+    auto it = std::upper_bound(pieces.begin(), pieces.end(), frame, [](std::int64_t f, const FramePiece& p) { return f < p.first; });
+    if (it == pieces.begin()) return false;
+    --it;
+    return it->present && frame < it->first + it->count;
+}
+
 const Stretch& Record::stretch(const std::string& entry) const {
     for (const Stretch& s : stretches)
         if (s.entry == entry) return s;
@@ -132,7 +156,7 @@ void frame_pieces(hid_t file, const std::string& file_path, const std::string& d
     s.cols = static_cast<int>(dims[2]);
     h5::Id dcpl(H5Dget_create_plist(d.id), H5Pclose);
     if (H5Pget_layout(dcpl.id) != H5D_VIRTUAL) {
-        s.pieces.push_back({file_path, dataset, 0, s.n_frames, 0});
+        s.pieces.push_back({file_path, dataset, 0, s.n_frames, 0, true});
         return;
     }
     std::size_t n = 0;
@@ -154,6 +178,8 @@ void frame_pieces(hid_t file, const std::string& file_path, const std::string& d
         hsize_t sa[3] = {0, 0, 0}, sb[3] = {0, 0, 0};
         if (H5Sget_simple_extent_ndims(ss.id) == 3 && H5Sget_select_bounds(ss.id, sa, sb) >= 0)
             p.source_first = static_cast<std::int64_t>(sa[0]);
+        struct stat st;
+        p.present = ::stat(p.file.c_str(), &st) == 0 && S_ISREG(st.st_mode);
         s.pieces.push_back(std::move(p));
     }
     std::sort(s.pieces.begin(), s.pieces.end(), [](const FramePiece& x, const FramePiece& y) { return x.first < y.first; });
@@ -174,7 +200,7 @@ void read_monitor(hid_t file, const std::string& entry, Monitor& m) {
 void read_frame_files(const std::string& detector, Stretch& s) {
     std::string last;
     for (const FramePiece& p : s.pieces) {
-        if (p.file == last) continue;
+        if (p.file == last || !p.present) continue;
         last = p.file;
         h5::Id f = h5::open_file(p.file);
         // the detector's group is the parent of the frame dataset
