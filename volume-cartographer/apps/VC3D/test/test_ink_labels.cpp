@@ -600,14 +600,14 @@ void TestInkLabels::countsMatchBruteForce()
 
 void TestInkLabels::storePathsAndSuffixes()
 {
-    const StorePaths paths = storePathsFor("/data/project", "w045");
-    QCOMPARE(QString::fromStdString(paths.dir.string()), QStringLiteral("/data/project/ink_labels/w045"));
-    QCOMPARE(QString::fromStdString(paths.file(LabelKind::Ink).filename().string()), QStringLiteral("w045_inklabels.tif"));
-    QCOMPARE(QString::fromStdString(paths.file(LabelKind::Supervision).filename().string()), QStringLiteral("w045_supervision_mask.tif"));
-    QCOMPARE(QString::fromStdString(paths.file(LabelKind::Validation).filename().string()), QStringLiteral("w045_validation_mask.tif"));
+    const StorePaths paths = storePathsFor("/data/project", "seg_a");
+    QCOMPARE(QString::fromStdString(paths.dir.string()), QStringLiteral("/data/project/ink_labels/seg_a"));
+    QCOMPARE(QString::fromStdString(paths.file(LabelKind::Ink).filename().string()), QStringLiteral("seg_a_inklabels.tif"));
+    QCOMPARE(QString::fromStdString(paths.file(LabelKind::Supervision).filename().string()), QStringLiteral("seg_a_supervision_mask.tif"));
+    QCOMPARE(QString::fromStdString(paths.file(LabelKind::Validation).filename().string()), QStringLiteral("seg_a_validation_mask.tif"));
     StorePaths v2 = paths;
     v2.version = 2;
-    QCOMPARE(QString::fromStdString(v2.file(LabelKind::Ink).filename().string()), QStringLiteral("w045_inklabels_v2.tif"));
+    QCOMPARE(QString::fromStdString(v2.file(LabelKind::Ink).filename().string()), QStringLiteral("seg_a_inklabels_v2.tif"));
 
     // The trainer reads .tif/.tiff/.zarr and create_label_zarrs .tif/.tiff/.png:
     // every auxiliary file must use another extension.
@@ -731,10 +731,10 @@ void TestInkLabels::sidecarCanvasRoundTrip()
         const auto canvas = vc::RenderCanvas::make({152, 76}, {scale, scale}, 1.0);
         Sidecar s;
         s.canvas = canvasKeyFor(canvas);
-        s.segmentName = "w045";
+        s.segmentName = "seg_a";
         s.segmentUuid = "abc";
         s.sha256[LabelKind::Ink] = "00ff";
-        s.fileNames[LabelKind::Ink] = "w045_inklabels.tif";
+        s.fileNames[LabelKind::Ink] = "seg_a_inklabels.tif";
         s.stateSerial = 412;
         s.predictionShown = std::string("/tmp/pred.png");
         s.edits = QJsonObject{{"user", QJsonObject{{"brush", 3}}}};
@@ -1039,10 +1039,10 @@ void TestInkLabels::controllerSaveAndReopen()
     std::map<LabelKind, std::string> sha;
     {
         Labeler l;
-        const auto out = l.labels->openForTesting(canvas, toPath(dir), "w045");
+        const auto out = l.labels->openForTesting(canvas, toPath(dir), "seg_a");
         QVERIFY2(out.ok, qPrintable(out.message));
         paths = l.labels->session()->paths;
-        QCOMPARE(QString::fromStdString(paths.dir.string()), QString::fromStdString((toPath(dir) / "ink_labels" / "w045").string()));
+        QCOMPARE(QString::fromStdString(paths.dir.string()), QString::fromStdString((toPath(dir) / "ink_labels" / "seg_a").string()));
         l.labels->setRadius(15);
         l.labels->setPaintClass(PaintClass::Background);
         QVERIFY(l.labels->applyShape(polygon({{100, 100}, {700, 100}, {700, 500}, {100, 500}}), Actor::User) > 0);
@@ -1067,7 +1067,7 @@ void TestInkLabels::controllerSaveAndReopen()
     QVERIFY(!targetExists(paths, Target::Autosave));
 
     Labeler again;
-    const auto reopened = again.labels->openForTesting(canvas, toPath(dir), "w045");
+    const auto reopened = again.labels->openForTesting(canvas, toPath(dir), "seg_a");
     QVERIFY2(reopened.ok, qPrintable(reopened.message));
     QVERIFY(!reopened.readOnly);
     QVERIFY(reopened.warnings.isEmpty());
@@ -1486,7 +1486,7 @@ void TestInkLabels::unusableAutosaveIsMovedAside()
 void TestInkLabels::labelRootLeavesTheRemoteCache()
 {
     QCOMPARE(labelRootFor("/data/proj/p.volpkg.json", "/cache", "/appdata"), fs::path("/data/proj"));
-    QCOMPARE(labelRootFor("/cache/open_data/projects/PHerc0139.volpkg.json", "/cache", "/appdata"), fs::path("/appdata/PHerc0139"));
+    QCOMPARE(labelRootFor("/cache/open_data/projects/scroll_a.volpkg.json", "/cache", "/appdata"), fs::path("/appdata/scroll_a"));
     QCOMPARE(labelRootFor("/cache/open_data/projects/x.volpkg.json", "/cache/", "/appdata"), fs::path("/appdata/x"));
     QCOMPARE(labelRootFor("/cachefoo/p.volpkg.json", "/cache", "/appdata"), fs::path("/cachefoo"));
     QCOMPARE(labelRootFor("/data/p.volpkg.json", "", "/appdata"), fs::path("/data"));
@@ -2520,7 +2520,7 @@ void TestInkLabels::importPngAndRgbTiff()
     // An anti-aliased PNG: every pixel above 0 counts, with a warning.
     cv::Mat_<uint8_t> aa = cv::Mat_<uint8_t>::zeros(140, 200);
     cv::circle(aa, {100, 70}, 30, cv::Scalar(255), cv::FILLED, cv::LINE_AA);
-    const fs::path png = toPath(dir) / "w045_inklabels.png";
+    const fs::path png = toPath(dir) / "seg_a_inklabels.png";
     QVERIFY(cv::imwrite(png.string(), aa));
     QCOMPARE(detectFormat(png), ImportFormat::Png);
     TileRaster raster(canvas.size);
@@ -2535,7 +2535,7 @@ void TestInkLabels::importPngAndRgbTiff()
     cv::Mat bgr(140, 200, CV_8UC3, cv::Scalar(0, 0, 0));
     bgr(cv::Rect(10, 10, 50, 40)).setTo(cv::Scalar(0, 0, 255));  // red square
     bgr(cv::Rect(100, 80, 30, 30)).setTo(cv::Scalar(255, 0, 0)); // blue square, ignored
-    const fs::path tif = toPath(dir) / "w045_supervision_mask.tif";
+    const fs::path tif = toPath(dir) / "seg_a_supervision_mask.tif";
     QVERIFY(cv::imwrite(tif.string(), bgr));
     QCOMPARE(kindForFileName(tif), LabelKind::Supervision);
     ImportOptions options;
@@ -2549,7 +2549,7 @@ void TestInkLabels::importPngAndRgbTiff()
 
     // Through the controller: one undo entry, provenance recorded.
     Labeler l;
-    QVERIFY(l.labels->openForTesting(canvas, toPath(dir), "w045").ok);
+    QVERIFY(l.labels->openForTesting(canvas, toPath(dir), "seg_a").ok);
     int finished = 0;
     ImportOutcome last;
     QObject::connect(l.labels.get(), &InkLabelController::importFinished, l.labels.get(),
@@ -2584,7 +2584,7 @@ void TestInkLabels::importLabelZarr65()
 {
     QTemporaryDir dir;
     const auto canvas = testCanvas({300, 200});
-    const fs::path root = toPath(dir) / "w045_supervision_mask.zarr";
+    const fs::path root = toPath(dir) / "seg_a_supervision_mask.zarr";
     fs::create_directories(root);
     vcr::zarr::CreateOptions create;
     create.shape = {65, 200, 300};
@@ -2622,7 +2622,7 @@ void TestInkLabels::importZarr2DVersion3()
     const auto canvas = testCanvas({100, 150});
     QCOMPARE(canvas.size, cv::Size(100, 140));
     const cv::Size size = canvas.size;
-    const fs::path array = toPath(dir) / "w045_inklabels.zarr" / "0";
+    const fs::path array = toPath(dir) / "seg_a_inklabels.zarr" / "0";
     fs::create_directories(array);
     {
         std::ofstream meta(array / "zarr.json");
@@ -2721,15 +2721,15 @@ void TestInkLabels::importLegacyPngPair()
     ink(cv::Rect(50, 50, 20, 20)) = 255;
     cv::Mat_<uint8_t> mask = cv::Mat_<uint8_t>::zeros(140, 200);
     mask(cv::Rect(10, 10, 180, 120)) = 255;
-    QVERIFY(cv::imwrite((toPath(dir) / "w045_inklabels.png").string(), ink));
-    QVERIFY(cv::imwrite((toPath(dir) / "w045_mask.png").string(), mask));
-    const fs::path path = toPath(dir) / "w045_inklabels.png";
+    QVERIFY(cv::imwrite((toPath(dir) / "seg_a_inklabels.png").string(), ink));
+    QVERIFY(cv::imwrite((toPath(dir) / "seg_a_mask.png").string(), mask));
+    const fs::path path = toPath(dir) / "seg_a_inklabels.png";
     QCOMPARE(detectFormat(path), ImportFormat::LegacyPngPair);
 
     TileRaster raster(canvas.size);
     ImportOutcome out = importInto(raster, path, canvas, {});
     QVERIFY(!out.ok && out.needsDecision);
-    QVERIFY(out.error.contains(QStringLiteral("w045_mask.png")));
+    QVERIFY(out.error.contains(QStringLiteral("seg_a_mask.png")));
     ImportOptions options;
     options.legacyMaskAs = LegacyMaskAs::Supervision;
     out = importInto(raster, path, canvas, options);
@@ -2800,12 +2800,12 @@ void TestInkLabels::numberedVersionsWriteAllKinds()
 
 void TestInkLabels::datasetEntryTargetsTheSegment()
 {
-    const StorePaths paths = storePathsFor("/data/proj", "w045");
+    const StorePaths paths = storePathsFor("/data/proj", "seg_a");
     QJsonObject entry = datasetEntry(paths, "/data/proj", {1});
     QCOMPARE(entry.value("segments_path").toString(), QStringLiteral("/data/proj/ink_labels"));
-    QCOMPARE(entry.value("segment_names").toArray(), QJsonArray{QStringLiteral("w045")});
-    QCOMPARE(entry.value("surface_volume_paths").toObject().value("w045").toString(),
-             QStringLiteral("/data/proj/ink_labels/w045/w045.zarr"));
+    QCOMPARE(entry.value("segment_names").toArray(), QJsonArray{QStringLiteral("seg_a")});
+    QCOMPARE(entry.value("surface_volume_paths").toObject().value("seg_a").toString(),
+             QStringLiteral("/data/proj/ink_labels/seg_a/seg_a.zarr"));
     QVERIFY(!entry.contains("label_version"));  // one version: the trainer's default
     // With several versions, the saved one is named, also v1 (unnumbered),
     // since the trainer otherwise takes the newest.
@@ -2814,7 +2814,7 @@ void TestInkLabels::datasetEntryTargetsTheSegment()
     v3.version = 3;
     QCOMPARE(datasetEntry(v3, "/data/proj", {1, 3}).value("label_version").toString(), QStringLiteral("v3"));
     // Built as JSON, so quotes and backslashes in paths stay valid.
-    const StorePaths odd = storePathsFor("C:\\data\\my \"proj\"", "w045");
+    const StorePaths odd = storePathsFor("C:\\data\\my \"proj\"", "seg_a");
     const QByteArray text = QJsonDocument(datasetEntry(odd, "C:\\data\\my \"proj\"", {1})).toJson();
     QJsonParseError error;
     QVERIFY(QJsonDocument::fromJson(text, &error).isObject());

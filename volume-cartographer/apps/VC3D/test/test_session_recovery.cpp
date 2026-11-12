@@ -38,8 +38,8 @@ namespace {
 
 constexpr auto kChildEnv = "VC3D_SESSION_RECOVERY_TEST_CHILD";
 constexpr int kChildExitCode = 42;
-const QString kProject = QStringLiteral("/data/PHerc0139.volpkg.json");
-const QString kSegment = QStringLiteral("w045");
+const QString kProject = QStringLiteral("/data/scroll_a.volpkg.json");
+const QString kSegment = QStringLiteral("seg_a");
 
 void fillPoints(VCCollection& points)
 {
@@ -504,7 +504,7 @@ private slots:
     {
         QTemporaryDir root;
         QTemporaryDir project;
-        const QString segmentDir = QDir(project.path()).filePath("paths/w045");
+        const QString segmentDir = QDir(project.path()).filePath("paths/seg_a");
         QVERIFY(QDir().mkpath(segmentDir));
         const QStringList before = filesUnder(project.path());
 
@@ -512,7 +512,7 @@ private slots:
         auto session = std::make_unique<SessionRecovery>(root.path());
         QVERIFY(session->begin(&points));
         session->setProject(QDir(project.path()).filePath("scroll.volpkg.json"));
-        session->setSegment("w045");
+        session->setSegment("seg_a");
         fillPoints(points);
         session->flush();
         QVERIFY(session->waitForWrite());

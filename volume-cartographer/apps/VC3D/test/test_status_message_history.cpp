@@ -56,8 +56,8 @@ private slots:
         QCOMPARE(history.entries().back().time, start.addSecs(2));
 
         // Other words keep messages apart, whatever their numbers.
-        history.add(QStringLiteral("Loaded 3 segments from w035"), start.addSecs(3));
-        history.add(QStringLiteral("Loaded 3 points from w035"), start.addSecs(4));
+        history.add(QStringLiteral("Loaded 3 segments from seg_b"), start.addSecs(3));
+        history.add(QStringLiteral("Loaded 3 points from seg_b"), start.addSecs(4));
         QCOMPARE(history.entries().size(), std::size_t{3});
         QVERIFY(StatusMessageHistory::repeats(QStringLiteral("a"), QStringLiteral("a")));
         QVERIFY(!StatusMessageHistory::repeats(QStringLiteral("Drag brush radius: 4 steps"),

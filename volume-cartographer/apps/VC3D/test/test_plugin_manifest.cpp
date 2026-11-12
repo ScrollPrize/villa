@@ -98,13 +98,13 @@ void expandsEachTemplateToExactlyOneArgument()
     auto m = *parseManifest(manifestJson(), QStringLiteral("/plugins/render.json")).manifest;
     PluginContext ctx;
     ctx.volume = QStringLiteral("/data/scroll vol.zarr");
-    ctx.segment = QStringLiteral("/data/segs/w035; rm -rf ~");
+    ctx.segment = QStringLiteral("/data/segs/seg_b; rm -rf ~");
     ctx.output = QStringLiteral("/runs/example.render/1");
     ctx.inputs.insert(QStringLiteral("label"), QStringLiteral("a b"));
     const auto e = expand(m, ctx);
     CHECK_MSG(e.error.isEmpty(), e.error);
     CHECK_EQ(e.args, (QStringList{QStringLiteral("--volume"), QStringLiteral("/data/scroll vol.zarr"),
-                                  QStringLiteral("--segmentation"), QStringLiteral("/data/segs/w035; rm -rf ~"),
+                                  QStringLiteral("--segmentation"), QStringLiteral("/data/segs/seg_b; rm -rf ~"),
                                   QStringLiteral("--tif-output"), QStringLiteral("/runs/example.render/1/layers/%02d.tif"),
                                   QStringLiteral("--label"), QStringLiteral("a b")}));
     CHECK_EQ(e.resultPath, QStringLiteral("/runs/example.render/1/layers/00.tif"));

@@ -105,7 +105,7 @@ class InkLabelsToolTest(unittest.IsolatedAsyncioTestCase):
             erase=True,
             background_keeps_ink=True,
             mask=mask,
-            expect={"segment": "w045", "serial": 7},
+            expect={"segment": "seg_a", "serial": 7},
         )
         self._assert_wire(
             "ink_labels.paint",
@@ -115,7 +115,7 @@ class InkLabelsToolTest(unittest.IsolatedAsyncioTestCase):
                 "backgroundKeepsInk": True,
                 "space": "label",
                 "mask": mask,
-                "expect": {"segment": "w045", "serial": 7},
+                "expect": {"segment": "seg_a", "serial": 7},
             },
         )
 
@@ -252,8 +252,8 @@ class InkLabelsToolTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_import(self) -> None:
-        await vc3d_ink_labels_import(path="/data/w045_inklabels.png")
-        self._assert_wire("ink_labels.import", {"path": "/data/w045_inklabels.png", "allowResample": False})
+        await vc3d_ink_labels_import(path="/data/seg_a_inklabels.png")
+        self._assert_wire("ink_labels.import", {"path": "/data/seg_a_inklabels.png", "allowResample": False})
         await vc3d_ink_labels_import(
             path="/data/x.tif", label="validation", allow_resample=True, legacy_mask_as="ignore"
         )

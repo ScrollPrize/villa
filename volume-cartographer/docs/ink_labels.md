@@ -181,9 +181,9 @@ labels on the clipboard as JSON:
 ```json
 {
     "label_version": "v2",
-    "segment_names": ["w045"],
+    "segment_names": ["seg_a"],
     "segments_path": "/data/proj/ink_labels",
-    "surface_volume_paths": {"w045": "/data/proj/ink_labels/w045/w045.zarr"}
+    "surface_volume_paths": {"seg_a": "/data/proj/ink_labels/seg_a/seg_a.zarr"}
 }
 ```
 
