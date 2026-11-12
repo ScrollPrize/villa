@@ -33,6 +33,22 @@ class FitDeviceAvailabilityTest(unittest.TestCase):
 			with self.assertRaisesRegex(RuntimeError, "only 1 visible CUDA"):
 				fit._require_torch_device_available(torch.device("cuda:1"))
 
+	def test_bool_index_probe_passes_on_cpu(self) -> None:
+		self.assertTrue(fit._bool_index_sizes_ok(torch.device("cpu")))
+
+	def test_requested_xpu_fails_fast_when_not_visible(self) -> None:
+		with mock.patch.object(fit.torch, "xpu", mock.Mock(is_available=lambda: False), create=True):
+			with self.assertRaisesRegex(RuntimeError, "XPU device was requested"):
+				fit._require_torch_device_available(torch.device("xpu"))
+
+	def test_requested_xpu_fails_fast_on_wrong_mask_sizes(self) -> None:
+		with (
+			mock.patch.object(fit.torch, "xpu", mock.Mock(is_available=lambda: True), create=True),
+			mock.patch.object(fit, "_bool_index_sizes_ok", return_value=False),
+		):
+			with self.assertRaisesRegex(RuntimeError, "wrong number of rows"):
+				fit._require_torch_device_available(torch.device("xpu"))
+
 
 class _GridModel:
 	def __init__(self, xyz: torch.Tensor) -> None:
