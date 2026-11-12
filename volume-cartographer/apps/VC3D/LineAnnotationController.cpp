@@ -15848,6 +15848,23 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     FiberReadContext& context, const std::optional<std::vector<std::string>>& uuids,
     bool lines, FiberDependencies* dependencies)
 {
+    // A commit during the read (this controller's own background save, or
+    // another client's) leaves a graph that straddles two store positions:
+    // such a read is discarded and made again, at the new position.
+    for (int attempt = 0;; ++attempt) {
+        try {
+            return readStoredFibersInContextOnce(context, uuids, lines, dependencies);
+        } catch (const FiberGraphMoved&) {
+            if (attempt == 3) throw;
+            if (dependencies) dependencies->clear();
+        }
+    }
+}
+
+std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFibersInContextOnce(
+    FiberReadContext& context, const std::optional<std::vector<std::string>>& uuids,
+    bool lines, FiberDependencies* dependencies)
+{
     using namespace vc::objects;
     std::vector<StoredFiber> result;
     const auto& connection = context.connection;
@@ -16158,7 +16175,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         const auto after = reader.status();
         if (after.storeUuid != loadedStatus.storeUuid || after.generation != loadedStatus.generation ||
             after.commitSequence != loadedStatus.commitSequence)
-            throw std::runtime_error("Fiber graph changed while loading; reload it");
+            throw FiberGraphMoved("Fiber graph changed while loading; reload it");
     });
     return result;
 }

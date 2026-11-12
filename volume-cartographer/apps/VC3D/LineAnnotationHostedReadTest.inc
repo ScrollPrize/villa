@@ -226,20 +226,34 @@
         require(first && first->branches.size() == 1, "hosted decode of A with its link");
         auto fast = controller._storedFiberFastValidations;
         require(read(aUuid) && controller._storedFiberFastValidations == fast + 1, "hosted fast path");
-        // Another client's commit while A is being decoded: the read is
-        // refused (its graph would straddle two store positions), and the
-        // next read decodes A and B at the new position.
+        // Another client's commit while A is being decoded: that attempt is
+        // discarded (its graph would straddle two store positions) and the
+        // read is made again, at the new position.
         controller._storedFiberDecodeCache.clear(); controller._storedFiberDependencies.clear();
-        bool changed = false, refused = false;
+        bool changed = false;
+        int64_t sequenceAfterChange = -1;
         controller._fiberReadTestStage = [&](const char* stage) {
             if (changed || std::string_view(stage) != "decode-heads") return;
             changed = true;
             submitOther({SetMetaOp{bUuid, "provenance_test", "true"}}, bUuid);
+            writer.readStore(other, [&](const StoreReader& reader, const auto&) { sequenceAfterChange = reader.status().commitSequence; });
         };
-        try { (void)read(aUuid); } catch (const std::exception&) { refused = true; }
-        controller._fiberReadTestStage = {};
-        require(changed && refused, "a read interleaved with another client's commit is refused");
         const auto afterChange = read(aUuid);
+        controller._fiberReadTestStage = {};
+        require(changed && afterChange && afterChange->graphCommit == sequenceAfterChange,
+                "a read interleaved with another client's commit is made again at the new position");
+        // A store that keeps committing: the read gives up.
+        {
+            controller._storedFiberDecodeCache.clear(); controller._storedFiberDependencies.clear();
+            bool refused = false;
+            controller._fiberReadTestStage = [&](const char* stage) {
+                if (std::string_view(stage) == "decode-heads") submitOther({SetMetaOp{bUuid, "provenance_test", "again"}}, bUuid);
+            };
+            try { (void)read(aUuid); } catch (const std::exception&) { refused = true; }
+            controller._fiberReadTestStage = {};
+            require(refused, "a read that every attempt interleaves with a commit is refused");
+            (void)read(aUuid);
+        }
         const auto peer = controller.storedFibersShared(std::vector<std::string>{bUuid}, false);
         require(afterChange && afterChange->branches.size() == 1 && !peer.empty(), "A and B decode at the new position");
         // Any commit ends every cached decode (each carries the position its

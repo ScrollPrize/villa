@@ -1232,6 +1232,12 @@ private:
     bool sideStripContextCurrent(const SideStripLoadContext&) const;
     static std::vector<StoredFiber> readStoredFibersInContext(
         FiberReadContext&, const std::optional<std::vector<std::string>>&, bool, FiberDependencies*);
+    // One attempt: throws FiberGraphMoved when the store committed during it.
+    struct FiberGraphMoved : std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
+    static std::vector<StoredFiber> readStoredFibersInContextOnce(
+        FiberReadContext&, const std::optional<std::vector<std::string>>&, bool, FiberDependencies*);
     static std::vector<StoredFiberPtr> storedFibersInContext(
         FiberReadContext&, const std::optional<std::vector<std::string>>&, bool);
     static void prepareSideStripSnapshots(SideStripIntersectionRequest&);
