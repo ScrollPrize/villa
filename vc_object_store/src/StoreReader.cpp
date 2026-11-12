@@ -1,21 +1,138 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "internal/TransformedLength.hpp"
+#include "internal/ObjectVersionJson.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <set>
 
 namespace vc::objects {
+SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position) const
+{
+    const auto before = status();
+    const bool inherited = std::any_of(refs.begin(), refs.end(), [&](const auto& ref) { return util::canonicalUuid(ref.storeUuid) != before.storeUuid; });
+    if (position.commitSequence < 0 || before.commitSequence < position.commitSequence ||
+        before.storeUuid != util::canonicalUuid(position.storeUuid) || before.generation != util::canonicalUuid(position.generation) ||
+        (inherited && before.commitSequence != position.commitSequence))
+        throw StoreBusy("selected inputs: requested graph position is no longer available");
+    SelectedInputs result;
+    const auto records = objectsAtVersions(refs);
+    for (size_t i = 0; i < refs.size(); ++i) {
+        if (!records[i] || records[i]->deleted) throw std::invalid_argument("selected object is not retained: " + refs[i].objectUuid);
+        result.objects.push_back(*records[i]);
+    }
+    result.relationships = relationshipsAt(refs);
+    return result;
+}
+
+ObjectVersion StoreReader::decodeObjectReference(const std::string& json) const
+{
+    using Json = nlohmann::json;
+    auto input = Json::parse(json);
+    if (input.is_string()) {
+        auto text = input.get<std::string>();
+        if (text.starts_with("vcobj:")) text.erase(0, 6);
+        const auto at = text.find('@');
+        input = Json{{"uuid", text.substr(0, at)}};
+        if (at != std::string::npos) {
+            const auto suffix = text.substr(at + 1);
+            const auto slash = suffix.find('/'), last = suffix.rfind('/');
+            if (slash == std::string::npos || slash == last || slash == 0 || last == suffix.size()-1)
+                throw std::invalid_argument("stored reference requires store/generation/version; regenerate ownerless locators");
+            const auto number = suffix.substr(last+1);
+            int64_t version = 0;
+            const auto [end, error] = std::from_chars(number.data(), number.data()+number.size(), version);
+            if (error != std::errc{} || end != number.data()+number.size() || version <= 0)
+                throw std::invalid_argument("stored reference requires a numbered version");
+            input = detail::objectVersionJson({suffix.substr(0,slash), suffix.substr(slash+1,last-slash-1), input.at("uuid").get<std::string>(), version});
+        }
+    }
+    if (!input.is_object()) throw std::invalid_argument("object reference input must be an object or locator");
+    if (input.contains("revision"))
+        throw std::invalid_argument("stored references select a numbered version, not a revision");
+    if (input.contains("reference")) {
+        const auto ref = detail::objectVersionFrom(input.at("reference"));
+        if (input.contains("uuid") && util::canonicalUuid(input.at("uuid").get<std::string>()) != ref.objectUuid)
+            throw std::invalid_argument("reference names a different object");
+        if (input.contains("version") || input.contains("generation") || input.contains("store"))
+            throw std::invalid_argument("reference cannot be combined with separate version fields");
+        return ref;
+    }
+    if (input.contains("object")) return detail::objectVersionFrom(input);
+    const auto uuid = util::canonicalUuid(input.at("uuid").get<std::string>());
+    if (input.contains("store") || input.contains("generation") || input.contains("version"))
+        throw std::invalid_argument("numbered selections require a complete reference; regenerate legacy selectors");
+    const auto selected = selectedObject(uuid);
+    if (!selected) throw std::invalid_argument("stored object selection is unavailable");
+    return selected->reference();
+}
+
+std::vector<ObjectVersion> StoreReader::versionsAt(const ObjectVersion&) const
+{
+    throw std::runtime_error("reader does not support publication snapshot selection");
+}
+std::vector<ObjectVersion> LocalStoreReader::versionsAt(const ObjectVersion& ref) const { return store_->versionsAt(*txn_, ref); }
+void LocalStoreReader::validateExportDestination(const std::filesystem::path& path) const { store_->validateExportDestination(*txn_, path); }
+std::optional<std::filesystem::path> StoreReader::resolveStoragePath(const std::string&,
+    const std::optional<std::filesystem::path>&) const { throw std::runtime_error("reader does not support source location resolution"); }
+std::optional<std::filesystem::path> LocalStoreReader::resolveStoragePath(const std::string& uuid,
+    const std::optional<std::filesystem::path>& root) const { return store_->resolveStoragePath(*txn_, uuid, root); }
+
+std::optional<ObjectRevision> StoreReader::selectedObject(const std::string& objectUuid,std::optional<int64_t> version,
+    const std::optional<std::string>& generation,const std::optional<ObjectVersion>& reference) const
+{
+    const auto uuid=util::canonicalUuid(objectUuid);
+    if(reference){
+        if(util::canonicalUuid(reference->objectUuid)!=uuid||version||generation)
+            throw std::invalid_argument("reference must name this object and cannot be combined with version/generation");
+        return objectsAtVersions({*reference}).front();
+    }
+    if(generation&&!version)throw std::invalid_argument("generation requires a version");
+    const auto current=currentObject(uuid);
+    return version&&current?objectsAtVersions({current->reference(version,generation)}).front():current;
+}
+
+std::vector<int64_t> StoreReader::assignGeometryPointIds(const std::string& objectUuid,const std::string& array,
+                                                       std::vector<int64_t> ids) const
+{
+    std::set<int64_t> used;
+    std::vector<size_t> unassigned;
+    for(size_t i=0;i<ids.size();++i)
+        if(ids[i]<0||!used.insert(ids[i]).second)unassigned.push_back(i);
+    if(unassigned.empty())return ids;
+    auto next=nextGeometryPointId(objectUuid,array);
+    if(!used.empty()){
+        if(*used.rbegin()==INT64_MAX)throw std::overflow_error("geometry point IDs exhausted");
+        next=std::max(next,*used.rbegin()+1);
+    }
+    for(const auto i:unassigned){
+        if(next==INT64_MAX)throw std::overflow_error("geometry point IDs exhausted");
+        ids[i]=next++;
+    }
+    return ids;
+}
+
+int64_t LocalStoreReader::nextGeometryPointId(const std::string& objectUuid,const std::string& array) const
+{
+    return store_->nextGeometryPointId(*txn_,objectUuid,array);
+}
 
 std::vector<vcr::catalog::TransformResolution> StoreReader::availableTransforms(const std::string& objectUuid) const
 {
     const auto object = currentObject(objectUuid);
     if (!object) throw std::invalid_argument("object not found");
+    return availableTransforms(*object);
+}
+
+std::vector<vcr::catalog::TransformResolution> StoreReader::availableTransforms(const ObjectRevision& object) const
+{
     const auto coordinates = geometryCoordinates(
-        nlohmann::json::parse(object->record.meta).value("coordinates", nlohmann::json::object()));
+        nlohmann::json::parse(object.record.meta).value("coordinates", nlohmann::json::object()));
     if (coordinates["volume_uuid"].is_null() || coordinates["scale_factor"].is_null()) return {};
     const auto source = coordinates["volume_uuid"].get<std::string>();
     const auto context = volumeTransforms();
@@ -95,56 +212,94 @@ double StoreReader::geometryLengthInVolume(const std::string& objectUuid, const 
         rows(name), kind, *mapping);
 }
 
-void expectRelationshipEndpoints(const StoreReader& reader, VersionSelection& expected)
+void expectRelationshipEndpoints(const StoreReader& reader, TransactionRequest& request)
 {
+    auto& expected = request.expectedObjects;
     EdgeSelection edges;
     edges.endpointUuids.emplace();
     for (const auto& [uuid, version] : expected)
-        if (version) edges.endpointUuids->push_back(uuid);
+        if (version.number()) edges.endpointUuids->push_back(uuid);
     if (edges.endpointUuids->empty()) return;
     edges.includeRetired = true;
-    std::set<std::string> endpoints;
+    std::set<std::string> endpoints(edges.endpointUuids->begin(), edges.endpointUuids->end());
     for (const auto& edge : reader.selectEdges(edges))
         for (const auto& endpoint : {edge.aUuid, edge.bUuid})
             if (!expected.contains(endpoint)) endpoints.insert(endpoint);
     for (const auto& endpoint : endpoints) {
+        if (const auto guard = expected.find(endpoint); guard != expected.end() && guard->second.complete()) continue;
         const auto head = reader.currentObject(endpoint);
-        expected.emplace(endpoint, head ? std::optional(head->version) : std::nullopt);
+        const auto [entry, inserted] = expected.emplace(endpoint, std::nullopt);
+        // Never replace a stale caller expectation with a newer snapshot.
+        if (head && (inserted || entry->second.number() == head->version)) expectObject(request, *head);
     }
+}
+
+void expectRelationshipEndpoints(const StoreReader& reader, RecordSelection& expected)
+{
+    TransactionRequest request;
+    request.expectedObjects = expected;
+    expectRelationshipEndpoints(reader, request);
+    expected = std::move(request.expectedObjects);
 }
 
 void editCurrentRequest(const StoreReader& reader, TransactionRequest& request, const std::vector<std::string>& objectUuids,
                         std::vector<TransactionOperation> operations)
+{
+    buildCurrentEditRequest(reader, request, objectUuids, [&] { return std::move(operations); });
+}
+
+void buildCurrentEditRequest(const StoreReader& reader, TransactionRequest& request, const std::vector<std::string>& objectUuids,
+                             const std::function<std::vector<TransactionOperation>()>& operations)
 {
     std::vector<std::string> uuids;
     for (const auto& objectUuid : objectUuids) {
         const auto uuid = util::canonicalUuid(objectUuid);
         const auto current = reader.currentObject(uuid);
         if (!current) throw std::runtime_error("object is not in the store: " + uuid);
-        request.expectedObjects[uuid] = current->version;
+        expectObject(request, current->reference());
         uuids.push_back(uuid);
     }
-    expectRelationshipEndpoints(reader, request.expectedObjects);
-    for (auto& operation : operations) request.operations.push_back(std::move(operation));
+    expectRelationshipEndpoints(reader, request);
+    for (auto& operation : operations()) request.operations.push_back(std::move(operation));
     if (uuids.empty()) return;
+    const auto status = reader.status();
     EdgeSelection edges;
     edges.endpointUuids = uuids;
     edges.includeRetired = true;
     std::set<std::string> kept;
+    std::set<std::string> decidedEdges, removedEndpoints;
+    for (const auto& operation : request.operations) {
+        if (const auto* remove = std::get_if<RemoveEdgeOp>(&operation))
+            decidedEdges.insert(util::canonicalUuid(remove->uuid));
+        else if (const auto* retain = std::get_if<RetainRelationshipOp>(&operation))
+            decidedEdges.insert(util::canonicalUuid(retain->uuid));
+        else if (const auto* keep = std::get_if<KeepRecordedRelationshipOp>(&operation))
+            decidedEdges.insert(util::canonicalUuid(keep->uuid));
+        else if (const auto* retire = std::get_if<RetireObjectOp>(&operation))
+            removedEndpoints.insert(util::canonicalUuid(retire->uuid));
+        else if (const auto* restore = std::get_if<RestoreObjectOp>(&operation); restore && restore->source)
+            removedEndpoints.insert(util::canonicalUuid(restore->uuid));
+    }
     for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{}))
-        if (kept.insert(edge.uuid).second) request.operations.push_back(KeepRecordedRelationshipOp{edge.uuid});
+        // In direct mode, the writer checks local edges' dependencies without
+        // inventing an archive. Inherited bindings remain retained by their owner.
+        if ((status.historyEnabled || edge.versionStoreUuid != status.storeUuid) &&
+            !decidedEdges.contains(edge.uuid) && !removedEndpoints.contains(edge.aUuid) &&
+            !removedEndpoints.contains(edge.bUuid) && kept.insert(edge.uuid).second) {
+            request.operations.push_back(KeepRecordedRelationshipOp{edge.uuid});
+        }
 }
 
-VersionSelection transformDependencies(const StoreReader& reader)
+RecordSelection transformDependencies(const StoreReader& reader)
 {
-    VersionSelection result;
+    RecordSelection result;
     for (const auto* kind : {"volume_transform", "volume_transform_choice"}) {
         ObjectSelection selection;
         selection.kind = kind;
         selection.includeRetired = true;
         for (const auto& record : reader.selectObjects(selection)) {
             if (!record.version) throw std::runtime_error("transform record without a numbered version: " + record.uuid);
-            result.emplace(record.uuid, record.version);
+            result.emplace(record.uuid, record.reference());
         }
     }
     return result;
@@ -153,8 +308,39 @@ VersionSelection transformDependencies(const StoreReader& reader)
 std::optional<int64_t> currentVersionOf(const StoreReader& reader, const std::string& objectUuid)
 {
     if (const auto head = reader.currentObject(objectUuid)) return head->version;
-    const auto history = reader.objectHistory(objectUuid);
+    const auto history = reader.objectHistory(objectUuid, true);
     return history.empty() ? std::nullopt : std::optional(history.back().version);
+}
+
+RecordExpectation currentObjectExpectation(const StoreReader& reader, const std::string& objectUuid)
+{
+    const auto current = reader.currentObject(objectUuid, true);
+    if (!current) return {};
+    RecordExpectation expected{current->reference()};
+    expected.deleted = current->deleted;
+    return expected;
+}
+
+RecordSelection selectCurrentExpectations(const StoreReader& reader, const VersionSelection& numbers, bool relationships)
+{
+    RecordSelection result;
+    for (const auto& [key, number] : numbers) {
+        const auto uuid = util::canonicalUuid(key);
+        if (result.contains(uuid)) throw std::invalid_argument("duplicate expected record identity");
+        if (!number) { result[uuid] = std::nullopt; continue; }
+        RecordExpectation selected;
+        if (relationships) {
+            EdgeSelection query; query.uuids = {uuid}; query.includeRetired = true;
+            const auto edges = reader.selectEdges(query);
+            if (!edges.empty()) selected = edges.front().reference();
+        } else if (const auto current = reader.currentObject(uuid)) selected = current->reference();
+        if (selected.number() != number)
+            throw TransactionConflict(TransactionConflict::Reason::Version,
+                {{relationships ? "relationship" : "object", uuid, number, selected.number()}},
+                "current-owner selection: requested version is not the live selected version");
+        result.emplace(uuid, std::move(selected));
+    }
+    return result;
 }
 
 std::vector<EdgeRecord> attachments(const StoreReader& reader, const std::string& ownerUuid,
@@ -175,6 +361,7 @@ bool changesTouchKinds(const StoreReader& reader, const FeedCursor& since, const
 {
     const auto status = reader.status();
     if (since.storeUuid != status.storeUuid || since.generation != status.generation) return true;
+    if (!status.historyEnabled) return since.sequence != status.commitSequence || since.offset != 0;
     std::vector<ObjectVersion> objects;
     std::vector<std::string> edges;
     for (auto cursor = since;;) {
@@ -209,16 +396,16 @@ ChangePage LocalStoreReader::changesSince(const FeedCursor& cursor, int64_t maxC
     return store_->changesSince(*txn_, cursor, maxChanges);
 }
 
-std::optional<ObjectRevision> LocalStoreReader::currentObject(const std::string& objectUuid) const
+std::optional<ObjectRevision> LocalStoreReader::currentObject(const std::string& objectUuid, bool includeDeleted) const
 {
     auto revision = store_->currentObjectRevision(*txn_, objectUuid);
-    if (revision && revision->deleted) return std::nullopt;
+    if (revision && revision->deleted && !includeDeleted) return std::nullopt;
     return revision;
 }
 
-std::vector<ObjectRevision> LocalStoreReader::objectHistory(const std::string& objectUuid) const
+std::vector<ObjectRevision> LocalStoreReader::objectHistory(const std::string& objectUuid, bool ifRetained) const
 {
-    return store_->objectHistory(*txn_, objectUuid);
+    return store_->objectHistory(*txn_, objectUuid, ifRetained);
 }
 
 std::vector<std::optional<ObjectRevision>> LocalStoreReader::objectsAtVersions(
@@ -266,6 +453,8 @@ nlohmann::json LocalStoreReader::geometryPointAnnotations(const std::string& rev
     return store_->geometryPointAnnotations(*txn_, revisionUuid, arrayName);
 }
 
+std::optional<ObjectRevision> LocalStoreReader::objectAtGeometry(const std::string& uuid) const
+{ return store_->objectAtGeometry(*txn_,uuid); }
 VolumeTransforms LocalStoreReader::volumeTransforms() const { return store_->volumeTransforms(*txn_); }
 
 std::vector<ObjectRecord> LocalStoreReader::selectObjects(const ObjectSelection& selection,

@@ -29,7 +29,7 @@ double polylineLength(const Read& read,int64_t count,const std::string& kind,con
 inline double transformedLength(sqlite3* db,const std::string& revision,const VolumeAffine& matrix,const std::string& kind) {
     const auto key=revision+matrix.json().dump();
     auto pool=activeStatementPools.find(db);
-    if(pool!=activeStatementPools.end()) {
+    if(pool!=activeStatementPools.end()&&pool->second->readSnapshot) {
         const auto found=pool->second->transformedLengths.find(key);
         if(found!=pool->second->transformedLengths.end())return found->second;
     }
@@ -38,7 +38,7 @@ inline double transformedLength(sqlite3* db,const std::string& revision,const Vo
     const auto name=lengthArrayName(kind,kind=="fiber"?arrays.at("line_points").at("shape")[0].get<int64_t>():0);
     const auto count=arrays.at(name).at("shape")[0].get<int64_t>();
     const auto length=polylineLength([&](int64_t offset,int64_t bytes){return reader.read(name,offset,bytes);},count,kind,matrix);
-    if(pool!=activeStatementPools.end()) {
+    if(pool!=activeStatementPools.end()&&pool->second->readSnapshot) {
         auto& cache=pool->second->transformedLengths;
         if(cache.size()>=1024)cache.clear();
         cache.emplace(key,length);

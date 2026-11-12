@@ -2409,12 +2409,15 @@ def stored_seed_surfaces(store: str | Path, tracks_path: str | Path) -> dict[int
 
 
 def retire_surfaces(store: str | Path, uuids: list[str]) -> None:
+    if not uuids:
+        return
     import getpass
 
-    from vc_object_store import ObjectStore
+    from vc_object_store import ObjectStore, object_reference
 
     with ObjectStore.open(str(store), author=getpass.getuser()) as db:
-        pins = {u: db.current_version(u) for u in uuids}
+        records = db.select_objects(object_uuids=uuids, include_retired=True)
+        pins = {record['uuid']: object_reference(record) for record in records}
         with db.write(expected_versions=pins) as tx:
             for u in uuids:
                 tx.retire_object(u)

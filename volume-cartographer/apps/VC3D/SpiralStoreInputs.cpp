@@ -1,12 +1,15 @@
 #include "SpiralStoreInputs.hpp"
+#include <vc_object_store/store/GeometryViews.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/RelationshipInputs.hpp>
+#include <vc_object_store/objects/ManifestReferences.hpp>
 
 #include <algorithm>
-#include <cstring>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -22,115 +25,28 @@ Json valueOrNull(const Json& object, const char* key)
     return object.is_object() && object.contains(key) ? object.at(key) : Json(nullptr);
 }
 
-std::vector<cv::Vec3d> readXyz(const StoreReader& reader,
-                               const vc::objects::GeometryRevision& revision,
-                               const std::string& name, double scale)
+std::vector<cv::Vec3d> scaledPoints(const std::vector<vc::geometry::Point>& points, double scale)
 {
-    const auto info = std::find_if(revision.arrays.begin(), revision.arrays.end(),
-                                   [&](const auto& array) { return array.name == name; });
-    if (info == revision.arrays.end())
-        throw std::runtime_error("geometry " + revision.uuid + " has no " + name + " array");
-    const std::size_t itemSize = info->dtype == "<f8" ? 8 : info->dtype == "<f4" ? 4 : 0;
-    if (!itemSize) throw std::runtime_error(name + " has unsupported dtype " + info->dtype);
-    if (info->shape.size() != 2 || info->shape[1] != 3 || info->shape[0] < 0)
-        throw std::runtime_error(name + " is not an (N, 3) array");
-    const auto count = std::size_t(info->shape[0]);
-    const auto bytes = reader.readGeometryArray(revision.uuid, name);
-    // The bytes read must hold the shape: a short read is refused, never read past.
-    if (bytes.size() < count * 3 * itemSize)
-        throw std::runtime_error(name + " holds " + std::to_string(bytes.size()) + " bytes, fewer than its "
-                                 + std::to_string(count) + " x 3 " + info->dtype + " values");
-    std::vector<cv::Vec3d> points(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        for (int axis = 0; axis < 3; ++axis) {
-            double value = 0;
-            if (itemSize == 8) {
-                std::memcpy(&value, bytes.data() + (i * 3 + axis) * 8, 8);
-            } else {
-                float single = 0;
-                std::memcpy(&single, bytes.data() + (i * 3 + axis) * 4, 4);
-                value = single;
-            }
-            points[i][axis] = value * scale;
-        }
-    }
-    return points;
+    std::vector<cv::Vec3d> result;
+    result.reserve(points.size());
+    for (const auto& p : points) result.emplace_back(p[0] * scale, p[1] * scale, p[2] * scale);
+    return result;
 }
 
-std::vector<int64_t> readIds(const StoreReader& reader, const vc::objects::GeometryRevision& revision)
-{
-    const auto info = std::find_if(revision.arrays.begin(), revision.arrays.end(),
-                                   [](const auto& array) { return array.name == "point_ids"; });
-    if (info == revision.arrays.end() || info->dtype != "<i8")
-        throw std::runtime_error("geometry " + revision.uuid + " has no int64 point_ids");
-    const auto bytes = reader.readGeometryArray(revision.uuid, "point_ids");
-    std::vector<int64_t> ids(bytes.size() / 8);
-    std::memcpy(ids.data(), bytes.data(), ids.size() * 8);
-    return ids;
-}
-
-// object_store_inputs.KINDS and FAMILIES: the relationship families the
-// fitter consumes, by edge kind and endpoint kinds in KINDS order.
-int kindIndex(const std::string& kind)
-{
-    constexpr const char* kinds[] = {"surface", "point_collection", "fiber", "track"};
-    for (int i = 0; i < 4; ++i)
-        if (kind == kinds[i]) return i;
-    return 4;
-}
-
-std::string relationshipFamily(const std::string& edgeKind, const std::string& first,
-                               const std::string& second)
-{
-    if (edgeKind == "point-surface" && first == "surface" && second == "point_collection") return "pcl_patch";
-    if (edgeKind == "same-surface" && first == "surface" && second == "fiber") return "fiber_patch";
-    if (edgeKind == "same-surface" && first == "surface" && second == "surface") return "patch_overlap";
-    if (edgeKind == "fiber_branch" && first == "fiber" && second == "fiber") return "fiber_branch";
-    if (edgeKind == "crossing" && first == "track" && second == "track") return "track_crossing";
-    return {};
-}
-
-// The identity fields of StoredRelationship.provenance() for a relationship
-// version the adapter would consume (filter_relationships); nullopt when it
-// would not be consumed. A content change bumps the generation, so the
-// generation stands for the anchors and metadata.
-std::optional<Json> consumedIdentity(const vc::objects::SelectedRelationship& selected,
-                                     const std::map<std::string, std::string>& kinds,
-                                     bool approvedLinksOnly)
-{
-    const auto& version = selected.relationship;
-    const auto& record = version.record;
-    const auto aKind = kinds.find(record.aUuid), bKind = kinds.find(record.bUuid);
-    if (aKind == kinds.end() || bKind == kinds.end() || !selected.applicable) return std::nullopt;
-    struct End {
-        std::string uuid, kind;
-        std::optional<std::string> geometry;
-    };
-    End ends[2] = {{record.aUuid, aKind->second, version.aGeometryRevision},
-                   {record.bUuid, bKind->second, version.bGeometryRevision}};
-    // Ordered by kind, then UUID; a stable sort keeps stored order otherwise.
-    if (std::pair(kindIndex(ends[1].kind), ends[1].uuid) < std::pair(kindIndex(ends[0].kind), ends[0].uuid))
-        std::swap(ends[0], ends[1]);
-    const auto family = relationshipFamily(record.kind, ends[0].kind, ends[1].kind);
-    if (family.empty()) return std::nullopt;
-    if (record.approvalState == "rejected") return std::nullopt;
-    if (approvedLinksOnly && record.approvalState != "approved") return std::nullopt;
-    const auto geometry = [](const auto& revision) { return revision ? Json(*revision) : Json(nullptr); };
-    return Json{{"uuid", record.uuid}, {"kind", record.kind}, {"family", family},
-                {"approval_state", record.approvalState}, {"generation", record.generation},
-                {"a", ends[0].uuid}, {"a_geometry_revision", geometry(ends[0].geometry)},
-                {"b", ends[1].uuid}, {"b_geometry_revision", geometry(ends[1].geometry)}};
-}
+struct ConsumedRelationshipIdentity {
+    vc::objects::RelationshipVersion reference;
+    std::string family, a, b;
+};
 
 // The manifest's consumed relationships against the ones the current heads
 // of the fitted objects give, by record UUID. With `scope`, only those
 // relationships are compared, from the heads of their fitted endpoints.
 void compareRelationships(const StoreReader& reader, const Json& manifest,
                           const std::vector<StoreInputPin>& pins, const std::set<std::string>* scope,
-                          FitInputs& result)
+                          const std::map<std::string, vc::objects::RelationshipVersion>& references, FitInputs& result)
 {
     std::map<std::string, std::string> kinds;
-    for (const auto& pin : pins) kinds[pin.uuid] = pin.kind;
+    for (const auto& pin : pins) if (!pin.outerShell) kinds[pin.uuid] = pin.kind;
     const auto inScope = [&](const std::string& uuid) { return !scope || scope->contains(uuid); };
     const auto fitted = manifest.value("relationships", Json::array());
     std::set<std::string> endpoints;
@@ -146,21 +62,24 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
         for (const auto& [uuid, kind] : kinds) endpoints.insert(uuid);
     }
     // The fitted endpoints at their current versions.
-    const auto status = reader.status();
     std::vector<vc::objects::ObjectVersion> heads;
     for (const auto& uuid : endpoints) {
         if (!kinds.contains(uuid)) continue;
         if (const auto current = reader.currentObject(uuid); current && !current->deleted)
-            heads.push_back({status.storeUuid, current->generation, uuid, current->version});
+            heads.push_back(current->reference());
     }
-    std::map<std::string, Json> consumed;
+    std::map<std::string, ConsumedRelationshipIdentity> consumed;
     try {
         const bool approvedOnly = manifest.value("approved_links_only", false);
         if (!heads.empty())
             for (const auto& selected : reader.relationshipsAt(heads))
-                if (inScope(selected.relationship.record.uuid))
-                    if (auto identity = consumedIdentity(selected, kinds, approvedOnly))
-                        consumed[selected.relationship.record.uuid] = std::move(*identity);
+                if (inScope(selected.relationship.record.uuid)) {
+                    const auto& edge = selected.relationship.record;
+                    const auto decision = vc::objects::fittingRelationshipInput(edge, selected.applicable, kinds, approvedOnly);
+                    if (decision.exclusion.empty())
+                        consumed[edge.uuid] = {selected.relationship.reference(), decision.family,
+                            decision.reversed ? edge.bUuid : edge.aUuid, decision.reversed ? edge.aUuid : edge.bUuid};
+                }
     } catch (const std::exception& error) {
         result.problems.push_back(std::string("relationships: ") + error.what());
         return;
@@ -171,21 +90,24 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
         if (!inScope(link.uuid)) continue;
         if (const auto local = consumed.find(link.uuid); local != consumed.end()) {
             link.state = LinkState::Fitted;
-            for (const auto& [key, value] : local->second.items())
-                if (entry.contains(key) && entry.at(key) != value) link.state = LinkState::Changed;
+            if (references.at(link.uuid) != local->second.reference)
+                link.state = LinkState::Changed;
             consumed.erase(local);
         }
         result.relationships.push_back(std::move(link));
     }
     for (const auto& [uuid, identity] : consumed)
-        result.addedRelationships.push_back({uuid, identity.at("family").get<std::string>(), LinkState::Added,
-                                             identity.at("a").get<std::string>(), identity.at("b").get<std::string>()});
+        result.addedRelationships.push_back({uuid, identity.family, LinkState::Added, identity.a, identity.b});
 }
 
 // Read one manifest object as the store holds it now into `result`.
 void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::string& volume,
                 FitInputs& result)
 {
+    if (pin.outerShell && pin.kind != "surface") {
+        result.problems.push_back("the fit's outer shell " + pin.uuid + " is a " + pin.kind + ", not a surface");
+        return;
+    }
     const auto current = reader.currentObject(pin.uuid);
     const bool present = current && !current->deleted && current->geometryRevision;
     auto state = InputState::Missing;
@@ -206,7 +128,7 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
     FitPointCollection collection;
     collection.pin = pin;
     collection.state = state;
-    if (present) collection.version = current->version;
+    if (present) collection.reference = current->reference();
     FitFiber fiber{pin, state, {}, {}, {}, {}};
     if (pin.kind == "track") {
         // Its state is all a track contributes; its geometry is not shown.
@@ -224,25 +146,13 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
             if (!scale) throw std::runtime_error("it declares no frame in volume " + volume);
         }
         if (geometry && pin.kind == "surface") {
-            auto stored = load_quad_from_store(reader, pin.uuid, geometry->uuid);
-            if (*scale != 1.0) {
-                // Invalid vertices keep the sentinel; grid steps follow the frame.
-                auto* points = new cv::Mat_<cv::Vec3f>(stored->rawPointsPtr()->clone());
-                for (auto& point : *points)
-                    if (point[0] != -1.f) point *= float(*scale);
-                auto converted = std::make_unique<QuadSurface>(points, stored->scale() / float(*scale));
-                converted->id = stored->id;
-                converted->meta = stored->meta;
-                converted->tags = stored->tags;
-                const cv::Mat mask = stored->channel("mask");
-                if (!mask.empty()) converted->setChannel("mask", mask);
-                stored = std::move(converted);
-            }
-            surface.surface = std::shared_ptr<QuadSurface>(std::move(stored));
+            const auto view=vc::objects::GeometrySnapshot(reader).surface(*current).viewTransformedAt(volume);
+            surface.surface = std::shared_ptr<QuadSurface>(load_quad_from_store(reader,*current,true,&view));
         } else if (geometry && pin.kind == "point_collection") {
             collection.absolute = valueOrNull(valueOrNull(meta, "source"), "winding_is_absolute") == Json(true);
-            const auto ids = readIds(reader, *geometry);
-            const auto points = readXyz(reader, *geometry, "points", *scale);
+            const auto view = vc::objects::GeometrySnapshot(reader).pointCollection(pin.uuid, geometry->uuid);
+            const auto ids = view.ids(0, view.size());
+            const auto points = scaledPoints(view.points(0, view.size()), *scale);
             if (ids.size() != points.size()) throw std::runtime_error("point IDs and points differ in length");
             const auto annotations = reader.geometryPointAnnotations(geometry->uuid, "points");
             std::vector<std::size_t> order(ids.size());
@@ -258,8 +168,9 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
             }
         } else if (geometry && pin.kind == "fiber") {
             if (current->record.fiber) fiber.family = current->record.fiber->family;
-            fiber.controls = readXyz(reader, *geometry, "control_points", *scale);
-            fiber.line = readXyz(reader, *geometry, "line_points", *scale);
+            const auto view = vc::objects::GeometrySnapshot(reader).fiber(pin.uuid, geometry->uuid);
+            fiber.controls = scaledPoints(view.controlPoints(0, view.controlPointCount()), *scale);
+            fiber.line = scaledPoints(view.linePoints(0, view.linePointCount()), *scale);
         }
     } catch (const std::exception& error) {
         // Nothing of an unreadable input is shown.
@@ -270,7 +181,8 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
     }
     if (pin.kind == "surface") {
         surface.problem = problem;
-        result.surfaces.push_back(std::move(surface));
+        if (pin.outerShell) result.outerShell = std::move(surface);
+        else result.surfaces.push_back(std::move(surface));
     } else if (pin.kind == "point_collection") {
         collection.problem = problem;
         result.pointCollections.push_back(std::move(collection));
@@ -281,9 +193,12 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
 }
 
 // The manifest's store and volume; false (with the problem) for another store.
-bool sameStore(const StoreReader& reader, const Json& document, FitInputs& result)
+bool sameStore(const StoreReader& reader, const Json& document, FitInputs& result,
+               vc::objects::ManifestReferences& references)
 {
     const auto& manifest = document.at("manifest");
+    try { references=vc::objects::manifestReferences(manifest); }
+    catch(const std::exception& error){result.problems.push_back(error.what());return false;}
     result.digest = document.value("digest", std::string());
     result.storeUuid = manifest.at("store").at("uuid").get<std::string>();
     result.volumeUuid = manifest.at("volume_uuid").get<std::string>();
@@ -330,7 +245,7 @@ const char* linkStateName(LinkState state)
 
 std::size_t FitInputs::count(InputState state) const
 {
-    std::size_t total = 0;
+    std::size_t total = outerShell && outerShell->state == state;
     for (const auto& entry : surfaces) total += entry.state == state;
     for (const auto& entry : pointCollections) total += entry.state == state;
     for (const auto& entry : fibers) total += entry.state == state;
@@ -345,7 +260,7 @@ std::size_t FitInputs::count(LinkState state) const
 }
 
 namespace {
-StoreInputPin objectPin(const Json& object)
+StoreInputPin objectPin(const Json& object,const vc::objects::ManifestReferences& references)
 {
     StoreInputPin pin;
     pin.uuid = object.at("uuid").get<std::string>();
@@ -353,18 +268,30 @@ StoreInputPin objectPin(const Json& object)
     pin.name = object.value("name", std::string());
     pin.geometryRevision = object.at("geometry_revision").get<std::string>();
     pin.metadata = valueOrNull(object, "metadata");
+    pin.reference=references.objects.at(pin.uuid);
     return pin;
+}
+std::vector<StoreInputPin> objectPins(const Json& document,const vc::objects::ManifestReferences& references)
+{
+    std::vector<StoreInputPin> pins;
+    for (const auto& object : document.at("manifest").value("objects", Json::array()))
+        pins.push_back(objectPin(object,references));
+    if (const auto shell = valueOrNull(document.at("manifest"), "outer_shell"); !shell.is_null()) {
+        pins.push_back(objectPin(shell, references));
+        pins.back().outerShell = true;
+    }
+    return pins;
 }
 }
 
 std::vector<StoreInputPin> manifestPins(const Json& document)
 {
-    std::vector<StoreInputPin> pins;
-    for (const auto& object : document.at("manifest").value("objects", Json::array()))
-        pins.push_back(objectPin(object));
-    return pins;
+    return objectPins(document,vc::objects::manifestReferences(document.at("manifest")));
 }
 
+// Spiral input-protocol projection, mirrored by object_store_inputs.adapter_metadata.
+// test_spiral_store_inputs pins this domain contract; geometry/placement decoding
+// belongs exclusively to GeometrySnapshot, not to either adapter.
 Json adapterMetadata(const std::string& kind, const Json& meta,
                      const std::optional<vc::objects::FiberDetail>& fiber,
                      const std::optional<vc::objects::TrackDetail>& track)
@@ -392,23 +319,11 @@ Json adapterMetadata(const std::string& kind, const Json& meta,
 FitInputs readFitInputs(const StoreReader& reader, const Json& document)
 {
     FitInputs result;
-    if (!sameStore(reader, document, result)) return result;
-    const auto pins = manifestPins(document);
+    vc::objects::ManifestReferences references;
+    if (!sameStore(reader, document, result, references)) return result;
+    const auto pins = objectPins(document,references);
     for (const auto& pin : pins) readObject(reader, pin, result.volumeUuid, result);
-    // The outer shell: read as a surface, held apart from the patches.
-    if (const Json shell = valueOrNull(document.at("manifest"), "outer_shell"); shell.is_object()) {
-        FitInputs read;
-        const auto pin = objectPin(shell);
-        readObject(reader, pin, result.volumeUuid, read);
-        // Only a surface pin lands among the surfaces: anything else the
-        // manifest names as its shell is a problem, not a shell.
-        if (read.surfaces.empty())
-            result.problems.push_back("the fit's outer shell " + pin.uuid + " is a " + pin.kind
-                                      + ", not a surface");
-        else
-            result.outerShell = std::move(read.surfaces.front());
-    }
-    compareRelationships(reader, document.at("manifest"), pins, nullptr, result);
+    compareRelationships(reader, document.at("manifest"), pins, nullptr, references.relationships, result);
     return result;
 }
 
@@ -417,8 +332,9 @@ FitInputChanges readFitInputChanges(const StoreReader& reader, const Json& docum
                                     const std::set<std::string>& relationshipUuids)
 {
     FitInputChanges changes;
-    if (!sameStore(reader, document, changes.inputs)) return changes;
-    const auto pins = manifestPins(document);
+    vc::objects::ManifestReferences references;
+    if (!sameStore(reader, document, changes.inputs, references)) return changes;
+    const auto pins = objectPins(document,references);
     for (const auto& pin : pins)
         if (objectUuids.contains(pin.uuid)) readObject(reader, pin, changes.inputs.volumeUuid, changes.inputs);
     // A changed object's links: the fitted ones, and the ones it has now.
@@ -430,12 +346,12 @@ FitInputChanges readFitInputChanges(const StoreReader& reader, const Json& docum
     vc::objects::EdgeSelection incident;
     incident.endpointUuids = std::vector<std::string>();
     for (const auto& pin : pins)
-        if (objectUuids.contains(pin.uuid)) incident.endpointUuids->push_back(pin.uuid);
+        if (!pin.outerShell && objectUuids.contains(pin.uuid)) incident.endpointUuids->push_back(pin.uuid);
     incident.includeRetired = true;
     if (!incident.endpointUuids->empty())
         for (const auto& edge : reader.selectEdges(incident, std::vector<std::string>{"uuid"}))
             changes.checkedRelationships.insert(edge.uuid);
-    compareRelationships(reader, document.at("manifest"), pins, &changes.checkedRelationships, changes.inputs);
+    compareRelationships(reader, document.at("manifest"), pins, &changes.checkedRelationships, references.relationships, changes.inputs);
     return changes;
 }
 
@@ -452,6 +368,7 @@ void applyFitInputChanges(FitInputs& inputs, FitInputChanges changes)
     replaceByUuid(inputs.pointCollections, changes.inputs.pointCollections);
     replaceByUuid(inputs.fibers, changes.inputs.fibers);
     replaceByUuid(inputs.tracks, changes.inputs.tracks);
+    if (changes.inputs.outerShell) inputs.outerShell = std::move(changes.inputs.outerShell);
     for (auto& link : changes.inputs.relationships) {
         const auto found = std::find_if(inputs.relationships.begin(), inputs.relationships.end(),
                                         [&](const auto& old) { return old.uuid == link.uuid; });

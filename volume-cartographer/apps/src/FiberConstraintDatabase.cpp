@@ -198,7 +198,9 @@ nlohmann::json orientFiberConstraintDatabase(
     if((priorUmbilicus || exportNormalCurves) && metaValue("normal_orientation").at("sample_spacing_base")!=sampleSpacing)
         throw std::runtime_error("Prior sweep spacing must match baked orientation");
     const auto original=metaValue("provenance");
-    for(const char* key:{"fibers_store_uuid","normal_manifest","normal_provenance"})
+    if(!original.contains("fiber_source"))
+        throw std::runtime_error("Missing fiber source version; regenerate frozen evidence");
+    for(const char* key:{"fiber_source","normal_manifest","normal_provenance"})
         if(original.at(key)!=provenance.at(key))throw std::runtime_error(std::string("Source mismatch: ")+key);
 
     struct Endpoint { size_t slot; double arc; cv::Vec3d point; };

@@ -7,12 +7,54 @@
 #include <string>
 #include <system_error>
 #include "platform_io.hpp"
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <linux/fs.h>
+#elif defined(__APPLE__)
+#include <stdio.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 namespace vcr::files {
 void replaceFile(
     const std::filesystem::path& source,
     const std::filesystem::path& destination)
 {
     platform::replace_file(source, destination, true);
+}
+
+void publishPath(const std::filesystem::path& source,const std::filesystem::path& destination,bool overwrite)
+{
+    namespace fs=std::filesystem;
+    const auto from=fs::symlink_status(source),to=fs::symlink_status(destination);
+    const bool directory=fs::is_directory(from),exists=fs::exists(to);
+    if(fs::is_symlink(from)||(!directory&&!fs::is_regular_file(from)))
+        throw std::invalid_argument("publication source must be a regular file or directory");
+    if(fs::absolute(source).lexically_normal()==fs::absolute(destination).lexically_normal())
+        throw std::invalid_argument("publication source and destination must differ");
+    if(exists&&!overwrite)throw fs::filesystem_error("publication destination already exists",source,destination,
+        std::make_error_code(std::errc::file_exists));
+    if(exists&&(fs::is_symlink(to)||(directory?!fs::is_directory(to):!fs::is_regular_file(to))))
+        throw std::invalid_argument("publication destination must have the same type and cannot be a symlink");
+#if defined(__linux__) && defined(SYS_renameat2)
+    if(::syscall(SYS_renameat2,AT_FDCWD,source.c_str(),AT_FDCWD,destination.c_str(),exists?RENAME_EXCHANGE:RENAME_NOREPLACE)!=0)
+        throw fs::filesystem_error("atomic publication",source,destination,std::error_code(errno,std::generic_category()));
+#elif defined(__APPLE__)
+    if(::renamex_np(source.c_str(),destination.c_str(),exists?RENAME_SWAP:RENAME_EXCL)!=0)
+        throw fs::filesystem_error("atomic publication",source,destination,std::error_code(errno,std::generic_category()));
+#elif defined(_WIN32)
+    if(directory&&exists)throw std::runtime_error("atomic replacement of nonempty directories is unsupported on Windows");
+    const DWORD flags=MOVEFILE_WRITE_THROUGH|(exists?MOVEFILE_REPLACE_EXISTING:0);
+    if(!::MoveFileExW(source.c_str(),destination.c_str(),flags))
+        throw fs::filesystem_error("atomic publication",source,destination,std::error_code(int(::GetLastError()),std::system_category()));
+#else
+    if(directory)throw std::runtime_error("atomic no-replace/exchange directory publication is unsupported on this platform");
+    if(exists)platform::replace_file(source,destination,true);
+    else {fs::create_hard_link(source,destination);fs::remove(source);}
+#endif
 }
 
 constexpr auto kSaveRollbackDir = ".vc-save-rollback";
@@ -90,12 +132,14 @@ void publishDirectory(const std::filesystem::path& source,
                       const std::filesystem::path& destination,bool overwrite)
 {
     std::lock_guard<std::recursive_mutex> lock(directoryMutex(destination));
-    if (!std::filesystem::exists(destination)) {
-        std::filesystem::rename(source,destination);
+    if (!overwrite) {
+        publishPath(source,destination,false);
         return;
     }
-    if (!overwrite) throw std::filesystem::filesystem_error("directory already exists",destination,
-        std::make_error_code(std::errc::file_exists));
+    if (!std::filesystem::exists(destination)) {
+        publishPath(source,destination,false);
+        return;
+    }
 
     // If a previous process stopped during publication, restore its complete
     // prior generation before beginning another save.

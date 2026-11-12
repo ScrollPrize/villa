@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "internal/Database.hpp"
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -39,11 +40,11 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(const StoreReader& reader, const 
         throw std::runtime_error("several umbilici map to volume " + volume.volume + ":" + names);
     }
     const auto& record = records.front();
-    const auto head = reader.currentObject(record.uuid);
+    const auto head = reader.selectedObject(record.uuid, {}, {}, record.reference());
     if (!head || !head->geometryRevision) throw std::runtime_error("umbilicus " + record.name + " has no geometry");
     // The geometry of the version read, so points and version agree.
-    const auto canonical = GeometrySnapshot(reader).umbilicus(record.uuid, *head->geometryRevision);
-    VolumeUmbilicus result{record.uuid, record.name, {reader.status().storeUuid, head->generation, record.uuid, head->version},
+    const auto canonical = GeometrySnapshot(reader).umbilicus(*head);
+    VolumeUmbilicus result{record.uuid, record.name, head->reference(),
                            canonical.viewTransformedAt(volume.volume, volume.scale).points("points", 0, canonical.size())};
     return result;
 }
@@ -59,10 +60,12 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession& session, cons
 std::string setVolumeUmbilicus(ObjectStore& store, WriteTxn& txn, const std::string& volume, ObjectRecord record,
                                const geometry::Umbilicus& geometry)
 {
+    detail::Savepoint save(ObjectStoreImplAccess::conn(txn));
     requireUmbilicusFor(store.volumeTransforms(txn), record, volume);
     for (const auto& existing : store.selectObjects(txn, umbilici(volume))) store.retireObject(txn, existing.uuid);
     const auto uuid = store.upsertObject(txn, record);
     store.putGeometry(txn, uuid, geometry::encode(geometry));
+    save.release();
     return uuid;
 }
 
@@ -76,7 +79,7 @@ void setVolumeUmbilicusRequest(const StoreReader& reader, TransactionRequest& re
     if (!request.expectedCommitSequence) request.expectedCommitSequence = reader.status().commitSequence;
     requireUmbilicusFor(reader.volumeTransforms(), record, volume);
     for (const auto& existing : volumeUmbilici(reader, volume)) {
-        request.expectedObjects[existing.uuid] = existing.version;
+        expectObject(request, existing.reference());
         request.operations.push_back(RetireObjectOp{existing.uuid});
     }
     request.expectedObjects[record.uuid] = std::nullopt;

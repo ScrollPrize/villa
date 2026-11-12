@@ -78,13 +78,15 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | List S3 prefixes; URL helpers | `zarr.hpp`: `zarr::listChildren`, `listObjects`, `listPage`, `isRemote`, `httpUrl`, `s3Location`, `levelGroupLocation`; `s3_listing.hpp`: `s3::listUrl`, `parseListPage` | `zarr/access.cpp`, `s3_listing.cpp` | `ObjectStore`, `reader/auth.py` |
 | SFTP sessions, pooled fetches, directory listing; owned SSH forwards to hosted services | `sftp.hpp`: `sftp::Session`, `Fetcher`, `Url`, `setAuthenticator`, `Forward`, `parseForwardUrl` | `sftp/` | through any `sftp://` location; `SshForward` |
 | Prefill array chunks or download a remote prefix through the existing disk caches, with progress and cancellation | `cache.hpp`: `cache::prefill`, `cache::downloadPrefix` | `cache.cpp` | `_reader.prefill`, `_reader.download_prefix`, `_reader.CacheCancellation` |
-| Decoded chunk memory cache | `array.hpp`: `MemoryCache` | `memory_cache.hpp`, `lru.hpp` | `reader/memory_cache.py`: `MemoryCache` |
+| Decoded chunk memory cache; optional available-memory budget and shared channel-selective caching/decoding | `array.hpp`: `MemoryCache::automatic`, `Array::request_channel_cache`, `read_many` | `memory_cache.hpp`, `channel_policy.hpp`, `channel_decode.hpp`, `lru.hpp` | `MemoryCache("auto")`, `ZarrReader.request_channel_cache`, `read_many` |
 | Disk caches: budgets, cache discovery, VC3D cache roots and leases, low-disk handling | `zarr.hpp`: `zarr::openLayers`, `diskBudget`, `decodedCachePath`, `vc3dConfigDirectory`, `vc3dCacheRoot`, `selectedVc3dCacheRoot`, `vc3dVolumeId`, `createVc3dVolumeDir`, `Vc3dLease`, `LowDiskSpace` | `zarr/layers.cpp`, `disk_budget.cpp`, `disk_cache.hpp`, `write_behind.hpp` | `reader/disk_cache.py` |
 | Write arrays (v2/v3, shards, local or S3), attributes, groups, inventories | `zarr_write.hpp`: `zarr::Writer`, `createGroup`, `removeNode`, `nodeChildren`, `readAttributes`, `writeAttributes`, `inventory`, `atomicWrite`, `compressBytes`, `decompressBytes`, `decompressZstdFrame` | `zarr/writer.cpp` | `reader/writer.py`: `ZarrWriter`, `create_group`, `zarr_inventory`, `atomic_write`, `compress_bytes`, `decompress_bytes`, `decompress_zstd_frame` |
 | Object store over a local directory or S3 prefix | `zarr_write.hpp`: `zarr::Store` | `zarr/store.cpp` | `ObjectStore` |
 | Build pyramids and OME multiscales metadata | `zarr_write.hpp`: `zarr::writePyramid`, `writePyramidLevel`, `createPyramidLevels`, `omeMultiscales` | `zarr/pyramid.cpp` | `write_pyramid`, `write_pyramid_level`, `create_pyramid_levels`, `ome_multiscales` |
 | Compress and decompress bytes | `zarr_write.hpp`: `zarr::compressBytes`, `decompressBytes` | `zarr/writer.cpp`, `codecs.hpp`, `lzw.hpp` | `compress_bytes`, `decompress_bytes` |
-| Atomic and durable file writes; directory publication with rollback; snapshots | `zarr.hpp`: `zarr::atomicWrite`, `Durability`; `publication.hpp`: `files::publishDirectory`, `replaceFile`, `recoverDirectory`, `snapshot` | `atomic_file.hpp`, `zarr/layers.cpp`, `publication.cpp` | `snapshot` |
+| Atomic and durable file writes; directory publication with rollback; snapshots | `zarr.hpp`: `zarr::atomicWrite`, `Durability`; `publication.hpp` (`vc_reader::catalog`): `files::publishDirectory`, `replaceFile`, `recoverDirectory`, `snapshot` | `atomic_file.hpp`, `zarr/layers.cpp`, `publication.cpp` | `snapshot` |
+
+For opt-in memory-pressure-aware budgets and selective compound-channel reads, see [adaptive and channel-selective caching](docs/channel-cache.md).
 
 ### Images and labelled sources
 

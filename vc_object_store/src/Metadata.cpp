@@ -1,14 +1,16 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/RecordOverrides.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 
 namespace vc::objects {
 using namespace detail;
 namespace {
-std::pair<const char*, int64_t> recordLocation(sqlite3* db, const std::array<unsigned char, 16>& bytes, const std::string& uuid)
+std::pair<const char*, RecordCommon> currentRecord(sqlite3* db, const std::string& uuid)
 {
-    if (auto id = objectIdByUuid(db, bytes)) return {"objects", *id};
-    if (auto id = edgeIdByUuid(db, bytes)) return {"edges", *id};
+    if (const auto object = resolveObject(db, uuid)) return {"objects", object->record};
+    if (const auto edge = resolveEdge(db, uuid)) return {"edges", edge->record};
     throw std::runtime_error("object store: record not found: " + uuid);
 }
 }
@@ -22,15 +24,13 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
     if (state == "approved" && edgeByUuid(txn, recordUuid) && edgeGeometryState(txn, recordUuid).stale)
         throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
-    const auto [table, id] = recordLocation(db, bytes, recordUuid);
-    int64_t generation;
-    {
-        Statement cur(db, std::string("SELECT generation FROM ") + table + " WHERE id=?", id);
-        (void)cur.row();
-        generation = cur.i64(0);
-    }
+    const auto [table, current] = currentRecord(db, recordUuid);
+    if (current.approvalState == state) return;
+    createRecordOverride(db, table, recordUuid);
+    const auto version = writeRecordVersion(db, table, recordUuid);
+    const int64_t commit_sequence = writeCommitSequence(db);
     Statement s(db, std::string("UPDATE ") + table +
-                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE id=?",
+                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=?,commit_sequence=? WHERE uuid=?",
         state);
     if (state == "pending") {
         s.bindNull(2); s.bindNull(3); s.bindNull(4); s.bindNull(5);
@@ -38,11 +38,11 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
         s.bind(2, author());
         s.bind(3, nowIsoUtc());
         s.bind(4, impl_->hostname);
-        s.bind(5, generation);
+        s.bind(5, version);
     }
-    s.bind(6, id);
+    s.bind(6, commit_sequence); s.bind(7, bytes);
     s.stepDone();
-    appendJournal(db, author(), impl_->hostname, bytes, generation, "approval");
+    appendJournal(db, author(), impl_->hostname, bytes, commit_sequence, "approval");
     savepoint.release();
 }
 
@@ -53,23 +53,27 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
 {
     Savepoint savepoint(db);
     if (key.empty()) throw std::runtime_error("object store: meta key must be non-empty");
+    if (key == extensionManifestKey)
+        throw std::invalid_argument("extension: vcobj_extensions is reserved; use replaceExtensionRows");
     const auto path = jsonPathForKey(key);
     const auto bytes = parseUuid(recordUuid);
-    const auto [table, id] = recordLocation(db, bytes, recordUuid);
+    const auto [table, current] = currentRecord(db, recordUuid);
     // Compare JSON values, not their spelling. Missing and explicit null are
     // distinct; removing a missing key is also a no-op. Keep approval/history
     // untouched when an autosave submits the same logical value.
     {
-        Statement current(db, std::string("SELECT meta FROM ") + table + " WHERE id=?", id);
-        (void)current.row();
-        const auto meta = nlohmann::json::parse(current.text(0));
+        const auto meta = nlohmann::json::parse(current.meta);
         const auto found = meta.find(key);
         if (jsonValue ? found != meta.end() && *found == nlohmann::json::parse(*jsonValue)
                       : found == meta.end()) {
-            savepoint.release();
             return;
         }
     }
+    createRecordOverride(db, table, recordUuid);
+    Statement location(db, std::string("SELECT id FROM ") + table + " WHERE uuid=?", bytes);
+    location.row();
+    const auto id = location.i64(0);
+    if(std::string_view(table)=="objects")beforeCurrentObjectEdit(db,recordUuid);
     if (jsonValue) {
         execute(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?", path, *jsonValue,
             id);
@@ -123,6 +127,7 @@ void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const
 
 int64_t ObjectStore::journalPosition(const Txn& txn) const
 {
+    requireHistory(static_cast<sqlite3*>(connection(txn)));
     Statement position(static_cast<sqlite3*>(connection(txn)), "SELECT COALESCE(MAX(seq),0) FROM journal");
     position.row();
     return position.i64(0);
@@ -130,16 +135,17 @@ int64_t ObjectStore::journalPosition(const Txn& txn) const
 
 std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afterSeq) const
 {
+    requireHistory(static_cast<sqlite3*>(connection(txn)));
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation,record_kind FROM journal WHERE seq>? ORDER BY seq",
+    Statement s(db, "SELECT seq,record_uuid,commit_sequence,author,hostname,timestamp,change_kind,"
+                    "approval_state,approved_by,approved_at,approved_host,approved_version,record_kind FROM journal WHERE seq>? ORDER BY seq",
         afterSeq);
     std::vector<JournalEntry> out;
     while (s.row()) {
         JournalEntry e;
         e.seq = s.i64(0);
         e.recordUuid = formatUuid(s.blob16(1));
-        e.generation = s.i64(2);
+        e.commitSequence = s.i64(2);
         e.author = s.text(3);
         e.hostname = s.text(4);
         e.timestamp = s.text(5);
@@ -148,7 +154,7 @@ std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afte
         e.approvedBy = s.optText(8);
         e.approvedAt = s.optText(9);
         e.approvedHost = s.optText(10);
-        if (!s.isNull(11)) e.approvedGeneration = s.i64(11);
+        if (!s.isNull(11)) e.approvedVersion = s.i64(11);
         e.kind = s.text(12);
         out.push_back(std::move(e));
     }

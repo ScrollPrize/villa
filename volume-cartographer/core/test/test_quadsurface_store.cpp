@@ -52,7 +52,7 @@ struct Store {
     template<class Build> void edit(const std::string& uuid, Build&& build) {
         auto request = session->newRequest(attachment);
         session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
-            request.expectedObjects = {{uuid, reader.currentObject(uuid)->version}};
+            request.expectedObjects = {{uuid, reader.currentObject(uuid)->reference()}};
             build(reader, request.operations);
         });
         session->submit(attachment, request);
@@ -194,8 +194,8 @@ TEST_CASE("A stored vertex without coordinates loads as missing")
     Store store;
     const auto uuid = util::newUuid();
     GeometryData data{"surface", 1, "source_xyz", R"({"scale":[1,1]})", {}};
-    const std::vector<float> xyz{1, 2, 3, 5, -1, 7, std::nanf(""), 1, 2};
-    GeometryArray points{"points", "<f4", {1, 3, 3}, std::vector<uint8_t>(xyz.size() * 4)};
+    const std::vector<float> xyz{1, 2, 3, 5, -1, 7, std::nanf(""), 1, 2, -3, 1, 4, 1, -3, 4};
+    GeometryArray points{"points", "<f4", {1, 5, 3}, std::vector<uint8_t>(xyz.size() * 4)};
     std::memcpy(points.bytes.data(), xyz.data(), points.bytes.size());
     data.arrays.push_back(points);
     {
@@ -206,6 +206,11 @@ TEST_CASE("A stored vertex without coordinates loads as missing")
     CHECK((*loaded->rawPointsPtr())(0, 0) == cv::Vec3f(1, 2, 3));
     CHECK((*loaded->rawPointsPtr())(0, 1) == cv::Vec3f(-1, -1, -1));
     CHECK((*loaded->rawPointsPtr())(0, 2) == cv::Vec3f(-1, -1, -1));
+    // Native coordinates can be negative; only the missing sentinel is invalid.
+    CHECK((*loaded->rawPointsPtr())(0, 3) == cv::Vec3f(-3, 1, 4));
+    CHECK((*loaded->rawPointsPtr())(0, 4) == cv::Vec3f(1, -3, 4));
+    CHECK(stored(store, uuid, 0, 3) == cv::Vec3f(-3, 1, 4));
+    CHECK(stored(store, uuid, 0, 4) == cv::Vec3f(1, -3, 4));
 }
 
 TEST_CASE("A view hides stored z <= 0 vertices and keeps them on save")
@@ -279,8 +284,12 @@ TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only st
         auto reread = surfaces.load(derived, true, VolumeVoxels{"registered"});
         CHECK((*reread->rawPointsPtr())(1, 1) == cv::Vec3f(11, 1, 4));
         auto derivedInStore = surfaces.load(derived);
-        CHECK_THROWS(surfaces.create(*derivedInStore, "mixed", nlohmann::json::object(), {uuid, derived}));
+        // A native read in the registered frame is compatible with a source
+        // shown in that same frame; physical read paths do not define units.
+        const auto sameFrame = surfaces.create(*derivedInStore, "same-frame", nlohmann::json::object(), {uuid, derived});
+        CHECK((*surfaces.load(sameFrame, true, VolumeVoxels{"registered"})->rawPointsPtr())(1, 1) == cv::Vec3f(11, 1, 4));
         auto inStore = surfaces.load(uuid);
+        CHECK_THROWS(surfaces.create(*derivedInStore, "mixed", nlohmann::json::object(), {uuid, derived}));
         CHECK((*inStore->rawPointsPtr())(1, 1) == cv::Vec3f(2, 2, 8));
         CHECK(surfaces.update(uuid, *inStore) >= 1);  // unchanged: the version it loaded
         // At working level 1 (half the volume's voxels): read there, and what is

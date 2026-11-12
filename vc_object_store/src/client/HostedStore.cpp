@@ -1,7 +1,9 @@
 #include "vc_object_store/client/HostedStore.hpp"
 
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include "internal/Artifacts.hpp"
+#include "internal/JsonFields.hpp"
 
 #include <nlohmann/json.hpp>
 #include <vc_reader/native/atomic_file.hpp>
@@ -83,6 +85,37 @@ StoreStatus HostedStore::status()
     return storeStatusFromJson(expectOk(impl_->http.request("GET", requestEndpoint_ + "/v1/status"), "status").body);
 }
 
+VolumeTransforms HostedStore::volumeTransforms()
+{
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/volume-transforms");
+    std::vector<std::pair<ObjectRecord, std::string>> registrations;
+    std::vector<ObjectRecord> choices;
+    for (const auto& selected : objectsAtVersionsResultFromJson(expectOk(response, "volume transforms").body, nullptr)) {
+        if (!selected) throw std::runtime_error("hosted store: missing transform state");
+        if (selected->record.kind == "volume_transform") registrations.emplace_back(selected->record, selected->uuid);
+        else choices.push_back(selected->record);
+    }
+    return volumeTransformsFrom(registrations, choices, nullptr);
+}
+
+std::vector<ObjectVersion> HostedStore::versionsAt(const ObjectVersion& anchor)
+{
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/versions-at",
+        objectVersionsRequestToJson({anchor}), {{"Content-Type", "application/json"}});
+    return objectVersionsRequestFromJson(expectOk(response, "version snapshot").body);
+}
+
+std::optional<std::filesystem::path> HostedStore::resolveStoragePath(const std::string& objectUuid,
+    const std::optional<std::filesystem::path>& datasetRoot)
+{
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/storage-path",
+        Json{{"uuid", objectUuid}, {"dataset_root", datasetRoot ? Json(datasetRoot->string()) : Json(nullptr)}}.dump(),
+        {{"Content-Type", "application/json"}});
+    const auto path = Json::parse(expectOk(response, "storage path").body);
+    if (path.is_null()) return std::nullopt;
+    return std::filesystem::path(path.get<std::string>());
+}
+
 std::string HostedStore::serviceReport()
 {
     return expectOk(impl_->http.request("GET", requestEndpoint_ + "/v1/service"), "service").body;
@@ -114,7 +147,7 @@ TransactionReceipt HostedStore::submit(const TransactionRequest& request)
         const auto answer = Json::parse(response.body);  // the loop reads into it
         if (!answer.contains("missing"))
             throw PreparationFailed("hosted store: submit " + request.requestUuid + ": " + serverError(response));
-        for (const auto& hash : answer.at("missing")) {
+        for (const auto& hash : detail::jsonArrayField(answer, "missing")) {
             const auto name = hash.get<std::string>();
             if (!payloads.contains(name)) throw std::runtime_error("hosted store: server asked for an unknown payload " + name);
             upload(name);
@@ -139,9 +172,7 @@ std::optional<ObjectRevision> HostedStore::currentObjectRevision(const std::stri
 {
     const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/objects/" + objectUuid);
     if (response.status == 404) return std::nullopt;
-    const auto j = Json::parse(expectOk(response, "object").body);
-    if (asOf) *asOf = storeStatusFromJson(j.at("status").dump());
-    return objectRevisionFromJson(j.at("revision").dump());
+    return currentObjectResultFromJson(expectOk(response, "object").body, asOf);
 }
 
 std::optional<int64_t> HostedStore::currentVersion(const std::string& objectUuid)
@@ -165,6 +196,13 @@ std::optional<GeometryRevision> HostedStore::geometryRevision(const std::string&
     const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/geometry/" + revisionUuid);
     if (response.status == 404) return std::nullopt;
     return geometryRevisionFromJson(expectOk(response, "geometry").body);
+}
+
+std::optional<ObjectRevision> HostedStore::objectAtGeometry(const std::string& revisionUuid)
+{
+    const auto response=impl_->http.request("GET",requestEndpoint_+"/v1/geometry/"+revisionUuid+"/object");
+    if(response.status==404)return std::nullopt;
+    return objectRevisionFromJson(expectOk(response,"geometry object").body);
 }
 
 std::vector<uint8_t> HostedStore::readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
@@ -290,6 +328,8 @@ private:
             auto records = page(cursor, start ? &first : &status);
             if (start) status = first;
             if (!sameLineage(first, status)) return std::nullopt;
+            // With no retained feed, every page must come from the same committed state.
+            if (!first.historyEnabled && status.commitSequence != first.commitSequence) return std::nullopt;
             high = std::max(high, status.commitSequence);
             const bool last = int64_t(records.size()) < pageSize;
             if (!records.empty()) cursor = records.back().uuid;
@@ -297,6 +337,15 @@ private:
             if (last) break;
         }
         FeedCursor feed{first.storeUuid, first.generation, first.commitSequence, 0};
+        if (!first.historyEnabled) {
+            const auto current = store.status();
+            if (!sameLineage(first, current) || first.commitSequence != current.commitSequence) return std::nullopt;
+            if (asOf) *asOf = current;
+            std::vector<Record> result;
+            result.reserve(found.size());
+            for (auto& [uuid, record] : found) result.push_back(std::move(record));
+            return result;
+        }
         for (int round = 0; round < maxRounds; ++round) {
             std::set<std::string> changed;
             StoreStatus end = first;
@@ -367,6 +416,21 @@ std::vector<std::string> restrictTo(const std::vector<std::string>& chunk, const
         if (keep.contains(uuid)) result.push_back(uuid);
     return result;
 }
+
+template<class Selection>
+void normalizePagingIds(Selection& selection)
+{
+    const auto normalize = [](auto& ids) {
+        for (auto& uuid : ids) uuid = util::canonicalUuid(std::move(uuid));
+    };
+    if constexpr (std::is_same_v<Selection, EdgeSelection>) {
+        if (selection.uuids) normalize(*selection.uuids);
+        if (selection.endpointUuids) normalize(*selection.endpointUuids);
+    } else {
+        normalize(selection.uuids);
+    }
+    if (selection.afterUuid) *selection.afterUuid = util::canonicalUuid(std::move(*selection.afterUuid));
+}
 } // namespace
 
 std::vector<ObjectRecord> HostedStore::selectObjects(const ObjectSelection& selection,
@@ -389,6 +453,7 @@ std::vector<ObjectRecord> HostedStore::selectAllObjects(ObjectSelection selectio
     const std::optional<std::vector<std::string>>& fields, int64_t pageSize, int maxRestarts, StoreStatus* asOf)
 {
     if (selection.limit) throw std::invalid_argument("hosted store: selectAllObjects pages itself; remove the limit");
+    normalizePagingIds(selection);
     // UUID order pages by cursor and catches up from the feed. Length order
     // and volume listings with unbound objects, or an explicit initial offset,
     // page by offset within one snapshot: they restart when a commit lands.
@@ -450,6 +515,7 @@ std::vector<EdgeRecord> HostedStore::selectAllEdges(EdgeSelection selection,
     const std::optional<std::vector<std::string>>& fields, int64_t pageSize, int maxRestarts, StoreStatus* asOf)
 {
     if (selection.limit) throw std::invalid_argument("hosted store: selectAllEdges pages itself; remove the limit");
+    normalizePagingIds(selection);
     const auto start = selection;
     CatchUp<EdgeRecord> listing{*this, pageSize, maxRestarts};
     listing.page = [&](const std::optional<std::string>& after, StoreStatus* status) {
@@ -486,17 +552,17 @@ SelectionRecord HostedStore::recordSelection(const ObjectSelection& selection, i
     if (selection.transforms)
         throw std::invalid_argument("hosted store: selections use the store's recorded transforms, not explicit ones");
     const auto query = objectQueryRequestToJson(selection, std::nullopt);
-    auto versions = [](const StoreStatus& at, const std::vector<ObjectRecord>& records, std::vector<ObjectVersion>& out) {
+    auto versions = [](const std::vector<ObjectRecord>& records, std::vector<ObjectVersion>& out) {
         for (const auto& r : records) {
             if (!r.version) throw std::runtime_error("hosted store: selected record without a version");
-            out.push_back({at.storeUuid, r.versionGeneration, r.uuid, *r.version});
+            out.push_back(r.reference());
         }
     };
     for (int attempt = 0; attempt <= maxRestarts; ++attempt) {
         StoreStatus asOf;
         const auto objects = selectAllObjects(selection, std::vector<std::string>{}, pageSize, maxRestarts, &asOf);
         SelectionRecord record{asOf.storeUuid, asOf.generation, asOf.commitSequence, query, {}, {}};
-        versions(asOf, objects, record.objects);
+        versions(objects, record.objects);
         if (!selectionUsesTransforms(selection)) return record;
         // The transforms in force at asOf: read them, then make sure the feed
         // since asOf touched none of them (the listing itself restarts on
@@ -533,15 +599,16 @@ SelectionRecord HostedStore::recordSelection(const ObjectSelection& selection, i
         if (!valid || touchesTransforms(*this, changed, deleted, pageSize)) continue;
         std::sort(transforms.begin(), transforms.end(),
                   [](const ObjectRecord& a, const ObjectRecord& b) { return a.uuid < b.uuid; });
-        versions(asOf, transforms, record.transforms);
+        versions(transforms, record.transforms);
         return record;
     }
     throw StoreBusy("hosted store: transforms kept changing while recording a selection; retry later");
 }
 
-std::vector<ObjectRevision> HostedStore::objectHistory(const std::string& objectUuid, StoreStatus* asOf)
+std::vector<ObjectRevision> HostedStore::objectHistory(const std::string& objectUuid, StoreStatus* asOf, bool ifRetained)
 {
-    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/objects/" + objectUuid + "/history");
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/objects/" + objectUuid + "/history" +
+                                            (ifRetained ? "?if_retained=1" : ""));
     if (response.status == 404) {
         if (asOf) *asOf = status();
         return {};
@@ -572,6 +639,12 @@ nlohmann::json HostedStore::geometryPointAnnotations(const std::string& revision
     const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/geometry/" + revisionUuid + "/annotations/" + arrayPathSegment(arrayName));
     if (response.status == 404) throw std::invalid_argument("geometry revision not found: " + revisionUuid);
     return Json::parse(expectOk(response, "point annotations").body);
+}
+
+int64_t HostedStore::nextGeometryPointId(const std::string& objectUuid,const std::string& arrayName)
+{
+    const auto response=impl_->http.request("GET",requestEndpoint_+"/v1/objects/"+objectUuid+"/next-point-id/"+arrayPathSegment(arrayName));
+    return Json::parse(expectOk(response,"next point ID").body).get<int64_t>();
 }
 
 std::vector<std::string> HostedStore::traverse(const GraphQuery& query, StoreStatus* asOf)
@@ -607,6 +680,15 @@ std::vector<SelectedRelationship> HostedStore::relationshipsAt(const std::vector
     const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/relationships",
         objectVersionsRequestToJson(versions), {{"Content-Type", "application/json"}});
     return relationshipQueryResultFromJson(expectOk(response, "relationship query").body, asOf);
+}
+
+SelectedInputs HostedStore::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position)
+{
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/selected-inputs",
+        selectedInputsRequestToJson(refs, position), {{"Content-Type", "application/json"}});
+    if (response.status == 409 && Json::parse(response.body).value("store_busy", false))
+        throw StoreBusy(serverError(response));
+    return selectedInputsFromJson(expectOk(response, "selected input query").body);
 }
 
 RegionResult HostedStore::geometryRegion(const RegionSlice& slice, const RegionOptions& options, StoreStatus* asOf)

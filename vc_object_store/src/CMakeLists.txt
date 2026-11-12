@@ -19,10 +19,10 @@ else()
 endif()
 
 # Shared owned geometry and operations; no SQLite, OpenCV or application types.
-add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp)
+add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp geometry/PointMap.cpp)
 target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json vc_reader::catalog)
+target_link_libraries(vc_geometry PUBLIC nlohmann_json::nlohmann_json PRIVATE vc_reader::catalog)
 target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
@@ -36,13 +36,29 @@ add_library(vc_objects ${_vc_store_library_type}
     Wire.cpp
     client/HostedStore.cpp
     internal/Sqlite.cpp
+    internal/Schema.cpp
     internal/RecordSql.cpp
+    internal/RecordOverrides.cpp
     internal/EdgeSql.cpp
+    internal/InitialEdges.cpp
+    internal/InitialObjects.cpp
     internal/RecordJson.cpp
+    geometry/GeometryReference.cpp
     Uuid.cpp
     internal/JsonFields.cpp
     formats/FiberJson.cpp
     Database.cpp
+    Provisioning.cpp
+    Extensions.cpp
+    ExtensionHistory.cpp
+    ObjectCollection.cpp
+    InitialImport.cpp
+    PackedStore.cpp
+    PackedCollection.cpp
+    StoreConversion.cpp
+    imports/AfvSource.cpp
+    imports/FiberImportExtension.cpp
+    imports/FiberGraphSolveExtension.cpp
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
     HostedSession.cpp
@@ -84,6 +100,7 @@ add_library(vc_objects ${_vc_store_library_type}
     geometry/GeometryDelta.cpp
     geometry/GeometryReader.cpp
     relationships/Edges.cpp
+    relationships/RelationshipInputs.cpp
     relationships/Traversal.cpp
     relationships/EdgeGeometry.cpp
 )

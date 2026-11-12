@@ -6,6 +6,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "geometry/Dependencies.hpp"
 #include "geometry/GeometrySnapshot.hpp"
+#include "imports/SourceRelationships.hpp"
 #include <algorithm>
 #include <set>
 
@@ -67,6 +68,7 @@ GeometrySource decodeFiberJson(const std::string& text)
     // VC3D's version 4 files from before the store still name their frame the version 3 way.
     if (version < 4 || (!root.contains("coordinates") && root.contains("vc_open_data_coordinate_space")))
         version3Coordinates(root);
+    detail::validateSourceTopology("fiber", root);
     GeometrySource p;
     p.object.uuid = util::canonicalUuid(root.at("uuid").get<std::string>());
     p.object.kind = "fiber";
@@ -120,6 +122,7 @@ std::vector<std::string> fiberBatchEndpoints(const std::vector<GeometrySource>& 
     for (const auto& entry : batch) inBatch.insert(entry.object.uuid);
     for (const auto& entry : batch) {
         if (entry.object.kind != "fiber") continue;
+        detail::validateSourceTopology(entry.object.kind, entry.source);
         for (const auto* key : {"branches", "adjacent_branches"})
             for (const auto& branch : entry.source.value(key, Json::array()))
                 targets.insert(util::canonicalUuid(branch.at("target_uuid").get<std::string>()));
@@ -287,7 +290,7 @@ std::map<std::string, std::string> fiberNetworkJson(
     if (pending.empty()) for (const auto& [uuid, revision] : revisions)
         if (!revision.record.retired) pending.push_back(uuid);
     while (!pending.empty()) {
-        auto uuid = std::move(pending.back()); pending.pop_back();
+        auto uuid = util::canonicalUuid(pending.back()); pending.pop_back();
         if (!revisions.contains(uuid) || revisions.at(uuid).record.retired)
             throw std::invalid_argument("Unknown active fiber export root " + uuid);
         if (!included.insert(uuid).second) continue;
@@ -308,5 +311,17 @@ std::map<std::string, std::string> fiberNetworkJson(
     for (auto& [uuid, fiber] : fibers) result.emplace(uuid, fiber.dump());
     return result;
 }
+
+
+std::map<std::string, std::string> currentFiberNetworkJson(
+    const ObjectStore& db, const Txn& txn, const std::vector<std::string>& roots, uint64_t byteBudget)
+{
+    LocalStoreReader reader(db, txn);
+    std::vector<ObjectVersion> selection;
+    for (const auto& object : db.objectsByKind(txn, "fiber", {}, true))
+        selection.push_back(object.reference());
+    return fiberNetworkJson(reader, selection, roots, byteBudget);
+}
+
 
 }

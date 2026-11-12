@@ -103,10 +103,25 @@ bool PointCollectionSync::flush()
     }
     const std::vector<std::string> removed(removed_.begin(), removed_.end());
     try {
-        vc::objects::writeVolumeCollections(*state_->objectStoreSession(), *attachment_, volume_, changed, removed);
-        std::vector<std::string> uuids(removed);
-        for (const auto& collection : changed) uuids.push_back(collection.uuid);
-        noteRevisions(uuids);
+        vc::objects::RecordSelection expected;
+        std::vector<vc::objects::ObjectVersion> references;
+        for (auto& collection : changed) {
+            const auto found = selected_.find(collection.uuid);
+            if (found != selected_.end()) {
+                collection.reference = found->second.reference;
+                collection.mapping = found->second.mapping;
+            } else expected[collection.uuid] = std::nullopt;
+        }
+        for (const auto& uuid : removed)
+            if (const auto found = selected_.find(uuid); found != selected_.end()) references.push_back(found->second.reference.value());
+            else expected[uuid] = std::nullopt;
+        const auto receipt = vc::objects::writeVolumeCollections(*state_->objectStoreSession(), *attachment_, volume_,
+                                                                 changed, removed, expected, references);
+        for (const auto& uuid : removed) selected_.erase(uuid);
+        for (auto& collection : changed) {
+            collection.reference = receipt.objectReference(collection.uuid).value();
+            selected_[collection.uuid] = std::move(collection);
+        }
         changed_.clear();
         removed_.clear();
         return true;
@@ -116,22 +131,13 @@ bool PointCollectionSync::flush()
     }
 }
 
-void PointCollectionSync::noteRevisions(const std::vector<std::string>& uuids)
-{
-    if (!attachment_ || uuids.empty()) return;
-    state_->objectStoreSession()->readStore(*attachment_, [&](const vc::objects::StoreReader& reader, const auto&) {
-        for (const auto& uuid : uuids)
-            if (const auto head = reader.currentObject(uuid)) revisions_[uuid] = {head->generation, head->version};
-            else revisions_.erase(uuid);
-    });
-}
-
 void PointCollectionSync::unload()
 {
     if (!flush()) return;
     attachment_.reset();
     volume_ = {};
     uuids_.clear();
+    selected_.clear();
     installing_ = true;
     state_->pointCollection()->replaceUnanchoredCollections({});
     installing_ = false;
@@ -163,6 +169,7 @@ void PointCollectionSync::reload()
     auto* points = state_->pointCollection();
     installing_ = true;
     points->replaceUnanchoredCollections(collections);
+    for (const auto& collection : stored) points->reservePointIds(uint64_t(collection.nextPointId));
     uuids_.clear();
     std::map<std::string, uint64_t> ids;
     for (const auto& [id, collection] : points->getAllCollections())
@@ -170,10 +177,11 @@ void PointCollectionSync::reload()
             uuids_[id] = collection.uuid;
             ids[collection.uuid] = id;
         }
-    std::vector<std::string> loaded;
-    for (const auto& collection : stored) loaded.push_back(collection.uuid);
-    revisions_.clear();
-    noteRevisions(loaded);
+    selected_.clear();
+    for (auto& collection : stored) {
+        const auto uuid = collection.uuid;
+        selected_[uuid] = std::move(collection);
+    }
     for (const auto& [uuid, others] : linked) {
         std::vector<uint64_t> otherIds;
         for (const auto& other : others)
@@ -191,8 +199,12 @@ void PointCollectionSync::onStoreEvent(const vc::objects::StoreSessionEvent& eve
         return;
     }
     if (event.kind != Kind::Committed || !attachment_ || event.attachment.storeUuid != attachment_->storeUuid ||
-        !event.touches({kKind}))
+        !event.touches({kKind, "volume_transform", "volume_transform_choice"}))
         return;
+    if (event.touches({"volume_transform", "volume_transform_choice"})) {
+        reload();
+        return;
+    }
     // Our own writes coming back are no reason to reload: a collection is
     // someone else's change when its revision is not the one we wrote or read.
     std::vector<std::string> touched;
@@ -202,9 +214,9 @@ void PointCollectionSync::onStoreEvent(const vc::objects::StoreSessionEvent& eve
     state_->objectStoreSession()->readStore(*attachment_, [&](const vc::objects::StoreReader& reader, const auto&) {
         for (const auto& uuid : touched) {
             const auto head = reader.currentObject(uuid);
-            const auto known = revisions_.find(uuid);
-            if (head.has_value() != (known != revisions_.end()) ||
-                (head && known->second != std::pair(head->generation, head->version)))
+            const auto known = selected_.find(uuid);
+            if (head.has_value() != (known != selected_.end()) ||
+                (head && known->second.reference != head->reference()))
                 external = true;
         }
     });
