@@ -14,6 +14,7 @@ import napari.layers
 import json
 import yaml
 from pathlib import Path
+import tempfile
 import torch.nn as nn
 
 
@@ -21,9 +22,12 @@ Image.MAX_IMAGE_PIXELS = None
 
 _config_manager = None
 
+# The shipped configs are in <package>/models/configuration; this file is <package>/napari_trainer/main_window.py.
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'models' / 'configuration' / 'single_task' / 'ps128_dicece.yaml'
+
 @magicgui(filenames={"label": "select config file", "filter": "*.yaml"},
           auto_call=True)
-def filespicker(filenames: Sequence[Path] = str(Path(__file__).parent.parent.parent / 'models' / 'configuration' / 'single_task' / 'ps128_dicece.yaml')) -> Sequence[Path]:
+def filespicker(filenames: Sequence[Path] = str(DEFAULT_CONFIG_PATH)) -> Sequence[Path]:
     print("selected config : ", filenames)
     if filenames and _config_manager is not None:
         # Load the first selected file into the config manager
@@ -38,14 +42,14 @@ def filespicker(filenames: Sequence[Path] = str(Path(__file__).parent.parent.par
     patch_size_y={'widget_type': 'SpinBox', 'label': 'Patch Size Y', 'min': 0, 'max': 4096, 'value': 128},
     min_labeled_percentage={'widget_type': 'FloatSpinBox', 'label': 'Min Labeled Percentage', 'min': 0.0, 'max': 100.0, 'step': 1.0, 'value': 10.0},
     max_epochs={'widget_type': 'SpinBox', 'label': 'Max Epochs', 'min': 1, 'max': 1000, 'value': 5},
-    loss_function={'widget_type': 'ComboBox', 'choices': ["BCELoss", "BCEWithLogitsLoss", "MSELoss", 
-                                                         "L1Loss", "SoftDiceLoss", "BCEDiceLoss", 
-                                                         "CrossEntropyLoss", "DiceLoss", "CEDiceLoss"], 'value': "CEDiceLoss"}
+    loss_function={'widget_type': 'ComboBox', 'choices': ["nnUNet_DC_and_CE_loss", "nnUNet_DC_and_BCE_loss",
+                                                         "MemoryEfficientSoftDiceLoss", "BCEWithLogitsLoss",
+                                                         "MSELoss", "L1Loss"], 'value': "nnUNet_DC_and_CE_loss"}
 )
 def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: int = 128,
                 min_labeled_percentage: float = 10.0,
                 max_epochs: int = 5,
-                loss_function: str = "BCEDiceLoss"):
+                loss_function: str = "nnUNet_DC_and_CE_loss"):
     if _config_manager is None:
         print("Error: No configuration loaded. Please load a config file first.")
         return
@@ -137,7 +141,9 @@ def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: i
         print("Label layers should be named as: {image_name}_{target_name}")
         print("For example: if image is 'image1', label should be 'image1_ink'")
         return
-    
+
+    _export_viewer_layers(image_layers, label_layers)
+
     try:
         from vesuvius.models.training.train import BaseTrainer
         
@@ -164,12 +170,42 @@ def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: i
         traceback.print_exc()
         raise
 
+def _write_layer_zarr(path, data):
+    from vc_reader.reader import ZarrWriter
+
+    data = np.asarray(data)
+    chunks = tuple(min(int(n), 128) for n in data.shape)
+    ZarrWriter.create(path, shape=data.shape, chunks=chunks, dtype=data.dtype, overwrite=True)[...] = data
+
+
+def _export_viewer_layers(image_layers, label_layers):
+    """Write each image layer and its '<image>_<target>' label layers to a new
+    data_path in the images/ + labels/ layout the trainer's ZarrDataset reads,
+    and set the config's data_path and targets to them."""
+    data_path = Path(tempfile.mkdtemp(prefix="napari_trainer_"))
+    targets = {}
+    for img_layer in image_layers:
+        pairs = [l for l in label_layers
+                 if l.name.startswith(f"{img_layer.name}_") and not l.name.endswith("_mask")]
+        if not pairs:
+            continue
+        _write_layer_zarr(data_path / "images" / f"{img_layer.name}.zarr", img_layer.data)
+        for lbl_layer in pairs:
+            _write_layer_zarr(data_path / "labels" / f"{lbl_layer.name}.zarr", lbl_layer.data)
+            target = lbl_layer.name[len(img_layer.name) + 1:]
+            # A target the loaded config defines keeps its settings (losses, ignore label, ...).
+            targets.setdefault(target, deepcopy(_config_manager.targets.get(target, {})))
+
+    _config_manager.data_path = data_path
+    _config_manager.set_targets_and_data(targets, {})
+    print(f"Wrote the viewer's layers to {data_path} (targets: {', '.join(targets)})")
+
+
 def main():
     viewer = napari.Viewer()
     global _config_manager
     _config_manager = ConfigManager(verbose=True)
-    # Use an absolute path based on the location of this script
-    default_config_path = Path(__file__).parent.parent.parent / 'models' / 'configuration' / 'single_task' / 'ps128_dicece.yaml'
+    default_config_path = DEFAULT_CONFIG_PATH
     _config_manager.load_config(default_config_path)
     print(f"Default config loaded from {default_config_path}")
 
