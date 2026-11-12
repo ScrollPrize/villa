@@ -208,17 +208,17 @@ struct PySession {
         nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
         {
             nb::gil_scoped_release nogil;
-            line_integrals_mapped(s->frames(scan), s->flat_field(scan), s->detector_map(), index, frames.data(), row0, n, nrows, col0, ncols, flip, data);
+            line_integrals_mapped(s->frames(scan), s->flat_field(scan), s->detector_map(scan), index, frames.data(), row0, n, nrows, col0, ncols, flip, data);
             shear_frames(data, n, nrows, ncols, frame_shear);
         }
         const std::size_t shape[3] = {n, static_cast<std::size_t>(nrows), static_cast<std::size_t>(ncols)};
         return nb::ndarray<nb::numpy, float>(data, 3, shape, owner);
     }
-    void set_map(const std::vector<int>& i, const std::vector<int>& j, const std::vector<double>& eu, const std::vector<double>& ev, double c0, double cs, double v0, double vs) {
+    void set_map(const std::vector<int>& i, const std::vector<int>& j, const std::vector<double>& eu, const std::vector<double>& ev, double c0, double cs, double v0, double vs, int scan) {
         DetectorMap m;
         m.i = i, m.j = j, m.eu = eu, m.ev = ev;
         m.c0 = c0, m.cs = cs, m.v0 = v0, m.vs = vs;
-        s->set_detector_map(m);
+        s->set_detector_map(m, scan);
     }
     nb::ndarray<nb::numpy, float> flat(int scan, bool dark) {
         const FlatField* ff;
@@ -357,9 +357,10 @@ void bind_calibration(nb::module_& m) {
         .def("read_rows", &PySession::read_rows, "scan"_a, "stretch"_a, "frames"_a, "row0"_a, "nrows"_a, "Raw values (n, nrows, cols) of rows [row0, row0 + nrows) of the frames.")
         .def("line_integrals", &PySession::line_integrals_of, "scan"_a, "stretch"_a, "frames"_a, "row0"_a, "nrows"_a, "col0"_a, "ncols"_a, "flip"_a = false,
              "-ln((raw - dark) / mean flat), (n, nrows, ncols): rows [row0[i], row0[i] + nrows) of frame i (0 outside the detector), columns reversed if flip.")
-        .def("set_detector_map", &PySession::set_map, "i"_a, "j"_a, "eu"_a, "ev"_a, "c0"_a = 0.0, "cs"_a = 1.0, "v0"_a = 0.0, "vs"_a = 1.0,
+        .def("set_detector_map", &PySession::set_map, "i"_a, "j"_a, "eu"_a, "ev"_a, "c0"_a = 0.0, "cs"_a = 1.0, "v0"_a = 0.0, "vs"_a = 1.0, "scan"_a = -1,
              "A detector map to be tested: pixel (c, v) looks along the ray at (c + Eu, v + Ev), Eu = sum eu[k] x^i[k] y^j[k], x = (c - c0) / cs, "
-             "y = (v - v0) / vs. From then on measure() and mapped_line_integrals() cut blocks on the map's ideal grid; empty lists take the map away.")
+             "y = (v - v0) / vs. From then on measure() and mapped_line_integrals() cut blocks on the map's ideal grid; empty lists take the map away. "
+             "scan < 0 (the default): for every scan; otherwise for that scan alone.")
         .def("mapped_line_integrals", &PySession::mapped_integrals, "scan"_a, "stretch"_a, "frames"_a, "row0"_a, "nrows"_a, "col0"_a, "ncols"_a, "flip"_a = false, "frame_shear"_a = 0.0,
              "line_integrals on the ideal grid of the session's detector map (cubic convolution), rows [row0, row0 + nrows) of every frame; then, if "
              "frame_shear is not 0, frame q of column c read at q + frame_shear (c - (ncols - 1) / 2).")

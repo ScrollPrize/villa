@@ -12,13 +12,14 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
   a unit-DC Paganin kernel and a two-scan luminosity window independent of the chunk height; a scan at a
   fractional column offset shifted exactly (`x_interp=sinc`), a slice's fractional detector row interpolated with
   a Lanczos-3 kernel (`z_interp`); each projection gridded whole into one angular bin and backprojected at its measured angle
-  (`angle_interp=nearest`; GHBP keeps the two-bin splat); the exposure arc of a continuous scan deconvolved
-  (`exposure_arc=auto`); the helical pitch measured from the frames (`z_translation_scale=auto`); the companion
+  (`angle_interp=nearest`; GHBP keeps the two-bin splat); the helical pitch measured from the frames (`z_translation_scale=auto`); the companion
   scan's frames placed as they register on the main scan's, row offset and roll per projection
-  (`companion_registration=auto`); recordings of a ray combined with band-dependent weights where the detector's
-  sharpness depends on the place (`detector_smear=auto`); the turns recorded with the z stage at rest placed against
+  (`companion_registration=auto`); the turns recorded with the z stage at rest placed against
   the helix as the frames register them (`stationary_registration=auto`); the rotation axis refined from the scan's
-  opposite views (`axis_refinement=auto`). No projection filters by default.
+  opposite views (`axis_refinement=auto`). No projection filters by default, and since 2026-11-11 neither of the two
+  blur corrections: the exposure arc of a continuous scan is not deconvolved (`exposure_arc=0`; `auto` turns it on)
+  and recordings of a ray are not combined with band-dependent weights (`detector_smear=off`; `auto` turns it on).
+  Both are left for the intensity side of the calibration, after the geometry.
 * `legacy_reference`: the reference workflow's conventions (half-attenuation units, its rebalance endpoints,
   integer padding reflection, mending bounds, chunk-dependent Paganin and luminosity window, two-column splat of
   fractional column offsets, linear rows, two-bin angular splat, no exposure-arc correction) with every parameter pinned (GHBP, Paganin 1000 + unsharp 1.2/4, …); overriding one
@@ -353,7 +354,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     (`debug["angles"]`). A skipped projection leaves its bin empty (filled as any empty angle). It needs a
     backprojector that takes each slice's angles: FBP, the whole-slice methods and bands; GHBP, whose plan fixes its
     angles, keeps the splat (`info["angle_interp"]` records which is in use).
-  * `exposure_arc=auto|F` (default `auto`): in a continuous scan the detector integrates while the sample turns, a
+  * `exposure_arc=auto|F` (default `0`: off): in a continuous scan the detector integrates while the sample turns, a
     box blur along the angle of F angular steps (tangential, growing with the radius: 0.7 px at r = 1000 px for
     PHerc0343P). `auto` takes F from the scan (the recorded rotation swept per exposure / per period, 0.91 here;
     0 for step scans); its inverse 1 / sinc(F f) is applied to every sinogram as a 9-tap kernel along the angle
@@ -454,7 +455,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     show at the axis is measured and logged but not applied: where the detector's blur is one-sided and differs
     between the two places a ray is recorded at, it is the blur's displacement, not the scan's (applying it on
     PHerc0343P moved the companion 0.3–0.4 voxel radially off the main scan).
-  * `detector_smear=auto|off|a11:a12:a21:a22:c1:c2` (default `auto`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
+  * `detector_smear=auto|off|a11:a12:a21:a22:c1:c2` (default `off`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
     band-dependent redundancy weights for a detector that is not equally sharp everywhere. The field is a uniform
     smear of A r + c pixels at r = (column, row) from the detector's centre in units of 1000 pixels; `auto` takes
     the one the calibration fits to the noise of the scan's flats (`calibration.measure_smear`: the noise that
@@ -702,11 +703,81 @@ count, which can be rounded down to a suitable FFT size. These options change on
 measurement support; they apply no geometric correction. Narrow windows may lack sample
 texture, so compare accepted matches and retain rejected attempts.
 
+## Geometry calibration step (`helirec-geometry`)
+
+Measures the geometry of a two-scan helical acquisition from its own frames, with nothing typed in: the detector
+map and the poses that a reconstruction needs before it can assign a raw value to the line it measured. It is a
+step that writes what it measured (JSON); `helirec-slices` applies it when asked to (`--set geometry=...`, below)
+and otherwise uses the calibration of `python/helirec/calibration.py` as before.
+
+```bash
+helirec-geometry <main.h5> <companion.h5> --out geometry.json            # main: the scan with the axis inside the field
+helirec-geometry <main.h5> <companion.h5> --out geometry.json --row-time-us -19.87   # if no stretch holds a refill
+```
+
+```python
+from helirec import geometry
+cal = geometry.calibrate_geometry([main_h5, companion_h5])
+geometry.save(cal, "geometry.json")
+```
+
+What it needs of the acquisition: a helix whose travel per turn is less than the detector's height, a turn at rest
+before and after it, the axis inside the field in the first scan, a second scan moved sideways, and, for the rows'
+timing, a refill of the ring during one of the stretches (otherwise `--row-time-us`, which belongs to the camera's
+configuration and not to the scan).
+
+What it does (`python/helirec/geometry.py`):
+
+1. **Layout**, from the record and single frames: frames per turn, the stretches, the sense of the rows against
+   the axis stage, a coarse axis column and lateral move (profiles correlated), and the rows that hold something
+   across the whole width (the mount), which are kept out of every comparison.
+2. **Rows' timing**: the time of a detector row within the frame, from the beam dips of a refill.
+3. **Map**: pixel (c, v) looks along the ray at (c + Eu, v + Ev), polynomials of order 3. Views that hold the same
+   lines on different parts of the detector (opposite views, a rest turn against the helix, the helix a turn
+   apart, one scan against the other) are registered on the current map's grid, what they still disagree by is
+   fitted as a correction, and that is repeated until nothing is left (0.02 px).
+4. **Poses**, from the same fit: the axis column per rest turn, the second scan's place against the first per
+   stretch with its own line in the column, the heights of the rest turns against the helix, the axial scale.
+5. **Motion within a turn**, on the finished map's grid (about 1400 full-width registrations): the rotating body's
+   place against the rotation axis as a function of time (a point every half turn in the first scan, every turn
+   in the second), the sample's height once per turn and its drift at rest, and how far the helix is further on
+   in angle than the rows' timing gives.
+
+`geometry.json` holds the layout, the row time, the map (`i`, `j`, `eu`, `ev` with its normalisation), the poses
+and what every pass left per kind of comparison. On PHerc0343P (two scans of 49,202 frames, RTX 5090) it takes
+9 minutes and five passes for the map and 4 minutes for the motion; `development_notes/calibration/05_experiments.md`, experiment 31, sets its result
+beside the one found by hand and tests it on slices reconstructed twice from disjoint frames. The step uses
+`helirec::calibration`'s session (raw frames, the scan's own dark and mean flat, the registration on CPU or CUDA)
+and none of the pipeline's calibration.
+
+**In the reconstruction:** `helirec-slices ... --set geometry=OUT/geometry.json` (or `params["geometry"]`). Every
+projection is then read on the grid of the calibration's detector map (the rows at the mapped row by the row
+kernel, the columns resampled exactly: `resample_rows`, a non-uniform transform of the interpolant the exact shift
+uses, within 1e-6 of the direct sum), at the pose `geometry.frame_poses` gives its frame, and at the angle of its
+rows. `z_translation_scale`, `companion_registration`, `stationary_registration`, `axis_refinement` and
+`rolling_shutter` are not used with it; it needs `x_interp=sinc`, and `fbp` with `angle_interp=nearest` for the row
+timing. `provenance()["geometry"]` records the file and what the calibration measured that the reconstruction
+cannot express. Off by default; without it nothing changes. On PHerc0343P, without projection filters it costs
+no time (7.5 s per 32 slices against 7.3–8.4 s); with Paganin and unsharp a slab of 256 slices takes 53 s against
+32–33 s. What the reconstruction still does not do exactly (views a turn apart backprojected at their
+mean angle, the beam's divergence, the six-row kernel along the rows) is listed in
+`development_notes/calibration/05_experiments.md`, section 33.
+
 ## Tests
 
 `pytest` runs the unit tests: CPU vs CUDA vs NumPy references for every kernel, projector adjointness, the
 whole-slice methods, and regression checks of the corrected conventions (`tests/test_regressions.py`).
 `tests/test_calibration.py` covers `helirec::calibration` on synthetic blocks and a synthetic acquisition record.
+`tests/test_geometry.py` covers the geometry step's fit (a known map, roll, rotation and lines recovered from
+comparisons made up from them) and its plan of comparisons; the step itself needs an acquisition (experiment 31).
+`tests/test_detector_map.py` covers a scan's detector map in the gridding (`ScanTrajectory::map_*`, `col_scale`,
+`row_scale`; `detector_map.hpp`): `resample_rows` (`sino.hpp`), which reads a row at the detector column of every
+ideal column without loss, against the direct sum of the row's trigonometric interpolant (within 1e-6 of the row's
+amplitude, content at Nyquist included; CPU and CUDA), the inversion of the map and its sign conventions, and scans
+gridded through a map or a scale against the same scene on the ideal grid. `_core.time_rows(what, n_rows, n,
+repeats, device, ...)` times `shift_rows` (`what="shift"`) and `resample_rows` (`"positions"`, or `"map"` with the
+map's arguments) on rows of noise without the transfers, and returns the seconds of each call (the first includes
+the transform plans).
 
 ## Build
 

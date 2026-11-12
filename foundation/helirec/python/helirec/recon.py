@@ -20,7 +20,10 @@ Modes (params["mode"]):
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -37,10 +40,19 @@ DEFAULTS = dict(
     mode="corrected", filters=DEFAULT_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="fbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9, sld="", x_interp="sinc", z_interp="lanczos3", angle_interp="nearest", exposure_arc="auto",
-    angle_subset="", z_translation_scale="auto", detector_smear="auto", sharp_f=0.35, sharp_band="0.15:0.30",
+    axis_source_meters=1e9, sld="", x_interp="sinc", z_interp="lanczos3", angle_interp="nearest", exposure_arc=0.0,
+    angle_subset="", z_translation_scale="auto", detector_smear="off", sharp_f=0.35, sharp_band="0.15:0.30",
     companion_registration="auto", stationary_registration="auto", axis_refinement="auto", rolling_shutter="off",
+    geometry="",
 )
+# geometry: "" (default: the calibration above) | the path of a geometry calibration (helirec-geometry, geometry.py).
+#   With it every projection is read on the grid of that calibration's detector map (rows by the row kernel at the
+#   mapped row, columns resampled exactly) at the pose the calibration gives its frame (geometry.frame_poses), at the
+#   angle of its rows (the calibration's row timing), and z_translation_scale, companion_registration,
+#   stationary_registration, axis_refinement and rolling_shutter are not used: the calibration holds what they
+#   stand for. The darks, flats, weights and the merged frame's layout stay the calibration's above. Needs
+#   x_interp=sinc; the row timing needs angle_interp=nearest and fbp. provenance()["geometry"] says what was applied
+#   and what the calibration measured and the reconstruction cannot express.
 # rolling_shutter: the time from the read-out of the detector's first row to its last, in frame periods (negative when
 #   the last row is read first): the rows of a frame were recorded at different angles while the sample turned, and a
 #   slice, read at one row of every frame, is backprojected at those angles. "off" (default): one angle per frame;
@@ -58,15 +70,17 @@ DEFAULTS = dict(
 # companion_registration: "auto" (the companion's frames are placed on the main scan's as the calibration registered
 #   them: a row offset and a roll (rows by the column, columns by the row), per projection:
 #   calibration.measure_registration) | "off" (the calibrated vector alone)
-# detector_smear: "auto" (the field the calibration measured from the flats' noise; none if nothing significant) |
-#   "" or "off" | "a11:a12:a21:a22:c1:c2": the detector's smear field for the band-dependent redundancy weights
+# detector_smear: "off" (default since 2026-11-11: no blur correction is on by default while the geometry is being
+#   settled) or "" | "auto" (the field the calibration measured from the flats' noise; none if nothing significant)
+#   | "a11:a12:a21:a22:c1:c2": the detector's smear field for the band-dependent redundancy weights
 #   (pipeline.hpp); sharp_f, sharp_band = "f1:f2": the frequency the weights are taken at, and the crossover band.
 # z_interp: lanczos3 | cubic | linear, the vertical interpolation of a slice's (fractional) detector row.
 # angle_interp: nearest (each projection whole in one bin, slices backprojected at the measured angles) | linear (the
 #   reference's two-bin angular splat). ghbp, whose plan fixes its angles, keeps the splat: info["angle_interp"]
 #   records the gridding in use.
-# exposure_arc: fraction of the angular step swept during an exposure, deconvolved along the angle; "auto" (default)
-#   takes it from the scan (bliss.BlissScan.exposure_arc; 0 for step scans), 0 leaves the sinogram as recorded.
+# exposure_arc: fraction of the angular step swept during an exposure, deconvolved along the angle; 0 (default since
+#   2026-11-11, with detector_smear) leaves the sinogram as recorded; "auto" takes it from the scan
+#   (bliss.BlissScan.exposure_arc; 0 for step scans).
 # z_translation_scale: detector rows the sample really moves per row of recorded z translation: the calibration of
 #   the helical pitch. "auto" (default): what the calibration measured from the frames (calibration.measure_pitch:
 #   projections half a turn apart are mirror images displaced by the travel; 1 where no significant error was found
@@ -87,6 +101,7 @@ LEGACY_REFERENCE = dict(
     axis_source_meters=1e9, sld="", x_interp="linear", z_interp="linear", angle_interp="linear", exposure_arc=0.0,
     angle_subset="", z_translation_scale=1.0, detector_smear="", sharp_f=0.35, sharp_band="0.15:0.30",
     companion_registration="off", stationary_registration="off", axis_refinement="off", rolling_shutter="off",
+    geometry="",
 )
 assert set(LEGACY_REFERENCE) == set(DEFAULTS) - {"mode"}
 
@@ -113,7 +128,7 @@ CONVENTIONS = {
                       row_position="z_interp kernel (lanczos3 by default); linear next to unmeasured rows",
                       angular_gridding="angle_interp (nearest by default: one bin, measured angles; ghbp and "
                                        "linear: two-bin splat)",
-                      exposure_arc="deconvolved along the angle (the scan's recorded arc by default)"),
+                      exposure_arc="as recorded by default; exposure_arc=auto deconvolves the scan's recorded arc along the angle"),
     "legacy_reference": dict(output_units="reference_units (attenuation / 2)", ramp_angular_weight="pi/n_angles",
                              rebalance="nabuxx (endpoint quirks)", ramp_padding_reflection="lround(2*rot_center)",
                              mending_domain="main-scan first/last column as left/right widths",
@@ -243,12 +258,66 @@ class HelicalRecon:
         self._build()
 
     def _wants_rolling_shutter(self) -> bool:
+        if self.params.get("geometry"):
+            return False
         v = self.params["rolling_shutter"]
         return isinstance(v, str) and v.strip().lower() == "auto" and not self.legacy
 
     # ------------------------------------------------------------------ setup
+    def _geometry(self):
+        """params["geometry"] resolved: None, or the geometry calibration with the reconstruction's terms of both
+        scans (geometry.frame_poses, geometry.reconstruction_terms) in the merged frame of the calibration"""
+        path = self.params.get("geometry") or ""
+        if not path or self.legacy:
+            return None
+        key = (os.path.abspath(path), os.path.getmtime(path))
+        if getattr(self, "_geometry_key", None) != key:
+            from . import geometry as G
+            with open(path) as fh:
+                raw = fh.read()
+            cal = json.loads(raw)
+            scans = (self.main, self.companion)
+            for k, s in enumerate(scans):
+                if os.path.basename(str(cal["scans"][k])) != os.path.basename(str(s.master)):
+                    raise ValueError(f"geometry {path} was made from {cal['scans'][k]}, not from {s.master} (first scan: the one with the rotation axis in its field)")
+            sign = cal["layout"]["row_sign"]
+            H = [sign * np.asarray(s.z_translation_m, np.float64) / s.pixel_size_m for s in scans]
+            poses, not_applied = G.frame_poses(cal, [np.asarray(s.unwrapped_angles_deg, np.float64) for s in scans], H)
+            first_helix = cal["layout"]["frames"][0]["rest1"]
+            origin = float(H[0][first_helix] - H[0][0])      # the slices keep their numbers: the helix's first frame lies where the record puts it
+            terms = {}
+            for s, pose, h in zip(scans, poses, H):
+                pl = self.cal.placement[s.name]
+                terms[s.name] = G.reconstruction_terms(pose, h, cal["layout"], rot_center=float(self.cal.rot_center), column_offset=pl.shift_x - pl.x_readjustment,
+                                                       z_readjustment=pl.z_readjustment, row_origin=origin)
+            m = cal["map"]
+            self._geometry_data = dict(cal=cal, terms=terms, not_applied=not_applied, rolling_shutter=G.rolling_shutter_of(cal),
+                                       map=dict(map_i=[int(x) for x in m["i"]], map_j=[int(x) for x in m["j"]], map_eu=[float(x) for x in m["eu"]], map_ev=[float(x) for x in m["ev"]],
+                                                map_c0=float(m["c0"]), map_cs=float(m["cs"]), map_v0=float(m["v0"]), map_vs=float(m["vs"])),
+                                       path=key[0], sha256=hashlib.sha256(raw.encode()).hexdigest())
+            self._geometry_key = key
+        return self._geometry_data
+
     def _scan_data(self, scan, tag):
         pl = self.cal.placement[scan.name]
+        geo = self._geometry()
+        if geo is not None:
+            t = geo["terms"][scan.name]
+            reader = _core.RawReader(list(scan.projections.files), scan.projections.dataset, *scan.frame_shape)
+            flats = (self.arrays[f"{tag}_flats"] - self.arrays[f"{tag}_dark"][None]).astype(np.float32)
+            return _core.make_scan_data(
+                np.ascontiguousarray(t["angles_deg"], np.float64),
+                np.ascontiguousarray(scan.z_translation_m, np.float64), scan.pixel_size_m, scan.frame_shape[0],
+                scan.frame_shape[1], pl.shift_x, pl.x_readjustment, pl.z_readjustment,
+                np.ascontiguousarray(scan.control_A, np.float64),
+                np.ascontiguousarray(scan.flats_unwrapped_angles_deg, np.float32),
+                np.ascontiguousarray(self.arrays[f"{tag}_dark"]), np.ascontiguousarray(flats),
+                np.ascontiguousarray(self.arrays[f"{tag}_weight"]), reader, scan.projections.file_index,
+                scan.projections.frame_index, t["z_translation_scale"],
+                row_offset=t["row_offset"].tolist(), row_slope=t["row_slope"].tolist(), slope_col=t["slope_col"],
+                col_offset=t["col_offset"].tolist(), col_slope=t["col_slope"].tolist(), slope_row=t["slope_row"],
+                col_scale=t["col_scale"].tolist(), scale_col=t["scale_col"], row_scale=t["row_scale"].tolist(), scale_row=t["scale_row"],
+                **geo["map"])
         reader = _core.RawReader(list(scan.projections.files), scan.projections.dataset, *scan.frame_shape)
         flats = (self.arrays[f"{tag}_flats"] - self.arrays[f"{tag}_dark"][None]).astype(np.float32)
         return _core.make_scan_data(
@@ -301,7 +370,10 @@ class HelicalRecon:
         return rows[near]
 
     def rot_center(self) -> float:
-        """the rotation axis in the merged frame: the calibration's, refined (params["axis_refinement"])"""
+        """the rotation axis in the merged frame: the calibration's, refined (params["axis_refinement"]); with
+        params["geometry"] the calibration's as it is (every projection's own axis is in its column offset)"""
+        if self._geometry() is not None:
+            return float(self.cal.rot_center)
         v = self.params["axis_refinement"]
         t = v.strip().lower() if isinstance(v, str) else v
         if t in ("auto", "off", "", None):
@@ -315,7 +387,9 @@ class HelicalRecon:
 
     def rolling_shutter(self) -> float:
         """params["rolling_shutter"] resolved: "off" = 0, "auto" = the calibration's (0 if not measured), or a
-        number of frame periods"""
+        number of frame periods; with params["geometry"] that calibration's row timing"""
+        if self._geometry() is not None:
+            return float(self._geometry()["rolling_shutter"])
         v = self.params["rolling_shutter"]
         t = v.strip().lower() if isinstance(v, str) else v
         if t in ("off", "", None):
@@ -354,6 +428,7 @@ class HelicalRecon:
         cfg.pop("companion_registration")
         cfg.pop("stationary_registration")
         cfg.pop("axis_refinement")       # (in rot_center)
+        cfg.pop("geometry")              # (of the scans: _scan_data)
         cfg["rolling_shutter"] = 0.0 if mode == "legacy_reference" else self.rolling_shutter()
         scans = [self._scan_data(self.main, "main"), self._scan_data(self.companion, "companion")]
         return _core.SliceReconstructor(scans, cfg)
@@ -443,9 +518,19 @@ class HelicalRecon:
                     companion_registration=bool(getattr(self, "_registered", False)),
                     stationary_registration=bool(getattr(self, "_stationary", False)),
                     resolved_rot_center=self.rot_center(), resolved_rolling_shutter=self.rolling_shutter(),
+                    geometry=self._geometry_provenance(),
                     reconstructor=dict(self.info), pixel_size_m=self.main.pixel_size_m,
                     energy_kev=self.main.energy_kev, distance_m=self.main.distance_m,
                     helirec=_build_identity())
+
+    def _geometry_provenance(self):
+        geo = self._geometry()
+        if geo is None:
+            return None
+        cal = geo["cal"]
+        return dict(path=geo["path"], sha256=geo["sha256"], scans=cal["scans"], map={k: cal["map"][k] for k in ("c0", "cs", "v0", "vs", "i", "j", "eu", "ev")},
+                    row_time_s_per_row=cal["row_time"]["seconds_per_row"], measured_not_applied=copy.deepcopy(geo["not_applied"]),
+                    replaces=["z_translation_scale", "companion_registration", "stationary_registration", "axis_refinement", "rolling_shutter"])
 
     def set_params(self, **kw):
         """Change reconstruction parameters (rebuilds the reconstructor; calibration is kept). Filter chain:

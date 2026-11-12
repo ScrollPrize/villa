@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "helirec/common.hpp"
+#include "helirec/detector_map.hpp"
 
 namespace helirec {
 
@@ -88,11 +89,32 @@ struct AccumScanView {
     const float* col_offset = nullptr;
     const float* col_slope = nullptr;
     float slope_row = 0;
+    // optional detector map of the scan (ScanTrajectory::map_*; detector_map.hpp) and scales of its projections
+    // (ScanTrajectory::row_scale, col_scale; per projection, each or none): detector pixel (c, v) of projection k
+    // looks at the ideal position (c + Eu(c, v) + col_scale[k] (c - scale_col), v + Ev(c, v) + row_scale[k] (v -
+    // scale_row)), and the positions above (the slice's row with the roll, the column with the lateral
+    // registration) are ideal ones.
+    // map_rows: the vertical part is there (terms with ev, or row_scale). The sample for stack row t at detector
+    // column c is then taken at the detector row v with v + Ev(c, v) + row_scale[k] (v - scale_row) = the row above.
+    // The kernel's weights are read from z_lut as with a roll, here interpolated linearly between its fractions
+    // (within 4e-7 of the kernel's weights). win_off must cover the largest row displacement as well.
+    // map_cols: the lateral part is there (terms with eu, or col_scale). With x_exact the block's rows, which are
+    // functions of the detector column, are read at the detector column p of every ideal column
+    // (accumulate; resample_rows): p + Eu(p, v) + col_scale[k] (p - scale_col) = the column above, v the detector
+    // row read at p; otherwise it is not applied (the pipeline refuses such a map).
+    DetectorMapView map;
+    const float* row_scale = nullptr;
+    float scale_row = 0;
+    const float* col_scale = nullptr;
+    float scale_col = 0;
+    int map_rows = 0;
+    int map_cols = 0;
     // optional (accumulate sets it for the block in hand): the vertically interpolated values of the block's
     // projections, each computed once instead of at every column tap of every pixel it lands on. The value of
     // projection k at stack row t, column c is col_val[(col_slot[k] * col_rows + t) * det_cols + c].
     // col_stride: storage columns per row (det_cols, or shift_row_stride(det_cols)); col_shifted: the rows hold the
-    // values delayed by fract_x, i.e. col_val[.. c] is the value at source position c - fract_x.
+    // values delayed by fract_x, i.e. col_val[.. c] is the value at source position c - fract_x (with map_cols: at
+    // the detector column of that ideal column).
     const float* col_val = nullptr;
     const int32_t* col_slot = nullptr;
     int col_rows = 0;

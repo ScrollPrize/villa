@@ -97,9 +97,10 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
     const int n[3] = {plan.n, cut.rows.n, cut.cols.n}, mg[3] = {plan.margin, cut.rows.m, cut.cols.m};
     const int L[3] = {n[0] + 2 * mg[0], n[1] + 2 * mg[1], n[2] + 2 * mg[2]};
     if (cut.row_a < 0 || cut.row_a + n[1] > rows || cut.col_a < 0 || cut.col_a + n[2] > cols) return false;
-    const bool modelled = P.map && !P.map->empty();
+    const DetectorMap* const map_b = P.map_b ? P.map_b : P.map;
+    const bool modelled_a = P.map && !P.map->empty(), modelled_b = map_b && !map_b->empty();
     static std::vector<std::uint16_t> raw;  // kept between blocks: its pages are touched once
-    if (!modelled) raw.resize(static_cast<std::size_t>(L[0]) * L[1] * cols);
+    if (!modelled_a || !modelled_b) raw.resize(static_cast<std::size_t>(L[0]) * L[1] * cols);
     // the blocks are written where the registration's device takes them fastest
     Registrar& registrar = registrars().get(n, mg, ropt);
     float* a = registrar.staging_a();
@@ -108,7 +109,7 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
     std::vector<std::int32_t> row0(L[0]);
     for (int q = 0; q < n[0]; ++q) frame[q] = plan.p0 + q, row0[q] = cut.row_a;
     auto t0 = std::chrono::steady_clock::now();
-    if (modelled) {
+    if (modelled_a) {
         line_integrals_mapped(*P.A.frames, *P.A.ff, *P.map, P.sa, frame.data(), cut.row_a, n[0], n[1], cut.col_a, n[2], false, a);
         view_timing().integrals += seconds_since(t0);
     } else {
@@ -130,8 +131,8 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
         if (plan.j0 - mg[0] < 0 || plan.j0 + n[0] + mg[0] > nb) return false;
         for (int q = 0; q < L[0]; ++q) frame[q] = plan.j0 - mg[0] + q, row0[q] = row_b;
         t0 = std::chrono::steady_clock::now();
-        if (modelled) {
-            line_integrals_mapped(*P.B.frames, *P.B.ff, *P.map, P.sb, frame.data(), row_b, L[0], L[1], col_b, L[2], P.mirror, b);
+        if (modelled_b) {
+            line_integrals_mapped(*P.B.frames, *P.B.ff, *map_b, P.sb, frame.data(), row_b, L[0], L[1], col_b, L[2], P.mirror, b);
         } else {
             P.B.frames->read_rows(P.sb, frame.data(), row0.data(), L[0], L[1], raw.data());
             view_timing().read += seconds_since(t0);
@@ -169,7 +170,7 @@ struct Session::Impl {
     std::vector<std::unique_ptr<FlatField>> flats;
     std::map<std::pair<int, int>, Trajectory> trajectories;  // (scan, stretch), for trajectory_sign
     double trajectory_sign = 0;
-    DetectorMap map;  // empty: the blocks are cut from the frames as stored
+    std::vector<DetectorMap> maps;  // per scan; empty: its blocks are cut from the frames as stored
 };
 
 Session::Session(const std::vector<std::string>& scans, int threads) : impl_(std::make_unique<Impl>()) {
@@ -180,6 +181,7 @@ Session::Session(const std::vector<std::string>& scans, int threads) : impl_(std
         impl_->frames.push_back(std::make_unique<Frames>(*impl_->records.back(), threads));
         impl_->flats.emplace_back();
     }
+    impl_->maps.resize(impl_->records.size());
 }
 Session::~Session() = default;
 
@@ -192,12 +194,13 @@ const FlatField& Session::flat_field(int scan) {
     return *ff;
 }
 
-void Session::set_detector_map(const DetectorMap& map) {
+void Session::set_detector_map(const DetectorMap& map, int scan) {
     if (map.j.size() != map.i.size() || map.eu.size() != map.i.size() || map.ev.size() != map.i.size()) throw Error("calibration session: a detector map has one power pair and two coefficients per term");
     if (map.cs == 0 || map.vs == 0) throw Error("calibration session: a detector map's scales are not zero");
-    impl_->map = map;
+    if (scan < 0) std::fill(impl_->maps.begin(), impl_->maps.end(), map);
+    else impl_->maps.at(static_cast<std::size_t>(scan)) = map;
 }
-const DetectorMap& Session::detector_map() const { return impl_->map; }
+const DetectorMap& Session::detector_map(int scan) const { return impl_->maps.at(static_cast<std::size_t>(scan)); }
 
 std::vector<ViewMeasurement> Session::measure(const std::vector<ViewRequest>& requests, double row_sign, Device device) {
     if (row_sign != 1.0 && row_sign != -1.0) throw Error("calibration session: row_sign is +1 or -1");
@@ -231,7 +234,8 @@ std::vector<ViewMeasurement> Session::measure(const std::vector<ViewRequest>& re
         const Trajectory& tb = traj(q.scan_b, q.stretch_b);
         const Pairing P{{&record(q.scan_a), &frames(q.scan_a), &flat_field(q.scan_a)},
                         {&record(q.scan_b), &frames(q.scan_b), &flat_field(q.scan_b)},
-                        q.stretch_a, q.stretch_b, &ta, &tb, q.angle_offset_deg, q.mirror, &impl_->map, q.frame_shear};
+                        q.stretch_a, q.stretch_b, &ta, &tb, q.angle_offset_deg, q.mirror, &impl_->maps[static_cast<std::size_t>(q.scan_a)],
+                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear};
         const int rows = P.A.frames->rows();
         const Size fsize = pick_size(q.frames + 24, q.frames, 8);
         BlockPlan plan;

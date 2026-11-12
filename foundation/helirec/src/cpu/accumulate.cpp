@@ -118,7 +118,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     if (!p.measured_only && !s.col_val && !c.proj.empty()) {
         contributor_slots(c, s.n_proj, slot, slot_proj);
         const int n_slots = static_cast<int>(slot_proj.size()), W = s.det_cols;
-        const bool shift = s.x_exact && (s.fract_x != 0.f || s.col_offset);
+        const bool shift = s.x_exact && (s.fract_x != 0.f || s.col_offset || s.map_cols);
         const int stride = shift ? shift_row_stride(W) : W;
         col.resize(static_cast<std::size_t>(n_slots) * p.H * stride);
         float* const values = col.data();   // (the calling thread's buffer: `col` names another in each worker)
@@ -128,7 +128,17 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
                 float* out = values + (static_cast<std::size_t>(q) * p.H + t) * stride;
                 for (int x = 0; x < W; ++x) out[x] = column_interp(s, slot_proj[q], t, x);
             }
-        if (shift && s.col_offset) {   // each row by its own amount: the frames' lateral registration
+        if (shift && s.map_cols) {   // each ideal column from its detector column: the detector map, the frames' scale
+            std::vector<ResampleRow> row(static_cast<std::size_t>(n_slots) * p.H);
+            for (int q = 0; q < n_slots; ++q)
+                for (int t = 0; t < p.H; ++t) row[static_cast<std::size_t>(q) * p.H + t] = resample_row(s, slot_proj[q], t);
+            ResampleGeometry g;
+            g.map = s.map;
+            g.slope_col = s.slope_col;
+            g.scale_col = s.scale_col;
+            g.scale_row = s.scale_row;
+            resample_rows(values, n_slots * p.H, W, row.data(), g);
+        } else if (shift && s.col_offset) {   // each row by its own amount: the frames' lateral registration
             std::vector<float> delay(static_cast<std::size_t>(n_slots) * p.H);
             for (int q = 0; q < n_slots; ++q)
                 for (int t = 0; t < p.H; ++t) delay[static_cast<std::size_t>(q) * p.H + t] = column_delay(s, slot_proj[q], t);

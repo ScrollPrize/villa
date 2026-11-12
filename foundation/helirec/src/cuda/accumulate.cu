@@ -43,6 +43,12 @@ __global__ void column_delay_kernel(AccumScanView s, const int32_t* __restrict__
     if (q < n_slots * H) out[q] = column_delay(s, slot_proj[q / H], q % H);
 }
 
+// the rows of resample_rows for the cached rows (resample_row): (n_slots, H)
+__global__ void resample_row_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int n_slots, int H, ResampleRow* __restrict__ out) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q < n_slots * H) out[q] = resample_row(s, slot_proj[q / H], q % H);
+}
+
 __global__ void lum_sums_kernel(const float* R, const float* RW, int L, int H, int NX, int cx, const float* gx,
                                 const float* gz, int radius, float* A, float* B) {
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
@@ -109,6 +115,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     thread_local DeviceBuffer<int32_t> d_off, d_proj, d_slot, d_slot_proj;
     thread_local DeviceBuffer<int8_t> d_role;
     thread_local DeviceBuffer<float> d_col, d_delay;
+    thread_local DeviceBuffer<ResampleRow> d_row;
     AccumScanView s = view;
     // the vertically interpolated values of the block's projections, once each (they are the same at every column
     // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead
@@ -116,7 +123,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     if (!p.measured_only && !s.col_val) {
         contributor_slots(c, s.n_proj, slot, slot_proj);
         const std::size_t n_slots = slot_proj.size();
-        const bool shift = s.x_exact && (s.fract_x != 0.f || s.col_offset);
+        const bool shift = s.x_exact && (s.fract_x != 0.f || s.col_offset || s.map_cols);
         const int stride = shift ? shift_row_stride(s.det_cols) : s.det_cols;
         d_col.ensure(n_slots * p.H * stride);
         s.col_slot = load(d_slot, slot, st);
@@ -125,7 +132,17 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         column_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, d_col.data());
         HELIREC_CUDA_CHECK(cudaGetLastError());
         const int n_rows = static_cast<int>(n_slots) * p.H;
-        if (shift && s.col_offset) {   // each row by its own amount: the frames' lateral registration
+        if (shift && s.map_cols) {   // each ideal column from its detector column: the detector map, the frames' scale
+            d_row.ensure(n_rows);
+            resample_row_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(s, sp, static_cast<int>(n_slots), p.H, d_row.data());
+            HELIREC_CUDA_CHECK(cudaGetLastError());
+            ResampleGeometry g;
+            g.map = s.map;
+            g.slope_col = s.slope_col;
+            g.scale_col = s.scale_col;
+            g.scale_row = s.scale_row;
+            resample_rows(d_col.data(), n_rows, s.det_cols, d_row.data(), g, st);
+        } else if (shift && s.col_offset) {   // each row by its own amount: the frames' lateral registration
             d_delay.ensure(n_rows);
             column_delay_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(s, sp, static_cast<int>(n_slots), p.H, d_delay.data());
             HELIREC_CUDA_CHECK(cudaGetLastError());

@@ -164,10 +164,12 @@ class Session {
     const Record& record(int scan) const;
     Frames& frames(int scan);
     const FlatField& flat_field(int scan);
-    // A detector map to be tested (frames.hpp): from then on measure() cuts every block on the map's ideal grid.
+    // A detector map to be tested (frames.hpp): from then on measure() cuts the blocks on the map's ideal grid.
     // An empty map (the default) cuts them from the frames as stored. The view checks never use one.
-    void set_detector_map(const DetectorMap& map);
-    const DetectorMap& detector_map() const;
+    // scan < 0: the same map for every scan (a property of the detector); otherwise for that scan alone (what
+    // differs between two scans, tested on one of them).
+    void set_detector_map(const DetectorMap& map, int scan = -1);
+    const DetectorMap& detector_map(int scan = 0) const;
     // row_sign: +1 if a larger axis-stage position puts the sample on higher rows, -1 if on lower (the view
     // checks determine it: finding "sense of the detector's rows against the axis stage").
     std::vector<ViewMeasurement> measure(const std::vector<ViewRequest>& requests, double row_sign, Device device = Device::CPU);

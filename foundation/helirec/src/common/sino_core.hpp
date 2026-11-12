@@ -120,4 +120,62 @@ HR_HD void shift_bin(float& re, float& im, int k, int L, float shift) {
     re = r;
 }
 
+// ---------------------------------------------------------------- band-limited resampling of rows (sino.hpp)
+// The row's values at B positions p (samples of the row; any real numbers: the row is periodic) from g, its
+// transform laid in M = resample_oversampling x L bins and transformed back (M samples): for each the sum of the
+// resample_taps samples around resample_oversampling x p with the kernel's weights (kernel: resample_kernel()), in
+// ascending order. The weights of the taps i and taps - 1 - i are the two signs of one polynomial: its even and odd
+// parts in t are evaluated once, in powers of t^2. Out: the first `count` values (NaN for a position that is not
+// finite, or too large to be reduced to the row's period).
+template <int B>
+HR_HD void resample_values(const double* g, int M, const double* p, const double* kernel, float* out, int count) {
+    constexpr int H = resample_taps / 2, D = resample_degree;
+    constexpr int qe = D - D % 2, qo = D - 1 + D % 2;   // the largest even and odd powers
+    // (loops over the B positions, one operation each: the form the CPU's compilers vectorise)
+    double first[B], t[B], s[B], even[B], odd[B], bad[B], w[resample_taps][B];
+    HR_SIMD
+    for (int l = 0; l < B; ++l) {
+        double u = p[l] * static_cast<double>(resample_oversampling);   // (exact: a power of two)
+        u -= static_cast<double>(M) * floor(u / static_cast<double>(M));   // (exact: fmod's result, or M - a rounding of it)
+        const bool in_period = u >= 0.0 && u <= static_cast<double>(M);
+        bad[l] = in_period ? 0.0 : static_cast<double>(NAN);
+        u = in_period ? u : 0.0;
+        const double lo = dsub(u, 0.5 * resample_taps);
+        first[l] = ceil(lo);
+        t[l] = dsub(dmul(2.0, dsub(first[l], lo)), 1.0);
+        s[l] = dmul(t[l], t[l]);
+    }
+    for (int i = 0; i < H; ++i) {
+        const double* c = kernel + i;   // (the coefficient of t^q of tap i: c[q * H])
+        HR_SIMD
+        for (int l = 0; l < B; ++l) even[l] = c[qe * H];
+        for (int q = qe - 2; q >= 0; q -= 2)
+            HR_SIMD
+            for (int l = 0; l < B; ++l) even[l] = dmuladd(even[l], s[l], c[q * H]);
+        HR_SIMD
+        for (int l = 0; l < B; ++l) odd[l] = c[qo * H];
+        for (int q = qo - 2; q >= 1; q -= 2)
+            HR_SIMD
+            for (int l = 0; l < B; ++l) odd[l] = dmuladd(odd[l], s[l], c[q * H]);
+        HR_SIMD
+        for (int l = 0; l < B; ++l) odd[l] = dmul(odd[l], t[l]);
+        double* lower = w[i];
+        double* upper = w[resample_taps - 1 - i];
+        HR_SIMD
+        for (int l = 0; l < B; ++l) lower[l] = dadd(even[l], odd[l]);
+        HR_SIMD
+        for (int l = 0; l < B; ++l) upper[l] = dsub(even[l], odd[l]);
+    }
+    for (int l = 0; l < count; ++l) {
+        int m = static_cast<int>(first[l]);
+        m = m < 0 ? m + M : m;
+        double v = 0.0;
+        for (int i = 0; i < resample_taps; ++i) {
+            v = dmuladd(w[i][l], g[m], v);
+            m = m + 1 == M ? 0 : m + 1;
+        }
+        out[l] = static_cast<float>(v + bad[l]);
+    }
+}
+
 }  // namespace helirec::sino_core

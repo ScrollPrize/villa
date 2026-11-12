@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "helirec/detector_map.hpp"
 #include "helirec/fourier.hpp"
 
 namespace helirec {
@@ -181,6 +182,66 @@ void shift_rows(float* rows, int n_rows, int n, float shift, const float* shifts
 #ifdef HELIREC_WITH_CUDA
 namespace cuda {
 void shift_rows(float* rows, int n_rows, int n, float shift, void* stream = nullptr, const float* shifts = nullptr);
+}
+#endif
+
+// ------------------------------------------------------------- band-limited resampling
+// Rows read at positions of their own, in place, without loss: sample j of row r becomes the value at position
+// p(r, j) of the row's band-limited interpolant, the one shift_rows delays (the same storage, transform length,
+// bridge and treatment of the Nyquist bin: p = j - shift is shift_rows up to rounding):
+//   G(p) = (1 / L) (A_0 + 2 Re sum_{0 < k < L / 2} A_k exp(2 pi i k p / L) + Re A_{L/2} cos(pi p)),
+// A the transform of the row bridged to L = upsample_fft_length(n) samples (periodic in p). Evaluated as a
+// non-uniform transform (type 2): the row's transform, divided by the transform of a compact kernel, is laid in
+// one of resample_oversampling x L bins and transformed back; each value is the sum of the resample_taps nearest
+// samples of that, weighted by the kernel. The kernel is a Kaiser-Bessel window, I0(beta sqrt(1 - z^2)) / I0(beta),
+// z = distance / (taps / 2), as a polynomial of degree resample_degree on each of its taps' intervals (through the
+// window at the interval's Chebyshev nodes: within 2e-11 of it); the transform it is divided by is that of those
+// polynomials, so that the kernel's aliases are all that is lost: at most 4e-9 of the amplitude of a frequency, at
+// any frequency up to Nyquist (10 taps, oversampling 2, beta = 23; a row of n frequencies in phase could add them
+// up, random ones do not). The row's transform is taken in single precision, as shift_rows takes it, and its
+// rounding is what the result's error is made of (some 1e-7 of the amplitude, 5e-7 at most over the rows tested);
+// all that follows is in double precision: the kernel's transform falls by 3.7 from the middle of the band to its
+// end, and the sum takes that back by cancellation.
+constexpr int resample_oversampling = 2;
+constexpr int resample_taps = 10;
+constexpr int resample_degree = 10;
+constexpr double resample_beta = 23.0;
+constexpr int resample_block = 8;   // positions of a row computed together (CPU: in its vector unit; CUDA: by one thread)
+static_assert(resample_taps % 2 == 0 && resample_degree >= 2, "resample_values takes the taps in mirrored pairs");
+// The kernel: coefficient [q * (resample_taps / 2) + i] of t^q of tap i < resample_taps / 2, t = 2 f - 1, where the
+// taps are the oversampled samples first + i, first = ceil(u - taps / 2) for the position u, and
+// f = first - (u - taps / 2) in [0, 1); tap resample_taps - 1 - i is the same polynomial of -t (the kernel is even).
+const std::vector<double>& resample_kernel();
+// the factors of the transform's bins 0 .. L / 2 before they are transformed back: 1 / (L x the kernel's transform),
+// half of it at the Nyquist bin of an even L
+std::vector<double> resample_deconvolution(int n);
+
+// One row of resample_rows read through a detector map (detector_map.hpp): sample j is the value at the ideal column
+// X = j - shift of the row whose ideal row is y at column slope_col and y + row_slope (c - slope_col) at detector
+// column c, i.e. the row's value at the detector column p with
+//   p + Eu(p, v) + col_scale (p - scale_col) = X,   v + Ev(p, v) + row_scale (v - scale_row) = y + row_slope (p - slope_col)
+struct ResampleRow {
+    double y = 0;
+    float shift = 0;
+    float row_slope = 0;
+    float col_scale = 0;
+    float row_scale = 0;
+};
+struct ResampleGeometry {
+    DetectorMapView map;   // (pointer space = backend)
+    float slope_col = 0, scale_col = 0, scale_row = 0;
+};
+namespace cpu {
+// positions: (n_rows, n), in samples of the row (finite; a sample whose position is not becomes NaN)
+void resample_rows(float* rows, int n_rows, int n, const double* positions);
+// row: (n_rows)
+void resample_rows(float* rows, int n_rows, int n, const ResampleRow* row, const ResampleGeometry& g);
+}
+#ifdef HELIREC_WITH_CUDA
+namespace cuda {
+// (positions, row: device pointers)
+void resample_rows(float* rows, int n_rows, int n, const double* positions, void* stream = nullptr);
+void resample_rows(float* rows, int n_rows, int n, const ResampleRow* row, const ResampleGeometry& g, void* stream = nullptr);
 }
 #endif
 

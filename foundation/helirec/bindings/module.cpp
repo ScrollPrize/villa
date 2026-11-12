@@ -31,6 +31,8 @@
 #include "../src/cuda/cuda_utils.cuh"
 #endif
 
+#include <chrono>
+#include <cmath>
 #include <cstring>
 
 namespace nb = nanobind;
@@ -590,8 +592,23 @@ ScanData make_scan_data(DIn angles_deg, DIn z_translation_m, double pixel_size_m
                         HostIn dark, HostIn flats, HostIn weight, std::shared_ptr<RawReader> reader, IntIn file_index,
                         IntIn frame_index, double z_translation_scale, std::vector<float> row_offset,
                         std::vector<float> row_slope, float slope_col, std::vector<float> col_offset,
-                        std::vector<float> col_slope, float slope_row) {
+                        std::vector<float> col_slope, float slope_row, std::vector<int32_t> map_i, std::vector<int32_t> map_j,
+                        std::vector<double> map_eu, std::vector<double> map_ev, double map_c0, double map_cs, double map_v0,
+                        double map_vs, std::vector<float> col_scale, float scale_col, std::vector<float> row_scale,
+                        float scale_row) {
     ScanData d;
+    d.traj.map_i = std::move(map_i);
+    d.traj.map_j = std::move(map_j);
+    d.traj.map_eu = std::move(map_eu);
+    d.traj.map_ev = std::move(map_ev);
+    d.traj.map_c0 = map_c0;
+    d.traj.map_cs = map_cs;
+    d.traj.map_v0 = map_v0;
+    d.traj.map_vs = map_vs;
+    d.traj.col_scale = std::move(col_scale);
+    d.traj.scale_col = scale_col;
+    d.traj.row_scale = std::move(row_scale);
+    d.traj.scale_row = scale_row;
     d.traj.z_translation_scale = z_translation_scale;
     d.traj.row_offset = std::move(row_offset);
     d.traj.row_slope = std::move(row_slope);
@@ -616,6 +633,193 @@ ScanData make_scan_data(DIn angles_deg, DIn z_translation_m, double pixel_size_m
     d.file_index = vec<int32_t>(file_index);
     d.frame_index = vec<int32_t>(frame_index);
     return d;
+}
+
+// a detector map handed over from Python, planned for one detector (detector_map.hpp); `view` points into it
+struct PyDetectorMap {
+    std::vector<int32_t> i, j;
+    std::vector<double> eu, ev;
+    std::vector<float> ev_f;
+    DetectorMapView view;
+    DetectorMapPlan plan;
+    PyDetectorMap(std::vector<int32_t> i_, std::vector<int32_t> j_, std::vector<double> eu_, std::vector<double> ev_, double c0,
+                  double cs, double v0, double vs, int det_rows, int det_cols, double row_slope, double col_scale, double row_scale)
+        : i(std::move(i_)), j(std::move(j_)), eu(std::move(eu_)), ev(std::move(ev_)) {
+        require(j.size() == i.size() && eu.size() == i.size() && ev.size() == i.size(), "map_i, map_j, map_eu, map_ev: one value per term");
+        ev_f.assign(ev.begin(), ev.end());
+        view.n = static_cast<int>(i.size());
+        view.i = i.data(); view.j = j.data(); view.eu = eu.data(); view.ev = ev.data(); view.ev_f = ev_f.data();
+        view.c0 = c0; view.cs = cs; view.v0 = v0; view.vs = vs;
+        view.det_rows = det_rows; view.det_cols = det_cols;
+        plan = detector_map_plan(view, row_slope, col_scale, row_scale);
+        view.passes = plan.passes;
+        view.settle = plan.settle;
+    }
+    PyDetectorMap(const PyDetectorMap&) = delete;
+};
+using DoubleIn = nb::ndarray<const double, nb::c_contig, nb::device::cpu>;
+
+template <class T>
+double max_abs(const std::vector<T>& v) {
+    double m = 0;
+    for (T x : v) m = std::max(m, std::fabs(static_cast<double>(x)));
+    return m;
+}
+
+HostOut resample_rows_py(HostIn rows, std::optional<DoubleIn> positions, float shift, const std::vector<float>& shifts,
+                         const std::vector<double>& row_y, const std::vector<float>& row_slope, float slope_col,
+                         const std::vector<float>& col_scale, float scale_col, const std::vector<float>& row_scale, float scale_row,
+                         std::vector<int32_t> map_i, std::vector<int32_t> map_j, std::vector<double> map_eu, std::vector<double> map_ev,
+                         double map_c0, double map_cs, double map_v0, double map_vs, int det_rows, const std::string& device) {
+    require(rows.ndim() == 2, "rows must be (n_rows, n)");
+    const int nr = static_cast<int>(rows.shape(0)), n = static_cast<int>(rows.shape(1));
+    const std::size_t count = static_cast<std::size_t>(nr) * n;
+    require(!positions || (positions->ndim() == 2 && positions->size() == count && static_cast<int>(positions->shape(0)) == nr),
+            "positions must be (n_rows, n)");
+    if (positions)
+        for (std::size_t q = 0; q < count; ++q) require(std::isfinite(positions->data()[q]), "positions must be finite");
+    auto per_row = [&](std::size_t size) { return size == 0 || size == static_cast<std::size_t>(nr); };
+    require(per_row(shifts.size()) && per_row(row_y.size()) && per_row(row_slope.size()) && per_row(col_scale.size()) &&
+            per_row(row_scale.size()), "shifts, row_y, row_slope, col_scale, row_scale: one value per row (or none)");
+    const Device dev = parse_device(device);
+    PyDetectorMap map(std::move(map_i), std::move(map_j), std::move(map_eu), std::move(map_ev), map_c0, map_cs, map_v0, map_vs,
+                      det_rows, n, max_abs(row_slope), max_abs(col_scale), max_abs(row_scale));
+    std::vector<ResampleRow> row(nr);
+    for (int r = 0; r < nr; ++r) {
+        row[r].y = row_y.empty() ? 0.0 : row_y[r];
+        row[r].shift = shifts.empty() ? shift : shift + shifts[r];
+        row[r].row_slope = row_slope.empty() ? 0.f : row_slope[r];
+        row[r].col_scale = col_scale.empty() ? 0.f : col_scale[r];
+        row[r].row_scale = row_scale.empty() ? 0.f : row_scale[r];
+    }
+    ResampleGeometry g;
+    g.map = map.view;
+    g.slope_col = slope_col;
+    g.scale_col = scale_col;
+    g.scale_row = scale_row;
+    const int S = shift_row_stride(n);
+    HostOut out = new_array({static_cast<std::size_t>(nr), static_cast<std::size_t>(n)});
+    nb::gil_scoped_release nogil;
+    std::vector<float> work(static_cast<std::size_t>(nr) * S, 0.f);
+    for (int r = 0; r < nr; ++r)
+        std::copy(rows.data() + static_cast<std::size_t>(r) * n, rows.data() + static_cast<std::size_t>(r + 1) * n,
+                  work.begin() + static_cast<std::size_t>(r) * S);
+    if (dev == Device::CPU) {
+        if (positions) cpu::resample_rows(work.data(), nr, n, positions->data());
+        else cpu::resample_rows(work.data(), nr, n, row.data(), g);
+    } else {
+#ifdef HELIREC_WITH_CUDA
+        cuda::DeviceBuffer<float> d;
+        d.upload(work.data(), work.size());
+        if (positions) {
+            cuda::DeviceBuffer<double> dp;
+            dp.upload(positions->data(), count);
+            cuda::resample_rows(d.data(), nr, n, dp.data());
+            d.download(work.data());
+        } else {
+            cuda::DeviceBuffer<ResampleRow> d_row;
+            cuda::DeviceBuffer<int32_t> d_i, d_j;
+            cuda::DeviceBuffer<double> d_eu, d_ev;
+            d_row.upload(row.data(), row.size());
+            if (map.view.n > 0) {
+                d_i.upload(map.i.data(), map.i.size());
+                d_j.upload(map.j.data(), map.j.size());
+                d_eu.upload(map.eu.data(), map.eu.size());
+                d_ev.upload(map.ev.data(), map.ev.size());
+                g.map.i = d_i.data(); g.map.j = d_j.data(); g.map.eu = d_eu.data(); g.map.ev = d_ev.data();
+                g.map.ev_f = nullptr;   // (the rows' positions are solved in double precision)
+            }
+            cuda::resample_rows(d.data(), nr, n, d_row.data(), g);
+            d.download(work.data());
+        }
+#endif
+    }
+    for (int r = 0; r < nr; ++r)
+        std::copy(work.begin() + static_cast<std::size_t>(r) * S, work.begin() + static_cast<std::size_t>(r) * S + n,
+                  data(out) + static_cast<std::size_t>(r) * n);
+    return out;
+}
+
+// Seconds of each of `repeats` calls of a row routine on (n_rows, n) rows of noise, without the transfers:
+// "shift" = shift_rows by 0.37, "positions" = resample_rows at the positions j - 0.37 (no map to solve),
+// "map" = resample_rows through the given detector map and scales (rows spread over the detector's rows, shift 0.37).
+std::vector<double> time_rows_py(const std::string& what, int n_rows, int n, int repeats, const std::string& device,
+                                 std::vector<int32_t> map_i, std::vector<int32_t> map_j, std::vector<double> map_eu,
+                                 std::vector<double> map_ev, double map_c0, double map_cs, double map_v0, double map_vs, int det_rows,
+                                 float row_slope, float slope_col, float col_scale, float scale_col, float row_scale, float scale_row) {
+    require(what == "shift" || what == "positions" || what == "map", "what: shift, positions or map");
+    require(n_rows > 0 && n > 1 && repeats > 0, "n_rows, n, repeats must be positive");
+    const Device dev = parse_device(device);
+    PyDetectorMap map(std::move(map_i), std::move(map_j), std::move(map_eu), std::move(map_ev), map_c0, map_cs, map_v0, map_vs,
+                      det_rows, n, row_slope, col_scale, row_scale);
+    const int S = shift_row_stride(n);
+    const float shift = 0.37f;
+    std::vector<float> work(static_cast<std::size_t>(n_rows) * S);
+    std::uint32_t state = 12345u;
+    for (auto& v : work) {
+        state = state * 1664525u + 1013904223u;
+        v = static_cast<float>(state >> 8) * (1.0f / 16777216.0f);
+    }
+    std::vector<double> positions;
+    if (what == "positions") {
+        positions.resize(static_cast<std::size_t>(n_rows) * n);
+        for (std::size_t q = 0; q < positions.size(); ++q) positions[q] = static_cast<double>(q % n) - static_cast<double>(shift);
+    }
+    std::vector<ResampleRow> row(n_rows);
+    for (int r = 0; r < n_rows; ++r) {
+        row[r].y = (r + 0.5) * det_rows / n_rows - 0.5;
+        row[r].shift = shift;
+        row[r].row_slope = row_slope;
+        row[r].col_scale = col_scale;
+        row[r].row_scale = row_scale;
+    }
+    ResampleGeometry g;
+    g.map = map.view;
+    g.slope_col = slope_col;
+    g.scale_col = scale_col;
+    g.scale_row = scale_row;
+    std::vector<double> seconds;
+    nb::gil_scoped_release nogil;
+    auto timed = [&](auto&& call, auto&& sync) {
+        for (int i = 0; i < repeats; ++i) {
+            sync();
+            const auto t0 = std::chrono::steady_clock::now();
+            call();
+            sync();
+            seconds.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+    };
+    if (dev == Device::CPU) {
+        timed([&] {
+            if (what == "shift") cpu::shift_rows(work.data(), n_rows, n, shift);
+            else if (what == "positions") cpu::resample_rows(work.data(), n_rows, n, positions.data());
+            else cpu::resample_rows(work.data(), n_rows, n, row.data(), g);
+        }, [] {});
+    } else {
+#ifdef HELIREC_WITH_CUDA
+        cuda::DeviceBuffer<float> d;
+        cuda::DeviceBuffer<double> dp, d_eu, d_ev;
+        cuda::DeviceBuffer<ResampleRow> d_row;
+        cuda::DeviceBuffer<int32_t> d_i, d_j;
+        d.upload(work.data(), work.size());
+        if (!positions.empty()) dp.upload(positions.data(), positions.size());
+        d_row.upload(row.data(), row.size());
+        if (map.view.n > 0) {
+            d_i.upload(map.i.data(), map.i.size());
+            d_j.upload(map.j.data(), map.j.size());
+            d_eu.upload(map.eu.data(), map.eu.size());
+            d_ev.upload(map.ev.data(), map.ev.size());
+            g.map.i = d_i.data(); g.map.j = d_j.data(); g.map.eu = d_eu.data(); g.map.ev = d_ev.data();
+            g.map.ev_f = nullptr;
+        }
+        timed([&] {
+            if (what == "shift") cuda::shift_rows(d.data(), n_rows, n, shift);
+            else if (what == "positions") cuda::resample_rows(d.data(), n_rows, n, dp.data());
+            else cuda::resample_rows(d.data(), n_rows, n, d_row.data(), g);
+        }, [] { HELIREC_CUDA_CHECK(cudaDeviceSynchronize()); });
+#endif
+    }
+    return seconds;
 }
 
 SldParams sld_from(const nb::dict& c) {
@@ -925,6 +1129,78 @@ NB_MODULE(_core, m) {
           },
           "rows"_a, "shift"_a, "device"_a = "cpu",
           "rows delayed by `shift` samples without loss (a phase ramp on their transform): out[r, i] = row r at i - shift");
+    m.def("resample_rows", &resample_rows_py, "rows"_a, nb::arg("positions") = nb::none(), "shift"_a = 0.f,
+          "shifts"_a = std::vector<float>{}, "row_y"_a = std::vector<double>{}, "row_slope"_a = std::vector<float>{},
+          "slope_col"_a = 0.f, "col_scale"_a = std::vector<float>{}, "scale_col"_a = 0.f, "row_scale"_a = std::vector<float>{},
+          "scale_row"_a = 0.f, "map_i"_a = std::vector<int32_t>{}, "map_j"_a = std::vector<int32_t>{},
+          "map_eu"_a = std::vector<double>{}, "map_ev"_a = std::vector<double>{}, "map_c0"_a = 0.0, "map_cs"_a = 1.0,
+          "map_v0"_a = 0.0, "map_vs"_a = 1.0, "det_rows"_a = 1, "device"_a = "cpu",
+          "rows read at positions of their own without loss (sino.hpp): out[r, j] = the band-limited interpolant of row "
+          "r, the one shift_rows delays, at positions[r, j] (float64, (n_rows, n)); or, without positions, at the "
+          "detector column p that a detector map puts at the ideal column X = j - shift - shifts[r]: p + Eu(p, v) + "
+          "col_scale[r] (p - scale_col) = X, v + Ev(p, v) + row_scale[r] (v - scale_row) = row_y[r] + row_slope[r] (p - "
+          "slope_col) (detector_map.hpp; the rows span the detector's columns, det_rows its rows)");
+    m.def("time_rows", &time_rows_py, "what"_a, "n_rows"_a, "n"_a, "repeats"_a = 5, "device"_a = "cpu",
+          "map_i"_a = std::vector<int32_t>{}, "map_j"_a = std::vector<int32_t>{}, "map_eu"_a = std::vector<double>{},
+          "map_ev"_a = std::vector<double>{}, "map_c0"_a = 0.0, "map_cs"_a = 1.0, "map_v0"_a = 0.0, "map_vs"_a = 1.0,
+          "det_rows"_a = 1, "row_slope"_a = 0.f, "slope_col"_a = 0.f, "col_scale"_a = 0.f, "scale_col"_a = 0.f,
+          "row_scale"_a = 0.f, "scale_row"_a = 0.f,
+          "benchmark: seconds of each of `repeats` calls of a row routine on (n_rows, n) rows, transfers excluded: what = "
+          "'shift' (shift_rows), 'positions' (resample_rows at given positions) or 'map' (resample_rows through the "
+          "detector map and scales given, as for resample_rows); the first call includes the transform plans");
+    m.def("detector_map_plan",
+          [](std::vector<int32_t> map_i, std::vector<int32_t> map_j, std::vector<double> map_eu, std::vector<double> map_ev,
+             double map_c0, double map_cs, double map_v0, double map_vs, int det_rows, int det_cols, double row_slope,
+             double col_scale, double row_scale) {
+              PyDetectorMap map(std::move(map_i), std::move(map_j), std::move(map_eu), std::move(map_ev), map_c0, map_cs, map_v0,
+                                map_vs, det_rows, det_cols, row_slope, col_scale, row_scale);
+              nb::dict d;
+              d["passes"] = map.plan.passes;
+              d["max_eu"] = map.plan.max_eu;
+              d["max_ev"] = map.plan.max_ev;
+              d["gradient"] = map.plan.gradient;
+              d["contraction"] = map.plan.contraction;
+              d["settle"] = map.plan.settle;
+              d["tolerance"] = detector_map_tolerance;
+              return d;
+          },
+          "map_i"_a, "map_j"_a, "map_eu"_a, "map_ev"_a, "map_c0"_a, "map_cs"_a, "map_v0"_a, "map_vs"_a, "det_rows"_a, "det_cols"_a,
+          "row_slope"_a = 0.0, "col_scale"_a = 0.0, "row_scale"_a = 0.0,
+          "the inversion of a detector map (detector_map.hpp): fixed-point passes, bounds of |Eu|, |Ev| and of their "
+          "gradient over the detector, for projections whose |row_slope|, |col_scale|, |row_scale| are at most those given");
+    m.def("detector_map_source",
+          [](DoubleIn x, DoubleIn y, std::vector<int32_t> map_i, std::vector<int32_t> map_j, std::vector<double> map_eu,
+             std::vector<double> map_ev, double map_c0, double map_cs, double map_v0, double map_vs, int det_rows, int det_cols,
+             double row_slope, double slope_col, double col_scale, double scale_col, double row_scale, double scale_row) {
+              require(x.size() == y.size(), "x and y must have the same size");
+              PyDetectorMap map(std::move(map_i), std::move(map_j), std::move(map_eu), std::move(map_ev), map_c0, map_cs, map_v0,
+                                map_vs, det_rows, det_cols, row_slope, col_scale, row_scale);
+              auto c = new_array_t<double>({x.size()}), v = new_array_t<double>({x.size()});
+              detector_map_source(map.view, x.data(), y.data(), x.size(), row_slope, slope_col, col_scale, scale_col, row_scale,
+                                  scale_row, c.data(), v.data());
+              return nb::make_tuple(c, v);
+          },
+          "x"_a, "y"_a, "map_i"_a, "map_j"_a, "map_eu"_a, "map_ev"_a, "map_c0"_a, "map_cs"_a, "map_v0"_a, "map_vs"_a, "det_rows"_a,
+          "det_cols"_a, "row_slope"_a = 0.0, "slope_col"_a = 0.0, "col_scale"_a = 0.0, "scale_col"_a = 0.0, "row_scale"_a = 0.0,
+          "scale_row"_a = 0.0,
+          "the detector positions (c, v) read for the ideal columns x of rows whose ideal row is y at column slope_col, "
+          "as resample_rows solves them (double precision): c + Eu + col_scale (c - scale_col) = x, v + Ev + row_scale "
+          "(v - scale_row) = y + row_slope (c - slope_col)");
+    m.def("detector_map_source_row",
+          [](IntIn c, IntIn base, HostIn pos, std::vector<int32_t> map_i, std::vector<int32_t> map_j, std::vector<double> map_eu,
+             std::vector<double> map_ev, double map_c0, double map_cs, double map_v0, double map_vs, int det_rows, int det_cols,
+             float row_scale, float scale_row) {
+              require(c.size() == pos.size() && base.size() == pos.size(), "c, base and pos must have the same size");
+              PyDetectorMap map(std::move(map_i), std::move(map_j), std::move(map_eu), std::move(map_ev), map_c0, map_cs, map_v0,
+                                map_vs, det_rows, det_cols, 0.0, 0.0, row_scale);
+              HostOut out = new_array({pos.size()});
+              detector_map_source_row(map.view, c.data(), base.data(), pos.data(), pos.size(), row_scale, scale_row, data(out));
+              return out;
+          },
+          "c"_a, "base"_a, "pos"_a, "map_i"_a, "map_j"_a, "map_eu"_a, "map_ev"_a, "map_c0"_a, "map_cs"_a, "map_v0"_a, "map_vs"_a,
+          "det_rows"_a, "det_cols"_a, "row_scale"_a = 0.f, "scale_row"_a = 0.f,
+          "the detector row read at the detector column c for the ideal row base + pos, minus base, as the gridding "
+          "solves it (single precision): v + Ev(c, v) + row_scale (v - scale_row) = base + pos");
     m.def("bspline_prefilter",
           [](HostIn rows, int degree, const std::string& device) {
               require(rows.ndim() == 2, "rows must be (n_rows, n)");
@@ -1209,10 +1485,17 @@ NB_MODULE(_core, m) {
           "dark"_a, "flats"_a, "weight"_a, "reader"_a, "file_index"_a, "frame_index"_a, "z_translation_scale"_a = 1.0,
           "row_offset"_a = std::vector<float>{}, "row_slope"_a = std::vector<float>{}, "slope_col"_a = 0.f,
           "col_offset"_a = std::vector<float>{}, "col_slope"_a = std::vector<float>{}, "slope_row"_a = 0.f,
+          "map_i"_a = std::vector<int32_t>{}, "map_j"_a = std::vector<int32_t>{}, "map_eu"_a = std::vector<double>{},
+          "map_ev"_a = std::vector<double>{}, "map_c0"_a = 0.0, "map_cs"_a = 1.0, "map_v0"_a = 0.0, "map_vs"_a = 1.0,
+          "col_scale"_a = std::vector<float>{}, "scale_col"_a = 0.f, "row_scale"_a = std::vector<float>{}, "scale_row"_a = 0.f,
           "row_offset, row_slope, slope_col: registration of the scan's frames per projection (helical.hpp): rows added "
           "to the vertical position, and a row offset of row_slope (column - slope_col); col_offset, col_slope, "
           "slope_row: the lateral counterpart, a column offset of col_offset + col_slope (row - slope_row), applied "
-          "where columns are shifted exactly (x_interp=sinc)");
+          "where columns are shifted exactly (x_interp=sinc). map_*: the scan's detector map (detector_map.hpp): pixel "
+          "(c, v) looks at the ideal position (c + Eu, v + Ev), Eu = sum map_eu x^map_i y^map_j, Ev likewise, x = (c - "
+          "map_c0) / map_cs, y = (v - map_v0) / map_vs; every projection is read on the ideal grid. col_scale, "
+          "scale_col, row_scale, scale_row: per projection, pixel (c, v) looks at the ideal column c + Eu + col_scale "
+          "(c - scale_col) and the ideal row v + Ev + row_scale (v - scale_row). Lateral parts need x_interp=sinc");
     nb::class_<PySliceReconstructor>(m, "SliceReconstructor")
         .def(nb::init<std::vector<ScanData>, const nb::dict&>(), "scans"_a, "config"_a)
         .def_prop_ro("info", &PySliceReconstructor::info)

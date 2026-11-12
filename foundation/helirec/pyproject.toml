@@ -12,6 +12,7 @@ dependencies = ["numpy>=1.24", "h5py>=3.8", "tifffile", "vc-reader"]
 [project.scripts]
 helirec-slices = "helirec.cli:main"
 helirec-composite = "helirec.composite:main"
+helirec-geometry = "helirec.geometry:main"
 
 [project.optional-dependencies]
 test = ["pytest", "tifffile", "h5py", "hdf5plugin"]

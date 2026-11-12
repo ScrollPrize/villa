@@ -400,3 +400,30 @@ def test_session_detector_map(tmp_path, monkeypatch):
     assert all(after[k] == pytest.approx(before[k], abs=1e-9) for k in before if k != "label")
     with pytest.raises(Exception):
         s.set_detector_map([1], [1, 2], [0.0], [0.0])
+
+
+def test_session_detector_map_per_scan(tmp_path, monkeypatch):
+    """A map given to one scan of a session alone: the other scan's blocks stay as stored, and a comparison of the
+    two finds the displacement the map puts between them."""
+    import sys
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "ROWS", 48)
+    monkeypatch.setattr(module, "COLS", 80)
+    monkeypatch.setattr(module, "PER_TURN", 40)
+    master = _write_record(tmp_path, np.random.default_rng(13))
+    s = _core.CalibrationSession([str(master), str(master)])   # the same scan twice: its two copies hold the same lines
+    frames = np.array([3, 17, 39], dtype=np.int64)
+    plain = s.line_integrals(0, 2, frames, np.full(3, 0, np.int32), 48, 0, 80)
+    s.set_detector_map([0], [0], [2.0], [-1.0], scan=1)       # scan 1 alone: read two columns lower and one row higher
+    assert np.array_equal(s.mapped_line_integrals(0, 2, frames, 6, 20, 8, 32), plain[:, 6:26, 8:40])
+    assert np.allclose(s.mapped_line_integrals(1, 2, frames, 6, 20, 8, 32), plain[:, 7:27, 6:38], atol=1e-6)
+    req = [dict(label="pair", scan_a=0, scan_b=1, stretch_a=2, frame_a=12, frames=16, rows=16, cols=32, row_a=14, col_a=20, col_b=20)]
+    r = s.measure(req, -1.0, "cpu")[0]
+    assert r["ok"] and r["correlation"] > 0.999 and abs(r["dq"]) < 1e-3
+    assert abs(r["du"] - 2.0) < 1e-3 and abs(r["D"] + 1.0) < 1e-3, r      # B's content lies where the map moved it from
+    s.set_detector_map([0], [0], [2.0], [-1.0])               # every scan: nothing between them again
+    r = s.measure(req, -1.0, "cpu")[0]
+    assert abs(r["du"]) < 1e-3 and abs(r["D"]) < 1e-3
+    s.set_detector_map([], [], [], [])
+    r = s.measure(req, -1.0, "cpu")[0]
+    assert abs(r["du"]) < 1e-3 and abs(r["D"]) < 1e-3

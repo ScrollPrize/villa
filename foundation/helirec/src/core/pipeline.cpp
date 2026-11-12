@@ -85,6 +85,35 @@ void set_lateral(AccumScanView& v, const ScanData& sd, const ChunkScan& c, const
     v.x_exact = 1;   // (set_x_kernel leaves it off for a scan at a whole column offset)
 }
 
+// The detector map of a scan and the scales of its projections (ScanTrajectory::map_*, row_scale, col_scale), as
+// planned by the reconstructor: `host` views the scan's own arrays (a device copy is the same with other pointers).
+struct ScanMap {
+    DetectorMapView host;
+    std::vector<float> ev_f;       // map_ev in single precision (empty: no vertical terms)
+    bool rows = false;             // a vertical part: terms with ev, or row_scale
+    bool cols = false;             // a lateral part: terms with eu, or col_scale
+    float reach = 0;               // the largest row displacement on the detector (rows)
+};
+
+// map: the view of the scan's map in the backend's pointer space; row_scale, col_scale, lut: host or device copies.
+// (after set_z_kernel)
+void set_map(AccumScanView& v, const ScanData& sd, const ScanMap& m, const DetectorMapView& map, const float* row_scale,
+             const float* col_scale, const float* lut, int lut_n) {
+    if (!m.rows && !m.cols) return;
+    v.map = map;
+    v.map_rows = m.rows ? 1 : 0;
+    v.map_cols = m.cols ? 1 : 0;
+    v.row_scale = sd.traj.row_scale.empty() ? nullptr : row_scale;
+    v.scale_row = sd.traj.scale_row;
+    v.col_scale = sd.traj.col_scale.empty() ? nullptr : col_scale;
+    v.scale_col = sd.traj.scale_col;
+    if (m.rows) {
+        v.z_lut = v.z_taps > 0 ? lut : nullptr;
+        v.z_lut_n = lut_n;
+    }
+    if (m.cols) v.x_exact = 1;   // (the pipeline shifts columns exactly: checked by the reconstructor)
+}
+
 AccumScanView make_view(const ScanData& sd, const ScanChunk& ch, const uint16_t* raw, const float* dark,
                         const float* flats, const float* weight, const int32_t* row0, const float* fract_v,
                         const float* alpha, const float* cdiv, const float* wfac, const float* ffrac,
@@ -136,6 +165,7 @@ struct SliceReconstructor::Impl {
     int z_ctx = 0;                 // ... of which the kernel's own (the rest covers the frames' roll: row_slope)
     static constexpr int z_lut_n = 2048;
     std::vector<float> z_lut;      // the kernel's weights by fraction (z_kernel_lut), for scans with a roll
+    std::vector<ScanMap> maps;     // per scan: its detector map and scales (ScanTrajectory::map_*, row_scale, col_scale)
     // nearest-bin angular gridding: each scan's bins (helical.hpp), the mean weight of each detector row (how much
     // a projection weighs in a slice), and the angles of the chunk's slices (DY, n_grid), -angle as fbp_angles
     bool nearest = false;
@@ -191,7 +221,10 @@ struct SliceReconstructor::Impl {
     ChunkGlare chunk_glare(std::size_t s, const ScanChunk& chunk);
 #ifdef HELIREC_WITH_CUDA
     struct DevScan {
-        cuda::DeviceBuffer<float> dark, flats, weight, weight2;
+        cuda::DeviceBuffer<float> dark, flats, weight, weight2, map_ev_f;
+        cuda::DeviceBuffer<int32_t> map_i, map_j;
+        cuda::DeviceBuffer<double> map_eu, map_ev;
+        DetectorMapView map;   // ScanMap::host with the device copies
     };
     std::vector<DevScan> dev;
     // persistent GPU work buffers (grow-only), pinned raw staging, copy stream
@@ -296,8 +329,14 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             (!s.traj.row_offset.empty() && s.traj.row_offset.size() != s.traj.n()) ||
             (!s.traj.row_slope.empty() && s.traj.row_slope.size() != s.traj.n()) ||
             (!s.traj.col_offset.empty() && s.traj.col_offset.size() != s.traj.n()) ||
-            (!s.traj.col_slope.empty() && s.traj.col_slope.size() != s.traj.n()))
+            (!s.traj.col_slope.empty() && s.traj.col_slope.size() != s.traj.n()) ||
+            (!s.traj.col_scale.empty() && s.traj.col_scale.size() != s.traj.n()) ||
+            (!s.traj.row_scale.empty() && s.traj.row_scale.size() != s.traj.n()))
             throw Error("ScanData: per-projection arrays have inconsistent lengths");
+    for (const auto& s : I.scans)
+        if (s.traj.map_j.size() != s.traj.map_i.size() || s.traj.map_eu.size() != s.traj.map_i.size() ||
+            s.traj.map_ev.size() != s.traj.map_i.size())
+            throw Error("ScanData: the detector map's terms (map_i, map_j, map_eu, map_ev) have inconsistent lengths");
     if (I.scans.empty() || I.scans[0].traj.n() < 2) throw Error("SliceReconstructor: no scan");
     {   // the step between consecutive recorded projections: the median, which skipped projections do not stretch
         const auto& a = I.scans[0].traj.angles_deg;
@@ -332,6 +371,8 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             take(s.traj.row_slope);
             take(s.traj.col_offset);
             take(s.traj.col_slope);
+            take(s.traj.col_scale);
+            take(s.traj.row_scale);
             take(s.control_A);
             take(s.file_index);
             take(s.frame_index);
@@ -373,11 +414,54 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         for (const auto& s : I.scans) {
             if (I.cfg.legacy_reference && (!s.traj.row_slope.empty() || !s.traj.col_offset.empty() || !s.traj.col_slope.empty()))
                 throw Error("legacy reference mode has no frame registration");
+            if (I.cfg.legacy_reference && (!s.traj.map_i.empty() || !s.traj.col_scale.empty() || !s.traj.row_scale.empty()))
+                throw Error("legacy reference mode has no detector map and no frame scales");
             const float span = std::max(std::fabs(s.traj.slope_col), std::fabs(static_cast<float>(s.traj.det_cols - 1) - s.traj.slope_col));
-            for (float v : s.traj.row_slope) reach = std::max(reach, std::fabs(v) * span);
+            float roll = 0.f, slope = 0.f;
+            for (float v : s.traj.row_slope) {
+                roll = std::max(roll, std::fabs(v) * span);
+                slope = std::max(slope, std::fabs(v));
+            }
+            if (roll > 16.f) throw Error("row_slope: a row offset of more than 16 rows across the detector is not a roll");
+            // the scan's detector map and scales: their parts, the passes of the inversion, the rows they reach
+            ScanMap sm;
+            const auto& t = s.traj;
+            float col_scale = 0.f, row_scale = 0.f;
+            for (float v : t.col_scale) col_scale = std::max(col_scale, std::fabs(v));
+            for (float v : t.row_scale) row_scale = std::max(row_scale, std::fabs(v));
+            sm.host.n = static_cast<int>(t.map_i.size());
+            sm.host.i = t.map_i.data();
+            sm.host.j = t.map_j.data();
+            sm.host.eu = t.map_eu.data();
+            sm.host.ev = t.map_ev.data();
+            sm.host.c0 = t.map_c0; sm.host.cs = t.map_cs; sm.host.v0 = t.map_v0; sm.host.vs = t.map_vs;
+            sm.host.det_rows = t.det_rows;
+            sm.host.det_cols = t.det_cols;
+            const DetectorMapPlan plan = detector_map_plan(sm.host, slope, col_scale, row_scale);
+            sm.host.passes = plan.passes;
+            sm.host.settle = plan.settle;
+            const bool ev = std::any_of(t.map_ev.begin(), t.map_ev.end(), [](double v) { return v != 0; });
+            const bool eu = std::any_of(t.map_eu.begin(), t.map_eu.end(), [](double v) { return v != 0; });
+            if (ev) sm.ev_f.assign(t.map_ev.begin(), t.map_ev.end());
+            sm.rows = ev || !t.row_scale.empty();
+            sm.cols = eu || !t.col_scale.empty();
+            if (sm.cols && !I.x_exact)
+                throw Error("detector map / col_scale: the lateral part is applied where the columns are read exactly "
+                            "(x_interp = sinc), not with x_interp = " + I.cfg.x_interp);
+            if (sm.cols && I.measured)
+                throw Error("detector map / col_scale: the lateral part is applied where the columns are read exactly, "
+                            "which the gridding of measured pixels only (the iterative methods) does not do");
+            if (sm.rows) {
+                const float rows = std::max(std::fabs(t.scale_row), std::fabs(static_cast<float>(t.det_rows - 1) - t.scale_row));
+                sm.reach = (ev ? static_cast<float>(plan.max_ev) : 0.f) + row_scale * rows;
+                if (!(sm.reach <= 16.f))
+                    throw Error("detector map / row_scale: a row displacement of more than 16 rows is not a detector's distortion");
+            }
+            I.maps.push_back(std::move(sm));
+            reach = std::max(reach, roll + I.maps.back().reach);
         }
+        for (auto& m : I.maps) m.host.ev_f = m.ev_f.empty() ? nullptr : m.ev_f.data();
         if (reach > 0.f) {
-            if (reach > 16.f) throw Error("row_slope: a row offset of more than 16 rows across the detector is not a roll");
             I.z_pad += static_cast<int>(std::ceil(reach)) + 1;
             I.z_lut = z_kernel_lut(I.z_kernel, Impl::z_lut_n);
         }
@@ -485,6 +569,20 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             if (!I.z_lut.empty() && I.d_z_lut.size() == 0) I.d_z_lut.upload(I.z_lut.data(), I.z_lut.size());
             d.weight.upload(s.weight.data(), s.weight.size());
             if (I.sharp) d.weight2.upload(I.weight2[I.dev.size()].data(), I.weight2[I.dev.size()].size());
+            const ScanMap& sm = I.maps[I.dev.size()];
+            d.map = sm.host;
+            if (sm.host.n > 0) {
+                d.map_i.upload(s.traj.map_i.data(), s.traj.map_i.size());
+                d.map_j.upload(s.traj.map_j.data(), s.traj.map_j.size());
+                d.map_eu.upload(s.traj.map_eu.data(), s.traj.map_eu.size());
+                d.map_ev.upload(s.traj.map_ev.data(), s.traj.map_ev.size());
+                if (!sm.ev_f.empty()) d.map_ev_f.upload(sm.ev_f.data(), sm.ev_f.size());
+                d.map.i = d.map_i.data();
+                d.map.j = d.map_j.data();
+                d.map.eu = d.map_eu.data();
+                d.map.ev = d.map_ev.data();
+                d.map.ev_f = sm.ev_f.empty() ? nullptr : d.map_ev_f.data();
+            }
             I.dev.push_back(std::move(d));
         }
         HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
@@ -945,6 +1043,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 set_z_kernel(view, I.z_pad, I.z_ctx, ch.z_w.data());
                 set_roll(view, sd, c.row_slope.data(), I.z_lut.data(), Impl::z_lut_n);
                 set_lateral(view, sd, c, c.col_offset.data(), c.col_slope.data(), I.x_exact);
+                set_map(view, sd, I.maps[s], I.maps[s].host, c.row_scale.data(), c.col_scale.data(), I.z_lut.data(), Impl::z_lut_n);
                 if (cfg.sld.enabled())
                     set_glare(view, *I.glare[s], cg[s].maps.data(), cg[s].i0.data(), cg[s].i1.data(), cg[s].frac.data(),
                               cg[s].rows, cg[s].row0.empty() ? nullptr : cg[s].row0.data());
@@ -1065,7 +1164,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     if (prefetched) step("grid");
     struct DevChunk {
         cuda::DeviceBuffer<int32_t> row0, fi0, fi1, gi0, gi1, grow0;
-        cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac, z_w, slope, col_offset, col_slope;
+        cuda::DeviceBuffer<float> fract_v, alpha, cdiv, wfac, ffrac, glare, gfrac, z_w, slope, col_offset, col_slope, col_scale, row_scale;
     };
     std::vector<DevChunk> dc(nsc);
     std::vector<std::size_t> per(nsc);
@@ -1085,6 +1184,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             dc[s].col_offset.upload(c.col_offset.data(), c.col_offset.size());
             dc[s].col_slope.upload(c.col_slope.data(), c.col_slope.size());
         }
+        if (!c.col_scale.empty()) dc[s].col_scale.upload(c.col_scale.data(), c.col_scale.size());
+        if (!c.row_scale.empty()) dc[s].row_scale.upload(c.row_scale.data(), c.row_scale.size());
         dc[s].alpha.upload(c.alpha.data(), c.alpha.size());
         dc[s].cdiv.upload(c.current_div.data(), c.current_div.size());
         dc[s].wfac.upload(c.weight_factor.data(), c.weight_factor.size());
@@ -1267,6 +1368,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             set_z_kernel(view, I.z_pad, I.z_ctx, dc[s].z_w.data());
             set_roll(view, sd, dc[s].slope.data(), I.d_z_lut.data(), Impl::z_lut_n);
             set_lateral(view, sd, chunks[s].cs, dc[s].col_offset.data(), dc[s].col_slope.data(), I.x_exact);
+            set_map(view, sd, I.maps[s], I.dev[s].map, dc[s].row_scale.data(), dc[s].col_scale.data(), I.d_z_lut.data(), Impl::z_lut_n);
             if (cfg.sld.enabled())
                 set_glare(view, *I.glare[s], dc[s].glare.data(), dc[s].gi0.data(), dc[s].gi1.data(), dc[s].gfrac.data(),
                           cg[s].rows, cg[s].row0.empty() ? nullptr : dc[s].grow0.data());

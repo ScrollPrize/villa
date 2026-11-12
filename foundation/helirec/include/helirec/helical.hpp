@@ -40,6 +40,23 @@ struct ScanTrajectory {
     std::vector<float> col_offset;
     std::vector<float> col_slope;
     float slope_row = 0;
+    // Detector map of this scan (detector_map.hpp; no terms: none): detector pixel (c, v) looks along the ray at the
+    // ideal position (c + Eu(c, v), v + Ev(c, v)), Eu = sum_k map_eu[k] x^map_i[k] y^map_j[k], Ev likewise with
+    // map_ev, x = (c - map_c0) / map_cs, y = (v - map_v0) / map_vs. Every projection is then read on the ideal
+    // grid: what the geometry (with the registration above) puts at the ideal position (X, Y) is read at the
+    // detector position (c, v) with c + Eu(c, v) = X, v + Ev(c, v) = Y. The rows are solved wherever frames are
+    // gridded; the columns where they are shifted exactly (x_interp = sinc), and a map with a lateral part is
+    // refused elsewhere.
+    std::vector<int32_t> map_i, map_j;
+    std::vector<double> map_eu, map_ev;
+    double map_c0 = 0, map_cs = 1, map_v0 = 0, map_vs = 1;
+    // Scales of the projections' own, per projection (empty: none), in the map's convention and with or without a
+    // map: pixel (c, v) of projection i looks at the ideal column c + Eu + col_scale[i] (c - scale_col) and at the
+    // ideal row v + Ev + row_scale[i] (v - scale_row). col_scale is a lateral part (x_interp = sinc).
+    std::vector<float> col_scale;
+    float scale_col = 0;
+    std::vector<float> row_scale;
+    float scale_row = 0;
     std::size_t n() const { return angles_deg.size(); }
 };
 
@@ -70,6 +87,7 @@ struct ChunkScan {
     std::vector<float> fract_v;          // vertical interpolation fraction a
     std::vector<float> row_slope;        // ScanTrajectory::row_slope of the projections (empty: none)
     std::vector<float> col_offset, col_slope;   // ScanTrajectory::col_offset, col_slope (both, or both empty)
+    std::vector<float> col_scale, row_scale;    // ScanTrajectory::col_scale, row_scale (each empty: none)
     std::vector<int32_t> j0;             // lower grid angle bin (unwrapped; j1 = (j0 + 1) % n_grid)
     std::vector<float> alpha;            // angular splat fraction (weight alpha to j0+1)
     std::vector<float> current_div;      // float32(I_p / 0.2): flat-field divisor

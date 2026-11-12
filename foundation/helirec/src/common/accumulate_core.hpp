@@ -4,8 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "detector_map_core.hpp"
 #include "hd_math.hpp"
 #include "helirec/accumulate.hpp"
+#include "helirec/sino.hpp"
 #include "sino_core.hpp"
 #include "sld_core.hpp"
 
@@ -36,12 +38,15 @@ HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
 }
 
 // The vertical position of the sample for stack row t at column c: window row tt and fraction a, i.e. row
-// t + fract_v[k], plus the frame's row offset at that column (AccumScanView::row_slope).
+// t + fract_v[k], plus the frame's row offset at that column (AccumScanView::row_slope); with a detector map or a
+// row scale (AccumScanView::map_rows) the detector row that looks at that row.
 HR_HD void row_position(const AccumScanView& s, int k, int t, int c, int& tt, float& a) {
     tt = t;
     a = s.fract_v[k];
-    if (s.row_slope) {
-        const float pos = add(a, mul(s.row_slope[k], sub(static_cast<float>(c), s.slope_col)));
+    if (s.row_slope || s.map_rows) {
+        float pos = a;
+        if (s.row_slope) pos = add(a, mul(s.row_slope[k], sub(static_cast<float>(c), s.slope_col)));
+        if (s.map_rows) pos = map_core::source_row(s.map, s.row_scale ? s.row_scale[k] : 0.0f, s.scale_row, c, s.row0[k] + t, pos);
         const float fl = hd::floor(pos);
         tt = t + static_cast<int>(fl);
         a = sub(pos, fl);
@@ -56,8 +61,30 @@ HR_HD float column_delay(const AccumScanView& s, int k, int t) {
     return -add(s.col_offset[k], mul(s.col_slope[k], sub(row, s.slope_row)));
 }
 
-// the vertical kernel's weights for projection k at fraction a (per projection, or with a roll from the table)
-HR_HD const float* z_weights(const AccumScanView& s, int k, float a) {
+// The row of resample_rows (sino.hpp) for the cached row of projection k at stack row t: its ideal row and roll, the
+// delay shift_rows gives it (fract_x, and column_delay with a lateral registration) and its scales.
+HR_HD ResampleRow resample_row(const AccumScanView& s, int k, int t) {
+    ResampleRow w;
+    w.y = static_cast<double>(s.row0[k] + t) + static_cast<double>(s.fract_v[k]);
+    w.shift = s.col_offset ? s.fract_x + column_delay(s, k, t) : s.fract_x;
+    w.row_slope = s.row_slope ? s.row_slope[k] : 0.0f;
+    w.col_scale = s.col_scale ? s.col_scale[k] : 0.0f;
+    w.row_scale = s.row_scale ? s.row_scale[k] : 0.0f;
+    return w;
+}
+
+// the vertical kernel's weights for projection k at fraction a (per projection, or with a roll from the table: its
+// nearest fraction; with a detector map or a row scale interpolated between the two fractions around a, into buf)
+HR_HD const float* z_weights(const AccumScanView& s, int k, float a, float* buf) {
+    if (s.map_rows && s.z_lut) {
+        const float f = mul(a, static_cast<float>(s.z_lut_n));
+        int i0 = static_cast<int>(f);
+        i0 = i0 < 0 ? 0 : (i0 > s.z_lut_n - 1 ? s.z_lut_n - 1 : i0);
+        const float u = sub(f, static_cast<float>(i0));
+        const float* w0 = s.z_lut + static_cast<std::size_t>(i0) * s.z_taps;
+        for (int i = 0; i < s.z_taps; ++i) buf[i] = add(mul(sub(1.0f, u), w0[i]), mul(u, w0[s.z_taps + i]));
+        return buf;
+    }
     if (s.row_slope && s.z_lut)
         return s.z_lut + static_cast<std::size_t>(static_cast<int>(add(mul(a, static_cast<float>(s.z_lut_n)), 0.5f))) * s.z_taps;
     return s.z_w + static_cast<std::size_t>(k) * s.z_taps;
@@ -100,8 +127,8 @@ HR_HD float column_interp(const AccumScanView& s, int k, int t0, int c) {
     row_position(s, k, t0, c, t, a);
     bool pad;
     const int tv = padded_row(s, k, t, pad);
-    float val;
-    if (!(a != 0.0f && s.z_taps > 0 && !pad && z_kernel_value(s, k, t, z_weights(s, k, a), c, false, false, 0.f, 0.f, val))) {
+    float val, zw[8];
+    if (!(a != 0.0f && s.z_taps > 0 && !pad && z_kernel_value(s, k, t, z_weights(s, k, a, zw), c, false, false, 0.f, 0.f, val))) {
         val = flat_field(s, k, tv, c);
         if (a != 0.0f) val = add(mul(sub(1.0f, a), val), mul(a, flat_field(s, k, tv + 1, c)));
     }
@@ -154,8 +181,8 @@ HR_HD void measured_column(const AccumScanView& s, int k, int t0, int c, const A
     row_position(s, k, t0, c, t, a);
     const int base_row = s.row0[k] + t;
     if (base_row < 0 || base_row >= s.det_rows || (a > 0.f && base_row + 1 >= s.det_rows)) return;
-    float kv;
-    if (a > 0.f && s.z_taps > 0 && z_kernel_value(s, k, t, z_weights(s, k, a), c, true, p.log_values, p.log_clip_min, p.log_clip_max, kv)) {
+    float kv, zw[8];
+    if (a > 0.f && s.z_taps > 0 && z_kernel_value(s, k, t, z_weights(s, k, a, zw), c, true, p.log_values, p.log_clip_min, p.log_clip_max, kv)) {
         // every row is measured: the kernel's value with the linear weight
         const float fac = s.weight_factor[k];
         const float w0 = mul(mul(s.weight[static_cast<std::size_t>(base_row) * s.det_cols + c], fac), sub(1.f, a));

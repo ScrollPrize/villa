@@ -1,6 +1,7 @@
 #include <cufft.h>
 
 #include "cuda_utils.cuh"
+#include "common/detector_map_core.hpp"
 #include "common/interp_core.hpp"
 #include "common/sino_core.hpp"
 #include "helirec/sino.hpp"
@@ -128,6 +129,111 @@ void shift_rows(float* rows, int n_rows, int n, float shift, void* stream, const
             HELIREC_CUDA_CHECK(cudaMemcpyAsync(a, w, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
     }
     HELIREC_CUDA_CHECK(cudaGetLastError());
+}
+
+namespace {
+// the rows' transforms A (n_rows, nc) times `factor` (nc), laid in the nco bins of the oversampled transform
+__global__ void resample_spread_kernel(const cufftComplex* A, cufftDoubleComplex* B, int n_rows, int nc, int nco, int L,
+                                       const double* factor) {
+    const size_t total = static_cast<size_t>(n_rows) * nco;
+    for (size_t q = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; q < total; q += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int k = static_cast<int>(q % nco);
+        cufftDoubleComplex v = make_cuDoubleComplex(0.0, 0.0);
+        if (k < nc) {
+            const cufftComplex a = A[(q / nco) * nc + k];   // (the Nyquist bin of a real row is real)
+            v = make_cuDoubleComplex(hd::dmul(a.x, factor[k]), 2 * k == L ? 0.0 : hd::dmul(a.y, factor[k]));
+        }
+        B[q] = v;
+    }
+}
+// g (n_rows, So): the oversampled rows (M samples each); rows (n_rows, S): sample j of row r <- its value at
+// positions[r n + j], or at the position its detector map gives (row, geo). A thread takes B consecutive samples
+// of a row (what a row's positions share is computed once for them).
+__global__ void resample_gather_kernel(const double* g, float* rows, int n_rows, int n, int S, int So, int M, const double* positions,
+                                       const ResampleRow* row, ResampleGeometry geo, const double* kernel) {
+    constexpr int B = resample_block;
+    const int strips = (n + B - 1) / B;
+    const size_t total = static_cast<size_t>(n_rows) * strips;
+    for (size_t q = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; q < total; q += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const size_t r = q / strips;
+        const int j0 = static_cast<int>(q % strips) * B;
+        double X[B], p[B], v[B];
+        const int count = n - j0 < B ? n - j0 : B;
+        if (positions) {
+            for (int l = 0; l < B; ++l) p[l] = l < count ? positions[r * n + j0 + l] : 0.0;
+        } else {
+            const ResampleRow w = row[r];
+            for (int l = 0; l < B; ++l) X[l] = static_cast<double>(j0 + l) - static_cast<double>(w.shift);
+            map_core::source<B>(geo.map, w.y, w.row_slope, geo.slope_col, w.col_scale, geo.scale_col, w.row_scale, geo.scale_row, X, p, v);
+        }
+        sino_core::resample_values<B>(g + r * So, M, p, kernel, rows + r * S + j0, count);
+    }
+}
+
+// the oversampled transform back, in batches as RowShifter's, and the kernel's factors
+struct RowResampler {
+    int L = 0, batch = 0;
+    cufftHandle inv = 0;
+    DeviceBuffer<double> grid, factor, kernel;
+    ~RowResampler() { release(); }
+    void release() {
+        if (inv) { cufftDestroy(inv); inv = 0; }
+    }
+    void ensure(int n, int l, int b) {
+        if (l == L && b == batch) return;
+        release();
+        L = l; batch = b;
+        int m = resample_oversampling * L, cplx = m / 2 + 1, real = 2 * cplx;
+        check(cufftPlanMany(&inv, 1, &m, &cplx, 1, cplx, &real, 1, real, CUFFT_Z2D, batch), "plan Z2D (resample)");
+        grid.ensure(static_cast<size_t>(batch) * real);
+        const std::vector<double> f = resample_deconvolution(n);
+        factor.upload(f.data(), f.size());
+        kernel.upload(resample_kernel().data(), resample_kernel().size());
+        HELIREC_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    }
+};
+
+void resample_rows_at(float* rows, int n_rows, int n, const double* positions, const ResampleRow* row, const ResampleGeometry& geo,
+                      void* stream) {
+    if (n_rows <= 0 || n <= 1) return;
+    cudaStream_t s = as_stream(stream);
+    thread_local RowShifter U;
+    thread_local RowResampler V;
+    const int L = upsample_fft_length(n), S = shift_row_stride(n), nc = L / 2 + 1;
+    const int M = resample_oversampling * L, nco = M / 2 + 1, So = 2 * nco;
+    U.ensure(L, 4096);
+    V.ensure(n, L, U.batch);
+    check(cufftSetStream(U.fwd, s), "stream");
+    check(cufftSetStream(V.inv, s), "stream");
+    shift_bridge_kernel<<<grid_for(static_cast<size_t>(n_rows) * (L - n)), 256, 0, s>>>(rows, n_rows, n, L, S);
+    for (int r0 = 0; r0 < n_rows; r0 += U.batch) {
+        const int nr = std::min(U.batch, n_rows - r0);
+        float* a = rows + static_cast<size_t>(r0) * S;
+        float* w = a;
+        if (nr < U.batch) {   // (the spare rows of the buffer: zero, so that every transform stays finite)
+            w = U.tail.data();
+            HELIREC_CUDA_CHECK(cudaMemcpyAsync(w, a, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
+            HELIREC_CUDA_CHECK(cudaMemsetAsync(w + static_cast<size_t>(nr) * S, 0, static_cast<size_t>(U.batch - nr) * S * sizeof(float), s));
+        }
+        check(cufftExecR2C(U.fwd, w, reinterpret_cast<cufftComplex*>(w)), "R2C (resample)");
+        cufftDoubleComplex* B = reinterpret_cast<cufftDoubleComplex*>(V.grid.data());
+        resample_spread_kernel<<<grid_for(static_cast<size_t>(U.batch) * nco), 256, 0, s>>>(reinterpret_cast<cufftComplex*>(w), B, U.batch,
+                                                                                         nc, nco, L, V.factor.data());
+        check(cufftExecZ2D(V.inv, B, V.grid.data()), "Z2D (resample)");
+        resample_gather_kernel<<<grid_for(static_cast<size_t>(nr) * ((n + resample_block - 1) / resample_block)), 256, 0, s>>>(
+            V.grid.data(), a, nr, n, S, So, M, positions ? positions + static_cast<size_t>(r0) * n : nullptr, row ? row + r0 : nullptr, geo,
+            V.kernel.data());
+    }
+    HELIREC_CUDA_CHECK(cudaGetLastError());
+}
+}  // namespace
+
+void resample_rows(float* rows, int n_rows, int n, const double* positions, void* stream) {
+    resample_rows_at(rows, n_rows, n, positions, nullptr, ResampleGeometry{}, stream);
+}
+
+void resample_rows(float* rows, int n_rows, int n, const ResampleRow* row, const ResampleGeometry& g, void* stream) {
+    resample_rows_at(rows, n_rows, n, nullptr, row, g, stream);
 }
 
 __global__ void bspline_prefilter_kernel(const float* in, float* out, int n_rows, int n, int degree) {
