@@ -771,6 +771,22 @@ private:
                                          const QString& pendingSolveMessage,
                                          const ControlPointEdit& edit,
                                          std::vector<size_t>* changedGoalOwners = nullptr);
+    // Edits of one action applied to the session and not stored yet: the
+    // action's last edit stores them all in one save.
+    struct HeldControlEdits {
+        std::string surfaceName;
+        std::vector<vc3d::line_annotation::LineControlPoint> controlsBefore;
+        std::vector<std::pair<cv::Vec3d, ControlPointEdit>> edits;
+    };
+    std::optional<HeldControlEdits> _heldControlEdits;
+    bool _holdControlEditSave = false;
+    bool _heldControlEditsReverted = false;
+    bool _gapEditActive = false;
+    // Stores held edits no later edit stored; false if they were taken back.
+    bool flushHeldControlEdits(const std::string& surfaceName);
+    // A stored edit shown: mirrored to the fiber's other panes, overlays.
+    void showPersistedControlPointEdit(PaneRecord& editedPane, const cv::Vec3d& editedPoint,
+                                       const ControlPointEdit& edit);
     // Whether adding `tag` to the control (or the matching control of any
     // other pane showing this fiber, or of their rollback snapshots) would
     // combine the kollesis and break tags.
@@ -1539,6 +1555,9 @@ private:
     [[nodiscard]] std::shared_ptr<vc::lasagna::LasagnaDataset>
         resolveAlignmentMetricsDataset();
     void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
+    // A landing's request: the stored fiber is read on a worker first.
+    void requestFiberAlignmentMetricsAfterWorkerRead(uint64_t fiberId);
+    std::unordered_set<uint64_t> _alignmentMetricWorkerReads;
     // stillValid (optional): a failed metadata save shows a modal; false
     // right after it returns without scheduling the autosave.
     void saveFiberDisplayAnnotations(LineAnnotationSession& session,

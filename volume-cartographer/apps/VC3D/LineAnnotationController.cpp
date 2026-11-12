@@ -2148,7 +2148,12 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     } else {
         connectSessionEditing(dialog, surfaceName);
     }
-    connect(dialog, &QObject::destroyed, this, [this, surfaceName]() {
+    connect(dialog, &QObject::destroyed, this, [this, surfaceName, dialog]() {
+        // Emitted from the widget's destructor, after the dialog's own
+        // members are gone: the cleanup installs a running save and applies
+        // queued edits, none of which may reach the dialog any more.
+        for (auto& pane : _panes)
+            if (pane.dialog.data() == dialog) pane.dialog = nullptr;
         cleanupSurfaceName(surfaceName);
     });
 
@@ -8824,11 +8829,25 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
         changedGoalOwners->clear();
     }
 
+    if (_holdControlEditSave) {
+        // One of several edits of one action (a gap tags both of its ends):
+        // applied to the session only, stored by the action's last edit in
+        // one save. Nothing else sees it before that save.
+        if (!_heldControlEdits) _heldControlEdits = HeldControlEdits{surfaceName, controlsBeforeEdit, {}};
+        _heldControlEdits->edits.emplace_back(editedPoint, edit);
+        if (changedGoalOwners) *changedGoalOwners = std::move(goalOwnersChanged);
+        return true;
+    }
+    // The action's earlier edits are stored by this save, and taken back
+    // with this edit if it cannot be made.
+    std::optional<HeldControlEdits> earlier;
+    if (_heldControlEdits && _heldControlEdits->surfaceName == surfaceName) earlier = std::move(_heldControlEdits);
+    _heldControlEdits.reset();
+
     // The tag is fiber content: publish it to the store.
-    // Reading the session for the save first waits for a running save (a gap
-    // tags both of its ends, one after the other); if that one failed, its
-    // warning (modal) can let a reconcile discard this pane: the session is
-    // kept alive across it and the pane looked up again.
+    // Reading the session for the save first waits for a running save; if
+    // that one failed, its warning (modal) can let a reconcile discard this
+    // pane: the session is kept alive across it and the pane looked up again.
     const std::shared_ptr<LineAnnotationSession> held = pane->session;
     try {
         StoredFiber localFiber = storedFiberFromSession(session);
@@ -8846,7 +8865,8 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
         // Nothing persisted: put the session back so what is shown and
         // enforced matches the stored fiber, and so the same toggle can be
         // retried (setControlPointTag would otherwise report no change).
-        session.controlPoints = controlsBeforeEdit;
+        session.controlPoints = earlier ? earlier->controlsBefore : controlsBeforeEdit;
+        if (earlier) _heldControlEditsReverted = true;
         showError(tr("Could not save fiber after tagging the control point: %1")
                       .arg(QString::fromStdString(ex.what())),
                   session.suppressErrorDialogs);
@@ -8856,6 +8876,46 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
     if (changedGoalOwners) {
         *changedGoalOwners = std::move(goalOwnersChanged);
     }
+
+    if (earlier)
+        for (const auto& [point, earlierEdit] : earlier->edits) showPersistedControlPointEdit(*pane, point, earlierEdit);
+    showPersistedControlPointEdit(*pane, editedPoint, edit);
+    return true;
+}
+
+bool LineAnnotationController::flushHeldControlEdits(const std::string& surfaceName)
+{
+    if (!_heldControlEdits) return true;
+    const auto earlier = std::move(*_heldControlEdits);
+    _heldControlEdits.reset();
+    auto* pane = paneForSurface(earlier.surfaceName);
+    if (earlier.surfaceName != surfaceName || !pane || !pane->session) return false;
+    const std::shared_ptr<LineAnnotationSession> held = pane->session;
+    auto& session = *held;
+    try {
+        StoredFiber localFiber = storedFiberFromSession(session);
+        pane = paneForSurface(surfaceName);
+        if (!pane || pane->session != held) return false;
+        std::vector<FiberSaveSnapshot> snapshots{makeFiberSaveSnapshot(localFiber)};
+        if (!publishInBackground(snapshots)) commitFibers({&localFiber});
+        session.fiberMetricsMatchStoredFiber = true;
+    } catch (const std::exception& ex) {
+        session.controlPoints = earlier.controlsBefore;
+        showError(tr("Could not save fiber after tagging the control point: %1")
+                      .arg(QString::fromStdString(ex.what())),
+                  session.suppressErrorDialogs);
+        return false;
+    }
+    for (const auto& [point, edit] : earlier.edits) showPersistedControlPointEdit(*pane, point, edit);
+    return true;
+}
+
+void LineAnnotationController::showPersistedControlPointEdit(PaneRecord& editedPane,
+                                                            const cv::Vec3d& editedPoint,
+                                                            const ControlPointEdit& edit)
+{
+    auto* pane = &editedPane;
+    auto& session = *pane->session;
 
     // The same fiber can be open in another pane (an intersection-inspection
     // side, or a second dialog). Those sessions hold their own control
@@ -8923,7 +8983,6 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
             true,
             generatedSpanAlignmentMetricsForSession(session));
     }
-    return true;
 }
 
 
@@ -9272,6 +9331,35 @@ void LineAnnotationController::handleGeneratedSpanSetGap(
     });
     const QString pendingMessage = tr("A line optimization is pending; wait for it to finish "
                                       "before changing the gap.");
+    // Both ends are stored by one save: every end but the last is applied
+    // to the session only (held), the last one's save carries them all. An
+    // exit before that save stores what was held; if the save cannot be
+    // made, the held ends are taken back with it and nothing is re-solved.
+    // One such action at a time: a warning inside it is modal, and a queued
+    // edit drained from that loop would share (and reset) what is held here.
+    // The drain waits for this action and is scheduled again when it ends.
+    if (_gapEditActive) return;
+    _gapEditActive = true;
+    _heldControlEdits.reset();
+    _heldControlEditsReverted = false;
+    const auto storeHeld = qScopeGuard([this, surfaceName, &changedGapOwners]() {
+        _holdControlEditSave = false;
+        if (!flushHeldControlEdits(surfaceName) || _heldControlEditsReverted) changedGapOwners.clear();
+        _heldControlEditsReverted = false;
+        _gapEditActive = false;
+        scheduleDeferredControlEdits();
+    });
+    const auto tagEnds = [&](const std::vector<size_t>& todo, bool tagged) {
+        for (size_t i = 0; i < todo.size(); ++i) {
+            std::vector<size_t> owners;
+            _holdControlEditSave = i + 1 < todo.size();
+            const bool ok = setControlPointTagAndPersist(surfaceName, todo[i], vc3d::line_annotation::kBreakTag,
+                                                         tagged, pendingMessage, &owners);
+            _holdControlEditSave = false;
+            if (!ok) return;
+            collect(owners);
+        }
+    };
     if (enabled) {
         // Both ends become breaks. A break at or immediately next to a
         // kollesis termination is refused altogether.
@@ -9291,21 +9379,17 @@ void LineAnnotationController::handleGeneratedSpanSetGap(
                 return;
             }
         }
+        std::vector<size_t> todo;
         for (const size_t end : ends) {
-            if (vc3d::line_annotation::hasControlPointTag(session.controlPoints[end].tags,
-                                                          vc3d::line_annotation::kBreakTag)) {
-                continue;
+            if (!vc3d::line_annotation::hasControlPointTag(session.controlPoints[end].tags,
+                                                           vc3d::line_annotation::kBreakTag)) {
+                todo.push_back(end);
             }
-            std::vector<size_t> owners;
-            if (!setControlPointTagAndPersist(surfaceName, end,
-                                              vc3d::line_annotation::kBreakTag, true,
-                                              pendingMessage, &owners)) {
-                return;
-            }
-            collect(owners);
         }
+        tagEnds(todo, true);
     } else {
         // Remove the break only from ends no other gap span depends on.
+        std::vector<size_t> todo;
         for (const size_t end : ends) {
             bool needed = false;
             for (const auto& span : spansBefore) {
@@ -9321,14 +9405,9 @@ void LineAnnotationController::handleGeneratedSpanSetGap(
                                                            vc3d::line_annotation::kBreakTag)) {
                 continue;
             }
-            std::vector<size_t> owners;
-            if (!setControlPointTagAndPersist(surfaceName, end,
-                                              vc3d::line_annotation::kBreakTag, false,
-                                              pendingMessage, &owners)) {
-                return;
-            }
-            collect(owners);
+            todo.push_back(end);
         }
+        tagEnds(todo, false);
     }
 }
 
@@ -11897,7 +11976,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         session.fiberMetricsMatchStoredFiber &&
         !hasCachedAlignmentForFiber(session.fiberId) &&
         !isAlignmentPendingForFiber(session.fiberId)) {
-        requestFiberAlignmentMetrics(session.fiberId);
+        requestFiberAlignmentMetricsAfterWorkerRead(session.fiberId);
     }
     // Every line publish is followed by a solve-activity report, so the
     // dialog's overview bar can confirm the geometry whatever path published
@@ -13165,6 +13244,9 @@ void LineAnnotationController::scheduleDeferredControlEdits()
 
 void LineAnnotationController::drainDeferredControlEdits()
 {
+    // A gap action in progress (inside its modal warning) ends first; it
+    // schedules this drain again.
+    if (_gapEditActive) return;
     // In order per pane; a pane that is still busy keeps its edits (and their
     // order) for its next landing.
     std::set<std::string> waiting;
@@ -13206,6 +13288,67 @@ void LineAnnotationController::drainDeferredControlEdits()
         edit.replay(indices);
         if (auto* after = paneForSurface(surfaceName); after && after->session) syncDialogLineSolveActivity(*after->session);
     }
+}
+
+void LineAnnotationController::requestFiberAlignmentMetricsAfterWorkerRead(uint64_t fiberId)
+{
+    // A landing asks for the metrics of the fiber it shows. On a hosted
+    // store the stored fiber may have to be decoded first (several requests):
+    // that read runs on a worker and is merged into the decode cache, and
+    // the ordinary request, made afterwards, finds it there. The request
+    // itself is unchanged: it still validates what it reads.
+    const auto connection = _state ? _state->objectStoreSession() : nullptr;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
+    const auto uuid = fiberUuidForId(fiberId);
+    if (!connection || !attachment || !connection->hosted(*attachment) || uuid.empty() ||
+        QThread::currentThread() != thread()) {
+        requestFiberAlignmentMetrics(fiberId);
+        return;
+    }
+    if (!_alignmentMetricWorkerReads.insert(fiberId).second) return;
+    struct Load {
+        FiberReadContext read;
+        WorkerFiberIds ids;
+        bool ok = false;
+    };
+    auto load = std::make_shared<Load>();
+    load->read.connection = connection;
+    load->read.attachment = attachment;
+    load->read.hasVolume = bool(_state->currentVolume());
+    load->read.target = _state->annotationVolume().value_or(vc::project::AnnotationVolume{});
+    seedWorkerFiberRead(load->read, load->ids);
+    const auto generation = _packageGeneration;
+    auto* watcher = new QFutureWatcher<void>(this);
+    connect(watcher, &QFutureWatcher<void>::finished, this, [this, watcher, load, fiberId, generation] {
+        watcher->deleteLater();
+        _alignmentMetricWorkerReads.erase(fiberId);
+        if (generation != _packageGeneration || !_state || _state->storeFor("fiber") != load->read.attachment) return;
+        if (load->ok) {
+            assignWorkerFiberIds(load->ids);
+            remapWorkerFiberCache(load->read, load->ids);
+            mergeWorkerFiberRead(load->read);
+            if (load->read.snapshotsInvalidated) _sideStripStoredSnapshotCache.clear();
+        }
+        // Asked again as the landing asked: only for a pane that still shows
+        // the stored fiber, and only if nothing answered in the meantime.
+        const auto pane = std::find_if(_panes.begin(), _panes.end(), [&](const PaneRecord& candidate) {
+            return candidate.session && candidate.session->fiberId == fiberId &&
+                candidate.session->fiberMetricsMatchStoredFiber && !candidate.session->inspectionFrameOnly &&
+                !candidate.session->modelOnly;
+        });
+        if (pane == _panes.end() || hasCachedAlignmentForFiber(fiberId) || isAlignmentPendingForFiber(fiberId)) return;
+        requestFiberAlignmentMetricsForFibers({fiberId});
+    });
+    watcher->setFuture(QtConcurrent::run([load, uuid] {
+        // Best effort: without it the request decodes what it needs itself.
+        try {
+            useWorkerFiberIds(load->read, load->ids);
+            (void)storedFibersInContext(load->read, std::vector<std::string>{uuid}, true);
+            load->ok = true;
+        } catch (const std::exception&) {
+        }
+        load->read.idForUuid = {};
+    }));
 }
 
 bool LineAnnotationController::publishInBackground(std::vector<FiberSaveSnapshot>& snapshots)

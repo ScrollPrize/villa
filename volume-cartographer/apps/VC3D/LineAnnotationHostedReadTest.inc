@@ -543,11 +543,17 @@
                 publishing.handleGeneratedControlPointSetBreak(live->surfaceName, 1, false);
                 settle("the tag removal is published");
                 require(publishing._fiberSaveFailureCount == before, "the tag is removed again");
-                // A gap tags both of its ends, one save after the other: the
-                // second follows the first instead of conflicting with it.
+                // A gap tags both of its ends in one save: the GUI thread
+                // never waits for the first end's save to store the second.
                 const auto first = live->controlPoints.at(0).volumePoint, second = live->controlPoints.at(1).volumePoint;
+                const auto commitBeforeGap = stored().graphCommit;
+                require(bool(commitBeforeGap), "the stored fiber names its commit before the gap");
                 publishing.handleGeneratedSpanSetGap(live->surfaceName, 0, 1, true);
+                require(bool(publishing._publication) && !publishing._heldControlEdits,
+                        "a gap's save runs in the background");
                 settle("the gap is published");
+                require(stored().graphCommit && *stored().graphCommit == *commitBeforeGap + 1,
+                        "both ends of a gap are stored by one save");
                 const auto gapped = stored();
                 const auto isBreak = [&](const cv::Vec3d& where) {
                     const auto found = std::find_if(gapped.controlPoints.begin(), gapped.controlPoints.end(),
