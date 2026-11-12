@@ -38,6 +38,16 @@ Local files and ranged HTTP/S3/SFTP sources, including indexed Zarr shards, use 
 
 ## Lock profiling
 
+### Shared chunk-load coordination
+
+Whole-chunk and channel-selective decoded reads use the same per-key in-flight result, across reader instances and local, remote, or computed sources. The key includes the decoded-cache quality namespace. A short-lived registration entry shares the producer's result or exception with concurrent waiters; failures do not poison subsequent retries. Partial results can supply the requested channel planes; another request loads only planes still missing. Resident cache hits bypass registration entirely.
+
+Registration maps use independent hash shards (hardware concurrency by default), like the decoded LRU, but do not share its locks. No registration lock covers source I/O, decoding, cache admission, or waiting on another producer. Different chunks that hash to the same shard only serialize their brief registration/completion steps, not their source work. Cache-only requests return a miss rather than wait on an active source load. Explicit caller-thread-only computed sources retain caller-thread execution. Uncached raw range streaming retains bounded range reads rather than materializing an entire chunk just to share it.
+
+See [coordination benchmarks](../benchmarks/singleflight.md) for reproducible whole/selected read cases and sustained contention tests, including oversubscribed users.
+
+For sampled producer/waiter/queued-task counts on real workloads, see [coordination profiling](coordination-profiling.md).
+
 C++ callers can opt in with `MemoryCache::enable_profiling()` and read `profile()` snapshots. Counters distinguish acquisition wait and time holding shard mutexes for get, put, erase and clear, aggregated across shards. Memory-availability probe time and refresh call counts are separate. The legacy `refresh` lock-timing member is zero in the sharded implementation: pressure trimming across shards is not currently instrumented. Profiling is off by default; enabled timing uses the real steady clock, independently of the injectable budget clock. Counters are updated under the owning mutex without another counter lock. Clock reads and counter updates perturb the measured workload, so compare a profiling-disabled control. Wait times sum across threads: they are not wall-clock percentages. Two readers sharing a cache report the same counters; do not sum those snapshots twice.
 
 ## Validation

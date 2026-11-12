@@ -413,7 +413,6 @@ public:
         for (auto c : channels)
             if (c < 0 || c >= spec_.shape[0]) throw std::out_of_range("cache channel outside array");
         channel_policy_->relevant.insert(channels.begin(), channels.end());
-        if (!channel_policy_->reads) channel_policy_->reads = std::make_unique<std::array<std::mutex,256>>();
         channel_policy_->enabled.store(true, std::memory_order_release);
     }
     bool channel_cache_enabled() const noexcept { return channel_policy_->enabled.load(std::memory_order_acquire); }
@@ -673,6 +672,7 @@ public:
     void sample_interpolated_coordinates(const Coordinates& coords, std::size_t n,
         const ElementType& type, const Policy& policy, std::uint8_t* missing = nullptr)
     {
+        diagnostics::Scope planning(diagnostics::Planning);
         static_assert(Policy::custom && Policy::components>0);
         if (ndim()>kMaxSampleDims) throw std::invalid_argument("sample() supports at most 16 dimensions");
         for(std::size_t c=0;c<Policy::components;++c)
@@ -743,42 +743,9 @@ public:
     ChunkPtr chunk(const Index& idx)
     {
         check_chunk_index(idx);
-        if (channel_policy_->enabled.load(std::memory_order_acquire))
-            return selected_span(idx, all_channels(), false).second;
-        const std::string k = key(idx);
-        const std::string ck = spec_.identity + "|" + k;
-        if (cache_) {
-            auto [found, chunk] = cache_->get(ck);
-            if (found) {
-                ++stats_.memory_hits;
-                return chunk;
-            }
-        }
-        if (writes_) {
-            auto [found, chunk] = writes_->pending(k);
-            if (found) {
-                ++stats_.pending_hits;
-                return chunk;
-            }
-        }
-        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
-            if (auto chunk = read_layer_chunk(li, k)) {
-                ++stats_.disk_hits;
-                if (cache_)
-                    cache_->put(ck, *chunk);
-                return *chunk;
-            }
-        }
-        if (spec_.offline) {
-            if (spec_.offline_fill) {
-                offline_miss(idx, ck);
-                return nullptr;
-            }
-            throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-        }
-        if (!http_ && !source_ && !spec_.compute)
-            return nullptr;
-        return fetch(idx, k, ck);
+        if(channel_policy_->enabled.load(std::memory_order_acquire))
+            return selected_span(idx,all_channels(),false).second;
+        return full_span(idx,false).second;
     }
 
     // Copy a full decoded chunk, including stored padding at the array edge, or
@@ -805,40 +772,9 @@ public:
     std::pair<bool, ChunkPtr> cached_chunk(const Index& idx)
     {
         check_chunk_index(idx);
-        if (channel_policy_->enabled.load(std::memory_order_acquire))
-            return selected_span(idx, all_channels(), true);
-        const std::string k = key(idx);
-        const std::string ck = spec_.identity + "|" + k;
-        if (cache_) {
-            auto found = cache_->get(ck);
-            if (found.first) {
-                ++stats_.memory_hits;
-                return found;
-            }
-        }
-        if (writes_) {
-            auto found = writes_->pending(k);
-            if (found.first) {
-                ++stats_.pending_hits;
-                return found;
-            }
-        }
-        bool store = false;  // the array's own store, its source
-        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
-            if (spec_.layers[li].kind == "array") {
-                store = true;
-                continue;
-            }
-            if (auto chunk = read_layer_chunk(li, k)) {
-                ++stats_.disk_hits;
-                if (cache_)
-                    cache_->put(ck, *chunk);
-                return {true, *chunk};
-            }
-        }
-        if (!store && !http_ && !source_ && !spec_.compute && !spec_.offline)
-            return {true, nullptr};  // no source: nothing is stored
-        return {false, nullptr};
+        if(channel_policy_->enabled.load(std::memory_order_acquire))
+            return selected_span(idx,all_channels(),true);
+        return full_span(idx,true);
     }
 
     // Whether fetching chunks may touch the network (a remote source that is not offline).
@@ -940,6 +876,8 @@ private:
              const BoxOutput* output = nullptr, bool stream = false, const std::atomic<bool>* cancel = nullptr,
              std::vector<std::uint8_t>* resolved = nullptr)
     {
+        diagnostics::SchedulerStageScope stage(diagnostics::SchedulerStage::Resolve);
+        diagnostics::Scope chunkBatch(diagnostics::ChunkBatch);
         const auto cancelled = [cancel] { return cancel && cancel->load(std::memory_order_acquire); };
         if (spec_.hint && (!cache_ || stream))
             pool_->parallel_for(work.size(), [&](std::size_t i) {
@@ -987,6 +925,7 @@ private:
     template <std::size_t N = 0, class Locate>
     std::vector<Work> plan_points(std::size_t n, std::vector<Point>& points, std::vector<Run>& runs, Locate&& locate)
     {
+        diagnostics::SchedulerStageScope stage(diagnostics::SchedulerStage::Planning);
         const std::size_t nd = N ? N : spec_.shape.size();
         const std::size_t segs = plan_segments(n);
         struct Entry {
@@ -1183,6 +1122,7 @@ private:
     template <class Fn>
     void for_points(std::span<const Point> pts, Fn&& fn)
     {
+        diagnostics::SchedulerStageScope stage(diagnostics::SchedulerStage::Interpolation);
         const std::size_t parts = pts.size() / kPlanGrain;
         if (parts < 2) {
             fn(pts);
@@ -1198,6 +1138,7 @@ private:
     template <class Fn>
     void for_runs(std::span<const Run> runs, Fn&& fn)
     {
+        diagnostics::SchedulerStageScope stage(diagnostics::SchedulerStage::Interpolation);
         std::uint64_t total = 0;
         for (const Run& r : runs)
             total += r.count;
@@ -1365,8 +1306,11 @@ private:
             cell_of<N>(c,nd,cell,coords);
             if constexpr(Policy::custom)policy.prepare_cell(cell);
         };
-        const auto interpolate=[&](const auto& cell,auto&& read) {
-            if constexpr(Policy::custom)return policy.evaluate(cell,read);
+        const auto interpolate=[&](const auto& cell,auto&& read,std::size_t p) {
+            if constexpr(Policy::custom) {
+                if constexpr(requires { policy.evaluate(cell,read,p); })return policy.evaluate(cell,read,p);
+                else return policy.evaluate(cell,read);
+            }
             else return sampling::interpolate(cell,[&](std::size_t corner){return read(corner,0);});
         };
         struct Split {
@@ -1390,14 +1334,14 @@ private:
         if (missing)
             std::fill_n(missing, n, std::uint8_t{0});
         // A point whose neighbours all lie in the chunk at `at`'s; `at` is the near corner.
-        const auto value = [&](const Cell<N,Real>& cell, std::int64_t src,auto&& element) {
+        const auto value = [&](const Cell<N,Real>& cell, std::int64_t src,auto&& element,std::size_t p) {
             if constexpr(Policy::custom) {
                 return interpolate(cell,[&](std::size_t corner,std::size_t c){
                     auto displacement=componentBytes[c];
                     for(std::size_t a=0;a<cell.k;++a)
                         if(corner>>a&1)displacement+=chunk_strides_[cell.axes[a]];
                     return load(element(src+displacement));
-                });
+                },p);
             } else {
             const auto* at=element(src);
             if (nd == 3 && cell.k == 3)
@@ -1538,7 +1482,7 @@ private:
                             continue;
                         }
                         cellAt(coords(pt.tag, coordinate),cell);
-                        store(pt.tag, value(cell,pt.src,element));
+                        store(pt.tag, value(cell,pt.src,element,pt.tag));
                     }
                 });
                 if (w.runs.empty())
@@ -1550,7 +1494,7 @@ private:
                     for (const Run& r : part)
                         for (std::uint64_t p = r.first; p < r.first + r.count; ++p) {
                             cellAt(coords(p, coordinate),cell);
-                            store(p, value(cell,offset_in<N>(cell.lo, chunk.data()),element));
+                            store(p, value(cell,offset_in<N>(cell.lo, chunk.data()),element,p));
                         }
                 });
             };
@@ -1571,12 +1515,12 @@ private:
                     if (pt.tag & kSplit)
                         continue;  // its raw slot holds fill already
                     cellAt(coords(pt.tag, coordinate),cell);
-                    store(pt.tag, interpolate(cell, [&](std::size_t,std::size_t) { return fill; }));
+                    store(pt.tag, interpolate(cell, [&](std::size_t,std::size_t) { return fill; },pt.tag));
                 }
                 for (const Run& r : w.runs)
                     for (std::uint64_t p = r.first; p < r.first + r.count; ++p) {
                         cellAt(coords(p, coordinate),cell);
-                        store(p, interpolate(cell, [&](std::size_t,std::size_t) { return fill; }));
+                        store(p, interpolate(cell, [&](std::size_t,std::size_t) { return fill; },p));
                     }
             };
             if (missing) {
@@ -1593,6 +1537,7 @@ private:
                 };
             }
             run(work, {}, &op);
+            diagnostics::SchedulerStageScope splitStage(diagnostics::SchedulerStage::Interpolation);
             pool_->parallel_for(split.size(), [&](std::size_t s) {
                 Cell<N,Real> cell;
                 Coord coordinate[N ? N : kMaxSampleDims];
@@ -1607,7 +1552,7 @@ private:
                     }
                     const std::uint8_t* at = raw.data() + (base[s] + sp.first) * isz;
                     cellAt(coords(sp.p, coordinate),cell);
-                    store(sp.p, interpolate(cell, [&](std::size_t corner,std::size_t c) { return load(at + (corner*components+c) * isz); }));
+                    store(sp.p, interpolate(cell, [&](std::size_t corner,std::size_t c) { return load(at + (corner*components+c) * isz); },sp.p));
                 }
             });
         }
@@ -1622,140 +1567,185 @@ private:
         return out;
     }
 
+    std::shared_ptr<const ChunkLoad> chunk_result(bool available,ChunkPtr whole=nullptr) {
+        auto result=std::make_shared<ChunkLoad>();result->available=available;
+        result->complete=true;result->whole=std::move(whole);result->cache=cache_;return result;
+    }
+
+    // Called only by the producer for this exact physical/cache-quality key.
+    std::shared_ptr<const ChunkLoad> selected_now(const Index& idx,const std::string& k,
+        const std::string& ck,std::size_t plane,const std::vector<std::size_t>& missing,bool cached_only)
+    {
+        std::vector<std::size_t> relevant;
+        {
+            std::lock_guard lock(channel_policy_->mutex);
+            const auto base = idx[0]*spec_.chunks[0];
+            for (auto c : channel_policy_->relevant)
+                if (c >= base && c < base+spec_.chunks[0]) relevant.push_back(std::size_t(c-base));
+        }
+        std::optional<ChannelDecodeResult> decoded;
+        const auto split = [&](const ChunkPtr& whole) {
+            ChannelDecodeResult out;
+            auto keep = missing;
+            keep.insert(keep.end(), relevant.begin(), relevant.end());
+            std::sort(keep.begin(), keep.end());
+            keep.erase(std::unique(keep.begin(), keep.end()), keep.end());
+            for (auto c : keep) out.channels.push_back({c, whole ?
+                std::make_shared<const Chunk>(whole->begin()+c*plane, whole->begin()+(c+1)*plane) : nullptr});
+            return out;
+        };
+        // A caller may enable channel caching after a full chunk was cached.
+        if (cache_) {
+            auto whole = cache_->get(ck);
+            if (whole.first) { decoded = split(whole.second); cache_->erase(ck); ++stats_.memory_hits; }
+        }
+        if (!decoded && writes_) {
+            auto pending = writes_->pending(k);
+            if (pending.first) { decoded = split(pending.second); ++stats_.pending_hits; }
+        }
+        bool skipped_store = false;
+        for (std::size_t li = 0; !decoded && li < spec_.layers.size(); ++li) {
+            const auto& layer = spec_.layers[li];
+            if (cached_only && layer.kind == "array") { skipped_store = true; continue; }
+            const auto path = layer.root+"/"+k;
+            File file = [&]{diagnostics::Scope io(diagnostics::Io);return File::open_read(path);}();
+            if (!file) {
+                if (layer.kind == "array" || exists(marker_path(layer,k))) decoded = split(nullptr);
+                continue;
+            }
+            try {
+                platform::FileStat st;
+                const auto statResult=[&]{diagnostics::SourceElapsed elapsed(diagnostics::SchedulerMetric::FileStat);
+                    return platform::fstat(file.fd(),st);}();
+                if (statResult)
+                    throw std::system_error(errno,std::generic_category(),"stat "+path);
+                if (codecs_[li] == Codec::Delta3d && !layer.allow_lossy) {
+                    // Preserve the existing lossless-cache eligibility check.
+                    auto whole = read_layer_chunk(li,k);
+                    if (whole) decoded = split(*whole);
+                } else decoded = decode_channels(codecs_[li],chunk_bytes_,plane,missing,relevant,
+                    std::size_t(st.size),[&](auto off, auto size, auto* dst) {
+                        pread_exact(file.fd(),dst,size,std::int64_t(off),path);
+                    });
+                if (decoded) ++stats_.disk_hits;
+            } catch (const std::system_error&) {
+                throw;
+            } catch (const std::exception& error) {
+                corrupt(path,error);
+                if (layer.kind == "array") decoded = split(nullptr);
+            }
+        }
+        if (!decoded && cached_only && (skipped_store || http_ || source_ || spec_.compute || spec_.offline))
+            return chunk_result(false);
+        if (!decoded && spec_.offline) {
+            if (!spec_.offline_fill) throw CacheMiss("chunk "+k+" of "+spec_.identity+" is not cached (offline)");
+            offline_miss(idx,ck);
+            decoded = split(nullptr);
+        }
+        if (!decoded) {
+            if (spec_.compute) decoded = split(compute_now(idx,k));
+            else if (source_ || http_) {
+                // Whole-source requests retain the ordinary persistent cache
+                // behavior. Partial requests must never publish an incomplete
+                // compressed chunk under a full-chunk disk-cache key.
+                const bool random_access = remote_codec_ == Codec::Raw || remote_codec_ == Codec::Blosc;
+                if (!random_access || missing.size() == std::size_t(spec_.chunks[0]))
+                    decoded = split(fetch_now(k));
+                else try {
+                    if (source_) decoded = source_->read_channels(k,remote_codec_,chunk_bytes_,plane,missing,relevant);
+                    else {
+                        ZarrStorage remote(spec_.remote_url,"",spec_.separator,{},true,false,chunk_bytes_,
+                                           http_.get(),stats_.remote_fetches,stats_.remote_bytes);
+                        decoded = remote.read_channels(k,remote_codec_,chunk_bytes_,plane,missing,relevant);
+                    }
+                    if (!decoded) {
+                        ++stats_.remote_missing;
+                        queue_write(k,nullptr,64,[this,k] { store_missing(k); });
+                    }
+                    else if (!http_) ++stats_.disk_hits;
+                } catch (const ChannelDecodeError& error) {
+                    corrupt((source_ ? spec_.source_root : spec_.remote_url)+"/"+k,error);
+                    decoded = split(nullptr);
+                }
+            }
+            if (!decoded) decoded = split(nullptr);
+        }
+        for (auto& c : decoded->channels) {
+            if (cache_) cache_->put(ck+"|channel="+std::to_string(c.index),c.bytes);
+        }
+        stats_.channel_read_bytes += decoded->bytesRead;
+        stats_.channel_decoded_bytes += decoded->bytesDecoded;
+
+        auto result=std::make_shared<ChunkLoad>();result->cache=cache_;
+        result->channels=std::move(decoded->channels);return result;
+    }
+
     // The result spans first..last requested channel. Gaps are not read/decoded
     // and are never addressed by the work that requested this span. A single
     // channel returns its cache buffer directly, with no assembly/copy.
     std::pair<bool, ChunkPtr> selected_span(const Index& idx,
         const std::vector<std::size_t>& requested, bool cached_only,
-        std::vector<ChunkPtr>* planes = nullptr)
+        std::vector<ChunkPtr>* planes = nullptr,const std::shared_ptr<const ChunkLoad>& seed = {})
     {
-        const auto plane = std::size_t(chunk_strides_[0]);
-        const auto k = key(idx), ck = spec_.identity + "|" + k;
-        std::unique_lock flight((*channel_policy_->reads)[std::hash<std::string>{}(k)%channel_policy_->reads->size()],
-                                std::defer_lock);
-        const auto channel_key = [&](auto c) { return ck+"|channel="+std::to_string(c); };
+        const auto plane=std::size_t(chunk_strides_[0]);
+        const auto k=key(idx),ck=spec_.identity+"|"+k;
+        const auto channel_key=[&](auto c){return ck+"|channel="+std::to_string(c);};
         std::vector<ChunkPtr> channels(std::size_t(spec_.chunks[0]));
+        std::vector<bool> supplied(channels.size(),false);
+        if(seed)for(const auto& c:seed->channels){channels[c.index]=c.bytes;supplied[c.index]=true;}
         std::vector<std::size_t> missing;
-        for (auto c : requested) {
-            auto entry = cache_ ? cache_->get(channel_key(c)) : std::pair<bool,ChunkPtr>{false, {}};
-            if (entry.first) channels[c] = std::move(entry.second);
-            else missing.push_back(c);
+        for(auto c:requested) {
+            if(supplied[c])continue;
+            auto entry=cache_?cache_->get(channel_key(c)):std::pair<bool,ChunkPtr>{false,{}};
+            if(entry.first)channels[c]=std::move(entry.second);else missing.push_back(c);
         }
-        if (missing.empty()) ++stats_.memory_hits;
-        else {
-            // Hits never wait behind I/O; cache-only reads must not wait for an
-            // in-flight source read either. Recheck after acquiring the stripe.
-            if (cached_only) { if (!flight.try_lock()) return {false,nullptr}; }
-            else flight.lock();
-            if (cache_) {
-                std::vector<std::size_t> still_missing;
-                for (auto c : missing) {
-                    auto entry = cache_->get(channel_key(c));
-                    if (entry.first) channels[c] = std::move(entry.second);
-                    else still_missing.push_back(c);
-                }
-                missing = std::move(still_missing);
-            }
-            if (missing.empty()) ++stats_.memory_hits;
-            else {
-            std::vector<std::size_t> relevant;
-            {
-                std::lock_guard lock(channel_policy_->mutex);
-                const auto base = idx[0]*spec_.chunks[0];
-                for (auto c : channel_policy_->relevant)
-                    if (c >= base && c < base+spec_.chunks[0]) relevant.push_back(std::size_t(c-base));
-            }
-            std::optional<ChannelDecodeResult> decoded;
-            const auto split = [&](const ChunkPtr& whole) {
-                ChannelDecodeResult out;
-                auto keep = missing;
-                keep.insert(keep.end(), relevant.begin(), relevant.end());
-                std::sort(keep.begin(), keep.end());
-                keep.erase(std::unique(keep.begin(), keep.end()), keep.end());
-                for (auto c : keep) out.channels.push_back({c, whole ?
-                    std::make_shared<const Chunk>(whole->begin()+c*plane, whole->begin()+(c+1)*plane) : nullptr});
-                return out;
-            };
-            // A caller may enable channel caching after a full chunk was cached.
-            if (cache_) {
-                auto whole = cache_->get(ck);
-                if (whole.first) { decoded = split(whole.second); cache_->erase(ck); ++stats_.memory_hits; }
-            }
-            if (!decoded && writes_) {
-                auto pending = writes_->pending(k);
-                if (pending.first) { decoded = split(pending.second); ++stats_.pending_hits; }
-            }
-            bool skipped_store = false;
-            for (std::size_t li = 0; !decoded && li < spec_.layers.size(); ++li) {
-                const auto& layer = spec_.layers[li];
-                if (cached_only && layer.kind == "array") { skipped_store = true; continue; }
-                const auto path = layer.root+"/"+k;
-                File file = File::open_read(path);
-                if (!file) {
-                    if (layer.kind == "array" || exists(marker_path(layer,k))) decoded = split(nullptr);
-                    continue;
-                }
-                try {
-                    platform::FileStat st;
-                    if (platform::fstat(file.fd(),st))
-                        throw std::system_error(errno,std::generic_category(),"stat "+path);
-                    if (codecs_[li] == Codec::Delta3d && !layer.allow_lossy) {
-                        // Preserve the existing lossless-cache eligibility check.
-                        auto whole = read_layer_chunk(li,k);
-                        if (whole) decoded = split(*whole);
-                    } else decoded = decode_channels(codecs_[li],chunk_bytes_,plane,missing,relevant,
-                        std::size_t(st.size),[&](auto off, auto size, auto* dst) {
-                            pread_exact(file.fd(),dst,size,std::int64_t(off),path);
-                        });
-                    if (decoded) ++stats_.disk_hits;
-                } catch (const std::system_error&) {
-                    throw;
-                } catch (const std::exception& error) {
-                    corrupt(path,error);
-                    if (layer.kind == "array") decoded = split(nullptr);
-                }
-            }
-            if (!decoded && cached_only && (skipped_store || http_ || source_ || spec_.compute || spec_.offline))
-                return {false,nullptr};
-            if (!decoded && spec_.offline) {
-                if (!spec_.offline_fill) throw CacheMiss("chunk "+k+" of "+spec_.identity+" is not cached (offline)");
-                offline_miss(idx,ck);
-                decoded = split(nullptr);
-            }
-            if (!decoded) {
-                if (spec_.compute) decoded = split(compute_now(idx,k));
-                else if (source_ || http_) {
-                    // Whole-source requests retain the ordinary persistent cache
-                    // behavior. Partial requests must never publish an incomplete
-                    // compressed chunk under a full-chunk disk-cache key.
-                    const bool random_access = remote_codec_ == Codec::Raw || remote_codec_ == Codec::Blosc;
-                    if (!random_access || missing.size() == std::size_t(spec_.chunks[0]))
-                        decoded = split(fetch_now(k));
-                    else try {
-                        if (source_) decoded = source_->read_channels(k,remote_codec_,chunk_bytes_,plane,missing,relevant);
-                        else {
-                            ZarrStorage remote(spec_.remote_url,"",spec_.separator,{},true,false,chunk_bytes_,
-                                               http_.get(),stats_.remote_fetches,stats_.remote_bytes);
-                            decoded = remote.read_channels(k,remote_codec_,chunk_bytes_,plane,missing,relevant);
-                        }
-                        if (!decoded) {
-                            ++stats_.remote_missing;
-                            queue_write(k,nullptr,64,[this,k] { store_missing(k); });
-                        }
-                        else if (!http_) ++stats_.disk_hits;
-                    } catch (const ChannelDecodeError& error) {
-                        corrupt((source_ ? spec_.source_root : spec_.remote_url)+"/"+k,error);
-                        decoded = split(nullptr);
+        if(missing.empty())++stats_.memory_hits;
+        while(!missing.empty()) {
+            const auto produce=[&]()->std::shared_ptr<const ChunkLoad> {
+                if(cache_) {
+                    std::vector<std::size_t> still_missing;
+                    for(auto c:missing) {
+                        auto entry=cache_->get(channel_key(c));
+                        if(entry.first)channels[c]=std::move(entry.second);else still_missing.push_back(c);
                     }
+                    missing=std::move(still_missing);
                 }
-                if (!decoded) decoded = split(nullptr);
+                if(missing.empty()) {
+                    ++stats_.memory_hits;
+                    auto result=std::make_shared<ChunkLoad>();result->cache=cache_;
+                    for(auto c:requested)result->channels.push_back({c,channels[c]});
+                    return result;
+                }
+                return selected_now(idx,k,ck,plane,missing,cached_only);
+            };
+            std::shared_ptr<const ChunkLoad> loaded;
+            if(spec_.caller_thread_only)loaded=produce();
+            else {
+                auto claim=channel_policy_->reads.acquire(ck);
+                if(cached_only&&!claim.owner())return {false,nullptr};
+                loaded=claim.resolve(produce);
             }
-            for (auto& c : decoded->channels) {
-                channels[c.index] = c.bytes;
-                if (cache_) cache_->put(channel_key(c.index),c.bytes);
+            if(!loaded->available) {
+                if(cached_only)return {false,nullptr};
+                continue; // A cache-only producer could not consult the source.
             }
-            stats_.channel_read_bytes += decoded->bytesRead;
-            stats_.channel_decoded_bytes += decoded->bytesDecoded;
+            if(loaded->complete) {
+                for(auto c:missing) {
+                    channels[c]=loaded->whole?std::make_shared<const Chunk>(
+                        loaded->whole->begin()+c*plane,loaded->whole->begin()+(c+1)*plane):nullptr;
+                    if(cache_)cache_->put(channel_key(c),channels[c]);
+                }
+                if(cache_)cache_->erase(ck);
+                missing.clear();
+            } else {
+                for(const auto& c:loaded->channels) {
+                    channels[c.index]=c.bytes;
+                    if(cache_&&cache_.get()!=loaded->cache.get())cache_->put(channel_key(c.index),c.bytes);
+                }
+                std::erase_if(missing,[&](auto c){
+                    return std::any_of(loaded->channels.begin(),loaded->channels.end(),
+                        [&](const auto& value){return value.index==c;});
+                });
             }
         }
         if (planes) {
@@ -1958,7 +1948,7 @@ private:
                 check_raw_size(data.size(), chunk_bytes_);
                 return std::make_shared<const Chunk>(std::move(data));
             }
-            auto chunk = std::make_shared<Chunk>(chunk_bytes_);
+            auto chunk = std::make_shared<Chunk>(Chunk::Overwrite{},chunk_bytes_);
             decode(codecs_[li], data.data(), data.size(), chunk->data(), chunk_bytes_);
             return ChunkPtr(std::move(chunk));
         } catch (const std::exception& error) {
@@ -2045,7 +2035,7 @@ private:
         }
         const std::string k = key(w.idx);
         const std::string ck = spec_.identity + "|" + k;
-        if (cache_) {
+        if (stream&&cache_) {
             auto [found, chunk] = cache_->get(ck);
             if (found) {
                 ++stats_.memory_hits;
@@ -2053,7 +2043,7 @@ private:
                 return;
             }
         }
-        if (writes_) {  // fetched, but its cache file is not written yet
+        if ((!cache_||stream)&&writes_) {  // fetched, but its cache file is not written yet
             auto [found, chunk] = writes_->pending(k);
             if (found) {
                 ++stats_.pending_hits;
@@ -2061,15 +2051,14 @@ private:
                 return;
             }
         }
-        const bool cached_only = op && op->miss;
-        bool skipped_store = false;  // a cache-only read skipped the array's own store
-        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
-            const LayerSpec& l = spec_.layers[li];
-            if (cached_only && l.kind == "array") {
-                skipped_store = true;  // the array's own store is its source
-                continue;
-            }
-            if ((!cache_ || stream) && codecs_[li] == Codec::Raw) {
+        const bool cached_only=op&&bool(op->miss);
+        // Explicit uncached raw streaming keeps bounded range I/O: there is no
+        // decoder or whole chunk to coalesce, and no full allocation is needed.
+        if(!cache_||stream)for(std::size_t li=0;li<spec_.layers.size();++li) {
+            const auto& l=spec_.layers[li];
+            if(cached_only&&l.kind=="array")continue;
+            if(codecs_[li]!=Codec::Raw)break;
+            {
                 Found found;
                 try {
                     found = read_raw_pieces(l.root + "/" + k, w, out_strides, op, output);
@@ -2091,31 +2080,10 @@ private:
                 }
                 continue;
             }
-            if (auto chunk = read_layer_chunk(li, k)) {
-                ++stats_.disk_hits;
-                if (cache_)
-                    cache_->put(ck, *chunk);
-                apply(*chunk, w, out_strides, op, output);
-                return;
-            }
         }
-        if (cached_only && (skipped_store || http_ || source_ || spec_.compute || spec_.offline)) {
-            op->miss(w);
-            return;
-        }
-        if (!http_ && !source_ && !spec_.compute && !spec_.offline) {
-            fill_pieces(w, out_strides, op, output);
-            return;
-        }
-        if (spec_.offline) {
-            if (spec_.offline_fill) {
-                offline_miss(w.idx, ck);
-                fill_pieces(w, out_strides, op, output);
-                return;
-            }
-            throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-        }
-        apply(fetch(w.idx, k, ck), w, out_strides, op, output);
+        const auto [found,chunk]=full_span(w.idx,cached_only);
+        if(!found){op->miss(w);return;}
+        apply(chunk,w,out_strides,op,output);
     }
 
     // offline_fill: records a chunk no layer holds, and remembers it as absent in the
@@ -2129,52 +2097,66 @@ private:
             ++stats_.offline_misses;
     }
 
-    // Fetches (or computes) a chunk once, however many reads want it at the same time,
-    // and puts it in the memory cache (key `ck`) before it stops being in flight, so a
-    // read that missed the memory cache meanwhile finds it there instead of fetching again.
-    ChunkPtr fetch(const Index& idx, const std::string& k, const std::string& ck)
+    // All whole-chunk loads, including local decoded layers, share the same
+    // per-key producer as selected-plane loads. Hot hits bypass coordination.
+    std::pair<bool,ChunkPtr> full_span(const Index& idx,bool cached_only)
     {
-        if (spec_.caller_thread_only) {
-            ChunkPtr chunk = spec_.compute ? compute_now(idx, k) : fetch_now(k);
-            if (cache_)
-                cache_->put(ck, chunk);
-            return chunk;
-        }
-        std::shared_future<ChunkPtr> future;
-        std::promise<ChunkPtr> promise;
-        bool owner = false;
-        {
-            std::lock_guard lock(inflight_mutex_);
-            auto it = inflight_.find(k);
-            if (it != inflight_.end()) {
-                future = it->second;
-            } else {
-                if (cache_) {
-                    if (auto [found, chunk] = cache_->get(ck); found) {
-                        ++stats_.memory_hits;
-                        return chunk;
+        const auto k=key(idx),ck=spec_.identity+"|"+k;
+        const auto cached=[&]()->std::optional<ChunkPtr> {
+            if(cache_) {
+                auto entry=cache_->get(ck);
+                if(entry.first){++stats_.memory_hits;return entry.second;}
+            }
+            if(writes_) {
+                auto entry=writes_->pending(k);
+                if(entry.first){++stats_.pending_hits;return entry.second;}
+            }
+            return std::nullopt;
+        };
+        if(auto value=cached())return {true,*value};
+        for(;;) {
+            const auto produce=[&]()->std::shared_ptr<const ChunkLoad> {
+                if(auto value=cached())return chunk_result(true,*value);
+                bool skipped_store=false;
+                for(std::size_t li=0;li<spec_.layers.size();++li) {
+                    if(cached_only&&spec_.layers[li].kind=="array"){skipped_store=true;continue;}
+                    if(auto value=read_layer_chunk(li,k)) {
+                        ++stats_.disk_hits;
+                        if(cache_)cache_->put(ck,*value);
+                        return chunk_result(true,*value);
                     }
                 }
-                future = promise.get_future().share();
-                inflight_.emplace(k, future);
-                owner = true;
+                if(cached_only&&(skipped_store||http_||source_||spec_.compute||spec_.offline))
+                    return chunk_result(false);
+                if(spec_.offline) {
+                    if(spec_.offline_fill){offline_miss(idx,ck);return chunk_result(true);}
+                    throw CacheMiss("chunk "+k+" of "+spec_.identity+" is not in the disk cache (offline)");
+                }
+                if(!http_&&!source_&&!spec_.compute)return chunk_result(true);
+                auto value=spec_.compute?compute_now(idx,k):fetch_now(k);
+                if(cache_)cache_->put(ck,value);
+                return chunk_result(true,std::move(value));
+            };
+            std::shared_ptr<const ChunkLoad> loaded;
+            if(spec_.caller_thread_only)loaded=produce();
+            else {
+                auto claim=channel_policy_->reads.acquire(ck);
+                if(cached_only&&!claim.owner())return {false,nullptr};
+                loaded=claim.resolve(produce);
             }
-        }
-        if (!owner)
-            return future.get();
-        try {
-            ChunkPtr chunk = spec_.compute ? compute_now(idx, k) : fetch_now(k);
-            if (cache_)
-                cache_->put(ck, chunk);
-            promise.set_value(chunk);
-            std::lock_guard lock(inflight_mutex_);
-            inflight_.erase(k);
-            return chunk;
-        } catch (...) {
-            promise.set_exception(std::current_exception());
-            std::lock_guard lock(inflight_mutex_);
-            inflight_.erase(k);
-            throw;
+            if(!loaded->available) {
+                if(cached_only)return {false,nullptr};
+                continue;
+            }
+            if(!loaded->complete) {
+                // Channel selection was enabled during an earlier whole read.
+                // Reuse the selected result and request only the missing planes.
+                if(cache_&&cache_.get()!=loaded->cache.get())
+                    for(const auto& c:loaded->channels)cache_->put(ck+"|channel="+std::to_string(c.index),c.bytes);
+                return selected_span(idx,all_channels(),cached_only,nullptr,loaded);
+            }
+            if(cache_&&cache_.get()!=loaded->cache.get())cache_->put(ck,loaded->whole);
+            return {true,loaded->whole};
         }
     }
 
@@ -2196,7 +2178,7 @@ private:
             return nullptr;
         }
         ChunkPtr chunk;
-        std::shared_ptr<const std::vector<std::uint8_t>> payload;
+        ChunkPtr payload;
         try {
             if (remote_codec_ == Codec::Raw) {
                 if (body.size() != chunk_bytes_)
@@ -2204,10 +2186,10 @@ private:
                 chunk = std::make_shared<const Chunk>(std::move(body));
                 payload = chunk;  // the stored bytes are the decoded chunk
             } else {
-                auto decoded = std::make_shared<Chunk>(chunk_bytes_);
+                auto decoded = std::make_shared<Chunk>(Chunk::Overwrite{},chunk_bytes_);
                 decode(remote_codec_, body.data(), body.size(), decoded->data(), chunk_bytes_);
                 chunk = std::move(decoded);
-                payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(body));
+                payload = std::make_shared<const Chunk>(std::move(body));
             }
         } catch (const std::exception& error) {  // reads as not stored; nothing is cached on disk
             corrupt((source_ ? spec_.source_root : spec_.remote_url) + "/" + k, error);
@@ -2234,7 +2216,7 @@ private:
 
     // Writes a fetched chunk to the write layer in that layer's format. A cache another
     // tool compressed some other way only gets read: raw bytes would corrupt it.
-    void store(const std::string& k, const Chunk& decoded, const std::vector<std::uint8_t>& payload)
+    void store(const std::string& k, const Chunk& decoded, const Chunk& payload)
     {
         if (write_disabled_.load())
             return;
@@ -2309,8 +2291,6 @@ private:
     std::size_t chunk_bytes_ = 0;
     Stats stats_;
     std::unique_ptr<ZarrStorage> source_;
-    std::mutex inflight_mutex_;
-    std::unordered_map<std::string, std::shared_future<ChunkPtr>> inflight_;
     std::atomic<bool> write_disabled_{false};
     std::atomic<int> keep_writes_{0};
     std::mutex error_mutex_;

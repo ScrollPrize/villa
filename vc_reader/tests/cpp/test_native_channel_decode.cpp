@@ -1,12 +1,23 @@
 #include <vc_reader/native/channel_decode.hpp>
 #include <iostream>
 #include <random>
+#include <future>
 
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 
 int main()
 {
     try {
+        vcr::Chunk zero(19);require(std::all_of(zero.begin(),zero.end(),[](auto b){return b==0;}),"ordinary chunks keep zero fill");
+        vcr::Chunk overwritten(vcr::Chunk::Overwrite{},19);std::fill(overwritten.begin(),overwritten.end(),93);
+        vcr::Chunk copied(overwritten);require(copied==overwritten&&copied.data()!=overwritten.data(),"chunk copy owns bytes");
+        std::vector<uint8_t> adopted(23,71);auto* allocation=adopted.data();vcr::Chunk moved(std::move(adopted));
+        require(moved.data()==allocation&&moved[22]==71,"moving source vector does not copy payload");
+        {
+            auto first=vcr::workerScratch().lease();auto* context=first.resource<vcr::DecoderContexts>().bloscContext();
+            auto nested=vcr::workerScratch().lease();
+            require(nested.resource<vcr::DecoderContexts>().bloscContext()!=context,"nested codec context isolated");
+        }
         const std::size_t plane = 10002, channels = 7;
         std::vector<std::uint8_t> plain(plane*channels);
         for (std::size_t i = 0; i < plain.size(); ++i) plain[i] = std::uint8_t((i/2)%81);
@@ -76,6 +87,41 @@ int main()
         auto result = vcr::decode_channels({vcr::Codec::Blosc}, plain.size(), plane, one, tags, encoded.size(),
             [&](auto offset, auto size, auto dst) { std::memcpy(dst, encoded.data()+offset, size); });
         require(result.channels.size() >= 2 && result.channels.back().index != 6, "opportunistic relevant channels");
+        std::size_t reads=0;bool nested=false;
+        result=vcr::decode_channels({vcr::Codec::Blosc},plain.size(),plane,request,relevant,encoded.size(),
+            [&](auto offset,auto size,auto* dst){
+                if(++reads==3){
+                    const std::vector<std::size_t> all{0,1,2,3,4,5,6};
+                    auto inner=vcr::decode_channels({vcr::Codec::Raw},plain.size(),plane,all,all,plain.size(),
+                        [&](auto at,auto count,auto* output){std::memcpy(output,plain.data()+at,count);});
+                    require(inner.channels.size()==7,"nested decode result");nested=true;
+                }
+                std::memcpy(dst,encoded.data()+offset,size);
+            });
+        require(nested,"nested read callback exercised");
+        for(const auto& c:result.channels)
+            require(std::equal(c.bytes->begin(),c.bytes->end(),plain.begin()+c.index*plane),"nested scratch decode preserves outer bytes");
+        std::vector<std::future<void>> workers;
+        for(int worker=0;worker<32;++worker)workers.push_back(std::async(std::launch::async,[&]{
+            const auto zstd=vcr::encode(vcr::Codec::Zstd,{},plain.data(),plain.size(),2,{7,5001});
+            std::vector<uint8_t> whole(plain.size());
+            for(int repeat=0;repeat<12;++repeat){
+                vcr::decode(vcr::Codec::Zstd,zstd.data(),zstd.size(),whole.data(),whole.size());
+                require(whole==plain,"parallel repeated Zstd context decode");
+                auto current=vcr::decode_channels({vcr::Codec::Blosc},plain.size(),plane,request,relevant,encoded.size(),
+                    [&](auto offset,auto size,auto* dst){std::memcpy(dst,encoded.data()+offset,size);});
+                for(const auto& c:current.channels)
+                    require(std::equal(c.bytes->begin(),c.bytes->end(),plain.begin()+c.index*plane),"parallel repeated Blosc context decode");
+            }
+        }));
+        for(auto& worker:workers)worker.get();
+        auto zstd=vcr::encode(vcr::Codec::Zstd,{},plain.data(),plain.size(),2,{7,5001});
+        std::vector<uint8_t> recovered(plain.size());bool failed=false;
+        try{vcr::decode(vcr::Codec::Zstd,zstd.data(),zstd.size()-1,recovered.data(),recovered.size());}
+        catch(const std::runtime_error&){failed=true;}
+        require(failed,"reject truncated Zstd frame");
+        vcr::decode(vcr::Codec::Zstd,zstd.data(),zstd.size(),recovered.data(),recovered.size());
+        require(recovered==plain,"reuse Zstd context after error");
         std::cout << "Channel range reads: raw, Blosc shuffle/bitshuffle/memcpy/short final/unordered blocks, full codecs and corrupt inputs passed\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

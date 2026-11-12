@@ -235,9 +235,11 @@ int main()
             std::promise<void> locked,release;
             auto released = release.get_future().share();
             auto holder = std::async(std::launch::async,[&] {
-                std::lock_guard hold((*policy->reads)[std::hash<std::string>{}("0.0.0.0")%policy->reads->size()]);
-                locked.set_value();
-                released.wait();
+                auto claim=policy->reads.acquire(migration.spec.identity+"|0.0.0.0");
+                claim.resolve([&] {
+                    locked.set_value();released.wait();
+                    return std::shared_ptr<const vcr::ChunkLoad>(std::make_shared<vcr::ChunkLoad>());
+                });
             });
             locked.get_future().wait();
             auto reads = std::async(std::launch::async,[&] {
@@ -251,7 +253,7 @@ int main()
             release.set_value(); // release even if a regression blocked the reader
             holder.get();
             reads.get();
-            require(ready == std::future_status::ready,"resident/cache-only reads waited on source-I/O stripe");
+            require(ready == std::future_status::ready,"resident/cache-only reads waited on in-flight source I/O");
 #ifndef _WIN32
             std::lock_guard parent_hold(policy->mutex);
             const auto child = fork();

@@ -1,0 +1,33 @@
+# Shared reader scheduling
+
+Arrays configured with the same helper-thread count share one process-local pool. Callers execute their own work as well as publishing a batch for helpers; this lets nested reads make progress without relying on an idle helper. Reading, decoding and interpolation happen outside the scheduling lock.
+
+Each batch has an atomic item cursor. A moodycamel MPMC queue distributes batch tickets; there is no shared active-job list, scheduler mutex or completed-job removal. A helper republishes its ticket before claiming work, allowing other helpers to join one large request. With concurrent requests it revisits the queue between items; with one active request it can keep claiming items directly. Each finished item still updates completion under its own batch mutex. Chunk deduplication is separate: a per-key producer supplies the result to overlapping readers.
+
+The moodycamel queue preallocates storage for 4096 tickets by default. This is a block-rounded storage hint, not a strict global ticket limit: producer-local block ownership can also make publication fail before all nominal slots are occupied. Publication uses `try_enqueue`, which does not allocate more message blocks; implicit producer registration may allocate once per participating thread. Producer state belongs to the queue and helpers retain consumer tokens for their lifetime. Tickets hold references to batch descriptors, so a completed descriptor may safely remain queued after its caller returns. A late ticket checks the atomic cursor and never accesses the expired callback. Failed publication never blocks a caller: it drops its ticket reference and the caller continues the same batch's work. Helpers also continue their claimed work if republishing fails. No chunk work is discarded or duplicated. Tests use minimal preallocation to exercise this path. Cross-producer FIFO order is not guaranteed; callback order is unspecified and correctness does not depend on ticket ordering.
+
+Helpers try the queue before sleeping. An atomic availability epoch, read before the empty-queue check and incremented after publication, prevents lost wakeups. Only idle helpers wait on it. Stopping the pool changes the epoch and wakes all helpers; after joining them, remaining tickets are drained. As with other executors, destruction requires that external callers have finished. Zero/one-item calls do not publish a ticket; one-item calls do not allocate a batch descriptor. Single-item dispatch is kept separate from the heavier queued path so it remains cheap to inline.
+
+The native build and headers require the header-only concurrentqueue CMake package (`libconcurrentqueue-dev` on Ubuntu, upstream concurrentqueue on other platforms). The installed CMake package propagates `concurrentqueue::concurrentqueue` through its headers target; shared scheduling is also used by connected-component processing. One batch descriptor is still allocated for each multi-item call. Queue atomic lock-freedom can be checked with the internal pool's `queue_lock_free()`; it is reported by the scheduler benchmark.
+
+The public sampling calls remain synchronous. Exceptions stop unstarted operations and are rethrown only after all claimed work has completed. Independent output writes become visible before return. Callback execution order is unspecified.
+
+Build with native tests enabled:
+
+```bash
+cmake --build build --target test_native_thread_pool bench_thread_pool -j 8
+ctest --test-dir build -R '^test_native_(thread_pool|computed|sampling|singleflight|channel_cache)$' --output-on-failure
+build/bench_thread_pool tiny 128 16 0.3
+build/bench_thread_pool bulk 128 16 0.3
+build/bench_thread_pool mixed 128 16 0.3
+```
+
+Benchmark arguments are workload, concurrent callers, helper count, seconds per measured window, and optional items per batch. `tiny` defaults to 16 cheap items per call, `bulk` to 256, and `mixed` to 64 with a short sleep every 16 items to represent unequal latency. Use `build/bench_thread_pool tiny 128 16 0.3 2` to test two-item batches; repeat explicitly for 1, 2 and 4 items. One warm-up precedes three measured windows. JSON reports mean/median/min/max batches per second, items per second, runtime queue lock-freedom and validation failures. Window timing includes completion of outstanding calls. These isolate scheduler overhead, not storage bandwidth or decode speed; use real-volume extraction separately. For oversubscription testing, repeat at 1, 8, 32, 128, 192, 384 and 1920 callers with sufficient OS thread limits.
+
+## Detailed diagnostic counters
+
+Set both `VC_READER_COORDINATION_TRACE=/path/to/trace.jsonl` and `VC_READER_SCHEDULER_PROFILE=1` before opening readers. The existing trace adds cumulative scheduler snapshots approximately every 100 ms. Counters distinguish planning, chunk resolution, interpolation and other work. They include call-size histograms, published jobs, caller/helper items, producer/follower activity, selected-channel range reads and decoded blocks. Source-read units are encoded bytes; decode-block units are requested block capacity, not a universal decoded-byte counter. Array disk-load statistics are a separate measure of actual source chunks.
+
+Mutex acquisition counts are exact, while timing samples one in 64 acquisitions per thread/category. `wait_ns` and `hold_ns` contain sampled nanoseconds; divide by `samples` for sampled average latency, or multiply that average by acquisition count for an estimated aggregate. For condition waits, sleep and reacquisition are reported separately as `batch_wait`/`helper_idle`, excluded from lock hold time. Dependency-future elapsed time is also sampled one in 64 calls. Durations can overlap across threads and nested work and must not be summed as disjoint process time.
+
+Counters are thread-local atomic records aggregated by the existing monitor, not shared hot counters. Queue counters distinguish push/pop attempts, full-queue backpressure and completed tickets skipped by helpers. Push/pop sampled elapsed time is recorded in `wait_ns`, not interpreted as mutex wait; the old shared-scheduler lock counters remain zero. Pop attempts include empty polls before sleeping. Detailed mode omits the ordinary tracer's per-job registry insertion so the measurement does not introduce a global diagnostic mutex on every job; instantaneous queued-job gauges are consequently unavailable in this mode. Compare against a trace-disabled run to assess instrumentation overhead. The environment switch enables diagnostics only, not a different scheduler or deduplication policy. The diagnostic native test checks stage/call accounting and exclusion of condition sleeps from lock hold time.

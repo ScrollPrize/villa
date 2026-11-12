@@ -5,6 +5,7 @@
 #include <cstdint>
 #include "lru.hpp"
 #include "available_memory.hpp"
+#include "chunk_buffer.hpp"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -23,8 +24,7 @@
 
 namespace vcr {
 
-using Chunk = std::vector<std::uint8_t>;
-using ChunkPtr = std::shared_ptr<const Chunk>;  // nullptr: the chunk is not stored (reads as fill)
+// A null ChunkPtr denotes missing data and reads as the array's fill value.
 
 class MemoryCache {
 public:

@@ -86,7 +86,7 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | Compress and decompress bytes | `zarr_write.hpp`: `zarr::compressBytes`, `decompressBytes` | `zarr/writer.cpp`, `codecs.hpp`, `lzw.hpp` | `compress_bytes`, `decompress_bytes` |
 | Atomic and durable file writes; directory publication with rollback; snapshots | `zarr.hpp`: `zarr::atomicWrite`, `Durability`; `publication.hpp` (`vc_reader::catalog`): `files::publishDirectory`, `replaceFile`, `recoverDirectory`, `snapshot` | `atomic_file.hpp`, `zarr/layers.cpp`, `publication.cpp` | `snapshot` |
 
-For opt-in memory-pressure-aware budgets and selective compound-channel reads, see [adaptive and channel-selective caching](docs/channel-cache.md).
+For opt-in memory-pressure-aware budgets and selective compound-channel reads, see [adaptive and channel-selective caching](docs/channel-cache.md). For nonlinear interpolation of encoded fields, including pairs stored in independent arrays, see [C++ interpolation policies](docs/interpolation-policies.md).
 
 ### Images and labelled sources
 
@@ -153,6 +153,7 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | Low-level aligned and projection sampling plans | `sampling.hpp`: `aligned::Plan`, `PointPlan`, `projection::Plan` | `aligned/`, `projection/` | through `SampleReader` |
 | Triangle slice labels, interpolated normals and surface frames (ordered DDA rasterization) | `sampling.hpp`: `geometry::MeshSlice`, `raster_slice` | `geometry/triangle_mesh.hpp`, `geometry/kernels.cu` | `geometry.rasterize_mesh_slice` |
 | Sheet normals from CT | `reader.hpp`: `sheetNormals`, `sheetNormalsCpu`; `cuda_reader.hpp`: `sheet_normal::sample_cuda` | `sheet_normal/`, `native_reader.cpp`, `symmetric_eigen.hpp` | `sheet_normal.py`: `sheet_normals`, `sample_sheet_normals` |
+| Compact unsigned axes and signed three-byte normal/direction encoding | `compact_normal.hpp`: `normal::encodeCompactAxis`, `decodeCompactAxis`, `encodeSignedCompact`, `decodeSignedCompact` | header only | Consumed by native object-store measurement bindings |
 | Shortest path over a 2D cost grid | `pathfinding.hpp`: `pathfinding::shortestPath` | `pathfinding/` | `shortest_path` |
 | Connected components of a 2D/3D mask (4/8, 6/18/26-connected), numbered as `scipy.ndimage.label`; CPU (threaded, run-based) or CUDA | `components.hpp`: `components::label`, `components::cuda::label` | `components/` | `geometry.label_components`; `transforms.ConnectedComponents` |
 | Fill holes of a 2D/3D mask (`scipy.ndimage.binary_fill_holes`), CPU or CUDA | `components.hpp`: `components::fillHoles`, `components::cuda::fillHoles` | `components/` | `geometry.fill_holes` |
@@ -191,7 +192,7 @@ included as `vc_reader/native/<file>`. They have no stability guarantee beyond t
 | Bilinear, trilinear and masked interpolation; corner weights | `sampling_math.hpp`, `sample_point.hpp` |
 | Numpy typestrs and element types; encoding element values | `element_type.hpp`, `element_value.hpp` |
 | Symmetric eigendecomposition | `symmetric_eigen.hpp` |
-| LRU storage, thread pool, reused output buffers | `lru.hpp`, `thread_pool.hpp`, `output_pool.hpp` |
+| LRU storage, [shared reader scheduling](docs/reader-scheduling.md), owned chunk bytes, reused output buffers and [worker-local decoder scratch/contexts](docs/decoder-scratch.md) | `lru.hpp`, `thread_pool.hpp`, `chunk_buffer.hpp`, `output_pool.hpp`, `scratch_pool.hpp`, `decoder_context.hpp` |
 | Atomic file writes | `atomic_file.hpp` |
 | Portable file I/O (open, pread, fstat, mmap, file locks, rename-over, temp dirs) on POSIX and Windows; headers must not include `<windows.h>` | `platform_io.hpp` (Windows bodies in `platform_io.cpp`) |
 | OME storage transforms | `storage_transform.hpp` |
@@ -1749,6 +1750,8 @@ resolver used by Python. Include `<vc_reader/catalog.hpp>` to load a catalog,
 browse its samples, scans, volumes, segments and artifacts, or build a
 `RegistrationGraph`. `loadCatalog` accepts a cache file and refresh policy;
 its result reports cached fallback and a warning when refresh fails.
+
+Native builds require Boost headers (Ubuntu: `libboost-dev`; Homebrew: `boost`) and the header-only concurrentqueue CMake package for shared scheduling (Ubuntu: `libconcurrentqueue-dev`). Neither dependency needs a queue runtime library. On other platforms, install upstream concurrentqueue with its CMake package available through `CMAKE_PREFIX_PATH`.
 
 The catalog target requires nlohmann_json, libcurl and zlib; it does not require
 Python, Qt, OpenCV, CUDA or the volume reader. Configure with
