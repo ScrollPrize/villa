@@ -2875,7 +2875,13 @@ class FiberTrace3DLoader:
             rel_output = local - cp_local.view(1, 1, 1, 3)
             record("geometry_center_ms", start)
             start = time.perf_counter()
-            rel_aug = torch.einsum("...i,ji->...j", rel_output, inv_matrix)
+            # Fixed-order elementwise products, not a BLAS matmul: its kernel can depend on
+            # the tile size, and tiled maps must equal the whole-patch map bit for bit.
+            rel_aug = (
+                rel_output[..., 0:1] * inv_matrix[:, 0]
+                + rel_output[..., 1:2] * inv_matrix[:, 1]
+                + rel_output[..., 2:3] * inv_matrix[:, 2]
+            )
             record("geometry_affine_ms", start)
             start = time.perf_counter()
             rel_source = _smooth_backward_rel_zyx(rel_aug, params.smooth, controls)

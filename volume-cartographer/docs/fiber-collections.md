@@ -10,22 +10,14 @@ and the store chosen for each kind are remembered with the project on this
 machine. Changing the fiber store cancels old background reads and closes the
 fiber panes after accepted writes finish.
 
-To share fibers with other people, keep the store as a hosted hub on a network
-share. **File → Stores → Clone Hosted Store...** copies the hub into a local
-replica and attaches it beside the project; **File → Clone Hosted Project...**
-opens it as the project itself, so the team also shares its volumes. VC3D syncs
-replicas in the background: every 15 s, and shortly after each local edit. The
-status bar shows the sync state. **File → Stores → Sync Hosted Stores Now** syncs
-immediately. Remote volumes (URLs) of a shared project are everyone's; a volume
-at a local path is listed only for the person who attached it.
-
-Enabling editing of a fiber, and any edit, tag or retire action, first leases
-that fiber from the hub. If someone else holds the lease, VC3D reports who and
-the fiber stays read-only. Leases of fibers still open for editing are renewed.
-Other leases are released once their changes are pushed. When a fiber changed
-both here and on the hub, VC3D asks whether to use the hub's version or keep
-yours. See the store's [hosted hub
-guide](../../vc_object_store/docs/README.md#hosted-hub-and-replicas).
+To share fibers with other people, serve the store with `vc_object_server` and
+attach its endpoint: **File → Stores → Attach Hosted Store...**. VC3D checks it
+every 2 s and shows other people's commits; the status bar shows when it was
+last current. Every save is a checked request: a fiber someone else changed
+since you opened it is refused, and you reopen it to edit. Remote volumes (URLs)
+of a shared project are everyone's; a volume at a local path is listed only for
+the person who attached it. See [hosting a
+store](../../vc_object_store/docs/hosted.md#serving-a-store).
 
 Create the database outside VC3D, using the sibling object-store tools:
 
@@ -72,7 +64,7 @@ serialize pinned revisions into temporary transport artifacts while retaining
 their existing wire formats; the Lasagna service reads surfaces from the store
 itself (`{type: "surface", uuid, revision}` references). Fiber transport uses UUID filenames, with
 display names stored separately. The object-store `fiberNetworkJson` exporter
-reads pinned relationship edges and resolves stable control-point IDs into wire
+reads the relationship edges of fibers pinned at numbered versions and resolves stable control-point IDs into wire
 indices, preserving reciprocal ordinary, adjacent, and pending branches. Adding
 fibers to Spiral stages their complete linked components before applying inputs.
 Changes refresh the tracked drafts; retirement removes the corresponding UUID
@@ -134,7 +126,7 @@ AGENTS_AGENT_MODE=1 ninja -C build -j2
 AGENTS_AGENT_MODE=1 ninja -C ../volume-cartographer/build -j6 VC3D \
   test_viewer_overlay_surface_primitives test_line_annotation_structural_edits \
   test_line_annotation_link_validation test_line_annotation_generated_views \
-  test_line_annotation_fiber_deletion test_spiral_input_workflow test_object_store_fiber_json
+  test_line_annotation_fiber_deletion test_object_store_fiber_json
 ctest --test-dir build --output-on-failure
 PYTHONPATH=build/python python3 -m pytest tests/python -q
 ctest --test-dir ../volume-cartographer/build --output-on-failure -R '(fiber|line_annotation|spiral|agent_bridge|object_store|viewer_overlay_surface_primitives)'
@@ -171,12 +163,7 @@ VC3D_OBJECT_STORE_READ_ONLY_BENCH=/path/to/paris4-fibers.vcobj \
 Use fresh settings for the default-limit assertion. The check prints attachment,
 first-page and selected-fiber timings and verifies UI heartbeats, deferred line
 geometry, bounded catalog pages, and clearing runtime identities on detach.
-It also dispatches 20 status-only hub events against the loaded catalog and
-reports mean, median and p95 time until the catalog is ready, plus catalog,
-fiber-refresh and selection-reset counts. These events must preserve selection
-and warm fiber snapshots without reloading geometry. Use a local replica when
-testing a hosted store. This measures notification handling, not rendering FPS;
-the regular smoke test separately checks that actual commits refresh the views.
+The regular smoke test separately checks that actual commits refresh the views.
 
 The PHerc1451 save/cache regression uses the fixed 589-control fiber
 `6af54546-cad8-4696-9f4a-763334378476` and its real relationship neighbourhood.

@@ -1,5 +1,6 @@
 #include "internal/RecordJson.hpp"
 #include "internal/RecordFields.hpp"
+#include "internal/ObjectVersionJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 
 namespace vc::objects::detail {
@@ -18,6 +19,16 @@ bool includeField(const std::set<std::string>* fields, const char* key)
     return !fields || fields->contains(key);
 }
 
+nlohmann::json recordContent(nlohmann::json record)
+{
+    if (!record.is_object()) return record;
+    record.erase("commit_sequence");
+    record.erase("approved_version");
+    record.erase("version");
+    record.erase("version_generation");
+    return record;
+}
+
 nlohmann::json commonToJson(const RecordCommon& r, const std::set<std::string>* fields)
 {
     nlohmann::json j{{"uuid", r.uuid}, {"kind", r.kind}};
@@ -30,8 +41,9 @@ nlohmann::json commonToJson(const RecordCommon& r, const std::set<std::string>* 
 
 void commonFromJson(const nlohmann::json& j, RecordCommon& r)
 {
-    r.generation = j.at("generation").get<int64_t>();
-    if (r.generation < 1) throw std::runtime_error("object store: snapshot generation must be positive");
+    r.commitSequence = commitSequenceFrom(j.at("commit_sequence"));
+    r.version = versionNumberFrom(j.at("version"));
+    r.versionGeneration = j.at("version_generation").get<std::string>();
     r.createdBy = j.at("created_by").get<std::string>();
     r.createdAt = j.at("created_at").get<std::string>();
     r.createdHost = j.at("created_host").get<std::string>();
@@ -45,13 +57,31 @@ void commonFromJson(const nlohmann::json& j, RecordCommon& r)
     r.approvedBy = optionalText("approved_by");
     r.approvedAt = optionalText("approved_at");
     r.approvedHost = optionalText("approved_host");
-    if (!j.at("approved_generation").is_null()) r.approvedGeneration = j.at("approved_generation").get<int64_t>();
+    if (!j.at("approved_version").is_null()) r.approvedVersion = versionNumberFrom(j.at("approved_version"));
     if (r.approvalState != "pending" && r.approvalState != "approved" && r.approvalState != "rejected")
         throw std::runtime_error("object store: invalid snapshot approval state");
-    if (r.approvedGeneration && *r.approvedGeneration != r.generation)
-        throw std::runtime_error("object store: snapshot approval does not cover its generation");
-    if (r.approvalState == "pending" && (r.approvedBy || r.approvedAt || r.approvedHost || r.approvedGeneration))
+    if (r.approvedVersion && r.approvedVersion != r.version)
+        throw std::runtime_error("object store: snapshot approval does not cover its version");
+    if (r.approvalState == "pending" && (r.approvedBy || r.approvedAt || r.approvedHost || r.approvedVersion))
         throw std::runtime_error("object store: pending snapshot has approval stamps");
+}
+
+void presentCommonFromJson(const nlohmann::json& j, RecordCommon& r)
+{
+    commonFields(r, [&](const char* key, auto& field) {
+        if (!j.contains(key)) return;
+        const auto& value = j.at(key);
+        using T = std::remove_cvref_t<decltype(field)>;
+        if constexpr (std::is_same_v<T, int64_t>) field = commitSequenceFrom(value);
+        else if constexpr (std::is_same_v<T, std::optional<int64_t>>) {
+            field = value.is_null() ? std::nullopt : std::optional(versionNumberFrom(value));
+        } else if constexpr (std::is_same_v<T, std::optional<std::string>>) {
+            if (value.is_null()) field.reset();
+            else field = value.get<typename T::value_type>();
+        } else {
+            value.get_to(field);
+        }
+    });
 }
 
 nlohmann::json objectToJson(const ObjectRecord& r, const std::set<std::string>* fields)
@@ -106,7 +136,7 @@ nlohmann::json edgeToJson(EdgeRecord e, const std::set<std::string>* fields, boo
     return j;
 }
 
-EdgeRecord edgeFromJson(const nlohmann::json& j)
+EdgeRecord edgeFromJson(const nlohmann::json& j, bool projected)
 {
     EdgeRecord e;
     e.uuid = j.at("uuid").get<std::string>(); e.kind = j.at("kind").get<std::string>();
@@ -117,7 +147,8 @@ EdgeRecord edgeFromJson(const nlohmann::json& j)
     if (j.contains("tags")) e.tags = j.at("tags").get<std::vector<std::string>>();
     if (j.contains("meta")) e.meta = j.at("meta").dump();
     e.approvalState = j.value("approval_state", "pending");
-    commonFromJson(j, e);
+    if (projected) presentCommonFromJson(j, e);
+    else commonFromJson(j, e);
     return e;
 }
 } // namespace vc::objects::detail

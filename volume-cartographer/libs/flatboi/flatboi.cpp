@@ -990,7 +990,8 @@ static nlohmann::json parameters(const Options& opt)
           {"keep_percent", opt.keep_percent}, {"inpaint", opt.inpaint}};
 }
 
-// A stored surface into a new surface object; reports go to its artifact directory.
+// A stored surface into a new surface object; its reports are published as the
+// new surface's artifacts (flatboi/<file name>), kept on disk if that fails.
 static int run_store(const StoreToolOptions& output, const std::string& source, const Options& opt)
 {
   StoreSurfaces store(output.store, "flatboi");
@@ -1004,13 +1005,19 @@ static int run_store(const StoreToolOptions& output, const std::string& source, 
   const std::string name = output.name.value_or(
       (surface->meta.contains("name") ? surface->meta["name"].get<std::string>() : surface->id) + "_flatboi");
   const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.volume);
-  const auto artifacts = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid);
-  for (const auto& entry : fs::directory_iterator(report_dir)) {
-    std::error_code ignored;
-    fs::copy_file(entry.path(), artifacts / entry.path().filename(), fs::copy_options::overwrite_existing, ignored);
+  std::vector<std::pair<std::string, fs::path>> reports;
+  for (const auto& entry : fs::directory_iterator(report_dir))
+    if (entry.is_regular_file()) reports.emplace_back("flatboi/" + entry.path().filename().string(), entry.path());
+  std::sort(reports.begin(), reports.end());
+  bool keep = false;
+  try {
+    if (!reports.empty()) store.objects().publishArtifacts(uuid, reports);
+  } catch (const std::exception& failure) {
+    keep = true;
+    std::cerr << "keeping flatboi reports at " << report_dir << ": " << failure.what() << std::endl;
   }
   std::error_code ignored;
-  fs::remove_all(report_dir, ignored);
+  if (!keep) fs::remove_all(report_dir, ignored);
   store.objects().finish();
   std::cout << "surface_uuid: " << uuid << std::endl;
   return 0;

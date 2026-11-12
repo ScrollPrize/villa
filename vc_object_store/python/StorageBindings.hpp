@@ -66,49 +66,29 @@ nb::tuple detailFieldToPy(const std::array<double, 2>& value) { return nb::make_
 
 vo::Anchor anchorFromPy(const nb::handle& obj)
 {
-    vo::Anchor a;
-    if (obj.is_none()) return a;
-    nb::dict d = nb::cast<nb::dict>(obj);
-    for (auto item : d) {
-        const auto key = nb::cast<std::string>(item.first);
-        if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction" && key != "metadata_keys" && key != "channels")
-            throw std::invalid_argument("unknown anchor field: " + key);
-    }
-    if (has(d, "whole_geometry")) a.wholeGeometry = nb::cast<bool>(d["whole_geometry"]);
-    if (has(d, "channels")) a.channels = nb::cast<std::vector<std::string>>(d["channels"]);
-    if (has(d, "metadata_keys")) a.metadataKeys = nb::cast<std::vector<std::string>>(d["metadata_keys"]);
-    if (has(d, "points")) for (nb::handle item : nb::cast<nb::list>(d["points"])) {
-        const auto point = nb::cast<nb::dict>(item);
-        a.points.push_back({nb::cast<std::string>(point["array"]), nb::cast<std::vector<int64_t>>(point["index"])});
-    }
-    for (const char* key : {"position", "direction"}) {
-        if (!has(d, key)) continue;
-        nb::sequence seq = nb::cast<nb::sequence>(d[key]);
-        if (nb::len(seq) != 3)
-            throw std::runtime_error(std::string("anchor ") + key + " must have 3 numbers");
-        std::array<double, 3> v{nb::cast<double>(seq[0]), nb::cast<double>(seq[1]), nb::cast<double>(seq[2])};
-        if (std::string(key) == "position") a.position = v; else a.direction = v;
-    }
-    vo::detail::validateAnchor(a);
-    return a;
+    if (obj.is_none()) return {};
+    const auto toJsonValue = nb::cpp_function([](nb::handle value) -> nb::object {
+        if (PySequence_Check(value.ptr()))
+            return nb::steal<nb::object>(PySequence_List(value.ptr()));
+        if (PyIndex_Check(value.ptr()))
+            return nb::steal<nb::object>(PyNumber_Index(value.ptr()));
+        if (PyNumber_Check(value.ptr()))
+            return nb::steal<nb::object>(PyNumber_Float(value.ptr()));
+        throw nb::type_error("unsupported anchor value type");
+    });
+    const auto encoded = nb::module_::import_("json").attr("dumps")(
+        nb::cast<nb::dict>(obj), nb::arg("default") = toJsonValue);
+    return vo::detail::anchorFromJson(nlohmann::json::parse(nb::cast<std::string>(encoded)), true);
 }
 
 nb::dict anchorToPy(const vo::Anchor& a)
 {
-    nb::dict d;
-    if (a.wholeGeometry) d["whole_geometry"] = true;
-    if (!a.channels.empty()) d["channels"] = a.channels;
-    if (!a.metadataKeys.empty()) d["metadata_keys"] = a.metadataKeys;
-    if (!a.points.empty()) {
-        nb::list points;
-        for (const auto& point : a.points) {
-            nb::dict value; value["array"] = point.array; value["index"] = point.index; points.append(value);
-        }
-        d["points"] = points;
-    }
-    if (a.position) d["position"] = nb::make_tuple((*a.position)[0], (*a.position)[1], (*a.position)[2]);
-    if (a.direction) d["direction"] = nb::make_tuple((*a.direction)[0], (*a.direction)[1], (*a.direction)[2]);
-    return d;
+    auto result = nb::cast<nb::dict>(jsonLoads(vo::detail::anchorToJson(a).dump()));
+    // Preserve the Python API's tuple representation of fixed-size vectors.
+    for (const auto* key : {"position", "direction"})
+        if (result.contains(key))
+            result[key] = nb::module_::import_("builtins").attr("tuple")(result[key]);
+    return result;
 }
 
 nb::str pyStr(const std::string& s) { return nb::str(s.data(), s.size()); }
@@ -122,9 +102,12 @@ void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::stri
         if (include(key)) d[key] = value;
     });
     if (include("meta")) d["meta"] = jsonLoads(r.meta);
+    // Inline numbered version (including pending edits inside a write).
+    if (r.version) { d["version"] = *r.version; d["version_generation"] = r.versionGeneration;
+        d["version_store"] = r.versionStoreUuid; }
 }
 
-nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fields = nullptr)
+nb::dict recordToPy(const vo::ObjectRecord& r, const std::set<std::string>* fields = nullptr)
 {
     auto include = [&](const char* name) { return !fields || fields->contains(name); };
     nb::dict d;
@@ -167,7 +150,7 @@ vo::ObjectRecord objectFromPy(const nb::dict& d)
     return r;
 }
 
-nb::dict edgeToPy(const vo::EdgeRecord& e, const std::set<std::string>* fields = nullptr)
+nb::dict recordToPy(const vo::EdgeRecord& e, const std::set<std::string>* fields = nullptr)
 {
     nb::dict d;
     commonToPy(d, e, fields);
@@ -176,6 +159,15 @@ nb::dict edgeToPy(const vo::EdgeRecord& e, const std::set<std::string>* fields =
     if (!fields || fields->contains("a_anchor")) d["a_anchor"] = anchorToPy(e.aAnchor);
     if (!fields || fields->contains("b_anchor")) d["b_anchor"] = anchorToPy(e.bAnchor);
     return d;
+}
+
+template<class Record> nb::list recordsToPy(const std::vector<Record>& records,
+    const std::optional<std::vector<std::string>>& fields=std::nullopt)
+{
+    const std::set<std::string> selected=fields?std::set<std::string>(fields->begin(),fields->end()):std::set<std::string>{};
+    nb::list result;
+    for(const auto& record:records)result.append(recordToPy(record,fields?&selected:nullptr));
+    return result;
 }
 
 vo::EdgeRecord edgeFromPy(const nb::dict& d)
@@ -245,7 +237,7 @@ nb::dict geometryToPy(const vo::GeometryRevision& r)
     result["kind"] = r.kind; result["format_version"] = r.formatVersion;
     result["coordinate_system"] = r.coordinateSystem; result["attributes"] = jsonLoads(r.attributes);
     result["grid_origin"] = r.gridOrigin;
-    result["object_generation"] = r.objectGeneration;
+    result["object_version"] = r.objectVersion;
     result["created_by"] = r.createdBy; result["created_at"] = r.createdAt; result["created_host"] = r.createdHost;
     nb::list arrays;
     for (const auto& a : r.arrays) {
@@ -260,6 +252,12 @@ nb::dict geometryReportToPy(const vo::GeometryIngestReport& r)
 {
     nb::dict result;
     result["edges_imported"] = r.edgesImported; result["ingested"] = r.ingested; result["problems"] = r.problems;
+    result["notices"] = r.notices;
+    result["uuids"] = r.uuids; result["existing"] = r.existing; result["cancelled"] = r.cancelled;
+    if (r.fatalError) {
+        nb::dict fatal; fatal["message"] = *r.fatalError;
+        result["fatal_error"] = fatal;
+    } else result["fatal_error"] = nb::none();
     return result;
 }
 
@@ -270,7 +268,7 @@ std::vector<vo::GeometryEdgeEdit> edgeEditsFromPy(const nb::list& edits)
         const auto d = nb::cast<nb::dict>(item);
         vo::GeometryEdgeEdit edit;
         edit.edgeUuid = nb::cast<std::string>(d["edge_uuid"]);
-        edit.expectedGeneration = nb::cast<int64_t>(d["expected_generation"]);
+        edit.expectedVersion = nb::cast<int64_t>(d["expected_version"]);
         edit.action = nb::cast<std::string>(d["action"]);
         edit.aRevision = nb::cast<std::optional<std::string>>(d["a_revision"]);
         edit.bRevision = nb::cast<std::optional<std::string>>(d["b_revision"]);
@@ -295,9 +293,12 @@ struct PyObjectStore {
 
     static PyObjectStore create(const std::string& path, const std::string& author,
                                              const std::optional<std::string>& hostname, int readerPoolSize,
-                                             size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog)
+                                             size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog,
+                                             bool historyEnabled, bool spatialIndex)
     {
         vo::OpenOptions o;
+        o.history = historyEnabled ? vo::HistoryMode::On : vo::HistoryMode::Off;
+        o.spatialIndex = spatialIndex;
         o.author = author;
         o.hostnameOverride = hostname;
         o.readerPoolSize = readerPoolSize;
@@ -386,7 +387,8 @@ struct PyObjectWriteTxn {
     PyObjectStore* owner = nullptr;
     std::shared_ptr<vo::ObjectStore> lease;
     std::unique_ptr<vo::WriteTxn> txn;
-    std::optional<vo::RevisionSelection> expected;
+    std::optional<vo::TransactionContext> context;
+    std::optional<vo::TransactionReceipt> receipt;
 
     vo::WriteTxn& require()
     {
@@ -398,14 +400,15 @@ struct PyObjectWriteTxn {
         if (txn) throw std::runtime_error("transaction is already active");
         owner->require();
         lease = owner->db;
-        try { txn = std::make_unique<vo::WriteTxn>(expected ? lease->write(*expected) : lease->write()); }
+        receipt.reset();
+        try { txn = std::make_unique<vo::WriteTxn>(context ? lease->write(*context) : lease->write()); }
         catch (...) { lease.reset(); throw; }
         return *this;
     }
     void exit(bool failed)
     {
         if (txn) {
-            try { if (!failed) txn->commit(); }
+            try { if (!failed) { txn->commit(); receipt = txn->receipt(); } }
             catch (...) { txn.reset(); lease.reset(); throw; }
             txn.reset();  // RAII rolls back when not committed
             lease.reset();

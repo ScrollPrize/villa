@@ -1,5 +1,15 @@
 # Python venvs, IDE files, build artifacts
 /local/
+# Transient vcobj review/planning artifacts belong under local/, not API docs.
+/vc_object_store/docs/reference-review/
+/vc_object_store/docs/review-r*/
+/vc_object_store/docs/review-r*.md
+/vc_object_store/docs/audit-*.md
+/vc_object_store/docs/full-review-*.md
+/vc_object_store/docs/coherent-store-*.md
+/vc_object_store/docs/reference-cleanup.md
+/vc_object_store/docs/schema-integration.md
+/plans/
 /task.md
 /experiments/
 /global-fiber-sgd

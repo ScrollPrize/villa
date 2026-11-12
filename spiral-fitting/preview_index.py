@@ -102,8 +102,10 @@ class PublishedPreviewIndex:
     # -- operations ------------------------------------------------------
 
     def record(self, digest, *, manifest_path, session_id, generation,
-               source_fit_iteration=None):
-        """Remember that ``manifest_path`` is the published surface of ``digest``."""
+               source_fit_iteration=None, input_digest=None, input_position=None):
+        """Remember that ``manifest_path`` is the published surface of ``digest``,
+        fitted to the inputs of ``input_digest``, read at the store position
+        ``input_position`` (when they were)."""
         if not digest:
             return
         with self._lock:
@@ -114,6 +116,8 @@ class PublishedPreviewIndex:
                 "session_id": str(session_id),
                 "generation": int(generation),
                 "source_fit_iteration": source_fit_iteration,
+                "input_digest": input_digest,
+                "input_position": input_position,
             }
             self._store(document)
 
@@ -127,8 +131,10 @@ class PublishedPreviewIndex:
             document["pins"][str(checkpoint_path)] = str(digest)
             self._store(document)
 
-    def lookup(self, digest):
-        """The live published entry for ``digest``, or None."""
+    def lookup(self, digest, *, input_digest=None):
+        """The live published entry for ``digest`` fitted to the inputs of
+        ``input_digest``, or None. An entry recorded without input
+        provenance matches no input digest."""
         if not digest:
             return None
         with self._lock:
@@ -136,7 +142,9 @@ class PublishedPreviewIndex:
             if self._drop_dead_entries_locked(document):
                 self._store(document)
             entry = document["previews"].get(str(digest))
-            return dict(entry) if entry else None
+            if not entry or entry.get("input_digest") != input_digest:
+                return None
+            return dict(entry)
 
     def pinned_roots(self):
         """Published generation directories a live checkpoint still names."""

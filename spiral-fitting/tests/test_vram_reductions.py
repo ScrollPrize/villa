@@ -13,7 +13,9 @@ from flow_fields import CartesianFlowField, CylindricalFlowField, sample_field
 from checkpoint_io import load_checkpoint_cpu
 from tifxyz import Patch
 from transforms import SpiralAndTransform
+from track_graph import TrackGraph
 from tracks import (
+    _build_crossing_partner_csr,
     _grouped_same_radius_loss,
     _pack_track_points,
     _sample_prepared_track_points,
@@ -409,7 +411,7 @@ class DevicePatchAtlasTests(unittest.TestCase):
                          ['first', 'second'])
         self.assertEqual(atlas.patch_ids_for_theta_nodes([10, 999]), [])
 
-    def test_fit_context_gate_excludes_patch_and_writes_source_path(self):
+    def test_fit_context_gate_excludes_patch_and_writes_its_uuid(self):
         from fit_spiral import FitContext, _UnattachedPclStripList
 
         # Construct a 2x2 quad-centre field whose theta values make the
@@ -435,7 +437,6 @@ class DevicePatchAtlasTests(unittest.TestCase):
             _sampling_2d_path=None,
             _sampling_area=4.0,
             area=4.0,
-            _source_path='/inputs/non-liftable-patch.tifxyz',
         )
 
         with tempfile.TemporaryDirectory() as out_path:
@@ -448,17 +449,14 @@ class DevicePatchAtlasTests(unittest.TestCase):
             context.slice_to_spiral_transform = lambda value: value
             context.dist = types.SimpleNamespace(is_main_process=True)
             context.out_path = out_path
-            context.non_liftable_patch_paths = set()
-            context.verified_patches_path = '/inputs'
-            context.verified_patches = {'bad': patch}
+            context.non_liftable_patch_ids = set()
+            context.verified_patches = {'bad-patch-uuid': patch}
             context.verified_patches_list = [patch]
             context.patch_sampling_probabilities = np.ones(1)
             context.num_verified_patches = 1
             context.patch_atlas = self.PatchAtlas(
                 context.verified_patches, device='cpu').materialize()
             context.cross_patch_pcls = []
-            context.regular_pcl_catalog = {}
-            context.fiber_catalog = {}
             context.unattached_pcl_strips = _UnattachedPclStripList()
             context.unattached_component_edges = []
             context.interactive_driver = None
@@ -474,9 +472,7 @@ class DevicePatchAtlasTests(unittest.TestCase):
                     'inconsistent_edges'],
                 0)
             report = Path(out_path, 'non_liftable_patches.txt').read_text()
-            self.assertEqual(
-                report,
-                '/inputs/non-liftable-patch.tifxyz\n')
+            self.assertEqual(report, 'bad-patch-uuid\n')
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
     def test_sample_patch_batch_carries_pregathered_points(self):
@@ -853,6 +849,14 @@ class CpuTrackStorageTests(unittest.TestCase):
         self.assertEqual(filtered['lengths'].numel(), 1)
         np.testing.assert_array_equal(filtered['flat_zyx_cpu'].numpy(), straight)
 
+    @staticmethod
+    def _crossings(tracks, families):
+        """The crossing graph a fit builds from the store's crossing links,
+        here found by Spiral's own exact-crossing builder."""
+        csr = _build_crossing_partner_csr(tracks, families)
+        return {'track_families': families, 'track_source_ids': csr['source_ids'],
+                'track_graph': TrackGraph(csr)}
+
     def test_crossing_partners_are_sampled_from_all_exact_partners(self):
         primary = self._line_track(20, z=10, y=10, axis=2)
 
@@ -878,7 +882,8 @@ class CpuTrackStorageTests(unittest.TestCase):
                 'track_crossing_precompute_max': 2,
                 'track_max_track_crossing_per_step': 2,
             },
-            track_families=['horizontal', 'vertical', 'vertical', 'vertical', 'vertical'],
+            **self._crossings(
+                tracks, ['horizontal', 'vertical', 'vertical', 'vertical', 'vertical']),
         )
 
         self.assertIn('crossing_index', prepared)
@@ -946,13 +951,14 @@ class CpuTrackStorageTests(unittest.TestCase):
             [10, 12, 2],
         ], dtype=np.float32)
         same_family = vertical.copy()
+        tracks = [horizontal, vertical, same_family]
         prepared = prepare_main_phase_tracks(
-            [horizontal, vertical, same_family], None, 0.0, 'cpu',
+            tracks, None, 0.0, 'cpu',
             sampling_config={
                 'track_crossing_precompute_max': 1,
                 'track_max_track_crossing_per_step': 1,
             },
-            track_families=['horizontal', 'vertical', 'vertical'],
+            **self._crossings(tracks, ['horizontal', 'vertical', 'vertical']),
         )
 
         self.assertEqual(

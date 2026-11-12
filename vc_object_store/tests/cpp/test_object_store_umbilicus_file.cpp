@@ -88,6 +88,14 @@ int main() try {
             R"({"metadata": {"volume_width": -5, "volume_height": 8174},)" + points));
         require(badWidth.metadataErrors == std::vector<std::string>{"volume_width: expected a positive integer, got -5"},
                 "a rejected dimension is blamed once");
+        for (const auto& width : {"2147483648", "4294967297", "9223372036854775808", "18446744073709551615"}) {
+            const auto oversized = readUmbilicusFile(write(dir, "oversized.json",
+                std::string(R"({"metadata":{"volume_width":)") + width +
+                R"(,"volume_height":1,"volume_slices":1},)" + points));
+            require(!oversized.volumeWidth && oversized.metadataErrors.size() == 1 &&
+                    bindTo(oversized, {1, 1, 1}, 1).refusal.has_value(),
+                    "oversized signed and unsigned dimensions reject before narrowing");
+        }
         const auto badVoxel = readUmbilicusFile(write(dir, "v.json",
             R"({"metadata": {"voxelsize_um": "nine point six", "volume": "scroll.zarr", "volume_width": 8174,)"
             R"( "volume_height": 8174, "volume_slices": 18946},)" + points));

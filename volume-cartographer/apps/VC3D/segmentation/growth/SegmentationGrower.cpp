@@ -1,5 +1,6 @@
 #include "SegmentationGrower.hpp"
 #include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 
 
 #include "../../NeuralTraceServiceManager.hpp"
@@ -315,10 +316,12 @@ void refreshSegmentationViewers(ViewerManager* manager)
 struct CopyDisplacementJob
 {
     QString socketPath;
-    // The input surface, read at geometryRevision from the store file the
-    // service shares with this session; the outputs are new surfaces there.
+    // The input surface, read at its numbered version (in generation) from
+    // the store file the service shares with this session; the outputs are
+    // new surfaces there.
     QString store;
-    std::string surfaceUuid, geometryRevision, volumeUuid;
+    std::string surfaceUuid, volumeUuid;
+    vc::objects::ObjectVersion surfaceReference;
     QString volumeZarrPath;
     int volumeScale{0};
     QString checkpointPath;
@@ -342,7 +345,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     request["request_type"] = "displacement_copy_grow";
     request["store"] = job.store.toStdString();
     request["surface_uuid"] = job.surfaceUuid;
-    request["geometry_revision"] = job.geometryRevision;
+    request["surface_reference"] = nlohmann::json::parse(vc::objects::objectVersionToJson(job.surfaceReference));
     request["volume_uuid"] = job.volumeUuid;
     request["volume_path"] = job.volumeZarrPath.toStdString();
     request["volume_scale"] = std::max(0, job.volumeScale);
@@ -850,7 +853,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     }
     const auto pin = _context.module->storePin(segmentationSurface.get());
     const auto* row = catalog->row(segmentationSurface->id);
-    if (!pin || !pin->geometryRevision || !row || !row->bound()) {
+    if (!pin || !pin->stored() || !pin->geometryRevision || !row || !row->bound()) {
         showStatus(tr("Copy with NT needs a surface of the writable object store that opens in the current volume."),
                    kStatusLong);
         return false;
@@ -868,8 +871,8 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     CopyDisplacementJob copyJob;
     copyJob.socketPath = socketPath;
     copyJob.store = QString::fromStdString(toolStore.store.string());
-    copyJob.surfaceUuid = pin->object.objectUuid;
-    copyJob.geometryRevision = *pin->geometryRevision;
+    copyJob.surfaceUuid = pin->reference().objectUuid;
+    copyJob.surfaceReference = pin->reference();
     // The service works in level-0 voxels of the zarr it is given, not in the
     // open volume's working level: the store volume's own voxels.
     copyJob.volumeUuid = toolStore.volume.volume;
@@ -1137,13 +1140,14 @@ void SegmentationGrower::onFutureFinished()
 
     refreshSegmentationViewers(_context.viewerManager);
 
+    bool correctionsSaved = true;
     // Keep the growth's corrections with the revisions before and after it.
     auto* annotated = primarySurface ? primarySurface : request.segmentationSurface.get();
     if (request.usingCorrections && request.beforePin && request.correctionsBounds && _context.module && annotated &&
         _context.state && _context.state->currentVolume() && _context.module->saveSurface(annotated)) {
         if (const auto afterPin = _context.module->storePin(annotated)) {
             vc3d::corrections::GrowthAnnotation annotation;
-            annotation.surfaceUuid = afterPin->object.objectUuid;
+            annotation.surfaceUuid = afterPin->reference().objectUuid;
             annotation.beforeGeometry = request.beforePin->geometryRevision.value_or("");
             annotation.afterGeometry = afterPin->geometryRevision.value_or("");
             annotation.volumeUsed = request.growthVolumeId;
@@ -1156,9 +1160,9 @@ void SegmentationGrower::onFutureFinished()
                     annotation.points.push_back({collection.id, point.id, collection.name,
                                                  {point.p[0], point.p[1], point.p[2]}, int64_t(point.creation_time)});
             try {
-                vc3d::corrections::writeGrowthAnnotation(*_context.state->objectStoreSession(), afterPin->attachment, annotation,
-                                                         _context.state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
+                _context.module->saveGrowthAnnotation(annotation);
             } catch (const std::exception& ex) {
+                correctionsSaved = false;
                 qCWarning(lcSegGrowth) << "Failed to save the corrections annotation:" << ex.what();
             }
         }
@@ -1175,12 +1179,12 @@ void SegmentationGrower::onFutureFinished()
             if (offsetX != 0.0f || offsetY != 0.0f) {
                 _context.module->applyCorrectionAnchorOffset(offsetX, offsetY);
                 // The anchors moved with the grown grid.
-                _context.module->saveCorrections();
+                correctionsSaved = _context.module->saveCorrections() && correctionsSaved;
             }
         }
     }
 
-    if (request.usingCorrections && _context.module) {
+    if (request.usingCorrections && _context.module && correctionsSaved) {
         _context.module->clearPendingCorrections();
     }
 
@@ -1188,7 +1192,9 @@ void SegmentationGrower::onFutureFinished()
     delete result.surface;
 
     QString message;
-    if (!result.statusMessage.isEmpty()) {
+    if (!correctionsSaved) {
+        message = tr("Growth completed, but corrections were not saved; pending corrections were kept.");
+    } else if (!result.statusMessage.isEmpty()) {
         message = result.statusMessage;
     } else if (request.usingCorrections) {
         message = tr("Corrections applied; tracer growth complete.");

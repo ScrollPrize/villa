@@ -22,7 +22,8 @@ public:
     std::vector<LookupResult> locateAll(const PointQuery& query) const;
 private:
     vc::object_links::SurfaceIndex index_;
-    std::unordered_map<vc::object_links::SurfaceGrid*,SurfacePtr> identities_;
+    struct Identity { SurfacePtr surface; cv::Vec3f ptrOrigin; };
+    std::unordered_map<vc::object_links::SurfaceGrid*,Identity> identities_;
     std::unordered_map<QuadSurface*,std::shared_ptr<vc::object_links::SurfaceGrid>> geometry_;
     vc::object_links::SurfaceIndex::PointQuery queryFor(const PointQuery& query) const;
 };

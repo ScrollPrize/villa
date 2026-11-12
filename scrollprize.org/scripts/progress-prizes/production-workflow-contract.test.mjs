@@ -6,28 +6,12 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const googleJobs = [
-  'validate',
-  'dry-run',
-  'reconcile-active',
-  'prepare-google',
-  'activate-production',
-  'verify-completed-activation',
-  'verify-prepared',
-  'verify-active',
-];
+const googleJobs = ['validate', 'dry-run', 'prepare-google', 'verify'];
 const githubOnlyJobs = [
   'preflight',
   'prepare-page',
-  'activation-state',
-  'activation-page-state',
-  'refresh-page',
-  'activation-binding',
-  'activation-gate',
-  'activation-approval',
-  'reconcile-approval',
-  'merge',
-  'verify-prepared-state',
+  'ready',
+  'verify-state',
   'report-scheduled-failure',
 ];
 const protectedMappings = new Map([
@@ -114,8 +98,7 @@ test('production accepts only a secret-free manual dispatch contract', async () 
   assert.match(preflight, /assert\.equal\(process\.env\.EVENT_NAME, 'workflow_dispatch'\)/);
   assert.match(preflight, /process\.env\.TARGET_CYCLE, target/);
   assert.match(preflight, /\^\[1-9\]\\d\*\$/);
-  assert.match(preflight, /process\.env\.OPERATION === 'reconcile-active'/);
-  assert.match(preflight, /assert\.equal\(process\.env\.REQUEST_ID, ''\)/);
+  assert.doesNotMatch(source, /verify-mode|reconcile|activate|merge_method|progress-prizes-production-activation/);
   assert.deepEqual(
     new Set(jobNames(source)),
     new Set([...googleJobs, ...githubOnlyJobs]),
@@ -134,10 +117,9 @@ test('production preflight executes a strict valid and invalid control matrix', 
     REF: 'refs/heads/main',
     HEAD_SHA: 'a'.repeat(40),
     EVENT_NAME: 'workflow_dispatch',
-    OPERATION: 'activate',
+    OPERATION: 'ready',
     SOURCE_CYCLE: '2026-07',
     TARGET_CYCLE: '2026-08',
-    VERIFY_MODE: 'prepared',
     REQUEST_ID: '',
   };
   const execute = (overrides = {}) => spawnSync('bash', ['--noprofile', '--norc', '-c', guard], {
@@ -145,14 +127,16 @@ test('production preflight executes a strict valid and invalid control matrix', 
     encoding: 'utf8',
   });
   assert.equal(execute().status, 0);
+  assert.equal(execute({ OPERATION: 'prepare', REQUEST_ID: '123' }).status, 0);
   for (const overrides of [
     { REPOSITORY_ID: '1' },
     { REF: 'refs/heads/feature' },
     { EVENT_NAME: 'schedule' },
     { OPERATION: 'cleanup' },
+    { OPERATION: 'activate' },
+    { OPERATION: 'reconcile-active' },
     { TARGET_CYCLE: '2026-09' },
     { REQUEST_ID: 'untrusted' },
-    { OPERATION: 'reconcile-active', REQUEST_ID: '123' },
   ]) {
     assert.notEqual(execute(overrides).status, 0, JSON.stringify(overrides));
   }
@@ -203,11 +187,9 @@ test('production dry-run immediately exercises a read-only public proposal', asy
   assert.match(dryRun, /getCycleDeadline\(process\.env\.TARGET_CYCLE\)/);
   assert.match(dryRun, /Google mutation: `disabled`/);
   assert.match(dryRun, /Website mutation: `disabled`/);
-  assert.match(
-    action,
-    /PROGRESS_PRIZE_ENVIRONMENT" = production \\\n\s+-a "\$OPERATION" = prepare \\\n\s+-a "\$DRY_RUN" = true/,
-  );
-  assert.match(action, /arguments\+=\(--preparation-days 31\)/);
+  assert.match(action, /if test "\$DRY_RUN" = true; then/);
+  assert.match(action, /arguments\+=\(--dry-run --preparation-days 31\)/);
+  assert.match(action, /if test "\$DRY_RUN" = true; then test "\$OPERATION" = prepare; fi/);
   assert.match(
     action,
     /if: inputs\.operation == 'validate' \|\| inputs\.operation == 'verify' \|\| inputs\['dry-run'\] == 'true'/,
@@ -238,13 +220,9 @@ test('GitHub control-plane jobs have no Google identity or OIDC', async () => {
     assert.doesNotMatch(job, /google-github-actions\/auth|GOOGLE_ACCESS_TOKEN/);
   }
 
-  const approval = jobBlock(source, 'activation-approval');
-  assert.match(approval, /environment: progress-prizes-production-activation/);
-  assert.match(approval, /permissions: \{\}/);
-  const reconciliationApproval = jobBlock(source, 'reconcile-approval');
-  assert.match(reconciliationApproval, /environment: progress-prizes-production-activation/);
-  assert.match(reconciliationApproval, /permissions: \{\}/);
-  assert.match(reconciliationApproval, /test -z "\$REQUEST_ID"/);
+  for (const name of ['preflight', 'ready', 'verify-state', 'report-scheduled-failure']) {
+    assert.doesNotMatch(jobBlock(source, name), /environment:/);
+  }
   const reporter = jobBlock(source, 'report-scheduled-failure');
   assert.match(reporter, /permissions:\n      issues: write/);
   assert.match(reporter, /\/search\/issues\?\$\{query\}/);
@@ -252,46 +230,9 @@ test('GitHub control-plane jobs have no Google identity or OIDC', async () => {
   assert.match(reporter, /Google identifiers, ACL identities, and operation output are intentionally omitted/);
 });
 
-test('reconcile-active requires secret-free approval and permits only marker metadata writes', async () => {
-  const production = await productionWorkflow();
-  const action = await googleAction();
-  const approval = jobBlock(production, 'reconcile-approval');
-  const reconciliation = jobBlock(production, 'reconcile-active');
-
-  assert.match(approval, /^    if: inputs\.operation == 'reconcile-active'$/m);
-  assert.match(approval, /^    needs: preflight$/m);
-  assert.doesNotMatch(approval, /secrets\.|id-token|google-github-actions/);
-  assert.match(
-    reconciliation,
-    /needs:\n      - preflight\n      - reconcile-approval/,
-  );
-  assert.match(reconciliation, /^          operation: reconcile-active$/m);
-  assert.match(reconciliation, /^          branch: main$/m);
-  assert.match(reconciliation, /^          target-branch: main$/m);
-  assert.doesNotMatch(reconciliation, /simulated-now:|fault:|dry-run:|head-sha:|base-sha:/);
-
-  assert.match(action, /test "\$OPERATION" = reconcile-active/);
-  assert.match(action, /test -z "\$SIMULATED_NOW"/);
-  assert.match(action, /test -z "\$FAULT"/);
-  assert.match(action, /test -z "\$HEAD_SHA"/);
-  assert.match(action, /test -z "\$BASE_SHA"/);
-  assert.match(
-    action,
-    /if: inputs\.operation != 'validate' && inputs\.operation != 'verify' && inputs\.operation != 'reconcile-active' && inputs\['dry-run'\] != 'true'/,
-  );
-  assert.match(action, /Authenticate marker-only reconciliation without a credential file/);
-});
-
 test('every privileged checkout executes the immutable trigger code', async () => {
   const source = await productionWorkflow();
-  for (const name of [
-    ...googleJobs,
-    'activation-state',
-    'activation-page-state',
-    'activation-gate',
-    'merge',
-    'verify-prepared-state',
-  ]) {
+  for (const name of [...googleJobs, 'ready', 'verify-state']) {
     const job = jobBlock(source, name);
     assert.match(job, /uses: actions\/checkout@[a-f0-9]{40}/);
     assert.match(job, /ref: \$\{\{ github\.sha \}\}/);
@@ -299,122 +240,36 @@ test('every privileged checkout executes the immutable trigger code', async () =
   }
 });
 
-test('activation gates, approves, waits, authenticates, leases, verifies, then merges', async () => {
+test('ready waits for the public tests and preview, flips the draft, and never merges', async () => {
   const production = await productionWorkflow();
-  const action = await googleAction();
-  const gate = jobBlock(production, 'activation-gate');
-  const approval = jobBlock(production, 'activation-approval');
-  const activation = jobBlock(production, 'activate-production');
-  const merge = jobBlock(production, 'merge');
+  const ready = jobBlock(production, 'ready');
 
-  assert.match(gate, /needs:\n      - activation-state\n      - activation-binding/);
-  assert.match(gate, /progress-prizes-github\.mjs gate/);
-  assert.match(gate, /--timeout-seconds 1800/);
-  assert.match(gate, /Open approval only inside the bounded cutoff window/);
-  assert.match(gate, /waitMilliseconds > 60 \* 60 \* 1000/);
-  assert.match(approval, /needs:\n      - activation-state\n      - activation-gate/);
-  assert.match(activation, /needs:\n      - activation-state\n      - activation-gate\n      - activation-approval/);
-  assert.match(activation, /base-sha: \$\{\{ needs\.activation-gate\.outputs\['base-sha'\] \}\}/);
-  assert.match(activation, /github-token: \$\{\{ github\.token \}\}/);
-
-  const wait = action.indexOf('Wait for the real production cutoff without a Google token');
-  const auth = action.indexOf('Authenticate mutating operations without a credential file');
-  const zeroLease = action.indexOf('--timeout-seconds 0');
-  const mutation = action.indexOf('automation-cli.mjs "${arguments[@]}"');
-  assert.ok(wait !== -1 && wait < auth && auth < zeroLease && zeroLease < mutation);
-  assert.match(action, /waitMilliseconds > 60 \* 60 \* 1000/);
-  assert.match(action, /GATED_BASE_SHA: \$\{\{ inputs\['base-sha'\] \}\}/);
-  assert.match(action, /result\.sourceAcceptingResponses !== false/);
-  assert.match(action, /result\.targetAcceptingResponses !== true/);
-
-  assert.match(merge, /needs:\n      - activation-state\n      - activate-production/);
-  assert.match(merge, /HEAD_SHA: \$\{\{ needs\.activate-production\.outputs\['head-sha'\] \}\}/);
-  assert.match(merge, /BASE_SHA: \$\{\{ needs\.activate-production\.outputs\['base-sha'\] \}\}/);
-  assert.match(merge, /PR_NUMBER: \$\{\{ needs\.activate-production\.outputs\['pr-number'\] \}\}/);
-  assert.match(merge, /--sha "\$HEAD_SHA"/);
-  assert.match(merge, /--base-sha "\$BASE_SHA"/);
+  assert.match(ready, /^    if: inputs\.operation == 'ready'$/m);
+  assert.match(ready, /^    needs: preflight$/m);
+  assert.match(ready, /permissions:\n      actions: read\n      checks: read\n      contents: read\n      pull-requests: write\n      statuses: read/);
+  assert.match(ready, /progress-prizes-github\.mjs rollover-state/);
+  assert.match(ready, /if: steps\.state\.outputs\.state == 'pending' && steps\.state\.outputs\.draft == 'true'/);
+  assert.match(ready, /waitMilliseconds > 60 \* 60 \* 1000/);
+  assert.match(ready, /if: steps\.state\.outputs\.state == 'pending'/);
+  assert.match(ready, /progress-prizes-github\.mjs ready/);
+  assert.match(ready, /--timeout-seconds 1800/);
+  assert.match(ready, /if: steps\.state\.outputs\.state == 'completed'/);
+  assert.doesNotMatch(ready, /pulls\/\d+\/merge|merge_method|environment:|id-token|secrets\./);
+  assert.doesNotMatch(production, /progress-prizes-google[\s\S]*operation: (?:activate|reconcile-active)/);
 });
 
-function jobNeeds(block) {
-  const list = block.match(/^    needs:\n((?:      - [a-z0-9-]+\n)+)/m);
-  if (list) return [...list[1].matchAll(/- ([a-z0-9-]+)/g)].map((match) => match[1]);
-  const single = block.match(/^    needs: ([a-z0-9-]+)$/m);
-  return single ? [single[1]] : [];
-}
-
-test('a skipped refresh-page cannot silently skip activation downstream', async () => {
-  const source = await productionWorkflow();
-  const needs = new Map(jobNames(source).map((name) => [name, jobNeeds(jobBlock(source, name))]));
-  const downstream = new Set(['refresh-page']);
-  for (let changed = true; changed;) {
-    changed = false;
-    for (const [name, dependencies] of needs) {
-      if (!downstream.has(name) && dependencies.some((dependency) => downstream.has(dependency))) {
-        downstream.add(name);
-        changed = true;
-      }
-    }
-  }
-  downstream.delete('refresh-page');
-
-  for (const name of ['activation-binding', 'activation-gate', 'activation-approval',
-    'activate-production', 'merge']) {
-    assert.ok(downstream.has(name), `${name} should depend on refresh-page`);
-  }
-  for (const name of downstream) {
-    const block = jobBlock(source, name);
-    // GitHub skips a job when any ancestor was skipped unless its condition
-    // opts out of the implicit success() with always() or !cancelled().
-    assert.match(block, /^    if: >-\n      (?:always\(\)|!cancelled\(\)) &&$/m, name);
-    // The failure reporter runs precisely when an upstream job did not succeed.
-    if (name === 'report-scheduled-failure') continue;
-    for (const dependency of needs.get(name)) {
-      if (dependency === 'refresh-page') continue;
-      assert.match(
-        block,
-        new RegExp(`needs\\.${dependency}\\.result == 'success'`),
-        `${name} must require ${dependency} to succeed`,
-      );
-    }
-  }
-});
-
-test('activation reuses an exact prepared commit and refreshes only stale parents', async () => {
+test('verification binds the Google check to the pending rollover page commit', async () => {
   const production = await productionWorkflow();
-  const state = jobBlock(production, 'activation-state');
-  const page = jobBlock(production, 'activation-page-state');
-  const refresh = jobBlock(production, 'refresh-page');
-  const binding = jobBlock(production, 'activation-binding');
-  const completed = jobBlock(production, 'verify-completed-activation');
+  const resolver = jobBlock(production, 'verify-state');
+  const verify = jobBlock(production, 'verify');
 
-  assert.match(state, /refresh-required: \$\{\{ steps\.state\.outputs\['refresh-required'\] \}\}/);
-  assert.match(state, /--expected-base-sha "\$TRIGGER_SHA"/);
-  assert.match(page, /outputs\['refresh-required'\] == 'true'/);
-  assert.match(page, /parseProgressPrizeMarkdown/);
-  assert.match(refresh, /outputs\['refresh-required'\] == 'true'/);
-  assert.match(refresh, /progress-prizes-page-pr\.yml/);
-  assert.match(binding, /if test "\$REFRESH_REQUIRED" = true/);
-  assert.match(binding, /test "\$base_sha" = "\$TRIGGER_SHA"/);
-  assert.match(completed, /outputs\.state == 'completed'/);
-  assert.match(completed, /operation: verify/);
-  assert.match(completed, /verify-mode: active/);
-});
-
-test('prepared verification binds the pending page while active verification binds main', async () => {
-  const production = await productionWorkflow();
-  const resolver = jobBlock(production, 'verify-prepared-state');
-  const prepared = jobBlock(production, 'verify-prepared');
-  const active = jobBlock(production, 'verify-active');
-
-  assert.match(resolver, /progress-prizes-github\.mjs activation-state/);
-  assert.match(resolver, /--expected-base-sha "\$TRIGGER_SHA"/);
+  assert.match(resolver, /progress-prizes-github\.mjs rollover-state/);
   assert.match(resolver, /steps\.state\.outputs\.state != 'pending'/);
-  assert.match(resolver, /steps\.state\.outputs\['refresh-required'\] != 'false'/);
-  assert.match(prepared, /needs:\n      - preflight\n      - verify-prepared-state/);
-  assert.match(prepared, /branch: \$\{\{ needs\.verify-prepared-state\.outputs\['head-branch'\] \}\}/);
-  assert.match(prepared, /head-sha: \$\{\{ needs\.verify-prepared-state\.outputs\['head-sha'\] \}\}/);
-  assert.match(active, /branch: main/);
-  assert.match(active, /head-sha: \$\{\{ github\.sha \}\}/);
+  assert.match(verify, /needs:\n      - preflight\n      - verify-state/);
+  assert.match(verify, /^          operation: verify$/m);
+  assert.match(verify, /branch: \$\{\{ needs\.verify-state\.outputs\['head-branch'\] \}\}/);
+  assert.match(verify, /head-sha: \$\{\{ needs\.verify-state\.outputs\['head-sha'\] \}\}/);
+  assert.doesNotMatch(verify, /verify-mode/);
 });
 
 test('documentation pins production WIF to only the exact top-level dispatch workflow', async () => {

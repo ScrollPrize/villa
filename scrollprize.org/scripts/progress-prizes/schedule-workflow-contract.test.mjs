@@ -214,7 +214,7 @@ test('workflow wiring makes manual scheduler dispatch read-only dry-run only', a
     assert.equal(result.status, 0, result.stderr);
     const output = await readFile(outputPath, 'utf8');
     assert.match(output, /^operation=dry-run$/m);
-    assert.doesNotMatch(output, /^operation=(?:prepare|activate)$/m);
+    assert.doesNotMatch(output, /^operation=(?:prepare|ready)$/m);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
@@ -249,7 +249,7 @@ test('dedupe and dispatch use only the tested fixed helper contract', async () =
   assert.match(helper, /MAX_GITHUB_RESPONSE_BYTES = 256 \* 1024/);
   assert.match(
     helper,
-    /'validate',[\s\S]*'dry-run',[\s\S]*'prepare',[\s\S]*'activate'/,
+    /'validate',[\s\S]*'dry-run',[\s\S]*'prepare',[\s\S]*'ready'/,
   );
   assert.match(helper, /'requested'[\s\S]*'queued'[\s\S]*'pending'[\s\S]*'waiting'[\s\S]*'in_progress'/);
   assert.match(

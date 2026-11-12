@@ -3,13 +3,15 @@
 
 namespace vcr::sftp::detail {
 
-// The ssh child process and its byte stream: an SFTP subsystem or, for hubs,
-// an existing sftp-server running under a process-owned remote lock. With an
+// The ssh child process and its byte stream (the SFTP subsystem). With an
 // authenticator (Linux/macOS), ssh's prompts arrive through SSH_ASKPASS and are
 // answered on a background thread until authenticated() is called.
 class SshProcess {
 public:
-    SshProcess(const Url& destination, const Options& options, Authenticator authenticator);
+    // A nonempty forwarding specification runs an owned `ssh -N -L` process
+    // instead of the SFTP subsystem, using the same authentication handling.
+    SshProcess(const Url& destination, const Options& options, Authenticator authenticator,
+               const std::string& forwarding = {});
     ~SshProcess();
     SshProcess(const SshProcess&) = delete;
     SshProcess& operator=(const SshProcess&) = delete;

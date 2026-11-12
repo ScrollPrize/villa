@@ -5,6 +5,9 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
 #include "support/TestProject.hpp"
+#ifndef _WIN32
+#include "support/LoopbackHttpServer.hpp"
+#endif
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
 
@@ -42,6 +45,169 @@ void createZyx(const fs::path& path, vcr::Index shape = {2, 2, 2})
 
 }  // namespace
 
+#ifndef _WIN32
+TEST_CASE("remote packed subgroup views reload and change working level together")
+{
+    const auto dir = temporaryDirectory();
+    const auto root = dir / "compound.zarr" / "sd1";
+    createArray(root / "0", {2, 8, 8, 8});
+    createArray(root / "1", {2, 4, 4, 4});
+    std::ofstream(root / "meta.json") << R"({"uuid":"channel-test","name":"compound",
+        "format":"zarr","width":8,"height":8,"slices":8,"voxelsize":1})";
+    vc::test::LoopbackHttpServer server;
+    server.serveDirectory(dir);
+    const auto location = server.url() + "/compound.zarr/sd1";
+    const auto source = Volume::NewFromUrl(location);
+    const std::vector<VolumePkg::PreparedVolumeAttachment> attachments{
+        {location, {}, source, {"presence", "width"}}};
+    const auto project = vc::test::createTestProject();
+    auto package = project.open();
+    REQUIRE(package->attachPreparedLasagnaDataset(server.url() + "/fiber.lasagna.json", {}, true, attachments)
+            == VolumePkg::AttachLasagnaResult::Attached);
+    package = project.open();
+    REQUIRE(package->numberOfVolumes() == 2);
+    const auto id = source->channelView(1, "width")->id();
+    REQUIRE(package->volume(id));
+    CHECK(package->volume(id)->channel() == 1);
+    CHECK(package->volume(id)->remotePersistentCachePath() == source->remotePersistentCachePath());
+    REQUIRE(package->setVolumeLevel(id, 1));
+    CHECK(package->volume(id)->channel() == 1);
+    CHECK(package->volume(id)->baseScaleLevel() == 1);
+    CHECK(package->volume(source->id())->baseScaleLevel() == 1);
+    package = project.open();
+    REQUIRE(package->numberOfVolumes() == 2);
+    CHECK(package->volume(id)->baseScaleLevel() == 1);
+    CHECK(package->volume(id)->shape() == std::array<int,3>{4,4,4});
+    CHECK(vc::project::annotationVolume(package.get(), *package->volume(id)).volume == source->id());
+    fs::remove_all(dir);
+}
+#endif
+
+TEST_CASE("Compound project preparation accepts packed CZYX channels")
+{
+    const auto dir = temporaryDirectory();
+    createArray(dir / "compound.zarr" / "sd2" / "2", {7, 8, 10, 12});
+    vcr::zarr::writeAttributes(dir / "compound.zarr", nlohmann::json::parse(R"({
+        "lasagna":{"version":3,"source_to_base":1,"base_shape_zyx":[32,40,48],
+        "validity_channel":"presence","groups":{"sd2":{"zarr":"sd2/2","scaledown":2,
+        "channels":["presence","nx","ny","width","sheet_nx","sheet_ny","sheet_grad_mag"]}}}
+    })"));
+    const auto dataset = vc::lasagna::LasagnaDataset::openLocation((dir / "compound.zarr").string());
+    const auto prepared = vc::lasagna::prepareLasagnaProjectVolumes(dataset);
+    REQUIRE(prepared.size() == 1);
+    CHECK(prepared[0].volume->shape() == std::array<int, 3>{32, 40, 48});
+    CHECK(std::find(prepared[0].tags.begin(), prepared[0].tags.end(),
+                    vc::project::kPredictedFiberNormalsTag) != prepared[0].tags.end());
+    std::vector<VolumePkg::PreparedVolumeAttachment> attachments;
+    for (const auto& item : prepared)
+        attachments.push_back(item);
+    const auto manifest = (dir / "compound.zarr").string();
+    const auto project = vc::test::createTestProject();
+    auto package = project.open();
+
+    SUBCASE("all named channels are selectable and survive reopening without source duplication") {
+        REQUIRE(prepared[0].channels == dataset.manifest().groups[0].channels);
+        REQUIRE(package->attachPreparedLasagnaDataset(manifest, {}, true, attachments) == VolumePkg::AttachLasagnaResult::Attached);
+        REQUIRE(package->numberOfVolumes() == 7);
+        REQUIRE(package->volumeEntries().size() == 1);
+        const auto base = prepared[0].volume;
+        for (std::size_t c = 0; c < prepared[0].channels.size(); ++c) {
+            const auto expected = base->channelView(c, prepared[0].channels[c]);
+            const auto view = package->volume(expected->id());
+            REQUIRE(view);
+            CHECK(view->channel() == c);
+            CHECK(view->sourceLocation() == base->sourceLocation());
+            CHECK(view->name() == expected->name());
+            CHECK(vc::project::annotationVolume(package.get(), *view).volume == base->id());
+        }
+        const auto selected = base->channelView(3, "width")->id();
+        package->setCurrentVolumeId(selected);
+        package = project.open();
+        CHECK(package->currentVolumeId() == selected);
+        REQUIRE(package->volume(selected));
+        CHECK(package->volume(selected)->channel() == 3);
+        CHECK(package->numberOfVolumes() == 7);
+        CHECK(package->volumeEntries()[0].channels == prepared[0].channels);
+        CHECK(package->attachPreparedLasagnaDataset(manifest, {}, true, attachments) == VolumePkg::AttachLasagnaResult::AlreadyAttached);
+
+        // Generic project reload applies changed channel labels, not only attachment.
+        auto data = package->document().data();
+        data["volumes"][0]["channels"][3] = "fiber_width";
+        package->document().replace(data);
+        REQUIRE(package->reload());
+        CHECK(package->volume(selected)->name() == base->name() + " / fiber_width");
+        CHECK(package->numberOfVolumes() == 7);
+        data["volumes"][0].erase("channels");
+        package->document().replace(data);
+        REQUIRE(package->reload());
+        CHECK(package->numberOfVolumes() == 1);
+        CHECK_FALSE(package->volume(selected));
+        CHECK(package->volume(base->id())->channel() == std::nullopt);
+    }
+
+    SUBCASE("malformed channel declarations are rejected") {
+        auto invalid = attachments;
+        invalid[0].channels.pop_back();
+        CHECK_THROWS(package->attachPreparedLasagnaDataset(manifest, {}, true, invalid));
+        CHECK(package->numberOfVolumes() == 0);
+        CHECK(package->volumeEntries().empty());
+        CHECK_THROWS(prepared[0].volume->channelView(7, "invalid"));
+        CHECK_THROWS(prepared[0].volume->channelView(-1, "invalid"));
+    }
+
+    SUBCASE("first attachment selects fiber normals and persists across reopening") {
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(package->annotationNormalSource() == "fiber");
+        CHECK(project.open()->annotationNormalSource() == "fiber");
+        package->setAnnotationNormalSource("lasagna");
+        package = project.open();
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(package->annotationNormalSource() == "lasagna");
+        CHECK(project.open()->annotationNormalSource() == "lasagna");
+        // Other projects remain independent; this is not a global preference.
+        auto other = vc::test::emptyProject();
+        other->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(other->annotationNormalSource() == "fiber");
+    }
+    SUBCASE("legacy selected Lasagna is never overridden") {
+        package->setSelectedLasagnaDataset("existing-normal.json");
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(package->annotationNormalSource() == "lasagna");
+    }
+    SUBCASE("explicit choice before attachment is respected") {
+        package->setAnnotationNormalSource("lasagna");
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(package->annotationNormalSource() == "lasagna");
+    }
+    SUBCASE("attaching normal data never changes an explicit fiber choice") {
+        package->setAnnotationNormalSource("fiber");
+        package->attachPreparedLasagnaDataset(manifest, {}, false, attachments);
+        CHECK(package->annotationNormalSource() == "fiber");
+    }
+    SUBCASE("background attachment does not initialize the choice") {
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments, false);
+        CHECK(package->annotationNormalSource() == "lasagna");
+        package = project.open();
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(package->annotationNormalSource() == "fiber");
+    }
+    SUBCASE("fiber data without normal heads defaults to Lasagna permanently") {
+        auto withoutNormals = attachments;
+        for (auto& item : withoutNormals)
+            std::erase(item.tags, vc::project::kPredictedFiberNormalsTag);
+        package->attachPreparedLasagnaDataset(manifest, {}, true, withoutNormals);
+        CHECK(package->annotationNormalSource() == "lasagna");
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(package->annotationNormalSource() == "lasagna");
+    }
+    SUBCASE("invalid source including auto is rejected") {
+        CHECK_THROWS_AS(package->setAnnotationNormalSource("auto"), std::invalid_argument);
+        CHECK_THROWS_AS(package->setAnnotationNormalSource("typo"), std::invalid_argument);
+        CHECK(package->annotationNormalSource() == "lasagna");
+    }
+    fs::remove_all(dir);
+}
+
 TEST_CASE("Lasagna project preparation attaches group zarrs as regular volumes")
 {
     const auto dir = temporaryDirectory();
@@ -69,6 +235,10 @@ TEST_CASE("Lasagna project preparation attaches group zarrs as regular volumes")
     CHECK(prepared[0].tags == std::vector<std::string>{
           "vc-lasagna-manifest:" + manifestPath.string(),
           "vc-lasagna-group:pred"});
+    auto package = vc::test::emptyProject();
+    package->attachPreparedLasagnaDataset(manifestPath.string(), {}, true,
+        {{prepared[0].location, prepared[0].tags, prepared[0].volume}});
+    CHECK(package->annotationNormalSource() == "lasagna");
 
     fs::remove_all(dir);
 }
@@ -279,12 +449,12 @@ TEST_CASE("Lasagna project preparation leaves scale handling to native volume lo
 TEST_CASE("Lasagna project preparation uses native volume validation")
 {
     const auto dir = temporaryDirectory();
-    createArray(dir / "pred.zarr", {2, 2, 2, 2});
+    createArray(dir / "pred.zarr", {2, 2, 2, 2, 2});
     const auto manifest = vc::lasagna::LasagnaDatasetManifest::
         parseText(R"({"version":2,"groups":{"pred":{"zarr":"pred.zarr","channels":["presence"]}}})", dir / "data.lasagna.json");
     CHECK_THROWS_WITH_AS(
         vc::lasagna::prepareLasagnaProjectVolumes(vc::lasagna::LasagnaDataset(manifest)),
-        doctest::Contains("must be 3D"),
+        doctest::Contains("must be ZYX or CZYX"),
         std::runtime_error);
     fs::remove_all(dir);
 }

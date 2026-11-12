@@ -1,5 +1,6 @@
 #include "fibers3d/Fiber3DData.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <QtTest/QtTest>
@@ -43,7 +44,11 @@ struct Fixture {
              {"hv_classification", {{"automatic_tag", family}}}};
         root.update(extras);
         const auto entry = vc::objects::decodeFiberJson(root.dump());
-        session->act(attachment, {{id, {}}}, [&](auto& db, auto& txn) { vc::objects::ingestGeometryBatch(db, txn, {entry}); });
+        auto request = session->newRequest(attachment);
+        session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            vc::objects::addIngestOperation(request, reader, {entry});
+        });
+        session->submit(attachment, request);
         return id;
     }
 };
@@ -151,6 +156,21 @@ private slots:
         QCOMPARE(scene.fibers[0].key, storeFiberKey(f.attachment, id));
         QCOMPARE(scene.fibers[0].runs[0].points.back(), (Point{10, 0, 0}));
         QCOMPARE(scene.fibers[0].lengthMm, 0.08);
+    }
+    void geometryOnlyEditUsesActualPointsAndLength()
+    {
+        using namespace vc::objects;
+        Fixture f;
+        const auto id = f.add("H", {{0,0,0}, {10,0,0}, {20,0,0}, {30,0,0}});
+        f.session->editCurrent(f.attachment, {id}, [&](const StoreReader&, const auto&) {
+            vc::geometry::Fiber geometry; geometry.linePoints = {{1,0,0}, {3,0,0}};
+            return std::vector<TransactionOperation>{UpdateGeometryArraysOp{id, vc::geometry::encode(geometry), {}}};
+        });
+        const auto scene = loadStore(f.source(), {});
+        QCOMPARE(scene.fibers.size(), size_t{1});
+        QCOMPARE(scene.fibers[0].runs[0].points.size(), size_t{2});
+        QCOMPARE(scene.fibers[0].runs[0].points.back(), (Point{3,0,0}));
+        QCOMPARE(scene.fibers[0].lengthMm, .016);
     }
     void filtersSelectionAndLengthOrder()
     {

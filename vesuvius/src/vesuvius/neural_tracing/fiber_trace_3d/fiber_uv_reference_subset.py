@@ -136,7 +136,7 @@ def validate_cache(config):
 def run(settings):
     from . import fiber_reference_comparison as ref
     from .fiber_normal_sign_visualization import load_umbilicus_frame
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines, verify_fiber_source
     started=time.monotonic()
     source_path=Path(settings['source_config'])
     config=json.loads(source_path.read_text());config=config.get('fiber_uv_layout',config)
@@ -148,9 +148,10 @@ def run(settings):
     parent_signature=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text())['signature']
     for key in ('fibers','umbilicus','database','features','stage1','hv_solution','h_direction_solution','v_direction_solution'):
         if parent_signature.get(key)!=inputs[key]:raise ValueError('Parent tensor provenance mismatch: '+key)
+    source_version=verify_fiber_source(config['fibers'],inputs['fibers'],parent_signature.get('fiber_source'))
     if parent_signature.get('h_convention')!=config.get('h_convention','ccw') or parent_signature.get('layout_mode')!='shared_anchor':
         raise ValueError('Parent tensor geometry convention mismatch')
-    signature=dict(version=1,inputs=inputs,source_config=sha256_file(source_path),
+    signature=dict(version=1,inputs=inputs,fiber_source=source_version,source_config=sha256_file(source_path),
                    z_range=list(settings['z_range']),winding_range=list(settings['winding_range']) if reference_selected else None,
                    sample_spacing=float(settings.get('sample_spacing',64.)))
     if manifest_path.exists():
@@ -161,7 +162,7 @@ def run(settings):
     if root.exists() and any(root.iterdir()):raise FileExistsError('Incomplete/nonempty subset output: '+str(root))
     if signature['sample_spacing']<=0:raise ValueError('Invalid sample spacing')
     with np.load(config['tensor_cache']) as src:d={k:src[k] for k in src.files}
-    chosen=(ref.load_metric_projection(config['reference_projection'],d,config)['chosen_winding']
+    chosen=(ref.load_metric_projection(config['reference_projection'],d,config,source=(inputs['fibers'],source_version))['chosen_winding']
             if reference_selected else np.full(len(d['family']),np.nan))
     wlo,whi=map(float,settings['winding_range']) if reference_selected else (-np.inf,np.inf)
     if wlo>whi:raise ValueError('Invalid winding range')
@@ -174,7 +175,7 @@ def run(settings):
     directions=np.sign(directions)
     centers,widths=uv.radial_initial_geometry(d,config)
     rows=[];curves=[];curve_arcs=[];nodes=[];parents=[]
-    geometry=read_polylines(config['fibers'],selected_ids)
+    geometry=read_polylines(config['fibers'],selected_ids,source_version=source_version)
     for row,xyz in geometry:
         sid=row['id'];first=np.searchsorted(d['source_id'],sid);last=np.searchsorted(d['source_id'],sid,side='right')
         intervals=clipped_intervals(xyz,settings['z_range'])
@@ -205,7 +206,7 @@ def run(settings):
     for key in ('phase_a','phase_b','phase_delta','distance','sign','parallel','event_ids'):out[key]=d[key][keep]
     out['degree']=np.bincount(np.r_[out['i'],out['j']],minlength=len(parents)).astype(np.float32)
     out['links']=retained_links(d,parents,out['start'],out['end'],directions)
-    sample=ref.samples(out,config,signature['sample_spacing'])
+    sample=ref.samples(out,config,signature['sample_spacing'],source_version=source_version)
     projection_out=dict(sample,chosen_winding=chosen[parents],**{key:out[key] for key in ('source_id','start','end')})
     audit_subset(out,d,projection_out,settings['z_range'],settings.get('winding_range'))
     zlo,zhi=settings['z_range']
@@ -216,6 +217,7 @@ def run(settings):
     projection_signature=(json.loads(Path(config['reference_projection']).with_name('projection_signature.json').read_text())
                           if reference_selected else dict(fibers=inputs['fibers'],reference_selected=False))
     projection_signature['reference_subset']=signature
+    projection_signature['fiber_source']=source_version
     atomic_write(root/'projection_signature.json',projection_signature,durable=False)
     np.savez(root/'clipped_curves.npz',xyz=np.concatenate(curves),arc=np.concatenate(curve_arcs),
              offsets=np.r_[0,np.cumsum([len(c) for c in curves])],source_id=out['source_id'],start=out['start'],end=out['end'],parent_piece=parents)

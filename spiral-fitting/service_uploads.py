@@ -1,8 +1,9 @@
-"""Session-input uploads: transfer, validation, and publication.
+"""Checkpoint uploads: transfer, validation, and publication.
 
 ``UploadManager`` owns the staging area, the per-upload transfer state, the
-content validation for every input kind, and the content-addressed store of
-uploaded resume checkpoints. It never sees ``ServiceState``: everything it
+checkpoint validation, and the content-addressed store of uploaded resume
+checkpoints. Fit inputs are never uploaded: patches, point collections and
+fibers come from the service's object store. It never sees ``ServiceState``: everything it
 needs from the lifecycle orchestrator arrives through the small callback set
 in ``UploadEnvironment`` (where the output directory is, whether a session is
 loaded and which checkpoint the session is using).
@@ -19,7 +20,6 @@ import copy
 import hashlib
 from http import HTTPStatus
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -31,10 +31,7 @@ from typing import Callable, Optional
 
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
-from fit_session import (PCL_ROLE_CONVENTIONS,
-                         validate_checkpoint_container)
-from vc3d_fiber_format_adapter import (parse_vc3d_fiber_format,
-                                       validate_fiber_uuid)
+from fit_session import validate_checkpoint_container
 
 
 MAX_UPLOAD_FILES = 256
@@ -43,21 +40,16 @@ UPLOADED_CHECKPOINTS_KEPT = 3
 UPLOADED_CHECKPOINTS_DIRNAME = "uploaded-checkpoints"
 MAX_CHECKPOINT_UPLOAD_BYTES = int(os.environ.get(
     "SPIRAL_CHECKPOINT_UPLOAD_MAX_BYTES", 64 * 1024 * 1024 * 1024))
-UPLOAD_KINDS = ("patch", "fiber", "pcl", "checkpoint")
+UPLOAD_KINDS = ("checkpoint",)
 STAGING_DIRNAME = ".spiral-upload-staging"
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
-PCL_ROLE_FILES = {
-    role.value: filename for role, filename in PCL_ROLE_CONVENTIONS}
-
-
 class Upload:
-    def __init__(self, upload_id, session_id, kind, role, input_id, manifest, staging_dir):
+    def __init__(self, upload_id, session_id, kind, input_id, manifest, staging_dir):
         self.upload_id = upload_id
         self.session_id = session_id
         self.kind = kind
-        self.role = role
         self.input_id = input_id
         self.manifest = manifest
         self.staging_dir = staging_dir
@@ -99,135 +91,15 @@ def _validate_upload_manifest(value):
     return manifest
 
 
-def _validate_patch_content(directory):
-    meta_path = directory / "meta.json"
-    if not meta_path.is_file():
-        raise ApiError(HTTPStatus.BAD_REQUEST, "Patch upload is missing meta.json")
+def _validate_checkpoint_content(directory):
+    files = [p for p in directory.rglob("*") if p.is_file()]
+    if len(files) != 1:
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "A checkpoint upload must contain exactly one file")
     try:
-        with meta_path.open("r", encoding="utf-8") as stream:
-            meta = json.load(stream)
-    except Exception as exc:
-        raise ApiError(HTTPStatus.BAD_REQUEST, f"Patch meta.json is invalid JSON: {exc}")
-    if meta.get("format") != "tifxyz":
-        raise ApiError(HTTPStatus.BAD_REQUEST, "Patch meta.json format must be 'tifxyz'")
-    for raster in ("x.tif", "y.tif", "z.tif"):
-        if not (directory / raster).is_file():
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"Patch upload is missing raster file {raster}")
-
-
-def _load_single_json(directory, kind):
-    json_files = [p for p in directory.rglob("*") if p.is_file()]
-    if len(json_files) != 1 or json_files[0].suffix.lower() != ".json":
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       f"A {kind} upload must contain exactly one JSON file")
-    try:
-        with json_files[0].open("r", encoding="utf-8") as stream:
-            return json.load(stream), json_files[0]
-    except Exception as exc:
-        raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid JSON: {exc}")
-
-
-def _validate_replacement_document(document, target_collection_id, role=None):
-    collections = document.get("collections")
-    if not isinstance(collections, dict) \
-            or list(collections) != [target_collection_id]:
-        raise ApiError(
-            HTTPStatus.BAD_REQUEST,
-            "A replacement upload must contain exactly its target collection")
-    collection = collections[target_collection_id]
-    if not isinstance(collection, dict):
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "The replacement collection is malformed")
-    if ("id" in collection
-            and str(collection["id"]) != target_collection_id):
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "The replacement collection id does not match its target")
-    if collection.get("windings_linked"):
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "Linked collections cannot be replaced safely")
-    points = collection.get("points")
-    if not isinstance(points, dict) or len(points) < 2:
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "A replacement collection needs at least two points")
-    expected = [str(index) for index in range(len(points))]
-    if set(points) != set(expected):
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "Replacement point ids must be contiguous from zero")
-    previous_time = None
-    for point_id in expected:
-        point = points[point_id]
-        if not isinstance(point, dict) or point.get("links"):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Linked points cannot be replaced safely")
-        position = point.get("p")
-        if not isinstance(position, list) or len(position) != 3 \
-                or any(not isinstance(value, (int, float))
-                       or isinstance(value, bool) or not math.isfinite(value)
-                       for value in position):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"Replacement point {point_id} has an invalid position")
-        creation_time = point.get("creation_time")
-        if not isinstance(creation_time, (int, float)) \
-                or isinstance(creation_time, bool) \
-                or not math.isfinite(creation_time):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Replacement points need numeric creation_time values")
-        if previous_time is not None and creation_time <= previous_time:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Replacement creation_time values must strictly increase")
-        previous_time = creation_time
-        if role == "relative":
-            # The fitter drops unannotated points from a partially annotated
-            # collection, so a relative replacement must annotate every point.
-            winding = point.get("wind_a")
-            if not isinstance(winding, (int, float)) \
-                    or isinstance(winding, bool) or not math.isfinite(winding):
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    f"Relative-winding replacement point {point_id} needs a "
-                    "finite wind_a annotation")
-
-
-def _validate_upload_content(kind, role, directory):
-    if kind == "patch":
-        _validate_patch_content(directory)
-        return
-    if kind == "checkpoint":
-        files = [p for p in directory.rglob("*") if p.is_file()]
-        if len(files) != 1:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "A checkpoint upload must contain exactly one file")
-        try:
-            validate_checkpoint_container(files[0])
-        except (OSError, ValueError) as exc:
-            raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid checkpoint: {exc}")
-        return
-    document, _ = _load_single_json(directory, kind)
-    if kind == "fiber":
-        if not isinstance(document, dict) or document.get("type") != "vc3d_fiber":
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Fiber uploads must be JSON documents with type 'vc3d_fiber'")
-        try:
-            if document.get("version", 1) == 1:
-                validate_fiber_uuid(document)
-                return
-            parse_vc3d_fiber_format(document)
-        except ValueError as exc:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"Invalid fiber upload: {exc}") from exc
-        return
-    if kind == "pcl":
-        if not isinstance(document, dict) \
-                or document.get("vc_pointcollections_json_version") != "1":
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "PCL uploads must be vc_pointcollections_json_version 1 documents")
-        if not isinstance(document.get("collections"), dict) or not document["collections"]:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "PCL upload contains no collections")
-        if role not in PCL_ROLE_FILES:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "PCL uploads must declare a valid role")
-        return
-    raise ApiError(HTTPStatus.BAD_REQUEST, f"Unknown input kind {kind!r}")
+        validate_checkpoint_container(files[0])
+    except (OSError, ValueError) as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid checkpoint: {exc}")
 
 
 @dataclass(frozen=True)
@@ -329,7 +201,6 @@ class UploadManager:
         record = {
             "id": input_id,
             "kind": "checkpoint",
-            "role": None,
             "path": str(path),
             "bytes": size,
             "state": "uploaded",
@@ -396,23 +267,8 @@ class UploadManager:
         content is already retained by the service.
         """
         kind = str(request.get("kind") or "").strip()
-        if kind not in UPLOAD_KINDS:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Input kind must be one of patch, fiber, pcl, checkpoint")
-        role = request.get("role")
-        if kind == "pcl":
-            if role not in PCL_ROLE_FILES:
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "A PCL upload must declare its role")
-        else:
-            role = None
-        if kind not in self.environment.allowed_kinds:
-            raise ApiError(400, "This upload store does not accept that input kind")
-        if any(key in request for key in ("operation", "target_collection_id",
-                                          "base_source_revision", "base_revision")):
-            raise ApiError(400, "Uploads contain bytes only; stage revisions with /session/input-changes")
-        if kind != "checkpoint" and not request.get("upload_id"):
-            raise ApiError(400, "Input uploads require a stable upload_id")
+        if kind not in UPLOAD_KINDS or kind not in self.environment.allowed_kinds:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Only checkpoints are uploaded")
         input_id = str(request.get("id") or "").strip()
         if not _SAFE_ID.match(input_id):
             raise ApiError(HTTPStatus.BAD_REQUEST,
@@ -423,12 +279,12 @@ class UploadManager:
             with self._lock:
                 # Resume checkpoints are needed before a session exists, so
                 # they are service-scoped: allowed whenever an output
-                # directory is known (a --dataset launch or a live session).
+                # directory is known (a bound --output or a live session).
                 output_root = self.environment.output_root()
                 if output_root is None:
                     raise ApiError(HTTPStatus.CONFLICT,
-                                   "Checkpoint uploads need a --dataset service "
-                                   "or an active session")
+                                   "Checkpoint uploads need a service bound to "
+                                   "an --output directory or an active session")
                 if len(manifest) != 1:
                     raise ApiError(HTTPStatus.BAD_REQUEST,
                                    "A checkpoint upload must declare exactly one file")
@@ -471,7 +327,7 @@ class UploadManager:
             upload_id = request.get("upload_id") or secrets.token_hex(16)
             staging = self.staging_root() / upload_id
             upload = Upload(upload_id, self.environment.session_id(), kind,
-                            role, input_id, manifest, staging)
+                            input_id, manifest, staging)
             staging.mkdir(parents=True, exist_ok=True)
             self.uploads[upload_id] = upload
         return {"upload_id": upload_id, "accepted": True}
@@ -639,19 +495,10 @@ class UploadManager:
                                "The upload is missing declared files",
                                [{"field": name, "message": "File was not uploaded"}
                                 for name in missing])
-            _validate_upload_content(upload.kind, upload.role, upload.staging_dir)
-            if upload.kind != "checkpoint":
-                path = (upload.staging_dir if upload.kind == "patch" else
-                        next(p for p in upload.staging_dir.rglob("*") if p.is_file()))
-                upload.record = {
-                    "id": upload.input_id, "kind": upload.kind, "role": upload.role,
-                    "path": str(path), "upload_id": upload.upload_id,
-                    "bytes": upload.declared_bytes(), "state": "uploaded"}
-                return FinalizedUpload(upload.kind, dict(upload.record))
-            if upload.kind == "checkpoint":
-                record = self._publish_checkpoint(upload)
-                upload.record = record
-                return FinalizedUpload(upload.kind, dict(record))
+            _validate_checkpoint_content(upload.staging_dir)
+            record = self._publish_checkpoint(upload)
+            upload.record = record
+            return FinalizedUpload(upload.kind, dict(record))
     def _publish_checkpoint(self, upload):
         """Move a finalized checkpoint into the service's upload directory.
 
@@ -711,30 +558,3 @@ class UploadManager:
                     del self.uploads[upload_id]
         for upload in expired:
             shutil.rmtree(upload.staging_dir, ignore_errors=True)
-
-
-def collection_has_affected_links(collections, target_id):
-    target = collections[target_id]
-    if target.get("windings_linked"):
-        return True
-    points = target.get("points") or {}
-    try:
-        target_point_ids = {int(key) for key in points}
-    except (TypeError, ValueError):
-        # A malformed source cannot be renumbered safely by a local
-        # replacement operation.
-        return True
-    if any(point.get("links") for point in points.values()
-           if isinstance(point, dict)):
-        return True
-    target_numeric = int(target_id)
-    for collection_id, collection in collections.items():
-        if collection_id == target_id or not isinstance(collection, dict):
-            continue
-        if target_numeric in (collection.get("windings_linked") or []):
-            return True
-        for point in (collection.get("points") or {}).values():
-            if isinstance(point, dict) and target_point_ids.intersection(
-                    point.get("links") or []):
-                return True
-    return False

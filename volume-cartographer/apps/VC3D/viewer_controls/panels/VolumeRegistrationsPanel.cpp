@@ -74,7 +74,6 @@ VolumeRegistrationsPanel::VolumeRegistrationsPanel(CState* state, QWidget* paren
     if (_state) {
         connect(_state, &CState::volumeChanged, this, [this]() { refresh(); });
         connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-            if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
             if (event.touches({"volume_transform", "volume_transform_choice"})) refresh();
         });
     }
@@ -98,11 +97,9 @@ void VolumeRegistrationsPanel::refresh()
     const auto target = _state->annotationVolume()->volume;
     _heading->setText(tr("Volumes mapped into %1").arg(QString::fromStdString(target)));
     try {
-        _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-            const auto transforms = db.volumeTransforms(txn);
-            _graph = transforms.graph;
-            _related = transforms.related(target);
-        });
+        const auto transforms = _state->objectStoreSession()->volumeTransforms(*attachment);
+        _graph = transforms.graph;
+        _related = transforms.related(target);
         _status->setText(_related.empty() ? tr("No other volume maps into this one.") : QString());
     } catch (const std::exception& error) {
         _status->setText(tr("Cannot read registrations: %1").arg(QString::fromUtf8(error.what())));

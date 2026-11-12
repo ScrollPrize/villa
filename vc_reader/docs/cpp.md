@@ -64,7 +64,15 @@ already link them. The Python extensions link those same CUDA libraries.
 | `vc_reader/sampling.hpp` | `aligned::Plan` and `PointPlan`, `projection::Plan`, `geometry::Curves` and `Voxels`, sheet-normal kernels | Existing CPU algorithms and CUDA launch APIs, including surface projection, curves and voxel membership |
 | `vc_reader/transforms.hpp` | All `transforms::Op` alternatives, parameter types, `Pipeline`, `Sample`, `Plan`, `save_plan`, `load_plan` | Full transform catalog; `cpu`, `cuda` and `auto` pipeline backends |
 | `vc_reader/cuda.hpp` | Device storage, borrowed storage, stream scope, completion, resident transform input/output sessions, device sample and batch runs | CUDA only |
-| `vc_reader/cuda_reader.hpp` | `reader_cuda::Reader`, region/affine grids, point plans, resident sampling, cache statistics; CUDA sampling declarations | CUDA only |
+| `vc_reader/cuda_reader.hpp` | `reader_cuda::Reader`, region/affine grids, point plans, resident sampling, cache statistics; optional scalar CZYX channel | CUDA uint8, including the same reader's CPU/upload fallback |
+
+For a packed uint8 CZYX array, construct `reader_cuda::Reader(array, pool, channel)`
+(or `Reader(array, budget, device, channel)`). All requests still use spatial ZYX
+triples. Readers for different channels share the original decoded multichannel
+RAM chunks; each uploads only its scalar bricks, sharing the pool's VRAM budget.
+For grid sampling, set `Level::channel` to the same channel as its CUDA reader.
+Python exposes this as `reader.cuda(channel=...)`; `reader.grid_level(cuda=gpu)`
+inherits that selection. No extracted volume or additional disk cache is created.
 
 The `vc_reader/native/` include tree contains the underlying typed APIs,
 including individual transform operators and CPU/CUDA kernels. These are
@@ -91,6 +99,17 @@ mounted. `vc_reader/sftp.hpp` exposes the session, the pooled `Fetcher` the
 reader uses (at most 8 sessions per host, transport failures retried, a missing
 file reads as not stored) and directory listing. Without an
 `sftp::setAuthenticator` callback, ssh runs in batch mode and never prompts.
+
+`sftp::Forward("ssh://[user@]host:8750")` owns a TCP forward to port 8750
+on the remote host's loopback interface. `sftp://` is accepted as an alias in
+this service context; file paths are rejected and the explicit port is the
+**service port**, while OpenSSH configuration supplies the SSH login port.
+`Forward::endpoint()` returns the temporary local HTTP endpoint. Keep the object
+alive while using it; destruction closes the SSH process and listener. It uses
+the same authenticator, keys and host verification as SFTP, without starting a
+remote command. Recreate the forward after an SSH disconnect. In Python this
+class is available as `vc_reader.SshForward(endpoint)` with an `endpoint` property.
+Interactive prompts are supported on Linux/macOS; Windows uses keys and the agent.
 
 ## Opening and writing Zarr arrays
 

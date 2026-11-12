@@ -4,6 +4,7 @@
 
 namespace vc::objects {
 class TransformedGeometryView;
+class StoreReader;
 namespace detail { struct GeometryReadState; struct GeometryViewState; }
 
 // Views share a read transaction and pin a geometry revision. Reads are bounded
@@ -11,12 +12,17 @@ namespace detail { struct GeometryReadState; struct GeometryViewState; }
 // views; otherwise they keep the snapshot alive. Thread-confined, like Txn.
 class GeometryView {
 public:
-    // This revision in `targetVolume`'s voxels; an older revision maps with the
-    // coordinates of the latest object revision that held it.
-    TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1) const;
+    // In `targetVolume`'s voxels, with the selected object's coordinate metadata.
+    // A payload-only selector uses the latest retained record holding that payload;
+    // it carries no object reference and does not authorize inverse edits.
+    TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1,
+                                             const VolumeTransforms* context=nullptr) const;
     std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
-    const std::string& objectRevision() const;
+    // Derived from the selected reference; nullopt for a payload-only view.
+    std::optional<int64_t> version() const;
+    // Complete identity retained by current/selected views, not just its counter.
+    std::optional<ObjectVersion> reference() const;
 protected:
     explicit GeometryView(std::shared_ptr<detail::GeometryViewState>);
     geometry::Geometry loadGeometry() const;
@@ -104,13 +110,17 @@ class TransformedGeometryView {
 public:
     ViewFrame frame() const {return {target_, targetScale_, mapping_};}
     const GeometryRevision& revision() const;
-    const std::string& objectRevision() const;
+    // The canonical view's version(): nullopt for a pinned geometry revision.
+    std::optional<int64_t> version() const;
     const VolumeAffine& mapping() const {return mapping_;}
     const TypedGeometryView& canonical() const {return source_;}
     const std::string& targetVolume() const {return target_;}
     double targetScale() const {return targetScale_;}
     // Validate the pinned mapping and geometry before submitting inverse edits.
     void validateForWrite(const ObjectStore&, const Txn&) const;
+    // Place before inverse edits in a checked request; expectedObjects must
+    // also guard the object version used to compute those edits.
+    CheckVolumeMappingOp checkMappingOperation() const;
     std::string writeCoordinates(ObjectStore&, WriteTxn&, const std::string& array, int64_t start,
         const std::vector<geometry::Point>& desired, const std::vector<GeometryEdgeEdit>& edges={}) const;
     std::string writeSurface(ObjectStore&, WriteTxn&, int64_t row, int64_t column, int64_t rows, int64_t columns,
@@ -127,8 +137,12 @@ public:
     // canonical coordinates. Points keep their exact canonical values while
     // their displayed position is unchanged, matched by stable ID.
     geometry::PointCollection canonicalPointCollection(const geometry::PointCollection& desired) const;
+    // `validity`, when given, is the whole grid's validity the edits apply to
+    // instead of the stored one (an earlier operation of the same request
+    // replaces the valid channel).
     std::vector<GeometryArrayEdit> surfaceEdits(int64_t row, int64_t column,
-        int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired) const;
+        int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired,
+        const std::vector<uint8_t>* validity = nullptr) const;
     std::vector<geometry::Point> points(const std::string& array,int64_t start,int64_t count) const;
     TransformedSurfaceTile readTile(int64_t row,int64_t column,int64_t rows,int64_t columns) const;
     // Encode only explicitly changed positions; unchanged values reuse their
@@ -155,8 +169,13 @@ public:
     // Views over the caller's transaction (e.g. inside ObjectStoreSession::read),
     // valid while it is.
     GeometrySnapshot(const ObjectStore&, const Txn&);
+    // Views over any attachment's reader (objects/StoreReader.hpp, e.g. inside
+    // ObjectStoreSession::readStore), valid while it is.
+    explicit GeometrySnapshot(const StoreReader&);
     void close();
     TransformedGeometryView viewTransformedAt(const std::string& objectUuid,const std::string& target,
+        double targetScale=1, const VolumeTransforms* transforms=nullptr) const;
+    TransformedGeometryView viewTransformedAt(const ObjectRevision&, const std::string& target,
         double targetScale=1, const VolumeTransforms* transforms=nullptr) const;
     // The object's geometry (current, or `geometryRevision`) in its stored
     // coordinates: the identity view, so edits in stored units take the same
@@ -165,7 +184,7 @@ public:
                                        const std::optional<std::string>& geometryRevision = std::nullopt) const;
     bool active() const;
     // The object's current geometry, or its pinned `geometryRevision`. A view of
-    // a pinned revision has an empty objectRevision().
+    // a pinned revision has no version().
     PointCollectionView pointCollection(const std::string& objectUuid,
                                         const std::optional<std::string>& geometryRevision = std::nullopt) const;
     FiberView fiber(const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt) const;
@@ -175,9 +194,24 @@ public:
     SurfaceView surface(const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt) const;
     TypedGeometryView geometry(const std::string& objectUuid,
                                const std::optional<std::string>& geometryRevision = std::nullopt) const;
+    // Carry the selected metadata/identity with its geometry, without a head lookup.
+    PointCollectionView pointCollection(const ObjectRevision&) const;
+    FiberView fiber(const ObjectRevision&) const;
+    TrackView track(const ObjectRevision&) const;
+    UmbilicusView umbilicus(const ObjectRevision&) const;
+    SurfaceView surface(const ObjectRevision&) const;
+    TypedGeometryView geometry(const ObjectRevision&) const;
+    ObjectRevision selected(const ObjectVersion&) const;
 private:
+    friend class GeometryView;
+    // Another snapshot over the same reads (and lifetime).
+    explicit GeometrySnapshot(std::shared_ptr<detail::GeometryReadState> state) : state_(std::move(state)) {}
     std::shared_ptr<detail::GeometryViewState> view(const std::string&, const std::string& kind,
                                                     const std::optional<std::string>& geometryRevision) const;
+    std::shared_ptr<detail::GeometryViewState> view(const ObjectRevision&, const std::string& kind) const;
+    std::shared_ptr<detail::GeometryViewState> payload(const std::string& object, const std::string& kind,
+                                                    const std::string& geometry) const;
+    TypedGeometryView typed(std::shared_ptr<detail::GeometryViewState>) const;
     std::shared_ptr<detail::GeometryReadState> state_;
 };
 
