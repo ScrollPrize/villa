@@ -57,7 +57,10 @@ class ModelLoader:
                 self.spacing = [1] * len(self.train_patch_size)
                 self.model_name = "Loaded_Model"
                 
-        if self.config_manager is not None:
+        # The checkpoint's own config describes the network its weights belong to;
+        # the GUI's config manager is only a fallback for checkpoints without one.
+        checkpoint_has_config = 'model_config' in checkpoint_data or 'config' in checkpoint_data
+        if self.config_manager is not None and not checkpoint_has_config:
             mgr = self.config_manager
         else:
             mgr = MinimalConfigManager(model_config)
