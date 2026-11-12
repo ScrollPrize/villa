@@ -20,21 +20,23 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
     std::unique_ptr<QuadSurface> surface;
     std::optional<vc::objects::PinnedObject> pin;
     bool identity = true;
+    std::optional<vc::objects::CheckVolumeMappingOp> mapping;
     const auto& session = objects_.session();
     session->readStore(objects_.attachment(), [&](const vc::objects::StoreReader& reader, const auto&) {
         const auto activeGeneration = reader.status().generation;
         const auto head = reader.currentObject(vc::objects::util::canonicalUuid(uuid));
         if (!head || !head->geometryRevision) throw std::runtime_error("not a stored surface: " + uuid);
         if (volume) {
-            const auto view = vc::objects::GeometrySnapshot(reader).viewTransformedAt(head->objectUuid, volume->volume, volume->scale);
+            const auto view = vc::objects::GeometrySnapshot(reader).viewTransformedAt(*head, volume->volume, volume->scale);
             identity = view.mapping() == vc::objects::VolumeAffine::identity();
-            surface = load_quad_from_store(reader, head->objectUuid, head->geometryRevision, applyValidity, &view);
+            mapping = view.checkMappingOperation();
+            surface = load_quad_from_store(reader, *head, applyValidity, &view);
         } else {
-            surface = load_quad_from_store(reader, head->objectUuid, head->geometryRevision, applyValidity);
+            surface = load_quad_from_store(reader, *head, applyValidity);
         }
         pin = vc::objects::pinOf(objects_.attachment(), *head, activeGeneration);
     });
-    objects_.noteRead(*pin, volume, identity);
+    objects_.noteRead(*pin, volume, identity, mapping);
     surface->setChannelLoader(store_channel_loader(session, objects_.attachment(), *pin->geometryRevision));
     return surface;
 }
@@ -57,19 +59,16 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
 int64_t StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto pin = objects_.writable(canonical);
     const auto& points = *surface.rawPointsPtr();
     const auto& session = objects_.session();
     auto request = session->newRequest(objects_.attachment());
-    request.generation = pin.writeGeneration;
-    request.expectedObjects = {{canonical, pin.version}};
+    const auto pin = objects_.writable(canonical, request);
     session->readStore(objects_.attachment(), [&](const vc::objects::StoreReader& reader, const auto&) {
         const auto view = vc::objects::GeometrySnapshot(reader).viewStored(canonical, pin.geometryRevision);
         if (auto edit = quad_rect_edit(view, surface, cv::Rect(0, 0, points.cols, points.rows)))
             request.operations.push_back(std::move(*edit));
-        vc::objects::expectRelationshipEndpoints(reader, request.expectedObjects);
+        vc::objects::expectRelationshipEndpoints(reader, request);
     });
-    if (request.operations.empty()) return pin.version;
     const auto receipt = session->submit(objects_.attachment(), request);
     return *receipt.objects.at(canonical);
 }

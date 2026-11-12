@@ -25,6 +25,9 @@ public:
     void mergeAllocated(const MetadataSnapshot&);
     SharedJson save();
 };
+// Union the allocation facts retained for this logical object throughout its
+// pinned scope. Restores and inherited edits must not recycle earlier IDs.
+void mergeRetainedAllocations(sqlite3*,const std::string& object,const std::string& array,MetadataSnapshot&);
 SharedJson identityGet(sqlite3*,const SharedJson&,int64_t);
 SharedJson packAnnotation(sqlite3*,const SharedJson&);
 SharedJson unpackAnnotation(sqlite3*,const SharedJson&);

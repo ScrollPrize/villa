@@ -42,7 +42,6 @@ target_sources(vc_reader_native PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sampling/resident.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/display.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/slab.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/publication.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/pathfinding/pathfinding.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/composite/reduce.cpp"

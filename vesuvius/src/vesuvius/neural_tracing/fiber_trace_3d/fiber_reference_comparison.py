@@ -178,12 +178,14 @@ def visualization_offset(settings,reference,fitted,weights):
     return int(np.rint(weighted_median(reference-fitted,weights)))
 
 
-def load_metric_projection(path,d,config=None):
+def load_metric_projection(path,d,config=None,*,source=None):
     """Load existing geometry-only projection; fail on mismatched piece identity."""
     if config is not None:
-        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_source
         signature=json.loads(Path(path).with_name('projection_signature.json').read_text())
-        if signature['fibers']!=fibers_digest(config['fibers']):
+        digest=signature['fibers']
+        version=verify_fiber_source(config['fibers'],digest,signature.get('fiber_source'))
+        if source is not None and source!=(digest,version):
             raise ValueError('Reference projection fiber provenance mismatch')
     with np.load(path) as src:
         for key in ('source_id','start','end'):
@@ -322,9 +324,10 @@ class Surface:
         return result, distances
 
 
-def samples(d, cfg, spacing):
+def samples(d, cfg, spacing, *, source_version=None):
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
-    source_ids = np.unique(d['source_id']); curves = read_polylines(cfg['fibers'], source_ids)
+    source_ids = np.unique(d['source_id'])
+    curves = read_polylines(cfg['fibers'], source_ids, source_version=source_version)
     counts=[]; xyzs=[]; arcs=[]; weights=[]
     # Source pieces are sorted by source and arc in the tensor cache.
     if np.any(d['source_id'][1:] < d['source_id'][:-1]): raise ValueError('Unsorted source pieces')
@@ -586,9 +589,9 @@ def metric_report(settings):
             ccw_tangential_weight_percent=float(100*positive),direction='ccw' if positive>.5 else 'cw',
             sampled_valid_segments=int(ok.sum()))
     for entry in settings.get('solutions',[]):
-        root=Path(entry['run_root']);cfg=json.loads((root/'summary.json').read_text())['config']
+        root=Path(entry['run_root']);summary=json.loads((root/'summary.json').read_text());cfg=summary['config']
         with np.load(cfg['tensor_cache']) as src:d={k:src[k] for k in src.files}
-        projection=load_metric_projection(settings['projection_cache'],d,cfg)
+        projection=load_metric_projection(settings['projection_cache'],d,cfg,source=_verified_run_source(summary))
         if entry.get('initial_state',False):
             state,widths=uv.fresh_initial_state(d,cfg)
             metrics=reference_winding_metrics(d,state,widths,cfg,projection)
@@ -637,6 +640,11 @@ def projection_coverage_report(settings):
     return result
 
 
+def _verified_run_source(summary):
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_signature
+    return verify_fiber_signature(summary['config']['fibers'], summary.get('input', {}).get('signature', {}))
+
+
 def run(settings):
     if settings.get('projection_coverage_only'):return projection_coverage_report(settings)
     if settings.get('metrics_only'):return metric_report(settings)
@@ -646,12 +654,15 @@ def run(settings):
     started=time.monotonic(); maximum=settings.get('max_distance_base',200.)
     surface=Surface(settings['reference'],settings.get('xyz_scale',4.),settings.get('surface_stride',2),
                     settings.get('workers',32),settings.get('candidates',4))
-    first=Path(settings['solutions'][0]['run_root']);cfg=json.loads((first/'summary.json').read_text())['config']
+    first=Path(settings['solutions'][0]['run_root'])
+    first_summary=json.loads((first/'summary.json').read_text())
+    cfg=first_summary['config']
+    fiber_digest,source_version=_verified_run_source(first_summary)
     if not uv.anchored(cfg):raise ValueError('Reference comparison requires shared-anchor geometry')
     keys=('source_id','start','end','family','node_ds','lengths','phase','z')
     with np.load(cfg['tensor_cache']) as src:d={k:src[k] for k in keys}
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
-    signature=dict(fibers=fibers_digest(cfg['fibers']),reference={c:uv.sha256_file(surface.root/(c+'.tif')) for c in 'xyz'},
+    signature=dict(fibers=fiber_digest,fiber_source=source_version,
+                   reference={c:uv.sha256_file(surface.root/(c+'.tif')) for c in 'xyz'},
                    metadata=uv.sha256_file(surface.root/'meta.json'),
                    parameters={k:settings.get(k) for k in ('xyz_scale','surface_stride','sample_spacing_base','max_distance_base','candidates')},
                    version=2)
@@ -670,7 +681,7 @@ def run(settings):
             placed=src['placed_rc'];placed_dist=src['placed_distance']
     else:
         print('reference: sampling original source fiber curves',flush=True)
-        sample=samples(d,cfg,settings.get('sample_spacing_base',200.))
+        sample=samples(d,cfg,settings.get('sample_spacing_base',200.),source_version=source_version)
         print(f'reference: {len(sample["xyz"]):,} curve samples',flush=True)
         rc,distance=surface.project(sample['xyz'])
         ref_q=winding_at(rc[:,1],surface.x,surface.q)
@@ -704,7 +715,10 @@ def run(settings):
     reports=[]
     for entry in settings['solutions']:
         source=Path(entry['run_root']);dest=root/entry['label'].lower();dest.mkdir(exist_ok=True)
-        cfg=json.loads((source/'summary.json').read_text())['config']
+        summary=json.loads((source/'summary.json').read_text())
+        cfg=summary['config']
+        if _verified_run_source(summary) != (fiber_digest,source_version):
+            raise ValueError('Compared layouts do not use the same frozen fiber source')
         if not uv.anchored(cfg):raise ValueError('Reference comparison requires shared-anchor geometry')
         with np.load(cfg['tensor_cache']) as src:
             for key in ('source_id','start','end','family'):

@@ -19,7 +19,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization impo
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import arrow_mesh, write_ply
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import tube_mesh, export_umbilicus, umbilicus_frame
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import catalog_rows
-from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers, fiber_source_version
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import subset_mesh, export_classified_layers
 
 
@@ -83,11 +83,13 @@ def test_spatial_subset_spans_axes_deterministically():
 
 
 def test_repair_reads_store_geometry(tmp_path):
+    import pytest
+    from vc_object_store import ObjectStore
     path=tmp_path/'source.vcobj';ids=['00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000007']
     write_fibers(path,[(dict(id=fid),np.array([[k,0,0],[k,1,0],[k,2,0]],dtype=float)) for k,fid in zip((1,7),ids)],volume='123')
     assert catalog_rows(path)==[(ids[0],1.,1.,0.,2.),(ids[1],7.,1.,0.,2.)]
     # Repair a previously truncated preview directly from source geometry.
-    (tmp_path/'index.json').write_text(json.dumps(dict(config=dict(fibers=str(path)),records=[
+    (tmp_path/'index.json').write_text(json.dumps(dict(config=dict(fibers=str(path)),fiber_source=fiber_source_version(path),records=[
         dict(fiber_id=ids[1],obj_first_vertex=1,obj_vertex_count=2,broken=True,arrows=[])])))
     for name in ('fibers.obj','broken_fibers.obj'):
         (tmp_path/name).write_text('v 7 1 0\nv 7 2 0\nl 1 2\n')
@@ -97,6 +99,35 @@ def test_repair_reads_store_geometry(tmp_path):
     assert repaired['fibers.obj']['segments']==2
     assert 'v 7.000000000 0.000000000 0.000000000' in (tmp_path/'fibers.obj').read_text()
     assert (tmp_path/'signed_normals.ply').read_bytes()==b'unchanged'
+    with ObjectStore.open(str(path),author='edit') as store:
+        store.set_meta(ids[1],'coordinates',dict(volume_uuid='123',scale_factor=2))
+    with pytest.raises(ValueError,match='source changed'):
+        repair_obj_lines(dict(output_root=str(tmp_path)))
+
+
+def test_normal_export_rejects_same_store_uuid_after_geometry_change(tmp_path):
+    import sqlite3
+    import pytest
+    from vc_object_store import ObjectStore
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import export, sha256_file
+    path=tmp_path/'source.vcobj'
+    fid='00000000-0000-4000-8000-000000000001'
+    write_fibers(path,[(dict(id=fid),np.array([[0.,0,10],[1.,0,10]]))],volume='123')
+    expected=fiber_source_version(path)
+    database=tmp_path/'constraints.sqlite'
+    with sqlite3.connect(database) as db:
+        db.execute('CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT)')
+        db.execute('INSERT INTO metadata VALUES(?,?)',('provenance',json.dumps(dict(fiber_source=expected))))
+    solution=tmp_path/'solution.npz'
+    np.savez(solution,ids=[fid],normal_sign=[1],sign_logit=[1.],sign_probability=[.8],broken=[False])
+    (tmp_path/'summary.json').write_text(json.dumps(dict(input=dict(signature=dict(database_sha256=sha256_file(database))))))
+    with ObjectStore.open(str(path),author='edit') as store:
+        store.edit_geometry(fid,[dict(array='line_points',element_offset=0,data=np.array([0.,1.,10.]).tobytes())],
+                            store.current_version(fid))
+    with pytest.raises(ValueError,match='source changed'):
+        export(dict(output_root=str(tmp_path/'vis'),solution=str(solution),database=str(database),
+                    fibers=str(path),fiber_ids=[fid]))
+    assert not (tmp_path/'vis').exists()
 
 
 def test_explicit_obj_edges_and_existing_repair(tmp_path):

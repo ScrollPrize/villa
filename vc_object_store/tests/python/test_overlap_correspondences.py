@@ -35,6 +35,50 @@ def materialize(db, edge, **kwargs):
     return result
 
 
+def pinned(db, edge):
+    endpoints = {side: db.current_object_revision(edge[side]) for side in "ab"}
+    return {"uuid": edge["uuid"], "whole_geometry": True, "meta": json.dumps(edge["meta"]),
+            **{f"{side}_reference": {"object": revision["object_uuid"],
+                                    **{key: revision[key] for key in ("store", "generation", "version")}}
+               for side, revision in endpoints.items()}}
+
+
+@pytest.mark.parametrize("history_enabled", [False, True])
+def test_incremental_overlaps_and_current_pairs_with_optional_history(tmp_path, history_enabled):
+    from vc_object_store import ObjectStore
+
+    with ObjectStore.create(str(tmp_path / "overlaps.vcobj"), author="test",
+                            history_enabled=history_enabled) as store:
+        patch(store, LOW, flat())
+        patch(store, HIGH, flat(10))
+        report = store.link_surface_overlaps(volume_uuid=VOLUME, min_inliers=16,
+                                             new_uuids=[HIGH])
+        assert report["edges_created"] == 1 and not report["problems"], report
+        edge = store.edges_by_kind("same-surface")[0]
+        assert "generation" not in edge and edge["version"] >= 1
+        result = materialize(store, edge)
+        assert result["error"] is None and result["pairs"]
+        repeat = store.link_surface_overlaps(volume_uuid=VOLUME, min_inliers=16,
+                                             new_uuids=[HIGH])
+        assert repeat["edges_skipped_existing"] == 1 and not repeat["problems"]
+
+
+def test_incremental_overlaps_do_not_implicitly_build_omitted_spatial_index(tmp_path):
+    from vc_object_store import ObjectStore
+
+    with ObjectStore.create(str(tmp_path / "slim.vcobj"), author="test",
+                            history_enabled=False, spatial_index=False) as store:
+        patch(store, LOW, flat())
+        patch(store, HIGH, flat(10))
+        with pytest.raises(RuntimeError, match="spatial index is absent"):
+            store.link_surface_overlaps(volume_uuid=VOLUME, new_uuids=[HIGH])
+        assert not store.provisioning()["spatial_index"]
+        assert not store.edges_by_kind("same-surface")
+        # Full detection does not need a persisted spatial index.
+        edge = overlap_edge(store)
+        assert materialize(store, edge)["pairs"]
+
+
 def assert_consistent(result, a_to_xyz, b_to_xyz):
     """Every pair names nearly the same volume point on both patches, at its grid position.
 
@@ -51,20 +95,20 @@ def assert_consistent(result, a_to_xyz, b_to_xyz):
 
 @pytest.mark.parametrize("first,second", [(LOW, HIGH), (HIGH, LOW)])
 def test_pairs_follow_stored_endpoint_order_whatever_the_pose_direction(db, first, second):
-    # Insertion order decides stored endpoint order; UUID order decided the detector's seed.
+    # Endpoint identity/order uses UUID keys, independent of insertion order.
     patch(db, first, flat())
     patch(db, second, flat(10))
     edge = overlap_edge(db)
-    assert edge["a"] == first
+    assert (edge["a"], edge["b"]) == (LOW, HIGH)
     fit = edge["meta"]["fit"]
     assert (fit["pose_from"], fit["pose_to"]) == (HIGH, LOW)
     assert fit["grid_scales"] == {LOW: [1, 1], HIGH: [1, 1]}
     shifts = {first: 0, second: 10}
     result = materialize(db, edge)
-    assert (result["a"], result["b"]) == (first, second)
-    assert_consistent(result, flat(shifts[first]), flat(shifts[second]))
+    assert (result["a"], result["b"]) == (edge["a"], edge["b"])
+    assert_consistent(result, flat(shifts[edge["a"]]), flat(shifts[edge["b"]]))
     for pair in result["pairs"]:
-        assert pair["b_grid"][1] == pytest.approx(pair["a_grid"][1] + shifts[first] - shifts[second], abs=0.5)
+        assert pair["b_grid"][1] == pytest.approx(pair["a_grid"][1] + shifts[edge["a"]] - shifts[edge["b"]], abs=0.5)
 
 
 def test_reflected_pose_and_mixed_scales(db):
@@ -171,10 +215,7 @@ def test_correspondence_agreement_boundary(db, radius, accepted):
 def test_pairs_from_an_earlier_state_ignore_later_changes(db):
     edge, geometry = overlapping_pair(db)
     # The edge and its endpoints as a reader holding them now would pass them.
-    then = {"uuid": edge["uuid"], "a": edge["a"], "b": edge["b"], "whole_geometry": True,
-            "meta": json.dumps(edge["meta"]),
-            **{f"{side}_object_meta": json.dumps(db.object(edge[side])["meta"]) for side in "ab"},
-            **{f"{side}_geometry_revision": db.current_geometry(edge[side])["uuid"] for side in "ab"}}
+    then = pinned(db, edge)
     before = materialize(db, edge)
     assert db.overlap_correspondences_at([then], VOLUME) == [before]
     # Later HIGH moves and the edge is removed: the earlier state still reads
@@ -196,10 +237,7 @@ def test_pinned_pairs_read_through_a_session_attachment(db, db_path, tmp_path):
     from vc_object_store.locations import open_store
 
     edge, _ = overlapping_pair(db)
-    then = {"uuid": edge["uuid"], "a": edge["a"], "b": edge["b"], "whole_geometry": True,
-            "meta": json.dumps(edge["meta"]),
-            **{f"{side}_object_meta": json.dumps(db.object(edge[side])["meta"]) for side in "ab"},
-            **{f"{side}_geometry_revision": db.current_geometry(edge[side])["uuid"] for side in "ab"}}
+    then = pinned(db, edge)
     expected = db.overlap_correspondences_at([then], VOLUME)
     assert expected[0]["error"] is None and expected[0]["pairs"]
     db.close()
@@ -226,3 +264,18 @@ def test_pinned_pairs_read_through_a_session_attachment(db, db_path, tmp_path):
     finally:
         server.terminate()
         assert server.wait(timeout=30) == 0
+
+
+def test_pinned_cache_distinguishes_metadata_only_coordinate_edits(db):
+    edge, _ = overlapping_pair(db)
+    before = pinned(db, edge)
+    db.set_meta(HIGH, "coordinates", frame(2))
+    after = pinned(db, edge)
+    # Geometry bytes/revision are unchanged, but the selected coordinate frame
+    # differs. Batching must not reuse the first endpoint's transform.
+    assert before["b_reference"] != after["b_reference"]
+    old = db.overlap_correspondences_at([before], VOLUME)[0]
+    new = db.overlap_correspondences_at([after], VOLUME)[0]
+    assert old["error"] is None and "grid scale differs" in new["error"]
+    assert db.overlap_correspondences_at([before, after], VOLUME) == [old, new]
+    assert db.overlap_correspondences_at([after, before], VOLUME) == [new, old]

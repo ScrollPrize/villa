@@ -7,6 +7,15 @@ import pytest
 
 
 VOLUME = "20260411134726"
+def fixture_guards(status, numbers):
+    """Synthetic local fixture guards, including deliberately stale counters.
+
+    These tests own their fixture store/lineage. This is not a production
+    resolver or a recipe for reconstructing a lost selected reference.
+    """
+    return {key: None if number is None else dict(store=status['store'], generation=status['generation'], object=key, version=number)
+            for key, number in numbers.items()}
+
 LINE_OPTIONS = dict(volume_uuid=VOLUME, strip_spacing=2, strip_march_step=1,
                     anchor_contact=10, contact_gap=10, strip_margin=0)
 
@@ -33,7 +42,7 @@ def export(db, uuid, output, revision=None, valid_only=False):
 def edge_choice(db, edge_uuid, action, **anchors):
     edge = db.edge(edge_uuid)
     revisions = [db.current_geometry(edge[side]) for side in ("a", "b")]
-    return dict(edge_uuid=edge_uuid, expected_generation=edge["generation"], action=action,
+    return dict(edge_uuid=edge_uuid, expected_version=edge["version"], action=action,
                 a_revision=revisions[0]["uuid"] if revisions[0] else None,
                 b_revision=revisions[1]["uuid"] if revisions[1] else None, **anchors)
 

@@ -1,4 +1,5 @@
 #include "segmentation/SurfaceCorrections.hpp"
+#include "segmentation/SurfaceStoreEdit.hpp"
 
 #include "vc/core/StoredCollection.hpp"
 #include <vc_object_store/objects/AttachedDocument.hpp>
@@ -24,32 +25,46 @@ AttachedCollection toStore(uint64_t id, const nlohmann::json& collection)
     stored.source["source_collection_id"] = std::to_string(id);
     return stored;
 }
-}
 
-std::map<uint64_t, nlohmann::json> vc3d::corrections::read(ObjectStoreSession& session, const AttachmentIdentity& attachment,
-                                                        const std::string& surfaceUuid, const std::optional<vc::objects::ViewFrame>& view)
+std::map<uint64_t, Json> fromStore(const std::vector<AttachedCollection>& collections)
 {
-    std::map<uint64_t, nlohmann::json> result;
-    for (auto stored : attachedCollections(session, attachment, surfaceUuid, kRole, view)) {
+    std::map<uint64_t, Json> result;
+    for (auto stored : collections) {
         const auto id = std::stoull(stored.source.value("source_collection_id", std::string("0")));
         stored.source.erase("source_collection_id");
         result[id] = vc::collectionJson(stored);
     }
     return result;
 }
+}
 
-void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& surfaceUuid,
-                              const std::map<uint64_t, nlohmann::json>& collections, const vc::objects::VolumeVoxels& volume,
-                              const std::optional<vc::objects::ViewFrame>& view)
+vc3d::corrections::Snapshot vc3d::corrections::read(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+                                                        const std::string& surfaceUuid, const std::optional<vc::objects::ViewFrame>& view)
 {
+    Snapshot result;
+    result.baseline = attachedCollections(session, attachment, surfaceUuid, kRole, view);
+    result.collections = fromStore(result.baseline.collections);
+    return result;
+}
+
+void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdentity& attachment, Snapshot& snapshot,
+                              const std::map<uint64_t, nlohmann::json>& collections, const vc::objects::VolumeVoxels& volume,
+                              SurfaceStoreEdit* editor)
+{
+    // Compare with the retained baseline, not the editable presentation map:
+    // callers can edit snapshot.collections in place. A genuine no-op neither
+    // submits a stale edit nor advances its baseline.
+    if (collections == fromStore(snapshot.baseline.collections)) return;
     std::vector<AttachedCollection> stored;
     for (const auto& [id, json] : collections) stored.push_back(toStore(id, json));
-    replaceAttachedCollections(session, attachment, surfaceUuid, kRole, stored,
-                               vc::objects::volumeCoordinates(volume), view);
+    if (editor) editor->saveAttachedCollections(snapshot.baseline, stored, vc::objects::volumeCoordinates(volume));
+    else replaceAttachedCollections(session, attachment, snapshot.baseline, stored, vc::objects::volumeCoordinates(volume));
+    snapshot.collections = collections;
 }
 
 std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session, const AttachmentIdentity& attachment,
-                                                     const GrowthAnnotation& annotation, const vc::objects::VolumeVoxels& volume)
+                                                     const GrowthAnnotation& annotation, const vc::objects::VolumeVoxels& volume,
+                                                     SurfaceStoreEdit* editor)
 {
     auto points = annotation.points;
     std::stable_sort(points.begin(), points.end(), [](const auto& a, const auto& b) { return a.creationTime < b.creationTime; });
@@ -80,14 +95,15 @@ std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session
     auto edge = attachmentEdge(uuid, annotation.surfaceUuid, "growth_annotation");
     edge.uuid = util::newUuid();
     auto request = session.newRequest(attachment);
-    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+    if (!editor) session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         const auto surface = reader.currentObject(annotation.surfaceUuid);
         if (!surface) throw std::runtime_error("surface not found: " + annotation.surfaceUuid);
-        request.expectedObjects[surface->objectUuid] = surface->version;
+        expectObject(request, *surface);
     });
     request.expectedObjects[uuid] = std::nullopt;
     request.operations = {CreateObjectOp{objectRecordJson(record)}, PutGeometryOp{uuid, vc::geometry::encode(geometry), {}},
                           AddEdgeOp{edgeRecordJson(edge)}};
-    (void)session.submit(attachment, request);
+    if (editor) (void)editor->submitAttached(std::move(request));
+    else (void)session.submit(attachment, request);
     return uuid;
 }

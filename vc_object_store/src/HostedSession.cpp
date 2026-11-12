@@ -2,6 +2,7 @@
 #include "geometry/ArrayLayout.hpp"
 #include "internal/Artifacts.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/native/disk_cache.hpp>
 #include <fstream>
@@ -22,8 +23,12 @@ int64_t nowUs()
 std::size_t cost(const ObjectRevision& revision) { return revision.record.meta.size() + 1024; }
 std::size_t cost(const GeometryRevision& geometry) { return geometry.attributes.size() + 512 + 64 * geometry.arrays.size(); }
 
-std::string headKey(const std::string& object) { return "head/" + object; }
-std::string versionKey(const ObjectVersion& v) { return "version/" + v.storeUuid + "/" + v.generation + "/" + v.objectUuid + "/" + std::to_string(v.version); }
+std::string headKey(const std::string& object) { return "head/" + util::canonicalUuid(object); }
+// Conversion preserves logical identities, but schema-20 cached JSON has the
+// old generation fields. Version metadata separately; raw payload keys stay
+// unchanged so a schema upgrade never duplicates geometry/artifact blocks.
+std::string metadataKey(const std::string& key) { return "schema21/" + key; }
+std::string versionKey(const ObjectVersion& v) { return metadataKey("version/" + v.storeUuid + "/" + v.generation + "/" + v.objectUuid + "/" + std::to_string(v.version)); }
 bool isTransformKind(const std::string& kind)
 {
     return kind.empty() || kind == "volume_transform" || kind == "volume_transform_choice";
@@ -225,7 +230,7 @@ void HostedAttachment::prefetch(ObjectPrefetchJob& job, const std::atomic_bool& 
         std::vector<ObjectVersion> versions;
         for (const auto& record : records) {
             if (!record.version) throw std::runtime_error("Object listing has no version");
-            versions.push_back({captured.storeUuid, record.versionGeneration, record.uuid, *record.version});
+            versions.push_back(record.reference());
         }
         {
             std::lock_guard lock(job.mutex_);
@@ -377,7 +382,9 @@ void HostedAttachment::check()
         // Keep each feed page's commit once: copying it per change duplicates
         // its entire change vector and makes bulk edits quadratic in memory.
         std::vector<FeedCommit> commits;
-        bool revalidate = false;
+        bool revalidate = !status.historyEnabled &&
+            (cursor.generation != status.generation || cursor.sequence != status.commitSequence || cursor.offset);
+        if (revalidate) cursor = {status.storeUuid, status.generation, status.commitSequence, 0};
         while (cursor.generation != status.generation || cursor.sequence < status.commitSequence || cursor.offset) {
             auto page = client_.changesSince(cursor);
             if (!page.cursorValid) {
@@ -469,13 +476,24 @@ StoreStatus HostedAttachment::status() { return client_.status(); }
 
 TransactionReceipt HostedAttachment::submit(const TransactionRequest& request)
 {
+    // Serialize with the feed poll so an older status response cannot erase
+    // the commit floor supplied by this successful receipt. Do not advance
+    // the feed cursor: the poller must still deliver these changes.
+    std::lock_guard checking(checking_);
     auto receipt = client_.submit(request);
     std::vector<std::string> touched;
     for (const auto& [uuid, version] : receipt.objects) touched.push_back(uuid);
     invalidate(touched);
-    std::lock_guard lock(cacheMutex_);
-    transforms_.reset();
-    ++transformInvalidations_;
+    {
+        std::lock_guard lock(cacheMutex_);
+        transforms_.reset();
+        ++transformInvalidations_;
+    }
+    if (receipt.commitSequence) {
+        std::lock_guard lock(stateMutex_);
+        if (freshness_.status->generation == receipt.generation)
+            freshness_.status->commitSequence = std::max(freshness_.status->commitSequence, *receipt.commitSequence);
+    }
     return receipt;
 }
 
@@ -498,8 +516,6 @@ std::optional<ObjectRevision> HostedAttachment::currentObject(const std::string&
 
 std::vector<std::optional<ObjectRevision>> HostedAttachment::objectsAtVersions(const std::vector<ObjectVersion>& references)
 {
-    for (const auto& reference : references)
-        if (reference.storeUuid != storeUuid_) return client_.objectsAtVersions(references);
     std::vector<std::optional<ObjectRevision>> result(references.size());
     std::vector<ObjectVersion> missing;
     std::vector<std::size_t> positions;
@@ -598,17 +614,36 @@ std::vector<SelectedRelationship> HostedAttachment::relationshipsAt(const std::v
 {
     if (!disk_) return client_.relationshipsAt(versions);
     const auto query = objectVersionsRequestToJson(versions);
-    const auto bytes = cachedPayload(payloadKey("relationships/" + payloadHash(bytesOf(query))), [&] {
+    // Endpoint revisions are immutable; graph membership is not. An overlay
+    // can add edges without changing either inherited endpoint reference.
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const auto before = *freshness().status;
+        const auto key = metadataKey("relationships/" + before.storeUuid + "/" + before.generation + "/" +
+            std::to_string(before.commitSequence) + "/" + payloadHash(bytesOf(query)));
+        const auto bytes = cachedPayload(key, [&] {
+            StoreStatus asOf;
+            const auto relationships = client_.relationshipsAt(versions, &asOf);
+            return bytesOf(relationshipQueryResultToJson(asOf, relationships));
+        });
         StoreStatus asOf;
-        const auto relationships = client_.relationshipsAt(versions, &asOf);
-        return bytesOf(relationshipQueryResultToJson(asOf, relationships));
-    });
-    return relationshipQueryResultFromJson(textOf(bytes), nullptr);
+        auto relationships = relationshipQueryResultFromJson(textOf(bytes), &asOf);
+        // The key is a freshness floor, not a historical graph snapshot: a
+        // response may already include a newer commit than our last poll.
+        if (asOf.storeUuid != before.storeUuid || asOf.generation != before.generation ||
+            asOf.commitSequence < before.commitSequence) {
+            check();
+            continue;
+        }
+        const auto after = *freshness().status;
+        if (before.generation != after.generation || before.commitSequence != after.commitSequence) continue;
+        return relationships;
+    }
+    throw StoreBusy("hosted store: relationships kept changing while reading; retry later");
 }
 
 std::optional<GeometryRevision> HostedAttachment::geometryRevision(const std::string& revisionUuid)
 {
-    const auto key = payloadKey("geometry/" + revisionUuid);
+    const auto key = payloadKey(metadataKey("geometry/" + revisionUuid));
     {
         std::lock_guard lock(cacheMutex_);
         if (const auto* entry = cache_.get(key); entry && entry->geometry && !prefetchAudit) return entry->geometry;
@@ -715,19 +750,7 @@ VolumeTransforms HostedAttachment::volumeTransforms()
             if (transforms_) return *transforms_;
             epoch = transformInvalidations_;
         }
-        // Recorded registrations and choices only: a shared store never applies
-        // a client's unrecorded catalog registrations.
-        ObjectSelection registrations;
-        registrations.kind = "volume_transform";
-        std::vector<std::pair<ObjectRecord, std::string>> recorded;
-        for (auto& record : client_.selectAllObjects(registrations)) {
-            const auto head = client_.currentObjectRevision(record.uuid);
-            if (!head) continue; // removed since the listing; the next check invalidates
-            recorded.emplace_back(std::move(record), head->uuid);
-        }
-        ObjectSelection choices;
-        choices.kind = "volume_transform_choice";
-        auto transforms = volumeTransformsFrom(recorded, client_.selectAllObjects(choices), nullptr);
+        auto transforms = client_.volumeTransforms();
         std::lock_guard lock(cacheMutex_);
         // A poll or submission may have invalidated the snapshot while HTTP was in flight.
         if (epoch != transformInvalidations_) continue;
@@ -760,16 +783,16 @@ std::vector<EdgeRecord> HostedAttachment::selectEdges(const EdgeSelection& selec
     return selection.limit ? client_.selectEdges(selection, fields) : client_.selectAllEdges(selection, fields);
 }
 
-std::optional<ObjectRevision> HostedStoreReader::currentObject(const std::string& objectUuid) const
+std::optional<ObjectRevision> HostedStoreReader::currentObject(const std::string& objectUuid, bool includeDeleted) const
 {
     auto revision = attachment_->currentObject(objectUuid);
-    if (revision && revision->deleted) return std::nullopt;
+    if (revision && revision->deleted && !includeDeleted) return std::nullopt;
     return revision;
 }
 
-std::vector<ObjectRevision> HostedStoreReader::objectHistory(const std::string& objectUuid) const
+std::vector<ObjectRevision> HostedStoreReader::objectHistory(const std::string& objectUuid, bool ifRetained) const
 {
-    return attachment_->client().objectHistory(objectUuid);
+    return attachment_->client().objectHistory(objectUuid, nullptr, ifRetained);
 }
 
 std::optional<GeometryRevision> HostedStoreReader::currentGeometry(const std::string& objectUuid) const

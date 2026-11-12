@@ -1,6 +1,8 @@
 #include "linking/StoredGeometry.hpp"
 #include "internal/Anchors.hpp"
+#include "internal/Database.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
+#include "vc_object_store/Uuid.hpp"
 
 #include <algorithm>
 #include <set>
@@ -54,6 +56,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
 {
     if (detectorName.empty())
         throw std::runtime_error("object links: detector name must be non-empty");
+    objects::detail::Savepoint operation(objects::ObjectStoreImplAccess::conn(txn));
     DetectorReport report;
     report.candidatesFound = int64_t(candidates.size());
 
@@ -62,8 +65,8 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
     std::set<std::string> scopedKinds, scopedObjects, touching;
     if (staleScope) {
         scopedKinds.insert(staleScope->edgeKinds.begin(), staleScope->edgeKinds.end());
-        scopedObjects.insert(staleScope->objectUuids.begin(), staleScope->objectUuids.end());
-        touching.insert(staleScope->touching.begin(), staleScope->touching.end());
+        for (const auto& uuid : staleScope->objectUuids) scopedObjects.insert(objects::util::canonicalUuid(uuid));
+        for (const auto& uuid : staleScope->touching) touching.insert(objects::util::canonicalUuid(uuid));
         kinds.insert(scopedKinds.begin(), scopedKinds.end());
     }
 
@@ -151,13 +154,13 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
             if (validateGeometry) {
                 const auto updated = *db.edgeByUuid(txn, e.uuid);
                 objects::EdgeGeometryRepair repair;
-                repair.edgeUuid = updated.uuid; repair.expectedGeneration = updated.generation;
+                repair.edgeUuid = updated.uuid; repair.expectedVersion = updated.version.value();
                 if (const auto revision = db.currentGeometry(txn, updated.aUuid)) repair.aRevision = revision->uuid;
                 if (const auto revision = db.currentGeometry(txn, updated.bUuid)) repair.bRevision = revision->uuid;
                 repair.aAnchor = updated.aAnchor; repair.bAnchor = updated.bAnchor;
                 db.repairEdgeGeometry(txn, repair);
             }
-            if (db.edgeByUuid(txn, e.uuid)->generation == old.generation) ++report.edgesSkippedExisting;
+            if (db.edgeByUuid(txn, e.uuid)->version == old.version) ++report.edgesSkippedExisting;
             else ++report.edgesUpdated;
         } else {
             db.addEdge(txn, e);  // starts 'pending' until reviewed
@@ -166,6 +169,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
     }
 
     objects::util::reportProgress(progress, "writing links", candidates.size(), candidates.size());
+    operation.release();
     return report;
 }
 

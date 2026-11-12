@@ -1,5 +1,7 @@
 #include "geometry/GeometryReader.hpp"
 #include "geometry/GeometryDelta.hpp"
+#include "geometry/SharedGeometry.hpp"
+#include "internal/ReferenceResolver.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 
@@ -74,7 +76,7 @@ namespace {
 std::shared_ptr<GeometryReadCache> connectionGeometryCache(sqlite3* db)
 {
     const auto lease = activeStatementPools.find(db);
-    return lease == activeStatementPools.end() ? nullptr : lease->second->geometryCache;
+    return lease == activeStatementPools.end() || !lease->second->readSnapshot ? nullptr : lease->second->geometryCache;
 }
 }
 
@@ -103,48 +105,68 @@ template<class F> auto withGeometryReader(const Txn& txn, const std::string& rev
 GeometryReader::GeometryReader(const Txn& txn, const std::string& revision, bool cacheChunks)
     : GeometryReader(ObjectStoreImplAccess::conn(txn), revision, cacheChunks) {}
 
-GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool cacheChunks)
-    : db_(db), revision_(parseUuid(revision)), cacheChunks_(cacheChunks)
+GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool cacheChunks, bool allowReverse)
+    : db_(db), cacheChunks_(cacheChunks)
 {
-    Statement row(db_, "SELECT content_hash,manifest,object_uuid,parent_uuid FROM geometry_revisions WHERE uuid=?",
-        revision_);
-    if (!row.row()) throw std::invalid_argument("geometry: revision not found");
-    const auto text = row.text(1);
+    auto record=resolveGeometryRecord(db,revision);
+    if (!record) throw std::invalid_argument("geometry: revision not found");
+    db_=record->source;
+    reference_=canonicalGeometryToken(revision);
+    objectUuid_=record->revision.objectUuid;
+    revision_=parseUuid(revision);
     // Charge JSON nodes/strings, layouts and cache bookkeeping conservatively,
     // in addition to the separately accounted retained payload bytes.
-    metadataCharge_ = text.size() * 32 + 4096;
-    manifest_ = loadGeometryManifest(db_, revision, text, row.hash(0));
+    metadataCharge_ = record->manifest.size() * 32 + 4096;
+    contentHash_ = record->revision.contentHash;
+    manifest_ = std::move(record->descriptor);
+    std::optional<nlohmann::json> currentDescriptor;
+    if(record->archived) {
+        Statement object(db_,"SELECT geometry_manifest,data_checksum FROM objects WHERE uuid=? AND storage_ref=? AND state<>2 AND geometry_manifest IS NOT NULL",
+            parseUuid(record->revision.objectUuid),revision);
+        if(object.row()) {
+            if(object.text(1)!=contentHash_)
+                throw std::runtime_error("geometry: current checksum disagrees with archive revision");
+            currentDescriptor=verifiedGeometryManifest(object.text(0),object.text(1));
+            metadataCharge_+=object.text(0).size()*32;
+        }
+    }
     if (manifest_.contains("delta")) {
         const auto target = manifest_;
-        const auto object = row.blob16(2);
+        const auto object = parseUuid(record->revision.objectUuid);
         baseRevision_ = target.at("delta").at("base").get<std::string>();
         Statement current(db_, "SELECT manifest FROM geometry_materializations WHERE object_uuid=? AND revision_uuid=?",
             object, revision_);
         if (current.row()) {
             const auto full = current.text(0);
-            manifest_ = verifiedGeometryManifest(full, target.at("delta").at("result_hash"));
+            auto materialized=verifiedGeometryManifest(full,target.at("delta").at("result_hash"));
+            if(currentDescriptor && *currentDescriptor!=materialized)
+                throw std::runtime_error("geometry: current descriptor disagrees with materialized archive");
+            manifest_=currentDescriptor ? *currentDescriptor : std::move(materialized);
             auto compact = manifest_;
             for (auto& a : compact.at("arrays")) a.erase("chunks");
             auto expected = target; expected.erase("delta");
             if (compact != expected) throw std::runtime_error("geometry delta: materialized layout mismatch");
             materializedObject_ = formatUuid(object);
+            parentReference_=record->revision.parentUuid.value_or("");
+            parentHash_=target.at("delta").at("parent_hash").get<std::string>();
+            if(parentReference_.empty()||parentReference_==reference_)
+                throw std::runtime_error("geometry delta: invalid parent reference");
         } else {
             auto descriptor = target;
             auto id = revision;
-            auto parent = row.isNull(3) ? std::string() : formatUuid(row.blob16(3));
+            auto parent = record->revision.parentUuid.value_or("");
             std::set<std::string> seen;
             while (descriptor.contains("delta")) {
                 if (!seen.insert(id).second || parent.empty())
                     throw std::runtime_error("geometry delta: cyclic or missing parent");
                 deltas_.emplace_back(id, descriptor);
-                Statement previous(db_, "SELECT content_hash,manifest,parent_uuid,object_uuid FROM geometry_revisions WHERE uuid=?",
-                    parseUuid(parent));
-                if (!previous.row() || previous.blob16(3) != object ||
-                    previous.hash(0) != descriptor.at("delta").at("parent_hash").get<std::string>())
+                const auto previous=resolveGeometryRecord(db_,parent);
+                if (!previous || previous->revision.objectUuid != record->revision.objectUuid ||
+                    previous->revision.contentHash != descriptor.at("delta").at("parent_hash").get<std::string>())
                     throw std::runtime_error("geometry delta: invalid parent");
                 id = parent;
-                descriptor = loadGeometryManifest(db_, id, previous.text(1), previous.hash(0));
-                parent = previous.isNull(2) ? std::string() : formatUuid(previous.blob16(2));
+                descriptor = previous->descriptor;
+                parent = previous->revision.parentUuid.value_or("");
             }
             if (id != baseRevision_) throw std::runtime_error("geometry delta: invalid base");
             manifest_ = descriptor;
@@ -169,18 +191,17 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
             // For payloads, reversing a shorter current-head suffix avoids
             // replaying a long prefix. Stop at branches/explicit replacements.
             Statement tip(db_, "SELECT revision_uuid FROM geometry_materializations WHERE object_uuid=?", object);
-            if (tip.row()) {
+            if (allowReverse && tip.row()) {
                 const auto head = formatUuid(tip.blob16(0));
                 auto cursor = head;
                 std::vector<std::pair<std::string, nlohmann::json>> reverse;
                 while (cursor != revision && reverse.size() + 1 < deltas_.size()) {
-                    Statement step(db_, "SELECT manifest,content_hash,parent_uuid,object_uuid FROM geometry_revisions WHERE uuid=?",
-                        parseUuid(cursor));
-                    if (!step.row() || step.isNull(2) || step.blob16(3) != object) break;
-                    auto m = loadGeometryManifest(db_, cursor, step.text(0), step.hash(1));
+                    const auto step=resolveGeometryRecord(db_,cursor);
+                    if (!step || !step->revision.parentUuid || step->revision.objectUuid!=record->revision.objectUuid) break;
+                    auto m = step->descriptor;
                     if (!m.contains("delta") || m.at("delta").at("base") != baseRevision_) break;
                     reverse.emplace_back(cursor, std::move(m));
-                    cursor = formatUuid(step.blob16(2));
+                    cursor = *step->revision.parentUuid;
                 }
                 if (cursor == revision && !reverse.empty()) {
                     reverseSource_ = std::make_unique<GeometryReader>(db_, head, false);
@@ -191,11 +212,20 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
         }
         metadataCharge_ += manifest_.dump().size() * 32;
     }
+    if(currentDescriptor) {
+        if(manifest_!=*currentDescriptor)
+            throw std::runtime_error("geometry: current descriptor disagrees with archive");
+        manifest_=std::move(*currentDescriptor);
+    }
     for (const auto& [name, array] : manifest_.at("arrays").items())
         layouts_.emplace(name, geometryLayout(array));
 }
 
 std::vector<uint8_t> GeometryReader::chunk(const std::string& name, int64_t index) {
+    // References can span databases; physical row ordering cannot detect cycles.
+    static thread_local std::set<std::string> active;
+    if(!active.insert(reference_).second)throw std::runtime_error("geometry: cyclic payload reference");
+    struct Guard {std::set<std::string>& active;const std::string& ref;~Guard(){active.erase(ref);}} guard{active,reference_};
     std::vector<uint8_t> result;
     visitChunk(name, index, [&](auto bytes) { result.assign(bytes.begin(), bytes.end()); });
     return result;
@@ -228,7 +258,19 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
             const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(current.value, 0));
             if (geometryWork) geometryWork->readBytes[name] += sqlite3_column_bytes(current.value, 0);
             owned.assign(p, p + sqlite3_column_bytes(current.value, 0));
-            storedHash = current.text(1);
+            storedHash = readDigest(current,1);
+        } else {
+            // Materialized rows contain modified chunks. An unchanged chunk
+            // is the parent's chunk, irrespective of its physical location.
+            if(!parentSource_) {
+                const auto parent=resolveGeometryRecord(db_,parentReference_);
+                if(!parent||parent->revision.objectUuid!=objectUuid_||parent->revision.contentHash!=parentHash_)
+                    throw std::runtime_error("geometry delta: invalid parent");
+                parentSource_=std::make_unique<GeometryReader>(db_,parentReference_,false,false);
+                metadataCharge_+=parentSource_->retainedCharge();
+            }
+            owned=parentSource_->chunk(name,index);
+            storedHash=parentSource_->manifest().at("arrays").at(name).at("chunks").at(index).get<std::string>();
         }
     }
     if (reverseSource_) {
@@ -238,12 +280,19 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
         const auto& descriptor = manifest_.at("arrays").at(name);
         if (descriptor.contains("source_revision")) {
             const auto source = descriptor.at("source_revision").get<std::string>();
-            // References always point backwards within the same object. This
-            // also bounds corrupt cycles without relying on recursion depth.
-            Statement ancestry(db_, "SELECT a.object_uuid=b.object_uuid AND a.object_generation<b.object_generation "
-                "FROM geometry_revisions a,geometry_revisions b WHERE a.uuid=? AND b.uuid=?",
-                parseUuid(source), revision_);
-            if (!ancestry.row() || !ancestry.i64(0)) throw std::runtime_error("geometry: invalid array source");
+            // Follow immutable ancestry, not SQLite row ordering: ancestors
+            // can live in another pinned store just like their payloads.
+            auto ancestor=resolveGeometryRecord(db_,formatUuid(revision_));
+            std::set<std::string> seen;
+            while(ancestor && ancestor->revision.uuid!=source) {
+                if(!seen.insert(ancestor->revision.uuid).second || !ancestor->revision.parentUuid) {
+                    ancestor.reset();break;
+                }
+                const auto object=ancestor->revision.objectUuid;
+                ancestor=resolveGeometryRecord(db_,*ancestor->revision.parentUuid);
+                if(ancestor&&ancestor->revision.objectUuid!=object)ancestor.reset();
+            }
+            if(!ancestor||seen.empty())throw std::runtime_error("geometry: invalid array source");
             GeometryReader inherited(db_, source, false);
             const auto& original = inherited.manifest().at("arrays").at(name);
             auto layout = descriptor; layout.erase("chunks"); layout.erase("source_revision");
@@ -252,20 +301,20 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
             owned = inherited.chunk(name, index);
             storedHash = original.at("chunks").at(index).get<std::string>();
         } else {
-            if (readRequest) {
-                Statement size(db_, "SELECT length(c.data) FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
-                    "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
-                    baseRevision_.empty() ? revision_ : parseUuid(baseRevision_), name, index);
-                if (!size.row()) throw std::runtime_error("geometry: missing payload chunk");
-                requestBytes(size.i64(0), &RegionStats::payloadBytes);
+            storedHash = descriptor.at("chunks").at(index).get<std::string>();
+            // The descriptor is the ordered chunk index. For an archived
+            // delta chain, start from the earliest pre-change payload.
+            bool foundBase=false;
+            for(const auto& [id,delta]:deltas_) {
+                for(const auto& c:delta.at("delta").at("chunks"))
+                    if(c.at("array")==name&&c.at("index")==index) {
+                        storedHash=c.at("before").get<std::string>();foundBase=true;break;
+                    }
+                if(foundBase)break;
             }
-            Statement chunk(db_, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
-                                 "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
-                baseRevision_.empty() ? revision_ : parseUuid(baseRevision_), name, index);
-            if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
-            const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0));
-            if (geometryWork) geometryWork->readBytes[name] += sqlite3_column_bytes(chunk.value, 0);
-            owned.assign(p, p + sqlite3_column_bytes(chunk.value, 0)); storedHash = chunk.hash(1);
+            if (readRequest) requestBytes(geometryPayloadSize(db_,storedHash), &RegionStats::payloadBytes);
+            owned=readGeometryPayload(db_,storedHash);
+            if (geometryWork) geometryWork->readBytes[name] += owned.size();
             if (!deltas_.empty()) verifyGeometryChunk(owned, storedHash, storedHash, expectedSize, name);
         }
     }
@@ -466,107 +515,78 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
         GeometryLayout layout;
         std::vector<std::string> hashes;
         size_t offset;
+        std::unique_ptr<GeometryReader> reader;
     };
     std::vector<ArrayPlan> plan;
     plan.reserve(revisions.size());
     size_t totalBytes = 0;
-    // Bound parameters/manifest parsing; retain only layouts and expected hashes
-    // before allocating the final packed payload once.
     constexpr size_t window = 256;
-    auto request = [](size_t count) {
-        std::string sql = "WITH requested(pos,uuid) AS (VALUES ";
-        for (size_t i = 0; i < count; ++i)
-            sql += (i ? "," : "") + std::string("(") + std::to_string(i) + ",?" + std::to_string(i+1) + ")";
-        return sql + ") ";
-    };
-    auto bind = [&](Statement& query, size_t begin, size_t count) {
-        for (size_t i = 0; i < count; ++i) query.bind(int(i+1), parseUuid(revisions[begin+i]));
-    };
-    for (size_t begin = 0; begin < revisions.size(); begin += window) {
-        const auto count = std::min(window, revisions.size() - begin);
-        Statement manifests(db, request(count) + "SELECT q.pos,r.content_hash,r.manifest FROM requested q "
-            "LEFT JOIN geometry_revisions r ON r.uuid=q.uuid ORDER BY q.pos");
-        bind(manifests, begin, count);
-        while (manifests.row()) {
-            if (manifests.isNull(1)) throw std::invalid_argument("geometry: revision not found");
-            auto manifest = loadGeometryManifest(db, revisions[begin + size_t(manifests.i64(0))], manifests.text(2), manifests.hash(1));
-            if (manifest.contains("delta") || (manifest.at("arrays").contains(name) && manifest.at("arrays").at(name).contains("source_revision"))) {
-                // Snapshot-only batches keep the SQL fast path below. Mixed
-                // batches use the same verified reader as all other APIs.
-                PackedGeometryArray packed;
-                for (const auto& revision : revisions) {
-                    GeometryReader reader(db, revision, false);
-                    const auto& arrays = reader.manifest().at("arrays");
-                    if (!arrays.contains(name)) throw std::invalid_argument("geometry: array not found: " + name);
-                    const auto& a = arrays.at(name);
-                    const auto shape = a.at("shape").get<std::vector<int64_t>>();
-                    const std::string dtype = a.at("dtype");
-                    if (packed.offsets.size() == 1) { packed.dtype = dtype; packed.shape = shape; packed.shape[0] = 0; }
-                    if (packed.dtype != dtype || packed.shape.size() != shape.size() ||
-                        !std::equal(shape.begin()+1, shape.end(), packed.shape.begin()+1))
-                        throw std::invalid_argument("geometry: packed arrays require matching dtype and trailing dimensions");
-                    const auto length = geometryLayout(a).length;
-                    if (shape[0] > std::numeric_limits<int64_t>::max() - packed.shape[0] ||
-                        uint64_t(length) > packed.data.max_size() - packed.data.size())
-                        throw std::overflow_error("geometry: packed array size overflow");
-                    auto bytes = reader.read(name, 0);
-                    packed.data.insert(packed.data.end(), bytes.begin(), bytes.end());
-                    packed.shape[0] += shape[0]; packed.offsets.push_back(packed.shape[0]);
-                }
-                return packed;
+    // The storage backend resolves both single and batched references. Keep
+    // batched payload I/O for full snapshots; deltas use their normal reader.
+    for(size_t begin=0;begin<revisions.size();begin+=window) {
+        const auto count=std::min(window,revisions.size()-begin);
+        auto records=resolveGeometryRecords(db,std::span(revisions).subspan(begin,count));
+        for(size_t i=0;i<count;++i) {
+            if(!records[i])throw std::invalid_argument("geometry: revision not found");
+            auto manifest=std::move(records[i]->descriptor);
+            std::unique_ptr<GeometryReader> reader;
+            if(manifest.contains("delta") || (manifest.at("arrays").contains(name) &&
+                manifest.at("arrays").at(name).contains("source_revision"))) {
+                reader=std::make_unique<GeometryReader>(db,revisions[begin+i],false);
+                manifest=reader->manifest();
             }
-            const auto& descriptors = manifest.at("arrays");
-            if (!descriptors.contains(name)) throw std::invalid_argument("geometry: array not found: " + name);
+            const auto& descriptors=manifest.at("arrays");
+            if(!descriptors.contains(name))throw std::invalid_argument("geometry: array not found: "+name);
             GeometryLayout layout;
-            for (const auto& [key, array] : descriptors.items()) {
-                const auto validated = geometryLayout(array);
-                if (key == name) layout = validated;
+            for(const auto& [key,array]:descriptors.items()) {
+                const auto validated=geometryLayout(array);
+                if(key==name)layout=validated;
             }
-            const auto& array = descriptors.at(name);
-            const auto shape = array.at("shape").get<std::vector<int64_t>>();
-            const auto dtype = array.at("dtype").get<std::string>();
-            if (result.offsets.size() == 1) {
-                result.dtype = dtype; result.shape = shape; result.shape[0] = 0;
-            }
-            if (dtype != result.dtype || shape.size() != result.shape.size() ||
-                !std::equal(shape.begin()+1, shape.end(), result.shape.begin()+1))
+            const auto& array=descriptors.at(name);
+            const auto shape=array.at("shape").get<std::vector<int64_t>>();
+            const auto dtype=array.at("dtype").get<std::string>();
+            if(result.offsets.size()==1){result.dtype=dtype;result.shape=shape;result.shape[0]=0;}
+            if(dtype!=result.dtype||shape.size()!=result.shape.size()||
+                !std::equal(shape.begin()+1,shape.end(),result.shape.begin()+1))
                 throw std::invalid_argument("geometry: packed arrays require matching dtype and trailing dimensions");
-            if (shape[0] > std::numeric_limits<int64_t>::max() - result.shape[0] ||
-                uint64_t(layout.length) > result.data.max_size() - totalBytes)
+            if(shape[0]>std::numeric_limits<int64_t>::max()-result.shape[0]||
+                uint64_t(layout.length)>result.data.max_size()-totalBytes)
                 throw std::overflow_error("geometry: packed array size overflow");
-            result.shape[0] += shape[0];
-            result.offsets.push_back(uint64_t(result.shape[0]));
-            plan.push_back({layout, array.at("chunks").get<std::vector<std::string>>(), totalBytes});
-            totalBytes += size_t(layout.length);
+            result.shape[0]+=shape[0];result.offsets.push_back(uint64_t(result.shape[0]));
+            plan.push_back({layout,array.at("chunks").get<std::vector<std::string>>(),totalBytes,std::move(reader)});
+            totalBytes+=size_t(layout.length);
         }
-        if (plan.size() != begin + count) throw std::runtime_error("geometry: incomplete revision selection");
     }
     result.data.resize(totalBytes);
-    for (size_t begin = 0; begin < revisions.size(); begin += window) {
-        const auto count = std::min(window, revisions.size() - begin);
-        // Keep requested revisions outermost: otherwise SQLite can scan the
-        // entire reference table for every window, even with its primary key.
-        Statement chunks(db, request(count) + "SELECT q.pos,r.chunk_index,r.hash,c.data FROM requested q "
-            "CROSS JOIN geometry_revision_chunks r ON r.revision_uuid=q.uuid AND r.array_name=?" + std::to_string(count+1) +
-            " LEFT JOIN geometry_chunks c ON c.hash=r.hash");
-        bind(chunks, begin, count); chunks.bind(int(count+1), name);
-        std::vector<int64_t> seen(count, 0);
-        while (chunks.row()) {
-            const auto row = size_t(chunks.i64(0));
-            const auto index = chunks.i64(1);
-            ++seen.at(row); // unique (revision,array,index), independent of SQL row order
-            if (chunks.isNull(3)) throw std::runtime_error("geometry: missing payload chunk");
-            const auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3)),
-                                        size_t(sqlite3_column_bytes(chunks.value, 3)));
-            const auto& array = plan.at(begin + row);
-            const auto expectedSize = array.layout.chunkBytes(index);
-            if (geometryWork) geometryWork->readBytes[name] += bytes.size();
-            verifyGeometryChunk(bytes, chunks.hash(2), array.hashes.at(index), expectedSize, name);
-            copyGeometryChunk(array.layout, index, bytes, result.data.data() + array.offset);
+    struct ChunkRequest {size_t array;int64_t index;};
+    std::vector<ChunkRequest> requested;
+    const auto flush=[&]{
+        if(requested.empty())return;
+        std::vector<std::string> hashes;
+        hashes.reserve(requested.size());
+        for(const auto& q:requested)hashes.push_back(plan[q.array].hashes.at(q.index));
+        visitGeometryPayloads(db,hashes,[&](size_t i,std::span<const uint8_t> bytes){
+            const auto& q=requested.at(i);
+            const auto& array=plan[q.array];
+            const auto& hash=hashes[i];
+            if(geometryWork)geometryWork->readBytes[name]+=bytes.size();
+            verifyGeometryChunk(bytes,hash,hash,array.layout.chunkBytes(q.index),name);
+            copyGeometryChunk(array.layout,q.index,bytes,result.data.data()+array.offset);
+        });
+        requested.clear();
+    };
+    for(size_t i=0;i<plan.size();++i) {
+        if(plan[i].reader) {
+            const auto bytes=plan[i].reader->read(name,0);
+            std::copy(bytes.begin(),bytes.end(),result.data.begin()+plan[i].offset);
+            continue;
         }
-        for (size_t i = 0; i < count; ++i)
-            if (seen[i] != plan[begin+i].layout.chunkCount()) throw std::runtime_error("geometry: missing payload chunk");
+        for(int64_t j=0;j<plan[i].layout.chunkCount();++j) {
+            requested.push_back({i,j});
+            if(requested.size()==window)flush();
+        }
     }
+    flush();
     return result;
 }
 
@@ -627,10 +647,14 @@ std::shared_ptr<const detail::SurfaceTile> detail::surfaceTile(SurfaceTileCache*
                                                                GeometryReader& reader, int64_t row, int64_t column,
                                                                int64_t rows, int64_t columns)
 {
+    // Current history-off references keep the same object version throughout
+    // one transaction. Distinct edits therefore need distinct cache keys even
+    // while the reference is unchanged; use the existing descriptor checksum.
+    const auto& key=revision;
     if (cache)
-        if (auto tile = cache->find(revision, row, column, rows, columns)) return tile;
+        if (auto tile = cache->find(key, row, column, rows, columns)) return tile;
     auto tile = std::make_shared<const SurfaceTile>(surfaceTile(reader, row, column, rows, columns));
-    if (cache) cache->insert(revision, row, column, rows, columns, tile);
+    if (cache) cache->insert(key, row, column, rows, columns, tile);
     return tile;
 }
 

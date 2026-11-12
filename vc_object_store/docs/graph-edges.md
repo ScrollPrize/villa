@@ -104,7 +104,7 @@ pagination applies after applicability filtering.
 Editing a dependency an anchor declares requires a decision for that edge.
 Preview with `store.affected_geometry_edit_edges(uuid, edits, version)` (or
 `affected_geometry_edges` for full replacement), then supply `edge_edits` —
-each `{edge_uuid, expected_generation, action, a_revision, b_revision}`
+each `{edge_uuid, expected_version, action, a_revision, b_revision}`
 (geometry revision UUIDs or `None`; `update` also supplies `a_anchor` /
 `b_anchor`) — and expect every validation endpoint in `expected_versions`:
 

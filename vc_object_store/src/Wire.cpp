@@ -1,15 +1,23 @@
 // JSON forms of conflicts, status, feed pages and historical reads, shared by
 // the hosted service and its clients.
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/ManifestReferences.hpp"
 #include "internal/RecordJson.hpp"
+#include "internal/ObjectVersionJson.hpp"
+#include "internal/RelationshipOrder.hpp"
 
 #include <set>
+#include <limits>
+#include <type_traits>
 
 namespace vc::objects {
 using namespace detail;
 using Json = nlohmann::json;
+static void versionToJson(const RecordCommon&, Json&);
+static void versionFromJson(const Json&, RecordCommon&);
 
 namespace {
+void requireKeys(const Json&, std::initializer_list<const char*>, const char*);
 const char* reasonName(TransactionConflict::Reason reason)
 {
     switch (reason) {
@@ -50,7 +58,7 @@ Json withExactMeta(Json j, const RecordCommon& r)
 }
 template<class Record> Record exactMetaFrom(const Json& j, Record r)
 {
-    if (j.contains("meta") && j.at("meta").is_string()) r.meta = j.at("meta").get<std::string>();
+    if (j.contains("meta")) r.meta = j.at("meta").get<std::string>();
     return r;
 }
 
@@ -74,7 +82,7 @@ TransactionConflict transactionConflictFromJson(const std::string& text)
 {
     const auto j = Json::parse(text);
     std::vector<ConflictDetail> details;
-    for (const auto& d : j.at("details"))
+    for (const auto& d : jsonArrayField(j, "details"))
         details.push_back({d.at("kind").get<std::string>(), d.at("uuid").get<std::string>(), intFrom(d.at("expected")),
                            intFrom(d.at("actual"))});
     return TransactionConflict(reasonFrom(j.at("reason").get<std::string>()), std::move(details),
@@ -83,9 +91,33 @@ TransactionConflict transactionConflictFromJson(const std::string& text)
 
 StoreStatus storeStatusFromJson(const std::string& text)
 {
-    const auto j = Json::parse(text);
-    return {j.at("store").get<std::string>(), j.at("generation").get<std::string>(),
-            j.at("commit_sequence").get<int64_t>(), j.at("feed_start").get<int64_t>()};
+    return storeStatusFrom(Json::parse(text));
+}
+
+ManifestReferences manifestReferences(const Json& manifest)
+{
+    if(!manifest.is_object())throw std::invalid_argument("input manifest must be an object; regenerate the fit inputs");
+    ManifestReferences result;
+    const auto add=[&]<class Map>(const Json& entry,Map& references,const char* kind){
+        const auto fail=[&](const char* reason){throw std::invalid_argument(std::string(reason)+" "+kind+" manifest reference; regenerate the fit inputs");};
+        if(!entry.contains("reference"))fail("missing complete");
+        typename Map::mapped_type ref;
+        if constexpr(std::is_same_v<typename Map::mapped_type,ObjectVersion>) ref=objectVersionFrom(entry.at("reference"));
+        else ref=relationshipVersionFrom(entry.at("reference"));
+        const auto& uuid=entry.at("uuid").get_ref<const std::string&>();
+        const auto id=[&]{if constexpr(std::is_same_v<typename Map::mapped_type,ObjectVersion>)return ref.objectUuid;else return ref.relationshipUuid;}();
+        if(id!=uuid||(entry.contains("version")&&versionNumberFrom(entry.at("version"))!=ref.version))fail("inconsistent");
+        if(!references.emplace(uuid,std::move(ref)).second)fail("duplicate");
+    };
+    for(const auto* key:{"objects","relationships"})if(manifest.contains(key)&&!manifest.at(key).is_null()){
+        const auto& entries=manifest.at(key);
+        if(!entries.is_array())throw std::invalid_argument(std::string(key)+" manifest must be an array; regenerate the fit inputs");
+        for(const auto& entry:entries)
+            if(std::string_view(key)=="objects")add(entry,result.objects,"object");
+            else add(entry,result.relationships,"relationship");
+    }
+    if(manifest.contains("outer_shell")&&!manifest.at("outer_shell").is_null())add(manifest.at("outer_shell"),result.objects,"object");
+    return result;
 }
 
 ChangePage changePageFromJson(const std::string& text)
@@ -95,7 +127,7 @@ ChangePage changePageFromJson(const std::string& text)
     page.cursorValid = j.at("cursor_valid").get<bool>();
     page.more = j.at("more").get<bool>();
     page.next = cursorFrom(j.at("next"));
-    for (const auto& c : j.at("commits")) {
+    for (const auto& c : jsonArrayField(j, "commits")) {
         FeedCommit commit;
         commit.sequence = c.at("sequence").get<int64_t>();
         commit.requestUuid = textFrom(c.at("request_uuid"));
@@ -103,7 +135,7 @@ ChangePage changePageFromJson(const std::string& text)
         commit.host = c.at("host").get<std::string>();
         commit.publishedAtUs = c.at("published_at_us").get<int64_t>();
         commit.complete = c.at("complete").get<bool>();
-        for (const auto& change : c.at("changes"))
+        for (const auto& change : jsonArrayField(c, "changes"))
             commit.changes.push_back({change.at("kind").get<std::string>(), change.at("uuid").get<std::string>(),
                                       change.at("version").get<int64_t>(), change.at("deleted").get<bool>()});
         page.commits.push_back(std::move(commit));
@@ -123,7 +155,7 @@ Json revisionJson(const ObjectRevision& r)
     return Json{{"uuid", r.uuid}, {"object", r.objectUuid}, {"parent", optionalText(r.parentUuid)},
                 {"geometry_revision", optionalText(r.geometryRevision)}, {"sequence", r.sequence},
                 {"metadata_complete", r.metadataComplete}, {"published_at_us", optionalInt(r.publishedAtUs)},
-                {"deleted", r.deleted}, {"version", r.version}, {"generation", r.generation},
+                {"deleted", r.deleted}, {"version", r.version}, {"generation", r.generation}, {"store", r.storeUuid},
                 {"commit_sequence", optionalInt(r.commitSequence)}, {"record", withExactMeta(objectToJson(r.record), r.record)}};
 }
 
@@ -138,12 +170,15 @@ ObjectRevision revisionFrom(const Json& j)
     r.metadataComplete = j.at("metadata_complete").get<bool>();
     r.publishedAtUs = intFrom(j.at("published_at_us"));
     r.deleted = j.at("deleted").get<bool>();
-    r.version = j.at("version").get<int64_t>();
+    r.version = versionNumberFrom(j.at("version"));
     r.generation = j.at("generation").get<std::string>();
-    r.commitSequence = intFrom(j.at("commit_sequence"));
+    r.storeUuid = j.at("store").get<std::string>();
+    r.commitSequence = j.at("commit_sequence").is_null() ? std::nullopt :
+        std::optional(commitSequenceFrom(j.at("commit_sequence")));
     const auto& record = j.at("record");
     r.record = exactMetaFrom(record, objectFromJson(record));
     commonFromJson(record, r.record);
+    r.record.versionStoreUuid=r.storeUuid;
     return r;
 }
 } // namespace
@@ -160,7 +195,7 @@ std::string geometryRevisionToJson(const GeometryRevision& g)
     return Json{{"uuid", g.uuid}, {"object", g.objectUuid}, {"parent", optionalText(g.parentUuid)},
                 {"content_hash", g.contentHash}, {"kind", g.kind}, {"coordinate_system", g.coordinateSystem},
                 {"attributes", g.attributes}, {"format_version", g.formatVersion},
-                {"object_generation", g.objectGeneration}, {"created_by", g.createdBy}, {"created_at", g.createdAt},
+                {"object_version", g.objectVersion}, {"created_by", g.createdBy}, {"created_at", g.createdAt},
                 {"created_host", g.createdHost}, {"arrays", arrays}, {"grid_origin", g.gridOrigin}}
         .dump();
 }
@@ -177,11 +212,11 @@ GeometryRevision geometryRevisionFromJson(const std::string& text)
     g.coordinateSystem = j.at("coordinate_system").get<std::string>();
     g.attributes = j.at("attributes").get<std::string>(); // exact stored text
     g.formatVersion = j.at("format_version").get<int64_t>();
-    g.objectGeneration = j.at("object_generation").get<int64_t>();
+    g.objectVersion = j.at("object_version").get<int64_t>();
     g.createdBy = j.at("created_by").get<std::string>();
     g.createdAt = j.at("created_at").get<std::string>();
     g.createdHost = j.at("created_host").get<std::string>();
-    for (const auto& a : j.at("arrays"))
+    for (const auto& a : jsonArrayField(j, "arrays"))
         g.arrays.push_back({a.at("name").get<std::string>(), a.at("dtype").get<std::string>(),
                             a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length").get<int64_t>()});
     g.gridOrigin = j.at("grid_origin").get<std::array<int64_t, 2>>();
@@ -221,15 +256,22 @@ std::optional<std::set<std::string>> fieldSet(const std::optional<std::vector<st
 
 Json envelope(const StoreStatus& status, const char* key, Json value)
 {
-    return Json{{"status", Json::parse(storeStatusToJson(status))}, {key, std::move(value)}};
+    return Json{{"status", storeStatusJson(status)}, {key, std::move(value)}};
 }
 
 // The `key` member of an answer; `asOf` receives its snapshot status.
 Json unwrap(const std::string& text, StoreStatus* asOf, const char* key)
 {
     auto j = Json::parse(text);
-    if (asOf) *asOf = storeStatusFromJson(j.at("status").dump());
+    if (asOf) *asOf = storeStatusFrom(j.at("status"));
     return std::move(j.at(key));
+}
+
+Json unwrapArray(const std::string& text, StoreStatus* asOf, const char* key)
+{
+    auto value = unwrap(text, asOf, key);
+    jsonArray(value, key);
+    return value;
 }
 
 void refuseTransforms(bool explicitTransforms, const char* what)
@@ -292,10 +334,13 @@ Json fieldsJson(const std::optional<std::vector<std::string>>& fields) { return 
 
 Json relationshipJson(const RelationshipRevision& r)
 {
-    return Json{{"uuid", r.uuid}, {"record", withExactMeta(edgeToJson(r.record, nullptr, false), r.record)}, {"a_revision", r.aRevision},
+    auto record = withExactMeta(edgeToJson(r.record, nullptr, false), r.record);
+    versionToJson(r.record, record);
+    return Json{{"uuid", r.uuid}, {"record", std::move(record)}, {"a_revision", r.aRevision},
                 {"b_revision", r.bRevision}, {"a_geometry_revision", optionalText(r.aGeometryRevision)},
                 {"b_geometry_revision", optionalText(r.bGeometryRevision)}, {"version", r.version},
-                {"generation", r.generation}, {"a_version", r.aVersion}, {"b_version", r.bVersion}};
+                {"generation", r.generation}, {"a_version", r.aReference.version}, {"b_version", r.bReference.version},
+                {"a_reference", objectVersionJson(r.aReference)}, {"b_reference", objectVersionJson(r.bReference)}};
 }
 
 RelationshipRevision relationshipFrom(const Json& j)
@@ -303,14 +348,17 @@ RelationshipRevision relationshipFrom(const Json& j)
     RelationshipRevision r;
     r.uuid = j.at("uuid").get<std::string>();
     r.record = exactMetaFrom(j.at("record"), edgeFromJson(j.at("record")));
+    versionFromJson(j.at("record"), r.record);
     r.aRevision = j.at("a_revision").get<std::string>();
     r.bRevision = j.at("b_revision").get<std::string>();
     r.aGeometryRevision = textFrom(j.at("a_geometry_revision"));
     r.bGeometryRevision = textFrom(j.at("b_geometry_revision"));
-    r.version = j.at("version").get<int64_t>();
+    r.version = versionNumberFrom(j.at("version"));
     r.generation = j.at("generation").get<std::string>();
-    r.aVersion = j.at("a_version").get<int64_t>();
-    r.bVersion = j.at("b_version").get<int64_t>();
+    r.aReference = objectVersionFrom(j.at("a_reference"));
+    r.bReference = objectVersionFrom(j.at("b_reference"));
+    if (!r.aRevision.empty()) r.aRevision = util::canonicalUuid(r.aRevision);
+    if (!r.bRevision.empty()) r.bRevision = util::canonicalUuid(r.bRevision);
     return r;
 }
 
@@ -323,6 +371,16 @@ RegionStop regionStopFrom(const std::string& name)
     throw std::invalid_argument("region query: unknown stop reason " + name);
 }
 } // namespace
+
+std::string currentObjectResultToJson(const StoreStatus& status, const ObjectRevision& revision)
+{
+    return envelope(status, "revision", revisionJson(revision)).dump();
+}
+
+ObjectRevision currentObjectResultFromJson(const std::string& text, StoreStatus* asOf)
+{
+    return revisionFrom(unwrap(text, asOf, "revision"));
+}
 
 std::string objectQueryRequestToJson(const ObjectSelection& selection, const std::optional<std::vector<std::string>>& fields)
 {
@@ -343,13 +401,15 @@ static void versionToJson(const RecordCommon& record, Json& j)
     if (!record.version) return;
     j["version"] = *record.version;
     j["version_generation"] = record.versionGeneration;
+    j["version_store"] = record.versionStoreUuid;
 }
 
 static void versionFromJson(const Json& j, RecordCommon& record)
 {
     if (!j.contains("version")) return;
-    record.version = j.at("version").get<int64_t>();
+    record.version = versionNumberFrom(j.at("version"));
     record.versionGeneration = j.at("version_generation").get<std::string>();
+    record.versionStoreUuid = j.at("version_store").get<std::string>();
 }
 
 std::string objectQueryResultToJson(const StoreStatus& status, const std::vector<ObjectRecord>& objects,
@@ -369,7 +429,7 @@ std::string objectQueryResultToJson(const StoreStatus& status, const std::vector
 std::vector<ObjectRecord> objectQueryResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<ObjectRecord> result;
-    for (const auto& j : unwrap(text, asOf, "objects")) {
+    for (const auto& j : unwrapArray(text, asOf, "objects")) {
         auto record = exactMetaFrom(j, objectFromJson(j));
         presentCommonFromJson(j, record);
         read(j, "volume_length", record.volumeLength);
@@ -408,7 +468,7 @@ std::string edgeQueryResultToJson(const StoreStatus& status, const std::vector<E
 std::vector<EdgeRecord> edgeQueryResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<EdgeRecord> result;
-    for (const auto& j : unwrap(text, asOf, "edges")) {
+    for (const auto& j : unwrapArray(text, asOf, "edges")) {
         auto edge = exactMetaFrom(j, edgeFromJson(j, true));
         versionFromJson(j, edge);
         result.push_back(std::move(edge));
@@ -505,29 +565,25 @@ std::string objectHistoryToJson(const StoreStatus& status, const std::vector<Obj
 std::vector<ObjectRevision> objectHistoryFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<ObjectRevision> result;
-    for (const auto& j : unwrap(text, asOf, "revisions")) result.push_back(revisionFrom(j));
+    for (const auto& j : unwrapArray(text, asOf, "revisions")) result.push_back(revisionFrom(j));
     return result;
 }
 
+std::string objectVersionToJson(const ObjectVersion& reference) { return objectVersionJson(reference).dump(); }
+std::string relationshipVersionToJson(const RelationshipVersion& reference) { return relationshipVersionJson(reference).dump(); }
+RelationshipVersion relationshipVersionFromJson(const std::string& text) { return relationshipVersionFrom(Json::parse(text)); }
+ObjectVersion objectVersionFromJson(const std::string& text) { return objectVersionFrom(Json::parse(text)); }
+
 std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>& versions)
 {
-    auto array = Json::array();
-    for (const auto& v : versions)
-        array.push_back({{"store", v.storeUuid}, {"generation", v.generation}, {"object", v.objectUuid}, {"version", v.version}});
-    return Json{{"versions", std::move(array)}}.dump();
+    return Json{{"versions", objectVersionsJson(versions)}}.dump();
 }
 
 std::vector<ObjectVersion> objectVersionsRequestFromJson(const std::string& text)
 {
     const auto j = Json::parse(text);
     requireKeys(j, {"versions"}, "object versions request");
-    std::vector<ObjectVersion> result;
-    for (const auto& v : j.at("versions")) {
-        requireKeys(v, {"store", "generation", "object", "version"}, "object version");
-        result.push_back({v.at("store").get<std::string>(), v.at("generation").get<std::string>(),
-                          v.at("object").get<std::string>(), v.at("version").get<int64_t>()});
-    }
-    return result;
+    return objectVersionsFrom(j.at("versions"));
 }
 
 std::string objectsAtVersionsResultToJson(const StoreStatus& status, const std::vector<std::optional<ObjectRevision>>& revisions)
@@ -540,7 +596,7 @@ std::string objectsAtVersionsResultToJson(const StoreStatus& status, const std::
 std::vector<std::optional<ObjectRevision>> objectsAtVersionsResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<std::optional<ObjectRevision>> result;
-    for (const auto& j : unwrap(text, asOf, "revisions"))
+    for (const auto& j : unwrapArray(text, asOf, "revisions"))
         result.push_back(j.is_null() ? std::nullopt : std::optional(revisionFrom(j)));
     return result;
 }
@@ -556,15 +612,47 @@ std::string relationshipQueryResultToJson(const StoreStatus& status, const std::
 std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<SelectedRelationship> result;
-    for (const auto& j : unwrap(text, asOf, "relationships"))
+    for (const auto& j : unwrapArray(text, asOf, "relationships"))
         result.push_back({relationshipFrom(j.at("relationship")), j.at("applicable").get<bool>()});
+    orderRelationships(result);
+    return result;
+}
+
+std::string selectedInputsToJson(const StoreStatus& status, const SelectedInputs& inputs)
+{
+    auto records = Json::array(), relationships = Json::array();
+    for (const auto& object : inputs.objects) records.push_back(revisionJson(object));
+    for (const auto& edge : inputs.relationships)
+        relationships.push_back({{"relationship", relationshipJson(edge.relationship)}, {"applicable", edge.applicable}});
+    return envelope(status, "inputs", Json{{"objects", records}, {"relationships", relationships}}).dump();
+}
+std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>& refs, const StoreStatus& position)
+{
+    return Json{{"versions", objectVersionsJson(refs)}, {"position", storePositionJson(position)}}.dump();
+}
+std::pair<std::vector<ObjectVersion>, StoreStatus> selectedInputsRequestFromJson(const std::string& text)
+{
+    auto request = Json::parse(text);
+    requireKeys(request, {"versions", "position"}, "selected inputs request");
+    const auto position = request.at("position");
+    requireKeys(position, {"store", "generation", "commit_sequence"}, "selected inputs position");
+    return {objectVersionsFrom(request.at("versions")), storePositionFrom(position)};
+}
+SelectedInputs selectedInputsFromJson(const std::string& text)
+{
+    const auto data = unwrap(text, nullptr, "inputs");
+    SelectedInputs result;
+    for (const auto& object : jsonArrayField(data, "objects")) result.objects.push_back(revisionFrom(object));
+    for (const auto& edge : jsonArrayField(data, "relationships"))
+        result.relationships.push_back({relationshipFrom(edge.at("relationship")), edge.at("applicable").get<bool>()});
+    orderRelationships(result.relationships);
     return result;
 }
 
 std::string regionQueryRequestToJson(const RegionSlice& slice, const RegionOptions& o)
 {
     refuseTransforms(o.transforms || o.toTarget, "region query");
-    return Json{{"slice", {{"origin", slice.origin}, {"u", slice.u}, {"v", slice.v}, {"normal", slice.normal},
+    auto result = Json{{"slice", {{"origin", slice.origin}, {"u", slice.u}, {"v", slice.v}, {"normal", slice.normal},
                            {"local_bounds", slice.localBounds}}},
                 {"options", {{"kind", o.kind}, {"maximum_objects", o.maximumObjects}, {"selected", opt(o.selected)},
                              {"family", opt(o.family)}, {"min_length", o.minLength}, {"min_points", o.minPoints},
@@ -573,8 +661,9 @@ std::string regionQueryRequestToJson(const RegionSlice& slice, const RegionOptio
                              {"candidate_work_budget", o.candidateWorkBudget}, {"sql_step_budget", o.sqlStepBudget},
                              {"max_unit_bytes", o.maxUnitBytes}, {"uuids", opt(o.uuids)},
                              {"coordinates", opt(o.coordinates)}, {"volume", opt(o.volume)},
-                             {"target_scale", o.targetScale}}}}
-        .dump();
+                             {"target_scale", o.targetScale}}}};
+    if (!o.excludedUuids.empty()) result["options"]["excluded_uuids"] = o.excludedUuids;
+    return result.dump();
 }
 
 std::pair<RegionSlice, RegionOptions> regionQueryRequestFromJson(const std::string& text)
@@ -591,12 +680,13 @@ std::pair<RegionSlice, RegionOptions> regionQueryRequestFromJson(const std::stri
         const auto& p = j.at("options");
         requireKeys(p, {"kind", "maximum_objects", "selected", "family", "min_length", "min_points",
                         "output_byte_budget", "processing_byte_budget", "candidate_work_budget", "sql_step_budget",
-                        "max_unit_bytes", "uuids", "coordinates", "volume", "target_scale"}, "region options");
+                        "max_unit_bytes", "uuids", "excluded_uuids", "coordinates", "volume", "target_scale"}, "region options");
         read(p, "kind", o.kind); read(p, "maximum_objects", o.maximumObjects); read(p, "selected", o.selected);
         read(p, "family", o.family); read(p, "min_length", o.minLength); read(p, "min_points", o.minPoints);
         read(p, "output_byte_budget", o.outputByteBudget); read(p, "processing_byte_budget", o.processingByteBudget);
         read(p, "candidate_work_budget", o.candidateWorkBudget); read(p, "sql_step_budget", o.sqlStepBudget);
         read(p, "max_unit_bytes", o.maxUnitBytes); read(p, "uuids", o.uuids); read(p, "coordinates", o.coordinates);
+        read(p, "excluded_uuids", o.excludedUuids);
         read(p, "volume", o.volume); read(p, "target_scale", o.targetScale);
     }
     return {slice, o};
@@ -608,7 +698,9 @@ std::string regionQueryResultToJson(const StoreStatus& status, const RegionResul
     for (const auto& run : r.runs)
         runs.push_back({{"object", run.objectUuid}, {"revision", run.revisionUuid}, {"array", run.arrayName},
                         {"family", run.family}, {"first_segment", run.firstSegment}, {"points", run.points},
-                        {"grid", run.grid}});
+                        {"grid", run.grid},
+                        {"object_reference", objectVersionJson(run.objectReference)},
+                        {"object_to_volume", run.objectToVolume ? run.objectToVolume->json() : Json(nullptr)}});
     const auto& s = r.stats;
     Json stats{{"output_bytes", s.outputBytes}, {"processing_bytes", s.processingBytes},
                {"payload_bytes", s.payloadBytes}, {"verified_bytes", s.verifiedBytes},
@@ -625,12 +717,14 @@ RegionResult regionQueryResultFromJson(const std::string& text, StoreStatus* asO
 {
     const auto j = unwrap(text, asOf, "result");
     RegionResult r;
-    for (const auto& run : j.at("runs"))
+    for (const auto& run : jsonArrayField(j, "runs"))
         r.runs.push_back({run.at("object").get<std::string>(), run.at("revision").get<std::string>(),
                           run.at("array").get<std::string>(), run.at("family").get<std::string>(),
                           run.at("first_segment").get<int64_t>(),
                           run.at("points").get<std::vector<std::array<double, 3>>>(),
-                          run.at("grid").get<std::vector<std::array<double, 2>>>()});
+                          run.at("grid").get<std::vector<std::array<double, 2>>>(),
+                          objectVersionFrom(run.at("object_reference")),
+                          run.at("object_to_volume").is_null() ? std::nullopt : std::optional(VolumeAffine::fromJson(run.at("object_to_volume")))});
     r.remote = j.at("remote").get<std::vector<std::string>>();
     const auto& s = j.at("stats");
     auto& t = r.stats;
@@ -675,7 +769,7 @@ std::string proximityQueryResultToJson(const StoreStatus& status, const std::vec
 std::vector<SurfaceProximityHit> proximityQueryResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<SurfaceProximityHit> result;
-    for (const auto& h : unwrap(text, asOf, "hits"))
+    for (const auto& h : unwrapArray(text, asOf, "hits"))
         result.push_back({h.at("object").get<std::string>(), h.at("revision").get<std::string>(),
                           h.at("grid").get<std::array<double, 2>>(), h.at("point").get<std::array<double, 3>>(),
                           h.at("distance").get<double>()});

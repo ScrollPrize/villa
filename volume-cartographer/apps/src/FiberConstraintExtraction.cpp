@@ -54,6 +54,8 @@ int runFiberConstraintExtraction(int argc, char** argv)
     vc::objects::OpenOptions storeOptions; storeOptions.readOnly=true;
     auto store=vc::objects::ObjectStore::open(cfg.at("fibers").get<std::string>(),storeOptions);
     const auto txn=store.read();
+    // Status, selection, transforms and payloads all use this same read snapshot.
+    const auto sourceStatus=store.status(txn);
     vc::lasagna::LasagnaDatasetOpenOptions open;
     open.workingToBaseScale=1.;
     open.remoteCacheRoot=cfg.at("remote_cache").get<std::string>();
@@ -169,6 +171,8 @@ int runFiberConstraintExtraction(int argc, char** argv)
     options.localMovingProjectionWindows=cfg.value("moving_projection_windows",true);
     options.localPerpendicularProjectionIterations=cfg.value("perpendicular_iterations",16u);
     Json result={{"config",cfg},{"fibers_store_uuid",store.uuid(txn)},
+        {"fiber_source",{{"store",sourceStatus.storeUuid},{"generation",sourceStatus.generation},
+                         {"commit_sequence",sourceStatus.commitSequence}}},
         {"normal_manifest",dataset.manifest().raw},{"normal_provenance",provenance},
         {"selected_ids",ids},{"selected_fibers",lines.size()},{"points",totalPoints},
         {"arc_base",totalArc},{"query_seconds",querySeconds},{"load_seconds",loadSeconds},

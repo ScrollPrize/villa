@@ -1,4 +1,4 @@
-// Offline conversion of schema-17, 18 and 19 stores to the current schema.
+// Offline conversion of upstream schema-17 through schema-20 stores.
 // The fixtures (data/convert_schema17.sql, data/convert_schema18.sql) were
 // written by the schema-18 runtime from one history (data/convert_schema19.sql
 // is the schema-18 fixture converted by the last schema-19 converter): tracks with geometry,
@@ -14,14 +14,18 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
+#include "vc_object_store/objects/StoreConversion.hpp"
 
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <utility>
 
 using namespace vc::objects;
 using Json = nlohmann::json;
@@ -67,6 +71,61 @@ std::string hex(const std::vector<uint8_t>& bytes)
     return out;
 }
 
+// Add artifacts to an authentic frozen upstream fixture, not a current store
+// whose user_version was merely changed to impersonate an old schema.
+size_t fixtureArtifacts(const std::filesystem::path& path, const std::string& object,
+                       const std::string& first, const std::string& later)
+{
+    sqlite3* db = nullptr;
+    require(sqlite3_open(path.string().c_str(), &db) == SQLITE_OK, "open artifact fixture");
+    const auto close = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>(db, sqlite3_close);
+    sqlite3_stmt* rows = nullptr;
+    require(sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='trigger'", -1, &rows, nullptr) == SQLITE_OK, "fixture triggers");
+    std::vector<std::string> triggers;
+    while (sqlite3_step(rows) == SQLITE_ROW) triggers.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(rows, 0)));
+    sqlite3_finalize(rows);
+    for (const auto& trigger : triggers)
+        require(sqlite3_exec(db, ("DROP TRIGGER \"" + trigger + "\"").c_str(), nullptr, nullptr, nullptr) == SQLITE_OK, "drop fixture trigger");
+    const auto key = util::canonicalUuid(object);
+    auto compact = key; compact.erase(std::remove(compact.begin(), compact.end(), '-'), compact.end());
+    const auto query = "SELECT uuid,parent_uuid,metadata_delta FROM object_revisions WHERE object_uuid=x'" + compact + "' ORDER BY seq";
+    require(sqlite3_prepare_v2(db, query.c_str(), -1, &rows, nullptr) == SQLITE_OK, "fixture revisions");
+    std::vector<std::pair<std::vector<uint8_t>, Json>> rewritten;
+    Json old = Json::object(), previous = Json::object(), current;
+    while (sqlite3_step(rows) == SQLITE_ROW) {
+        const auto delta = Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(rows, 2)));
+        old = delta.is_object() ? delta : old.patch(delta);
+        current = old;
+        current["meta"][kArtifactsMetaKey] = Json::parse(rewritten.empty() ? first : later);
+        const auto* bytes = static_cast<const uint8_t*>(sqlite3_column_blob(rows, 0));
+        const bool root = sqlite3_column_type(rows, 1) == SQLITE_NULL;
+        rewritten.emplace_back(std::vector<uint8_t>(bytes, bytes + sqlite3_column_bytes(rows, 0)), root ? current : Json::diff(previous, current));
+        previous = current;
+    }
+    sqlite3_finalize(rows);
+    require(rewritten.size() >= 2, "fixture has two artifact versions");
+    sqlite3_stmt* update = nullptr;
+    require(sqlite3_prepare_v2(db, "UPDATE object_revisions SET metadata_delta=? WHERE uuid=?", -1, &update, nullptr) == SQLITE_OK, "update fixture revisions");
+    for (const auto& [uuid, delta] : rewritten) {
+        const auto json = delta.dump();
+        sqlite3_bind_text(update, 1, json.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_blob(update, 2, uuid.data(), int(uuid.size()), SQLITE_TRANSIENT);
+        require(sqlite3_step(update) == SQLITE_DONE, "write fixture revision");
+        sqlite3_reset(update);
+    }
+    sqlite3_finalize(update);
+    const auto writeJson = [&](const std::string& statement, const Json& value) {
+        sqlite3_stmt* target = nullptr;
+        require(sqlite3_prepare_v2(db, statement.c_str(), -1, &target, nullptr) == SQLITE_OK, "fixture current update");
+        const auto text = value.dump(); sqlite3_bind_text(target, 1, text.c_str(), -1, SQLITE_TRANSIENT);
+        const auto result = sqlite3_step(target); sqlite3_finalize(target);
+        require(result == SQLITE_DONE, "write fixture current record");
+    };
+    writeJson("UPDATE object_head_records SET record=? WHERE object_uuid=x'" + compact + "'", current);
+    writeJson("UPDATE objects SET meta=? WHERE uuid=x'" + compact + "'", current.at("meta"));
+    return rewritten.size();
+}
+
 // Everything the fixture's runtime read back, read again from `path`.
 // `generation`: the converted store's generation replaces the recorded one
 // when a schema-17 source got a new one.
@@ -83,13 +142,28 @@ void requireSameHistory(const std::filesystem::path& path, const Json& expected,
         require(history.size() == recorded.size(), "revision count");
         for (size_t i = 0; i < history.size(); ++i) {
             auto want = recorded.at(i);
+            want["store"] = expected.at("store");
             if (generation) want["generation"] = *generation;
+            auto& record = want.at("record");
+            record["approved_version"] = record.at("approved_generation").is_null() ? Json(nullptr) : want.at("version");
+            record.erase("approved_generation"); record.erase("generation"); record.erase("data_generation");
+            record["version"] = want.at("version");
+            record["commit_sequence"] = want.at("commit_sequence").is_null() ? Json(0) : want.at("commit_sequence");
+            record["version_generation"] = want.at("generation");
             require(Json::parse(objectRevisionToJson(history[i])) == want, ("revision " + std::to_string(i) + " of " + object.get<std::string>()).c_str());
         }
     }
     for (const auto& [uuid, geometry] : expected.at("geometry").items()) {
         const auto g = db.geometryRevision(txn, uuid);
-        require(g && Json::parse(geometryRevisionToJson(*g)) == geometry.at("descriptor"), ("geometry descriptor " + uuid).c_str());
+        auto descriptor = geometry.at("descriptor");
+        descriptor.erase("object_generation");
+        int64_t version = 0;
+        for (const auto& history : expected.at("history"))
+            for (const auto& state : history)
+                if (state.at("geometry_revision") == uuid && (!version || state.at("version").get<int64_t>() < version))
+                    version = state.at("version").get<int64_t>();
+        descriptor["object_version"] = version;
+        require(g && Json::parse(geometryRevisionToJson(*g)) == descriptor, ("geometry descriptor " + uuid).c_str());
         for (const auto& [name, bytes] : geometry.at("arrays").items())
             require(hex(db.readGeometryArray(txn, uuid, name)) == bytes.get<std::string>(), ("geometry array " + name).c_str());
     }
@@ -110,15 +184,17 @@ void requireWritable(const std::filesystem::path& path, const std::string& objec
     OpenOptions options; options.author = "convert-test";
     auto db = ObjectStore::open(path, options);
     StoreStatus status; std::optional<int64_t> before; Json oldRecord;
+    std::string publicationGeneration;
     { auto txn = db.read(); status = db.status(txn); before = db.currentVersion(txn, object);
-      oldRecord = Json::parse(objectRevisionToJson(*db.currentObjectRevision(txn, object))).at("record"); }
+      const auto revision = *db.currentObjectRevision(txn, object);
+      oldRecord = Json::parse(objectRevisionToJson(revision)).at("record"); publicationGeneration = revision.generation; }
     TransactionRequest r; r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
-    r.author = "convert-test"; r.expectedObjects = {{object, before}};
-    r.operations = {SetMetaOp{object, "after_conversion", "true"}};
+    r.author = "convert-test"; r.expectedObjects = testNumberedGuards(db, {{object, before}});
+    r.operations = {SetMetaOp{object, "after_conversion", std::to_string(*before + 1)}};
     const auto receipt = db.submit(r);
     require(receipt.objects.at(object) == *before + 1, "edit after conversion");
     auto txn = db.read();
-    const auto old = db.objectAtVersion(txn, {status.storeUuid, status.generation, object, *before});
+    const auto old = db.objectAtVersion(txn, {status.storeUuid, publicationGeneration, object, *before});
     require(old && Json::parse(objectRevisionToJson(*old)).at("record") == oldRecord, "old version reads back");
 }
 }
@@ -128,9 +204,11 @@ try {
     TemporaryDirectory directory;
     const auto expected = Json::parse(bytesOf(kData / "convert_expected.json"));
     OpenOptions options; options.author = "convert-test";
-    for (const int schema : {17, 18, 19}) {
+    for (const int schema : {17, 18, 19, 20}) {
         const auto source = directory.path / ("old" + std::to_string(schema) + ".vcobj");
-        sql(source, bytesOf(kData / ("convert_schema" + std::to_string(schema) + ".sql")));
+        // Upstream schema 20 differs from 19 only by dropping replica identity.
+        sql(source, bytesOf(kData / ("convert_schema" + std::to_string(std::min(schema, 19)) + ".sql")));
+        if (schema == 20) sql(source, "DROP TABLE sync_replica; PRAGMA user_version=20;");
         const auto before = bytesOf(source);
         mustFail([&] { (void)ObjectStore::open(source, options); }); // the runtime refuses old schemas
 
@@ -141,7 +219,7 @@ try {
         const auto report = Json::parse(result.reportJson);
         const auto mapping = Json::parse(result.mappingJson);
         require(report.at("validation") == "ok" && report.at("source_role") == "standalone", "report");
-        require(report.at("source_schema") == schema && report.at("target_schema") == 20, "schemas reported");
+        require(report.at("source_schema") == schema && report.at("target_schema") == 21, "schemas reported");
         mustFail([&] { (void)migration::convertStore(source, destination); }); // never overwrites
         // Storage form: whole records for revisions without a parent, no
         // materialized head record duplicating one, 16-byte keys.
@@ -151,8 +229,10 @@ try {
                                     "WHERE r.parent_uuid IS NULL") == 0, "no duplicate head records");
         require(scalar(destination, "SELECT count(*) FROM object_versions WHERE length(object_uuid)<>16 OR length(revision_uuid)<>16") == 0,
                 "blob keys");
-        require(scalar(destination, "SELECT count(*) FROM sqlite_master WHERE name='sync_replica'") == 0 &&
-                std::find(report.at("removed_tables").begin(), report.at("removed_tables").end(), "sync_replica") !=
+        require(scalar(destination, "SELECT count(*) FROM sqlite_master WHERE name='sync_replica'") == 0,
+                "no obsolete replica identity");
+        if (schema < 20)
+            require(std::find(report.at("removed_tables").begin(), report.at("removed_tables").end(), "sync_replica") !=
                     report.at("removed_tables").end(), "replica identity dropped");
 
         requireSameHistory(destination, expected,
@@ -179,8 +259,88 @@ try {
         require(!std::filesystem::exists(refused) && !std::filesystem::exists(refused.string() + ".converting"), "no partial destination");
         sql(source, "DELETE FROM hub_pending;");
         const auto settled = Json::parse(migration::convertStore(source, directory.path / "settled.vcobj").reportJson);
-        require(settled.at("source_role") == "replica" &&
-                settled.at("removed_tables") == Json::array({"hub_pending", "hub_upstream", "sync_replica"}), "coordination removed");
+        require(settled.at("source_role") == "replica", "replica conversion reported");
+        for (const auto* table : {"hub_pending", "hub_upstream", "sync_replica"})
+            require(std::find(settled.at("removed_tables").begin(), settled.at("removed_tables").end(), table) !=
+                    settled.at("removed_tables").end(), "coordination removed");
+    }
+    // The unpublished experimental branch reused version 18, but it is not
+    // upstream schema 18 and must never be treated as a migration input.
+    {
+        const auto source = directory.path / "unpublished18.vcobj";
+        sql(source, bytesOf(kData / "convert_schema18.sql"));
+        sql(source, "CREATE TABLE store_manifest(schema_version INTEGER); INSERT INTO store_manifest VALUES(18);");
+        const auto before = bytesOf(source);
+        const auto destination = directory.path / "unpublished-converted.vcobj";
+        mustFail([&] { (void)migration::convertStore(source, destination); });
+        require(bytesOf(source) == before && !std::filesystem::exists(destination) &&
+                !std::filesystem::exists(destination.string() + ".converting"), "unpublished layout rejected without changes");
+    }
+    {
+        const auto source = directory.path / "in-place20.vcobj";
+        sql(source, bytesOf(kData / "convert_schema19.sql"));
+        sql(source, "DROP TABLE sync_replica; PRAGMA user_version=20;");
+        const auto receipts = scalar(source, "SELECT count(*) FROM transaction_receipts");
+        sql(source, "CREATE VIEW extension_current AS SELECT uuid FROM objects;");
+        const auto before = bytesOf(source);
+        mustFail([&] { (void)migration::convertStoreInPlace(source); });
+        require(bytesOf(source) == before && scalar(source, "PRAGMA user_version") == 20,
+                "unsupported extension rejects in-place conversion without modifying source");
+        sql(source, "DROP VIEW extension_current;");
+        const auto mapping = directory.path / "in-place-mapping.json";
+        mustFail([&] { (void)migration::convertStoreInPlace(source, [&](const auto& converted) {
+            migration::writeConversionReports(converted, mapping, directory.path / "absent" / "report.json");
+        }); });
+        require(scalar(source, "PRAGMA user_version") == 20 && !std::filesystem::exists(mapping),
+                "unstageable conversion report leaves legacy store and no partial mapping");
+        const auto result = migration::convertStoreInPlace(source);
+        require(Json::parse(result.reportJson).at("in_place") == true && scalar(source, "PRAGMA user_version") == 21,
+                "explicit in-place conversion publishes current schema");
+        requireSameHistory(source, expected, std::nullopt);
+        require(scalar(source, "SELECT count(*) FROM transaction_receipts") == receipts, "in-place receipts retained");
+        requireWritable(source, expected.at("objects").at(1));
+    }
+    // Policy transitions retain numbered current identities, including the
+    // old publication lineage after an intervening history-off lineage reset.
+    {
+        const auto path = directory.path / "policy-converted.vcobj";
+        (void)migration::convertStore(directory.path / "old20.vcobj", path);
+        const auto object = expected.at("objects").at(1).get<std::string>();
+        requireWritable(path, object); // Produces a request receipt to retain.
+        const auto receiptCount = scalar(path, "SELECT count(*) FROM transaction_receipts");
+        require(receiptCount > 0, "policy fixture contains request receipts");
+        ObjectRecord before;
+        StoreStatus status;
+        {
+            auto store = ObjectStore::open(path, options);
+            auto txn = store.read(); before = *store.objectByUuid(txn, object); status = store.status(txn);
+        }
+        changeHistoryMode(path, HistoryMode::Off);
+        {
+            auto store = ObjectStore::open(path, options);
+            {
+                auto txn = store.read(); const auto after = *store.objectByUuid(txn, object);
+                require(after.version == before.version && after.versionGeneration == before.versionGeneration &&
+                        after.commitSequence == before.commitSequence, "history removal retains record identity");
+                require(store.status(txn).commitSequence == status.commitSequence + 1, "history removal advances policy clock once");
+            }
+            store.startHistoryGeneration("conversion policy regression");
+        }
+        require(scalar(path, "SELECT count(*) FROM sqlite_schema WHERE name IN ('object_versions','relationship_versions','store_commits')") == 0,
+                "history-off has no archival numbered tables");
+        require(scalar(path, "SELECT count(*) FROM transaction_receipts") == receiptCount, "history removal preserves idempotency receipts");
+        changeHistoryMode(path, HistoryMode::On);
+        {
+            auto store = ObjectStore::open(path, options);
+            auto txn = store.read(); const auto after = *store.objectByUuid(txn, object);
+            require(after.version == before.version && after.versionGeneration == before.versionGeneration &&
+                    after.commitSequence == before.commitSequence, "enabling history retains original publication identity");
+            require(store.status(txn).commitSequence == status.commitSequence + 3, "each policy or lineage change advances clock once");
+            const auto baseline = store.objectAtVersion(txn, {status.storeUuid, before.versionGeneration, object, *before.version});
+            require(baseline && !baseline->commitSequence, "history enablement archives untimed current baseline without inventing a commit");
+        }
+        require(scalar(path, "SELECT count(*) FROM transaction_receipts") == receiptCount, "history enablement preserves idempotency receipts");
+        requireWritable(path, object);
     }
     // Schema 19 differs from 20 only by sync_replica. Preserve artifacts
     // named solely by old versions too, without modifying the source.
@@ -190,24 +350,22 @@ try {
         std::string object, oldHash, currentHash;
         const std::string oldBytes = "old model", currentBytes = "new model";
         {
-            auto store = ObjectStore::create(source, options);
+            auto store = ObjectStore::create(directory.path / "artifact-writer.vcobj", options);
             std::ofstream(input) << oldBytes;
             oldHash = store.putArtifact(input);
             std::ofstream(input) << currentBytes;
             currentHash = store.putArtifact(input);
-            auto txn = store.write();
-            ObjectRecord record; record.kind = "note";
-            object = store.upsertObject(txn, record);
-            store.setMeta(txn, object, kArtifactsMetaKey,
-                          artifactManifestJson({{"model.pt", oldHash, oldBytes.size()}}));
-            txn.commit();
-            auto update = store.write(VersionSelection{{object, 1}});
-            store.setMeta(update, object, kArtifactsMetaKey,
-                          artifactManifestJson({{"model.pt", currentHash, currentBytes.size()}}));
-            update.commit();
         }
-        sql(source, "CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);"
-                    "INSERT INTO sync_replica VALUES(1,'00000000-0000-4000-8000-000000000001'); PRAGMA user_version=19;");
+        sql(source, bytesOf(kData / "convert_schema19.sql"));
+        object = expected.at("objects").at(1).get<std::string>();
+        const auto historyCount = fixtureArtifacts(source, object,
+            artifactManifestJson({{"model.pt", oldHash, oldBytes.size()}}),
+            artifactManifestJson({{"model.pt", currentHash, currentBytes.size()}}));
+        for (const auto& [hash, content] : {std::pair{oldHash, oldBytes}, std::pair{currentHash, currentBytes}}) {
+            const auto blob = artifactBlobPath(source, hash);
+            std::filesystem::create_directories(blob.parent_path());
+            std::ofstream(blob, std::ios::binary) << content;
+        }
         const auto before = bytesOf(source);
         const auto destination = directory.path / "converted-artifacts.vcobj";
         const auto result = migration::convertStore(source, destination);
@@ -216,7 +374,7 @@ try {
             auto store = ObjectStore::open(destination, options);
             auto txn = store.read();
             const auto history = store.objectHistory(txn, object);
-            require(history.size() == 2, "artifact history preserved");
+            require(history.size() == historyCount, "artifact history preserved");
             for (size_t i = 0; i < history.size(); ++i) {
                 const auto manifest = artifactManifest(history[i].record);
                 const auto bytes = store.readArtifact(manifest.at(0).sha256);
@@ -225,6 +383,16 @@ try {
         }
         require(bytesOf(source) == before && bytesOf(artifactBlobPath(source, oldHash)) == oldBytes &&
                 bytesOf(artifactBlobPath(source, currentHash)) == currentBytes, "artifact source untouched");
+        changeHistoryMode(destination, HistoryMode::Off);
+        changeHistoryMode(destination, HistoryMode::On);
+        {
+            auto store = ObjectStore::open(destination, options);
+            auto txn = store.read();
+            const auto manifest = artifactManifest(*store.objectByUuid(txn, object));
+            const auto bytes = store.readArtifact(manifest.at(0).sha256);
+            require(std::string(bytes.begin(), bytes.end()) == currentBytes,
+                    "history-policy staging retains artifacts at the published store location");
+        }
 
         const auto occupied = directory.path / "occupied.vcobj";
         const auto occupiedArtifacts = artifactBlobDirectory(occupied).parent_path();
@@ -241,7 +409,23 @@ try {
             mustFail([&] { migration::convertStore(source, refused); });
             require(!std::filesystem::exists(refused) && !std::filesystem::exists(refused.string() + ".converting") &&
                     !std::filesystem::exists(artifactBlobDirectory(refused).parent_path()), "failed artifact conversion cleaned up");
+            const auto beforeFailure = bytesOf(source);
+            mustFail([&] { (void)migration::convertStoreInPlace(source); });
+            require(bytesOf(source) == beforeFailure && scalar(source, "PRAGMA user_version") == 19,
+                    "failed in-place artifact validation leaves upstream source untouched");
         }
+        std::ofstream(oldBlob, std::ios::binary) << oldBytes;
+        (void)migration::convertStoreInPlace(source);
+        {
+            auto store = ObjectStore::open(source, options);
+            auto txn = store.read();
+            require(store.objectHistory(txn, object).size() == historyCount, "in-place artifact history retained");
+            require(bytesOf(artifactBlobPath(source, oldHash)) == oldBytes &&
+                    bytesOf(artifactBlobPath(source, currentHash)) == currentBytes, "in-place artifacts retain their published location");
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(directory.path))
+            require(!entry.path().filename().string().starts_with(source.filename().string() + ".convert-"),
+                    "in-place private conversion files cleaned on success and failure");
     }
     // Schema 16 (the patches detail table, hub sync baselines): its form of
     // the schema-17 fixture. Surface data is refused; without it the history

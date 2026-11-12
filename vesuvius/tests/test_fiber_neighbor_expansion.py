@@ -67,3 +67,70 @@ def test_conditional_fit_freezes_old_anchors_and_widths():
     assert state[0,0]==0 and ext.curve.u[0]==0 and ext.curve.v[0]==0
     assert abs(state[1,0].item()-1)<1e-5
     assert abs(ext.curve.u[1].item()-2)<1e-5 and abs(ext.curve.v[1].item()-3)<1e-5
+def test_paired_neighbor_publishes_verified_baseline_manifest(tmp_path, monkeypatch):
+    import json
+    import numpy as np
+    import pytest
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_neighbor_pair as pair
+    from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
+
+    dataset=tmp_path/'dataset'
+    (dataset/'cross').mkdir(parents=True)
+    (dataset/'summary.json').write_text('{}')
+    (dataset/'inputs.json').write_text('{"fibers":"saved"}')
+    (dataset/'cross/cross_events.json').write_text('{"events":[]}')
+    np.savez(dataset/'tensors.npz', source_id=['source'])
+    base=tmp_path/'config.json'
+    base.write_text(json.dumps(dict(fiber_implicit_winding=dict(fibers='original',gpu_manager={}))))
+    root=tmp_path/'pair'
+    pin={'store':'saved-store','commit_sequence':7}
+    def verify(path,digest,version):
+        assert (path,digest,version)==('original','saved',pin)
+        return pin
+    monkeypatch.setattr(fiber_store,'verify_fiber_source',verify)
+    monkeypatch.setattr(fiber_store,'fibers_digest',lambda path:'selected')
+    monkeypatch.setattr(pair,'induced_graph',lambda parent,*args:parent)
+    monkeypatch.setattr(pair,'perpendicular_supported_graph',lambda graph,*args:(graph,{}))
+    monkeypatch.setattr(pair,'remap_events',lambda events,graph:events)
+    def execute(argv,**kwargs):
+        from pathlib import Path
+        config=Path(argv[-1])
+        if config.stem=='joint_run':
+            spec=json.loads(config.read_text())['fiber_joint_gt_eval']
+            assert json.loads((Path(spec['baseline_root'])/'inputs.json').read_text()) == {
+                'fibers':'saved','fiber_source':pin}
+        targets={'joint_run':'joint/results.json','joint_report':'joint/comparison.json',
+                 'free_run':'free/results.json','free_sign':'free/gt_signs/summary.json',
+                 'visualization':'visualization/summary.json'}
+        done=root/targets[config.stem]
+        done.parent.mkdir(parents=True,exist_ok=True)
+        done.write_text('{}')
+    monkeypatch.setattr(pair.subprocess,'run',execute)
+    settings=dict(dataset=str(dataset),output_root=str(root),base_config=str(base),
+                  gt_root='fixture',devices=['0','1'])
+    with pytest.raises(ValueError,match='regenerate the expansion'):
+        pair.run(settings)
+    (dataset/'inputs.json').write_text(json.dumps(dict(fibers='saved',fiber_source=pin)))
+    pair.run(settings)
+
+
+def test_expansion_checks_parent_evidence_before_sampling(tmp_path, monkeypatch):
+    import json
+    import pytest
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_neighbor_expansion as expansion
+    from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
+
+    seed=tmp_path/'seed'
+    seed.mkdir()
+    (seed/'config.json').write_text('{}')
+    parent=tmp_path/'tensors.npz'
+    saved=dict(fibers='old',fiber_source=dict(commit_sequence=1))
+    parent.with_suffix('.json').write_text(json.dumps(dict(signature=saved)))
+    def verify(path,signature):
+        assert path=='source' and signature==saved
+        raise ValueError('Saved fiber source differs')
+    monkeypatch.setattr(fiber_store,'verify_fiber_signature',verify)
+    monkeypatch.setattr(fiber_store,'fiber_catalog',lambda *args,**kwargs:pytest.fail('Sampled stale source'))
+    with pytest.raises(ValueError,match='Saved fiber source differs'):
+        expansion.run(dict(seed_solve=str(seed),parent_tensors=str(parent),
+                           fibers='source',output_root=str(tmp_path/'output')))

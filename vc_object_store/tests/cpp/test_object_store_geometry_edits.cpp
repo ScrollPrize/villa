@@ -292,7 +292,7 @@ int main() try {
                 [&](const std::vector<EdgeRecord>& affected) {
                     std::vector<GeometryEdgeEdit> result;
                     for (const auto& edge : affected) {
-                        GeometryEdgeEdit edit; edit.edgeUuid = edge.uuid; edit.expectedGeneration = edge.generation;
+                        GeometryEdgeEdit edit; edit.edgeUuid = edge.uuid; edit.expectedVersion = edge.version.value();
                         edit.action = "keep_recorded";
                         edit.aRevision = db.currentGeometry(txn, edge.aUuid)->uuid;
                         edit.bRevision = db.currentGeometry(txn, edge.bUuid)->uuid;
@@ -325,7 +325,7 @@ int main() try {
         {
             auto read = store.read();
             const auto head = store.currentVersion(read, uid);
-            auto txn = store.write({{uid, head}});
+            auto txn = store.writeNumbered({{uid, head}});
             GeometrySequencePart part; part.count = 1; part.ids = {30}; part.bytes = doubles({7, 8, 9});
             part.annotations = R"([{"label":"C"}])";
             GeometrySequenceEdit splice; splice.array = "points"; splice.start = 1; splice.parts = {part};
@@ -347,7 +347,7 @@ int main() try {
         require(view.point(30) == vc::geometry::Point{7, 8, 9}, "lookup by stable ID");
         std::string third;
         {
-            auto txn = store.write({{uid, view.version()}});
+            auto txn = store.writeNumbered({{uid, view.version()}});
             third = store.editGeometry(txn, uid, {{"points", 3, doubles({10, 11, 12})}}, view.revision().uuid);
             txn.commit();
         }

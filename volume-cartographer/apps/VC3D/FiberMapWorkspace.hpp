@@ -599,7 +599,7 @@ private:
     // since; a fresh workspace is stale until its first rebuild.
     uint64_t _layoutGeneration = 0;
     QString _layoutAnnotationVolume;
-    QString _layoutUmbilicusFingerprint;
+    vc3d::fiber_map::UmbilicusDependency _layoutUmbilicusDependency;
     QString _layoutCatalogOrientation;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.
@@ -637,6 +637,6 @@ private:
     // See setOperationStatus(). Empty when the line shows only its floor.
     QString _operationStatus;
     QString _umbilicusStatusText;
-    QString _umbilicusStatusFingerprint;
+    vc3d::fiber_map::UmbilicusDependency _umbilicusStatusDependency;
     bool _umbilicusStatusValid = false;
 };

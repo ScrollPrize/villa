@@ -8,6 +8,9 @@ is validation when all its samples lie in the z band ``--val-z`` (patch voxels),
     python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.build_index --fibers FIBERS.vcobj \\
         --runs H_runs.jsonl V_runs.jsonl --patches-dir PATCHES --out INDEX_DIR
 
+Store matches must carry the producer's complete ``fiber_reference``. Unversioned or stale matches must be regenerated;
+building an index does not certify old evidence against new geometry.
+
 Output (INDEX_DIR): ``runs_*.npy`` (one row per run, sorted by fiber then start), ``sample_*.npy`` (``run_samples``
 gives each run's slice), ``patches.json`` (sheets/data/patches.PatchInfo rows) and ``meta.json``.
 """
@@ -41,25 +44,31 @@ def main(argv=None):
     index = build_index(args.patches_dir, sheet_config.OUTPUT/'cache')
     patch_id = {(info.root, info.name): i for i, info in enumerate(index)}
     fibers = FiberStore(args.fibers, fiber_volume(args.fibers), split='all')
+    source_digest = fibers_digest(args.fibers)
+    fibers.require_digest(source_digest)
     catalog = fibers.id_to_index
     rows, rc, xyz = [], [], []
     for path in args.runs:
         with open(path) as stream:
             for line in stream:
                 run = json.loads(line)
+                kind, fiber = run['fiber'].split(':', 1)
+                if kind != 'fiber':
+                    raise ValueError(f"Run of {run['fiber']}: the index holds fiber-store fibers (fiber:<UUID>) only")
+                ordinal = catalog[fiber]
+                if run.get('fiber_reference') != fibers.catalog[ordinal]['reference']:
+                    raise ValueError(f"Run of {run['fiber']}: stale or missing fiber reference; regenerate matches")
                 points = np.asarray(run['xyz'], np.float32)
                 z = points[:, 2]
                 lo, hi = args.val_z
                 split = ('validation' if ((z >= lo) & (z <= hi)).all() else
                          'train' if ((z < lo-args.val_margin) | (z > hi+args.val_margin)).all() else 'unused')
-                kind, fiber = run['fiber'].split(':', 1)
-                if kind != 'fiber':
-                    raise ValueError(f"Run of {run['fiber']}: the index holds fiber-store fibers (fiber:<UUID>) only")
-                rows.append((catalog[fiber], patch_id[(run['root'], run['patch'])], run['start'], run['end'],
+                rows.append((ordinal, patch_id[(run['root'], run['patch'])], run['start'], run['end'],
                              run['offset'], SPLITS[split]))
                 rc.append(np.asarray(run['rc'], np.int32))
                 xyz.append(points)
     order = sorted(range(len(rows)), key=lambda i: (rows[i][0], rows[i][2]))
+    fibers.require_digest(source_digest)
     args.out.mkdir(parents=True, exist_ok=True)
     columns = dict(fiber=np.int64, patch=np.int32, start=np.float32, end=np.float32, offset=np.float32, split=np.int8)
     for k, (name, dtype) in enumerate(columns.items()):
@@ -74,7 +83,7 @@ def main(argv=None):
     summary = {name: dict(runs=int((split == value).sum()), length=float(length[split == value].sum()),
                           fibers=len({rows[i][0] for i in order if rows[i][5] == value}))
                for name, value in SPLITS.items()}
-    meta = dict(fibers=str(Path(args.fibers).resolve()), fibers_digest=fibers_digest(args.fibers),
+    meta = dict(fibers=str(Path(args.fibers).resolve()), fibers_digest=source_digest,
                 runs=[str(Path(p).resolve()) for p in args.runs],
                 patches_dir=[str(Path(p).resolve()) for p in args.patches_dir], fibers_per_patch_voxel=args.grid_scale,
                 val_z=list(args.val_z), val_margin=args.val_margin, splits=summary)

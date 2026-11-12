@@ -1,5 +1,7 @@
 #include "internal/Database.hpp"
 #include "internal/ReadRequest.hpp"
+#include "vc_object_store/objects/PackedStore.hpp"
+#include <limits>
 
 namespace vc::objects::detail {
 [[noreturn]] void fail(sqlite3* db, const std::string& what)
@@ -19,6 +21,18 @@ void exec(sqlite3* db, const char* sql)
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::string msg = err ? err : sqlite3_errmsg(db);
         sqlite3_free(err);
+        if(sqlite3_extended_errcode(db)==SQLITE_CONSTRAINT_FOREIGNKEY){
+            // Failed commits otherwise hide which reference could not be
+            // satisfied. This diagnostic does no work on successful writes.
+            sqlite3_stmt* check=nullptr;
+            if(sqlite3_prepare_v2(db,"PRAGMA foreign_key_check",-1,&check,nullptr)==SQLITE_OK&&sqlite3_step(check)==SQLITE_ROW){
+                msg+=" ["+std::string(reinterpret_cast<const char*>(sqlite3_column_text(check,0)))+
+                    " -> "+std::string(reinterpret_cast<const char*>(sqlite3_column_text(check,2)))+
+                    ", row "+std::to_string(sqlite3_column_int64(check,1))+
+                    ", key "+std::to_string(sqlite3_column_int(check,3))+"]";
+            }
+            sqlite3_finalize(check);
+        }
         throw std::runtime_error("sqlite exec failed: " + msg + " (" + sql + ")");
     }
 }
@@ -75,10 +89,10 @@ std::string formatUuid(const std::array<unsigned char, 16>& bytes)
     return out;
 }
 
-std::string nowIsoUtc()
+static std::string isoUtc(std::chrono::system_clock::time_point now, bool fractional)
 {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    const auto second = std::chrono::floor<std::chrono::seconds>(now);
+    const std::time_t t = std::chrono::system_clock::to_time_t(second);
     std::tm tm{};
 #ifdef _WIN32
     gmtime_s(&tm, &t);
@@ -86,8 +100,24 @@ std::string nowIsoUtc()
     gmtime_r(&t, &tm);
 #endif
     char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return buf;
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+    if (!fractional) return std::string(buf) + "Z";
+    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now-second).count();
+    return std::string(buf) + "." + std::to_string(1000000 + micros).substr(1) + "Z";
+}
+
+std::string nowIsoUtc(bool fractional)
+{
+    return isoUtc(std::chrono::system_clock::now(), fractional);
+}
+
+std::string refineCreationStamp(const std::string& created, std::optional<int64_t> publicationUs)
+{
+    if (created.size() != 20 || !publicationUs) return created;
+    const auto publication = isoUtc(std::chrono::system_clock::time_point(
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::microseconds(*publicationUs))), true);
+    return publication.compare(0, 19, created, 0, 19) == 0 ? publication : created;
 }
 
 std::string detectHostname()
@@ -108,7 +138,11 @@ void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly)
     sqlite3_busy_timeout(db, options.busyTimeoutMs);
     exec(db, "PRAGMA foreign_keys=ON;");
     exec(db, "PRAGMA temp_store=MEMORY;");
-    exec(db, "PRAGMA cache_size=-8000;");
+    const auto cacheKiB=options.sqliteCacheBytes/1024+(options.sqliteCacheBytes%1024!=0);
+    if(cacheKiB>static_cast<size_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("object store: SQLite cache budget exceeds supported range");
+    const auto cachePragma="PRAGMA cache_size=-"+std::to_string(cacheKiB)+";";
+    exec(db,cachePragma.c_str());
     if (queryOnly)
         exec(db, "PRAGMA query_only=ON;");
 }
@@ -116,10 +150,18 @@ void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly)
 sqlite3* openConnection(const std::filesystem::path& path, int flags, const OpenOptions& options, bool queryOnly)
 {
     sqlite3* db = nullptr;
-    const int rc = sqlite3_open_v2(reinterpret_cast<const char*>(path.u8string().c_str()), &db,
-                                   flags | SQLITE_OPEN_FULLMUTEX, nullptr);
+    const bool packedLocator = isPackedDatabasePath(path);
+    const bool packedFile = !packedLocator && isPackedStore(path);
+    const bool packed = packedLocator || packedFile;
+    const auto name = packedFile ? packedDatabasePath(path).string() : path.string();
+    const char* vfs = packed ? packedStoreVfs() : nullptr;
+    if (vfs && !sqlite3_vfs_find(vfs))
+        throw std::runtime_error("object store: this SQLite build lacks the unix-dotfile VFS needed for shared files");
+    const int rc = sqlite3_open_v2(packed ? name.c_str() : reinterpret_cast<const char*>(path.u8string().c_str()), &db,
+                                   flags & SQLITE_OPEN_NOMUTEX ? flags : flags | SQLITE_OPEN_FULLMUTEX, vfs);
     if (rc != SQLITE_OK) {
         std::string msg = db ? sqlite3_errmsg(db) : "open failed";
+        if (packed && !packedStoreLastError().empty()) msg += " (" + packedStoreLastError() + ")";
         if (db) sqlite3_close(db);
         throw std::runtime_error("object store: cannot open " + path.string() + ": " + msg);
     }
@@ -174,6 +216,9 @@ void Statement::bind(int i, double v)
 void Statement::bind(int i, const std::string& v)
 { check(sqlite3_bind_text(value, i, v.c_str(), int(v.size()), SQLITE_TRANSIENT), db_, "bind"); }
 
+void Statement::bindBorrowedText(int i, const std::string& v)
+{ check(sqlite3_bind_text(value, i, v.data(), int(v.size()), SQLITE_STATIC), db_, "bind"); }
+
 void Statement::bind(int i, std::span<const uint8_t> bytes)
 { check(sqlite3_bind_blob64(value, i, bytes.data(), bytes.size(), SQLITE_TRANSIENT), db_, "bind"); }
 
@@ -214,9 +259,12 @@ void Statement::stepDone()
 
 void Statement::reset()
 {
-    check(sqlite3_reset(value), db_, "reset");
+    resetKeepingBindings();
     check(sqlite3_clear_bindings(value), db_, "clear_bindings");
 }
+
+void Statement::resetKeepingBindings()
+{ check(sqlite3_reset(value), db_, "reset"); }
 
 bool Statement::isNull(int c) const
 { return sqlite3_column_type(value, c) == SQLITE_NULL; }
@@ -260,10 +308,18 @@ std::array<unsigned char, 16> Statement::blob16(int c) const
     return out;
 }
 
-Savepoint::Savepoint(sqlite3* db) : db_(db) { exec(db_, "SAVEPOINT object_operation"); }
+Savepoint::Savepoint(sqlite3* db) : db_(db) {
+    if(const auto found=activeStatementPools.find(db);found!=activeStatementPools.end()) {
+        pool_=found->second;currentWrite_=pool_->currentWrite;
+    }
+    exec(db_, "SAVEPOINT object_operation");
+}
 Savepoint::~Savepoint()
 {
-    if (db_) sqlite3_exec(db_, "ROLLBACK TO object_operation; RELEASE object_operation", nullptr, nullptr, nullptr);
+    if (db_) {
+        sqlite3_exec(db_, "ROLLBACK TO object_operation; RELEASE object_operation", nullptr, nullptr, nullptr);
+        if(pool_)pool_->currentWrite=std::move(currentWrite_);
+    }
 }
 void Savepoint::release()
 {
