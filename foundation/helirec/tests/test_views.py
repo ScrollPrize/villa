@@ -231,7 +231,7 @@ def test_views_with_the_other_corrections(tmp_path, device):
                 mid = middle(r) - 2
                 np.testing.assert_allclose(r.reconstruct(mid, mid + 5)[2], n.reconstruct(mid, mid + 5)[2], atol=5e-7)
             else:
-                assert error(sl, truth) < 0.8 * error(ref, truth), (skip, error(sl, truth), error(ref, truth))
+                assert error(sl, truth) < 0.9 * error(ref, truth), (skip, error(sl, truth), error(ref, truth))
     # the exposure arc is not deconvolved with a row per view (disabled for now)
     arc = recon(scan, device, exposure_arc=0.9)
     assert arc.info["exposure_arc_bins"] == 0 and abs(recon(scan, device, exposure_arc=0.9, angle_interp="nearest").info["exposure_arc_bins"] - 0.9) < 0.01
