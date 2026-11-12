@@ -460,6 +460,12 @@ it). The manifest records the position (outside the digest: equal inputs
 at two positions are equal) and the link parameters and normal source, so a
 later change of either shows the fit's links as stale.
 
+Object pins carry the shared `{store, generation, object, version}` reference
+unchanged, including the selected source owner in a referenced collection.
+Older numeric pin maps are decoded once using their recorded original
+store/generation, not a later current-owner lookup. Link requests use the
+existing command-v2 complete-reference guards; database schema remains 21.
+
 The inputs are frozen for the fit: settings that would relink or re-derive
 them (`config.OBJECT_STORE_PCL_KEYS`, the PCL role toggles, selection and
 frame settings) need a new fit. Each run writes `object_store_inputs.json`
@@ -858,8 +864,8 @@ and rebuild carries a `project` block (`fit_session.SpiralProject`):
   `left_handed_coordinates` and full-resolution `base_shape_zyx`), the
   Lasagna arrays' downsampling relative to its voxels (`lasagna_scale`, from
   the manifest's `source_to_base`, scaledown and base shape and the volume's
-  shape) and its umbilicus from the project's umbilicus store (`uuid`,
-  `generation`, `version`, `points_zyx` in the volume's own voxels).
+  shape) and its umbilicus from the project's umbilicus store (`reference:
+  {store, generation, object, version}`, plus `points_zyx` in the volume's own voxels).
 
 The fit volume is the one the selection's objects name (a checkpoint resume:
 the one its inputs were read in). The build fits that project volume:
@@ -878,8 +884,12 @@ the one its inputs were read in). The build fits that project volume:
   one in the cache it refreshes fiber links centerline-only, with a warning.
   The command-line fit builds its normals pack before refreshing.
 - **Umbilicus.** The project's, written under the output directory
-  (`project-inputs/umbilicus-<uuid>-v<version>.json`) as the file the fit reads, at
-  coordinate scale 1.
+  (`project-inputs/umbilicus-<identity-hash>.json`) as the file the fit reads, at
+  coordinate scale 1. The file retains the complete source reference; its
+  identity hash includes that reference and the materialized points. Old
+  flattened project inputs remain readable. If an older point snapshot has
+  no owning store, it stays an explicit `legacy_source`, never a fabricated
+  exact reference.
 
 The service reads no scroll specification or input manifest (those are the
 command-line fit's); winding counts come from the fit configuration. A fit

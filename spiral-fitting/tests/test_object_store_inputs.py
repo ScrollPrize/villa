@@ -1,5 +1,6 @@
 """Selection, frames and relationship filtering of object-store fit inputs."""
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -29,6 +30,61 @@ def request(**selectors):
         volume, approved)
 
 
+@pytest.mark.parametrize('value', [True, 1.5, '1', -1, 2**63])
+def test_saved_positions_use_native_validation(db, value):
+    position = dict(db.status(), commit_sequence=value)
+    for decode in (osi.InputPosition.from_provenance, osi.InputPins.from_provenance):
+        with pytest.raises((ValueError, RuntimeError), match='commit_sequence'):
+            decode({'position': position})
+    with pytest.raises((ValueError, RuntimeError), match='commit_sequence'):
+        osi.InputPins.from_manifest({'position': position})
+    assert osi.InputPosition.from_provenance(dict(db.status(), commit_sequence=0)).commit_sequence == 0
+
+
+def test_dense_fiber_without_synthetic_controls_materializes_whole_line(db):
+    fid = put_fiber(db, _line(), [])
+    snapshot = osi.read_snapshot(db, request())
+    fibers, links, counts = osi.materialize_fibers(db, snapshot, {}, min_point_spacing=0)
+    assert counts['fibers'] == 1 and links == []
+    assert fibers[fid]['metadata']['fiber_num_control_points'] == 0
+    assert list(fibers[fid]['points']) == list(range(6))
+    np.testing.assert_allclose([p['zyx'] for p in fibers[fid]['points'].values()], _line())
+
+
+@pytest.mark.parametrize('history_enabled', [False, True])
+def test_snapshot_uses_numbered_relationship_versions_without_record_generations(tmp_path, history_enabled):
+    from vc_object_store import ObjectStore, relationship_reference
+
+    with ObjectStore.create(str(tmp_path / 'input.vcobj'), author='test',
+                            history_enabled=history_enabled) as store:
+        surface = put_patch(store, _grid())
+        collection = put_pcl(store, {3: ([20.0, 14.0, 14.0], None)})
+        edge = pcl_patch_edge(store, collection, 3, surface, (1.0, 1.0))
+        snapshot = osi.read_snapshot(store, request())
+        [relationship] = snapshot.relationships
+        assert relationship.uuid == edge
+        assert relationship.version == store.edge(edge)['version']
+        selected = store.relationships_at_versions(snapshot.request.pins.refs())[0]
+        assert relationship.reference == relationship_reference(selected)
+        assert relationship.provenance()['reference'] == relationship.reference
+        assert relationship.reference['store'] == store.status()['store']
+        assert 'generation' not in relationship.provenance()
+        assert snapshot.manifest()['position']['generation'] == store.status()['generation']
+        # A pinned current snapshot works even without historical storage.
+        import dataclasses
+        again = osi.read_snapshot(store, dataclasses.replace(
+            request(), pins=snapshot.request.pins))
+        assert again.digest() == snapshot.digest()
+        changed_reference = dict(relationship.reference, store='11111111-1111-4111-8111-111111111111')
+        changed = dataclasses.replace(relationship, reference=changed_reference)
+        assert changed.provenance()['reference'] != relationship.provenance()['reference']
+        assert changed.provenance()['content_sha256'] == relationship.provenance()['content_sha256']
+        # Publication provenance does not redefine consumed-content identity.
+        manifest = snapshot.manifest()
+        manifest['relationships'] = [changed.provenance()]
+        assert osi.manifest_digest(manifest) == snapshot.digest()
+
+
 def test_default_selection_reads_every_active_object_in_uuid_order(db):
     patches = sorted(put_patch(db, _grid(z)) for z in (10.0, 20.0, 30.0))
     pcl = put_pcl(db, {3: ([20.0, 14.0, 14.0], None)})
@@ -47,6 +103,108 @@ def test_unknown_selector_kind_is_refused():
     # Store kind "patch" became "surface"; a stale key must not select everything.
     with pytest.raises(ValueError, match='unknown object kinds'):
         request(patch={'uuids': ()})
+
+
+def test_selection_preserves_inherited_source_identity_and_manifest_pins(db):
+    """A collection attachment has its own position, not its inherited objects' identities.
+
+    Delegate actual object/geometry/version reads to a real native store while exposing
+    a distinct attachment identity. Native collection routing is covered by test_coherent_store.
+    """
+    import uuid
+    import dataclasses
+    from vc_object_store import object_reference
+
+    fiber = put_fiber(db, _line(), [0, 5])
+    source = object_reference(db.object(fiber))
+    class Attachment:
+        def __getattr__(self, name):
+            return getattr(db, name)
+
+        def status(self):
+            return {**db.status(), 'store': owner, 'generation': generation}
+
+        def selected_inputs(self, refs, position):
+            # This fixture tests transport, not collection routing. Actual
+            # inherited-position validation is native test_coherent_store.
+            return db.selected_inputs(refs, dict(position, store=db.status()['store'], generation=db.status()['generation']))
+
+    owner, generation = str(uuid.uuid4()), str(uuid.uuid4())
+    attachment = Attachment()
+    snapshot = osi.read_snapshot(attachment, request())
+    assert snapshot.pins().refs() == [source]
+    assert snapshot.request.pins.refs() == [source]
+    pins = osi.InputPins.from_manifest(snapshot.manifest())
+    assert pins.refs() == [source]
+    assert osi.InputPins.from_provenance(pins.provenance()).refs() == [source]
+    again = osi.read_snapshot(attachment, dataclasses.replace(request(), pins=pins))
+    assert again.digest() == snapshot.digest()
+    with pytest.raises(ValueError, match='regenerate'):
+        osi.InputPins.from_provenance(dict(position=osi.InputPosition.of_status(db.status()).provenance(),
+                                          objects={fiber: source['version']}))
+    original = dict(source)
+    with pytest.raises(ValueError, match='regenerate'):
+        osi.InputPins.from_provenance(dict(position=dict(store=owner, generation=generation,
+                                                       commit_sequence=0), objects={fiber: 1}))
+    assert source == original
+
+
+def test_reference_only_pins_validate_boundary_and_carry_reference_unchanged(db):
+    from vc_object_store import object_reference, TransactionConflict
+    fiber = put_fiber(db, _line(), [0, 5])
+    reference = object_reference(db.object(fiber))
+    value = dict(position=osi.InputPosition.of_status(db.status()).provenance(),
+                 references={fiber: reference}, selection={'fiber': [fiber]})
+    pins = osi.InputPins.from_provenance(value)
+    assert pins.refs()[0] is pins.references[fiber]
+    assert pins.provenance()['references'] is pins.references
+    assert 'objects' not in pins.provenance()
+    assert osi.InputPins.from_provenance(pins.provenance()).refs() == [reference]
+    command = osi.link_request(db.status(), {}, author='test', read_references=pins.refs())
+    assert command['command_version'] == 3
+    assert command['read_dependencies'][fiber] is pins.references[fiber]
+    assert 'expected_object_references' not in command
+    command['operations'] = []
+    db.submit(command)
+    assert object_reference(db.object(fiber)) == reference
+    wrong_owner = osi.link_request(db.status(), {}, author='test', read_references=[dict(reference, store=fiber)])
+    wrong_owner['operations'] = []
+    with pytest.raises(TransactionConflict):
+        db.submit(wrong_owner)
+    with pytest.raises(ValueError, match='inconsistent exact input reference'):
+        osi.InputPins.from_provenance(dict(value, references={VOLUME: reference}))
+    with pytest.raises(ValueError):
+        osi.InputPins.from_provenance(dict(value, references={fiber: dict(reference, version=0)}))
+
+
+@pytest.mark.parametrize('bad', [[], None, '', 1, True])
+def test_saved_pin_maps_are_not_coerced_to_empty(db, bad):
+    base = dict(position=osi.InputPosition.of_status(db.status()).provenance())
+    for field in ('references', 'selection'):
+        with pytest.raises(ValueError, match='maps'):
+            osi.InputPins.from_provenance(dict(base, **{field: bad}))
+
+
+@pytest.mark.parametrize('bad', [{}, None, '', 1, True])
+def test_saved_pin_selection_arrays_are_validated_once(db, bad):
+    value = dict(position=osi.InputPosition.of_status(db.status()).provenance(),
+                 references={}, selection={'fiber': bad})
+    with pytest.raises(ValueError, match='arrays'):
+        osi.InputPins.from_provenance(value)
+    assert osi.InputPins.from_provenance(dict(value, selection={'fiber': []})).refs() == []
+
+
+def test_marker_read_passes_complete_receipt_reference_unchanged():
+    reference = dict(store='11111111-1111-4111-8111-111111111111',
+                     generation='22222222-2222-4222-8222-222222222222',
+                     object='33333333-3333-4333-8333-333333333333', version=7)
+    class Reader:
+        def objects_at_versions(self, refs):
+            assert refs == [reference]
+            assert refs[0] is reference
+            return [dict(record=dict(meta=dict(commit_sequence=9)))]
+    assert osi._link_marker_at(Reader(), reference) == dict(commit_sequence=9)
+    assert osi._link_marker_at(Reader(), None) is None
 
 
 def test_explicit_selectors_tags_and_empty_matches(db):
@@ -184,6 +342,28 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
     assert {obj['uuid']: obj['scale_factor'] for obj in manifest['objects']} == {
         patch: 2, pcl: 1}
     assert manifest['relationships'][0]['uuid'] == edge
+    incomplete = json.loads(json.dumps(manifest))
+    incomplete['relationships'][0].pop('reference')
+    for read in (osi.InputPins.from_manifest, osi.manifest_digest):
+        with pytest.raises(ValueError, match='regenerate'):
+            read(incomplete)
+    assert osi.validated_manifest_references({'relationships': []}) == {}
+    original = manifest['objects'][0]
+    conflicting = dict(original, version=original['version'] + 1,
+                       reference=dict(original['reference'], version=original['version'] + 1))
+    for duplicate in (original, conflicting):
+        repeated = json.loads(json.dumps(manifest))
+        repeated['objects'].append(duplicate)
+        for read in (osi.InputPins.from_manifest, osi.manifest_digest):
+            with pytest.raises(ValueError, match='regenerate'):
+                read(repeated)
+    repeated = json.loads(json.dumps(manifest))
+    repeated['outer_shell'] = repeated['objects'][0]
+    with pytest.raises(ValueError, match='duplicate object'):
+        osi.validated_manifest_references(repeated)
+    # A position-only request is current/position discovery, not partial pins.
+    discovery = osi.InputPins.from_provenance({'position': snapshot.position.provenance()})
+    assert not discovery.pinned
     assert snapshot.digest() == osi.read_snapshot(db, request()).digest()
     db.set_approval(edge, 'approved')
     assert snapshot.digest() != osi.read_snapshot(db, request()).digest()
@@ -193,6 +373,26 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
     written = json.loads(report.read_text())
     assert written['manifest']['volume_uuid'] == VOLUME
     assert any('pcl_patch 1' in line for line in written['report'])
+
+
+def test_manifest_validation_reuses_decoded_references(db, monkeypatch):
+    import vc_object_store
+    put_patch(db, _grid())
+    snapshot = osi.read_snapshot(db, request())
+    manifest = snapshot.manifest()
+    decode = vc_object_store.manifest_references
+    decoded = []
+    def counted(value):
+        result = decode(value)
+        decoded.append(result['objects'])
+        return result
+    monkeypatch.setattr(vc_object_store, 'manifest_references', counted)
+    pins = osi.InputPins.from_manifest(manifest)
+    assert len(decoded) == 1 and pins.references is decoded[0]
+    assert pins.references == {entry['uuid']: entry['reference'] for entry in manifest['objects']}
+    decoded.clear()
+    assert osi.resume_problems({'object_store': manifest}, SimpleNamespace(manifest=manifest)) == []
+    assert len(decoded) == 2
 
 
 def test_the_outer_shell_is_read_on_its_own_never_as_a_patch(db):
@@ -209,6 +409,14 @@ def test_the_outer_shell_is_read_on_its_own_never_as_a_patch(db):
     # Its revision is part of the manifest and so of the digest.
     snapshot = osi.read_snapshot(db, request())
     assert snapshot.manifest()['outer_shell']['uuid'] == shell
+    # Exact pins identify owners without changing the consumed-content digest.
+    manifest = snapshot.manifest()
+    legacy = json.loads(json.dumps(manifest))
+    legacy['outer_shell'].pop('reference')
+    for entry in legacy['objects']:
+        entry.pop('reference')
+    with pytest.raises(ValueError, match='regenerate'):
+        osi._compared(legacy)
     assert any(line.startswith('outer shell: ') and shell in line
                for line in osi.snapshot_report(snapshot))
     moved = _grid(31.0, size=8)[..., ::-1].astype('<f4')

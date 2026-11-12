@@ -7,6 +7,7 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
@@ -69,10 +70,33 @@ server::ServerOptions serverOptions()
     o.stagingLifetime = std::chrono::seconds(3600);
     return o;
 }
+
+void retainedHistoryOverReferences(HistoryMode sourceMode)
+{
+    TemporaryDirectory directory;const auto base=directory.path/"base.vcobj",overlay=directory.path/"overlay.vcobj";
+    OpenOptions options;options.author="history-policy";options.history=sourceMode;
+    const auto id=util::newUuid();
+    {auto store=ObjectStore::create(base,options);auto w=store.write();store.upsertObject(w,trackRecord(id));w.commit();
+        auto remove=store.write();store.deleteObject(remove,id);store.seal(remove);remove.commit();}
+    options.history=sourceMode==HistoryMode::On?HistoryMode::Off:HistoryMode::On;
+    {auto collection=ObjectCollection::create(overlay,{base},options);}
+    server::Server service(overlay,serverOptions());service.start();
+    const auto endpoint="http://127.0.0.1:"+std::to_string(service.port());HostedStore client(endpoint);
+    require(client.objectHistory(id,nullptr,true).size()==(sourceMode==HistoryMode::On?2:0),
+        "hosted optional history follows source policy, not root policy");
+    if(sourceMode==HistoryMode::Off)mustFail([&]{client.objectHistory(id);});
+    ObjectStoreSession session;const auto attachment=session.attachHosted(endpoint);
+    session.readStore(attachment,[&](const StoreReader& reader,const auto&){
+        require(currentVersionOf(reader,id)==(sourceMode==HistoryMode::On?std::optional<int64_t>(2):std::nullopt),
+            "hosted retained version helper follows tombstone owner");
+    });
+}
 } // namespace
 
 int main()
 try {
+    retainedHistoryOverReferences(HistoryMode::Off);
+    retainedHistoryOverReferences(HistoryMode::On);
     TemporaryDirectory directory;
     OpenOptions options; options.author = "hosted-test";
     auto local = ObjectStore::create(directory.path / "local.vcobj", options);
@@ -107,8 +131,10 @@ try {
     struct Pair { TransactionRequest local, hosted; };
     auto request = [&](VersionSelection expected, std::vector<TransactionOperation> operations, std::string author = "alice") {
         TransactionRequest r;
-        r.author = std::move(author); r.expectedObjects = std::move(expected); r.operations = std::move(operations);
+        r.author = std::move(author); r.operations = std::move(operations);
         Pair p{r, r};
+        p.local.expectedObjects = testNumberedGuards(local, expected);
+        p.hosted.expectedObjects = testNumberedGuards(hosted, expected);
         p.local.requestUuid = util::newUuid(); p.local.storeUuid = localInitial.storeUuid; p.local.generation = localInitial.generation;
         p.hosted.requestUuid = util::newUuid(); p.hosted.storeUuid = hostedInitial.storeUuid; p.hosted.generation = hostedInitial.generation;
         return p;
@@ -191,7 +217,7 @@ try {
 
     both(request({{a, 1}}, {SetMetaOp{a, "reviewed", "true"}}, "bob"), "metadata parity");
     {
-        auto p = request({{a, 2}}, {SetMetaOp{a, "derived", "1"}}); p.local.readDependencies = p.hosted.readDependencies = {{b, 1}};
+        auto p = request({{a, 2}}, {SetMetaOp{a, "derived", "1"}}); p.local.readDependencies = testNumberedGuards(local, {{b, 1}}); p.hosted.readDependencies = testNumberedGuards(hosted, {{b, 1}});
         both(p, "read dependency parity");
     }
     const auto edge = util::newUuid();
@@ -308,7 +334,7 @@ try {
         require(all.size() == 7 && ids(all) == ids(localTracks), "paged selection parity");
         require(asOf.commitSequence == hosted.status().commitSequence, "listing snapshot");
         for (std::size_t i = 0; i < all.size(); ++i) {
-            require(all[i].meta == localTracks[i].meta && all[i].generation == localTracks[i].generation &&
+            require(all[i].meta == localTracks[i].meta && all[i].version == localTracks[i].version &&
                 all[i].changedBy == localTracks[i].changedBy && all[i].track->externalKey == localTracks[i].track->externalKey,
                 "record parity");
             // Listings pin what they returned: the published head's numbered version.
@@ -382,7 +408,19 @@ try {
                 {{hostedInitial.storeUuid, hostedInitial.generation, a, va}, {hostedInitial.storeUuid, hostedInitial.generation, b, vb}});
             require(l.size() == 1 && h.size() == 1 && h[0].relationship.record.uuid == edge &&
                 h[0].relationship.version == l[0].relationship.version && h[0].applicable == l[0].applicable &&
-                h[0].relationship.aVersion == va && h[0].relationship.bVersion == vb, "numbered relationship parity");
+                h[0].relationship.aReference.version == (h[0].relationship.record.aUuid == a ? va : vb) &&
+                h[0].relationship.bReference.version == (h[0].relationship.record.bUuid == b ? vb : va), "numbered relationship parity");
+            require(h[0].relationship.record.versionStoreUuid == hostedInitial.storeUuid &&
+                h[0].relationship.record.versionGeneration == h[0].relationship.generation &&
+                h[0].relationship.record.version == h[0].relationship.version,
+                "relationship wire preserves complete owner identity");
+            require(h[0].relationship.aReference.storeUuid == hostedInitial.storeUuid &&
+                h[0].relationship.aReference.objectUuid == h[0].relationship.record.aUuid &&
+                h[0].relationship.aReference.generation == hostedInitial.generation &&
+                h[0].relationship.bReference.storeUuid == hostedInitial.storeUuid &&
+                h[0].relationship.bReference.objectUuid == h[0].relationship.record.bUuid &&
+                h[0].relationship.bReference.generation == hostedInitial.generation,
+                "relationship wire preserves complete selected endpoint references");
         }
         mustFail([&] { (void)hosted.relationshipsAt({{hostedInitial.storeUuid, hostedInitial.generation, a, 99}}); });
         mustFail([&] { (void)hosted.relationshipsAt({{hostedInitial.storeUuid, util::newUuid(), a, 1}}); });
@@ -395,6 +433,15 @@ try {
             hostedRegion.runs.size() == 1 && hostedRegion.runs[0].objectUuid == sheetUuid &&
             hostedRegion.runs[0].points == localRegion.runs[0].points && hostedRegion.runs[0].grid == localRegion.runs[0].grid &&
             hostedRegion.intersectingObjects == localRegion.intersectingObjects, "region parity (exact doubles)");
+        require(hostedRegion.runs[0].objectReference == hosted.currentObjectRevision(sheetUuid)->reference() &&
+            localRegion.runs[0].objectReference == local.currentObjectRevision(txn, sheetUuid)->reference() &&
+            !hostedRegion.runs[0].objectToVolume,
+            "region wire retains selected owner state and exact display mapping");
+        const auto hostedAnchor = hosted.currentObjectRevision(sheetUuid)->reference();
+        const auto hostedSnapshot = hosted.versionsAt(hostedAnchor);
+        require(std::find(hostedSnapshot.begin(), hostedSnapshot.end(), hostedAnchor) != hostedSnapshot.end(),
+            "hosted export snapshot retains its exact anchor");
+        require(!hosted.resolveStoragePath(util::newUuid()), "hosted source path resolver preserves missing-object result");
         surfaces.processingByteBudget = 0;
         require(hosted.geometryRegion(plane, surfaces).stop == RegionStop::ProcessingBudget, "region budget stop");
 
@@ -444,7 +491,8 @@ try {
     // exact membership and versions as of the feed position it reports.
     std::vector<std::string> churned;
     {
-        std::atomic<bool> done{false};
+        std::atomic<bool> done{false}, writerFinished{false};
+        std::atomic<size_t> createdCount{0};
         std::string writerError;
         std::thread writer([&] {
             try {
@@ -458,6 +506,7 @@ try {
                         client.submit(request({{created, std::nullopt}},
                             {CreateObjectOp{objectRecordJson(trackRecord(created))}}).hosted);
                         churned.push_back(created);
+                        ++createdCount;
                     } else if (i % 3 == 1) {
                         const auto v = *client.currentVersion(extra[0]);
                         client.submit(request({{extra[0], v}}, {SetMetaOp{extra[0], "tick", std::to_string(i)}}).hosted);
@@ -469,13 +518,16 @@ try {
             } catch (const std::exception& e) {
                 writerError = e.what();
             }
+            writerFinished = true;
         });
         ObjectSelection tracks; tracks.kind = "track";
         std::vector<std::pair<StoreStatus, std::vector<ObjectRecord>>> listings;
         std::string listingError;
         try {
             const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-            while (std::chrono::steady_clock::now() < until || listings.size() < 20) {
+            const auto deadline = until + std::chrono::seconds(20);
+            while (std::chrono::steady_clock::now() < until || listings.size() < 20 || createdCount < 3) {
+                if (writerFinished || std::chrono::steady_clock::now() > deadline) break;
                 StoreStatus asOf;
                 auto listed = hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1, 0, &asOf);
                 listings.emplace_back(asOf, std::move(listed));
@@ -545,7 +597,7 @@ try {
             auto request = session.newRequest(attachment);
             session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
                 const auto head = reader.currentObject(uuid);
-                request.expectedObjects[uuid] = head->version;
+                request.expectedObjects[uuid] = head->reference();
                 const auto view = GeometrySnapshot(reader).surface(uuid, *head->geometryRevision).viewTransformedAt("mapping-b");
                 auto desired = view.readTile(0, 0, 1, 1).points.front();
                 desired[0] += 2;
@@ -602,7 +654,7 @@ try {
     // The shared JSON path behaves the same in process.
     {
         TransactionPayloads payloads;
-        const auto local1 = request({{a, 5}, {b, 3}}, {EditGeometryOp{a, {{"points", 0, int32Bytes(11)}}, {{edge, "retain", "{}", "{}"}}}}).local;
+        const auto local1 = later.local;
         const auto text = transactionRequestToJson(local1, &payloads);
         bool missing = false;
         try { (void)local.submit(text, {}); } catch (const MissingPayloads& e) { missing = e.hashes().size() == 1; }

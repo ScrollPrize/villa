@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip('vc_object_store')
-from vc_object_store import ObjectStore  # noqa: E402
+from vc_object_store import ObjectStore, object_reference  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 import spiral_service  # noqa: E402
@@ -57,10 +57,10 @@ def prepare(location, config=None, cache=None, **options):
 def set_meta(store, uuid, key, value, request='7b9d0c2e-5a1f-4f6b-9c3d-2e1f0a9b8c7d'):
     """An editor's checked metadata edit through ``store``; returns the receipt."""
     status = store.status()
-    return store.submit({'command_version': 1, 'request': request,
+    return store.submit({'command_version': 3, 'request': request,
                          'store': status['store'], 'generation': status['generation'],
                          'author': 'editor',
-                         'expected_objects': {uuid: store.current_version(uuid)},
+                         'expected_objects': {uuid: object_reference(store.current_object_revision(uuid)['record'])},
                          'expected_relationships': {}, 'read_dependencies': {},
                          'expected_commit_sequence': None,
                          'operations': [{'op': 'set_meta', 'uuid': uuid, 'key': key, 'value': value}]})
@@ -85,7 +85,7 @@ def test_links_and_pins_through_the_endpoint_as_through_the_file(served, tmp_pat
     assert prepared.head == before
     assert prepared.position.commit_sequence == before + 1 == head(path)
     assert len(edges(path)) == 3
-    assert set(prepared.pins.objects) == set(names(path).values())
+    assert set(prepared.pins.references) == set(names(path).values())
     assert any('links committed at commit' in line for line in prepared.lines)
     # Served: one stage, no detector progress; the strip cache is the server's.
     with osi.open_store(fit_config(endpoint, 'service'), read_only=True) as store:

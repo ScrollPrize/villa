@@ -20,6 +20,9 @@ check fails. Every socket wait carries a timeout so an offscreen hang cannot
 block forever.
 
     python3 smoke_offscreen.py [--vc3d /path/to/VC3D] [--rpc-timeout SECONDS]
+
+For Qt versions without working offscreen OpenGL widgets, use the same test
+under Xvfb with QT_QPA_PLATFORM=xcb and LIBGL_ALWAYS_SOFTWARE=1.
 """
 from __future__ import annotations
 
@@ -75,12 +78,12 @@ def launch(
     name: str,
     project: str | None = None,
     config_home: str | None = None,
-    platform: str = "offscreen",
+    platform: str | None = None,
 ) -> VC3DProcess:
     args = ["--agent-bridge", "--agent-bridge-name", name]
     if project is not None:
         args.extend(["--project", project])
-    env = dict(OFFSCREEN_ENV, QT_QPA_PLATFORM=platform)
+    env = dict(OFFSCREEN_ENV, QT_QPA_PLATFORM=platform or os.environ.get("QT_QPA_PLATFORM", "offscreen"))
     if config_home is not None:
         config = Path(config_home)
         config.mkdir(parents=True, exist_ok=True)
@@ -2097,6 +2100,10 @@ def main() -> int:
                            f"running={proc.is_running()}")
         except Exception as e:  # noqa: BLE001
             results.record("harness", False, f"{type(e).__name__}: {e}")
+            try:
+                require_running(proc, results, "harness")
+            except RuntimeError:
+                pass  # The shared crash reporter already printed the diagnostics.
         finally:
             if client is not None:
                 client.close()

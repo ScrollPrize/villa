@@ -261,6 +261,7 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
         spec.write_layer = out.writer;
         // A shared decoded cache must not let quantized reads satisfy an exact reader.
         spec.identity = Json::array({keyUrl, options.allowLossyCache}).dump();
+        spec.channel_identity = keyUrl;
     } else {
         std::error_code ec;
         root = fs::absolute(location, ec).lexically_normal().string();

@@ -740,7 +740,8 @@ def test_fiber_patch_matching_keeps_fibers_on_or_inside_the_sheet():
 
     class Fibers:
         def __init__(self, x):
-            self.catalog = [dict(id='00000000-0000-4000-8000-000000000007', name='f7', family='H')]
+            self.catalog = [dict(id='00000000-0000-4000-8000-000000000007', name='f7', family='H',
+                                 reference=dict(store='s', generation='g', object='00000000-0000-4000-8000-000000000007', version=2))]
             self.x = x
 
         def geometry(self, i):
@@ -756,6 +757,7 @@ def test_fiber_patch_matching_keeps_fibers_on_or_inside_the_sheet():
         if runs:
             assert runs[0]['patch'] == 'p0' and runs[0]['end']-runs[0]['start'] >= 240 and abs(runs[0]['offset']-(x-100)) < 1e-3
             assert runs[0]['fiber'] == 'fiber:00000000-0000-4000-8000-000000000007'
+            assert runs[0]['fiber_reference'] == mod._STATE['fibers'].catalog[0]['reference']
 
 
 def test_rotated_window_matches_axis_window_and_follows_a_diagonal(tmp_path):

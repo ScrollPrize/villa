@@ -229,7 +229,9 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_state) {
         connect(_state, &CState::surfaceChanged,
                 this, &SegmentationModule::onSurfaceCollectionChanged);
-        connect(_state, &CState::pointCollectionsSaveRequested, this, &SegmentationModule::saveCorrections);
+        _state->saveSurfaceCorrections = [editor = QPointer<SegmentationModule>(this)] {
+            return !editor || editor->saveCorrections();
+        };
         connect(_state, &CState::recoveredDraftFound, this, &SegmentationModule::offerRecoveredDraft);
     }
 
@@ -592,6 +594,10 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
 {
     qCInfo(lcSegModule) << "Active segment changed";
 
+    // Do not discard the loaded correction state if it cannot be committed.
+    if (_pointCollection && !saveCorrections())
+        throw std::runtime_error("Correction points were not saved; keep the current editor open");
+
     resetManualAddState(true);
 
     if (_surfaceMaskTool) {
@@ -599,14 +605,8 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
         _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
     }
 
-    // Save corrections for old segment and load for new segment
-    if (_pointCollection) {
-        saveCorrections();
-    }
     // The previous surface's pending saves are done: its store edit ends here.
-    if (_storeEdit && (!newSurface || newSurface->id != _storeEdit->uuid())) {
-        _storeEdit.reset();
-    }
+    _storeEdit.reset(); // A new selection may be another version of the same UUID.
     if (_pointCollection) {
         loadCorrections(newSurface);
     }

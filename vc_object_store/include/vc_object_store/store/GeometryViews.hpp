@@ -12,18 +12,17 @@ namespace detail { struct GeometryReadState; struct GeometryViewState; }
 // views; otherwise they keep the snapshot alive. Thread-confined, like Txn.
 class GeometryView {
 public:
-    // This revision in `targetVolume`'s voxels; an older revision maps with the
-    // coordinates of the latest object revision that held it.
-    TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1) const;
-    // Use this numbered revision's coordinate metadata, even when later
-    // object revisions share the same geometry. The revision must name this view.
-    TransformedGeometryView viewTransformedAt(const ObjectRevision&, const std::string& targetVolume,
-                                             double targetScale=1) const;
+    // In `targetVolume`'s voxels, with the selected object's coordinate metadata.
+    // A payload-only selector uses the latest retained record holding that payload;
+    // it carries no object reference and does not authorize inverse edits.
+    TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1,
+                                             const VolumeTransforms* context=nullptr) const;
     std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
-    // The numbered version of the object this view read (its current one);
-    // nullopt for a view of a pinned geometry revision.
+    // Derived from the selected reference; nullopt for a payload-only view.
     std::optional<int64_t> version() const;
+    // Complete identity retained by current/selected views, not just its counter.
+    std::optional<ObjectVersion> reference() const;
 protected:
     explicit GeometryView(std::shared_ptr<detail::GeometryViewState>);
     geometry::Geometry loadGeometry() const;
@@ -176,6 +175,8 @@ public:
     void close();
     TransformedGeometryView viewTransformedAt(const std::string& objectUuid,const std::string& target,
         double targetScale=1, const VolumeTransforms* transforms=nullptr) const;
+    TransformedGeometryView viewTransformedAt(const ObjectRevision&, const std::string& target,
+        double targetScale=1, const VolumeTransforms* transforms=nullptr) const;
     // The object's geometry (current, or `geometryRevision`) in its stored
     // coordinates: the identity view, so edits in stored units take the same
     // path as edits through a transformed view.
@@ -193,12 +194,24 @@ public:
     SurfaceView surface(const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt) const;
     TypedGeometryView geometry(const std::string& objectUuid,
                                const std::optional<std::string>& geometryRevision = std::nullopt) const;
+    // Carry the selected metadata/identity with its geometry, without a head lookup.
+    PointCollectionView pointCollection(const ObjectRevision&) const;
+    FiberView fiber(const ObjectRevision&) const;
+    TrackView track(const ObjectRevision&) const;
+    UmbilicusView umbilicus(const ObjectRevision&) const;
+    SurfaceView surface(const ObjectRevision&) const;
+    TypedGeometryView geometry(const ObjectRevision&) const;
+    ObjectRevision selected(const ObjectVersion&) const;
 private:
     friend class GeometryView;
     // Another snapshot over the same reads (and lifetime).
     explicit GeometrySnapshot(std::shared_ptr<detail::GeometryReadState> state) : state_(std::move(state)) {}
     std::shared_ptr<detail::GeometryViewState> view(const std::string&, const std::string& kind,
                                                     const std::optional<std::string>& geometryRevision) const;
+    std::shared_ptr<detail::GeometryViewState> view(const ObjectRevision&, const std::string& kind) const;
+    std::shared_ptr<detail::GeometryViewState> payload(const std::string& object, const std::string& kind,
+                                                    const std::string& geometry) const;
+    TypedGeometryView typed(std::shared_ptr<detail::GeometryViewState>) const;
     std::shared_ptr<detail::GeometryReadState> state_;
 };
 

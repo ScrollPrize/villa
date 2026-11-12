@@ -31,9 +31,13 @@ std::string attachDocument(ObjectStoreSession&, const AttachmentIdentity&, const
 // with geometry); nullopt when there is none.
 std::optional<nlohmann::json> attachedDocument(const StoreReader&, const std::string& objectUuid,
                                                const std::string& role);
+// Exact owner selection; attached evidence must be applicable to that state.
+std::optional<nlohmann::json> attachedDocument(const StoreReader&, const ObjectVersion&, const std::string& role);
 // The same, read from a session's attachment.
 std::optional<nlohmann::json> attachedDocument(ObjectStoreSession&, const AttachmentIdentity&,
                                                const std::string& objectUuid, const std::string& role);
+std::optional<nlohmann::json> attachedDocument(ObjectStoreSession&, const AttachmentIdentity&,
+                                               const ObjectVersion&, const std::string& role);
 
 // Editable point collections attached to an object in a role (e.g. a surface's
 // corrections): each its points with stable ids, one annotation per point, and
@@ -43,20 +47,35 @@ struct AttachedCollection {
     geometry::PointCollection points;
     nlohmann::json annotations = nlohmann::json::array();
     nlohmann::json source = nlohmann::json::object();
+    std::optional<ObjectVersion> reference;
+    // Mapping used when loading editable coordinates; checked under the write lock.
+    std::optional<CheckVolumeMappingOp> mapping;
+    // Runtime allocation floor, including IDs removed from retained revisions.
+    int64_t nextPointId = 0;
 };
 // The live collections attached to `objectUuid` in `role`, with their points in
 // `frame` when given (else as stored).
-std::vector<AttachedCollection> attachedCollections(ObjectStoreSession&, const AttachmentIdentity&,
+struct AttachedCollectionsSnapshot {
+    ObjectVersion owner;
+    StoreStatus snapshot;
+    std::string role;
+    std::optional<ViewFrame> frame;
+    std::vector<AttachedCollection> collections;
+};
+AttachedCollectionsSnapshot attachedCollections(ObjectStoreSession&, const AttachmentIdentity&,
                                                     const std::string& objectUuid, const std::string& role,
                                                     const std::optional<ViewFrame>& frame = std::nullopt);
 // Make the collections attached to `objectUuid` in `role` exactly
 // `collections` (by UUID) in one commit: new ones are created with
 // `coordinates` and attached; changed ones get a new geometry revision whose
 // remaining points keep their identity, and keep their attachment; the others
-// are detached and retired. Points are in `frame` when given.
-void replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& objectUuid,
-                                const std::string& role, const std::vector<AttachedCollection>& collections,
-                                const nlohmann::json& coordinates, const std::optional<ViewFrame>& frame = std::nullopt);
+// are detached and retired. The loaded snapshot guards membership, complete
+// collection identities and coordinate mappings. On success it is repinned
+// from the receipt, ready for another edit; on conflict it stays unchanged.
+// Membership uses the store's commit sequence, so unrelated commits also
+// require reloading. An inherited owner's unchanged version is not sufficient.
+TransactionReceipt replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, AttachedCollectionsSnapshot&,
+                                const std::vector<AttachedCollection>& collections, const nlohmann::json& coordinates);
 
 // A volume's point collections: the live point_collection objects whose
 // coordinates map to `volume`'s volume (bound to it, or through a
@@ -78,5 +97,6 @@ std::vector<AttachedCollection> pointCollections(const StoreReader&, const std::
 TransactionReceipt writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume,
                                           const std::vector<AttachedCollection>& changed,
                                           const std::vector<std::string>& removed,
-                                          const VersionSelection& expected = {});
+                                          const RecordSelection& expected = {},
+                                          const std::vector<ObjectVersion>& references = {});
 }

@@ -328,9 +328,11 @@ void InkDetectionOverlayController::refreshOptionsForActiveSurface()
     // The detections a catalog surface was published with, kept in its artifacts.
     const std::string nextSegmentKey = activeSegmentKey();
     std::vector<Option> next;
-    if (const auto* row = _catalog && !nextSegmentKey.empty() ? _catalog->row(nextSegmentKey) : nullptr) {
+    if (const auto surface = _state ? _state->surface("segmentation") : nullptr) {
         try {
-            if (const auto reference = vc::objects::catalogReference(row->record)) {
+            vc::objects::ObjectRecord selected;
+            selected.meta = surface->meta.dump();
+            if (const auto reference = vc::objects::catalogReference(selected)) {
                 for (const auto& file : reference->files)
                     next.push_back({QString::fromStdString(file.label), file.name, file.url, publishedFileLocation(file)});
             }

@@ -9,7 +9,7 @@ using namespace vc::objects;
 
 SurfaceStoreEdit::SurfaceStoreEdit(std::shared_ptr<ObjectStoreSession> session, PinnedObject pin,
                                  std::optional<vc::objects::ViewFrame> view)
-    : _session(std::move(session)), _uuid(pin.object.objectUuid), _pin(pin), _origin(std::move(pin)),
+    : _session(std::move(session)), _uuid(pin.reference().objectUuid), _pin(pin), _origin(std::move(pin)),
       _view(std::move(view))
 {
     if (!_pin.geometryRevision) throw std::runtime_error("The surface has no geometry");
@@ -23,12 +23,60 @@ PinnedObject SurfaceStoreEdit::pin() const
 
 void SurfaceStoreEdit::repin(const TransactionReceipt& receipt)
 {
-    const auto version = receipt.objects.find(_uuid);
-    if (version == receipt.objects.end() || !version->second || *version->second == _pin.version) return;
+    if (_collections) {
+        _collections->snapshot.commitSequence = receipt.commitSequence.value_or(_collections->snapshot.commitSequence);
+        if (const auto owner = receipt.objectReference(_uuid)) _collections->owner = *owner;
+        for (auto& collection : _collections->collections)
+            if (const auto reference = receipt.objectReference(collection.uuid)) collection.reference = *reference;
+    }
+    const auto reference = receipt.objectReference(_uuid);
+    if (!reference || *reference == _pin.reference()) return;
     const auto committed = _session->objectsAtVersions(
-        _pin.attachment, {{_pin.object.storeUuid, receipt.generation, _uuid, *version->second}});
+        _pin.attachment, {*reference});
     if (!committed.front()) throw std::runtime_error("the saved surface version cannot be read back");
     _pin = pinOf(_pin.attachment, *committed.front(), receipt.generation);
+}
+
+void SurfaceStoreEdit::watchAttachedCollections(const AttachedCollectionsSnapshot& snapshot)
+{
+    std::lock_guard lock(_mutex);
+    if (snapshot.owner != _pin.reference()) throw std::runtime_error("Surface changed while loading corrections; reopen it");
+    _collections = snapshot;
+}
+
+void SurfaceStoreEdit::guardAttached(TransactionRequest& request) const
+{
+    expectObject(request, _pin.reference());
+    if (!_collections) return;
+    request.storeUuid = _collections->snapshot.storeUuid;
+    request.generation = _collections->snapshot.generation;
+    request.expectedCommitSequence = _collections->snapshot.commitSequence;
+    for (const auto& collection : _collections->collections)
+        if (collection.reference) expectObject(request, *collection.reference);
+}
+
+void SurfaceStoreEdit::saveAttachedCollections(AttachedCollectionsSnapshot& snapshot,
+    const std::vector<AttachedCollection>& collections, const nlohmann::json& coordinates)
+{
+    std::lock_guard lock(_mutex);
+    settlePending();
+    if (!_collections || _collections->role != snapshot.role || _collections->owner.objectUuid != snapshot.owner.objectUuid)
+        throw std::runtime_error("Attached collections were not loaded by this editor");
+    auto next = *_collections;
+    const auto receipt = replaceAttachedCollections(*_session, _pin.attachment, next, collections, coordinates);
+    _collections = std::move(next);
+    repin(receipt);
+    snapshot = *_collections;
+}
+
+TransactionReceipt SurfaceStoreEdit::submitAttached(TransactionRequest request)
+{
+    std::lock_guard lock(_mutex);
+    settlePending();
+    guardAttached(request);
+    const auto receipt = _session->submit(_pin.attachment, request);
+    repin(receipt);
+    return receipt;
 }
 
 void SurfaceStoreEdit::settlePending()
@@ -60,7 +108,8 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
     const auto& points = *surface.rawPointsPtr();
     auto request = _session->newRequest(_pin.attachment);
     request.generation = _pin.writeGeneration;
-    request.expectedObjects = {{_uuid, _pin.version}};
+    vc::objects::expectObject(request, _pin.reference());
+    guardAttached(request);
     _session->readStore(_pin.attachment, [&](const StoreReader& reader, const auto&) {
         const GeometrySnapshot snapshot(reader);
         std::optional<TransformedGeometryView> transformed;
@@ -106,7 +155,20 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
         // and route choices that a list of existing record versions cannot guard.
         if (transformed && !request.operations.empty())
             request.operations.insert(request.operations.begin(), transformed->checkMappingOperation());
-        expectRelationshipEndpoints(reader, request.expectedObjects);
+        expectRelationshipEndpoints(reader, request);
+        // The loaded correction collections move with this editor's surface.
+        // Revalidate only that role after its geometry edit; unrelated derived
+        // results keep their original evidence rather than being made current.
+        if (_collections && !request.operations.empty()) {
+            std::vector<GeometryRelationshipEdit> corrections;
+            for (const auto& edge : attachments(reader, _uuid, _collections->role))
+                corrections.push_back({edge.uuid, "retain"});
+            for (auto& operation : request.operations) std::visit([&](auto& edit) {
+                using T = std::decay_t<decltype(edit)>;
+                if constexpr (std::is_same_v<T, PutGeometryOp> || std::is_same_v<T, EditGeometryOp> || std::is_same_v<T, SetSurfaceChannelsOp>)
+                    edit.relationships.insert(edit.relationships.end(), corrections.begin(), corrections.end());
+            }, operation);
+        }
     });
     if (request.operations.empty()) return;
     DurableSave durable;

@@ -56,7 +56,7 @@ def _flat_raster(patch_tifxyz, y0: int, y1: int, x0: int, x1: int, stride: int):
 def _flat_positions(patch_tifxyz, y0: int, y1: int, x0: int, x1: int, stride: int):
     """ZYX positions (-1 where missing) and validity of those full-resolution samples."""
     origin, step, size = _flat_raster(patch_tifxyz, y0, y1, x0, x1, stride)
-    xyz, valid = patch_tifxyz.resample(origin, step, size, interpolation="smooth")
+    xyz, valid = patch_tifxyz.resample(origin, step, size, interpolation="bicubic")
     return np.where(valid[..., None], xyz[..., ::-1], -1.0).astype(np.float32), valid
 
 
@@ -64,7 +64,7 @@ def read_normals_on_flat_grid(patch_tifxyz, *, y0: int, y1: int, x0: int, x1: in
     """ZYX unit normals (row direction x column direction, NaN off the surface) of flat-grid points y0:y1, x0:x1."""
     stride = int(flat_grid_stride)
     origin, step, size = _flat_raster(patch_tifxyz, int(y0) * stride, int(y1) * stride, int(x0) * stride, int(x1) * stride, stride)
-    _, _, normals = patch_tifxyz.resample(origin, step, size, interpolation="smooth", normals=True)
+    _, _, normals = patch_tifxyz.resample(origin, step, size, interpolation="bicubic", normals=True)
     return -normals[..., ::-1]
 
 

@@ -203,7 +203,7 @@ private:
                     QString* errorMessage = nullptr,
                     const QString& preferredVolumeId = {},
                     VolumeOpenError* openError = nullptr);
-    void CloseVolume(void);
+    bool CloseVolume();
 
 
     void setVolume(std::shared_ptr<Volume> newvol);

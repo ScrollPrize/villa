@@ -768,12 +768,14 @@ void CState::savePointCollections()
 {
     if (_pointCollectionSync && !_pointCollectionSync->flush())
         throw std::runtime_error("Pending point-collection edits could not be saved");
-    emit pointCollectionsSaveRequested();
+    if (saveSurfaceCorrections && !saveSurfaceCorrections())
+        throw std::runtime_error("Pending surface corrections could not be saved");
 }
 
-void CState::closeAll()
+void CState::closeAll(const std::function<void()>& afterSave)
 {
     savePointCollections();
+    if (afterSave) afterSave();
     emit volumeClosing();
 
     clearActiveSurface();

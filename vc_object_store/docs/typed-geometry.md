@@ -105,13 +105,16 @@ read — the view keeps reading its pinned revision afterwards:
 
 ```python
 import struct
+from vc_object_store import object_reference
 
+selected = store.current_object_revision(collection_uuid)
+reference = object_reference(selected["record"])
 with store.geometry_snapshot() as snapshot:
-    collection = snapshot.point_collection(collection_uuid)
-    with store.write(expected_versions={collection_uuid: collection.version}) as tx:
+    collection = snapshot.point_collection(collection_uuid, selected["geometry_revision"])
+    with store.write(expected_versions={collection_uuid: reference}) as tx:
         revision = tx.edit_geometry(collection_uuid, [dict(
             array="points", element_offset=0, data=struct.pack("<3d", 10, 20, 30)
-        )], collection.version)
+        )], reference["version"])
 ```
 
 The version check applies even to no-ops. Affected relationships need
@@ -127,3 +130,7 @@ consumed into that revision, read with `geometry_point_annotations`, and
 edited through sequence operations alongside the points they describe.
 Import-summary counts and lengths stay historical annotations; view counts
 and owned measurements describe current geometry.
+
+## Point-map boundaries
+
+Native `geometry/PointMap.hpp` provides `pointIdFromString` and `decodePointMap` for VC point maps (`{numeric_id: {p: [x,y,z], ...annotations}}`). File imports and GUI-to-store collection adapters share full-consumption, nonnegative int64 ID validation, numeric-alias rejection, finite XYZ validation, numeric ordering and annotation extraction. File-level collection collision/renumbering rules remain in the importer. This does not narrow unrelated standalone formats' uint64 ID domains.

@@ -15,7 +15,8 @@ class CurveBank:
     """Vectorized exact polyline interpolation and shared native normal samples."""
     def __init__(self,fibers,source_ids,normal_root,normal_solution):
         self.ids=np.unique(np.asarray(source_ids,dtype=str))
-        curves=read_polylines(fibers,self.ids)
+        doc=json.loads((Path(normal_root)/'index.json').read_text())
+        curves=read_polylines(fibers,self.ids,source_version=doc.get('provenance',{}).get('fiber_source',{}))
         if not np.array_equal([row['id'] for row,_ in curves],self.ids):raise ValueError('Fiber source identity mismatch')
         lengths=[];arcs=[];points=[]
         for row,xyz in curves:
@@ -29,7 +30,6 @@ class CurveBank:
         self.xyz=np.concatenate(points)
         self.first=np.r_[0,np.cumsum([len(a) for a in arcs])[:-1]]
         self.last=self.first+np.asarray([len(a) for a in arcs])-1
-        doc=json.loads((Path(normal_root)/'index.json').read_text())
         if doc['format']!='fiber-normal-curves' or doc['columns']!=['arc','nx','ny','nz','valid']:raise ValueError('Normal curve format')
         # Rows are [fiber UUID, first sample, sample count] in UUID order.
         index_ids=np.asarray([r[0] for r in doc['index']],dtype=str)

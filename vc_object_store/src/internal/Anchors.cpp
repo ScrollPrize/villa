@@ -1,9 +1,19 @@
 #include "internal/Anchors.hpp"
+#include "internal/JsonFields.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
+namespace vc::objects {
+std::string EdgeRecord::otherEndpoint(const std::string& endpoint) const
+{
+    const auto key=util::canonicalUuid(endpoint);
+    if(key==util::canonicalUuid(aUuid))return util::canonicalUuid(bUuid);
+    if(key==util::canonicalUuid(bUuid))return util::canonicalUuid(aUuid);
+    throw std::invalid_argument("object is not an endpoint of this edge");
+}
+}
 namespace vc::objects::detail {
 void validateAnchor(const Anchor& anchor)
 {
@@ -21,27 +31,34 @@ void validateAnchor(const Anchor& anchor)
             std::any_of(point.index.begin(), point.index.end(), [](auto i) { return i < 0; }))
             throw std::invalid_argument("invalid anchor point reference");
 }
-void validateEdgeAnchors(const EdgeRecord& edge)
+namespace {
+void validateEdgeAnchorsWithIdentity(const EdgeRecord& edge,bool sameObject)
 {
     validateAnchor(edge.aAnchor); validateAnchor(edge.bAnchor);
-    if (util::canonicalUuid(edge.aUuid) == util::canonicalUuid(edge.bUuid) &&
+    if (sameObject &&
         (edge.aAnchor.points.empty() || edge.bAnchor.points.empty() ||
          edge.aAnchor.points.front() == edge.bAnchor.points.front()))
         throw std::invalid_argument("self-edges require two distinct point references");
+}
+}
+void validateEdgeAnchors(const EdgeRecord& edge)
+{
+    validateEdgeAnchorsWithIdentity(edge,util::canonicalUuid(edge.aUuid)==util::canonicalUuid(edge.bUuid));
 }
 void swapEndpoints(EdgeRecord& edge)
 {
     std::swap(edge.aUuid, edge.bUuid);
     std::swap(edge.aAnchor, edge.bAnchor);
 }
-void canonicalizeEdge(EdgeRecord& edge)
+bool canonicalizeEdge(EdgeRecord& edge)
 {
     edge.aUuid = util::canonicalUuid(edge.aUuid);
     edge.bUuid = util::canonicalUuid(edge.bUuid);
-    validateEdgeAnchors(edge);
-    if (edge.bUuid < edge.aUuid || (edge.aUuid == edge.bUuid &&
-        dependenciesToJson(edge.bAnchor).dump() < dependenciesToJson(edge.aAnchor).dump()))
-        swapEndpoints(edge);
+    validateEdgeAnchorsWithIdentity(edge,edge.aUuid==edge.bUuid);
+    const bool swapped=edge.bUuid < edge.aUuid || (edge.aUuid == edge.bUuid &&
+        dependenciesToJson(edge.bAnchor).dump() < dependenciesToJson(edge.aAnchor).dump());
+    if(swapped)swapEndpoints(edge);
+    return swapped;
 }
 std::string edgeIdentity(const EdgeRecord& input)
 {
@@ -50,8 +67,9 @@ std::string edgeIdentity(const EdgeRecord& input)
     edge.kind = input.kind; edge.aUuid = input.aUuid; edge.bUuid = input.bUuid;
     edge.aAnchor = input.aAnchor; edge.bAnchor = input.bAnchor;
     canonicalizeEdge(edge);
-    return nlohmann::json::array({edge.kind, edge.aUuid, edge.bUuid,
-        dependenciesToJson(edge.aAnchor), dependenciesToJson(edge.bAnchor)}).dump();
+    auto identity = nlohmann::json::array({edge.kind, edge.aUuid, edge.bUuid,
+        dependenciesToJson(edge.aAnchor), dependenciesToJson(edge.bAnchor)});
+    return identity.dump();
 }
 
 nlohmann::json dependenciesToJson(const Anchor& anchor)
@@ -75,8 +93,17 @@ void dependenciesFromJson(Anchor& anchor, const nlohmann::json& value)
     anchor.channels = value.value("channels", std::vector<std::string>{});
     anchor.wholeGeometry = value.value("whole_geometry", false);
     anchor.metadataKeys = value.value("metadata_keys", std::vector<std::string>{});
-    for (const auto& point : value.value("points", nlohmann::json::array()))
-        anchor.points.push_back({point.at("array").get<std::string>(), point.at("index").get<std::vector<int64_t>>()});
+    for (const auto& point : jsonArrayField(value, "points", true)) {
+        const auto& index = jsonArrayField(point, "index");
+        std::vector<int64_t> indices;
+        for (const auto& coordinate : index) {
+            if (!coordinate.is_number_integer() ||
+                (coordinate.is_number_unsigned() && coordinate.get<uint64_t>() > INT64_MAX))
+                throw std::invalid_argument("anchor point index must contain signed 64-bit integers");
+            indices.push_back(coordinate.get<int64_t>());
+        }
+        anchor.points.push_back({point.at("array").get<std::string>(), std::move(indices)});
+    }
     (void)dependenciesToJson(anchor);
 }
 
@@ -89,14 +116,21 @@ nlohmann::json anchorToJson(const Anchor& a)
     return j;
 }
 
-Anchor anchorFromJson(const nlohmann::json& j)
+Anchor anchorFromJson(const nlohmann::json& j, bool omitNullFields)
 {
     Anchor a;
     if (!j.is_object()) throw std::invalid_argument("anchor must be a JSON object");
     for (const auto& [key, value] : j.items())
         if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction" && key != "metadata_keys" && key != "channels")
             throw std::invalid_argument("unknown anchor field: " + key);
-    dependenciesFromJson(a, j);
+    if (omitNullFields) {
+        auto normalized = nlohmann::json::object();
+        for (const auto& [key, value] : j.items())
+            if (!value.is_null()) normalized[key] = value;
+        dependenciesFromJson(a, normalized);
+    } else {
+        dependenciesFromJson(a, j);
+    }
     for (const char* key : {"position", "direction"}) {
         if (j.contains(key) && !j.at(key).is_null()) {
             if (!j.at(key).is_array() || j.at(key).size() != 3)

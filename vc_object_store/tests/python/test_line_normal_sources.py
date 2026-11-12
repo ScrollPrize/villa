@@ -246,7 +246,7 @@ def test_a_source_that_fails_while_sampling_fails_the_run(db, tmp_path):
 # --- link_objects: the same sources as plan parameters ---
 
 def link_request(status, plan):
-    return dict(command_version=1, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
+    return dict(command_version=3, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
                 author="py", expected_objects={}, expected_relationships={}, read_dependencies={},
                 expected_commit_sequence=None, operations=[{"op": vos.LINK_OBJECTS_OPERATION, "plan": plan}])
 

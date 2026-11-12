@@ -21,10 +21,12 @@ Fibers are identified by their object-store UUID strings everywhere: the
 constraint database keys `fibers(id)` and `constraints(fiber_a, fiber_b)` by
 UUID, trace order and `source_index` are ascending UUID order, and Python stage
 arrays (`ids`, `source_id`) are fixed-width UUID string arrays. Results record
-`fibers_store_uuid`; axial priors also record `fibers_digest` (from
+`fibers_store_uuid` and the compact `fiber_source` identity (`store`, `generation`, `commit_sequence`) captured with the source read transaction; axial priors also record `fibers_digest` (from
 `fiber_store.fibers_digest`) and `umbilicus_sha256`. The Python stages read
 fibers through `vesuvius.neural_tracing.tracers.shared.annotations.fiber_store`
 and write derived fiber subsets as new stores with its `write_fibers`.
+
+Frozen normal evidence, its curve bank and visualizations must match that complete source identity. Shared `read_polylines(source_version=...)` validates before and after reading; matching only the store UUID is insufficient. Source changes (including coordinate-registration edits) or legacy artifacts lacking this identity require regenerating evidence. This intentionally conservative snapshot guard may also reject unrelated source edits; it stores no per-fiber provenance lists. Sheet-strip ordinal indices similarly validate their recorded fiber digest before use, and inference resumes only complete matching input-object references, not UUIDs alone.
 
 Required extraction config entries are `fibers`, `coordinate_space`,
 `normal_manifest`, `normal_provenance`, `remote_cache`, `output`, and either

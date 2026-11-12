@@ -707,7 +707,7 @@ def _build_segment_download_patches(
     for y0, x0 in candidates:
         patch_bbox_zyx = surface_patch_bbox(surface, y0, x0, patch_size)
         flat_xyz, flat_valid = patch_tifxyz.resample_full(
-            (int(y0), int(x0)), (patch_size[1], patch_size[2]), interpolation="smooth"
+            (int(y0), int(x0)), (patch_size[1], patch_size[2]), interpolation="bicubic"
         )
         patch_zyxs = flat_xyz[..., ::-1]
         native_world_bbox = compute_native_crop_bbox(

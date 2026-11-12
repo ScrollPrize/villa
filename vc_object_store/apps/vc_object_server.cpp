@@ -2,7 +2,9 @@
 #include "vc_object_store/server/Server.hpp"
 
 #include <chrono>
+#include <charconv>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -33,7 +35,12 @@ int main(int argc, char** argv)
             if (i + 1 >= argc) return usage();
             const std::string value = argv[++i];
             if (flag == "--listen") options.listenAddress = value;
-            else if (flag == "--port") options.port = static_cast<uint16_t>(std::stoul(value));
+            else if (flag == "--port") {
+                const auto end = value.data() + value.size();
+                const auto [next, error] = std::from_chars(value.data(), end, options.port);
+                if (error != std::errc{} || next != end)
+                    throw std::invalid_argument("--port must be an integer from 0 to 65535");
+            }
             else if (flag == "--read-workers") options.readWorkers = std::stoi(value);
             else if (flag == "--max-payload-mib") options.maxPayloadBytes = std::stoull(value) << 20;
             else if (flag == "--max-staged-mib") options.maxStagedBytes = std::stoull(value) << 20;

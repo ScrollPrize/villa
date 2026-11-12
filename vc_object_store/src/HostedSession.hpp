@@ -5,9 +5,10 @@
 //
 // Cache keys are immutable identities (geometry revision UUIDs, numbered
 // versions) or current heads that the feed invalidates, so a cached answer is
-// "current as of the last check". The cache never answers queries: listings,
-// regions and proximity always run on the host, so a partial cache never
-// claims complete coverage.
+// "current as of the last check". Exact-endpoint relationship queries also
+// cache complete answers, scoped to the observed commit (membership can change
+// without changing inherited endpoints). Listings, regions and proximity run
+// on the host, so a partial object cache never claims complete coverage.
 
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
@@ -130,8 +131,8 @@ public:
     explicit HostedStoreReader(HostedAttachment& attachment) : attachment_(&attachment) {}
     bool active() const override { return true; }
     StoreStatus status() const override { return attachment_->status(); }
-    std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const override;
-    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid) const override;
+    std::optional<ObjectRevision> currentObject(const std::string& objectUuid, bool includeDeleted = false) const override;
+    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, bool ifRetained = false) const override;
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>& references) const override
     {
         return attachment_->objectsAtVersions(references);
@@ -140,11 +141,22 @@ public:
     {
         return attachment_->relationshipsAt(versions);
     }
+    SelectedInputs selectedInputs(const std::vector<ObjectVersion>& versions, const StoreStatus& position) const override
+    {
+        return attachment_->client().selectedInputs(versions, position);
+    }
+    std::vector<ObjectVersion> versionsAt(const ObjectVersion& anchor) const override
+    { return attachment_->client().versionsAt(anchor); }
+    std::optional<std::filesystem::path> resolveStoragePath(const std::string& objectUuid,
+        const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const override
+    { return attachment_->client().resolveStoragePath(objectUuid, datasetRoot); }
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override
     {
         return attachment_->geometryRevision(revisionUuid);
     }
+    std::optional<ObjectRevision> objectAtGeometry(const std::string& revisionUuid) const override
+    { return attachment_->client().objectAtGeometry(revisionUuid); }
     std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                            int64_t byteOffset = 0,
                                            const std::optional<int64_t>& byteCount = std::nullopt) const override;
@@ -167,6 +179,10 @@ public:
     nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override
     {
         return *attachment_->geometryPointAnnotations(revisionUuid, arrayName);
+    }
+    int64_t nextGeometryPointId(const std::string& objectUuid,const std::string& arrayName) const override
+    {
+        return attachment_->client().nextGeometryPointId(objectUuid,arrayName);
     }
     std::vector<std::string> componentOf(const std::string& objectUuid, const std::vector<std::string>& edgeKinds = {},
                                          const std::atomic_bool* = nullptr) const override

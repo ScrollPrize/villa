@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SpiralPclRole.hpp"
+#include <vc_object_store/objects/Transactions.hpp>
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -14,6 +15,7 @@
 #include <vector>
 
 namespace vc3d::spiral {
+inline constexpr const char* kObjectReferenceKey = "reference";
 
 struct EditablePclPoint {
     cv::Vec3f previewPosition{0.0f, 0.0f, 0.0f};
@@ -34,6 +36,7 @@ struct EditablePclPoint {
 // without the others. `role` decides what `wind_a` each appended point gets
 // and what reversing the collection means for the annotations.
 struct EditablePclDraft {
+    std::optional<vc::objects::ObjectVersion> reference;
     PclRole role = PclRole::SameWinding;
     QString collectionId;
     QString sourceIdentity;

@@ -286,6 +286,7 @@ target_include_directories(test_spiral_point_collection_edit PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 target_link_libraries(test_spiral_point_collection_edit PRIVATE
+    vc_object_store::vc_objects
     Qt6::Core
     Qt6::Gui
     Qt6::Test
@@ -362,6 +363,13 @@ target_link_libraries(test_spiral_store_edits PRIVATE vc_core Qt6::Core Qt6::Gui
 add_test(NAME spiral_store_edits COMMAND test_spiral_store_edits)
 vc_register_test_target(test_spiral_store_edits)
 vc_register_ctest(spiral_store_edits test_spiral_store_edits)
+add_executable(test_store_region_requests test_store_region_requests.cpp)
+set_target_properties(test_store_region_requests PROPERTIES AUTOMOC ON)
+target_include_directories(test_store_region_requests PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_store_region_requests PRIVATE vc_core vc_fiber_view Qt6::Core Qt6::Concurrent Qt6::Test)
+add_test(NAME store_region_requests COMMAND test_store_region_requests)
+vc_register_test_target(test_store_region_requests)
+vc_register_ctest(store_region_requests test_store_region_requests)
 
 add_executable(test_spiral_preview_provenance
     test_spiral_preview_provenance.cpp)
@@ -390,6 +398,7 @@ target_include_directories(test_spiral_updated_drafts PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 target_link_libraries(test_spiral_updated_drafts PRIVATE
+    vc_object_store::vc_objects
     Qt6::Core
     Qt6::Test)
 
