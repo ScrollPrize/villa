@@ -5399,14 +5399,35 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
     // Fibers chained together through branch links, each one included: one
     // read per component, which every member shares.
     std::unordered_map<std::string, int> componentSizes;
-    _state->objectStoreSession()->readStore(fibers.front()->storePin->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-        for (const auto& fiber : fibers)
-            if (!fiber->branches.empty() && !componentSizes.contains(fiber->uuid)) {
-                const auto component = reader.componentOf(fiber->uuid, {"fiber_branch"});
-                for (const auto& member : component) componentSizes[member] = static_cast<int>(component.size());
-                componentSizes[fiber->uuid] = static_cast<int>(component.size());
-            }
-    });
+    // Remembered while the store view stays where it is.
+    const auto view = QThread::currentThread() == thread() ? fiberStoreView(fibers.front()->storePin->attachment) : std::nullopt;
+    const auto sameCursor = [](const vc::objects::FeedCursor& a, const vc::objects::FeedCursor& b) {
+        return a.storeUuid == b.storeUuid && a.generation == b.generation && a.sequence == b.sequence;
+    };
+    if (!view || !_componentSizesAtView || !sameCursor(*_componentSizesAtView, *view)) {
+        _componentSizesMemo.clear();
+        _componentSizesAtView = view;
+    }
+    bool unknown = false;
+    for (const auto& fiber : fibers)
+        if (!fiber->branches.empty()) {
+            if (const auto known = _componentSizesMemo.find(fiber->uuid); view && known != _componentSizesMemo.end())
+                componentSizes[fiber->uuid] = known->second;
+            else unknown = true;
+        }
+    if (unknown) {
+        _state->objectStoreSession()->readStore(fibers.front()->storePin->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            for (const auto& fiber : fibers)
+                if (!fiber->branches.empty() && !componentSizes.contains(fiber->uuid)) {
+                    const auto component = reader.componentOf(fiber->uuid, {"fiber_branch"});
+                    for (const auto& member : component) componentSizes[member] = static_cast<int>(component.size());
+                    componentSizes[fiber->uuid] = static_cast<int>(component.size());
+                }
+        });
+        // Only if the view did not move across the read.
+        if (view && _fiberStoreView && sameCursor(*_fiberStoreView, *view))
+            for (const auto& [uuid, size] : componentSizes) _componentSizesMemo.insert_or_assign(uuid, size);
+    }
     std::unordered_map<uint64_t, int> linkedFiberCounts;
     for (const auto& fiber : fibers)
         if (!fiber->branches.empty()) linkedFiberCounts[fiber->id] = componentSizes[fiber->uuid];
@@ -8804,9 +8825,22 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
     }
 
     // The tag is fiber content: publish it to the store.
+    // Reading the session for the save first waits for a running save (a gap
+    // tags both of its ends, one after the other); if that one failed, its
+    // warning (modal) can let a reconcile discard this pane: the session is
+    // kept alive across it and the pane looked up again.
+    const std::shared_ptr<LineAnnotationSession> held = pane->session;
     try {
         StoredFiber localFiber = storedFiberFromSession(session);
-        commitFibers({&localFiber});
+        pane = paneForSurface(surfaceName);
+        if (!pane || pane->session != held) return false;
+        // Off the GUI thread on a hosted store, like a placement's save,
+        // and with the same outcome if that save fails: the failure is
+        // reported when it ends and the edit stays in the session, to be
+        // stored by its next save (it is not taken back: later edits and a
+        // solve started meanwhile build on it).
+        std::vector<FiberSaveSnapshot> snapshots{makeFiberSaveSnapshot(localFiber)};
+        if (!publishInBackground(snapshots)) commitFibers({&localFiber});
         session.fiberMetricsMatchStoredFiber = true;
     } catch (const std::exception& ex) {
         // Nothing persisted: put the session back so what is shown and
@@ -16685,7 +16719,7 @@ void LineAnnotationController::resetStoreDerivedState()
     _fiberLineDigests.clear();
     _storedFiberCachePosition.reset();
     _fiberStoreView.reset(); _fiberStoreViewAttachment.reset();
-    _knownFiberTagsAtView.reset(); _installedPublicationSequences.clear();
+    _knownFiberTagsAtView.reset(); _componentSizesAtView.reset(); _componentSizesMemo.clear(); _installedPublicationSequences.clear();
     _fiberAlignmentMetrics.clear(); _pendingFiberAlignmentMetrics.clear();
     _pendingFiberAlignmentMetricTokens.clear(); ++_nextFiberAlignmentMetricToken;
     ++_fiberDataGeneration; ++_fiberMetricsGeneration; _fiberMetricsPending = false;
@@ -16781,6 +16815,17 @@ LineAnnotationController::FiberCommitJob LineAnnotationController::prepareFiberC
     for (const auto& pane : _panes)
         if (pane.session && pane.session->storePin && pane.session->storePin->stored())
             job.openSessions.emplace_back(pane.session->fiberUuid, pane.session->storePin->reference());
+    // Whether every edit leaves its fiber's tags as the cached decode of the
+    // stored fiber has them (unknown counts as changed).
+    job.fiberTagsUnchanged = std::all_of(edits.begin(), edits.end(), [&](const auto& edit) {
+        const auto cached = _storedFiberDecodeCache.find(edit.fiber.uuid);
+        if (cached == _storedFiberDecodeCache.end() || !edit.fiber.storePin || !cached->second->storePin ||
+            cached->second->storePin->reference() != edit.fiber.storePin->reference())
+            return false;
+        auto before = cached->second->tags, after = edit.fiber.tags;
+        std::sort(before.begin(), before.end()); std::sort(after.begin(), after.end());
+        return before == after;
+    });
     return job;
 }
 
@@ -17134,7 +17179,29 @@ void LineAnnotationController::installFiberCommit(FiberCommitJob& job, const Fib
         if (session.watcher) session.solveQueue.noteSessionMutated();
         session.storePin = pinOf(*attachment, committed->second, receipt.generation);
     }
+    const auto viewBefore = _fiberStoreView;
     applyOwnFiberCommit(*attachment, receipt);
+    // What the store's tag list and linked-network sizes were just before
+    // this commit, they still are after it when it brought no new tag and
+    // added, removed or retired nothing: they move with the view instead of
+    // being asked for again.
+    const auto sameCursor = [](const vc::objects::FeedCursor& a, const vc::objects::FeedCursor& b) {
+        return a.storeUuid == b.storeUuid && a.generation == b.generation && a.sequence == b.sequence;
+    };
+    if (viewBefore && _fiberStoreView && _fiberStoreView->storeUuid == viewBefore->storeUuid &&
+        _fiberStoreView->generation == viewBefore->generation && _fiberStoreView->sequence == viewBefore->sequence + 1) {
+        if (_knownFiberTagsAtView && sameCursor(_knownFiberTagsAtView->first, *viewBefore)) {
+            if (job.fiberTagsUnchanged && job.retired.empty()) _knownFiberTagsAtView->first = *_fiberStoreView;
+        }
+        if (_componentSizesAtView && sameCursor(*_componentSizesAtView, *viewBefore)) {
+            const bool sameLinks = job.retired.empty() &&
+                std::none_of(job.request.operations.begin(), job.request.operations.end(), [](const auto& operation) {
+                    return std::holds_alternative<AddEdgeOp>(operation) || std::holds_alternative<RemoveEdgeOp>(operation) ||
+                           std::holds_alternative<RetireObjectOp>(operation) || std::holds_alternative<CreateObjectOp>(operation);
+                });
+            if (sameLinks) _componentSizesAtView = *_fiberStoreView;
+        }
+    }
 }
 
 
@@ -17185,6 +17252,15 @@ bool LineAnnotationController::fiberBoundToVolume(uint64_t id, const std::shared
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
     const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!volume || uuid.empty() || !attachment) return false;
+    // A fiber decoded in the open volume is bound to it (asked at every
+    // landing): answered from the decode cache when it says yes.
+    if (QThread::currentThread() == thread() && volume == _state->currentVolume()) {
+        try {
+            const auto cached = storedFibersShared(std::vector<std::string>{uuid}, false);
+            if (!cached.empty() && fiberInVolume(*cached.front())) return true;
+        } catch (const std::exception&) {
+        }
+    }
     bool bound = false;
     connection->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
         const auto object = reader.currentObject(uuid);

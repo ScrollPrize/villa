@@ -1410,6 +1410,8 @@ private:
         // edited and retired ones and both endpoints of every link added,
         // updated or removed): set by buildFiberCommitOperations.
         std::set<std::string> involved;
+        // Every edit leaves its fiber's tags as stored (prepareFiberCommit).
+        bool fiberTagsUnchanged = false;
         const StoredFiber& fiberFor(uint64_t id) const
         {
             for (const auto& edit : edits) if (edit.fiber.id == id) return edit.fiber;
@@ -1483,6 +1485,12 @@ private:
     // The fiber tag list as of a store view position (asked for by every
     // pane refresh; it can only change with the position).
     mutable std::optional<std::pair<vc::objects::FeedCursor, std::vector<std::string>>> _knownFiberTagsAtView;
+    // Linked-network sizes as of a store view position (asked for by the
+    // status bar and the Fibers panel after every save; they can only change
+    // with the position, and not with a commit of this controller that adds
+    // or removes no link).
+    mutable std::optional<vc::objects::FeedCursor> _componentSizesAtView;
+    mutable std::unordered_map<std::string, int> _componentSizesMemo;
     // Off (VC3D_BACKGROUND_PUBLICATION=0, or the tests' seam): every
     // publication is synchronous.
     static inline bool s_backgroundPublicationDefault =

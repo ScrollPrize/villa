@@ -523,6 +523,48 @@
                 settle("the queued tag edit drains from the event loop");
                 require(replayed == 1 && at == std::vector<size_t>{1}, "and is applied once to the control it named");
             }
+            // A control-point tag edit (a break) is saved like a placement:
+            // off the GUI thread, and stored when that save ends.
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto pinBefore = live->storePin;
+                const auto tagged = live->controlPoints.at(1).volumePoint;
+                publishing.handleGeneratedControlPointSetBreak(live->surfaceName, 1, true);
+                require(bool(publishing._publication) && live->storePin == pinBefore,
+                        "a tag edit's save runs in the background");
+                settle("the tag edit is published");
+                const auto after = stored();
+                const auto control = std::find_if(after.controlPoints.begin(), after.controlPoints.end(),
+                                                  [&](const auto& candidate) { return candidate == tagged; });
+                require(publishing._fiberSaveFailureCount == before && control != after.controlPoints.end() &&
+                        vc3d::line_annotation::hasControlPointTag(control->tags, vc3d::line_annotation::kBreakTag) &&
+                        live->storePin != pinBefore && stored().storePin == live->storePin,
+                        "and the tag is stored at the pin the session holds");
+                publishing.handleGeneratedControlPointSetBreak(live->surfaceName, 1, false);
+                settle("the tag removal is published");
+                require(publishing._fiberSaveFailureCount == before, "the tag is removed again");
+                // A gap tags both of its ends, one save after the other: the
+                // second follows the first instead of conflicting with it.
+                const auto first = live->controlPoints.at(0).volumePoint, second = live->controlPoints.at(1).volumePoint;
+                publishing.handleGeneratedSpanSetGap(live->surfaceName, 0, 1, true);
+                settle("the gap is published");
+                const auto gapped = stored();
+                const auto isBreak = [&](const cv::Vec3d& where) {
+                    const auto found = std::find_if(gapped.controlPoints.begin(), gapped.controlPoints.end(),
+                                                    [&](const auto& candidate) { return candidate == where; });
+                    return found != gapped.controlPoints.end() &&
+                        vc3d::line_annotation::hasControlPointTag(found->tags, vc3d::line_annotation::kBreakTag);
+                };
+                require(publishing._fiberSaveFailureCount == before && isBreak(first) && isBreak(second) &&
+                        gapped.storePin == live->storePin, "both ends of a gap are stored");
+                publishing.handleGeneratedSpanSetGap(live->surfaceName, 0, 1, false);
+                settle("the gap removal is published");
+                const auto ungapped = stored();
+                require(publishing._fiberSaveFailureCount == before &&
+                        std::none_of(ungapped.controlPoints.begin(), ungapped.controlPoints.end(), [](const auto& control) {
+                            return vc3d::line_annotation::hasControlPointTag(control.tags, vc3d::line_annotation::kBreakTag);
+                        }) && ungapped.storePin == live->storePin, "the gap is removed again");
+            }
             // The install gives a published control its id by position when a
             // control placed meanwhile shifted the order.
             {
@@ -558,6 +600,28 @@
                 require(publishing._fiberSaveFailureCount == failures && kept != after.controlPoints.end() &&
                         kept->storeId == published && idOf(p1.position) >= 0 && idOf(p1.position) != published,
                         "the next save keeps the published control's identity and gives the new one its own");
+            }
+            // A tag edit whose background save is refused (a commit by
+            // another client that this controller has not seen) is reported
+            // and stays in the session, like a placement whose save failed.
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto where = live->controlPoints.at(1).volumePoint;
+                const auto hasBreak = [&] {
+                    const auto control = std::find_if(live->controlPoints.begin(), live->controlPoints.end(),
+                                                      [&](const auto& candidate) { return candidate.volumePoint == where; });
+                    return control != live->controlPoints.end() &&
+                        vc3d::line_annotation::hasControlPointTag(control->tags, vc3d::line_annotation::kBreakTag);
+                };
+                submitOther({SetMetaOp{aUuid, "tag_retain_test", "true"}}, aUuid);
+                publishing.handleGeneratedControlPointSetBreak(live->surfaceName, 1, true);
+                require(bool(publishing._publication) && hasBreak(), "the tag shows at once while its save runs");
+                settle("the refused tag save ends");
+                for (int i = 0; i < 5; ++i) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                require(publishing._fiberSaveFailureCount == before + 1 && hasBreak() &&
+                        std::any_of(publishing._panes.begin(), publishing._panes.end(),
+                                    [&](const auto& open) { return open.session == live; }),
+                        "a tag whose save failed is reported and kept in the session");
             }
             // A publication that fails (another client changed the fiber): it
             // is counted, and what was queued behind it does not stay queued.
