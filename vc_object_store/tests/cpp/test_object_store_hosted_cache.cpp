@@ -5,6 +5,10 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <thread>
 #include "vc_object_store/server/Server.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
 #include <vc_reader/http.hpp>
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -138,6 +142,118 @@ private:
     std::thread thread_;
 };
 
+void referencedRecordsCache()
+{
+    TemporaryDirectory directory;OpenOptions options;options.author="cache-test";options.history=HistoryMode::Off;
+    const auto base=directory.path/"base.vcobj",overlay=directory.path/"overlay.vcobj";
+    std::vector<ObjectVersion> refs;
+    {auto store=ObjectStore::create(base,options);auto w=store.write();ObjectRecord r;r.kind="note";
+        const auto id=store.upsertObject(w,r);w.commit();
+        {auto read=store.read();refs.push_back(store.currentObjectRevision(read,id)->reference());}
+        auto seal=store.write();store.seal(seal);seal.commit();}
+    {auto collection=ObjectCollection::create(overlay,{base},options);}
+    {auto store=ObjectStore::open(overlay,options);auto w=store.write();ObjectRecord r;r.kind="note";
+        const auto id=store.upsertObject(w,r);w.commit();auto read=store.read();refs.push_back(store.currentObjectRevision(read,id)->reference());}
+    server::Server server(overlay,{});server.start();
+    const auto endpoint="http://127.0.0.1:"+std::to_string(server.port());
+    HostedSessionOptions settings;settings.client.retries=0;settings.cacheDirectory=directory.path/"cache";settings.minFreeBytes=0;
+    {ObjectStoreSession session;const auto attachment=session.attachHosted(endpoint,settings);
+        const auto job=session.prefetchObjects(attachment);
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+        while(!job->snapshot().done&&std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(job->snapshot().complete,"mixed-source prefetch completes");}
+    // A fresh attachment must find every prefetched record on disk, with no service.
+    detail::HostedAttachment cold(endpoint,settings);
+    server.stop();
+    const auto cached=cold.objectsAtVersions(refs);
+    require(cached.size()==2&&cached[0]&&cached[1]&&cached[0]->reference()==refs[0]&&cached[1]->reference()==refs[1],
+            "mixed-source prefetch retains both owner-qualified records across restart");
+}
+
+void referencedGraphCache()
+{
+    TemporaryDirectory directory;
+    for(const auto policy:{HistoryMode::On,HistoryMode::Off}) {
+        const auto root=directory.path/std::to_string(int(policy));std::filesystem::create_directory(root);
+        OpenOptions options;options.author="cache-test";options.history=policy;
+        const auto base=root/"base.vcobj",overlay=root/"overlay.vcobj";
+        std::vector<ObjectVersion> refs;
+        {auto db=ObjectStore::create(base,options);auto w=db.write();ObjectRecord record;record.kind="note";
+            const auto a=db.upsertObject(w,record),b=db.upsertObject(w,record);w.commit();
+            {auto r=db.read();refs={db.currentObjectRevision(r,a)->reference(),db.currentObjectRevision(r,b)->reference()};}
+            auto seal=db.write();db.seal(seal);seal.commit();}
+        {auto db=ObjectCollection::create(overlay,{base},options);}
+        server::Server server(overlay,{});server.start();
+        const auto endpoint="http://127.0.0.1:"+std::to_string(server.port());HostedStore writer(endpoint);
+        HostedSessionOptions settings;settings.client.retries=0;settings.cacheDirectory=root/"cache";settings.minFreeBytes=0;
+        detail::HostedAttachment cached(endpoint,settings);
+        require(cached.relationshipsAt(refs).empty(),"cache initially empty inherited graph");
+        const auto request=[&] {
+            const auto status=writer.status();TransactionRequest value;value.requestUuid=util::newUuid();
+            value.storeUuid=status.storeUuid;value.generation=status.generation;value.author="cache-test";
+            for(const auto& ref:refs)expectObject(value,ref);
+            return value;
+        };
+        EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="test";edge.aUuid=refs[0].objectUuid;edge.bUuid=refs[1].objectUuid;
+        auto add=request();add.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});const auto added=writer.submit(add);
+        cached.refresh();require(cached.relationshipsAt(refs).size()==1,"refresh invalidates inherited graph disk cache");
+        detail::HostedAttachment reopened(endpoint,settings);
+        require(reopened.relationshipsAt(refs).size()==1,"reopened cache retains current graph membership");
+        auto remove=request();remove.expectedRelationships=testNumberedGuards(writer, {{edge.uuid, added.relationships.at(edge.uuid)}}, true);
+        remove.operations.push_back(RemoveEdgeOp{edge.uuid});cached.submit(remove);
+        require(cached.relationshipsAt(refs).empty(),"own submit invalidates graph without explicit refresh");
+        // An empty response already in flight must not outlive a refresh that
+        // observes a new overlay edge, even though endpoint pins are identical.
+        PausingProxy proxy(endpoint,"/v1/query/relationships");
+        auto raceSettings=settings;raceSettings.cacheDirectory=root/"race-cache";
+        detail::HostedAttachment racing(proxy.endpoint(),raceSettings);
+        auto pending=std::async(std::launch::async,[&]{return racing.relationshipsAt(refs);});
+        try {
+            proxy.wait();edge.uuid=util::newUuid();auto next=request();
+            next.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});writer.submit(next);
+            racing.refresh();proxy.release();
+            require(pending.get().size()==1,"late graph response retries after newer observed commit");
+        } catch (...) {proxy.release();throw;}
+        server.stop();
+    }
+}
+
+void selectedHeadAndCanonicalCache()
+{
+    TemporaryDirectory directory;const auto path=directory.path/"store.vcobj";
+    const std::string id="abcdefab-abcd-4abc-8abc-abcdefabcdef",upper="ABCDEFAB-ABCD-4ABC-8ABC-ABCDEFABCDEF";
+    OpenOptions options;options.author="cache-test";
+    ObjectVersion initial;
+    {auto store=ObjectStore::create(path,options);auto w=store.write();ObjectRecord record;record.uuid=id;record.kind="track";record.track.emplace();
+        store.upsertObject(w,record);store.putGeometry(w,id,vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,6}}}));w.commit();
+        auto r=store.read();initial=store.currentObjectRevision(r,id)->reference();}
+    server::Server server(path,{});server.start();
+    const auto endpoint="http://127.0.0.1:"+std::to_string(server.port());
+    HostedStore writer(endpoint);PausingProxy proxy(endpoint,"/v1/objects/"+id);
+    HostedSessionOptions settings;settings.client.retries=0;settings.client.requestTimeoutMs=10000;
+    detail::HostedAttachment attachment(proxy.endpoint(),settings);
+    auto viewRead=std::async(std::launch::async,[&] {
+        detail::HostedStoreReader reader(attachment);
+        const auto view=GeometrySnapshot(reader).track(id);
+        require(view.reference()==initial,"typed current view carries the selected complete identity");
+        require(view.points(0,1).front()[0]==1,"typed view must not pair the selected identity with a newer geometry head");
+    });
+    try {
+        proxy.wait();const auto status=writer.status();TransactionRequest request;
+        request.requestUuid=util::newUuid();request.storeUuid=status.storeUuid;request.generation=status.generation;request.author="cache-test";
+        expectObject(request,initial);
+        request.operations={UpdateGeometryArraysOp{id,vc::geometry::encode(vc::geometry::Track{{{9,2,3},{4,5,6}}}),{}}};
+        writer.submit(request);attachment.refresh();
+    } catch(...) {proxy.release();viewRead.wait();throw;}
+    proxy.release();viewRead.get();
+    require(attachment.currentObject(upper)->version==2&&attachment.currentObject(id)->version==2,"both UUID spellings select the updated head");
+    const auto status=writer.status();TransactionRequest update;
+    update.requestUuid=util::newUuid();update.storeUuid=status.storeUuid;update.generation=status.generation;update.author="cache-test";
+    update.expectedObjects=testNumberedGuards(writer, {{id,2}});update.operations={SetMetaOp{id,"label","true"}};
+    attachment.submit(update);
+    require(attachment.currentObject(upper)->version==3&&attachment.currentObject(id)->version==3,"canonical invalidation clears all UUID spellings");
+}
+
 void invalidationDuringRead(bool poll)
 {
     TemporaryDirectory directory;
@@ -152,9 +268,7 @@ void invalidationDuringRead(bool poll)
     server::Server server(path, {}); server.start();
     const auto endpoint = "http://127.0.0.1:" + std::to_string(server.port());
     HostedStore writer(endpoint);
-    // The registration heads are read by version (one batched request) after
-    // the listing: hold that response while the registration changes.
-    PausingProxy proxy(endpoint, "/v1/query/versions");
+    PausingProxy proxy(endpoint, "/v1/volume-transforms");
     HostedSessionOptions hosted; hosted.client.retries = 0; hosted.client.requestTimeoutMs = 10000;
     detail::HostedAttachment attachment(proxy.endpoint(), hosted);
     auto read = std::async(std::launch::async, [&] { return attachment.volumeTransforms(); });
@@ -166,7 +280,7 @@ void invalidationDuringRead(bool poll)
         TransactionRequest request;
         request.requestUuid = util::newUuid(); request.storeUuid = status.storeUuid;
         request.generation = status.generation; request.author = "cache-test";
-        request.expectedObjects = {{registration.uuid, 1}};
+        request.expectedObjects = testNumberedGuards(writer, {{registration.uuid, 1}});
         request.operations = {UpdateObjectOp{objectRecordJson(registration)}};
         if (poll) {
             writer.submit(request);
@@ -215,7 +329,7 @@ void multiPageCommitInvalidatesHeads()
     request.requestUuid = util::newUuid(); request.storeUuid = before.storeUuid;
     request.generation = before.generation; request.author = "bulk-editor";
     for (const auto& uuid : uuids) {
-        request.expectedObjects[uuid] = 1;
+        request.expectedObjects[uuid] = writer.currentObjectRevision(uuid)->reference();
         request.operations.push_back(SetMetaOp{uuid, "edited", "true"});
     }
     const auto receipt = writer.submit(request);
@@ -235,6 +349,67 @@ void multiPageCommitInvalidatesHeads()
     attachment.refresh();
     require(events.size() == 1, "bulk feed cursor advances past the entire commit");
     attachment.stop();
+}
+
+void oldMetadataCacheDoesNotShadowConvertedStore()
+{
+    TemporaryDirectory directory;
+    const auto path = directory.path / "converted.vcobj";
+    OpenOptions options; options.author = "cache-upgrade-test";
+    StoreStatus status;
+    ObjectVersion reference;
+    std::string geometry;
+    std::vector<uint8_t> expected;
+    nlohmann::json oldObject, oldGeometry;
+    {
+        auto store = ObjectStore::create(path, options);
+        std::string uuid;
+        {
+            auto txn = store.write();
+            ObjectRecord record; record.kind = "track";
+            uuid = store.upsertObject(txn, record);
+            vc::geometry::Track track; track.points = {{1, 2, 3}, {4, 5, 6}};
+            geometry = store.putGeometry(txn, uuid, vc::geometry::encode(track));
+            txn.commit();
+        }
+        auto txn = store.read();
+        status = store.status(txn);
+        const auto current = store.currentObjectRevision(txn, uuid);
+        reference = current->reference();
+        oldObject = nlohmann::json::parse(objectRevisionToJson(*current));
+        auto& record = oldObject["record"];
+        record["generation"] = 2; record["approved_generation"] = nullptr;
+        for (const auto* name : {"version", "version_generation", "commit_sequence", "approved_version"}) record.erase(name);
+        oldGeometry = nlohmann::json::parse(geometryRevisionToJson(*store.currentGeometry(txn, uuid)));
+        oldGeometry["object_generation"] = 2; oldGeometry.erase("object_version");
+        expected = store.readGeometryArray(txn, geometry, "points");
+    }
+    HostedSessionOptions hosted;
+    hosted.cacheDirectory = directory.path / "cache"; hosted.minFreeBytes = 0;
+    const auto cacheRoot = hosted.cacheDirectory / "objects";
+    std::filesystem::create_directories(cacheRoot);
+    const auto bytes = [](const std::string& text) { return std::vector<uint8_t>(text.begin(), text.end()); };
+    const auto cache = [&](const std::string& key, const std::vector<uint8_t>& value) {
+        std::ofstream file(cacheRoot / payloadHash(bytes(key)), std::ios::binary);
+        file << payloadHash(value);
+        file.write(reinterpret_cast<const char*>(value.data()), value.size());
+    };
+    cache("version/" + status.storeUuid + "/" + status.generation + "/" + reference.objectUuid + "/" +
+        std::to_string(reference.version), bytes(oldObject.dump()));
+    const auto prefix = status.storeUuid + "/" + status.generation + "/";
+    cache(prefix + "geometry/" + geometry, bytes(oldGeometry.dump()));
+    cache(prefix + "block/" + geometry + "/points/" + std::to_string(expected.size()) + "/0", expected);
+    server::Server server(path, {}); server.start();
+    PausingProxy proxy("http://127.0.0.1:" + std::to_string(server.port()), "never");
+    detail::HostedAttachment attachment(proxy.endpoint(), hosted);
+    const auto found = attachment.objectsAtVersions({reference});
+    require(found.front() && found.front()->record.uuid == reference.objectUuid,
+            "schema-20 cached records cannot break current numbered reads");
+    const auto descriptor = attachment.geometryRevision(geometry);
+    require(descriptor && descriptor->objectVersion == reference.version,
+            "schema-20 cached descriptors are refetched in the current metadata namespace");
+    require(*attachment.geometryArray(geometry, "points") == expected && proxy.payloadRequests == 0,
+            "wire metadata upgrade reuses existing raw geometry blocks without download");
 }
 #ifdef VC_REAL_SURFACE
 void persistentObjects()
@@ -269,7 +444,7 @@ void persistentObjects()
         ObjectStoreSession local;
         auto attachment = local.attach(path, options);
         const auto head = local.currentObject(attachment, uuid);
-        local.publishArtifacts(attachment, uuid, head->version,
+        local.publishArtifacts(attachment, head->reference(),
             {{"source/x.tif", std::filesystem::path(VC_REAL_SURFACE) / "x.tif"}});
     }
     server::Server server(path, {}); server.start();
@@ -346,7 +521,7 @@ void persistentObjects()
         TransactionRequest edit;
         edit.requestUuid = util::newUuid(); edit.storeUuid = status.storeUuid;
         edit.generation = status.generation; edit.author = "cache-test";
-        edit.expectedObjects = {{uuid, head->version}};
+        edit.expectedObjects = {{uuid, head->reference()}};
         edit.operations = {SetMetaOp{uuid, "during_prefetch", "true"}};
         writer.submit(edit);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -491,6 +666,9 @@ void batchedGeometryPrefetch()
 
 int main()
 try {
+    selectedHeadAndCanonicalCache();
+    referencedRecordsCache();
+    referencedGraphCache();
     boundedPayloadUploads();
     batchedGeometryPrefetch();
 #ifdef VC_REAL_SURFACE
@@ -499,6 +677,7 @@ try {
     invalidationDuringRead(false);
     invalidationDuringRead(true);
     multiPageCommitInvalidatesHeads();
+    oldMetadataCacheDoesNotShadowConvertedStore();
     std::cout << "object_store_hosted_cache: ok\n";
 } catch (const std::exception& error) {
     std::cerr << "object_store_hosted_cache: " << error.what() << '\n';

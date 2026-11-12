@@ -2,10 +2,12 @@
 #include "internal/Database.hpp"
 
 namespace vc::objects::detail {
-// Derived current-state index. Dirty rows are refreshed before publication and
-// before source relationship lookup; history is never modified.
+// Optional derived current-state index, provisioned on first source-point
+// identity publication. Dirty rows are refreshed before publication and before
+// source relationship lookup; history is never modified.
 void createSourceIdentityIndex(sqlite3*);
 void refreshSourceIdentityIndex(sqlite3*);
+void markSourceIdentityDirty(sqlite3*,const std::string& object);
 void updateSourcePointIdentities(sqlite3*, const std::string& object,
     const std::string& previous, const std::string& revision,
     const nlohmann::json& manifest, const std::vector<int64_t>& changed);

@@ -40,6 +40,8 @@ struct ObjectStoreSession::Attachment {
     // writer serializes accepted actions; journal guards journalPosition.
     std::mutex writer, journal;
     int64_t journalPosition = 0;
+    // Current-only stores have no journal; compare their committed state instead.
+    std::optional<StoreStatus> observedState;
     // Writable attachments: fetches the geometry of objects published elsewhere
     // (setGeometryFetcher).
     std::unique_ptr<detail::FetchQueue> fetches;
@@ -101,7 +103,9 @@ std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::open(const s
     next->author = next->store().author();
     auto txn = next->store().read();
     next->identity.storeUuid = next->store().uuid(txn);
-    next->journalPosition = next->store().journalPosition(txn);
+    next->observedState = next->store().status(txn);
+    next->journalPosition = next->observedState->historyEnabled
+        ? next->store().journalPosition(txn) : next->observedState->commitSequence;
     return next;
 }
 
@@ -262,8 +266,7 @@ StoreStatus ObjectStoreSession::status(const AttachmentIdentity& identity)
 
 PinnedObject pinOf(const AttachmentIdentity& attachment, const ObjectRevision& revision, const std::string& activeGeneration)
 {
-    return {attachment, {attachment.storeUuid, revision.objectUuid}, revision.generation, revision.version,
-            revision.geometryRevision, activeGeneration};
+    return {attachment, revision.reference(), revision.geometryRevision, activeGeneration};
 }
 
 TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& identity)
@@ -290,6 +293,13 @@ TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& iden
     request.generation = generation;
     request.author = author;
     return request;
+}
+
+ObjectVersion ObjectStoreSession::decodeObjectReference(const AttachmentIdentity& attachment, const std::string& json)
+{
+    ObjectVersion result;
+    readStore(attachment, [&](const StoreReader& reader, const auto&) { result = reader.decodeObjectReference(json); });
+    return result;
 }
 
 TransactionReceipt ObjectStoreSession::submit(const AttachmentIdentity& identity, const TransactionRequest& request)
@@ -360,25 +370,22 @@ VolumeTransforms ObjectStoreSession::volumeTransforms(const AttachmentIdentity& 
 }
 
 std::vector<ArtifactFile> ObjectStoreSession::artifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
-                                                       const std::optional<int64_t>& version, const std::optional<std::string>& generation)
+                                                       const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                                                       const std::optional<ObjectVersion>& reference)
 {
     const auto uuid = util::canonicalUuid(objectUuid);
     std::optional<ObjectRevision> revision;
-    if (version) {
-        const auto status = this->status(identity);
-        revision = objectsAtVersions(identity, {{status.storeUuid, generation.value_or(status.generation), uuid, *version}}).front();
-    } else {
-        revision = currentObject(identity, uuid);
-    }
+    readStore(identity,[&](const StoreReader& reader,const auto&){revision=reader.selectedObject(uuid,version,generation,reference);});
     if (!revision || revision->deleted) throw std::invalid_argument("object version not found: " + uuid);
     return artifactManifest(revision->record);
 }
 
 std::vector<ArtifactFile> ObjectStoreSession::materializeArtifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
                                                                   const std::filesystem::path& destination,
-                                                                  const std::optional<int64_t>& version, const std::optional<std::string>& generation)
+                                                                  const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                                                                  const std::optional<ObjectVersion>& reference)
 {
-    const auto files = artifacts(identity, objectUuid, version, generation);
+    const auto files = artifacts(identity, objectUuid, version, generation, reference);
     for (const auto& file : files) writeArtifact(identity, file, destination / std::filesystem::path(file.name));
     return files;
 }
@@ -387,6 +394,10 @@ void ObjectStoreSession::writeArtifact(const AttachmentIdentity& identity, const
                                        const std::filesystem::path& target)
 {
     withAttachment(identity, false, [&](Attachment& attachment) {
+        if (!attachment.remote) {
+            auto& store = attachment.store();
+            auto txn = store.read(); store.validateExportDestination(txn, target);
+        }
         std::filesystem::create_directories(target.parent_path());
         if (attachment.remote) { attachment.remote->writeArtifact(file, target); return 0; }
         auto& store = attachment.store();
@@ -399,9 +410,10 @@ void ObjectStoreSession::writeArtifact(const AttachmentIdentity& identity, const
 std::optional<std::filesystem::path> ObjectStoreSession::artifactFile(const AttachmentIdentity& identity,
                                                                       const std::string& objectUuid, const std::string& name,
                                                                       const std::filesystem::path& cacheDirectory,
-                                                                      const std::optional<int64_t>& version, const std::optional<std::string>& generation)
+                                                                      const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                                                                      const std::optional<ObjectVersion>& reference)
 {
-    const auto files = artifacts(identity, objectUuid, version, generation);
+    const auto files = artifacts(identity, objectUuid, version, generation, reference);
     const auto file = std::find_if(files.begin(), files.end(), [&](const auto& f) { return f.name == name; });
     if (file == files.end()) return std::nullopt;
     // Content-addressed: a complete file at its path is that content (writes are atomic and verified).
@@ -411,12 +423,10 @@ std::optional<std::filesystem::path> ObjectStoreSession::artifactFile(const Atta
     return target;
 }
 
-TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
-                                                        int64_t expectedVersion,
+TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity& identity, const ObjectVersion& reference,
                                                         const std::vector<std::pair<std::string, std::filesystem::path>>& files,
                                                         const std::string& author)
 {
-    const auto uuid = util::canonicalUuid(objectUuid);
     TransactionRequest request;
     if (author.empty()) {
         request = newRequest(identity);
@@ -430,13 +440,35 @@ TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity
     // Read the manifest from the expected head, whose publication generation
     // can predate the active history. The request still guards both the head
     // version and the active generation across the uploads below.
-    const auto head = currentObject(identity, uuid);
-    const auto actual = head && !head->deleted ? std::optional(head->version) : std::nullopt;
-    if (actual != expectedVersion)
-        throw TransactionConflict(TransactionConflict::Reason::Version, {{"object", uuid, expectedVersion, actual}},
-                                  "artifact publication: expected version changed for " + uuid);
+    expectObject(request, reference);
+    const auto& expected = std::get<ObjectVersion>(request.expectedObjects.at(util::canonicalUuid(reference.objectUuid)).selected);
+    const auto head = currentObject(identity, expected.objectUuid);
+    if (!head || head->deleted || head->reference() != expected)
+        throw TransactionConflict(TransactionConflict::Reason::Version,
+            {{"object", expected.objectUuid, expected.version, head ? std::optional(head->version) : std::nullopt}},
+            "artifact publication: selected reference changed");
+    return publishArtifactManifest(identity, std::move(request), *head, files);
+}
+
+TransactionReceipt ObjectStoreSession::publishArtifacts(const PinnedObject& pin,
+    const std::vector<std::pair<std::string, std::filesystem::path>>& files, const std::string& author,
+    const std::optional<CheckVolumeMappingOp>& mapping)
+{
+    auto request = newRequest(pin.attachment);
+    if (!author.empty()) request.author = author;
+    request.generation = pin.writeGeneration;
+    expectObject(request, pin.reference());
+    if (mapping) request.operations.push_back(*mapping);
+    const auto selected = objectsAtVersions(pin.attachment, {pin.reference()}).front();
+    if (!selected) throw std::runtime_error("artifact source revision is unavailable");
+    return publishArtifactManifest(pin.attachment, std::move(request), *selected, files);
+}
+
+TransactionReceipt ObjectStoreSession::publishArtifactManifest(const AttachmentIdentity& identity, TransactionRequest request,
+    const ObjectRevision& head, const std::vector<std::pair<std::string, std::filesystem::path>>& files)
+{
     std::map<std::string, ArtifactFile> manifest;
-    for (auto& file : artifactManifest(head->record)) manifest[file.name] = std::move(file);
+    for (auto& file : artifactManifest(head.record)) manifest[file.name] = std::move(file);
     // Bytes first: the request may only name what the store holds.
     withAttachment(identity, true, [&](Attachment& attachment) {
         for (const auto& [name, path] : files) {
@@ -447,8 +479,7 @@ TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity
     });
     std::vector<ArtifactFile> listed;
     for (auto& [name, file] : manifest) listed.push_back(std::move(file));
-    request.expectedObjects = {{uuid, expectedVersion}};
-    request.operations = {SetMetaOp{uuid, kArtifactsMetaKey, artifactManifestJson(std::move(listed))}};
+    request.operations.push_back(SetMetaOp{head.objectUuid, kArtifactsMetaKey, artifactManifestJson(std::move(listed))});
     return submit(identity, request);
 }
 
@@ -619,13 +650,12 @@ std::optional<TransactionReceipt> ObjectStoreSession::editCurrent(const Attachme
     readStore(identity, [&](const StoreReader& reader, const auto&) {
         // Guard the versions before callbacks read or compute their edits. A
         // hosted poll during a callback must not advance these expectations.
-        editCurrentRequest(reader, request, objectUuids, {});
-        std::vector<TransactionOperation> edits;
-        for (const auto& objectUuid : objectUuids)
-            for (auto& operation : operations(reader, util::canonicalUuid(objectUuid))) edits.push_back(std::move(operation));
-        // Relationship decisions still run after the edits they describe.
-        for (auto& operation : request.operations) edits.push_back(std::move(operation));
-        request.operations = std::move(edits);
+        buildCurrentEditRequest(reader, request, objectUuids, [&] {
+            std::vector<TransactionOperation> edits;
+            for (const auto& objectUuid : objectUuids)
+                for (auto& operation : operations(reader, util::canonicalUuid(objectUuid))) edits.push_back(std::move(operation));
+            return edits;
+        });
     });
     return submit(identity, request);
 }
@@ -678,7 +708,7 @@ void ObjectStoreSession::startFetching(Attachment& attachment)
                     if (!fetch && meta.is_object() && meta.contains(key)) fetch = fetcher;
             }
             if (!fetch) throw std::runtime_error("no geometry fetcher for " + uuid);
-            fetch(held->store(), uuid, [&](const VersionSelection& expected, const Action& action) {
+            fetch(held->store(), uuid, [&](const RecordSelection& expected, const Action& action) {
                 return fetchWrite(identity, expected, action);
             });
         } catch (...) { release(*held, false); throw; }
@@ -686,7 +716,7 @@ void ObjectStoreSession::startFetching(Attachment& attachment)
     });
 }
 
-TransactionReceipt ObjectStoreSession::fetchWrite(const AttachmentIdentity& identity, const VersionSelection& expected,
+TransactionReceipt ObjectStoreSession::fetchWrite(const AttachmentIdentity& identity, const RecordSelection& expected,
                                                   const Action& callback)
 {
     TransactionReceipt committed;
@@ -1024,6 +1054,7 @@ TransactionReceipt ObjectStoreSession::submitDurably(const AttachmentIdentity& a
 {
     if (request.requestUuid.empty()) throw std::invalid_argument("a durable submission needs a request UUID");
     const auto requestUuid = util::canonicalUuid(request.requestUuid);
+    std::unique_lock writing(durable_->writing);
     bool durable = false;
     {
         std::lock_guard lock(mutex_);
@@ -1047,18 +1078,30 @@ TransactionReceipt ObjectStoreSession::submitDurably(const AttachmentIdentity& a
     }
     if (durable) {
         try {
-            {
-                std::lock_guard writing(durable_->writing);
-                TransactionPayloads payloads;
-                const auto canonical = transactionRequestToJson(request, &payloads);
-                durable_->directory->storeRequest(requestUuid, canonical, payloads);
-            }
+            TransactionPayloads payloads;
+            const auto canonical = transactionRequestToJson(request, &payloads);
+            durable_->directory->storeRequest(requestUuid, canonical, payloads);
+            writing.unlock();
             checkpointDrafts();
         } catch (...) {
+            // Remove any unstaged pending record before allowing a checkpoint.
+            if (writing.owns_lock()) {
+                std::lock_guard lock(mutex_);
+                auto record = durable_->pending.extract(requestUuid);
+                if (!record.empty()) for (const auto& [uuid, revision] : record.mapped().drafts) {
+                    auto found = durable_->meta.find(uuid);
+                    if (found != durable_->meta.end() && found->second.pendingRequest == requestUuid) {
+                        found->second.pendingRequest.reset();
+                        found->second.submittedRevision.reset();
+                    }
+                }
+                throw;
+            }
             conclude(requestUuid, nullptr, "");
             throw;
         }
     }
+    if (writing.owns_lock()) writing.unlock();
     return sendPending(attachment, request, requestUuid);
 }
 
@@ -1094,6 +1137,8 @@ TransactionReceipt ObjectStoreSession::sendPending(const AttachmentIdentity& att
     TransactionReceipt result;
     try {
         result = submit(attachment, request);
+    } catch (const ReceiptDecodeError&) {
+        throw; // May already be committed, including a local saved replay.
     } catch (const TransactionConflict& conflict) {
         conclude(requestUuid, nullptr, conflict.what());
         throw;
@@ -1145,8 +1190,8 @@ void ObjectStoreSession::conclude(const std::string& requestUuid, const Transact
                 draftChanged(uuid, attachment);
                 continue;
             }
-            if (const auto version = receipt->objects.find(uuid); version != receipt->objects.end() && version->second) {
-                meta->second.base = ObjectVersion{receipt->storeUuid, receipt->generation, uuid, *version->second};
+            if (const auto reference = receipt->objectReference(uuid)) {
+                meta->second.base = *reference;
                 meta->second.conflict.clear();
             }
             if (unchanged) meta->second.savedRevision = submitted;
@@ -1206,22 +1251,49 @@ std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector
     const RegionSlice& slice, const RegionOptions& options, const RegionCancel& cancel)
 {
     const auto drafts = options.kind == "surface" ? this->drafts() : Drafts{};
+    std::set<std::string> excluded;
+    for (const auto& uuid : options.excludedUuids) excluded.insert(util::canonicalUuid(uuid));
     std::vector<AttachedRegion> result;
     std::vector<AttachmentIdentity> earlier;
     const bool stored = !(options.kind == "surface" && onlyDrafts(options.uuids, drafts));
     for (const auto& attachment : stored ? order : std::vector<AttachmentIdentity>{}) {
         // A hosted store answers the whole query on the host (no cancellation).
-        auto region = withAttachment(attachment, false, [&](Attachment& held) {
-            if (held.remote) return held.remote->client().geometryRegion(slice, options);
-            auto txn = held.store().read();
-            return held.store().geometryRegion(txn, slice, options, cancel);
-        });
-        std::set<std::string> uuids(region.remote.begin(), region.remote.end());
-        for (const auto& run : region.runs) uuids.insert(run.objectUuid);
-        const auto hidden = heldBy(earlier, uuids);
-        const auto replaced = [&](const std::string& uuid) { return hidden.contains(uuid) || drafts.contains(uuid); };
-        std::erase_if(region.runs, [&](const VisibleRun& run) { return replaced(run.objectUuid); });
-        std::erase_if(region.remote, replaced);
+        RegionResult region;
+        auto page = options;
+        std::set<std::string> visible, remote;
+        for (;;) {
+            const auto remaining = [](uint64_t budget, uint64_t used) { return budget - std::min(budget, used); };
+            page.outputByteBudget = remaining(options.outputByteBudget, region.stats.outputBytes);
+            page.processingByteBudget = remaining(options.processingByteBudget, region.stats.processingBytes);
+            page.candidateWorkBudget = remaining(options.candidateWorkBudget, region.stats.candidateWork);
+            page.sqlStepBudget = remaining(options.sqlStepBudget, region.stats.sqlSteps);
+            if (options.maximumObjects) page.maximumObjects = options.maximumObjects - visible.size();
+            const RegionCancel cumulativeCancel = cancel ? RegionCancel([&](const RegionStats& current) {
+                auto spent = region.stats; addRegionStats(spent, current); return cancel(spent);
+            }) : RegionCancel{};
+            auto part = withAttachment(attachment, false, [&](Attachment& held) {
+                if (held.remote) return held.remote->client().geometryRegion(slice, page);
+                auto txn = held.store().read();
+                return held.store().geometryRegion(txn, slice, page, cumulativeCancel);
+            });
+            addRegionStats(region.stats, part.stats);
+            std::set<std::string> uuids(part.remote.begin(), part.remote.end());
+            for (const auto& run : part.runs) uuids.insert(run.objectUuid);
+            const auto hidden = heldBy(earlier, uuids);
+            const auto replaced = [&](const std::string& uuid) { return hidden.contains(uuid) || drafts.contains(uuid); };
+            for (auto& run : part.runs) if (!replaced(run.objectUuid)) {
+                visible.insert(run.objectUuid); region.runs.push_back(std::move(run));
+            }
+            for (auto& uuid : part.remote) if (!replaced(uuid)) remote.insert(std::move(uuid));
+            region.intersectingObjects = visible.size();
+            region.stop = part.stop;
+            if (part.stop != RegionStop::ObjectLimit || !options.maximumObjects ||
+                visible.size() == options.maximumObjects || uuids.empty()) break;
+            // Refill only the bounded page lost to precedence. Already returned
+            // candidates cannot consume another slot; all spent work stays charged.
+            page.excludedUuids.insert(page.excludedUuids.end(), uuids.begin(), uuids.end());
+        }
+        region.remote.assign(remote.begin(), remote.end());
         result.push_back({attachment, std::move(region)});
         earlier.push_back(attachment);
     }
@@ -1236,7 +1308,7 @@ std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector
     std::vector<AttachedRegion> drafted;
     for (const auto* entry : ordered) {
         const auto& [uuid, draft] = *entry;
-        if (!admits(options.uuids, uuid)) continue;
+        if (!admits(options.uuids, uuid) || excluded.contains(uuid)) continue;
         const auto placement = detail::placeDraft(*draft, options.coordinates, options.volume, options.targetScale,
                                                   options.toTarget,
                                                   needsTransforms(*draft, options.volume) ? transforms(*draft) : nullptr);
@@ -1343,12 +1415,32 @@ void ObjectStoreSession::observe(Attachment& attachment)
     if (attachment.remote) return; // its poller delivers its commits
     std::lock_guard journal(attachment.journal);
     auto txn = attachment.store().read();
+    const auto state = attachment.store().status(txn);
+    const bool changedLineage = attachment.observedState &&
+        (state.generation != attachment.observedState->generation || state.historyEnabled != attachment.observedState->historyEnabled);
+    if (!state.historyEnabled || changedLineage) {
+        if (attachment.observedState && state.generation == attachment.observedState->generation &&
+            state.commitSequence == attachment.observedState->commitSequence) return;
+        std::lock_guard lock(mutex_);
+        events_.push_back({StoreSessionEvent::Kind::Committed, attachment.identity, state.commitSequence, {}, true});
+        attachment.observedState = state;
+        attachment.journalPosition = state.historyEnabled ? attachment.store().journalPosition(txn) : state.commitSequence;
+        return;
+    }
     auto changes = attachment.store().journalSince(txn, attachment.journalPosition);
-    if (changes.empty()) return;
+    if (changes.empty()) {
+        if(attachment.observedState && attachment.observedState->commitSequence != state.commitSequence) {
+            std::lock_guard lock(mutex_);
+            events_.push_back({StoreSessionEvent::Kind::Committed, attachment.identity, state.commitSequence, {}, true});
+        }
+        attachment.observedState = state;
+        return;
+    }
     const auto position = changes.back().seq;
     std::lock_guard lock(mutex_);
     events_.push_back({StoreSessionEvent::Kind::Committed, attachment.identity, position, std::move(changes)});
     attachment.journalPosition = position;
+    attachment.observedState = state;
 }
 
 std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()
@@ -1384,9 +1476,9 @@ bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) c
 void ObjectStoreSession::requireCurrent(const PinnedObject& pin)
 {
     readStore(pin.attachment, [&](const StoreReader& reader, const auto&) {
-        const auto head = reader.currentObject(pin.object.objectUuid);
+        const auto head = reader.currentObject(pin.reference().objectUuid);
         if (reader.status().generation != pin.writeGeneration ||
-            !head || head->version != pin.version || head->generation != pin.generation)
+            !head || head->reference() != pin.reference())
             throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");
     });
 }

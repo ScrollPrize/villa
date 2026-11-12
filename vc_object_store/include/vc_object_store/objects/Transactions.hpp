@@ -15,6 +15,7 @@
 // ordered feed. A transaction that changes nothing advances nothing.
 
 #include <atomic>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -31,6 +32,17 @@
 #include <vc_reader/registrations.hpp>
 
 namespace vc::objects {
+// A coherent read could not retain the requested snapshot. Retry or reselect.
+class StoreBusy : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+// An unreadable success/replay receipt does not prove the request failed.
+// Keep its pending identity; never resubmit under a fresh request UUID.
+class ReceiptDecodeError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct ObjectRecord;
 struct EdgeRecord;
@@ -40,17 +52,43 @@ struct ObjectVersion {
     std::string storeUuid, generation, objectUuid;
     int64_t version = 0;
     bool operator==(const ObjectVersion&) const = default;
+    auto operator<=>(const ObjectVersion&) const = default;
 };
 
 struct RelationshipVersion {
     std::string storeUuid, generation, relationshipUuid;
     int64_t version = 0;
     bool operator==(const RelationshipVersion&) const = default;
+    auto operator<=>(const RelationshipVersion&) const = default;
 };
 
-// Record UUID -> expected live version; nullopt expects no live record (never
-// created, or deleted).
+// Numbered wire/receipt and storage projection only. Native selected guards use
+// RecordSelection below; do not drop their owner/lineage into this map.
 using VersionSelection = std::map<std::string, std::optional<int64_t>>;
+
+// One selected identity per guard. NoLive does not mean never seen:
+// a deleted record also has no live head. A selected tombstone retains its
+// reference with deleted=true instead.
+struct RecordExpectation {
+    std::variant<std::monostate, ObjectVersion, RelationshipVersion> selected;
+    bool deleted = false;
+    RecordExpectation() = default;
+    RecordExpectation(std::nullopt_t) {}
+    RecordExpectation(ObjectVersion ref) : selected(std::move(ref)) {}
+    RecordExpectation(RelationshipVersion ref) : selected(std::move(ref)) {}
+    std::optional<int64_t> number() const {
+        if (deleted) return {};
+        if (const auto* r = std::get_if<ObjectVersion>(&selected)) return r->version;
+        if (const auto* r = std::get_if<RelationshipVersion>(&selected)) return r->version;
+        return {};
+    }
+    bool complete() const { return std::holds_alternative<ObjectVersion>(selected) || std::holds_alternative<RelationshipVersion>(selected); }
+    bool operator==(const RecordExpectation&) const = default;
+};
+
+using RecordSelection = std::map<std::string, RecordExpectation>;
+VersionSelection numberedSelection(const RecordSelection&); // storage/wire projection only
+void mergeExpectations(RecordSelection&, const RecordSelection&, const char* description);
 
 struct StoreStatus {
     std::string storeUuid, generation;
@@ -58,6 +96,10 @@ struct StoreStatus {
     // Changes after this sequence are retained in the feed; a cursor below it
     // cannot be continued and requires revalidating cached state.
     int64_t feedStart = 0;
+    bool historyEnabled = true;
+    // Generic record-only copies cannot preserve extension-owned rows. This
+    // capability is advertised by local and hosted readers before such copies.
+    bool extensionsPresent = false;
 };
 
 // Writes are attributed to `author` (falling back to the store's open
@@ -67,7 +109,7 @@ struct StoreStatus {
 //    history generation;
 //  - expectedObjects are write preconditions. Every object the transaction
 //    changes (including relationship endpoints) must be listed, and creation
-//    lists the new UUID as nullopt;
+//    lists the new UUID as nullopt (no live record);
 //  - expectedRelationships are optional relationship preconditions (every
 //    relationship change also versions both endpoints, which must be listed);
 //  - readDependencies are current-state guards on records read but not
@@ -81,7 +123,7 @@ struct TransactionContext {
     std::optional<std::string> requestDigest;
     std::optional<std::string> storeUuid, generation;
     std::optional<std::string> author;
-    VersionSelection expectedObjects, expectedRelationships, readDependencies;
+    RecordSelection expectedObjects, expectedRelationships, readDependencies;
     std::optional<int64_t> expectedCommitSequence;
 };
 
@@ -93,6 +135,11 @@ struct TransactionReceipt {
     // Versions after commit of every expected and every changed record;
     // nullopt for a record that is absent (deleted).
     VersionSelection objects, relationships;
+    // Complete identities at commit, including unchanged inherited inputs.
+    // Absent/deleted objects have no reference. Never reconstruct these from
+    // the receipt's committing store/generation and a numeric object version.
+    std::map<std::string, ObjectVersion> objectReferences;
+    std::optional<ObjectVersion> objectReference(const std::string& uuid) const;
     // Objects/relationships this transaction created, in creation order.
     std::vector<std::string> created;
     // True when submit() returned the receipt saved by an earlier identical
@@ -290,17 +337,23 @@ using TransactionOperation = std::variant<
     UpdateGeometryArraysOp, IngestGeometryOp, CheckVolumeMappingOp, LinkObjectsOp>;
 
 // Wire/command format version, part of every request digest.
-inline constexpr int kTransactionCommandVersion = 1;
+inline constexpr int kTransactionCommandVersion = 3;
 
 struct TransactionRequest {
     std::string requestUuid;       // required: identifies retries
     std::string storeUuid;         // required
     std::string generation;        // required: expected active generation
     std::string author;            // required: attribution, not authentication
-    VersionSelection expectedObjects, expectedRelationships, readDependencies;
+    RecordSelection expectedObjects, expectedRelationships, readDependencies;
     std::optional<int64_t> expectedCommitSequence;
     std::vector<TransactionOperation> operations;
 };
+
+// Guard the selected owner, lineage and version as well as its numeric version.
+void expectObject(TransactionRequest&, const ObjectVersion&);
+void expectObject(TransactionRequest&, const struct ObjectRevision&);
+void expectRead(TransactionRequest&, const ObjectVersion&);
+void expectRelationship(TransactionRequest&, const RelationshipVersion&);
 
 // ---- Prepared operations ---------------------------------------------------
 // An operation whose work happens before the writer lock is taken (link
@@ -323,7 +376,7 @@ public:
 };
 
 struct PreparedOperation {
-    VersionSelection expectedObjects, readDependencies;
+    RecordSelection expectedObjects, readDependencies;
     std::function<void(ObjectStore&, WriteTxn&)> apply;
 };
 
@@ -337,8 +390,8 @@ public:
     // receipt is already saved (submit replays it).
     bool empty() const { return operations_.empty(); }
     // Every version the preparations observed and the write expects.
-    VersionSelection expectedObjects() const;
-    VersionSelection readDependencies() const;
+    RecordSelection expectedObjects() const;
+    RecordSelection readDependencies() const;
 
 private:
     friend class ObjectStore;

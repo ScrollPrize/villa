@@ -204,7 +204,7 @@ int list(const std::string& path, int iterations)
                     r.author = "churn";
                     if (i % 7 == 6 && !created.empty()) {
                         const auto& target = created[rng() % created.size()];
-                        r.expectedObjects[target] = client.currentVersion(target);
+                        r.expectedObjects[target] = client.currentObjectRevision(target)->reference();
                         r.operations.push_back(SetMetaOp{target, "edit", std::to_string(i)});
                     } else {
                         ObjectRecord record;

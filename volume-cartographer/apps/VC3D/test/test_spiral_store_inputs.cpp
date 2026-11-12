@@ -1,7 +1,7 @@
 // The Spiral workspace's reads of a fit's object-store inputs: they are read
 // as the store holds them now and converted to reference-volume voxels, and
 // each input and consumed relationship says whether it is what the fit read,
-// by geometry revision, the adapter's metadata values and link generations.
+// by geometry revision, the adapter's metadata values and relationship versions.
 #include "SpiralStoreInputs.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
@@ -9,7 +9,9 @@
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <vc_object_store/objects/ObjectCollection.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 
 #include <QCoreApplication>
 #include <QTemporaryDir>
@@ -85,14 +87,15 @@ struct Fixture {
     {
         OpenOptions options; options.author = "spiral-store-inputs-test";
         auto db = ObjectStore::open(path, options);
-        auto txn = db.write(expected);
+        auto txn = db.writeNumbered(expected);
         fn(db, txn);
         txn.commit();
     }
 
-    explicit Fixture(const fs::path& path) : path(path)
+    explicit Fixture(const fs::path& path, HistoryMode history = HistoryMode::On) : path(path)
     {
         OpenOptions options; options.author = "spiral-store-inputs-test";
+        options.history = history;
         { auto created = ObjectStore::create(path, options); }
         attachment = session->attach(path, options);
         surface = util::newUuid();
@@ -161,6 +164,7 @@ struct Fixture {
                                                     std::tuple{fiber, "fiber", 4.0}}) {
                 const auto current = reader.currentObject(uuid);
                 objects.push_back({{"uuid", uuid}, {"kind", kind}, {"name", current->record.name},
+                                   {"reference", Json::parse(objectVersionToJson(current->reference()))},
                                    {"generation", current->generation}, {"version", current->version},
                                    {"geometry_revision", *current->geometryRevision},
                                    {"metadata", vc3d::spiral::adapterMetadata(
@@ -171,19 +175,19 @@ struct Fixture {
         // The link as the adapter records it: surface end first.
         Json relationships = Json::array();
         session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
-            const auto status = reader.status();
             std::vector<ObjectVersion> heads;
             for (const auto& uuid : {surface, pcl}) {
                 const auto current = reader.currentObject(uuid);
-                heads.push_back({status.storeUuid, current->generation, uuid, current->version});
+                heads.push_back(current->reference());
             }
             for (const auto& selected : reader.relationshipsAt(heads)) {
                 const auto& version = selected.relationship;
                 const bool stored = version.record.aUuid == surface;
                 relationships.push_back(
-                    {{"uuid", version.record.uuid}, {"version", version.record.version.value_or(0)}, {"kind", version.record.kind},
+                    {{"reference", Json::parse(relationshipVersionToJson(version.reference()))},
+                     {"uuid", version.record.uuid}, {"kind", version.record.kind},
                      {"family", "pcl_patch"}, {"approval_state", version.record.approvalState},
-                     {"generation", version.record.generation}, {"a", surface},
+                     {"version", version.version}, {"a", surface},
                      {"a_geometry_revision", *(stored ? version.aGeometryRevision : version.bGeometryRevision)},
                      {"b", pcl},
                      {"b_geometry_revision", *(stored ? version.bGeometryRevision : version.aGeometryRevision)}});
@@ -234,13 +238,15 @@ Json describe(const vc3d::spiral::FitInputs& inputs)
         for (const auto& value : values) list.push_back({value[0], value[1], value[2]});
         return list;
     };
-    for (const auto& entry : inputs.surfaces) {
+    const auto surface = [&](const auto& entry) {
         Json grid = Json::array();
         if (entry.surface)
             for (const auto& point : *entry.surface->rawPointsPtr()) grid.push_back({point[0], point[1], point[2]});
         result["objects"][entry.pin.uuid] = {{"state", vc3d::spiral::inputStateName(entry.state)},
                                              {"problem", entry.problem}, {"grid", grid}};
-    }
+    };
+    for (const auto& entry : inputs.surfaces) surface(entry);
+    if (inputs.outerShell) surface(*inputs.outerShell);
     for (const auto& entry : inputs.pointCollections)
         result["objects"][entry.pin.uuid] = {{"state", vc3d::spiral::inputStateName(entry.state)},
                                              {"problem", entry.problem}, {"absolute", entry.absolute},
@@ -273,20 +279,53 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     const auto document = fixture.manifest();
     auto inputs = fixture.read(document);
     require(inputs.unchanged(), "the fixture holds its inputs as fitted");
+    for(int variant=0;variant<5;++variant){
+        auto invalid=document;auto& objects=invalid["manifest"]["objects"];
+        if(variant==0)objects[0].erase("reference");
+        if(variant==1)objects[0]["reference"]["object"]=util::newUuid();
+        if(variant==2)objects.push_back(objects[0]);
+        if(variant==3)invalid["manifest"]["outer_shell"]=objects[0];
+        if(variant==4)objects[0]["version"]=1.5;
+        bool rejected=false;
+        try{vc3d::spiral::manifestPins(invalid);}catch(const std::exception&){rejected=true;}
+        require(rejected,"public manifest selection rejects malformed object evidence");
+        require(!fixture.read(invalid).problems.empty(),"full comparison rejects malformed object evidence");
+        require(!fixture.changes(invalid,{},{}).inputs.problems.empty(),"partial refresh validates before filtering");
+    }
+    auto legacy = document;
+    legacy["manifest"]["relationships"][0].erase("reference");
+    require(!fixture.read(legacy).problems.empty(), "unqualified relationship manifests require regeneration");
+    fixture.session->readStore(fixture.attachment, [&](const StoreReader& reader, const auto&) {
+        require(!vc3d::spiral::readFitInputChanges(reader, legacy, {}, {}).inputs.problems.empty(),
+                "incomplete out-of-scope manifest is refused");
+    });
+    for (const auto* field : {"store", "generation"}) {
+        auto otherIdentity = document;
+        otherIdentity["manifest"]["relationships"][0]["reference"][field] = util::newUuid();
+        require(fixture.read(otherIdentity).relationships.at(0).state == vc3d::spiral::LinkState::Changed,
+                "same relationship counter with another owner or lineage is changed");
+    }
     require(inputs.count(InputState::Fitted) == 3, "every input is as fitted");
     require(!inputs.outerShell, "a fit that read no outer shell has none");
     // The manifest's outer shell is read as a surface, apart from the patches.
     auto withShell = document;
     withShell["manifest"]["outer_shell"] = document["manifest"]["objects"][0];
+    withShell["manifest"]["objects"].erase(withShell["manifest"]["objects"].begin());
     const auto shelled = fixture.read(withShell);
     require(shelled.outerShell && shelled.outerShell->state == InputState::Fitted
-                && shelled.outerShell->surface && shelled.surfaces.size() == 1,
-            "the outer shell is read beside the patches");
+                && shelled.outerShell->surface && shelled.surfaces.empty(),
+            "the outer shell is read separately from the patches");
+    require(shelled.count(InputState::Fitted) == 3, "input counts include the shell");
+    const auto pins = vc3d::spiral::manifestPins(withShell);
+    require(pins.size() == 3 && pins.back().uuid == fixture.surface && pins.back().outerShell,
+            "notification admission includes the role-tagged shell");
     // A manifest naming something other than a surface as its shell is
     // reported, not read as one.
     auto misnamed = document;
     for (const auto& object : document["manifest"]["objects"])
         if (object["kind"] == "point_collection") misnamed["manifest"]["outer_shell"] = object;
+    auto& misnamedObjects=misnamed["manifest"]["objects"];
+    misnamedObjects.erase(std::find_if(misnamedObjects.begin(),misnamedObjects.end(),[](const auto& object){return object["kind"]=="point_collection";}));
     const auto misread = fixture.read(misnamed);
     require(!misread.outerShell && misread.problems.size() == 1 && misread.surfaces.size() == 1
                 && misread.problems[0].find("not a surface") != std::string::npos,
@@ -374,6 +413,7 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     // An object this store does not hold is missing and shows nothing.
     auto missing = document;
     missing["manifest"]["objects"][0]["uuid"] = util::newUuid();
+    missing["manifest"]["objects"][0]["reference"]["object"] = missing["manifest"]["objects"][0]["uuid"];
     inputs = fixture.read(missing);
     require(inputs.surfaces.at(0).state == InputState::Missing && !inputs.surfaces.at(0).surface,
             "a missing object has no geometry");
@@ -385,6 +425,56 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     inputs = fixture.read(other);
     require(inputs.surfaces.empty() && inputs.problems.size() == 1, "another store is refused");
 }
+
+void shellRefreshMatchesFullRead(const fs::path& directory, HistoryMode sourceHistory,
+                                std::optional<HistoryMode> overlayHistory)
+{
+    Fixture fixture(directory / "source.vcobj", sourceHistory);
+    if (overlayHistory) {
+        fixture.session->detach(fixture.attachment);
+        OpenOptions options; options.author = "shell-refresh";
+        { auto source = ObjectStore::open(fixture.path, options);
+          auto txn = source.write(); source.seal(txn); txn.commit(); }
+        const auto overlay = directory / "overlay.vcobj";
+        options.history = *overlayHistory;
+        { auto collection = ObjectCollection::create(overlay, {fixture.path}, options); }
+        fixture.path = overlay;
+        fixture.attachment = fixture.session->attach(overlay, options);
+    }
+    auto document = fixture.manifest();
+    document["manifest"]["outer_shell"] = document["manifest"]["objects"][0];
+    document["manifest"]["objects"].erase(document["manifest"]["objects"].begin());
+    document["manifest"]["relationships"] = Json::array();
+    auto inputs = fixture.read(document);
+    require(inputs.unchanged() && inputs.count(InputState::Fitted) == 3, "shell starts fitted");
+    require(inputs.addedRelationships.empty(), "shell is not admitted as a fitting endpoint");
+    require(!fixture.changes(document, {fixture.fiber}, {}).inputs.outerShell,
+            "unrelated refresh does not reread the shell");
+    fixture.act(fixture.pins({fixture.surface}), [&](auto& db, auto& txn) {
+        db.setMeta(txn, fixture.surface, "source", R"({"spiral_patch_erode_cells":7})");
+    });
+    inputs = incremental(fixture, document, inputs, {fixture.surface}, {}, "shell metadata edit");
+    require(inputs.outerShell->state == InputState::MetadataChanged
+                && inputs.count(InputState::MetadataChanged) == 1 && !inputs.unchanged(),
+            "shell metadata freshness is counted");
+    fixture.act(fixture.pins({fixture.surface, fixture.pcl}), [&](auto& db, auto& txn) {
+        GeometryData geometry{"surface", 1, "source_xyz", R"({"scale":[1,1]})",
+            {array("points", "<f4", {2, 2, 3}, std::vector<float>{10,20,40, 11,20,40, 10,21,40, 11,21,40})}};
+        db.removeEdge(txn, fixture.link);
+        db.putGeometry(txn, fixture.surface, geometry, db.currentGeometry(txn, fixture.surface)->uuid);
+    });
+    inputs = incremental(fixture, document, inputs, {fixture.surface}, {}, "shell geometry edit");
+    require(inputs.outerShell->state == InputState::Edited
+                && inputs.outerShell->surface->rawPointsPtr()->at<cv::Vec3f>(0, 0)[2] == 40,
+            "shell refresh installs the changed geometry");
+    fixture.act(fixture.pins({fixture.surface, fixture.pcl}), [&](auto& db, auto& txn) {
+        db.deleteObject(txn, fixture.surface);
+    });
+    inputs = incremental(fixture, document, inputs, {fixture.surface}, {}, "shell deletion");
+    require(inputs.outerShell->state == InputState::Missing && !inputs.outerShell->surface
+                && inputs.count(InputState::Missing) == 1 && !inputs.unchanged(),
+            "deleted shell drops its geometry and remains a missing input");
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -394,6 +484,11 @@ int main(int argc, char** argv)
         adapterMetadataMatchesThePythonAdapter();
         QTemporaryDir directory;
         readsCurrentInputsAndTheirDifferences(directory.path().toStdString());
+        for (auto source : {HistoryMode::Off, HistoryMode::On})
+            for (auto overlay : {std::optional<HistoryMode>{}, std::optional{HistoryMode::Off}, std::optional{HistoryMode::On}}) {
+                QTemporaryDir shellDirectory;
+                shellRefreshMatchesFullRead(shellDirectory.path().toStdString(), source, overlay);
+            }
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << "\n";
         return 1;

@@ -384,21 +384,14 @@ def _layer_output_name(cfg: ExportConfig, store: _StoreTarget | None, layer: int
 
 
 def _stored_sources(job_spec: dict | None) -> tuple[str, ...]:
-	"""UUIDs of the stored surfaces a job read (its ``{"type": "surface", "uuid": ...}`` references)."""
-	found: list[str] = []
-
-	def visit(item: object) -> None:
-		if isinstance(item, dict):
-			if item.get("type") == "surface" and isinstance(item.get("uuid"), str) and item["uuid"] not in found:
-				found.append(item["uuid"])
-			for child in item.values():
-				visit(child)
-		elif isinstance(item, list):
-			for child in item:
-				visit(child)
-
-	visit(job_spec)
-	return tuple(found)
+	"""Source UUID projection of the exact inputs captured when the job ran."""
+	if job_spec is None:
+		return ()
+	if "input_references" not in job_spec:
+		raise ValueError("checkpoint has no selected input references; regenerate its input provenance")
+	from vc_object_store import object_versions_from_json
+	return tuple(dict.fromkeys(ref["object"] for ref in
+		object_versions_from_json(json.dumps(job_spec["input_references"]))))
 
 
 def _mark_segment_vertices(

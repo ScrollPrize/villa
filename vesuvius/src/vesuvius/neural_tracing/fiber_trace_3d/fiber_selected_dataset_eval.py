@@ -82,15 +82,16 @@ def run(settings):
     from .fiber_workflows import run as dispatch
     from .fiber_implicit_match_report import run as match_report
     from .fiber_uv_arc_phase import event_arc_points
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest,read_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_source_version,fibers_digest,read_polylines
     started=time.monotonic();root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     dataset=Path(settings['dataset']);base_path=Path(settings['base_config'])
     config=json.loads(base_path.read_text())['fiber_implicit_winding']
     config.update(settings.get('parameters',{}))
+    source_version=fiber_source_version(config['fibers'])
     parent=arrays(dataset/'tensors.npz')
     curves=read_polylines(dataset/'selected.vcobj');sources=np.asarray([r['id'] for r,_ in curves],dtype=str)
     if len(sources)!=len(np.unique(sources)):raise ValueError('Duplicate selected source')
-    for (row,xyz),(original,points) in zip(curves,read_polylines(config['fibers'],sources)):
+    for (row,xyz),(original,points) in zip(curves,read_polylines(config['fibers'],sources,source_version=source_version),strict=True):
         if row['id']!=original['id'] or not np.array_equal(xyz,points):raise ValueError('Changed selected geometry')
     paths=[base_path,dataset/'tensors.npz',dataset/'cross/cross_events.json',Path(__file__),Path(soft.__file__),Path(config['umbilicus'])]
     gtroot=Path(settings['gt_root']);gcfg_path=gtroot/'uv_whole/config.json'
@@ -109,8 +110,9 @@ def run(settings):
     if width_source and settings.get('initialization_stages'):
         raise ValueError('Width diagnostic requires fresh fiber state')
     if width_source.get('solution'):paths.append(Path(width_source['solution']))
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},
-                   fibers=dict(selected=fibers_digest(dataset/'selected.vcobj'),source=fibers_digest(config['fibers'])))
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},fiber_source=source_version,
+                   fibers=dict(selected=fibers_digest(dataset/'selected.vcobj'),
+                               source=fibers_digest(config['fibers'],source_version=source_version)))
     stamp=root/'inputs.json'
     if stamp.exists() and json.loads(stamp.read_text())!=signature:raise ValueError('Changed evaluation inputs/code')
     atomic_write(stamp,signature,durable=False)
@@ -127,7 +129,7 @@ def run(settings):
         atomic_write(root/'perpendicular_support_filter.json',geometry_filter,durable=False)
         print(json.dumps(dict(perpendicular_support_filter=geometry_filter)),flush=True)
     from .fiber_piece_split import split_graph
-    d=split_graph(d,config)
+    d=split_graph(d,config,source_version=source_version)
     d['degree']=np.bincount(np.r_[d['i'],d['j']],minlength=len(d['family'])).astype(np.float32)
     np.savez(root/'tensors.npz',**d)
     for key in list(config):
@@ -172,7 +174,7 @@ def run(settings):
     atomic_write(root/'width_initialization.json',width_info,durable=False)
     init=root/'init';init.mkdir(exist_ok=True)
     np.savez(init/'solution.npz',state=initial,widths=widths,**{k:d[k] for k in ('source_id','start','end','family')})
-    np.savez(init/'samples.npz',**soft.prepare_samples(config,d))
+    np.savez(init/'samples.npz',**soft.prepare_samples(config,d,source_version=source_version))
     atomic_write(init/'config.json',dict(tensor_sha256=sha256_file(root/'tensors.npz'),soft_samples=str(init/'samples.npz')),durable=False)
     stages=[];previous=None
     for index,stage in enumerate(settings.get('initialization_stages',[])):
@@ -183,7 +185,7 @@ def run(settings):
             raise ValueError('Unknown initialization model')
         atomic_write(root/f'initialization_{index}_config.json',{stage['model']:stage_config},durable=False)
         if not (stage_root/'summary.json').exists():
-            if stage['model']=='fiber_soft_winding':soft.run_prepared(stage_config)
+            if stage['model']=='fiber_soft_winding':soft.run_prepared(stage_config,source_version=source_version)
             else:dispatch({stage['model']:stage_config})
         stage_saved=json.loads((stage_root/'config.json').read_text())
         if any(stage_saved.get(k)!=v for k,v in stage_config.items()):raise ValueError('Initialization configuration mismatch')

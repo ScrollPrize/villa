@@ -44,19 +44,26 @@ detail::Detection detail::detectTracksToTracks(StoredGeometry& inputs, const Tra
         checkCancelled(cancel);
         std::map<std::string, std::vector<objects::ObjectRecord>> datasets;
         for (auto& object : inputs.select("track", params.trackUuids)) {
-            if (!params.datasetRef.empty() && (!object.track || object.track->datasetRef != params.datasetRef)) {
-                if (!params.trackUuids.empty()) throw std::runtime_error("selected track is outside dataset_ref");
-                continue;
-            }
-            ++report.objectsConsidered;
             if (!object.track || object.track->datasetRef.empty())
                 throw std::runtime_error("track has no dataset_ref: " + object.uuid);
-            datasets[object.track->datasetRef].push_back(std::move(object));
+            datasets[inputs.sourcePath(object).generic_string()].push_back(std::move(object));
         }
-        if (!params.datasetRef.empty() && datasets.empty())
-            throw std::runtime_error("no registered tracks for dataset_ref: " + params.datasetRef);
+        if (!params.datasetRef.empty()) {
+            const auto requested = std::filesystem::weakly_canonical(params.datasetRef).generic_string();
+            for (auto it = datasets.begin(); it != datasets.end();) {
+                // A raw spelling identifies its whole resolved group, including
+                // inherited/overridden peers whose locators were rebased.
+                const bool matches = it->first == requested || std::any_of(it->second.begin(), it->second.end(),
+                    [&](const auto& object) { return object.track->datasetRef == params.datasetRef; });
+                if (matches) { ++it; continue; }
+                if (!params.trackUuids.empty()) throw std::runtime_error("selected track is outside dataset_ref");
+                it = datasets.erase(it);
+            }
+            if (datasets.empty()) throw std::runtime_error("no registered tracks for dataset_ref: " + params.datasetRef);
+        }
 
         for (auto& [dataset, objects] : datasets) {
+            report.objectsConsidered += objects.size();
             checkCancelled(cancel);
             std::map<uint64_t, objects::ObjectRecord*> byId;
             for (auto& object : objects) {

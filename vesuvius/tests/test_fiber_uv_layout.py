@@ -125,7 +125,7 @@ def test_prepare_reads_store_fibers_by_uuid(tmp_path):
     import json,sqlite3
     from lasagna.inference_provenance import sha256_file
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout import prepare
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, write_fibers
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, fiber_source_version, write_fibers
     ids=['00000000-0000-4000-8000-000000000003','4a000000-0000-4000-8000-000000000001','f0000000-0000-4000-8000-000000000002']
     theta=np.linspace(0,1,11)
     curves=[np.c_[50+20*np.cos(theta),50+20*np.sin(theta),np.full(11,40.)],
@@ -142,7 +142,8 @@ def test_prepare_reads_store_fibers_by_uuid(tmp_path):
         'CREATE TABLE constraints(id,fiber_a TEXT,fiber_b TEXT,arc_a,arc_b,ax,ay,az,bx,by,bz,parallel_score,perpendicular_score,'
         'winding_distance,parallel_winding_distance,normal_a,normal_b);')
     db.executemany('INSERT INTO metadata VALUES(?,?)',[(k,json.dumps(v)) for k,v in dict(complete=True,
-        provenance=dict(fibers_store_uuid='s',config=dict(fibers=str(store),coordinate_space='scroll/123'))).items()])
+        provenance=dict(fibers_store_uuid='s',fiber_source=fiber_source_version(store),
+                        config=dict(fibers=str(store),coordinate_space='scroll/123'))).items()])
     db.executemany('INSERT INTO fibers VALUES(?,?,?)',[(f,k,lengths[k]) for k,f in enumerate(ids)])
     normal=json.dumps(dict(valid=True,xyz=[1.,0.,0.]))
     def event(n,a,b,arc_a,arc_b,parallel):

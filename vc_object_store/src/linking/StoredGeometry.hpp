@@ -45,7 +45,7 @@ public:
     // The numbered version of every object selected so far: what a checked
     // write publishing links over them expects (every endpoint of a published
     // relationship must be expected).
-    objects::VersionSelection expectations() const;
+    objects::RecordSelection expectations() const;
     // Stored (conservative) bounds of an object's current geometry in working
     // voxels: the params' volume, else source XYZ * explicitScale. nullopt
     // when the store records none.
@@ -56,11 +56,12 @@ public:
     std::set<std::string> objectsNear(const std::string& kind, const Box& box, double margin,
                                       const CoordinateParams& params, double explicitScale = 1.0);
     const objects::ReadTxn& txn() const;
+    // Source identity through the same pinned store snapshot as geometry.
+    std::filesystem::path sourcePath(const objects::ObjectRecord& object) const;
 private:
     objects::ObjectStore& db_;
     std::optional<objects::ReadTxn> read_;
-    std::map<std::string, int64_t> generations_;
-    std::map<std::string, int64_t> versions_;
+    objects::RecordSelection versions_;
     std::map<std::string, std::string> revisions_;
 };
 

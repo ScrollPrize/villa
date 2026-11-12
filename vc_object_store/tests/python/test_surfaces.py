@@ -4,6 +4,20 @@ from vc_object_store import ObjectStore, Surface
 from vc_object_store.surfaces import create_surface, read_surface
 
 
+def test_exact_surface_reference_survives_deletion(db, db_path):
+    from vc_object_store import Surface, object_reference
+    uid = db.upsert_object(dict(kind='surface', meta={'coordinates': {'volume_uuid': 'a', 'scale_factor': 1}}))
+    points = np.full((2, 2, 3), 4, dtype='<f4')
+    db.put_geometry(uid, Surface.from_arrays(points, [1, 1]))
+    reference = object_reference(db.object(uid))
+    db.delete_object(uid)
+    grid = read_surface(db_path, uid, volume='a', reference=reference)
+    np.testing.assert_array_equal(grid.points, points)
+    assert object_reference(grid.record) == reference
+    with pytest.raises(ValueError, match='cannot be combined'):
+        read_surface(db_path, uid, volume='a', version=reference['version'], reference=reference)
+
+
 def test_created_surface_reads_back_through_registrations(db_path):
     ObjectStore.create(db_path, author="pytest").close()
     xyz = np.array([[[1, 2, 3], [4, 5, 6]], [[-1, -1, -1], [np.nan, 0, 0]]], dtype=np.float32)
@@ -20,12 +34,14 @@ def test_created_surface_reads_back_through_registrations(db_path):
         assert "area_vx2" not in record["meta"] and "format" not in record["meta"] and "uuid" not in record["meta"]
         assert record["surface"]["area"] == 0 and record["surface"]["grid_width"] == 2
         db.register_volume_transform("a", "b", [[2, 0, 0, 10], [0, 1, 0, 0], [0, 0, 1, 0]])
-    points, valid, scale, _, version, generation, revision, channels = read_surface(db_path, uid, volume="a")
-    assert channels == {"approval"} and revision and version == 1 and generation
+    grid = read_surface(db_path, uid, volume="a")
+    points, valid, scale = grid.points, grid.valid, grid.scale
+    assert grid.channels == {"approval"} and grid.geometry_revision and grid.version == 1 and grid.generation
     np.testing.assert_array_equal(valid, [[True, True], [False, False]])
     np.testing.assert_array_equal(points[0], xyz[0])
     assert (points[1] == -1).all() and scale == (0.05, 0.05)
-    points, valid, *_ = read_surface(db_path, uid, volume="b")
+    grid = read_surface(db_path, uid, volume="b")
+    points, valid = grid.points, grid.valid
     np.testing.assert_array_equal(points[0], [[12, 2, 3], [18, 5, 6]])
     assert (points[1] == -1).all()
 

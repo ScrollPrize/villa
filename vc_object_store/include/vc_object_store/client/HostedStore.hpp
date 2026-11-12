@@ -27,13 +27,6 @@
 
 namespace vc::objects {
 
-// A paged listing kept seeing new commits between its pages and gave up
-// rather than combine snapshots. Retry later or page a pinned selection.
-class StoreBusy : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
-
 struct HostedStoreOptions {
     int connections = 4;
     long connectTimeoutMs = 10000;
@@ -62,6 +55,11 @@ public:
 
     const std::string& endpoint() const { return endpoint_; }
     StoreStatus status();
+    // Registrations and route choices selected in one server read transaction.
+    VolumeTransforms volumeTransforms();
+    std::vector<ObjectVersion> versionsAt(const ObjectVersion& anchor);
+    std::optional<std::filesystem::path> resolveStoragePath(const std::string& objectUuid,
+        const std::optional<std::filesystem::path>& datasetRoot = std::nullopt);
     // The service's own state as JSON text (queues, staging, connections,
     // WAL checkpoints); see vc_object_server.
     std::string serviceReport();
@@ -86,6 +84,7 @@ public:
     // above rangeBytes, and reads the server refuses as too large for one
     // response, arrive as several range requests within both limits.
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid);
+    std::optional<ObjectRevision> objectAtGeometry(const std::string& revisionUuid);
     std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                            int64_t byteOffset = 0, const std::optional<int64_t>& byteCount = std::nullopt);
 
@@ -125,6 +124,7 @@ public:
     SelectionRecord recordSelection(const ObjectSelection&, int64_t pageSize = 1000, int maxRestarts = 3);
     // ObjectStore::geometryPointAnnotations.
     nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName);
+    int64_t nextGeometryPointId(const std::string& objectUuid, const std::string& arrayName);
     // Many geometry revisions in one request: each descriptor (nullopt when
     // the store has no such revision), the named arrays and point annotations
     // it has. Answers a non-empty prefix of `revisions` (the reply is bounded);
@@ -144,8 +144,9 @@ public:
     int64_t unboundObjectCount(const std::string& kind, const std::string& volume, StoreStatus* asOf = nullptr);
     std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt, StoreStatus* asOf = nullptr);
     // Every recorded revision of an object (empty when it never existed).
-    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr);
+    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr, bool ifRetained = false);
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&, StoreStatus* asOf = nullptr);
+    SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus&);
     // Budgets above the server's limits are clamped; the result's stop reason
     // reports a budget stop (complete() is false).
     RegionResult geometryRegion(const RegionSlice&, const RegionOptions& = {}, StoreStatus* asOf = nullptr);

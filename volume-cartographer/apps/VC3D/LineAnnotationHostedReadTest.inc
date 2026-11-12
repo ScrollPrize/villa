@@ -28,11 +28,16 @@
         link.controlPointIndex = 1; link.branchControlPointIndex = 1; link.branchFiberId = b.id; link.branchFileName = b.fileName;
         link.controlPointPosition = a.controlPoints[1]; link.branchControlPointPosition = b.controlPoints[1];
         link.controlPointDirection = {1, 0, 0}; link.branchControlPointDirection = {1, 0, 0};
-        link.pending = false;
+        // Created pending, approved by a second save (an approval is of a stored link).
+        link.pending = true;
         a.branches.push_back(link);
         std::swap(link.controlPointPosition, link.branchControlPointPosition);
         link.branchFiberId = a.id; link.branchFileName = a.fileName;
         b.branches.push_back(link);
+        batch = {controller.makeFiberSaveSnapshot(a), controller.makeFiberSaveSnapshot(b)};
+        controller.commitFiberStoreAction(batch);
+        a = batch[0].fiber; b = batch[1].fiber;
+        a.branches.front().pending = false; b.branches.front().pending = false;
         batch = {controller.makeFiberSaveSnapshot(a), controller.makeFiberSaveSnapshot(b)};
         controller.commitFiberStoreAction(batch);
         return std::array<std::string, 3>{a.uuid, b.uuid, c.uuid};
@@ -65,11 +70,11 @@
         // A second writer on the same file, expecting both endpoints' heads.
         const auto checkedWrite = [&](const std::function<void(ObjectStore&, WriteTxn&)>& edit) {
             auto db = ObjectStore::open(storePath, readOptions);
-            VersionSelection expected;
+            RecordSelection expected;
             {
                 auto txn = db.read();
                 for (const auto& uuid : {aUuid, bUuid})
-                    expected[uuid] = db.currentObjectRevision(txn, uuid)->version;
+                    expected[uuid] = db.currentObjectRevision(txn, uuid)->reference();
             }
             auto txn = db.write(expected);
             edit(db, txn);
@@ -212,7 +217,7 @@
         auto submitOther = [&](std::vector<TransactionOperation> operations, const std::string& expectUuid) {
             auto request = writer.newRequest(other);
             writer.readStore(other, [&](const StoreReader& reader, const auto&) {
-                request.expectedObjects[expectUuid] = reader.currentObject(expectUuid)->version;
+                request.expectedObjects[expectUuid] = reader.currentObject(expectUuid)->reference();
             });
             request.operations = std::move(operations);
             writer.submit(other, request);
@@ -221,49 +226,33 @@
         require(first && first->branches.size() == 1, "hosted decode of A with its link");
         auto fast = controller._storedFiberFastValidations;
         require(read(aUuid) && controller._storedFiberFastValidations == fast + 1, "hosted fast path");
-        // Provenance: B changes after A's decode selected the heads; A's
-        // dependency on B must name the B revision that was decoded, so the next
-        // read revalidates and A's branch follows the new B.
+        // Another client's commit while A is being decoded: the read is
+        // refused (its graph would straddle two store positions), and the
+        // next read decodes A and B at the new position.
         controller._storedFiberDecodeCache.clear(); controller._storedFiberDependencies.clear();
-        bool changed = false;
-        Controller::StoredFiberPtr decodedDuringChange;
+        bool changed = false, refused = false;
         controller._fiberReadTestStage = [&](const char* stage) {
             if (changed || std::string_view(stage) != "decode-heads") return;
             changed = true;
             submitOther({SetMetaOp{bUuid, "provenance_test", "true"}}, bUuid);
         };
-        decodedDuringChange = read(aUuid);
+        try { (void)read(aUuid); } catch (const std::exception&) { refused = true; }
         controller._fiberReadTestStage = {};
-        require(changed && decodedDuringChange, "the interleaved write ran during the decode");
-        const auto slow = controller._storedFiberSlowValidations;
+        require(changed && refused, "a read interleaved with another client's commit is refused");
         const auto afterChange = read(aUuid);
-        require(controller._storedFiberSlowValidations == slow + 1, "a moved store position validates by listing");
-        require(afterChange && afterChange != decodedDuringChange,
-                "A's dependency names the B revision it decoded, so B's newer head re-decodes A");
         const auto peer = controller.storedFibersShared(std::vector<std::string>{bUuid}, false);
-        require(afterChange && !peer.empty(), "A and B still decode");
-        // Stamp ordering: a commit between the validation's status and its
-        // listing leaves the stamp at the older position, so the next read
-        // (unchanged position) still validates by listing.
-        (void)read(cUuid);
-        bool interleaved = false;
-        controller._fiberReadTestStage = [&](const char* stage) {
-            if (interleaved || std::string_view(stage) != "validate-status") return;
-            interleaved = true;
-            // Unrelated to C: C is accepted unchanged, at the status read before.
-            submitOther({SetMetaOp{aUuid, "stamp_test", "true"}}, aUuid);
-        };
-        submitOther({SetMetaOp{aUuid, "move_position", "true"}}, aUuid);
-        const auto cBefore = read(cUuid);
-        controller._fiberReadTestStage = {};
-        require(interleaved, "the interleaved write ran during validation");
-        const auto slowBefore = controller._storedFiberSlowValidations;
-        require(read(cUuid) == cBefore, "C was accepted, not re-decoded");
-        require(controller._storedFiberSlowValidations == slowBefore + 1,
-                "a validation stamped before an interleaved commit does not certify the newer position");
-        fast = controller._storedFiberFastValidations;
-        (void)read(cUuid);
-        require(controller._storedFiberFastValidations == fast + 1, "after which the fast path resumes");
+        require(afterChange && afterChange->branches.size() == 1 && !peer.empty(), "A and B decode at the new position");
+        // Any commit ends every cached decode (each carries the position its
+        // graph was loaded at): C is decoded again after a change to A.
+        {
+            const auto cBefore = read(cUuid);
+            fast = controller._storedFiberFastValidations;
+            require(read(cUuid) == cBefore && controller._storedFiberFastValidations == fast + 1, "an unchanged position answers from the cache");
+            submitOther({SetMetaOp{aUuid, "move_position", "true"}}, aUuid);
+            const auto cAfter = read(cUuid);
+            require(cAfter && cAfter != cBefore && cAfter->graphCommit && cBefore->graphCommit &&
+                    *cAfter->graphCommit == *cBefore->graphCommit + 1, "a moved position decodes again, at that position");
+        }
 
         // Bounded stale validation: inside one HostedStatusScope the fast path
         // answers from the scope's first status; a read in a nested event loop
@@ -304,31 +293,6 @@
             require(committed, "the commit ran between the validation status and the decode");
             const auto cAfter = read(cUuid);
             require(cAfter && cAfter != cBefore, "the decode's newer observation dropped the memo candidate");
-        }
-        // The same through the feed helper: entries stamped at P1 while the
-        // cache position is older (as a worker merge leaves it). Reading A
-        // validates at P1, another writer changes C, the helper that checks
-        // the feed from the older position sees the newer status, A needs no
-        // decode; a later read of C in the scope must not be answered from P1.
-        (void)read(aUuid);
-        (void)read(cUuid);
-        {
-            auto older = *controller._storedFiberCachePosition;
-            older.sequence -= 1;
-            controller._storedFiberCachePosition = older;
-            const Controller::HostedStatusScope scope(controller);
-            bool committed = false;
-            controller._fiberReadTestStage = [&](const char* stage) {
-                if (committed || std::string_view(stage) != "validate-status") return;
-                committed = true;
-                submitOther({SetMetaOp{cUuid, "helper_test", "true"}}, cUuid);
-            };
-            const auto cBefore = controller._storedFiberDecodeCache.at(cUuid);
-            (void)read(aUuid);
-            controller._fiberReadTestStage = {};
-            require(committed, "the commit ran during A's validation");
-            const auto cAfter = read(cUuid);
-            require(cAfter && cAfter != cBefore, "the feed helper's observation ended the memo candidate");
         }
         // Attaching and detaching a store the controller does not read leaves
         // it alone; changing its fiber route resets it.
@@ -397,9 +361,9 @@
             deliver();
             const auto a2 = view(aUuid);
             require(sequence() == before + 1 && a2 && a2 != a1, "and is decoded again after it");
-            fast = viewing._storedFiberFastValidations;
-            require(view(cUuid) == c1 && viewing._storedFiberFastValidations == fast + 1,
-                    "an entry the commit did not touch moved with the view");
+            const auto c1b = view(cUuid);
+            require(c1b && c1b != c1 && c1b->graphCommit == sequence(),
+                    "every cached decode ends with the commit: C is decoded again at the new position");
             // This controller's own commit directly after the view: the view
             // moves with it, what it changed is decoded once, and its event
             // finds nothing to do.
@@ -410,27 +374,32 @@
                 viewing.commitFibers({&own});
                 require(sequence() == at + 1, "an own commit directly after the view moves it");
                 const auto c2 = view(cUuid);
-                require(c2 && c2 != c1 && c2->storePin == own.storePin &&
+                require(c2 && c2 != c1b && c2->storePin == own.storePin && c2->graphCommit == at + 1 &&
                         std::find(c2->tags.begin(), c2->tags.end(), "view-own") != c2->tags.end(),
-                        "the saved fiber is decoded at its new version");
+                        "the saved fiber is decoded at its new version and position");
+                const auto a3 = view(aUuid);
                 fast = viewing._storedFiberFastValidations;
-                require(view(cUuid) == c2 && view(aUuid) == a2 && viewing._storedFiberFastValidations == fast + 2,
-                        "and is cached at the new position, like the fibers it did not touch");
+                require(view(cUuid) == c2 && view(aUuid) == a3 && viewing._storedFiberFastValidations == fast + 2,
+                        "and reads at that position answer from the cache");
                 deliver();
                 fast = viewing._storedFiberFastValidations;
-                require(sequence() == at + 1 && view(cUuid) == c2 && view(aUuid) == a2 &&
+                require(sequence() == at + 1 && view(cUuid) == c2 && view(aUuid) == a3 &&
                         viewing._storedFiberFastValidations == fast + 2, "its own event changes nothing");
-                // With another client's commit in between, the view waits for the events.
+                // Another client's commit this controller has not seen: a save
+                // from the older position is refused; after its event, the
+                // fiber read again saves.
                 submitOther({SetMetaOp{aUuid, "view_between", "true"}}, aUuid);
                 Controller::StoredFiber again = *view(cUuid);
                 again.tags.push_back("view-own-2");
-                viewing.commitFibers({&again});
-                require(sequence() == at + 1, "an own commit after an unseen one leaves the view");
+                bool refusedSave = false;
+                try { viewing.commitFibers({&again}); } catch (const std::exception&) { refusedSave = true; }
+                require(refusedSave, "a save that has not seen another client's commit is refused");
                 deliver();
-                const auto a3 = view(aUuid);
+                again = *view(cUuid);
+                again.tags.push_back("view-own-2");
+                viewing.commitFibers({&again});
                 const auto c3 = view(cUuid);
-                require(sequence() == at + 3 && a3 && a3 != a2 && c3 && c3->storePin == again.storePin,
-                        "both are current once the events arrive");
+                require(sequence() == at + 3 && c3 && c3->storePin == again.storePin, "and succeeds from the current position");
             }
         }
         // Background publication: a placement's save runs on a worker; saves
@@ -445,13 +414,14 @@
             const auto stored = [&] {
                 return publishing.readStoredFibers(std::vector<std::string>{cUuid}, true).at(0);
             };
-            const auto original = stored();
+            const auto openSession = [&](const Controller::StoredFiber& original, const std::string& name) {
             auto live = std::make_shared<Controller::LineAnnotationSession>();
-            live->surfaceName = "publication-test";
+            live->surfaceName = name;
             live->fiberId = original.id; live->fiberUuid = original.uuid;
             live->fiberFileName = original.fileName; live->fiberUsername = original.username;
             live->fiberStartedAt = original.startedAt; live->fiberSequence = original.sequence;
             live->storePin = original.storePin; live->coordinateIdentity = original.coordinateIdentity;
+            live->graphCommit = original.graphCommit;
             live->frame = original.frame; live->fiberOptimizationMode = original.optimizationMode;
             live->fiberTags = original.tags; live->fiberManualHvTag = original.manualHvTag;
             live->fiberWidth = original.width; live->fiberWidthGapFraction = original.widthGapFraction;
@@ -471,6 +441,13 @@
             }
             Controller::PaneRecord pane; pane.surfaceName = live->surfaceName; pane.session = live;
             publishing._panes.push_back(pane);
+            return live;
+            };
+            const auto original = stored();
+            const auto live = openSession(original, "publication-test");
+            // A second open fiber (A, not linked to C): this controller's
+            // saves of C must not leave its session behind the store.
+            const auto other = openSession(publishing.readStoredFibers(std::vector<std::string>{aUuid}, true).at(0), "publication-other");
             const auto settle = [&](const char* what) {
                 QElapsedTimer waited; waited.start();
                 while ((publishing._publication || !publishing._afterPublication.empty() ||
@@ -492,6 +469,15 @@
             publishing.saveSessionAsFiber(*live, false, true);
             require(publishing._afterPublication.size() == 1, "saves behind a publication queue once per session");
             settle("the publication and the queued save finish");
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                other->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*other, false);
+                require(publishing._fiberSaveFailureCount == before &&
+                        publishing.readStoredFibers(std::vector<std::string>{aUuid}, true).at(0).width == other->fiberWidth,
+                        "another open fiber still saves after this controller's saves of C");
+                settle("nothing queued after the other fiber's save");
+            }
             require(publishing._fiberSaveFailureCount == failures && live->storePin != pin &&
                     stored().width == live->fiberWidth && stored().storePin == live->storePin,
                     "the queued save stored the session as it was when it ran, at the pin the session holds");
@@ -611,7 +597,7 @@
             fiber = batch[0].fiber; partner = batch[1].fiber;
             Controller::FiberBranchRef link;
             link.controlPointIndex = 1; link.branchControlPointIndex = 2; link.branchFiberId = partner.id;
-            link.branchFileName = partner.fileName; link.pending = false; link.adjacent = true;
+            link.branchFileName = partner.fileName; link.pending = true; link.adjacent = true;
             link.controlPointPosition = fiber.controlPoints[1]; link.branchControlPointPosition = partner.controlPoints[2];
             link.controlPointDirection = {1, 0, 0}; link.branchControlPointDirection = {1, 0, 0};
             fiber.branches.push_back(link);
@@ -619,6 +605,10 @@
             std::swap(link.controlPointPosition, link.branchControlPointPosition);
             link.branchFiberId = fiber.id; link.branchFileName = fiber.fileName;
             partner.branches.push_back(link);
+            batch = {creating.makeFiberSaveSnapshot(fiber), creating.makeFiberSaveSnapshot(partner)};
+            creating.commitFiberStoreAction(batch);
+            fiber = batch[0].fiber; partner = batch[1].fiber;
+            fiber.branches.front().pending = false; partner.branches.front().pending = false;
             batch = {creating.makeFiberSaveSnapshot(fiber), creating.makeFiberSaveSnapshot(partner)};
             creating.commitFiberStoreAction(batch);
             boundUuid = batch.front().fiber.uuid;
@@ -630,11 +620,11 @@
         registration = volumeTransformRecord(registration, source, volume->id(), VolumeAffine::identity(), "test registration");
         {
             auto db = ObjectStore::open(transformed, readOptions);
-            VersionSelection expected;
+            RecordSelection expected;
             {
                 auto txn = db.read();
-                expected[boundUuid] = db.currentObjectRevision(txn, boundUuid)->version;
-                expected[partnerUuid] = db.currentObjectRevision(txn, partnerUuid)->version;
+                expected[boundUuid] = db.currentObjectRevision(txn, boundUuid)->reference();
+                expected[partnerUuid] = db.currentObjectRevision(txn, partnerUuid)->reference();
             }
             expected[registration.uuid] = std::nullopt;  // created here
             auto txn = db.write(expected);
@@ -673,7 +663,7 @@
         {
             auto request = editor.newRequest(editing);
             editor.readStore(editing, [&](const StoreReader& reader, const auto&) {
-                request.expectedObjects[registration.uuid] = reader.currentObject(registration.uuid)->version;
+                request.expectedObjects[registration.uuid] = reader.currentObject(registration.uuid)->reference();
             });
             request.operations = {UpdateObjectOp{objectRecordJson(registration)}};
             editor.submit(editing, request);
@@ -693,23 +683,6 @@
             require(!refreshed && reading._storedFiberDecodeCache.contains(boundUuid),
                     "skips the transform refresh and is cached");
         }
-        // Another commit: the store moved past the last check, so the read
-        // refreshes first. A failed refresh: the decode is returned but not cached.
-        {
-            auto request = editor.newRequest(editing);
-            editor.readStore(editing, [&](const StoreReader& reader, const auto&) {
-                request.expectedObjects[registration.uuid] = reader.currentObject(registration.uuid)->version;
-            });
-            request.operations = {UpdateObjectOp{objectRecordJson(registration)}};
-            editor.submit(editing, request);
-        }
-        reading._storedFiberDecodeCache.clear(); reading._storedFiberDependencies.clear();
-        reading._fiberReadTestStage = [](const char* stage) {
-            if (std::string_view(stage) == "transforms-refresh") throw std::runtime_error("refresh unavailable");
-        };
-        require(readBound() == before + 12, "a decode after a failed refresh is still returned");
-        reading._fiberReadTestStage = {};
-        require(!reading._storedFiberDecodeCache.contains(boundUuid), "but not cached");
         // The Fiber Map snapshot with its store reads on another thread equals
         // the synchronous one: same runtime ids (fresh controllers, so every
         // uuid is new to both), labels, geometry and links.

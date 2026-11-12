@@ -10,6 +10,13 @@ void attachRelationshipVersions(sqlite3*, std::vector<EdgeRecord>&);
 // Tables shared by new stores and the offline converter. `generation` is the
 // initial active history generation.
 void createVersionSchema(sqlite3*, const std::string& generation, const std::string& reason = "created");
+// Operational request deduplication, independent of archival history. Created
+// lazily for history-off typed requests; immutable batch imports omit it.
+void createReceiptSchema(sqlite3*);
+// Only for maintenance that forks logical store identity. A new logical store
+// must not answer retries belonging to its source store.
+void clearTransactionReceipts(sqlite3*);
+void recordCurrentChange(sqlite3*, const std::array<unsigned char,16>& uuid, const char* changeKind);
 
 std::string activeGeneration(sqlite3*);
 int64_t commitSequence(sqlite3*);
@@ -23,18 +30,18 @@ int64_t revisionVersion(sqlite3*, const std::string& revisionUuid);
 // commit sequence unchanged. Called only from publishHistory.
 class CommitPublisher {
 public:
-    CommitPublisher(sqlite3* db, int64_t publishedAtUs);
+    CommitPublisher(sqlite3* db, int64_t publishedAtUs, bool baseline = false);
     int64_t object(const std::string& objectUuid, const std::string& revisionUuid, bool deleted);
     // nullopt revision records the relationship's deletion.
     int64_t relationship(const std::string& edgeUuid, const std::optional<std::string>& revisionUuid);
     std::optional<int64_t> sequence() const { return sequence_; }
 private:
-    int64_t nextObject(const std::string& objectUuid);
     void begin();
     sqlite3* db_;
     std::string generation_;
     int64_t publishedAtUs_;
     std::optional<int64_t> sequence_;
+    bool baseline_ = false;
 };
 
 // Called by Txn::release after publishHistory, inside the write transaction:
@@ -49,4 +56,7 @@ TransactionReceipt receiptFromJson(const nlohmann::json&);
 // Begin-time checks for TransactionContext (writer lock held). Translates
 // object expectations to revision expectations for the strict publish checks.
 void checkTransactionContext(sqlite3*, const TransactionContext&, RevisionSelection& expectedRevisions);
+// One setup path for low-level checked writes and typed submit requests:
+// validates expectations, tracks checked keys and provisions request receipts.
+void prepareCheckedWrite(sqlite3*, const TransactionContext&, RevisionSelection& expectedRevisions);
 }

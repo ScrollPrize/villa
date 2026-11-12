@@ -1,4 +1,5 @@
 #include "SpiralPointCollectionEdit.hpp"
+#include <vc_object_store/objects/TransactionJson.hpp>
 
 #include <QJsonArray>
 
@@ -211,6 +212,11 @@ QJsonDocument EditablePclDraft::replacementDocument() const
     }
 
     QJsonObject collection = sourceCollection;
+    auto metadata = collection.value(QStringLiteral("metadata")).toObject();
+    if (reference)
+        metadata[QLatin1String(kObjectReferenceKey)] = QJsonDocument::fromJson(
+            QByteArray::fromStdString(vc::objects::objectVersionToJson(*reference))).object();
+    collection[QStringLiteral("metadata")] = metadata;
     collection[QStringLiteral("points")] = pointsObject;
     QJsonObject root = topLevel;
     root[QStringLiteral("vc_pointcollections_json_version")] = QStringLiteral("1");
@@ -236,6 +242,12 @@ std::vector<EditablePclDraft> importEditablePcls(
         draft.collectionId = collectionId;
         draft.topLevel = root;
         draft.sourceCollection = collection;
+        const auto metadata = collection.value(QStringLiteral("metadata")).toObject();
+        const auto reference = metadata.value(QLatin1String(kObjectReferenceKey));
+        if (!reference.isUndefined())
+            draft.reference = vc::objects::objectVersionFromJson(QJsonDocument(reference.toObject()).toJson(QJsonDocument::Compact).toStdString());
+        if (metadata.contains(QStringLiteral("object_uuid")) && !draft.reference)
+            throw std::invalid_argument("point collection has no complete reference; regenerate the document");
         draft.sourceToPreviewScale = sourceToPreviewScale;
         draft.sourceRevision = sourceRevision;
         draft.editable = sourceEditable

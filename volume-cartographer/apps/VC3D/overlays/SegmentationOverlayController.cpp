@@ -28,6 +28,7 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceQuerySet.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "SurfaceCatalog.hpp"
 #include <vc_object_store/Uuid.hpp>
@@ -694,21 +695,19 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
 
     if (needsRebuild) {
         // Overlay surfaces by id (stored, or drafts) and their colours.
-        std::vector<std::string> targets;
-        std::unordered_map<std::string, cv::Vec3b> targetColors;
+        std::vector<SurfaceQuerySet::SurfacePtr> targets;
+        std::unordered_map<const QuadSurface*, cv::Vec3b> targetColors;
         targets.reserve(overlays.size());
         targetColors.reserve(overlays.size());
 
         for (const auto& [surfId, color] : overlays) {
             auto surfBase = _state->surface(surfId);
             auto overlaySurf = std::dynamic_pointer_cast<QuadSurface>(surfBase);
-            if (!overlaySurf || overlaySurf.get() == currentQuad || overlaySurf->id == currentQuad->id ||
-                !vc::objects::util::isUuid(overlaySurf->id)) {
+            if (!overlaySurf || overlaySurf.get() == currentQuad) {
                 continue;
             }
-            const auto uuid = vc::objects::util::canonicalUuid(overlaySurf->id);
-            targets.push_back(uuid);
-            targetColors[uuid] = color;
+            targets.push_back(overlaySurf);
+            targetColors[overlaySurf.get()] = color;
         }
 
         if (targets.empty()) {
@@ -759,14 +758,14 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
             auto cancel = std::make_shared<std::atomic_bool>(false);
             _overlapCancel = cancel;
 
+            auto index = std::make_shared<SurfaceQuerySet>();
+            index->rebuild(targets); // Snapshot displayed grids before worker threads use them.
             auto future = QtConcurrent::run(
                 [sampledPoints = std::move(sampledPoints),
                  targets = std::move(targets),
                  targetColors = std::move(targetColors),
                  threshold,
-                 session,
-                 sources = _state->surfaceSources(),
-                 volume = vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{})),
+                 index,
                  cancel]() -> QImage {
                 try {
                     QElapsedTimer timer;
@@ -780,7 +779,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
 
                     // Explicit fan-out: VC3D pins the implicit pools (OpenCV/
                     // OMP) to one thread, so parallelism must be spawned here.
-                    // Each row is one store read; rows own their scanlines.
+                    // Rows query one immutable displayed-geometry snapshot.
                     const unsigned hw = std::thread::hardware_concurrency();
                     const std::size_t workerCount = std::max<std::size_t>(
                         1, std::min<std::size_t>(hw == 0 ? 4 : hw,
@@ -808,14 +807,14 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                                     }
                                 }
                                 // The nearest overlay surface within the threshold colours the sample.
-                                const auto hits = SurfaceCatalog::nearest(*session, sources, volume,
-                                                                          targets, points, threshold);
                                 auto* scanline = reinterpret_cast<QRgb*>(bits + r * bytesPerLine);
                                 for (size_t i = 0; i < points.size(); ++i) {
-                                    if (hits[i].empty()) {
+                                    const auto& p = points[i];
+                                    const auto hit = index->locate({{float(p[0]), float(p[1]), float(p[2])}, threshold, {}});
+                                    if (!hit) {
                                         continue;
                                     }
-                                    const auto colorIt = targetColors.find(hits[i].front().objectUuid);
+                                    const auto colorIt = targetColors.find(hit->surface.get());
                                     if (colorIt == targetColors.end()) {
                                         continue;
                                     }

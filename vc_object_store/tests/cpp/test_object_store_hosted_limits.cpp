@@ -149,11 +149,12 @@ try {
         require(chunked.starts_with("HTTP/1.1 413"), "oversized chunked command refused");
     }
     HostedStore hosted(endpoint);
+    HostedStore* activeClient = &hosted;
     const auto initial = hosted.status();
     auto request = [&](VersionSelection expected, std::vector<TransactionOperation> operations, std::string author) {
         TransactionRequest r;
         r.requestUuid = util::newUuid(); r.storeUuid = initial.storeUuid; r.generation = initial.generation;
-        r.author = std::move(author); r.expectedObjects = std::move(expected); r.operations = std::move(operations);
+        r.author = std::move(author); r.expectedObjects = testNumberedGuards(*activeClient, expected); r.operations = std::move(operations);
         return r;
     };
 
@@ -328,6 +329,7 @@ try {
     const auto endpoint2 = "http://127.0.0.1:" + std::to_string(service->port());
     const auto port2 = service->port();
     HostedStore client(endpoint2);
+    activeClient = &client;
 
     // Status latency while four clients upload 16 MiB payloads at once
     // through one transfer worker.

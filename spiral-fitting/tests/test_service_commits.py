@@ -51,8 +51,9 @@ def _fit(binding, tmp_path):
     state.session_id = SESSION
     state.session_request = {'project': {
         'name': 's1', 'volume': VOLUME, 'base_shape_zyx': BASE_SHAPE,
-        'umbilicus': {'uuid': UMBILICUS['uuid'], 'generation': UMBILICUS['generation'],
-                      'version': UMBILICUS['version'], 'points': 2}}}
+        'umbilicus': {'reference': dict(store=UMBILICUS['store'], object=UMBILICUS['uuid'],
+                                        generation=UMBILICUS['generation'], version=UMBILICUS['version']),
+                      'points': 2}}}
     serial = iter(range(1, 1000))
 
     def generation(**kwargs):
@@ -137,8 +138,8 @@ def test_a_commit_is_the_published_generation_with_its_provenance(fit):
     assert meta['model_state_sha256'] == MODEL_STATE
     assert meta['input_digest'] == fit.inputs.digest
     assert meta['input_position'] == fit.inputs.manifest['position']
-    assert meta['umbilicus'] == {'uuid': UMBILICUS['uuid'], 'generation': UMBILICUS['generation'],
-                                 'version': UMBILICUS['version']}
+    assert meta['umbilicus'] == {'reference': dict(store=UMBILICUS['store'], object=UMBILICUS['uuid'],
+                                                 generation=UMBILICUS['generation'], version=UMBILICUS['version'])}
     assert meta['coordinates']['volume_uuid'] == VOLUME
     provenance = meta['provenance']
     assert provenance['tool'] == 'spiral-fitting'

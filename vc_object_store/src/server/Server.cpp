@@ -8,6 +8,7 @@
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #if VC_OBJECT_SERVER_LINKING
 #include "vc_object_store/object_links/LinkObjects.hpp"
@@ -586,8 +587,7 @@ struct ServerState {
         auto txn = store->read();
         const auto revision = store->currentObjectRevision(txn, uuidSegment(uuid));
         if (!revision) return errorReply(http::status::not_found, "no object " + uuid);
-        return jsonReply(Json{{"status", Json::parse(storeStatusToJson(store->status(txn)))},
-                              {"revision", Json::parse(objectRevisionToJson(*revision))}}.dump());
+        return jsonReply(currentObjectResultToJson(store->status(txn), *revision));
     }
 
     Reply objectVersion(const std::string& uuid, const std::string& version, const Target& target)
@@ -611,6 +611,13 @@ struct ServerState {
         return jsonReply(geometryRevisionToJson(*revision));
     }
 
+    Reply geometryObject(const std::string& revisionUuid)
+    {
+        auto txn=store->read();
+        const auto object=store->objectAtGeometry(txn,uuidSegment(revisionUuid));
+        return object?jsonReply(objectRevisionToJson(*object)):errorReply(http::status::not_found,"geometry metadata unavailable");
+    }
+
     Reply geometryAnnotations(const std::string& revisionUuid, const std::string& array)
     {
         auto txn = store->read();
@@ -620,6 +627,12 @@ struct ServerState {
         if (int64_t(text.size()) > options.maxResponseBytes)
             return errorReply(http::status::payload_too_large, "point annotations exceed the response limit");
         return jsonReply(std::move(text));
+    }
+
+    Reply nextPointId(const std::string& objectUuid,const std::string& array)
+    {
+        auto txn=store->read();
+        return jsonReply(Json(store->nextGeometryPointId(txn,uuidSegment(objectUuid),array)).dump());
     }
 
     Reply geometryArray(const std::string& revisionUuid, const std::string& array, const Target& target)
@@ -850,10 +863,10 @@ struct ServerState {
         return jsonReply(uuidListResultToJson(store->status(txn), uuids));
     }
 
-    Reply objectHistory(const std::string& uuid)
+    Reply objectHistory(const std::string& uuid, const Target& target)
     {
         auto txn = store->read();
-        const auto history = store->objectHistory(txn, uuidSegment(uuid));
+        const auto history = store->objectHistory(txn, uuidSegment(uuid), target.integer("if_retained", 0) != 0);
         if (history.empty()) return errorReply(http::status::not_found, "no object " + uuid);
         return jsonReply(objectHistoryToJson(store->status(txn), history));
     }
@@ -863,6 +876,13 @@ struct ServerState {
         const auto versions = objectVersionsRequestFromJson(body);
         auto txn = store->read();
         return jsonReply(relationshipQueryResultToJson(store->status(txn), store->relationshipsAt(txn, versions)));
+    }
+
+    Reply querySelectedInputs(const std::string& body)
+    {
+        const auto [versions, position] = selectedInputsRequestFromJson(body);
+        auto txn = store->read();
+        return jsonReply(selectedInputsToJson(store->status(txn), LocalStoreReader(*store, txn).selectedInputs(versions, position)));
     }
 
     Reply queryVersions(const std::string& body)
@@ -935,18 +955,29 @@ struct ServerState {
         }
         if (method == http::verb::get && is({"v1", "changes"}))
             return {readers.get(), [this, target] { return changes(*target); }};
+        if (method == http::verb::get && is({"v1", "volume-transforms"}))
+            return {readers.get(), [this] {
+                auto txn = store->read();
+                std::vector<std::optional<ObjectRevision>> selected;
+                for (const auto* kind : {"volume_transform", "volume_transform_choice"})
+                    for (const auto& object : store->objectsByKind(txn, kind))
+                        selected.push_back(store->currentObjectRevision(txn, object.uuid));
+                return jsonReply(objectsAtVersionsResultToJson(store->status(txn), selected));
+            }};
         if (method == http::verb::get && is({"v1", "objects", "*"}))
             return {readers.get(), [this, target] { return currentObject(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "objects", "*", "versions", "*"}))
             return {readers.get(), [this, target] { return objectVersion(target->path[2], target->path[4], *target); }};
         if (method == http::verb::get && is({"v1", "objects", "*", "history"}))
-            return {readers.get(), [this, target] { return objectHistory(target->path[2]); }};
+            return {readers.get(), [this, target] { return objectHistory(target->path[2], *target); }};
         if (method == http::verb::post && is({"v1", "query", "objects"}))
             return {readers.get(), [this, body] { return queryObjects(*body); }};
         if (method == http::verb::post && is({"v1", "query", "edges"}))
             return {readers.get(), [this, body] { return queryEdges(*body); }};
         if (method == http::verb::post && is({"v1", "query", "relationships"}))
             return {readers.get(), [this, body] { return queryRelationships(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "selected-inputs"}))
+            return {readers.get(), [this, body] { return querySelectedInputs(*body); }};
         if (method == http::verb::post && is({"v1", "query", "count"}))
             return {readers.get(), [this, body] { return queryCount(*body); }};
         if (method == http::verb::post && is({"v1", "query", "graph"}))
@@ -955,6 +986,22 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryTags(*body); }};
         if (method == http::verb::post && is({"v1", "query", "versions"}))
             return {readers.get(), [this, body] { return queryVersions(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "versions-at"}))
+            return {readers.get(), [this, body] {
+                const auto anchors = objectVersionsRequestFromJson(*body);
+                if (anchors.size() != 1) throw std::invalid_argument("version snapshot needs one anchor");
+                auto txn = store->read();
+                return jsonReply(objectVersionsRequestToJson(store->versionsAt(txn, anchors.front())));
+            }};
+        if (method == http::verb::post && is({"v1", "query", "storage-path"}))
+            return {readers.get(), [this, body] {
+                const auto request = Json::parse(*body);
+                std::optional<std::filesystem::path> root;
+                if (!request.at("dataset_root").is_null()) root = request.at("dataset_root").get<std::string>();
+                auto txn = store->read();
+                const auto path = store->resolveStoragePath(txn, request.at("uuid").get<std::string>(), root);
+                return jsonReply((path ? Json(path->string()) : Json(nullptr)).dump());
+            }};
         if (method == http::verb::post && is({"v1", "query", "region"}))
             return {readers.get(), [this, body] { return queryRegion(*body); }};
         if (method == http::verb::post && is({"v1", "query", "nearest_surfaces"}))
@@ -965,6 +1012,8 @@ struct ServerState {
         }
         if (method == http::verb::get && is({"v1", "geometry", "*"}))
             return {readers.get(), [this, target] { return geometry(target->path[2]); }};
+        if (method == http::verb::get && is({"v1", "geometry", "*", "object"}))
+            return {readers.get(), [this, target] { return geometryObject(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "artifacts", "*", "info"}))
             return {transfers.get(), [this, target] { return artifactInfo(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "artifacts", "*"})) {
@@ -973,6 +1022,8 @@ struct ServerState {
         }
         if (method == http::verb::get && is({"v1", "geometry", "*", "annotations", "*"}))
             return {readers.get(), [this, target] { return geometryAnnotations(target->path[2], target->path[4]); }};
+        if (method == http::verb::get && is({"v1", "objects", "*", "next-point-id", "*"}))
+            return {readers.get(), [this, target] { return nextPointId(target->path[2], target->path[4]); }};
         if (method == http::verb::get && is({"v1", "geometry", "*", "arrays", "*"})) {
             // Bounded download memory: unsent replies stay below the limit
             // (plus the replies being produced, each maxResponseBytes at most).
@@ -988,6 +1039,8 @@ struct ServerState {
             return work();
         } catch (const TransactionConflict& conflict) {
             return jsonReply(transactionConflictToJson(conflict), http::status::conflict);
+        } catch (const StoreBusy& e) {
+            return jsonReply(Json{{"error", e.what()}, {"store_busy", true}}.dump(), http::status::conflict);
         } catch (const MissingPayloads& missing) {
             return jsonReply(Json{{"error", missing.what()}, {"missing", missing.hashes()}}.dump(),
                              http::status::unprocessable_entity);

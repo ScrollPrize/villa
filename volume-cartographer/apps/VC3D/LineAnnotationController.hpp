@@ -36,6 +36,7 @@
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationStoredFiber.hpp"
 #include "FiberMapAutoLink.hpp"
+#include "FiberMapStaleness.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/fiber_tracer/FiberSideStripIntersections.hpp"
@@ -401,9 +402,8 @@ public:
     // Default-constructed (no voxel size, zero extent) when no volume is loaded.
     // Holders of derived geometry compare it to know whether what they built is
     // still in a frame that means anything.
-    // The stored umbilicus of the current volume as uuid@revision, or why there
-    // is none: changes whenever the umbilicus derived views depend on does.
-    [[nodiscard]] QString umbilicusFingerprint() const;
+    // Complete selected identity, with unavailable status kept separately.
+    [[nodiscard]] vc3d::fiber_map::UmbilicusDependency umbilicusDependency() const;
     // The catalog volume the current volume shows and its orientation
     // (catalogVolumeSense); cheap enough for dependency checks.
     [[nodiscard]] std::optional<vc3d::opendata::CatalogVolumeSense> fiberMapCatalogVolume() const;
@@ -1156,19 +1156,12 @@ private:
     // decoded for editing. Branch refs resolve against their endpoints in the
     // same snapshot; missing and retired objects are skipped. Line points are
     // read on request, otherwise loaded on demand by ensureFiberLines().
-    // The published head a decode used (or found): record generation plus the
-    // numbered version, which relationship-only changes revise without a new
-    // record generation.
-    struct StoredFiberHeadState {
-        uint64_t generation = 0;
-        std::string versionGeneration;
-        int64_t version = 0;
-        bool operator==(const StoredFiberHeadState&) const = default;
-    };
+    // The published head a decode used (or found).
+    using StoredFiberHeadState = vc::objects::ObjectVersion;
     static StoredFiberHeadState storedFiberHeadState(const vc::objects::ObjectRecord& record);
     struct StoredFiberDependencies {
         // Each linked endpoint's head as the decode saw it; nullopt: absent.
-        std::map<std::string, std::optional<StoredFiberHeadState>> peers;
+        std::map<std::string, std::optional<vc::objects::ObjectVersion>> peers;
         std::set<std::string> relationships;
         // The store position (store, history generation, commit sequence) at
         // which this entry and these peers were last confirmed current, read
@@ -1404,6 +1397,13 @@ private:
         std::vector<FiberSaveSnapshot> edits;
         std::vector<StoredFiber> targets, retired;
         vc::objects::TransactionRequest request;
+        // The fibers of the open sessions and the versions they hold: the
+        // ones the commit revises are read back with the saved heads.
+        std::vector<std::pair<std::string, vc::objects::ObjectVersion>> openSessions;
+        // The fibers the built operations change, or change a link of (the
+        // edited and retired ones and both endpoints of every link added,
+        // updated or removed): set by buildFiberCommitOperations.
+        std::set<std::string> involved;
         const StoredFiber& fiberFor(uint64_t id) const
         {
             for (const auto& edit : edits) if (edit.fiber.id == id) return edit.fiber;
@@ -1414,6 +1414,8 @@ private:
     struct FiberCommitResult {
         vc::objects::TransactionReceipt receipt;
         std::vector<std::optional<vc::objects::ObjectRevision>> saved;
+        // The other objects the commit revised (linked endpoints), as committed.
+        std::map<std::string, vc::objects::ObjectRevision> revised;
     };
     [[nodiscard]] FiberCommitJob prepareFiberCommit(const std::vector<FiberSaveSnapshot>& snapshots,
                                                     const std::vector<StoredFiber>& retired) const;

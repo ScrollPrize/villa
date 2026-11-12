@@ -1,6 +1,7 @@
 #pragma once
 #include "internal/Database.hpp"
 #include "geometry/GeometryInternal.hpp"
+#include "geometry/GeometryReference.hpp"
 #include <functional>
 #include <optional>
 #include <list>
@@ -13,10 +14,11 @@ namespace vc::objects::detail {
 class GeometryReader {
 public:
     GeometryReader(const Txn& txn, const std::string& revision, bool cacheChunks = true);
-    GeometryReader(sqlite3* db, const std::string& revision, bool cacheChunks = true);
+    GeometryReader(sqlite3* db, const std::string& revision, bool cacheChunks = true, bool allowReverse = true);
     GeometryReader(const GeometryReader&) = delete;
     GeometryReader& operator=(const GeometryReader&) = delete;
     const nlohmann::json& manifest() const { return manifest_; }
+    const std::string& contentHash() const { return contentHash_; }
     std::vector<uint8_t> chunk(const std::string& name, int64_t index);
     size_t retainedCharge() const { return metadataCharge_ + cachedBytes_ + chunks_.size() * 256; }
     std::vector<uint8_t> read(const std::string& name, int64_t offset, std::optional<int64_t> count = std::nullopt);
@@ -39,6 +41,7 @@ private:
     std::array<unsigned char, 16> revision_;
     bool cacheChunks_;
     nlohmann::json manifest_;
+    std::string contentHash_;
     std::map<std::string, GeometryLayout> layouts_;
     std::map<ChunkKey, CachedChunk> chunks_;
     std::list<ChunkKey> recency_;
@@ -47,6 +50,8 @@ private:
     std::string baseRevision_, materializedObject_;
     std::vector<std::pair<std::string, nlohmann::json>> deltas_;
     std::unique_ptr<GeometryReader> reverseSource_;
+    std::string reference_, parentReference_, parentHash_, objectUuid_;
+    std::unique_ptr<GeometryReader> parentSource_;
 };
 // A surface rectangle's XYZ and whether each vertex is valid by the store's
 // rule (geometry::validSurfacePoint and the valid channel), row-major.
