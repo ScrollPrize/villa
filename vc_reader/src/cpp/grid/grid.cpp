@@ -327,7 +327,7 @@ struct ChunkLookup {
 
     // A sample's chunk is almost always the last one used: that check stays inline, the
     // rest (other slots, reading a chunk) is out of line.
-    const unsigned char* voxel(const std::int64_t* v, bool& available)
+    [[gnu::always_inline]] const unsigned char* voxel(const std::int64_t* v, bool& available)
     {
         const std::int64_t c[3]{chunkOf(v[0], 0), chunkOf(v[1], 1), chunkOf(v[2], 2)};
         const std::int64_t key = keyOffset + (c[0] * grid[1] + c[1]) * grid[2] + c[2];
