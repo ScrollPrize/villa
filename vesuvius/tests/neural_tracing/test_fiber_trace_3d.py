@@ -956,6 +956,58 @@ def test_fiber_inference_cli_omits_config_for_current_checkpoint(monkeypatch: py
     assert captured["config_path"] is None
 
 
+class _ConstantPresenceFiberModel(torch.nn.Module):
+    def forward(self, volume: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        out = torch.full((volume.shape[0], 7, *volume.shape[2:]), 0.5)
+        out[:, 6] = 1.0
+        return out
+
+
+def test_fiber_inference_cli_defaults_predict_every_voxel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    arr = create_v2_array(input_path, shape=(96, 96, 96), chunks=(32, 32, 32), dtype=np.uint8)
+    arr[:] = 100
+    checkpoint = tmp_path / "model.pt"
+    torch.save({"config": {
+        "patch_shape_zyx": [64, 64, 64],
+        "image_normalization": "none",
+        "model_3d": {"output_stride": 1},
+        "training": {"mixed_precision": "off"},
+    }}, checkpoint)
+    monkeypatch.setattr(
+        "vesuvius.neural_tracing.fiber_trace_3d.inference_adapter.build_fiber_trace_3d_model",
+        lambda config: _ConstantPresenceFiberModel(),
+    )
+    monkeypatch.setattr(
+        "vesuvius.neural_tracing.fiber_trace_3d.train._load_snapshot",
+        lambda *args, **kwargs: None,
+    )
+
+    assert fiber_infer_module.main([
+        "--input", str(input_path), "--output", str(tmp_path / "fiber.lasagna.json"),
+        "--output-format", "legacy", "--checkpoint", str(checkpoint),
+        "--base-ref", str(input_path), "--base-scale", "0",
+        "--device", "cpu", "--levels", "1",
+    ]) == 0
+
+    presence = np.asarray(open_zarr(tmp_path / "fiber_presence.ome.zarr" / "0")[:])
+    assert presence.shape == (96, 96, 96)
+    assert int((presence == 0).sum()) == 0
+
+
+def test_fiber_inference_rejects_overlap_below_both_tile_borders(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="overlap=16 must be >= 2 \\* border=16"):
+        run_fiber_trace_3d_inference(
+            input_path=str(tmp_path / "input.zarr"),
+            output_path=tmp_path / "fiber.lasagna.json",
+            checkpoint=None,
+            overlap=16,
+            border=16,
+        )
+
+
 def test_checkpoint_config_is_authoritative_with_legacy_fallback(tmp_path: Path) -> None:
     checkpoint = tmp_path / "model.pt"
     legacy = tmp_path / "legacy.json"
