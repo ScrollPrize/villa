@@ -630,9 +630,17 @@ void FiberCollectionController::listPage(bool reset)
                         if (edge.approvalState != "approved") ++found->second->pendingLinks;
                     }
                 }
-                for (auto& row : rows)
-                    if (row.links > 0)
-                        row.componentSize = int(reader.componentOf(row.record.uuid, {"fiber_branch"}, &cancelled).size());
+                // One graph query per linked network, not per row: every listed
+                // member of a component takes its size from the first answer.
+                for (auto& row : rows) {
+                    if (row.links <= 0 || row.componentSize > 0) continue;
+                    const auto component = reader.componentOf(row.record.uuid, {"fiber_branch"}, &cancelled);
+                    row.componentSize = int(component.size());
+                    for (const auto& member : component) {
+                        const auto found = byUuid.find(member);
+                        if (found != byUuid.end()) found->second->componentSize = row.componentSize;
+                    }
+                }
             });
             return rows;
         },
