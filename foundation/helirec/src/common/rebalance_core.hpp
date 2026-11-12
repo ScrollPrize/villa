@@ -124,17 +124,19 @@ inline std::vector<std::vector<Contribution>> contribution_table_turns(int n_pro
     return table;
 }
 
-// The angles nothing was recorded at, for such a sinogram (sino.hpp, TurnHoles): an angle (row modulo `turn`) is empty
-// when every row at it is (`nonempty`, per row; n_proj >= turn). Each is filled in its first row, from the first
-// non-empty rows of the angles either side of its run (as fill_holes fills a run of one turn).
-inline TurnHoles turn_holes_from(const std::vector<char>& nonempty, int turn) {
-    const int n_proj = static_cast<int>(nonempty.size());
+// The angles nothing was recorded at, for such a sinogram (sino.hpp, TurnHoles). peak: the largest weight in the
+// mid-row of each row (n_proj >= turn of them; 0: an empty row, the emptiness test of rebalance). An angle (row modulo
+// `turn`) is empty when every row at it is. Each is filled in its first row, from the rows of the angles either side
+// of its run (as fill_holes fills a run of one turn): of an angle's rows, the one whose peak is largest (the first of
+// equal ones), i.e. the view that records the slice rather than a row that holds only what pads it.
+inline TurnHoles turn_holes_from(const std::vector<float>& peak, int turn) {
+    const int n_proj = static_cast<int>(peak.size());
     TurnHoles out;
     std::vector<char> angle(turn, 0);
-    std::vector<int> first(turn, -1);   // the first non-empty row of each angle
+    std::vector<int> best(turn, -1);
     for (int r = 0; r < n_proj; ++r)
-        if (nonempty[r] && first[r % turn] < 0) {
-            first[r % turn] = r;
+        if (peak[r] > 0.f && (best[r % turn] < 0 || peak[r] > peak[best[r % turn]])) {
+            best[r % turn] = r;
             angle[r % turn] = 1;
         }
     bool any = false;
@@ -144,7 +146,7 @@ inline TurnHoles turn_holes_from(const std::vector<char>& nonempty, int turn) {
         return out;
     }
     for (auto [s, e] : holes_from(angle)) {
-        const int left = first[(s + turn - 1) % turn], right = first[e % turn];
+        const int left = best[(s + turn - 1) % turn], right = best[e % turn];
         for (int idx = s; idx < e; ++idx) {
             out.dst.push_back(idx % turn);
             out.left.push_back(left);

@@ -356,19 +356,6 @@ void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std:
     }
 }
 
-// rows whose mid-row holds a weight (the emptiness test of rebalance)
-std::vector<char> nonempty_rows(const float* W, int n_proj, int n_rows, int n_cols) {
-    const std::size_t plane = static_cast<std::size_t>(n_rows) * n_cols;
-    std::vector<char> nonempty(n_proj, 0);
-#pragma omp parallel for schedule(static)
-    for (int i = 0; i < n_proj; ++i) {
-        const float* w = W + i * plane + static_cast<std::size_t>(n_rows / 2) * n_cols;
-        for (int c = 0; c < n_cols; ++c)
-            if (w[c] != 0.0f) { nonempty[i] = 1; break; }
-    }
-    return nonempty;
-}
-
 void check_turns(int n_proj, int turn) {
     if (turn < 2 || turn % 2 != 0) throw Error("rebalance_turns: the rows of a turn must be an even number");
     if (n_proj < turn) throw Error("rebalance_turns: fewer rows than a turn");
@@ -378,7 +365,15 @@ void check_turns(int n_proj, int turn) {
 // ------------------------------------------------------------------ rebalance, one row per view
 TurnHoles turn_holes(const float* W, int n_proj, int n_rows, int n_cols, int turn) {
     check_turns(n_proj, turn);
-    return rebalance_core::turn_holes_from(nonempty_rows(W, n_proj, n_rows, n_cols), turn);
+    const std::size_t plane = static_cast<std::size_t>(n_rows) * n_cols;
+    std::vector<float> peak(n_proj, 0.f);   // the largest weight of each row's mid-row
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < n_proj; ++i) {
+        const float* w = W + i * plane + static_cast<std::size_t>(n_rows / 2) * n_cols;
+        for (int c = 0; c < n_cols; ++c)
+            if (w[c] > peak[i]) peak[i] = w[c];
+    }
+    return rebalance_core::turn_holes_from(peak, turn);
 }
 
 void fill_turn_holes(float* X, const TurnHoles& holes, int n_rows, int n_cols) {

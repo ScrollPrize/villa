@@ -84,11 +84,11 @@ void balance_weights(float* W, int n_proj, int n_rows, int n_cols, float rot_cen
 // (mirrored about rot_center for odd k), and the balanced weights are
 //   W_i / (W_i + sum over k != 0 of M^k (W at row i + k turn / 2)):
 // a partition of unity over all of them, as rebalance's over a view and its opposite.
-// Holes: an angle is empty when every row at it is (mid-row test); it is filled in its first row from the first
-// non-empty rows of the angles either side (R and W, as rebalance fills). A sample without weight is never
-// backprojected, but the filters along the angle and along the row read it: fill_from_turns gives every sample of R
-// whose weight is 0 the value of the nearest row a whole number of turns away whose weight is positive (i + turn,
-// i - turn, i + 2 turn, ...), if there is one.
+// Holes: an angle is empty when every row at it is (mid-row test); it is filled in its first row from the angles
+// either side (R and W, as rebalance fills), of whose rows the one with the largest weight in its mid-row is taken:
+// the view that records the slice, not a row that only pads it. A sample without weight is never backprojected, but
+// the filter along the row reads it: fill_from_turns gives every sample of R whose weight is 0 the value of the row
+// a whole number of turns away whose weight there is largest (the nearest of equal ones), if one has a weight.
 // rebalance_turns: holes, fill_from_turns, balanced weights; returns the number of filled angles.
 struct TurnHoles {
     bool all_empty = false;

@@ -36,17 +36,27 @@ def test_rebalance_turns(device):
     W[12] = 0                                    # a row without anything, whose angle rows 4 and 20 record
     W[[5, 13]] = 0                               # an angle nothing records (row 21 would be the third)
     r, w = _core.rebalance_turns(R, W, turn, rot, device=device)
-    # the empty angle: its first row takes the mean of the first rows of the angles either side
+    # the empty angle: its first row takes the mean of the rows of the angles either side, of each angle the row with
+    # the largest weight in its mid-row
+    peak = W[:, rows // 2].max(1)
+    best = lambda angle: max((i for i in range(angle, n_proj, turn) if peak[i] > 0), key=lambda i: (peak[i], -i))
+    assert best(4) in (4, 20) and best(6) in (6, 14)
     Rf, Wf = R.copy(), W.copy()
-    Rf[5], Wf[5] = 0.5 * (R[4] + R[6]), 0.5 * (W[4] + W[6])
+    Rf[5], Wf[5] = 0.5 * (R[best(4)] + R[best(6)]), 0.5 * (W[best(4)] + W[best(6)])
     np.testing.assert_allclose(r[5], Rf[5], rtol=1e-6)
-    # samples without weight take the value of the nearest row whole turns away that has one (i + turn first)
-    np.testing.assert_array_equal(r[3, :, 5:8], Rf[11, :, 5:8])
-    np.testing.assert_array_equal(r[12, :, 2:], Rf[20, :, 2:])
-    np.testing.assert_array_equal(r[13, :, 2:], Rf[5, :, 2:])
+    # samples without weight take the value of the row whole turns away whose weight there is largest
+    ref = Rf.copy()
+    for i in range(n_proj):
+        others = sorted((j for j in range(i % turn, n_proj, turn) if j != i), key=lambda j: (abs(j - i), j < i))
+        wbest = np.zeros((rows, cols), np.float32)
+        for j in others:
+            take = (Wf[i] == 0) & (Wf[j] > wbest)
+            ref[i][take] = Rf[j][take]
+            wbest = np.where(take, Wf[j], wbest)
+    np.testing.assert_allclose(r, ref, rtol=1e-6)
+    assert not np.array_equal(r[3, :, 5:8], R[3, :, 5:8]) and not np.array_equal(r[12, :, 2:], R[12, :, 2:])
+    np.testing.assert_array_equal(r[13, :, 2:], r[5, :, 2:])            # (its only other turn is the filled row)
     np.testing.assert_array_equal(r[:, :, :2], Rf[:, :, :2])
-    kept = Wf != 0
-    np.testing.assert_array_equal(r[kept & (np.arange(n_proj) != 5)[:, None, None]], R[kept & (np.arange(n_proj) != 5)[:, None, None]])
     # the weights: every recording of a line (rows i + k turn / 2, mirrored for odd k) shares it
     ref = np.zeros_like(Wf)
     for i in range(n_proj):
@@ -216,6 +226,10 @@ def test_views_with_the_other_corrections(tmp_path, device):
             assert np.isfinite(sl).all()
             if per_turn == NG:
                 np.testing.assert_allclose(sl, ref, atol=5e-7)
+                # (in a chunk of several slices the sinogram also has rows of projections that do not see the
+                # slice: the angle is filled from the views that do)
+                mid = middle(r) - 2
+                np.testing.assert_allclose(r.reconstruct(mid, mid + 5)[2], n.reconstruct(mid, mid + 5)[2], atol=5e-7)
             else:
                 assert error(sl, truth) < 0.8 * error(ref, truth), (skip, error(sl, truth), error(ref, truth))
     # the exposure arc is not deconvolved with a row per view (disabled for now)

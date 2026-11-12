@@ -107,6 +107,22 @@ __global__ void nonempty_kernel(const float* W, size_t plane, size_t row_off, in
     if (threadIdx.x == 0) out[i] = static_cast<char>(any);
 }
 
+// the largest weight of each row's mid-row (weights are not negative: their bit patterns order as they do)
+__global__ void peak_kernel(const float* W, size_t plane, size_t row_off, int n_cols, int n_proj, float* out) {
+    const int i = blockIdx.x;
+    if (i >= n_proj) return;
+    const float* w = W + i * plane + row_off;
+    __shared__ int peak;
+    if (threadIdx.x == 0) peak = 0;
+    __syncthreads();
+    float v = 0.f;
+    for (int c = threadIdx.x; c < n_cols; c += blockDim.x)
+        if (w[c] > v) v = w[c];
+    atomicMax(&peak, __float_as_int(v));
+    __syncthreads();
+    if (threadIdx.x == 0) out[i] = __int_as_float(peak);
+}
+
 __global__ void average_planes_kernel(const float* a, const float* b, float* out, size_t n) {
     for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < n; k += static_cast<size_t>(gridDim.x) * blockDim.x)
         out[k] = 0.5f * (a[k] + b[k]);
@@ -251,7 +267,14 @@ void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std:
 // ---- rebalance, one row per view
 TurnHoles turn_holes(const float* W, int n_proj, int n_rows, int n_cols, int turn, void* stream) {
     check_turns(n_proj, turn);
-    return rebalance_core::turn_holes_from(nonempty_rows(W, n_proj, n_rows, n_cols, as_stream(stream)), turn);
+    cudaStream_t s = as_stream(stream);
+    const size_t plane = static_cast<size_t>(n_rows) * n_cols;
+    DeviceBuffer<float> d_peak(n_proj);
+    peak_kernel<<<n_proj, 256, 0, s>>>(W, plane, static_cast<size_t>(n_rows / 2) * n_cols, n_cols, n_proj, d_peak.data());
+    HELIREC_CUDA_CHECK(cudaGetLastError());
+    std::vector<float> peak(n_proj);
+    d_peak.download(peak.data(), s);
+    return rebalance_core::turn_holes_from(peak, turn);
 }
 
 void fill_turn_holes(float* X, const TurnHoles& holes, int n_rows, int n_cols, void* stream) {
