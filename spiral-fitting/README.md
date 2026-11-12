@@ -182,8 +182,9 @@ the fitter's checkpoint input-manifest checks still apply when fitting resumes.
   "scroll": {
     "name": "PHerc0826",
     "voxel_size_um": 9.362,
-    "base_shape_zyx": [12000, 8000, 8000],
-    "spiral_outward_sense": "CW"
+    "base_shape_zyx": [16920, 8169, 8169],
+    "z_direction_is_top_to_bottom": true,
+    "left_handed_coordinates": false
   },
   "umbilicus": {"path": "umbilicus.json", "coordinate_scale": 1},
   "lasagna": {
