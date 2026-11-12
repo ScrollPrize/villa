@@ -914,6 +914,11 @@ vc_register_ctest(grow_patch_seed_dialog test_grow_patch_seed_dialog)
 # Ink labels: the GUI-free raster and store, and the controller, overlay and
 # panel against a stub ViewerManager (as core/test's ink detection test does).
 find_package(TIFF REQUIRED)
+# AUTOMOC does not pick up the VCCollection shim header; wrap it here as
+# test_session_recovery does.
+qt6_wrap_cpp(ink_labels_vccollection_moc
+    ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+
 add_executable(test_ink_labels
     test_ink_labels.cpp
     ../StatusDockPanelHost.cpp
@@ -956,7 +961,7 @@ add_executable(test_ink_labels
     ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.hpp
     ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
-    ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp
+    ${ink_labels_vccollection_moc}
     ${PROJECT_SOURCE_DIR}/core/test/test_viewer_manager_stub.cpp)
 set_target_properties(test_ink_labels PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_ink_labels PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
