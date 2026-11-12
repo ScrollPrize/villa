@@ -67,7 +67,12 @@ VCR_POINT_HD inline bool point(Lookup& L, const std::int64_t* base, const float*
     bool whole = cell.lo[0] >= 0 && cell.lo[1] >= 0 && cell.lo[2] >= 0;
     for (std::size_t i = 0; i < cell.k; ++i) {
         const std::size_t a = cell.axes[i];
-        whole &= cell.lo[a] + 1 < L.shape[a] && cell.lo[a] % L.block[a] + 1 < L.block[a];
+        // lo % block without the 64-bit division when the block edge is a power of two
+        // (the stored chunk sizes are). A negative lo already made `whole` false above,
+        // so the two forms only need to agree for lo >= 0, where they are equal.
+        const std::int64_t b = L.block[a];
+        const std::int64_t within = (b & (b - 1)) == 0 ? (cell.lo[a] & (b - 1)) : cell.lo[a] % b;
+        whole &= cell.lo[a] + 1 < L.shape[a] && within + 1 < b;
     }
     if (whole) {
         bool available = true;
