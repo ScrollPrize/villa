@@ -510,19 +510,48 @@ std::pair<HostOut, HostOut> rebalance_py(HostIn R, HostIn W, float rot_center, b
     return {r, w};
 }
 
+std::pair<HostOut, HostOut> rebalance_turns_py(HostIn R, HostIn W, int turn, float rot_center, const std::string& device) {
+    require(R.ndim() == 3 && W.ndim() == 3 && R.size() == W.size(), "R, W must be (n_proj, n_rows, n_cols)");
+    HostOut r = copy_of(R), w = copy_of(W);
+    const int np = static_cast<int>(R.shape(0)), nr = static_cast<int>(R.shape(1)), nc = static_cast<int>(R.shape(2));
+    if (parse_device(device) == Device::CPU) {
+        nb::gil_scoped_release nogil;
+        cpu::rebalance_turns(data(r), data(w), np, nr, nc, turn, rot_center);
+        return {r, w};
+    }
+#ifdef HELIREC_WITH_CUDA
+    {
+        nb::gil_scoped_release nogil;
+        cuda::DeviceBuffer<float> dr, dw;
+        dr.upload(data(r), R.size());
+        dw.upload(data(w), W.size());
+        cuda::rebalance_turns(dr.data(), dw.data(), np, nr, nc, turn, rot_center);
+        dr.download(data(r));
+        dw.download(data(w));
+    }
+#endif
+    return {r, w};
+}
+
 HostOut ramp_filter_py(HostIn sino, float rot_center, int pad_factor, bool normalize, bool legacy, const std::string& device,
-                       const std::string& filter_name, const std::string& filter_par) {
+                       const std::string& filter_name, const std::string& filter_par, const std::vector<int32_t>& opposite, int turn) {
     require(sino.ndim() == 2, "sino must be (n_proj, n_bins)");
     const int n_proj = static_cast<int>(sino.shape(0)), n_bins = static_cast<int>(sino.shape(1));
+    // opposite: the row holding the opposite view of each row, for rows that are not one full turn (`turn` rows are)
+    require(opposite.empty() || static_cast<int>(opposite.size()) == n_proj, "opposite: one row index per row");
+    for (int32_t o : opposite) require(o >= 0 && o < n_proj, "opposite: a row index out of range");
+    require(opposite.empty() ? turn == 0 : turn > 0, "opposite and turn are given together");
+    const int32_t* opp = opposite.empty() ? nullptr : opposite.data();
     const Device dev = parse_device(device);
     HostOut out = new_array(shape_of(sino));
     nb::gil_scoped_release nogil;
-    const RampGeometry g = ramp_geometry(n_bins, n_proj, rot_center, pad_factor, legacy);
-    const FourierFilterSpec spec = ramp_filter_spec(g, normalize ? ramp_scale(n_proj, legacy) : 1.f, filter_name,
+    RampGeometry g = ramp_geometry(n_bins, opp ? turn : n_proj, rot_center, pad_factor, legacy);
+    g.n_proj = n_proj;
+    const FourierFilterSpec spec = ramp_filter_spec(g, normalize ? ramp_scale(opp ? turn : n_proj, legacy) : 1.f, filter_name,
                                                     ramp_filter_par(filter_par));
     if (dev == Device::CPU) {
         std::vector<float> padded(static_cast<std::size_t>(n_proj) * g.npad);
-        cpu::ramp_pad(sino.data(), padded.data(), g);
+        cpu::ramp_pad(sino.data(), padded.data(), g, opp);
         cpu::make_fourier_filter(spec)->apply(padded.data(), padded.data(), n_proj);
         cpu::ramp_crop(padded.data(), data(out), g);
         return out;
@@ -530,7 +559,9 @@ HostOut ramp_filter_py(HostIn sino, float rot_center, int pad_factor, bool norma
 #ifdef HELIREC_WITH_CUDA
     cuda::DeviceBuffer<float> d_sino, d_pad(static_cast<std::size_t>(n_proj) * g.npad), d_out(sino.size());
     d_sino.upload(sino.data(), sino.size());
-    cuda::ramp_pad(d_sino.data(), d_pad.data(), g);
+    cuda::DeviceBuffer<int32_t> d_opp;
+    if (opp) d_opp.upload(opp, opposite.size());
+    cuda::ramp_pad(d_sino.data(), d_pad.data(), g, nullptr, opp ? d_opp.data() : nullptr);
     cuda::make_fourier_filter(spec)->apply(d_pad.data(), d_pad.data(), n_proj);
     cuda::ramp_crop(d_pad.data(), d_out.data(), g);
     d_out.download(data(out));
@@ -998,7 +1029,10 @@ class PySliceReconstructor {
         if (o.u8) d["uint8"] = u8;
         if (timing) d["seconds"] = sec;
         if (!debug) return d;
-        const std::size_t DY = h_hi - h_lo, NG = impl_->n_grid(), NX = impl_->merged_width();
+        // (the sinogram's rows: the grid angles, or with angle_interp views the bins the chunk's projections span,
+        // row r being bin first_bin + r)
+        const std::size_t DY = h_hi - h_lo, NG = dbg.n_rows > 0 ? dbg.n_rows : impl_->n_grid(), NX = impl_->merged_width();
+        d["first_bin"] = dbg.first_bin;
         auto mk = [&](const std::vector<float>& v, std::vector<std::size_t> shape) {
             HostOut a = new_array(shape);
             std::memcpy(data(a), v.data(), v.size() * sizeof(float));
@@ -1794,14 +1828,21 @@ NB_MODULE(_core, m) {
     m.def("angular_fir", &angular_fir_py, "sino"_a, "taps"_a, "support"_a = nb::none(), "device"_a = "cpu",
           "Symmetric periodic FIR along the angle of a sinogram (n_proj, n_cols); with support, only where every tap "
           "has support > 0");
+    m.def("rebalance_turns", &rebalance_turns_py, "R"_a, "W"_a, "turn"_a, "rot_center"_a, "device"_a = "cpu",
+          "rebalance for a sinogram with one row per view over more than one turn (`turn` rows per turn): empty angles "
+          "filled, samples without weight taken from the rows whole turns away, weights balanced over every recording "
+          "of a line (rows i + k turn / 2); returns (R, W_bal) copies");
     m.def("rebalance", &rebalance_py, "R"_a, "W"_a, "rot_center"_a, "legacy_reference"_a = false, "device"_a = "cpu",
           "Hole filling + half-acquisition balanced weights (opposite view, periodic; legacy_reference: the nabuxx "
           "endpoint handling); returns (R, W_bal) copies");
     m.def("ramp_filter", &ramp_filter_py, "sino"_a, "rot_center"_a, "pad_factor"_a = 1, "normalize"_a = true,
           "legacy_reference"_a = false, "device"_a = "cpu", "filter_name"_a = "ramlak", "filter_par"_a = "",
+          "opposite"_a = std::vector<int32_t>(), "turn"_a = 0,
           "Ramp filter with opposite-ray padding, (n_proj, n_bins) -> same shape. normalize: x 2 pi / n_proj "
           "(attenuation for pair-balanced full-turn data; legacy_reference: pi / n_proj and integer padding reflection). "
-          "filter_name: ramlak or a windowed ramp (ramp_filter_names), filter_par 'p0:p1'");
+          "filter_name: ramlak or a windowed ramp (ramp_filter_names), filter_par 'p0:p1'. opposite, turn: for rows "
+          "that are not one full turn (one row per view), the row holding each row's opposite view and the rows of a "
+          "turn (normalize: x 2 pi / turn)");
     m.def("ramp_filter_names", &ramp_filter_names, "ramp filters of fbp / ghbp and gridrec");
     m.def("ramp_scale", &ramp_scale, "n_proj"_a, "legacy_reference"_a = false);
     m.def("ramp_geometry", [](int n_bins, int n_proj, float rot_center, int pad_factor, bool legacy) {

@@ -40,8 +40,8 @@ DEFAULTS = dict(
     mode="corrected", filters=DEFAULT_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="fbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9, sld="", x_interp="sinc", z_interp="lanczos3", angle_interp="nearest", exposure_arc=0.0,
-    angle_subset="", z_translation_scale="auto", sharpness_weighting="off", sharp_f=0.35, sharp_band="0.15:0.30",
+    axis_source_meters=1e9, sld="", x_interp="sinc", z_interp="lanczos3", angle_interp="views", exposure_arc=0.0,
+    angle_subset="", z_translation_scale="auto", sharpness_weighting="auto", sharp_f=0.35, sharp_band="0.15:0.30",
     companion_registration="auto", stationary_registration="auto", axis_refinement="auto", rolling_shutter="off",
     geometry="",
 )
@@ -51,15 +51,15 @@ DEFAULTS = dict(
 #   angle of its rows (the calibration's row timing), and z_translation_scale, companion_registration,
 #   stationary_registration, axis_refinement and rolling_shutter are not used: the calibration holds what they
 #   stand for. The darks, flats, weights and the merged frame's layout stay the calibration's above. Needs
-#   x_interp=sinc; the row timing needs angle_interp=nearest and fbp. provenance()["geometry"] says what was applied
+#   x_interp=sinc; the row timing needs angle_interp=views or nearest and fbp. provenance()["geometry"] says what was applied
 #   and what the calibration measured and the reconstruction cannot express.
 # rolling_shutter: the time from the read-out of the detector's first row to its last, in frame periods (negative when
 #   the last row is read first): the rows of a frame were recorded at different angles while the sample turned, and a
 #   slice, read at one row of every frame, is backprojected at those angles. "off" (default): one angle per frame;
 #   "auto": what the calibration measures (measure_rolling_shutter: two reconstructions of a slab, from the upper and
 #   from the lower rows of the detector, are turned against each other by the shutter; measured on first use, a
-#   minute on a GPU, then cached); a number: that value. Applied with the angles of each slice (angle_interp nearest;
-#   not ghbp): info["rolling_shutter"] is what is in use. Not a default: on PHerc0343P it removes the rotation
+#   minute on a GPU, then cached); a number: that value. Applied with the angles of each slice (angle_interp views or
+#   nearest; not ghbp): info["rolling_shutter"] is what is in use. Not a default: on PHerc0343P it removes the rotation
 #   between the two halves of the detector's data, and against a finer scan of the sample it gains on one side of the
 #   axis and loses on the other (README).
 # axis_refinement: "auto" (the rotation axis the search found on its quarter-pixel grid, plus what the scan's opposite
@@ -72,18 +72,25 @@ DEFAULTS = dict(
 #   calibration.measure_registration) | "off" (the calibrated vector alone)
 # sharpness_weighting (detector_smear until 2026-11-11, still accepted): where a ray is recorded more than once, its
 #   recordings are combined above a crossover frequency with weights that favour the one recorded where the detector
-#   is sharper. "off" (default since 2026-11-11: no blur correction is on by default while the geometry is being
-#   settled) or "" | "auto" (the detector's blur field the calibration measured from the flats' noise,
-#   Calibration.detector_blur_field; none if nothing significant)
+#   is sharper. "auto" (default: the detector's blur field the calibration measured from the flats' noise,
+#   Calibration.detector_blur_field; none if nothing significant) | "off" or ""
 #   | "a11:a12:a21:a22:c1:c2": that blur field given outright, for the band-dependent redundancy weights
 #   (pipeline.hpp); sharp_f, sharp_band = "f1:f2": the frequency the weights are taken at, and the crossover band.
 # z_interp: lanczos3 | cubic | linear, the vertical interpolation of a slice's (fractional) detector row.
-# angle_interp: nearest (each projection whole in one bin, slices backprojected at the measured angles) | linear (the
-#   reference's two-bin angular splat). ghbp, whose plan fixes its angles, keeps the splat: info["angle_interp"]
-#   records the gridding in use.
+# angle_interp: views (default since 2026-11-11: every projection in a sinogram row of its own, filtered and
+#   backprojected at its own angle; views of a slice a turn apart, or a turn at rest and the helix, share a grid angle
+#   but were not recorded at the same angle, by the turn's excess over a whole number of steps and by the rows'
+#   timing between them, and are no longer averaged at their mean angle. The sinogram has as many rows as bins the
+#   chunk's projections span: 1.2 turns' worth in a helix of PHerc0343P's pitch, 2.2 where a turn at rest is among
+#   them, and memory and time of the filters and the backprojection grow with it) | nearest (each projection whole
+#   in one bin of one turn, slices backprojected at the bins' measured mean angles) | linear (the reference's two-bin
+#   angular splat). views needs the exact backprojector (fbp, bands): the whole-slice methods use nearest, and ghbp,
+#   whose plan fixes its angles, keeps the splat: info["angle_interp"] records the gridding in use. With views the
+#   exposure arc is not deconvolved (exposure_arc is disabled for now; info["exposure_arc_bins"] is 0).
 # exposure_arc: fraction of the angular step swept during an exposure, deconvolved along the angle; 0 (default since
-#   2026-11-11, with sharpness_weighting) leaves the sinogram as recorded; "auto" takes it from the scan
-#   (bliss.BlissScan.exposure_arc; 0 for step scans).
+#   2026-11-11) leaves the sinogram as recorded; "auto" takes it from the scan
+#   (bliss.BlissScan.exposure_arc; 0 for step scans). Disabled for now with angle_interp=views (the default): the
+#   filter runs along one turn of grid angles and is not carried over to a row per view; angle_interp=nearest has it.
 # z_translation_scale: detector rows the sample really moves per row of recorded z translation: the calibration of
 #   the helical pitch. "auto" (default): what the calibration measured from the frames (calibration.measure_pitch:
 #   projections half a turn apart are mirror images displaced by the travel; 1 where no significant error was found
@@ -129,9 +136,11 @@ CONVENTIONS = {
                                     "linear splat next to unmeasured columns",
                       luminosity_window="full 25 rows (12 context rows read either side of a chunk)",
                       row_position="z_interp kernel (lanczos3 by default); linear next to unmeasured rows",
-                      angular_gridding="angle_interp (nearest by default: one bin, measured angles; ghbp and "
-                                       "linear: two-bin splat)",
-                      exposure_arc="as recorded by default; exposure_arc=auto deconvolves the scan's recorded arc along the angle"),
+                      angular_gridding="angle_interp (views by default: a sinogram row per projection, each at its "
+                                       "measured angle; nearest: one bin of one turn, the bin's mean measured angle; "
+                                       "ghbp and linear: two-bin splat)",
+                      exposure_arc="as recorded by default; exposure_arc=auto deconvolves the scan's recorded arc along the angle "
+                                   "(disabled with angle_interp=views)"),
     "legacy_reference": dict(output_units="reference_units (attenuation / 2)", ramp_angular_weight="pi/n_angles",
                              rebalance="nabuxx (endpoint quirks)", ramp_padding_reflection="lround(2*rot_center)",
                              mending_domain="main-scan first/last column as left/right widths",
@@ -408,6 +417,8 @@ class HelicalRecon:
         self.rec = self._new_reconstructor()
         self.info = self.rec.info
         self.lo, self.hi = self.info["doable"]
+        if self.info["angle_interp"] == "views" and self.exposure_arc() != 0:
+            self.log("note: exposure_arc is disabled with angle_interp=views (not deconvolved; angle_interp=nearest applies it)")
 
     def _new_reconstructor(self):
         """a SliceReconstructor of the current params, arrays and calibration"""
@@ -717,7 +728,7 @@ def measure_rolling_shutter(r: "HelicalRecon"):
         del probe
     finally:
         r.params = keep_params
-    if info["angle_interp"] != "nearest":
+    if info["angle_interp"] not in ("nearest", "views"):
         return finish("the gridding in use takes one angle per bin")
     lo, hi = info["doable"]
     # the slab: the middle of the heights the helix alone records

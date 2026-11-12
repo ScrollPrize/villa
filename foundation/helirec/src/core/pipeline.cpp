@@ -44,6 +44,10 @@ std::pair<int, int> weight_vanishing_margins(const std::vector<float>& w, int ro
     return {first, last};
 }
 
+// angle_interp "views": the most turns the projections that see a chunk may span (the rows of its sinogram; the
+// recordings of a line, two per turn, are then at most the rebalance's table: sino.hpp)
+constexpr int kMaxViewTurns = 16;
+
 struct ScanChunk {  // host data of one scan for the current chunk
     ChunkScan cs;
     std::vector<uint16_t> raw;
@@ -172,8 +176,17 @@ struct SliceReconstructor::Impl {
     std::vector<AngleBins> bins;
     std::vector<std::vector<double>> row_weight;
     std::vector<float> slice_fbp_angles;
+    // One row per view (angle_interp "views": nearest-bin gridding without the wrap to one turn). The chunk's sinogram
+    // has chunk_rows >= n_grid rows, row r holding the projections of the (unwrapped) bin row_base + r, so that views
+    // a turn apart, which share a grid angle but were not recorded at the same angle, stay apart and are each
+    // backprojected at their own. chunk_rows = n_grid otherwise. slice_opposite (DY, chunk_rows): the row whose
+    // mirrored values pad each row for the ramp filter, the opposite view that weighs most in the slice.
+    bool views = false;
+    int chunk_rows = 0;
+    long row_base = 0;
+    std::vector<int32_t> slice_opposite;
     const float* fbp_angles_of(int y) const {
-        return nearest ? slice_fbp_angles.data() + static_cast<std::size_t>(y) * n_grid : fbp_angles.data();
+        return nearest ? slice_fbp_angles.data() + static_cast<std::size_t>(y) * chunk_rows : fbp_angles.data();
     }
     void set_slice_angles(const std::vector<ChunkScan*>& cs, int DY, int m);
     // exposure arc: taps of its inverse along the angle (empty: none), and the arc in grid angles
@@ -293,23 +306,24 @@ struct SliceReconstructor::Impl {
     const float* fbp_rows(const float* row) {
         const int os = cfg.bp_oversample, deg = interp_core::spline_degree(bp.interp);
         if (os <= 1 && !deg) return row;
-        const std::size_t n = static_cast<std::size_t>(n_grid) * NX * os;
+        const std::size_t n = static_cast<std::size_t>(chunk_rows) * NX * os;
 #ifdef HELIREC_WITH_CUDA
         if (cfg.device == Device::CUDA) {
             up_d.ensure(n);
-            if (os > 1) cuda::upsample_rows(row, up_d.data(), n_grid, NX, os);
-            if (deg) cuda::bspline_prefilter(os > 1 ? up_d.data() : row, up_d.data(), n_grid, NX * os, deg);
+            if (os > 1) cuda::upsample_rows(row, up_d.data(), chunk_rows, NX, os);
+            if (deg) cuda::bspline_prefilter(os > 1 ? up_d.data() : row, up_d.data(), chunk_rows, NX * os, deg);
             return up_d.data();
         }
 #endif
         up_h.resize(n);
-        if (os > 1) cpu::upsample_rows(row, up_h.data(), n_grid, NX, os);
-        if (deg) cpu::bspline_prefilter(os > 1 ? up_h.data() : row, up_h.data(), n_grid, NX * os, deg);
+        if (os > 1) cpu::upsample_rows(row, up_h.data(), chunk_rows, NX, os);
+        if (deg) cpu::bspline_prefilter(os > 1 ? up_h.data() : row, up_h.data(), chunk_rows, NX * os, deg);
         return up_h.data();
     }
 #ifdef HELIREC_WITH_CUDA
     cuda::DeviceBuffer<float> Icache;   // sweeps: pre-filter intensity of the chunk, or (one Fourier step) its spectra
     cuda::DeviceBuffer<float> d_z_lut;
+    cuda::DeviceBuffer<int32_t> d_opposite;   // slice_opposite
 #endif
 };
 
@@ -495,10 +509,14 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         I.sharp = true;
     }
     I.n_grid = I.cfg.n_grid > 0 ? I.cfg.n_grid : grid_angle_count(m.angles_deg);
-    if (I.cfg.angle_interp != "linear" && I.cfg.angle_interp != "nearest")
-        throw Error("angle_interp must be linear or nearest");
+    if (I.cfg.angle_interp != "linear" && I.cfg.angle_interp != "nearest" && I.cfg.angle_interp != "views")
+        throw Error("angle_interp must be linear, nearest or views");
     // (the ghbp plan fixes its angles: it cannot take those of each slice, and keeps the splat)
-    I.nearest = !I.cfg.legacy_reference && I.cfg.angle_interp == "nearest" && I.cfg.backprojector != "ghbp";
+    I.nearest = !I.cfg.legacy_reference && I.cfg.angle_interp != "linear" && I.cfg.backprojector != "ghbp";
+    // (a row per view needs a backprojector that takes any number of rows at any angles: the exact one; the
+    // whole-slice methods keep one row per grid angle)
+    I.views = I.nearest && I.cfg.angle_interp == "views" && I.cfg.backprojector == "fbp";
+    I.chunk_rows = I.n_grid;
     if (I.nearest) {
         const double phase = angle_grid_phase(m.angles_deg, I.n_grid);
         for (const auto& s : I.scans) {
@@ -514,8 +532,13 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     if (I.cfg.exposure_arc != 0) {
         if (I.cfg.legacy_reference) throw Error("legacy reference mode has no exposure arc correction");
         if (!(I.cfg.exposure_arc > 0 && I.cfg.exposure_arc <= 1)) throw Error("exposure_arc must be in [0, 1]");
-        I.arc_bins = I.cfg.exposure_arc * I.recorded_step * I.n_grid / 360.0;
-        I.arc_taps = arc_deblur_taps(I.arc_bins);
+        // Disabled with a row per view (angle_interp views): the filter runs along the rows of one turn of grid
+        // angles, and has not been carried over to rows that are views of several turns (the neighbours of a slice's
+        // first and last views are then other turns' rows or none). exposure_arc_bins() is 0 there.
+        if (!I.views) {
+            I.arc_bins = I.cfg.exposure_arc * I.recorded_step * I.n_grid / 360.0;
+            I.arc_taps = arc_deblur_taps(I.arc_bins);
+        }
     }
     // merged width: main width + ceil(max |companion offset|)
     float max_off = 0.f;
@@ -608,7 +631,7 @@ std::pair<int, int> SliceReconstructor::mend_domain() const { return {impl_->men
 const ReconConfig& SliceReconstructor::config() const { return impl_->cfg; }
 double SliceReconstructor::exposure_arc_bins() const { return impl_->arc_bins; }
 double SliceReconstructor::rolling_shutter() const { return impl_->nearest ? impl_->cfg.rolling_shutter : 0.0; }
-std::string SliceReconstructor::angle_interp() const { return impl_->nearest ? "nearest" : "linear"; }
+std::string SliceReconstructor::angle_interp() const { return impl_->views ? "views" : impl_->nearest ? "nearest" : "linear"; }
 std::string SliceReconstructor::z_interp() const {
     return impl_->z_kernel == interp_core::Lanczos3 ? "lanczos3" : impl_->z_kernel == interp_core::Cubic ? "cubic" : "linear";
 }
@@ -619,13 +642,17 @@ std::string SliceReconstructor::z_interp() const {
 // the residual of the nearest filled bin before it (the first filled one's, for those ahead of it).
 // Rolling shutter (ReconConfig::rolling_shutter): the row a slice is read at was recorded at another angle than the
 // projection's by shutter_bins x (row - middle row), which is added to the projection's residual.
+// With a row per view (views) the rows are the unwrapped bins row_base + r: the same per row, the angle taken modulo
+// the turn, and for each row the opposite row for the ramp's padding (slice_opposite): of the rows an odd number of
+// half turns away, the one that weighs most in the slice (the nearest, if several or none do).
 void SliceReconstructor::Impl::set_slice_angles(const std::vector<ChunkScan*>& cs, int DY, int m) {
-    const int NG = n_grid;
+    const int NG = n_grid, NR = chunk_rows;
     // (bins per detector row: the scan's signed angular step, in bins, over the frame's rows)
     const auto& a0 = scans[0].traj.angles_deg;
     const double shutter_bins = cfg.rolling_shutter * (a0.back() >= a0.front() ? recorded_step : -recorded_step) * NG / 360.0;
-    slice_fbp_angles.resize(static_cast<std::size_t>(DY) * NG);
-    std::vector<double> sw(NG), sd(NG);
+    slice_fbp_angles.resize(static_cast<std::size_t>(DY) * NR);
+    if (views) slice_opposite.resize(static_cast<std::size_t>(DY) * NR);
+    std::vector<double> sw(NR), sd(NR);
     for (int y = 0; y < DY; ++y) {
         std::fill(sw.begin(), sw.end(), 0.0);
         std::fill(sd.begin(), sd.end(), 0.0);
@@ -644,14 +671,34 @@ void SliceReconstructor::Impl::set_slice_angles(const std::vector<ChunkScan*>& c
             }
         }
         int first = -1;
-        for (int b = 0; b < NG && first < 0; ++b)
+        for (int b = 0; b < NR && first < 0; ++b)
             if (sw[b] > 0) first = b;
         double d = first >= 0 ? sd[first] / sw[first] : 0.0;
-        float* out = slice_fbp_angles.data() + static_cast<std::size_t>(y) * NG;
-        for (int i = 0; i < NG; ++i) {   // from the first filled bin, around the circle
-            const int b = first >= 0 ? (first + i) % NG : i;
+        float* out = slice_fbp_angles.data() + static_cast<std::size_t>(y) * NR;
+        if (!views) {
+            for (int i = 0; i < NG; ++i) {   // from the first filled bin, around the circle
+                const int b = first >= 0 ? (first + i) % NG : i;
+                if (sw[b] > 0) d = sd[b] / sw[b];
+                out[b] = -static_cast<float>((b + d) * (2 * M_PI / NG));
+            }
+            continue;
+        }
+        for (int b = 0; b < NR; ++b) {   // (the rows ahead of the first filled one take its residual)
             if (sw[b] > 0) d = sd[b] / sw[b];
-            out[b] = -static_cast<float>((b + d) * (2 * M_PI / NG));
+            double f = std::fmod(static_cast<double>(row_base) + b + d, static_cast<double>(NG));
+            if (f < 0) f += NG;
+            out[b] = -static_cast<float>(f * (2 * M_PI / NG));
+        }
+        int32_t* opp = slice_opposite.data() + static_cast<std::size_t>(y) * NR;
+        const int half = NG / 2;
+        for (int b = 0; b < NR; ++b) {
+            int best = -1;
+            for (int c = b % NG >= half ? b % NG - half : b % NG + half; c < NR; c += NG) {
+                if (best < 0) { best = c; continue; }
+                const int db = std::abs(best - b), dc = std::abs(c - b);
+                if (sw[c] > sw[best] || (sw[c] == sw[best] && dc < db)) best = c;
+            }
+            opp[b] = best;
         }
     }
 }
@@ -944,7 +991,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         chunks[s].win_rows = H + 1 + 2 * I.z_pad;
         chunks[s].win0 = window_rows(chunks[s].cs, I.z_pad);
         chunks[s].z_w = z_kernel_weights(chunks[s].cs.fract_v, I.z_kernel);
-        if (I.nearest) {   // every projection whole in its bin
+        if (I.nearest && !I.views) {   // every projection whole in its bin
             auto& c = chunks[s].cs;
             for (int k = 0; k < c.p1 - c.p0; ++k) {
                 const int b = I.bins[s].bin[c.p0 + k] % NG;
@@ -958,17 +1005,52 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             dbg->stats["raw_gb"] += np * chunks[s].win_rows * I.scans[s].traj.det_cols * 2 / 1e9;
         }
     }
+    // the rows of the chunk's sinogram: the grid angles, or (views) the unwrapped bins of its projections
+    I.chunk_rows = NG;
+    if (I.views) {   // every projection whole in the row of its own bin
+        long lo = 0, hi = -1;
+        for (std::size_t s = 0; s < I.scans.size(); ++s) {
+            const auto& c = chunks[s].cs;
+            for (int k = c.p0; k < c.p1; ++k) {
+                const long b = I.bins[s].bin[k];
+                if (hi < lo) lo = hi = b;
+                lo = std::min(lo, b);
+                hi = std::max(hi, b);
+            }
+        }
+        const long span = std::max<long>(hi - lo + 1, NG);
+        if (span > static_cast<long>(kMaxViewTurns) * NG)
+            throw Error("angle_interp views: the projections that see these slices span more than " + std::to_string(kMaxViewTurns) +
+                        " turns (use angle_interp nearest)");
+        I.row_base = lo;
+        I.chunk_rows = static_cast<int>(span);
+        for (std::size_t s = 0; s < I.scans.size(); ++s) {
+            auto& c = chunks[s].cs;
+            for (int k = 0; k < c.p1 - c.p0; ++k) {
+                c.j0[k] = static_cast<int32_t>(I.bins[s].bin[c.p0 + k] - lo);
+                c.alpha[k] = 0.f;
+            }
+        }
+    }
+    const int NR = I.chunk_rows;
+    const bool views = I.views;
+    RampGeometry rg = I.rg;   // (the chunk's rows)
+    rg.n_proj = NR;
     if (I.nearest) {
         std::vector<ChunkScan*> cs;
         for (auto& ch : chunks) cs.push_back(&ch.cs);
         set_slice_angles(cs, DY, m);
     }
-    if (dbg && dbg->keep) {
-        dbg->angles.resize(static_cast<std::size_t>(DY) * NG);
-        for (int y = 0; y < DY; ++y)
-            for (int i = 0; i < NG; ++i) dbg->angles[static_cast<std::size_t>(y) * NG + i] = -fbp_angles_of(y)[i];
+    if (dbg) {
+        dbg->n_rows = NR;
+        dbg->first_bin = views ? I.row_base : 0;
     }
-    if (timing) dbg->stats["sino_gb"] = 2.0 * NG * DY * NX * 4 / 1e9;
+    if (dbg && dbg->keep) {
+        dbg->angles.resize(static_cast<std::size_t>(DY) * NR);
+        for (int y = 0; y < DY; ++y)
+            for (int i = 0; i < NR; ++i) dbg->angles[static_cast<std::size_t>(y) * NR + i] = -fbp_angles_of(y)[i];
+    }
+    if (timing) dbg->stats["sino_gb"] = 2.0 * NR * DY * NX * 4 / 1e9;
     tick("prepare");
     std::vector<ChunkGlare> cg(I.scans.size());
     if (cfg.sld.enabled()) {
@@ -1004,7 +1086,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     const bool filter_context = !sets[0]->steps().empty();
     const int BL = std::max(1, cfg.block_angles);
     const std::size_t blk = static_cast<std::size_t>(BL) * H * NX;
-    const std::size_t sino_n = static_cast<std::size_t>(NG) * DY * NX;
+    const std::size_t sino_n = static_cast<std::size_t>(NR) * DY * NX;
 
     if (!gpu) {
         // ============================================================ CPU
@@ -1021,8 +1103,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         std::vector<float> S(sino_n), Wc(sino_n);
         std::vector<float> R(blk), RW(blk), Wp, Aha, Bha, Atot, Btot;
         std::vector<float> Wc2(sharp ? sino_n : 0), R2(sharp ? blk : 0), RW2(sharp ? blk : 0), Wp2, Aha2, Bha2, Atot2, Btot2;
-        for (int g0 = 0; g0 < NG; g0 += BL) {
-            const int g1 = std::min(NG, g0 + BL), L = g1 - g0;
+        for (int g0 = 0; g0 < NR; g0 += BL) {
+            const int g1 = std::min(NR, g0 + BL), L = g1 - g0;
             const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
             if (sharp) {
                 std::fill(R2.begin(), R2.begin() + n_el, 0.f);
@@ -1035,7 +1117,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 const auto& ch = chunks[s];
                 const auto& c = ch.cs;
                 const int n = c.p1 - c.p0;
-                const auto contrib = make_contributors(c.j0.data(), n, NG, g0, g1, !I.nearest);
+                const auto contrib = make_contributors(c.j0.data(), n, NR, g0, g1, !I.nearest);
                 auto view = make_view(sd, ch, ch.raw.data(), sd.dark.data(), sd.flats.data(), sd.weight.data(),
                                       c.row0.data(), c.fract_v.data(), c.alpha.data(), c.current_div.data(),
                                       c.weight_factor.data(), c.flat_frac.data(), c.flat_i0.data(), c.flat_i1.data(),
@@ -1106,19 +1188,26 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         }
         for (auto& ch : chunks) std::vector<uint16_t>().swap(ch.raw);
         if (dbg && dbg->keep) { dbg->sino = S; dbg->weights = Wc; }
-        if (!ap.measured_only) cpu::rebalance(S.data(), Wc.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
-        if (sharp) {   // the balanced weights of the second set (the sinogram's holes are filled already)
+        if (views) cpu::rebalance_turns(S.data(), Wc.data(), NR, DY, NX, NG, cfg.rot_center);
+        else if (!ap.measured_only) cpu::rebalance(S.data(), Wc.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        if (sharp && views) {   // the balanced weights of the second set (the sinogram's holes are filled already)
+            const TurnHoles holes = cpu::turn_holes(Wc2.data(), NR, DY, NX, NG);
+            if (!holes.all_empty) {
+                cpu::fill_turn_holes(Wc2.data(), holes, DY, NX);
+                cpu::balance_weights_turns(Wc2.data(), NR, DY, NX, NG, cfg.rot_center);
+            }
+        } else if (sharp) {
             std::vector<float> scratch(S);
-            cpu::rebalance(scratch.data(), Wc2.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+            cpu::rebalance(scratch.data(), Wc2.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
         }
-        if (dbg && dbg->keep) { dbg->wbal = Wc; dbg->filtered.resize(static_cast<std::size_t>(DY) * NG * NX); }
+        if (dbg && dbg->keep) { dbg->wbal = Wc; dbg->filtered.resize(static_cast<std::size_t>(DY) * NR * NX); }
         tick("rebalance");
-        std::vector<float> row(static_cast<std::size_t>(NG) * NX), wrow(row.size());
+        std::vector<float> row(static_cast<std::size_t>(NR) * NX), wrow(row.size());
         std::vector<float> w2row(sharp ? row.size() : 0), brow(sharp ? row.size() : 0);
-        std::vector<float> padded(static_cast<std::size_t>(NG) * rg.npad);
+        std::vector<float> padded(static_cast<std::size_t>(NR) * rg.npad);
         step("backproject");
         for (int y = 0; y < DY; ++y) {
-            for (int i = 0; i < NG; ++i) {
+            for (int i = 0; i < NR; ++i) {
                 std::memcpy(&row[static_cast<std::size_t>(i) * NX], &S[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
                 std::memcpy(&wrow[static_cast<std::size_t>(i) * NX], &Wc[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
                 if (sharp)
@@ -1127,24 +1216,24 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             tick("ramp_gather");
             if (!arc_taps.empty()) {
                 arc_h.resize(row.size());
-                cpu::angular_fir(row.data(), arc_h.data(), NG, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1,
+                cpu::angular_fir(row.data(), arc_h.data(), NR, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1,
                                  ap.measured_only ? wrow.data() : nullptr);
                 std::memcpy(row.data(), arc_h.data(), row.size() * sizeof(float));
                 tick("arc");
             }
             if (!raw_rows) {
-                cpu::ramp_pad(row.data(), padded.data(), rg);
-                ramp_filter->apply(padded.data(), padded.data(), NG);
+                cpu::ramp_pad(row.data(), padded.data(), rg, views ? I.slice_opposite.data() + static_cast<std::size_t>(y) * NR : nullptr);
+                ramp_filter->apply(padded.data(), padded.data(), NR);
                 cpu::ramp_crop(padded.data(), row.data(), rg);
                 if (sharp) {   // usual pair weights, and above the band the second set's: row w + HP (row (w2 - w))
                     cpu::weight_difference(row.data(), wrow.data(), w2row.data(), brow.data(), row.size());
-                    I.band1d->apply(brow.data(), brow.data(), NG);
+                    I.band1d->apply(brow.data(), brow.data(), NR);
                     cpu::multiply_add(row.data(), wrow.data(), brow.data(), row.size());
                 } else {
                     cpu::multiply(row.data(), wrow.data(), row.size());
                 }
             }
-            if (dbg && dbg->keep) std::memcpy(&dbg->filtered[static_cast<std::size_t>(y) * NG * NX], row.data(), row.size() * sizeof(float));
+            if (dbg && dbg->keep) std::memcpy(&dbg->filtered[static_cast<std::size_t>(y) * NR * NX], row.data(), row.size() * sizeof(float));
             tick("ramp");
             sink(0, y, row.data(), wrow.data());
             tick("backproject");
@@ -1209,14 +1298,14 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     };
     std::vector<BlockPlan> plans;
     std::vector<std::size_t> max_count(nsc, 0);
-    for (int g0 = 0; g0 < NG; g0 += BL) {
+    for (int g0 = 0; g0 < NR; g0 += BL) {
         BlockPlan bpl;
         bpl.g0 = g0;
-        bpl.g1 = std::min(NG, g0 + BL);
+        bpl.g1 = std::min(NR, g0 + BL);
         for (std::size_t s = 0; s < nsc; ++s) {
             const auto& c = chunks[s].cs;
             const int n = c.p1 - c.p0;
-            bpl.contrib.push_back(make_contributors(c.j0.data(), n, NG, bpl.g0, bpl.g1, !I.nearest));
+            bpl.contrib.push_back(make_contributors(c.j0.data(), n, NR, bpl.g0, bpl.g1, !I.nearest));
             std::vector<char> used(n, 0);
             for (int32_t k : bpl.contrib.back().proj) used[k] = 1;
             std::vector<std::pair<int, int>> rg_;
@@ -1339,9 +1428,9 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     FourierFilter* fwd = nullptr;
     if (spectral) {
         fwd = fft_for(0, sets[0]->step_spec(0, H, NX, fm));
-        Icache.ensure(static_cast<std::size_t>(NG) * fwd->spectrum_floats());
+        Icache.ensure(static_cast<std::size_t>(NR) * fwd->spectrum_floats());
     } else if (K > 1) {
-        Icache.ensure(static_cast<std::size_t>(NG) * H * NX);
+        Icache.ensure(static_cast<std::size_t>(NR) * H * NX);
     }
     issue_upload(0);
     for (std::size_t b = 0; b < plans.size(); ++b) {
@@ -1424,7 +1513,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             if (!ap.log_values) cuda::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
             apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, fm);
             tick("log");
-            // rows [m, m + DY) of each grid angle -> device sinogram (NG, DY, NX)
+            // rows [m, m + DY) of each grid angle -> device sinogram (NR, DY, NX)
             HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(S.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
                                                  R.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
@@ -1450,36 +1539,37 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
         step("backproject");
     }
-    const std::size_t rown = static_cast<std::size_t>(NG) * NX;
-    row.ensure(rown); wrow.ensure(rown); pad.ensure(static_cast<std::size_t>(NG) * rg.npad);
+    const std::size_t rown = static_cast<std::size_t>(NR) * NX;
+    row.ensure(rown); wrow.ensure(rown); pad.ensure(static_cast<std::size_t>(NR) * rg.npad);
+    if (views) d_opposite.upload(I.slice_opposite.data(), I.slice_opposite.size());
     if (sharp) { w2row.ensure(rown); brow.ensure(rown); }
     auto slices = [&](int k) {  // ramp filter x balanced weights per slice -> sink
         for (int y = 0; y < DY; ++y) {
             HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(row.data(), NX * sizeof(float), S.data() + static_cast<std::size_t>(y) * NX,
-                                                 static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NG,
+                                                 static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR,
                                                  cudaMemcpyDeviceToDevice));
             HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(wrow.data(), NX * sizeof(float), W.data() + static_cast<std::size_t>(y) * NX,
-                                                 static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NG,
+                                                 static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR,
                                                  cudaMemcpyDeviceToDevice));
             if (sharp)
                 HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(w2row.data(), NX * sizeof(float), W2.data() + static_cast<std::size_t>(y) * NX,
-                                                     static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NG,
+                                                     static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR,
                                                      cudaMemcpyDeviceToDevice));
             tick("ramp_gather");
             if (!arc_taps.empty()) {
                 arc_d.ensure(rown);
-                cuda::angular_fir(row.data(), arc_d.data(), NG, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1,
+                cuda::angular_fir(row.data(), arc_d.data(), NR, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1,
                                   ap.measured_only ? wrow.data() : nullptr);
                 HELIREC_CUDA_CHECK(cudaMemcpyAsync(row.data(), arc_d.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
                 tick("arc");
             }
             if (!raw_rows) {
-                cuda::ramp_pad(row.data(), pad.data(), rg);
-                ramp_filter->apply(pad.data(), pad.data(), NG);
+                cuda::ramp_pad(row.data(), pad.data(), rg, nullptr, views ? d_opposite.data() + static_cast<std::size_t>(y) * NR : nullptr);
+                ramp_filter->apply(pad.data(), pad.data(), NR);
                 cuda::ramp_crop(pad.data(), row.data(), rg);
                 if (sharp) {   // usual pair weights, and above the band the second set's: row w + HP (row (w2 - w))
                     cuda::weight_difference(row.data(), wrow.data(), w2row.data(), brow.data(), rown);
-                    I.band1d->apply(brow.data(), brow.data(), NG);
+                    I.band1d->apply(brow.data(), brow.data(), NR);
                     cuda::multiply_add(row.data(), wrow.data(), brow.data(), rown);
                 } else {
                     cuda::multiply(row.data(), wrow.data(), rown);
@@ -1499,11 +1589,18 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             HELIREC_CUDA_CHECK(cudaMemcpy(dbg->sino.data(), S.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
             HELIREC_CUDA_CHECK(cudaMemcpy(dbg->weights.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
         }
-        if (!ap.measured_only) cuda::rebalance(S.data(), W.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
-        if (sharp) {   // the balanced weights of the second set (the sinogram's holes are filled already)
-            const auto holes = cuda::rebalance_holes(W2.data(), NG, DY, NX);
-            cuda::fill_holes(W2.data(), holes, NG, DY, NX);
-            cuda::balance_weights(W2.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        if (views) cuda::rebalance_turns(S.data(), W.data(), NR, DY, NX, NG, cfg.rot_center);
+        else if (!ap.measured_only) cuda::rebalance(S.data(), W.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        if (sharp && views) {   // the balanced weights of the second set (the sinogram's holes are filled already)
+            const TurnHoles holes = cuda::turn_holes(W2.data(), NR, DY, NX, NG);
+            if (!holes.all_empty) {
+                cuda::fill_turn_holes(W2.data(), holes, DY, NX);
+                cuda::balance_weights_turns(W2.data(), NR, DY, NX, NG, cfg.rot_center);
+            }
+        } else if (sharp) {
+            const auto holes = cuda::rebalance_holes(W2.data(), NR, DY, NX);
+            cuda::fill_holes(W2.data(), holes, NR, DY, NX);
+            cuda::balance_weights(W2.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
         }
         if (dbg && dbg->keep) {
             dbg->wbal.resize(sino_n);
@@ -1515,20 +1612,36 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         return;
     }
     // ---- sweep: shared weights, then per set: phase / log / crop from the cached intensity, slices
-    const auto holes = cuda::rebalance_holes(W.data(), NG, DY, NX);
-    const bool all_empty = !holes.empty() && holes.front().first < 0;
-    if (!all_empty) {
-        cuda::fill_holes(W.data(), holes, NG, DY, NX);
-        cuda::balance_weights(W.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
-        if (sharp) {
-            cuda::fill_holes(W2.data(), holes, NG, DY, NX);
-            cuda::balance_weights(W2.data(), NG, DY, NX, cfg.rot_center, cfg.legacy_reference);
+    std::vector<std::pair<int, int>> holes;
+    TurnHoles tholes;
+    bool all_empty = false;
+    if (views) {
+        tholes = cuda::turn_holes(W.data(), NR, DY, NX, NG);
+        all_empty = tholes.all_empty;
+        if (!all_empty) {   // (balanced weights are 0 where the weights are: fill_from_turns below reads either)
+            cuda::fill_turn_holes(W.data(), tholes, DY, NX);
+            cuda::balance_weights_turns(W.data(), NR, DY, NX, NG, cfg.rot_center);
+            if (sharp) {
+                cuda::fill_turn_holes(W2.data(), tholes, DY, NX);
+                cuda::balance_weights_turns(W2.data(), NR, DY, NX, NG, cfg.rot_center);
+            }
+        }
+    } else {
+        holes = cuda::rebalance_holes(W.data(), NR, DY, NX);
+        all_empty = !holes.empty() && holes.front().first < 0;
+        if (!all_empty) {
+            cuda::fill_holes(W.data(), holes, NR, DY, NX);
+            cuda::balance_weights(W.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
+            if (sharp) {
+                cuda::fill_holes(W2.data(), holes, NR, DY, NX);
+                cuda::balance_weights(W2.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
+            }
         }
     }
     tick("rebalance");
     for (int k = 0; k < K; ++k) {
-        for (int g0 = 0; g0 < NG; g0 += BL) {
-            const int L = std::min(NG, g0 + BL) - g0;
+        for (int g0 = 0; g0 < NR; g0 += BL) {
+            const int L = std::min(NR, g0 + BL) - g0;
             const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
             if (spectral) {
                 FourierFilter* f = fft_for(0, sets[k]->step_spec(0, H, NX, fm));
@@ -1546,7 +1659,12 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
             tick("log");
         }
-        if (!all_empty) cuda::fill_holes(S.data(), holes, NG, DY, NX);
+        if (!all_empty && views) {
+            cuda::fill_turn_holes(S.data(), tholes, DY, NX);
+            cuda::fill_from_turns(S.data(), W.data(), NR, DY, NX, NG);
+        } else if (!all_empty) {
+            cuda::fill_holes(S.data(), holes, NR, DY, NX);
+        }
         tick("rebalance");
         slices(k);
     }
@@ -1757,14 +1875,14 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
         I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
             host_sink(y, [&](float* dst) {
                 if (external) {
-                    I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles_of(y), bp, N, computed, Device::CPU, dst);
+                    I.cfg.external->slice(h_lo + y, row, wrow, I.chunk_rows, I.NX, I.fbp_angles_of(y), bp, N, computed, Device::CPU, dst);
                 } else if (use_ghbp) {
                     cpu::ghbp(I.plan, row, full.data());
                     for (int r = 0; r < bh; ++r)
                         std::memcpy(dst + static_cast<std::size_t>(r) * bw,
                                     full.data() + static_cast<std::size_t>(computed.y0 + r) * N + computed.x0, bw * sizeof(float));
                 } else if (set_tiles(y)) {
-                    cpu::backproject(I.fbp_rows(row), I.fbp_angles_of(y), dst, I.n_grid, nd, bh, bw, bp);
+                    cpu::backproject(I.fbp_rows(row), I.fbp_angles_of(y), dst, I.chunk_rows, nd, bh, bw, bp);
                 } else {
                     std::fill(dst, dst + block_plane, 0.f);
                 }
@@ -1783,7 +1901,7 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
     I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
         if (external) {
             host_sink(y, [&](float* dst) {
-                I.cfg.external->slice(h_lo + y, row, wrow, I.n_grid, I.NX, I.fbp_angles_of(y), bp, N, computed, Device::CUDA, dst);
+                I.cfg.external->slice(h_lo + y, row, wrow, I.chunk_rows, I.NX, I.fbp_angles_of(y), bp, N, computed, Device::CUDA, dst);
             });
             return;
         }
@@ -1795,7 +1913,7 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
             dev += static_cast<std::size_t>(computed.y0) * N + computed.x0;
             pitch = static_cast<std::size_t>(N);
         } else if (set_tiles(y)) {
-            cuda::backproject(I.fbp_rows(row), I.fbp_angles_of(y), I.slice.data(), I.n_grid, nd, bh, bw, bp);
+            cuda::backproject(I.fbp_rows(row), I.fbp_angles_of(y), I.slice.data(), I.chunk_rows, nd, bh, bw, bp);
         } else {   // nothing kept: an empty slice
             if (out.u8) clear_outside(u8_of(y), ry, rx, Block{});
             to_sinks(y, nullptr, nullptr);
@@ -1861,7 +1979,7 @@ void SliceReconstructor::reconstruct_band(int h_lo, int h_hi, BandSampler& band,
         for (const auto& h : held) fm = std::max(fm, h->margin_rows());
     }
     I.run(h_lo, h_hi, dbg, sets, sw ? sweep_margin(*sweep) : I.margin, fm, [&](int k, int y, float* row, float*) {
-        band.slice(h_lo + y, I.fbp_rows(row), I.n_grid, nd, I.fbp_angles_of(y), I.bp, k);
+        band.slice(h_lo + y, I.fbp_rows(row), I.chunk_rows, nd, I.fbp_angles_of(y), I.bp, k);
     }, next_lo, next_hi);
 }
 

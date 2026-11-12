@@ -48,7 +48,7 @@ struct ReconConfig {
     // fractional column offset of a scan in the merged frame: "sinc" (default) = each projection row delayed by the
     // offset exactly (a phase ramp on its transform; the gridding of measured pixels only, for the iterative methods,
     // uses lanczos3); "lanczos3" / "cubic" = a kernel of 6 / 4 columns, which loses the top of the band (lanczos3 at
-    // half a pixel: 0.83 at 0.36 cycles per pixel, 0.33 at 0.45); "linear" = the reference's two-column splat, which
+    // half a pixel: 0.82 at 0.36 cycles per pixel, 0.35 at 0.45); "linear" = the reference's two-column splat, which
     // averages neighbouring columns (cos(pi nu) at half a pixel). The legacy reference mode always uses the splat.
     std::string x_interp = "sinc";
     // Band-dependent redundancy weights (sino.hpp), for a detector whose sharpness depends on the place: "" = off, or
@@ -70,9 +70,18 @@ struct ReconConfig {
     // reference's splat of each projection over the two grid angles around its own. Nearest needs a backprojector that
     // takes the angles of each slice (fbp, the whole-slice methods, bands): ghbp, whose plan fixes its angles, and the
     // legacy reference mode keep the splat (SliceReconstructor::angle_interp() tells which is in use).
+    // "views" = nearest without the wrap to one turn: every bin of every turn is a row of the sinogram, so that the
+    // views of a slice that share a grid angle (a turn apart where the detector is taller than the travel per turn,
+    // or a turn at rest and the helix) are not averaged at their mean angle but each filtered and backprojected at
+    // its own, with its share of the weight (sino.hpp rebalance_turns). They differ in angle by the turn's excess
+    // over a whole number of steps and, with a rolling shutter, by the rows between them. The sinogram then has as
+    // many rows as bins the chunk's projections span (at most 16 turns), and gridding, filters and backprojection
+    // cost in proportion. It needs the exact backprojector (fbp, bands): the others use nearest. The exposure arc
+    // (exposure_arc below) is not deconvolved with it: disabled for now.
     std::string angle_interp = "nearest";
     // continuous rotation: fraction of the angular step between projections swept during one exposure (0: none, or
     // step scans). > 0: that box blur along the angle is deconvolved in every sinogram (sino.hpp angular_fir).
+    // Not with angle_interp "views", where it is disabled for now (SliceReconstructor::exposure_arc_bins() is then 0).
     double exposure_arc = 0;
     // Rolling shutter: the detector's rows are read one after another while the sample turns, so the angle of a
     // recording depends on its row. rolling_shutter = the time from the read-out of the first row to that of the
@@ -126,11 +135,15 @@ struct ReconConfig {
 // Optional intermediate outputs (filled when requested)
 struct ChunkDebug {
     bool keep = false;
-    std::vector<float> sino;      // (n_grid, DY, NX) -log sinogram before rebalance
-    std::vector<float> weights;   // (n_grid, DY, NX) accumulated weights (cropped)
+    // n_rows: the rows of the chunk's sinogram: n_grid, or with a row per view (angle_interp "views") the bins its
+    // projections span, at least n_grid (row r: bin first_bin + r, at the grid angle of that bin modulo n_grid)
+    int n_rows = 0;
+    long first_bin = 0;
+    std::vector<float> sino;      // (n_rows, DY, NX) -log sinogram before rebalance
+    std::vector<float> weights;   // (n_rows, DY, NX) accumulated weights (cropped)
     std::vector<float> wbal;      // backprojector weights: balanced for FBP/gridrec, measured support for SIRT/MLEM
-    std::vector<float> filtered;  // (DY, n_grid, NX) backprojector input
-    std::vector<float> angles;    // (DY, n_grid) angle of each grid bin in each slice (radians)
+    std::vector<float> filtered;  // (DY, n_rows, NX) backprojector input
+    std::vector<float> angles;    // (DY, n_rows) angle of each row in each slice (radians)
     // per-stage wall time (seconds); with timing on, the GPU is synchronised at stage boundaries
     bool timing = false;
     std::map<std::string, double> seconds;
@@ -205,7 +218,7 @@ class SliceReconstructor {
     std::pair<int, int> mend_domain() const;   // [x0, x1) merged columns the mending works on
     double exposure_arc_bins() const;          // the deconvolved exposure arc in grid angles (0: none)
     double rolling_shutter() const;            // the rolling shutter in use (frame periods over the rows; 0: none)
-    std::string angle_interp() const;          // the angular gridding in use: "nearest" or "linear"
+    std::string angle_interp() const;          // the angular gridding in use: "views", "nearest" or "linear"
     std::string z_interp() const;              // the vertical kernel in use
     std::vector<int> projection_counts() const;   // projections in use, per scan (a subset: fewer than recorded)
     const ReconConfig& config() const;

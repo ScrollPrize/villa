@@ -11,15 +11,15 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
   rebalance; ramp padding reflected about the true rotation axis; mending over the merged columns both scans cover;
   a unit-DC Paganin kernel and a two-scan luminosity window independent of the chunk height; a scan at a
   fractional column offset shifted exactly (`x_interp=sinc`), a slice's fractional detector row interpolated with
-  a Lanczos-3 kernel (`z_interp`); each projection gridded whole into one angular bin and backprojected at its measured angle
-  (`angle_interp=nearest`; GHBP keeps the two-bin splat); the helical pitch measured from the frames (`z_translation_scale=auto`); the companion
+  a Lanczos-3 kernel (`z_interp`); each projection gridded whole into a sinogram row of its own and backprojected at its measured angle
+  (`angle_interp=views`; GHBP keeps the two-bin splat); the helical pitch measured from the frames (`z_translation_scale=auto`); the companion
   scan's frames placed as they register on the main scan's, row offset and roll per projection
-  (`companion_registration=auto`); the turns recorded with the z stage at rest placed against
+  (`companion_registration=auto`); recordings of a ray combined with band-dependent weights where the detector's
+  sharpness depends on the place (`sharpness_weighting=auto`); the turns recorded with the z stage at rest placed against
   the helix as the frames register them (`stationary_registration=auto`); the rotation axis refined from the scan's
-  opposite views (`axis_refinement=auto`). No projection filters by default, and since 2026-11-11 neither of the two
-  blur corrections: the exposure arc of a continuous scan is not deconvolved (`exposure_arc=0`; `auto` turns it on)
-  and recordings of a ray are not combined with band-dependent weights (`sharpness_weighting=off`; `auto` turns it on).
-  Both are left for the intensity side of the calibration, after the geometry.
+  opposite views (`axis_refinement=auto`). No projection filters by default, and since 2026-11-11 the exposure arc of
+  a continuous scan is not deconvolved (`exposure_arc=0`; `auto` turns it on): that is left for the intensity side of
+  the calibration, after the geometry.
 * `legacy_reference`: the reference workflow's conventions (half-attenuation units, its rebalance endpoints,
   integer padding reflection, mending bounds, chunk-dependent Paganin and luminosity window, two-column splat of
   fractional column offsets, linear rows, two-bin angular splat, no exposure-arc correction) with every parameter pinned (GHBP, Paganin 1000 + unsharp 1.2/4, …); overriding one
@@ -346,7 +346,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     kernels use 6 / 4 rows wherever all of them are on the detector with a positive weight (else the two rows); the
     accumulated weights stay the linear ones. Measured on PHerc0343P (64 slices of papyrus, Paganin): the z spectrum
     amplitude rises by 5 % at 0.125, 18 % at 0.22 and 27 % at 0.27 cycles/pixel over `linear`, as 1 / sinc² predicts.
-  * `angle_interp=nearest|linear` (default `nearest`): the reference splits every projection between the two grid
+  * `angle_interp=views|nearest|linear` (default `views`): the reference splits every projection between the two grid
     angles around its own (weights 1 − α, α), an average of neighbouring views wherever the recorded angles sit off
     the regular grid (PHerc0343P: α drifts through all values, the step being 0.0449985° rather than 0.045°).
     `nearest` puts each projection whole into one bin, consecutive projections in consecutive bins
@@ -354,11 +354,43 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     (`debug["angles"]`). A skipped projection leaves its bin empty (filled as any empty angle). It needs a
     backprojector that takes each slice's angles: FBP, the whole-slice methods and bands; GHBP, whose plan fixes its
     angles, keeps the splat (`info["angle_interp"]` records which is in use).
+
+    `views` is `nearest` without the wrap to one turn. Where the detector is taller than the travel per turn a slice
+    is seen twice at a grid angle, a turn apart (and again by a turn at rest), and those views were not recorded
+    at one angle: a turn is not a whole number of steps, and with a rolling shutter the rows they are read at were
+    exposed at different times. PHerc0343P: the two views of a bin are 8000 frames apart and differ by 0.90 frames
+    by the record and the row timing (0.27 from the turn of 8000.27 frames, 0.63 from 1053 rows of row timing, the
+    same way) and by 0.93–0.94 with the helix's measured excess: 0.7 px at 1000 px from the axis, in 13.8 % of the
+    angles in the helix; a rest turn against the helix 0.27 to 0.90 frames. `nearest` averages them into one row at
+    their mean angle. `views` keeps a sinogram row per bin of every turn (`debug["sino"]` has `n_rows >= n_grid`
+    rows, row r being bin `debug["first_bin"] + r`): each view is ramp-filtered and backprojected at its own angle,
+    with its share of the weight, the balanced weights now a partition of unity over every recording of a line
+    (the rows a half turn's multiple away; `rebalance_turns`, `sino.hpp`). Values and weights are those `nearest`
+    grids; with the turns at one angle the slices are the same to 1e-7. On an analytic phantom with views 0.4 to
+    0.8 of a step apart the error of `nearest` is 2.6 times that of the aligned case and that of `views` is the
+    aligned case's (`tests/test_views.py`). What is not exact in it: the weights of two views of a bin are shared
+    bin by bin, not at equal angle, which shows only where a weight jumps (a missing projection, a weight map
+    without a taper at its top and bottom).
+
+    PHerc0343P, geometry calibration, ramp filter only, the signal shared by reconstructions from two interleaved
+    halves of the angles (cross-power in blocks of 512 px, 16 slices), `views` over `nearest`: in the middle of the
+    helix nothing changes outside one sector of each slice (which turns with the height); in it, 570–1080 px from
+    the axis, the power rises by 4–8 % at 0.15–0.25 and 7–12 % at 0.25–0.35 cycles/px in the 45° of directions
+    the doubled views measure (1.7 % over all directions), and by a third at 1000–1500 px (outside the sample
+    there). Where the last rest turn and the helix both record: 5–6 % over all directions at 0.25–0.35 cycles/px
+    and 10–25 % at 0.35–0.5 at 520–1080 px, the split-half correlation 0.691 → 0.718 and 0.880 → 0.889 at
+    0.25–0.35. Cost: the sinogram has 9523 rows for 8000 (helix) and about 2.2 times as many with a rest turn; a
+    chunk of 32 whole slices without projection filters takes 8.6 s for 7.5 s (the backprojection's rows), the
+    device holds 15.3 GB for 13.4 GB. It needs the exact backprojector (FBP, bands; at most 16 turns of rows);
+    the whole-slice methods use `nearest`. The exposure arc is not deconvolved with it (below).
   * `exposure_arc=auto|F` (default `0`: off): in a continuous scan the detector integrates while the sample turns, a
     box blur along the angle of F angular steps (tangential, growing with the radius: 0.7 px at r = 1000 px for
     PHerc0343P). `auto` takes F from the scan (the recorded rotation swept per exposure / per period, 0.91 here;
     0 for step scans); its inverse 1 / sinc(F f) is applied to every sinogram as a 9-tap kernel along the angle
-    (`sino.hpp`), at most 1.43 at the angular Nyquist frequency. 0: off.
+    (`sino.hpp`), at most 1.43 at the angular Nyquist frequency. 0: off. **Disabled for now with
+    `angle_interp=views`** (the default): the kernel runs along one turn of grid angles and has not been carried
+    over to a row per view; `info["exposure_arc_bins"]` is then 0 and `helirec-slices` says so. `angle_interp=nearest`
+    applies it.
     On PHerc0343P `nearest` and the arc correction together sharpen the tangential edge of the wrap at r ≈ 1200 px by
     3 % (Paganin only) to 7 % (with the unsharp mask); as the removed blurs also averaged noise, the noise in the outer
     air rises by 16 % (Paganin) to 33 % (unsharp).
@@ -427,7 +459,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     | half a pixel, response at | 0.25 | 0.36 | 0.45 cycles/pixel |
     |---|---|---|---|
     | `sinc` | 1.00 | 1.00 | 1.00 |
-    | `lanczos3` (6 columns) | 1.02 | 0.83 | 0.35 |
+    | `lanczos3` (6 columns) | 1.02 | 0.82 | 0.35 |
     | `cubic` (4 columns) | 0.88 | 0.60 | 0.23 |
     | `linear` (the reference's two-column splat, cos(πν)) | 0.71 | 0.43 | 0.16 |
 
@@ -455,7 +487,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     show at the axis is measured and logged but not applied: where the detector's blur is one-sided and differs
     between the two places a ray is recorded at, it is the blur's displacement, not the scan's (applying it on
     PHerc0343P moved the companion 0.3–0.4 voxel radially off the main scan).
-  * `sharpness_weighting=auto|off|a11:a12:a21:a22:c1:c2` (default `off`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
+  * `sharpness_weighting=auto|off|a11:a12:a21:a22:c1:c2` (default `auto`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
     (named `detector_smear` until 2026-11-11; that key is still accepted, and calibration caches written with the
     old names still load.)
     band-dependent redundancy weights for a detector that is not equally sharp everywhere. The field is a uniform
@@ -564,7 +596,11 @@ because their attenuation is higher). `crops` writes full-resolution crop sheets
 
 `tests/test_resolution.py` checks the fused filter's response, the vertical kernels against a NumPy reference and a
 row pattern, nearest-bin gridding and its angles on drifting angles with a missing projection, and the exposure-arc
-kernel, each on CPU and CUDA and across chunkings.
+kernel, each on CPU and CUDA and across chunkings. `tests/test_views.py` checks the row per view: the balanced
+weights, hole filling and ramp padding of a sinogram of more than one turn against NumPy, that it gives the slices
+of `nearest` when the turns are at one angle (also with missing projections and two scans) and the aligned case's
+error when they are not (a turn that is not a whole number of steps, a rolling shutter), chunk independence, bands
+and sweeps.
 
 `tests/test_epr.py` checks `epr` against exact Fresnel propagation of a homogeneous object (about half of Paganin's
 error where ray shifts reach a fraction of a pixel, Paganin's result where they do not), CPU/CUDA parity and chunk
@@ -757,13 +793,13 @@ projection is then read on the grid of the calibration's detector map (the rows 
 kernel, the columns resampled exactly: `resample_rows`, a non-uniform transform of the interpolant the exact shift
 uses, within 1e-6 of the direct sum), at the pose `geometry.frame_poses` gives its frame, and at the angle of its
 rows. `z_translation_scale`, `companion_registration`, `stationary_registration`, `axis_refinement` and
-`rolling_shutter` are not used with it; it needs `x_interp=sinc`, and `fbp` with `angle_interp=nearest` for the row
-timing. `provenance()["geometry"]` records the file and what the calibration measured that the reconstruction
+`rolling_shutter` are not used with it; it needs `x_interp=sinc`, and `fbp` with `angle_interp=views` or `nearest`
+for the row timing. `provenance()["geometry"]` records the file and what the calibration measured that the reconstruction
 cannot express. Off by default; without it nothing changes. On PHerc0343P, without projection filters it costs
 no time (7.5 s per 32 slices against 7.3–8.4 s); with Paganin and unsharp a slab of 256 slices takes 53 s against
-32–33 s. What the reconstruction still does not do exactly (views a turn apart backprojected at their
-mean angle, the beam's divergence, the six-row kernel along the rows) is listed in
-`development_notes/calibration/05_experiments.md`, section 33.
+32–33 s. What the reconstruction still does not do exactly (the beam's divergence, the six-row kernel along the
+rows; views a turn apart are backprojected each at its own angle since `angle_interp=views`, section 34) is listed
+in `development_notes/calibration/05_experiments.md`, section 33.
 
 ## Tests
 

@@ -258,10 +258,10 @@ void angular_fir(const float* in, float* out, int n_proj, int n_cols, const floa
             out[static_cast<std::size_t>(j) * n_cols + x] = sino_core::angular_fir_at(in, support, n_proj, n_cols, j, x, g, radius);
 }
 
-void ramp_pad(const float* sino, float* padded, const RampGeometry& g) {
+void ramp_pad(const float* sino, float* padded, const RampGeometry& g, const int32_t* opposite) {
 #pragma omp parallel for schedule(static)
     for (int y = 0; y < g.n_proj; ++y) {
-        const int m = (y + g.n_proj / 2) % g.n_proj;
+        const int m = opposite ? opposite[y] : (y + g.n_proj / 2) % g.n_proj;
         const float* row = sino + static_cast<std::size_t>(y) * g.n_bins;
         const float* mrow = sino + static_cast<std::size_t>(m) * g.n_bins;
         const float adj = ramp_adj(row, mrow, g);
@@ -288,6 +288,8 @@ inline float mapped(const float* row, const OddMap& e) {
     if (e.src1 >= 0) v += e.w1 * row[e.src1];
     return v;
 }
+void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std::vector<std::vector<Contribution>>& table,
+                        const std::vector<OddMap>& omap);
 }  // namespace
 
 int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy) {
@@ -316,10 +318,16 @@ int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_
             std::memcpy(W + (idx % n_proj) * plane, wf.data(), plane * sizeof(float));
         }
     }
-    // ---- contribution table
-    const auto table = rebalance_core::contribution_table(n_proj, legacy);
-    const auto omap = rebalance_core::odd_shift_map(n_cols, rot_center);
-    // ---- balanced weights, row by row
+    balance_with_table(W, n_proj, n_rows, n_cols, rebalance_core::contribution_table(n_proj, legacy),
+                       rebalance_core::odd_shift_map(n_cols, rot_center));
+    return static_cast<int>(holes.size());
+}
+
+namespace {
+// W <- W_i / (W_i + the contributions table[i] names), row by row
+void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std::vector<std::vector<Contribution>>& table,
+                        const std::vector<OddMap>& omap) {
+    const std::size_t plane = static_cast<std::size_t>(n_rows) * n_cols;
     std::vector<float> Wsrc(static_cast<std::size_t>(n_proj) * n_cols);
     for (int row = 0; row < n_rows; ++row) {
         for (int i = 0; i < n_proj; ++i)
@@ -346,7 +354,71 @@ int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_
             }
         }
     }
-    return static_cast<int>(holes.size());
+}
+
+// rows whose mid-row holds a weight (the emptiness test of rebalance)
+std::vector<char> nonempty_rows(const float* W, int n_proj, int n_rows, int n_cols) {
+    const std::size_t plane = static_cast<std::size_t>(n_rows) * n_cols;
+    std::vector<char> nonempty(n_proj, 0);
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < n_proj; ++i) {
+        const float* w = W + i * plane + static_cast<std::size_t>(n_rows / 2) * n_cols;
+        for (int c = 0; c < n_cols; ++c)
+            if (w[c] != 0.0f) { nonempty[i] = 1; break; }
+    }
+    return nonempty;
+}
+
+void check_turns(int n_proj, int turn) {
+    if (turn < 2 || turn % 2 != 0) throw Error("rebalance_turns: the rows of a turn must be an even number");
+    if (n_proj < turn) throw Error("rebalance_turns: fewer rows than a turn");
+}
+}  // namespace
+
+// ------------------------------------------------------------------ rebalance, one row per view
+TurnHoles turn_holes(const float* W, int n_proj, int n_rows, int n_cols, int turn) {
+    check_turns(n_proj, turn);
+    return rebalance_core::turn_holes_from(nonempty_rows(W, n_proj, n_rows, n_cols), turn);
+}
+
+void fill_turn_holes(float* X, const TurnHoles& holes, int n_rows, int n_cols) {
+    const std::size_t plane = static_cast<std::size_t>(n_rows) * n_cols;
+    for (std::size_t h = 0; h < holes.dst.size(); ++h) {
+        float* dst = X + holes.dst[h] * plane;
+        const float* a = X + holes.left[h] * plane;
+        const float* b = X + holes.right[h] * plane;
+#pragma omp parallel for schedule(static)
+        for (std::ptrdiff_t k = 0; k < static_cast<std::ptrdiff_t>(plane); ++k) dst[k] = 0.5f * (a[k] + b[k]);
+    }
+}
+
+void fill_from_turns(float* R, const float* W, int n_proj, int n_rows, int n_cols, int turn) {
+    check_turns(n_proj, turn);
+    const std::size_t plane = static_cast<std::size_t>(n_rows) * n_cols;
+    // (only samples without weight are written and only samples with weight are read: no order matters)
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < n_proj; ++i)
+        for (std::size_t k = 0; k < plane; ++k) {
+            const std::size_t o = i * plane + k;
+            const int src = W[o] != 0.0f ? -1 : sino_core::turn_source(W, plane, k, n_proj, turn, i);
+            if (src >= 0) R[o] = R[static_cast<std::size_t>(src) * plane + k];
+        }
+}
+
+void balance_weights_turns(float* W, int n_proj, int n_rows, int n_cols, int turn, float rot_center) {
+    check_turns(n_proj, turn);
+    balance_with_table(W, n_proj, n_rows, n_cols, rebalance_core::contribution_table_turns(n_proj, turn),
+                       rebalance_core::odd_shift_map(n_cols, rot_center));
+}
+
+int rebalance_turns(float* R, float* W, int n_proj, int n_rows, int n_cols, int turn, float rot_center) {
+    const TurnHoles holes = turn_holes(W, n_proj, n_rows, n_cols, turn);
+    if (holes.all_empty) return 0;
+    fill_turn_holes(R, holes, n_rows, n_cols);
+    fill_turn_holes(W, holes, n_rows, n_cols);
+    fill_from_turns(R, W, n_proj, n_rows, n_cols, turn);
+    balance_weights_turns(W, n_proj, n_rows, n_cols, turn, rot_center);
+    return static_cast<int>(holes.dst.size());
 }
 
 }  // namespace cpu

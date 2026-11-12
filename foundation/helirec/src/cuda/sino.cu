@@ -44,11 +44,11 @@ __global__ void angular_fir_kernel(const float* __restrict__ in, float* __restri
 }
 
 // adj per row computed on the host-side formula but on device: one block per row
-__global__ void ramp_adj_kernel(const float* sino, float* adj, RampGeometry g) {
+__global__ void ramp_adj_kernel(const float* sino, float* adj, RampGeometry g, const int32_t* opposite) {
     const int y = blockIdx.x;
     if (y >= g.n_proj || threadIdx.x != 0) return;
     if (g.R <= 0) { adj[y] = 0.f; return; }
-    const int m = (y + g.n_proj / 2) % g.n_proj;
+    const int m = opposite ? opposite[y] : (y + g.n_proj / 2) % g.n_proj;
     const float* row = sino + static_cast<size_t>(y) * g.n_bins;
     const float* mrow = sino + static_cast<size_t>(m) * g.n_bins;
     if (!g.legacy) { adj[y] = sino_core::ramp_adj_exact(row, mrow, g); return; }
@@ -74,11 +74,11 @@ __global__ void ramp_adj_kernel(const float* sino, float* adj, RampGeometry g) {
     adj[y] = (wa > 0 && wb > 0) ? __fsub_rn(__fdiv_rn(sb, wb), __fdiv_rn(sa, wa)) : 0.f;
 }
 
-__global__ void ramp_pad_kernel(const float* sino, const float* adj, float* padded, RampGeometry g) {
+__global__ void ramp_pad_kernel(const float* sino, const float* adj, float* padded, RampGeometry g, const int32_t* opposite) {
     const size_t total = static_cast<size_t>(g.n_proj) * g.npad;
     for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total; k += static_cast<size_t>(gridDim.x) * blockDim.x) {
         const int x = static_cast<int>(k % g.npad), y = static_cast<int>(k / g.npad);
-        const int m = (y + g.n_proj / 2) % g.n_proj;
+        const int m = opposite ? opposite[y] : (y + g.n_proj / 2) % g.n_proj;
         padded[k] = sino_core::ramp_pad_value(sino + static_cast<size_t>(y) * g.n_bins, sino + static_cast<size_t>(m) * g.n_bins,
                                               adj[y], x, g);
     }
@@ -91,7 +91,7 @@ __global__ void ramp_crop_kernel(const float* padded, float* out, RampGeometry g
 }
 
 // ---- rebalance
-constexpr int kMaxContrib = 8;
+constexpr int kMaxContrib = 32;   // (the legacy table has 6; a sinogram of 16 turns, one row per view, 31)
 struct DevContrib { int k0, k1; float alpha; int flags; };  // flags: 1 has_two, 2 odd
 
 __global__ void nonempty_kernel(const float* W, size_t plane, size_t row_off, int n_cols, int n_proj, char* out) {
@@ -110,6 +110,17 @@ __global__ void nonempty_kernel(const float* W, size_t plane, size_t row_off, in
 __global__ void average_planes_kernel(const float* a, const float* b, float* out, size_t n) {
     for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < n; k += static_cast<size_t>(gridDim.x) * blockDim.x)
         out[k] = 0.5f * (a[k] + b[k]);
+}
+
+// fill_from_turns: samples without weight take the value of the nearest row a whole number of turns away that has one
+__global__ void fill_from_turns_kernel(float* R, const float* W, size_t plane, int n_proj, int turn) {
+    const size_t n = static_cast<size_t>(n_proj) * plane;
+    for (size_t o = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; o < n; o += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        if (W[o] != 0.0f) continue;
+        const size_t k = o % plane;
+        const int src = sino_core::turn_source(W, plane, k, n_proj, turn, static_cast<int>(o / plane));
+        if (src >= 0) R[o] = R[static_cast<size_t>(src) * plane + k];
+    }
 }
 
 __device__ inline float mapped_dev(const float* row, int c, const int2* osrc, const float2* ow) {
@@ -144,14 +155,30 @@ __global__ void rebalance_row_kernel(const float* __restrict__ Wsrc, float* W, s
 
 }  // namespace
 
-std::vector<std::pair<int, int>> rebalance_holes(const float* W, int n_proj, int n_rows, int n_cols, void* stream) {
-    cudaStream_t s = as_stream(stream);
+namespace {
+// rows whose mid-row holds a weight (the emptiness test of rebalance)
+std::vector<char> nonempty_rows(const float* W, int n_proj, int n_rows, int n_cols, cudaStream_t s) {
     const size_t plane = static_cast<size_t>(n_rows) * n_cols;
     DeviceBuffer<char> d_ne(n_proj);
     nonempty_kernel<<<n_proj, 256, 0, s>>>(W, plane, static_cast<size_t>(n_rows / 2) * n_cols, n_cols, n_proj, d_ne.data());
     HELIREC_CUDA_CHECK(cudaGetLastError());
     std::vector<char> nonempty(n_proj);
     d_ne.download(nonempty.data(), s);
+    return nonempty;
+}
+
+void check_turns(int n_proj, int turn) {
+    if (turn < 2 || turn % 2 != 0) throw Error("rebalance_turns: the rows of a turn must be an even number");
+    if (n_proj < turn) throw Error("rebalance_turns: fewer rows than a turn");
+}
+
+void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std::vector<std::vector<rebalance_core::Contribution>>& table,
+                        const std::vector<rebalance_core::OddMap>& omap, cudaStream_t s);
+}  // namespace
+
+std::vector<std::pair<int, int>> rebalance_holes(const float* W, int n_proj, int n_rows, int n_cols, void* stream) {
+    cudaStream_t s = as_stream(stream);
+    const std::vector<char> nonempty = nonempty_rows(W, n_proj, n_rows, n_cols, s);
     bool any = false;
     for (char v : nonempty) any |= v;
     if (!any) return {{-1, -1}};  // all empty: nothing to do (marker)
@@ -174,10 +201,15 @@ void fill_holes(float* X, const std::vector<std::pair<int, int>>& holes, int n_p
 }
 
 void balance_weights(float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy, void* stream) {
-    cudaStream_t s = as_stream(stream);
+    balance_with_table(W, n_proj, n_rows, n_cols, rebalance_core::contribution_table(n_proj, legacy),
+                       rebalance_core::odd_shift_map(n_cols, rot_center), as_stream(stream));
+}
+
+namespace {
+// W <- W_i / (W_i + the contributions table[i] names), row by row
+void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std::vector<std::vector<rebalance_core::Contribution>>& table,
+                        const std::vector<rebalance_core::OddMap>& omap, cudaStream_t s) {
     const size_t plane = static_cast<size_t>(n_rows) * n_cols;
-    const auto table = rebalance_core::contribution_table(n_proj, legacy);
-    const auto omap = rebalance_core::odd_shift_map(n_cols, rot_center);
     std::vector<DevContrib> tab(static_cast<size_t>(n_proj) * kMaxContrib);
     std::vector<int> cnt(n_proj);
     for (int i = 0; i < n_proj; ++i) {
@@ -213,6 +245,46 @@ void balance_weights(float* W, int n_proj, int n_rows, int n_cols, float rot_cen
         HELIREC_CUDA_CHECK(cudaGetLastError());
     }
     HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+}
+}  // namespace
+
+// ---- rebalance, one row per view
+TurnHoles turn_holes(const float* W, int n_proj, int n_rows, int n_cols, int turn, void* stream) {
+    check_turns(n_proj, turn);
+    return rebalance_core::turn_holes_from(nonempty_rows(W, n_proj, n_rows, n_cols, as_stream(stream)), turn);
+}
+
+void fill_turn_holes(float* X, const TurnHoles& holes, int n_rows, int n_cols, void* stream) {
+    cudaStream_t s = as_stream(stream);
+    const size_t plane = static_cast<size_t>(n_rows) * n_cols;
+    for (size_t h = 0; h < holes.dst.size(); ++h) {
+        average_planes_kernel<<<grid_for(plane), 256, 0, s>>>(X + holes.left[h] * plane, X + holes.right[h] * plane,
+                                                              X + holes.dst[h] * plane, plane);
+        HELIREC_CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void fill_from_turns(float* R, const float* W, int n_proj, int n_rows, int n_cols, int turn, void* stream) {
+    check_turns(n_proj, turn);
+    const size_t plane = static_cast<size_t>(n_rows) * n_cols;
+    fill_from_turns_kernel<<<grid_for(static_cast<size_t>(n_proj) * plane), 256, 0, as_stream(stream)>>>(R, W, plane, n_proj, turn);
+    HELIREC_CUDA_CHECK(cudaGetLastError());
+}
+
+void balance_weights_turns(float* W, int n_proj, int n_rows, int n_cols, int turn, float rot_center, void* stream) {
+    check_turns(n_proj, turn);
+    balance_with_table(W, n_proj, n_rows, n_cols, rebalance_core::contribution_table_turns(n_proj, turn),
+                       rebalance_core::odd_shift_map(n_cols, rot_center), as_stream(stream));
+}
+
+int rebalance_turns(float* R, float* W, int n_proj, int n_rows, int n_cols, int turn, float rot_center, void* stream) {
+    const TurnHoles holes = turn_holes(W, n_proj, n_rows, n_cols, turn, stream);
+    if (holes.all_empty) return 0;
+    fill_turn_holes(R, holes, n_rows, n_cols, stream);
+    fill_turn_holes(W, holes, n_rows, n_cols, stream);
+    fill_from_turns(R, W, n_proj, n_rows, n_cols, turn, stream);
+    balance_weights_turns(W, n_proj, n_rows, n_cols, turn, rot_center, stream);
+    return static_cast<int>(holes.dst.size());
 }
 
 int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy, void* stream) {
@@ -260,13 +332,13 @@ void angular_fir(const float* in, float* out, int n_proj, int n_cols, const floa
     HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));  // d_g is freed on return
 }
 
-void ramp_pad(const float* sino, float* padded, const RampGeometry& g, void* stream) {
+void ramp_pad(const float* sino, float* padded, const RampGeometry& g, void* stream, const int32_t* opposite) {
     cudaStream_t s = as_stream(stream);
     thread_local DeviceBuffer<float> adj;  // reused: no allocation / synchronisation per call
     adj.ensure(g.n_proj);
-    ramp_adj_kernel<<<g.n_proj, 32, 0, s>>>(sino, adj.data(), g);
+    ramp_adj_kernel<<<g.n_proj, 32, 0, s>>>(sino, adj.data(), g, opposite);
     HELIREC_CUDA_CHECK(cudaGetLastError());
-    ramp_pad_kernel<<<grid_for(static_cast<size_t>(g.n_proj) * g.npad), 256, 0, s>>>(sino, adj.data(), padded, g);
+    ramp_pad_kernel<<<grid_for(static_cast<size_t>(g.n_proj) * g.npad), 256, 0, s>>>(sino, adj.data(), padded, g, opposite);
     HELIREC_CUDA_CHECK(cudaGetLastError());
 }
 

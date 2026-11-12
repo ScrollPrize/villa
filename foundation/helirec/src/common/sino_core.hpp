@@ -35,6 +35,16 @@ HR_HD float angular_fir_at(const float* in, const float* support, int n_proj, in
     return v;
 }
 
+// fill_from_turns (sino.hpp): the row whose sample k of the plane replaces that of row i (whose weight is 0): the
+// nearest row a whole number of turns away with a weight there (i + turn, i - turn, i + 2 turn, ...); -1: none
+HR_HD int turn_source(const float* W, std::size_t plane, std::size_t k, int n_proj, int turn, int i) {
+    for (int d = turn; i + d < n_proj || i - d >= 0; d += turn) {
+        if (i + d < n_proj && W[static_cast<std::size_t>(i + d) * plane + k] > 0.f) return i + d;
+        if (i - d >= 0 && W[static_cast<std::size_t>(i - d) * plane + k] > 0.f) return i - d;
+    }
+    return -1;
+}
+
 // row sample at fractional position xf in [0, nx - 1] (linear)
 HR_HD float lerp_row(const float* row, float xf, int nx) {
     const int i = static_cast<int>(floorf(xf));

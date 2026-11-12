@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "helirec/sino.hpp"
+
 namespace helirec::rebalance_core {
 
 struct Contribution {
@@ -100,6 +102,56 @@ inline std::vector<std::pair<int, int>> holes_from(const std::vector<char>& none
         holes.back() = {last.first, first.second + n_proj};
     }
     return holes;
+}
+
+// A sinogram with one row per recorded view over more than one turn (sino.hpp, rebalance_turns): `turn` rows per full
+// turn (even), rows i and i + turn at the same angle. table[i]: the other recordings of the lines of row i, i.e. the
+// rows i + k turn / 2 (k != 0) inside the sinogram, in ascending order; those of odd k are opposite views (mirrored).
+inline std::vector<std::vector<Contribution>> contribution_table_turns(int n_proj, int turn) {
+    std::vector<std::vector<Contribution>> table(n_proj);
+    const int half = turn / 2;
+    for (int i = 0; i < n_proj; ++i)
+        for (int k = -(i / half); i + k * half < n_proj; ++k) {
+            if (k == 0) continue;
+            Contribution c;
+            c.k0 = i + k * half;
+            c.k1 = -1;
+            c.alpha = 0.f;
+            c.has_two = false;
+            c.odd = (k & 1) != 0;
+            table[i].push_back(c);
+        }
+    return table;
+}
+
+// The angles nothing was recorded at, for such a sinogram (sino.hpp, TurnHoles): an angle (row modulo `turn`) is empty
+// when every row at it is (`nonempty`, per row; n_proj >= turn). Each is filled in its first row, from the first
+// non-empty rows of the angles either side of its run (as fill_holes fills a run of one turn).
+inline TurnHoles turn_holes_from(const std::vector<char>& nonempty, int turn) {
+    const int n_proj = static_cast<int>(nonempty.size());
+    TurnHoles out;
+    std::vector<char> angle(turn, 0);
+    std::vector<int> first(turn, -1);   // the first non-empty row of each angle
+    for (int r = 0; r < n_proj; ++r)
+        if (nonempty[r] && first[r % turn] < 0) {
+            first[r % turn] = r;
+            angle[r % turn] = 1;
+        }
+    bool any = false;
+    for (char v : angle) any |= v;
+    if (!any) {
+        out.all_empty = true;
+        return out;
+    }
+    for (auto [s, e] : holes_from(angle)) {
+        const int left = first[(s + turn - 1) % turn], right = first[e % turn];
+        for (int idx = s; idx < e; ++idx) {
+            out.dst.push_back(idx % turn);
+            out.left.push_back(left);
+            out.right.push_back(right);
+        }
+    }
+    return out;
 }
 
 }  // namespace helirec::rebalance_core

@@ -2,6 +2,7 @@
 // Sinogram-stage kernels between the gridded projections and backprojection:
 // -log, half-acquisition rebalance,
 // Ram-Lak ramp filter with opposite-ray ("mirror edges") padding.
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -75,6 +76,42 @@ void balance_weights(float* W, int n_proj, int n_rows, int n_cols, float rot_cen
 }
 #endif
 
+// ------------------------------------------------------------- rebalance, one row per view
+// The same for a sinogram that keeps every recorded view in a row of its own (PipelineConfig::angle_interp "views"):
+// R, W: (n_proj, n_rows, n_cols), n_proj >= turn rows at theta_i = 2 pi i / turn over more than one turn (turn even),
+// so that rows i and i + turn are two recordings at one grid angle, which need not have been made at the same
+// angle and are not averaged. The recordings of a line are then the rows i + k turn / 2 inside the sinogram
+// (mirrored about rot_center for odd k), and the balanced weights are
+//   W_i / (W_i + sum over k != 0 of M^k (W at row i + k turn / 2)):
+// a partition of unity over all of them, as rebalance's over a view and its opposite.
+// Holes: an angle is empty when every row at it is (mid-row test); it is filled in its first row from the first
+// non-empty rows of the angles either side (R and W, as rebalance fills). A sample without weight is never
+// backprojected, but the filters along the angle and along the row read it: fill_from_turns gives every sample of R
+// whose weight is 0 the value of the nearest row a whole number of turns away whose weight is positive (i + turn,
+// i - turn, i + 2 turn, ...), if there is one.
+// rebalance_turns: holes, fill_from_turns, balanced weights; returns the number of filled angles.
+struct TurnHoles {
+    bool all_empty = false;
+    std::vector<int> dst, left, right;   // row `dst` takes the mean of rows `left` and `right`
+};
+namespace cpu {
+TurnHoles turn_holes(const float* W, int n_proj, int n_rows, int n_cols, int turn);
+void fill_turn_holes(float* X, const TurnHoles& holes, int n_rows, int n_cols);
+void fill_from_turns(float* R, const float* W, int n_proj, int n_rows, int n_cols, int turn);
+void balance_weights_turns(float* W, int n_proj, int n_rows, int n_cols, int turn, float rot_center);
+int rebalance_turns(float* R, float* W, int n_proj, int n_rows, int n_cols, int turn, float rot_center);
+}
+#ifdef HELIREC_WITH_CUDA
+namespace cuda {
+// device R, W, X
+TurnHoles turn_holes(const float* W, int n_proj, int n_rows, int n_cols, int turn, void* stream = nullptr);
+void fill_turn_holes(float* X, const TurnHoles& holes, int n_rows, int n_cols, void* stream = nullptr);
+void fill_from_turns(float* R, const float* W, int n_proj, int n_rows, int n_cols, int turn, void* stream = nullptr);
+void balance_weights_turns(float* W, int n_proj, int n_rows, int n_cols, int turn, float rot_center, void* stream = nullptr);
+int rebalance_turns(float* R, float* W, int n_proj, int n_rows, int n_cols, int turn, float rot_center, void* stream = nullptr);
+}
+#endif
+
 // ------------------------------------------------------------- ramp filter
 struct RampGeometry {
     int n_bins = 0, n_proj = 0;
@@ -113,12 +150,14 @@ FourierFilterSpec ramp_filter_spec(const RampGeometry& g, float scale, const std
 // sino (n_proj, n_bins) -> padded (n_proj, npad): own row, opposite (theta+pi) row
 // mirrored about the axis (offset-matched near the axis), constant edge elsewhere. The mirror is x -> 2 rot_center - x,
 // linearly interpolated (g.legacy: x -> lround(2 rot_center) - x, integer samples, as the reference)
+// opposite (n_proj; CUDA: a device pointer): the row that holds the opposite view of each row, for sinograms whose
+// rows are not one full turn (null: row (y + n_proj / 2) mod n_proj).
 namespace cpu {
-void ramp_pad(const float* sino, float* padded, const RampGeometry& g);
+void ramp_pad(const float* sino, float* padded, const RampGeometry& g, const int32_t* opposite = nullptr);
 }
 #ifdef HELIREC_WITH_CUDA
 namespace cuda {
-void ramp_pad(const float* sino, float* padded, const RampGeometry& g, void* stream = nullptr);
+void ramp_pad(const float* sino, float* padded, const RampGeometry& g, void* stream = nullptr, const int32_t* opposite = nullptr);
 }
 #endif
 
@@ -170,7 +209,7 @@ void bspline_prefilter(const float* in, float* out, int n_rows, int n, int degre
 // ------------------------------------------------------------- band-limited shift
 // Rows delayed by `shift` samples, in place, without loss: sample i of a row becomes the row's band-limited value at
 // position i - shift (a phase ramp on its discrete Fourier transform; a kernel of a few taps cannot do it: at half a
-// sample lanczos3 passes 0.83 at 0.36 cycles per sample, 0.33 at 0.45). `rows` is (n_rows, shift_row_stride(n)): n
+// sample lanczos3 passes 0.82 at 0.36 cycles per sample, 0.35 at 0.45). `rows` is (n_rows, shift_row_stride(n)): n
 // samples per row, the rest work space. The transform has upsample_fft_length(n) samples, the ones beyond n a
 // raised-cosine bridge from the row's last sample to its first, so that the periodic extension is continuous. For
 // an even length the Nyquist bin, which a real row cannot delay by a fraction, is scaled by cos(pi shift).

@@ -366,10 +366,22 @@ HR_HD void mend_row(float* r, const float* w, int NX, float thr, int x0, int x1)
     for (int x = x0; x < x1; ++x) s = add(s, w[x]);
     const float avg = div(s, static_cast<float>(n_valid));
     const float lim = mul(avg, thr);
-    for (int x = x0; x < x1; ++x) {
-        if (!(w[x] < lim)) continue;
-        const int q = nearest_supported(w, NX, x, lim);
-        if (q >= 0) r[x] = r[q];
+    // (run by run: every column of a run of columns below the level has the same supported columns either side, and
+    // nearest_supported for each of them is the nearer of the two, found once)
+    for (int x = x0; x < x1;) {
+        if (!(w[x] < lim)) { ++x; continue; }
+        int e = x + 1;
+        while (e < x1 && w[e] < lim) ++e;
+        int left = x - 1, right = e;
+        while (left >= 0 && !(w[left] >= lim && w[left] > 0.f)) --left;
+        while (right < NX && !(w[right] >= lim && w[right] > 0.f)) ++right;
+        for (int c = x; c < e; ++c) {
+            // (a supported column lies outside the run: beyond its ends, or beyond the domain's)
+            const bool l = left >= 0, g = right < NX;
+            if (l && (!g || c - left <= right - c)) r[c] = r[left];
+            else if (g) r[c] = r[right];
+        }
+        x = e;
     }
 }
 
