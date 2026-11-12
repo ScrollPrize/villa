@@ -18,7 +18,7 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
   the helix as the frames register them (`stationary_registration=auto`); the rotation axis refined from the scan's
   opposite views (`axis_refinement=auto`). No projection filters by default, and since 2026-11-11 neither of the two
   blur corrections: the exposure arc of a continuous scan is not deconvolved (`exposure_arc=0`; `auto` turns it on)
-  and recordings of a ray are not combined with band-dependent weights (`detector_smear=off`; `auto` turns it on).
+  and recordings of a ray are not combined with band-dependent weights (`sharpness_weighting=off`; `auto` turns it on).
   Both are left for the intensity side of the calibration, after the geometry.
 * `legacy_reference`: the reference workflow's conventions (half-attenuation units, its rebalance endpoints,
   integer padding reflection, mending bounds, chunk-dependent Paganin and luminosity window, two-column splat of
@@ -251,7 +251,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   where the kernel's rows beyond it hold less than 2 % of it (18 rows for the table below, against 31 for
   `paganin + unsharp`): no more cost. Give smooth, finely sampled tables (a kink is a long kernel).
   `evaluation/wiener_table.py` builds the file from an in-plane transfer measured on a thin film of the sample
-  (optionally also where the detector is sharpest, which separates a smear along the columns) and the two half
+  (optionally also where the detector is sharpest, which separates a blur along the columns) and the two half
   reconstructions' shell correlation. By default no direction gets more signal-to-noise ratio than the in-plane
   one, and the loss of the interpolation between detector rows is not undone (`--snr_direction measured`,
   `--row_response restore` do otherwise: on PHerc0343P that left a ridge of power at the slices' Nyquist
@@ -455,14 +455,16 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     show at the axis is measured and logged but not applied: where the detector's blur is one-sided and differs
     between the two places a ray is recorded at, it is the blur's displacement, not the scan's (applying it on
     PHerc0343P moved the companion 0.3–0.4 voxel radially off the main scan).
-  * `detector_smear=auto|off|a11:a12:a21:a22:c1:c2` (default `off`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
+  * `sharpness_weighting=auto|off|a11:a12:a21:a22:c1:c2` (default `off`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
+    (named `detector_smear` until 2026-11-11; that key is still accepted, and calibration caches written with the
+    old names still load.)
     band-dependent redundancy weights for a detector that is not equally sharp everywhere. The field is a uniform
-    smear of A r + c pixels at r = (column, row) from the detector's centre in units of 1000 pixels; `auto` takes
-    the one the calibration fits to the noise of the scan's flats (`calibration.measure_smear`: the noise that
-    passed the optics is smeared like the signal; none if it reaches less than 0.5 px). Below `sharp_band` the
+    blur of A r + c pixels at r = (column, row) from the detector's centre in units of 1000 pixels; `auto` takes
+    the one the calibration fits to the noise of the scan's flats (`calibration.measure_detector_blur`: the noise that
+    passed the optics is blurred like the signal; none if it reaches less than 0.5 px). Below `sharp_band` the
     recordings of a ray are combined with the usual weights, above it with the usual weights × the detector's
     squared response at `sharp_f` along the columns, with a raised-cosine crossover: both sets sum to one, so no
-    band is biased, and a zero field gives the usual result bit for bit. PHerc0343P (2 px of smear per 1000
+    band is biased, and a zero field gives the usual result bit for bit. PHerc0343P (2 px of blur per 1000
     columns from column 1194): in-plane correlation with the 2.215 µm volume 0.859 → 0.885 at 0.36 and
     0.546 → 0.626 at 0.45 cycles/voxel, nothing lost below. Cost on an RTX 5090, whole slices: 6.9 → 7.5 s per
     32-slice chunk and 7.5 GB more GPU memory (a second gridded stack); use a smaller `--chunk` or `off` on a
@@ -476,7 +478,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
 * **Geometry**: `--cor` / `--vector` override the calibration for one run (never cached; not allowed in
   `legacy_reference`).
 * **Calibration cache** (`--cache_dir`): darks/flats reduction and the measured calibration (rotation axis and its
-  refinement, overlap vector, helical pitch, detector smear, the companion's and the stationary turns'
+  refinement, overlap vector, helical pitch, detector blur, the companion's and the stationary turns'
   registration, the rolling shutter once asked for), keyed by a fingerprint of the acquisition and the calibration
   version; written atomically. A cache written before one of these measurements existed gets it added on its
   next use.

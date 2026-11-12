@@ -481,16 +481,16 @@ def test_tile_shifts_recover_an_offset_and_a_roll():
     assert calibration.registration_arrays({}, 100) is None and calibration.registration_arrays(None, 100) is None
 
 
-# ---------------------------------------------------------------- detector smear from the noise of flats
-def test_smear_field_from_noise_spectra():
-    """noise smeared along the columns by 4 px per 1000 columns (0.5 px at the centre) on a white floor"""
+# ---------------------------------------------------------------- detector blur from the noise of flats
+def test_detector_blur_field_from_noise_spectra():
+    """noise blurred along the columns by 4 px per 1000 columns (0.5 px at the centre) on a white floor"""
     rng = np.random.default_rng(11)
     rows, cols, tile, a11, c1 = 384, 1024, 128, 4.0, 0.5
     ys, xs = list(range(0, rows, tile)), list(range(0, cols, tile))
     f = np.fft.rfftfreq(cols)
     power = np.zeros((len(ys), len(xs), tile, tile // 2 + 1))
     for _ in range(6):
-        # (what passed the optics is band-limited before it is smeared: little of it is left at the white floor's corner)
+        # (what passed the optics is band-limited before it is blurred: little of it is left at the white floor's corner)
         g = lambda v, ax: _core.gaussian_filter1d(np.ascontiguousarray(v, np.float32), ax, 0.8, "reflect")
         w = np.fft.rfft(np.stack([g(g(v, 0), 1) for v in rng.standard_normal((16, rows, cols))]), axis=-1)
         img = 0.5 * rng.standard_normal((16, rows, cols))
@@ -499,10 +499,10 @@ def test_smear_field_from_noise_spectra():
             img[:, :, x0:x0 + tile] += np.fft.irfft(w * np.sinc(s * f), cols, axis=-1)[:, :, x0:x0 + tile]
         power += _core.tile_power_spectra(np.ascontiguousarray(img, np.float32), tile, ys, xs)
     assert power.shape == (3, 8, 128, 65) and (power > 0).all()
-    field, rms_none, rms_fit = _core.smear_field_fit(power, ys, xs, rows, cols)
+    field, rms_none, rms_fit = _core.detector_blur_field_fit(power, ys, xs, rows, cols)
     assert abs(field[0] - a11) < 0.5 and abs(field[4] - c1) < 0.15 and rms_fit < 0.6 * rms_none
-    assert abs(field[2]) * 0.5 + abs(field[3]) * 0.2 + abs(field[5]) < 0.6       # no smear along the rows
+    assert abs(field[2]) * 0.5 + abs(field[3]) * 0.2 + abs(field[5]) < 0.6       # no blur along the rows
     # white noise everywhere: nothing to fit
     white = _core.tile_power_spectra(rng.standard_normal((40, rows, cols)).astype(np.float32), tile, ys, xs)
     with pytest.raises(Exception):
-        _core.smear_field_fit(white, ys, xs, rows, cols)
+        _core.detector_blur_field_fit(white, ys, xs, rows, cols)

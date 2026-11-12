@@ -199,16 +199,16 @@ def test_frame_registration_undoes_offset_and_roll(tmp_path, device, backproject
 
 
 @pytest.mark.parametrize("device", helirec.devices())
-def test_band_weights_without_smear_change_nothing(tmp_path, device):
-    """detector_smear: a zero field gives both weight sets the same weights, and the result of the usual ones bit for
+def test_sharpness_weighting_with_zero_blur_changes_nothing(tmp_path, device):
+    """sharpness_weighting: a zero field gives both weight sets the same weights, and the result of the usual ones bit for
     bit; a field leaves every ray an average of its recordings (weights that sum to one)"""
     run = lambda **k: recon(pattern_scan(tmp_path, 0.5, nd=160, nu=0.45), device, backprojector="fbp",
                             **k).reconstruct(7, 8, debug=True)["sino"]
     usual = run()
-    np.testing.assert_array_equal(run(detector_smear="0:0:0:0:0:0"), usual)
-    smeared = run(detector_smear="20:0:0:0:1:0")             # (3.2 px across this small detector)
-    assert np.isfinite(smeared).all() and abs(float(smeared.mean() - usual.mean())) < 1e-3
-    for bad in dict(detector_smear="1:2:3"), dict(detector_smear="0:0:0:0:0:0", sharp_band="0.3:0.2"), dict(detector_smear="a:0:0:0:0:0"):
+    np.testing.assert_array_equal(run(sharpness_weighting="0:0:0:0:0:0"), usual)
+    blurred = run(sharpness_weighting="20:0:0:0:1:0")             # (3.2 px across this small detector)
+    assert np.isfinite(blurred).all() and abs(float(blurred.mean() - usual.mean())) < 1e-3
+    for bad in dict(sharpness_weighting="1:2:3"), dict(sharpness_weighting="0:0:0:0:0:0", sharp_band="0.3:0.2"), dict(sharpness_weighting="a:0:0:0:0:0"):
         with pytest.raises(Exception):
             run(**bad)
 

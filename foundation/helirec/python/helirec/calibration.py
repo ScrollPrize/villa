@@ -566,10 +566,10 @@ class Calibration:
     # Detector rows the sample really moves per row of recorded z translation (measure_pitch; details["pitch"]).
     # None: not measured yet (a cache written before the measurement existed: measured and added on loading).
     z_translation_scale: float | None = None
-    # The detector's smear field (measure_smear; details["smear"]): [a11, a12, a21, a22, c1, c2], a uniform smear of
+    # The detector's blur field (measure_detector_blur; details["detector_blur"]): [a11, a12, a21, a22, c1, c2], a uniform blur of
     # A r + c pixels at r = (column, row) from the detector's centre in units of 1000 pixels, from the noise of the
     # flats. []: measured, nothing significant. None: not measured yet (an older cache: measured on loading).
-    detector_smear: list | None = None
+    detector_blur_field: list | None = None
     # Registration of the companion's frames on the main scan's (measure_registration; details["registration"]):
     # dict(projection, row_offset, row_slope, col_slope: knots along the companion's projections, segments: the
     # stretches they are interpolated within, slope_col, slope_row). {}: measured, nothing usable.
@@ -676,6 +676,8 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
     fp = acquisition_fingerprint(main, companion)
     override = cor_override is not None or vector_override is not None
     cached_cal, arrays = _load_cache(cache_dir, fp, log) if cache_dir else (None, None)
+    if cached_cal is not None:
+        cached_cal = _current_names(cached_cal)
     if cached_cal is not None and not override:
         d = dict(cached_cal)
         d["placement"] = {k: ScanPlacement(**v) for k, v in d["placement"].items()}
@@ -688,8 +690,8 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
         if cal.z_translation_scale is None:   # (a cache from before the pitch measurement)
             _add_pitch(cal, main, companion, arrays, log, progress)
             _save_calibration(cache_dir, cal)
-        if cal.detector_smear is None:        # (a cache from before the smear measurement)
-            _add_smear(cal, main, arrays, log)
+        if cal.detector_blur_field is None:        # (a cache from before the blur measurement)
+            _add_detector_blur(cal, main, arrays, log)
             _save_calibration(cache_dir, cal)
         if cal.companion_registration is None or (cal.companion_registration and "col_slope" not in cal.companion_registration):
             # (a cache from before the frame registration, or from before its lateral part)
@@ -762,12 +764,12 @@ def calibrate(main: BlissScan, companion: BlissScan, cache_dir=None, log=print, 
                                                     companion.name: companion.estimated_cor_from_motor_pix},
                       details=details, source="override" if override else "measured", fingerprint=fp)
     _add_pitch(cal, main, companion, arrays, log, progress)
-    if override and cached_cal is not None and cached_cal.get("detector_smear") is not None:
+    if override and cached_cal is not None and cached_cal.get("detector_blur_field") is not None:
         # (the detector does not change with the caller's axis or vector: take the cached measurement)
-        cal.detector_smear = list(cached_cal["detector_smear"])
-        cal.details["smear"] = cached_cal.get("details", {}).get("smear")
+        cal.detector_blur_field = list(cached_cal["detector_blur_field"])
+        cal.details["detector_blur"] = cached_cal.get("details", {}).get("detector_blur")
     else:
-        _add_smear(cal, main, arrays, log)
+        _add_detector_blur(cal, main, arrays, log)
     _add_registration(cal, main, companion, arrays, log, progress)
     if cor_override is not None:
         cal.axis_refinement = 0.0                    # (the caller's axis is used as given)
@@ -1187,21 +1189,37 @@ def stationary_arrays(reg, n_proj):
     return out
 
 
-def _add_smear(cal, main, arrays, log):
-    """measure the detector's smear field from the main scan's flats and record it in the calibration"""
-    res = measure_smear(main, arrays["main_dark"], log=log)
-    cal.detector_smear = [float(v) for v in res["field"]]
-    cal.details["smear"] = res
+def _current_names(cached: dict) -> dict:
+    """a cached calibration under today's names (until 2026-11-11 the detector's blur field was "detector_smear",
+    its details "smear" with "max_smear_px")"""
+    d = dict(cached)
+    if "detector_smear" in d:
+        d.setdefault("detector_blur_field", d.pop("detector_smear"))
+    details = dict(d.get("details") or {})
+    if "smear" in details:
+        blur = details.pop("smear")
+        if isinstance(blur, dict) and "max_smear_px" in blur:
+            blur = {("max_blur_px" if k == "max_smear_px" else k): v for k, v in blur.items()}
+        details.setdefault("detector_blur", blur)
+        d["details"] = details
+    return d
 
 
-# ============================================================================ detector smear from the flats' noise
-SMEAR_TILE = 128
-SMEAR_MIN_FLATS = 20      # fewer flats in the series do not carry the noise spectra
-SMEAR_MIN_PX = 0.5        # a field whose smear nowhere reaches this many pixels is not used
-SMEAR_MIN_GAIN = 0.97     # ... nor one that does not bring the residual of the noise spectra below this share
+def _add_detector_blur(cal, main, arrays, log):
+    """measure the detector's blur field from the main scan's flats and record it in the calibration"""
+    res = measure_detector_blur(main, arrays["main_dark"], log=log)
+    cal.detector_blur_field = [float(v) for v in res["field"]]
+    cal.details["detector_blur"] = res
 
 
-def flat_noise_spectra(scan: BlissScan, dark, n_flats=200, tile=SMEAR_TILE):
+# ============================================================================ detector blur from the flats' noise
+BLUR_TILE = 128
+BLUR_MIN_FLATS = 20      # fewer flats in the series do not carry the noise spectra
+BLUR_MIN_PX = 0.5        # a field whose blur nowhere reaches this many pixels is not used
+BLUR_MIN_GAIN = 0.97     # ... nor one that does not bring the residual of the noise spectra below this share
+
+
+def flat_noise_spectra(scan: BlissScan, dark, n_flats=200, tile=BLUR_TILE):
     """Noise power spectra of the scan's first flat series on a lattice of tiles (_core.tile_power_spectra): of the
     differences of consecutive flats, each less the dark and scaled to its mean (what is the same in both, the beam's
     profile and the fixed pattern, drops out; the noise stays). Returns (power (ny, nx, tile, tile / 2 + 1), tile
@@ -1209,7 +1227,7 @@ def flat_noise_spectra(scan: BlissScan, dark, n_flats=200, tile=SMEAR_TILE):
     refs = scan.flats[0]
     n = min(n_flats, len(refs)) // 2 * 2
     if n < 2:
-        raise ValueError("the detector's smear needs at least two flats")
+        raise ValueError("the detector's blur needs at least two flats")
     rows, cols = scan.frame_shape
     ys = list(range((rows % tile) // 2, rows - tile + 1, tile))
     xs = list(range((cols % tile) // 2, cols - tile + 1, tile))
@@ -1222,20 +1240,20 @@ def flat_noise_spectra(scan: BlissScan, dark, n_flats=200, tile=SMEAR_TILE):
     return power, ys, xs, n
 
 
-def measure_smear(scan: BlissScan, dark, n_flats=200, log=print):
-    """The detector's smear field of a scan, from the noise of its flats (_core.smear_field_fit: calib.hpp). The field is kept
-    only if it explains the noise spectra (residual below SMEAR_MIN_GAIN of the residual without it) and reaches
-    SMEAR_MIN_PX somewhere on the detector; otherwise "field" is [] and nothing changes in the reconstruction."""
+def measure_detector_blur(scan: BlissScan, dark, n_flats=200, log=print):
+    """The detector's blur field of a scan, from the noise of its flats (_core.detector_blur_field_fit: calib.hpp). The field is kept
+    only if it explains the noise spectra (residual below BLUR_MIN_GAIN of the residual without it) and reaches
+    BLUR_MIN_PX somewhere on the detector; otherwise "field" is [] and nothing changes in the reconstruction."""
     t0 = time.time()
     rows, cols = scan.frame_shape
     n_have = min(n_flats, len(scan.flats[0])) if scan.flats else 0
-    if n_have < SMEAR_MIN_FLATS or (rows // SMEAR_TILE) * (cols // SMEAR_TILE) < 6:
-        reason = (f"{n_have} flats in the first series" if n_have < SMEAR_MIN_FLATS else
-                  f"a detector of {rows} x {cols} holds too few tiles of {SMEAR_TILE}")
-        log(f"detector smear: not measured ({reason})")
+    if n_have < BLUR_MIN_FLATS or (rows // BLUR_TILE) * (cols // BLUR_TILE) < 6:
+        reason = (f"{n_have} flats in the first series" if n_have < BLUR_MIN_FLATS else
+                  f"a detector of {rows} x {cols} holds too few tiles of {BLUR_TILE}")
+        log(f"detector blur: not measured ({reason})")
         return dict(field=[], measured=None, reason=reason, scan=scan.name)
     power, ys, xs, n = flat_noise_spectra(scan, dark, n_flats)
-    field, rms_none, rms_fit = _core.smear_field_fit(power, ys, xs, rows, cols)
+    field, rms_none, rms_fit = _core.detector_blur_field_fit(power, ys, xs, rows, cols)
     th = np.array(field)
     try:
         zero = (-np.linalg.solve(th[:4].reshape(2, 2), th[4:]) * 1000 + [0.5 * (cols - 1), 0.5 * (rows - 1)]).tolist()
@@ -1245,12 +1263,12 @@ def measure_smear(scan: BlissScan, dark, n_flats=200, log=print):
                tiles=[len(ys), len(xs)])
     corners = [(x, y) for x in (-0.5 * cols / 1000, 0.5 * cols / 1000) for y in (-0.5 * rows / 1000, 0.5 * rows / 1000)]
     reach = max(abs(th[0] * x + th[1] * y + th[4]) for x, y in corners)
-    res.update(n_flats=int(n), max_smear_px=float(reach), scan=scan.name)
-    ok = res["rms_fit"] < SMEAR_MIN_GAIN * res["rms_none"] and reach >= SMEAR_MIN_PX
+    res.update(n_flats=int(n), max_blur_px=float(reach), scan=scan.name)
+    ok = res["rms_fit"] < BLUR_MIN_GAIN * res["rms_none"] and reach >= BLUR_MIN_PX
     res["measured"] = res["field"]
     if not ok:
         res["field"] = []
-    log(f"detector smear from the noise of {n} flats of {scan.name}: "
+    log(f"detector blur from the noise of {n} flats of {scan.name}: "
         + (f"{reach:.1f} px along the columns at the worst corner, none at column {res['zero'][0]:.0f} "
            f"(residual of the noise spectra {res['rms_none']:.3f} -> {res['rms_fit']:.3f})" if ok else
            f"nothing significant (residual {res['rms_none']:.3f} -> {res['rms_fit']:.3f}, reach {reach:.2f} px)")

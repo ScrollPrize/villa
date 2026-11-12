@@ -96,22 +96,22 @@ void bind_calib(nb::module_& m) {
         "Hann-windowed power spectra of the tiles at (ys, xs) of images (n, rows, cols), summed over the images -> "
         "(len(ys), len(xs), tile, tile / 2 + 1) float64, rfft2 layout");
     m.def(
-        "smear_field_fit",
+        "detector_blur_field_fit",
         [](nb::ndarray<const double, nb::ndim<4>, nb::c_contig, nb::device::cpu> power, std::vector<int> ys,
            std::vector<int> xs, std::size_t rows, std::size_t cols, double f_max) {
             require(power.shape(0) == ys.size() && power.shape(1) == xs.size(), "power must be (len(ys), len(xs), tile, tile / 2 + 1)");
             require(power.shape(3) == power.shape(2) / 2 + 1, "power must be (len(ys), len(xs), tile, tile / 2 + 1)");
-            calib::SmearField r;
+            calib::DetectorBlurField r;
             {
                 nb::gil_scoped_release nogil;
-                r = calib::smear_field_fit(power.data(), static_cast<int>(ys.size()), static_cast<int>(xs.size()),
+                r = calib::detector_blur_field_fit(power.data(), static_cast<int>(ys.size()), static_cast<int>(xs.size()),
                                            static_cast<int>(power.shape(2)), ys.data(), xs.data(), rows, cols, f_max);
             }
             return nb::make_tuple(std::vector<double>(r.field, r.field + 6), r.rms_none, r.rms_fit);
         },
         "power"_a, "ys"_a, "xs"_a, "rows"_a, "cols"_a, "f_max"_a = 0.30,
-        "The detector's smear field from the noise power spectra of flats on tiles (tile_power_spectra) -> "
-        "([a11, a12, a21, a22, c1, c2], rms_none, rms_fit): a uniform smear of A r + c pixels at r = (column, row) "
+        "The detector's blur field from the noise power spectra of flats on tiles (tile_power_spectra) -> "
+        "([a11, a12, a21, a22, c1, c2], rms_none, rms_fit): a uniform blur of A r + c pixels at r = (column, row) "
         "from the detector's centre in units of 1000 pixels");
     m.def("apodisation_mask",
           [](int Lx, float w_left, float w_right, float min_val, int sh_left, int sh_right) {

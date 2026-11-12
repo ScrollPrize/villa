@@ -861,7 +861,7 @@ class PySliceReconstructor {
         f("angular_tolerance_steps", cfg.angular_tolerance_steps);
         f("luminosity_repartition", cfg.luminosity_repartition);
         f("x_interp", cfg.x_interp);
-        f("detector_smear", cfg.detector_smear);
+        f("sharpness_weighting", cfg.sharpness_weighting);
         f("sharp_f", cfg.sharp_f);
         f("sharp_band", cfg.sharp_band);
         f("z_interp", cfg.z_interp);

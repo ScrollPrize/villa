@@ -155,7 +155,7 @@ struct SliceReconstructor::Impl {
     int lum_margin = 0;      // context rows of the luminosity window, added to the filters' in `margin`
     int x_kernel = 0;        // interp_core::Interp of fractional column offsets (legacy reference: Linear, the splat)
     bool x_exact = false;    // x_interp=sinc: the exact shift (the lanczos3 kernel where measured pixels alone are gridded)
-    // band-dependent redundancy weights (PipelineConfig::detector_smear)
+    // band-dependent redundancy weights (PipelineConfig::sharpness_weighting)
     bool sharp = false;
     double sharp_f1 = 0, sharp_f2 = 0;
     std::vector<std::vector<float>> weight2;          // per scan: its weight map x the detector's squared response
@@ -466,7 +466,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             I.z_lut = z_kernel_lut(I.z_kernel, Impl::z_lut_n);
         }
     }
-    if (!I.cfg.detector_smear.empty() && !I.cfg.legacy_reference && !I.measured) {
+    if (!I.cfg.sharpness_weighting.empty() && !I.cfg.legacy_reference && !I.measured) {
         auto numbers = [](const std::string& text, const char* what) {
             std::vector<double> v;
             std::size_t pos = 0;
@@ -481,14 +481,14 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             }
             return v;
         };
-        const auto smear = numbers(I.cfg.detector_smear, "detector_smear");
+        const auto blur = numbers(I.cfg.sharpness_weighting, "sharpness_weighting");
         const auto band = numbers(I.cfg.sharp_band, "sharp_band");
         if (band.size() != 2) throw Error("sharp_band: f1:f2 (cycles per pixel) is expected");
         I.sharp_f1 = band[0];
         I.sharp_f2 = band[1];
         band_filter_spec(1, 1, 16, I.sharp_f1, I.sharp_f2);   // (checks the band)
         for (const auto& s : I.scans) {
-            auto w2 = smear_response(smear, I.cfg.sharp_f, s.traj.det_rows, s.traj.det_cols);
+            auto w2 = blur_response(blur, I.cfg.sharp_f, s.traj.det_rows, s.traj.det_cols);
             for (std::size_t i = 0; i < w2.size(); ++i) w2[i] *= s.weight[i];
             I.weight2.push_back(std::move(w2));
         }

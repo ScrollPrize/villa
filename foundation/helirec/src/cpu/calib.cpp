@@ -475,7 +475,7 @@ std::vector<double> tile_shifts(const float* a, const float* b, std::size_t rows
     return out;
 }
 
-// ---------------------------------------------------------------- detector smear from the noise of the flats
+// ---------------------------------------------------------------- detector blur from the noise of the flats
 void tile_power_spectra(const float* img, std::size_t n, std::size_t rows, std::size_t cols, int tile, const int* ys,
                         int ny, const int* xs, int nx, double* power) {
     if (tile < 8 || tile % 2) throw Error("tile_power_spectra: an even tile of at least 8 pixels is needed");
@@ -527,8 +527,8 @@ inline double sinc_pi(double a) {
     return std::fabs(pa) < 1e-9 ? 1.0 : std::sin(pa) / pa;
 }
 
-// the normalised noise spectra of the tiles and the model of smear_field_fit
-struct SmearProblem {
+// the normalised noise spectra of the tiles and the model of detector_blur_field_fit
+struct BlurFieldProblem {
     int tiles = 0, bins = 0;
     std::vector<double> Y;                 // (tiles, bins)
     std::vector<double> X, Yr;             // tile centres (units of 1000 px from the detector's centre)
@@ -595,7 +595,7 @@ bool solve6(std::array<std::array<double, 7>, 6> a, double* x) {
 }
 
 // Levenberg-Marquardt from `th` (forward-difference Jacobian); returns the sum of squares reached
-double smear_levenberg(const SmearProblem& p, std::array<double, 6>& th) {
+double blur_levenberg(const BlurFieldProblem& p, std::array<double, 6>& th) {
     std::vector<double> r, r2, J;
     p.residual(th.data(), r);
     double cost = sum_squares(r), lam = 1e-2;
@@ -651,11 +651,11 @@ double smear_levenberg(const SmearProblem& p, std::array<double, 6>& th) {
 
 }  // namespace
 
-SmearField smear_field_fit(const double* power, int ny, int nx, int tile, const int* ys, const int* xs,
+DetectorBlurField detector_blur_field_fit(const double* power, int ny, int nx, int tile, const int* ys, const int* xs,
                            std::size_t rows, std::size_t cols, double f_max) {
-    if (ny < 1 || nx < 1 || ny * nx < 6) throw Error("smear_field_fit: at least 6 tiles are needed");
-    if (tile < 32 || tile % 2) throw Error("smear_field_fit: an even tile of at least 32 pixels is needed");
-    if (!(f_max > 0.15 && f_max <= 0.42)) throw Error("smear_field_fit: f_max must be in (0.15, 0.42] cycles per pixel");
+    if (ny < 1 || nx < 1 || ny * nx < 6) throw Error("detector_blur_field_fit: at least 6 tiles are needed");
+    if (tile < 32 || tile % 2) throw Error("detector_blur_field_fit: an even tile of at least 32 pixels is needed");
+    if (!(f_max > 0.15 && f_max <= 0.42)) throw Error("detector_blur_field_fit: f_max must be in (0.15, 0.42] cycles per pixel");
     const int nc = tile / 2 + 1, nbx = 8, nby = 16, nb = nbx * nby;
     const std::size_t per = static_cast<std::size_t>(tile) * nc;
     // frequency bins of the half plane fx > 0 (and fx = 0, fy > 0), and the frequencies of the white floor
@@ -676,7 +676,7 @@ SmearField smear_field_fit(const double* power, int ny, int nx, int tile, const 
             bfy[b] += fy;
         }
     }
-    SmearProblem p;
+    BlurFieldProblem p;
     std::vector<int> sel;
     for (int b = 0; b < nb; ++b) {
         if (nin[b] == 0) continue;
@@ -692,7 +692,7 @@ SmearField smear_field_fit(const double* power, int ny, int nx, int tile, const 
     }
     p.bins = static_cast<int>(sel.size());
     p.tiles = ny * nx;
-    if (std::count(p.low.begin(), p.low.end(), 1) == 0) throw Error("smear_field_fit: no frequency bins below 0.11");
+    if (std::count(p.low.begin(), p.low.end(), 1) == 0) throw Error("detector_blur_field_fit: no frequency bins below 0.11");
     p.Y.resize(static_cast<std::size_t>(p.tiles) * p.bins);
     std::vector<double> binned(nb);
     for (int t = 0; t < p.tiles; ++t) {
@@ -710,12 +710,12 @@ SmearField smear_field_fit(const double* power, int ny, int nx, int tile, const 
         for (int k = 0; k < p.bins; ++k)
             if (p.low[k]) { lo += binned[sel[k]] / nin[sel[k]]; ++nlo; }
         lo /= nlo;
-        if (!(lo > 0)) throw Error("smear_field_fit: a tile has no noise above its floor at low frequencies");
+        if (!(lo > 0)) throw Error("detector_blur_field_fit: a tile has no noise above its floor at low frequencies");
         for (int k = 0; k < p.bins; ++k) p.Y[static_cast<std::size_t>(t) * p.bins + k] = binned[sel[k]] / nin[sel[k]] / lo;
         p.X.push_back((xs[t % nx] + 0.5 * tile - 0.5 * (static_cast<double>(cols) - 1)) / 1000.0);
         p.Yr.push_back((ys[t / nx] + 0.5 * tile - 0.5 * (static_cast<double>(rows) - 1)) / 1000.0);
     }
-    SmearField out;
+    DetectorBlurField out;
     std::vector<double> r;
     const double none[6] = {1e-9, 0, 0, 1e-9, 0, 0};
     p.residual(none, r);
@@ -723,7 +723,7 @@ SmearField smear_field_fit(const double* power, int ny, int nx, int tile, const 
     const std::array<double, 6> starts[3] = {{2.0, 0, 0, 1.0, 0, 0}, {1.0, 0, 0, 1.0, 0.3, 0}, {3.0, 0.3, 0, 0.5, -0.3, 0.2}};
     double best = std::numeric_limits<double>::infinity();
     for (auto th : starts) {
-        const double c = smear_levenberg(p, th);
+        const double c = blur_levenberg(p, th);
         if (c < best) {
             best = c;
             const double sign = th[0] >= 0 ? 1.0 : -1.0;

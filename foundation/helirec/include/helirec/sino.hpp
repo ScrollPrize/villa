@@ -34,18 +34,18 @@ void multiply_add(float* x, const float* w, const float* t, std::size_t n, void*
 #endif
 
 // ------------------------------------------------------------- band-dependent redundancy weights
-// When the recordings of a ray differ in sharpness (PipelineConfig::detector_smear), they are combined with two sets
+// When the recordings of a ray differ in sharpness (PipelineConfig::sharpness_weighting), they are combined with two sets
 // of weights: the usual ones below the band [f1, f2] cycles per pixel, weights that favour the sharper recording
 // above it. With X the result of the usual weights and Y that of the others, the combination is X + HP (Y - X), HP
 // a raised cosine from 0 at f1 to 1 at f2: both sets sum to one for every ray, so every band is an unbiased average.
 // The high-pass as a Fourier filter (fourier.hpp): ndim 2 on frames (h, w), on the frequency magnitude in the
 // frame; ndim 1 along rows of w samples. Edge padding.
 FourierFilterSpec band_filter_spec(int ndim, int h, int w, double f1, double f2);
-// The detector's squared response at `f` cycles per pixel along the columns, for a uniform smear whose width is
-// smear[0] X + smear[1] Y + smear[4] pixels at (X, Y) = (column, row) from the detector's centre in units of 1000
-// pixels (the first row and the constant of the smear field s = A r + c); 0 beyond the response's first zero.
+// The detector's squared response at `f` cycles per pixel along the columns, for a uniform blur whose width is
+// blur[0] X + blur[1] Y + blur[4] pixels at (X, Y) = (column, row) from the detector's centre in units of 1000
+// pixels (the first row and the constant of the blur field s = A r + c); 0 beyond the response's first zero.
 // (rows, cols), floored at 1e-6.
-std::vector<float> smear_response(const std::vector<double>& smear, double f, int rows, int cols);
+std::vector<float> blur_response(const std::vector<double>& blur, double f, int rows, int cols);
 
 // ------------------------------------------------------------- rebalance
 // R, W: (n_proj, n_rows, n_cols), grid angles theta_i = 2 pi i / n_proj over one full turn.

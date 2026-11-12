@@ -52,13 +52,13 @@ struct ReconConfig {
     // averages neighbouring columns (cos(pi nu) at half a pixel). The legacy reference mode always uses the splat.
     std::string x_interp = "sinc";
     // Band-dependent redundancy weights (sino.hpp), for a detector whose sharpness depends on the place: "" = off, or
-    // the detector's smear field "a11:a12:a21:a22:c1:c2" (a uniform smear of A r + c pixels at r = (column, row) from
+    // the detector's blur field "a11:a12:a21:a22:c1:c2" (a uniform blur of A r + c pixels at r = (column, row) from
     // the detector's centre in units of 1000 pixels; only its component along the columns, a11 a12 c1, is used).
     // Below sharp_band = "f1:f2" (cycles per pixel) the recordings of a ray are combined with the usual weights,
     // above it with those weights times the detector's squared response at sharp_f; raised-cosine crossover. On the
     // frames before the phase filter the band is taken on the frequency magnitude (columns and rows), between
     // opposite views along the columns. Not in the legacy reference mode or for measured-only gridding.
-    std::string detector_smear;
+    std::string sharpness_weighting;
     double sharp_f = 0.35;
     std::string sharp_band = "0.15:0.30";
     // vertical position of a slice in a projection (a fractional detector row): "lanczos3" (default) or "cubic"

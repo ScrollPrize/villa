@@ -186,15 +186,15 @@ FourierFilterSpec band_filter_spec(int ndim, int h, int w, double f1, double f2)
     return s;
 }
 
-std::vector<float> smear_response(const std::vector<double>& smear, double f, int rows, int cols) {
-    if (smear.size() != 6) throw Error("detector_smear: six numbers a11:a12:a21:a22:c1:c2 are needed");
+std::vector<float> blur_response(const std::vector<double>& blur, double f, int rows, int cols) {
+    if (blur.size() != 6) throw Error("sharpness_weighting: six numbers a11:a12:a21:a22:c1:c2 are needed");
     if (!(f > 0 && f <= 0.5)) throw Error("sharp_f must be in (0, 0.5] cycles per pixel");
     std::vector<float> out(static_cast<std::size_t>(rows) * cols);
     for (int r = 0; r < rows; ++r) {
         const double Y = (r - 0.5 * (rows - 1)) / 1000.0;
         for (int c = 0; c < cols; ++c) {
             const double X = (c - 0.5 * (cols - 1)) / 1000.0;
-            const double a = (smear[0] * X + smear[1] * Y + smear[4]) * f;
+            const double a = (blur[0] * X + blur[1] * Y + blur[4]) * f;
             double v = 0.0;
             if (std::fabs(a) < 1.0) {
                 const double pa = M_PI * a;

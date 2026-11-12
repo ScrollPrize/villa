@@ -41,7 +41,7 @@ DEFAULTS = dict(
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="fbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
     axis_source_meters=1e9, sld="", x_interp="sinc", z_interp="lanczos3", angle_interp="nearest", exposure_arc=0.0,
-    angle_subset="", z_translation_scale="auto", detector_smear="off", sharp_f=0.35, sharp_band="0.15:0.30",
+    angle_subset="", z_translation_scale="auto", sharpness_weighting="off", sharp_f=0.35, sharp_band="0.15:0.30",
     companion_registration="auto", stationary_registration="auto", axis_refinement="auto", rolling_shutter="off",
     geometry="",
 )
@@ -70,16 +70,19 @@ DEFAULTS = dict(
 # companion_registration: "auto" (the companion's frames are placed on the main scan's as the calibration registered
 #   them: a row offset and a roll (rows by the column, columns by the row), per projection:
 #   calibration.measure_registration) | "off" (the calibrated vector alone)
-# detector_smear: "off" (default since 2026-11-11: no blur correction is on by default while the geometry is being
-#   settled) or "" | "auto" (the field the calibration measured from the flats' noise; none if nothing significant)
-#   | "a11:a12:a21:a22:c1:c2": the detector's smear field for the band-dependent redundancy weights
+# sharpness_weighting (detector_smear until 2026-11-11, still accepted): where a ray is recorded more than once, its
+#   recordings are combined above a crossover frequency with weights that favour the one recorded where the detector
+#   is sharper. "off" (default since 2026-11-11: no blur correction is on by default while the geometry is being
+#   settled) or "" | "auto" (the detector's blur field the calibration measured from the flats' noise,
+#   Calibration.detector_blur_field; none if nothing significant)
+#   | "a11:a12:a21:a22:c1:c2": that blur field given outright, for the band-dependent redundancy weights
 #   (pipeline.hpp); sharp_f, sharp_band = "f1:f2": the frequency the weights are taken at, and the crossover band.
 # z_interp: lanczos3 | cubic | linear, the vertical interpolation of a slice's (fractional) detector row.
 # angle_interp: nearest (each projection whole in one bin, slices backprojected at the measured angles) | linear (the
 #   reference's two-bin angular splat). ghbp, whose plan fixes its angles, keeps the splat: info["angle_interp"]
 #   records the gridding in use.
 # exposure_arc: fraction of the angular step swept during an exposure, deconvolved along the angle; 0 (default since
-#   2026-11-11, with detector_smear) leaves the sinogram as recorded; "auto" takes it from the scan
+#   2026-11-11, with sharpness_weighting) leaves the sinogram as recorded; "auto" takes it from the scan
 #   (bliss.BlissScan.exposure_arc; 0 for step scans).
 # z_translation_scale: detector rows the sample really moves per row of recorded z translation: the calibration of
 #   the helical pitch. "auto" (default): what the calibration measured from the frames (calibration.measure_pitch:
@@ -99,7 +102,7 @@ LEGACY_REFERENCE = dict(
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="ghbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
     axis_source_meters=1e9, sld="", x_interp="linear", z_interp="linear", angle_interp="linear", exposure_arc=0.0,
-    angle_subset="", z_translation_scale=1.0, detector_smear="", sharp_f=0.35, sharp_band="0.15:0.30",
+    angle_subset="", z_translation_scale=1.0, sharpness_weighting="", sharp_f=0.35, sharp_band="0.15:0.30",
     companion_registration="off", stationary_registration="off", axis_refinement="off", rolling_shutter="off",
     geometry="",
 )
@@ -422,7 +425,7 @@ class HelicalRecon:
         self._resolved_sld = sld_config(cfg.pop("sld"))
         cfg.update(self._resolved_sld)
         cfg["exposure_arc"] = self.exposure_arc()
-        cfg["detector_smear"] = "" if mode == "legacy_reference" else self.detector_smear()
+        cfg["sharpness_weighting"] = "" if mode == "legacy_reference" else self.sharpness_weighting()
         cfg["angle_subset"], cfg["angle_subsets"] = angle_subset_config(cfg.pop("angle_subset"))
         cfg.pop("z_translation_scale")   # (of the scans: _scan_data)
         cfg.pop("companion_registration")
@@ -440,18 +443,18 @@ class HelicalRecon:
             return float(self.main.exposure_arc or 0.0)
         return float(v)
 
-    def detector_smear(self) -> str:
-        """params["detector_smear"] resolved to "a11:a12:a21:a22:c1:c2" or "" (off); "auto" = the calibration's"""
-        v = self.params["detector_smear"]
+    def sharpness_weighting(self) -> str:
+        """params["sharpness_weighting"] resolved to "a11:a12:a21:a22:c1:c2" or "" (off); "auto" = the calibration's"""
+        v = self.params["sharpness_weighting"]
         if v is None or (isinstance(v, str) and v.strip().lower() in ("", "off", "none")):
             return ""
         if isinstance(v, str) and v.strip().lower() == "auto":
-            field = getattr(self.cal, "detector_smear", None) or []
+            field = getattr(self.cal, "detector_blur_field", None) or []
             return ":".join(f"{x:.6g}" for x in field)
         if not isinstance(v, str):
             v = ":".join(f"{float(x):.6g}" for x in v)
         if len(v.split(":")) != 6:
-            raise ValueError("detector_smear must be 'auto', 'off' or a11:a12:a21:a22:c1:c2")
+            raise ValueError("sharpness_weighting must be 'auto', 'off' or a11:a12:a21:a22:c1:c2")
         return v
 
     def z_translation_scale(self) -> float:
@@ -474,6 +477,9 @@ class HelicalRecon:
                              "calibration (no cor / vector overrides)")
 
     def _update(self, kw):
+        if "detector_smear" in kw:     # (the name of sharpness_weighting until 2026-11-11: configs written before)
+            kw = dict(kw)
+            kw.setdefault("sharpness_weighting", kw.pop("detector_smear"))
         regular = {k: v for k, v in kw.items() if not is_filter_key(k) or k == "filters"}
         unknown = set(regular) - set(DEFAULTS)
         if unknown:
@@ -514,7 +520,7 @@ class HelicalRecon:
                                      axis_refinement=getattr(self.cal, "axis_refinement", None),
                                      rolling_shutter=getattr(self.cal, "rolling_shutter", None)),
                     resolved_z_translation_scale=self.z_translation_scale(),
-                    resolved_detector_smear=self.detector_smear(),
+                    resolved_sharpness_weighting=self.sharpness_weighting(),
                     companion_registration=bool(getattr(self, "_registered", False)),
                     stationary_registration=bool(getattr(self, "_stationary", False)),
                     resolved_rot_center=self.rot_center(), resolved_rolling_shutter=self.rolling_shutter(),
@@ -610,7 +616,7 @@ def _half_turn_field(r, h0, roi, shutter, axis):
     keep_params, keep_arrays = r.params, r.arrays
     try:
         for part in (1 - ramp, ramp):
-            r.params = dict(keep_params, backprojector="fbp", filters=[], sld="", detector_smear="off", angle_subset="",
+            r.params = dict(keep_params, backprojector="fbp", filters=[], sld="", sharpness_weighting="off", angle_subset="",
                             rolling_shutter=float(shutter), axis_refinement=float(axis))
             r.arrays = dict(keep_arrays,
                             main_weight=(keep_arrays["main_weight"] * np.maximum(part, 1e-9)[:, None]).astype(np.float32),
@@ -704,7 +710,7 @@ def measure_rolling_shutter(r: "HelicalRecon"):
     if not 0.05 * rows <= per_turn <= rows:
         return finish(f"travel of {per_turn:.0f} rows per turn")
     keep_params = r.params
-    r.params = dict(keep_params, backprojector="fbp", filters=[], sld="", detector_smear="off", angle_subset="", rolling_shutter=0.0)
+    r.params = dict(keep_params, backprojector="fbp", filters=[], sld="", sharpness_weighting="off", angle_subset="", rolling_shutter=0.0)
     try:
         probe = r._new_reconstructor()
         info = probe.info
