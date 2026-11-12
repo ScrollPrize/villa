@@ -340,14 +340,21 @@ LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest& source)
 {
     auto result=source;
     result.groups.clear();
+    std::unordered_set<const LasagnaChannelGroup*> aliased;
     for(const auto* name:{"nx","ny","grad_mag"}) {
         const std::string original=std::string("sheet_")+name;
         const auto* group=source.groupForChannel(original);
         if(!group)throw std::invalid_argument("missing predicted normal channel "+original);
+        // One runtime group per physical packed array, not one per requested
+        // channel. Grouped sampling can then read all sheet channels together.
+        if(!aliased.insert(group).second)continue;
         auto alias=*group;
-        alias.name=name;
-        for(auto& channel:alias.channels)
-            channel=channel==original?name:"unused_fiber_normal_"+channel;
+        for(auto& channel:alias.channels) {
+            if(channel=="sheet_nx")channel="nx";
+            else if(channel=="sheet_ny")channel="ny";
+            else if(channel=="sheet_grad_mag")channel="grad_mag";
+            else channel="unused_fiber_normal_"+channel;
+        }
         result.groups.push_back(std::move(alias));
     }
     result.raw["grad_mag_encode_scale"]=1.0;

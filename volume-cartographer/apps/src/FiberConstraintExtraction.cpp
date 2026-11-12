@@ -1,15 +1,21 @@
 #include "FiberConstraintExtraction.hpp"
+#include "FiberConstraintConfig.hpp"
 #include "FiberConstraintGeometry.hpp"
+#include "FiberGeometryStageBenchmark.hpp"
 #include <vc_object_store/objects/ObjectCollection.hpp>
 #include <vc_object_store/geometry/SegmentClip.hpp>
 #include <vc_object_store/geometry/ArrayBytes.hpp>
 #include "FiberConstraintDatabase.hpp"
+#include "FiberConstraintChunks.hpp"
+#include "FiberConstraintParallelism.hpp"
 #include "FiberNormalSamplingBenchmark.hpp"
+#include "FiberConstraintSources.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/array.hpp>
 #include "vc/core/util/Umbilicus.hpp"
 #include <vc_object_store/objects/UmbilicusFile.hpp>
-#include "vc/core/util/OrderedBatchQueue.hpp"
+#include <sqlite3.h>
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -43,6 +49,25 @@ namespace {
 using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
 
+vc::fiber_tracer::FiberTraceConstraintConfig extractionOptions(
+    const Json& cfg,int threads,size_t crossQueryPrefix,size_t lineCount)
+{
+    vc::fiber_tracer::FiberTraceConstraintConfig options;
+    options.localEvents=true;options.localKeepWholeFibers=true;options.parallelThreads=threads;
+    options.candidateBatchSize=cfg.value("candidate_batch_size",options.candidateBatchSize);
+    options.scoringRegionBaseVoxels=cfg.value("scoring_region_base_voxels",options.scoringRegionBaseVoxels);
+    options.crossQueryPrefix=crossQueryPrefix;
+    if(crossQueryPrefix>=lineCount&&crossQueryPrefix)throw std::invalid_argument("Cross query prefix must leave reference lines");
+    options.certifyWinding=cfg.value("certify_winding",false);
+    options.enforceMaximumWindingDistance=cfg.value("enforce_maximum_winding",false);
+    options.closestParallelEstimator=cfg.value("closest_parallel_estimator",false);
+    options.localParallelReciprocal=cfg.value("parallel_reciprocal",false);
+    options.localMovingProjectionWindows=cfg.value("moving_projection_windows",true);
+    options.localPerpendicularProjectionIterations=cfg.value("perpendicular_iterations",16u);
+    options.pairOwnedGeometry=cfg.value("pair_owned_geometry",false);
+    return options;
+}
+
 Json processResources()
 {
     Json result=Json::object();
@@ -73,6 +98,7 @@ class ExtractionProgress {
     std::size_t sequence_=0;
     double interval_;
     std::ofstream stream_;
+    std::function<Json()> readerStats_;
 public:
     ExtractionProgress(double interval,const std::string& file):interval_(interval) {
         if(!std::isfinite(interval_) || interval_<0)throw std::invalid_argument("Invalid progress interval");
@@ -84,6 +110,10 @@ public:
         }
     }
     bool enabled()const{return interval_>0;}
+    void readerStats(std::function<Json()> fn) {
+        std::lock_guard lock(mutex_);
+        readerStats_=std::move(fn);
+    }
     void operator()(const vc::fiber_tracer::FiberTraceConstraintProgress& p) {
         if(!enabled())return;
         std::lock_guard lock(mutex_);
@@ -106,6 +136,8 @@ public:
             {"units_per_second",rate},
             {"eta_seconds",rate>0 && p.total>0 && p.total>=phase.done?Json((p.total-phase.done)/rate):Json(nullptr)},
             {"resources",processResources()}};
+        if(readerStats_)row["reader_stats"]=readerStats_();
+        if(vcr::diagnostics::Trace::enabled())row["coordination_monotonic_seconds"]=std::chrono::duration<double>(now.time_since_epoch()).count();
         std::cout<<row.dump()<<std::endl;
         if(stream_)stream_<<row.dump()<<std::endl;
         phase.terminal=finished;phase.last=now;
@@ -120,6 +152,8 @@ int runFiberConstraintExtraction(int argc, char** argv)
     using Json = nlohmann::json;
     if (argc != 2) throw std::invalid_argument("usage: vc_fiber_constraints CONFIG.json [--cuda] [--cuda-cache-gb N]");
     Json cfg; std::ifstream input(argv[1]); input >> cfg;
+    if(!cfg.value("sqlite_memory_statistics",true) && sqlite3_config(SQLITE_CONFIG_MEMSTATUS,0)!=SQLITE_OK)
+        throw std::runtime_error("SQLite memory statistics must be configured before opening any store");
     for(const auto* key:{"sqlite_serialize_memory","sqlite_in_memory","sqlite_page_size","sqlite_insert_batch_rows"})
         if(cfg.contains(key))throw std::invalid_argument(std::string("Legacy AFC setting is unsupported: ")+key+"; use import_workers/packed_store");
     const auto seconds = [](auto start) { return std::chrono::duration<double>(Clock::now()-start).count(); };
@@ -127,7 +161,9 @@ int runFiberConstraintExtraction(int argc, char** argv)
         if (!v.is_array() || v.size()!=3) throw std::invalid_argument("Expected XYZ triple");
         return cv::Vec3d{v.at(0).get<double>(),v.at(1).get<double>(),v.at(2).get<double>()};
     };
-    const int threads=cfg.value("threads",32), repetitions=cfg.value("repetitions",3);
+    const int threads=cfg.contains("threads")?cfg.at("threads").get<int>():defaultFiberConstraintWorkers();
+    const int repetitions=cfg.value("repetitions",3);
+    const bool jointNormals=validateFiberConstraintJointNormals(cfg);
     // SQLite reader fan-out can regress badly through backend contention;
     // keep it independent of the compute pool and opt in only after measuring.
     const int loadThreads=cfg.value("load_threads",1);
@@ -151,29 +187,28 @@ int runFiberConstraintExtraction(int argc, char** argv)
     vc::lasagna::LasagnaDatasetOpenOptions open;
     open.workingToBaseScale=1.;
     open.remoteCacheRoot=cfg.at("remote_cache").get<std::string>();
-    auto dataset=vc::lasagna::LasagnaDataset::openLocation(cfg.at("normal_manifest"),open);
+    auto normalInput=openFiberConstraintSource(cfg,"normal",scan,open);
+    auto dataset=std::move(normalInput.dataset);
+    auto provenance=std::move(normalInput.provenance);
     const auto normalSource=cfg.value("normal_source",std::string("lasagna"));
     if(normalSource=="fiber"){
         // The compound sheet_grad_mag channel is a validity mask, never a
         // Lasagna winding-density measurement.
-        if(!cfg.contains("orient_database"))
-            throw std::invalid_argument("Fiber sheet normals are for orientation, not winding-distance extraction");
+        if(!cfg.contains("orient_database") && !cfg.value("axial_prior_only",false) && !cfg.contains("winding_manifest"))
+            throw std::invalid_argument("Fiber sheet normals require an independent Lasagna winding_manifest for extraction");
         dataset=vc::lasagna::fiberSheetNormalDataset(dataset);
     }else if(normalSource!="lasagna")throw std::invalid_argument("normal_source must be lasagna or fiber");
     if (!dataset.manifest().baseShapeZYX)
         throw std::invalid_argument("Lasagna manifest has no base shape");
     const auto baseShapeZYX=*dataset.manifest().baseShapeZYX;
-    // This historical manifest has no coordinate identity. Require its sibling
-    // inference provenance to name the expected scan rather than trusting shape.
-    Json provenance; std::ifstream prov(cfg.at("normal_provenance").get<std::string>()); prov>>provenance;
-    if (provenance.at("source").at("sample_id")!=scan.substr(0,slash) ||
-        provenance.at("source").at("volume_id")!=scan.substr(slash+1))
-        throw std::invalid_argument("Normal provenance does not name expected scan");
-    const auto manifestName=std::filesystem::path(cfg.at("normal_manifest").get<std::string>()).filename().string();
-    bool artifactFound=false;
-    for(const auto& artifact:provenance.at("artifacts"))
-        artifactFound=artifactFound || (artifact.at("kind")=="manifest" && artifact.at("path")==manifestName);
-    if(!artifactFound)throw std::invalid_argument("Normal manifest is not the recorded provenance artifact");
+    std::optional<FiberConstraintSource> windingInput;
+    if(cfg.contains("winding_manifest")) {
+        windingInput=openFiberConstraintSource(cfg,"winding",scan,open);
+        if(*windingInput->dataset.manifest().baseShapeZYX!=baseShapeZYX)
+            throw std::invalid_argument("Normal and winding sources use different base shapes");
+        if(windingInput->dataset.manifest().raw.value("normal_source",std::string{})=="fiber_sheet")
+            throw std::invalid_argument("Fiber sheet validity is not winding density");
+    }
     const auto queryStart=Clock::now();
     // Fiber UUID -> stored-to-volume mapping (bound or registered), in UUID
     // order: that order is the trace order and the database's source_index.
@@ -271,9 +306,87 @@ int runFiberConstraintExtraction(int argc, char** argv)
     mappings.resize(ids.size());
     progress({"load",lines.size(),ids.size()});
     const double loadSeconds=seconds(loadStart);
+    auto options=extractionOptions(cfg,threads,crossQueryPrefix,lines.size());
+    if(cfg.value("geometry_only",false)) {
+        // Use the EXACT production source catalogue, UUID ordering, transforms,
+        // geometry loading and options above. No alternative fixture loader.
+        // Stop before constructing readers/samplers or exporting graph data.
+        Json result={{"config",cfg},{"geometry_only",true},{"selected_fibers",lines.size()},
+            {"points",totalPoints},{"fibers_store_uuid",store.uuid(txn)},
+            {"query_seconds",querySeconds},{"load_seconds",loadSeconds}};
+        result["runs"]=benchmarkFiberGeometryStage(lines,options,cfg);
+        result["wall_seconds"]=seconds(started);result["resources"]=processResources();
+        const auto output=std::filesystem::path(cfg.at("output").get<std::string>());
+        std::filesystem::create_directories(output.parent_path());
+        vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
+        return 0;
+    }
     vc::lasagna::LasagnaNormalSamplerOptions samplerOptions;
+    samplerOptions.maxCachedBytes=cfg.value("normal_cache_bytes",samplerOptions.maxCachedBytes);
+    const auto cacheMode=cfg.value("normal_cache_mode",std::string("auto"));
+    if(cacheMode=="auto") {
+        samplerOptions.autoCacheFraction=cfg.value("normal_cache_fraction",0.5);
+        // One process budget, not one fraction of available RAM per dataset.
+        samplerOptions.memoryCache=vcr::MemoryCache::automatic(*samplerOptions.autoCacheFraction);
+    } else if(cacheMode!="fixed") {
+        throw std::invalid_argument("normal_cache_mode must be fixed or auto");
+    } else if(cfg.value("normal_cache_shared",false)) {
+        samplerOptions.memoryCache=std::make_shared<vcr::MemoryCache>(samplerOptions.maxCachedBytes);
+    }
+    samplerOptions.channelCache=cfg.value("normal_channel_cache",false);
+    samplerOptions.readerThreads=cfg.value("reader_threads",size_t{0});
     samplerOptions.pointInterpolation=cfg.value("normal_point_interpolation",true);
+    samplerOptions.windingPointInterpolation=cfg.value("winding_point_interpolation",true);
+    samplerOptions.windingRegionBaseVoxels=cfg.value("winding_region_base_voxels",
+        cfg.value("scoring_region_base_voxels",4096.));
+    samplerOptions.windingBatchPoints=cfg.value("winding_batch_points",size_t{262144});
     const vc::lasagna::LasagnaNormalSampler normals(dataset,samplerOptions);
+    std::unique_ptr<vc::lasagna::LasagnaNormalSampler> separateWindings;
+    if(windingInput)separateWindings=std::make_unique<vc::lasagna::LasagnaNormalSampler>(windingInput->dataset,samplerOptions);
+    const auto& windingSampler=separateWindings?*separateWindings:normals;
+    const auto maintenanceWorkers=cfg.value("normal_cache_maintenance_workers",std::size_t(0));
+    if(maintenanceWorkers) {
+        std::set<vcr::MemoryCache*> configured;
+        for(const auto* sampler : {&normals,&windingSampler})
+            for(const auto& binding:sampler->regionChannels())
+                if(const auto& cache=binding.array->memory_cache(); cache && configured.insert(cache.get()).second)
+                    cache->enable_maintenance(maintenanceWorkers,cfg.value("normal_cache_candidate_scan",std::size_t(8)));
+    }
+    if(cfg.value("normal_cache_profile",false))
+        for(const auto* sampler : {&normals,&windingSampler})
+            for(const auto& binding:sampler->regionChannels())
+                if(const auto& cache=binding.array->memory_cache()) cache->enable_profiling();
+    const auto readerStats=[](const auto& sampler) {
+        Json result={{"arrays",Json::array()}};
+        std::set<const vcr::Array*> seen;
+        for(const auto& binding:sampler.regionChannels()) {
+            if(!seen.insert(binding.array.get()).second)continue;
+            const auto& stats=binding.array->stats();
+            result["arrays"].push_back({{"memory_hits",stats.memory_hits.load()},
+                {"disk_hits",stats.disk_hits.load()},{"remote_fetches",stats.remote_fetches.load()},
+                {"remote_bytes",stats.remote_bytes.load()},{"corrupt",stats.corrupt.load()},
+                {"channel_read_bytes",stats.channel_read_bytes.load()},
+                {"channel_decoded_bytes",stats.channel_decoded_bytes.load()}});
+            if(const auto& cache=binding.array->memory_cache()) {
+                result["cache"]={{"bytes",cache->nbytes()},{"entries",cache->size()},
+                    {"hits",cache->hits()},{"misses",cache->misses()},{"limit_bytes",cache->max_bytes()}};
+                const auto maintenance=cache->maintenance_stats();
+                result["cache"]["maintenance"]={{"evicted_entries",maintenance.evicted_entries},
+                    {"batches",maintenance.batches},{"assist_puts",maintenance.assist_puts},
+                    {"headroom_bytes",maintenance.headroom_bytes}};
+                const auto profile=cache->profile();
+                const auto timing=[](const auto& t){return Json{{"calls",t.calls},
+                    {"wait_seconds",t.wait_ns*1e-9},{"hold_seconds",t.hold_ns*1e-9}};};
+                result["cache"]["lock_profile"]={{"get",timing(profile.get)},{"put",timing(profile.put)},
+                    {"erase",timing(profile.erase)},{"refresh",timing(profile.refresh)},
+                    {"refresh_calls",profile.refresh_calls},{"refresh_probe_seconds",profile.refresh_probe_ns*1e-9}};
+            }
+        }
+        return result;
+    };
+    progress.readerStats([&] {
+        return Json{{"normals",readerStats(normals)},{"windings",readerStats(windingSampler)}};
+    });
     if(cfg.contains("normal_sampling_benchmark")) {
         const auto timings=benchmarkFiberNormalSampling(cfg.at("normal_sampling_benchmark"),lines,dataset,samplerOptions);
         const Json benchmark={{"normal_sampling_benchmark",timings},{"query_seconds",querySeconds},
@@ -285,19 +398,6 @@ int runFiberConstraintExtraction(int argc, char** argv)
     const double spacing=vc::lasagna::bindLasagnaChannel(dataset.manifest(),"nx",arrays).spacing;
     std::cout<<"selected fibers="<<lines.size()<<" points="<<totalPoints<<" arc_base="<<totalArc
              <<" unsigned normals; no alignment"<<std::endl;
-    FiberTraceConstraintConfig options;
-    options.localEvents=true; options.localKeepWholeFibers=true; options.parallelThreads=threads;
-    options.crossQueryPrefix=crossQueryPrefix;
-    if(options.crossQueryPrefix>=lines.size() && options.crossQueryPrefix)
-        throw std::invalid_argument("Cross query prefix must leave reference lines");
-    // Extraction records continuous evidence; rejection/quantization belongs to
-    // downstream processing. Explicit flags retain historical benchmark modes.
-    options.certifyWinding=cfg.value("certify_winding",false);
-    options.enforceMaximumWindingDistance=cfg.value("enforce_maximum_winding",false);
-    options.closestParallelEstimator=cfg.value("closest_parallel_estimator",false);
-    options.localParallelReciprocal=cfg.value("parallel_reciprocal",false);
-    options.localMovingProjectionWindows=cfg.value("moving_projection_windows",true);
-    options.localPerpendicularProjectionIterations=cfg.value("perpendicular_iterations",16u);
     Json result={{"config",cfg},{"fibers_store_uuid",store.uuid(txn)},
         {"normal_manifest",dataset.manifest().raw},{"normal_provenance",provenance},
         {"selected_ids",ids},{"selected_fibers",lines.size()},{"points",totalPoints},
@@ -308,7 +408,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
         {"geometry_minimum_xyz",{lo[0],lo[1],lo[2]}},
         {"geometry_maximum_xyz",{hi[0],hi[1],hi[2]}},
         {"settings",{{"local_events",true},{"keep_whole_fibers",true},
-            {"load_threads",loadThreads},
+            {"load_threads",loadThreads},{"threads",threads},
             {"certify_winding",*options.certifyWinding},
             {"enforce_maximum_winding",options.enforceMaximumWindingDistance},
             {"closest_parallel_estimator",*options.closestParallelEstimator},
@@ -316,12 +416,17 @@ int runFiberConstraintExtraction(int argc, char** argv)
             {"moving_projection_windows",options.localMovingProjectionWindows},
             {"event_spacing",options.localSpacingBaseVoxels},{"tangent_span",options.localTangentSpanBaseVoxels},
             {"candidate_batch_size",options.candidateBatchSize},
+            {"scoring_region_base_voxels",options.scoringRegionBaseVoxels},
             {"parallel_span",options.localParallelSpanBaseVoxels},{"maximum_distance",options.maximumDistanceBaseVoxels},
             {"integration_step",options.windingIntegrationStepBaseVoxels},{"maximum_windings",options.maximumWindingDistance},
             {"reciprocal_tolerance",options.localReciprocalToleranceBaseVoxels},
             {"angular_tolerance",options.localAngularToleranceDegrees},{"distance_tolerance",options.localDistanceTolerance},
             {"refinement_rounds",options.localRefinementRounds},{"normalize_evidence",options.localNormalizeEvidence}}},
         {"normal_spacing_base",spacing},{"runs",Json::array()}};
+    if(windingInput) {
+        result["winding_manifest"]=windingInput->dataset.manifest().raw;
+        result["winding_provenance"]=windingInput->provenance;
+    }
     const auto output=std::filesystem::path(cfg.at("output").get<std::string>());
     std::filesystem::create_directories(output.parent_path());
     const auto loadAxis=[&]() {
@@ -390,34 +495,63 @@ int runFiberConstraintExtraction(int argc, char** argv)
         std::cout<<"orientation complete "<<result["orientation"].dump()<<std::endl;
         return 0;
     }
+    if(cfg.value("chunk_pipeline",jointNormals)) {
+        if(!jointNormals || repetitions!=1 || cfg.contains("compare_database"))
+            throw std::invalid_argument("Chunk pipeline requires one joint-normal extraction, without legacy comparison mode");
+        auto databaseOptions=fiberConstraintDatabaseOptions(cfg);
+        for(const auto& mapping:mappings)databaseOptions.baseToStored.push_back(mapping.inverse());
+        const auto axis=loadAxis();
+        result["chunk_pipeline"]=extractFiberConstraintChunks(cfg,result,ids,lines,options,normals,windingSampler,axis,std::move(databaseOptions),[&] {
+            // The two samplers share the auto cache: count each cache once.
+            Json caches=Json::array();std::set<const vcr::MemoryCache*> seen;size_t bytes=0;
+            for(const auto* sampler:{&normals,&windingSampler})for(const auto& binding:sampler->regionChannels())
+                if(const auto& cache=binding.array->memory_cache();cache&&seen.insert(cache.get()).second) {
+                    const auto resident=cache->nbytes();bytes+=resident;
+                    caches.push_back({{"bytes",resident},{"entries",cache->size()},{"limit_bytes",cache->max_bytes()}});
+                }
+            Json snapshot={{"decoded_cache_bytes",bytes},{"caches",caches},{"resources",processResources()}};
+            if(cfg.value("normal_cache_profile",false))
+                snapshot["reader_stats"]={{"normals",readerStats(normals)},{"windings",readerStats(windingSampler)}};
+            return snapshot;
+        });
+        if(cfg.value("saturated_chunk_benchmark",false))
+            result["saturated_chunk_benchmark"]=result["chunk_pipeline"].at("benchmark");
+        else result["export"]=result["chunk_pipeline"]["export"];
+        result["wall_seconds"]=seconds(started);
+        result["reader_stats"]={{"normals",readerStats(normals)},{"windings",readerStats(windingSampler)}};
+        result["resources"]=processResources();
+        vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
+        std::cout<<"chunk extraction complete "<<result["chunk_pipeline"].dump()<<std::endl;
+        return 0;
+    }
     for(int i=0;i<repetitions;++i) {
         const auto begin=Clock::now();
         std::cout<<"extraction repetition="<<i<<std::endl;
         const auto extract=[&](const FiberTraceConstraintStream& stream) {
             return extractFiberTraceConstraints(lines,options,
-                [&](const auto& a,const auto& b,double step){return normals.normalAlignedWindingDistance(a,b,step);},
-                [&](const auto& pairs,double step,int workers){return normals.normalAlignedWindingDistancesBatch(pairs,step,workers);},
+                [&](const auto& a,const auto& b,double step){return windingSampler.normalAlignedWindingDistance(a,b,step);},
+                [&](const auto& pairs,double step,int workers){return windingSampler.normalAlignedWindingDistancesBatch(pairs,step,workers);},
                 {},nullptr,progress.enabled()?FiberTraceConstraintProgressCallback(
                     [&](const auto& p){progress(p);}):FiberTraceConstraintProgressCallback{},stream);
         };
-        FiberConstraintDatabaseOptions databaseOptions;
-        databaseOptions.workers=cfg.value("import_workers",32);
-        databaseOptions.packed=cfg.value("packed_store",true);
+        auto databaseOptions=fiberConstraintDatabaseOptions(cfg);
         databaseOptions.baseToStored.reserve(mappings.size());
         for(const auto& mapping:mappings)databaseOptions.baseToStored.push_back(mapping.inverse());
-        const bool streaming=cfg.contains("database") && cfg.value("stream_export",true);
+        const bool streaming=cfg.contains("database") && cfg.value("stream_export",true) && !jointNormals;
         double extractionSeconds=0.;
         const auto report=[&]() {
             if(!streaming) {
                 auto report=extract({});extractionSeconds=seconds(begin);return report;
             }
-            using Batch=std::vector<FiberTraceConstraint>;
-            vc::core::util::OrderedBatchQueue<Batch> queue(cfg.value("export_queue_batches",std::size_t{128}));
             std::promise<std::vector<FiberTraceConstraintPiece>> prepared;
             auto preparedFuture=prepared.get_future();
+            std::promise<FiberConstraintBatchConsumer> consumerReady;
+            auto consumerFuture=consumerReady.get_future().share();
             auto extractionDone=begin;
-            // Extraction owns its report; SQLite owns its connection. Only
-            // immutable finalized batches cross the bounded queue.
+            std::optional<FiberTraceConstraintReport> extracted;
+            // The extraction worker samples normals and prepares its own
+            // completed events, then emits directly to independent shard queues.
+            // Source job IDs keep identity independent of completion order.
             auto extraction=std::async(std::launch::async,[&] {
                 bool delivered=false;
                 try {
@@ -433,51 +567,72 @@ int runFiberConstraintExtraction(int argc, char** argv)
                         }
                         prepared.set_value(std::move(compact));delivered=true;
                     };
-                    stream.batch=[&](auto index,auto events) {
-                        queue.push(index,Batch(events.begin(),events.end()));
+                    stream.batch=[&](auto worker,auto index,auto events) {
+                        if(index>0x7fffffffULL || events.size()>0xffffffffULL)
+                            throw std::overflow_error("Constraint source event ID exceeds int64 range");
+                        consumerFuture.get()(worker,std::size_t(index)*0x100000000ULL,events);
                     };
-                    stream.failed=[&](auto failure){queue.finish(failure);};
                     auto report=extract(stream);
                     if(report.pieces.size()!=lines.size() || report.hardConstraints || report.localMidpointCuts)
                         throw std::runtime_error("Unexpected split/continuation or degenerate source");
                     extractionDone=Clock::now();extractionSeconds=seconds(begin);
-                    queue.finish();return report;
+                    return report;
                 } catch(...) {
                     const auto failure=std::current_exception();
-                    queue.finish(failure);
                     if(!delivered)prepared.set_exception(failure);
                     throw;
                 }
             });
+            bool consumerDelivered=false;
             try {
                 const auto pieces=preparedFuture.get();
                 // Progress maintains independent timelines for concurrent phases.
                 result["export"]=streamFiberConstraintDatabase(
                     cfg.at("database").get<std::string>(),ids,pieces,
-                    [&](std::stop_token stop) {
-                        while(!stop.stop_requested()) {
-                            auto batch=queue.next(stop);
-                            if(!batch)return Batch{};
-                            if(!batch->empty())return std::move(*batch);
-                        }
-                        return Batch{};
-                    },normals,threads,result,
+                    {},normals,threads,result,
                     progress.enabled()?FiberTraceConstraintProgressCallback([&](const auto& p){progress(p);}):
-                        FiberTraceConstraintProgressCallback{},databaseOptions);
-                auto report=extraction.get();
+                        FiberTraceConstraintProgressCallback{},databaseOptions,0,
+                    [&](const auto& consumer) {
+                        consumerReady.set_value(consumer);consumerDelivered=true;
+                        // Propagate failures before the store can be finalized.
+                        extracted.emplace(extraction.get());
+                    },std::max(1,threads));
+                auto report=std::move(extracted.value());
                 result["export"]["streamed"]=true;
-                result["export"]["queue_peak_batches"]=queue.peakPending();
                 result["export"]["tail_after_extraction_seconds"]=seconds(extractionDone);
                 return report;
             } catch(...) {
-                queue.finish(std::current_exception());
-                // Unblock producers before waiting for the extraction future.
+                const auto failure=std::current_exception();
+                try {std::rethrow_exception(failure);}
+                catch(const std::exception& e){std::cerr<<"constraint stream failed: "<<e.what()<<std::endl;}
+                catch(...){std::cerr<<"constraint stream failed: unknown exception"<<std::endl;}
+                if(!consumerDelivered)consumerReady.set_exception(failure);
+                // Writer failures wake shard-queue producers through the shared
+                // import stream failure state; no ordered queue needs draining.
                 if(extraction.valid())try{extraction.get();}catch(...){}
                 throw;
             }
         }();
         if(report.pieces.size()!=lines.size() || report.hardConstraints || report.localMidpointCuts)
             throw std::runtime_error("Unexpected split/continuation or degenerate source");
+        if(jointNormals) {
+            const auto axis=loadAxis();
+            progress({"normal_sweep",0,lines.size()});
+            auto sampled=sampleFiberConstraintNormals(ids,lines,report,normals,threads,
+                cfg.value("normal_sample_spacing",spacing),&axis,
+                FiberNormalBatchOptions{cfg.value("normal_region_base_voxels",4096.),
+                    cfg.value("normal_batch_points",size_t{262144})});
+            progress({"normal_sweep",lines.size(),lines.size()});
+            result["normal_orientation"]=sampled.statistics;
+            databaseOptions.normalSamples=&sampled;
+            result["export"]=writeFiberConstraintDatabase(cfg.at("database").get<std::string>(),ids,
+                report,normals,threads,result,
+                progress.enabled()?FiberTraceConstraintProgressCallback([&](const auto& p){progress(p);}):
+                    FiberTraceConstraintProgressCallback{},databaseOptions);
+            writeFiberConstraintOutwardPriors(cfg.at("normal_prior_output").get<std::string>(),
+                ids,sampled,result.at("export").at("source_store"),result);
+            databaseOptions.normalSamples=nullptr;
+        }
         std::size_t parallel=0,signedCount=0;
         for(const auto& c:report.constraints){parallel+=c.parallelScore>.5;signedCount+=c.signedWindingDelta.has_value();}
         Json run={{"seconds",extractionSeconds},{"prepare_seconds",report.prepareSeconds},
@@ -491,6 +646,10 @@ int runFiberConstraintExtraction(int argc, char** argv)
             {"rejected_winding_cutoff",report.rejectedWindingCutoff}};
         run["resources"]=processResources();
         run["scoring_batches"]=report.scoringBatches;
+        run["scoring_regions"]=report.scoringRegions;
+        run["winding_batches"]=report.windingBatches;
+        run["winding_regions"]=report.windingRegions;
+        run["maximum_winding_batch_candidates"]=report.maximumWindingBatchCandidates;
         run["maximum_batch_candidates"]=report.maximumBatchCandidates;
         run["first_failure_checks"]=report.localFailureChecks;
         run["outcomes_by_initial_relation"]=report.localOutcomesByRelation;
@@ -504,12 +663,12 @@ int runFiberConstraintExtraction(int argc, char** argv)
         if(cfg.contains("compare_database")) {
             const auto comparisonStarted=Clock::now();
             progress({"verify",0,report.constraints.size(),report.constraints.size()});
-            verifyFiberConstraintDatabaseMeasurements(cfg.at("compare_database").get<std::string>(),report);
+            verifyFiberConstraintDatabaseMeasurements(cfg.at("compare_database").get<std::string>(),report,ids);
             result["comparison_seconds"]=result.value("comparison_seconds",0.)+seconds(comparisonStarted);
             progress({"verify",report.constraints.size(),report.constraints.size(),report.constraints.size()});
             result["all_measurements_match_database"]=true;
         }
-        if(cfg.contains("database") && !streaming) {
+        if(cfg.contains("database") && !streaming && !jointNormals) {
             result["export"]=writeFiberConstraintDatabase(cfg.at("database").get<std::string>(),
                 ids,report,normals,threads,result,
                 progress.enabled()?FiberTraceConstraintProgressCallback([&](const auto& p){progress(p);}):
@@ -520,6 +679,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
         result["wall_seconds"]=seconds(started);
         result["processing_seconds"]=result.at("wall_seconds").get<double>()-result.value("comparison_seconds",0.);
         result["resources"]=processResources();
+        result["reader_stats"]={{"normals",readerStats(normals)},{"windings",readerStats(windingSampler)}};
         vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
         std::cout<<run.dump()<<std::endl;
     }

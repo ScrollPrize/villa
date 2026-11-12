@@ -45,6 +45,7 @@ struct LasagnaGroupArrays {
         : cache(std::move(sharedCache)), channelCache(channelCache) {}
     std::shared_ptr<vcr::MemoryCache> cache;
     bool channelCache = false;
+    std::size_t readerThreads=0;
     // The opened level of each group, whole: its cache layers (and a VC3D layer's lease)
     // live as long as any binding shares its array.
     std::map<const LasagnaChannelGroup*, std::shared_ptr<vcr::zarr::OpenedArray>> arrays;

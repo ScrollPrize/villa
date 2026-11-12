@@ -189,11 +189,16 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
         floatPacked.writeChunk({int64_t(c),0,0,0},reinterpret_cast<const uint8_t*>(bytes.data()),bytes.size()*sizeof(float));
     }
     auto floatManifest=normals.manifest();
-    for(auto& group:floatManifest.groups)group.relativeZarrKey=(dir/"float").string();
+    for(auto& group:floatManifest.groups) {
+        group.relativeZarrKey=(dir/"float").string();
+        group.sourceLocation=(dir/"float").string();
+        group.zarrPath=dir/"float";
+    }
     const vc::lasagna::LasagnaDataset floatDataset(floatManifest);
     fusedOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
     referenceOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
     vc::lasagna::LasagnaNormalSampler floatFused(floatDataset,fusedOptions),floatReference(floatDataset,referenceOptions);
+    REQUIRE(floatFused.regionChannels()[0].float32);
     (void)floatFused.sampleNormalBatch(locations,1,policyValues);
     (void)floatReference.sampleNormalBatch(locations,1,cornerValues);
     for(size_t i=0;i<locations.size();++i) {
@@ -399,6 +404,10 @@ TEST_CASE("Batched aligned winding tracks scalar sampling on varying fields")
         connectors, 0.37, 1);
     const auto batchFour = sampler.normalAlignedWindingDistancesBatch(
         connectors, 0.37, 4);
+    vc::lasagna::LasagnaNormalSamplerOptions referenceOptions;
+    referenceOptions.windingPointInterpolation=false;
+    vc::lasagna::LasagnaNormalSampler reference(dataset,referenceOptions);
+    const auto referenceBatch=reference.normalAlignedWindingDistancesBatch(connectors,0.37,1);
     REQUIRE(batchOne.size() == connectors.size());
     REQUIRE(batchFour.size() == connectors.size());
     for (size_t index = 0; index < connectors.size(); ++index) {
@@ -406,7 +415,52 @@ TEST_CASE("Batched aligned winding tracks scalar sampling on varying fields")
             connectors[index].first, connectors[index].second, 0.37);
         CHECK(batchOne[index] == doctest::Approx(scalar).epsilon(2.0e-5));
         CHECK(batchFour[index] == batchOne[index]);
+        CHECK(batchOne[index] == referenceBatch[index]);
     }
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Interpolated winding samples preserve independent chunk layouts and bounded tiles")
+{
+    const auto dir=tmpDir("winding_independent_chunks");
+    createConstantChunkedU8Zarr(dir/"density",{12,12,12},{5,4,3},255);
+    createConstantChunkedU8Zarr(dir/"nx",{12,12,12},{3,4,5},220);
+    auto writer=vcr::zarr::Writer::create(dir/"ny",{
+        .shape={1,12,12,12},.chunks={1,4,3,2},.dtype="<f4",.compressor=""});
+    const std::vector<float> bytes(4*3*2,128.f);
+    for(int64_t z=0;z<3;++z)for(int64_t y=0;y<4;++y)for(int64_t x=0;x<6;++x)
+        writer.writeChunk({0,z,y,x},reinterpret_cast<const uint8_t*>(bytes.data()),bytes.size()*sizeof(float));
+    writeText(dir/"dataset.lasagna.json",R"({"version":2,"packed_channel_view":true,"grad_mag_encode_scale":100.0,"grad_mag_factor":1.0,
+        "groups":{"density":{"zarr":"density","scaledown":0,"channels":["grad_mag"]},
+                  "nx":{"zarr":"nx","scaledown":0,"channels":["nx"]},
+                  "ny":{"zarr":"ny","scaledown":0,"channels":["ny"]}}})");
+    const auto dataset=vc::lasagna::LasagnaDataset::open(dir/"dataset.lasagna.json");
+    vc::lasagna::LasagnaNormalSamplerOptions directOptions;directOptions.readerThreads=4;
+    vc::lasagna::LasagnaNormalSampler direct(dataset,directOptions);
+    vc::lasagna::LasagnaNormalSamplerOptions referenceOptions;
+    referenceOptions.windingPointInterpolation=false;referenceOptions.readerThreads=1;
+    vc::lasagna::LasagnaNormalSampler reference(dataset,referenceOptions);
+    std::vector<std::pair<cv::Vec3d,cv::Vec3d>> connectors;
+    for(size_t i=0;i<1025;++i)
+        connectors.push_back({{0.17,0.31,double(i%10)+0.44},{10.73,9.82,double(i%10)+0.19}});
+    connectors.push_back({{11,11,11},{1,1,1}});
+    connectors.push_back({{-1,0,0},{1,1,1}});
+    connectors.push_back({{NAN,0,0},{1,1,1}});
+    connectors.push_back({{1,1,1},{1,1,1}});
+    const auto actual=direct.normalAlignedWindingDistancesBatch(connectors,0.37,4);
+    const auto repeated=direct.normalAlignedWindingDistancesBatch(connectors,0.37,4);
+    std::vector<std::pair<cv::Vec3d,cv::Vec3d>> expanded;
+    for(int copy=0;copy<4;++copy)expanded.insert(expanded.end(),connectors.begin(),connectors.end());
+    const auto expandedValues=direct.normalAlignedWindingDistancesBatch(expanded,0.37,4);
+    for(size_t i=0;i<expandedValues.size();++i)CHECK(expandedValues[i]==actual[i%actual.size()]);
+    const auto expected=reference.normalAlignedWindingDistancesBatch(connectors,0.37,1);
+    vc::lasagna::LasagnaNormalSamplerOptions tiledOptions;
+    tiledOptions.windingRegionBaseVoxels=2.;tiledOptions.windingBatchPoints=17;
+    vc::lasagna::LasagnaNormalSampler tiled(dataset,tiledOptions);
+    const auto tiledValues=tiled.normalAlignedWindingDistancesBatch(connectors,0.37,4);
+    REQUIRE(actual.size()==expected.size());
+    REQUIRE(tiledValues.size()==actual.size());
+    for(size_t i=0;i<actual.size();++i){CHECK(actual[i]==expected[i]);CHECK(tiledValues[i]==actual[i]);CHECK(repeated[i]==actual[i]);}
     fs::remove_all(dir);
 }
 

@@ -27,6 +27,10 @@ struct LasagnaNormalSamplerOptions {
     std::optional<double> autoCacheFraction;
     bool channelCache = false;
     bool pointInterpolation = true;
+    bool windingPointInterpolation = true;
+    std::size_t readerThreads=0;
+    double windingRegionBaseVoxels = 4096.;
+    std::size_t windingBatchPoints = 262144;
 };
 
 class LasagnaNormalSampler final : public NormalSampler

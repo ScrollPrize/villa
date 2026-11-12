@@ -55,7 +55,8 @@ private:
 // A channel group's Zarr array opened through vc_reader, with `cache` as its
 // memory cache: a local array, or a remote array cached under the group's remote cache root.
 [[nodiscard]] vcr::zarr::OpenedArray openLasagnaGroupArray(
-    const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache);
+    const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache,
+    std::size_t readerThreads=0);
 
 // Select predicted sheet normals while preserving the compound channel layout.
 [[nodiscard]] LasagnaDataset fiberSheetNormalDataset(const LasagnaDataset& prediction);
