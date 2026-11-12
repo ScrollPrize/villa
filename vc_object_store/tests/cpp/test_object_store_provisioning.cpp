@@ -35,7 +35,7 @@ void directStore(bool spatial)
         require(scalar(store,t,"PRAGMA cache_size")==-131072,"configured SQLite reader page cache");
         require(store.provisioning(t).commitSequence == 0, "initial commit sequence");
         physical = store.databaseIdentity(t);
-        require(physical.uuid != store.uuid(t) && physical.schemaVersion == 21, "physical database and logical store identities are separate");
+        require(physical.uuid != store.uuid(t) && physical.schemaVersion == 22, "physical database and logical store identities are separate");
         std::set<std::string> tableIds;
         for (const auto& table : physical.tables) {
             require(tableIds.insert(table.uuid).second, "table UUIDs are unique");

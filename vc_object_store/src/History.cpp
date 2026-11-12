@@ -2,6 +2,7 @@
 #include "internal/Artifacts.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "internal/Versions.hpp"
+#include "internal/JsonFields.hpp"
 #include "internal/RecordJson.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/EdgeSql.hpp"
@@ -39,7 +40,7 @@ nlohmann::json detail::currentDependencyMetadata(sqlite3* db,const std::string& 
         const auto meta=anchor.metadataKeys.empty()?nlohmann::json{}:nlohmann::json::parse(record.meta);
         return dependencyFields(&meta,record.retired,record.lifecycleEpoch,anchor);
     }
-    const auto meta=anchor.metadataKeys.empty() ? nlohmann::json{} : nlohmann::json::parse(row.text(2));
+    const auto meta=anchor.metadataKeys.empty() ? nlohmann::json{} : parseObjectJson(row.text(2));
     return dependencyFields(&meta,row.i64(0)!=0,row.text(1),anchor);
 }
 namespace {
@@ -256,9 +257,9 @@ CREATE TABLE history_validated_edges(uuid BLOB PRIMARY KEY, a_meta TEXT NOT NULL
             mark("history_dirty_objects", "SELECT uuid FROM objects WHERE uuid IN (" + row + ".a_uuid," + row + ".b_uuid)"));
         for (const auto* table : {"edge_tags"})
             trigger(table,
-                mark("history_dirty_edges", "SELECT uuid FROM edges WHERE id=" + row + ".edge_id") +
+                mark("history_dirty_edges", "SELECT uuid FROM edges WHERE uuid=" + row + ".edge_uuid") +
                 mark("history_dirty_objects", "SELECT o.uuid FROM objects o JOIN edges e "
-                "ON o.uuid=e.a_uuid OR o.uuid=e.b_uuid WHERE e.id=" + row + ".edge_id"));
+                "ON o.uuid=e.a_uuid OR o.uuid=e.b_uuid WHERE e.uuid=" + row + ".edge_uuid"));
     }
 }
 
@@ -364,7 +365,7 @@ void detail::beforeCurrentObjectEdit(sqlite3* db,const std::string& input)
     if(state&&state->before.contains(uuid))return;
     Statement object(db,"SELECT meta,(state<>0),lifecycle_epoch FROM objects WHERE uuid=?",parseUuid(uuid));
     if(!object.row())return;
-    mutableCurrentWrite(db).before.emplace(uuid,Json{{"meta",Json::parse(object.text(0))},
+    mutableCurrentWrite(db).before.emplace(uuid,Json{{"meta",parseObjectJson(object.text(0))},
         {"retired",bool(object.i64(1))},{"lifecycle_epoch",object.text(2)}});
 }
 
@@ -378,7 +379,7 @@ void detail::validateCurrentRelationships(sqlite3* db)
     if(!state)return;
     std::set<std::string> seen;
     for(const auto& [uuid,before]:state->before) {
-        Statement incident(db,std::string("SELECT ")+kEdgeCols+" FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1)",parseUuid(uuid));
+        Statement incident(db,"SELECT "+projectedEdgeColumns(db)+" FROM "+edgeReadSource(db)+" AS edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1)",parseUuid(uuid));
         while(incident.row()) {
             const auto edge=readEdgeRow(db,incident);
             if(!seen.insert(edge.uuid).second)continue;
@@ -476,8 +477,8 @@ void detail::publishHistory(sqlite3* db, bool baseline)
         const auto before = p.parent ? metadata(db, *p.parent) : objectToJson(externalEndpointRecord(db,object));
         const bool lifecycleChanged = before.value("lifecycle_epoch", "") != p.record.value("lifecycle_epoch", "");
         if (!lifecycleChanged && before.at("meta") == p.record.at("meta")) continue;
-        Statement incident(db, std::string("SELECT ") + kEdgeCols +
-            " FROM edges WHERE state=0 AND (a_uuid=? OR b_uuid=?)",
+        Statement incident(db, "SELECT " + projectedEdgeColumns(db) +
+            " FROM "+edgeReadSource(db)+" AS edges WHERE state=0 AND (a_uuid=? OR b_uuid=?)",
             parseUuid(object), parseUuid(object));
         while (incident.row()) {
             const auto edge = readEdgeRow(db, incident);
@@ -516,7 +517,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
             e.owners.insert(formatUuid(old.blob16(0)));
             if (!previous) previous = relationship(db, formatUuid(old.blob16(1)));
         }
-        Statement row(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=? AND state=0", parseUuid(e.uuid));
+        Statement row(db, "SELECT " + projectedEdgeColumns(db) + " FROM "+edgeReadSource(db)+" AS edges WHERE uuid=? AND state=0", parseUuid(e.uuid));
         if (row.row()) {
             e.record = readEdgeRow(db, row);
             // Legacy snapshots can retain a different endpoint side order.
@@ -632,7 +633,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
             const auto aPin = edge.aPin ? *edge.aPin : pin(edge.record->aUuid, edge.aGeometry);
             const auto bPin = edge.bPin ? *edge.bPin : pin(edge.record->bUuid, edge.bGeometry);
             if (!baseline) writeRecordVersion(db,"edges",edge.uuid);
-            Statement currentEdge(db, std::string("SELECT ")+kEdgeCols+" FROM edges WHERE uuid=?",parseUuid(edge.uuid)); currentEdge.row();
+            Statement currentEdge(db, "SELECT "+projectedEdgeColumns(db)+" FROM "+edgeReadSource(db)+" AS edges WHERE uuid=?",parseUuid(edge.uuid)); currentEdge.row();
             execute(db, "INSERT INTO relationship_revisions VALUES(?,?,?,?,?,?,?)", parseUuid(edge.version), parseUuid(edge.uuid),
                 edgeToJson(readEdgeRow(db,currentEdge), nullptr, false).dump(), sqlReference(aPin), sqlReference(bPin), sqlReference(edge.aGeometry), sqlReference(edge.bGeometry));
             const auto a = metadata(db, aPin);
@@ -895,7 +896,7 @@ bool detail::currentRelationshipApplicable(const ObjectStore& store, const Txn& 
                                           const std::string& edgeUuid)
 {
     auto* db = ObjectStoreImplAccess::conn(txn);
-    Statement current(db,"SELECT a_uuid,b_uuid FROM edges WHERE state=0 AND uuid=? AND "+activeEdgeSql(),parseUuid(edgeUuid));
+    Statement current(db,"SELECT a_uuid,b_uuid FROM "+edgeReadSource(db)+" AS edges WHERE state=0 AND uuid=? AND "+activeEdgeSql(),parseUuid(edgeUuid));
     if (!current.row()) return false;
     if (!historyEnabled(db)) return true;
     // Retained history may contain deliberately kept-as-recorded observations.

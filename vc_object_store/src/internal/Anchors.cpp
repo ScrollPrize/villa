@@ -1,4 +1,5 @@
 #include "internal/Anchors.hpp"
+#include "internal/JsonFields.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <algorithm>
 #include <cmath>
@@ -78,8 +79,10 @@ nlohmann::json dependenciesToJson(const Anchor& anchor)
     return value;
 }
 
-void dependenciesFromJson(Anchor& anchor, const nlohmann::json& value)
+void dependenciesFromJson(Anchor& anchor, const nlohmann::json& input)
 {
+    const auto value=objectJson(input);
+    anchor.points.clear();
     anchor.channels = value.value("channels", std::vector<std::string>{});
     anchor.wholeGeometry = value.value("whole_geometry", false);
     anchor.metadataKeys = value.value("metadata_keys", std::vector<std::string>{});

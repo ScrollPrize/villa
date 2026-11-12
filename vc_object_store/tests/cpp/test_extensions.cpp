@@ -88,7 +88,7 @@ void storeChanges(HistoryMode history)
     {
         auto txn = store.read();
         require(store.extensionTables(txn).empty(), "plain stores need no extension payloads");
-        require(store.provisioning(txn).schemaVersion == 21, "extension support retains core schema 21");
+        require(store.provisioning(txn).schemaVersion == 22, "extension support retains core schema 22");
     }
     { auto txn = store.write(); store.createExtensionTable(txn, spec); txn.commit(); }
     require(sequence(store) == 1, "extension registration publishes one store commit");
@@ -316,7 +316,7 @@ void initialReservedMetadata()
                     InitialCollectionEdge edge;
                     edge.a = {shard.storeUuid(), firstUuid}; edge.b = {shard.storeUuid(), secondUuid};
                     edge.record.uuid = "00000000-0000-4000-8000-000000000003";
-                    edge.record.kind = "test_link";
+                    edge.record.kind = "declared_reference";
                     edge.record.aAnchor.wholeGeometry = edge.record.bAnchor.wholeGeometry = true;
                     edge.record.meta = reserved;
                     batch.push_back(std::move(edge));
@@ -522,7 +522,7 @@ void versionedRelationship(HistoryMode history)
     }
     {
         auto txn = store.write(VersionSelection{{firstUuid, int64_t(1)}, {secondUuid, int64_t(1)}});
-        EdgeRecord edge; edge.uuid = edgeUuid; edge.kind = "test_link"; edge.aUuid = firstUuid; edge.bUuid = secondUuid;
+        EdgeRecord edge; edge.uuid = edgeUuid; edge.kind = "declared_reference"; edge.aUuid = firstUuid; edge.bUuid = secondUuid;
         edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
         store.addEdge(txn, edge); txn.commit();
     }
@@ -649,7 +649,7 @@ void storeReferenceVersionedFields(HistoryMode history)
         }
         base.replaceExtensionRows(txn, objectTable.name, firstUuid, first);
         base.replaceExtensionRows(txn, objectTable.name, secondUuid, second);
-        EdgeRecord edge; edge.uuid = edgeUuid; edge.kind = "test_link";
+        EdgeRecord edge; edge.uuid = edgeUuid; edge.kind = "declared_reference";
         edge.aUuid = firstUuid; edge.bUuid = secondUuid;
         edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
         base.addEdge(txn, edge);
@@ -857,7 +857,7 @@ void shardedOverlayScan(bool packed)
     InitialImportOptions options;
     options.store.author = "extension-overlay-test";
     options.dependencies = {basePath}; options.extensions = tables;
-    options.shards = {{{1, 100}, {1, 100}}, {{101, 200}, {101, 200}}};
+    options.shards = {{{1, 100}}, {{101, 200}}};
     if (packed) {
         options.packed.emplace(); options.packed->memoryFirst = true;
         options.packed->disposableBulk = true; options.packed->backgroundFlush = false;
@@ -907,8 +907,7 @@ void shardedImport(bool packed)
     options.store.author = "extension-import-test";
     options.shards.clear();
     for (size_t i = 0; i < count; ++i)
-        options.shards.push_back({{int64_t(i * 100 + 1), int64_t((i + 1) * 100)},
-                                 {int64_t(i * 100 + 1), int64_t((i + 1) * 100)}});
+        options.shards.push_back({{int64_t(i * 100 + 1), int64_t((i + 1) * 100)}});
     if (packed) {
         options.packed.emplace(); options.packed->memoryFirst = true;
         options.packed->disposableBulk = true; options.packed->backgroundFlush = false;

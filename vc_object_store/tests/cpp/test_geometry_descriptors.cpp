@@ -131,7 +131,7 @@ void unpublishedRelationship()
      for(const auto& id:{a,b}){store.upsertObject(w,track(id));const auto token=store.putGeometry(w,id,shape());if(id==a)before=token;}
      w.commit();}
     auto w=store.write();
-    EdgeRecord edge;edge.kind="related";edge.aUuid=a;edge.bUuid=b;
+    EdgeRecord edge;edge.kind="declared_reference";edge.aUuid=a;edge.bUuid=b;
     edge.aAnchor.points=edge.bAnchor.points={{"points",{0}}};
     const auto id=store.addEdge(w,edge);
     mustFail([&]{store.keepRecordedRelationship(w,id);});
@@ -158,7 +158,7 @@ void changedRelationshipKeepsPublishedGeometry(bool retainFirst)
     const auto a=util::newUuid(),b=util::newUuid();std::string edge,before;
     {auto w=store.write();
      for(const auto& id:{a,b}){store.upsertObject(w,track(id));const auto token=store.putGeometry(w,id,shape());if(id==a)before=token;}
-     EdgeRecord record;record.kind="related";record.aUuid=a;record.bUuid=b;
+     EdgeRecord record;record.kind="declared_reference";record.aUuid=a;record.bUuid=b;
      record.aAnchor.points=record.bAnchor.points={{"points",{0}}};edge=store.addEdge(w,record);w.commit();}
     const std::array<int32_t,1> changed{40};
     {auto w=store.write();

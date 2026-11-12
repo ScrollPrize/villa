@@ -210,7 +210,7 @@ force. `record_selection(query)` captures one (hosted stores too);
 
 ## Converting old stores
 
-The runtime opens schema 21 only. Upstream schemas 16–20 require conversion; unpublished experimental layouts are not supported. Stop every client, then convert into a new
+The runtime opens schema 22 only. Upstream schemas 16–21 require explicit conversion; unpublished experimental layouts are not supported. Stop every client, then convert into a new
 file (the source is never changed):
 
 ```sh

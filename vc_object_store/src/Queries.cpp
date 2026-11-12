@@ -1,5 +1,6 @@
 #include "internal/Versions.hpp"
 #include "internal/EdgeSql.hpp"
+#include "internal/JsonFields.hpp"
 #include "internal/SpatialCache.hpp"
 #include "internal/CoordinateFilter.hpp"
 #include "internal/VolumeFrames.hpp"
@@ -227,7 +228,7 @@ std::vector<VolumeRow> registeredVolumeSelection(sqlite3* db,const ObjectSelecti
         auto query=objectSelectionQuery(db,sub,"o.uuid,o.meta",nullptr);
         while(query->row()) {
             const auto id=formatUuid(query->blob16(0));
-            if(!selection.transforms->toVolume(nlohmann::json::parse(query->text(1)),*selection.volume))rows.push_back({id,0,0,false});
+            if(!selection.transforms->toVolume(parseObjectJson(query->text(1)),*selection.volume))rows.push_back({id,0,0,false});
         }
     }
     std::sort(rows.begin(),rows.end(),[&](const auto& a,const auto& b){
@@ -342,7 +343,9 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     if (!selection.volume && !selection.includeUnbound) {
         auto rows = objectSelectionQuery(db, selection, projectedObjectColumns(fields));
         auto records = readObjectRows(db, *rows, fields);
-        if (!txn.write_) attachObjectVersions(db, records);
+        // Full records already contain the current version and generation.
+        // Only projected records can have omitted these columns.
+        if (!txn.write_ && projection) attachObjectVersions(db, records);
         return records;
     }
     const auto order = volumeSelection(db, selection);
@@ -360,7 +363,7 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     if (selection.orderBy == "length_desc")
         for (auto& record : records)
             if (const auto& row = order[position.at(record.uuid)]; row.bound) record.volumeLength = row.volume;
-    if (!txn.write_) attachObjectVersions(db, records);
+    if (!txn.write_ && projection) attachObjectVersions(db, records);
     return records;
 }
 

@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/PackedStore.hpp"
 #include "internal/Artifacts.hpp"
 #include "internal/Database.hpp"
 
@@ -126,7 +127,8 @@ bool isArtifactHash(const std::string& text)
 
 std::filesystem::path artifactBlobDirectory(const std::filesystem::path& storePath)
 {
-    return std::filesystem::path(storePath.string() + ".artifacts") / "sha256";
+    const auto container=isPackedDatabasePath(storePath)?packedContainerPath(storePath):storePath;
+    return std::filesystem::path(container.string() + ".artifacts") / "sha256";
 }
 
 std::filesystem::path artifactBlobPath(const std::filesystem::path& storePath, const std::string& sha256)

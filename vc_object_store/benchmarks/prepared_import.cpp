@@ -295,7 +295,7 @@ Json native(Prepared& data,const fs::path& path,bool storeReference,bool packed,
     for(auto& row:data.objects){restore.ids.push_back(row.id);row.id.reset();}
     opt.shards.clear();const auto reservation=INT64_MAX/int64_t(workers);
     for(size_t i=0;i<workers;++i){
-        const std::array<int64_t,2> range{int64_t(i)*reservation+1,int64_t(i+1)*reservation};opt.shards.push_back({range,range});
+        const std::array<int64_t,2> range{int64_t(i)*reservation+1,int64_t(i+1)*reservation};opt.shards.push_back({range});
     }
     const auto partitionSeconds=elapsed(partitionStart);
     if(packed){opt.packed.emplace();opt.packed->disposableBulk=true;opt.packed->memoryFirst=true;

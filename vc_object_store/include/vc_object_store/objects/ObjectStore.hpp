@@ -189,7 +189,7 @@ struct JournalEntry {
 enum class HistoryMode { Off, On };
 
 struct StoreProvisioning {
-    int schemaVersion = 21;
+    int schemaVersion = 22;
     int64_t commitSequence = 0;
     std::string generation; // Publication lineage UUID.
     HistoryMode history = HistoryMode::On;
@@ -216,13 +216,18 @@ struct OpenOptions {
     // Creation only. Omit bounds/R-tree storage; spatial queries then throw.
     // Ordinary geometry, metadata and graph operations remain available.
     bool spatialIndex = true;
+    // Creation only: adjacency accelerators can be provisioned explicitly later.
+    bool edgeAdjacencyIndex = true;
+    // Creation only: nullopt creates the full edge layout. An explicit list
+    // selects optional columns in addition to uuid/a_uuid/b_uuid/kind/commit_sequence.
+    // Omitted fields have defined read defaults; unsupported writes must fail.
+    std::optional<std::vector<std::string>> edgeColumns;
     // Creation-only provisioning for independently built shards. Integer key
     // ranges are reservations, not counts of currently populated records.
     std::optional<std::string> creationStoreUuid;
     int64_t initialCommitSequence = 0;
     std::optional<std::string> creationGeneration;
     std::array<int64_t,2> objectIdRange{1,INT64_MAX};
-    std::array<int64_t,2> edgeIdRange{1,INT64_MAX};
     // Explicit low-level access to one physical partition. Ordinary opens of
     // collections fail rather than silently return only locally stored data.
     bool physicalPartitionOnly = false;
@@ -719,9 +724,6 @@ public:
     // Edges. addEdge normalises endpoint order (swapping anchors to
     // match) and enforces uniqueness of the edge's own UUID.
     std::string addEdge(WriteTxn& txn, const EdgeRecord& record);
-    // Import-only explicit edge ID within the reserved edge key range. Uses
-    // the same current-endpoint validation and history as addEdge.
-    std::string insertEdgeWithId(WriteTxn&, const EdgeRecord&, int64_t id);
     // Refresh anchors/tags/meta while retaining UUID, endpoints, kind and history.
     // Changes reset approval and validate the resulting current endpoint dependencies.
     void updateEdge(WriteTxn& txn, const EdgeRecord& record);

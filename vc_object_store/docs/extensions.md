@@ -1,6 +1,6 @@
 # Typed extension tables
 
-Extensions add ordinary, typed SQL tables without adding domain-specific columns to core objects or relationships. Core schema 21 owns table registration, common input-state references and transactional change stamps. Each extension owns its column layout, indexes, format version and small provisioning JSON object. Existing object/edge UUIDs remain the references: results do not require duplicate geometry, proxy objects or an attachment edge per row.
+Extensions add ordinary, typed SQL tables without adding domain-specific columns to core objects or relationships. The core schema owns table registration, common input-state references and transactional change stamps (introduced in schema 21 and retained in schema 22). Each extension owns its column layout, indexes, format version and small provisioning JSON object. Existing object/edge UUIDs remain the references: results do not require duplicate geometry, proxy objects or an attachment edge per row.
 
 Use this for measurements and derived results that generic viewers need not understand, such as fiber-constraint distances, classifications or winding runs. Keep ordinary geometry, endpoint anchors and graph relationships in the core tables. Arbitrary `meta` JSON remains available, but large numerical result sets belong in typed columns rather than JSON blobs.
 
@@ -11,7 +11,7 @@ The optional `extension_tables` registry has one descriptor per physical extensi
 | Information | Meaning |
 | --- | --- |
 | Extension identifier | The consumer-defined extension family |
-| Extension format version | The interpretation of this extension's data, independent of core schema 21 |
+| Extension format version | The interpretation of this extension's data, independent of the core schema version |
 | Physical table UUID/name | The table instance registered in the existing directory |
 | `basedOn` | Common input-state references for the rows in this table |
 | `lastModifiedCommit` | Destination-store commit which last wrote this table through the extension API |
@@ -159,64 +159,43 @@ Generic extension read/write methods are currently local C++/Python APIs. `Hoste
 
 The shared extension family is `ext_fiber_graph_solve`. Import definitions and row builders are in [`objects/FiberImportExtension.hpp`](../include/vc_object_store/objects/FiberImportExtension.hpp); workflow-result definitions are in [`objects/FiberGraphSolveExtension.hpp`](../include/vc_object_store/objects/FiberGraphSolveExtension.hpp). These are optional typed tables, not additional core-schema columns. Importers create only the applicable source/constraint tables; merely requesting a solver-table definition creates nothing. This supplies storage for workflows without changing or rerunning any solver algorithm.
 
-Formats are table-specific. Source and workflow-result tables use format 1. The constraint table uses format 2 for native extraction and retains format 1 for external legacy AFC import. Both use core schema 21; format 2 does not change the result-table schemas or introduce another storage backend.
+Formats are table-specific. Source and workflow-result tables use format 1. Native extraction and AFC import publish compact constraint format 4 on core schema 22. The numerical graph reader rejects earlier measurement formats explicitly; a core-schema conversion preserves unknown extension tables but does not reinterpret their payloads.
 
 ### Imported observations
 
 | Table | Key/routing | Contents |
 | --- | --- | --- |
 | `ext_fiber_graph_solve_sources` | `fiber_uuid`, object shard | Original numeric `source_id` and free-form source `annotation` |
-| `ext_fiber_graph_solve_constraints` | `edge_uuid`, edge shard | Typed extraction measurements and diagnostics |
+| `ext_fiber_graph_solve_constraints` | `edge_uuid`, edge shard | Compact canonical-endpoint observations |
 
-Fiber line geometry, names, family, length/bounds and coordinate bindings stay in their existing core representation. Each source constraint produces exactly one ordinary core edge carrying its endpoint UUIDs, kind and XYZ anchors, plus one `ext_fiber_graph_solve_constraints` row. A measured distance such as 1.3 remains one REAL value; import does not expand it into separate integer-step edges or duplicate the endpoints.
+Chunk extraction stages piece-local measurements on the existing shard-writer connections. A TEMP-only staging payload identifies source fibers and exact sample arcs for the final sign transport. Once identical shared-boundary samples determine the along-fiber signs, transfer writes ordinary format-4 rows with aligned normal bytes. Unresolved pieces produce undefined endpoint normals. No piece IDs, correction tables or source-ID directories persist. See [initial import staging](initial-import.md).
 
-`ext_fiber_graph_solve_constraints` contains these fields:
+The obsolete `normal_frames` workflow role is not exposed by current factories. Legacy extension data remains accessible through generic extension APIs without being silently accepted as a compact numerical graph.
 
-| Group | Columns |
-| --- | --- |
-| Source identity/order | `source_id`, `source_fiber_a`, `source_fiber_b`, `source_reversed` |
-| Base-point arc positions | `arc_a`, `arc_b` |
-| Exact measured endpoint XYZ, format 2 only | `point_a_x`, `point_a_y`, `point_a_z`, `point_b_x`, `point_b_y`, `point_b_z` |
-| Classification/evidence | `parallel_score`, `perpendicular_score`, `evidence_weight` |
-| Lasagna measurements | `las_winding`, `parallel_las_winding` |
-| Endpoint sheet normals | For each of `normal_a` and `normal_b`: `_valid`, `_x`, `_y`, `_z`, `_reason` |
-| Local relation diagnostics | `piece_a`, `piece_b`, `closest_distance`, `hard_continuity`, `artificial_tile_seam`, `allow_measurement_disable`, `local_event`, `local_orientation` |
-| Parallel support/fit | `support_a_begin`, `support_a_end`, `support_b_begin`, `support_b_end`, `parallel_correspondence_samples`, `parallel_advance_residual`, `parallel_connector_tangent_dot`, `parallel_connector_length_change`, `parallel_connector_direction_change`, `parallel_limit_hit_fraction` |
-| Signed/orientation evidence | `signed_winding_delta`, `perpendicular_normal_alignment`, `winding_normal_component`, `signed_parallel_winding_delta`, `parallel_normal_alignment` |
-| Unrecognized or inconsistent source extras | Nullable `extra` JSON text, not the ordinary measurement payload |
+Fiber line geometry and source identity remain in the core objects and source extension. Each accepted observation creates one core edge and one measurement row, without integer-step expansion. The core edge carries UUID endpoints and integer kind; it does not carry XYZ anchors or dependency JSON in this workflow. Adjacency indexes are disabled.
 
-Arc/length values use base voxels; winding distances use turns. Optional numerical fields are nullable typed scalars, not zero-filled for absent measurements. The six format-2 measured XYZ columns are required finite REAL values. Normals remain sheet normals; they are not inserted into the core anchor's fiber-tangent direction field. Source normal validity and reason are retained separately from coordinates.
+| Column | Encoding | Value bytes |
+| --- | --- | --- |
+| `edge_uuid` | Binary UUID, primary key | 16 |
+| `arc_a`, `arc_b` | Separate little-endian float32 BLOBs, base voxels | 4 each |
+| `normal_a`, `normal_b` | Lasagna compact XY plus hemisphere sign | 3 each |
+| `connector` | Compact signed unit direction from canonical A to B | 3 |
+| `winding_distance` | Unsigned byte; code 0 invalid, otherwise (code−1)/16 turns | 1 |
+| `extra` | Explicitly supplied optional JSON | NULL normally |
 
-Core edges canonicalize their endpoint UUID order. Measurement fields deliberately retain the source A/B convention: `source_reversed=1` means source A/B is opposite to core edge A/B. Consumers map endpoint fields accordingly. The importer does not guess sign inversions for measured scalars merely because UUID ordering changed.
+The maximum winding distance is 15.875 turns. Extraction/import skips larger measurements before quantization; it never clamps them into range. Endpoint arcs use the canonical core A/B order. A normal blob is two unsigned Lasagna hemisphere coordinates plus an int8 sign: 0 undefined, +1 positive Z, −1 negative Z. The shared `vc_reader/compact_normal.hpp` implementation is also used by the Lasagna sampler. The connector supplies ordering direction only, not physical connector length. Coincident endpoints have an undefined connector.
 
-For external legacy import, the source's `measurement` JSON repeats some scalar and XYZ data. Equal duplicate copies are omitted from the extension payload; differing copies are retained in `extra`, together with genuinely unknown fields. Supported diagnostics and normals are typed columns. The fiber's original free-form annotation remains opaque JSON text because this importer does not impose a schema on arbitrary source annotations. Native extraction also writes the typed columns directly; legacy JSON is not an internal graph representation.
+No source constraint ID, source fiber IDs, reversal flag, scores, evidence weight, endpoint XYZ, temporary piece IDs, support diagnostics or winding-distance index is persisted. Persistent identity comes from UUIDs; source catalog mapping remains per fiber in the source extension. Runtime graph indices are dense positions in deterministic edge-UUID order, not persistent identities.
 
-Provisioning is explicitly constructed from compact typed inputs, not copied or filtered out of a source metadata/configuration tree. `FiberSourceInfo` supplies the source UUID when known, optional SHA-256 and optional fiber/point counts. `FiberConstraintSourceInfo` supplies the input fiber-source UUID when known, optional constraint-file SHA-256 and optional constraint count, plus fixed units/order conventions. Supplying its `coordinateSpace` selects the native format-2 definition below; leaving it absent preserves the legacy format-1 interpretation. AFC has no independent file UUID: its AFV UUID identifies the input fibers, not the constraint file. Unknown identity is omitted, never guessed. Filesystem paths, reports, selection-ID lists and nested source configuration are not stored in provisioning. Per-fiber source annotations are a separate opaque source field, not provisioning.
+Provisioning is explicitly constructed from compact metadata: known source UUID/checksum, optional counts, units, coordinate space and codec conventions. It is never copied wholesale from configuration or source metadata. Paths, selection lists and lengthy numerical arrays are forbidden. Source annotations are separate opaque source data, not provisioning.
 
-The source table indexes `source_id`; the constraint table indexes `source_id` and `las_winding` in addition to its edge UUID primary key. Existing core adjacency indexes still find relationships from a fiber; the extension row is then looked up by edge UUID.
+Stored XYZ access fails explicitly; consumers needing source geometry evaluate it separately at the requested arc. Numerical winding and UV consumers do not request or reconstruct missing measurement XYZ. The compact graph reader supports plain, sharded, packed and referenced collections through `ObjectCollection`, resolves overlay ownership, and validates byte lengths, normal signs, canonical UUID order and finite arc values.
 
-### Native extraction measurement format 2
+Native extraction records the selected cohort in `_fibers` rows under a `constraint_extraction` run, including fibers without observations. These refer to existing core objects rather than copying geometry. `_inputs` and table `basedOn` identify the input snapshot; compact `normal_source_sha256` identifies the normal source.
 
-The native extractor records measured endpoints before converting them into source-object anchors. These are distinct coordinate representations, not interchangeable copies:
+Normal orientation writes changed measurement rows into a sealed derived store referencing the input graph. Edge UUIDs, canonical arcs and every non-normal field are retained. Subsequent normal-curve/prior export requires matching normal-source identity, sampling spacing and endpoint validity. Since float32 arc and compact-axis quantization are intentional, it checks transported orientation and reports mean/max angular discrepancies rather than asserting impossible float64 byte equality. An arc rounded upward at the final endpoint is accepted only up to the exact float32 representation of that endpoint and is evaluated at the source endpoint.
 
-| Representation | Frame and purpose |
-| --- | --- |
-| Constraint `point_a_*` / `point_b_*` | Exact extracted XYZ in the named volume's base-voxel frame; used for numerical graph evaluation and normal sampling |
-| Constraint `arc_a` / `arc_b` | Distance along the corresponding source fiber in base voxels |
-| Constraint `normal_a_*` / `normal_b_*` | Sheet-normal axes in the same measurement frame, with separate validity/reason |
-| Core edge anchor `position` | Position transformed into that endpoint object's stored geometry frame; used by ordinary object/geometry consumers |
-
-The extension's compact provisioning declares `coordinate_space` as `SAMPLE/VOLUME_ID`, `anchor_frame` as `object_geometry`, `length_units` as `base_voxels`, `winding_units` as `turns`, and `endpoint_order` as `source`. Numerical consumers must read the explicit measured XYZ columns instead of treating core anchor coordinates as base voxels or reconstructing measurements by a transform round trip. For example, geometry stored at a four-base-voxel scale has different anchor and measurement coordinates even though they identify the same physical point. There is no rounding, nearest-point substitution or change to measured winding distances in this representation.
-
-Native `source_id` is the event's numeric extraction-order identifier; `source_fiber_a/b` are source-catalog ordinals. Neither identifies a fiber across stores. Persistent fiber/relationship identity comes from the core UUIDs. `source_reversed` maps source-ordered arc positions, normals and measured XYZ to the canonical core edge endpoints; signed measurements remain in their recorded source convention.
-
-[`readFiberConstraintGraph`](../include/vc_object_store/objects/FiberConstraintGraph.hpp) joins the typed measurement rows with core parallel/perpendicular edges and returns source-ordered endpoint UUIDs and numerical columns. It supports plain, sharded and packed collections through `ObjectCollection`, sorts by event `source_id`, and rejects duplicate event identifiers instead of silently combining independently extracted graphs. Format 1 reads endpoint XYZ from the original core anchors; format 2 reads the six explicit measurement columns. This format-1 support is for the external legacy adapter, not permission to write AFC databases or reuse the removed JSON/SQLite graph backend.
-
-Native extraction records the selected cohort in `_fibers` rows under a `constraint_extraction` run, including fibers with no events. These are participant rows referring to existing core objects, not copied geometry. `_inputs` and table `basedOn` pin the source snapshot. `normal_source_sha256` is a compact identity check for the normal inputs; manifests, input paths and source metadata trees are not stored in provisioning.
-
-Normal orientation creates a sealed derived store referencing the input graph. It writes only changed measurement rows, retaining the same edge UUIDs, source ordering, exact measurement positions, validity and all non-normal fields; unchanged rows and geometry remain referenced. The new `normal_orientation` run records `sample_spacing_base`. Subsequent normal-curve/prior export requires that orientation run, matching normal-source identity and matching sampling spacing; it must not infer spacing or silently resample an incompatible gauge. Collection full scans and keyed reads must therefore resolve the same winning measurement rows across all partitions.
-
-Python `vc_object_store.CollectionReader` exposes the same composed graph through `fiber_constraints()` and typed extension discovery/reads. The winding workflows use the shared `fiber_graph_store.FiberGraph` adapter and UUID-indexed source geometry rather than opening SQLite files themselves. See [fiber storage and extraction](../../vesuvius/docs/fiber_layout.md#storage-and-identities) for workflow inputs and cache invalidation.
+Python `CollectionReader.fiber_constraints()` returns the same composed compact graph. Shared winding workflows use `fiber_graph_store.FiberGraph` and UUID-indexed geometry rather than opening SQLite directly. See [fiber storage and extraction](../../vesuvius/docs/fiber_layout.md#storage-and-identities).
 
 ### Run results
 

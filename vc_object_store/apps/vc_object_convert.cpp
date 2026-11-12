@@ -21,7 +21,7 @@ int main(int argc, char** argv)
                          "       vc_object_convert --in-place STORE.vcobj [MAPPING.json [REPORT.json]]\n"
                          "       vc_object_convert --enable-history STORE.vcobj\n"
                          "       vc_object_convert --remove-history-and-disable STORE.vcobj\n"
-                         "Conversion copies an upstream schema 16–20 SOURCE (never modified) into a new DESTINATION.\n"
+                         "Conversion copies a schema 16–21 SOURCE (never modified) into a schema-22 DESTINATION.\n"
                          "Stop every client first; settle legacy hub replicas with their old tooling.\n"
                          "MAPPING defaults to DESTINATION.mapping.json, REPORT to DESTINATION.report.json.\n"
                          "History maintenance validates a sibling file before atomically replacing STORE.\n";

@@ -38,7 +38,7 @@ struct ExtensionIndex {
 struct ExtensionTable {
     std::string name; // ext_*; a physical SQL table, not a JSON/EAV payload
     std::string extension;
-    int64_t formatVersion = 1; // independent of core schema 21
+    int64_t formatVersion = 1; // independent of the core schema version
     std::string provisioning = "{}"; // extension-owned, small JSON object
     std::vector<ExtensionSource> basedOn; // common input snapshot for these rows
     std::vector<ExtensionColumn> columns;
@@ -63,6 +63,9 @@ struct ExtensionTableInfo {
 struct InitialExtensionRow {
     std::string table;
     ExtensionRow values;
+    // Transient import-only data. Available as the final transform-row value
+    // in a staged table, then discarded before insertion into the final schema.
+    std::vector<uint8_t> stagingPayload;
 };
 size_t extensionPayloadBytes(std::span<const InitialExtensionRow>);
 } // namespace vc::objects

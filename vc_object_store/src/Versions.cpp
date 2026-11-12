@@ -1,6 +1,7 @@
 #include "internal/Versions.hpp"
 #include "internal/History.hpp"
 #include "internal/Extensions.hpp"
+#include "internal/EdgeLayout.hpp"
 
 #include <limits>
 
@@ -134,7 +135,7 @@ void detail::attachObjectVersions(sqlite3* db, std::vector<ObjectRecord>& record
 
 void detail::attachRelationshipVersions(sqlite3* db, std::vector<EdgeRecord>& records)
 {
-    Statement s(db, "SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)),state=2 FROM edges WHERE uuid=?");
+    Statement s(db, "SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)),state=2 FROM "+edgeReadSource(db)+" WHERE uuid=?");
     for (auto& record : records) {
         s.reset();
         s.bind(1, parseUuid(record.uuid));
@@ -147,7 +148,7 @@ void detail::attachRelationshipVersions(sqlite3* db, std::vector<EdgeRecord>& re
 
 std::optional<int64_t> detail::relationshipHeadVersion(sqlite3* db, const std::string& edgeUuid)
 {
-    Statement s(db, "SELECT version,state=2 FROM edges WHERE uuid=?",
+    Statement s(db, "SELECT version,state=2 FROM "+edgeReadSource(db)+" WHERE uuid=?",
         parseUuid(edgeUuid));
     if (!s.row() || s.i64(1)) return std::nullopt;
     return s.i64(0);
@@ -205,7 +206,7 @@ int64_t CommitPublisher::object(const std::string& objectUuid, const std::string
 int64_t CommitPublisher::relationship(const std::string& edgeUuid, const std::optional<std::string>& revisionUuid)
 {
     if (baseline_) {
-        Statement row(db_, "SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)) FROM edges WHERE uuid=?", parseUuid(edgeUuid));
+        Statement row(db_, "SELECT version,coalesce(version_generation,(SELECT initial_generation FROM store_manifest)) FROM "+edgeReadSource(db_)+" WHERE uuid=?", parseUuid(edgeUuid));
         if (!row.row()) throw std::runtime_error("baseline relationship is absent");
         execute(db_, "INSERT INTO relationship_versions VALUES(?,?,?,NULL,?,?)", parseUuid(edgeUuid), row.i64(0), row.blob16(1), parseOptionalUuid(revisionUuid), int64_t(!revisionUuid));
         return row.i64(0);
@@ -284,7 +285,7 @@ void detail::recordCurrentChange(sqlite3* db, const std::array<unsigned char,16>
            (expected!=pool.checkedObjects.end() && !expected->second))) state->created.insert(uuid);
         return;
     }
-    Statement edge(db,"SELECT a_uuid,b_uuid,state FROM edges WHERE uuid=?",key);
+    Statement edge(db,"SELECT a_uuid,b_uuid,state FROM "+edgeReadSource(db)+" WHERE uuid=?",key);
     if(!edge.row()) throw std::logic_error("object store: changed record is absent: "+uuid);
     state->changedRelationships.insert(uuid);
     if(edge.i64(2)!=2 && std::string_view(changeKind)=="add_edge") state->created.insert(uuid);

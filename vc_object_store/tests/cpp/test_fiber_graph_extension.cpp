@@ -88,7 +88,9 @@ void definitionsAndValidation()
     require(Json::parse(source.provisioning) == Json({{"source_uuid", sourceUuid}, {"source_sha256", std::string(64, 'a')},
                 {"fiber_count", 2}, {"point_count", 100}}), "source provisioning is explicitly constructed compact identity/count data");
     require(Json::parse(constraints.provisioning) == Json({{"fiber_source_uuid", sourceUuid}, {"constraint_count", 1},
-                {"length_units", "base_voxels"}, {"winding_units", "turns"}, {"endpoint_order", "source"}}),
+                {"length_units", "base_voxels"}, {"winding_units", "turns"}, {"endpoint_order", "canonical"},
+                {"arc_encoding","float32-le"},{"direction_encoding","lasagna-xy-u8-hemisphere-i8"},
+                {"connector_direction","a_to_b"},{"winding_scale",16},{"winding_code_offset",1},{"winding_invalid_code",0}}),
             "constraint provenance identifies its fiber source, not an invented constraint file UUID");
     for (const auto kind : tables) {
         const auto spec = fiberGraphSolveTable(kind);
@@ -135,7 +137,7 @@ void multipleRuns()
     {
         auto txn = store.read(); const auto status = store.status(txn);
         source = {status.storeUuid, status.generation, status.commitSequence};
-        require(store.extensionTables(txn).size() == 2 && store.provisioning(txn).schemaVersion == 21,
+        require(store.extensionTables(txn).size() == 2 && store.provisioning(txn).schemaVersion == 22,
                 "import creates only its two optional tables without changing the core schema");
     }
     ExtensionSource priorRun;
@@ -210,8 +212,7 @@ void shardedResults(bool packed)
     TemporaryDirectory dir;
     constexpr size_t count = 2;
     InitialImportOptions options; options.store.author = "fiber-graph-test"; options.shards.clear();
-    for (size_t i = 0; i < count; ++i) options.shards.push_back({{int64_t(i * 100 + 1), int64_t((i + 1) * 100)},
-                                                              {int64_t(i * 100 + 1), int64_t((i + 1) * 100)}});
+    for (size_t i = 0; i < count; ++i) options.shards.push_back({{int64_t(i * 100 + 1), int64_t((i + 1) * 100)}});
     for (const auto kind : tables) options.extensions.push_back(fiberGraphSolveTable(kind));
     if (packed) { options.packed.emplace(); options.packed->memoryFirst = true; options.packed->disposableBulk = true;
         options.packed->backgroundFlush = false; options.packed->residentBytes = 64 * 1024 * 1024; }

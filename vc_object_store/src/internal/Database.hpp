@@ -44,6 +44,7 @@ struct CurrentWriteState {
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
+    std::optional<std::set<std::string>> edgeColumnNames;
     // Installed only by a collection transaction with pinned dependencies.
     // Hashes resolve directly through pinned readonly dependencies, without
     // per-reference registration. Size returns zero when no dependency owns it.
@@ -108,7 +109,7 @@ void beforeCurrentObjectEdit(sqlite3*, const std::string& uuid);
 // The current schema version and the whole schema of a new store (one
 // history generation), inside the caller's transaction. The offline
 // converter builds its destination with the same function.
-inline constexpr int kSchemaVersion = 21;
+inline constexpr int kSchemaVersion = 22;
 void createStoreSchema(sqlite3*, const std::string& generation);
 }
 struct ObjectStore::Impl {

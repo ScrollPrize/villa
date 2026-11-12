@@ -74,7 +74,7 @@ Approval metadata belongs to the version it approves. Migrate legacy approval-ge
 - Contract committed before integration as `e43271649`. Pre-integration branch head: `ef3442aeb`; fetched upstream head: `2144fdd3f` (schema 20).
 - Schema 21, ordinary record versions, direct geometry descriptors, store_reference lineage/commit pins and explicit upstream conversion are implemented. Final validation: 49 native tests pass (9.25 s; the external-credential SSH test is skipped), and all 126 Python tests pass (8.62 s), including hosted-server tests and importer readback. No deferred delta-history redesign was implemented.
 - History-off request retry receipts are operational state, not retained object history: create their existing standalone receipt table lazily only when an explicit request UUID is submitted. Slim initial imports never need this table. History-policy changes preserve already-issued receipts.
-- Conversion preserves logical identities, so hosted metadata-cache keys now include the schema-21 wire namespace. Existing raw geometry/artifact blocks remain reusable. Geometry-only and metadata-plus-geometry edits preserve explicitly recorded historical relationship pins; an unpublished relationship cannot claim a historical state that never existed.
+- Conversion preserves logical identities, so hosted metadata-cache keys include the schema-22 wire namespace. Existing raw geometry/artifact blocks remain reusable. Geometry-only and metadata-plus-geometry edits preserve explicitly recorded historical relationship pins; an unpublished relationship cannot claim a historical state that never existed.
 
 ### Repeating validation
 

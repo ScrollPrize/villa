@@ -2,7 +2,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 namespace vc::objects {
-namespace detail { struct CollectionReadContext; struct InitialCollectionAccess; }
+namespace detail { struct CollectionReadContext; struct InitialCollectionAccess; struct CollectionScanAccess; }
 // The UUID is the complete logical identity. storeUuid is a routing hint and
 // provenance for numeric lookup, never a second part of object identity.
 struct ObjectKey {
@@ -25,15 +25,19 @@ struct InitialObjectIdentity { ObjectKey key; int64_t id; };
 struct InitialEdgeImportOptions {
     bool deferIndexes = true;
     std::size_t sqlBatchRows = 1;
+    // Transient per-shard measurement tables. Rows are transferred explicitly
+    // after producer-side reconciliation; none may remain at publication.
+    std::vector<std::string> stagedExtensions;
 };
 struct CollectionMember {
     std::string databaseUuid, storeUuid, generation;
     int64_t commitSequence = 0;
     std::filesystem::path locator;
     bool partition = false;
-    std::array<int64_t,2> objectIds{}, edgeIds{};
+    std::array<int64_t,2> objectIds{};
 };
-// Rules operate on positive signed SQLite IDs. One group has one rule kind;
+// Numeric object rules operate on positive signed SQLite IDs; UUID rules
+// cover objects and edges. One group has one rule kind;
 // ranges may have multiple disjoint entries per destination. HashV1 is the
 // documented SplitMix64 finalizer, not std::hash or a platform-dependent hash.
 enum class RoutingKind { Range, Modulo, Bits, HashV1, UuidHashV1 };
@@ -41,7 +45,7 @@ enum class RoutingKind { Range, Modulo, Bits, HashV1, UuidHashV1 };
 // Use this exact function in producers declaring UUID-hash routing.
 std::size_t uuidShardIndex(const std::string& uuid, std::size_t shardCount);
 struct KeyRoute {
-    std::string keySpace; // objects/edges: numeric IDs; objects.uuid/edges.uuid: UUID keys
+    std::string keySpace; // objects: numeric IDs; objects.uuid/edges.uuid: UUID keys
     RoutingKind kind = RoutingKind::Range;
     int64_t lower = 1, upper = INT64_MAX;
     uint64_t divisor = 1, remainder = 0;
@@ -73,7 +77,7 @@ public:
     static ObjectCollection open(const std::filesystem::path&, const OpenOptions&);
     // Publish independently imported, sealed physical partitions of one logical
     // store. Each must have the same store/lineage UUID and commit sequence and
-    // disjoint reserved object/edge ID ranges. The manifest has the same state pin.
+    // disjoint reserved object ID ranges. Edges use UUIDs only. The manifest has the same state pin.
     static ObjectCollection publishShards(const std::filesystem::path&, const std::vector<std::filesystem::path>&, const OpenOptions&, const std::vector<KeyRoute>& routes = {});
     ObjectCollection(ObjectCollection&&) noexcept;
     ~ObjectCollection();
@@ -115,13 +119,11 @@ public:
     std::vector<CollectionEdge> edgesOf(const CollectionTxn&, const ObjectKey&) const;
     std::vector<CollectionEdge> edgesByKind(const CollectionTxn&, const std::string&) const;
     std::optional<CollectionEdge> edge(const CollectionTxn&, const ObjectKey&) const;
-    std::optional<CollectionEdge> edgeById(const CollectionTxn&, const std::string& owner, int64_t id) const;
     ObjectKey upsertObject(CollectionTxn&, const ObjectRecord&);
     void replaceObject(CollectionTxn&, const ObjectKey&, const ObjectRecord&);
     void setMeta(CollectionTxn&, const ObjectKey&, const std::string&, const std::string& json);
     void deleteObject(CollectionTxn&, const ObjectKey&);
     ObjectKey addEdge(CollectionTxn&, const ObjectKey& a, const ObjectKey& b, const EdgeRecord&);
-    ObjectKey insertEdgeWithId(CollectionTxn&, const ObjectKey& a, const ObjectKey& b, const EdgeRecord&, int64_t id);
     // Initial-only append: no updates/replacements, no existing local edges,
     // history off. A failed batch rolls back every object and geometry row.
     std::vector<InitialObjectIdentity> importInitialObjects(CollectionTxn&,
@@ -144,6 +146,7 @@ public:
 private:
     friend class CollectionTxn;
     friend struct detail::CollectionReadContext;
+    friend struct detail::CollectionScanAccess;
     friend struct detail::InitialCollectionAccess;
     struct Impl;
     explicit ObjectCollection(std::unique_ptr<Impl>);

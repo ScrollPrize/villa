@@ -1,5 +1,5 @@
 #pragma once
-// Offline conversion of upstream schema-16 to schema-20 stores (standalone,
+// Offline conversion of schema-16 through schema-21 stores (standalone,
 // hosted, or settled legacy hub replica) to the current schema. The only place that knows
 // the previous formats; the runtime opens the current schema only. Schema 16
 // (without surface data) is first brought to schema 17; schema 17

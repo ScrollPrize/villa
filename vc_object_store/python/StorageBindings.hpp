@@ -68,6 +68,7 @@ vo::Anchor anchorFromPy(const nb::handle& obj)
 {
     vo::Anchor a;
     if (obj.is_none()) return a;
+    if (nb::isinstance<nb::str>(obj) && nb::cast<std::string>(obj).empty()) return a;
     nb::dict d = nb::cast<nb::dict>(obj);
     for (auto item : d) {
         const auto key = nb::cast<std::string>(item.first);
@@ -303,11 +304,14 @@ struct PyObjectStore {
     static PyObjectStore create(const std::string& path, const std::string& author,
                                              const std::optional<std::string>& hostname, int readerPoolSize,
                                              size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog,
-                                             bool historyEnabled, bool spatialIndex)
+                                             bool historyEnabled, bool spatialIndex, bool edgeAdjacencyIndex,
+                                             const std::optional<std::vector<std::string>>& edgeColumns)
     {
         vo::OpenOptions o;
         o.history = historyEnabled ? vo::HistoryMode::On : vo::HistoryMode::Off;
         o.spatialIndex = spatialIndex;
+        o.edgeAdjacencyIndex = edgeAdjacencyIndex;
+        o.edgeColumns = edgeColumns;
         o.author = author;
         o.hostnameOverride = hostname;
         o.readerPoolSize = readerPoolSize;

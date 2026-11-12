@@ -5,6 +5,7 @@
 #include "geometry/SequenceMetadata.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/ImmutableImport.hpp"
+#include "internal/JsonFields.hpp"
 
 namespace vc::objects::detail {
 namespace {
@@ -50,9 +51,9 @@ CREATE TRIGGER source_identity_object_insert AFTER INSERT ON objects
 CREATE TRIGGER source_identity_object_update AFTER UPDATE OF meta,storage_ref,kind,geometry_manifest,state ON objects
  WHEN (new.kind='point_collection' OR old.kind='point_collection') AND
  (new.state IS NOT old.state OR new.kind IS NOT old.kind OR new.geometry_manifest IS NOT old.geometry_manifest OR
- json_extract(new.meta,'$.source.origin') IS NOT json_extract(old.meta,'$.source.origin') OR
- json_extract(new.meta,'$.source.source_collection_id') IS NOT json_extract(old.meta,'$.source.source_collection_id') OR
- (json_extract(new.meta,'$.source.origin') IS NULL AND new.storage_ref IS NOT old.storage_ref)) BEGIN
+ json_extract(nullif(new.meta,''),'$.source.origin') IS NOT json_extract(nullif(old.meta,''),'$.source.origin') OR
+ json_extract(nullif(new.meta,''),'$.source.source_collection_id') IS NOT json_extract(nullif(old.meta,''),'$.source.source_collection_id') OR
+ (json_extract(nullif(new.meta,''),'$.source.origin') IS NULL AND new.storage_ref IS NOT old.storage_ref)) BEGIN
  INSERT OR IGNORE INTO source_identity_dirty VALUES(new.uuid); END;
 )SQL");
 }
@@ -62,7 +63,7 @@ void refreshSourceIdentityIndex(sqlite3* db) {
         // Fiber-only/native object stores need no source-point accelerator.
         // Install it only once there is actual source identity to resolve.
         Statement source(db,"SELECT 1 FROM objects WHERE state<>2 AND kind='point_collection' "
-            "AND json_type(meta,'$.source.source_collection_id') IS NOT NULL LIMIT 1");
+            "AND json_type(nullif(meta,''),'$.source.source_collection_id') IS NOT NULL LIMIT 1");
         if(!source.row())return;
         createSourceIdentityIndex(db);
         exec(db,"INSERT INTO source_identity_dirty SELECT uuid FROM objects WHERE state<>2 AND kind='point_collection';");
@@ -79,7 +80,7 @@ void refreshSourceIdentityIndex(sqlite3* db) {
             execute(db,"DELETE FROM source_collections WHERE object_uuid=?",parseUuid(object));
             clearDirty(db,object);continue;
         }
-        const auto source=Json::parse(record.text(1)).value("source",Json::object());
+        const auto source=parseObjectJson(record.text(1)).value("source",Json::object());
         if(record.text(0)!="point_collection" || record.isNull(3) || !source.contains("source_collection_id")) {
             execute(db,"DELETE FROM source_collections WHERE object_uuid=?", parseUuid(object));
             clearDirty(db,object); continue;
@@ -120,7 +121,7 @@ void updateSourcePointIdentities(sqlite3* db, const std::string& object,
     const std::string& previous, const std::string& revision, const Json& manifest,
     const std::vector<int64_t>& changed) {
     if(!hasSourceIdentityIndex(db))return;
-    Statement state(db,"SELECT s.origin FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid WHERE o.state<>2 AND s.object_uuid=? AND s.revision_uuid=? AND s.origin=coalesce(json_extract(o.meta,'$.source.origin'),o.storage_ref) AND s.collection_id=json_extract(o.meta,'$.source.source_collection_id')");
+    Statement state(db,"SELECT s.origin FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid WHERE o.state<>2 AND s.object_uuid=? AND s.revision_uuid=? AND s.origin=coalesce(json_extract(nullif(o.meta,''),'$.source.origin'),o.storage_ref) AND s.collection_id=json_extract(nullif(o.meta,''),'$.source.source_collection_id')");
     state.bind(1,parseUuid(object));bindGeometryToken(state,2,previous);
     if(!state.row()) return; // The source index is created at publication.
     const auto origin=state.text(0);

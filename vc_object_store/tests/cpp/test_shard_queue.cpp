@@ -47,7 +47,7 @@ void parallelStream(){
     std::vector<InitialObjectRecord> records(count);std::vector<std::atomic<int>> visits(count);
     for(size_t i=0;i<count;++i){records[i].record.uuid=util::nameUuid("stream-test-"+std::to_string(i));records[i].record.kind="note";}
     InitialImportOptions options;options.store.author="stream-test";options.shards.clear();
-    for(int64_t i=0;i<int64_t(workers);++i)options.shards.push_back({{i*100+1,(i+1)*100},{i*100+1,(i+1)*100}});
+    for(int64_t i=0;i<int64_t(workers);++i)options.shards.push_back({{i*100+1,(i+1)*100}});
     ParallelImportStream stream({workers,workers,3,512,512});
     stream.start(count,count,[&](size_t,size_t task,ObjectEmitter& out){
         ++visits[task];
@@ -55,7 +55,7 @@ void parallelStream(){
         if(task%2)out.emit(ImportObject{&records[task]},sizeof(ImportObject),records[task].record.uuid);
         else out.emit(ImportObject{records[task]},sizeof(ImportObject),records[task].record.uuid);
     },[&](size_t,size_t task,EdgeEmitter& out){
-        EdgeRecord e;e.uuid=util::nameUuid("stream-edge-"+std::to_string(task));e.kind="test";
+        EdgeRecord e;e.uuid=util::nameUuid("stream-edge-"+std::to_string(task));e.kind="declared_reference";
         e.aUuid=records[task].record.uuid;e.bUuid=records[(task+1)%count].record.uuid;
         out.emit({{"",e.aUuid},{"",e.bUuid},e},sizeof(e),e.uuid);
     });

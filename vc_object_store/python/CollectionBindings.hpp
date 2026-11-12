@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/objects/InitialImport.hpp"
+#include "vc_object_store/objects/PackedStore.hpp"
 #include "vc_object_store/objects/imports/ParallelImportStream.hpp"
 #include "vc_object_store/objects/FiberConstraintGraph.hpp"
 #include "vc_object_store/objects/VolumeTransforms.hpp"
@@ -50,6 +51,17 @@ inline void bindCollectionApi(nb::module_& module) {
         nb::dict result;result["store_uuid"]=self.collection->uuid(*self.txn);
         result["generation"]=p.generation;result["commit_sequence"]=p.commitSequence;return result;
     })
+    .def_prop_ro("members",[](PyCollectionReader& self){
+        self.check();nb::list result;
+        for(const auto& member:self.collection->members()) {
+            nb::dict row;row["database_uuid"]=member.databaseUuid;row["store_uuid"]=member.storeUuid;
+            row["generation"]=member.generation;row["commit_sequence"]=member.commitSequence;
+            row["locator"]=member.locator.string();row["partition"]=member.partition;
+            row["container"]=vo::isPackedDatabasePath(member.locator)?vo::packedContainerPath(member.locator).string():member.locator.string();
+            result.append(row);
+        }
+        return result;
+    },"Resolved read-only physical members and their snapshot pins; no object directory is created.")
     .def("objects",[](PyCollectionReader& self,const std::optional<std::string>& kind){
         self.check();std::vector<vo::ObjectRecord> records;
         self.collection->scanObjects(*self.txn,[&](const auto& row){records.push_back(row.record);return true;},kind);
@@ -99,21 +111,21 @@ inline void bindCollectionApi(nb::module_& module) {
         return edge?nb::object(edgeToPy(edge->record)):nb::object(nb::none());
     },"uuid"_a)
     .def("fiber_constraints",[](PyCollectionReader& self){
-        self.check();std::vector<vo::FiberConstraintRecord> records;
-        records=vo::readFiberConstraintGraph(*self.collection,*self.txn);
-        std::vector<int64_t> ids;std::vector<double> values;ids.reserve(records.size());values.reserve(records.size()*21);
+        self.check();std::vector<vo::CompactFiberConstraint> records;
+        {nb::gil_scoped_release release;records=vo::readCompactFiberConstraintGraph(*self.collection,*self.txn);}
+        std::vector<int64_t> ids;std::vector<double> values;ids.reserve(records.size());values.reserve(records.size()*16);
         nb::list uuids,a,b;
-        for(const auto& r:records){ids.push_back(r.sourceId);uuids.append(r.edge.uuid);a.append(r.a);b.append(r.b);
+        for(const auto& r:records){ids.push_back(int64_t(r.runtimeIndex));uuids.append(vo::fiberGraphUuid(r.uuid));a.append(vo::fiberGraphUuid(r.a));b.append(vo::fiberGraphUuid(r.b));
             values.push_back(r.arcA);values.push_back(r.arcB);
-            values.insert(values.end(),r.pointA.begin(),r.pointA.end());values.insert(values.end(),r.pointB.begin(),r.pointB.end());
-            for(const auto v:{r.parallelScore,r.perpendicularScore,r.windingDistance,r.parallelWindingDistance,r.evidenceWeight})values.push_back(v);
             values.insert(values.end(),r.normalA.begin(),r.normalA.end());values.insert(values.end(),r.normalB.begin(),r.normalB.end());
-            values.push_back(r.validA);values.push_back(r.validB);}
+            values.insert(values.end(),r.connector.begin(),r.connector.end());
+            values.push_back(r.windingDistance);values.push_back(r.parallel);
+            values.push_back(r.validA);values.push_back(r.validB);values.push_back(r.validConnector);}
         nb::dict result;result["edge_uuid"]=uuids;result["fiber_a"]=a;result["fiber_b"]=b;
         result["ids"]=nb::bytes(reinterpret_cast<const char*>(ids.data()),ids.size()*sizeof(int64_t));
         result["values"]=nb::bytes(reinterpret_cast<const char*>(values.data()),values.size()*sizeof(double));
         return result;
-    },"Bulk source-ordered native numeric buffers (host-endian int64/float64); no JSON measurement decoding.")
+    },"Bulk UUID-ordered compact graph buffers (host int64 runtime indices/float64 decoded values). No stored endpoint XYZ.")
     .def("extension_tables",[](PyCollectionReader& self){
         self.check();nb::list result;for(const auto& table:self.collection->extensionTables(*self.txn))result.append(extensionTableToPy(table));return result;
     })
@@ -126,7 +138,8 @@ inline void bindCollectionApi(nb::module_& module) {
     // the same InitialImport and ParallelImportStream, not another SQL writer.
     module.def("import_initial_records",[](const std::filesystem::path& destination,const nb::sequence& objects,
             const nb::sequence& edges,const nb::sequence& definitions,const std::vector<std::filesystem::path>& dependencies,
-            size_t workers,bool packed){
+            size_t workers,bool packed,bool edgeAdjacencyIndex,
+            const std::optional<std::vector<std::string>>& edgeColumns){
         if(!workers||workers>1024)throw std::invalid_argument("workers must be in 1..1024");
         std::vector<vo::InitialObjectRecord> records;records.reserve(nb::len(objects));
         for(const auto input:objects){const auto row=nb::cast<nb::dict>(input);vo::InitialObjectRecord record;
@@ -141,7 +154,8 @@ inline void bindCollectionApi(nb::module_& module) {
         const auto stride=INT64_MAX/static_cast<int64_t>(workers);
         for(size_t i=0;i<workers;++i){const std::array<int64_t,2> range{
             1+static_cast<int64_t>(i)*stride,static_cast<int64_t>(i+1)*stride};
-            options.shards[i].objectIds=range;options.shards[i].edgeIds=range;}
+            options.shards[i].objectIds=range;}
+        options.store.edgeAdjacencyIndex=edgeAdjacencyIndex;options.store.edgeColumns=edgeColumns;
         options.store.author="fiber-workflow";if(packed)options.packed=vo::PackedStoreOptions{};
         for(const auto input:definitions)options.extensions.push_back(extensionTableFromPy(nb::cast<nb::dict>(input)));
         vo::InitialImportResult result;
@@ -165,7 +179,8 @@ inline void bindCollectionApi(nb::module_& module) {
         nb::dict out;out["path"]=result.path.string();out["store_uuid"]=result.storeUuid;
         out["ingestion_seconds"]=result.ingestionSeconds;out["persistence_seconds"]=result.persistenceSeconds;return out;
     },"destination"_a,"objects"_a,"edges"_a=nb::list(),"extensions"_a=nb::list(),
-      "dependencies"_a=std::vector<std::filesystem::path>{},"workers"_a=1,"packed"_a=false);
+      "dependencies"_a=std::vector<std::filesystem::path>{},"workers"_a=1,"packed"_a=false,
+      "edge_adjacency_index"_a=true,"edge_columns"_a=std::nullopt);
 
     module.def("write_extension_store",[](const std::filesystem::path& path,
             const std::vector<std::filesystem::path>& bases,const nb::sequence& definitions,const nb::dict& payload){

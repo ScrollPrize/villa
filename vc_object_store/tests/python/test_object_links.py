@@ -143,7 +143,7 @@ def test_attached_collections_are_not_graph_links(db):
         db.link_point_collections_to_surfaces(collection_uuids=[results])
 
     # Traversal and graph reads skip attachments unless asked for by kind.
-    link = db.add_edge(dict(a=surface, b=other, kind="surface-overlap", a_anchor=whole, b_anchor=whole))
+    link = db.add_edge(dict(a=surface, b=other, kind="same-surface", a_anchor=whole, b_anchor=whole))
     assert results not in db.neighbours(surface)
     assert db.neighbours(surface, edge_kind="attachment") == [results]
     assert set(db.component(surface)) == {surface, other}

@@ -15,6 +15,11 @@ ROLES = ("runs", "inputs", "fibers", "samples", "hypotheses", "widths",
          "positions", "relations", "metrics")
 
 
+def test_piece_normal_frames_are_not_a_persisted_workflow_role():
+    with pytest.raises(ValueError):
+        fiber_graph_solve_table("normal_frames")
+
+
 def unpack(spec, row):
     return dict(zip((c["name"] for c in spec["columns"]), row))
 
@@ -26,7 +31,7 @@ def append(tx, row):
 def test_workflow_two_runs_share_graph(db):
     fiber = db.upsert_object(dict(kind="fiber"))
     other = db.upsert_object(dict(kind="fiber"))
-    edge = db.add_edge(dict(kind="test_link", a=fiber, b=other,
+    edge = db.add_edge(dict(kind="declared_reference", a=fiber, b=other,
                             a_anchor=dict(whole_geometry=True), b_anchor=dict(whole_geometry=True)))
     source_state = db.status()
     source_fiber_version = db.current_version(fiber)
@@ -104,7 +109,9 @@ def test_metadata_is_constructed_not_copied():
     assert fiber_source_extension("")["provisioning"] == {}
     constraints = fiber_constraint_extension(source, constraint_count=12)
     assert constraints["provisioning"] == dict(fiber_source_uuid=source, constraint_count=12,
-        length_units="base_voxels", winding_units="turns", endpoint_order="source")
+        length_units="base_voxels", winding_units="turns", endpoint_order="canonical",
+        arc_encoding="float32-le", direction_encoding="lasagna-xy-u8-hemisphere-i8",
+        connector_direction="a_to_b", winding_scale=16, winding_code_offset=1, winding_invalid_code=0)
     with pytest.raises(TypeError):
         fiber_source_extension({"uuid": source, "selected_ids": list(range(100)), "path": "/not/copied"})
     run = str(uuid.uuid4())

@@ -2,6 +2,7 @@
 #include "internal/History.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/ExternalEndpoint.hpp"
+#include "vc_object_store/objects/EdgeKinds.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -11,25 +12,26 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
                                              std::optional<bool> adjacentFilter, bool applicableOnly) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
+    requireAdjacencyIndex(db);
     const auto key=parseUuid(objectUuid);
     Statement own(db,"SELECT state FROM objects WHERE uuid=?",key);
     if(own.row()) {if(own.i64(0)==2)return {};}
-    else {Statement known(db,"SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
+    else {Statement known(db,"SELECT 1 FROM "+edgeReadSource(db)+" WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
         if(!known.row())throw std::runtime_error("object store: object not found: "+objectUuid);
         if(!includeRetired&&externalEndpointRecord(db,objectUuid).retired)return {};
     }
     if (applicableOnly) requirePublishedGraphRead(txn);
     const std::string filter = " AND state=0" + fiberAdjacencySql(adjacentFilter) +
-        (edgeKind ? std::string(" AND kind=?2") : " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'") +
+        (edgeKind ? std::string(" AND kind=?2") : " AND kind<>" + std::to_string(edgeKindCode(kAttachmentEdgeKind))) +
         (includeRetired ? "" : " AND " + activeEdgeSql());
     // Filter before deduplication: a rejected parallel edge must not hide a
     // later applicable edge to the same neighbour. Preserve first-edge order.
-    std::string sql = "SELECT e.neighbour,e.uuid,owned.id,owned.kind FROM (SELECT id,uuid,b_uuid AS neighbour FROM edges INDEXED BY edges_a WHERE a_uuid=?1" + filter +
-        " UNION SELECT id,uuid,a_uuid AS neighbour FROM edges INDEXED BY edges_b WHERE b_uuid=?1" + filter +
+    std::string sql = "SELECT e.neighbour,e.uuid,owned.id,owned.kind FROM (SELECT uuid,b_uuid AS neighbour FROM "+edgeReadSource(db)+" AS edges WHERE a_uuid=?1" + filter +
+        " UNION SELECT uuid,a_uuid AS neighbour FROM "+edgeReadSource(db)+" AS edges WHERE b_uuid=?1" + filter +
         ") e LEFT JOIN objects owned ON owned.uuid=e.neighbour WHERE coalesce(owned.state,0)<>2";
-    sql += " ORDER BY e.id";
+    sql += " ORDER BY e.uuid";
     Statement rows(db, sql, key);
-    if (edgeKind) rows.bind(2, *edgeKind);
+    if (edgeKind) rows.bind(2, edgeKindCode(*edgeKind));
     std::vector<std::string> out;
     std::unordered_set<std::string> seen;
     while (rows.row()) {
@@ -85,6 +87,7 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
 {
     auto checkCancelled = [&] { checkTraversalCancelled(cancel); };
     checkCancelled();
+    requireAdjacencyIndex(db);
     ProgressGuard guard{db};
     if (cancel)
         sqlite3_progress_handler(
@@ -96,7 +99,7 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
         if(local.row())return local.i64(0)!=2&&(includeRetired||local.i64(0)==0);
         return includeRetired||!externalEndpointRecord(db,uuid).retired;
     };
-    Statement known(db,"SELECT 1 FROM objects WHERE uuid=?1 UNION ALL SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",startBytes);
+    Statement known(db,"SELECT 1 FROM objects WHERE uuid=?1 UNION ALL SELECT 1 FROM "+edgeReadSource(db)+" WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",startBytes);
     if(!known.row())throw std::runtime_error("object store: object not found: "+startUuid);
     if(!active(startUuid))return {};
     // Probe the endpoint indexes only for nodes reached by this traversal.
@@ -108,20 +111,20 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
             filter += (i ? ",?" : "?") + std::to_string(i + 2);
         filter += ")";
     } else {
-        filter += " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'";
+        filter += " AND kind<>" + std::to_string(edgeKindCode(kAttachmentEdgeKind));
     }
     filter += fiberAdjacencySql(adjacentFilter);
     if (!includeRetired) filter += " AND " + activeEdgeSql();
     // Each UNION arm uses an endpoint-leading index even without ANALYZE.
-    std::string sql = "SELECT id,b_uuid,uuid FROM edges INDEXED BY edges_a WHERE a_uuid=?1" + filter +
-        " UNION SELECT id,a_uuid,uuid FROM edges INDEXED BY edges_b WHERE b_uuid=?1" + filter + " ORDER BY id";
+    std::string sql = "SELECT uuid,b_uuid,uuid FROM "+edgeReadSource(db)+" AS edges WHERE a_uuid=?1" + filter +
+        " UNION SELECT uuid,a_uuid,uuid FROM "+edgeReadSource(db)+" AS edges WHERE b_uuid=?1" + filter + " ORDER BY 1";
     Statement adjacent(db, sql);
     std::unordered_map<std::string,bool> activeNodes;
     activeNodes.emplace(startUuid,true);
     try {
         return breadthFirst(formatUuid(startBytes), maxDepth, cancel, [&](const std::string& uuid, auto visit) {
             adjacent.reset(); adjacent.bind(1, parseUuid(uuid));
-            for(size_t i=0;i<edgeKindFilter.size();++i)adjacent.bind(int(i)+2,edgeKindFilter[i]);
+            for(size_t i=0;i<edgeKindFilter.size();++i)adjacent.bind(int(i)+2,edgeKindCode(edgeKindFilter[i]));
             while(adjacent.row()) {
                 const auto endpoint=formatUuid(adjacent.blob16(1));
                 visit(endpoint,[&] {

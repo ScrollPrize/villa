@@ -4,6 +4,7 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "internal/Database.hpp"
 #include "internal/Versions.hpp"
+#include "internal/JsonFields.hpp"
 #include <algorithm>
 #include <map>
 #include <limits>
@@ -188,7 +189,7 @@ std::vector<ProjectResource> projectResources(const StoreReader& reader, const s
     std::vector<ProjectResource> resources;
     for (auto& record : records) {
         if (record.storageKind != kDatasetStorage) continue;
-        auto meta = Json::parse(record.meta);
+        auto meta = detail::parseObjectJson(record.meta);
         if (!meta.is_object()) meta = Json::object();
         auto owner = meta.value("owner", std::string{});
         if (viewer && !owner.empty() && owner != *viewer) continue;
@@ -230,7 +231,7 @@ bool addProjectResource(ObjectStoreSession& session, const AttachmentIdentity& a
     std::optional<ObjectRecord> existing;
     const auto revision = currentRevision(session, attachment, record.uuid, &existing);
     if (existing && !existing->retired && existing->tags == record.tags &&
-        Json::parse(existing->meta) == Json::parse(record.meta))
+        detail::parseObjectJson(existing->meta) == detail::parseObjectJson(record.meta))
         return false;
     writeRecord(session, attachment, record, revision, existing.has_value(), existing && existing->retired);
     return true;
@@ -243,7 +244,7 @@ void updateProjectResourceMeta(ObjectStoreSession& session, const AttachmentIden
     const auto revision = currentRevision(session, attachment, uuid, &record);
     if (!record || record->retired || !isProjectResourceKind(record->kind))
         throw std::runtime_error("not a project resource: " + uuid);
-    auto merged = Json::parse(record->meta);
+    auto merged = detail::parseObjectJson(record->meta);
     const auto before = merged;
     merged.update(meta);
     if (merged == before) return;
@@ -267,7 +268,7 @@ Json projectView(const StoreReader& reader, const std::string& author)
 {
     const auto head = reader.currentObject(projectViewUuid(author));
     if (!head || head->record.retired) return Json::object();
-    auto view = Json::parse(head->record.meta);
+    auto view = detail::parseObjectJson(head->record.meta);
     return view.is_object() ? view : Json::object();
 }
 
@@ -282,7 +283,7 @@ void setProjectView(ObjectStoreSession& session, const AttachmentIdentity& attac
     record.meta = (view.is_object() ? view : Json::object()).dump();
     std::optional<ObjectRecord> existing;
     const auto revision = currentRevision(session, attachment, record.uuid, &existing);
-    if (existing && Json::parse(existing->meta) == Json::parse(record.meta)) return;
+    if (existing && detail::parseObjectJson(existing->meta) == detail::parseObjectJson(record.meta)) return;
     writeRecord(session, attachment, record, revision, existing.has_value());
 }
 

@@ -39,6 +39,7 @@ add_library(vc_objects ${_vc_store_library_type}
     internal/Schema.cpp
     internal/RecordSql.cpp
     internal/EdgeSql.cpp
+    internal/EdgeLayout.cpp
     internal/InitialEdges.cpp
     internal/InitialObjects.cpp
     internal/RecordJson.cpp
@@ -113,7 +114,7 @@ target_link_libraries(vc_objects PUBLIC vc_geometry vc_reader::catalog nlohmann_
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
 # Offline schema conversion; the runtime library knows only the current schema.
-add_library(vc_object_migration STATIC migration/ConvertStore.cpp)
+add_library(vc_object_migration STATIC migration/ConvertStore.cpp migration/ConvertSchema21.cpp)
 target_include_directories(vc_object_migration PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 # geometry/GeometryInternal.hpp includes <openssl/evp.h>; Homebrew OpenSSL is not on the default include path.
 target_link_libraries(vc_object_migration PUBLIC vc_objects PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)

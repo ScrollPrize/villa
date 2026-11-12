@@ -198,6 +198,12 @@ void bindExtensionApi(nb::class_<T>& cls)
 
 inline void bindExtensionHelpers(nb::module_& module)
 {
+    module.def("encode_fiber_arc",[](double value){const auto b=vo::encodeFiberArc(value);return nb::bytes(reinterpret_cast<const char*>(b.data()),b.size());});
+    module.def("encode_fiber_direction",[](const std::array<double,3>& value){const auto b=vo::encodeFiberDirection(value);return nb::bytes(reinterpret_cast<const char*>(b.data()),b.size());});
+    module.def("encode_fiber_winding",[](double value)->nb::object{const auto b=vo::encodeFiberWindingDistance(value);if(!b)return nb::none();const char c=char(*b);return nb::bytes(&c,1);});
+    module.def("decode_fiber_arc",[](nb::bytes value){return vo::decodeFiberArc({reinterpret_cast<const uint8_t*>(value.c_str()),value.size()});});
+    module.def("decode_fiber_direction",[](nb::bytes value){return vo::decodeFiberDirection({reinterpret_cast<const uint8_t*>(value.c_str()),value.size()});});
+    module.def("decode_fiber_winding",[](nb::bytes value){return vo::decodeFiberWindingDistance({reinterpret_cast<const uint8_t*>(value.c_str()),value.size()});});
     module.def("extension_uuid", [](const nb::handle& input) -> nb::object {
         if (nb::isinstance<nb::str>(input)) return extensionValueToPy(vo::extensionUuid(nb::cast<std::string>(input)));
         return nb::cast(vo::extensionUuid(extensionValueFromPy(input)));

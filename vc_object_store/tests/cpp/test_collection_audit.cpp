@@ -63,11 +63,11 @@ int main() try {
     }
     ObjectKey edge;
     {
-        auto w=overlay.write();EdgeRecord record;record.kind="indexed";record.aAnchor.points.push_back({"line_points",{2}});
+        auto w=overlay.write();EdgeRecord record;record.uuid=util::newUuid();record.kind="declared_reference";record.aAnchor.points.push_back({"line_points",{2}});
         record.aAnchor.metadataKeys={"foo"};record.bAnchor.wholeGeometry=true;
-        edge=overlay.insertEdgeWithId(w,a,c,record,17);w.commit();
+        edge=overlay.addEdge(w,a,c,record);w.commit();
     }
-    {auto r=overlay.read();require(overlay.edgeById(r,owner,17)->key==edge,"qualified explicit edge ID was not preserved");}
+    {auto r=overlay.read();require(overlay.edge(r,edge)->key==edge,"explicit edge UUID was not preserved");}
     {
         auto read=overlay.read();const auto current=overlay.edge(read,edge);
         require(current&&((current->a==a&&current->b==c)||(current->a==c&&current->b==a)),"indexed edge retains direct endpoint keys");
@@ -109,7 +109,7 @@ int main() try {
         {auto db=ObjectStore::create(parent,options);auto w=db.write();endpoint={db.uuid(w),db.upsertObject(w,fiber())};
          auto restored=*db.objectByUuid(w,endpoint.objectUuid);restored.lifecycleEpoch=util::newUuid();
          writeLifecycle(ObjectStoreImplAccess::conn(w),*objectIdByUuid(ObjectStoreImplAccess::conn(w),parseUuid(endpoint.objectUuid)),restored);
-         const auto other=db.upsertObject(w,fiber());EdgeRecord edge;edge.kind="metadata";edge.aUuid=endpoint.objectUuid;edge.bUuid=other;
+         const auto other=db.upsertObject(w,fiber());EdgeRecord edge;edge.kind="declared_reference";edge.aUuid=endpoint.objectUuid;edge.bUuid=other;
          edge.aAnchor.metadataKeys={"foo"};inheritedEdge=db.addEdge(w,edge);db.seal(w);w.commit();}
         auto c=ObjectCollection::create(dir.path/"metadata-overlay.vcobj",{parent},options);
         {auto w=c.write();c.setMeta(w,endpoint,"family","\"H\"");w.commit();}
@@ -122,14 +122,14 @@ int main() try {
         auto r=c.read();require(nlohmann::json::parse(c.object(r,endpoint)->record.meta).at("foo")==9,"removed relationship still blocked endpoint change");r.commit();
         const auto dependency=c.members().at(1).databaseUuid;
         {auto raw=ObjectStore::open(dir.path/"metadata-overlay.vcobj",OpenOptions{.physicalPartitionOnly=true,.author="audit"});auto w=raw.write();
-         for(const auto* keySpace:{"objects","edges"})execute(ObjectStoreImplAccess::conn(w),
-             "INSERT INTO collection_routes VALUES(?,0,1,100,1,0,0,?)",std::string(keySpace),parseUuid(dependency));w.commit();}
+         execute(ObjectStoreImplAccess::conn(w),
+             "INSERT INTO collection_routes VALUES(?,0,1,100,1,0,0,?)",std::string("objects"),parseUuid(dependency));w.commit();}
         mustFail([&]{ObjectCollection::open(dir.path/"metadata-overlay.vcobj",OpenOptions{.readOnly=true});});
     }
     for(auto mode:{HistoryMode::On,HistoryMode::Off}){
-        auto explicitOptions=options;explicitOptions.history=mode;explicitOptions.objectIdRange={10,15};explicitOptions.edgeIdRange={100,103};
+        auto explicitOptions=options;explicitOptions.history=mode;explicitOptions.objectIdRange={10,15};
         auto db=ObjectStore::create(dir.path/(mode==HistoryMode::On?"explicit-on.vcobj":"explicit-off.vcobj"),explicitOptions);
-        EdgeRecord edge;edge.kind="explicit";std::string high,low;
+        EdgeRecord edge;edge.kind="declared_reference";std::string high,low,rolledBack;
         {
             auto w=db.write();auto* sql=ObjectStoreImplAccess::conn(w);
             edge.aUuid=db.insertObjectWithId(w,fiber(),15);edge.bUuid=db.insertObjectWithId(w,fiber(),10);
@@ -138,26 +138,26 @@ int main() try {
             mustFail([&]{db.insertObjectWithId(w,fiber(),9);});
             auto duplicate=fiber();duplicate.uuid=edge.aUuid;mustFail([&]{db.insertObjectWithId(w,duplicate,11);});
             db.insertObjectWithId(w,fiber(),11);
-            auto invalid=edge;invalid.kind.clear();mustFail([&]{db.insertEdgeWithId(w,invalid,102);});
+            auto invalid=edge;invalid.kind.clear();mustFail([&]{db.addEdge(w,invalid);});
             const auto automatic=db.addEdge(w,edge);
-            require(edgeIdByUuid(sql,parseUuid(automatic))==100,"failed explicit edge insertion moved allocator");
-            high=db.insertEdgeWithId(w,edge,103);
-            low=db.insertEdgeWithId(w,edge,101);
-            require(edgeIdByUuid(sql,parseUuid(high))==103&&edgeIdByUuid(sql,parseUuid(low))==101,"explicit edge IDs changed");
-            mustFail([&]{db.insertEdgeWithId(w,edge,101);});
-            mustFail([&]{db.insertEdgeWithId(w,edge,104);});
-            auto sameUuid=edge;sameUuid.uuid=high;mustFail([&]{db.insertEdgeWithId(w,sameUuid,102);});
-            mustFail([&]{db.addEdge(w,edge);});w.commit();
+            require(db.edgeByUuid(w,automatic).has_value(),"failed insertion prevented a valid UUID edge");
+            edge.uuid=util::newUuid();high=db.addEdge(w,edge);
+            edge.uuid=util::newUuid();low=db.addEdge(w,edge);
+            require(db.edgeByUuid(w,high)&&db.edgeByUuid(w,low),"explicit edge UUIDs changed");
+            auto sameUuid=edge;sameUuid.uuid=high;mustFail([&]{db.addEdge(w,sameUuid);});
+            Statement allocator(sql,"SELECT count(*) FROM key_allocators WHERE name='edges'");
+            require(allocator.row()&&allocator.i64(0)==0,"no numeric edge allocator");
+            rolledBack=util::newUuid();edge.uuid=rolledBack;w.commit();
         }
         int64_t before;{auto r=db.read();before=db.provisioning(r).commitSequence;}
-        {auto rollback=db.write();db.insertEdgeWithId(rollback,edge,102);}
-        {auto r=db.read();require(db.provisioning(r).commitSequence==before&&db.edgesByKind(r,"explicit").size()==3,"explicit edge rollback leaked state");}
+        {auto rollback=db.write();db.addEdge(rollback,edge);}
+        {auto r=db.read();require(db.provisioning(r).commitSequence==before&&db.edgesByKind(r,"declared_reference").size()==3&&!db.edgeByUuid(r,rolledBack),"UUID edge rollback leaked state");}
         {
-            auto w=db.write();const auto final=db.insertEdgeWithId(w,edge,102);
-            require(edgeIdByUuid(ObjectStoreImplAccess::conn(w),parseUuid(final))==102,"rolled-back edge ID was not reusable");
+            auto w=db.write();const auto final=db.addEdge(w,edge);
+            require(final==rolledBack,"rolled-back edge UUID was not reusable");
             mustFail([&]{db.addEdge(w,edge);});w.commit();
         }
-        auto r=db.read();require(db.edgesByKind(r,"explicit").size()==4,"explicit edges not published");
+        auto r=db.read();require(db.edgesByKind(r,"declared_reference").size()==4,"explicit UUID edges not published");
         require(db.provisioning(r).commitSequence==before+1,"explicit edge publication commit sequence changed incorrectly");
     }
     std::cout<<"collection audit passed\n";

@@ -254,6 +254,7 @@ bool AfcSource::next(AfcConstraint& constraint)
 {
     auto& p=*impl_;auto& s=*p.rows;
     if(p.finished)return false;
+    for(;;){
     detail::GeometryPhase total("source.afc.decode");bool hasRow;
     {detail::GeometryPhase step("source.afc.sqlite_step");hasRow=s.row();}
     if(!hasRow){
@@ -283,6 +284,9 @@ bool AfcSource::next(AfcConstraint& constraint)
             if(!std::isfinite(s.f64(col)))throw std::invalid_argument("non-finite AFC scalar");values[index]=s.f64(col);}
         ++index;
     }
+    const auto selected=values[edge.kind=="parallel"?5:4];
+    if(!selected)throw std::invalid_argument("missing AFC winding distance for selected edge kind");
+    if(!encodeFiberWindingDistance(*selected)){++p.read;continue;}
     std::array<nlohmann::json,3> fields;
     {detail::GeometryPhase parse("source.afc.json_parse");
     for(int col=16;col<=18;++col)fields[col-16]=
@@ -291,8 +295,11 @@ bool AfcSource::next(AfcConstraint& constraint)
     auto& measurement=fields[2];
     for(const auto& [name,position]:{std::pair{"pointABaseXYZ",edge.aAnchor.position},std::pair{"pointBBaseXYZ",edge.bAnchor.position}})
         if(measurement.is_object()&&measurement.contains(name)&&measurement.at(name)==nlohmann::json(*position))measurement.erase(name);
+    const std::array<std::array<double,3>,2> positions{*edge.aAnchor.position,*edge.bAnchor.position};
     const bool reversed=detail::canonicalizeEdge(edge);
-    constraint.measurement=fiberConstraintRow(edge.uuid,constraint.sourceId,constraint.sourceFiberA,constraint.sourceFiberB,reversed,values,fields[0],fields[1],measurement);
+    constraint.measurement=fiberConstraintRow(edge.uuid,constraint.sourceId,constraint.sourceFiberA,constraint.sourceFiberB,reversed,values,fields[0],fields[1],measurement,positions);
+    edge.aAnchor={};edge.bAnchor={};
     ++p.read;return true;
+    }
 }
 }

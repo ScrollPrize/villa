@@ -102,7 +102,7 @@ def test_manual_relationship_reference(db):
     db.create_extension_table(spec)
     a = db.upsert_object(dict(kind="fiber"))
     b = db.upsert_object(dict(kind="fiber"))
-    edge = db.add_edge(dict(kind="test_link", a=a, b=b,
+    edge = db.add_edge(dict(kind="declared_reference", a=a, b=b,
                             a_anchor=dict(whole_geometry=True), b_anchor=dict(whole_geometry=True)))
     first = [row(edge)]
     with db.write(expected_versions={a: db.current_version(a), b: db.current_version(b)},

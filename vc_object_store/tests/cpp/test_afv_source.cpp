@@ -37,7 +37,9 @@ void compactProvisioning()
     require(constraints.name=="ext_fiber_graph_solve_constraints"&&constraints.extension==kFiberGraphSolveExtension,
             "one typed measurement row uses the graph-solve constraint table");
     require(Json::parse(constraints.provisioning)==Json({{"fiber_source_uuid",uuid},{"constraint_count",17},
-        {"length_units","base_voxels"},{"winding_units","turns"},{"endpoint_order","source"}}),
+        {"length_units","base_voxels"},{"winding_units","turns"},{"endpoint_order","canonical"},
+        {"arc_encoding","float32-le"},{"direction_encoding","lasagna-xy-u8-hemisphere-i8"},
+        {"connector_direction","a_to_b"},{"winding_scale",16},{"winding_code_offset",1},{"winding_invalid_code",0}}),
         "constraint provenance does not pretend the parent fiber UUID identifies the AFC file");
     require(fibers.basedOn.empty()&&constraints.basedOn.empty(),"external files do not fabricate vcobj source commits");
     require(Json::parse(fiberSourceExtension({uuid}).provisioning)==Json({{"source_uuid",uuid}}),
@@ -169,33 +171,20 @@ int main()
         require(constraint.sourceId==0&&constraint.sourceFiberA==0&&constraint.sourceFiberB==9,
                 "source IDs remain available without decoding JSON metadata");
         require(constraint.edge.meta=="{}","ordinary constraint measurements are not duplicated in edge JSON");
-        require(extensionUuid(field(constraint,"edge_uuid"))==constraint.edge.uuid&&
-                std::get<int64_t>(field(constraint,"source_id"))==0&&
-                std::get<int64_t>(field(constraint,"source_fiber_a"))==0&&
-                std::get<int64_t>(field(constraint,"source_fiber_b"))==9,"typed source identities");
-        require(std::get<double>(field(constraint,"arc_a"))==1.25&&
-                std::get<double>(field(constraint,"arc_b"))==2.5&&
-                std::get<double>(field(constraint,"las_winding"))==.75&&
-                std::get<double>(field(constraint,"parallel_las_winding"))==.25,
-                "fractional winding measurements and arc positions remain typed without integer expansion");
-        require(Json::parse(std::get<std::string>(field(constraint,"extra"))).at("measurement").at("custom")==7,
-                "unknown source properties remain in the extension's explicit extra field");
-        require(std::get<int64_t>(field(constraint,"normal_a_valid"))==1&&
-                std::get<double>(field(constraint,"normal_a_x"))==1&&
-                std::get<double>(field(constraint,"normal_a_y"))==0&&
-                std::get<double>(field(constraint,"normal_a_z"))==0&&
-                std::get<int64_t>(field(constraint,"normal_b_valid"))==0&&
-                isNull(constraint,"normal_b_x")&&isNull(constraint,"normal_b_y")&&isNull(constraint,"normal_b_z"),
-                "valid and invalid source normals retain their typed validity and coordinates");
+        require(extensionUuid(field(constraint,"edge_uuid"))==constraint.edge.uuid,"one measurement key references the core edge");
+        require(decodeFiberWindingDistance(std::get<std::vector<uint8_t>>(field(constraint,"winding_distance")))==.75,
+                "only the effective edge-kind winding measurement is retained");
+        require(isNull(constraint,"extra"),"ordinary import diagnostics are not copied into free JSON");
         const auto sourceA=util::nameUuid("1482bcc8-f93e-4c3b-b380-2ddf369318f4","fiber:0");
         const auto sourceB=util::nameUuid("1482bcc8-f93e-4c3b-b380-2ddf369318f4","fiber:9");
-        const bool reversed=std::get<int64_t>(field(constraint,"source_reversed"))!=0;
-        require(reversed==(sourceB<sourceA)&&constraint.edge.aUuid==std::min(sourceA,sourceB)&&
+        const bool reversed=sourceB<sourceA;
+        require(constraint.edge.aUuid==std::min(sourceA,sourceB)&&
                 constraint.edge.bUuid==std::max(sourceA,sourceB),"source orientation is explicitly mapped to canonical core endpoints");
-        const auto& sourceAAnchor=reversed?constraint.edge.bAnchor:constraint.edge.aAnchor;
-        const auto& sourceBAnchor=reversed?constraint.edge.aAnchor:constraint.edge.bAnchor;
-        require(sourceAAnchor.position==std::array<double,3>{1,2,3}&&
-                sourceBAnchor.position==std::array<double,3>{4,5,6}&&!source.next(constraint),"native anchors and EOF");
+        require(decodeFiberArc(std::get<std::vector<uint8_t>>(field(constraint,reversed?"arc_b":"arc_a")))==1.25&&
+                decodeFiberArc(std::get<std::vector<uint8_t>>(field(constraint,reversed?"arc_a":"arc_b")))==2.5,"arc BLOBs follow canonical endpoint order");
+        require(std::get<std::vector<uint8_t>>(field(constraint,reversed?"normal_b":"normal_a"))[2]!=0&&
+                std::get<std::vector<uint8_t>>(field(constraint,reversed?"normal_a":"normal_b"))[2]==0,"validity is encoded in normal BLOBs");
+        require(!constraint.edge.aAnchor.position&&!constraint.edge.bAnchor.position&&!source.next(constraint),"positions are consumed for connector encoding, not persisted");
         require(!source.next(constraint)&&!source.next(constraint),"AFC EOF remains terminal across producer batches");
         const auto before=constraint;source.selectRange(0,1);
         require(source.next(constraint)&&constraint.edge.uuid==before.edge.uuid&&constraint.measurement.values==before.measurement.values&&
@@ -216,17 +205,14 @@ int main()
             "UPDATE metadata SET value='{\"constraints\":2}' WHERE key='statistics';");sqlite3_close(db);
         AfcSource source(reused,"1482bcc8-f93e-4c3b-b380-2ddf369318f4");AfcConstraint constraint;
         require(source.next(constraint),"first reusable typed row");const auto first=constraint.measurement.values;
-        require(source.next(constraint)&&constraint.edge.kind=="parallel","second reusable typed row");
-        require(isNull(constraint,"arc_a")&&isNull(constraint,"arc_b")&&isNull(constraint,"normal_a_valid")&&
-                isNull(constraint,"normal_a_x")&&isNull(constraint,"normal_b_valid")&&isNull(constraint,"normal_b_x")&&
-                Json::parse(std::get<std::string>(field(constraint,"extra"))).at("measurement")==Json({{"different",true}}),
-                "typed optional fields and extra properties do not leak between reused rows");
-        require(!source.next(constraint),"reused typed row EOF");source.selectRange(0,1);
+        mustFail([&]{source.next(constraint);}); // Missing effective distance/arcs cannot be invented.
+        source.selectRange(0,1);
         require(source.next(constraint)&&constraint.measurement.values==first,"reused row changes canonical typed values");
     }
     detail::check(sqlite3_open(afc.string().c_str(),&db),db);
     detail::exec(db,"UPDATE constraints SET parallel_winding_distance=NULL");sqlite3_close(db);
     {AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4");AfcConstraint constraint;
-        require(source.next(constraint)&&isNull(constraint,"parallel_las_winding"),"optional SQL null is not silently zero");}
+        require(source.next(constraint)&&decodeFiberWindingDistance(std::get<std::vector<uint8_t>>(field(constraint,"winding_distance")))==.75,
+                "unused parallel estimate is not required for a perpendicular edge");}
     mustFail([&]{AfcSource source(afc,util::newUuid());});
 }

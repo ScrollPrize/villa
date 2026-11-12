@@ -1,5 +1,6 @@
 #pragma once
 #include "internal/Database.hpp"
+#include "internal/EdgeLayout.hpp"
 #include "geometry/GeometryToken.hpp"
 
 namespace vc::objects::detail {
@@ -36,7 +37,7 @@ inline std::optional<std::pair<std::string,std::string>> externalEndpointKey(sql
     // edge references it. includeOverridden only probes an available referenced
     // source; absent a collection resolver, its own row is authoritative.
     if(owned)return {};
-    Statement referenced(db,"SELECT 1 FROM edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",bytes);
+    Statement referenced(db,"SELECT 1 FROM "+edgeReadSource(db)+" WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",bytes);
     if(referenced.row())throw std::runtime_error("external endpoint requires a pinned collection transaction");
     return {};
 }

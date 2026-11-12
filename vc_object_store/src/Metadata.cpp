@@ -1,5 +1,8 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/EdgeLayout.hpp"
+#include "internal/JsonFields.hpp"
+#include "vc_object_store/objects/EdgeKinds.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 
@@ -10,8 +13,8 @@ std::pair<const char*, int64_t> recordLocation(sqlite3* db, const std::array<uns
 {
     Statement object(db,"SELECT id FROM objects WHERE uuid=? AND state<>2",bytes);
     if(object.row())return {"objects",object.i64(0)};
-    Statement edge(db,"SELECT id FROM edges WHERE uuid=? AND state=0",bytes);
-    if(edge.row())return {"edges",edge.i64(0)};
+    Statement edge(db,"SELECT uuid FROM "+edgeReadSource(db)+" WHERE uuid=? AND state=0",bytes);
+    if(edge.row())return {"edges",0};
     throw std::runtime_error("object store: record not found: " + uuid);
 }
 }
@@ -26,15 +29,17 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
         throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
     const auto [table, id] = recordLocation(db, bytes, recordUuid);
+    const bool edge=std::string_view(table)=="edges";
+    if(edge)requireEdgeColumns(db,{"approval_state","approved_by","approved_at","approved_host","approved_version"});
     {
-        Statement current(db, std::string("SELECT approval_state FROM ") + table + " WHERE id=?", id);
-        if (current.row() && current.text(0) == state) { savepoint.release(); return; }
+        Statement current(db, std::string("SELECT approval_state FROM ") + table + " WHERE uuid=?", bytes);
+        if (current.row() && (edge?edgeApprovalName(current.i64(0)):current.text(0)) == state) { savepoint.release(); return; }
     }
     const auto version = writeRecordVersion(db, table, recordUuid);
     const int64_t commit_sequence = writeCommitSequence(db);
     Statement s(db, std::string("UPDATE ") + table +
-                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=?,commit_sequence=? WHERE id=?",
-        state);
+                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=?,commit_sequence=? WHERE uuid=?");
+    if(edge)s.bind(1,edgeApprovalCode(state));else s.bind(1,state);
     if (state == "pending") {
         s.bindNull(2); s.bindNull(3); s.bindNull(4); s.bindNull(5);
     } else {
@@ -43,7 +48,7 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
         s.bind(4, impl_->hostname);
         s.bind(5, version);
     }
-    s.bind(6, commit_sequence); s.bind(7, id);
+    s.bind(6, commit_sequence); s.bind(7, bytes);
     s.stepDone();
     appendJournal(db, author(), impl_->hostname, bytes, commit_sequence, "approval");
     savepoint.release();
@@ -64,10 +69,11 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
     // Compare JSON values, not their spelling. Missing and explicit null are
     // distinct; removing a missing key is also a no-op. Keep approval/history
     // untouched when an autosave submits the same logical value.
+    if(std::string_view(table)=="edges")requireEdgeColumns(db,{"meta"});
     {
-        Statement current(db, std::string("SELECT meta FROM ") + table + " WHERE id=?", id);
+        Statement current(db, std::string("SELECT meta FROM ") + table + " WHERE uuid=?", bytes);
         (void)current.row();
-        const auto meta = nlohmann::json::parse(current.text(0));
+        const auto meta = parseObjectJson(current.text(0));
         const auto found = meta.find(key);
         if (jsonValue ? found != meta.end() && *found == nlohmann::json::parse(*jsonValue)
                       : found == meta.end()) {
@@ -77,10 +83,10 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
     }
     if(std::string_view(table)=="objects")beforeCurrentObjectEdit(db,recordUuid);
     if (jsonValue) {
-        execute(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?", path, *jsonValue,
-            id);
+        execute(db, std::string("UPDATE ") + table + " SET meta=json_set(coalesce(nullif(meta,''),'{}'),?,json(?)) WHERE uuid=?", path, *jsonValue,
+            bytes);
     } else {
-        execute(db, std::string("UPDATE ") + table + " SET meta=json_remove(meta,?) WHERE id=?", path, id);
+        execute(db, std::string("UPDATE ") + table + " SET meta=nullif(json_remove(coalesce(nullif(meta,''),'{}'),?),'{}') WHERE uuid=?", path, bytes);
     }
     stampContentChange(db, author, host, table, id, bytes, "meta");
     savepoint.release();

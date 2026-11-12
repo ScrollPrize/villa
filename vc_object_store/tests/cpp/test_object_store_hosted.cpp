@@ -195,7 +195,7 @@ try {
         both(p, "read dependency parity");
     }
     const auto edge = util::newUuid();
-    EdgeRecord link; link.uuid = edge; link.kind = "test_link"; link.aUuid = a; link.bUuid = b;
+    EdgeRecord link; link.uuid = edge; link.kind = "declared_reference"; link.aUuid = a; link.bUuid = b;
     link.aAnchor.wholeGeometry = link.bAnchor.wholeGeometry = true;
     const auto linked = both(request({{a, 3}, {b, 1}}, {AddEdgeOp{edgeRecordJson(link)}}), "relationship parity");
     require(linked.relationships.at(edge) == 1, "relationship version");
@@ -344,7 +344,7 @@ try {
             mustFail([&] { (void)hosted.selectObjects(withTransforms); }); // the store's recorded transforms apply
         }
 
-        EdgeSelection links; links.kind = "test_link";
+        EdgeSelection links; links.kind = "declared_reference";
         require(ids(hosted.selectAllEdges(links, std::nullopt, 1)) == ids(local.selectEdges(txn, links)) &&
             ids(local.selectEdges(txn, links)) == std::vector<std::string>{edge}, "edge listing parity");
         {
@@ -355,13 +355,13 @@ try {
 
         // Graph traversal, counts and tags run on the host.
         auto sorted = [](std::vector<std::string> v) { std::sort(v.begin(), v.end()); return v; };
-        for (const std::vector<std::string>& kinds : {std::vector<std::string>{}, {"test_link"}, {"other"}})
+        for (const std::vector<std::string>& kinds : {std::vector<std::string>{}, {"declared_reference"}, {"other"}})
             require(sorted(hosted.traverse({GraphQuery::Kind::Component, a, kinds})) ==
                     sorted(local.componentOf(txn, a, kinds)), "component parity");
-        require(sorted(hosted.traverse({GraphQuery::Kind::Component, a, {"test_link"}})).size() == 2, "component reaches b");
-        require(hosted.traverse({GraphQuery::Kind::Neighbours, b, {"test_link"}, std::string("track")}) ==
-                local.neighbours(txn, b, std::string("test_link"), std::string("track")) &&
-                hosted.traverse({GraphQuery::Kind::Neighbours, b, {"test_link"}, std::string("track")}) ==
+        require(sorted(hosted.traverse({GraphQuery::Kind::Component, a, {"declared_reference"}})).size() == 2, "component reaches b");
+        require(hosted.traverse({GraphQuery::Kind::Neighbours, b, {"declared_reference"}, std::string("track")}) ==
+                local.neighbours(txn, b, std::string("declared_reference"), std::string("track")) &&
+                hosted.traverse({GraphQuery::Kind::Neighbours, b, {"declared_reference"}, std::string("track")}) ==
                 std::vector<std::string>{a}, "neighbour parity");
         mustFail([&] { (void)hosted.traverse({GraphQuery::Kind::Neighbours, b, {"x", "y"}}); });
         require(hosted.objectCount("track") == local.objectCount(txn, "track") &&

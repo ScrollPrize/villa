@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import shutil
 
 import numpy as np
 import pytest
@@ -14,6 +15,16 @@ from object_helpers import raw
 spec = importlib.util.spec_from_file_location('import_afv', Path(__file__).parents[2] / 'scripts/import_afv.py')
 import_afv = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(import_afv)
+
+
+def native_importer():
+    override = os.environ.get('VC_OBJECT_STORE_IMPORT_BINARY')
+    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
+    tool = Path(override) if override else (
+        Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None)
+    if not tool or not tool.is_file():
+        pytest.skip('needs the built vc_object_import_afv')
+    return tool
 
 
 def fixture(path):
@@ -110,10 +121,7 @@ def test_malformed_input_publishes_nothing(tmp_path, mutation):
 @pytest.mark.parametrize('shards', [1, 2])
 @pytest.mark.parametrize('verify', [None, True])
 def test_native_batch_command_readback_is_opt_in(tmp_path, shards, verify):
-    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
-    tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
-    if not tool or not tool.exists():
-        pytest.skip('needs the built vc_object_import_afv')
+    tool = native_importer()
     source = tmp_path / 'input.afv'
     fixture(source)
     output = tmp_path / 'native.vcobj'
@@ -155,14 +163,28 @@ def constraint_fixture(path, source_uuid):
                        (i * 3, 0, 9, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, .5, .5, 1, None, None, '{}'))
 
 
+def test_native_spatial_selection_is_whole_fiber_and_readback_consistent(tmp_path, request):
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path))
+    tool = native_importer()
+    source = tmp_path / 'source.afv'
+    fixture(source)
+    config = dict(source=str(source), output=str(tmp_path / 'selected'), report=str(tmp_path / 'report.json'),
+        unbound=True, shards=2, readers=2, source_chunk_fibers=1, verify_readback=True,
+        source_bounds_xyz=[-1, -1, -1, 1, 1, 1])
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps(config))
+    completed = subprocess.run([str(tool), str(path)], capture_output=True, text=True, timeout=30)
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(Path(config['report']).read_text())
+    assert (report['fibers'], report['points']) == (1, 260)
+    assert report['readback_verified'] and report['estimated_full_import_seconds'] is None
+
+
 @pytest.mark.parametrize('shards', [1, 2])
 @pytest.mark.parametrize('packed', [False, True])
 @pytest.mark.parametrize('bad_total', ['points', 'constraints'])
 def test_native_aggregate_mismatch_leaves_destination_retryable(tmp_path, shards, packed, bad_total):
-    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
-    tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
-    if not tool or not tool.exists():
-        pytest.skip('needs native importer')
+    tool = native_importer()
     source, constraints = tmp_path / 'source.afv', tmp_path / 'source.afc'
     metadata, _ = fixture(source)
     constraint_fixture(constraints, metadata['uuid'])
@@ -198,10 +220,7 @@ def test_native_aggregate_mismatch_leaves_destination_retryable(tmp_path, shards
 
 @pytest.mark.parametrize('packed', [False, True])
 def test_native_uuid_dispatch_combined_and_store_reference(tmp_path, packed):
-    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
-    tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
-    if not tool or not tool.exists():
-        pytest.skip('needs native importer')
+    tool = native_importer()
     source, constraints = tmp_path / 'source.afv', tmp_path / 'source.afc'
     metadata, _ = fixture(source)
     constraint_fixture(constraints, metadata['uuid'])
@@ -247,7 +266,10 @@ def test_native_uuid_dispatch_combined_and_store_reference(tmp_path, packed):
                         info = json.loads(provisioning)
                         if 'fiber_source_uuid' in info:
                             assert info == dict(fiber_source_uuid=metadata['uuid'], constraint_count=17,
-                                                length_units='base_voxels', winding_units='turns', endpoint_order='source')
+                                                length_units='base_voxels', winding_units='turns', endpoint_order='canonical',
+                                                arc_encoding='float32-le', direction_encoding='lasagna-xy-u8-hemisphere-i8',
+                                                connector_direction='a_to_b', winding_scale=16,
+                                                winding_code_offset=1, winding_invalid_code=0)
                         else:
                             assert info == dict(source_uuid=metadata['uuid'], fiber_count=2, point_count=262)
                     for (uuid,) in db.execute('SELECT uuid FROM objects'):
@@ -265,10 +287,7 @@ def test_native_uuid_dispatch_combined_and_store_reference(tmp_path, packed):
     ('readers', 2**32 + 1), ('constraint_limit', .5),
 ])
 def test_native_queue_limits_reject_invalid_integers(tmp_path, key, value):
-    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
-    tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
-    if not tool or not tool.exists():
-        pytest.skip('needs native importer')
+    tool = native_importer()
     source, output = tmp_path / 'source.afv', tmp_path / 'output'
     fixture(source)
     config = dict(source=str(source), output=str(output), unbound=True)

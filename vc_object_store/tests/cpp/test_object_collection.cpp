@@ -33,13 +33,25 @@ int main()try{
     ObjectKey newFiber,edge;
     {
         auto w=overlay.write();overlay.setMeta(w,a,"classification","\"H\"");newFiber=overlay.upsertObject(w,fiber());
-        EdgeRecord e;e.kind="fiber_constraint";e.aAnchor.wholeGeometry=true;e.bAnchor.wholeGeometry=true;
+        EdgeRecord e;e.kind="perpendicular";e.aAnchor.wholeGeometry=true;e.bAnchor.wholeGeometry=true;
         edge=overlay.addEdge(w,a,newFiber,e);w.commit();
         auto r=overlay.read();require(overlay.edgesOf(r,a).size()==1,"cross store adjacency");
+        const auto bulk=overlay.edgesByKind(r,"perpendicular");
+        require(bulk.size()==1&&bulk[0].key==edge&&bulk[0].record.version==overlay.edge(r,edge)->record.version,
+            "bulk edge query agrees with resolved single lookup");
+        require(bulk[0].record.versionGeneration==overlay.edge(r,edge)->record.versionGeneration,
+            "bulk edge query retains implicit initial generation");
         require(overlay.edgesOf(r,newFiber)[0].key==edge,"reverse adjacency");
         require(overlay.object(r,a)->record.meta.find("H")!=std::string::npos,"metadata override");
         require(overlay.readGeometryArray(r,a,"line_points")==geometry,"metadata override borrows chunks");
         size_t count=0;overlay.scanObjects(r,[&](auto&){++count;return true;});require(count==3,"references do not duplicate objects");
+        count=0;overlay.scanObjects(r,[&](const auto& row){
+            const auto resolved=overlay.object(r,row.key);
+            require(resolved&&row.record.meta==resolved->record.meta&&row.record.version==resolved->record.version&&
+                row.record.versionGeneration==resolved->record.versionGeneration&&row.record.lifecycleEpoch==resolved->record.lifecycleEpoch,
+                "bulk object values equal resolved lookup");
+            ++count;return true;},"fiber");require(count==3,"kind-filtered references do not duplicate objects");
+        count=0;overlay.scanObjects(r,[&](auto&){++count;return true;},"volume_transform");require(count==0,"unrelated fiber records excluded by kind");
     }
     {
         auto base=ObjectStore::open(basePath,OpenOptions{.readOnly=true});auto r=base.read();
@@ -54,7 +66,9 @@ int main()try{
     {
         auto w=child.write();child.setMeta(w,a,"classification","\"V\"");child.removeEdge(w,edge);child.deleteObject(w,a);w.commit();
         auto r=child.read();require(!child.object(r,a),"inherited deletion tombstone");require(child.edgesOf(r,newFiber).empty(),"inherited edge tombstone");
+        require(child.edgesByKind(r,"perpendicular").empty(),"bulk edge scan honors inherited deletion tombstones");
         size_t count=0;child.scanObjects(r,[&](auto&){++count;return true;});require(count==2,"deleted inherited geometry not enumerated");
+        count=0;child.scanObjects(r,[&](auto&){++count;return true;},"fiber");require(count==2,"kind-filtered scan honors inherited deletion tombstones");
     }
     {
         auto r=overlay.read();require(overlay.object(r,a).has_value()&&overlay.edgesOf(r,a).size()==1,"child changes do not change sealed parent");
@@ -99,7 +113,7 @@ int main()try{
     // Two independent workers reserve disjoint ranges under one publication.
     const auto logical=util::newUuid(),lineage=util::newUuid();std::vector<std::filesystem::path> shards;std::vector<ObjectKey> keys;
     for(int i=0;i<2;++i){auto path=dir.path/("shard"+std::to_string(i)+".vcobj");shards.push_back(path);
-        auto opt=options;opt.creationStoreUuid=logical;opt.creationGeneration=lineage;opt.initialCommitSequence=9;opt.objectIdRange={1+i*100,100+i*100};opt.edgeIdRange=opt.objectIdRange;
+        auto opt=options;opt.creationStoreUuid=logical;opt.creationGeneration=lineage;opt.initialCommitSequence=9;opt.objectIdRange={1+i*100,100+i*100};
         auto db=ObjectStore::create(path,opt);auto w=db.write();keys.push_back({logical,db.upsertObject(w,fiber())});db.seal(w);w.commit();}
     auto collection=ObjectCollection::publishShards(dir.path/"sharded.vcobj",shards,options);
     {
@@ -113,7 +127,7 @@ int main()try{
     for(auto mode:{RoutingKind::Modulo,RoutingKind::Bits,RoutingKind::HashV1}){
         const auto owner=util::newUuid(),generation=util::newUuid();std::vector<std::filesystem::path> parts;std::vector<KeyRoute> rules;std::map<int64_t,ObjectKey> ids,edgeIds;
         for(int partition=0;partition<2;++partition){auto p=dir.path/("route-"+std::to_string(int(mode))+"-"+std::to_string(partition));parts.push_back(p);
-            auto opt=options;opt.creationStoreUuid=owner;opt.creationGeneration=generation;opt.objectIdRange={1,100};opt.edgeIdRange={1,100};
+            auto opt=options;opt.creationStoreUuid=owner;opt.creationGeneration=generation;opt.objectIdRange={1,100};
             auto db=ObjectStore::create(p,opt);auto w=db.write();const auto physical=db.databaseIdentity(w).uuid;
             KeyRoute rule{"objects",mode,1,100,2,uint64_t(partition),mode==RoutingKind::Bits?1u:0u,physical};
             std::vector<std::string> endpoints;
@@ -121,20 +135,21 @@ int main()try{
                 const auto object=db.insertObjectWithId(w,fiber(),id);ids.emplace(id,ObjectKey{owner,object});endpoints.push_back(object);}
             require(endpoints.size()>=2,"custom edge route fixture needs two endpoints");
             for(int64_t id=1;id<=12;++id)if(rule.matches(id)){
-                EdgeRecord edge;edge.kind="routed";edge.aUuid=endpoints[0];edge.bUuid=endpoints[1];
-                edgeIds.emplace(id,ObjectKey{owner,db.insertEdgeWithId(w,edge,id)});
-                mustFail([&]{db.insertEdgeWithId(w,edge,id);});}
-            rules.push_back(rule);rule.keySpace="edges";rules.push_back(rule);db.seal(w);w.commit();}
+                EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="declared_reference";edge.aUuid=endpoints[0];edge.bUuid=endpoints[1];
+                edgeIds.emplace(id,ObjectKey{owner,db.addEdge(w,edge)});
+                mustFail([&]{db.addEdge(w,edge);});}
+            rules.push_back(rule);db.seal(w);w.commit();}
         auto c=ObjectCollection::publishShards(dir.path/("routed-"+std::to_string(int(mode))),parts,options,rules);
         auto r=c.read();for(auto& [id,key]:ids)require(c.objectById(r,owner,id)->key==key,"custom routing exact");
-        for(auto& [id,key]:edgeIds)require(c.edgeById(r,owner,id)->key==key,"custom edge routing exact");
+        require(c.edgesByKind(r,"declared_reference").size()==edgeIds.size(),"bulk relation scan includes every shard");
+        for(auto& [id,key]:edgeIds)require(c.edge(r,key)->key==key,"UUID edges remain exact beside custom object routing");
     }
     // Same manifest/routing API inside the packed VFS; no absolute staging refs.
     const auto packedPath=dir.path/"packed.vcobj";const auto packedOwner=util::newUuid(),packedLineage=util::newUuid();
     {
         PackedStoreBuilder builder(packedPath);std::vector<std::filesystem::path> paths;
         for(int i=0;i<2;++i){auto p=builder.addDatabase(util::newUuid());paths.push_back(p);auto opt=options;opt.creationStoreUuid=packedOwner;opt.creationGeneration=packedLineage;
-            opt.objectIdRange={1+i*100,100+i*100};opt.edgeIdRange=opt.objectIdRange;
+            opt.objectIdRange={1+i*100,100+i*100};
             auto db=ObjectStore::create(p,opt);auto w=db.write();db.upsertObject(w,fiber());db.seal(w);w.commit();}
         const auto root=util::newUuid();auto rootPath=builder.addDatabase(root);
         {auto c=ObjectCollection::publishShards(rootPath,paths,options);auto r=c.read();size_t n=0;c.scanObjects(r,[&](auto&){++n;return true;});require(n==2,"unpublished packed routing");}

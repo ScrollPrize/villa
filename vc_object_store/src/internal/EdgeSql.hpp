@@ -1,16 +1,16 @@
 #pragma once
 #include "internal/Anchors.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/EdgeLayout.hpp"
 namespace vc::objects::detail {
 // Shared semantics for SQL current queries and immutable relationship records.
 std::string fiberAdjacencySql(std::optional<bool> adjacent);
 bool matchesFiberAdjacency(const EdgeRecord&, std::optional<bool> adjacent);
 void validateEdgeSelection(const EdgeSelection&);
 bool matchesEdgeSelection(const EdgeRecord&, const EdgeSelection&);
-extern const char* kEdgeCols;
 std::unique_ptr<Statement> edgeSelectionQuery(sqlite3* db, const EdgeSelection& selection,
     const std::string& columns, const std::optional<std::vector<int64_t>>& endpointIds = std::nullopt);
-std::string projectedEdgeColumns(const ObjectFields& fields);
+std::string projectedEdgeColumns(sqlite3*,const ObjectFields& fields = std::nullopt);
 
 Anchor readAnchor(const Statement& s, int firstCol);
 
@@ -18,13 +18,13 @@ void bindAnchor(Statement& s, int firstIdx, const Anchor& a);
 
 
 EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details = true,
-                       const ObjectFields& fields = std::nullopt);
+                       const ObjectFields& fields = std::nullopt,
+                       const std::string* initialGeneration = nullptr);
 std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
 EdgeRecord prepareNewEdge(const EdgeRecord&);
 std::array<unsigned char,16> normalizeNewEdge(EdgeRecord&,bool* swapped=nullptr);
 struct EdgeInsertRow {
     const EdgeRecord* record;
-    int64_t id;
     std::array<unsigned char,16> aUuid,bUuid;
     std::optional<std::array<unsigned char,16>> binaryUuid;
 };
@@ -32,7 +32,7 @@ void requireUnusedObjectUuids(sqlite3*,std::span<const EdgeInsertRow>,size_t sql
 void insertEdgeRows(sqlite3*, std::span<const EdgeInsertRow>,int64_t commitSequence,
     const std::string& author,const std::string& host,const std::string& time,
     bool preserveRecord=false,size_t sqlBatchRows=1);
-void insertEdgeRow(sqlite3*, const EdgeRecord&, int64_t id,
+void insertEdgeRow(sqlite3*, const EdgeRecord&,
     int64_t commitSequence, const std::string& author, const std::string& host,
     const std::string& time, bool preserveRecord = false);
 std::vector<int64_t> componentIds(sqlite3* db, const std::string& start,

@@ -1,6 +1,22 @@
 #include "internal/JsonFields.hpp"
 
 namespace vc::objects::detail {
+nlohmann::json objectJson(const nlohmann::json& value)
+{
+    if(value.is_null()||(value.is_string()&&value.get_ref<const std::string&>().empty()))
+        return nlohmann::json::object();
+    if(!value.is_object())throw std::invalid_argument("object store: expected a JSON object or empty value");
+    return value;
+}
+nlohmann::json parseObjectJson(const std::string& text)
+{
+    return text.empty()?nlohmann::json::object():objectJson(nlohmann::json::parse(text));
+}
+std::string canonicalObjectJson(const std::string& text)
+{
+    if(text.empty()||text=="{}"||text=="null"||text=="\"\"")return "{}";
+    return parseObjectJson(text).dump();
+}
 std::optional<std::array<double, 6>> bboxFromJson(const nlohmann::json& j)
 {
     if (!j.is_array() || j.size() != 6) return std::nullopt;

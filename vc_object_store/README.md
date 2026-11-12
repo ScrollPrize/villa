@@ -137,7 +137,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python 
   /path/to/python -m pytest vc_object_store/tests/python -q
 ```
 
-Older upstream stores (schema 16–20; the runtime opens schema 21) convert with
+Older upstream stores (schema 16–21; the runtime opens schema 22) convert with
 `vc_object_convert old.vcobj new.vcobj`, which also writes a revision mapping
 and a report beside the destination. Native directory export currently
 requires Linux `renameat2` or macOS `renamex_np`.

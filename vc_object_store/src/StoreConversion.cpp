@@ -8,6 +8,7 @@
 #include "internal/EdgeSql.hpp"
 #include "internal/RecordJson.hpp"
 #include "internal/CollectionReads.hpp"
+#include "internal/SchemaPrograms.hpp"
 #include "internal/Digest.hpp"
 #include "internal/ExternalEndpoint.hpp"
 #include "geometry/GeometryReader.hpp"
@@ -23,52 +24,6 @@ namespace vc::objects {
 namespace {
 using namespace detail;
 using Db = std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)>;
-std::string quoteSqlIdentifier(const std::string& identifier)
-{
-    std::string result = "\"";
-    for (auto c : identifier) { result += c; if (c == '"') result += c; }
-    return result + "\"";
-}
-struct SchemaProgram { std::string type,name,owner,sql; };
-std::vector<SchemaProgram> schemaPrograms(sqlite3* db)
-{
-    std::vector<SchemaProgram> result;
-    Statement rows(db,"SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE type IN ('trigger','view') AND sql IS NOT NULL ORDER BY rowid");
-    while(rows.row()) result.push_back({rows.text(0),rows.text(1),rows.text(2),rows.text(3)});
-    return result;
-}
-void suspendPrograms(sqlite3* db,const std::vector<SchemaProgram>& programs,bool views)
-{
-    for(const auto* type:{"trigger","view"})
-        for(const auto& program:programs)
-            if(program.type==type && (views || program.type=="trigger"))
-                exec(db,("DROP "+program.type+" "+quoteSqlIdentifier(program.name)).c_str());
-}
-void restorePrograms(sqlite3* db,const std::vector<SchemaProgram>& programs,bool views,bool validateTriggers=true)
-{
-    // Views may depend on one another: install every definition before preparing
-    // any of them. Triggers are recreated only after their views exist.
-    for(const auto* type:{"view","trigger"})
-        for(const auto& program:programs)
-            if(program.type==type && (views || program.type=="trigger")) exec(db,program.sql.c_str());
-    std::set<std::string> owners;
-    for(const auto& program:programs) {
-        if(program.type=="trigger") owners.insert(program.owner);
-        else { Statement check(db,"SELECT * FROM "+quoteSqlIdentifier(program.name)+" LIMIT 0"); }
-    }
-    if(!validateTriggers) return;
-    for(const auto& owner:owners) {
-        Statement kind(db,"SELECT type FROM sqlite_schema WHERE name=?",owner);
-        if(!kind.row() || kind.text(0)!="table")
-            throw std::runtime_error("maintenance: cannot validate extension trigger on non-table "+owner);
-        std::string assignments;
-        Statement columns(db,"SELECT name FROM pragma_table_xinfo(?) WHERE hidden=0",owner);
-        while(columns.row()) { if(!assignments.empty()) assignments+=","; assignments+=quoteSqlIdentifier(columns.text(0))+"="+quoteSqlIdentifier(columns.text(0)); }
-        Statement insert(db,"EXPLAIN INSERT INTO "+quoteSqlIdentifier(owner)+" DEFAULT VALUES");
-        Statement update(db,"EXPLAIN UPDATE "+quoteSqlIdentifier(owner)+" SET "+assignments+" WHERE 0");
-        Statement erase(db,"EXPLAIN DELETE FROM "+quoteSqlIdentifier(owner)+" WHERE 0");
-    }
-}
 struct Sibling {
     std::filesystem::path path;
     ~Sibling() {
@@ -241,11 +196,11 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
             std::string("history enabled"));
         // A lineage restart does not republish untouched objects. Preserve
         // their original version identity when seeding retained history.
-        exec(db, "INSERT OR IGNORE INTO history_generations "
+        exec(db, ("INSERT OR IGNORE INTO history_generations "
                  "SELECT DISTINCT coalesce(version_generation,(SELECT initial_generation FROM store_manifest)),"
                  "0,0,'retained current-state lineage; original start unrecorded' FROM objects "
                  "UNION SELECT DISTINCT coalesce(version_generation,(SELECT initial_generation FROM store_manifest)),"
-                 "0,0,'retained current-state lineage; original start unrecorded' FROM edges;");
+                 "0,0,'retained current-state lineage; original start unrecorded' FROM "+edgeReadSource(db)+";").c_str());
     }
     if (const auto pool=activeStatementPools.find(db); pool!=activeStatementPools.end())
         pool->second->historyEnabled=enabled;
@@ -268,7 +223,7 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
                             "WHERE revision_uuid IN (SELECT old_uuid FROM _policy_revision_ids);"
                             "DELETE FROM spatial_regions WHERE array_name=''; INSERT INTO object_bounds SELECT * FROM _policy_bounds;");
     {
-        Statement edges(db,std::string("SELECT ")+kEdgeCols+" FROM edges WHERE state=0");
+        Statement edges(db,"SELECT "+projectedEdgeColumns(db)+" FROM "+edgeReadSource(db)+" AS edges WHERE state=0");
         while (edges.row()) recordRelationshipValidation(db,readEdgeRow(db,edges));
     }
     if (enabled) publishHistory(db,true); else validateCurrentRelationships(db);

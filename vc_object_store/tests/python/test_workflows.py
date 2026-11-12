@@ -59,7 +59,7 @@ def test_owned_views_native_export_and_one_time_ingest(db, tmp_path, kind, geome
     db.set_meta(uid, 'source', {'coordinates': {'scale_factor': 7}, 'volume_uuid': 'stale', 'coordinate_binding': {'active_volume_id': 'stale'}, 'retained_note': 'native'})
     output = tmp_path / 'native'
     assert db.export_geometry(uid, output) == refs(db, uid)[0]
-    with pytest.raises((RuntimeError, ValueError)):
+    with pytest.raises((RuntimeError, ValueError, FileExistsError)):
         db.export_geometry(uid, output)
     with ObjectStore.create(str(tmp_path / 'import.vcobj'), author='import') as other:
         report = other.ingest_geometry_source(kind, output)
@@ -353,7 +353,7 @@ def test_record_fields_and_transaction_bindings(db, kind, detail):
         assert {**imported, 'version_generation': record['version_generation']} == record
     with db.write() as tx:
         peer = tx.upsert_object(dict(kind='note'))
-        edge = tx.add_edge(dict(a=uid, b=peer, kind='related'))
+        edge = tx.add_edge(dict(a=uid, b=peer, kind='declared_reference'))
         tx.remove_edge(edge)
     assert db.edge(edge) is None
     with pytest.raises(RuntimeError, match='finished'):

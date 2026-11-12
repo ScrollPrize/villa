@@ -60,7 +60,7 @@ void scalarStateCheck(){
 void rollbackAndLifecycle(){
     TemporaryDirectory dir;OpenOptions o;o.author="test";o.history=HistoryMode::Off;o.spatialIndex=false;o.objectIdRange={10,30};
     auto store=ObjectStore::create(dir.path/"objects",o);auto a=record(),b=record();std::string relation;
-    {auto t=store.write();store.upsertObject(t,a);store.upsertObject(t,b);EdgeRecord e;e.kind="test";e.aUuid=a.uuid;e.bUuid=b.uuid;relation=store.addEdge(t,e);t.commit();}
+    {auto t=store.write();store.upsertObject(t,a);store.upsertObject(t,b);EdgeRecord e;e.kind="declared_reference";e.aUuid=a.uuid;e.bUuid=b.uuid;relation=store.addEdge(t,e);t.commit();}
     auto fails=[&](std::vector<InitialObjectRecord> rows){auto t=store.write();auto* db=ObjectStoreImplAccess::conn(t);
         const auto next=scalar(db,"SELECT next_id FROM key_allocators WHERE name='objects'");
         {Savepoint all(db);mustFail([&]{insertInitialObjects(store,t,rows);});}

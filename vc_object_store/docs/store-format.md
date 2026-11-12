@@ -1,6 +1,6 @@
-# Store format and immutable policies (schema 21)
+# Store format and immutable policies (schema 22)
 
-The current SQLite schema is 21 and the application ID is `0x56434f42`. There is no independent “v2” logical format family. An ordinary store is a plain SQLite file. Optional [collections](collections.md) compose independent databases, and optional [packed files](packed-stores.md) put them in an immutable VFS container with its own physical format version. SQLite 3.37 or later is required for reliable table versus virtual-table-shadow catalog discovery. The normal runtime accepts only the current schema. Never change `user_version` manually.
+The current SQLite schema is 22 and the application ID is `0x56434f42`. There is no independent “v2” logical format family. An ordinary store is a plain SQLite file. Optional [collections](collections.md) compose independent databases, and optional [packed files](packed-stores.md) put them in an immutable VFS container with its own physical format version. SQLite 3.37 or later is required for reliable table versus virtual-table-shadow catalog discovery. The normal runtime accepts only the current schema; older stores require explicit conversion. Never change `user_version` manually.
 
 The [schema integration contract](schema-integration.md) supersedes the old experimental plan. Its lazy/delta history redesign remains deferred.
 
@@ -18,7 +18,7 @@ All SQL UUID fields use the same 16-byte SQLite BLOB representation; public APIs
 | `table_key_columns` | Ordered primary-key column names for each table UUID |
 | `extension_tables` (optional) | Typed-extension identity, format version, input-state references and extension-owned provisioning; see [extensions](extensions.md) |
 | `store_write_state` | Transactional dirty marker, cleared at commit |
-| `key_allocators` | Namespace UUID, reserved bounds and next ID; NULL means exhausted |
+| `key_allocators` | Object-row namespace UUID, reserved bounds and next ID; NULL means exhausted. Edges have no numeric allocator. |
 
 Logical store, lineage, physical database and table identities have different meanings. Reopening/sealing preserves them. Independent database copies receive independent physical/table identities. Indexes, views, SQLite-owned tables and virtual-table shadow tables do not receive table UUIDs. A missing declared primary key does not make an implicit rowid a portable persistent key. The directory is populated at creation and refreshed after schema changes and before sealing.
 
@@ -29,6 +29,35 @@ Objects and relationships have their own numbered `version`, starting at 1 and a
 Graph snapshots expose these ordinary object versions as C++ `GraphReadView::versions` and Python `graph.versions`, parallel to their object UUID list. The obsolete numeric `generations` graph property is not retained as an alias.
 
 A historical reference is `(store UUID, lineage UUID, object UUID, version)`. Existing upstream archives use these same versions and commit sequences. Geometry descriptors are ordinary object state: changing the descriptor changes the object's version. Chunk hashes identify payload content, not another geometry-change counter.
+
+## UUID-only edges and optional columns
+
+`edges` uses a 16-byte binary UUID primary key and `WITHOUT ROWID`. There is no numeric edge ID or redundant UUID lookup index. `edge_tags` identifies its owner through `edge_uuid`. Objects and geometry chunks keep their existing independent layouts.
+
+The required edge columns are `uuid`, `a_uuid`, `b_uuid`, `kind` and `commit_sequence`. `OpenOptions::edgeColumns` selects additional optional columns when creating a database; `nullopt` creates the full layout, while an empty list creates only these five required columns. Python exposes the same choice as `ObjectStore.create(..., edge_columns=None)` or `edge_columns=[]`. Physical column presence is declared by the table schema and is discoverable with `PRAGMA table_info(edges)`; accidental absence of a required column is an error, not a request for a fallback layout.
+
+Absent optional fields have documented read defaults: state Active, version 1, lineage inherited from the store's initial lineage, approval Pending, empty provenance, empty metadata/dependencies and no anchor position/direction or approval details. These defaults preserve the API record shape; they do not create stored data. A reduced layout is not automatically readonly. Supported inserts and updates remain valid, but supplying/changing an absent field fails explicitly. APIs do not silently add columns or discard unsupported values.
+
+Core object/edge metadata and edge dependency declarations accept SQL NULL, empty string and `{}` as an empty JSON object. Empty values are stored as NULL and read as `{}`. Nonempty metadata/dependencies must remain JSON objects; malformed JSON, arrays and scalar values are rejected. This normalization does not impose rules on extension-owned payloads. Empty dependencies still mean unspecified dependencies, not that geometry edits are safe.
+
+Edge kinds are stable integer codes in storage, while public APIs continue to use their names:
+
+| Code | Name |
+| --- | --- |
+| 0 | `parallel` |
+| 1 | `perpendicular` |
+| 2 | `same-surface` |
+| 3 | `point-surface` |
+| 4 | `crossing` |
+| 5 | `fiber_branch` |
+| 6 | `attachment` |
+| 7 | `declared_reference` |
+| 8 | `point_link` |
+| 9 | `collection_winding` |
+
+Unknown kind names/codes fail explicitly. Additional extension/store-defined kind registration is reserved for future work; callers must not invent a local code with a conflicting meaning. Edge approval codes are 0 Pending, 1 Approved and 2 Rejected; object approval representation is unchanged. SQLite encodes integer values 0 and 1 without value payload bytes, but each present column still has a record-header entry.
+
+`OpenOptions::edgeAdjacencyIndex` (Python `edge_adjacency_index`) controls creation of `edges_a(a_uuid,kind)` and `edges_b(b_uuid,kind)`; it defaults to true. They are optional accelerators, not implicit SQLite table structures. Adjacency-dependent operations fail clearly when they are absent. Full graph scans do not require them. Slim immutable fiber-constraint imports disable them and select only the required edge columns. Any later index/layout upgrade must be explicit.
 
 ## History-off current storage
 
@@ -90,7 +119,7 @@ Geometry hashes resolve through pinned dependencies without local placeholder ro
 
 ## Conversion
 
-Use `vc_object_convert old.vcobj new.vcobj` for supported upstream schemas 16–20. Earlier upstream conversion restrictions still apply; schema 20 is then rebuilt into schema 21. Normal runtime opens never auto-upgrade old tables. The unpublished experimental v2/schema18 layout is not a supported migration input.
+Use `vc_object_convert old.vcobj new.vcobj` for supported upstream schemas 16–21. Earlier upstream conversion restrictions still apply; conversion rebuilds into schema 22 and preserves populated optional fields rather than applying the slim-import layout indiscriminately. Normal runtime opens never auto-upgrade old tables. The unpublished experimental v2/schema18 layout is not a supported migration input.
 
 Conversion preserves supported store/lineage identities, numbered versions, history, payloads, timestamps, approvals and artifacts. It validates the new output before success and leaves the source untouched. Explicit in-place replacement uses a sibling staging file and durable atomic replacement. Unknown/incompatible layouts or extensions fail rather than silently losing information. See the converter's report for input-specific restrictions.
 
@@ -98,4 +127,4 @@ Conversion preserves supported store/lineage identities, numbered versions, hist
 
 `ObjectStore.create(..., history_enabled=False, spatial_index=False)` selects creation policies. `store.provisioning()` reports `schema_version`, lineage `generation`, `commit_sequence` and flags. `store.database_identity()` reports physical/table identities. Use `store.seal()` or `txn.seal()`. Module-level `enable_history(path)` and `remove_history_and_disable(path)` invoke native offline maintenance. There is no experimental `convert_v1_to_v2` binding.
 
-Run `bash vc_object_store/scripts/run_cpp_tests.sh`. The argument-free runner writes build/log artifacts under `local/vcobj-tests` by default and owns automatically cleaned fixtures there. `VC_OBJECT_STORE_TEST_ROOT`, `VC_OBJECT_STORE_BUILD_JOBS` and `VC_OBJECT_STORE_TEST_JOBS` configure location/concurrency. Tests install no dependencies.
+Run `bash vc_object_store/scripts/run_cpp_tests.sh`. The argument-free runner writes build/log artifacts under `local/vcobj-tests` by default and owns automatically cleaned fixtures. `VC_OBJECT_STORE_TEST_ROOT`, `VC_OBJECT_STORE_BUILD_JOBS` and `VC_OBJECT_STORE_TEST_JOBS` configure location/concurrency. `VC_OBJECT_STORE_BUILD_TYPE` selects `Debug`, `Release`, `RelWithDebInfo` (default) or `MinSizeRel`; `VC_OBJECT_STORE_BUILD_DIR` optionally reuses a different absolute, non-temporary build directory without changing the log/fixture root. The runner's EXIT trap removes its private fixture directory even when a test aborts. Tests install no dependencies.

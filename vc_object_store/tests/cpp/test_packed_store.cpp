@@ -136,10 +136,14 @@ int main()
         mustFail([&]{PackedStoreBuilder invalid(temp.path/"invalid-memory.vcobj",memoryOptions);});
         memoryOptions.disposableBulk=true;memoryOptions.backgroundFlush=false;
         memoryOptions.residentBytes=16*options.extentBytes;
+        memoryOptions.memoryStats=std::make_shared<PackedStoreMemoryStats>();
         {
             const auto destination=temp.path/"memory-sql.vcobj";
             PackedStoreBuilder builder(destination,memoryOptions);
             populate(builder.addDatabase(root),7);
+            require(memoryOptions.memoryStats->residentBytes.load()>0,"memory-first resident diagnostics missing");
+            require(memoryOptions.memoryStats->residentBytes.load()<=memoryOptions.residentBytes,"resident diagnostics exceed budget");
+            require(memoryOptions.memoryStats->peakResidentBytes.load()>=memoryOptions.memoryStats->residentBytes.load(),"resident high-water diagnostics invalid");
             bool found=false;
             for(const auto& entry:std::filesystem::directory_iterator(temp.path))
                 if(entry.path().filename().string().starts_with("memory-sql.vcobj.building-")){

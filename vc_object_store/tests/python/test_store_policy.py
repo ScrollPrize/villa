@@ -1,4 +1,4 @@
-"""The Python facade delegates schema-21 policy to the native store implementation."""
+"""The Python facade delegates schema-22 policy to the native store implementation."""
 import sqlite3
 import json
 
@@ -11,15 +11,56 @@ from vc_object_store import (
 from object_helpers import raw
 
 
+def test_reduced_uuid_edge_layout_and_optional_adjacency(tmp_path):
+    path = tmp_path / "slim-edges.vcobj"
+    with ObjectStore.create(str(path), author="test", history_enabled=False,
+                            spatial_index=False, edge_adjacency_index=False,
+                            edge_columns=[]) as db:
+        a = db.upsert_object(dict(kind="note", meta=None))
+        b = db.upsert_object(dict(kind="note", meta=""))
+        edge = db.add_edge(dict(kind="parallel", a=a, b=b,
+                               a_anchor=None, b_anchor="", meta=None))
+        record = db.edge(edge)
+        assert record["kind"] == "parallel" and record["meta"] == {}
+        assert record["version"] == 1 and record["approval_state"] == "pending"
+        with pytest.raises(RuntimeError, match="adjacency index is absent"):
+            db.edges_of(a)
+        with pytest.raises(RuntimeError, match="not supported.*meta"):
+            db.set_meta(edge, "manual", True)
+        with pytest.raises(RuntimeError, match="not supported"):
+            db.set_approval(edge, "approved")
+    with sqlite3.connect(path) as sql:
+        assert {row[1] for row in sql.execute("PRAGMA table_info(edges)")} == {
+            "uuid", "a_uuid", "b_uuid", "kind", "commit_sequence"}
+        assert "WITHOUT ROWID" in sql.execute(
+            "SELECT sql FROM sqlite_schema WHERE name='edges'").fetchone()[0]
+        assert not sql.execute("SELECT 1 FROM key_allocators WHERE name='edges'").fetchall()
+        assert not sql.execute("SELECT 1 FROM sqlite_schema WHERE name IN ('edges_a','edges_b')").fetchall()
+        assert sql.execute("SELECT typeof(uuid),length(uuid),kind FROM edges").fetchone() == ("blob", 16, 0)
+    with ObjectStore.open(str(path), author="test") as db:
+        assert db.edge(edge)["meta"] == {}
+        assert db.add_edge(dict(kind="perpendicular", a=a, b=b))
+
+
+@pytest.mark.parametrize("meta", [None, "", {}])
+def test_empty_json_forms_in_full_layout(tmp_path, meta):
+    path = tmp_path / "empty.vcobj"
+    with ObjectStore.create(str(path), author="test", history_enabled=False) as db:
+        a = db.upsert_object(dict(kind="note", meta=meta))
+        b = db.upsert_object(dict(kind="note"))
+        edge = db.add_edge(dict(kind="perpendicular", a=a, b=b, meta=meta))
+        assert db.object(a)["meta"] == {} and db.edge(edge)["meta"] == {}
+
+
 def test_history_off_spatial_off_and_atomic_seal(tmp_path):
     path = tmp_path / "direct.vcobj"
     with ObjectStore.create(str(path), author="test", history_enabled=False, spatial_index=False) as db:
         policy = db.provisioning()
-        assert policy == dict(schema_version=21, generation=db.status()["generation"],
+        assert policy == dict(schema_version=22, generation=db.status()["generation"],
                               commit_sequence=db.status()["commit_sequence"], history_enabled=False,
                               spatial_index=False, sealed=False)
         identity = db.database_identity()
-        assert identity["schema_version"] == 21
+        assert identity["schema_version"] == 22
         tables = {table["name"] for table in identity["tables"]}
         assert {"objects", "geometry_chunks"} <= tables
         assert not {"geometry_heads", "current_geometry", "current_geometry_chunks", "current_shared_payloads"} & tables

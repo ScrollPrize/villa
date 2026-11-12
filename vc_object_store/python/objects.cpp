@@ -847,6 +847,7 @@ NB_MODULE(_native, m)
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
                     nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024, nb::arg("catalog") = nb::none(),
                     nb::kw_only(), nb::arg("history_enabled") = true, nb::arg("spatial_index") = true,
+                    nb::arg("edge_adjacency_index") = true, nb::arg("edge_columns") = std::nullopt,
                     "Create a new object database at path (refuses existing files).")
         .def_static("open", &PyObjectStore::open, nb::arg("path"), nb::arg("author") = std::nullopt,
                     nb::arg("read_only") = false, nb::arg("hostname") = std::nullopt,
