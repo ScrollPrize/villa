@@ -607,6 +607,59 @@
                         kept->storeId == published && idOf(p1.position) >= 0 && idOf(p1.position) != published,
                         "the next save keeps the published control's identity and gives the new one its own");
             }
+            // A window closed while a save runs: the pane's cleanup and its
+            // close save wait behind that save instead of blocking, and the
+            // close save itself runs in the background.
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto readA = [&] { return publishing.readStoredFibers(std::vector<std::string>{aUuid}, true).at(0); };
+                const auto closing = openSession(readA(), "publication-closing");
+                closing->taskState = Controller::LineAnnotationSession::TaskState::Succeeded;
+                closing->fiberWidth += .5;
+                const auto widthToStore = closing->fiberWidth;
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                const auto running = publishing._publication;
+                require(bool(running), "a save of another fiber is running");
+                publishing.closeWindowlessPane("publication-closing");
+                require(publishing._publication == running && publishing.paneForSurface("publication-closing") &&
+                        publishing._closingSurfaces.size() == 1,
+                        "closing a window during a save returns at once and keeps the pane until that save ends");
+                settle("the save, the queued close and its save finish");
+                require(!publishing.paneForSurface("publication-closing") && publishing._closingSurfaces.empty() &&
+                        publishing._fiberSaveFailureCount == before && readA().width == widthToStore,
+                        "the closed pane is gone and its session was stored");
+                // Nothing running: the close save still leaves the GUI thread.
+                const auto again = openSession(readA(), "publication-closing-2");
+                again->taskState = Controller::LineAnnotationSession::TaskState::Succeeded;
+                again->fiberWidth += .5;
+                const auto second = again->fiberWidth;
+                publishing.closeWindowlessPane("publication-closing-2");
+                require(bool(publishing._publication) && !publishing.paneForSurface("publication-closing-2"),
+                        "a close with nothing running saves in the background");
+                // An open of a fiber meanwhile waits for that save: it must
+                // read what the closed window stored.
+                publishing.settleClosedPanes();
+                require(!publishing._publication && !publishing._closedPanePublication &&
+                        publishing._fiberSaveFailureCount == before && readA().width == second,
+                        "an open waits for a closed window's save and reads what it stored");
+                settle("nothing is left queued");
+                // The same for a close still queued behind a running save.
+                const auto third = openSession(readA(), "publication-closing-3");
+                third->taskState = Controller::LineAnnotationSession::TaskState::Succeeded;
+                third->fiberWidth += .5;
+                const auto thirdWidth = third->fiberWidth;
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                publishing.closeWindowlessPane("publication-closing-3");
+                require(bool(publishing._publication) && publishing._closingSurfaces.size() == 1, "a close is queued");
+                publishing.settleClosedPanes();
+                require(!publishing._publication && publishing._closingSurfaces.empty() &&
+                        !publishing.paneForSurface("publication-closing-3") &&
+                        publishing._fiberSaveFailureCount == before && readA().width == thirdWidth,
+                        "an open makes a queued close save before it reads");
+                settle("the queued close finds its pane gone");
+            }
             // A tag edit whose background save is refused (a commit by
             // another client that this controller has not seen) is reported
             // and stays in the session, like a placement whose save failed.

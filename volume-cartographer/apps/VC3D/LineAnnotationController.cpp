@@ -1690,6 +1690,10 @@ LineAnnotationController::~LineAnnotationController()
     joinPublication();
     _afterPublication.clear();
     _eventsDuringPublication.clear();
+    // Windows closed behind that publication: their close saves, now.
+    for (const auto& surfaceName : std::exchange(_closingSurfaces, {})) cleanupSurfaceName(surfaceName);
+    joinPublication();
+    _afterPublication.clear();
     flushAllPendingSessionAutoSaves();
     waitForFiberSaves();
     // Bounded teardown of in-flight line solves: request cooperative
@@ -1892,6 +1896,11 @@ bool LineAnnotationController::prepareForUserFacingLineAnnotationOpen(
     const std::function<bool(const LineAnnotationSession&)>& only)
 {
     const QPointer<LineAnnotationController> alive(this);
+    // A window closed moments ago may still be storing its session (in the
+    // background, or queued behind a save): what opens next must read that,
+    // not the fiber as it was before.
+    settleClosedPanes();
+    if (!alive) return false;
     struct DialogRecord {
         std::string surfaceName;
         QPointer<LineAnnotationDialog> dialog;
@@ -2154,7 +2163,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         // queued edits, none of which may reach the dialog any more.
         for (auto& pane : _panes)
             if (pane.dialog.data() == dialog) pane.dialog = nullptr;
-        cleanupSurfaceName(surfaceName);
+        closeWindowlessPane(surfaceName);
     });
 
     refreshSessionOptimizationStatus(*session);
@@ -4590,6 +4599,10 @@ void LineAnnotationController::addFibersToPointCollections(std::vector<uint64_t>
 
 void LineAnnotationController::saveOpenFibersCore()
 {
+    // A window closed moments ago may still be storing its session, with no
+    // pane left to save below: made and awaited here (quit detaches the
+    // store right after this).
+    settleClosedPanes();
     std::vector<std::string> surfaces;
     for (const auto& pane : _panes) if (pane.session) surfaces.push_back(pane.surfaceName);
     for (const auto& surface : surfaces) {
@@ -5664,8 +5677,12 @@ void LineAnnotationController::refreshChangedStoreFibers()
             return !head || head->reference() != pin->reference() || head->record.retired;
         };
         // A fiber not yet committed (no revision) has nothing to be stale against.
+        // A pane whose window closed is on its way out (its close save is
+        // queued): it is not reopened; that save is refused if it is stale.
         for (const auto& pane : _panes) if (pane.session && pane.session->storePin &&
                                            pane.session->storePin->stored() &&
+                                           std::find(_closingSurfaces.begin(), _closingSurfaces.end(), pane.surfaceName) ==
+                                               _closingSurfaces.end() &&
                                            stale(pane.session->storePin)) {
             changed.push_back(pane.session->fiberId);
             reopen[pane.session->fiberUuid] = {!pane.session->readOnly,
@@ -12077,8 +12094,42 @@ std::string LineAnnotationController::nextSurfaceName()
     return "line_annotation_slice_" + std::to_string(_nextPaneId++);
 }
 
-void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName)
+void LineAnnotationController::closeWindowlessPane(const std::string& surfaceName)
 {
+    // The window is gone; nothing here should hold up the GUI thread.
+    // Behind a running save the cleanup (and the close save in it) waits
+    // its turn in the queue; the pane stays, without a dialog, until then,
+    // so that save still hands its stored version to the session.
+    if (_publication && paneForSurface(surfaceName)) {
+        _closingSurfaces.push_back(surfaceName);
+        deferDuringPublication([this, surfaceName] { finishDeferredClose(surfaceName); }, {}, {});
+        return;
+    }
+    cleanupSurfaceName(surfaceName, true);
+}
+
+void LineAnnotationController::settleClosedPanes()
+{
+    if (_closingSurfaces.empty() && !(_publication && _publication == _closedPanePublication)) return;
+    const QPointer<LineAnnotationController> alive(this);
+    joinPublication();
+    while (alive && !_closingSurfaces.empty()) {
+        const auto surfaceName = _closingSurfaces.front();
+        // Synchronous: the caller continues with what it stored.
+        cleanupSurfaceName(surfaceName);
+    }
+    if (alive) joinPublication();
+}
+
+void LineAnnotationController::finishDeferredClose(const std::string& surfaceName)
+{
+    std::erase(_closingSurfaces, surfaceName);
+    cleanupSurfaceName(surfaceName, true);
+}
+
+void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName, bool backgroundSave)
+{
+    std::erase(_closingSurfaces, surfaceName);
     if (surfaceName.empty()) {
         return;
     }
@@ -12166,10 +12217,18 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
     // unless it is alive. The names are held by value.
     const QPointer<LineAnnotationController> alive(this);
     if (sessionToSave) {
-        saveSessionAsFiber(*sessionToSave);
+        // A closed window's save runs off the GUI thread where it can (the
+        // snapshot is complete; nothing of the pane is needed afterwards).
+        // Not behind a publication started meanwhile: a save queued there
+        // looks its pane up again, and this one is gone.
+        const bool inBackground = backgroundSave && !_publication;
+        saveSessionAsFiber(*sessionToSave, false, inBackground);
         if (!alive) {
             return;
         }
+        // No pane holds what this publication stores: an open of the fiber
+        // waits for it (settleClosedPanes).
+        if (inBackground && _publication) _closedPanePublication = _publication;
     }
 
     if (_state) {
@@ -13408,7 +13467,9 @@ void LineAnnotationController::abandonPublication()
     if (!_publication) return;
     _publication->future.waitForFinished();
     _publication.reset();
+    _closedPanePublication.reset();
     _afterPublication.clear();
+    _closingSurfaces.clear();
     _deferredControlEdits.clear();
     _eventsDuringPublication.clear();
 }
@@ -13418,6 +13479,7 @@ void LineAnnotationController::finishPublication(bool drainNow)
     if (!_publication) return;
     const auto publication = std::move(_publication);
     _publication.reset();
+    if (_closedPanePublication == publication) _closedPanePublication.reset();
     try {
         if (publication->error) std::rethrow_exception(publication->error);
         if (publication->packageGeneration == _packageGeneration && _state &&

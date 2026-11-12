@@ -649,7 +649,16 @@ private:
     VolumeSelectorFactory _volumeSelectorFactory;
 
     std::string nextSurfaceName();
-    void cleanupSurfaceName(const std::string& surfaceName);
+    // backgroundSave: the close save may run off the GUI thread (a window
+    // the user closed); callers that continue with the result leave it off.
+    void cleanupSurfaceName(const std::string& surfaceName, bool backgroundSave = false);
+    // Panes whose window closed during a publication: cleaned up behind it.
+    std::vector<std::string> _closingSurfaces;
+    void finishDeferredClose(const std::string& surfaceName);
+    // Before an open: closed windows' pending saves are made and awaited.
+    void settleClosedPanes();
+    // A pane whose window was destroyed: cleaned up without blocking.
+    void closeWindowlessPane(const std::string& surfaceName);
     // stillValid (optional): forwarded to each session's finalization and
     // checked after each save (both can yield); false makes it return false.
     // only (optional): finalizes, saves and closes just the dialogs whose
@@ -1466,6 +1475,8 @@ private:
     //   been made synchronously.
     struct FiberPublication;
     std::shared_ptr<FiberPublication> _publication;
+    // That publication, when it is the close save of a pane already gone.
+    std::shared_ptr<FiberPublication> _closedPanePublication;
     struct DeferredWork {
         std::string surfaceName;  // the pane it is for (its dialog shows it pending); may be empty
         std::function<void()> work;
