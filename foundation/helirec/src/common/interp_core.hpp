@@ -8,6 +8,8 @@
 //   BSpline3  4 taps of cubic B-spline coefficients (rows prefiltered once, bspline_prefilter_row): the cubic
 //             spline through the samples; near-ideal passband, no ringing
 //   BSpline5  6 taps, quintic B-spline (two prefilter poles); closer still to band-limited (sinc) interpolation
+// Lanczos8 (16 taps, sinc(x) sinc(x/8)) is a kernel of the vertical position of a slice in a projection alone
+// (accumulate.hpp, z_kernel_weights): no backprojector takes it.
 // Samples (and spline coefficients) outside [0, n) are 0: the row is zero-extended; the coefficients are exact for
 // that extension inside [0, n), the taps beyond are dropped (affects u within 2-3 bins of the detector ends).
 #include <cmath>
@@ -16,7 +18,7 @@
 
 namespace helirec::interp_core {
 
-enum Interp : int { Linear = 0, Cubic = 1, Lanczos3 = 2, BSpline3 = 3, BSpline5 = 4 };
+enum Interp : int { Linear = 0, Cubic = 1, Lanczos3 = 2, BSpline3 = 3, BSpline5 = 4, Lanczos8 = 5 };
 
 // rows of the exact backprojectors need a B-spline prefilter (spline degree, 0: none)
 HR_HD int spline_degree(int interp) { return interp == BSpline3 ? 3 : (interp == BSpline5 ? 5 : 0); }
@@ -35,6 +37,13 @@ HR_HD float lanczos3(float t) {
     if (fabsf(t) >= 3.f) return 0.f;
     const float pt = 3.14159265358979f * t;
     return 3.f * sinf(pt) * sinf(pt / 3.f) / (pt * pt);
+}
+
+HR_HD float lanczos8(float t) {
+    if (fabsf(t) < 1e-6f) return 1.f;
+    if (fabsf(t) >= 8.f) return 0.f;
+    const float pt = 3.14159265358979f * t;
+    return 8.f * sinf(pt) * sinf(pt / 8.f) / (pt * pt);
 }
 
 // cubic B-spline, spelled out as nvcc contracts  2/3 - t t + 0.5 t t t  and without the division on CUDA

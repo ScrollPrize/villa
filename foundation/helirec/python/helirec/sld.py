@@ -37,7 +37,8 @@ def _terms(value, name, positive=False):
 def sld_config(spec):
     """Resolve a scalar spec, BM18 dictionary, or Night Rail diffusion JSON.
 
-    Old: ``fraction=0.1,length=100[,bin=8,stride=10]``.
+    Old: ``fraction=0.1,length=100[,bin=8,stride=10,outside=dark|lit]`` (outside=lit: beyond the detector the
+    frame continues by its edge values, for a beam wider than the field; dark is the default).
     BM18: ``profile=bm18,fraction=0.06:0.03,length=40:200`` or ``json=/path/model.json``.
     A dictionary with ``scale_l`` (Night Rail's spelling) also selects BM18.
     BM18 defaults: full resolution (bin=1), every projection (stride=1), illuminated
@@ -66,7 +67,7 @@ def sld_config(spec):
         names = {"fraction", "scale_l", "replica_shift_x", "replica_shift_y", "replica_factor", "save_binning"}
         d = {**{k: v for k, v in payload.items() if k in names}, **d}
         loaded = True
-    known = {"fraction", "length", "scale_l", "bin", "stride", "profile", "border_x", "border_y",
+    known = {"fraction", "length", "scale_l", "bin", "stride", "profile", "border_x", "border_y", "outside",
              "replica_shift_x", "replica_shift_y", "replica_factor", "save_binning"}
     if set(d) - known or "fraction" not in d:
         raise ValueError(f"sld: expected fraction and known model options, got {sorted(d)}")
@@ -86,6 +87,11 @@ def sld_config(spec):
         if name in d and (not math.isfinite(float(d[name])) or float(d[name]) != 0):
             raise ValueError("sld: shifted-replica calibrations are not supported")
     bm18 = profile == "bm18"
+    outside = str(d.get("outside", "dark"))
+    if outside not in ("dark", "lit"):
+        raise ValueError("sld: outside must be dark or lit")
+    if bm18 and "outside" in d:
+        raise ValueError("sld: outside belongs to the binned profile; the BM18 profile takes border_x and border_y")
     binning = _positive_int(d.get("bin", 1 if bm18 else 8), "bin")
     stride = _positive_int(d.get("stride", 1 if bm18 else 10), "stride")
     if bm18:
@@ -98,7 +104,12 @@ def sld_config(spec):
         raise ValueError("sld: calibration JSON, multiple tails and borders require profile=bm18")
     if binning > 64 or fractions[0] >= 1 or lengths[0] < 1:
         raise ValueError("sld: legacy profile requires fraction < 1, length >= 1 and bin <= 64")
-    return dict(sld_fraction=fractions[0], sld_length=lengths[0], sld_bin=binning, sld_stride=stride) if fractions[0] else {}
+    if not fractions[0]:
+        return {}
+    out = dict(sld_fraction=fractions[0], sld_length=lengths[0], sld_bin=binning, sld_stride=stride)
+    if outside == "lit":      # (absent otherwise: a resolved configuration without it is the same as before)
+        out["sld_lit_outside"] = True
+    return out
 
 
 def correct(frames, spec):

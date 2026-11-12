@@ -45,7 +45,28 @@ def test_frames_against_exact_psf(binning):
         _core.sld_correct(seen[None].astype(np.float32), 1.5, L, binning)
 
 
+def test_lit_outside():
+    """a beam wider than the detector: the scene goes on beyond the field. outside=lit (the frame continued by its
+    edge values) corrects the frame's margins; outside=dark takes the light from beyond for the image's own"""
+    H, W, f, L, P = 240, 320, 0.3, 40.0, 160
+    yy, xx = np.mgrid[-P:H + P, -P:W + P]
+    big = 20000.0 * np.exp(-0.5 * ((yy - H / 2) / 400.0) ** 2) * (1 - 0.3 * (xx > 0.6 * W))   # a shadow that runs off the field
+    seen = np.fft.irfft2(np.fft.rfft2(np.pad(big, 4 * int(L))) * psf_fft((big.shape[0] + 8 * int(L), big.shape[1] + 8 * int(L)), L, f),
+                         (big.shape[0] + 8 * int(L), big.shape[1] + 8 * int(L)))[4 * int(L):-4 * int(L), 4 * int(L):-4 * int(L)]
+    true, seen = big[P:-P, P:-P], seen[P:-P, P:-P].astype(np.float32)
+    rel = lambda a: float(np.sqrt(np.mean((a - true) ** 2)) / np.sqrt(np.mean(true ** 2)))
+    dark = _core.sld_correct_config(seen[None], sld_config(f"fraction={f},length={L}"))[0] * (1 + f)
+    lit = _core.sld_correct_config(seen[None], sld_config(f"fraction={f},length={L},outside=lit"))[0] * (1 + f)
+    assert rel(dark) > 0.02 and rel(lit) < 0.25 * rel(dark), (rel(seen), rel(dark), rel(lit))   # (measured: 0.010 as seen, 0.056 dark, 0.0015 lit)
+    np.testing.assert_array_equal(dark, _core.sld_correct(seen[None], f, L, 8)[0] * (1 + f))   # the default is dark, as before
+
+
 def test_spec():
+    assert sld_config("fraction=0.1,outside=dark") == sld_config("fraction=0.1")
+    assert sld_config("fraction=0.1,outside=lit") == dict(sld_fraction=0.1, sld_length=100.0, sld_bin=8, sld_stride=10, sld_lit_outside=True)
+    for bad in ("fraction=0.1,outside=bright", "profile=bm18,fraction=0.1,length=40,outside=lit"):
+        with pytest.raises(ValueError):
+            sld_config(bad)
     assert sld_config("") == {} and sld_config(None) == {} and sld_config("fraction=0") == {}
     assert sld_config("fraction=0.1, length=80") == dict(sld_fraction=0.1, sld_length=80.0, sld_bin=8, sld_stride=10)
     assert sld_config(dict(fraction=0.2, bin=4, stride=5)) == dict(sld_fraction=0.2, sld_length=100.0, sld_bin=4, sld_stride=5)

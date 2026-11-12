@@ -43,6 +43,7 @@ struct ScintillatorGlare::Impl {
 
     void configure_bm18(const SldParams& p) {
         if (p.bin != 1) throw Error("sld: BM18 full-resolution correction requires bin=1");
+        if (p.lit_outside) throw Error("sld: outside=lit belongs to the binned profile; the BM18 profile has border_x, border_y");
         if (p.stride < 1) throw Error("sld: stride must be >= 1");
         if (p.border_x < 0 || p.border_y < 0) throw Error("sld: illuminated borders must be non-negative");
         auto fractions = p.fractions.empty() ? std::vector<double>{p.fraction} : p.fractions;
@@ -148,7 +149,8 @@ ScintillatorGlare::ScintillatorGlare(int det_rows, int det_cols, const SldParams
         throw Error("sld: multiple tails and illuminated borders require the BM18 profile");
     if (!(p.fraction > 0 && p.fraction < 1)) throw Error("sld: fraction must be in (0, 1)");
     if (!(p.length >= 1) || !std::isfinite(p.length)) throw Error("sld: length must be finite and >= 1 pixel");
-    // zero padding: three damping lengths on every side (the tail there is < 2 % of its value at one length)
+    // padding: three damping lengths on every side (the tail there is < 2 % of its value at one length), dark, or
+    // (lit_outside) the frame's edge values
     const int b = p.bin, pad = static_cast<int>(std::ceil(3.0 * p.length / b));
     FourierFilterSpec sp;
     sp.ndim = 2;
@@ -158,7 +160,7 @@ ScintillatorGlare::ScintillatorGlare(int det_rows, int det_cols, const SldParams
     sp.pw = roundfft(I.cols + 2 * pad);
     sp.pad_top = (sp.ph - I.rows) / 2;
     sp.pad_left = (sp.pw - I.cols) / 2;
-    sp.mode = PadMode::Zero;
+    sp.mode = p.lit_outside ? PadMode::Edge : PadMode::Zero;
     // the tail between binned images: the detector-pixel tail t(r) = exp(-r / l) / r (0 at r = 0) coupled between
     // two bin x bin cells, i.e. correlated with the triangle (b - |u|)(b - |v|) / b^2; then unit sum
     const int ph = sp.ph, pw = sp.pw;

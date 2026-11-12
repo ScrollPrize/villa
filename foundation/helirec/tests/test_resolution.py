@@ -165,14 +165,14 @@ def test_wiener_table_filter(tmp_path):
 NU = 0.25   # cycles / row of the row pattern
 
 
-def row_scan(tmp_path, nr=32, values=None, angles=None, name="rows"):
-    """frames constant along the columns: 1 + 5 % cos(2 pi NU row), or `values` per projection"""
+def row_scan(tmp_path, nr=32, values=None, angles=None, name="rows", nu=NU):
+    """frames constant along the columns: 1 + 5 % cos(2 pi nu row), or `values` per projection"""
     nd, ngrid = 24, 64
     p = np.arange(193)
     angles = p * (360 / ngrid) if angles is None else np.asarray(angles, np.float64)
     z = np.arange(len(angles)) * .06
     if values is None:
-        raw = np.broadcast_to(np.rint(40000 * (1 + .05 * np.cos(2 * np.pi * NU * np.arange(nr))))[None, :, None],
+        raw = np.broadcast_to(np.rint(40000 * (1 + .05 * np.cos(2 * np.pi * nu * np.arange(nr))))[None, :, None],
                               (len(z), nr, nd)).astype(np.uint16)
     else:
         raw = np.broadcast_to(np.asarray(values)[:, None, None], (len(z), nr, nd)).astype(np.uint16)
@@ -187,13 +187,17 @@ def row_scan(tmp_path, nr=32, values=None, angles=None, name="rows"):
     return scan, angles, z, raw
 
 
+Z_TAPS = {"linear": 2, "cubic": 4, "lanczos3": 6, "lanczos8": 16}
+
+
 def kernel_weights(f, kind):
-    T = {"cubic": 4, "lanczos3": 6}[kind]
+    T = Z_TAPS[kind]
     d = np.abs((np.arange(T) - (T // 2 - 1) - np.float32(f)).astype(np.float32))
     if kind == "cubic":
         w = np.where(d < 1, (1.5 * d - 2.5) * d * d + 1, np.where(d < 2, ((-.5 * d + 2.5) * d - 4) * d + 2, 0))
     else:
-        w = np.where(d < 1e-6, 1, np.where(d >= 3, 0, np.sinc(d) * np.sinc(d / 3)))
+        a = T // 2   # lanczos3, lanczos8
+        w = np.where(d < 1e-6, 1, np.where(d >= a, 0, np.sinc(d) * np.sinc(d / a)))
     return w / w.sum()
 
 
@@ -211,7 +215,7 @@ def vertical_reference(raw, z, h, kind, log_first, nr):
                 continue
             col = raw[i, :, 10] / 50000.
             col = -np.log(col) if log_first else col
-            T = {"linear": 2, "cubic": 4, "lanczos3": 6}[kind]
+            T = Z_TAPS[kind]
             first = lo - (T // 2 - 1)
             if kind != "linear" and f > 0 and first >= 0 and first + T <= nr:
                 values.append(float(kernel_weights(f, kind) @ col[first:first + T]))
@@ -227,7 +231,7 @@ def test_vertical_kernel(tmp_path, device, backprojector):
     kw = dict(backprojector=backprojector, tomo_params={"num_iter": "1"} if backprojector == "sirt" else {})
     # a short detector: slices whose rows reach its edges fall back to the linear interpolation there
     scan, _, z, raw = row_scan(tmp_path, nr=12, name="short")
-    for kind in ("linear", "cubic", "lanczos3"):
+    for kind in ("linear", "cubic", "lanczos3", "lanczos8"):   # (lanczos8's 16 rows never fit: linear throughout)
         got = recon(scan, device, z_interp=kind, **kw).reconstruct(7, 8, debug=True)
         ref = vertical_reference(raw, z, 7, kind, backprojector == "sirt", 12)
         np.testing.assert_allclose(got["sino"][:, 0, 10], ref, atol=2e-5, err_msg=kind)
@@ -248,6 +252,27 @@ def test_vertical_kernel(tmp_path, device, backprojector):
     assert np.abs(legacy["sino"][:, 0, 10] - ideal).max() > 5e-3
     with pytest.raises(Exception, match="z_interp"):
         recon(scan, device, z_interp="bspline3", **kw)
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("backprojector", ["fbp", "sirt"])
+def test_vertical_kernel_lanczos8(tmp_path, device, backprojector):
+    """z_interp=lanczos8: 16 rows, the given weights; at 0.4 cycles per row, where lanczos3 loses a fifth of the
+    pattern over the fractions of a helix, it keeps it"""
+    kw = dict(backprojector=backprojector, tomo_params={"num_iter": "1"} if backprojector == "sirt" else {})
+    nu, nr, h = 0.4, 64, 40           # rows h - z = 28.5 .. 40: every kernel's rows are on the detector
+    scan, _, z, raw = row_scan(tmp_path, nr=nr, name="fine", nu=nu)
+    ideal = np.array([np.mean([-np.log(.8 * (1 + .05 * np.cos(2 * np.pi * nu * (h - np.float32(z[i])))))
+                               for i in np.flatnonzero(np.arange(len(z)) % 64 == a)]) for a in range(64)])
+    err = {}
+    for kind in ("lanczos3", "lanczos8"):
+        r = recon(scan, device, z_interp=kind, **kw)
+        assert r.info["z_interp"] == kind
+        got = r.reconstruct(h, h + 1, debug=True)
+        ref = vertical_reference(raw, z, h, kind, backprojector == "sirt", nr)
+        np.testing.assert_allclose(got["sino"][:, 0, 10], ref, atol=2e-5, err_msg=kind)
+        err[kind] = np.abs(got["sino"][:, 0, 10] - ideal).max()
+    assert err["lanczos3"] > 3e-3 and err["lanczos8"] < 0.4 * err["lanczos3"], err   # (measured: 4.95e-3, 1.25e-3)
 
 
 @pytest.mark.parametrize("device", helirec.devices())
@@ -322,7 +347,7 @@ def test_nearest_angles_reconstruct_the_phantom(tmp_path, device):
     assert recon(scan, device, backprojector="fbp").info["angle_interp"] == "nearest"
     assert recon(scan, device, backprojector="ghbp").info["angle_interp"] == "linear"
     assert recon(scan, device, backprojector="fbp", legacy_reference=True).info["angle_interp"] == "linear"
-    assert recon(scan, device, backprojector="fbp").info["z_interp"] == "lanczos3"
+    assert recon(scan, device, backprojector="fbp").info["z_interp"] == "lanczos8"
     assert recon(scan, device, backprojector="fbp", legacy_reference=True).info["z_interp"] == "linear"
     if device == "cuda":
         cpu = recon(scan, "cpu", backprojector="fbp", angle_interp="nearest").reconstruct(7, 10)

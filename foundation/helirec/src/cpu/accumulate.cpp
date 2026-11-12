@@ -61,22 +61,36 @@ void set_x_kernel(AccumScanView& v, int interp, bool exact) {
     v.x_taps = T;
 }
 
+int z_kernel_from_name(const std::string& name) {
+    if (name == "linear") return interp_core::Linear;
+    if (name == "cubic") return interp_core::Cubic;
+    if (name == "lanczos3") return interp_core::Lanczos3;
+    if (name == "lanczos8") return interp_core::Lanczos8;
+    throw Error("z_interp must be linear, cubic, lanczos3 or lanczos8, not '" + name + "'");
+}
+
+const char* z_kernel_name(int interp) {
+    return interp == interp_core::Lanczos8 ? "lanczos8" : interp == interp_core::Lanczos3 ? "lanczos3" : interp == interp_core::Cubic ? "cubic" : "linear";
+}
+
 int z_kernel_context(int interp) {
     if (interp == interp_core::Linear) return 0;
     if (interp == interp_core::Cubic) return 1;
     if (interp == interp_core::Lanczos3) return 2;
-    throw Error("z_interp must be linear, cubic or lanczos3");
+    if (interp == interp_core::Lanczos8) return 7;
+    throw Error("z_interp must be linear, cubic, lanczos3 or lanczos8");
 }
 
 std::vector<float> z_kernel_weights(const std::vector<float>& fract_v, int interp) {
     const int T = 2 + 2 * z_kernel_context(interp);
     if (T == 2) return {};
     std::vector<float> out(fract_v.size() * T);
+    static_assert(2 + 2 * 7 <= z_max_taps, "the widest vertical kernel fits the callers' weight buffers");
     for (std::size_t k = 0; k < fract_v.size(); ++k) {
-        double w[8], sum = 0;
+        double w[z_max_taps], sum = 0;
         for (int i = 0; i < T; ++i) {   // tap i: row t - (T / 2 - 1) + i, at  i - (T / 2 - 1) - a  from the position t + a
             const float d = static_cast<float>(i - (T / 2 - 1)) - fract_v[k];
-            w[i] = interp == interp_core::Cubic ? interp_core::keys(d) : interp_core::lanczos3(d);
+            w[i] = interp == interp_core::Cubic ? interp_core::keys(d) : interp == interp_core::Lanczos8 ? interp_core::lanczos8(d) : interp_core::lanczos3(d);
             sum += w[i];
         }
         for (int i = 0; i < T; ++i) out[k * T + i] = static_cast<float>(w[i] / sum);

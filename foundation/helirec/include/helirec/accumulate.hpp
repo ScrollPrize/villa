@@ -20,8 +20,11 @@
 // Vertically, a slice lies at a fractional detector row of each projection. The reference interpolates the two
 // neighbouring rows linearly; as the fraction sweeps all values along a helix, that is a triangle kernel along z
 // (sinc^2: 0.81 at half Nyquist, 0.41 at Nyquist). With AccumScanView::z_taps > 0 the value is interpolated across
-// z_taps rows instead (the weight stays the linear one), wherever all of them are measured.
+// z_taps rows instead (the weight stays the linear one), wherever all of them are measured. Over the views of a
+// voxel in a helix a kernel keeps the mean of its response over the fraction: lanczos3 (6 rows) 0.91 of the
+// amplitude at 0.36 cycles per row, 0.82 at 0.40, 0.68 at 0.45; lanczos8 (16 rows) 1.00, 1.01, 0.90.
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "helirec/common.hpp"
@@ -72,7 +75,7 @@ struct AccumScanView {
     // optional kernel for the vertical position (z_taps > 0): the value at row t + fract_v[k] of projection k is
     // sum_i z_w[k * z_taps + i] value(t - (z_taps / 2 - 1) + i), wherever all those rows are on the detector with a
     // positive weight (else the linear interpolation of rows t, t + 1). The weight stays the linear one.
-    int z_taps = 0;
+    int z_taps = 0;               // at most z_max_taps
     const float* z_w = nullptr;   // (n_proj, z_taps)
     // optional roll of the frames (ScanTrajectory::row_slope, per projection): the sample for stack row t at column c
     // is taken at row t + fract_v[k] + row_slope[k] (c - slope_col). The vertical kernel's weights then depend on
@@ -126,8 +129,12 @@ struct AccumScanView {
 // 4 columns) or lanczos3 (6 columns), weights normalised to sum 1. A zero offset needs none. `exact`: the exact shift
 // (x_exact) wherever accumulate computes the block's rows, the kernel elsewhere.
 void set_x_kernel(AccumScanView& v, int interp, bool exact = false);
-// Vertical kernel: rows of context it needs either side of the two linear rows (0 linear, 1 cubic, 2 lanczos3), and
-// its weights (n, taps) for the vertical fractions fract_v (taps = 2 + 2 context rows; empty for linear).
+// Vertical kernel: its id from the name (linear, cubic, lanczos3, lanczos8: interp_core::Interp), the rows of
+// context it needs either side of the two linear rows (0 linear, 1 cubic, 2 lanczos3, 7 lanczos8), and its weights
+// (n, taps) for the vertical fractions fract_v (taps = 2 + 2 context rows <= z_max_taps; empty for linear).
+inline constexpr int z_max_taps = 16;
+int z_kernel_from_name(const std::string& name);
+const char* z_kernel_name(int interp);
 int z_kernel_context(int interp);
 std::vector<float> z_kernel_weights(const std::vector<float>& fract_v, int interp);
 // the weights for the fractions i / n, i = 0 .. n: (n + 1, taps) (AccumScanView::z_lut; empty for linear)

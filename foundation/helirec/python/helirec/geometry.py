@@ -26,9 +26,11 @@ finds, in this order:
            a function of time, the sample's height once per turn and its drift at rest, and how far the helix is
            further on in angle than the rows' timing gives.
 
-Nothing here is applied to a reconstruction; the step writes what it measured. It uses helirec.calibration's
-session (raw frames, the scan's own dark and mean flat, the registration) and nothing of the pipeline's
-calibration.
+The step writes what it measured; the reconstruction (recon.py) takes its geometry from that alone: frame_poses,
+reconstruction_terms and merged_layout turn the result into the pose of every frame, the reconstruction's terms
+per projection and the frame the two scans are merged in. The step uses helirec::calibration's session (raw
+frames, the scan's own dark and mean flat, the registration) and nothing of the reconstruction's intensity
+calibration (calibration.py).
 """
 from __future__ import annotations
 

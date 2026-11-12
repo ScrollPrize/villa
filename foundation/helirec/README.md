@@ -11,19 +11,20 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
   rebalance; ramp padding reflected about the true rotation axis; mending over the merged columns both scans cover;
   a unit-DC Paganin kernel and a two-scan luminosity window independent of the chunk height; a scan at a
   fractional column offset shifted exactly (`x_interp=sinc`), a slice's fractional detector row interpolated with
-  a Lanczos-3 kernel (`z_interp`); each projection gridded whole into a sinogram row of its own and backprojected at its measured angle
-  (`angle_interp=views`; GHBP keeps the two-bin splat); the helical pitch measured from the frames (`z_translation_scale=auto`); the companion
-  scan's frames placed as they register on the main scan's, row offset and roll per projection
-  (`companion_registration=auto`); recordings of a ray combined with band-dependent weights where the detector's
-  sharpness depends on the place (`sharpness_weighting=auto`); the turns recorded with the z stage at rest placed against
-  the helix as the frames register them (`stationary_registration=auto`); the rotation axis refined from the scan's
-  opposite views (`axis_refinement=auto`). No projection filters by default, and since 2026-11-11 the exposure arc of
+  a 16-row Lanczos kernel (`z_interp=lanczos8`); each projection gridded whole into a sinogram row of its own and backprojected at its measured angle
+  (`angle_interp=views`; GHBP keeps the two-bin splat); every projection read where the geometry calibration
+  puts it (`geometry`: the detector map, the frame's own row, axis column, roll and scales, and the angle of each
+  of its rows; `geometry.json`, made on first use by the geometry calibration step and cached); recordings of a ray
+  combined with band-dependent weights where the detector's sharpness depends on the place
+  (`sharpness_weighting=auto`). No projection filters by default, and since 2026-11-11 the exposure arc of
   a continuous scan is not deconvolved (`exposure_arc=0`; `auto` turns it on): that is left for the intensity side of
   the calibration, after the geometry.
 * `legacy_reference`: the reference workflow's conventions (half-attenuation units, its rebalance endpoints,
   integer padding reflection, mending bounds, chunk-dependent Paganin and luminosity window, two-column splat of
   fractional column offsets, linear rows, two-bin angular splat, no exposure-arc correction) with every parameter pinned (GHBP, Paganin 1000 + unsharp 1.2/4, …); overriding one
-  is an error, and only the measured calibration is allowed.
+  is an error. Of the geometry calibration it takes the merged frame alone: one rotation axis and one vector
+  between the scans (on a quarter-pixel grid, as the reference's searches gave them), with the recorded angles and
+  heights.
 
 Outputs record the mode, its conventions and every resolved parameter (`manifest.json`, OME-Zarr attributes).
 
@@ -61,7 +62,7 @@ helirec-slices PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif       
 * `--reference_volume ZARR` reuses the mask of a masked uint8 volume on the same grid (e.g. the published volume of
   the scan): the uint8 output is 0 wherever the reference is 0; the float32 output is not masked. The reference's
   level 0 must have the reconstruction's slices (y, x); its number of slices may differ by up to 2 %, as it does
-  when the reference was made with another helical pitch calibration (`z_translation_scale`): its slices are then
+  when the reference was made with the recorded helical pitch and not the measured one: its slices are then
   spread evenly over the reconstruction's, which places the mask to within a few slices (PHerc0343P, published
   volume of 5398 slices on the 5411 of the measured pitch: within 0.1 slice mid-volume, about 2 at the two ends).
   `--reference_scale LEVEL` takes the mask from a coarser
@@ -134,7 +135,8 @@ mx, mean = bc.composites(set=2)
 |---|---|---|---|
 | 0 | Bliss master parsing: entries, angles, z, machine current, frame→file map | `python/helirec/bliss.py` | Python |
 | 1 | raw row-window reads (`pread`, one HDF5 chunk per frame) | `raw_reader.hpp` | CPU (threads) |
-| 2 | calibration: darks/flats, weight map + apodisation, rotation axis, HA→TA vector | `calib.hpp`, `python/helirec/calibration.py` | CPU |
+| 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame | `calib.hpp`, `python/helirec/calibration.py` | CPU |
+| 2b | geometry calibration: layout, rows' timing, detector map, poses and motion (`helirec-geometry`) | `calibration/`, `python/helirec/geometry.py` | CPU, CUDA |
 | 3 | helical geometry: span info, doable span, per-projection shifts and grid bins | `helical.hpp` | CPU |
 | 4 | gridding: flat-field, weights, vertical / horizontal kernels, angular bins (gather form) | `accumulate.hpp` | CPU, CUDA |
 | 5 | HA/TA luminosity equalisation, divide, mend | `accumulate.hpp` | CPU, CUDA |
@@ -282,7 +284,8 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   of a pixel the result is Paganin's. Not implemented: the non-local (ray-mapping) solver for shifts well beyond a
   pixel, oversampling, and the polychromatic spectrum lines of the reference implementation.
   Example: `--set "filters=epr(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)"`.
-* **Scintillator light diffusion** (`sld="fraction=0.1,length=100"`, default `""`: none; `bin=8`, `stride=10`):
+* **Scintillator light diffusion** (`sld="fraction=0.1,length=100"`, default `""`: none; `bin=8`, `stride=10`,
+  `outside=dark|lit`):
   the correction of the same paper (section 3.6) for the detector's long-range glare. The recorded frame is the
   image convolved with `K = (δ + f·t) / (1 + f)`, `t(r) ∝ exp(−r/length) / r` (pixels); the glare `S ∗ M`,
   `Ŝ = f t̂ / (1 + f t̂)`, is computed on frames binned by `bin`, subtracted from `(raw − dark) / current` before the
@@ -290,6 +293,15 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   frame of every `stride`-th projection for its glare map (kept across consecutive chunks) and interpolates in
   between. `fraction` and `length` are properties of the scintillator and optics and must be measured; 0.1 / 100
   are the Night Rail defaults, not a calibration of any particular scan. Not available in `legacy_reference`.
+  `outside` says what lies beyond the detector's field: `dark` (default: nothing) or `lit` (the frame continued by
+  its edge values over the padding, for a beam wider than the field; there `dark` takes the light that comes in
+  from beyond the edge for the image's own and can do worse near the edges than no correction).
+  The numbers can be read off the projections where a sharp edge has open beam beside it: the air's deficit
+  against the distance from the edge is the kernel's one-sided integral. On PHerc0343P (8.64 µm) the wall of the
+  sample's case gives fraction 0.43, length 170 px (0.48 / 150 to 0.37 / 200 fit alike), with `outside=lit`
+  agreeing better than `dark` between the two scans; the 0.6 / 400 that `evaluation/calibrate_sld.py` found by
+  bringing the reconstructed air to zero spreads 37.5 % of the light where the edge shows 30 %, and reverses the
+  air's dependence on the angle. `--set sld=fraction=0.43,length=170,outside=lit`.
   Example: `--set sld=fraction=0.1,length=100`.
   For ESRF **BM18 calibration files**, use the new full-resolution profile:
 
@@ -340,12 +352,18 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   wrap's height beside it).
 * **Gridding**: `luminosity_repartition`, `mend_threshold`, `n_grid`, `angular_tolerance_steps`, `block_angles`
   (memory/speed only), `x_interp`.
-  * `z_interp=lanczos3|cubic|linear` (default `lanczos3`): a slice lies at a fractional detector row of every
+  * `z_interp=lanczos8|lanczos3|cubic|linear` (default `lanczos8`): a slice lies at a fractional detector row of every
     projection. The reference interpolates the two neighbouring rows linearly; along a helix the fraction sweeps all
     values, which makes that a triangle kernel along z: sinc²(ν), 0.81 at half Nyquist and 0.41 at Nyquist. The
-    kernels use 6 / 4 rows wherever all of them are on the detector with a positive weight (else the two rows); the
+    kernels use 16 / 6 / 4 rows wherever all of them are on the detector with a positive weight (else the two rows); the
     accumulated weights stay the linear ones. Measured on PHerc0343P (64 slices of papyrus, Paganin): the z spectrum
     amplitude rises by 5 % at 0.125, 18 % at 0.22 and 27 % at 0.27 cycles/pixel over `linear`, as 1 / sinc² predicts.
+    `lanczos8` (the default since 2026-11-12; `lanczos3` before) uses 16 rows: lanczos3 still loses the top of the
+    band along z (over the fractions of a helix it keeps 0.82 of the amplitude at 0.40 cycles/pixel and 0.68 at
+    0.45; lanczos8 1.00 and 0.90). Measured on PHerc0343P
+    (FBP, ramp only): the signal's power along z rises by 39 % at 0.35–0.45 and 29 % at 0.45–0.5 cycles/pixel over
+    `lanczos3` and is unchanged below 0.3, for 2.4 % more time per chunk and 10 more rows read of every projection.
+    A value within 7 rows of an unmeasured row or of the detector's ends takes the two rows, as with every kernel.
   * `angle_interp=views|nearest|linear` (default `views`): the reference splits every projection between the two grid
     angles around its own (weights 1 − α, α), an average of neighbouring views wherever the recorded angles sit off
     the regular grid (PHerc0343P: α drifts through all values, the step being 0.0449985° rather than 0.045°).
@@ -398,59 +416,15 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     On PHerc0343P `nearest` and the arc correction together sharpen the tangential edge of the wrap at r ≈ 1200 px by
     3 % (Paganin only) to 7 % (with the unsharp mask); as the removed blurs also averaged noise, the noise in the outer
     air rises by 16 % (Paganin) to 33 % (unsharp).
-  * `z_translation_scale=auto|S` (default `auto`): detector rows the sample really moves per row of recorded z
-    translation, the calibration of the helical pitch. A slice is seen at every row of the detector as the sample
-    travels; if the recorded travel is off by a fraction e, what two rows see of it is placed e × (rows between
-    them) apart along z, a blur along z that no filter undoes. `auto` uses what the calibration measures from the
-    frames (`calibration.measure_pitch`): two projections half a turn apart are mirror images about the rotation
-    axis, displaced along the rows by the travel in between, so the displacement of ~40 such pairs over the
-    recorded one is the scale (1 when the difference is not significant or nothing can be measured: a scan that
-    does not move, an axis off the detector). PHerc0343P: 1.00316 ± 0.00003, i.e. 1053.4 rows per turn where the
-    metadata gives 1050.1; against the 2.215 µm volume of the same sample the correlation at 0.39 cycles per voxel
-    rises from 0.56 to 0.71 (0.10 to 0.74 for frequencies along z). `1` uses the recorded translations as they
-    are. The volume's slice indices (z = view height − first doable height) and the sample's place in them change
-    with the scale: compare runs by view height (`--heights`). The rotation-axis and overlap searches still use
-    the recorded translations.
-  * `stationary_registration=auto|off` (default `auto`): a scan may begin and end with a turn recorded with the z
-    stage at rest. Its recorded z joins the helix's by what the motor record says, which need not be where the
-    sample was while the stage started or stopped. The calibration compares projections of such a turn with those
-    a whole turn away in the helix (the same rays, displaced along the rows by the travel in between; 24 pairs per
-    turn, tiles registered by `calib::tile_shifts`; `calibration.stationary_from_pairs`) and adds the turn's
-    offset to the vertical position of its projections, in both scans (`ScanTrajectory::row_offset`; the
-    companion's own registration is on the main scan's frames). PHerc0343P: the recorded helix is a line that starts
-    0.79 row behind the first stationary position and stops 0.73 row short of the last; the first turn really lies
-    −0.16 row from where that puts it, the last **+1.09 rows**. Slices that both the last turn and the helix
-    record (the last ~1200 of 5409) averaged two copies a voxel apart along z: against the 2.215 µm volume, at
-    slices 912–1167 (with the axis refinement below), correlation along z 0.751 → 0.895 at 0.36, 0.563 → 0.839 at
-    0.42, 0.455 → 0.789 at 0.45 cycles/voxel, in plane 0.736 → 0.836 at 0.42 and 0.635 → 0.756 at 0.45. 5 s once
-    per scan (cached); nothing per chunk. The first and last doable view heights move with the offsets, and with
-    them the volume's slice indices (PHerc0343P: 5409 slices where there were 5411, the same sample one index
-    lower): compare runs by view height (`--heights`). `off`: the recorded z as it is.
-  * `axis_refinement=auto|off|PIXELS` (default `auto`): the rotation-axis search works on a grid of a quarter
-    pixel. A projection and the one half a turn on are mirror images about the axis: for 48 pairs along the scan
-    the one is registered on the mirrored other (`calibration.axis_from_pairs`), and half the median lateral
-    displacement is added to the searched axis. The slice grid stays that of the searched axis, so the volume
-    keeps its shape and place. PHerc0343P: +0.096 px (0.04 … 0.14 along the scan; the two halves of the detector's
-    data, see `rolling_shutter`, put the axis within 0.01 px of that). In-plane correlation with the 2.215 µm
-    volume at 0.42 / 0.45 / 0.48 cycles/voxel: centre block 0.736 / 0.620 / 0.487 → 0.753 / 0.646 / 0.519, 730 px
-    right of the axis 0.694 / 0.581 / 0.455 → 0.717 / 0.610 / 0.486, 670 px left 0.742 / 0.636 / 0.508 →
-    0.753 / 0.652 / 0.530; along z unchanged within 0.005. 4 s once per scan (cached). `off`: the searched axis;
-    a number: that many pixels added. With `--cor` the given axis is used as it is.
-  * `rolling_shutter=off|auto|S` (default `off`): a camera that reads its rows one after another while the sample
-    turns records each row at another angle. S is the time from the read-out of the first row to that of the last,
-    in frame periods (negative when the last row is read first); a slice, read at one row of every projection, is
-    then backprojected at that row's angle (the angles of each slice: `angle_interp=nearest`, not GHBP). `auto`
-    measures it on first use (`recon.measure_rolling_shutter`, a minute on a GPU, cached): a slab reconstructed
-    from the upper rows of the main scan's detector alone and from the lower rows alone (each half a turn) is
-    turned against itself by the shutter; the same fit gives the axis's remaining error, a shear of the rows and
-    the change of magnification between the halves (logged, not applied). PHerc0343P: the halves are turned
-    −0.277 mrad against each other, S = −0.75 (0.59 mrad between the first and the last row; about 10 µs per sensor
-    line), and with it the rotation is gone on every side of the axis. **Not a default**: against the 2.215 µm
-    volume the in-plane correlation at 0.45 cycles/voxel rises 730 px right of the axis (0.610 → 0.640), stays at
-    the centre (0.646 → 0.644) and falls 670 px left of it (0.652 → 0.634), with or without the band-dependent
-    weights, the exposure-arc correction, the companion scan or the rows where two turns overlap. What is left
-    between the two halves is a magnification that differs by 0.03 % (a keystone of the detector's image, not
-    corrected), of the same size as the rotation.
+  * `geometry=PATH` (default: `geometry.json` in the calibration cache, made there on first use), `row_time_us`:
+    the geometry calibration (`helirec-geometry`, below), the only one. Every projection is read on the grid of its
+    detector map, at the row, axis column, roll and scales it gives that frame and at the angle of each of its
+    rows (the rows' timing), in a merged frame laid out from the same poses. It holds what the earlier calibration's
+    options stood for, which are gone and refused by name: the helical pitch (`z_translation_scale`), the turns at
+    rest against the helix (`stationary_registration`), the axis' refinement (`axis_refinement`), the second
+    scan's frames on the first's (`companion_registration`) and the rolling shutter (`rolling_shutter`).
+    `row_time_us`: the time of a detector row within the frame in microseconds per stored row (signed), for making
+    the calibration when no stretch of the scans holds a refill of the ring to measure it from.
   * `angle_subset=I/N` (default: every projection): subset I of N interleaved subsets of the projections, chosen
     by angle (the same angles in every scan) and reconstructed on a grid of 1 / N of the angles. `0/2` and `1/2`
     are two reconstructions of one scan with independent noise and everything else in common
@@ -474,23 +448,6 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     Next to the detector edges and to columns without weight the splat is used, so unmeasured values never enter.
     Notes: a row's two ends leak into a shifted row as 1 / distance (0.3 % of the high-frequency amplitude at the
     end, 400 columns in); the gridding of measured pixels only (SIRT, MLEM) uses `lanczos3` under `sinc`.
-  * `companion_registration=auto|off` (default `auto`): the calibration compares the companion's frames with the
-    main scan's frames of the same angle where the two detector positions overlap, at 240 projections along the
-    scan (`calibration.measure_registration`; tiles registered by `calib::tile_shifts` on the continuous
-    cross-correlation), and fits per pair a row displacement at the rotation axis and its slope along the columns,
-    and the column displacement's slope along the rows: a roll of the companion's frames about the axis. One calibrated vector is right only in the middle of the
-    overlap when there is a roll. Smoothed along the scan, they are applied per projection in the gridding
-    (`ScanTrajectory::row_offset`, `row_slope`, `col_slope`): every sample is read at its registered row, in the
-    one vertical interpolation there already was, and every row is delayed by its own column offset in the exact
-    column shift (`x_interp=sinc`). PHerc0343P: roll −0.72 mrad (−0.53 … −0.91 along the scan), 0.1–1.1 rows at
-    the axis; the companion's content lay −0.79 + 0.50 r / 1000 voxels from the main scan's along z (r: px from
-    the axis), after it +0.03 + 0.07 r / 1000; axial correlation with the 2.215 µm volume 0.774 → 0.850 at 0.36
-    and 0.564 → 0.674 at 0.45 cycles/voxel (centre block); the column slope (0.55 px per 1000 rows) halves the
-    companion's in-plane displacement from the main scan (0.17 → 0.08 voxel) and is otherwise a small gain. 17 s
-    once per scan (cached); +0.13 s per 32-slice chunk. `off`: the vector alone. The column *offset* the frames
-    show at the axis is measured and logged but not applied: where the detector's blur is one-sided and differs
-    between the two places a ray is recorded at, it is the blur's displacement, not the scan's (applying it on
-    PHerc0343P moved the companion 0.3–0.4 voxel radially off the main scan).
   * `sharpness_weighting=auto|off|a11:a12:a21:a22:c1:c2` (default `auto`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
     (named `detector_smear` until 2026-11-11; that key is still accepted, and calibration caches written with the
     old names still load.)
@@ -511,13 +468,11 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     rows (the filters' too) are gridded from every projection that sees them, not only from those of the chunk's
     own heights, so that the window, and therefore the result, does not depend on the chunking (about 0.2 s more
     per chunk on the PHerc0343P pair).
-* **Geometry**: `--cor` / `--vector` override the calibration for one run (never cached; not allowed in
-  `legacy_reference`).
-* **Calibration cache** (`--cache_dir`): darks/flats reduction and the measured calibration (rotation axis and its
-  refinement, overlap vector, helical pitch, detector blur, the companion's and the stationary turns'
-  registration, the rolling shutter once asked for), keyed by a fingerprint of the acquisition and the calibration
-  version; written atomically. A cache written before one of these measurements existed gets it added on its
-  next use.
+* **Calibration cache** (`--cache_dir`): the darks / flats reduction and the detector's blur field, keyed by a
+  fingerprint of the acquisition and the calibration version, and `geometry.json`, the geometry calibration of the
+  two scans, made there by the geometry calibration step when it is missing or is other scans' (about 13 minutes
+  on PHerc0343P; `--set geometry=PATH` uses one made before and makes nothing). Written atomically. A
+  `calibration.json` of the earlier calibration is read for its blur field and otherwise left alone.
 * **New kernels**: add a function with the same signature in `src/cpu` and `src/cuda`; shared per-element
   arithmetic lives in `src/common/*_core.hpp` so the backends cannot drift apart.
 
@@ -749,8 +704,10 @@ texture, so compare accepted matches and retain rejected attempts.
 
 Measures the geometry of a two-scan helical acquisition from its own frames, with nothing typed in: the detector
 map and the poses that a reconstruction needs before it can assign a raw value to the line it measured. It is a
-step that writes what it measured (JSON); `helirec-slices` applies it when asked to (`--set geometry=...`, below)
-and otherwise uses the calibration of `python/helirec/calibration.py` as before.
+step that writes what it measured (JSON), and it is the reconstruction's only geometry calibration:
+`helirec-slices` makes it on first use and keeps it in its calibration cache, or takes the file it is given
+(`--set geometry=...`, below). The darks, flats, weights and the detector's blur field are
+`python/helirec/calibration.py`'s.
 
 ```bash
 helirec-geometry <main.h5> <companion.h5> --out geometry.json            # main: the scan with the axis inside the field
@@ -792,14 +749,19 @@ beside the one found by hand and tests it on slices reconstructed twice from dis
 `helirec::calibration`'s session (raw frames, the scan's own dark and mean flat, the registration on CPU or CUDA)
 and none of the pipeline's calibration.
 
-**In the reconstruction:** `helirec-slices ... --set geometry=OUT/geometry.json` (or `params["geometry"]`). Every
-projection is then read on the grid of the calibration's detector map (the rows at the mapped row by the row
+**In the reconstruction:** `helirec-slices ...` with nothing said (the cache's `geometry.json`, made if it is not
+there), or `--set geometry=OUT/geometry.json` (`params["geometry"]`). Every
+projection is read on the grid of the calibration's detector map (the rows at the mapped row by the row
 kernel, the columns resampled exactly: `resample_rows`, a non-uniform transform of the interpolant the exact shift
 uses, within 1e-6 of the direct sum), at the pose `geometry.frame_poses` gives its frame, and at the angle of its
-rows. `z_translation_scale`, `companion_registration`, `stationary_registration`, `axis_refinement` and
-`rolling_shutter` are not used with it; it needs `x_interp=sinc`, and `fbp` with `angle_interp=views` or `nearest`
-for the row timing. `provenance()["geometry"]` records the file and what the calibration measured that the reconstruction
-cannot express. Off by default; without it nothing changes. On PHerc0343P, without projection filters it costs
+rows. The frame the two scans are merged in is laid out from the same poses (`geometry.merged_layout`: the medians
+over the helix of the axis' column and of the second scan's place, on a quarter-pixel grid; PHerc0343P: axis
+1684.75 in the first scan's columns, the second scan 843.5 columns and 1.0 rows from it, the axis at 2528.25 of
+3372 merged columns, as the earlier searches had it but for the rows, which they put at 0.5): a nominal frame,
+every projection's own axis and row being in its terms. It needs `x_interp=sinc`, and `fbp` with
+`angle_interp=views` or `nearest` for the row timing. `provenance()["geometry"]` records the file, the merged
+frame and what the calibration measured that the reconstruction cannot express. `mode=legacy_reference` takes the
+merged frame alone. On PHerc0343P, without projection filters it costs
 no time (7.5 s per 32 slices against 7.3–8.4 s); with Paganin and unsharp a slab of 256 slices takes 53 s against
 32–33 s. What the reconstruction still does not do exactly (the beam's divergence, the six-row kernel along the
 rows; views a turn apart are backprojected each at its own angle since `angle_interp=views`, section 34) is listed
@@ -844,13 +806,12 @@ uv sync --python 3.12 --extra test
 These raise explicit errors:
 * exactly one companion scan, on the left of the main scan, with the rotation axis in the main scan's right half;
 * both scans moving in the same z direction;
-* no per-projection lateral-correction drift: a rotation axis measured more than 0.25 px apart at the two ends of
-  the scan is an error (one axis is used for every slice; `--cor` reconstructs with a fixed one);
+* an acquisition the geometry calibration step can read: a helix whose travel per turn is less than the
+  detector's height, a turn at rest before and after it, two scans of equally long stretches;
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.
 
-The calibration kernels are CPU-only (they are cheap); the rolling-shutter measurement reconstructs and uses the
-reconstruction's device. The helical pitch is one scale for the helix; the turns at rest before and after it get
-an offset each (`stationary_registration`), the few projections in which the stage starts and stops do not. The
-detector's image is taken to be undistorted: PHerc0343P's is not (a keystone and a bend towards one side, up to
-1.2 px in the first 400 columns), which is what remains between its two scans beyond 1000 px from the axis.
+The intensity calibration's kernels are CPU-only (they are cheap); the geometry calibration step registers on
+the CPU or on CUDA. The reconstruction is parallel-beam and slice by slice: what depends on the depth along the
+ray (the beam's divergence, the axis' tilt) is measured by the geometry calibration and not applied
+(`provenance()["geometry"]["measured_not_applied"]`).

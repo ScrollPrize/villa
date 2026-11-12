@@ -127,7 +127,7 @@ HR_HD float column_interp(const AccumScanView& s, int k, int t0, int c) {
     row_position(s, k, t0, c, t, a);
     bool pad;
     const int tv = padded_row(s, k, t, pad);
-    float val, zw[8];
+    float val, zw[z_max_taps];
     if (!(a != 0.0f && s.z_taps > 0 && !pad && z_kernel_value(s, k, t, z_weights(s, k, a, zw), c, false, false, 0.f, 0.f, val))) {
         val = flat_field(s, k, tv, c);
         if (a != 0.0f) val = add(mul(sub(1.0f, a), val), mul(a, flat_field(s, k, tv + 1, c)));
@@ -181,7 +181,7 @@ HR_HD void measured_column(const AccumScanView& s, int k, int t0, int c, const A
     row_position(s, k, t0, c, t, a);
     const int base_row = s.row0[k] + t;
     if (base_row < 0 || base_row >= s.det_rows || (a > 0.f && base_row + 1 >= s.det_rows)) return;
-    float kv, zw[8];
+    float kv, zw[z_max_taps];
     if (a > 0.f && s.z_taps > 0 && z_kernel_value(s, k, t, z_weights(s, k, a, zw), c, true, p.log_values, p.log_clip_min, p.log_clip_max, kv)) {
         // every row is measured: the kernel's value with the linear weight
         const float fac = s.weight_factor[k];

@@ -174,6 +174,35 @@ def test_calibration_parameters():
         r._geometry_file()
 
 
+def test_geometry_calibration_is_made_once_and_kept(tmp_path, monkeypatch):
+    """no geometry given: geometry.json of the cache directory, made by the geometry calibration step when it is not
+    there or is other scans', and read from then on; a given file is used as it is and nothing is made"""
+    from helirec import geometry
+    made = []
+
+    def step(scans, row_time=None, device="auto", log=print, **kw):
+        made.append((list(scans), row_time, device))
+        return dict(scans=list(scans), row_time=dict(seconds_per_row=row_time))
+
+    monkeypatch.setattr(geometry, "calibrate_geometry", step)
+    r = bare_recon()
+    r.cache_dir, r.device, r.log = str(tmp_path / "cache"), "cpu", lambda *a: None
+    r.main, r.companion = SimpleNamespace(master="/data/HA/HA.h5"), SimpleNamespace(master="/data/TA/TA.h5")
+    path, raw = r._geometry_file()
+    assert path == str(tmp_path / "cache" / "geometry.json") and json.loads(raw)["scans"] == ["/data/HA/HA.h5", "/data/TA/TA.h5"]
+    assert made == [(["/data/HA/HA.h5", "/data/TA/TA.h5"], None, "cpu")]
+    assert r._geometry_file() == (path, raw) and len(made) == 1                    # kept: not made again
+    r.params["row_time_us"] = "-19.87"                                             # (only for making it)
+    r.companion = SimpleNamespace(master="/data/TB/TB.h5")                         # other scans: made again, replaced
+    path2, raw2 = r._geometry_file()
+    assert path2 == path and json.loads(raw2)["scans"][1] == "/data/TB/TB.h5" and len(made) == 2
+    assert made[1][1] == pytest.approx(-19.87e-6)
+    given = tmp_path / "given.json"
+    given.write_text('{"scans": ["x.h5", "y.h5"]}')
+    r.params["geometry"] = str(given)
+    assert r._geometry_file() == (str(given), given.read_text()) and len(made) == 2
+
+
 # ---------------------------------------------------------------- output scale (attenuation)
 @pytest.mark.parametrize("device", DEVICES)
 def test_ramp_scale_attenuation(device):

@@ -421,7 +421,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
                  : I.x_exact ? static_cast<int>(interp_core::Lanczos3) : interp_from_name(I.cfg.x_interp);
     if (I.x_kernel != interp_core::Linear && I.x_kernel != interp_core::Cubic && I.x_kernel != interp_core::Lanczos3)
         throw Error("x_interp must be sinc, lanczos3, cubic or linear");
-    I.z_kernel = I.cfg.legacy_reference ? static_cast<int>(interp_core::Linear) : interp_from_name(I.cfg.z_interp);
+    I.z_kernel = I.cfg.legacy_reference ? static_cast<int>(interp_core::Linear) : z_kernel_from_name(I.cfg.z_interp);
     I.z_ctx = I.z_pad = z_kernel_context(I.z_kernel);
     {   // rolled frames: rows of context for the largest row offset on the detector, and the kernel's table
         float reach = 0.f;
@@ -633,7 +633,7 @@ double SliceReconstructor::exposure_arc_bins() const { return impl_->arc_bins; }
 double SliceReconstructor::rolling_shutter() const { return impl_->nearest ? impl_->cfg.rolling_shutter : 0.0; }
 std::string SliceReconstructor::angle_interp() const { return impl_->views ? "views" : impl_->nearest ? "nearest" : "linear"; }
 std::string SliceReconstructor::z_interp() const {
-    return impl_->z_kernel == interp_core::Lanczos3 ? "lanczos3" : impl_->z_kernel == interp_core::Cubic ? "cubic" : "linear";
+    return z_kernel_name(impl_->z_kernel);
 }
 
 // Angles of the chunk's slices under nearest-bin gridding: bin b of slice y is at (b + d) 2 pi / n_grid, d the mean

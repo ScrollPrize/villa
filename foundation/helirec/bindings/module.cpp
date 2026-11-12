@@ -862,6 +862,7 @@ SldParams sld_from(const nb::dict& c) {
     get("sld_length", p.length);
     get("sld_bin", p.bin);
     get("sld_stride", p.stride);
+    get("sld_lit_outside", p.lit_outside);
     get("sld_bm18", p.bm18);
     get("sld_fractions", p.fractions);
     get("sld_lengths", p.lengths);

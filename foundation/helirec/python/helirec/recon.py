@@ -44,7 +44,7 @@ DEFAULTS = dict(
     mode="corrected", filters=DEFAULT_CHAIN, margin=-1, n_grid=0, angular_tolerance_steps=5.0,
     luminosity_repartition=100.0, mend_threshold=1e-4, log_clip_min=1e-6, log_clip_max=10.0, block_angles=500,
     backprojector="fbp", grid_size=0, ghbp_legs=8, ghbp_reduction_steps=2, clip_outer_circle=True,
-    axis_source_meters=1e9, sld="", x_interp="sinc", z_interp="lanczos3", angle_interp="views", exposure_arc=0.0,
+    axis_source_meters=1e9, sld="", x_interp="sinc", z_interp="lanczos8", angle_interp="views", exposure_arc=0.0,
     angle_subset="", sharpness_weighting="auto", sharp_f=0.35, sharp_band="0.15:0.30",
     geometry="", row_time_us="",
 )
@@ -66,7 +66,10 @@ DEFAULTS = dict(
 #   Calibration.detector_blur_field; none if nothing significant) | "off" or ""
 #   | "a11:a12:a21:a22:c1:c2": that blur field given outright, for the band-dependent redundancy weights
 #   (pipeline.hpp); sharp_f, sharp_band = "f1:f2": the frequency the weights are taken at, and the crossover band.
-# z_interp: lanczos3 | cubic | linear, the vertical interpolation of a slice's (fractional) detector row.
+# z_interp: lanczos8 (default since 2026-11-12) | lanczos3 | cubic | linear, the vertical interpolation of a slice's
+#   (fractional) detector row. lanczos8 (16 rows) keeps the signal along the axis to 0.40 cycles per row (0.90 of its
+#   amplitude at 0.45) where lanczos3 (6 rows, the default before) keeps 0.82 and 0.68; next to unmeasured rows and
+#   the detector's ends both fall back to linear.
 # angle_interp: views (default since 2026-11-11: every projection in a sinogram row of its own, filtered and
 #   backprojected at its own angle; views of a slice a turn apart, or a turn at rest and the helix, share a grid angle
 #   but were not recorded at the same angle, by the turn's excess over a whole number of steps and by the rows'
@@ -120,7 +123,7 @@ CONVENTIONS = {
                       column_offset="x_interp (sinc by default: rows shifted exactly; lanczos3 for measured-only gridding); "
                                     "linear splat next to unmeasured columns",
                       luminosity_window="full 25 rows (12 context rows read either side of a chunk)",
-                      row_position="z_interp kernel (lanczos3 by default); linear next to unmeasured rows",
+                      row_position="z_interp kernel (lanczos8 by default); linear next to unmeasured rows",
                       angular_gridding="angle_interp (views by default: a sinogram row per projection, each at its "
                                        "measured angle; nearest: one bin of one turn, the bin's mean measured angle; "
                                        "ghbp and linear: two-bin splat)",

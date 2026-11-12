@@ -61,10 +61,11 @@ struct ReconConfig {
     std::string sharpness_weighting;
     double sharp_f = 0.35;
     std::string sharp_band = "0.15:0.30";
-    // vertical position of a slice in a projection (a fractional detector row): "lanczos3" (default) or "cubic"
-    // (6 / 4 rows; accumulate.hpp), or "linear" = the reference's two rows, a triangle kernel along z (sinc^2). The
-    // legacy reference mode always interpolates linearly.
-    std::string z_interp = "lanczos3";
+    // vertical position of a slice in a projection (a fractional detector row): "lanczos8" (default), "lanczos3" or
+    // "cubic" (16 / 6 / 4 rows; accumulate.hpp), or "linear" = the reference's two rows, a triangle kernel along z
+    // (sinc^2). lanczos8 keeps the top of the band along the axis that lanczos3 loses (above 0.3 cycles per row) and
+    // reads 10 more rows of every projection per chunk. The legacy reference mode always interpolates linearly.
+    std::string z_interp = "lanczos8";
     // angular gridding: "nearest" (default) = each projection whole in one bin and every slice backprojected at the
     // measured mean angle of each bin (helical.hpp nearest_angle_bins): no angular averaging; "linear" = the
     // reference's splat of each projection over the two grid angles around its own. Nearest needs a backprojector that

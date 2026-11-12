@@ -9,7 +9,9 @@
 //   T / (1 + f) = M - G,   G = S * M,   S^ = f t^ / (1 + f t^)       (the "glare")
 // S is smooth (scale l), so G is computed from frames box-binned by `bin` and sampled bilinearly. What the bins
 // do not resolve of S is under f t^(pi / bin) of the fine-scale contrast (about 0.3 % of it for the defaults).
-// Outside the detector the scintillator is taken as dark.
+// Outside the detector the scintillator is taken as dark, or (lit_outside) as lit like the detector's nearest edge:
+// the frame is then continued by its edge values over the padding. Where the beam is wider than the detector's
+// field the second is nearer the truth: light from beyond the field reaches the pixels near the edge.
 //
 // In the reconstruction (SliceReconstructor, ReconConfig::sld) the glare of the normalised signal
 // (raw - dark) / current is subtracted before the flat division: the flats are corrected once, and the glare of
@@ -30,6 +32,7 @@ struct SldParams {
     double length = 100;   // l: damping length of the tail (detector pixels)
     int bin = 8;           // box binning of the frames the glare is computed from
     int stride = 10;       // every stride-th projection gets its own glare map
+    bool lit_outside = false;   // binned profile: beyond the detector the frame continues by its edge values (else dark)
     // BM18: full-resolution, unit-mass PSF, multiple tails and illuminated borders.
     // Python's BM18 profile defaults to bin=1, stride=1, borders=100 detector pixels.
     bool bm18 = false;

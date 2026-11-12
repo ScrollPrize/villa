@@ -363,7 +363,7 @@ def test_scan_through_a_detector_map(tmp_path, device):
     other = dict(x_interp="lanczos3")
     assert np.abs(gridded(frame_scan(tmp_path, "rows", None, ev, **rows_only), device, **other) -
                   gridded(frame_scan(tmp_path, "plain"), device, **other)).max() < BITS
-    # the default row kernel (lanczos3) at the rows the map gives: its own error on a ramp, 2 % of a row at worst
+    # the lanczos3 row kernel at the rows the map gives: its own error on a ramp, 2 % of a row at worst
     kernel = dict(z_interp="lanczos3")
     assert np.abs(gridded(frame_scan(tmp_path, "smooth", eu, ev, **MAP), device, **kernel) -
                   gridded(frame_scan(tmp_path, "plain"), device, **kernel)).max() < 3e-4
