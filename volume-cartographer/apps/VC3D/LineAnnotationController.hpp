@@ -60,6 +60,9 @@ class QTemporaryDir;
 namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; }
 namespace vc::fiber_tracer { class FiberPredictionField; }
 
+// LineAnnotationController::beginFiberMapSnapshot's state, opaque to other headers.
+struct FiberMapSnapshotDecodeState;
+
 class LineAnnotationController : public QObject
 {
     Q_OBJECT
@@ -381,6 +384,15 @@ public:
     bool ensureFiberInVolume(uint64_t id, bool prompt = false);
     [[nodiscard]] bool fiberBoundToVolume(uint64_t fiberId, const std::shared_ptr<Volume>& volume) const;
     [[nodiscard]] FiberMapSnapshot fiberMapSnapshot() const;
+    // The same snapshot in three steps, so its store reads run off the GUI
+    // thread: begin (GUI: volume, catalog, a seeded read context), decode
+    // (any thread: the store decodes, with temporary ids for new fibers),
+    // finish (GUI: runtime ids, cache merge, conversion, umbilicus). finish
+    // throws when the project or fiber store changed since begin.
+    using FiberMapSnapshotDecode = ::FiberMapSnapshotDecodeState;
+    [[nodiscard]] std::shared_ptr<FiberMapSnapshotDecode> beginFiberMapSnapshot() const;
+    static void decodeFiberMapSnapshot(FiberMapSnapshotDecode& decode);
+    [[nodiscard]] FiberMapSnapshot finishFiberMapSnapshot(FiberMapSnapshotDecode& decode) const;
     // The current volume's stored umbilicus for a status line only; nothing is
     // cached, so call it on user-visible state changes rather than per frame.
     [[nodiscard]] UmbilicusStatus umbilicusStatus() const;
@@ -563,6 +575,31 @@ private:
     using SideStripCancelCallback = std::function<bool()>;
 
     struct FiberReadContext;
+    // Runtime fiber ids for decodes made on a worker: known uuids keep their
+    // ids; new ones get temporary ids there and runtime ids only on the GUI
+    // (assignWorkerFiberIds), in the decoder's allocation order.
+    struct WorkerFiberIds {
+        std::unordered_map<std::string, uint64_t> ids;
+        std::vector<std::string> newUuids;
+        std::unordered_map<uint64_t, uint64_t> runtimeIds;
+        uint64_t nextTemporary = UINT64_MAX;
+    };
+    // GUI: complete decodes with their dependency records and the cache
+    // position (when the context reads the cached volume), plus known ids.
+    void seedWorkerFiberRead(FiberReadContext& read, WorkerFiberIds& ids) const;
+    // Worker: decodes allocate temporary ids for uuids without one.
+    static void useWorkerFiberIds(FiberReadContext& read, WorkerFiberIds& ids);
+    // GUI: runtime ids for every uuid the worker saw.
+    void assignWorkerFiberIds(WorkerFiberIds& ids) const;
+    // A worker decode with its fiber id and branch endpoint ids made runtime.
+    static StoredFiberPtr withRuntimeFiberIds(const StoredFiberPtr& decoded, const WorkerFiberIds& ids);
+    // The worker context's cached decodes with runtime ids (once, after
+    // assignWorkerFiberIds).
+    static void remapWorkerFiberCache(FiberReadContext& read, const WorkerFiberIds& ids);
+    // GUI: merge the (remapped) entries the worker decoded or confirmed back
+    // into the decode cache (pairs, older position), as side-strip queries
+    // always have.
+    void mergeWorkerFiberRead(FiberReadContext& read) const;
     struct SideStripLoadContext;
     struct SideStripIntersectionRequest {
         std::shared_ptr<SideStripLoadContext> load;
@@ -1119,9 +1156,25 @@ private:
     // decoded for editing. Branch refs resolve against their endpoints in the
     // same snapshot; missing and retired objects are skipped. Line points are
     // read on request, otherwise loaded on demand by ensureFiberLines().
+    // The published head a decode used (or found): record generation plus the
+    // numbered version, which relationship-only changes revise without a new
+    // record generation.
+    struct StoredFiberHeadState {
+        uint64_t generation = 0;
+        std::string versionGeneration;
+        int64_t version = 0;
+        bool operator==(const StoredFiberHeadState&) const = default;
+    };
+    static StoredFiberHeadState storedFiberHeadState(const vc::objects::ObjectRecord& record);
     struct StoredFiberDependencies {
-        std::map<std::string, std::optional<uint64_t>> peers;
+        // Each linked endpoint's head as the decode saw it; nullopt: absent.
+        std::map<std::string, std::optional<StoredFiberHeadState>> peers;
         std::set<std::string> relationships;
+        // The store position (store, history generation, commit sequence) at
+        // which this entry and these peers were last confirmed current, read
+        // before the reads it certifies. Equal to the store's current position
+        // => nothing was published since, so the entry is still exact.
+        std::optional<vc::objects::FeedCursor> validatedAt;
     };
     using FiberDependencies = std::unordered_map<std::string, StoredFiberDependencies>;
     [[nodiscard]] std::vector<StoredFiber> readStoredFibers(
@@ -1311,6 +1364,12 @@ private:
         const cv::Vec3d& seedPoint);
     [[nodiscard]] std::optional<int> storedBranchTargetControlPointIndex(
         const FiberBranchRef& branch) const;
+    // The same, resolving a target without an open pane from `stored`
+    // (canonical uuid -> decoded fiber, read once for all branches) instead of
+    // reading it.
+    [[nodiscard]] std::optional<int> storedBranchTargetControlPointIndex(
+        const FiberBranchRef& branch,
+        const std::unordered_map<std::string, StoredFiberPtr>& stored) const;
     [[nodiscard]] StoredFiberSessionSnapshot makeStoredFiberSessionSnapshot(
         LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
@@ -1327,10 +1386,47 @@ private:
     void flushSessionAutoSave(const std::string& surfaceName);
     [[nodiscard]] static nlohmann::json fiberSourceMetadata(const StoredFiber& fiber);
     friend int runObjectStoreControllerTests();
+    friend struct ::FiberMapSnapshotDecodeState;
     // Runtime handles <-> store identities; cleared with each attachment.
     mutable std::unordered_map<std::string, uint64_t> _fiberIdsByUuid;
     mutable std::unordered_map<uint64_t, std::string> _fiberUuidsById;
     mutable std::shared_ptr<QTemporaryDir> _fiberTransportDirectory;
+    // One publication in three parts: prepare (GUI: canonical snapshots,
+    // targets, expectations), execute (any thread: the store reads that build
+    // the operations, the durable submission, the saved heads), install (GUI:
+    // pins, ids, open sessions). commitFiberStoreAction runs all three.
+    struct FiberCommitJob {
+        vc::objects::AttachmentIdentity attachment;
+        std::vector<FiberSaveSnapshot> edits;
+        std::vector<StoredFiber> targets, retired;
+        vc::objects::TransactionRequest request;
+        const StoredFiber& fiberFor(uint64_t id) const
+        {
+            for (const auto& edit : edits) if (edit.fiber.id == id) return edit.fiber;
+            for (const auto& fiber : targets) if (fiber.id == id) return fiber;
+            throw std::runtime_error("Branch endpoint no longer exists");
+        }
+    };
+    struct FiberCommitResult {
+        vc::objects::TransactionReceipt receipt;
+        std::vector<std::optional<vc::objects::ObjectRevision>> saved;
+    };
+    [[nodiscard]] FiberCommitJob prepareFiberCommit(const std::vector<FiberSaveSnapshot>& snapshots,
+                                                    const std::vector<StoredFiber>& retired) const;
+    static void buildFiberCommitOperations(FiberCommitJob& job, const vc::objects::StoreReader& reader);
+    static FiberCommitResult executeFiberCommit(FiberCommitJob& job, vc::objects::ObjectStoreSession& connection);
+    // An edit the store's current state refuses as built (not a transport failure).
+    struct FiberCommitRefused : std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
+    // The saved heads of a committed job.
+    static void readSavedFiberHeads(const FiberCommitJob& job, vc::objects::ObjectStoreSession& connection,
+                                    FiberCommitResult& result);
+    void installFiberCommit(FiberCommitJob& job, const FiberCommitResult& result);
+    // The fiber and umbilicus attachments the controller last reset for;
+    // true (and updated) when either route changed since.
+    std::optional<vc::objects::AttachmentIdentity> _observedFiberStore, _observedUmbilicusStore;
+    bool observedStoreRoutesChanged();
     void commitFiberStoreAction(std::vector<FiberSaveSnapshot>& snapshots,
                                const std::vector<StoredFiber>& retired = {});
     void commitFibers(std::initializer_list<StoredFiber*> fibers);
@@ -1512,8 +1608,80 @@ private:
     mutable FiberDependencies _storedFiberDependencies;
     // The store's feed position when the decode cache was last checked.
     mutable std::optional<vc::objects::FeedCursor> _storedFiberCachePosition;
+    // Bounded stale validation (hosted fiber store, GUI thread): inside one
+    // HostedStatusScope the decode cache's fast path may answer from the
+    // store status first read in that scope. Kept only while this session's
+    // hosted write state is the one recorded (no transaction of ours started,
+    // ended or was found committed since), only at scope depth 1, and only
+    // until another status read of the scope sees a different position.
+    struct HostedStatusMemo {
+        vc::objects::AttachmentIdentity attachment;
+        vc::objects::HostedWriteState writes;
+        vc::objects::StoreStatus status;
+    };
+    mutable std::optional<HostedStatusMemo> _hostedStatusMemo;
+    // A status read by this scope's validation that may become the memo once
+    // the read returns; any different position observed meanwhile drops it.
+    mutable std::optional<vc::objects::StoreStatus> _hostedStatusCandidate;
+    mutable int _hostedStatusScopeDepth = 0;
+    // The GUI thread's event-delivery count when the open scope began: any
+    // event delivered since (a nested event loop: modal dialogs, processEvents,
+    // queued callbacks run inside one) ends memo use for the rest of the scope.
+    mutable uint64_t _hostedStatusScopeDispatch = 0;
+    [[nodiscard]] bool hostedStatusMemoEligible() const;
+    void noteObservedStoreStatus(const vc::objects::AttachmentIdentity&, const vc::objects::StoreStatus&) const;
+    // Opened by top-level GUI handlers only. A scope entered while another is
+    // open (re-entry through a nested event loop) gets no memo and drops the
+    // outer one when it closes.
+    class HostedStatusScope {
+    public:
+        explicit HostedStatusScope(const LineAnnotationController& controller);
+        ~HostedStatusScope();
+        HostedStatusScope(const HostedStatusScope&) = delete;
+        HostedStatusScope& operator=(const HostedStatusScope&) = delete;
+    private:
+        const LineAnnotationController& _controller;
+    };
+    // The hosted fiber store as this controller knows it without asking
+    // (GUI thread): the feed position through which every commit has been
+    // applied to the decode cache, either by a delivered store event or as
+    // this controller's own commit made directly after it. The cache's fast
+    // path validates against it instead of reading the store's status, so a
+    // read of cached fibers makes no request; another client's commit is seen
+    // when its event arrives (the attachment's poll interval), and a save
+    // built from a decode that turned stale meanwhile conflicts on the
+    // decode's pinned version. Unset until the attachment's first completed
+    // check, after a revalidation, and for local attachments.
+    mutable std::optional<vc::objects::FeedCursor> _fiberStoreView;
+    // Test seam: off, every validation reads the store's status (the path
+    // workers and local attachments use).
+    static inline bool s_fiberStoreViewDefault = true;
+    bool _fiberStoreViewEnabled = s_fiberStoreViewDefault;
+    mutable std::optional<vc::objects::AttachmentIdentity> _fiberStoreViewAttachment;
+    [[nodiscard]] std::optional<vc::objects::FeedCursor> fiberStoreView(
+        const vc::objects::AttachmentIdentity& attachment) const;
+    // A delivered event of the fiber attachment: entries changed by commits
+    // after the view are dropped, the others move to the event's position.
+    void applyFiberStoreEvent(const vc::objects::StoreSessionEvent& event);
+    // This controller's own commit: entries it changed are dropped; when it
+    // directly follows the view, the view (and what stayed) moves to it.
+    void applyOwnFiberCommit(const vc::objects::AttachmentIdentity& attachment,
+                             const vc::objects::TransactionReceipt& receipt);
+    void advanceFiberStoreView(const vc::objects::FeedCursor& position);
+    // Drops cached decodes of these records and of fibers depending on them.
+    void dropStoredFiberDecodes(const vc::objects::AttachmentIdentity& attachment, const std::set<std::string>& changed,
+                                const std::vector<std::string>& changedBranches);
+    // Test seam: status reads made by cache validations.
+    mutable uint64_t _storedFiberStatusReads = 0;
     // The voxels _storedFiberDecodeCache was decoded in.
     mutable vc::objects::VolumeVoxels _storedFiberDecodeVolume;
+    // Whether the cached decodes were read with a current volume (decoding
+    // branches on it), part of the cache's compatibility like the target.
+    mutable bool _storedFiberDecodeHasVolume = false;
+    // Test seam: storedFibersShared validations answered from the store
+    // position alone (fast) vs by listing heads (slow).
+    mutable uint64_t _storedFiberFastValidations = 0, _storedFiberSlowValidations = 0;
+    std::function<void(const char*)> _fiberReadTestStage;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {
