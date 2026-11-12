@@ -36,6 +36,7 @@ from vesuvius.ink_detection.training.dilation import (
 )
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
 from vesuvius.ink_detection.training.metrics import BalancedAccuracy, Confusion
+from vesuvius.ink_detection.training.scan_transfer import ScanTransfer
 from vesuvius.ink_detection.training.stitching import run_model_forward
 from vesuvius.ink_detection.types import ConfusionCounts, MetricBatch, SamplingPolicy
 from vesuvius.ink_detection.training.visualization import (
@@ -764,6 +765,12 @@ def _run_training(request: TrainingRequest) -> int:
     def get_model_input(batch):
         return prepare_model_input(batch, config)
 
+    scan_transfer = (
+        None
+        if config.scan_transfer is None
+        else ScanTransfer.from_config(config.scan_transfer, accelerator.device)
+    )
+
     for step in progress:
         model.train()
         if frozen_encoder is not None:
@@ -787,6 +794,8 @@ def _run_training(request: TrainingRequest) -> int:
             batch = apply_label_dilation(
                 batch, label_distance, supervision_distance
             )
+        if scan_transfer is not None:
+            batch["image"] = scan_transfer(batch["image"])
 
         with accelerator.accumulate(model):
             with accelerator.autocast():

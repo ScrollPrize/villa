@@ -185,6 +185,7 @@ where = ["src"]
 vesuvius = [
     "install/configs/cubes.yaml",
     "ink_detection/configs/*.json",
+    "ink_detection/configs/scan_transfer/*.json",
     "tifxyz_label_transfer/*.cpp",
     "tifxyz_label_transfer/*.md",
     "tifxyz_label_transfer/docs/*.md",
