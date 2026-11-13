@@ -222,11 +222,11 @@ int main(int argc, char** argv)
         ("zfit", po::value<double>()->default_value(0.0),
             "Fit one smooth axis through all the estimates before writing: each control point "
             "becomes a robust local-linear fit (LOWESS) of the estimates within this many voxels "
-            "of its z, in the frame the points are written in, so a slice that walked off the "
-            "axis is outvoted by its neighbours. 0 writes every slice's own median, as before. "
-            "Measured setting: about 4.7 mm, i.e. 500 at 9.4 um or 2000 at 2.4 um. The window "
-            "needs several slices in it, so estimate every 256 slices or closer. The raw "
-            "estimates stay in --csv")
+            "of its z, in the frame the points are written in, so each point is smoothed with "
+            "its neighbours along z. 0 writes every slice's own median, as before. Measured "
+            "setting: about 4.7 mm, i.e. 500 at 9.4 um or 2000 at 2.4 um, with --uncrush 1.5 "
+            "and one slice every 256. A window with one slice each side smooths but cannot drop "
+            "a slice that is far off the axis. The raw estimates stay in --csv")
         ("repeats", po::value<int>()->default_value(1),
             "Estimates per slice. The control point written is their coordinatewise median")
         ("threads", po::value<int>()->default_value(1),
@@ -502,6 +502,14 @@ int main(int argc, char** argv)
             }
         }
         fitted = fit_umbilicus_along_z(all, queryZ, zfit);
+        bool reaches = false;
+        for (size_t q = 1; q < queryZ.size(); ++q) {
+            reaches = reaches || queryZ[q] - queryZ[q - 1] < zfit;
+        }
+        if (!reaches) {
+            std::cerr << "Warning: --zfit " << zfit << " does not reach a neighbouring slice, so "
+                      << "nothing is fitted along z." << std::endl;
+        }
     }
 
     // One control point per slice, the coordinatewise median of that slice's repeats (or the fit
