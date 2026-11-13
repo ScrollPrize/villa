@@ -329,6 +329,7 @@ vc_add_test(NAME test_post_process SOURCES test_post_process.cpp
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_surface_meshing)
+vc_add_test(NAME test_inpaint_surface LIBS doctest::doctest vc_inpaint)
 
 # These spawn the built command-line tools, so they only exist in
 # configurations that build the apps -- the test shards configure with
