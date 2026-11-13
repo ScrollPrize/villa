@@ -3,7 +3,7 @@ import numpy as np
 from . import fiber_uv_layout as uv
 
 
-def split_graph(d, config, protected_sources=()):
+def split_graph(d, config, protected_sources=(), *, source_version=None):
     target=float(config.get('split_target_length_vx',0))
     if target==0:return d
     minimum=int(config.get('split_min_perpendicular',4))
@@ -15,7 +15,8 @@ def split_graph(d, config, protected_sources=()):
     from .fiber_normal_sign_visualization import load_umbilicus_frame
     volume=fiber_volume(config['fibers'])
     axis=load_umbilicus_frame(config['umbilicus'],volume)
-    curves={r['id']:xyz for r,xyz in read_polylines(config['fibers'],np.unique(d['source_id']),volume=volume)}
+    curves={r['id']:xyz for r,xyz in read_polylines(config['fibers'],np.unique(d['source_id']),volume=volume,
+                                                source_version=source_version)}
     return split_graph_geometry(d,target,minimum,curves,axis,config.get('h_convention','ccw'),protected_sources)
 
 

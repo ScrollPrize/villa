@@ -12,7 +12,8 @@ void checked(sqlite3* db) {
     if (!activeStatementPools.at(db)->checkedAction) throw std::runtime_error("structural editing requires a checked write (expected versions)");
 }
 void requireSource(sqlite3* db,const std::string& uuid) {
-    execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", uuid);
+    if (!historyEnabled(db)) return;
+    execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", parseUuid(uuid));
 }
 std::vector<int64_t> idsOf(GeometryReader& reader,const std::string& ids,int64_t count) {
     std::vector<int64_t> values(count);
@@ -22,7 +23,15 @@ std::vector<int64_t> idsOf(GeometryReader& reader,const std::string& ids,int64_t
     if (geometryWork) geometryWork->identityRows+=values.size();
     return values;
 }
+// maxBytes (when set): stop with std::nullopt as soon as the encoded values
+// read so far exceed it (at most one entry beyond the budget is unpacked).
+std::optional<Json> annotationsWithin(const Txn& txn,const GeometryRevision& revision,GeometryReader& reader,
+                                      const std::string& name,std::optional<size_t> maxBytes);
 Json annotations(const Txn& txn,const GeometryRevision& revision,GeometryReader& reader,const std::string& name) {
+    return *annotationsWithin(txn,revision,reader,name,std::nullopt);
+}
+std::optional<Json> annotationsWithin(const Txn& txn,const GeometryRevision& revision,GeometryReader& reader,
+                                      const std::string& name,std::optional<size_t> maxBytes) {
     const auto count=reader.manifest().at("arrays").at(name).at("shape").at(0).get<int64_t>();
     auto result=Json(std::vector<Json>(count,Json::object()));
     const auto& state = reader.manifest().at("sequences").at(name);
@@ -31,13 +40,33 @@ Json annotations(const Txn& txn,const GeometryRevision& revision,GeometryReader&
     MetadataSnapshot snapshot(db, state.at(ids.empty() ? "annotations" : "identities"));
     const auto values = ids.empty() ? std::vector<int64_t>() : idsOf(reader, ids, count);
     std::vector<bool> seen(count);
-    snapshot.entries([&](int64_t id, const auto& value) {
-        const int64_t row = ids.empty() ? id : value.at("row").template get<int64_t>();
-        if (row < 0 || row >= count || seen[row] || (!ids.empty() && values[row] != id))
-            throw std::runtime_error("invalid annotation row");
-        seen[row] = true;
-        result[row] = unpackAnnotation(db, ids.empty() ? value : value.at("annotation"));
-    });
+    // The encoded array: brackets, a separator and "{}" per row as the
+    // default; each value replaces its row's default.
+    size_t bytes = 2 + size_t(count) * 3;
+    if (maxBytes && bytes > *maxBytes) return std::nullopt;
+    bool exceeded = false;
+    struct Exceeded {};
+    try {
+        snapshot.entries([&](int64_t id, const auto& value) {
+            const int64_t row = ids.empty() ? id : value.at("row").template get<int64_t>();
+            if (row < 0 || row >= count || seen[row] || (!ids.empty() && values[row] != id))
+                throw std::runtime_error("invalid annotation row");
+            seen[row] = true;
+            const auto& packed = ids.empty() ? value : value.at("annotation");
+            if (maxBytes) {
+                // The packed form states its size: checked before anything is
+                // loaded or parsed.
+                const size_t size = packed.contains("inline") ? packed.at("inline").dump().size()
+                                                              : packed.at("byte_length").template get<size_t>();
+                bytes += size;
+                if (bytes > *maxBytes) throw Exceeded{};
+            }
+            result[row] = unpackAnnotation(db, packed);
+        });
+    } catch (const Exceeded&) {
+        exceeded = true;
+    }
+    if (exceeded) return std::nullopt;
     if (!ids.empty() && std::find(seen.begin(), seen.end(), false) != seen.end())
         throw std::runtime_error("missing point identity");
     return result;
@@ -63,6 +92,28 @@ nlohmann::json ObjectStore::geometryPointAnnotations(const Txn& txn,const std::s
     GeometryReader reader(txn,revision);
     return annotations(txn,*r,reader,name);
 }
+int64_t ObjectStore::nextGeometryPointId(const Txn& txn,const std::string& object,const std::string& array) const {
+    const auto current=objectByUuid(txn,object);
+    if(current&&sequenceIdArray(current->kind,array).empty())throw std::invalid_argument("sequence has no stable point IDs");
+    MetadataCacheScope cache;
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    MetadataSnapshot allocated(db);
+    mergeRetainedAllocations(db,object,array,allocated);
+    int64_t next=0;
+    allocated.entries([&](int64_t id,const auto&){
+        if(id==INT64_MAX)throw std::overflow_error("geometry point IDs exhausted");
+        next=std::max(next,id+1);
+    });
+    return next;
+}
+std::optional<nlohmann::json> ObjectStore::geometryPointAnnotationsWithin(const Txn& txn,const std::string& revision,
+                                                                          const std::string& name,size_t maxBytes) const {
+    MetadataCacheScope cache;
+    const auto r=geometryRevision(txn,revision);
+    if (!r) throw std::invalid_argument("geometry revision not found");
+    GeometryReader reader(txn,revision);
+    return annotationsWithin(txn,*r,reader,name,maxBytes);
+}
 std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& objectId,const GeometrySequenceEdit& edit,
     const std::string& expected,const std::vector<GeometryEdgeEdit>& edges)
 {
@@ -70,7 +121,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
     auto* db=static_cast<sqlite3*>(connection(txn)); checked(db); Savepoint savepoint(db); MetadataCacheScope cache;
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
-        if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
+        if (!current || current->uuid!=canonicalGeometryToken(expected)) historyConflict(db,"geometry: current revision changed; reload before committing");
         if (current->kind=="surface" || (current->kind=="fiber" ? edit.array!="control_points" && edit.array!="line_points" : edit.array!="points"))
             throw std::invalid_argument("invalid structural sequence array");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
@@ -85,14 +136,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
         std::vector<int64_t> originalIds;
         if(!idsName.empty()) {
             originalIds=idsOf(reader,idsName,oldCount);
-            // Restoration must not allow a previously allocated ID to be reused.
-            Statement latest(db,"SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation DESC,rowid DESC LIMIT 1",
-                parseUuid(uuid));
-            if(latest.row()) {
-                const auto tip=Json::parse(latest.text(0));
-                if(tip.at("sequences").at(edit.array).at("allocated")!=state.at("allocated"))
-                    allocated.mergeAllocated(MetadataSnapshot(db,tip.at("sequences").at(edit.array).at("allocated")));
-            }
+            mergeRetainedAllocations(db,uuid,edit.array,allocated);
         }
         const auto tail=edit.start+edit.eraseCount;
         std::set<int64_t> liveIds;
@@ -120,6 +164,9 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
                 partCoords=source.read(edit.array,part.start*stride,part.count*stride);
                 if(!idsName.empty()) {
                     pointIds.resize(part.count);copyScalars<int64_t>(source.read(idsName,part.start*8,part.count*8),pointIds);
+                    if(sourceRevision->objectUuid!=uuid)
+                        for(auto id:pointIds)if(!allocated.get(id).is_null())
+                            throw std::invalid_argument("foreign point ID already allocated by target; reference target history to restore it");
                 }
                 const auto all=annotations(txn,*sourceRevision,source,edit.array);
                 pointAttrs=Json::array();for(auto i=part.start;i<part.start+part.count;++i)pointAttrs.push_back(all.at(i));
@@ -185,7 +232,7 @@ std::string ObjectStore::resizeSurface(WriteTxn& txn,const std::string& objectId
     auto* db=static_cast<sqlite3*>(connection(txn)); checked(db); Savepoint savepoint(db); MetadataCacheScope cache;
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
-        if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
+        if (!current || current->uuid!=canonicalGeometryToken(expected)) historyConflict(db,"geometry: current revision changed; reload before committing");
         if (current->kind!="surface") throw std::invalid_argument("surface resize requires a surface");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
         if (resize.rows<0 || resize.columns<0) throw std::invalid_argument("negative surface shape");

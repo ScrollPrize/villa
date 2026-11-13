@@ -82,10 +82,8 @@ def export_store(out, destination=None, template=None, ct=None):
             raise SystemExit(f'{store} is not a Vesuvius open-data store: pass a fiber store of the same scan as the '
                              'template of its volume (--template / --fibers-template)')
         volume = ct_volume[1]
-    tmp = destination.with_name(destination.stem+'.writing.vcobj')
-    tmp.unlink(missing_ok=True)
-    counts = write_fibers(tmp, run_fibers(out, float(record['grid_scale']), record['fiber_namespace']), volume=volume)
-    tmp.replace(destination)
+    counts = write_fibers(destination, run_fibers(out, float(record['grid_scale']), record['fiber_namespace']),
+                          volume=volume, replace=True)
     return dict(fibers=counts['fibers'], points=counts['points'], volume=volume, path=str(destination))
 
 

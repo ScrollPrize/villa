@@ -199,11 +199,14 @@ int main(int argc, char *argv[])
     // Source tifxyz (optional): provides the scale that sizes the output grid
     // to the input sampling density. Absent -> legacy metric sizing.
     nlohmann::json sourceMeta = nlohmann::json::object();
+    std::unique_ptr<StoreSurfaces> store;
     if (!tifxyz_source.empty() || !source_surface.empty()) {
         try {
+            if (!source_surface.empty())
+                store = std::make_unique<StoreSurfaces>(store_output.store, "vc_obj2tifxyz");
             std::unique_ptr<QuadSurface> src(source_surface.empty()
                 ? load_quad_from_tifxyz(tifxyz_source)
-                : StoreSurfaces(store_output.store, "vc_obj2tifxyz").load(source_surface));
+                : store->load(source_surface));
             if (src->meta.is_object())
                 sourceMeta = src->meta;
             const cv::Vec2f s = src->scale();
@@ -214,7 +217,11 @@ int main(int argc, char *argv[])
             } else {
                 std::cerr << "warning: source scale invalid; falling back to metric sizing\n";
             }
-        } catch (...) {
+        } catch (const std::exception& error) {
+            if (!source_surface.empty()) {
+                std::cerr << "Error loading source surface: " << error.what() << "\n";
+                return EXIT_FAILURE;
+            }
             std::cerr << "warning: could not load tifxyz source: " << tifxyz_source << "\n";
         }
     }
@@ -233,10 +240,10 @@ int main(int argc, char *argv[])
     if (!store_output.store.empty()) {
         try {
             nlohmann::json parameters = {{"input", obj_path.filename().string()}, {"arguments", std::vector<std::string>(argv + 2, argv + argc)}};
-            StoreSurfaces store(store_output.store, std::filesystem::path(argv[0]).filename().string());
-            const auto uuid = store.create(*surf, store_output.name.empty() ? obj_path.stem().string() : store_output.name,
+            if (!store) store = std::make_unique<StoreSurfaces>(store_output.store, "vc_obj2tifxyz");
+            const auto uuid = store->create(*surf, store_output.name.empty() ? obj_path.stem().string() : store_output.name,
                                            parameters, source_surface.empty() ? std::vector<std::string>{} : std::vector<std::string>{source_surface}, store_output.tags, store_output.volume);
-            store.objects().finish();
+            store->objects().finish();
             std::cout << "surface_uuid: " << uuid << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "Error storing surface: " << e.what() << std::endl;

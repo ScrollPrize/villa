@@ -116,9 +116,12 @@ def prepare(config):
         return
     from .fiber_hv_stage import verify_feature_source
     from .fiber_normal_sign_visualization import umbilicus_frame
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, fiber_volume, read_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
+        fiber_catalog, fiber_source_version, fiber_volume, read_polylines)
     started=time.monotonic();cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
-    signature={key:(fibers_digest if key=='fibers' else sha256_file)(config[key]) for key in ('database','features','stage1','hv_solution','fibers','umbilicus')}
+    source_version=fiber_source_version(config['fibers'])
+    signature={key:sha256_file(config[key]) for key in ('database','features','stage1','hv_solution','umbilicus')}
+    signature.update(fibers=fibers_digest(config['fibers'],source_version=source_version),fiber_source=source_version)
     signature.update(version=2,minimum_length_mm=config.get('minimum_length_mm',10.),
                      sign_cosine_min=config.get('sign_cosine_min',.1),pilot_fibers=config.get('pilot_fibers',0))
     signature['keep_whole_fibers']=bool(config.get('keep_whole_fibers',False))
@@ -130,7 +133,9 @@ def prepare(config):
         signature.update(version=3,layout_mode='shared_anchor',h_convention=config.get('h_convention','ccw'))
         signature.update({key:sha256_file(config[key]) for key in ('h_direction_solution','v_direction_solution')})
     if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
-    feature=json.loads(Path(config['features']).read_text());verify_feature_source(config['database'],feature)
+    feature=json.loads(Path(config['features']).read_text())
+    if verify_feature_source(config['database'],feature)['fiber_source']!=source_version:
+        raise ValueError('Geometry/source version mismatch')
     hv_summary=json.loads((Path(config['hv_solution']).parent/'summary.json').read_text())
     if (hv_summary['input']['signature']['database']!=signature['database'] or
             hv_summary['input']['signature']['stage1']!=signature['stage1']):raise ValueError('H/V input mismatch')
@@ -149,7 +154,7 @@ def prepare(config):
     pilot=int(config.get('pilot_fibers',0))
     if pilot:
         # Deterministic central-z induced subgraph, used ONLY for timing pilot.
-        catalog=fiber_catalog(config['fibers'],volume)
+        catalog=fiber_catalog(config['fibers'],volume,source_version=source_version)
         if [r['id'] for r in catalog]!=ids.tolist():raise ValueError('Pilot fiber store IDs mismatch')
         zmid=np.asarray([(r['bbox'][2]+r['bbox'][5])/2 for r in catalog])
         center=np.median(zmid[kept]);select=np.flatnonzero(kept)
@@ -188,7 +193,8 @@ def prepare(config):
     phase=np.empty(2*ecount,np.float32);zpos=np.empty(2*ecount,np.float32)
     pieces=[];links=[];nodes=[]
     minimum=signature['minimum_length_mm']/voxel_size_mm
-    geometry=read_polylines(config['fibers'],ids[kept],volume=volume);print('UV prepare: events loaded; deriving pieces',flush=True)
+    geometry=read_polylines(config['fibers'],ids[kept],volume=volume,source_version=source_version)
+    print('UV prepare: events loaded; deriving pieces',flush=True)
     for fi,(row,xyz) in enumerate(geometry):
         idx=np.searchsorted(ids,row['id']);family=labels[idx]
         if anchored(config):

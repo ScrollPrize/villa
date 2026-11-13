@@ -6,6 +6,8 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <nlohmann/json.hpp>
 #include <iostream>
+#include <algorithm>
+#include <cctype>
 using namespace vc::objects;
 using Json = nlohmann::json;
 namespace {
@@ -13,10 +15,11 @@ namespace {
 std::vector<ObjectVersion> versionsOf(const StoreReader& reader, const VersionSelection& pins)
 {
     std::vector<ObjectVersion> result;
-    const auto status = reader.status();
     for (const auto& [uuid, pin] : pins) {
         if (!pin) throw std::runtime_error("pin without a recorded version");
-        result.push_back({status.storeUuid, status.generation, uuid, *pin});
+        const auto selected = reader.selectedObject(uuid, *pin);
+        if (!selected) throw std::runtime_error("pin version is not available");
+        result.push_back(selected->reference());
     }
     return result;
 }
@@ -71,12 +74,16 @@ int main() try {
     });
     require(receipt.size() == 1 && receipt.at(uuid).has_value(), "commit returns exact new pin");
     auto external = ObjectStore::open(path, options);
-    { auto txn = external.write(receipt); external.setMeta(txn,uuid,"external","true");
+    { auto txn = external.writeNumbered(receipt); external.setMeta(txn,uuid,"external","true");
       auto changed = source; changed["control_points_attributes"][0]["tags"] = {"changed"};
       mustFail([&] { external.setMeta(txn, uuid, "source", changed.dump()); }); txn.commit();
       require(txn.receipt()->objects.at(uuid) != receipt.at(uuid), "external commit produces different pin"); }
     storeReader(store,[&](const StoreReader& reader,const auto&) {
         const auto pinned = versionsOf(reader, receipt).front();
+        auto uppercase = uuid;
+        std::transform(uppercase.begin(), uppercase.end(), uppercase.begin(), [](unsigned char c) { return std::toupper(c); });
+        require(fiberNetworkJson(reader, {pinned}, {uppercase}) == fiberNetworkJson(reader, {pinned}, {uuid}),
+                "export traversal normalizes UUID spelling before visited/pinned lookup");
         require(reader.objectsAtVersions({pinned}).front()->record.meta.find("external") == std::string::npos, "receipt is immutable after external commit");
         const auto historical=Json::parse(fiberVersionJson(reader,pinned));
         require(historical["control_points"]==root["control_points"] && historical["line_points"]==root["line_points"], "pinned wire geometry and annotations");
@@ -178,7 +185,6 @@ int main() try {
     });
     storeAct(store, currentNetworkPins, [&](auto& db, auto& txn) {
         db.retireObject(txn, b);
-        db.keepRecordedRelationship(txn, adjacent);
     });
     storeReader(store, [&](const StoreReader& reader, const auto&) {
         for (auto& [objectUuid, pin] : currentNetworkPins) pin = reader.currentObject(objectUuid)->version;

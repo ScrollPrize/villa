@@ -321,7 +321,11 @@ objects::PreparedOperation prepareLinkObjects(objects::ObjectStore& store, const
     {
         // The marker's version under the same snapshot: concurrent link runs
         // conflict on it even when they read disjoint objects.
-        result.expectedObjects[linkMarkerUuid()] = store.currentVersion(prepared->inputs->txn(), linkMarkerUuid());
+        const auto marker = store.currentObjectRevision(prepared->inputs->txn(), linkMarkerUuid());
+        if (marker) {
+            result.expectedObjects[linkMarkerUuid()] = marker->reference();
+            result.expectedObjects[linkMarkerUuid()].deleted = marker->deleted;
+        } else result.expectedObjects[linkMarkerUuid()] = std::nullopt;
     }
     // A detector that could not run (a bad normal source, missing inputs,
     // ...) fails the request: no step's links are published and the marker

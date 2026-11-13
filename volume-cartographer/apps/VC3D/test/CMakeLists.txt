@@ -200,6 +200,7 @@ target_include_directories(test_spiral_point_collection_edit PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 target_link_libraries(test_spiral_point_collection_edit PRIVATE
+    vc_object_store::vc_objects
     Qt6::Core
     Qt6::Gui
     Qt6::Test
@@ -252,6 +253,13 @@ target_link_libraries(test_spiral_store_edits PRIVATE vc_core Qt6::Core Qt6::Gui
 add_test(NAME spiral_store_edits COMMAND test_spiral_store_edits)
 vc_register_test_target(test_spiral_store_edits)
 vc_register_ctest(spiral_store_edits test_spiral_store_edits)
+add_executable(test_store_region_requests test_store_region_requests.cpp)
+set_target_properties(test_store_region_requests PROPERTIES AUTOMOC ON)
+target_include_directories(test_store_region_requests PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_store_region_requests PRIVATE vc_core vc_fiber_view Qt6::Core Qt6::Concurrent Qt6::Test)
+add_test(NAME store_region_requests COMMAND test_store_region_requests)
+vc_register_test_target(test_store_region_requests)
+vc_register_ctest(store_region_requests test_store_region_requests)
 
 add_executable(test_spiral_preview_provenance
     test_spiral_preview_provenance.cpp)
@@ -280,6 +288,7 @@ target_include_directories(test_spiral_updated_drafts PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 target_link_libraries(test_spiral_updated_drafts PRIVATE
+    vc_object_store::vc_objects
     Qt6::Core
     Qt6::Test)
 
@@ -675,7 +684,13 @@ if(TARGET VC3D)
     set_tests_properties(scene_3d_panel PROPERTIES TIMEOUT 180)
     add_test(NAME object_store_vc3d_controller COMMAND VC3D --test-object-store)
     set_tests_properties(object_store_vc3d_controller PROPERTIES
-        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 180)
+    # Its hosted part runs against vc_object_server: named here so that a
+    # build without the binary fails the test instead of skipping that part.
+    if(TARGET vc_object_server_app)
+        set_property(TEST object_store_vc3d_controller APPEND PROPERTY
+            ENVIRONMENT "VC3D_OBJECT_SERVER_BIN=$<TARGET_FILE:vc_object_server_app>")
+    endif()
     vc_register_test_target(VC3D)
     vc_register_ctest(scene_3d_panel VC3D)
     vc_register_ctest(object_store_vc3d_controller VC3D)

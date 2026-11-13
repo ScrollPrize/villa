@@ -1,8 +1,7 @@
 #include "vc/core/StoredCollection.hpp"
 
 #include <nlohmann/json.hpp>
-
-#include <map>
+#include <vc_object_store/geometry/PointMap.hpp>
 
 namespace vc {
 
@@ -14,15 +13,9 @@ vc::objects::AttachedCollection storedCollection(const nlohmann::json& json)
     stored.name = collection.value("name", std::string{});
     stored.source = collection;
     for (const auto* key : {"points", "uuid", "name"}) stored.source.erase(key);
-    std::map<int64_t, nlohmann::json> ordered;
-    for (const auto& [key, value] : collection.at("points").items()) ordered.emplace(std::stoll(key), value);
-    for (const auto& [pointId, entry] : ordered) {
-        stored.points.ids.push_back(pointId);
-        stored.points.points.push_back(entry.at("p").get<std::array<double, 3>>());
-        auto extra = entry;
-        extra.erase("p");
-        stored.annotations.push_back(std::move(extra));
-    }
+    auto decoded=vc::geometry::decodePointMap(collection.at("points"));
+    stored.points=std::move(decoded.points);
+    stored.annotations=std::move(decoded.annotations);
     return stored;
 }
 

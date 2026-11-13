@@ -5,6 +5,7 @@
 #include "FiberMapRulerMath.hpp"
 #include "FiberLineGeometry.hpp"
 #include "LineAnnotationController.hpp"
+#include "FiberNameDisplay.hpp"
 #include "CState.hpp"
 #include "FiberMapAutoLink.hpp"
 #include "LineAnnotationFiberLinks.hpp"
@@ -1253,6 +1254,17 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
                     finishRebuild();
                 }
             });
+    _snapshotWatcher = new QFutureWatcher<void>(this);
+    connect(_snapshotWatcher, &QFutureWatcher<void>::finished, this, [this]() {
+        try {
+            continueRebuild();
+        } catch (...) {
+            Logger()->error("Fiber map: rebuild continuation failed");
+            markStale(tr("rebuild failed — press Update"));
+            _rebuildQueue.beginApply();
+            finishRebuild();
+        }
+    });
     _progressMarquee = new QTimer(this);
     _progressMarquee->setInterval(30);
     connect(_progressMarquee, &QTimer::timeout, this,
@@ -1278,6 +1290,9 @@ FiberMapWorkspace::~FiberMapWorkspace()
     }
     if (_rebuildWatcher) {
         _rebuildWatcher->disconnect(this);
+    }
+    if (_snapshotWatcher) {
+        _snapshotWatcher->disconnect(this);
     }
     _rebuildPool.waitForDone();
 }
@@ -1543,11 +1558,11 @@ void FiberMapWorkspace::applySceneRect()
 
 QString FiberMapWorkspace::withCachedUmbilicusStatus(const QString& status)
 {
-    const QString fingerprint =
-        _controller ? _controller->umbilicusFingerprint() : QString();
-    if (!_umbilicusStatusValid || fingerprint != _umbilicusStatusFingerprint) {
+    const auto dependency =
+        _controller ? _controller->umbilicusDependency() : vc3d::fiber_map::UmbilicusDependency{};
+    if (!_umbilicusStatusValid || dependency != _umbilicusStatusDependency) {
         _umbilicusStatusText = withUmbilicusStatus(QString(), _controller);
-        _umbilicusStatusFingerprint = fingerprint;
+        _umbilicusStatusDependency = dependency;
         _umbilicusStatusValid = true;
     }
     return status + _umbilicusStatusText;
@@ -1639,7 +1654,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _gapTiles.clear();
     _layoutGeneration = 0;
     _layoutAnnotationVolume.clear();
-    _layoutUmbilicusFingerprint.clear();
+    _layoutUmbilicusDependency = {};
     _layoutPackageGeneration = 0;
     _layoutUmbilicusGeneration = 0;
     _layoutBuilt = false;
@@ -1689,7 +1704,7 @@ FiberMapWorkspace::currentDependencies() const
     deps.fiberGeneration = _controller->fiberDataGeneration();
     deps.packageGeneration = _controller->packageGeneration();
     deps.umbilicusGeneration = _controller->umbilicusGeneration();
-    deps.umbilicusFingerprint = _controller->umbilicusFingerprint();
+    deps.umbilicusDependency = _controller->umbilicusDependency();
     if (const auto& annotation = _state->annotationVolume()) {
         deps.annotationVolume = QString::fromStdString(annotation->volume);
         deps.voxelSizeUm = annotation->voxelSizeUm;
@@ -1705,7 +1720,7 @@ FiberMapWorkspace::layoutDependencies() const
     deps.fiberGeneration = _layoutGeneration;
     deps.packageGeneration = _layoutPackageGeneration;
     deps.umbilicusGeneration = _layoutUmbilicusGeneration;
-    deps.umbilicusFingerprint = _layoutUmbilicusFingerprint;
+    deps.umbilicusDependency = _layoutUmbilicusDependency;
     deps.annotationVolume = _layoutAnnotationVolume;
     deps.voxelSizeUm = _voxelSizeUm;
     deps.catalogOrientation = _layoutCatalogOrientation;
@@ -1890,7 +1905,7 @@ struct FiberMapWorkspace::RebuildJobResult {
     bool automatic = false;
     uint64_t epoch = 0;
     // The world as of the start, for apply-time validation.
-    QString preReadUmbilicusFingerprint;
+    vc3d::fiber_map::UmbilicusDependency preReadUmbilicusDependency;
     uint64_t builtPackageGeneration = 0;
     uint64_t builtUmbilicusGeneration = 0;
     // Inputs (snapshot fibers are consumed by the worker's conversion).
@@ -2139,6 +2154,46 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild, bool automatic)
         _layoutCache.clear();
     }
 
+    // The snapshot's store reads (every fiber's decode; at high latency most
+    // of a rebuild) run on the rebuild worker first; continueRebuild finishes
+    // the snapshot on the GUI (runtime ids, conversion, umbilicus) and
+    // launches the layout job. Any failure before the worker starts runs the
+    // epilogue here, so the queue returns to Idle.
+    try {
+        // Captured after the pre-check: a clear above advanced the epoch, and
+        // this job publishes into the world as it stands now. The umbilicus
+        // fingerprint is read before the snapshot parses the umbilicus, so a
+        // rewrite during that parse that moves the file's size or mtime — the
+        // token's contract; a same-size rewrite inside one timestamp tick is
+        // beyond it — leaves the recorded token disagreeing with the disk, and
+        // the publish-time refresh raises the banner.
+        _pendingRebuild = PendingRebuild{fullRebuild, automatic, _rebuildQueue.epoch(),
+                                         _controller->umbilicusDependency()};
+        auto decode = _controller->beginFiberMapSnapshot();
+        _updateButton->setEnabled(false);
+        startRebuildProgress(_updateButton);
+        _snapshotDecode = decode;
+        _snapshotWatcher->setFuture(QtConcurrent::run(&_rebuildPool, [decode]() {
+            LineAnnotationController::decodeFiberMapSnapshot(*decode);
+        }));
+    } catch (const std::exception& ex) {
+        Logger()->error("Fiber map: rebuild start failed: {}", ex.what());
+        _pendingRebuild.reset();
+        _snapshotDecode.reset();
+        markStale(tr("rebuild failed — press Update"));
+        _rebuildQueue.beginApply();
+        finishRebuild();
+    }
+}
+
+void FiberMapWorkspace::continueRebuild()
+{
+    if (!_pendingRebuild) return;
+    const PendingRebuild pending = *_pendingRebuild;
+    _pendingRebuild.reset();
+    const auto decode = std::move(_snapshotDecode);
+    const bool fullRebuild = pending.fullRebuild;
+    const bool automatic = pending.automatic;
     // One rollback for the whole launch: the queue is already Running, so
     // any throw between here and a successfully created future must run the
     // epilogue itself or every later request would merely coalesce forever.
@@ -2148,21 +2203,16 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild, bool automatic)
     bool cacheMoved = false;
     QFuture<std::shared_ptr<RebuildJobResult>> future;
     try {
+        if (!decode) throw std::runtime_error("no fiber map snapshot read");
         job = std::make_shared<RebuildJobResult>();
         job->fullRebuild = fullRebuild;
         job->automatic = automatic;
-        // Captured after the pre-check: a clear above advanced the epoch, and
-        // this job publishes into the world as it stands now.
-        job->epoch = _rebuildQueue.epoch();
-        // Read before the snapshot: fiberMapSnapshot() parses the umbilicus,
-        // so a rewrite during that parse that moves the file's size or mtime
-        // — the token's contract; a same-size rewrite inside one timestamp
-        // tick is beyond it — leaves the recorded token disagreeing with the
-        // disk, and the publish-time refresh raises the banner.
-        job->preReadUmbilicusFingerprint = _controller->umbilicusFingerprint();
+        job->epoch = pending.epoch;
+        job->preReadUmbilicusDependency = pending.umbilicusDependency;
         QElapsedTimer snapshotTimer;
         snapshotTimer.start();
-        job->snapshot = _controller->fiberMapSnapshot();
+        // GUI part only: the store reads already ran on the worker.
+        job->snapshot = _controller->finishFiberMapSnapshot(*decode);
         job->snapshotMs = snapshotTimer.elapsed();
         job->builtPackageGeneration = _controller->packageGeneration();
         job->builtUmbilicusGeneration = _controller->umbilicusGeneration();
@@ -2206,8 +2256,6 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild, bool automatic)
         _layoutCache = vc3d::fiber_map::GlobalLayoutCache{};
         cacheMoved = true;
 
-        _updateButton->setEnabled(false);
-        startRebuildProgress(_updateButton);
 
         future = QtConcurrent::run(&_rebuildPool, [job]() {
             runRebuildJob(job);
@@ -2315,7 +2363,7 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
     // re-run stays warm and cheap.
     if (_controller->fiberDataGeneration() != job->snapshot.generation ||
         _controller->umbilicusGeneration() != job->builtUmbilicusGeneration ||
-        _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint ||
+        _controller->umbilicusDependency() != job->preReadUmbilicusDependency ||
         current.catalogOrientation != catalogOrientationKey(job->snapshot.catalogVolume)) {
         _layoutCache = std::move(job->cache);
         if (isVisible()) {
@@ -2362,7 +2410,7 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _gapPublishedWanted = job.wantGapField;
     _gapPublishedError = job.gapError;
     _gapFieldParams = job.gapParams;
-    _layoutUmbilicusFingerprint = job.preReadUmbilicusFingerprint;
+    _layoutUmbilicusDependency = job.preReadUmbilicusDependency;
     _layoutCatalogOrientation = catalogOrientationKey(job.snapshot.catalogVolume);
     _layoutGeneration = job.snapshot.generation;
     _layoutAnnotationVolume = QString::fromStdString(job.snapshot.annotationVolume);
@@ -3199,10 +3247,15 @@ void FiberMapWorkspace::rebuildTree()
         const auto it = _fiberLengthVx.find(fiberId);
         return it != _fiberLengthVx.end() && std::isfinite(it->second) ? it->second : 0.0;
     };
+    // The annotation name of the snapshot the map was built from (the layout
+    // carries each fiber's file name), like every other column: no store read.
+    const auto displayNameOf = [](const std::string& fileName) {
+        const QString stem = vc3d::displayStemForFiberFile(QString::fromStdString(fileName));
+        return stem.isEmpty() ? LineAnnotationController::tr("unnamed") : stem;
+    };
     const auto addFiberRow = [&](QTreeWidgetItem* parent,
                                  const vc3d::fiber_map::GlobalPlacedFiber* row) {
-        const QString annotationName =
-            _controller ? _controller->fiberDisplayName(row->fiber.id) : QString();
+        const QString annotationName = _controller ? displayNameOf(row->fiber.fileName) : QString();
         const QStringList columns{row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
                                   windingText(row->meta), lengthText(row->fiber.id),
                                   anchorText(row->meta), annotationName};
@@ -3312,8 +3365,7 @@ void FiberMapWorkspace::rebuildTree()
                   return labelLess(a->label, b->label, a->id, b->id);
               });
     for (const vc3d::fiber_map::UnplacedFiber* unplaced : unplaceable) {
-        const QString annotationName =
-            _controller ? _controller->fiberDisplayName(unplaced->id) : QString();
+        const QString annotationName = _controller ? displayNameOf(unplaced->fileName) : QString();
         auto* item = new QTreeWidgetItem(
             _tree, {unplaced->label, QString(QLatin1Char(unplaced->hvTag)),
                     QStringLiteral("—"), lengthText(unplaced->id), tr("unplaceable"),

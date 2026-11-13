@@ -62,7 +62,7 @@ TransactionRequest request(ObjectStoreSession& session, const AttachmentIdentity
     const auto status = session.status(attachment);
     TransactionRequest r;
     r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
-    r.author = "session-test"; r.expectedObjects = std::move(expected); r.operations = std::move(operations);
+    r.author = "session-test"; r.expectedObjects = testNumberedGuards(session, attachment, expected); r.operations = std::move(operations);
     return r;
 }
 
@@ -172,6 +172,8 @@ try {
         const auto remote = uncached.attachHosted(endpoint, noCache);
         uncached.readStore(remote, [&](const StoreReader& reader, const auto&) {
             const auto revision = *reader.currentObject(surface)->geometryRevision;
+            require(reader.objectAtGeometry(revision)->reference()==expected.objectAtGeometry(revision)->reference(),
+                    "hosted and local geometry metadata selection are identical");
             require(reader.readGeometryArray(revision, "points", 12, 24) == expected.readGeometryArray(revision, "points", 12, 24),
                     "uncached range");
             for (const auto& rect : {std::array<int64_t, 4>{2, 3, 5, 4}, {2, 0, 5, 20}, {30, 0, 0, 20}, {2, 3, 5, 0}})
@@ -182,6 +184,30 @@ try {
             mustFail([&] { (void)reader.readGeometryArray(revision, "points", 7201, 0); });
             mustFail([&] { (void)reader.readGeometryArray(revision, "points", 0, -1); });
         });
+        // A prefetch fills the caches with what the reads then return (same
+        // bytes), for revisions it knows, and ignores unknown ones; a second
+        // prefetch of complete revisions is a no-op.
+        for (const bool withCache : {true, false}) {
+            ObjectStoreSession fresh;
+            auto options = hostedOptions;
+            if (!withCache) options.cacheBytes = 0;
+            const auto remote = fresh.attachHosted(endpoint, options);
+            fresh.readStore(remote, [&](const StoreReader& reader, const auto&) {
+                const auto strand = *reader.currentObject(fiber)->geometryRevision;
+                const auto sheet = *reader.currentObject(surface)->geometryRevision;
+                const std::vector<std::string> revisions{strand, sheet, util::newUuid()};
+                reader.prefetchGeometry(revisions, {"control_points", "control_point_ids", "points"}, {"control_points"});
+                reader.prefetchGeometry(revisions, {"control_points", "control_point_ids", "points"}, {"control_points"});
+                require(reader.geometryRevision(strand)->contentHash == expected.geometryRevision(strand)->contentHash,
+                        "prefetched descriptor");
+                require(reader.readGeometryArray(strand, "control_points") == expected.readGeometryArray(strand, "control_points"),
+                        "prefetched array");
+                require(reader.readGeometryArray(sheet, "points", 12, 24) == expected.readGeometryArray(sheet, "points", 12, 24),
+                        "prefetched range");
+                require(reader.geometryPointAnnotations(strand, "control_points") ==
+                        expected.geometryPointAnnotations(strand, "control_points"), "prefetched annotations");
+            });
+        }
         bool ran = false;
         session.readStore(hosted, [&](const StoreReader& reader, const auto&) {
             const auto head = reader.currentObject(surface);
@@ -216,6 +242,13 @@ try {
             mustFail([&] { (void)reader.readGeometryArrays({strand, revision}, "control_points"); });
             require(reader.geometryPointAnnotations(strand, "control_points") ==
                     expected.geometryPointAnnotations(strand, "control_points"), "reader point annotations");
+            {
+                const auto full = direct.geometryPointAnnotations(txn, strand, "control_points");
+                require(!full.empty() && direct.geometryPointAnnotationsWithin(txn, strand, "control_points", 1 << 20) == full,
+                        "a bounded annotation read within its budget returns the values");
+                require(!direct.geometryPointAnnotationsWithin(txn, strand, "control_points", 0),
+                        "a bounded annotation read stops when its budget is exceeded");
+            }
             require(reader.geometryLengthInVolume(fiber, volume, 2) == expected.geometryLengthInVolume(fiber, volume, 2) &&
                     expected.geometryLengthInVolume(fiber, volume, 2) == 34, "reader fiber length");
             require(reader.objectTags() == std::vector<std::string>{"probe"} && reader.objectTags() == expected.objectTags() && reader.objectTags("track") == expected.objectTags("track"),
@@ -248,6 +281,11 @@ try {
     const auto before = session.status(hosted);
     const auto receipt = session.submit(hosted, request(session, hosted, {{track, 1}}, {SetMetaOp{track, "note", "\"one\""}}));
     require(receipt.objects.at(track) == 2 && session.currentObject(hosted, track)->version == 2, "own edit visible");
+    require(receipt.objectReference(track)==session.currentObject(hosted,track)->reference(),"hosted receipts retain exact identity");
+    session.readStore(hosted,[&](const StoreReader& reader,const auto&){
+        require(reader.assignGeometryPointIds(fiber,"control_points",{0,1,2,-1})==std::vector<int64_t>{0,1,2,3},
+            "hosted point allocation uses the shared retained-ID query");
+    });
     session.readStore(hosted, [&](const StoreReader& reader, const auto&) {
         const FeedCursor since{before.storeUuid, before.generation, before.commitSequence};
         require(changesTouchKinds(reader, since, {"track"}) && !changesTouchKinds(reader, since, {"surface", "fiber"}) &&
@@ -260,6 +298,13 @@ try {
     require(events.size() == 1 && events[0].changes.size() == 1 && events[0].changes[0].recordUuid == track &&
             events[0].changes[0].kind == "track" && events[0].touches({"track"}) && !events[0].touches({"surface"}) &&
             events[0].journalPosition == *receipt.commitSequence, "commit event with kind");
+    {
+        const auto now = session.status(hosted);
+        require(events[0].feedPosition && events[0].feedPosition->storeUuid == now.storeUuid &&
+                    events[0].feedPosition->generation == now.generation &&
+                    events[0].feedPosition->sequence == *receipt.commitSequence && events[0].feedPosition->offset == 0,
+                "a hosted commit event carries its completed feed cursor");
+    }
     require(session.receipt(hosted, receipt.requestUuid.value())->commitSequence == receipt.commitSequence, "receipt");
     mustFail([&] { (void)session.submit(hosted, request(session, hosted, {{track, 1}}, {SetMetaOp{track, "note", "\"stale\""}})); });
 
@@ -269,7 +314,7 @@ try {
         HostedStore other(endpoint);
         const auto status = other.status();
         TransactionRequest r; r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
-        r.author = "other"; r.expectedObjects = {{track, 2}}; r.operations = {SetMetaOp{track, "note", "\"two\""}};
+        r.author = "other"; r.expectedObjects = testNumberedGuards(other, {{track, 2}}); r.operations = {SetMetaOp{track, "note", "\"two\""}};
         other.submit(r);
     }
     require(session.currentObject(hosted, track)->version == 2, "cached until the next check");
@@ -314,7 +359,7 @@ try {
         const auto file = directory.path / "weights.bin";
         { std::ofstream(file, std::ios::binary) << "weights for " << object; }
         const auto version = session.currentObject(attachment, object)->version;
-        const auto published = session.publishArtifacts(attachment, object, version, {{"model/weights.bin", file}}, "session-test");
+        const auto published = session.publishArtifacts(attachment, session.currentObject(attachment, object)->reference(), {{"model/weights.bin", file}}, "session-test");
         require(published.objects.at(object) == version + 1, "artifacts published");
         if (attachment == hosted) session.refresh(hosted);
         const auto files = session.artifacts(attachment, object);
@@ -338,6 +383,10 @@ try {
     const auto committed = session.geometryRegion(order, plane(10.25), surfaces());
     require(!committed.empty() && committed[0].attachment == hosted && !committed[0].result.runs.empty() &&
             committed[0].result.runs[0].objectUuid == surface, "hosted region");
+    require(committed[0].result.runs[0].objectReference.objectUuid == surface &&
+            committed[0].result.runs[0].objectToVolume &&
+            committed[0].result.runs[0].objectToVolume->json() == VolumeAffine::scale(1).json(),
+            "target-volume region carries its selected mapping rather than requiring a later current lookup");
     SurfaceProximityQuery near; near.volume = volume; near.point = {10, 20, 11.2}; near.tolerance = 1;
     require(session.nearestSurfaces(order, near).size() == 1, "hosted proximity");
     // A draft moved off the plane hides the committed surface everywhere.
@@ -381,7 +430,7 @@ try {
                 session.currentObject(hosted, choice)->record.kind == "volume_transform_choice", "hosted transform writes");
         session.refresh(hosted);
         require(chooseVolumeTransform(session, hosted, "hosted-a", "hosted-b", route) == choice &&
-                session.currentObject(hosted, choice)->version == 2, "a choice is replaced in place");
+                session.currentObject(hosted, choice)->version == 1, "an unchanged choice preserves its version");
         mustFail([&] { (void)chooseVolumeTransform(session, hosted, "hosted-a", "hosted-b", {util::newUuid()}); });
     }
 
@@ -409,10 +458,11 @@ try {
         fix.uuid = util::newUuid(); fix.name = "fix";
         fix.points = {{0}, {{0, 0, 1}}};
         fix.annotations = nlohmann::json::array({nlohmann::json::object()});
-        replaceAttachedCollections(session, hosted, surface, "corrections", {fix}, volumeCoordinates(voxels));
-        require(attachedCollections(session, hosted, surface, "corrections").size() == 1, "hosted attached collection");
-        replaceAttachedCollections(session, hosted, surface, "corrections", {}, volumeCoordinates(voxels));
-        require(attachedCollections(session, hosted, surface, "corrections").empty(), "hosted attached collection removed");
+        auto corrections = attachedCollections(session, hosted, surface, "corrections");
+        replaceAttachedCollections(session, hosted, corrections, {fix}, volumeCoordinates(voxels));
+        require(attachedCollections(session, hosted, surface, "corrections").collections.size() == 1, "hosted attached collection");
+        replaceAttachedCollections(session, hosted, corrections, {}, volumeCoordinates(voxels));
+        require(attachedCollections(session, hosted, surface, "corrections").collections.empty(), "hosted attached collection removed");
         const auto copied = session.copyObject(hosted, hosted, fiber, "copied");
         const auto copy = session.currentObject(hosted, copied);
         const auto from = nlohmann::json::parse(copy->record.meta).at("copied_from");
@@ -457,7 +507,7 @@ try {
             const auto report = ingestGeometrySource(session, attachment, "fiber", file);
             require(report.ingested == 1 && report.problems.empty(), "file ingested through the session");
             auto request = ingest({source(linked, existing)});
-            require(request.expectedObjects.at(linked) == std::nullopt && request.expectedObjects.at(existing) == 1,
+            require(request.expectedObjects.at(linked).number() == std::nullopt && request.expectedObjects.at(existing).number() == 1,
                     "ingestion expects new objects absent and linked fibers at their versions");
             TransactionPayloads payloads;
             const auto text = transactionRequestToJson(request, &payloads);
@@ -499,7 +549,7 @@ try {
             const auto model = directory.path / "model.pt", empty = directory.path / "empty.bin";
             const auto content = "model of " + object;
             { std::ofstream(model, std::ios::binary) << content; std::ofstream(empty, std::ios::binary); }
-            session.publishArtifacts(from, object, 1, {{"model.pt", model}, {"nested/model.pt", model}, {"empty.bin", empty}});
+            session.publishArtifacts(from, session.currentObject(from, object)->reference(), {{"model.pt", model}, {"nested/model.pt", model}, {"empty.bin", empty}});
             const auto manifest = artifactManifestJson(session.artifacts(from, object));
             for (const auto& to : {another, second}) {
                 for (int attempt = 0; attempt < (importing ? 1 : 2); ++attempt) {
@@ -580,7 +630,7 @@ try {
             change.operations = {CreateObjectOp{objectRecordJson(volumeTransformChoiceRecord(choice, source, target, {key}))}};
         } else {
             const auto head = other.currentObjectRevision(registration);
-            change.expectedObjects[registration] = head->version;
+            change.expectedObjects[registration] = head->reference();
             change.operations = {UpdateObjectOp{objectRecordJson(
                 volumeTransformRecord(head->record, source, target, VolumeAffine::scale(10), "updated"))}};
         }
@@ -598,6 +648,41 @@ try {
         writeVolumeCollections(session, hosted, {target, 1}, shown, {});
         require(read().front().points.points.front() == vc::geometry::Point{20, 20, 20},
                 "collection saves correctly after refreshing the mapping");
+    }
+
+    // Transform registrations and their revision evidence come from one server
+    // snapshot, even while another client replaces both registrations together.
+    {
+        const auto source = util::newUuid(), middle = util::newUuid(), target = util::newUuid();
+        const auto a = registerVolumeTransform(session, hosted, source, middle, VolumeAffine::scale(1), "a");
+        const auto b = registerVolumeTransform(session, hosted, middle, target, VolumeAffine::scale(1), "b");
+        std::exception_ptr writerFailure;
+        std::jthread writer([&] {
+            try {
+                HostedStore client(endpoint);
+                const auto status = client.status();
+                for (int i = 0; i < 20; ++i) {
+                    const auto ar = client.currentObjectRevision(a), br = client.currentObjectRevision(b);
+                    TransactionRequest change;
+                    change.storeUuid = status.storeUuid; change.generation = status.generation;
+                    change.requestUuid = util::newUuid(); change.author = "atomic-transform-test";
+                    change.expectedObjects = {{a, ar->reference()}, {b, br->reference()}};
+                    const auto scale = VolumeAffine::scale(2 + i % 2);
+                    change.operations = {UpdateObjectOp{objectRecordJson(volumeTransformRecord(ar->record, source, middle, scale, "a"))},
+                                         UpdateObjectOp{objectRecordJson(volumeTransformRecord(br->record, middle, target, scale, "b"))}};
+                    client.submit(change);
+                }
+            } catch (...) { writerFailure = std::current_exception(); }
+        });
+        HostedStore client(endpoint);
+        for (int i = 0; i < 40; ++i) {
+            const auto transforms = client.volumeTransforms();
+            require(transforms.resolve(source, middle).resolved().forward.json() ==
+                    transforms.resolve(middle, target).resolved().forward.json(),
+                    "hosted transform snapshot never combines registrations from different commits");
+        }
+        writer.join();
+        if (writerFailure) std::rethrow_exception(writerFailure);
     }
 
     // Two imports prepared before either commits must not create two live

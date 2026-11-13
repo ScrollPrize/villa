@@ -24,7 +24,7 @@ namespace vc3d::spiral {
 // comes from its input manifest (object_store_inputs.json, published by the
 // service as its input manifest artifact), compared by identities of the
 // store: geometry revision UUIDs, the metadata values the adapter read,
-// relationship record UUIDs, generations and approval states.
+// relationship record UUIDs, numbered versions and approval states.
 
 // How one fitted input stands in the attached store now.
 enum class InputState {
@@ -42,6 +42,8 @@ struct StoreInputPin {
     // null in manifests that do not record it, which then compare on
     // geometry only.
     nlohmann::json metadata;
+    vc::objects::ObjectVersion reference;
+    bool outerShell = false;  // displayed input, not a fitting patch/endpoint
 };
 
 struct FitSurface {
@@ -59,7 +61,7 @@ struct FitPointCollection {
     std::vector<cv::Vec3d> points;
     std::vector<std::optional<double>> windings;  // wind_a annotations
     std::string problem;
-    int64_t version = 0;  // the object version read: what an edit starts from
+    vc::objects::ObjectVersion reference;  // the exact state an edit starts from
 };
 
 struct FitFiber {
@@ -73,7 +75,7 @@ struct FitFiber {
 // How one relationship the fit consumed stands now, judged as the fit's
 // adapter would consume it from the current heads of the fitted objects.
 enum class LinkState {
-    Fitted,   // consumed at the same generation, approval and endpoint geometry
+    Fitted,   // consumed at the same version, approval and endpoint geometry
     Changed,  // still consumed, but any of those differ
     Dropped,  // no longer consumed: removed, rejected, inapplicable or an endpoint gone
     Added,    // consumed now among the fitted objects, but not by the fit
@@ -115,14 +117,15 @@ struct FitInputs {
     // Every input and relationship is as the fit read it.
     bool unchanged() const
     {
-        return problems.empty() && (!outerShell || outerShell->state == InputState::Fitted)
+        return problems.empty()
             && count(InputState::Fitted) == surfaces.size() + pointCollections.size()
-                                                                   + fibers.size() + tracks.size()
+                                           + fibers.size() + tracks.size() + outerShell.has_value()
             && count(LinkState::Fitted) == relationships.size() && addedRelationships.empty();
     }
 };
 
-// The objects of an input manifest document ({"digest", "manifest"}).
+// All objects of an input manifest document ({"digest", "manifest"}),
+// including its separately displayed outer shell, identified by its role.
 std::vector<StoreInputPin> manifestPins(const nlohmann::json& document);
 
 // The metadata the fit's object-store adapter reads from one object, as

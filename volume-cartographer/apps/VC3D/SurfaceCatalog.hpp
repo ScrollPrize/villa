@@ -13,6 +13,7 @@
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/objects/GeometryRegion.hpp>
 #include <vc_object_store/objects/SurfaceCreate.hpp>
+#include <vc_object_store/objects/ResidentSurface.hpp>
 #include <nlohmann/json.hpp>
 #include <QObject>
 #include <QString>
@@ -112,11 +113,24 @@ public:
         std::vector<vc::objects::VisibleRun> runs;
         bool complete = true;
         std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> remote;
+        // Required before deriving persistent annotations from a query.
+        void requireComplete() const;
     };
     static Crossings region(vc::objects::ObjectStoreSession& session,
                             const std::vector<vc::objects::AttachmentIdentity>& sources,
                             const vc::objects::VolumeVoxels& volume, const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
                             const std::function<bool()>& cancelled = {});
+
+    // One explicitly selected query input (options.uuids must be supplied): displayed geometry wins over session drafts
+    // and stored heads. Keep these immutable grids alive for background reads.
+    struct RegionInput {
+        std::shared_ptr<vc::objects::ObjectStoreSession> session;
+        std::vector<vc::objects::AttachmentIdentity> sources;
+        vc::objects::VolumeVoxels volume;
+        vc::objects::RegionOptions options;
+        std::map<std::string, std::shared_ptr<const vc::objects::ResidentSurface>> displayed;
+        Crossings region(const vc::objects::RegionSlice& slice, const std::function<bool()>& cancelled = {}) const;
+    };
 
     // The nearest point of each of `uuids` (drafts or objects of the sources)
     // within `tolerance` of each of `points` (in `volume`): the hits per

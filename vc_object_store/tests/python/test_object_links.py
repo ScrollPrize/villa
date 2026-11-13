@@ -13,10 +13,18 @@ def test_surface_discovery_uses_current_revisions_and_preserves_review(db):
     objects = [db.object(a), db.object(b)]
     report = db.link_surface_overlaps()
     assert report["edges_created"] == 1
-    assert [db.object(a), db.object(b)] == objects
+    linked_objects = [db.object(a), db.object(b)]
+    for before, after in zip(objects, linked_objects):
+        # Relationships belong to the endpoint's numbered graph state, while
+        # discovery must leave its geometry, metadata and review fields intact.
+        assert after["version"] == before["version"] + 1
+        assert after["commit_sequence"] > before["commit_sequence"]
+        assert {**after, "version": before["version"],
+                "commit_sequence": before["commit_sequence"]} == before
     edge = db.edges_of(a)[0]["uuid"]
     assert not db.edge_geometry_state(edge)["stale"]
     assert db.link_surface_overlaps()["edges_skipped_existing"] == 1
+    assert [db.object(a), db.object(b)] == linked_objects
     # A new revision with identical coordinates still needs revalidation.
     gb["attributes"]["edit"] = True
     db.put_geometry(b, gb, expected_version=db.current_version(b), edge_edits=[edge_choice(db, e["uuid"], "retain") for e in db.affected_geometry_edges(b, gb)])

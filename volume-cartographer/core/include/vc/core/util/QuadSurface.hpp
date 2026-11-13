@@ -531,6 +531,9 @@ std::vector<std::string> tifxyz_tags(const nlohmann::json& meta);
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader&,
     const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt,
     bool applyValidity = true, const vc::objects::TransformedGeometryView* transformed = nullptr);
+std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader&,
+    const vc::objects::ObjectRevision&, bool applyValidity = true,
+    const vc::objects::TransformedGeometryView* transformed = nullptr);
 // Reads channels of an immutable geometry revision through a session on demand.
 std::function<cv::Mat(const std::string&)> store_channel_loader(
     std::shared_ptr<vc::objects::ObjectStoreSession>, vc::objects::AttachmentIdentity, std::string geometryRevision);

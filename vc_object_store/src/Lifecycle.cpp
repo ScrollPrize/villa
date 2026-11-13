@@ -1,77 +1,71 @@
 #include "internal/RecordSql.hpp"
 #include "internal/History.hpp"
+#include "internal/ExtensionHistory.hpp"
+#include "internal/SqlValues.hpp"
 #include "geometry/GeometryDelta.hpp"
+#include "internal/ImmutableImport.hpp"
+#include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
 
 namespace vc::objects {
 using namespace detail;
 
-void detail::createLifecycleSchema(sqlite3* db)
-{
-    exec(db, R"SQL(
-CREATE TABLE object_lifecycle(
-  object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
-  retired INTEGER NOT NULL CHECK(retired IN (0,1)), epoch TEXT NOT NULL
-);
-CREATE INDEX retired_objects ON object_lifecycle(retired,object_id);
-CREATE TABLE edge_lifecycle_bindings(
-  edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
-  a_epoch TEXT NOT NULL, b_epoch TEXT NOT NULL
-);
-)SQL");
-}
-
 void detail::readLifecycle(sqlite3* db, int64_t id, ObjectRecord& record)
 {
-    Statement s(db, "SELECT retired,epoch FROM object_lifecycle WHERE object_id=?", id);
-    if (s.row()) { record.retired = s.i64(0); record.lifecycleEpoch = s.text(1); }
+    Statement s(db, "SELECT state,lifecycle_epoch FROM objects WHERE id=?", id);
+    if (s.row()) { record.retired = s.i64(0)==1; record.lifecycleEpoch = s.text(1); }
 }
 
 void detail::writeLifecycle(sqlite3* db, int64_t id, const ObjectRecord& record)
 {
-    execute(db, "INSERT INTO object_lifecycle VALUES(?,?,?) ON CONFLICT(object_id) "
-        "DO UPDATE SET retired=excluded.retired,epoch=excluded.epoch", id, int64_t(record.retired),
-        record.lifecycleEpoch);
+    beforeCurrentObjectEdit(db,record.uuid);
+    execute(db, "UPDATE objects SET state=?,lifecycle_epoch=? WHERE id=?",int64_t(record.retired),
+        record.lifecycleEpoch,id);
 }
 
 std::string detail::activeObjectSql(const std::string& id)
 {
-    return "NOT EXISTS(SELECT 1 FROM object_lifecycle lc WHERE lc.object_id=" + id + " AND lc.retired=1)";
+    return "NOT EXISTS(SELECT 1 FROM objects owned WHERE owned.id="+id+" AND owned.state<>0)";
 }
 
 std::string detail::activeEdgeSql()
 {
-    return activeObjectSql("edges.a_id") + " AND " + activeObjectSql("edges.b_id") +
-        " AND coalesce((SELECT a_epoch FROM edge_lifecycle_bindings WHERE edge_id=edges.id),'')="
-        "coalesce((SELECT epoch FROM object_lifecycle WHERE object_id=edges.a_id),'')"
-        " AND coalesce((SELECT b_epoch FROM edge_lifecycle_bindings WHERE edge_id=edges.id),'')="
-        "coalesce((SELECT epoch FROM object_lifecycle WHERE object_id=edges.b_id),'')";
+    return "edges.state=0 AND NOT EXISTS(SELECT 1 FROM objects owned "
+        "WHERE (owned.uuid=edges.a_uuid OR owned.uuid=edges.b_uuid) AND owned.state<>0)";
+}
+
+namespace {
+ObjectRecord endpointLifecycle(sqlite3* db,const std::string& uuid)
+{
+    const auto object=resolveObject(db,uuid);
+    if(!object)throw std::runtime_error("relationship endpoint is missing or deleted");
+    return object->record;
+}
 }
 
 std::pair<std::string, std::string> detail::lifecycleBinding(sqlite3* db, const EdgeRecord& edge)
 {
-    Statement s(db, "SELECT a_epoch,b_epoch FROM edge_lifecycle_bindings WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)",
-        parseUuid(edge.uuid));
-    return s.row() ? std::pair{s.text(0), s.text(1)} : std::pair<std::string, std::string>{};
+    const auto a=endpointLifecycle(db,edge.aUuid),b=endpointLifecycle(db,edge.bUuid);
+    return {a.lifecycleEpoch,b.lifecycleEpoch};
 }
 
 bool detail::lifecycleBindingMatches(sqlite3* db, const EdgeRecord& edge)
 {
-    ObjectRecord a, b;
-    readLifecycle(db, *objectIdByUuid(db, parseUuid(edge.aUuid)), a);
-    readLifecycle(db, *objectIdByUuid(db, parseUuid(edge.bUuid)), b);
-    return lifecycleBinding(db, edge) == std::pair{a.lifecycleEpoch, b.lifecycleEpoch};
+    const auto a=endpointLifecycle(db,edge.aUuid),b=endpointLifecycle(db,edge.bUuid);
+    return !a.retired && !b.retired;
 }
 
 void detail::bindLifecycle(sqlite3* db, const EdgeRecord& edge, const std::string& aEpoch, const std::string& bEpoch)
 {
-    execute(db, "INSERT INTO edge_lifecycle_bindings VALUES(?,?,?) ON CONFLICT(edge_id) "
-        "DO UPDATE SET a_epoch=excluded.a_epoch,b_epoch=excluded.b_epoch", *edgeIdByUuid(db, parseUuid(edge.uuid)),
-        aEpoch, bEpoch);
+    // Wire/import compatibility check, not persistent per-edge state.
+    if(lifecycleBinding(db,edge)!=std::pair{aEpoch,bEpoch})
+        throw std::runtime_error("relationship lifecycle does not match current endpoints");
 }
 
 namespace {
 void requireCheckedLifecycle(sqlite3* db)
 {
+    if (!historyEnabled(db)) return;
     Statement checked(db, "SELECT 1 FROM history_checked");
     if (!checked.row()) throw std::runtime_error("object lifecycle requires a checked write (expected versions)");
 }
@@ -85,7 +79,12 @@ void ObjectStore::retireObject(WriteTxn& txn, const std::string& uuid)
     if (!record) throw std::invalid_argument("object lifecycle: unknown object");
     if (record->retired) return;
     Savepoint savepoint(db);
-    record->retired = true; record->lifecycleEpoch = util::newUuid();
+    createRecordOverride(db,"objects",uuid);
+    // Retiring is a native publication, not an independent version namespace.
+    // Removing current relationships also prevents restore from silently
+    // reviving observations whose endpoint was deliberately retired.
+    for (const auto& edge : edgesOf(txn,uuid,true)) removeEdge(txn,edge.uuid);
+    record->retired = true; record->lifecycleEpoch = std::to_string(writeCommitSequence(db));
     const auto id = *objectIdByUuid(db, parseUuid(uuid));
     writeLifecycle(db, id, *record);
     stampContentChange(db, author(), hostname(), "objects", id, parseUuid(uuid), "retire");
@@ -105,13 +104,22 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
         source = objectAtVersion(txn, *sourceVersion);
         if (!source) throw std::invalid_argument("object lifecycle: restore source version is not recorded in this store");
     } else {
-        auto history = objectHistory(txn, uuid);
+        auto history = objectHistory(txn, uuid, true);
         for (auto it = history.rbegin(); it != history.rend(); ++it)
             if (it->publishedAtUs && !it->deleted && !it->record.retired) { source = *it; break; }
+        if (history.empty()) {
+            source = currentObjectRevision(txn, uuid);
+            if (source) source->record.retired = false;
+        }
     }
     if (!source || source->objectUuid != current->uuid || source->deleted || source->record.retired)
         throw std::invalid_argument("object lifecycle: restoration requires an active revision of this object");
     Savepoint savepoint(db);
+    createRecordOverride(db,"objects",uuid);
+    // An explicit historical restore can replace active geometry/metadata.
+    // Its old observations remain in history, not attached to the new current
+    // state without an explicit revalidation decision.
+    for(const auto& edge:edgesOf(txn,uuid,true))removeEdge(txn,edge.uuid);
     const auto id = *objectIdByUuid(db, parseUuid(uuid));
     const auto oldGeometry = geometryHead(db, uuid);
     if (oldGeometry != source->geometryRevision) {
@@ -119,25 +127,25 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
         // needs to rebuild the current spatial/materialized views.
         clearGeometryMaterialization(db, uuid);
         if (source->geometryRevision) {
-            execute(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) "
-                "DO UPDATE SET revision_uuid=excluded.revision_uuid", parseUuid(uuid),
-                parseUuid(*source->geometryRevision));
+            // Install the selected managed descriptor before restoring its
+            // metadata, just as an existing geometry head is preserved by
+            // upsert. This also supports a metadata-only current object.
+            restoreGeometryReference(db,uuid,*source->geometryRevision);
         } else {
-            execute(db, "DELETE FROM geometry_heads WHERE object_uuid=?", parseUuid(uuid));
+            execute(db,"UPDATE objects SET geometry_manifest=NULL WHERE uuid=?",parseUuid(uuid));
         }
     }
     auto restored = source->record;
+    const auto origin=resolveObjectVersion(db,source->reference());
+    if(!origin)throw std::runtime_error("object lifecycle: restore source is unavailable");
+    prepareOverrideReferences(origin->source,db,restored);
+    restoreCurrentExtensionRows(db, "objects", uuid, restored.meta);
     // upsert preserves identity/creation stamps and resets approval normally.
-    upsertObjectImpl(db, author(), hostname(), restored);
-    restored.retired = false; restored.lifecycleEpoch = util::newUuid();
+    upsertObjectImpl(db, author(), hostname(), restored, false, "restore", true);
+    restored.retired = false; restored.lifecycleEpoch = std::to_string(writeCommitSequence(db));
     writeLifecycle(db, id, restored);
-    if (oldGeometry != source->geometryRevision && source->geometryRevision) {
-        const auto geometry = geometryRevision(txn, *source->geometryRevision);
-        execute(db, "UPDATE objects SET storage_kind='sqlite',storage_ref=?,data_checksum=?,data_generation=? WHERE id=?",
-            source->record.storageRef, geometry->contentHash, geometry->objectGeneration, id);
-    }
     if (oldGeometry != source->geometryRevision) refreshGeometryBounds(db, uuid);
-    appendJournal(db, author(), hostname(), parseUuid(uuid), objectByUuid(txn, uuid)->generation, "restore");
+    appendJournal(db, author(), hostname(), parseUuid(uuid), objectByUuid(txn, uuid)->commitSequence, "restore");
     savepoint.release();
 }
 } // namespace vc::objects

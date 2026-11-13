@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <nlohmann/json.hpp>
 #include <future>
@@ -12,16 +13,153 @@
 #include <tuple>
 #include <cctype>
 #include <sqlite3.h>
+#include <fstream>
 
 using namespace vc::objects;
 
+namespace {
+void referencedArtifacts(HistoryMode sourceMode, HistoryMode overlayMode)
+{
+    TemporaryDirectory directory;
+    OpenOptions options; options.author="artifact-test";options.history=sourceMode;
+    const auto base=directory.path/"base.vcobj", overlay=directory.path/"overlay.vcobj";
+    const auto oldFile=directory.path/"old.pt", newFile=directory.path/"new.pt";
+    std::ofstream(oldFile)<<"old checkpoint"; std::ofstream(newFile)<<"new checkpoint";
+    const auto uuid=util::newUuid();
+    {auto db=ObjectStore::create(base,options);auto txn=db.write();ObjectRecord record;
+        record.uuid=uuid;record.kind="note";db.upsertObject(txn,record);txn.commit();}
+    ObjectVersion original;
+    {ObjectStoreSession session;const auto attachment=session.attach(base,options);
+        session.publishArtifacts(attachment,session.currentObject(attachment,uuid)->reference(),{{"model.pt",oldFile}});
+        original=session.currentObject(attachment,uuid)->reference();}
+    {auto db=ObjectStore::open(base,options);auto txn=db.write();db.seal(txn);txn.commit();}
+    options.history=overlayMode;
+    {auto collection=ObjectCollection::create(overlay,{base},options);}
+    ObjectStoreSession session;const auto attachment=session.attach(overlay,options);
+    session.publishArtifacts(attachment,original,{{"model.pt",newFile}});
+    const auto latest=session.currentObject(attachment,uuid)->reference();
+    require(latest.storeUuid!=original.storeUuid,"artifact edit creates an overlay-owned version");
+    const auto expected=session.artifacts(attachment,uuid,{}, {},original);
+    require(expected.size()==1,"source artifact manifest survives shadowing");
+    session.materializeArtifacts(attachment,uuid,directory.path/"historical",{}, {},original);
+    const auto bytes=[](const std::filesystem::path& path){std::ifstream in(path);return std::string(std::istreambuf_iterator<char>(in),{});};
+    require(bytes(directory.path/"historical"/"model.pt")=="old checkpoint","exact materialization uses old bytes");
+    require(bytes(*session.artifactFile(attachment,uuid,"model.pt",directory.path/"cache"))=="new checkpoint","current artifact uses new bytes");
+    session.editCurrent(attachment,{uuid},[&](const StoreReader&,const std::string&){return std::vector<TransactionOperation>{DeleteObjectOp{uuid}};});
+    require(bytes(*session.artifactFile(attachment,uuid,"model.pt",directory.path/"cache",{}, {},original))=="old checkpoint",
+        "source artifacts remain readable after overlay deletion with either history policy");
+    mustFail([&]{session.artifacts(attachment,uuid);});
+    mustFail([&]{session.artifacts(attachment,util::newUuid(),{}, {},original);});
+    mustFail([&]{session.artifacts(attachment,uuid,original.version,{},original);});
+    auto wrong=original;wrong.storeUuid=util::newUuid();mustFail([&]{session.artifacts(attachment,uuid,{}, {},wrong);});
+}
+
+void editCurrentLifecycle(HistoryMode history)
+{
+    TemporaryDirectory directory;
+    OpenOptions options; options.author = "lifecycle-test"; options.history = history;
+    const auto path = directory.path / "lifecycle.vcobj";
+    auto store = ObjectStore::create(path, options);
+    const auto a = util::newUuid(), b = util::newUuid(), c = util::newUuid();
+    auto makeEdge = [](const std::string& first, const std::string& second) {
+        EdgeRecord edge; edge.uuid = util::newUuid(); edge.kind = "attachment";
+        edge.aUuid = first; edge.bUuid = second;
+        edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
+        return edge;
+    };
+    auto ab = makeEdge(a, b), bc = makeEdge(b, c);
+    {
+        auto txn = store.write();
+        for (const auto& uuid : {a, b, c}) {
+            ObjectRecord record; record.uuid = uuid; record.kind = "surface";
+            store.upsertObject(txn, record);
+        }
+        store.addEdge(txn, ab); store.addEdge(txn, bc); txn.commit();
+    }
+    ObjectStoreSession session;
+    const auto attachment = session.attach(path, options);
+    session.editCurrent(attachment, {a, b}, [&](const StoreReader&, const std::string& uuid) {
+        if (uuid == a) return std::vector<TransactionOperation>{RetireObjectOp{a}};
+        return std::vector<TransactionOperation>{SetMetaOp{b, "note", "1"}, RetainRelationshipOp{bc.uuid}};
+    });
+    {
+        auto txn = store.read();
+        require(store.objectByUuid(txn, a)->retired, "editCurrent retires an object with relationships");
+        require(!store.edgeByUuid(txn, ab.uuid), "retirement removes its incident relationship");
+        require(store.edgeByUuid(txn, bc.uuid).has_value(), "editCurrent retains unrelated surviving relationships");
+    }
+    session.editCurrent(attachment, {a}, [&](const StoreReader&, const std::string&) {
+        return std::vector<TransactionOperation>{RestoreObjectOp{a, {}}};
+    });
+    {
+        auto txn = store.read();
+        require(!store.objectByUuid(txn, a)->retired && !store.edgeByUuid(txn, ab.uuid),
+                "restoration does not revive removed relationships");
+    }
+    // A no-op restore of an active endpoint must still retain its relationships
+    // when the same request also edits its metadata.
+    session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+        return std::vector<TransactionOperation>{RestoreObjectOp{b, {}}, SetMetaOp{b, "note", "2"}, RetainRelationshipOp{bc.uuid}};
+    });
+    {
+        auto txn = store.read();
+        require(store.edgeByUuid(txn, bc.uuid).has_value(), "no-op restore does not suppress normal retention");
+    }
+    if (history == HistoryMode::On) {
+        ObjectVersion source;
+        { auto txn = store.read(); source = store.currentObjectRevision(txn, b)->reference(); }
+        session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+            return std::vector<TransactionOperation>{RestoreObjectOp{b, source}};
+        });
+        { auto txn = store.read(); require(!store.edgeByUuid(txn, bc.uuid), "historical restore removes old observations without retaining them"); }
+        bc = makeEdge(b, c);
+        VersionSelection expected;
+        { auto txn = store.read(); expected = {{b, store.currentVersion(txn, b)}, {c, store.currentVersion(txn, c)}}; }
+        { auto txn = store.writeNumbered(expected); store.addEdge(txn, bc); txn.commit(); }
+    }
+    // The standalone request helper must also omit an explicitly removed edge.
+    auto removal = session.newRequest(attachment);
+    session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+        return std::vector<TransactionOperation>{SetMetaOp{b, "unrelated_note", "42"}};
+    });
+    { auto txn = store.read(); require(store.edgeByUuid(txn, bc.uuid).has_value(),
+        "unrelated checked metadata edit keeps a relationship without requiring retained history"); }
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        editCurrentRequest(reader, removal, {b}, {SetMetaOp{b, "note", "3"}, RemoveEdgeOp{bc.uuid}});
+    });
+    require(removal.operations.size() == 2, "no generated retention for an explicitly removed edge");
+    session.submit(attachment, removal);
+    { auto txn = store.read(); require(!store.edgeByUuid(txn, bc.uuid), "explicit relationship removal succeeds through editCurrentRequest"); }
+    // Explicitly asking to retain a missing edge is still an error, not ignored.
+    mustFail([&] {
+        session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+            return std::vector<TransactionOperation>{RetainRelationshipOp{bc.uuid}};
+        });
+    });
+    // Capturing versions must precede callbacks, even if a callback causes a
+    // newer head to become visible (as a hosted reader could).
+    mustFail([&] {
+        session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+            auto txn = store.write(); store.setMeta(txn, b, "external", "true"); txn.commit();
+            return std::vector<TransactionOperation>{SetMetaOp{b, "stale_callback", "true"}};
+        });
+    });
+    { auto txn = store.read(); require(store.objectByUuid(txn, b)->meta.find("stale_callback") == std::string::npos,
+                                      "callback cannot advance the captured edit expectations"); }
+}
+}
+
 int main() try
 {
+    for(const auto source:{HistoryMode::On,HistoryMode::Off})for(const auto overlay:{HistoryMode::On,HistoryMode::Off})
+        referencedArtifacts(source,overlay);
+    editCurrentLifecycle(HistoryMode::On);
+    editCurrentLifecycle(HistoryMode::Off);
     TemporaryDirectory directory;
     OpenOptions options; options.author = "session-test";
     // Older formats are rejected before the new journal is queried; the ones
-    // vc_object_convert reads (16 to 19) name it.
-    for (const int version : {14, 15, 16, 19}) {
+    // vc_object_convert reads (16 to 20) name it.
+    for (const int version : {14, 15, 16, 19, 20}) {
         const auto oldPath = directory.path / ("schema-" + std::to_string(version) + ".vcobj");
         { auto db = ObjectStore::create(oldPath, options); }
         sqlite3* raw = nullptr;
@@ -37,7 +175,7 @@ int main() try
             catch (const std::runtime_error& error) {
                 const std::string message = error.what();
                 rejected = message.find("unsupported database schema") != std::string::npos &&
-                           (version < 16) == (message.find("vc_object_convert") == std::string::npos);
+                           (version < 16 || message.find("vc_object_convert") != std::string::npos);
             }
             require(rejected, "old formats are explicitly rejected in read-only and writable mode");
         }
@@ -71,7 +209,7 @@ int main() try
     auto metaRequest = [&](const AttachmentIdentity& attachment, const VersionSelection& expected,
                            const std::vector<std::tuple<std::string, std::string, std::string>>& values) {
         auto request = session.newRequest(attachment);
-        request.expectedObjects = expected;
+        request.expectedObjects = testNumberedGuards(session, attachment, expected);
         for (const auto& [uuid, key, value] : values) request.operations.push_back(SetMetaOp{uuid, key, value});
         return request;
     };
@@ -117,7 +255,7 @@ int main() try
     require(heads(identity) == committed && session.takeEvents().empty(), "operation rollback");
     {
         auto request = session.newRequest(identity);
-        request.expectedObjects = {{a, committed.at(a)}};
+        request.expectedObjects = testNumberedGuards(session, identity, {{a, committed.at(a)}});
         request.operations.push_back(RemoveEdgeOp{edge});
         mustFail([&] { session.submit(identity, request); });
     }
@@ -286,11 +424,11 @@ int main() try
     {
         // Editing starts from the version on screen.
         const auto pin = pinOf(replacement, *session.currentObject(replacement, named), session.status(replacement).generation);
-        require(pin.stored() && pin.reference() == ObjectVersion{replacement.storeUuid, pin.generation, named, pin.version},
+        require(pin.stored() && pin.reference() == ObjectVersion{replacement.storeUuid, pin.reference().generation, named, pin.reference().version},
                 "pin of the current revision");
         session.requireCurrent(pin);
         auto stale = pin;
-        ++stale.version;
+        ++stale.selected.version;
         bool refused = false;
         try { session.requireCurrent(stale); } catch (const std::runtime_error&) { refused = true; }
         require(refused, "a stale pin cannot be edited");
@@ -318,7 +456,7 @@ int main() try
         auto record = imported->record;
         record.name = "edited";
         auto request = session.newRequest(replacement);
-        request.expectedObjects[surface] = imported->version;
+        request.expectedObjects[surface] = imported->reference();
         request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
         request.operations.push_back(PutGeometryOp{surface,
             vc::geometry::encode(vc::geometry::Surface{1, 2, {1, 1}, {{9, 9, 9}, {4, 5, 6}}, {255, 255}}), {}});
@@ -328,7 +466,7 @@ int main() try
     require(*edited->geometryRevision != importedGeometry, "edits make new versions");
     {
         auto request = session.newRequest(replacement);
-        request.expectedObjects[surface] = edited->version;
+        request.expectedObjects[surface] = edited->reference();
         request.operations.push_back(RestoreObjectOp{surface,
             ObjectVersion{replacement.storeUuid, imported->generation, surface, imported->version}});
         session.submit(replacement, request);
@@ -365,8 +503,10 @@ int main() try
         auto edit = [&](bool keepRecorded) {
             auto request = session.newRequest(replacement);
             session.readStore(replacement, [&](const StoreReader& reader, const auto&) {
-                request.expectedObjects[sheet] = reader.currentObject(sheet)->version;
-                expectRelationshipEndpoints(reader, request.expectedObjects);
+                request.expectedObjects[sheet] = reader.currentObject(sheet)->reference();
+                expectRelationshipEndpoints(reader, request);
+                require(request.expectedObjects.at(marker) == RecordExpectation(reader.currentObject(marker)->reference()),
+                        "relationship peers have complete snapshot expectations");
             });
             std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
             request.operations.push_back(EditGeometryOp{sheet, {{"points", 0, moved}}, {}, keepRecorded});
@@ -421,5 +561,84 @@ int main() try
         session.takeEvents();
     }
     session.detach(replacement);
+    // Current-only stores use exactly the same checked request/version API.
+    // Their notifications invalidate current state rather than invent a journal.
+    {
+        auto directOptions = options;
+        directOptions.history = HistoryMode::Off;
+        const auto directPath = directory.path / "direct.vcobj";
+        auto direct = ObjectStore::create(directPath, directOptions);
+        auto directAttachment = session.attach(directPath, directOptions);
+        session.takeEvents();
+        const auto uuid = util::newUuid();
+        ObjectRecord record; record.uuid = uuid; record.kind = "fiber";
+        const auto firstRequest = create(directAttachment, {record});
+        const auto first = session.submit(directAttachment, firstRequest);
+        require(first.objects.at(uuid) == 1, "history-off record starts at version one");
+        require(first.created == std::vector<std::string>{uuid}, "history-off receipt reports created objects");
+        const auto head = session.currentObject(directAttachment, uuid);
+        require(head && head->version == 1 && head->uuid.empty(), "current version does not invent an archival revision");
+        auto notifications = session.takeEvents();
+        require(notifications.size() == 1 && notifications.front().revalidate && notifications.front().changes.empty(),
+                "history-off commit requests whole-store revalidation without fabricated journal entries");
+        const auto pin = pinOf(directAttachment, *head, first.generation);
+        session.requireCurrent(pin);
+        auto update = metaRequest(directAttachment, {{uuid, 1}}, {{uuid, "a", "1"}, {uuid, "b", "2"}});
+        const auto second = session.submit(directAttachment, update);
+        require(second.objects.at(uuid) == 2, "several setters advance one record version once");
+        const auto repeated = session.submit(directAttachment, firstRequest);
+        require(repeated.replayed && repeated.objects.at(uuid) == 1 && repeated.commitSequence == first.commitSequence,
+                "history-off request replay returns the original durable receipt after later edits");
+        require(session.currentObject(directAttachment, uuid)->version == 2, "retry does not repeat the original mutation");
+        auto mismatched = firstRequest;
+        mismatched.operations.push_back(SetMetaOp{uuid, "bad_retry", "true"});
+        mustFail([&] { session.submit(directAttachment, mismatched); });
+        mustFail([&] { session.requireCurrent(pin); });
+        mustFail([&] { session.submit(directAttachment, metaRequest(directAttachment, {{uuid, 1}}, {{uuid, "stale", "true"}})); });
+        session.takeEvents();
+        { auto txn = direct.write(); direct.setMeta(txn, uuid, "external", "true"); txn.commit(); }
+        notifications = session.takeEvents();
+        require(notifications.size() == 1 && notifications.front().revalidate && notifications.front().touches({"fiber"}),
+                "history-off changes from another handle invalidate session consumers");
+        // A checked current-only write must not silently edit an undeclared object.
+        mustFail([&] {
+            auto write = direct.writeNumbered(VersionSelection{});
+            direct.setMeta(write, uuid, "unguarded", "true");
+            write.commit();
+        });
+        const auto peer = util::newUuid();
+        ObjectRecord peerRecord; peerRecord.uuid = peer; peerRecord.kind = "fiber";
+        session.submit(directAttachment, create(directAttachment, {peerRecord}));
+        auto link = session.newRequest(directAttachment);
+        link.expectedObjects = testNumberedGuards(session, directAttachment, {{uuid, 3}, {peer, 1}});
+        EdgeRecord edge; edge.uuid = util::newUuid(); edge.kind = "test_link";
+        edge.aUuid = uuid; edge.bUuid = peer;
+        edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
+        link.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});
+        const auto linked = session.submit(directAttachment, link);
+        require(linked.objects.at(uuid) == 4 && linked.objects.at(peer) == 2 &&
+                linked.relationships.at(edge.uuid) == 1,
+                "history-off relationship edits number both endpoints and the relationship");
+        require(linked.created == std::vector<std::string>{edge.uuid}, "relationship creation is included in the receipt");
+        auto missingEndpoint = session.newRequest(directAttachment);
+        missingEndpoint.expectedObjects = testNumberedGuards(session, directAttachment, {{uuid, 4}});
+        missingEndpoint.operations.push_back(RemoveEdgeOp{edge.uuid});
+        mustFail([&] { session.submit(directAttachment, missingEndpoint); });
+        auto remove = session.newRequest(directAttachment);
+        remove.expectedObjects = testNumberedGuards(session, directAttachment, {{uuid, 4}, {peer, 2}});
+        remove.operations.push_back(RemoveEdgeOp{edge.uuid});
+        const auto removed = session.submit(directAttachment, remove);
+        require(removed.objects.at(uuid) == 5 && removed.objects.at(peer) == 3 &&
+                removed.relationships.contains(edge.uuid) && !removed.relationships.at(edge.uuid),
+                "history-off relationship deletion reports absence and endpoint versions");
+        auto noop = session.newRequest(directAttachment);
+        noop.expectedObjects = testNumberedGuards(session, directAttachment, {{uuid, 5}});
+        const auto sequence = session.status(directAttachment).commitSequence;
+        const auto nochange = session.submit(directAttachment, noop);
+        require(!nochange.commitSequence && nochange.objects.at(uuid) == 5 &&
+                session.status(directAttachment).commitSequence == sequence,
+                "history-off no-op receipt does not advance the store clock");
+        session.detach(directAttachment);
+    }
     std::cout << "session tests passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
