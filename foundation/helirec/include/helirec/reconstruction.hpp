@@ -34,6 +34,7 @@
 // name: z_translation_scale, companion_registration, stationary_registration, axis_refinement, rolling_shutter.
 #include <array>
 #include <functional>
+#include <optional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -162,6 +163,42 @@ using GeometryMaker = std::function<std::string(const std::vector<std::string>& 
 std::pair<std::string, std::string> geometry_calibration_file(const std::string& given, const std::string& cache_dir, const std::vector<std::string>& masters,
                                                               const std::string& row_time_us, Device device,
                                                               const std::function<void(const std::string&)>& log = nullptr, const GeometryMaker& make = nullptr);
+
+// ---------------------------------------------------------------- one tile of a mosaic
+// A reconstructor of one tile alone (python/helirec/mosaic.py describes the tiles' description, geometry.hpp
+// TileGeometry reads it): the detector map, the pose and the angle of every frame, the rows' timing, in the tile's
+// own frame (the slice's centre is the tile's rotation axis, rounded to half a pixel of the reconstruction); only the
+// helix frames on disk the description names are used. The intensity side is the pair's: the scan's own darks and
+// flats taken to the nominal ring current, a weight map from the flats with a taper at the detector's far edge and
+// across the axis.
+struct TileOptions {
+    Device device = Device::CUDA;
+    std::string params = "{}";        // over the defaults here: fbp, no filters, no sld, no sharpness weighting
+    // the slices' numbering (rows; the same for tiles that are compared); none: from the record's height of the tile's
+    // middle frame on disk
+    std::optional<double> row_origin;
+    std::function<void(std::vector<float>& weight, int rows, int cols)> weight;  // changes the weight map (stored pixels)
+    double cache_gb = 0;              // decoded chunks the reader keeps
+    const calibration::DarksFlats* reduced = nullptr;  // the scan's darks and flats as reduced before (none: reduced here)
+    std::string cache_dir;            // the darks and flats kept there (reduced_darks_flats)
+    // 1, 2 or 3: at a half, a quarter, an eighth, from the codestream's own lower resolutions (RawReader(reduce=)),
+    // the darks and flats through the same low-pass (at_resolution) and the whole geometry divided by 2^reduce
+    int reduce = 0;
+    std::function<void(const std::string&)> log;
+    ExternalBackprojectorFactory external_backprojector;
+};
+struct TileReconstruction {
+    std::shared_ptr<SliceReconstructor> reconstructor;
+    double rot_center = 0;            // where the axis lies in the slice (reduced pixels)
+    std::int64_t first_frame = 0, end_frame = 0;
+    geometry::Terms terms;            // as given to the reconstructor (reduced)
+    double row_origin = 0;            // stored rows
+    calibration::DarksFlats reduced;  // the darks and flats at full resolution (to pass on to another call)
+    int reduce = 0;
+    calibration::Scan scan;
+    std::string parameters;           // the parameters used (JSON object text)
+};
+TileReconstruction tile_reconstructor(const std::string& master, const std::string& description, const std::string& tile, const TileOptions& options);
 
 // helirec's source revision (git describe of the source tree it was built from, if it is a git checkout)
 std::string build_revision();

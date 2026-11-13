@@ -87,94 +87,14 @@ def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origi
     added: slice h of a reduced reconstruction is slice h 2^reduce of the full one, and its pixel at (x, y) from
     the axis is the full one's at (x, y) 2^reduce from the axis. The result's rot_center, where the axis lies in
     the slice, is in reduced pixels. row_origin stays in stored rows.
-    Returns (reconstructor, dict(rot_center, frames, scan, terms, row_origin, reduced, reduce))."""
-    from . import _core, bliss, calibration
-    from .recon import CALIBRATION_KEYS, DEFAULTS, angle_subset_config, backprojector_config
-    from .sld import sld_config
+    Returns (reconstructor, dict(rot_center, frames, scan, terms, row_origin, reduced, reduce, params)).
+    (helirec::tile_reconstructor, helirec/reconstruction.hpp)"""
+    import json
 
-    L = cal["layout"]
-    k = L["tiles"].index(label)
-    a, b = L["frames_on_disk"][k]
-    scan = bliss.open_scan(master)
-    rows, cols = scan.frame_shape
-    # the helix among the scan's projections (they are kept one stretch after the other)
-    session = _core.CalibrationSession([str(master)], 0)
-    st = session.stretches(0)
-    helix = next(x for x in st if x["role"] == "projection" and x["latched"] and x["helical"])
-    before = sum(x["n_frames"] for x in st if x["role"] == "projection" and x["index"] < helix["index"])
-    del session
-    frame = np.arange(a, b)
-    idx = before + frame
-    angle = np.asarray(scan.unwrapped_angles_deg, np.float64)[idx]
-    z = np.ascontiguousarray(np.asarray(scan.z_translation_m, np.float64)[idx])
-    height_rows = L["row_sign"] * z / scan.pixel_size_m
-    t = cal["tiles"][label]
-    # The slice's grid has its centre on a pixel or between two, and the reconstruction puts the axis there: the
-    # axis' column is rounded to half a pixel of the reconstruction (the rest goes into every frame's column
-    # offset), so that rot_center is where the axis lies in the slice. (Rounded to a quarter, as it was, the axis
-    # lay a quarter of a pixel from rot_center for some tiles and not for others.)
-    rot_center = (1 << int(reduce)) * round(2 * t["axis_column"] / (1 << int(reduce))) / 2.0
-    if reduced is None:
-        log(f"[{label}] darks and flats ...")
-        reduced = calibration.reduced_darks_flats(scan, cache_dir, log)
-    dark, flats = reduced
-    wm = calibration.weight_map([flats])
-    far, near = (50.0, min(2000.0, cols - t["axis_column"])) if t["axis_column"] > (cols - 1) / 2 else (min(2000.0, t["axis_column"]), 50.0)
-    w = (wm * _core.apodisation_mask(cols, far, near, 1e-8)[None, :]).astype(np.float32)
-    if weight is not None:
-        w = np.ascontiguousarray(weight(w), np.float32)
-    if row_origin is None:
-        row_origin = -(1.0 + cal["axial_scale"]) * float(height_rows[len(height_rows) // 2])
-    terms = reconstruction_terms(cal, label, angle, height_rows, frame, rot_center, row_origin)
-    m = cal["map"]
-    f = 1 << int(reduce)
-    pixel_size_m = scan.pixel_size_m * f
-    eu, ev = [float(x) for x in m["eu"]], [float(x) for x in m["ev"]]
-    c0, cs, v0, vs = (float(m[key]) for key in ("c0", "cs", "v0", "vs"))
-    rad_per_row = cal["row_time"]["rad_per_row"]
-    if reduce:
-        # every position of the stored detector and of the full reconstruction over f; slopes and scales are ratios
-        import h5py
-        with h5py.File(scan.projections.files[int(scan.projections.file_index[idx[0]])], "r") as h5:
-            chunk_rows = h5[scan.projections.dataset].chunks[1]
-        dark, flats = calibration.at_resolution(dark, reduce, chunk_rows), calibration.at_resolution(flats, reduce, chunk_rows)
-        w = np.ascontiguousarray(w[::f, ::f])                                # the weight of the stored pixel a reduced value sits at
-        rows_r, cols_r = rows // f, cols // f
-        # the reconstruction counts the rows' timing from its middle row, which is the stored row f (rows_r - 1) / 2
-        # and not the stored middle (rows - 1) / 2 the description's angles are for
-        terms = dict(terms, angles_deg=terms["angles_deg"] + np.degrees(rad_per_row * (f * (rows_r - 1) / 2 - (rows - 1) / 2)),
-                     row_offset=terms["row_offset"] / f, col_offset=terms["col_offset"] / f, slope_col=terms["slope_col"] / f, slope_row=terms["slope_row"] / f,
-                     scale_col=terms["scale_col"] / f, scale_row=terms["scale_row"] / f)
-        eu, ev = [x / f for x in eu], [x / f for x in ev]
-        c0, cs, v0, vs = c0 / f, cs / f, v0 / f, vs / f
-        rot_center, rad_per_row = rot_center / f, rad_per_row * f
-        rows, cols = rows_r, cols_r
-    reader = _core.RawReader(list(scan.projections.files), scan.projections.dataset, *scan.frame_shape, reduce=int(reduce))
-    if cache_gb:
-        reader.set_cache_bytes(int(cache_gb * (1 << 30)))
-    sd = _core.make_scan_data(
-        terms["angles_deg"], z, pixel_size_m, rows, cols, 0, 0.0, 0.0, np.ascontiguousarray(np.asarray(scan.control_A, np.float64)[idx]),
-        np.ascontiguousarray(scan.flats_unwrapped_angles_deg, np.float32), np.ascontiguousarray(dark), np.ascontiguousarray((flats - dark[None]).astype(np.float32)), w, reader,
-        np.ascontiguousarray(np.asarray(scan.projections.file_index)[idx]), np.ascontiguousarray(np.asarray(scan.projections.frame_index)[idx]), 1.0,
-        row_offset=np.asarray(terms["row_offset"], np.float32).tolist(), row_slope=terms["row_slope"].tolist(), slope_col=terms["slope_col"],
-        col_offset=np.asarray(terms["col_offset"], np.float32).tolist(),
-        col_slope=terms["col_slope"].tolist(), slope_row=terms["slope_row"], col_scale=terms["col_scale"].tolist(), scale_col=terms["scale_col"],
-        row_scale=terms["row_scale"].tolist(), scale_row=terms["scale_row"],
-        map_i=[int(x) for x in m["i"]], map_j=[int(x) for x in m["j"]], map_eu=eu, map_ev=ev, map_c0=c0, map_cs=cs, map_v0=v0, map_vs=vs)
-    p = dict(DEFAULTS)
-    p.update(backprojector="fbp", filters=[], sld="", sharpness_weighting="off", angle_subset="")
-    p.update(params or {})
-    p.pop("mode")
-    cfg = dict(p, device=device, energy_kev=scan.energy_kev, distance_m=scan.distance_m, pixel_size_m=pixel_size_m, rot_center=rot_center, legacy_reference=False)
-    cfg.update(backprojector_config(p["backprojector"]))
-    if not cfg.get("grid_size"):
-        cfg["grid_size"] = int(round(2.0 * rot_center)) + 1
-    cfg.update(sld_config(cfg.pop("sld")))
-    cfg["exposure_arc"] = 0.0
-    cfg["sharpness_weighting"] = ""
-    cfg["angle_subset"], cfg["angle_subsets"] = angle_subset_config(cfg.pop("angle_subset"))
-    for key in CALIBRATION_KEYS:
-        cfg.pop(key)
-    cfg["rolling_shutter"] = rad_per_row / np.radians(abs(L["step_deg"])) * (rows - 1)
-    return _core.SliceReconstructor([sd], cfg), dict(rot_center=rot_center, frames=(int(a), int(b)), scan=scan, terms=terms, row_origin=row_origin, reduced=reduced,
-                                                     reduce=int(reduce))
+    from . import _core
+    try:
+        return _core.tile_reconstructor(str(master), cal if isinstance(cal, str) else json.dumps(cal, default=float), str(label), device,
+                                        json.dumps(params or {}, default=float), row_origin, weight, float(cache_gb), reduced, str(cache_dir or ""),
+                                        int(reduce), log)     # helirec::tile_reconstructor
+    except RuntimeError as e:
+        raise ValueError(str(e)) from None

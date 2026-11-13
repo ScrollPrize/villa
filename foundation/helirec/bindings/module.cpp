@@ -1606,6 +1606,84 @@ NB_MODULE(_core, m) {
     m.def("backprojector_config", &backprojector_config, "spec"_a, "a backprojector spec as the reconstructor's settings (JSON text)");
     m.def("angle_subset_config", &parse_angle_subset, "spec"_a);
     m.def("build_revision", &build_revision);
+    m.def(
+        "tile_reconstructor",
+        [](const std::string& master, const std::string& description, const std::string& tile, const std::string& device, const std::string& params,
+           std::optional<double> row_origin, nb::object weight, double cache_gb, nb::object reduced, const std::string& cache_dir, int reduce,
+           std::optional<std::function<void(const std::string&)>> log) {
+            TileOptions o;
+            o.device = parse_device(device);
+            o.params = params;
+            o.row_origin = row_origin;
+            o.cache_gb = cache_gb;
+            o.cache_dir = cache_dir;
+            o.reduce = reduce;
+            o.external_backprojector = python_backprojector;
+            if (log)
+                o.log = [log](const std::string& line) {
+                    nb::gil_scoped_acquire gil;
+                    (*log)(line);
+                };
+            if (!weight.is_none())
+                o.weight = [weight](std::vector<float>& w, int rows, int cols) {
+                    nb::gil_scoped_acquire gil;
+                    auto a = new_array_t<float>({static_cast<std::size_t>(rows), static_cast<std::size_t>(cols)});
+                    std::copy(w.begin(), w.end(), static_cast<float*>(a.data()));
+                    nb::object r = nb::module_::import_("numpy").attr("ascontiguousarray")(weight(a), "float32");
+                    auto b = nb::cast<nb::ndarray<const float, nb::c_contig, nb::device::cpu>>(r);
+                    require(b.size() == w.size(), "weight: the function must return a weight map of the same shape");
+                    std::copy(b.data(), b.data() + b.size(), w.begin());
+                };
+            calibration::DarksFlats given;
+            if (!reduced.is_none()) {
+                auto dark = nb::cast<nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu>>(nb::module_::import_("numpy").attr("ascontiguousarray")(reduced[0], "float32"));
+                auto flats = nb::cast<nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu>>(nb::module_::import_("numpy").attr("ascontiguousarray")(reduced[1], "float32"));
+                given.rows = static_cast<int>(dark.shape(0)), given.cols = static_cast<int>(dark.shape(1));
+                given.dark.assign(dark.data(), dark.data() + dark.size());
+                given.flats.assign(flats.data(), flats.data() + flats.size());
+                o.reduced = &given;
+            }
+            TileReconstruction t;
+            {
+                nb::gil_scoped_release nogil;
+                t = tile_reconstructor(master, description, tile, o);
+            }
+            const auto f32 = [](const std::vector<float>& v) {
+                auto a = new_array_t<float>({v.size()});
+                std::copy(v.begin(), v.end(), static_cast<float*>(a.data()));
+                return nb::cast(a, nb::rv_policy::move);
+            };
+            const auto f64 = [](const std::vector<double>& v) {
+                auto a = new_array_t<double>({v.size()});
+                std::copy(v.begin(), v.end(), static_cast<double*>(a.data()));
+                return nb::cast(a, nb::rv_policy::move);
+            };
+            const geometry::Terms& T = t.terms;
+            nb::dict terms;
+            terms["angles_deg"] = f64(T.angles_deg), terms["z_translation_scale"] = T.z_translation_scale;
+            terms["row_offset"] = f32(T.row_offset), terms["row_slope"] = f32(T.row_slope), terms["slope_col"] = T.slope_col;
+            terms["col_offset"] = f32(T.col_offset), terms["col_slope"] = f32(T.col_slope), terms["slope_row"] = T.slope_row;
+            terms["col_scale"] = f32(T.col_scale), terms["scale_col"] = T.scale_col, terms["row_scale"] = f32(T.row_scale), terms["scale_row"] = T.scale_row;
+            const std::size_t R = static_cast<std::size_t>(t.reduced.rows), C = static_cast<std::size_t>(t.reduced.cols);
+            auto dark = new_array_t<float>({R, C});
+            std::copy(t.reduced.dark.begin(), t.reduced.dark.end(), static_cast<float*>(dark.data()));
+            auto flats = new_array_t<float>({t.reduced.series(), R, C});
+            std::copy(t.reduced.flats.begin(), t.reduced.flats.end(), static_cast<float*>(flats.data()));
+            nb::dict info;
+            info["rot_center"] = t.rot_center;
+            info["frames"] = nb::make_tuple(t.first_frame, t.end_frame);
+            info["scan"] = nb::cast(std::move(t.scan));
+            info["terms"] = terms;
+            info["row_origin"] = t.row_origin;
+            info["reduced"] = nb::make_tuple(nb::cast(dark, nb::rv_policy::move), nb::cast(flats, nb::rv_policy::move));
+            info["reduce"] = t.reduce;
+            info["params"] = json_loads(t.parameters);
+            return nb::make_tuple(PySliceReconstructor(t.reconstructor), info);
+        },
+        "master"_a, "description"_a, "tile"_a, "device"_a = "cuda", "params"_a = "{}", "row_origin"_a = nb::none(), "weight"_a = nb::none(), "cache_gb"_a = 0.0,
+        "reduced"_a = nb::none(), "cache_dir"_a = "", "reduce"_a = 0, "log"_a = nb::none(),
+        "A reconstructor of one tile of a mosaic alone -> (SliceReconstructor, dict(rot_center, frames, scan, terms, row_origin, reduced, reduce, params)) "
+        "(helirec::tile_reconstructor)");
     m.def("write_png", [](const std::string& path, nb::ndarray<const std::uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> img) {
         write_png(path, img.data(), static_cast<int>(img.shape(0)), static_cast<int>(img.shape(1)));
     }, "path"_a, "img"_a, "(ny, nx) uint8 as an 8-bit grey PNG");

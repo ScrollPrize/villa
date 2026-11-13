@@ -12,6 +12,7 @@
 #include <tuple>
 
 #include "helirec/calibration/geometry_calibration.hpp"
+#include "helirec/calibration/record.hpp"
 #include "helirec/raw_reader.hpp"
 #include "helirec/reconstruction.hpp"
 #include "io/json.hpp"
@@ -140,6 +141,34 @@ std::string build_revision() {
     while (std::fgets(buf, sizeof buf, p)) out += buf;
     ::pclose(p);
     return strip(out);
+}
+
+// the reconstructor's settings the parameters name (all but the device, the physics, the axis, the exposure arc,
+// the sharpness weighting and the rolling shutter, which come from the scans and the calibrations)
+void apply_parameters(const Json& params, ReconConfig& cfg, const ExternalBackprojectorFactory& external, std::string* resolved_sld) {
+    cfg.filters = filter_chain_of(member(params, "filters"));
+    cfg.margin = static_cast<int>(number_of(member(params, "margin"), "margin"));
+    cfg.n_grid = static_cast<int>(number_of(member(params, "n_grid"), "n_grid"));
+    cfg.angular_tolerance_steps = number_of(member(params, "angular_tolerance_steps"), "angular_tolerance_steps");
+    cfg.luminosity_repartition = static_cast<float>(number_of(member(params, "luminosity_repartition"), "luminosity_repartition"));
+    cfg.mend_threshold = static_cast<float>(number_of(member(params, "mend_threshold"), "mend_threshold"));
+    cfg.log_clip_min = static_cast<float>(number_of(member(params, "log_clip_min"), "log_clip_min"));
+    cfg.log_clip_max = static_cast<float>(number_of(member(params, "log_clip_max"), "log_clip_max"));
+    cfg.block_angles = static_cast<int>(number_of(member(params, "block_angles"), "block_angles"));
+    apply_backprojector(text_of(member(params, "backprojector")), cfg, external);
+    cfg.grid_size = static_cast<int>(number_of(member(params, "grid_size"), "grid_size"));  // (0: the caller's rule)
+    cfg.ghbp_legs = static_cast<int>(number_of(member(params, "ghbp_legs"), "ghbp_legs"));
+    cfg.ghbp_reduction_steps = static_cast<int>(number_of(member(params, "ghbp_reduction_steps"), "ghbp_reduction_steps"));
+    cfg.clip_outer_circle = truth(member(params, "clip_outer_circle"));
+    cfg.axis_source_meters = number_of(member(params, "axis_source_meters"), "axis_source_meters");
+    const Json& sld = member(params, "sld");
+    cfg.sld = sld_params(sld.is(Json::Object) ? sld.text() : text_of(sld), resolved_sld);
+    cfg.x_interp = text_of(member(params, "x_interp"));
+    cfg.z_interp = text_of(member(params, "z_interp"));
+    cfg.angle_interp = text_of(member(params, "angle_interp"));
+    cfg.sharp_f = number_of(member(params, "sharp_f"), "sharp_f");
+    cfg.sharp_band = text_of(member(params, "sharp_band"));
+    std::tie(cfg.angle_subset, cfg.angle_subsets) = parse_angle_subset(text_of(member(params, "angle_subset")));
 }
 
 std::pair<std::string, std::string> geometry_calibration_file(const std::string& given, const std::string& cache_dir, const std::vector<std::string>& masters,
@@ -337,32 +366,10 @@ struct Reconstruction::Impl {
         cfg.pixel_size_m = main.pixel_size_m;
         cfg.rot_center = static_cast<float>(intensity.rot_center);
         cfg.legacy_reference = legacy_mode;
-        cfg.filters = filter_chain_of(member(params, "filters"));
-        cfg.margin = static_cast<int>(number_of(member(params, "margin"), "margin"));
-        cfg.n_grid = static_cast<int>(number_of(member(params, "n_grid"), "n_grid"));
-        cfg.angular_tolerance_steps = number_of(member(params, "angular_tolerance_steps"), "angular_tolerance_steps");
-        cfg.luminosity_repartition = static_cast<float>(number_of(member(params, "luminosity_repartition"), "luminosity_repartition"));
-        cfg.mend_threshold = static_cast<float>(number_of(member(params, "mend_threshold"), "mend_threshold"));
-        cfg.log_clip_min = static_cast<float>(number_of(member(params, "log_clip_min"), "log_clip_min"));
-        cfg.log_clip_max = static_cast<float>(number_of(member(params, "log_clip_max"), "log_clip_max"));
-        cfg.block_angles = static_cast<int>(number_of(member(params, "block_angles"), "block_angles"));
-        apply_backprojector(text_of(member(params, "backprojector")), cfg, options.external_backprojector);
-        cfg.grid_size = static_cast<int>(number_of(member(params, "grid_size"), "grid_size"));
+        apply_parameters(params, cfg, options.external_backprojector, &resolved_sld);
         if (!cfg.grid_size) cfg.grid_size = static_cast<int>(std::nearbyint(2.0 * intensity.rot_center)) + 1;  // 2 x axis rounded to even, + 1
-        cfg.ghbp_legs = static_cast<int>(number_of(member(params, "ghbp_legs"), "ghbp_legs"));
-        cfg.ghbp_reduction_steps = static_cast<int>(number_of(member(params, "ghbp_reduction_steps"), "ghbp_reduction_steps"));
-        cfg.clip_outer_circle = truth(member(params, "clip_outer_circle"));
-        cfg.axis_source_meters = number_of(member(params, "axis_source_meters"), "axis_source_meters");
-        const Json& sld = member(params, "sld");
-        cfg.sld = sld_params(sld.is(Json::Object) ? sld.text() : text_of(sld), &resolved_sld);
-        cfg.x_interp = text_of(member(params, "x_interp"));
-        cfg.z_interp = text_of(member(params, "z_interp"));
-        cfg.angle_interp = text_of(member(params, "angle_interp"));
         cfg.exposure_arc = exposure_arc();
         cfg.sharpness_weighting = legacy_mode ? std::string() : sharpness_weighting();
-        cfg.sharp_f = number_of(member(params, "sharp_f"), "sharp_f");
-        cfg.sharp_band = text_of(member(params, "sharp_band"));
-        std::tie(cfg.angle_subset, cfg.angle_subsets) = parse_angle_subset(text_of(member(params, "angle_subset")));
         cfg.rolling_shutter = legacy_mode ? 0.0 : rolling_shutter;
         std::vector<ScanData> scans = {scan_data(0), scan_data(1)};
         rec = std::make_shared<SliceReconstructor>(std::move(scans), cfg);
@@ -503,6 +510,194 @@ std::string Reconstruction::provenance() const {
         .set("distance_m", Json::of(I.main.distance_m))
         .set("helirec", Json::dict().set("git", Json::of(build_revision())))
         .text();
+}
+
+// ---------------------------------------------------------------- one tile of a mosaic
+
+TileReconstruction tile_reconstructor(const std::string& master, const std::string& description, const std::string& label, const TileOptions& o) {
+    const Json cal = Json::parse(description);
+    const Json& L = member(cal, "layout");
+    const auto& tiles = member(L, "tiles").array;
+    std::size_t k = 0;
+    while (k < tiles.size() && tiles[k].string != label) ++k;
+    if (k == tiles.size()) throw Error("the description has no tile '" + label + "'");
+    const auto& range = member(L, "frames_on_disk").array.at(k).array;
+    TileReconstruction out;
+    out.first_frame = static_cast<std::int64_t>(range.at(0).number);
+    out.end_frame = static_cast<std::int64_t>(range.at(1).number);
+    out.reduce = o.reduce;
+    out.scan = calibration::open_scan(master);
+    const calibration::Scan& scan = out.scan;
+    const int rows_full = scan.rows, cols_full = scan.cols;
+    // the helix among the scan's projections (they are kept one stretch after the other)
+    std::int64_t before = 0;
+    {
+        const calibration::Record rec = calibration::read_record(scan.master, false);
+        bool found = false;
+        for (const calibration::Stretch& st : rec.stretches) {
+            if (st.role != calibration::Role::Projection) continue;
+            if (st.latched() && !st.z_center.empty()) {
+                found = true;
+                break;
+            }
+            before += st.n_frames;
+        }
+        if (!found) throw Error(scan.name + ": no helix among the projections");
+    }
+    std::vector<std::int64_t> idx;
+    std::vector<double> frame, angle, z, height_rows, control;
+    std::vector<std::int32_t> file_index, frame_index;
+    const double row_sign = member(L, "row_sign").number;
+    for (std::int64_t f = out.first_frame; f < out.end_frame; ++f) {
+        const std::size_t i = static_cast<std::size_t>(before + f);
+        frame.push_back(static_cast<double>(f));
+        angle.push_back(scan.unwrapped_angles_deg.at(i));
+        z.push_back(scan.z_translation_m.at(i));
+        height_rows.push_back(row_sign * scan.z_translation_m[i] / scan.pixel_size_m);
+        control.push_back(scan.control_A.at(i));
+        file_index.push_back(scan.projections.file_index.at(i));
+        frame_index.push_back(scan.projections.frame_index.at(i));
+    }
+    if (frame.empty()) throw Error("tile " + label + ": no frames on disk");
+    const Json& t = member(member(cal, "tiles"), label);
+    const double axis_column = member(t, "axis_column").number;
+    const int f = 1 << o.reduce;
+    // The slice's grid has its centre on a pixel or between two, and the reconstruction puts the axis there: the axis'
+    // column is rounded to half a pixel of the reconstruction (the rest goes into every frame's column offset), so
+    // that rot_center is where the axis lies in the slice.
+    double rot_center = f * std::nearbyint(2 * axis_column / f) / 2.0;
+    if (!o.reduced) say(o.log, "[" + label + "] darks and flats ...");
+    out.reduced = o.reduced ? *o.reduced : calibration::reduced_darks_flats(scan, o.cache_dir, o.log);
+    const calibration::DarksFlats& red = out.reduced;
+    const std::size_t px_full = static_cast<std::size_t>(rows_full) * static_cast<std::size_t>(cols_full);
+    std::vector<const float*> stacks;
+    for (std::size_t s = 0; s < red.series(); ++s) stacks.push_back(red.flats.data() + s * px_full);
+    const std::vector<float> wm = calibration::weight_map(stacks, rows_full, cols_full);
+    const bool right = axis_column > (cols_full - 1) / 2.0;
+    const double far = right ? 50.0 : std::min(2000.0, axis_column), near = right ? std::min(2000.0, cols_full - axis_column) : 50.0;
+    const std::vector<float> mask = calibration::apodisation_mask(cols_full, static_cast<float>(far), static_cast<float>(near), 1e-8f);
+    std::vector<float> w(px_full);
+    for (std::size_t r = 0; r < static_cast<std::size_t>(rows_full); ++r)
+        for (std::size_t c = 0; c < static_cast<std::size_t>(cols_full); ++c) w[r * cols_full + c] = wm[r * cols_full + c] * mask[c];
+    if (o.weight) o.weight(w, rows_full, cols_full);
+    out.row_origin = o.row_origin ? *o.row_origin : -(1.0 + member(cal, "axial_scale").number) * height_rows[height_rows.size() / 2];
+    out.terms = geometry::TileGeometry::parse(description).reconstruction_terms(label, angle, height_rows, frame, rot_center, out.row_origin);
+    geometry::Terms& T = out.terms;
+    const Json& m = member(cal, "map");
+    std::vector<double> eu, ev;
+    std::vector<std::int32_t> mi, mj;
+    for (const Json& v : member(m, "eu").array) eu.push_back(v.number);
+    for (const Json& v : member(m, "ev").array) ev.push_back(v.number);
+    for (const Json& v : member(m, "i").array) mi.push_back(static_cast<std::int32_t>(v.number));
+    for (const Json& v : member(m, "j").array) mj.push_back(static_cast<std::int32_t>(v.number));
+    double c0 = member(m, "c0").number, cs = member(m, "cs").number, v0 = member(m, "v0").number, vs = member(m, "vs").number;
+    double rad_per_row = member(member(cal, "row_time"), "rad_per_row").number;
+    double pixel_size_m = scan.pixel_size_m * f;
+    std::vector<float> dark = red.dark, flats = red.flats;
+    int rows = rows_full, cols = cols_full;
+    if (o.reduce) {
+        // every position of the stored detector and of the full reconstruction over f; slopes and scales are ratios
+        RawReader probe(scan.projections.files, scan.projections.dataset, rows_full, cols_full);
+        const int chunk_rows = probe.storage(file_index[0]).chunk_rows;
+        const std::vector<double> d64(dark.begin(), dark.end()), f64(flats.begin(), flats.end());
+        int ry = 0, rx = 0;
+        dark = calibration::at_resolution(d64.data(), 1, rows_full, cols_full, o.reduce, chunk_rows, &ry, &rx);
+        flats = calibration::at_resolution(f64.data(), red.series(), rows_full, cols_full, o.reduce, chunk_rows, &ry, &rx);
+        const int rows_r = rows_full / f, cols_r = cols_full / f;
+        std::vector<float> wr(static_cast<std::size_t>((rows_full + f - 1) / f) * ((cols_full + f - 1) / f));
+        const int wy = (rows_full + f - 1) / f, wx = (cols_full + f - 1) / f;
+        for (int y = 0; y < wy; ++y)
+            for (int x = 0; x < wx; ++x) wr[static_cast<std::size_t>(y) * wx + x] = w[static_cast<std::size_t>(y * f) * cols_full + x * f];  // the weight of the stored pixel a reduced value sits at
+        w = std::move(wr);
+        // the reconstruction counts the rows' timing from its middle row, which is the stored row f (rows_r - 1) / 2 and
+        // not the stored middle (rows - 1) / 2 the description's angles are for
+        const double shift = (rad_per_row * (f * (rows_r - 1) / 2.0 - (rows_full - 1) / 2.0)) * (180.0 / M_PI);
+        for (double& a : T.angles_deg) a += shift;
+        const float ff = static_cast<float>(f);
+        for (float& v : T.row_offset) v /= ff;
+        for (float& v : T.col_offset) v /= ff;
+        T.slope_col /= f, T.slope_row /= f, T.scale_col /= f, T.scale_row /= f;
+        for (double& v : eu) v /= f;
+        for (double& v : ev) v /= f;
+        c0 /= f, cs /= f, v0 /= f, vs /= f;
+        rot_center /= f, rad_per_row *= f;
+        rows = rows_r, cols = cols_r;
+        (void)wx;
+    }
+    out.rot_center = rot_center;
+
+    ScanData d;
+    ScanTrajectory& tr = d.traj;
+    tr.angles_deg = T.angles_deg;
+    tr.z_translation_m = z;
+    tr.pixel_size_m = pixel_size_m;
+    tr.det_rows = rows;
+    tr.det_cols = cols;
+    tr.z_translation_scale = 1.0;
+    tr.row_offset = T.row_offset;
+    tr.row_slope = T.row_slope;
+    tr.slope_col = static_cast<float>(T.slope_col);
+    tr.col_offset = T.col_offset;
+    tr.col_slope = T.col_slope;
+    tr.slope_row = static_cast<float>(T.slope_row);
+    tr.col_scale = T.col_scale;
+    tr.scale_col = static_cast<float>(T.scale_col);
+    tr.row_scale = T.row_scale;
+    tr.scale_row = static_cast<float>(T.scale_row);
+    tr.map_i = mi, tr.map_j = mj, tr.map_eu = eu, tr.map_ev = ev;
+    tr.map_c0 = c0, tr.map_cs = cs, tr.map_v0 = v0, tr.map_vs = vs;
+    d.control_A = control;
+    d.flat_info.angles_deg.assign(scan.flats_unwrapped_angles_deg.begin(), scan.flats_unwrapped_angles_deg.end());
+    d.dark = dark;
+    const std::size_t px = dark.size();
+    d.flats.resize(flats.size());
+    for (std::size_t i = 0; i < flats.size(); ++i) d.flats[i] = flats[i] - dark[i % px];
+    d.weight = w;
+    d.reader = std::make_shared<RawReader>(scan.projections.files, scan.projections.dataset, rows_full, cols_full, o.reduce);
+    if (o.cache_gb > 0) d.reader->set_cache_bytes(static_cast<std::size_t>(o.cache_gb * (1ull << 30)));
+    d.file_index = file_index;
+    d.frame_index = frame_index;
+
+    // the parameters: the defaults with fbp, the ramp filter alone, no sld, no sharpness weighting, then o.params
+    Json p = Json::parse(default_parameters());
+    const auto put = [&](const std::string& key, Json v) {
+        for (auto& kv : p.object)
+            if (kv.first == key) return void(kv.second = std::move(v));
+        p.object.emplace_back(key, std::move(v));
+    };
+    put("backprojector", Json::of(std::string("fbp")));
+    put("filters", Json::list());
+    put("sld", Json::of(std::string("")));
+    put("sharpness_weighting", Json::of(std::string("off")));
+    put("angle_subset", Json::of(std::string("")));
+    Json filter_changes = Json::dict();
+    for (const auto& [key, v] : Json::parse(o.params.empty() ? "{}" : o.params).object) {
+        if (key == "mode") {
+            if (v.string != "corrected") throw Error("a tile is reconstructed in mode corrected");
+            continue;
+        }
+        if (is_filter_key(key) && key != "filters") filter_changes.set(key, v);
+        else if (!p.find(key)) throw Error("unknown parameter '" + key + "'");
+        else put(key, key == "filters" && v.is(Json::String) ? Json::parse(parse_filter_chain(v.string)) : v);
+    }
+    if (!filter_changes.object.empty()) put("filters", Json::parse(override_filter_chain(p.find("filters")->text(), filter_changes.text())));
+    out.parameters = p.text();
+    ReconConfig cfg;
+    cfg.device = o.device;
+    cfg.energy_kev = scan.energy_kev;
+    cfg.distance_m = scan.distance_m;
+    cfg.pixel_size_m = pixel_size_m;
+    cfg.rot_center = static_cast<float>(rot_center);
+    cfg.legacy_reference = false;
+    apply_parameters(p, cfg, o.external_backprojector, nullptr);
+    if (!cfg.grid_size) cfg.grid_size = static_cast<int>(std::nearbyint(2.0 * rot_center)) + 1;
+    cfg.exposure_arc = 0.0;
+    cfg.sharpness_weighting.clear();
+    cfg.rolling_shutter = rad_per_row / (std::fabs(member(L, "step_deg").number) * (M_PI / 180.0)) * (rows - 1);
+    std::vector<ScanData> scans;
+    scans.push_back(std::move(d));
+    out.reconstructor = std::make_shared<SliceReconstructor>(std::move(scans), cfg);
+    return out;
 }
 
 }  // namespace helirec
