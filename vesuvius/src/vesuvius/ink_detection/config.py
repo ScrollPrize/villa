@@ -174,6 +174,53 @@ def _extra_patches_config(
     )
 
 
+@dataclass(frozen=True)
+class ScanTransferConfig:
+    """Pooled-to-native scan-type augmentation for flat training.
+
+    See ``training/scan_transfer.py`` and ``docs/ink_cross_scroll.md``. ``kernel`` is a
+    JSON/NPZ file or ``builtin:<name>`` for a kernel shipped with the package.
+    """
+
+    kernel: str
+    probability: float = 0.5
+    noise_amplitude: float = 0.5
+    noise_sigma_xy: float = 4.0
+    noise_sigma_z: float = 1.5
+
+
+def _scan_transfer_config(
+    authored: Mapping[str, Any], *, mode: str
+) -> ScanTransferConfig | None:
+    value = authored.get("scan_transfer") or {}
+    if not isinstance(value, Mapping):
+        raise TypeError("scan_transfer must be an object or null")
+    if not bool(value.get("enabled", False)):
+        return None
+    if mode != "flat":
+        raise ValueError("scan_transfer is supported only in mode='flat'")
+    kernel = value.get("kernel")
+    if kernel in (None, ""):
+        raise ValueError("scan_transfer.kernel is required")
+    probability = float(value.get("probability", 0.5))
+    amplitude = float(value.get("noise_amplitude", 0.5))
+    sigma_xy = float(value.get("noise_sigma_xy", 4.0))
+    sigma_z = float(value.get("noise_sigma_z", 1.5))
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("scan_transfer.probability must be in [0,1]")
+    if amplitude < 0.0:
+        raise ValueError("scan_transfer.noise_amplitude must be nonnegative")
+    if sigma_xy <= 0.0 or sigma_z <= 0.0:
+        raise ValueError("scan_transfer noise sigmas must be positive")
+    return ScanTransferConfig(
+        kernel=str(kernel),
+        probability=probability,
+        noise_amplitude=amplitude,
+        noise_sigma_xy=sigma_xy,
+        noise_sigma_z=sigma_z,
+    )
+
+
 class _FrozenMapping(Mapping):
     """Small ordered immutable mapping that remains safe across spawn/pickle."""
 
@@ -1481,6 +1528,7 @@ class TrainingConfig:
     extra_patches: ExtraPatchesConfig
     force_full_supervision: bool
     save_iterations: tuple[int, ...]
+    scan_transfer: ScanTransferConfig | None = None
 
     @classmethod
     def from_mapping(cls, canonical: Mapping[str, Any]) -> "TrainingConfig":
@@ -1624,6 +1672,7 @@ class TrainingConfig:
             extra_patches=extra_patches,
             force_full_supervision=force_full_supervision,
             save_iterations=save_iterations,
+            scan_transfer=_scan_transfer_config(canonical, mode=ink.data.mode),
         )
 
     @property
