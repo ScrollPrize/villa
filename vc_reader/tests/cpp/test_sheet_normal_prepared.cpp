@@ -32,10 +32,10 @@ int main()
     std::vector<uint8_t> image(width * width * width);
     CpuWorkspace workspace;
     CpuPatch patch;
-    // Consecutive centers differ in one coordinate only, and repeat.
+    // Consecutive centers differ in one coordinate only (z, y, then x), and repeat.
     const float centers[][4] = {{48,48,48,1}, {48.25f,47.5f,49,1}, {48.25f,47.5f,49.5f,1},
-                                {48.25f,48,49.5f,1}, {49,48,47,0}, {47,49.25f,48.5f,1},
-                                {48,48,48,1}, {48,48,48,1}};
+                                {48.25f,48,49.5f,1}, {48.75f,48,49.5f,1}, {49,48,47,0},
+                                {47,49.25f,48.5f,1}, {48,48,48,1}, {48,48,48,1}};
     // Textured, flat, then textured along another direction with a dark half.
     for (int pattern = 0; pattern < 3; ++pattern) {
         const bool flat = pattern == 1;
