@@ -1262,7 +1262,8 @@ private:
         using std::runtime_error::runtime_error;
     };
     static std::vector<StoredFiber> readStoredFibersInContextOnce(
-        FiberReadContext&, const std::optional<std::vector<std::string>>&, bool, FiberDependencies*);
+        FiberReadContext&, const std::optional<std::vector<std::string>>&, bool, FiberDependencies*,
+        std::optional<vc::objects::StoreStatus>* startedAt = nullptr);
     static std::vector<StoredFiberPtr> storedFibersInContext(
         FiberReadContext&, const std::optional<std::vector<std::string>>&, bool);
     static void prepareSideStripSnapshots(SideStripIntersectionRequest&);
@@ -1503,6 +1504,16 @@ private:
                           std::function<void(const std::vector<size_t>&)> replay);
     void scheduleDeferredControlEdits();
     void drainDeferredControlEdits();
+    // Applies a pane's queued tag edits now, joining the saves they start; true if any was applied.
+    bool applyDeferredControlEditsNow(const std::string& surfaceName, bool beforeDispatch = false);
+    // A control edit waits for the session's landing (see applyDeferredControlEditsNow's beforeDispatch).
+    [[nodiscard]] bool controlEditWaits(const LineAnnotationSession& session) const;
+    bool _applyControlEditsBeforeDispatch = false;
+    // For a pane about to be saved for good or removed: applies all its queued
+    // tag edits, awaiting a solve one of them starts.
+    void settleDeferredControlEdits(const std::string& surfaceName);
+    // Joins the running publication and stores what is queued behind it, in turn.
+    void settlePublicationWork();
     [[nodiscard]] bool hasDeferredWork(const std::string& surfaceName) const;
     std::vector<vc::objects::StoreSessionEvent> _eventsDuringPublication;
     bool _publicationDrainQueued = false;

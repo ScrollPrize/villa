@@ -82,7 +82,14 @@ private:
                     if (requested.starts_with("/v1/payloads/")) {
                         const int now = ++uploadsInFlight;
                         for (int seen = maxUploadsInFlight; now > seen && !maxUploadsInFlight.compare_exchange_weak(seen, now);) {}
-                        std::this_thread::sleep_for(std::chrono::milliseconds(uploadDelayMs.load()));
+                        // Held for the delay, and (with a delay set) until a second
+                        // upload has been seen in flight or thirty seconds pass:
+                        // the overlap does not depend on how threads are scheduled.
+                        const int delay = uploadDelayMs.load();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                        for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                             delay > 0 && maxUploadsInFlight < 2 && std::chrono::steady_clock::now() < deadline;)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
                         --uploadsInFlight;
                         if (refuseUploads) {
                             http::response<http::string_body> refused{http::status::internal_server_error, 11};

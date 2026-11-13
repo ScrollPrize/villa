@@ -3244,6 +3244,9 @@ LineAnnotationController::autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
                                          std::function<bool()> mapStillFresh,
                                          const FiberMapAutoLinkParams& params)
 {
+    // A background save in flight may be storing this fiber: what is read
+    // and changed here must start from that save's result.
+    joinPublication();
     namespace al = vc3d::fiber_map::autolink;
     FiberMapAutoLinkOutcome outcome;
     const auto refuse = [&outcome](const QString& message) {
@@ -3457,6 +3460,7 @@ LineAnnotationController::autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
     }
 
     // Step 5: the link, on the current records, in one checked commit.
+    joinPublication();
     for (Side& side : sides) {
         side.fiber = readStoredFiber(side.endpoint->fiberId, true);
         if (!side.fiber) {
@@ -4217,6 +4221,9 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
 vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers(
     std::vector<uint64_t> fiberIds)
 {
+    // A background save in flight may be storing this fiber: what is read
+    // and changed here must start from that save's result.
+    joinPublication();
     vc3d::line_annotation::FiberDeleteOutcome outcome;
     std::vector<std::string> uuids;
     for (const auto id : fiberIds) if (auto uuid = fiberUuidForId(id); !uuid.empty()) uuids.push_back(std::move(uuid));
@@ -4250,6 +4257,9 @@ vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers
 
 void LineAnnotationController::renameFiberFile(uint64_t fiberId)
 {
+    // A background save in flight may be storing this fiber: what is read
+    // and changed here must start from that save's result.
+    joinPublication();
     const auto original = readStoredFiber(fiberId);
     if (!original) return;
     bool accepted = false;
@@ -4363,6 +4373,7 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
 {
     // Publish pending edits before reading a consistent store snapshot.
     flushAllPendingSessionAutoSaves();
+    settlePublicationWork();
     if (exportedCount) {
         *exportedCount = 0;
     }
@@ -4398,6 +4409,9 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
 
 void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QString& tag)
 {
+    // A background save in flight may be storing this fiber: what is read
+    // and changed here must start from that save's result.
+    joinPublication();
     const auto normalizedTag = vc::fiber_tracer::fiberHvTagToString(
         vc::fiber_tracer::fiberHvTagFromString(tag.toStdString()));
     const std::string manualTag = normalizedTag == "unknown" ? std::string{} : normalizedTag;
@@ -4427,6 +4441,9 @@ void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QStri
 
 void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag, bool enabled)
 {
+    // A background save in flight may be storing this fiber: what is read
+    // and changed here must start from that save's result.
+    joinPublication();
     QString validationError;
     const auto normalizedTag = normalizedFiberTagInput(tag, &validationError);
     if (!normalizedTag) {
@@ -4512,6 +4529,9 @@ void LineAnnotationController::pushFiberUiState(const PaneRecord& pane) const
 
 void LineAnnotationController::recalculateFiberHvClassification(uint64_t fiberId)
 {
+    // A background save in flight may be storing this fiber: what is read
+    // and changed here must start from that save's result.
+    joinPublication();
     auto fiber = readStoredFiber(fiberId);
     if (!fiber) {
         showError(tr("Fiber %1 is not in the attached object store.").arg(fiberId));
@@ -4607,9 +4627,15 @@ void LineAnnotationController::saveOpenFibersCore()
     for (const auto& pane : _panes) if (pane.session) surfaces.push_back(pane.surfaceName);
     for (const auto& surface : surfaces) {
         auto* pane = paneForSurface(surface);
-        while (pane && pane->session && pane->session->watcher) {
-            pane->session->watcher->waitForFinished();
-            finishOptimization(surface);
+        // Tag edits queued behind a save or the solve belong to what is
+        // saved here; applying one can start another solve.
+        for (int pass = 0; pass < 2; ++pass) {
+            while (pane && pane->session && pane->session->watcher) {
+                pane->session->watcher->waitForFinished();
+                finishOptimization(surface);
+                pane = paneForSurface(surface);
+            }
+            if (pass == 0) settleDeferredControlEdits(surface);
             pane = paneForSurface(surface);
         }
         if (pane && pane->session && !pane->session->suppressFiberSave)
@@ -6434,6 +6460,9 @@ std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
     const cv::Vec3d& requestedLinkDirection,
     const LineAnnotationSession& templateSession)
 {
+    // A background save in flight may be storing this fiber: what is read
+    // and changed here must start from that save's result.
+    joinPublication();
     const cv::Vec3d linkDirection = normalizedOrZero(requestedLinkDirection);
     const cv::Vec3d parentEndpointDirection =
         endpointTangentFromLinePoints(parent.linePoints, parent.point, linkDirection);
@@ -6884,6 +6913,9 @@ std::optional<QString> LineAnnotationController::linkSessionControlToStoredContr
     bool adjacent,
     bool autoLink)
 {
+    // A background save in flight may be storing this fiber: what is read
+    // and changed here must start from that save's result.
+    joinPublication();
     // The link of a SESSION control point to a stored fiber's control point,
     // shared by the link-candidate menu (adjacent or ordinary, human pending)
     // and the automatic link made from a fiber-intersection marker
@@ -7023,8 +7055,16 @@ bool LineAnnotationController::structuralEditPreflight(uint64_t packageGeneratio
                                                        uint64_t attachmentSequence,
                                                        std::string* error)
 {
+    // The edit is planned from what is stored: a running background save
+    // and the saves queued behind it are stored (and installed) first.
+    settlePublicationWork();
     if (_packageGeneration != packageGeneration) {
         Logger()->warn("Structural edit abandoned: the package changed");
+        return false;
+    }
+    if (!_deferredControlEdits.empty()) {
+        // The edit would be planned without it and its fiber replaced.
+        if (error) *error = "a tag change is still waiting for a line to finish optimizing; try again when it has";
         return false;
     }
     if (_fiberSaveFailureCount != _fiberSaveFailureCountAtAttachment) {
@@ -10188,8 +10228,7 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
                     [&](const auto& edit) { return edit.surfaceName == surfaceName; })) {
         // Tag edits queued behind a running save belong to what the close
         // saves: applied now, while the dialog is alive.
-        joinPublication();
-        drainDeferredControlEdits();
+        applyDeferredControlEditsNow(surfaceName);
         pane = paneForSurface(surfaceName);
         if (!pane || !pane->dialog || !pane->session) return;
         // Still queued: the line is being solved (or about to be). Closing
@@ -12152,10 +12191,9 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
     if (paneForSurface(surfaceName)) {
         joinPublication();
         // Tag edits queued behind that save are applied (and saved) before
-        // the pane goes; one that still waits for a solve is dropped with it.
-        if (std::any_of(_deferredControlEdits.begin(), _deferredControlEdits.end(),
-                        [&](const auto& edit) { return edit.surfaceName == surfaceName; }))
-            drainDeferredControlEdits();
+        // the pane goes.
+        settleDeferredControlEdits(surfaceName);
+        joinPublication();
     }
 
     const auto before = _panes.size();
@@ -12341,6 +12379,7 @@ void LineAnnotationController::reoptimizeMergedFibers(
             Logger()->warn("Re-optimization abandoned: the package changed");
             return;
         }
+        joinPublication();
         auto stored = readStoredFiber(fiberId, true);
         if (!stored || !stored->editorError.empty()) {
             continue;
@@ -13286,11 +13325,21 @@ bool LineAnnotationController::sessionAwaitsLanding(const LineAnnotationSession&
         session.solveDispatchScheduled;
 }
 
+bool LineAnnotationController::controlEditWaits(const LineAnnotationSession& session) const
+{
+    if (!sessionAwaitsLanding(session)) return false;
+    // When the pane is about to be saved for good or removed (quit's
+    // save-all, a package switch), an edit that only waits for a solve not
+    // yet dispatched is applied instead: nothing would land for it in time.
+    return !(_applyControlEditsBeforeDispatch && !_publication &&
+             session.taskState != LineAnnotationSession::TaskState::Running && !session.watcher);
+}
+
 bool LineAnnotationController::deferControlEdit(const LineAnnotationSession& session,
                                                 const std::vector<size_t>& controlIndices,
                                                 std::function<void(const std::vector<size_t>&)> replay)
 {
-    if (!sessionAwaitsLanding(session)) return false;
+    if (!controlEditWaits(session)) return false;
     DeferredControlEdit edit;
     edit.surfaceName = session.surfaceName;
     for (const auto index : controlIndices) {
@@ -13301,6 +13350,66 @@ bool LineAnnotationController::deferControlEdit(const LineAnnotationSession& ses
     _deferredControlEdits.push_back(std::move(edit));
     syncDialogLineSolveActivity(session);
     return true;
+}
+
+bool LineAnnotationController::applyDeferredControlEditsNow(const std::string& surfaceName, bool beforeDispatch)
+{
+    QScopedValueRollback<bool> mode(_applyControlEditsBeforeDispatch, beforeDispatch);
+    // Each replay may start a background save, behind which the pane's next
+    // queued edit waits: joined and drained in turn until none is left or
+    // none can be applied (one that waits for a solve stays queued).
+    const auto queued = [&] {
+        return std::count_if(_deferredControlEdits.begin(), _deferredControlEdits.end(),
+                             [&](const auto& edit) { return edit.surfaceName == surfaceName; });
+    };
+    bool applied = false;
+    for (auto left = queued(); left > 0;) {
+        joinPublication();
+        drainDeferredControlEdits();
+        const auto now = queued();
+        if (now >= left) break;
+        applied = true;
+        left = now;
+    }
+    // The last replay's save hands its stored version to the pane's session
+    // while the pane still exists (the caller may be about to remove it).
+    if (applied) joinPublication();
+    return applied;
+}
+
+void LineAnnotationController::settleDeferredControlEdits(const std::string& surfaceName)
+{
+    // For a pane about to be saved for good or removed. A replay can start a
+    // solve (a gap edit) that the pane's next queued edit waits for: that
+    // solve is awaited and landed, then the rest is applied. The solve of
+    // the last replay is awaited too, or the pane would go (or be saved)
+    // with the edit's tags stored and its line not solved for them.
+    const auto awaitSolve = [&](bool dispatchScheduled) {
+        auto* pane = paneForSurface(surfaceName);
+        for (int solves = 0; solves < 16 && pane && pane->session; ++solves) {
+            if (dispatchScheduled && !pane->session->watcher && pane->session->solveDispatchScheduled) {
+                dispatchPendingSolve(surfaceName);
+                pane = paneForSurface(surfaceName);
+            }
+            if (!pane || !pane->session || !pane->session->watcher) break;
+            pane->session->watcher->waitForFinished();
+            finishOptimization(surfaceName);
+            pane = paneForSurface(surfaceName);
+        }
+    };
+    bool applied = false;
+    for (int pass = 0; pass < 64; ++pass) {
+        if (std::none_of(_deferredControlEdits.begin(), _deferredControlEdits.end(),
+                         [&](const auto& edit) { return edit.surfaceName == surfaceName; }))
+            break;
+        awaitSolve(applied);
+        if (!applyDeferredControlEditsNow(surfaceName, true)) break;
+        applied = true;
+    }
+    if (!applied) return;
+    awaitSolve(true);
+    // That landing's save hands its version to the session while the pane exists.
+    joinPublication();
 }
 
 void LineAnnotationController::scheduleDeferredControlEdits()
@@ -13330,7 +13439,7 @@ void LineAnnotationController::drainDeferredControlEdits()
             _deferredControlEdits.erase(_deferredControlEdits.begin() + std::ptrdiff_t(i));
             continue;
         }
-        if (sessionAwaitsLanding(*pane->session)) {
+        if (controlEditWaits(*pane->session)) {
             waiting.insert(surfaceName);
             ++i;
             continue;
@@ -13500,6 +13609,25 @@ void LineAnnotationController::joinPublication()
     // Installed inside the caller's operation: what was queued behind the
     // publication runs from the event loop, not inside that operation.
     finishPublication(false);
+}
+
+void LineAnnotationController::settlePublicationWork()
+{
+    // Everything accepted so far reaches the store: the running save, then
+    // the saves queued behind it, each in turn.
+    if (QThread::currentThread() != thread()) return;
+    // Tag edits queued behind those saves are applied (and saved) too; one
+    // that waits for a solve stays queued.
+    bool applied = true;
+    for (int pass = 0; pass < 64 && (applied || _publication || !_afterPublication.empty() ||
+                                     !_eventsDuringPublication.empty()); ++pass) {
+        joinPublication();
+        drainAfterPublication();
+        std::set<std::string> surfaces;
+        for (const auto& edit : _deferredControlEdits) surfaces.insert(edit.surfaceName);
+        applied = false;
+        for (const auto& surface : surfaces) applied |= applyDeferredControlEditsNow(surface);
+    }
 }
 
 void LineAnnotationController::abandonPublication()
@@ -15629,6 +15757,9 @@ void LineAnnotationController::setSessionFiberWidth(LineAnnotationSession& sessi
 void LineAnnotationController::saveFiberDisplayAnnotations(LineAnnotationSession& session,
                                                            const std::function<bool()>& stillValid)
 {
+    // A background save in flight may be storing this fiber: what is read
+    // and changed here must start from that save's result.
+    joinPublication();
     const QPointer<LineAnnotationController> alive(this);
     // Save metadata without invoking a solve or replacing stored geometry.
     // Newly moved/inserted CPs are persisted with the next geometry save.
@@ -16130,19 +16261,39 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     // A commit during the read (this controller's own background save, or
     // another client's) leaves a graph that straddles two store positions:
     // such a read is discarded and made again, at the new position.
+    // The same for any other failure of a read that a commit overtook (a
+    // store without history no longer has a version listed a moment ago).
     for (int attempt = 0;; ++attempt) {
+        std::optional<vc::objects::StoreStatus> before;
+        const auto position = [&]() -> std::optional<vc::objects::StoreStatus> {
+            std::optional<vc::objects::StoreStatus> status;
+            try {
+                if (context.connection && context.attachment)
+                    context.connection->readStore(*context.attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+                        status = reader.status();
+                    });
+            } catch (const std::exception&) {
+            }
+            return status;
+        };
         try {
-            return readStoredFibersInContextOnce(context, uuids, lines, dependencies);
+            return readStoredFibersInContextOnce(context, uuids, lines, dependencies, &before);
         } catch (const FiberGraphMoved&) {
             if (attempt == 3) throw;
-            if (dependencies) dependencies->clear();
+        } catch (const std::exception&) {
+            if (attempt == 3 || !before) throw;
+            const auto now = position();
+            if (!now || (now->storeUuid == before->storeUuid && now->generation == before->generation &&
+                         now->commitSequence == before->commitSequence))
+                throw;
         }
+        if (dependencies) dependencies->clear();
     }
 }
 
 std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFibersInContextOnce(
     FiberReadContext& context, const std::optional<std::vector<std::string>>& uuids,
-    bool lines, FiberDependencies* dependencies)
+    bool lines, FiberDependencies* dependencies, std::optional<vc::objects::StoreStatus>* startedAt)
 {
     using namespace vc::objects;
     std::vector<StoredFiber> result;
@@ -16155,6 +16306,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         // One status for the pins, the heads selected below and the validation
         // stamp, read before every read it certifies (transforms included).
         const auto state = reader.status();
+        if (startedAt) *startedAt = state;
         if (context.observedStatus) context.observedStatus(state);
         const auto activeGeneration = state.generation;
         const auto& loadedStatus = state;
@@ -16252,7 +16404,9 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             std::map<std::string, ObjectRevision> result;
             if (references.empty()) return result;
             for (auto& head : reader.objectsAtVersions(references)) {
-                if (!head) throw std::runtime_error("Missing object revision");
+                // Listed a moment ago: a store without history no longer has
+                // the version once another commit replaced it. Read again.
+                if (!head) throw FiberGraphMoved("Missing object revision");
                 result.emplace(head->objectUuid, std::move(*head));
             }
             return result;
@@ -16351,10 +16505,15 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             for (const auto& head : objects)
                 if (head.geometryRevision)
                     (lines && requested.contains(head.objectUuid) ? withLines : revisions).push_back(*head.geometryRevision);
-            if (!revisions.empty())
-                reader.prefetchGeometry(revisions, {"control_points", "control_point_ids"}, {"control_points"});
-            if (!withLines.empty())
-                reader.prefetchGeometry(withLines, {"control_points", "control_point_ids", "line_points"}, {"control_points"});
+            // Best effort: one unreadable geometry fails the whole batch, and
+            // the decodes below then read (and report) each fiber on its own.
+            try {
+                if (!revisions.empty())
+                    reader.prefetchGeometry(revisions, {"control_points", "control_point_ids"}, {"control_points"});
+                if (!withLines.empty())
+                    reader.prefetchGeometry(withLines, {"control_points", "control_point_ids", "line_points"}, {"control_points"});
+            } catch (const std::exception&) {
+            }
         }
         std::vector<StoredFiber> decoded;
         std::unordered_map<std::string, size_t> byUuid;

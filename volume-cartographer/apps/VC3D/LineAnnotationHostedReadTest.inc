@@ -723,6 +723,116 @@
                 publishing.invalidateFiberAlignmentMetrics(id, false);
                 live->fiberMetricsMatchStoredFiber = matched;
             }
+            // Tag edits queued behind a save are all applied and stored when
+            // their pane goes (a package switch, a close, quit's save-all):
+            // the first one's own save must not strand the second.
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto readA = [&] { return publishing.readStoredFibers(std::vector<std::string>{aUuid}, true).at(0); };
+                const auto queued = openSession(readA(), "publication-queued-tags");
+                queued->taskState = Controller::LineAnnotationSession::TaskState::Succeeded;
+                require(queued->controlPoints.size() >= 2, "A has two control points");
+                const auto first = queued->controlPoints.at(0).volumePoint, second = queued->controlPoints.at(1).volumePoint;
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "a save of another fiber is running");
+                publishing.handleGeneratedControlPointSetBreak("publication-queued-tags", 0, true);
+                publishing.handleGeneratedControlPointSetBreak("publication-queued-tags", 1, true);
+                require(publishing._deferredControlEdits.size() == 2, "two tag edits wait for the save");
+                publishing.cleanupSurfaceName("publication-queued-tags");
+                const auto after = readA();
+                const auto isBreak = [&](const cv::Vec3d& where) {
+                    const auto found = std::find_if(after.controlPoints.begin(), after.controlPoints.end(),
+                                                    [&](const auto& candidate) { return candidate == where; });
+                    return found != after.controlPoints.end() &&
+                        vc3d::line_annotation::hasControlPointTag(found->tags, vc3d::line_annotation::kBreakTag);
+                };
+                require(!publishing.paneForSurface("publication-queued-tags") && publishing._deferredControlEdits.empty() &&
+                        publishing._fiberSaveFailureCount == before && isBreak(first) && isBreak(second),
+                        "both queued tag edits are stored before their pane goes");
+                settle("nothing is left queued after the pane's cleanup");
+            }
+            // The same for an edit that waits for a solve not yet dispatched
+            // (the debounce after a placement): applied when its pane goes.
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto readA = [&] { return publishing.readStoredFibers(std::vector<std::string>{aUuid}, true).at(0); };
+                const auto queued = openSession(readA(), "publication-queued-dispatch");
+                queued->taskState = Controller::LineAnnotationSession::TaskState::Succeeded;
+                const auto where = queued->controlPoints.at(1).volumePoint;
+                const auto isBreak = [&] {
+                    const auto fiber = readA();
+                    const auto found = std::find_if(fiber.controlPoints.begin(), fiber.controlPoints.end(),
+                                                    [&](const auto& candidate) { return candidate == where; });
+                    return found != fiber.controlPoints.end() &&
+                        vc3d::line_annotation::hasControlPointTag(found->tags, vc3d::line_annotation::kBreakTag);
+                };
+                const bool wasBreak = isBreak();
+                queued->solveDispatchScheduled = true;
+                publishing.handleGeneratedControlPointSetBreak("publication-queued-dispatch", 1, !wasBreak);
+                require(publishing._deferredControlEdits.size() == 1 && isBreak() == wasBreak,
+                        "a tag edit waits for the scheduled solve");
+                publishing.cleanupSurfaceName("publication-queued-dispatch");
+                require(publishing._deferredControlEdits.empty() && publishing._fiberSaveFailureCount == before &&
+                        isBreak() != wasBreak, "a tag edit waiting for an undispatched solve is stored when its pane goes");
+                settle("nothing is left queued after that cleanup");
+            }
+            // An export or a structural edit starts from everything accepted
+            // so far: the running save and the save queued behind it.
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                live->fiberWidth += .25;
+                const auto width = live->fiberWidth;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication) && !publishing._afterPublication.empty(),
+                        "a second save is queued behind the first");
+                publishing.settlePublicationWork();
+                require(!publishing._publication && publishing._afterPublication.empty() &&
+                        publishing._fiberSaveFailureCount == before && stored().width == width,
+                        "settling stores the running save and the one queued behind it");
+                settle("nothing is left queued after settling");
+                // A tag edit queued behind a save is applied and stored by it too.
+                const auto where = live->controlPoints.at(1).volumePoint;
+                const auto isBreak = [&] {
+                    const auto fiber = stored();
+                    const auto found = std::find_if(fiber.controlPoints.begin(), fiber.controlPoints.end(),
+                                                    [&](const auto& candidate) { return candidate == where; });
+                    return found != fiber.controlPoints.end() &&
+                        vc3d::line_annotation::hasControlPointTag(found->tags, vc3d::line_annotation::kBreakTag);
+                };
+                const bool wasBreak = isBreak();
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                publishing.handleGeneratedControlPointSetBreak(live->surfaceName, 1, !wasBreak);
+                require(bool(publishing._publication) && publishing._deferredControlEdits.size() == 1,
+                        "a tag edit is queued behind the save");
+                publishing.settlePublicationWork();
+                require(!publishing._publication && publishing._deferredControlEdits.empty() &&
+                        publishing._fiberSaveFailureCount == before && isBreak() != wasBreak,
+                        "settling applies and stores a queued tag edit");
+                publishing.handleGeneratedControlPointSetBreak(live->surfaceName, 1, wasBreak);
+                settle("the tag is put back");
+            }
+            // A fiber-level edit made while that fiber's save is running
+            // starts from the save's result (it is not refused for it).
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto previous = stored().manualHvTag;
+                const QString wanted = previous == "H" ? "V" : "H";
+                live->fiberWidth += .25;
+                const auto width = live->fiberWidth;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "the fiber's save is running");
+                publishing.setFiberManualHvTag(live->fiberId, wanted);
+                const auto after = stored();
+                require(publishing._fiberSaveFailureCount == before && after.manualHvTag == wanted.toStdString() &&
+                        after.width == width,
+                        "a fiber-level edit during the fiber's save is stored on top of it");
+                publishing.setFiberManualHvTag(live->fiberId, QString::fromStdString(previous));
+                settle("the fiber-level edits are stored");
+            }
             // A tag edit whose background save is refused (a commit by
             // another client that this controller has not seen) is reported
             // and stays in the session, like a placement whose save failed.
