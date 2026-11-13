@@ -30,4 +30,7 @@ def json_umbilicus_z_to_yx(filename, coordinate_scale=1.0, downsample_factor=Non
     pts = sorted(data['control_points'], key=lambda p: p['z'])
     zs = np.asarray([p['z'] for p in pts], dtype=np.float32) * coordinate_scale
     yxs = np.asarray([(p['y'], p['x']) for p in pts], dtype=np.float32) * coordinate_scale
-    return scipy.interpolate.interp1d(zs, yxs, axis=0, fill_value='extrapolate')  # z -> yx
+    # Past the first and last control point, hold the end point as VC3D's Umbilicus::interpolate_center
+    # does, so one umbilicus JSON gives the same centre at every z in both tools (#2239).
+    return scipy.interpolate.interp1d(zs, yxs, axis=0, bounds_error=False,
+                                      fill_value=(yxs[0], yxs[-1]))  # z -> yx
