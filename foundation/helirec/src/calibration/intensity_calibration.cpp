@@ -22,6 +22,7 @@
 #include "io/array_file.hpp"
 #include "io/json.hpp"
 #include "io/sha256.hpp"
+#include "common/numpy_sum.hpp"
 
 namespace helirec::calibration {
 
@@ -143,28 +144,6 @@ DetectorBlur blur_of(const Json& cal) {
         b.solver.solver_version = text_of(s->find("solver_version"));
     }
     return b;
-}
-
-// numpy's pairwise sum of float32 values (the sum numpy.mean takes over a contiguous frame)
-float pairwise_sum(const float* a, std::size_t n) {
-    if (n < 8) {
-        float r = 0.f;
-        for (std::size_t i = 0; i < n; ++i) r += a[i];
-        return r;
-    }
-    if (n <= 128) {
-        float r[8];
-        for (int j = 0; j < 8; ++j) r[j] = a[j];
-        std::size_t i = 8;
-        for (; i < n - (n % 8); i += 8)
-            for (int j = 0; j < 8; ++j) r[j] += a[i + j];
-        float res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
-        for (; i < n; ++i) res += a[i];
-        return res;
-    }
-    std::size_t n2 = n / 2;
-    n2 -= n2 % 8;
-    return pairwise_sum(a, n2) + pairwise_sum(a + n2, n - n2);
 }
 
 std::string darks_flats_fingerprint(const Scan& scan) {

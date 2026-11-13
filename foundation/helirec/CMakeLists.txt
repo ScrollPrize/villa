@@ -49,6 +49,25 @@ find_package(ZLIB REQUIRED)   # zlib chunks of Zarr arrays (zarr.hpp)
 
 find_package(CURL REQUIRED)   # Zarr arrays at http(s):// and s3:// locations (reference volumes)
 
+# vc_reader's native library (surfaces, volume sampling, image files): an installed package, or the sibling
+# checkout built statically into helirec (its Python modules and install rules stay out of helirec's). Only
+# helirec_surfaces (below) uses it.
+if(NOT TARGET vc_reader::reader)
+  find_package(vc_reader CONFIG QUIET)
+endif()
+if(NOT TARGET vc_reader::reader)
+  set(VC_READER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../vc_reader" CACHE PATH "vc_reader source checkout")
+  if(NOT EXISTS "${VC_READER_SOURCE}/CMakeLists.txt")
+    message(FATAL_ERROR "Install vc_reader or set VC_READER_SOURCE to its checkout")
+  endif()
+  set(VC_READER_BUILD_PYTHON OFF)
+  set(VC_READER_BUILD_READER ON)
+  set(VC_READER_BUILD_C_API OFF)
+  set(VC_READER_SHARED_READER OFF)
+  set(VC_READER_ENABLE_CUDA OFF)   # helirec samples host arrays through it
+  add_subdirectory("${VC_READER_SOURCE}" "${CMAKE_BINARY_DIR}/vc_reader" EXCLUDE_FROM_ALL)
+endif()
+
 # OpenJPEG: frames stored as JPEG 2000 (HTJ2K) chunks, as ESRF BM18 writes projections (src/io/j2k_chunk.hpp).
 # Optional: without it such scans are refused with a message that names the package.
 option(HELIREC_OPENJPEG "Read frames stored as JPEG 2000 (needs libopenjp2 >= 2.5)" ON)
@@ -92,7 +111,7 @@ endif()
 # vc-delta3d (lossless uint8 chunk codec of vc_reader / VC3D), pinned to the revision vc_reader uses
 # so that everything helirec writes is readable there. Offline builds: -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>
 option(HELIREC_DELTA3D "Build the vc-delta3d chunk codec (uint8 OME-Zarr output)" ON)
-if(HELIREC_DELTA3D)
+if(HELIREC_DELTA3D AND NOT TARGET vc_delta3d::vc_delta3d)   # (vc_reader brings it)
   include(FetchContent)
   set(VC_DELTA3D_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
   set(VC_DELTA3D_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -102,6 +121,9 @@ if(HELIREC_DELTA3D)
     GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d)  # = vc_reader cmake/NativeReader.cmake pin
   set(CMAKE_AUTOMOC OFF)
   FetchContent_MakeAvailable(vc_delta3d)
+  set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+if(HELIREC_DELTA3D AND TARGET vc_delta3d)
   set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
@@ -141,6 +163,16 @@ if(HELIREC_WITH_CUDA)
 endif()
 
 # ---------------------------------------------------------------- tools
+# ---------------------------------------------------------------- surfaces (vc_reader; C++20 as vc_reader is)
+file(GLOB HELIREC_SURFACE_SOURCES CONFIGURE_DEPENDS src/surface/*.cpp)
+add_library(helirec_surfaces STATIC ${HELIREC_SURFACE_SOURCES})
+target_include_directories(helirec_surfaces PUBLIC include PRIVATE src)
+target_compile_features(helirec_surfaces PUBLIC cxx_std_20)
+# (vc_reader's headers are not written for -Wextra)
+target_compile_options(helirec_surfaces PRIVATE -O3 -Wall -Wno-missing-field-initializers -ffp-contract=off)
+set_target_properties(helirec_surfaces PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(helirec_surfaces PUBLIC helirec vc_reader::reader)
+
 # helirec-calibration: checks an acquisition record against itself and against the raw frames (src/calibration)
 option(HELIREC_TOOLS "Build the command-line tools" ON)
 if(HELIREC_TOOLS)
@@ -150,15 +182,20 @@ if(HELIREC_TOOLS)
   # helirec-reconstruct: slices and volumes of a scan pair from its raw folders (helirec/reconstruction.hpp)
   add_executable(helirec-reconstruct tools/helirec_reconstruct.cpp)
   target_include_directories(helirec-reconstruct PRIVATE src)
-  target_link_libraries(helirec-reconstruct PRIVATE helirec)
-  target_compile_options(helirec-reconstruct PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(helirec-reconstruct PRIVATE helirec vc_reader::reader)
+  target_compile_options(helirec-reconstruct PRIVATE -O2 -Wall -Wno-missing-field-initializers)
   # into the environment's scripts (bin of the venv) when built as the Python package, else bin
   if(DEFINED SKBUILD_SCRIPTS_DIR)
     set(HELIREC_TOOLS_DESTINATION "${SKBUILD_SCRIPTS_DIR}")
   else()
     set(HELIREC_TOOLS_DESTINATION bin)
   endif()
-  install(TARGETS helirec-calibration helirec-reconstruct RUNTIME DESTINATION "${HELIREC_TOOLS_DESTINATION}")
+  # helirec-composite: layer composites along a tifxyz surface, from a volume or the projections
+  add_executable(helirec-composite tools/helirec_composite.cpp)
+  target_include_directories(helirec-composite PRIVATE src)
+  target_link_libraries(helirec-composite PRIVATE helirec_surfaces)
+  target_compile_options(helirec-composite PRIVATE -O2 -Wall -Wno-missing-field-initializers)
+  install(TARGETS helirec-calibration helirec-reconstruct helirec-composite RUNTIME DESTINATION "${HELIREC_TOOLS_DESTINATION}")
   include(CTest)
   if(BUILD_TESTING)
     add_test(NAME calibration_selftest COMMAND helirec-calibration selftest)
@@ -177,6 +214,6 @@ if(HELIREC_PYTHON)
   find_package(nanobind CONFIG REQUIRED)
   file(GLOB HELIREC_BINDINGS CONFIGURE_DEPENDS bindings/*.cpp)
   nanobind_add_module(_core NB_STATIC ${HELIREC_BINDINGS})
-  target_link_libraries(_core PRIVATE helirec)
+  target_link_libraries(_core PRIVATE helirec helirec_surfaces)
   install(TARGETS _core LIBRARY DESTINATION helirec)
 endif()

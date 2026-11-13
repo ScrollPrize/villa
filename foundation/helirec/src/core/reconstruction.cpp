@@ -431,6 +431,12 @@ const calibration::Scan& Reconstruction::companion() const { return impl_->compa
 const calibration::IntensityCalibration& Reconstruction::intensity() const { return impl_->intensity; }
 std::shared_ptr<SliceReconstructor> Reconstruction::reconstructor() const { return impl_->rec; }
 std::pair<int, int> Reconstruction::doable() const { return {impl_->lo, impl_->hi}; }
+Device Reconstruction::device() const { return impl_->options.device; }
+FilterChain filter_chain(const std::string& chain) {
+    const std::string t = chain;
+    std::size_t i = t.find_first_not_of(" \t\n\r");
+    return filter_chain_of(i != std::string::npos && t[i] == '[' ? Json::parse(t) : Json::of(t));
+}
 std::string Reconstruction::mode() const { return member(impl_->params, "mode").string; }
 double Reconstruction::rot_center() const { return impl_->intensity.rot_center; }
 double Reconstruction::rolling_shutter() const { return impl_->legacy() ? 0.0 : impl_->rolling_shutter; }

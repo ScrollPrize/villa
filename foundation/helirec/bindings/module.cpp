@@ -26,7 +26,6 @@
 #include "helirec/reference.hpp"
 #include "helirec/zarr.hpp"
 #include "helirec/reconstruction.hpp"
-#include "../src/io/image_files.hpp"
 #include "helirec/calibration/scan.hpp"
 #include "helirec/calibration/intensity.hpp"
 #include "ndarray_utils.hpp"
@@ -1101,6 +1100,7 @@ void bind_projection(nb::module_& m);  // bindings/projection_bindings.cpp
 void bind_geometry(nb::module_& m);  // bindings/geometry_bindings.cpp
 void bind_geometry_calibration(nb::module_& m);  // bindings/geometry_calibration_bindings.cpp
 void bind_scan(nb::module_& m);  // bindings/scan_bindings.cpp
+void bind_surface(nb::module_& m);  // bindings/surface_bindings.cpp
 
 NB_MODULE(_core, m) {
     register_filter("python", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
@@ -1114,6 +1114,7 @@ NB_MODULE(_core, m) {
     bind_geometry(m);
     bind_geometry_calibration(m);
     bind_scan(m);
+    bind_surface(m);
     m.doc() = "helirec C++/CUDA kernels";
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
@@ -1684,9 +1685,6 @@ NB_MODULE(_core, m) {
         "reduced"_a = nb::none(), "cache_dir"_a = "", "reduce"_a = 0, "log"_a = nb::none(),
         "A reconstructor of one tile of a mosaic alone -> (SliceReconstructor, dict(rot_center, frames, scan, terms, row_origin, reduced, reduce, params)) "
         "(helirec::tile_reconstructor)");
-    m.def("write_png", [](const std::string& path, nb::ndarray<const std::uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> img) {
-        write_png(path, img.data(), static_cast<int>(img.shape(0)), static_cast<int>(img.shape(1)));
-    }, "path"_a, "img"_a, "(ny, nx) uint8 as an 8-bit grey PNG");
     m.def(
         "geometry_calibration_file",
         [](const std::string& given, const std::string& cache_dir, const std::vector<std::string>& masters, const std::string& row_time_us, const std::string& device,

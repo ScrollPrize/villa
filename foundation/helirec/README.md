@@ -116,13 +116,18 @@ helirec-composite --projections PROJ --cache_dir CAL SURFACE_TIFXYZ --z Z0 Z1 --
     [--set "filters=paganin(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)" --sweep paganin.delta_beta=250,500,1000,2000] --tag s
 ```
 
-Surface geometry and sampling come from vc_reader (bicubic Hermite patches, normal dP/du × dP/dv, trilinear
-layers; vc_reader is a required dependency from `villa/vc_reader`). Layer k sits at direction × (start + k·step) voxels along the normal; `--direction
-auto` steps toward the denser side. Output: `max.tif`, `mean.tif` (float32), uint8 TIFF/PNG copies, `mask.png`,
+`helirec-composite` is a C++ executable (`tools/helirec_composite.cpp`, `include/helirec/surface_composite.hpp`,
+library `helirec_surfaces`). Surface geometry, sampling and the max/mean reductions are vc_reader's C++ (bicubic
+Hermite patches, normal dP/du × dP/dv, `grid::sample` with its defaults, `composite::reduce`; images through
+vc_reader's writers). Layer k sits at direction × (start + k·step) voxels along the normal; `--direction
+auto` steps toward the denser side. From a volume, a layer that falls beyond the block reads vc_reader's fill value
+(0) rather than nothing, so pixels near the block's top and bottom are kept with those zeros among their layers. Output: `max.tif`, `mean.tif` (float32), uint8 TIFF/PNG copies, `mask.png`,
 `composite.json`, `layers/`, `xy_slices/`; `--surface_zarr` also writes the layer stack as a uint8 OME-Zarr.
 
-From the projections, `helirec.band.BandComposite` skips slices and volumes: it runs the exact backprojector only
-at the slice pixels the composite's sample points need, samples them on the GPU and returns max/mean. Raw data
+From the projections, `helirec.band.BandComposite` (C++ `helirec::surface::BandComposite`) skips slices and volumes:
+it runs the exact backprojector only at the slice pixels the composite's sample points need, samples them on the
+reconstructor's device and returns max/mean (the whole-slice methods reconstruct the points' box slice by slice and
+sample it with vc_reader's `sampling::sampleDense`). Parameter sweeps need CUDA. Raw data
 streams through pinned memory with read-ahead (`--no_prefetch` turns the read-ahead off: it holds a second chunk's
 raw windows, tens of GB where a z range overlaps a stationary turn and the filters need many context rows), and a
 filter sweep shares everything before the filters:
@@ -143,6 +148,7 @@ mx, mean = bc.composites(set=2)
 | 1 | raw row-window reads (`pread`, one HDF5 chunk per frame) | `raw_reader.hpp` | CPU (threads) |
 | 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame (`helirec-calibration intensity`) | `calibration/intensity.hpp` (Python: `helirec.calibration`) | CPU |
 | 2b | geometry calibration: layout, rows' timing, detector map, poses and motion (`helirec-calibration geometry`) | `calibration/geometry_calibration.hpp`, `python/helirec/geometry.py` | CPU, CUDA |
+| 2d | surface composites: layers along a tifxyz surface from a volume or the projections (`helirec-composite`) | `surface_composite.hpp` (Python: `helirec.band`) | CPU, CUDA |
 | 2c | the reconstruction of a pair: parameters (modes, filter chains, `--set`), scan data from both calibrations, provenance (`helirec-reconstruct`) | `reconstruction.hpp` (Python: `helirec.recon`) | CPU |
 | 3 | helical geometry: span info, doable span, per-projection shifts and grid bins | `helical.hpp` | CPU |
 | 4 | gridding: flat-field, weights, vertical / horizontal kernels, angular bins (gather form) | `accumulate.hpp` | CPU, CUDA |
@@ -1068,9 +1074,11 @@ Its BSD-2-Clause license is included with installed artifacts. Use `-DHELIREC_OP
 `-DCMAKE_CUDA_ARCHITECTURES=...`. `HELIREC_CUDA=AUTO` (default) builds CUDA only if `nvcc` is found, so put it on
 `PATH` (or pass `-C cmake.define.HELIREC_CUDA=ON`); check with `helirec.devices()`.
 
-Run from `foundation/helirec` in a Villa checkout containing `vc_reader` at `../../vc_reader`: `helirec-composite`
-uses the vc_reader Python package (surfaces), which `pyproject.toml` takes from there; `uv sync` includes it. The
-native library itself does not use vc_reader.
+Run from `foundation/helirec` in a Villa checkout containing `vc_reader` at `../../vc_reader`: the build links
+vc_reader's native library (an installed `vc_reader` CMake package, else that checkout, built statically with its
+Python modules, C API and CUDA off; `-DVC_READER_SOURCE=` points elsewhere) into `helirec_surfaces`, the composite
+tool and `helirec-reconstruct` (image files); the core library `helirec` does not use it. vc-delta3d comes with it.
+`pyproject.toml` takes the vc_reader Python package from the same checkout; `uv sync` includes it.
 To also install the test dependencies:
 
 ```bash

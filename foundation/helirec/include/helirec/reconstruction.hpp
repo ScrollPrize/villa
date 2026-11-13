@@ -73,6 +73,8 @@ std::string parse_filter_chain(const std::string& text);
 std::string override_filter_chain(const std::string& chain, const std::string& changes);
 // A chain (JSON list text) as its text form, numbers in %g
 std::string filter_chain_text(const std::string& chain);
+// A chain (JSON list text, or its text form) as the reconstructor takes it
+FilterChain filter_chain(const std::string& chain);
 // "TYPE.param" or "TYPE[k].param" (or "filters"): a key of the filter chain
 bool is_filter_key(const std::string& key);
 // --set's reading of a value: a whole number, a real, or the text itself (JSON text of it)
@@ -137,6 +139,7 @@ class Reconstruction {
     std::shared_ptr<SliceReconstructor> reconstructor() const;
     std::pair<int, int> doable() const;  // [lo, hi) view heights
     std::string mode() const;
+    Device device() const;
     double rot_center() const;
     double rolling_shutter() const;       // the geometry calibration's row timing (0 in mode legacy_reference)
     double exposure_arc() const;          // the parameter resolved

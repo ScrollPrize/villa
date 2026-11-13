@@ -42,7 +42,8 @@
 #include "helirec/reconstruction.hpp"
 #include "helirec/reference.hpp"
 #include "helirec/zarr.hpp"
-#include "io/image_files.hpp"
+#include "vc_reader/image_write.hpp"
+#include "io/command_line.hpp"
 #include "io/json.hpp"
 
 using namespace helirec;
@@ -50,35 +51,28 @@ namespace fs = std::filesystem;
 
 namespace {
 
-struct Exit {
-    std::string message;
-};
-[[noreturn]] void fail(const std::string& m) { throw Exit{m}; }
+using namespace helirec::command_line;
 
-// the options: name, number of values (0: a flag; -1: one or more; -2: repeatable, one each), kind of value
-struct OptionSpec {
-    const char* name;
-    int nargs;
-    char kind;  // 'i' whole, 'f' real, 's' text, 'b' flag
-    const char* alias;
-};
-const std::vector<OptionSpec>& option_specs() {
-    static const std::vector<OptionSpec> specs = {
-        {"config", 1, 's', nullptr},         {"n_slices", 1, 'i', "-n"},       {"range", 2, 'f', nullptr},           {"object_extent", 2, 'f', nullptr},
-        {"fractions", -1, 'f', nullptr},     {"z", 2, 'i', nullptr},           {"heights", 2, 'i', nullptr},         {"roi", 4, 'i', nullptr},
-        {"format", 1, 's', nullptr},         {"uint8", 0, 'b', nullptr},       {"uint8_only", 0, 'b', nullptr},      {"u8_window", 2, 'f', nullptr},
-        {"bbox", 4, 'i', nullptr},           {"reference_volume", 1, 's', nullptr}, {"reference_scale", 1, 'i', nullptr}, {"reference_cache", 1, 's', nullptr},
-        {"chunk", 1, 'i', nullptr},          {"zarr_chunks", 3, 'i', nullptr}, {"levels", 1, 'i', nullptr},          {"compression", 1, 's', nullptr},
-        {"u8_compression", 1, 's', nullptr}, {"u8_delta3d_preset", 1, 's', nullptr}, {"tag", 1, 's', nullptr},       {"out_root", 1, 's', nullptr},
-        {"previews", 0, 'b', nullptr},       {"no_preview", 0, 'b', nullptr},  {"overwrite", 0, 'b', nullptr},       {"set", -2, 's', nullptr},
-        {"device", 1, 's', nullptr},         {"cache_dir", 1, 's', nullptr},   {"projections", 1, 's', nullptr},
-    };
-    return specs;
-}
-const OptionSpec* spec_of(const std::string& name) {
-    for (const auto& s : option_specs())
-        if (name == s.name) return &s;
-    return nullptr;
+// slices and previews as files (vc_reader's writers): TIFF uncompressed, as tifffile.imwrite writes them
+void write_tiff(const std::string& path, const float* data, int ny, int nx) { vcr::sources::writeTiff(path, data, "<f4", ny, nx); }
+void write_tiff(const std::string& path, const std::uint8_t* data, int ny, int nx) { vcr::sources::writeTiff(path, data, "|u1", ny, nx); }
+void write_png(const std::string& path, const std::uint8_t* data, int ny, int nx) { vcr::sources::writeImage(path, vcr::sources::ImageView{data, "|u1", ny, nx}); }
+
+const Spec& option_spec() {
+    static const Spec spec{{
+                               {"config", 1, 's'},         {"n_slices", 1, 'i'},       {"range", 2, 'f'},           {"object_extent", 2, 'f'},
+                               {"fractions", -1, 'f'},     {"z", 2, 'i'},              {"heights", 2, 'i'},         {"roi", 4, 'i'},
+                               {"format", 1, 's'},         {"uint8", 0, 'b'},          {"uint8_only", 0, 'b'},      {"u8_window", 2, 'f'},
+                               {"bbox", 4, 'i'},           {"reference_volume", 1, 's'}, {"reference_scale", 1, 'i'}, {"reference_cache", 1, 's'},
+                               {"chunk", 1, 'i'},          {"zarr_chunks", 3, 'i'},    {"levels", 1, 'i'},          {"compression", 1, 's'},
+                               {"u8_compression", 1, 's'}, {"u8_delta3d_preset", 1, 's'}, {"tag", 1, 's'},          {"out_root", 1, 's'},
+                               {"previews", 0, 'b'},       {"no_preview", 0, 'b'},     {"overwrite", 0, 'b'},       {"set", -2, 's'},
+                               {"device", 1, 's'},         {"cache_dir", 1, 's'},      {"projections", 1, 's'},
+                           },
+                           {{"-n", "n_slices"}},
+                           "projections",
+                           false};
+    return spec;
 }
 
 int usage() {
@@ -93,116 +87,6 @@ int usage() {
                  "(see the head of tools/helirec_reconstruct.cpp and README.md)\n");
     return 2;
 }
-
-Json value_of(char kind, const std::string& t, const std::string& name) {
-    try {
-        std::size_t used = 0;
-        if (kind == 'i') {
-            const long long v = std::stoll(t, &used);
-            if (used != t.size()) throw std::invalid_argument(t);
-            return Json::whole_number(v);
-        }
-        if (kind == 'f') {
-            const double v = std::stod(t, &used);
-            if (used != t.size()) throw std::invalid_argument(t);
-            return Json::of(v);
-        }
-    } catch (const std::exception&) {
-        fail("--" + name + ": invalid value '" + t + "'");
-    }
-    return Json::of(t);
-}
-
-// the options given on the command line (as JSON values of their kinds)
-Json parse_command_line(int argc, char** argv) {
-    Json a = Json::dict();
-    const auto set = [&](const std::string& k, Json v) {
-        for (auto& kv : a.object)
-            if (kv.first == k) return void(kv.second = std::move(v));
-        a.object.emplace_back(k, std::move(v));
-    };
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") throw Exit{"help"};
-        if (arg.empty() || arg[0] != '-') {
-            if (a.find("projections")) fail("unexpected argument '" + arg + "'");
-            set("projections", Json::of(arg));
-            continue;
-        }
-        std::string name, inline_value;
-        bool has_inline = false;
-        if (arg == "-n") name = "n_slices";
-        else if (arg.rfind("--", 0) == 0) {
-            name = arg.substr(2);
-            const std::size_t eq = name.find('=');
-            if (eq != std::string::npos) inline_value = name.substr(eq + 1), name = name.substr(0, eq), has_inline = true;
-            std::replace(name.begin(), name.end(), '-', '_');
-        } else fail("unknown option " + arg);
-        const OptionSpec* s = spec_of(name);
-        if (!s || name == "projections") fail("unknown option " + arg);
-        if (s->nargs == 0) {
-            set(name, Json::of_bool(true));
-            continue;
-        }
-        std::vector<std::string> vals;
-        if (has_inline) vals.push_back(inline_value);
-        const int want = s->nargs > 0 ? s->nargs : 1;
-        while (static_cast<int>(vals.size()) < want) {
-            if (i + 1 >= argc) fail("option --" + name + " needs " + std::to_string(want) + " value(s)");
-            vals.push_back(argv[++i]);
-        }
-        if (s->nargs == -1)  // one or more: everything up to the next option
-            while (i + 1 < argc && (argv[i + 1][0] != '-' || std::isdigit(static_cast<unsigned char>(argv[i + 1][1])) || argv[i + 1][1] == '.'))
-                vals.push_back(argv[++i]);
-        if (s->nargs == 1) {
-            set(name, value_of(s->kind, vals[0], name));
-        } else if (s->nargs == -2) {
-            Json list = a.find(name) ? *a.find(name) : Json::list();
-            list.add(Json::of(vals[0]));
-            set(name, list);
-        } else {
-            Json list = Json::list();
-            for (const auto& v : vals) list.add(value_of(s->kind, v, name));
-            set(name, list);
-        }
-    }
-    return a;
-}
-
-std::string read_text(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) fail("cannot read " + path);
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-}
-
-void write_text(const std::string& path, const std::string& text) {
-    std::ofstream o(path);
-    o << text << "\n";
-    if (!o) fail("cannot write " + path);
-}
-
-// The options in effect: the defaults, the config file's, then the command line's
-struct Args {
-    Json all;
-    const Json* get(const char* k) const {
-        const Json* v = all.find(k);
-        return v && !v->is(Json::Null) ? v : nullptr;
-    }
-    bool flag(const char* k) const { return get(k) && get(k)->is(Json::Bool) && get(k)->boolean; }
-    std::string text(const char* k) const { return get(k) ? get(k)->string : std::string(); }
-    double number(const char* k) const { return get(k)->number; }
-    std::vector<double> numbers(const char* k) const {
-        std::vector<double> v;
-        if (get(k))
-            for (const Json& x : get(k)->array) v.push_back(x.number);
-        return v;
-    }
-    std::vector<int> ints(const char* k) const {
-        std::vector<int> v;
-        for (double x : numbers(k)) v.push_back(static_cast<int>(x));
-        return v;
-    }
-};
 
 std::string now_iso() {
     const std::time_t t = std::time(nullptr);
@@ -555,54 +439,31 @@ struct Run {
 };
 
 int run(int argc, char** argv) {
-    const Json given = parse_command_line(argc, argv);
+    Json given = parse(argc, argv, option_spec());
+    if (const Json* np = given.find("no_preview"))  // (--no_preview: the default)
+        if (np->boolean) put(given, "previews", Json::of_bool(false));
     // the defaults, then the config file, then the command line
-    Json all = Json::dict()
-                   .set("n_slices", Json::whole_number(5))
-                   .set("range", Json::list().add(Json::of(1.0 / 6)).add(Json::of(5.0 / 6)))
-                   .set("object_extent", Json::list().add(Json::of(0.0)).add(Json::of(1.0)))
-                   .set("reference_scale", Json::whole_number(0))
-                   .set("chunk", Json::whole_number(32))
-                   .set("levels", Json::whole_number(1))
-                   .set("compression", Json::of("none"))
-                   .set("u8_compression", Json::of("vc-delta3d"))
-                   .set("u8_delta3d_preset", Json::of("fast"))
-                   .set("out_root", Json::of(fs::absolute("helirec_slices").string()))
-                   .set("set", Json::list())
-                   .set("device", Json::of("cuda"));
+    Json all = in_effect(Json::dict()
+                             .set("n_slices", Json::whole_number(5))
+                             .set("range", Json::list().add(Json::of(1.0 / 6)).add(Json::of(5.0 / 6)))
+                             .set("object_extent", Json::list().add(Json::of(0.0)).add(Json::of(1.0)))
+                             .set("reference_scale", Json::whole_number(0))
+                             .set("chunk", Json::whole_number(32))
+                             .set("levels", Json::whole_number(1))
+                             .set("compression", Json::of("none"))
+                             .set("u8_compression", Json::of("vc-delta3d"))
+                             .set("u8_delta3d_preset", Json::of("fast"))
+                             .set("out_root", Json::of(fs::absolute("helirec_slices").string()))
+                             .set("set", Json::list())
+                             .set("device", Json::of("cuda")),
+                         given, option_spec(), [](const std::string& k, const Json& v, Json& clean) {
+                             if (k != "no_preview") return false;
+                             put(clean, "previews", Json::of_bool(!(v.is(Json::Bool) && v.boolean)));
+                             return true;
+                         });
     const auto merge = [&](const Json& from) {
-        for (const auto& [k, v] : from.object) {
-            if (k == "config") continue;
-            bool done = false;
-            for (auto& kv : all.object)
-                if (kv.first == k) kv.second = v, done = true;
-            if (!done) all.object.emplace_back(k, v);
-        }
+        for (const auto& [k, v] : from.object) put(all, k, v);
     };
-    if (const Json* config = given.find("config")) {
-        const Json file = Json::parse(read_text(config->string));
-        Json clean = Json::dict();
-        std::vector<std::string> unknown;
-        for (const auto& [k0, v] : file.object) {
-            if (!k0.empty() && k0[0] == '_') continue;
-            std::string k = k0;
-            std::replace(k.begin(), k.end(), '-', '_');
-            if (!spec_of(k)) unknown.push_back(k);
-            else if (k == "no_preview") clean.set("previews", Json::of_bool(!(v.is(Json::Bool) && v.boolean)));
-            else clean.set(k, v);
-        }
-        if (!unknown.empty()) {
-            std::sort(unknown.begin(), unknown.end());
-            std::string list;
-            for (const auto& u : unknown) list += (list.empty() ? "" : ", ") + u;
-            fail(config->string + ": unknown keys [" + list + "]");
-        }
-        merge(clean);
-    }
-    Json cl = given;
-    if (const Json* np = cl.find("no_preview"))  // (--no_preview: the default)
-        if (np->boolean) cl.set("previews", Json::of_bool(false));
-    merge(cl);
     Args a{all};
     if (a.text("projections").empty()) fail("projections folder missing (positional argument or 'projections' in --config)");
 
