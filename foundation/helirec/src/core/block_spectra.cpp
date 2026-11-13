@@ -6,6 +6,7 @@
 #include <complex>
 
 #include "common/block_spectra_core.hpp"
+#include "calibration/correlation_peak.hpp"
 
 namespace helirec {
 
@@ -140,9 +141,8 @@ void align(const BlockSpectraSpec& s, const float* box, const std::vector<double
                     bz = sz - m; by = sy - m; bx = sx - m;
                 }
             }
-    // Newton iterations on the continuous shift: value, gradient and Hessian of R are sums over the box
+    // Ceres continuous peak: value, gradient and Hessian of R are sums over the box
     double p[3] = {static_cast<double>(bz), static_cast<double>(by), static_cast<double>(bx)};
-    double value = best;
     auto evaluate = [&](const double* q, double* grad, double* hess) {
         double v = 0, g0 = 0, g1 = 0, g2 = 0, h00 = 0, h01 = 0, h02 = 0, h11 = 0, h12 = 0, h22 = 0;
         const double w0 = 2 * M_PI / n;
@@ -164,28 +164,16 @@ void align(const BlockSpectraSpec& s, const float* box, const std::vector<double
         hess[0] = h00; hess[1] = h01; hess[2] = h02; hess[3] = h11; hess[4] = h12; hess[5] = h22;
         return v;
     };
-    for (int it = 0; it < 12; ++it) {
-        double gr[3], h[6];
-        value = evaluate(p, gr, h);
-        // step = -H^-1 grad (H symmetric: 00 01 02 11 12 22); only while H is negative definite (a maximum nearby)
-        const double c00 = h[3] * h[5] - h[4] * h[4], c01 = h[2] * h[4] - h[1] * h[5], c02 = h[1] * h[4] - h[2] * h[3];
-        const double det = h[0] * c00 + h[1] * c01 + h[2] * c02;
-        const bool negative = h[0] < 0 && h[0] * h[3] - h[1] * h[1] > 0 && det < 0;
-        if (!negative) break;
-        const double c11 = h[0] * h[5] - h[2] * h[2], c12 = h[1] * h[2] - h[0] * h[4], c22 = h[0] * h[3] - h[1] * h[1];
-        const double d[3] = {-(c00 * gr[0] + c01 * gr[1] + c02 * gr[2]) / det, -(c01 * gr[0] + c11 * gr[1] + c12 * gr[2]) / det,
-                             -(c02 * gr[0] + c12 * gr[1] + c22 * gr[2]) / det};
-        const double step = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-        if (!(step < 1.5)) break;   // (not a step of a converging iteration from the integer maximum)
-        for (int a = 0; a < 3; ++a) p[a] += d[a];
-        if (step < 1e-5) {
-            double g2[3], h2[6];
-            value = evaluate(p, g2, h2);
-            break;
-        }
-    }
-    for (int a = 0; a < 3; ++a) shift[a] = -p[a];
-    peak = value / used;
+    const bool active[3] = {true, true, true};
+    const auto result = calibration::fitting::correlation_peak([&](const double* q, double& v, double* grad, double (*H)[3]) {
+        double h[6];
+        v = evaluate(q, grad, h);
+        H[0][0] = h[0]; H[0][1] = H[1][0] = h[1]; H[0][2] = H[2][0] = h[2];
+        H[1][1] = h[3]; H[1][2] = H[2][1] = h[4]; H[2][2] = h[5];
+    }, active, p, used);
+    if (!result.maximum) { peak = 0; return; }
+    for (int a = 0; a < 3; ++a) shift[a] = -result.at[a];
+    peak = result.value / used;
 }
 
 }  // namespace block_spectra

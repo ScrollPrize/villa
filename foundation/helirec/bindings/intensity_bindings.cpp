@@ -4,7 +4,9 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include "fit_summary.hpp"
 #include "helirec/calibration/intensity.hpp"
+#include "helirec/calibration/transfer.hpp"
 #include "helirec/raw_reader.hpp"
 #include "ndarray_utils.hpp"
 
@@ -38,6 +40,22 @@ nb::ndarray<nb::numpy, T> gauss(Arr<T> a, int axis, double sigma, const std::str
 }  // namespace
 
 void bind_intensity(nb::module_& m) {
+    const auto curve = [](const calibration::TransferFit& fit) {
+        auto d = fit_summary_dict(fit);
+        d["x"] = nb::cast(fit.x); d["residual"] = nb::cast(fit.residual); d["rms"] = fit.rms;
+        return d;
+    };
+    m.def("calibration_fit_transfer", [curve](const std::vector<double>& frequency, const std::vector<double>& gain) {
+        calibration::TransferFit fit;
+        { nb::gil_scoped_release release; fit = calibration::fit_transfer(frequency,gain); }
+        return curve(fit);
+    }, "frequency"_a, "gain"_a);
+    m.def("calibration_fit_smear", [curve](const std::vector<double>& frequency, const std::vector<double>& ratio) {
+        calibration::TransferFit fit;
+        { nb::gil_scoped_release release; fit = calibration::fit_smear(frequency,ratio); }
+        return curve(fit);
+    }, "frequency"_a, "ratio"_a);
+    m.def("calibration_transfer_model", &calibration::transfer_model, "parameters"_a, "frequency"_a);
     m.def(
         "mean_frames",
         [](RawReader& reader, IntIn file_index, IntIn frame_index, std::optional<Arr<float>> dark, std::optional<Arr<double>> control_A, double nominal_A,
@@ -144,11 +162,11 @@ void bind_intensity(nb::module_& m) {
                 r = calibration::detector_blur_field_fit(power.data(), static_cast<int>(ys.size()), static_cast<int>(xs.size()),
                                            static_cast<int>(power.shape(2)), ys.data(), xs.data(), rows, cols, f_max);
             }
-            return nb::make_tuple(std::vector<double>(r.field, r.field + 6), r.rms_none, r.rms_fit);
+            return nb::make_tuple(std::vector<double>(r.field, r.field + 6), r.rms_none, r.rms_fit, fit_summary_dict(r.solver));
         },
         "power"_a, "ys"_a, "xs"_a, "rows"_a, "cols"_a, "f_max"_a = 0.30,
         "The detector's blur field from the noise power spectra of flats on tiles (tile_power_spectra) -> "
-        "([a11, a12, a21, a22, c1, c2], rms_none, rms_fit): a uniform blur of A r + c pixels at r = (column, row) "
+        "([a11, a12, a21, a22, c1, c2], rms_none, rms_fit, solver): a uniform blur of A r + c pixels at r = (column, row) "
         "from the detector's centre in units of 1000 pixels");
     m.def("apodisation_mask",
           [](int Lx, float w_left, float w_right, float min_val, int sh_left, int sh_right) {

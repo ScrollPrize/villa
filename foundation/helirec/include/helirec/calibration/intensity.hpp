@@ -1,4 +1,5 @@
 #pragma once
+#include "helirec/calibration/solve.hpp"
 // The intensity calibration's kernels (python/helirec/calibration.py): the scipy-compatible Gaussian filter and the
 // borders of the weight maps, and the detector's blur field from the noise of the flats. CPU (OpenMP); the data
 // sizes are small. (The geometry is the geometry calibration's: helirec/calibration/, python/helirec/geometry.py.)
@@ -85,6 +86,7 @@ void tile_power_spectra(const float* img, std::size_t n, std::size_t rows, std::
 // at (X, Y) = (column, row) of the tile's centre from the detector's centre in units of 1000 pixels; the noise does
 // not see the sign of s: a11 >= 0. rms_none, rms_fit: residual of the normalised spectra without and with the field.
 struct DetectorBlurField {
+    FitSummary solver;
     double field[6] = {0, 0, 0, 0, 0, 0};
     double rms_none = 0, rms_fit = 0;
 };

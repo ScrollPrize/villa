@@ -408,7 +408,8 @@ def test_detector_blur_field_from_noise_spectra():
             img[:, :, x0:x0 + tile] += np.fft.irfft(w * np.sinc(s * f), cols, axis=-1)[:, :, x0:x0 + tile]
         power += _core.tile_power_spectra(np.ascontiguousarray(img, np.float32), tile, ys, xs)
     assert power.shape == (3, 8, 128, 65) and (power > 0).all()
-    field, rms_none, rms_fit = _core.detector_blur_field_fit(power, ys, xs, rows, cols)
+    field, rms_none, rms_fit, solver = _core.detector_blur_field_fit(power, ys, xs, rows, cols)
+    assert solver["usable"] and solver["solver_version"]
     assert abs(field[0] - a11) < 0.5 and abs(field[4] - c1) < 0.15 and rms_fit < 0.6 * rms_none
     assert abs(field[2]) * 0.5 + abs(field[3]) * 0.2 + abs(field[5]) < 0.6       # no blur along the rows
     # white noise everywhere: nothing to fit

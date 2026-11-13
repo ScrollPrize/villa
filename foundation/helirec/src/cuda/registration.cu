@@ -170,6 +170,22 @@ __global__ void correlation_kernel(const cufftComplex* __restrict__ C, int n0, i
     o[9] = -re22;
 }
 
+// Deterministic double reduction: only the ten evaluation scalars (or one
+// energy scalar) leave the GPU. The image and spectral work buffers stay resident.
+__global__ void evaluation_sum_kernel(const double* input, int lines, int stride, double* output) {
+    __shared__ double partial[256];
+    const int k = blockIdx.x, lane = threadIdx.x;
+    double value = 0;
+    for (int line = lane; line < lines; line += 256) value += input[static_cast<std::size_t>(line)*stride+k];
+    partial[lane] = value;
+    __syncthreads();
+    for (int step = 128; step > 0; step /= 2) {
+        if (lane < step) partial[lane] += partial[lane+step];
+        __syncthreads();
+    }
+    if (lane == 0) output[k] = partial[0];
+}
+
 // the correlation at the displacements -s .. s of each axis (wrapped), packed
 __global__ void gather_kernel(const float* __restrict__ r, int n0, int n1, int n2, int s0, int s1, int s2, float* __restrict__ out) {
     const int w0 = 2 * s0 + 1, w1 = 2 * s1 + 1, w2 = 2 * s2 + 1;
@@ -206,7 +222,7 @@ class CudaBackend final : public RegistrationBackend {
         rowsum_.resize(lines);
         mean_.resize(static_cast<std::size_t>(g_.L[0]));
         partial_.resize(static_cast<std::size_t>(g_.n[0]) * g_.n[1] * 10);
-        host_partial_.resize(partial_.size());
+        evaluation_.resize(10);
         // the weighted number of samples of a frame under the analysis window, summed as on the CPU
         double weight = 0;
         for (int j = 0; j < g_.n[1]; ++j)
@@ -333,10 +349,9 @@ class CudaBackend final : public RegistrationBackend {
         upload_phasors(e0, e1, e2);
         const int lines = n[0] * n[1];
         correlation_kernel<<<cuda::grid_1d(lines, 64), 64>>>(c_.data(), n[0], n[1], n[2], g_.nc, e0_.data(), e1_.data(), e2_.data(), partial_.data());
-        HELIREC_CUDA_CHECK(cudaMemcpy(host_partial_.data(), partial_.data(), static_cast<std::size_t>(lines) * 10 * sizeof(double), cudaMemcpyDeviceToHost));
-        double s[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        for (int line = 0; line < lines; ++line)
-            for (int k = 0; k < 10; ++k) s[k] += host_partial_[static_cast<std::size_t>(line) * 10 + k];
+        evaluation_sum_kernel<<<10,256>>>(partial_.data(),lines,10,evaluation_.data());
+        double s[10];
+        HELIREC_CUDA_CHECK(cudaMemcpy(s,evaluation_.data(),sizeof(s),cudaMemcpyDeviceToHost));
         value = s[0];
         g[0] = s[1], g[1] = s[2], g[2] = s[3];
         H[0][0] = s[4], H[0][1] = H[1][0] = s[5], H[0][2] = H[2][0] = s[6], H[1][1] = s[7], H[1][2] = H[2][1] = s[8], H[2][2] = s[9];
@@ -366,9 +381,9 @@ class CudaBackend final : public RegistrationBackend {
     }
 
     double sum_partial(int lines) {
-        HELIREC_CUDA_CHECK(cudaMemcpy(host_partial_.data(), partial_.data(), static_cast<std::size_t>(lines) * sizeof(double), cudaMemcpyDeviceToHost));
-        double e = 0;
-        for (int line = 0; line < lines; ++line) e += host_partial_[line];
+        evaluation_sum_kernel<<<1,256>>>(partial_.data(),lines,1,evaluation_.data());
+        double e;
+        HELIREC_CUDA_CHECK(cudaMemcpy(&e,evaluation_.data(),sizeof(e),cudaMemcpyDeviceToHost));
         return e;
     }
 
@@ -388,9 +403,8 @@ class CudaBackend final : public RegistrationBackend {
     DeviceBuffer<float> r_, rbig_, weight_, w0_, w1_, w2_, t0_, t1_, t2_, mean_, window_;
     DeviceBuffer<cufftComplex> aw_, c_, cs_, cbig_, cwork_, row_phase_;
     DeviceBuffer<cufftDoubleComplex> e0_, e1_, e2_;
-    DeviceBuffer<double> rowsum_, partial_;
+    DeviceBuffer<double> rowsum_, partial_, evaluation_;
     DeviceBuffer<unsigned char> work_;
-    std::vector<double> host_partial_;
     std::vector<float> host_window_;
     PinnedBuffer<float> stage_a_, stage_b_;
     cufftHandle forward_ = 0, inverse_ = 0, big_forward_ = 0, big_inverse_ = 0, frames_forward_ = 0, frames_inverse_ = 0;

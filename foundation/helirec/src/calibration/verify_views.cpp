@@ -36,30 +36,19 @@ Harmonics harmonics(const std::vector<double>& angle_deg, const std::vector<doub
     Harmonics h;
     const std::size_t n = y.size();
     if (n < 8) return h;
-    // normal equations of the five-term fit, solved by Gauss elimination
-    double A[5][6] = {};
+    if (angle_deg.size() != n) return h;
+    LinearProblem p;
+    p.unknowns = 5;
+    p.y = y;
     for (std::size_t i = 0; i < n; ++i) {
         const double t = angle_deg[i] * M_PI / 180.0;
         const double b[5] = {1.0, std::cos(t), std::sin(t), std::cos(2 * t), std::sin(2 * t)};
-        for (int r = 0; r < 5; ++r) {
-            for (int c = 0; c < 5; ++c) A[r][c] += b[r] * b[c];
-            A[r][5] += b[r] * y[i];
-        }
+        for (int c = 0; c < 5; ++c) { p.row.push_back(i); p.col.push_back(c); p.value.push_back(b[c]); }
     }
-    for (int c = 0; c < 5; ++c) {
-        int pivot = c;
-        for (int r = c + 1; r < 5; ++r)
-            if (std::fabs(A[r][c]) > std::fabs(A[pivot][c])) pivot = r;
-        if (std::fabs(A[pivot][c]) < 1e-9) return h;
-        for (int k = 0; k < 6; ++k) std::swap(A[c][k], A[pivot][k]);
-        for (int r = 0; r < 5; ++r) {
-            if (r == c) continue;
-            const double f = A[r][c] / A[c][c];
-            for (int k = c; k < 6; ++k) A[r][k] -= f * A[c][k];
-        }
-    }
-    double x[5];
-    for (int r = 0; r < 5; ++r) x[r] = A[r][5] / A[r][r];
+    LinearSolution fit;
+    try { fit = solve_linear(p); } catch (const Error&) { return h; }
+    if (!fit.usable) return h;
+    const auto& x = fit.x;
     h.mean = x[0];
     h.once = std::hypot(x[1], x[2]);
     h.twice = std::hypot(x[3], x[4]);
@@ -74,7 +63,7 @@ Harmonics harmonics(const std::vector<double>& angle_deg, const std::vector<doub
     return h;
 }
 std::string harmonics_text(const Harmonics& h, const char* unit) {
-    if (!h.ok) return std::string();
+    if (!h.ok) return "; harmonic fit unavailable (insufficient support or dependent predictors)";
     return fmt("; against the rotation angle: mean %+.4f %s, %.4f once per turn, %.4f twice per turn (amplitudes), %.4f rms left", h.mean, unit, h.once, h.twice, h.rms);
 }
 
@@ -287,7 +276,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                 }
             f.found = fmt("column %.3f +- %.3f (sd %.3f over %zu blocks of %d frames x %d rows x %d columns; %.3f to %.3f); nominal minus measured %+.2f px; target %.6g px; by row band: %s",
                           sa.mean, sa.sem(), sa.sd, sa.n, nq, cut.rows.n, diagnostic_columns(cut.cols, opt).n, sa.min, sa.max, nominal - sa.mean, tol.axis_px(), joined(per_band).c_str());
-            f.found += fmt("; along the stretch it changes by %+.4f px per 1000 frames", axis_trend.slope);
+            f.found += axis_trend.usable ? fmt("; along the stretch it changes by %+.4f px per 1000 frames", axis_trend.slope) : "; axis trend unavailable: " + axis_trend.message;
             f.numbers.push_back({"axis_px_per_1000_frames", axis_trend.slope});
             std::vector<double> residual(axis.size());
             for (std::size_t i = 0; i < axis.size(); ++i) residual[i] = axis[i] - nominal;
@@ -314,6 +303,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                 if (!D_by_band[bi].empty()) per_band.push_back(fmt("rows %d-%d: %+.3f", bands[bi], bands[bi] + cut.rows.n - 1, spread(D_by_band[bi]).mean));
             f.found = fmt("opposite views are displaced along the axis by %s; target %.6g rows; by row band: %s; along the stretch it changes by %+.4f rows per 1000 frames (%+.3f at the first pair, %+.3f at the last)",
                           pm(sD, "rows").c_str(), tol.rows(), joined(per_band).c_str(), D_trend.slope, D_trend.intercept + D_trend.slope * at.front(), D_trend.intercept + D_trend.slope * at.back());
+            if (!D_trend.usable) f.found += "; height trend unavailable: " + D_trend.message;
             f.numbers.push_back({"rows_per_1000_frames", D_trend.slope});
             assess_residuals(f, D, tol.rows(), "rows");
             f.note = "an axis rolled against the columns displaces opposite views by rows in proportion to the distance from the axis, with both signs inside one block: this mean does not show it";
@@ -381,6 +371,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                     f.note = "Under a uniform spatial mapping, the slope estimates the error of (stage scale / vertical pixel pitch) and the intercept estimates "
                              "a boundary-height offset. Spatial mapping, exposure timing and registration bias can also enter; this fit does not uniquely identify "
                              "a stage-scale error or a wrong static height readback";
+                    if (!lD.usable) { f.found += "; line fit unavailable: " + lD.message; f.verdict = "unverified"; }
                     f.numbers = {{"offset_rows", lD.intercept}, {"scale_error", lD.slope}, {"rms_rows", lD.rms}, {"mean_rows", sD.mean}, {"min_rows", sD.min}, {"max_rows", sD.max}};
                 }
                 {
@@ -393,6 +384,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                     f.note = fmt("the views of a block lie on detector rows a displacement apart. If the detector's rows were exposed one after another, the angle would differ in "
                                  "proportion to that displacement: the slope is %+.2f us per row, %+.2f ms over the %d rows read out",
                                  lq.slope * sh.timer_period[0] * 1e6, lq.slope * sh.timer_period[0] * 1e3 * rows, rows);
+                    if (!lq.usable) { f.found += "; line fit unavailable: " + lq.message; f.verdict = "unverified"; }
                     f.numbers = {{"offset_frames", lq.intercept}, {"frames_per_row", lq.slope}, {"mean_frames", sq.mean}, {"rms_frames", lq.rms}};
                 }
                 {
@@ -403,6 +395,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                     f.note = fmt("a slope is the travel's direction against the detector's columns (target %.6g rad) or the detector's distortion between the two bands", tol.eps / 2 / tol.H);
                     f.numbers = {{"offset_px", lu.intercept}, {"px_per_row", lu.slope}};
                     assess_residuals(f, ures, tol.eps, "px");
+                    if (!lu.usable) { f.found += "; line fit unavailable: " + lu.message; f.verdict = "unverified"; }
                     f.note += "; residuals are against zero unmodelled lateral motion, not a measured trajectory";
                 }
             }

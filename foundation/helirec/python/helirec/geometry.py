@@ -41,6 +41,7 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
+from .solve import fit_line
 
 KINDS = ("opposite", "resthelix", "turn", "pair")
 
@@ -210,72 +211,15 @@ def read_layout(session, device="auto", log=print):
 # ---------------------------------------------------------------- the time of a detector row
 
 def fit_refill_shots(x, n_rows, T, E, pre):
-    """The time of a row from the beam dips of a refill. x: (frames, rows), the logarithm of each row's level in
-    frames around the refill (of columns in air, or of all columns where nothing is: a row's level is compared
-    with the same row some frames before and after, against which the sample changes slowly). T, E: the frame
-    period and the gate [s]; pre: the number of frames at the start that lie before the refill (what a band of
-    rows scatters by without a shot is taken from them if there are enough, otherwise from frames between shots).
-    Returns (least-squares result, standard error of the row time, shots, noise) or None if fewer than 12 shots
-    are found. The fitted parameters start with the row time [s per row, signed] and the dips' decay."""
-    from scipy.optimize import least_squares
-
-    B = 20
-    nb = n_rows // B
-    vc = (np.arange(nb) + 0.5) * B - 0.5
-    u = (vc - (n_rows - 1) / 2) / (n_rows / 2)
-
-    def dip(n):
-        before, after = x[n - 7:n - 2].mean(0), x[n + 4:n + 9].mean(0)
-        return x[n] - (before + (after - before) * (4.5 / 10.5))
-
-    shots = []
-    for n in range(max(16, pre - 8), len(x) - 16):
-        d = dip(n).mean()
-        if d < -0.003:
-            if shots and n - shots[-1] <= 2:
-                if d < dip(shots[-1]).mean():
-                    shots[-1] = n
-            else:
-                shots.append(n)
-    shots = np.array(shots)
-    if len(shots) < 12:
-        return None
-    band = lambda n: dip(n)[:nb * B].reshape(nb, B).mean(1)
-    data = np.array([[band(n + o) for o in (-1, 0, 1)] for n in shots])
-    quiet = list(range(16, pre - 16)) if pre > 80 else [n for n in range(16, len(x) - 16) if np.abs(shots - n).min() > 3]
-    noise = float(np.std([band(n) for n in quiet]))
-    # the raster: the gaps between neighbouring shots are whole steps of it (a shot may be missing)
-    t = (shots - shots[0]) * T
-    gaps = np.diff(t)
-    raster = float(gaps[gaps < 1.5 * gaps.min()].mean())
-    j = np.concatenate([[0.0], np.cumsum(np.round(gaps / raster))])
-    raster = float(np.polyfit(j, t, 1)[0])
-
-    def model(p):
-        tau, theta, t0, ras = p[0], abs(p[1]), p[2], p[3]
-        alpha = 1 + p[4] * u + p[5] * u**2 + p[6] * u**3 + p[7] * u**4
-        out = np.empty_like(data)
-        P = lambda z: np.where(z > 0, 1 - np.exp(-np.clip(z, 0, None) / theta), 0.0)
-        for jj, o in enumerate((-1, 0, 1)):
-            s_ = ((shots - shots[0] + o) * T)[:, None] + tau * vc[None, :] - (t0 + j * ras)[:, None]
-            out[:, jj, :] = -p[8:][:, None] * alpha[None, :] * (P(s_ + E) - P(s_))
-        return out
-
-    best = None
-    for tau0 in (-0.6 * T / n_rows, 0.6 * T / n_rows):
-        start = None
-        for t0 in np.arange(-1.3 * T, 1.3 * T, T / 16):
-            p = np.array([tau0, 0.003, t0, raster, 0, 0, 0, 0] + [0.009] * len(shots))
-            c = ((model(p) - data) ** 2).sum()
-            if start is None or c < start[0]:
-                start = (c, p)
-        scale = np.array([1e-6, 1e-3, 1e-3, 1e-5, .1, .1, .1, .1] + [1e-3] * len(shots))
-        r = least_squares(lambda q: (model(q) - data).ravel() / noise, start[1], x_scale=scale)
-        if best is None or r.cost < best.cost:
-            best = r
-    dof = best.fun.size - best.x.size
-    se = float(np.sqrt(np.linalg.pinv(best.jac.T @ best.jac)[0, 0] * 2 * best.cost / dof))
-    return best, se, shots, noise
+    """Fit exposure-integrated beam dips in C++; return parameters and Ceres diagnostics.
+    Insufficient shots, invalid noise and unusable fits return None. Unavailable
+    row-time uncertainty is reported as NaN with uncertainty_available=False."""
+    from . import _core
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] != n_rows:
+        raise ValueError("refill levels must have shape (frames, n_rows)")
+    fit = _core.calibration_fit_refill_shots(x, T, E, pre)
+    return fit if fit["usable"] else None
 
 
 def row_time_from_refill(session, lay, log=print):
@@ -325,10 +269,11 @@ def row_time_from_refill(session, lay, log=print):
             got = fit_refill_shots(x, lay.rows, T, E, pre)
             if got is None:
                 continue
-            best, se, shots, noise = got
-            log(f"  refill in scan {scan} {name}, frames {f_lo}..{f_hi}: {len(shots)} shots on a raster of {best.x[3] * 1e3:.3f} ms, air columns {c0}..{c1}; "
-                f"row time {best.x[0] * 1e6:+.3f} +- {se * 1e6:.3f} us per stored row")
-            return dict(seconds_per_row=float(best.x[0]), se=se, scan=scan, stretch=name, frames=[f_lo, f_hi], shots=int(len(shots)), raster_s=float(best.x[3]), air_columns=[int(c0), int(c1)],
+            params, se, shots = got["x"], got["row_time_se"], got["shots"]
+            log(f"  refill in scan {scan} {name}, frames {f_lo}..{f_hi}: {len(shots)} shots on a raster of {params[3] * 1e3:.3f} ms, air columns {c0}..{c1}; "
+                f"row time {params[0] * 1e6:+.3f} +- {se * 1e6:.3f} us per stored row")
+            return dict(seconds_per_row=float(params[0]), se=se if got["uncertainty_available"] else None,
+                        solver={k: got[k] for k in ("solver_version", "termination", "message", "cost", "iterations")}, scan=scan, stretch=name, frames=[f_lo, f_hi], shots=int(len(shots)), raster_s=float(params[3]), air_columns=[int(c0), int(c1)],
                         period_s=T, gate_s=E)
     return None
 
@@ -434,7 +379,7 @@ def measure(session, lay, m, lines, device="auto", patch=0):
 
 # ---------------------------------------------------------------- the fit
 
-def fit(rows, lay, m, tau, period, huber=0.03, iterations=8):
+def fit(rows, lay, m, tau, period, huber=0.03, max_iterations=100):
     """What the comparisons leave, as a correction of the map `m` (same terms), the poses beside it, and the residuals.
 
     A feature seen at A and at B obeys, with E the part of the detector's map the grid does not hold yet:
@@ -486,9 +431,12 @@ def fit(rows, lay, m, tau, period, huber=0.03, iterations=8):
     for key, e in (("a", columns), ("b", lines_)):
         for s_ in range(K - 1):                         # the last stretch's line is minus the sum of the others
             e.add(key, s_, np.where(st == s_, cA - cref, -(cA - cref)), pair & ((st == s_) | (st == K - 1)))
-    sol = p.solve(huber=huber, iterations=iterations)
+    for k, t in enumerate(tm):
+        if t == (1, 0):
+            p.fix("eu", k)
+    sol = p.solve(huber=huber, max_iterations=max_iterations)
     res = np.concatenate([sol.left(columns), sol.left(lines_)])
-    out = dict(eu=[float(x) for x in sol["eu"]], ev=[float(x) for x in sol["ev"]], psi=float(sol["psi"][0]), rho={s_: float(x) for s_, x in zip(pair_st, sol["rho"])}, lines={}, n=n)
+    out = dict(eu=[float(x) for x in sol["eu"]], ev=[float(x) for x in sol["ev"]], psi=float(sol["psi"][0]), rho={s_: float(x) for s_, x in zip(pair_st, sol["rho"])}, lines={}, n=n, solver=sol.diagnostics)
     for i_, key in enumerate(("a", "b")):
         vals = [float(x) for x in sol[key]]
         vals.append(-sum(vals))
@@ -502,14 +450,16 @@ def fit(rows, lay, m, tau, period, huber=0.03, iterations=8):
 def _least_squares(X, y, columns=None, rows=None):
     """b of X b = y by least squares, through the steps' solver (helirec.solve, as every fit of the calibration).
     columns: the unknowns fitted (the others stay zero); rows: the equations used (the others are left to be
-    predicted). An unknown the equations do not determine comes out zero."""
+    predicted). Unused columns are fixed; dependent active columns are rejected."""
     from .solve import Problem
 
     X = np.asarray(X, float)
     cols = np.arange(X.shape[1]) if columns is None else np.asarray(columns, np.int64)
     b = np.zeros(X.shape[1])
-    if not len(cols) or not len(X):
+    if not len(cols):
         return b
+    if not len(X):
+        raise ValueError("INSUFFICIENT_SUPPORT: no observations for regression")
     p = Problem()
     p.unknowns("b", len(cols))
     e = p.equations(y, fit=True if rows is None else rows)
@@ -714,9 +664,9 @@ def measure_motion(session, lay, m, lines, tau, period, device="auto", log=print
         for a in ("rest1", "rest2"):
             D, y = get("resthelix", scan, "stated_D", a), get("resthelix", scan, "y", a)
             if len(D) >= 8:
-                sc, off = np.polyfit(D, y, 1)
+                sc, off = fit_line(D, y)
                 qa = get("resthelix", scan, "q", a) + tau / period * get("resthelix", scan, "row_offset", a)     # the helix's angle beyond the rows' timing [frames]
-                qs, q0 = np.polyfit(D, qa, 1)
+                qs, q0 = fit_line(D, qa)
                 S[a] = dict(offset_rows=float(off), scale_error=float(sc), left_rows=float(np.std(y - np.polyval([sc, off], D))), blocks=len(D),
                             angle_frames=float(q0), angle_frames_per_row=float(qs), angle_left_frames=float(np.std(qa - np.polyval([qs, q0], D))),
                             table=[[float(f_) + 16.0, float(d_), float(y_), float(q_)] for f_, d_, y_, q_ in zip(get("resthelix", scan, "frame_b", a), D, y, qa)])   # helix frame, encoder's rows from the rest turn, image minus encoder, angle
@@ -890,7 +840,7 @@ def calibrate_geometry(scans, row_time=None, device="auto", order=3, passes=6, t
         f = fit(rows, lay, m, row_time, period)
         du, dv = _update_range(m, f)
         dl = max(abs(v_) for st in f["lines"].values() for v_ in st) * lay.cols / 2
-        history.append(dict(accepted=f["n"], correction_px=du, correction_rows=dv, line_change_px=dl, left=f["left"]))
+        history.append(dict(accepted=f["n"], correction_px=du, correction_rows=dv, line_change_px=dl, left=f["left"], solver=f["solver"]))
         log(f"  pass {it + 1}: {f['n']} comparisons; the map is corrected by up to {du:.3f} px and {dv:.3f} rows, the second scan's lines by {dl:.3f}; left " +
             ", ".join(f"{k} {v_['px']:.3f} px / {v_['rows']:.3f} rows" for k, v_ in f["left"].items()))
         if max(du, dv, dl) < tolerance and it:
@@ -914,7 +864,7 @@ def calibrate_geometry(scans, row_time=None, device="auto", order=3, passes=6, t
             sel = [(next(r["stated_D"] for r in rows if r["kind"] == "resthelix" and r["scan_a"] == scan and r["stretch_a"] == a and int(r["frame_a"]) == fr), v_)
                    for (k, s_, st, fr), (u, v_) in g.items() if k == "resthelix" and s_ == scan and st == a]
             if len(sel) >= 4:
-                sc, off = np.polyfit([x for x, _ in sel], [y_ for _, y_ in sel], 1)
+                sc, off = fit_line([x for x, _ in sel], [y_ for _, y_ in sel])
                 heights[f"scan {scan} {a}"] = dict(offset_rows=float(off), scale_error=float(sc))
         tn = [(v_, next(r["stated_D"] for r in rows if r["kind"] == "turn" and r["scan_a"] == scan and int(r["frame_a"]) == fr)) for (k, s_, st, fr), (u, v_) in g.items() if k == "turn" and s_ == scan]
         if tn:
@@ -928,7 +878,7 @@ def calibrate_geometry(scans, row_time=None, device="auto", order=3, passes=6, t
                             blocked_rows={f"scan {k} {name}": dict(frames=[int(x) for x, hit in zip(fr, mask) if hit.any()], first_row=[int(np.nonzero(hit)[0].min()) for hit in mask if hit.any()],
                                                                     last_row=[int(np.nonzero(hit)[0].max()) for hit in mask if hit.any()]) for (k, name), (fr, mask) in lay.blocked.items()}),
                 row_time=dict(seconds_per_row=row_time, frame_period_s=period, measured=timing), map=m, poses=poses, passes=history, converged=bool(max(du, dv, dl) < tolerance),
-                patch=int(patch))
+                patch=int(patch), solver=f["solver"])
 
 
 def save(cal, path):

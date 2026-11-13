@@ -13,9 +13,8 @@ A calibration step states its model here and nowhere else:
     s["axis"], s.left(e)                             # the unknowns by name; what each equation leaves
 
 Every equation is a line in the unknowns; a model that is not (an angle that multiplies a place) is written as a
-line about the values in hand and solved again. The arithmetic is helirec's own, in C++
-(helirec/calibration/solve.hpp: columns scaled to unit length, a Huber loss by reweighting, the normal equations
-factored with pivoting; no outside solver). Equations with fit False take no part in the solve and are predicted:
+line about the values in hand and solved again. C++ fits the equations with Ceres Levenberg–Marquardt,
+column scaling and a scalar Huber loss. Equations with fit False take no part in the solve and are predicted:
 what they leave is the model's test.
 """
 from __future__ import annotations
@@ -51,8 +50,14 @@ class Equations:
 
 
 class Solution:
-    def __init__(self, problem, x, residual, weight, spread, rank):
+    def __init__(self, problem, x, residual, weight, spread, rank, diagnostics):
         self.problem, self.x, self.residual, self.weight, self.spread, self.rank = problem, x, residual, weight, spread, rank
+
+        self.diagnostics = diagnostics
+        self.cost = diagnostics["cost"]
+        self.iterations = diagnostics["iterations"]
+        self.termination = diagnostics["termination"]
+        self.message = diagnostics["message"]
 
     def __getitem__(self, block):
         offset, size = self.problem.blocks[block]
@@ -66,6 +71,7 @@ class Solution:
 class Problem:
     def __init__(self):
         self.blocks = {}                 # name -> (offset, size)
+        self._fixed = {}
         self.n = 0                       # unknowns
         self.m = 0                       # equations
         self._row, self._col, self._value, self._y, self._fit = [], [], [], [], []
@@ -73,6 +79,8 @@ class Problem:
     def unknowns(self, name, size):
         if name in self.blocks:
             raise ValueError(f"the unknowns {name!r} are already there")
+        if int(size) != size or size < 0:
+            raise ValueError("unknown block size must be a nonnegative integer")
         self.blocks[name] = (self.n, int(size))
         self.n += int(size)
         return name
@@ -86,9 +94,20 @@ class Problem:
         self.m += len(y)
         return e
 
-    def solve(self, huber=0.0, relative=False, iterations=8, rcond=1e-12):
-        """huber: the loss's threshold in the equations' units (0: least squares), or with relative a multiple of
-        the residuals' own robust spread. Returns a Solution."""
+    def fix(self, block, index, value=0.0):
+        """Hold named parameters at explicit values (choose the model's unobservable gauge)."""
+        offset, size = self.blocks[block]
+        indices, values = np.broadcast_arrays(np.atleast_1d(np.asarray(index, np.int64)), np.asarray(value, float))
+        if np.any((indices < 0) | (indices >= size)) or not np.all(np.isfinite(values)):
+            raise ValueError("invalid fixed parameter")
+        for i, v in zip(indices.flat, values.flat):
+            self._fixed[offset + int(i)] = float(v)
+        return self
+
+    def solve(self, huber=0.0, max_iterations=100, rcond=1e-12, function_tolerance=1e-7,
+              gradient_tolerance=1e-12, parameter_tolerance=1e-12):
+        """Ceres fit, with Huber threshold in residual units. Reject unusable or dependent active models.
+        Held-out equations are predicted but do not affect fitting, rank or cost."""
         from . import _core
 
         cat = lambda parts, dtype: np.concatenate(parts).astype(dtype) if parts else np.zeros(0, dtype)
@@ -98,9 +117,23 @@ class Problem:
         number = np.cumsum(fit) - 1
         use = fit[row]
         got = _core.calibration_solve(np.ascontiguousarray(number[row[use]]), np.ascontiguousarray(col[use]), np.ascontiguousarray(value[use]), np.ascontiguousarray(y[fit]),
-                                      self.n, float(huber), bool(relative), int(iterations), float(rcond))
+                                      self.n, huber=float(huber), max_iterations=int(max_iterations), rcond=float(rcond),
+                                      fixed=list(self._fixed), fixed_value=list(self._fixed.values()),
+                                      function_tolerance=function_tolerance, gradient_tolerance=gradient_tolerance, parameter_tolerance=parameter_tolerance)
+        if not got["usable"]:
+            raise ValueError(f"{got['termination']}: {got['message']}")
         x = np.asarray(got["x"])
         residual = y - np.bincount(row, weights=value * x[col], minlength=self.m)
         weight = np.zeros(self.m)
         weight[fit] = np.asarray(got["weight"])
-        return Solution(self, x, residual, weight, float(got["spread"]), int(got["rank"]))
+        return Solution(self, x, residual, weight, float(got["spread"]), int(got["rank"]),
+                        {k: got[k] for k in ("cost", "iterations", "evaluations", "usable", "termination", "message", "solver_version", "rank", "active", "unused")})
+
+
+def fit_line(x, y):
+    """Return (slope, intercept) of a centred/scaled Ceres line fit; reject unavailable fits."""
+    from . import _core
+    fit = _core.calibration_fit_line(np.asarray(x, float).tolist(), np.asarray(y, float).tolist())
+    if not fit["usable"]:
+        raise ValueError(f"{fit['termination']}: {fit['message']}")
+    return fit["slope"], fit["intercept"]

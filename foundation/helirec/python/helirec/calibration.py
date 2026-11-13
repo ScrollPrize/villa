@@ -368,14 +368,14 @@ def measure_detector_blur(scan: BlissScan, dark, n_flats=200, log=print):
         log(f"detector blur: not measured ({reason})")
         return dict(field=[], measured=None, reason=reason, scan=scan.name)
     power, ys, xs, n = flat_noise_spectra(scan, dark, n_flats)
-    field, rms_none, rms_fit = _core.detector_blur_field_fit(power, ys, xs, rows, cols)
+    field, rms_none, rms_fit, solver = _core.detector_blur_field_fit(power, ys, xs, rows, cols)
     th = np.array(field)
     try:
         zero = (-np.linalg.solve(th[:4].reshape(2, 2), th[4:]) * 1000 + [0.5 * (cols - 1), 0.5 * (rows - 1)]).tolist()
     except np.linalg.LinAlgError:
         zero = [float("nan"), float("nan")]
     res = dict(field=[float(v) for v in field], rms_none=float(rms_none), rms_fit=float(rms_fit), zero=zero,
-               tiles=[len(ys), len(xs)])
+               tiles=[len(ys), len(xs)], solver=solver)
     corners = [(x, y) for x in (-0.5 * cols / 1000, 0.5 * cols / 1000) for y in (-0.5 * rows / 1000, 0.5 * rows / 1000)]
     reach = max(abs(th[0] * x + th[1] * y + th[4]) for x, y in corners)
     res.update(n_flats=int(n), max_blur_px=float(reach), scan=scan.name)

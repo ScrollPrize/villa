@@ -13,7 +13,7 @@
 //   1. each volume has its window-weighted mean removed and is multiplied by a separable Hann window (the same
 //      continuous window on both grids), then transformed (real 3D FFT);
 //   2. optionally b is registered on a: the shift maximising their cross-correlation, whitened per shell and
-//      restricted to frequencies below align_band (integer search within max_shift voxels, then Newton iterations on
+//      restricted to frequencies below align_band (integer search within max_shift voxels, then Ceres BFGS on
 //      the continuous shift), is removed from b as a phase ramp;
 //   3. |A|^2, |B|^2 and Re(A conj B) are summed in bins (shell, theta): shells of |k| of width 0.5 / shells cycles per
 //      voxel, out to the corners of the cube (n_shells() of them: frequencies along an axis end at shell `shells`),

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "helirec/calibration/record.hpp"
+#include "helirec/calibration/solve.hpp"
 
 namespace helirec::calibration {
 
@@ -26,31 +27,20 @@ inline std::string fmt(const char* format, ...) {
     return s;
 }
 
-struct Line {
-    double slope = 0, intercept = 0, rms = 0, max_abs = 0;
-    std::size_t n = 0;
-};
-// least squares y = intercept + slope x over i in [i0, i1)
+using Line = LineFit;
+// Copy only the selected observations; fit_line centres and scales the predictor.
 template <class X, class Y>
 Line fit_line(const X& x, const Y& y, std::size_t i0, std::size_t i1) {
-    Line l;
-    l.n = i1 - i0;
-    if (l.n < 2) return l;
-    long double sx = 0, sy = 0;
-    for (std::size_t i = i0; i < i1; ++i) sx += x[i], sy += y[i];
-    const long double mx = sx / l.n, my = sy / l.n;
-    long double sxx = 0, sxy = 0;
-    for (std::size_t i = i0; i < i1; ++i) sxx += (x[i] - mx) * (x[i] - mx), sxy += (x[i] - mx) * (y[i] - my);
-    l.slope = static_cast<double>(sxy / sxx);
-    l.intercept = static_cast<double>(my - l.slope * mx);
-    long double ss = 0;
-    for (std::size_t i = i0; i < i1; ++i) {
-        const double r = y[i] - (l.intercept + l.slope * x[i]);
-        ss += static_cast<long double>(r) * r;
-        l.max_abs = std::max(l.max_abs, std::fabs(r));
+    if (i1 < i0 || i1 > x.size() || i1 > y.size()) throw Error("fit_line: invalid range");
+    try {
+        return fit_line(std::vector<double>(x.begin() + i0, x.begin() + i1),
+                        std::vector<double>(y.begin() + i0, y.begin() + i1));
+    } catch (const Error& e) {
+        Line l;
+        l.slope = l.intercept = l.rms = l.max_abs = std::numeric_limits<double>::quiet_NaN();
+        l.termination = "INVALID_INPUT"; l.message = e.what();
+        return l;
     }
-    l.rms = std::sqrt(static_cast<double>(ss / l.n));
-    return l;
 }
 
 struct Spread {

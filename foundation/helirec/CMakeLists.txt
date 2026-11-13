@@ -38,6 +38,7 @@ endif()
 message(STATUS "helirec: CUDA kernels ${HELIREC_WITH_CUDA}")
 
 # ---------------------------------------------------------------- dependencies
+find_package(Ceres 2.2 REQUIRED COMPONENTS EigenSparse)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFTW3F REQUIRED IMPORTED_TARGET fftw3f)
@@ -113,7 +114,7 @@ if(HELIREC_CPU_ARCH)
   target_compile_options(helirec PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=${HELIREC_CPU_ARCH}>)
 endif()
 target_link_libraries(helirec
-  PUBLIC OpenMP::OpenMP_CXX
+  PUBLIC OpenMP::OpenMP_CXX Ceres::ceres
   PRIVATE PkgConfig::FFTW3F PkgConfig::FFTW3 ${FFTW3F_OMP_LIB} HDF5::HDF5 ZLIB::ZLIB CURL::libcurl)
 if(HELIREC_DELTA3D)
   target_link_libraries(helirec PRIVATE vc_delta3d::vc_delta3d)
@@ -148,6 +149,10 @@ if(HELIREC_TOOLS)
   include(CTest)
   if(BUILD_TESTING)
     add_test(NAME calibration_selftest COMMAND helirec-calibration selftest)
+    add_executable(helirec-fitting-test tests/cpp/test_fitting.cpp)
+    target_include_directories(helirec-fitting-test PRIVATE src)
+    target_link_libraries(helirec-fitting-test PRIVATE helirec)
+    add_test(NAME fitting_derivatives COMMAND helirec-fitting-test)
   endif()
 endif()
 

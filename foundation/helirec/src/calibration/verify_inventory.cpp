@@ -5,6 +5,7 @@
 #include <fstream>
 
 #include "calibration/util.hpp"
+#include "calibration/ceres_support.hpp"
 #include "helirec/calibration/verify.hpp"
 
 namespace helirec::calibration {
@@ -457,7 +458,8 @@ void check_series(const Record& rec, Frames& frames, const FlatField& ff, Report
 namespace {
 
 // linear interpolation of the monitor's reading at time t; NaN readings are skipped
-double monitor_at(const Monitor& m, double t) {
+double monitor_at(const Monitor& m, double t, double* derivative = nullptr) {
+    if (derivative) *derivative = 0;
     const std::size_t n = std::min(m.epoch.size(), m.current.size());
     if (!n) return NAN;
     std::size_t hi = std::lower_bound(m.epoch.begin(), m.epoch.begin() + n, t) - m.epoch.begin();
@@ -467,8 +469,29 @@ double monitor_at(const Monitor& m, double t) {
     if (hi >= n) return m.current[lo];
     if (!std::isfinite(m.current[lo]) || hi == lo || m.epoch[hi] == m.epoch[lo]) return m.current[hi];
     const double w = std::clamp((t - m.epoch[lo]) / (m.epoch[hi] - m.epoch[lo]), 0.0, 1.0);
+    if (derivative && t >= m.epoch[lo] && t <= m.epoch[hi])
+        *derivative = (m.current[hi]-m.current[lo])/(m.epoch[hi]-m.epoch[lo]);
     return m.current[lo] + w * (m.current[hi] - m.current[lo]);
 }
+
+struct MonitorResidual final : ceres::SizedCostFunction<1,3> {
+    const Monitor& monitor;
+    double epoch, level, current_center, level_center;
+    MonitorResidual(const Monitor& m, double t, double y, double mx, double my)
+        : monitor(m), epoch(t), level(y), current_center(mx), level_center(my) {}
+    bool Evaluate(double const* const* parameters, double* residual, double** jacobian) const override {
+        const double* p = parameters[0];  // delay, slope, centred offset
+        double derivative;
+        const double current = monitor_at(monitor,epoch+p[0],&derivative)-current_center;
+        residual[0] = (level-level_center)-(p[1]*current+p[2]);
+        if (jacobian && jacobian[0]) {
+            jacobian[0][0] = -p[1]*derivative;
+            jacobian[0][1] = -current;
+            jacobian[0][2] = -1;
+        }
+        return std::isfinite(residual[0]);
+    }
+};
 
 }  // namespace
 
@@ -605,11 +628,30 @@ void check_beam(const Record& rec, const Inventory& inv, const FlatField& ff, Re
             // delay: the level is modelled as alpha * current(t - delay) + beta over the frames around the rise
             const std::size_t w0 = a > 300 ? a - 300 : 0, w1 = std::min(n, b + 300);
             double best_delay = NAN, best_rms = 1e30, best_alpha = NAN;
-            for (double delay = -10.0; delay <= 10.0001; delay += 0.05) {
-                std::vector<double> x(w1 - w0), y(w1 - w0);
-                for (std::size_t fr = w0; fr < w1; ++fr) x[fr - w0] = monitor_at(s.monitor, epoch[fr] + delay), y[fr - w0] = level[fr];
-                const Line l = fit_line(x, y, 0, x.size());
-                if (l.rms < best_rms) best_rms = l.rms, best_delay = delay, best_alpha = l.slope;
+            FitSummary best_solver;
+            const double mx = spread(current,w0,w1).mean, my = spread(level,w0,w1).mean;
+            // Multiple physical starting delays; continuous fitting is entirely Ceres.
+            for (double delay : {-10.,-5.,0.,5.,10.}) {
+                std::vector<double> x(w1-w0), y(w1-w0);
+                for (std::size_t fr = w0; fr < w1; ++fr) x[fr-w0] = monitor_at(s.monitor,epoch[fr]+delay), y[fr-w0] = level[fr];
+                const auto initial = fit_line(x,y);
+                if (!initial.usable) continue;
+                double p[3] = {delay,initial.slope,initial.intercept+initial.slope*mx-my};
+                ceres::Problem problem;
+                for (std::size_t fr = w0; fr < w1; ++fr)
+                    problem.AddResidualBlock(new MonitorResidual(s.monitor,epoch[fr],level[fr],mx,my),nullptr,p);
+                problem.SetParameterLowerBound(p,0,-10);
+                problem.SetParameterUpperBound(p,0,10);
+                ceres::Solver::Summary summary;
+                ceres::Solve(fitting::options(3),&problem,&summary);
+                const double rms = std::sqrt(2*summary.final_cost/(w1-w0));
+                if (summary.IsSolutionUsable() && rms < best_rms) {
+                    best_rms = rms; best_delay = p[0]; best_alpha = p[1]; best_solver = fitting::summary(summary);
+                }
+            }
+            if (!best_solver.usable) {
+                f.found += "; monitor-delay fit unavailable (insufficient variation or unusable fit)";
+                continue;
             }
             f.found += fmt("; around the refill the air level rises by %+.1f %% between projections %zu and %zu (10 %% and 90 %% of the step); modelled as a multiple of the ring current read %.2f s %s the frame "
                            "(residual %.4f rms, %.2f %% of the level per %% of current)",
@@ -617,6 +659,7 @@ void check_beam(const Record& rec, const Inventory& inv, const FlatField& ff, Re
             f.numbers.push_back({"rise_first_frame", static_cast<double>(at[a])});
             f.numbers.push_back({"rise_last_frame", static_cast<double>(at[b])});
             f.numbers.push_back({"monitor_delay_s", best_delay});
+            f.found += "; Ceres " + best_solver.solver_version + " " + best_solver.termination;
         }
         f.note = "air is found from the frames themselves; nothing here assumes where the sample is. The flat used is the mean of all the scan's flats";
     }

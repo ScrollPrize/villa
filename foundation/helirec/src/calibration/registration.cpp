@@ -1,3 +1,4 @@
+#include "calibration/correlation_peak.hpp"
 #include "helirec/calibration/registration.hpp"
 
 #include <fftw3.h>
@@ -289,51 +290,15 @@ class CpuBackend final : public RegistrationBackend {
     fftwf_plan forward_ = nullptr, inverse_ = nullptr, big_forward_ = nullptr, big_inverse_ = nullptr, rows_forward_ = nullptr, rows_inverse_ = nullptr;
 };
 
-// solve H x = -g for the active axes (H symmetric); false when H is not negative definite there
-bool newton_step(const double H[3][3], const double g[3], const bool active[3], double x[3]) {
-    int idx[3], m = 0;
-    for (int j = 0; j < 3; ++j)
-        if (active[j]) idx[m++] = j;
-    x[0] = x[1] = x[2] = 0;
-    if (!m) return true;
-    // -H must be positive definite: Cholesky of A = -H, then A x = g
-    double A[3][3], L[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, y[3], sol[3];
-    for (int r = 0; r < m; ++r)
-        for (int c = 0; c < m; ++c) A[r][c] = -H[idx[r]][idx[c]];
-    for (int r = 0; r < m; ++r) {
-        for (int c = 0; c <= r; ++c) {
-            double s = A[r][c];
-            for (int k = 0; k < c; ++k) s -= L[r][k] * L[c][k];
-            if (r == c) {
-                if (s <= 0) return false;
-                L[r][r] = std::sqrt(s);
-            } else {
-                L[r][c] = s / L[c][c];
-            }
-        }
-    }
-    for (int r = 0; r < m; ++r) {
-        double s = g[idx[r]];
-        for (int k = 0; k < r; ++k) s -= L[r][k] * y[k];
-        y[r] = s / L[r][r];
-    }
-    for (int r = m - 1; r >= 0; --r) {
-        double s = y[r];
-        for (int k = r + 1; k < m; ++k) s -= L[k][r] * sol[k];
-        sol[r] = s / L[r][r];
-    }
-    for (int r = 0; r < m; ++r) x[idx[r]] = sol[r];
-    return true;
-}
-
 struct Step {
     double delta[3] = {0, 0, 0};  // remaining displacement of the (displaced) b against a
     double correlation = 0;
     double curvature[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};  // of the correlation at delta, active axes
     bool at_edge = false, at_maximum = false;
+    FitSummary solver;
 };
 
-// b displaced by d, correlated with a: the continuous maximum of the correlation, by Newton steps from zero or
+// b displaced by d, correlated with a: the continuous maximum of the correlation, by Ceres from zero or
 // (search) from its integer maximum
 Step evaluate(RegistrationBackend& be, const RegistrationGeometry& geom, const RegistrationOptions& opt, double ea, const double d[3], bool search) {
     const double eb = be.cross(d);
@@ -346,44 +311,16 @@ Step evaluate(RegistrationBackend& be, const RegistrationGeometry& geom, const R
         step.at_edge = be.peak(s, best);
         for (int j = 0; j < 3; ++j) at[j] = best[j];
     }
-    double r = 0, g[3], H[3][3];
-    be.correlation(at, r, g, H);
-    for (int it = 0; it < 40; ++it) {
-        double x[3];
-        if (!newton_step(H, g, geom.active, x)) break;  // not near a maximum
-        double largest = 0;
-        for (int j = 0; j < 3; ++j) {
-            x[j] = std::clamp(x[j], -0.5, 0.5);
-            largest = std::max(largest, std::fabs(x[j]));
-        }
-        if (largest < 1e-6) {
-            step.at_maximum = true;
-            break;
-        }
-        double trial[3], rt = 0, gt[3], Ht[3][3], scale = 1.0;
-        bool accepted = false;
-        for (int half = 0; half < 8; ++half, scale *= 0.5) {
-            for (int j = 0; j < 3; ++j) trial[j] = at[j] + scale * x[j];
-            be.correlation(trial, rt, gt, Ht);
-            if (rt >= r) {
-                accepted = true;
-                break;
-            }
-        }
-        if (!accepted) {
-            // within the rounding of the sums the correlation no longer increases: a step this small is the maximum
-            step.at_maximum = largest < 1e-3;
-            break;
-        }
-        for (int j = 0; j < 3; ++j) at[j] = trial[j], g[j] = gt[j];
-        for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 3; ++j) H[i][j] = Ht[i][j];
-        r = rt;
-    }
-    for (int j = 0; j < 3; ++j) step.delta[j] = geom.active[j] ? at[j] : 0.0;
-    step.correlation = r / std::sqrt(ea * eb);
+    const double normalization = std::sqrt(ea * eb);
+    const auto peak = fitting::correlation_peak([&](const double* q, double& r, double* g, double (*H)[3]) {
+        be.correlation(q, r, g, H);
+    }, geom.active, at, normalization);
+    step.solver = peak.solver;
+    step.at_maximum = peak.maximum;
+    for (int j = 0; j < 3; ++j) step.delta[j] = peak.at[j];
+    step.correlation = peak.value / normalization;
     for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j) step.curvature[i][j] = geom.active[i] && geom.active[j] ? H[i][j] / std::sqrt(ea * eb) : 0.0;
+        for (int j = 0; j < 3; ++j) step.curvature[i][j] = peak.hessian[i][j] / normalization;
     return step;
 }
 
@@ -435,6 +372,8 @@ Registration Registrar::run(const float* a, const float* b, const double* row_sh
     Registration out;
     double d[3] = {0, 0, 0};
     const auto keep_curvature = [&](const Step& st) {
+        out.solver = st.solver;
+        out.function_evaluations += st.solver.evaluations;
         for (int i = 0; i < 3; ++i)
             for (int j = 0; j < 3; ++j) out.curvature[i][j] = st.curvature[i][j];
     };

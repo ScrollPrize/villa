@@ -1,98 +1,126 @@
-"""helirec's solver of the geometry steps (helirec/calibration/solve.hpp, helirec.solve): a linear model fitted
-under a Huber loss, against the same arithmetic done by numpy."""
+"""Known answers and independent objectives for the Ceres named-equation interface."""
 import numpy as np
 import pytest
-
 from helirec import _core
-from helirec.solve import Problem
+from helirec.solve import Problem, fit_line
 
 
 def _lstsq(A, y):
-    """numpy's least squares with the columns scaled to unit length first: as they are, unknowns nine decades apart
-    cost it half its digits (which is why the solver scales them)"""
-    norm = np.sqrt((A ** 2).sum(0))
-    norm[norm == 0] = 1.0
+    norm = np.linalg.norm(A, axis=0)
+    norm[norm == 0] = 1
     return np.linalg.lstsq(A / norm, y, rcond=None)[0] / norm
 
 
-def _reference(A, y, k, iterations):
-    """weighted least squares repeated with the Huber weights of the solve before (numpy)"""
-    w = np.ones(len(y))
-    for _ in range(iterations):
-        x = _lstsq(A * w[:, None], y * w)
-        res = y - A @ x
-        w = np.sqrt(np.minimum(1.0, k / np.maximum(np.abs(res), 1e-12)))
-    return x, res
-
-
-def _problem(rng, m=3000, n=60, per_row=6):
-    row = np.repeat(np.arange(m), per_row)
-    col = rng.integers(0, n, m * per_row)
-    scale = 10.0 ** rng.uniform(-6, 3, n)                     # unknowns of very different sizes, as a calibration's are
-    value = rng.standard_normal(m * per_row) / scale[col]
+def _problem(seed=5, m=1200, n=60):
+    rng = np.random.default_rng(seed)
+    row = np.repeat(np.arange(m), 6)
+    col = rng.integers(0, n, len(row))
+    scale = 10. ** rng.uniform(-6, 3, n)
+    value = rng.standard_normal(len(row)) / scale[col]
     A = np.zeros((m, n))
-    np.add.at(A, (row, col), value)                           # repeated entries add
-    x = rng.standard_normal(n) * scale
-    y = A @ x + 0.01 * rng.standard_normal(m)
-    y[::13] += 3 * rng.standard_normal(len(y[::13]))          # outliers
-    return row, col, value, A, y, x
+    np.add.at(A, (row, col), value)  # duplicate coefficients accumulate
+    truth = rng.standard_normal(n) * scale
+    y = A @ truth + .01 * rng.standard_normal(m)
+    y[::13] += 3 * rng.standard_normal(len(y[::13]))
+    return row, col, value, A, y, truth
 
 
-def test_least_squares_and_huber_equal_numpy():
-    rng = np.random.default_rng(5)
-    row, col, value, A, y, truth = _problem(rng)
-    s = _core.calibration_solve(row, col, value, y, A.shape[1])
-    x0 = _lstsq(A, y)
-    assert s["rank"] == A.shape[1] and np.allclose(s["x"], x0, rtol=1e-8, atol=0)
-    assert np.allclose(s["residual"], y - A @ x0, atol=1e-9) and np.all(s["weight"] == 1)
-    # the Huber loss: the outliers no longer pull the answer
-    s = _core.calibration_solve(row, col, value, y, A.shape[1], huber=0.03, iterations=8)
-    x, res = _reference(A, y, 0.03, 8)
-    assert np.allclose(s["x"], x, rtol=1e-7, atol=0) and np.allclose(s["residual"], res, atol=1e-8)
-    assert np.abs(s["x"] / truth - 1).max() < np.abs(x0 / truth - 1).max()
-    assert s["weight"][::13].mean() < 0.5 < s["weight"].mean()
-    # the threshold as a multiple of the residuals' own spread: the spread is the noise put in
-    s = _core.calibration_solve(row, col, value, y, A.shape[1], huber=2.0, relative=True, iterations=8)
-    assert s["spread"] == pytest.approx(0.01, rel=0.2) and np.abs(s["x"] / truth - 1).max() < np.abs(x0 / truth - 1).max()
+@pytest.mark.parametrize("n", [8, 60, 90])
+def test_scaled_known_answers_and_robust_objective(n):
+    row, col, value, A, y, truth = _problem(n=n)
+    s = _core.calibration_solve(row, col, value, y, n)
+    expected = _lstsq(A, y)
+    assert s["usable"] and s["rank"] == n and s["solver_version"]
+    np.testing.assert_allclose(s["x"], expected, rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(s["residual"], y - A @ expected, atol=1e-9)
+    assert np.all(s["weight"] == 1)
+    threshold = .03
+    s = _core.calibration_solve(row, col, value, y, n, huber=threshold, function_tolerance=1e-12)
+    # Independent IRLS reference converged to the robust objective, not a fixed
+    # number of iterations of the retired backend.
+    x = expected
+    for _ in range(100):
+        r = y - A @ x
+        w = np.sqrt(np.minimum(1., threshold / np.maximum(abs(r), 1e-30)))
+        new = _lstsq(A * w[:, None], y * w)
+        if np.max(abs(A @ (new-x))) < 1e-11:
+            break
+        x = new
+    objective = lambda r: np.where(abs(r) <= threshold, .5*r*r, threshold*(abs(r)-.5*threshold)).sum()
+    assert s["usable"] and s["cost"] == pytest.approx(objective(y-A@x), rel=1e-8)
+    assert s["cost"] == pytest.approx(objective(s["residual"]), rel=1e-12)
+    np.testing.assert_allclose(s["weight"], np.sqrt(np.minimum(1., threshold/np.maximum(abs(s["residual"]), 1e-30))))
+    assert np.std(A @ (s["x"]-truth)) < np.std(A @ (expected-truth))
+    assert s["spread"] == pytest.approx(.01, rel=.25)
 
 
-def test_what_the_equations_do_not_determine_is_zero():
-    rng = np.random.default_rng(6)
-    row, col, value, A, y, _ = _problem(rng, m=400, n=12)
-    # an unknown no equation holds, and one that is another's double: both are left out of the rank
-    A2 = np.concatenate([A, np.zeros((len(y), 1)), 2 * A[:, :1]], 1)
-    r, c = np.nonzero(A2)
-    s = _core.calibration_solve(r, c, A2[r, c], y, A2.shape[1])
-    assert s["rank"] == 12 and s["x"][12] == 0 and (s["x"][0] == 0 or s["x"][13] == 0)
-    assert np.allclose(s["residual"], y - A @ _lstsq(A, y), atol=1e-9)       # the fit is the same
-    with pytest.raises(Exception):
-        _core.calibration_solve(np.array([0, 400]), np.array([0, 0]), np.ones(2), y, 12)       # an entry outside the equations
-    with pytest.raises(Exception):
-        _core.calibration_solve(r, c, A2[r, c], y, 3)                                           # ... or outside the unknowns
+def test_explicit_fixed_parameters_and_rank_failure():
+    row, col, value, A, y, _ = _problem(n=12)
+    A = np.column_stack([A, np.zeros(len(y)), 2*A[:, 0]])
+    r, c = np.nonzero(A)
+    args = (r, c, A[r,c], y, A.shape[1])
+    failed = _core.calibration_solve(*args)
+    assert not failed["usable"] and failed["termination"] == "RANK_DEFICIENT"
+    assert failed["rank"] == 12 and failed["active"] == 13 and failed["unused"] == 1
+    s = _core.calibration_solve(*args, fixed=[13], fixed_value=[3.])
+    assert s["usable"] and s["x"][13] == 3. and s["x"][12] == 0
+    np.testing.assert_allclose(s["residual"], y-A[:, :12]@_lstsq(A[:, :12], y), atol=1e-8)
+    p = Problem(); p.unknowns("b", 2)
+    e = p.equations([1.,2.]); e.add("b", 0, 1); e.add("b", 1, 2)
+    with pytest.raises(ValueError, match="RANK_DEFICIENT"):
+        p.solve()
+    p.fix("b", 1, 2.)
+    assert p.solve()["b"] == pytest.approx([-2.5,2.])
 
 
-def test_problem_by_name():
-    """A model stated as equations over named unknowns: a line through points, some held out and predicted."""
-    rng = np.random.default_rng(8)
-    t = np.linspace(0, 10, 200)
-    which = rng.integers(0, 3, 200)                           # three lines of one slope, each with its own offset
-    y = 0.25 * t + np.array([1.0, -2.0, 5.0])[which] + 0.01 * rng.standard_normal(200)
-    y[5] += 7.0
-    held = np.arange(200) % 4 == 0
-    p = Problem()
-    p.unknowns("slope", 1)
-    p.unknowns("offset", 3)
+def test_named_heldout_and_cancelled_duplicates():
+    p = Problem(); p.unknowns("slope", 1); p.unknowns("offset", 1); p.unknowns("unused", 1)
+    t = np.linspace(0,10,200); held = np.arange(200)%4 == 0
+    y = .25*t+2
     e = p.equations(y, fit=~held)
-    e.add("slope", 0, t)
-    e.add("offset", which, 1.0)
-    pin = p.equations([0.0])                                  # an equation of the model's own: nothing measured
-    pin.add("offset", 0, 1e-6)
-    s = p.solve(huber=0.05)
-    assert s["slope"][0] == pytest.approx(0.25, abs=2e-3) and np.allclose(s["offset"], [1.0, -2.0, 5.0], atol=0.02)
-    left = s.left(e)
-    assert left.shape == (200,) and np.sqrt(np.mean(left[held] ** 2)) < 0.02 and abs(left[5] - 7.0) < 0.05
-    assert s.rank == 4 and np.all(s.weight[e.rows][held] == 0) and s.weight[e.rows][5] < 0.2
-    with pytest.raises(ValueError):
-        e.add("offset", 3, 1.0)
-    with pytest.raises(ValueError):
-        p.unknowns("slope", 2)
+    e.add("slope", 0, t).add("offset", 0, 1)
+    e.add("unused", 0, 5).add("unused", 0, -5)
+    p.fix("offset", 0, 2.)
+    s = p.solve()
+    assert s["slope"] == pytest.approx([.25], abs=1e-10)
+    assert s.rank == 1 and s.diagnostics["unused"] == 1
+    assert abs(s.left(e)).max() < 1e-9 and np.all(s.weight[held] == 0)
+    # Held-out equations do not establish rank or support.
+    p = Problem(); p.unknowns("a", 1); p.equations([1.], fit=False).add("a", 0, 1.)
+    with pytest.raises(ValueError, match="INSUFFICIENT_SUPPORT"):
+        p.solve()
+
+
+def test_input_errors_and_iteration_limit():
+    r,c,v,A,y,_ = _problem(n=8)
+    for kwargs in [dict(huber=-1), dict(huber=np.inf), dict(rcond=0), dict(max_iterations=0),
+                   dict(fixed=[8], fixed_value=[0.]), dict(fixed=[0,0], fixed_value=[1.,2.]),
+                   dict(function_tolerance=np.nan)]:
+        with pytest.raises(Exception):
+            _core.calibration_solve(r,c,v,y,8,**kwargs)
+    for values, measured in [(v*np.nan,y),(v,y*np.inf)]:
+        with pytest.raises(Exception): _core.calibration_solve(r,c,values,measured,8)
+    with pytest.raises(Exception): _core.calibration_solve(r+len(y),c,v,y,8)
+    s = _core.calibration_solve(r,c,v,y,8,huber=.03,max_iterations=1)
+    assert s["termination"] == "NO_CONVERGENCE" and s["iterations"] == 1 and s["message"]
+
+
+def test_large_encoder_line_and_unavailable_fits():
+    x = 1e12 + np.arange(1000)
+    slope, intercept = fit_line(x, 3.25*(x-1e12)+7)
+    assert slope == pytest.approx(3.25, abs=1e-10)
+    assert intercept == pytest.approx(7-3.25e12, abs=.002)
+    for x,y in [([1],[2]), ([1,1,1],[2,3,4]), ([],[])]:
+        assert not _core.calibration_fit_line(x,y)["usable"]
+        with pytest.raises(ValueError): fit_line(x,y)
+
+
+def test_all_fixed_and_constant_equations():
+    p = Problem(); p.unknowns("a", 1)
+    p.fix("a", 0, 2.)
+    p.equations([3., 4.]).add("a", 0, 1.)
+    p.equations([5.])
+    s = p.solve(huber=1.)
+    assert s.rank == 0 and s["a"][0] == 2.
+    assert s.residual == pytest.approx([1.,2.,5.])
+    assert s.cost == pytest.approx(.5+1.5+4.5)
