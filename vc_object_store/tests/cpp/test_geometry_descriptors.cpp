@@ -28,14 +28,14 @@ void borrowedChunks()
     const auto geometry=shape();
     auto otherGeometry=geometry;
     otherGeometry.arrays.front().bytes.front()^=1;
-    std::string baseRevision,currentRevision;
+    std::string baseRevision,currentRevision,currentOwner;
     {
         auto base=ObjectStore::create(basePath,options());auto w=base.write();
         base.upsertObject(w,track(owner));baseRevision=base.putGeometry(w,owner,geometry);base.seal(w);w.commit();
     }
     {
         auto config=options();config.history=HistoryMode::Off;
-        auto base=ObjectStore::create(currentPath,config);auto w=base.write();const auto key=util::newUuid();
+        auto base=ObjectStore::create(currentPath,config);auto w=base.write();const auto key=util::newUuid();currentOwner=key;
         base.upsertObject(w,track(key));currentRevision=base.putGeometry(w,key,otherGeometry);base.seal(w);w.commit();
     }
     std::string revision;
@@ -68,6 +68,29 @@ void borrowedChunks()
     const auto missing=resolveGeometryRecord(source.get(),util::newUuid());
     require(!missing,"missing geometry reference is not substituted by current geometry");
     require(chunks(source.get())==0,"source borrows payloads without local registrations");
+    {
+        auto readOptions=options();readOptions.readOnly=true;
+        auto root=ObjectStore::open(sourcePath,readOptions);auto snapshot=root.read();
+        const auto packed=root.readGeometryArrays(snapshot,mixed,"points");
+        for(size_t i=0;i<mixed.size();++i){
+            const auto expected=(mixed[i]==currentRevision?otherGeometry:geometry).arrays.front().bytes;
+            const auto actual=packedItem(packed,i);
+            require(std::equal(actual.begin(),actual.end(),expected.begin(),expected.end()),
+                "packed payload batches retain each descriptor owner's borrowed scope and duplicate order");
+        }
+        auto collection=ObjectCollection::open(sourcePath,readOptions);auto selected=collection.read();
+        const std::array<std::array<unsigned char,16>,3> keys{parseUuid(id),parseUuid(currentOwner),parseUuid(owner)};
+        for(const auto workers:{size_t(1),size_t(4)}){
+            const auto columns=collection.readGeometryArrayColumns(selected,keys,"points",std::string("track"),std::nullopt,std::nullopt,workers);
+            require(columns.objectUuids.size()==3,"parallel packed selection preserves all distinct descriptor owners");
+            for(size_t i=0;i<columns.objectUuids.size();++i){
+                const auto expected=(columns.objectUuids[i]==parseUuid(currentOwner)?otherGeometry:geometry).arrays.front().bytes;
+                const auto actual=packedItem(columns.geometry,i);
+                require(std::equal(actual.begin(),actual.end(),expected.begin(),expected.end()),
+                    "sealed packed selection reads borrowed chunks through the same owner-scoped resolver");
+            }
+        }
+    }
     {
         auto target=ObjectStore::create(dir.path/"standalone-target",options());auto w=target.write();
         target.upsertObject(w,track(id));auto* sql=ObjectStoreImplAccess::conn(w);

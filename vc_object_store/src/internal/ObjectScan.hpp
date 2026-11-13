@@ -11,6 +11,11 @@ void scanVisibleObjects(sqlite3*, const ObjectSelection&, const ObjectFields&,
 // reading only complete publication identity columns (no content hydration).
 void scanVisibleObjectReferences(sqlite3*,const ObjectSelection&,
                                 const std::function<bool(ObjectVersion&&)>&);
+// Build a query factory once, partitioning explicit UUID arguments only by
+// the existing collection route metadata. An absent candidate source has no
+// query; an explicit empty routed subset never means an unfiltered scan.
+std::function<std::unique_ptr<Statement>(sqlite3*)> prepareObjectSelectionQueries(
+    sqlite3*,ObjectSelection,std::string columns);
 // Same cursor/hydration implementation, with the geometry head read from the
 // selected row. An omitted descriptor is an absent head, never a base lookup.
 struct SelectedGeometryHead {

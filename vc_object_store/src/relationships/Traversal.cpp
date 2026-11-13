@@ -267,6 +267,12 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
 GraphReadView ObjectStore::geometryReadView(const Txn& txn,const ObjectSelection& selection,
                                          const std::optional<StoreStatus>& expectedPosition) const
 {
+    return geometryReadViewImpl(txn,selection,expectedPosition,false);
+}
+
+GraphReadView ObjectStore::geometryReadViewImpl(const Txn& txn,const ObjectSelection& selection,
+    const std::optional<StoreStatus>& expectedPosition,bool trustedCurrent) const
+{
     requirePublishedGraphRead(txn);
     auto* db=static_cast<sqlite3*>(connection(txn));
     if(selection.minLength||selection.bbox||selection.connectedTo||!selection.edgeKinds.empty()||
@@ -289,7 +295,8 @@ GraphReadView ObjectStore::geometryReadView(const Txn& txn,const ObjectSelection
     GraphReadView result;result.selectedObjects.emplace();result.selectedRelationships.emplace();
     int64_t skipped=0;
     if(!selection.limit||*selection.limit>0)
-        scanVisibleObjectRows(db,physical,std::nullopt,[&](ObjectRecord&& row,std::optional<SelectedGeometryHead> head){
+        scanVisibleObjectRows(db,physical,trustedCurrent?ObjectFields(std::set<std::string>{"meta","storage_kind","storage_ref","data_checksum"}):std::nullopt,
+            [&](ObjectRecord&& row,std::optional<SelectedGeometryHead> head){
             if(selection.volume){
                 const auto metadata=nlohmann::json::parse(row.meta);
                 if(!geometryScaleToVolume(metadata,*selection.volume)){
@@ -298,9 +305,9 @@ GraphReadView ObjectStore::geometryReadView(const Txn& txn,const ObjectSelection
                 }
             }
             if(skipped<selection.offset){++skipped;return true;}
-            if(head)(void)loadGeometryManifest(head->source,head->reference,head->manifest,row.dataChecksum.value_or(""));
+            if(head&&!trustedCurrent)(void)loadGeometryManifest(head->source,head->reference,head->manifest,row.dataChecksum.value_or(""));
             ObjectRevision selected;
-            selected.metadataComplete=true; // complete current record, not an imported historical baseline
+            selected.metadataComplete=!trustedCurrent; // trusted batch metadata is a projection, not a complete edit reference
             selected.storeUuid=row.versionStoreUuid;selected.generation=row.versionGeneration;
             selected.objectUuid=row.uuid;selected.version=row.version.value_or(0);
             selected.commitSequence=row.commitSequence;

@@ -27,6 +27,7 @@ target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
 add_library(vc_objects ${_vc_store_library_type}
+    SqliteRuntime.cpp
     internal/Anchors.cpp
     internal/Ownership.cpp
     Versions.cpp

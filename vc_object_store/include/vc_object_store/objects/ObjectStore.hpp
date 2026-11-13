@@ -907,6 +907,13 @@ public:
 private:
     // Lookups by internal revision UUID (storage keys, not public history
     // references); src/ reaches them through ObjectStoreImplAccess.
+    // Only the collection bulk reader may choose trusted current reads, after
+    // proving that its entire scope is sealed and history-free. Public APIs
+    // always retain full reference/archive/payload validation.
+    GraphReadView geometryReadViewImpl(const Txn&,const ObjectSelection&,
+        const std::optional<StoreStatus>&,bool trustedCurrent) const;
+    PackedGeometryArray readSelectedGeometryArraysImpl(const Txn&,std::span<const ObjectRevision>,
+        const std::string&,const std::optional<std::string>&,bool trustedCurrent) const;
     std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
     RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired) const;
     // Explicit, closed selection: omitted endpoints are not selected. null

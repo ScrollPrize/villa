@@ -96,7 +96,7 @@ struct SelectionFilter {
     std::string sql;
     std::vector<std::string> parameters;
 };
-SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection)
+void validateObjectFilterSelection(const ObjectSelection& selection)
 {
     if (selection.volume || selection.includeUnbound)
         throw std::invalid_argument("volume targets apply to object selections, spatial regions and geometry regions");
@@ -115,9 +115,15 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection)
         throw std::invalid_argument("length cursor requires after_uuid and after_length with length_desc");
     if (selection.afterUuid && selection.offset)
         throw std::invalid_argument("cursor and offset cannot be combined");
-    std::set<int64_t> selected, connected;
-    for (const auto& uuid : selection.uuids)
-        if (const auto id = objectIdByUuid(db, parseUuid(uuid))) selected.insert(*id);
+    if(selection.afterUuid)(void)parseUuid(*selection.afterUuid);
+    if(selection.connectedTo)(void)parseUuid(*selection.connectedTo);
+    if(selection.coordinates)(void)coordinateFilterValue(*selection.coordinates);
+    if(selection.bbox)validateBounds(*selection.bbox);
+}
+SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection)
+{
+    validateObjectFilterSelection(selection);
+    std::set<int64_t> connected;
     if (selection.connectedTo) {
         const auto ids = componentIds(db, *selection.connectedTo, selection.edgeKinds, selection.includeRetired);
         connected.insert(ids.begin(), ids.end());
@@ -129,13 +135,25 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection)
     auto bind = [&](const std::string& clause, const std::string& value) {
         filter.sql += clause; filter.parameters.push_back(value);
     };
-    if (!selection.uuids.empty() || selection.connectedTo) {
-        nlohmann::json ids = nlohmann::json::array();
-        const auto& candidates = selection.uuids.empty() ? connected : selected;
-        for (const auto id : candidates) {
-            if (selection.connectedTo && !connected.contains(id)) continue;
-            ids.push_back(id);
+    if (!selection.uuids.empty()) {
+        // UUID is already an indexed BLOB key. Do not issue a point SELECT
+        // merely to translate each requested UUID to a physical row ID.
+        // Typed byte literals avoid the SQLite variable-count limit and are
+        // injection-safe: only parsed UUID bytes can reach the SQL text.
+        constexpr char hex[]="0123456789ABCDEF";
+        filter.sql+=" AND o.uuid IN (";
+        for(size_t i=0;i<selection.uuids.size();++i){
+            const auto key=parseUuid(selection.uuids[i]);
+            if(i)filter.sql+=',';
+            filter.sql+="X'";
+            for(auto byte:key){filter.sql+=hex[byte>>4];filter.sql+=hex[byte&15];}
+            filter.sql+="'";
         }
+        filter.sql+=')';
+    }
+    if (selection.connectedTo) {
+        nlohmann::json ids = nlohmann::json::array();
+        for(const auto id:connected)ids.push_back(id);
         bind(" AND o.id IN (SELECT value FROM json_each(?))", ids.dump());
     }
     if (selection.kind) bind(" AND o.kind=?", *selection.kind);
@@ -293,7 +311,8 @@ std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const Objec
     // to avoid a sort when the R-tree returned only a few matches.
     const bool typed = selection.family || selection.minLength || selection.orderBy == "length_desc";
     const auto table = selection.kind == "fiber" ? "fibers" : "tracks";
-    std::string from = "objects o" + std::string(candidates ? " NOT INDEXED" : "");
+    const bool rowIdCandidates=selection.bbox||selection.connectedTo||selection.tag||!selection.tagGroups.empty();
+    std::string from = "objects o" + std::string(rowIdCandidates ? " NOT INDEXED" : "");
     if (typed) {
         if (!candidates) from = std::string(table) + " d CROSS JOIN objects o ON o.id=d.object_id";
         else from += std::string(" JOIN ") + table + " d ON d.object_id=o.id";
@@ -308,6 +327,28 @@ std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const Objec
     auto rows = std::make_unique<Statement>(db, sql);
     bindSelection(*rows, filter, selection);
     return rows;
+}
+
+std::function<std::unique_ptr<Statement>(sqlite3*)> detail::prepareObjectSelectionQueries(
+    sqlite3* root,ObjectSelection selection,std::string columns)
+{
+    // Validate even when route metadata eliminates every physical query.
+    // Ordinary API policy must never depend on whether matching rows exist.
+    validateObjectFilterSelection(selection);
+    if(selection.bbox)requireSpatial(root);
+    const auto pool=activeStatementPools.find(root);
+    if(selection.uuids.empty()||pool==activeStatementPools.end()||!pool->second->objectSelectionArguments)
+        return [selection=std::move(selection),columns=std::move(columns)](sqlite3* source){
+            return objectSelectionQuery(source,selection,columns);
+        };
+    const auto keys=std::move(selection.uuids);selection.uuids.clear();
+    auto arguments=std::make_shared<StatementPool::ObjectSelectionArguments>(pool->second->objectSelectionArguments(keys));
+    return [selection=std::move(selection),columns=std::move(columns),arguments](sqlite3* source)->std::unique_ptr<Statement>{
+        const auto found=arguments->find(source);
+        if(found==arguments->end()||found->second.empty())return {};
+        auto local=selection;local.uuids=found->second;
+        return objectSelectionQuery(source,local,columns);
+    };
 }
 
 namespace {
@@ -351,6 +392,7 @@ bool restrictConnected(const ObjectStore& store,const Txn& txn,ObjectSelection& 
 void detail::scanVisibleObjectRows(sqlite3* db,const ObjectSelection& selection,const ObjectFields& fields,
     const std::function<bool(ObjectRecord&&,std::optional<SelectedGeometryHead>)>& visit,bool includeGeometryHeads)
 {
+    validateObjectFilterSelection(selection);
     if(selection.limit&&*selection.limit==0) {
         (void)objectSelectionQuery(db,selection,projectedObjectColumns(fields));
         return;
@@ -358,7 +400,7 @@ void detail::scanVisibleObjectRows(sqlite3* db,const ObjectSelection& selection,
     auto physical=selection;physical.limit.reset();physical.offset=0;
     const auto columns=projectedObjectColumns(fields)+(includeGeometryHeads?
         ",CASE WHEN geometry_manifest IS NOT NULL THEN storage_ref ELSE NULL END,geometry_manifest":",NULL,NULL");
-    VisibleObjectRows rows(db,[&](auto* source){return objectSelectionQuery(source,physical,columns);},1);
+    VisibleObjectRows rows(db,prepareObjectSelectionQueries(db,std::move(physical),columns),1);
     struct Batch {
         std::vector<ObjectRecord> records;
         std::vector<int64_t> ids;
@@ -411,12 +453,13 @@ void detail::scanVisibleObjects(sqlite3* db,const ObjectSelection& selection,con
 void detail::scanVisibleObjectReferences(sqlite3* db,const ObjectSelection& selection,
                                        const std::function<bool(ObjectVersion&&)>& visit)
 {
+    validateObjectFilterSelection(selection);
     constexpr auto columns="o.uuid,o.version,o.version_generation";
     if(selection.limit&&*selection.limit==0){
         (void)objectSelectionQuery(db,selection,columns);return;
     }
     auto physical=selection;physical.limit.reset();physical.offset=0;
-    VisibleObjectRows rows(db,[&](auto* source){return objectSelectionQuery(source,physical,columns);},0);
+    VisibleObjectRows rows(db,prepareObjectSelectionQueries(db,std::move(physical),columns),0);
     struct SourceIdentity {std::string owner,initialGeneration;};
     std::map<sqlite3*,SourceIdentity> sources;
     for(auto* source:querySources(db)){
@@ -441,6 +484,7 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     auto selection=requested;
+    if(!selection.volume&&!selection.includeUnbound)validateObjectFilterSelection(selection);
     if(selection.offset<0||(selection.limit&&*selection.limit<0))throw std::invalid_argument("selection limit and offset must be nonnegative");
     if(selection.volume&&!selection.transforms)selection.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     const ObjectFields fields=projection?ObjectFields(std::in_place,projection->begin(),projection->end()):std::nullopt;

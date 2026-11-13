@@ -571,13 +571,14 @@ ObjectStore::GeometryArrayCounts ObjectStore::geometryArrayCounts(const Txn& txn
 namespace {
 PackedGeometryArray readPackedGeometryArrays(sqlite3* db,
     const std::vector<std::string>& revisions, const std::string& name,
-    std::span<const ObjectRevision> selected={})
+    std::span<const ObjectRevision> selected={},bool trustedCurrent=false)
 {
     if(!selected.empty()&&selected.size()!=revisions.size())throw std::invalid_argument("geometry: selected payload count differs");
     PackedGeometryArray result;
     struct ArrayPlan {
         GeometryLayout layout;
         std::vector<std::string> hashes;
+        sqlite3* source;
         size_t offset;
         std::unique_ptr<GeometryReader> reader;
     };
@@ -589,10 +590,10 @@ PackedGeometryArray readPackedGeometryArrays(sqlite3* db,
     // batched payload I/O for full snapshots; deltas use their normal reader.
     for(size_t begin=0;begin<revisions.size();begin+=window) {
         const auto count=std::min(window,revisions.size()-begin);
-        auto records=resolveGeometryRecords(db,std::span(revisions).subspan(begin,count));
+        auto records=resolveGeometryRecords(db,std::span(revisions).subspan(begin,count),trustedCurrent);
         for(size_t i=0;i<count;++i) {
             if(!records[i])throw std::invalid_argument("geometry: revision not found");
-            if(!selected.empty()){
+            if(!selected.empty()&&!trustedCurrent){
                 const auto& expected=selected[begin+i];
                 if(records[i]->revision.objectUuid!=expected.objectUuid||
                    (expected.record.dataChecksum&&records[i]->revision.contentHash!=*expected.record.dataChecksum))
@@ -608,10 +609,11 @@ PackedGeometryArray readPackedGeometryArrays(sqlite3* db,
             const auto& descriptors=manifest.at("arrays");
             if(!descriptors.contains(name))throw std::invalid_argument("geometry: array not found: "+name);
             GeometryLayout layout;
-            for(const auto& [key,array]:descriptors.items()) {
-                const auto validated=geometryLayout(array);
-                if(key==name)layout=validated;
-            }
+            if(trustedCurrent)layout=geometryLayout(descriptors.at(name));
+            else for(const auto& [key,array]:descriptors.items()) {
+                    const auto validated=geometryLayout(array);
+                    if(key==name)layout=validated;
+                }
             const auto& array=descriptors.at(name);
             const auto shape=array.at("shape").get<std::vector<int64_t>>();
             const auto dtype=array.at("dtype").get<std::string>();
@@ -623,7 +625,7 @@ PackedGeometryArray readPackedGeometryArrays(sqlite3* db,
                 uint64_t(layout.length)>result.data.max_size()-totalBytes)
                 throw std::overflow_error("geometry: packed array size overflow");
             result.shape[0]+=shape[0];result.offsets.push_back(uint64_t(result.shape[0]));
-            plan.push_back({layout,array.at("chunks").get<std::vector<std::string>>(),totalBytes,std::move(reader)});
+            plan.push_back({layout,array.at("chunks").get<std::vector<std::string>>(),records[i]->source,totalBytes,std::move(reader)});
             totalBytes+=size_t(layout.length);
         }
     }
@@ -632,17 +634,26 @@ PackedGeometryArray readPackedGeometryArrays(sqlite3* db,
     std::vector<ChunkRequest> requested;
     const auto flush=[&]{
         if(requested.empty())return;
-        std::vector<std::string> hashes;
-        hashes.reserve(requested.size());
-        for(const auto& q:requested)hashes.push_back(plan[q.array].hashes.at(q.index));
-        visitGeometryPayloads(db,hashes,[&](size_t i,std::span<const uint8_t> bytes){
-            const auto& q=requested.at(i);
-            const auto& array=plan[q.array];
-            const auto& hash=hashes[i];
-            if(geometryWork)geometryWork->readBytes[name]+=bytes.size();
-            verifyGeometryChunk(bytes,hash,hash,array.layout.chunkBytes(q.index),name);
-            copyGeometryChunk(array.layout,q.index,bytes,result.data.data()+array.offset);
-        });
+        // A descriptor already resolved its physical owner. As in the scalar
+        // GeometryReader, resolve payload hashes inside that owner's pinned
+        // scope, not every unrelated sibling shard of the outer collection.
+        // Borrowed payloads still follow the shared source-reference resolver.
+        std::map<sqlite3*,std::vector<size_t>> groups;
+        for(size_t i=0;i<requested.size();++i)groups[plan[requested[i].array].source].push_back(i);
+        for(const auto& [source,positions]:groups){
+            std::vector<std::string> hashes;hashes.reserve(positions.size());
+            for(const auto at:positions){const auto& q=requested[at];hashes.push_back(plan[q.array].hashes.at(q.index));}
+            visitGeometryPayloads(source,hashes,[&](size_t i,std::span<const uint8_t> bytes){
+                const auto& q=requested.at(positions.at(i));
+                const auto& array=plan[q.array];
+                const auto& hash=hashes[i];
+                if(geometryWork)geometryWork->readBytes[name]+=bytes.size();
+                if(!trustedCurrent)verifyGeometryChunk(bytes,hash,hash,array.layout.chunkBytes(q.index),name);
+                else if(bytes.size()!=size_t(array.layout.chunkBytes(q.index)))
+                    throw std::runtime_error("geometry: payload chunk byte length differs");
+                copyGeometryChunk(array.layout,q.index,bytes,result.data.data()+array.offset);
+            });
+        }
         requested.clear();
     };
     for(size_t i=0;i<plan.size();++i) {
@@ -670,12 +681,18 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
 PackedGeometryArray ObjectStore::readSelectedGeometryArrays(const Txn& txn,
     std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume) const
 {
+    return readSelectedGeometryArraysImpl(txn,selected,name,volume,false);
+}
+
+PackedGeometryArray ObjectStore::readSelectedGeometryArraysImpl(const Txn& txn,
+    std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume,bool trustedCurrent) const
+{
     std::vector<std::string> revisions;revisions.reserve(selected.size());
     for(const auto& object:selected){
         if(object.deleted||!object.geometryRevision)throw std::invalid_argument("geometry: selected object has no stored geometry");
         revisions.push_back(*object.geometryRevision);
     }
-    auto packed=readPackedGeometryArrays(static_cast<sqlite3*>(connection(txn)),revisions,name,selected);
+    auto packed=readPackedGeometryArrays(static_cast<sqlite3*>(connection(txn)),revisions,name,selected,trustedCurrent);
     if(!volume)return packed;
     if(name!="line_points"||std::any_of(selected.begin(),selected.end(),[](const auto& o){return o.record.kind!="fiber";}))
         throw std::invalid_argument("mapped packed geometry currently supports float64 fiber line_points only");

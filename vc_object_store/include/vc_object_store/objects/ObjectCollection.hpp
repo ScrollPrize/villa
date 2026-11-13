@@ -83,6 +83,23 @@ public:
     CollectionTxn write();
     std::string uuid(const CollectionTxn&) const;
     StoreProvisioning provisioning(const CollectionTxn&) const;
+    struct GeometryArrayColumns {
+        StoreStatus source;
+        std::vector<std::array<unsigned char,16>> objectUuids;
+        PackedGeometryArray geometry;
+        std::map<std::string,double> timings;
+    };
+    // Owned current geometry, sorted and deduplicated by requested UUID.
+    // Uses the caller's snapshot with one worker. Parallel reads require a
+    // sealed root (dependencies are sealed on collection admission), and use
+    // independent guarded native snapshots over one shared routing topology.
+    // No geometry/history/mapping rules are replaced by this batch API.
+    GeometryArrayColumns readGeometryArrayColumns(const CollectionTxn&,
+        std::span<const std::array<unsigned char,16>> objectUuids,
+        const std::string& arrayName,const std::optional<std::string>& objectKind=std::nullopt,
+        const std::optional<std::string>& volume=std::nullopt,
+        const std::optional<StoreStatus>& expectedPosition=std::nullopt,std::size_t workers=32,bool profile=false,
+        bool trustedImmutable=false) const;
     void createExtensionTable(CollectionTxn&, const ExtensionTable&);
     void replaceExtensionRows(CollectionTxn&, const std::string&, const ObjectKey&,
                               std::span<const ExtensionRow>);

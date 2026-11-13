@@ -1,4 +1,5 @@
 #include "vc_object_store/objects/ObjectCollection.hpp"
+#include "vc_object_store/ParallelFor.hpp"
 #include "internal/InitialEdges.hpp"
 #include "internal/InitialObjects.hpp"
 #include "internal/ImmutableImport.hpp"
@@ -24,6 +25,7 @@
 #include "internal/DatabaseCopy.hpp"
 #include <variant>
 #include <limits>
+#include <numeric>
 
 namespace vc::objects {
 using namespace detail;
@@ -294,6 +296,38 @@ struct ObjectCollection::Impl {
         // node indices can place a shared base before a later sibling shard.
         pool->querySources=[this,get,visibleScope]{std::vector<sqlite3*> result;
             for(auto i:readOrder())if(visibleScope.contains(i))result.push_back(get(i));return result;};
+        pool->objectSelectionArguments=[this,get,visibleScope](const std::vector<std::string>& keys){
+            StatementPool::ObjectSelectionArguments result;
+            struct Candidate {
+                bool unrestricted=false;
+                std::vector<std::pair<uint64_t,uint64_t>> rules;
+                std::vector<std::string>* keys=nullptr;
+            };
+            std::vector<Candidate> candidates;
+            std::map<size_t,size_t> positions;
+            for(const auto& step:readPlan){
+                if(!visibleScope.contains(step.node)||!nodes[step.node].objectsMayExist)continue;
+                auto [at,inserted]=positions.emplace(step.node,candidates.size());
+                if(inserted){
+                    auto& values=result[get(step.node)];
+                    candidates.push_back({false,{},&values});
+                }
+                auto& candidate=candidates[at->second];
+                if(step.objects)candidate.rules.push_back(*step.objects);
+                else candidate.unrestricted=true;
+            }
+            for(auto& candidate:candidates)candidate.keys->reserve(candidate.unrestricted?keys.size():keys.size()/std::max(size_t(1),candidates.size()));
+            for(const auto& key:keys){
+                const auto hash=util::uuidHash64(parseUuid(key));
+                for(auto& candidate:candidates){
+                    const bool matches=candidate.unrestricted||std::any_of(candidate.rules.begin(),candidate.rules.end(),[&](const auto& rule){
+                        return hash%rule.first==rule.second;
+                    });
+                    if(matches)candidate.keys->push_back(key);
+                }
+            }
+            return result;
+        };
     }
     void check(const CollectionTxn&) const;
     const Txn& txn(const CollectionTxn&,size_t) const;
@@ -328,7 +362,7 @@ struct CollectionTxn::Impl {
         auto* pool=activeStatementPools.at(db);
         if(configured.insert(pool).second){
             try{owner->installCallbacks(db,n,[this](size_t i){return ObjectStoreImplAccess::conn(get(i));});}
-            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};configured.erase(pool);throw;}
+            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};pool->objectSelectionArguments={};configured.erase(pool);throw;}
         }
         return *txn;
     }
@@ -455,6 +489,7 @@ struct detail::CollectionReadContext {
     std::function<sqlite3*(const std::string&,bool,bool,sqlite3*)> previousObjects;
     std::function<sqlite3*(const std::string&,bool,bool,sqlite3*)> previousEdges;
     std::function<std::vector<sqlite3*>()> previousQueries;
+    std::function<StatementPool::ObjectSelectionArguments(const std::vector<std::string>&)> previousObjectArguments;
     std::map<size_t,std::unique_ptr<ReadTxn>> readers;
     std::set<StatementPool*> configured;
     CollectionReadContext(sqlite3* sql,const std::filesystem::path& path,const OpenOptions& options):root(sql){
@@ -462,6 +497,7 @@ struct detail::CollectionReadContext {
         if(const auto found=activeStatementPools.find(root);found!=activeStatementPools.end()) {
             borrowedPool=found->second;previousReferences=borrowedPool->referenceSource;previousObjects=borrowedPool->objectSource;
             previousEdges=borrowedPool->edgeSource;previousQueries=borrowedPool->querySources;
+            previousObjectArguments=borrowedPool->objectSelectionArguments;
         } else {
             rootPool=std::make_unique<StatementPool>();rootPool->historyEnabled=historyEnabled(root);rootPool->spatialEnabled=spatialEnabled(root);
             activeStatementPools[root]=rootPool.get();
@@ -473,12 +509,13 @@ struct detail::CollectionReadContext {
         const bool borrowedActive=active!=activeStatementPools.end()&&active->second==borrowedPool;
         for(auto* p:configured){
             if(p==borrowedPool&&!borrowedActive)continue; // Lease already returned by commit/rollback.
-            p->geometryCache.reset();p->referenceSource={};p->objectSource={};p->edgeSource={};p->querySources={};
+            p->geometryCache.reset();p->referenceSource={};p->objectSource={};p->edgeSource={};p->querySources={};p->objectSelectionArguments={};
         }
         if(rootPool)activeStatementPools.erase(root);
         else if(const auto found=activeStatementPools.find(root);found!=activeStatementPools.end()&&found->second==borrowedPool){
             borrowedPool->referenceSource=std::move(previousReferences);borrowedPool->objectSource=std::move(previousObjects);
             borrowedPool->edgeSource=std::move(previousEdges);borrowedPool->querySources=std::move(previousQueries);
+            borrowedPool->objectSelectionArguments=std::move(previousObjectArguments);
         }
     }
     ~CollectionReadContext(){detach();}
@@ -488,7 +525,7 @@ struct detail::CollectionReadContext {
         auto* pool=activeStatementPools.at(sql);
         if(configured.insert(pool).second){
             try{collection.installCallbacks(sql,n,[this](size_t i){return get(i);});}
-            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};configured.erase(pool);throw;}
+            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};pool->objectSelectionArguments={};configured.erase(pool);throw;}
         }
         return sql;
     }
@@ -644,6 +681,150 @@ void ObjectCollection::checkpoint(){impl_->nodes[0].store->checkpoint();}
 CollectionTxn ObjectCollection::write(){if(!impl_->nodes[0].collection)throw std::runtime_error("collection: use ObjectStore to edit a plain store");return CollectionTxn(std::make_unique<CollectionTxn::Impl>(impl_.get(),true));}
 std::string ObjectCollection::uuid(const CollectionTxn& t)const{impl_->check(t);return impl_->nodes[0].member.storeUuid;}
 StoreProvisioning ObjectCollection::provisioning(const CollectionTxn& t)const{return impl_->nodes[0].store->provisioning(impl_->txn(t,0));}
+
+ObjectCollection::GeometryArrayColumns ObjectCollection::readGeometryArrayColumns(const CollectionTxn& txn,
+    std::span<const std::array<unsigned char,16>> requested,const std::string& name,
+    const std::optional<std::string>& kind,const std::optional<std::string>& volume,
+    const std::optional<StoreStatus>& expected,size_t workers,bool profile,bool trustedImmutable)const
+{
+    using Clock=std::chrono::steady_clock;
+    const auto stamp=[&]{return profile?Clock::now():Clock::time_point{};};
+    const auto seconds=[&](Clock::time_point begin){return profile?std::chrono::duration<double>(Clock::now()-begin).count():0.;};
+    const auto started=stamp();auto phase=started;
+    if(!workers)throw std::invalid_argument("geometry array workers must be positive");
+    impl_->check(txn);
+    GeometryArrayColumns result;
+    auto& root=*impl_->nodes[0].store;
+    result.source=root.status(impl_->txn(txn,0));
+    const auto requirePosition=[&](const StoreStatus& actual){
+        const auto& position=expected?*expected:result.source;
+        if(position.commitSequence<0||actual.storeUuid!=util::canonicalUuid(position.storeUuid)||
+           actual.generation!=util::canonicalUuid(position.generation)||actual.commitSequence!=position.commitSequence)
+            throw StoreBusy("geometry array read: source position changed");
+    };
+    requirePosition(result.source);
+    if(trustedImmutable){
+        // This explicit mode is only valid for a complete immutable scope.
+        // Prove it once, before allowing internal readers to skip integrity
+        // rechecks; never infer it from a read-only SQLite connection.
+        for(size_t i=0;i<impl_->nodes.size();++i){
+            const auto scope=impl_->nodes[i].store->provisioning(impl_->txn(txn,i));
+            if(!scope.sealed||scope.history!=HistoryMode::Off)
+                throw std::invalid_argument("trusted immutable geometry reads require sealed history-off stores throughout the collection");
+        }
+    }
+    if(workers>1&&!provisioning(txn).sealed)
+        throw std::invalid_argument("parallel geometry reads require a sealed store; use one worker for a mutable snapshot");
+    if(profile)result.timings["snapshot_validation_seconds"]=seconds(phase);
+    phase=stamp();
+    result.objectUuids.assign(requested.begin(),requested.end());
+    std::sort(result.objectUuids.begin(),result.objectUuids.end());
+    result.objectUuids.erase(std::unique(result.objectUuids.begin(),result.objectUuids.end()),result.objectUuids.end());
+    if(profile)result.timings["uuid_sort_seconds"]=seconds(phase);
+    if(result.objectUuids.empty()){
+        if(volume&&name=="line_points"){result.geometry.dtype="<f8";result.geometry.shape={0,3};}
+        if(profile)result.timings["total_seconds"]=seconds(started);
+        return result;
+    }
+    constexpr size_t blockRows=4096;
+    const auto blocks=result.objectUuids.size()/blockRows+(result.objectUuids.size()%blockRows!=0);
+    std::vector<PackedGeometryArray> values(blocks);
+    std::vector<double> selectionTimes(profile?blocks:0),payloadTimes(profile?blocks:0);
+    const auto readBlock=[&](const ObjectCollection& collection,const CollectionTxn& snapshot,size_t block){
+        auto phase=stamp();
+        const auto begin=block*blockRows,end=std::min(result.objectUuids.size(),begin+blockRows);
+        ObjectSelection selection;selection.kind=kind;
+        // Explicit requested keys must all be returned or fail. In the trusted
+        // batch path, the mapped array read immediately below already checks
+        // the target frame, so do not parse every metadata record twice.
+        if(!trustedImmutable)selection.volume=volume;
+        selection.uuids.reserve(end-begin);
+        for(size_t i=begin;i<end;++i)selection.uuids.push_back(formatUuid(result.objectUuids[i]));
+        const auto& store=*collection.impl_->nodes[0].store;
+        const auto& read=collection.impl_->txn(snapshot,0);
+        const auto view=trustedImmutable?
+            ObjectStoreImplAccess::trustedCurrentGeometryRead(store,read,selection,result.source):
+            store.geometryReadView(read,selection,result.source);
+        if(view.objectUuids!=selection.uuids)
+            throw std::invalid_argument("geometry array read: unknown, ineligible or deleted requested object");
+        if(!view.selectedObjects)throw std::logic_error("geometry array read lost its selected metadata");
+        if(profile)selectionTimes[block]=seconds(phase);
+        phase=stamp();
+        values[block]=trustedImmutable?
+            ObjectStoreImplAccess::trustedCurrentGeometryArrays(store,read,*view.selectedObjects,name,volume):
+            store.readSelectedGeometryArrays(read,*view.selectedObjects,name,volume);
+        if(profile)payloadTimes[block]=seconds(phase);
+    };
+    const auto count=std::min(workers,blocks);
+    std::vector<double> snapshotTimes(profile?count:0);
+    auto closing=Clock::time_point{};
+    phase=stamp();
+    if(workers==1){
+        for(size_t block=0;block<blocks;++block)readBlock(*this,txn,block);
+        if(profile)result.timings["worker_wall_seconds"]=seconds(phase);
+    }else{
+        if(count>=size_t(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("geometry array worker count is too large");
+        // Open once, not per UUID block. All workers share immutable routing
+        // metadata and each owns its transaction/leased SQLite connections.
+        auto options=readonlyOptions(impl_->options);options.readerPoolSize=int(count+1);
+        auto collection=ObjectCollection::open(root.path(),options);
+        if(profile)result.timings["collection_open_seconds"]=seconds(phase);
+        phase=stamp();
+        std::atomic<size_t> next{0};std::atomic<bool> cancelled{false};
+        parallelFor(count,count,[&](size_t worker){
+            try{
+                const auto begin=stamp();
+                auto snapshot=collection.read();
+                requirePosition(collection.impl_->nodes[0].store->status(collection.impl_->txn(snapshot,0)));
+                if(profile)snapshotTimes[worker]=seconds(begin);
+                for(size_t block;!cancelled.load()&&(block=next.fetch_add(1))<blocks;)readBlock(collection,snapshot,block);
+            }catch(...){cancelled.store(true);throw;}
+        });
+        if(profile)result.timings["worker_wall_seconds"]=seconds(phase);
+        auto final=collection.read();
+        requirePosition(collection.impl_->nodes[0].store->status(collection.impl_->txn(final,0)));
+        closing=stamp();
+    }
+    if(profile&&workers>1)result.timings["collection_close_seconds"]=seconds(closing);
+    phase=stamp();
+    auto& out=result.geometry;
+    out.dtype=values.front().dtype;out.shape=values.front().shape;out.shape[0]=0;
+    out.offsets.resize(result.objectUuids.size()+1);
+    std::vector<size_t> byteOffsets(blocks);size_t bytes=0;
+    for(size_t block=0;block<blocks;++block){
+        const auto& value=values[block];
+        const auto begin=block*blockRows,end=std::min(result.objectUuids.size(),begin+blockRows);
+        if(value.dtype!=out.dtype||value.shape.size()!=out.shape.size()||value.shape.empty()||
+           !std::equal(value.shape.begin()+1,value.shape.end(),out.shape.begin()+1)||value.offsets.size()!=end-begin+1)
+            throw std::invalid_argument("geometry: packed arrays require matching dtype and trailing dimensions");
+        if(value.shape[0]<0||value.shape[0]>std::numeric_limits<int64_t>::max()-out.shape[0]||
+           value.data.size()>out.data.max_size()-bytes)
+            throw std::overflow_error("geometry: packed array size overflow");
+        byteOffsets[block]=bytes;bytes+=value.data.size();
+        for(size_t i=0;i+1<value.offsets.size();++i)out.offsets[begin+i]=uint64_t(out.shape[0])+value.offsets[i];
+        out.shape[0]+=value.shape[0];
+    }
+    out.offsets.back()=uint64_t(out.shape[0]);out.data.resize(bytes);
+    if(profile)result.timings["assembly_allocation_seconds"]=seconds(phase);
+    phase=stamp();
+    parallelFor(blocks,count,[&](size_t block){
+        const auto& source=values[block].data;
+        if(!source.empty())std::memcpy(out.data.data()+byteOffsets[block],source.data(),source.size());
+        // Do not retain both copies until every other block has finished.
+        std::vector<uint8_t>().swap(values[block].data);
+    });
+    if(profile){
+        result.timings["copy_seconds"]=seconds(phase);
+        result.timings["selection_seconds_sum"]=std::accumulate(selectionTimes.begin(),selectionTimes.end(),0.);
+        result.timings["payload_mapping_seconds_sum"]=std::accumulate(payloadTimes.begin(),payloadTimes.end(),0.);
+        result.timings["worker_snapshot_seconds_sum"]=std::accumulate(snapshotTimes.begin(),snapshotTimes.end(),0.);
+        result.timings["total_seconds"]=seconds(started);
+        result.timings["workers"]=double(count);result.timings["blocks"]=double(blocks);
+        result.timings["objects"]=double(result.objectUuids.size());result.timings["bytes"]=double(bytes);
+    }
+    return result;
+}
 void ObjectCollection::createExtensionTable(CollectionTxn& t,const ExtensionTable& table){
     auto& w=impl_->writer(t);impl_->nodes[0].store->createExtensionTable(w,table);
 }

@@ -49,6 +49,7 @@ void Txn::release(bool commit)
             pool->second->objectSource = {};
             pool->second->edgeSource = {};
             pool->second->querySources = {};
+            pool->second->objectSelectionArguments = {};
             pool->second->currentWrite.reset();
         }
         activeStatementPools.erase(conn);

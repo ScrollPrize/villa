@@ -7,6 +7,8 @@
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "FiberResultBindings.hpp"
 #include "FiberGraphBindings.hpp"
+#include "ObjectReadBindings.hpp"
+#include "internal/ObjectVersionJson.hpp"
 #include "internal/Publication.hpp"
 #include <nanobind/stl/unique_ptr.h>
 #include <iostream>
@@ -116,6 +118,56 @@ inline void bindCollectionApi(nb::module_& module) {
             row["data"]=nb::bytes(reinterpret_cast<const char*>(bytes[i].data()),bytes[i].size());result.append(row);
         }return result;
     },"uuids"_a,"array"_a,"volume"_a=nb::none())
+    .def("geometry_array_columns",[](PyCollectionReader& self,
+        nb::ndarray<const uint8_t,nb::ndim<2>,nb::c_contig,nb::device::cpu> uuids,
+        const std::string& name,const std::optional<std::string>& kind,const std::optional<std::string>& volume,
+        const std::optional<nb::dict>& expected,size_t workers,bool profile,bool trustedImmutable){
+        self.check();
+        if(uuids.shape(1)!=16)throw std::invalid_argument("geometry object UUIDs must be a uint8 [N,16] column");
+        std::optional<vo::StoreStatus> position;
+        if(expected){
+            auto value=nlohmann::json::parse(jsonDumps(*expected));
+            // CollectionReader.source uses the extension-source spelling;
+            // ordinary store positions use the common `store` spelling.
+            if(value.contains("store_uuid")){
+                if(value.contains("store"))throw std::invalid_argument("geometry position has two store keys");
+                value["store"]=value.at("store_uuid");value.erase("store_uuid");
+            }
+            position=vo::detail::storePositionFrom(value);
+        }
+        auto columns=std::make_unique<vo::ObjectCollection::GeometryArrayColumns>();
+        std::unique_ptr<uint8_t[]> text;
+        {nb::gil_scoped_release release;
+            // ndarray byte storage does not contain live std::array objects.
+            // Copy the 16-byte keys into real UUID objects before passing a
+            // typed span; never reinterpret the input buffer as C++ objects.
+            std::vector<std::array<unsigned char,16>> keys(uuids.shape(0));
+            vo::parallelFor((keys.size()+4095)/4096,workers,[&](size_t block){
+                for(size_t i=block*4096;i<std::min(keys.size(),(block+1)*4096);++i)
+                    std::copy_n(uuids.data()+i*16,16,keys[i].data());
+            });
+            *columns=self.collection->readGeometryArrayColumns(*self.txn,
+                keys,name,kind,volume,position,workers,profile,trustedImmutable);
+            text=vo::fiberGraphUuidAscii(columns->objectUuids,workers);
+        }
+        auto* raw=columns.release();
+        nb::capsule owner(raw,[](void* p)noexcept{delete static_cast<vo::ObjectCollection::GeometryArrayColumns*>(p);});
+        auto* chars=text.release();
+        nb::capsule textOwner(chars,[](void* p)noexcept{delete[] static_cast<uint8_t*>(p);});
+        nb::dict result;
+        result["object_uuid"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<2>>(
+            reinterpret_cast<const uint8_t*>(raw->objectUuids.data()),{raw->objectUuids.size(),size_t(16)},owner);
+        result["uuid_ascii"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<2>>(
+            chars,{raw->objectUuids.size(),size_t(36)},textOwner);
+        result["geometry"]=nb::cast(PyPackedGeometryArray{std::make_shared<vo::PackedGeometryArray>(std::move(raw->geometry))});
+        nb::dict source;source["store_uuid"]=raw->source.storeUuid;source["generation"]=raw->source.generation;
+        source["commit_sequence"]=raw->source.commitSequence;result["source"]=source;
+        nb::dict timings;for(const auto& [name,value]:raw->timings)timings[nb::str(name.c_str())]=value;
+        result["timings"]=timings;
+        return result;
+    },"object_uuid"_a,"array_name"_a,"object_kind"_a=nb::none(),"volume"_a=nb::none(),
+       "expected_position"_a=nb::none(),"workers"_a=32,"profile"_a=false,"trusted_immutable"_a=false,
+       "Owned packed geometry and UUID columns; parallel sealed-store reads share one native routing topology.")
     .def("edges",[](PyCollectionReader& self,const std::string& kind){
         self.check();std::vector<vo::CollectionEdge> edges;
         edges=self.collection->edgesByKind(*self.txn,kind);

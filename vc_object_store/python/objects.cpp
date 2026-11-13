@@ -1,4 +1,5 @@
 #include "StorageBindings.hpp"
+#include "vc_object_store/SqliteRuntime.hpp"
 #include "internal/ObjectVersionJson.hpp"
 #include "AfvBindings.hpp"
 #include "ExtensionBindings.hpp"
@@ -1126,6 +1127,10 @@ NB_MODULE(_native, m)
         }, nb::arg("point_xyz"));
 
     m.doc() = "Revisioned objects and relationships, with owned geometry and typed snapshot views.";
+
+    m.def("configure_sqlite_runtime",&vo::configureSqliteRuntime,
+        nb::arg("memory_statistics")=nb::none(),nb::arg("pagecache_bulk_bytes")=0,
+        "Explicit process-startup allocator configuration before any SQLite initialization. Never closes or reconfigures active connections.");
 
     m.def("enable_history", [](const std::filesystem::path& path) {
         nb::gil_scoped_release release; vo::changeHistoryMode(path, vo::HistoryMode::On);

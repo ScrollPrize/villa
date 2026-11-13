@@ -1,18 +1,89 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
+#include "vc_object_store/objects/InitialImport.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "vc_object_store/objects/StoreConversion.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
 #include "internal/CollectionReads.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/RecordResolver.hpp"
 #include <iostream>
 #include <cstring>
 #include <algorithm>
 #include <string_view>
+#include <limits>
 using namespace vc::objects;
 using namespace vc::objects::detail;
 ObjectRecord fiber(){ObjectRecord r;r.kind="fiber";r.fiber.emplace();return r;}
+
+void emptyRoutedSelectionValidation()
+{
+    TemporaryDirectory dir;InitialImportOptions options;options.store.author="empty-query-validation";
+    options.shards.resize(2);options.shards[0].objectIds={1,100};options.shards[1].objectIds={101,200};
+    const auto initial=importInitialCollection(dir.path/"empty",options,[](size_t,InitialShardImport&){});
+    auto store=ObjectStore::open(initial.path,OpenOptions{.readOnly=true});auto read=store.read();
+    ObjectSelection valid;valid.kind="fiber";valid.uuids={util::newUuid()};
+    require(store.selectObjects(read,valid).empty(),"a valid explicit selection on sealed empty partitions has no matches");
+    const auto rejects=[&](const ObjectSelection& selection,const char* message){
+        bool rejected=false;
+        try{(void)store.selectObjects(read,selection);}catch(const std::invalid_argument&){rejected=true;}
+        require(rejected,message);
+    };
+    auto invalid=valid;invalid.kind="surface";invalid.family="H";
+    rejects(invalid,"typed catalog selection is validated even when route metadata eliminates every physical query");
+    invalid=valid;invalid.afterUuid=util::newUuid();invalid.offset=1;
+    rejects(invalid,"cursor and offset cannot be combined on an empty routed selection");
+    invalid=valid;invalid.afterUuid="not-a-uuid";
+    bool malformedCursorRejected=false;
+    try{(void)store.selectObjects(read,invalid);}catch(const std::runtime_error& error){
+        malformedCursorRejected=std::string_view(error.what()).find("not a UUID")!=std::string_view::npos;
+    }
+    require(malformedCursorRejected,"cursor UUID syntax retains its runtime-error contract independently of matching physical rows");
+    invalid=valid;invalid.minLength=std::numeric_limits<double>::quiet_NaN();
+    rejects(invalid,"nonfinite typed query limits are rejected before empty-result short circuits");
+    invalid=valid;invalid.afterLength=1.;
+    rejects(invalid,"length cursors require the same ordering policy on empty routed selections");
+}
+
+void routedExplicitSelection()
+{
+    TemporaryDirectory dir;InitialImportOptions options;options.store.author="routed-selection";
+    constexpr size_t shards=8,count=327;options.shards.resize(shards);
+    for(size_t i=0;i<shards;++i)options.shards[i].objectIds={int64_t(i*1000+1),int64_t((i+1)*1000)};
+    std::vector<std::string> ids;
+    for(size_t i=0;i<count;++i)ids.push_back(util::nameUuid("routed-selection-"+std::to_string(i)));
+    std::sort(ids.begin(),ids.end());
+    const auto imported=importInitialCollection(dir.path/"source",options,[&](size_t shard,InitialShardImport& writer){
+        std::vector<InitialObjectRecord> rows;
+        for(const auto& id:ids)if(uuidShardIndex(id,shards)==shard){InitialObjectRecord row;row.record.uuid=id;row.record.kind="note";rows.push_back(row);}
+        writer.appendObjects(rows);
+    });
+    auto store=ObjectStore::open(imported.path,OpenOptions{.readOnly=true});auto read=store.read();
+    struct Work {
+        size_t idProbes=0,uuidLiterals=0;std::vector<sqlite3*> sources;
+        explicit Work(sqlite3* root):sources(querySources(root)){
+            for(auto* source:sources)sqlite3_trace_v2(source,SQLITE_TRACE_STMT,[](unsigned,void* state,void* query,void*){
+                auto& work=*static_cast<Work*>(state);const std::string_view sql=sqlite3_sql(static_cast<sqlite3_stmt*>(query));
+                if(sql.starts_with("SELECT id FROM objects WHERE uuid="))++work.idProbes;
+                const auto clause=sql.find(" AND o.uuid IN (");
+                if(clause!=std::string_view::npos){
+                    const auto end=sql.find(')',clause);
+                    for(auto at=sql.find("X'",clause);at!=std::string_view::npos&&at<end;at=sql.find("X'",at+2))++work.uuidLiterals;
+                }
+                return 0;
+            },this);
+        }
+        ~Work(){for(auto* source:sources)sqlite3_trace_v2(source,0,nullptr,nullptr);}
+    } work(ObjectStoreImplAccess::conn(read));
+    ObjectSelection selection;selection.kind="note";
+    for(size_t i=0;i<ids.size();i+=2)selection.uuids.push_back(ids[i]);
+    selection.uuids.push_back(util::nameUuid("absent-routed-selection"));
+    const auto rows=store.selectObjects(read,selection,std::vector<std::string>{});
+    require(rows.size()==(ids.size()+1)/2,"explicit routed UUID selection retains all existing requested records");
+    require(work.idProbes==0,"explicit UUID selection never reads back physical row IDs");
+    require(work.uuidLiterals==selection.uuids.size(),"requested UUID predicates are routed once, not repeated on every physical shard");
+}
 
 void compactReferenceSelectionPlan()
 {
@@ -129,6 +200,10 @@ void boundedVisibleScan()
     ObjectSelection selection;selection.kind="note";selection.tag="eligible";selection.limit=1;
     const auto selected=ordinary.selectObjects(read,selection,std::vector<std::string>{"name"});
     require(selected.size()==1&&selected[0].uuid==ids[2],"filtered upper overrides and tombstones still suppress matching lower records");
+    selection.uuids={ids[0],ids[1],ids[2]};
+    const auto exact=ordinary.selectObjects(read,selection,std::vector<std::string>{"name"});
+    require(exact.size()==1&&exact[0].uuid==ids[2],"explicit UUID routing preserves filtered overrides, inherited matches and tombstones");
+    selection.uuids.clear();
     selection.tag.reset();selection.afterUuid=ids[4095];selection.limit=3;
     const auto page=ordinary.selectObjects(read,selection,std::vector<std::string>{});
     require(page.size()==3&&page[0].uuid==ids[4096]&&page[2].uuid==ids[4098],"cursor pagination seeks directly past its UUID boundary");
@@ -318,6 +393,8 @@ void metadataOverridesOfDeltaGeometry()
     }
 }
 int main()try{
+    emptyRoutedSelectionValidation();
+    routedExplicitSelection();
     compactReferenceSelectionPlan();
     interleavedPartitionScan();
     boundedVisibleScan();

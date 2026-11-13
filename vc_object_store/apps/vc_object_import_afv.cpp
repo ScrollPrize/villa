@@ -6,6 +6,7 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include <vc_reader/native/atomic_file.hpp>
 #include "vc_object_store/Uuid.hpp"
+#include "vc_object_store/SqliteRuntime.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "support/SqliteMutexProfile.hpp"
 #include "vc_object_store/objects/imports/ParallelImportStream.hpp"
@@ -363,16 +364,14 @@ int main(int argc,char** argv)
             benchmark::sqlite_profile::install(config.value("profile_sqlite_stacks",false),config.value("profile_stack_interval",uint64_t(65536)));
         // Benchmark-only opt-in. Do not alter the application's SQLite global
         // allocator configuration inside ObjectStore or a worker thread.
-        if(!config.value("sqlite_memory_statistics",true) && sqlite3_config(SQLITE_CONFIG_MEMSTATUS,0)!=SQLITE_OK)
-            throw std::runtime_error("SQLite was already initialized; cannot disable memory statistics");
         const auto pageBulk=config.value("sqlite_pagecache_bulk_bytes",int64_t(0));
         if(pageBulk<0 || pageBulk>int64_t(INT_MAX)*1024)
             throw std::invalid_argument("invalid SQLite page-cache allocation size");
         // A null buffer with negative N selects an independent initial bulk
         // allocation per cache, not the shared process-wide page buffer. This
         // avoids allocator-lock traffic without changing SQLite's page format.
-        if(pageBulk && sqlite3_config(SQLITE_CONFIG_PAGECACHE,nullptr,0,-int((pageBulk+1023)/1024))!=SQLITE_OK)
-            throw std::runtime_error("SQLite was already initialized; cannot configure page-cache allocation");
+        configureSqliteRuntime(config.value("sqlite_memory_statistics",true)?std::optional<bool>{}:std::optional<bool>{false},
+                               size_t(pageBulk));
         const auto input=std::filesystem::absolute(config.at("source").get<std::string>());
         const auto output=std::filesystem::absolute(config.at("output").get<std::string>());
         if (std::filesystem::exists(output) || std::filesystem::is_symlink(output)) throw std::runtime_error("output exists");

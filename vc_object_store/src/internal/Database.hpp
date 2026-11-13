@@ -44,6 +44,7 @@ struct CurrentWriteState {
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
+    using ObjectSelectionArguments=std::map<sqlite3*,std::vector<std::string>>;
     std::optional<std::set<std::string>> edgeColumnNames;
     // Installed only by a collection transaction with pinned dependencies.
     // Shared lookup for immutable records and payloads. Owns no data, aliases
@@ -56,6 +57,9 @@ struct StatementPool {
     // Physical query sources in this pinned logical scope; visibility is
     // checked by key resolution before filtering/pagination is finalized.
     std::function<std::vector<sqlite3*>()> querySources;
+    // Partition transient requested UUID arguments by compiled route metadata.
+    // This is not a membership cache or per-object routing directory.
+    std::function<ObjectSelectionArguments(const std::vector<std::string>&)> objectSelectionArguments;
     std::shared_ptr<CurrentWriteState> currentWrite;
     bool historyEnabled = true;
     bool spatialEnabled = true;
@@ -157,6 +161,16 @@ struct ObjectStore::Impl {
 };
 
 struct ObjectStoreImplAccess {
+    // Internal analysis projections only. The collection caller must first
+    // prove the entire pinned scope is sealed and history-off.
+    static GraphReadView trustedCurrentGeometryRead(const ObjectStore& store,const Txn& txn,
+        const ObjectSelection& selection,const StoreStatus& expected) {
+        return store.geometryReadViewImpl(txn,selection,expected,true);
+    }
+    static PackedGeometryArray trustedCurrentGeometryArrays(const ObjectStore& store,const Txn& txn,
+        std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume) {
+        return store.readSelectedGeometryArraysImpl(txn,selected,name,volume,true);
+    }
     static ObjectStore createInitial(const std::filesystem::path& path,const OpenOptions& options) {
         return ObjectStore(ObjectStore::openImpl(path,options,true,true));
     }

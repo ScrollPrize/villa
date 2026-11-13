@@ -1,6 +1,7 @@
 // Diagnostic benchmark, NOT a second supported object-store implementation.
 // Source decoding and UUID generation finish before any import timer starts.
 #include "vc_object_store/objects/AfvSource.hpp"
+#include "vc_object_store/SqliteRuntime.hpp"
 #include "vc_object_store/objects/InitialImport.hpp"
 #include "vc_object_store/objects/imports/ParallelImportStream.hpp"
 #include "geometry/GeometryInternal.hpp"
@@ -399,7 +400,7 @@ Json native(Prepared& data,const fs::path& path,bool storeReference,bool packed,
 }
 int main(int argc,char** argv){try{
     require(argc==2,"usage: vc_bench_prepared_import CONFIG.json");
-    sqlite3_config(SQLITE_CONFIG_MEMSTATUS,0);
+    configureSqliteRuntime(false);
     std::ifstream input(argv[1]);const auto config=Json::parse(input);
     Json cases=config.value("cases",Json::array());
     if(!config.contains("cases"))cases.push_back({{"variant",config.at("variant")}});
