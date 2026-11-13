@@ -90,11 +90,17 @@ StaleEdgeScope incrementalScope(const std::string& edgeKind, const std::vector<s
 DetectorReport commitStoredCandidates(objects::ObjectStore& db, const StoredGeometry& inputs,
     objects::WriteTxn& txn, const std::string& detectorName, int detectorVersion,
     const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
-    const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress);
+    const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress,
+    bool transactionRollsBack = false);
 // Commit a detection in the caller's write transaction (commitStoredCandidates
 // with its scope); the counts join detection.report, which is returned.
+// transactionRollsBack: the caller guarantees that txn is rolled back whenever
+// this throws (nothing catches the failure and goes on to commit), so the
+// commit takes no savepoint of its own. Stored results are the same either
+// way; the savepoint makes large commits quadratic (see commitCandidatesImpl).
 DetectorReport commitDetection(objects::ObjectStore& db, const StoredGeometry& inputs, objects::WriteTxn& txn,
-    const Detection& detection, const objects::util::ProgressCallback& progress);
+    const Detection& detection, const objects::util::ProgressCallback& progress,
+    bool transactionRollsBack = false);
 // Commit a detection in a write transaction of its own, the way the
 // standalone detectors publish: nothing when it is not to be published.
 DetectorReport publishDetection(objects::ObjectStore& db, const StoredGeometry& inputs, const Detection& detection,

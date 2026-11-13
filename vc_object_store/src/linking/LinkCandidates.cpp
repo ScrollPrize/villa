@@ -5,6 +5,7 @@
 #include "vc_object_store/Uuid.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -52,11 +53,20 @@ std::map<std::string, int> detectorVersions()
 static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
-                                const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress, bool validateGeometry)
+                                const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress, bool validateGeometry,
+                                bool transactionRollsBack = false)
 {
     if (detectorName.empty())
         throw std::runtime_error("object links: detector name must be non-empty");
-    objects::detail::Savepoint operation(objects::ObjectStoreImplAccess::conn(txn));
+    // The savepoint makes a failed commit leave the caller's transaction as
+    // it was. A caller whose transaction is rolled back by any failure here
+    // does not need it, and must not pay for it: while a savepoint stays
+    // open SQLite keeps its statement journal (in memory under
+    // temp_store=MEMORY) and walks it from the start whenever a statement or
+    // nested savepoint that journalled a page ends, so writing N links under
+    // one savepoint costs O(N^2).
+    std::optional<objects::detail::Savepoint> operation;
+    if (!transactionRollsBack) operation.emplace(objects::ObjectStoreImplAccess::conn(txn));
     DetectorReport report;
     report.candidatesFound = int64_t(candidates.size());
 
@@ -169,7 +179,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
     }
 
     objects::util::reportProgress(progress, "writing links", candidates.size(), candidates.size());
-    operation.release();
+    if (operation) operation->release();
     return report;
 }
 
@@ -196,20 +206,20 @@ DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn
 DetectorReport detail::commitStoredCandidates(objects::ObjectStore& db, const StoredGeometry& inputs,
     objects::WriteTxn& txn, const std::string& detectorName, int detectorVersion,
     const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
-    const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress)
+    const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress, bool transactionRollsBack)
 {
     inputs.validate(txn);
     return commitCandidatesImpl(db, txn, detectorName, detectorVersion, candidates,
-        replaceStalePending, staleScope, progress, true);
+        replaceStalePending, staleScope, progress, true, transactionRollsBack);
 }
 
 DetectorReport detail::commitDetection(objects::ObjectStore& db, const StoredGeometry& inputs, objects::WriteTxn& txn,
-    const Detection& detection, const objects::util::ProgressCallback& progress)
+    const Detection& detection, const objects::util::ProgressCallback& progress, bool transactionRollsBack)
 {
     auto report = detection.report;
     if (!detection.publish) return report;
     const auto committed = commitStoredCandidates(db, inputs, txn, detection.detector, detection.version,
-        detection.candidates, detection.replaceStalePending, &detection.scope, progress);
+        detection.candidates, detection.replaceStalePending, &detection.scope, progress, transactionRollsBack);
     report.candidatesFound = committed.candidatesFound;
     report.edgesCreated = committed.edgesCreated;
     report.edgesUpdated = committed.edgesUpdated;
@@ -227,7 +237,8 @@ DetectorReport detail::publishDetection(objects::ObjectStore& db, const StoredGe
     cancelled();
     auto txn = db.write();
     cancelled();
-    auto report = commitDetection(db, inputs, txn, detection, progress);
+    // txn is this function's own: any failure below destroys it uncommitted.
+    auto report = commitDetection(db, inputs, txn, detection, progress, true);
     cancelled();
     objects::util::reportProgress(progress, "committing links");
     txn.commit();
