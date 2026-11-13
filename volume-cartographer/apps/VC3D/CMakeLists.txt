@@ -208,6 +208,11 @@ set(srcs
     overlays/OverlayBatchItem.cpp
     overlays/OverlayBatchItem.hpp
     overlays/ScreenSpacePointIndex.hpp
+    overlays/InkPreviewClient.cpp
+    overlays/InkPreviewClient.hpp
+    overlays/InkPreviewOverlayController.cpp
+    overlays/InkPreviewOverlayController.hpp
+    overlays/ScalarOverlayImage.hpp
     overlays/InkDetectionOverlayController.cpp
     overlays/InkDetectionOverlayController.hpp
     overlays/VolumeOverlayController.cpp

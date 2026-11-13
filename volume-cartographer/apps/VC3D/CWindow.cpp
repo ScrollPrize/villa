@@ -1046,6 +1046,10 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _vectorOverlay = std::make_unique<VectorOverlayController>(_state, this);
     _viewerManager->setVectorOverlay(_vectorOverlay.get());
 
+    // Off until the Ink Detection dock turns it on; it only connects to a server the user started.
+    _inkPreviewOverlay = std::make_unique<InkPreviewOverlayController>(_state, this);
+    _viewerManager->setInkPreviewOverlay(_inkPreviewOverlay.get());
+
     _inkDetectionOverlay = std::make_unique<InkDetectionOverlayController>(_state, this);
     _viewerManager->setInkDetectionOverlay(_inkDetectionOverlay.get());
 
@@ -2453,6 +2457,9 @@ void CWindow::toggleVolumeOverlayVisibility()
     }
     if (_inkDetectionOverlay && _inkDetectionOverlay->hasLoadedSelection()) {
         _inkDetectionOverlay->toggleVisibility();
+    }
+    if (_inkPreviewOverlay && _inkPreviewOverlay->enabled()) {
+        _inkPreviewOverlay->toggleVisibility();
     }
 }
 

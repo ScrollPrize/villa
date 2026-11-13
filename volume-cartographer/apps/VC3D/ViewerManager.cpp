@@ -13,6 +13,7 @@
 #include "overlays/VectorOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
+#include "overlays/InkPreviewOverlayController.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "CState.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -910,6 +911,12 @@ void ViewerManager::setVolumeOverlay(VolumeOverlayController* overlay)
 void ViewerManager::setInkDetectionOverlay(InkDetectionOverlayController* overlay)
 {
     _inkDetectionOverlay = overlay;
+    registerOverlay(overlay);
+}
+
+void ViewerManager::setInkPreviewOverlay(InkPreviewOverlayController* overlay)
+{
+    _inkPreviewOverlay = overlay;
     registerOverlay(overlay);
 }
 

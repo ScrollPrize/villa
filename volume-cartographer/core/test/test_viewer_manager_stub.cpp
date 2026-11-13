@@ -23,6 +23,10 @@ ViewerManager::ViewerManager(CState* state, VCCollection* points, QObject* paren
 
 ViewerManager::~ViewerManager() = default;
 
+void ViewerManager::setInkDetectionOverlay(InkDetectionOverlayController* overlay) { _inkDetectionOverlay = overlay; }
+
+void ViewerManager::setInkPreviewOverlay(InkPreviewOverlayController* overlay) { _inkPreviewOverlay = overlay; }
+
 void ViewerManager::forEachBaseViewer(const std::function<void(VolumeViewerBase*)>&) const {}
 
 std::optional<ViewerManager::SurfaceLocation> ViewerManager::locate(const QuadSurface& surface, const cv::Vec3f& point,
