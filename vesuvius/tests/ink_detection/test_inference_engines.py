@@ -292,6 +292,30 @@ def _fake_inkrs(engine):
     )
 
 
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [
+        # index-less cuda is the current device, which set_device moved to 1
+        (torch.device("cuda"), 1),
+        (torch.device("cuda", 2), 2),
+        (torch.device("mps"), 0),
+    ],
+)
+def test_inkrs_loads_on_the_device_pytorch_uses(tmp_path, monkeypatch, device, expected):
+    opened = []
+
+    def load(checkpoint, *, device):
+        opened.append(device)
+        return object()
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    monkeypatch.setitem(sys.modules, "inkrs", _fake_inkrs(load))
+    engine = select_engine(_engine_args(tmp_path), _inkrs_shaped_model(), device)
+
+    assert opened == [expected]
+    assert engine.device_index == expected
+
+
 def test_inkrs_load_falls_back_only_when_inkrs_calls_it_unsupported(
     tmp_path, monkeypatch, caplog
 ):

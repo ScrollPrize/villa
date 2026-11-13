@@ -285,7 +285,7 @@ class InkrsEngine:
                 "inkrs extra (`uv sync --extra models --extra inkrs`)"
             ) from exc
 
-        device_index = 0 if device.index is None else int(device.index)
+        device_index = _engine_device_index(device)
         handle = _inkrs_open(module, Path(args.checkpoint), device_index)
         LOGGER.info(
             "Using the inkrs engine %s on device %d",
@@ -414,6 +414,22 @@ def _command_tiling(args: argparse.Namespace, patch_size: int) -> tuple[int, str
     except ValueError:
         # the run reports a bad stride or overlap itself, before any input
         return None
+
+
+def _engine_device_index(device: torch.device) -> int:
+    """The device index an engine uses for villa's ``device``.
+
+    An index-less CUDA device is PyTorch's current CUDA device, which
+    ``torch.cuda.set_device`` may have moved off GPU 0, so the engine and the
+    PyTorch path (including its per-input fallback) run on the same GPU. MPS
+    has a single device, index 0.
+    """
+
+    if device.index is not None:
+        return int(device.index)
+    if device.type == "cuda":
+        return int(torch.cuda.current_device())
+    return 0
 
 
 def _inkrs_open(module: Any, checkpoint: Path, device_index: int) -> Any:
