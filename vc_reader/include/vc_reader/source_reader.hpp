@@ -1,6 +1,7 @@
 #pragma once
 // Spatial crops of a Source: Zarr, PNG/JPEG/TIFF and explicit stacks, local or remote, with
 // exact encodings and explicitly owned decode caches.
+#include "vc_reader/exception_type.hpp"
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -23,11 +24,11 @@ class Sha256;
 namespace vcr::sources {
 
 // A decoded file is not what its format says it should be, or cannot be decoded.
-struct ImageFormatError : std::runtime_error {
+struct VCR_EXCEPTION_TYPE ImageFormatError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 // A read would exceed a decode or working budget.
-struct DecodeBudgetError : std::runtime_error {
+struct VCR_EXCEPTION_TYPE DecodeBudgetError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 

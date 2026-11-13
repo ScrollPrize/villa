@@ -1,12 +1,13 @@
 // Select contiguous channel planes without retaining another encoded-byte cache.
 #pragma once
+#include "vc_reader/exception_type.hpp"
 #include "codecs.hpp"
 #include <functional>
 #include <numeric>
 
 namespace vcr {
 
-class ChannelDecodeError : public std::runtime_error {
+class VCR_EXCEPTION_TYPE ChannelDecodeError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };

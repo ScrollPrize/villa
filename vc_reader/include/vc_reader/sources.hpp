@@ -2,6 +2,7 @@
 // Immutable descriptions of storage, values and registration. Building or decoding
 // one never opens storage; fields nobody declared stay empty, and unresolvedFields()
 // reports them without any I/O.
+#include "vc_reader/exception_type.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -23,7 +24,7 @@ using catalog::OpenDataVolumeCoverage;
 using catalog::VolumeTransform;
 
 // A declaration of the wrong kind of thing, as opposed to a bad value.
-struct DeclarationTypeError : std::invalid_argument {
+struct VCR_EXCEPTION_TYPE DeclarationTypeError : std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
