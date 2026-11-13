@@ -30,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "helirec/common.hpp"
@@ -51,6 +52,12 @@ class RawReader {
     // HDF5 metadata and any read-ahead/caching performed by the filesystem.
     std::uint64_t bytes_read() const;
     std::size_t n_files() const { return files_.size(); }
+
+    // File `file` is a partial local copy of a remote source: only the byte ranges [offsets[i], offsets[i] +
+    // lengths[i]) hold the source's bytes, the rest reads as zeros. A read of compressed chunk bytes outside
+    // them then throws ("not fetched") instead of decoding zeros, so the caller can fetch more and retry.
+    // HDF5 metadata is read by libhdf5 and is not checked. Set before reading; not thread safe with reads.
+    void set_fetched(int file, const std::vector<std::int64_t>& offsets, const std::vector<std::int64_t>& lengths);
 
     // How a file stores its frames (only headers of the first compressed chunk are read).
     struct Storage {
@@ -113,6 +120,8 @@ class RawReader {
     int rows_, cols_;  // as read
     int stored_rows_, stored_cols_, reduce_;
     std::vector<std::unique_ptr<FileInfo>> infos_;
+    std::vector<std::vector<std::pair<std::int64_t, std::int64_t>>> fetched_;  // per file: sorted, merged [begin, end)
+    void require_fetched(int file, std::int64_t offset, std::size_t n) const;
     struct Sync;
     std::unique_ptr<Sync> sync_;
     struct Cache;

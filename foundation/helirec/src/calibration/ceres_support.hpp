@@ -2,6 +2,8 @@
 // Configuration and result handling shared by all model-specific Ceres fits.
 #include <algorithm>
 #include <cmath>
+#include <vector>
+#include <Eigen/SparseCore>
 #include <ceres/ceres.h>
 #include <ceres/gradient_problem_solver.h>
 #include <ceres/version.h>
@@ -16,6 +18,10 @@ inline void validate(const SolveOptions& o) {
         !std::isfinite(o.parameter_tolerance) || o.parameter_tolerance < 0)
         throw Error("Ceres fit: invalid solver options");
 }
+// The rank of a design whose columns are normalised, at the relative threshold rcond (solve.cpp): what
+// solve_linear and the geometry's solver both refuse dependent unknowns by. dependent: the columns the pivoting
+// left out, in rising order (which of a dependent set they are is the pivoting's choice).
+int design_rank(const Eigen::SparseMatrix<double>& design, double rcond, std::vector<int>* dependent = nullptr);
 inline ceres::Solver::Options options(int active, const SolveOptions& o = {}) {
     validate(o);
     ceres::Solver::Options s;

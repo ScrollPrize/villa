@@ -41,16 +41,6 @@ Size diagnostic_columns(const Size& full, const ViewOptions& opt) {
     return small;
 }
 
-Trajectory trajectory(const Record& rec, const Stretch& s, double row_sign) {
-    Trajectory t;
-    t.angle_deg = stated_angle(s);
-    const auto z = stated_height(rec, s);
-    const double px_mm = pixel_um(rec) * 1e-3;
-    t.rows.resize(z.size());
-    for (std::size_t i = 0; i < z.size(); ++i) t.rows[i] = row_sign * z[i] / px_mm;
-    return t;
-}
-
 bool place_rows(int rows, int N, const Size& size, int& row_a) {
     const int lo = std::max(0, size.m - N), hi = std::min(rows - size.n, rows - size.n - size.m - N);
     if (hi < lo) return false;

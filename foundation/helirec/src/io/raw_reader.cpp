@@ -11,6 +11,8 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <iterator>
+#include <limits>
 #include <list>
 #include <map>
 #include <mutex>
@@ -141,6 +143,34 @@ void RawReader::set_cache_bytes(std::size_t bytes) {
         cache_->order.pop_back();
     }
 }
+void RawReader::set_fetched(int file, const std::vector<std::int64_t>& offsets, const std::vector<std::int64_t>& lengths) {
+    if (file < 0 || static_cast<std::size_t>(file) >= files_.size()) throw Error("RawReader: bad file index");
+    if (offsets.size() != lengths.size()) throw Error("RawReader: set_fetched needs one length per offset");
+    std::vector<std::pair<std::int64_t, std::int64_t>> r;
+    r.reserve(offsets.size());
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+        if (offsets[i] < 0 || lengths[i] < 0) throw Error("RawReader: negative fetched range");
+        if (lengths[i]) r.emplace_back(offsets[i], offsets[i] + lengths[i]);
+    }
+    std::sort(r.begin(), r.end());
+    std::vector<std::pair<std::int64_t, std::int64_t>> merged;
+    for (const auto& x : r)
+        if (!merged.empty() && x.first <= merged.back().second) merged.back().second = std::max(merged.back().second, x.second);
+        else merged.push_back(x);
+    if (fetched_.size() != files_.size()) fetched_.resize(files_.size());
+    fetched_[file] = std::move(merged);
+}
+
+void RawReader::require_fetched(int file, std::int64_t offset, std::size_t n) const {
+    if (fetched_.empty() || fetched_[file].empty()) return;
+    const auto& r = fetched_[file];
+    const std::int64_t end = offset + static_cast<std::int64_t>(n);
+    auto it = std::upper_bound(r.begin(), r.end(), std::make_pair(offset, std::numeric_limits<std::int64_t>::max()));
+    if (it == r.begin() || std::prev(it)->second < end)
+        throw Error("RawReader: bytes [" + std::to_string(offset) + ", " + std::to_string(end) + ") of " + files_[file] +
+                    " were not fetched");
+}
+
 std::uint64_t RawReader::bytes_read() const { return sync_->bytes_read.load(std::memory_order_relaxed); }
 void RawReader::cache_counts(std::uint64_t& hits, std::uint64_t& decoded) const {
     std::lock_guard<std::mutex> lock(cache_->mutex);
@@ -299,6 +329,7 @@ void RawReader::decode_chunk(int fd, int file, const FileInfo& fi, std::size_t a
     const auto nbytes = static_cast<std::size_t>(fi.stored_chunk_rows) * stored_cols_ * sample_bytes_;
     const j2k::ReadAt read = [&](void* dst, std::size_t n, std::size_t offset) {
         if (offset > bytes || n > bytes - offset) throw Error("RawReader: read outside compressed chunk");
+        require_fetched(file, fi.chunk_offset[at] + static_cast<std::int64_t>(offset), n);
         pread_all(fd, dst, n, fi.chunk_offset[at] + offset, files_[file]);
         sync_->bytes_read.fetch_add(n, std::memory_order_relaxed);
     };
@@ -409,6 +440,7 @@ RawReader::Storage RawReader::storage(int file) {
     OpenFile of;
     const int fd = of.get(file, path);
     const j2k::ReadAt read = [&](void* dst, std::size_t n, std::size_t offset) {
+        require_fetched(file, fi.chunk_offset[0] + static_cast<std::int64_t>(offset), n);
         pread_all(fd, dst, n, fi.chunk_offset[0] + offset, path);
         sync_->bytes_read.fetch_add(n, std::memory_order_relaxed);
     };

@@ -15,8 +15,11 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import queue
+import random
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 
 import h5py
@@ -43,11 +46,16 @@ def _atomic_json(path, value):
     os.replace(tmp, path)
 
 
-def _copy_metadata(src, dst, log):
-    """Copy only the master (never follow its virtual frame datasets)."""
+def _copy_metadata(src, dst, log, fetch=None):
+    """Copy only the master (never follow its virtual frame datasets). `fetch(path)`, when given, writes the
+    whole master to the new file `path` instead of reading `src` (--remote)."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(dst.name + ".partial")
     digest = hashlib.sha256()
+    if not dst.exists() and fetch is not None:
+        tmp.unlink(missing_ok=True)
+        fetch(str(tmp))
+        os.replace(tmp, dst)
     if not dst.exists():
         size, done, last = src.stat().st_size, 0, time.monotonic()
         with src.open("rb") as inp, tmp.open("wb") as out:
@@ -88,6 +96,7 @@ def build_plan(args, log):
         return plan
     jobs, tiles = [], []
     factor = 1 << args.reduce
+    link = _remote(args)
     for number, tile in enumerate(args.tiles, 1):
         log.info("Planning tile %d/%d: %s", number, len(args.tiles), tile)
         label = f"1.129um_mosaic_PHerc_Paris4_ROI-1_{tile}"
@@ -96,16 +105,24 @@ def build_plan(args, log):
         master_name = label + "_0001.h5"
         source_master = local / master_name if (local / master_name).is_file() else remote / master_name
         master_copy = args.output / "metadata" / tile / master_name
-        master_sha = _copy_metadata(source_master, master_copy, log)
+        # --remote: what is not local comes over SFTP, the plan included (no mount of --source-root is read)
+        over_sftp = link is not None and not (local / master_name).is_file()
+        master_sha = _copy_metadata(source_master, master_copy, log, fetch=(lambda path: _fetch(
+            _connect(link["spec"]), _remote_path(link, source_master)[0], path, None, None)) if over_sftp else None)
         p = _core.plan_projection_subset(str(master_copy), args.center_mm, args.slices, args.context_turns)
         if p["rows"] % factor or p["cols"] % factor:
             raise ValueError(f"{tile}: detector shape is not divisible by {factor}")
         projection = next(s for s in p["series"] if s["role"] == "projection")
         sample = next((p for p in projection["pieces"] if (local / p["file"]).is_file()), projection["pieces"][0])
         candidates = [str(local / sample["file"]), str(remote / sample["file"])]
-        probe = _core.RawReader([_source(dict(sources=candidates, tile=tile, relative_file=sample["file"]))],
-                                sample["dataset"], p["rows"], p["cols"], decoder="openjph")
-        storage = probe.storage()
+        with tempfile.TemporaryDirectory(prefix="plan-", dir=args.output) as tmp:
+            if link is not None and not Path(candidates[0]).is_file():  # the chunk headers are enough
+                candidates = [str(Path(tmp) / "sample.h5")]
+                _fetch(_connect(link["spec"]), _remote_path(link, remote / sample["file"])[0], candidates[0],
+                       sample["dataset"], _HEADS[3][0])
+            probe = _core.RawReader([_source(dict(sources=candidates, tile=tile, relative_file=sample["file"]))],
+                                    sample["dataset"], p["rows"], p["cols"], decoder="openjph")
+            storage = probe.storage()
         if not storage["compressed"] or storage["codec"] != "JPEG 2000 (HTJ2K)" or storage["reversible"]:
             raise ValueError(f"{tile}: this downloader expects the irreversible HTJ2K projection format; got {storage}")
         chunk_rows = storage["chunk_rows"]
@@ -162,7 +179,8 @@ def _complete(path, job):
     raise ValueError(f"Existing output is invalid or belongs to another plan; refusing to overwrite {path}")
 
 
-def _download_once(job, output, threads, batch, events):
+def _download_once(job, output, threads, batch, events, local=None, fetched=None, origin=None):
+    """local: a (partial) local copy of the source to read instead; fetched: its byte ranges that hold data."""
     from .calibration import at_resolution
     path = Path(output) / job["output"]
     if _complete(path, job):
@@ -170,10 +188,12 @@ def _download_once(job, output, threads, batch, events):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".partial")
     tmp.unlink(missing_ok=True)  # only this downloader's unpublished temporary file
-    source = _source(job)
+    source = local if local is not None else _source(job)
     projection = job["role"] == "projection"
     reader = _core.RawReader([source], job["dataset"], job["rows"], job["cols"],
                              reduce=job["reduce"] if projection else 0, decoder="openjph" if projection else "auto")
+    if fetched is not None:
+        reader.set_fetched(0, *fetched)
     storage = reader.storage()
     if projection and (not storage["compressed"] or storage["reversible"] or storage["chunk_rows"] != job["chunk_rows"]):
         raise ValueError(f"Projection storage differs from the planned calibration grid: {source}")
@@ -198,7 +218,7 @@ def _download_once(job, output, threads, batch, events):
     finally:
         writer.close()
     with h5py.File(tmp, "r+") as f:
-        f.attrs.update(complete=True, job_sha256=job["id"], data_sha256=digest.hexdigest(), source=source,
+        f.attrs.update(complete=True, job_sha256=job["id"], data_sha256=digest.hexdigest(), source=origin or source,
                        source_master_sha256=job["source_master_sha256"], original_frame_first=job["first"],
                        source_frame_first=job["source_first"], scale=2.0 ** -job["reduce"], role=job["role"],
                        decoder="OpenJPH 0.32.0" if projection else "helirec.calibration.at_resolution (9/7 low-pass)",
@@ -213,13 +233,170 @@ def _download_once(job, output, threads, batch, events):
     return dict(bytes_requested=reader.bytes_read, seconds=time.monotonic() - start, resumed=False)
 
 
-def _download(job, output, threads, batch, retries, events):
+# --remote: one SSH connection per worker process, kept between files. Each new login costs seconds, and the
+# ESRF server resets logins that start together. At its ~120 ms round trip, file reads through a mount are
+# latency bound; paramiko's readv instead keeps all of a file's chunk requests in flight on one open handle.
+_CONNECTION = None
+# Bytes of each chunk's start to fetch, by `reduce`, tried in turn; None: the whole file. A Paris4 chunk (162 KB)
+# decodes from its first 16.7, 24.8 and 57.7 KB at reduce 3, 2 and 1 (measured on five files of four tiles).
+_HEADS = {3: (20 << 10, 64 << 10, None), 2: (28 << 10, 64 << 10, None), 1: (64 << 10, None)}
+_TAIL = 1 << 10  # the decoder reads the codestream's end marker too
+
+
+def _rclone_remote(spec):
+    name, _, path = spec.partition(":")
+    config = json.loads(subprocess.run(["rclone", "config", "dump"], capture_output=True, check=True).stdout)
+    if config.get(name, {}).get("type") != "sftp":
+        raise ValueError(f"--remote: {name!r} is not an SFTP remote in the rclone config")
+    return config[name], path
+
+
+def _remote(args):
+    """--remote as the workers take it: the rclone spec, its path, and the --source-root it stands for."""
+    return (dict(spec=args.remote, path=_rclone_remote(args.remote)[1], source_root=str(args.source_root))
+            if args.remote else None)
+
+
+def _remote_path(remote, source):
+    """A file under --source-root: its path on the SFTP server and its origin as recorded in outputs."""
+    relative = Path(source).relative_to(remote["source_root"]).as_posix()
+    return remote["path"].rstrip("/") + "/" + relative, remote["spec"].rstrip("/") + "/" + relative
+
+
+def _connect(spec):
+    global _CONNECTION
+    if _CONNECTION is not None and _CONNECTION[0].get_transport() is not None and _CONNECTION[0].get_transport().is_active():
+        return _CONNECTION[1]
+    import paramiko
+    cfg, _ = _rclone_remote(spec)
+    client = paramiko.SSHClient()
+    client.load_host_keys(os.path.expanduser(cfg.get("known_hosts_file") or "~/.ssh/known_hosts"))
+    kwargs = dict(hostname=cfg["host"], port=int(cfg.get("port") or 22), username=cfg.get("user") or None,
+                  timeout=30, banner_timeout=60, auth_timeout=60)
+    if cfg.get("key_file"):
+        kwargs["key_filename"] = os.path.expanduser(cfg["key_file"])
+    if cfg.get("pass"):
+        kwargs["password"] = subprocess.run(["rclone", "reveal", cfg["pass"]], capture_output=True, check=True,
+                                            text=True).stdout.strip()
+    # paramiko prints a traceback for every refused login from its transport thread; failures surface here instead
+    logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+    import fcntl
+    lock_path = Path(tempfile.gettempdir()) / f"helirec-sftp-login-{hashlib.sha256(spec.encode()).hexdigest()[:12]}.lock"
+    for attempt in range(8):
+        # The server resets logins that start together: the workers log in one at a time.
+        with lock_path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                client.connect(**kwargs)
+                break
+            except paramiko.AuthenticationException:
+                raise
+            except (paramiko.SSHException, OSError, EOFError):
+                client.close()
+                if attempt == 7:
+                    raise
+            finally:
+                time.sleep(0.5)  # before the next worker's login
+        time.sleep(min(30, 2 ** attempt) * random.uniform(0.5, 1.5))
+    _CONNECTION = (client, client.open_sftp())
+    return _CONNECTION[1]
+
+
+def _drop_connection():
+    global _CONNECTION
+    if _CONNECTION is not None:
+        _CONNECTION[0].close()
+        _CONNECTION = None
+
+
+def _fetch(sftp, remote_path, local_path, dataset, head):
+    """Copy the HDF5 metadata and the first `head` + last _TAIL bytes of each chunk of `dataset` into a sparse
+    local file (None: the whole file). Returns the chunk ranges fetched (None if whole) and bytes transferred."""
+    import io
+    block = 1 << 16
+    with sftp.open(remote_path, "rb") as f:
+        size = f.stat().st_size
+        out = os.open(local_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.ftruncate(out, size)
+            if head is None:
+                pieces = [(o, min(1 << 20, size - o)) for o in range(0, size, 1 << 20)]
+                for (o, _), data in zip(pieces, f.readv(pieces)):
+                    os.pwrite(out, data, o)
+                return None, size
+            blocks = {}
+
+            class Metadata(io.RawIOBase):  # what libhdf5 reads to find the chunks, in 64 KiB blocks
+                pos = 0
+                def readable(self): return True
+                def seekable(self): return True
+                def tell(self): return self.pos
+                def seek(self, o, whence=0):
+                    self.pos = o if whence == 0 else self.pos + o if whence == 1 else size + o
+                    return self.pos
+                def readinto(self, b):
+                    n, got = min(len(b), max(0, size - self.pos)), bytearray()
+                    while len(got) < n:
+                        k, o = divmod(self.pos + len(got), block)
+                        if k not in blocks:
+                            n_k = min(block, size - k * block)  # readv: its pieces in flight together
+                            blocks[k] = b"".join(f.readv([(k * block, n_k)]))
+                        got += blocks[k][o:o + n - len(got)]
+                    b[:n] = got
+                    self.pos += n
+                    return n
+
+            with h5py.File(Metadata(), "r") as h:
+                d = h[dataset].id
+                chunks = [d.get_chunk_info(i) for i in range(d.get_num_chunks())]
+            for k, data in blocks.items():
+                os.pwrite(out, data, k * block)
+            ranges = []
+            for c in chunks:
+                ranges.append((c.byte_offset, min(head, c.size)))
+                if c.size > head:
+                    tail = min(_TAIL, c.size - head)
+                    ranges.append((c.byte_offset + c.size - tail, tail))
+            for (o, _), data in zip(ranges, f.readv(ranges)):
+                os.pwrite(out, data, o)
+            return ([o for o, _ in ranges], [n for _, n in ranges]), sum(map(len, blocks.values())) + sum(n for _, n in ranges)
+        finally:
+            os.close(out)
+
+
+def _download_remote(job, output, threads, batch, events, remote):
+    if _complete(Path(output) / job["output"], job):
+        return dict(bytes_requested=0, resumed=True)
+    remote_path, origin = _remote_path(remote, job["sources"][-1])
+    work = Path(output) / ".remote"
+    work.mkdir(parents=True, exist_ok=True)
+    for head in (_HEADS[job["reduce"]] if job["role"] == "projection" else (None,)):
+        with tempfile.TemporaryDirectory(prefix="source-", dir=work) as tmp:
+            local = str(Path(tmp) / "source.h5")
+            fetched, transferred = _fetch(_connect(remote["spec"]), remote_path, local, job["dataset"], head)
+            try:
+                result = _download_once(job, output, threads, batch, events, local=local, fetched=fetched, origin=origin)
+            except Exception as e:
+                if head is None:
+                    raise
+                # bytes beyond the fetched ones (or unread metadata): fetch more of each chunk
+                events.put(("retry", job["id"], 0, f"{head} bytes per chunk were not enough ({e}); fetching more"))
+                continue
+            result["bytes_transferred"] = transferred
+            return result
+
+
+def _download(job, output, threads, batch, retries, events, remote=None):
     for attempt in range(retries + 1):
         try:
+            if remote is not None and not Path(job["sources"][0]).is_file():
+                return _download_remote(job, output, threads, batch, events, remote)
             return _download_once(job, output, threads, batch, events)
         except Exception as e:
             if attempt == retries:
                 raise
+            if remote is not None:
+                _drop_connection()
             events.put(("retry", job["id"], attempt + 1, str(e)))
             time.sleep(min(30, 2 ** attempt))
 
@@ -282,6 +459,7 @@ def run_download(plan, args, log):
     context = mp.get_context("spawn")
     start, last_log, read_bytes = time.monotonic(), 0.0, 0
     status = {}
+    remote = _remote(args)
     with context.Manager() as manager, ProcessPoolExecutor(max_workers=args.workers, mp_context=context) as pool:
         events = manager.Queue()
         active = {}
@@ -289,7 +467,7 @@ def run_download(plan, args, log):
         def submit():
             job = next(iterator, None)
             if job is not None:
-                active[pool.submit(_download, job, str(args.output), args.threads, args.batch_frames, args.retries, events)] = job
+                active[pool.submit(_download, job, str(args.output), args.threads, args.batch_frames, args.retries, events, remote)] = job
                 status[job["id"]] = (0, 0)
                 log.info("START %s %s (%s, %d frames)", job["tile"], job["relative_file"], job["role"], job["count"])
         for _ in range(args.workers):
@@ -362,11 +540,21 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=4, help="concurrent files, separate processes")
     parser.add_argument("--threads", type=int, default=2, help="C++ decoding threads per file")
     parser.add_argument("--batch-frames", type=int, default=8)
+    parser.add_argument("--remote", help="rclone SFTP remote:path matching --source-root (e.g. esrf:/data/.../RAW_DATA): "
+                        "read sources missing locally over SFTP, fetching only the bytes the reduced decode reads; "
+                        "host, user and password come from the rclone config. Nothing under --source-root is then read: it only names the files.")
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--log-interval", type=float, default=5)
     parser.add_argument("--plan-only", action="store_true", help="copy metadata and report the plan without reading projection pixels")
     parser.add_argument("--max-files", type=int, default=0, help="stop after this many pending files; 0 means all")
     args = parser.parse_args(argv)
+    if args.remote:
+        try:
+            import paramiko  # noqa: F401
+        except ImportError:
+            parser.error("--remote requires paramiko")
+        if shutil.which("rclone") is None:
+            parser.error("--remote reads its connection from the rclone config; rclone is not on PATH")
     if min(args.workers, args.threads, args.batch_frames, args.slices) < 1 or args.retries < 0 or args.max_files < 0 or args.log_interval <= 0:
         parser.error("counts and log interval must be positive; retries/max-files must be nonnegative")
     if len(set(args.tiles)) != len(args.tiles):

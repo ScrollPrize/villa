@@ -128,6 +128,31 @@ struct EquationGroup {
 };
 }  // namespace
 
+int fitting::design_rank(const Eigen::SparseMatrix<double>& design, double rcond, std::vector<int>* dependent) {
+    const int n = static_cast<int>(design.cols());
+    int rank = 0;
+    Eigen::VectorXi order;
+    if (n <= 64) {
+        Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr{Eigen::MatrixXd(design)};
+        qr.setThreshold(rcond);
+        rank = static_cast<int>(qr.rank());
+        order = qr.colsPermutation().indices();
+    } else {
+        Eigen::SparseQR<Eigen::SparseMatrix<double>,Eigen::COLAMDOrdering<int>> qr;
+        qr.setPivotThreshold(rcond);
+        qr.compute(design);
+        if (qr.info() != Eigen::Success) throw Error("rank analysis failed");
+        rank = static_cast<int>(qr.rank());
+        order = qr.colsPermutation().indices();
+    }
+    if (dependent) {
+        dependent->clear();
+        for (int k = rank; k < n; ++k) dependent->push_back(order[k]);
+        std::sort(dependent->begin(), dependent->end());
+    }
+    return rank;
+}
+
 LinearSolution solve_linear(const LinearProblem& problem, const SolveOptions& opt) {
     fitting::validate(opt);
     if (problem.unknowns > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
@@ -220,17 +245,7 @@ LinearSolution solve_linear(const LinearProblem& problem, const SolveOptions& op
     if (out.active) {
         Sparse design(rank_rows,out.active);
         design.setFromTriplets(entries.begin(),entries.end());
-        if (out.active <= 64) {
-            Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr{Eigen::MatrixXd(design)};
-            qr.setThreshold(opt.rcond);
-            out.rank = static_cast<int>(qr.rank());
-        } else {
-            Eigen::SparseQR<Sparse,Eigen::COLAMDOrdering<int>> qr;
-            qr.setPivotThreshold(opt.rcond);
-            qr.compute(design);
-            if (qr.info() != Eigen::Success) throw Error("solve_linear: rank analysis failed");
-            out.rank = static_cast<int>(qr.rank());
-        }
+        out.rank = fitting::design_rank(design,opt.rcond);
     }
     if (!m || out.rank != out.active) {
         out.termination = !m ? "INSUFFICIENT_SUPPORT" : "RANK_DEFICIENT";

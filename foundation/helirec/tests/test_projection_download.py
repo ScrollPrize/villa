@@ -1,6 +1,7 @@
 """Slab selection, uncompressed exports, restart safety and frame metadata."""
 import hashlib
 import logging
+import os
 import queue
 from types import SimpleNamespace
 
@@ -145,3 +146,101 @@ def test_plan_settings_cannot_change_on_resume(tmp_path):
     download._atomic_json(tmp_path / "plan.json", dict(settings={"slices": 128}, jobs=[]))
     with pytest.raises(ValueError, match="different plan"):
         download.build_plan(args, logging.getLogger(__name__))
+
+
+class _FakeSFTP:
+    """paramiko's SFTPClient as far as --remote uses it, over local files; counts bytes served."""
+    def __init__(self):
+        self.served = 0
+
+    def open(self, path, mode):
+        fake = self
+        class File:
+            def __init__(self):
+                self.f = open(path, "rb")
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                self.f.close()
+            def stat(self):
+                return SimpleNamespace(st_size=os.fstat(self.f.fileno()).st_size)
+            def readv(self, ranges):
+                for o, n in ranges:
+                    self.f.seek(o)
+                    fake.served += n
+                    yield self.f.read(n)
+        return File()
+
+
+def _projection_source(source):
+    _write(source, _chunk((DATA / "unsigned16_97.j2k").read_bytes(), 256, 256, sample_bytes=2),
+           rows=256, cols=256, frames=3, dtype="uint16")
+
+
+@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="HELIREC_OPENJPH=OFF")
+def test_reader_refuses_bytes_that_were_not_fetched(tmp_path):
+    source = tmp_path / "source.h5"
+    _projection_source(source)
+    with h5py.File(source, "r") as f:
+        c = f["data"].id.get_chunk_info(1)
+    full = _core.RawReader([str(source)], "data", 256, 256, reduce=3, decoder="openjph")
+    want = full.read_frames(np.zeros(1, np.int32), np.array([1], np.int32), n_threads=1)
+    covered = _core.RawReader([str(source)], "data", 256, 256, reduce=3, decoder="openjph")
+    covered.set_fetched(0, [c.byte_offset, c.byte_offset + 10], [10, c.size - 10])  # merged: the whole chunk
+    np.testing.assert_array_equal(covered.read_frames(np.zeros(1, np.int32), np.array([1], np.int32), n_threads=1), want)
+    partial = _core.RawReader([str(source)], "data", 256, 256, reduce=3, decoder="openjph")
+    partial.set_fetched(0, [c.byte_offset], [40])
+    with pytest.raises(Exception, match="not fetched"):
+        partial.read_frames(np.zeros(1, np.int32), np.array([1], np.int32), n_threads=1)
+
+
+@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="HELIREC_OPENJPH=OFF")
+@pytest.mark.parametrize("role,heads", [("projection", download._HEADS[3]), ("projection", (64, None)), ("flat", None)])
+def test_remote_export_equals_local_export(tmp_path, monkeypatch, role, heads):
+    source, job = _job(tmp_path, role)
+    if role == "projection":
+        _projection_source(source)
+    else:
+        with h5py.File(source, "w") as f:
+            f.create_dataset("data", data=np.random.default_rng(10).integers(20000, 50000, (3, job["rows"], 256),
+                             dtype=np.uint16), chunks=(1, job["rows"], 256))
+    baseline = tmp_path / "baseline"
+    download._download(job, baseline, 1, 1, 0, queue.Queue())
+    sftp = _FakeSFTP()
+    monkeypatch.setattr(download, "_connect", lambda spec: sftp)
+    if heads is not None:
+        monkeypatch.setattr(download, "_HEADS", {job["reduce"]: heads})
+    remote = dict(spec="esrf:/raw", path=str(tmp_path), source_root=str(tmp_path))
+    out, events = tmp_path / "remote", queue.Queue()
+    result = download._download(job, out, 1, 1, 0, events, remote)
+    with h5py.File(baseline / job["output"], "r") as a, h5py.File(out / job["output"], "r") as b:
+        np.testing.assert_array_equal(a["data"][:], b["data"][:])
+        assert b.attrs["source"] == "esrf:/raw/source.h5"
+        assert {k: v for k, v in a.attrs.items() if k != "source"} == {k: v for k, v in b.attrs.items() if k != "source"}
+    retries = [e for e in iter(lambda: None if events.empty() else events.get_nowait(), None) if e[0] == "retry"]
+    assert bool(retries) == (heads == (64, None))  # 64 bytes per chunk cannot hold a codestream's low resolution
+    assert result["bytes_transferred"] > 0 and sftp.served >= result["bytes_transferred"]
+    assert not list((out / ".remote").iterdir())
+    assert download._download(job, out, 1, 1, 0, events, remote)["resumed"]
+
+
+def test_plan_reads_master_and_sample_over_sftp(tmp_path, monkeypatch):
+    """--remote: the plan needs nothing under --source-root (an SFTP mount that is down must not stop it)."""
+    label = "1.129um_mosaic_PHerc_Paris4_ROI-1_T0-01"
+    served = tmp_path / "served" / label / (label + "_0001")
+    served.mkdir(parents=True)
+    master = _write_record(served, np.random.default_rng(0), name=label)
+    sftp = _FakeSFTP()
+    monkeypatch.setattr(download, "_connect", lambda spec: sftp)
+    monkeypatch.setattr(download, "_rclone_remote", lambda spec: ({}, str(tmp_path / "served")))
+    out = tmp_path / "out"
+    out.mkdir()
+    args = SimpleNamespace(output=out, tiles=["T0-01"], slices=4, reduce=1, center_mm=-11.6, context_turns=0,
+                           source_root=tmp_path / "mount_that_is_down", local_root=tmp_path / "local",
+                           remote="esrf:/raw")
+    # the synthetic frames are plain: the plan gets as far as refusing what the fetched sample file stores
+    with pytest.raises(ValueError, match="expects the irreversible HTJ2K"):
+        download.build_plan(args, logging.getLogger(__name__))
+    assert (out / "metadata/T0-01" / master.name).read_bytes() == master.read_bytes()
+    assert sftp.served > master.stat().st_size  # the master and part of one sample file
+    assert not list(out.glob("plan-*")) and not (tmp_path / "mount_that_is_down").exists()

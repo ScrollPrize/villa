@@ -138,9 +138,126 @@ std::string fit_json(const std::string& rows_text, const std::string& layout, co
     return out.text();
 }
 
+// ---- the joint model (solve_geometry)
+
+using Table = nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+
+// {rows, cols, row_time, scans: [{name, mid_height, stretches: [{name, index, helix, angle_deg: [..], rows: [..]}]}]}
+gc::Acquisition acquisition_of(const std::string& text) {
+    const Json j = Json::parse(text);
+    gc::Acquisition acq;
+    acq.rows = static_cast<int>(number(j, "rows")), acq.cols = static_cast<int>(number(j, "cols"));
+    acq.row_time = number(j, "row_time", 0.0);
+    for (const Json& sj : member(j, "scans").array) {
+        gc::ScanLayout sc;
+        if (const Json* n = sj.find("name")) sc.name = n->string;
+        sc.mid_height = number(sj, "mid_height", 0.0);
+        for (const Json& tj : member(sj, "stretches").array) {
+            gc::StretchLayout st;
+            st.name = member(tj, "name").string;
+            st.index = static_cast<int>(number(tj, "index", 0.0));
+            if (const Json* h = tj.find("helix")) st.helix = h->boolean;
+            for (const Json& v : member(tj, "angle_deg").array) st.course.angle_deg.push_back(v.number);
+            for (const Json& v : member(tj, "rows").array) st.course.rows.push_back(v.number);
+            if (st.course.angle_deg.size() != st.course.rows.size()) throw Error("geometry: a stretch's angles and heights differ in length");
+            sc.stretches.push_back(std::move(st));
+        }
+        acq.scans.push_back(std::move(sc));
+    }
+    return acq;
+}
+
+// as solution_json writes them: {roll, scans: [{axis, axis_slope, axial_scale, d: [d0, d1], height, stretch_height: {name: rows}}]}
+gc::Parameters parameters_of(const gc::Acquisition& acq, const std::string& text) {
+    gc::Parameters p = gc::empty_parameters(acq);
+    if (text.empty()) return p;
+    const Json j = Json::parse(text);
+    p.roll = number(j, "roll", 0.0);
+    const Json& scans = member(j, "scans");
+    if (scans.array.size() != acq.scans.size()) throw Error("geometry: the parameters and the acquisition differ in their scans");
+    for (std::size_t k = 0; k < scans.array.size(); ++k) {
+        const Json& sj = scans.array[k];
+        gc::ScanParameters& q = p.scans[k];
+        q.axis = number(sj, "axis", 0.0), q.axis_slope = number(sj, "axis_slope", 0.0), q.axial_scale = number(sj, "axial_scale", 0.0);
+        q.height = number(sj, "height", 0.0);
+        if (const Json* d = sj.find("d"))
+            for (std::size_t i = 0; i < 2 && i < d->array.size(); ++i) q.d[i] = d->array[i].number;
+        if (const Json* h = sj.find("stretch_height"))
+            for (std::size_t a = 0; a < acq.scans[k].stretches.size(); ++a) q.stretch_height[a] = number(*h, acq.scans[k].stretches[a].name.c_str(), 0.0);
+    }
+    return p;
+}
+
+// a row of a table of sightings: scan, stretch, frame, row, column
+gc::Sighting sighting_of(const double* r) { return {static_cast<int>(r[0]), static_cast<int>(r[1]), r[2], r[3], r[4]}; }
+
 }  // namespace
 
 void bind_geometry_calibration(nb::module_& m) {
+    m.def(
+        "geometry_solve",
+        [](const std::string& acquisition, const std::vector<std::string>& kinds, Table a, Table b, const std::vector<bool>& opposite, const std::string& start, double huber,
+           int max_iterations, const std::vector<std::string>& held, const std::vector<std::string>& freed) {
+            const std::size_t n = kinds.size();
+            if (a.shape(0) != n || b.shape(0) != n || opposite.size() != n || a.shape(1) != 5 || b.shape(1) != 5)
+                throw Error("geometry_solve: one kind, two sightings (scan, stretch, frame, row, column) and one flag per comparison");
+            const gc::Acquisition acq = acquisition_of(acquisition);
+            std::vector<gc::Comparison> comparisons(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                comparisons[i].kind = kinds[i];
+                comparisons[i].a = sighting_of(a.data() + 5 * i), comparisons[i].b = sighting_of(b.data() + 5 * i);
+                comparisons[i].opposite = opposite[i];
+            }
+            gc::GeometryOptions opt;
+            opt.huber = huber, opt.max_iterations = max_iterations, opt.held = held, opt.freed = freed;
+            gc::GeometrySolution s;
+            {
+                const gc::Parameters p0 = parameters_of(acq, start);
+                nb::gil_scoped_release nogil;
+                s = gc::solve_geometry(acq, comparisons, p0, opt);
+            }
+            auto residual = helirec::py::new_array_t<double>({n, std::size_t(3)});
+            for (std::size_t i = 0; i < n; ++i) std::copy(s.residual[i].begin(), s.residual[i].end(), static_cast<double*>(residual.data()) + 3 * i);
+            return nb::make_tuple(gc::solution_json(acq, s), residual);
+        },
+        "acquisition"_a, "kinds"_a, "a"_a, "b"_a, "opposite"_a, "start"_a = "", "huber"_a = 0.03, "max_iterations"_a = 100, "held"_a = std::vector<std::string>(),
+        "freed"_a = std::vector<std::string>(),
+        "The places of the scans that best explain comparisons of their frames: (the solution as JSON text, the\n"
+        "residuals (n, 3): frames, rows, columns). (helirec::calibration::geometry_calibration::solve_geometry)");
+    m.def(
+        "geometry_residuals",
+        [](const std::string& acquisition, const std::string& parameters, Table a, Table b, const std::vector<bool>& opposite) {
+            const std::size_t n = opposite.size();
+            if (a.shape(0) != n || b.shape(0) != n || a.shape(1) != 5 || b.shape(1) != 5) throw Error("geometry_residuals: two sightings (scan, stretch, frame, row, column) and one flag per comparison");
+            const gc::Acquisition acq = acquisition_of(acquisition);
+            std::vector<gc::Comparison> comparisons(n);
+            for (std::size_t i = 0; i < n; ++i) comparisons[i].a = sighting_of(a.data() + 5 * i), comparisons[i].b = sighting_of(b.data() + 5 * i), comparisons[i].opposite = opposite[i];
+            const std::vector<std::array<double, 3>> r = gc::residuals(acq, parameters_of(acq, parameters), comparisons);
+            auto out = helirec::py::new_array_t<double>({n, std::size_t(3)});
+            for (std::size_t i = 0; i < n; ++i) std::copy(r[i].begin(), r[i].end(), static_cast<double*>(out.data()) + 3 * i);
+            return out;
+        },
+        "acquisition"_a, "parameters"_a, "a"_a, "b"_a, "opposite"_a,
+        "What the parameters leave of each comparison: (n, 3) frames, rows, columns.\n"
+        "(helirec::calibration::geometry_calibration::residuals)");
+    m.def(
+        "geometry_rays",
+        [](const std::string& acquisition, const std::string& parameters, Table sightings) {
+            if (sightings.shape(1) != 5) throw Error("geometry_rays: a sighting is scan, stretch, frame, row, column");
+            const gc::Acquisition acq = acquisition_of(acquisition);
+            const gc::Parameters p = parameters_of(acq, parameters);
+            const std::size_t n = sightings.shape(0);
+            auto out = helirec::py::new_array_t<double>({n, std::size_t(3)});
+            double* o = static_cast<double*>(out.data());
+            for (std::size_t i = 0; i < n; ++i) {
+                const gc::Ray r = gc::ray_of(acq, p, sighting_of(sightings.data() + 5 * i));
+                o[3 * i] = r.angle_deg, o[3 * i + 1] = r.s, o[3 * i + 2] = r.z;
+            }
+            return out;
+        },
+        "acquisition"_a, "parameters"_a, "sightings"_a,
+        "The ray each sighting records under the parameters: (n, 3) angle [deg], s [px], z [rows].\n"
+        "(helirec::calibration::geometry_calibration::ray_of)");
     m.def(
         "calibrate_geometry",
         [](const std::vector<std::string>& scans, std::optional<double> row_time, const std::string& device, int order, int passes, double tolerance, int threads, bool motion,

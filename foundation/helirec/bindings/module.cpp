@@ -1813,6 +1813,9 @@ NB_MODULE(_core, m) {
             return d;
         }, "file"_a = 0)
         .def_prop_ro("dtype", &RawReader::dtype)
+        .def("set_fetched", &RawReader::set_fetched, "file"_a, "offsets"_a, "lengths"_a,
+             "The file is a partial local copy: only these byte ranges hold the source's bytes. A compressed chunk "
+             "read outside them raises ('not fetched') instead of decoding zeros.")
         .def_prop_ro("bytes_read", &RawReader::bytes_read,
                      "Payload bytes requested, excluding HDF5 metadata and filesystem read-ahead.")
         .def("set_prefetch_threads", &RawReader::set_prefetch_threads, "threads"_a)

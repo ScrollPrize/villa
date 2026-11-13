@@ -162,6 +162,122 @@ std::string measure_motion(Session& session, const Layout& lay, const geometry::
 // fitted by calibration::fit_refill_shots (helirec/calibration/refill.hpp).
 std::string row_time_from_refill(Session& session, const Layout& lay, const Log& log);
 
+// ---------------------------------------------------------------- the joint model
+//
+// One model for any number of scans of one sample (a scan alone, a pair moved sideways, the tiles of a mosaic),
+// solved as one Ceres problem. A ray through the sample is named by the angle th it is seen at, its distance s
+// from the sample's origin across the beam [px] and its height z [rows]. Scan k records it at the ideal detector
+// position
+//     X = axis_k + axis_slope_k (H - H_mid_k) + u + roll (Y - middle row),        u = s + d_k . (cos th, sin th)
+//     Y = z + height_k + stretch height + (1 + axial_scale_k) H - roll u
+// with th and H the record's angle and height [rows] at the time the row was exposed: row v of frame f at the time
+// of frame f + row_time (v - middle row). The unknowns are the places, nothing else: no comparison has an offset
+// of its own, so what the model does not explain stays in the residuals.
+//
+// A comparison is two sightings of the same lines. Each is taken back to the ray it records, and the residual is
+// the difference of the two rays in the sample: s_b - s_a (s_b + s_a where b sees the rays from the other side)
+// and z_b - z_a. The frames' displacement is reported as the difference of the two angles and is not fitted. What
+// an error of it does to the other two differs:
+//   rows     nothing: z stays the same along the track a piece of content follows through the frames (the helix'
+//            travel is in H), so a frame's error costs axial_scale x the travel per frame.
+//   columns  content at the depth t along the beam (from the rotation axis) crosses t x the angle per frame columns
+//            per frame, so an error of e frames in the registration is a column residual of e x the angle per frame
+//            x the mean depth of the block's detail. Nothing for detail centred on the axis; for a scan whose axis
+//            lies c from the middle of the sample's detail the mean depth is about -c . (-sin th, cos th): a
+//            sinusoid of the angle. A column residual of that form is first of all a frames' error.
+// (The two-scan step above is being replaced by this; it stays until the new one has reproduced it.)
+
+// The projection stretches of one scan and what its record states of them.
+struct StretchLayout {
+    std::string name;       // "helix", "rest1", "rest2", ..: rest turns are numbered in the order of acquisition
+    int index = 0;          // the record's stretch
+    bool helix = false;
+    Trajectory course;      // per frame: the angle [deg, cumulative] and the height [rows] (record.hpp)
+};
+struct ScanLayout {
+    std::string name;
+    std::vector<StretchLayout> stretches;  // in the order of acquisition
+    double mid_height = 0;  // H_mid: the height [rows] the axis column is counted from (the middle of the helix' frames on disk)
+};
+struct Acquisition {
+    int rows = 0, cols = 0;
+    double row_time = 0;    // frames per stored row, signed
+    std::vector<ScanLayout> scans;
+};
+
+// The model's unknowns. The names the solver knows them by: "roll", "scan<k>.axis", "scan<k>.axis_slope",
+// "scan<k>.axial_scale", "scan<k>.d0", "scan<k>.d1", "scan<k>.height", "scan<k>.<stretch name>.height".
+struct ScanParameters {
+    double axis = 0;         // the axis column at the middle row, at the height H_mid
+    double axis_slope = 0;   // columns the axis moves per row of the axis stage's travel
+    double axial_scale = 0;  // the sample travels (1 + axial_scale) rows per row of the record
+    double d[2] = {0, 0};    // where the sample's origin sits on the rotation stage [px]
+    double height = 0;       // rows
+    std::vector<double> stretch_height;  // per stretch: rows beyond the scan's height
+};
+struct Parameters {
+    double roll = 0;         // of the rotation axis against the detector's columns [rad]
+    std::vector<ScanParameters> scans;
+};
+Parameters empty_parameters(const Acquisition& acq);
+
+// A piece of the sample as one scan holds it: the stored pixel (row, col) of a frame, fractions allowed.
+struct Sighting {
+    int scan = 0, stretch = 0;  // stretch: index into ScanLayout::stretches
+    double frame = 0, row = 0, col = 0;
+};
+struct Comparison {
+    std::string kind;       // "opposite", "turn", "resthelix", "pair": what the report groups by
+    Sighting a, b;
+    bool opposite = false;  // b sees a's rays from the other side, half a turn on
+    double correlation = 0;
+    double curvature[6] = {0, 0, 0, 0, 0, 0};  // of the correlation's peak (PatchMeasurement)
+};
+// The middle of a registered block or patch as two sightings: where A holds it, and where the registration found
+// it in B. stretch_a, stretch_b: indices into the scans' layouts. request: the one the measurement answered (its
+// sway is in where B's sighting lies).
+Comparison comparison_of(const Acquisition& acq, const std::string& kind, int scan_a, int stretch_a, int scan_b, int stretch_b, const ViewRequest& request,
+                         const ViewMeasurement& m);
+
+// The ray a sighting records under the parameters: the angle [deg], s [px], z [rows].
+struct Ray {
+    double angle_deg = 0, s = 0, z = 0;
+};
+Ray ray_of(const Acquisition& acq, const Parameters& p, const Sighting& g);
+// What the parameters leave of each comparison: frames (the two rays' angles, less the half turn of opposite
+// views, in B's frames), rows (z_b - z_a) and columns (s_b - s_a, or s_b + s_a for opposite views).
+std::vector<std::array<double, 3>> residuals(const Acquisition& acq, const Parameters& p, const std::vector<Comparison>& comparisons);
+
+struct GeometryOptions {
+    double huber = 0.03;       // on the length of a comparison's residual (columns, rows) [px]
+    int max_iterations = 100;
+    // Free unless held: every scan's axis, axis_slope and axial_scale, the roll, and the height of every stretch
+    // that is not a helix. Held unless freed: every scan's d and height, the helix' height. A stage of the
+    // calibration is these two lists.
+    std::vector<std::string> held, freed;
+};
+struct GeometrySolution {
+    Parameters parameters;
+    FitSummary solver;
+    std::vector<std::string> free;    // the unknowns that were solved for
+    std::vector<std::string> unused;  // asked free, but no comparison depends on them: held where they started
+    int rank = 0;
+    std::vector<std::array<double, 3>> residual;  // per comparison: frames, rows, columns
+    // what the solution leaves, per kind and pair of scans (scan_a = scan_b = -1: the kind over all scans)
+    struct Left {
+        std::string kind;
+        int scan_a = -1, scan_b = -1;
+        std::size_t n = 0;
+        double rms[3] = {0, 0, 0}, median[3] = {0, 0, 0};  // frames, rows, columns
+    };
+    std::vector<Left> left;
+};
+// The places that best explain the comparisons, from `start`. It is an error if the free unknowns depend on each
+// other (the message names a dependent set) or the solve is not usable.
+GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Comparison>& comparisons, const Parameters& start, const GeometryOptions& options = {});
+// As JSON text: the parameters by name, how the solve ended, what is left.
+std::string solution_json(const Acquisition& acq, const GeometrySolution& s);
+
 // ---- small numerics the stages share (as numpy does them)
 
 // num evenly spaced values from a to b inclusive

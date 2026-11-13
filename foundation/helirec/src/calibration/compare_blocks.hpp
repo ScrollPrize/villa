@@ -30,10 +30,6 @@ struct Size {
 Size pick_size(int max_total, int max_inner, int min_margin);
 Size diagnostic_columns(const Size& full, const ViewOptions& opt);
 
-// what the record states per frame of a stretch: angle, and height in rows (row_sign: +1 if a larger axis-stage
-// position puts the sample on higher rows)
-Trajectory trajectory(const Record& rec, const Stretch& s, double row_sign);
-
 struct Pairing {
     ViewScan A, B;
     int sa = 0, sb = 0;  // stretches

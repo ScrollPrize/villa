@@ -873,6 +873,12 @@ and `--center-mm` can override these defaults. `--workers` controls concurrent f
 the decoder threads per file (default 2). `--max-files 1` runs one pending file as a smoke test. No SDK or HDF5
 codec plugin is required; build helirec with `HELIREC_OPENJPH=ON` (the default).
 
+`--remote esrf:/data/.../RAW_DATA` (an rclone SFTP remote and the path that `--source-root` stands for) reads
+whatever is not local over SFTP with paramiko instead of through the mount: the masters and one sample file per
+tile for the plan, then for each projection file only the bytes the reduced decode needs (more are fetched when
+they do not suffice). Host, user and password come from the rclone config; no mount is read, so `--source-root`
+only names the files and must stay the same between runs of one output folder.
+
 Projection stacks are uncompressed uint16 HDF5. Darks and flats are read at full resolution, reduced with
 `calibration.at_resolution` on the same chunk boundaries, and saved uncompressed as float32 to preserve the
 fractional low-pass values. Their sources have no stored pyramid, so their full pixels must be read.

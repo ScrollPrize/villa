@@ -3,13 +3,15 @@
 // registration of the two blocks must then return. Pure bookkeeping, no frames: registration.cpp tests it on
 // synthetic data.
 //
-// A trajectory gives, per frame, the stated angle [deg, cumulative] and the stated position along the axis in
-// detector rows, counted so that a larger value puts the sample's content on a higher row: content at
+// A trajectory (record.hpp) gives, per frame, the stated angle [deg, cumulative] and the stated position along the
+// axis in detector rows, counted so that a larger value puts the sample's content on a higher row: content at
 // sample-fixed height w appears on detector row w + rows[frame].
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
+
+#include "helirec/calibration/record.hpp"
 
 namespace helirec::calibration {
 
@@ -21,10 +23,6 @@ inline void crop_column_origins(int& a, int& b, int width, int cropped_width, do
     a += offset;
     b += mirror ? spare - offset : offset;
 }
-
-struct Trajectory {
-    std::vector<double> angle_deg, rows;
-};
 
 struct BlockPlan {
     std::int64_t p0 = 0, j0 = 0;  // frames p0 .. p0 + n - 1 of A against frames j0 .. j0 + n - 1 of B

@@ -152,4 +152,20 @@ inline std::vector<double> stated_height(const Record& rec, const Stretch& s) {
 
 inline double pixel_um(const Record& rec) { return rec.technique.number("scan/sample_pixel_size"); }
 
+// What the record states per frame of a stretch: the angle [deg, cumulative] and the position along the axis in
+// detector rows, counted so that a larger value puts the sample's content on a higher row (row_sign: +1 if a larger
+// axis-stage position does that, -1 if it puts it on a lower one).
+struct Trajectory {
+    std::vector<double> angle_deg, rows;
+};
+inline Trajectory trajectory(const Record& rec, const Stretch& s, double row_sign) {
+    Trajectory t;
+    t.angle_deg = stated_angle(s);
+    const std::vector<double> z = stated_height(rec, s);
+    const double px_mm = pixel_um(rec) * 1e-3;
+    t.rows.resize(z.size());
+    for (std::size_t i = 0; i < z.size(); ++i) t.rows[i] = row_sign * z[i] / px_mm;
+    return t;
+}
+
 }  // namespace helirec::calibration

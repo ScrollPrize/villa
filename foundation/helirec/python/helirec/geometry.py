@@ -196,6 +196,67 @@ def fit_refill_shots(x, n_rows, T, E, pre):
     return fit if fit["usable"] else None
 
 
+# ---------------------------------------------------------------- the joint model
+
+def _acquisition_text(acq):
+    f = lambda x: [float(v) for v in x]
+    scans = [dict(name=str(s.get("name", k)), mid_height=float(s.get("mid_height", 0.0)),
+                  stretches=[dict(name=str(t["name"]), index=int(t.get("index", a)), helix=bool(t.get("helix", False)), angle_deg=f(t["angle_deg"]), rows=f(t["rows"]))
+                             for a, t in enumerate(s["stretches"])])
+             for k, s in enumerate(acq["scans"])]
+    return json.dumps(dict(rows=int(acq["rows"]), cols=int(acq["cols"]), row_time=float(acq.get("row_time", 0.0)), scans=scans))
+
+
+def _parameters_text(p):
+    """The joint model's parameters (a start, or a solution with whatever else it holds) as the C++ side reads them."""
+    return "" if p is None else json.dumps(dict(roll=p.get("roll", 0.0), scans=p["scans"]), default=float)
+
+
+def _sightings(rows):
+    return np.ascontiguousarray(np.asarray(rows, np.float64).reshape(-1, 5))
+
+
+def rays(acquisition, parameters, sightings):
+    """The ray each sighting (scan, stretch, frame, row, column) records under the joint model's parameters:
+    (n, 3) angle [deg], distance s from the sample's origin across the beam [px], height z [rows].
+    (helirec::calibration::geometry_calibration::ray_of)"""
+    from . import _core
+    return _core.geometry_rays(_acquisition_text(acquisition), _parameters_text(parameters), _sightings(sightings))
+
+
+def residuals(acquisition, parameters, comparisons):
+    """What the parameters leave of each comparison: (n, 3) frames (the two rays' angles, less the half turn of
+    opposite views), rows and columns. (helirec::calibration::geometry_calibration::residuals)"""
+    from . import _core
+    return _core.geometry_residuals(_acquisition_text(acquisition), _parameters_text(parameters), _sightings([c["a"] for c in comparisons]),
+                                    _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons])
+
+
+def solve_geometry(acquisition, comparisons, start=None, huber=0.03, max_iterations=100, held=(), freed=()):
+    """The joint geometry model solved on comparisons (helirec/calibration/geometry_calibration.hpp states the model).
+
+    acquisition: dict(rows, cols, row_time [frames per row], scans=[dict(name, mid_height, stretches=[dict(name,
+    helix, angle_deg, rows)])]): what the records state per frame. comparisons: dicts with kind, a and b (each a
+    sighting: scan, stretch, frame, row, column) and opposite. start: the parameters to start from, as the result
+    holds them (None: zeros). held, freed: names of unknowns to hold or free against the default (the scans' own
+    axis, axis_slope and axial_scale, the roll and the rest turns' heights are free; d, height and a helix' height
+    held).
+
+    Returns the solution (roll, scans, free, unused, solver, left) with "residual": (n, 3) frames, rows, columns.
+    It is an error if the free unknowns depend on each other.
+    (helirec::calibration::geometry_calibration::solve_geometry)"""
+    from . import _core
+    try:
+        text, residual = _core.geometry_solve(_acquisition_text(acquisition), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
+                                              _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons],
+                                              _parameters_text(start), float(huber), int(max_iterations), list(held), list(freed))
+    except RuntimeError as e:
+        raise ValueError(str(e)) from None
+    out = json.loads(text)
+    out["residual"] = residual
+    return out
+
+
 # ---------------------------------------------------------------- the pose of every frame
 
 def frame_poses(cal, angles_deg, heights_rows):
