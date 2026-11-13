@@ -49,7 +49,7 @@ class FrameSource:
 
 
 def _mean_frames(src: FrameSource, dark=None, control_A=None, progress=None) -> np.ndarray:
-    """The mean of a sequence's frames as nx2etf reduces them (helirec::calib::mean_frames): float32, added in
+    """The mean of a sequence's frames as nx2etf reduces them (helirec::calibration::mean_frames): float32, added in
     order, then / n; with dark and control_A (the ring current of every frame) each frame F enters as
     dark + (F - dark) NOMINAL_CURRENT_A / control_A. progress(k): called as k more frames are done."""
     refs = src.refs
@@ -115,14 +115,14 @@ def at_resolution(image, reduce, chunk_rows):
     change the frame's last two or three reduced rows, here as in the frames. On a Paris4 frame this differs
     from the reader's reduced frame by 0.3 counts rms (the rounding), at 1, 2 and 3 levels."""
     x = np.asarray(image, np.float64)
-    out = _core.at_resolution(np.ascontiguousarray(x.reshape((-1,) + x.shape[-2:])), int(reduce), int(chunk_rows))      # helirec::calib::at_resolution
+    out = _core.at_resolution(np.ascontiguousarray(x.reshape((-1,) + x.shape[-2:])), int(reduce), int(chunk_rows))      # helirec::calibration::at_resolution
     return out.reshape(x.shape[:-2] + out.shape[-2:])
 
 
 # ============================================================================ weights
 def weight_map(flat_stacks, transition_width_vertical=15.0, sigma=10.0, crop_top=0, crop_bottom=0) -> np.ndarray:
     """prepare_weights_double: gaussian_filter(mean(all flats) / max, sigma) * vertical erf border.
-    (helirec::calib::weight_map)"""
+    (helirec::calibration::weight_map)"""
     return _core.weight_map([np.ascontiguousarray(st, np.float32) for st in flat_stacks], float(transition_width_vertical), float(sigma), int(crop_top), int(crop_bottom))
 
 
@@ -131,7 +131,7 @@ def apodisation_widths(n_cols, est_cor_main_offset, companion_dx, transition_wid
     """(w_left, w_right) for (main, companion) as prepare_weights_double --is_tetra writes them.
     Main scan: 'pente' beyond the rotation axis (min(2 tw, distance axis->edge)) on the axis side and a
     border taper towards the companion; companion: border taper on the side facing the main scan.
-    (helirec::calib::apodisation_widths)"""
+    (helirec::calibration::apodisation_widths)"""
     try:
         return _core.apodisation_widths(int(n_cols), float(est_cor_main_offset), float(companion_dx), float(transition_width_horizontal), float(transition_width_borders))
     except RuntimeError as e:
@@ -356,7 +356,7 @@ def flat_noise_spectra(scan: BlissScan, dark, n_flats=200, tile=BLUR_TILE):
 
 
 def measure_detector_blur(scan: BlissScan, dark, n_flats=200, log=print):
-    """The detector's blur field of a scan, from the noise of its flats (_core.detector_blur_field_fit: calib.hpp). The field is kept
+    """The detector's blur field of a scan, from the noise of its flats (_core.detector_blur_field_fit: helirec/calibration/intensity.hpp). The field is kept
     only if it explains the noise spectra (residual below BLUR_MIN_GAIN of the residual without it) and reaches
     BLUR_MIN_PX somewhere on the detector; otherwise "field" is [] and nothing changes in the reconstruction."""
     t0 = time.time()

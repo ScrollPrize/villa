@@ -28,14 +28,14 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
 
 Outputs record the mode, its conventions and every resolved parameter (`manifest.json`, OME-Zarr attributes).
 
-## Slices and volumes (`helirec-slices`)
+## Slices and volumes (`helirec-reconstruct`)
 
 ```bash
-helirec-slices PROJ -n 8 --tag unfiltered                                    # 8 slices, default mode
-helirec-slices PROJ -n 8 --set mode=legacy_reference --tag reference         # the reference workflow
-helirec-slices PROJ --fractions 0.4 0.5 --set "filters=paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)" --tag db500
-helirec-slices PROJ -n 4 --device cpu --tag cpu
-helirec-slices PROJ -n 8 --set "filters=mtf_paganin(delta_beta=1000,sigma=1.06)" \
+helirec-reconstruct PROJ -n 8 --tag unfiltered                                    # 8 slices, default mode
+helirec-reconstruct PROJ -n 8 --set mode=legacy_reference --tag reference         # the reference workflow
+helirec-reconstruct PROJ --fractions 0.4 0.5 --set "filters=paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)" --tag db500
+helirec-reconstruct PROJ -n 4 --device cpu --tag cpu
+helirec-reconstruct PROJ -n 8 --set "filters=mtf_paganin(delta_beta=1000,sigma=1.06)" \
     --set sld=fraction=0.6,length=400 --tag mtf        # fused phase retrieval + detector deblur, calibrated glare
 ```
 
@@ -43,8 +43,8 @@ Range mode reconstructs contiguous slices in chunks (`--chunk`, default 32) and 
 Zarr v2) by default:
 
 ```bash
-helirec-slices PROJ --z 900 1700 --roi X0 X1 Y0 Y1 --uint8 --levels 4 --tag block       # float32 + uint8 OME-Zarr
-helirec-slices PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif                 # TIFF stacks
+helirec-reconstruct PROJ --z 900 1700 --roi X0 X1 Y0 Y1 --uint8 --levels 4 --tag block       # float32 + uint8 OME-Zarr
+helirec-reconstruct PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif                 # TIFF stacks
 ```
 
 * `--z` is the volume slice index (z = view height − first doable height, z = 0 at the top); `--heights` uses
@@ -135,7 +135,7 @@ mx, mean = bc.composites(set=2)
 |---|---|---|---|
 | 0 | Bliss master parsing: entries, angles, z, machine current, frame→file map | `python/helirec/bliss.py` | Python |
 | 1 | raw row-window reads (`pread`, one HDF5 chunk per frame) | `raw_reader.hpp` | CPU (threads) |
-| 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame | `calib.hpp`, `python/helirec/calibration.py` | CPU |
+| 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame | `calibration/intensity.hpp`, `python/helirec/calibration.py` | CPU |
 | 2b | geometry calibration: layout, rows' timing, detector map, poses and motion (`helirec-geometry`) | `calibration/`, `python/helirec/geometry.py` | CPU, CUDA |
 | 3 | helical geometry: span info, doable span, per-projection shifts and grid bins | `helical.hpp` | CPU |
 | 4 | gridding: flat-field, weights, vertical / horizontal kernels, angular bins (gather form) | `accumulate.hpp` | CPU, CUDA |
@@ -262,7 +262,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   ```bash
   .venv/bin/python evaluation/wiener_table.py wiener.json --transfer film_transfer.json --sharp ta_nophase 1250 1400 \
       --curves RUN/fsc_halves --pair half0 half1 [--filtered base]
-  helirec-slices PROJ --set backprojector=fbp --set "filters=wiener(table=wiener.json)" ...
+  helirec-reconstruct PROJ --set backprojector=fbp --set "filters=wiener(table=wiener.json)" ...
   ```
   On PHerc0343P (8.64 µm, glare correction 0.6 / 400) the Teflon wrap is reproduced through 1.00 ± 0.03 up to
   0.28 cycles per pixel and through the designed `g` beyond (0.84 at 0.36, 0.56 at 0.45), where
@@ -306,9 +306,9 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   For ESRF **BM18 calibration files**, use the new full-resolution profile:
 
   ```bash
-  helirec-slices PROJ -n 4 --set "sld=json=/path/to/diffusion.json" --tag bm18_sld
+  helirec-reconstruct PROJ -n 4 --set "sld=json=/path/to/diffusion.json" --tag bm18_sld
   # Explicit model, with two diffusion tails (illustrative values, not a calibration):
-  helirec-slices PROJ -n 4 --set "sld=profile=bm18,fraction=0.06:0.03,length=40:200" --tag bm18_sld
+  helirec-reconstruct PROJ -n 4 --set "sld=profile=bm18,fraction=0.06:0.03,length=40:200" --tag bm18_sld
   ```
 
   Night Rail JSON fields `fraction` and `scale_l` may be scalars or equal-length lists; lengths are in original
@@ -411,7 +411,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     0 for step scans); its inverse 1 / sinc(F f) is applied to every sinogram as a 9-tap kernel along the angle
     (`sino.hpp`), at most 1.43 at the angular Nyquist frequency. 0: off. **Disabled for now with
     `angle_interp=views`** (the default): the kernel runs along one turn of grid angles and has not been carried
-    over to a row per view; `info["exposure_arc_bins"]` is then 0 and `helirec-slices` says so. `angle_interp=nearest`
+    over to a row per view; `info["exposure_arc_bins"]` is then 0 and `helirec-reconstruct` says so. `angle_interp=nearest`
     applies it.
     On PHerc0343P `nearest` and the arc correction together sharpen the tangential edge of the wrap at r ≈ 1200 px by
     3 % (Paganin only) to 7 % (with the unsharp mask); as the removed blurs also averaged noise, the noise in the outer
@@ -492,7 +492,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
 Reconstructs the same slices with each method of a JSON config (default `evaluation/default_methods.json`: FBP,
 SIRT, MLEM and gridrec on unfiltered data) and writes float32 `slices/<method>/z<Z>.tif` and `manifest.json`
 (time, mean, std, fine-scale std). PNG contact and crop sheets are opt-in with `--previews` (the slice folders hold
-TIFFs only); `helirec-slices --previews` writes PNG slices. Preview windows are shared in attenuation units; legacy TIFFs retain native reference units.
+TIFFs only); `helirec-reconstruct --previews` writes PNG slices. Preview windows are shared in attenuation units; legacy TIFFs retain native reference units.
 Options: `--projections`, `--cache_dir`, `-n`, `--z Z0 Z1`, `--roi X0 X1 Y0 Y1` (`-1`: whole slices),
 `--methods NAME ...`, `--overwrite`; existing slices with matching provenance are reused.
 
@@ -632,7 +632,7 @@ disk rather than the page cache that read dominates. The first chunk of a proces
 
 `helirec::calibration` (`include/helirec/calibration/`, `src/calibration/`) checks what the acquisition record of
 a scan states, first against itself and then against the raw frames. It shares nothing with the calibration the
-reconstruction uses (`helirec/calib.hpp`, `helirec.calibration`): it reads the BLISS master file and the frame
+reconstruction uses (`helirec/calibration/intensity.hpp`, `helirec.calibration`): it reads the BLISS master file and the frame
 files directly, and the only processing is a dark subtraction and a division by the mean flat of the scan.
 
 ```bash
@@ -763,7 +763,7 @@ every row index of the reader in reduced rows, decoded 3.4, 12 and 44 times fast
 chunk: 8.5, 2.5, 0.7, 0.2 ms) with nothing written to disk. A reduced value is not the mean of 2^reduce pixels:
 value (j, k) is the wavelet's low band at the stored pixel (j, k) 2^reduce, each chunk of rows an image of its
 own, so a geometry in stored pixels holds for the reduced frame with every position divided by 2^reduce and
-nothing added. Darks, flats and weights are taken to the same grid by `helirec::calib::at_resolution`
+nothing added. Darks, flats and weights are taken to the same grid by `helirec::calibration::at_resolution`
 (`helirec.calibration.at_resolution(image, reduce, chunk_rows)` in Python) (the same low-pass; it reproduces a Paris4 frame read at reduce 1, 2, 3 to 0.3 counts rms,
 the rounding), so that a flat divides the fixed pattern out as at full resolution. Plain (uncompressed) frames
 have no such resolutions and are refused; rows, columns and rows per chunk must be multiples of 2^reduce.
@@ -883,7 +883,7 @@ texture, so compare accepted matches and retain rejected attempts.
 Measures the geometry of a two-scan helical acquisition from its own frames, with nothing typed in: the detector
 map and the poses that a reconstruction needs before it can assign a raw value to the line it measured. It is a
 step that writes what it measured (JSON), and it is the reconstruction's only geometry calibration:
-`helirec-slices` makes it on first use and keeps it in its calibration cache, or takes the file it is given
+`helirec-reconstruct` makes it on first use and keeps it in its calibration cache, or takes the file it is given
 (`--set geometry=...`, below). The darks, flats, weights and the detector's blur field are
 `python/helirec/calibration.py`'s.
 
@@ -941,7 +941,7 @@ see. The default is the blocks (`--patch 0`), whose result is unchanged. The ste
 `helirec::calibration`'s session (raw frames, the scan's own dark and mean flat, the registration on CPU or CUDA)
 and none of the pipeline's calibration.
 
-**In the reconstruction:** `helirec-slices ...` with nothing said (the cache's `geometry.json`, made if it is not
+**In the reconstruction:** `helirec-reconstruct ...` with nothing said (the cache's `geometry.json`, made if it is not
 there), or `--set geometry=OUT/geometry.json` (`params["geometry"]`). Every
 projection is read on the grid of the calibration's detector map (the rows at the mapped row by the row
 kernel, the columns resampled exactly: `resample_rows`, a non-uniform transform of the interpolant the exact shift
@@ -1006,7 +1006,7 @@ These raise explicit errors:
 * an acquisition the geometry calibration step can read: a helix whose travel per turn is less than the
   detector's height, a turn at rest before and after it, two scans of equally long stretches;
 * a mosaic (tiles that differ in the sample's place on the rotation stage) is checked by `helirec-calibration`
-  and nothing calibrates its geometry; `helirec-geometry` and `helirec-slices` do not take one, and a tile can
+  and nothing calibrates its geometry; `helirec-geometry` and `helirec-reconstruct` do not take one, and a tile can
   only be reconstructed alone, from a geometry given to it (`helirec.mosaic.tile_reconstructor`);
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.

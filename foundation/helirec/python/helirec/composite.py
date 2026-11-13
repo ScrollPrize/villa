@@ -1,7 +1,7 @@
 """helirec-composite: layer composites (max, mean) of a tifxyz surface, plus xy slices.
 
 Two sources:
-  * a reconstructed OME-Zarr block (helirec-slices output):
+  * a reconstructed OME-Zarr block (helirec-reconstruct output):
         helirec-composite VOLUME.zarr TIFXYZ_DIR --layers 15 --start -4 --tag seg
   * the raw projections directly (band reconstruction: exact backprojector at the pixels the layers need, no
     volume), optionally sweeping Paganin parameters:
@@ -260,10 +260,10 @@ def main(argv=None):
     p.add_argument("inputs", nargs="*", help="[VOLUME.zarr] TIFXYZ_DIR (VOLUME omitted with --projections)")
     p.add_argument("--config", help="JSON file of arguments (keys = option names); command line overrides it")
     src = p.add_argument_group("source")
-    src.add_argument("--volume", help="OME-Zarr written by helirec-slices (or the first positional argument)")
+    src.add_argument("--volume", help="OME-Zarr written by helirec-reconstruct (or the first positional argument)")
     src.add_argument("--surface", help="tifxyz directory (or the last positional argument)")
     src.add_argument("--projections", help="raw projection folder: reconstruct the band directly (no volume)")
-    src.add_argument("--cache_dir", help="--projections: calibration cache (helirec-slices' OUT_ROOT/_calibration)")
+    src.add_argument("--cache_dir", help="--projections: calibration cache (helirec-reconstruct' OUT_ROOT/_calibration)")
     src.add_argument("--z", nargs=2, type=int, metavar=("Z0", "Z1"),
                      help="--projections: volume slices [Z0, Z1) to use (default: all the surface reaches)")
     src.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="--projections: recon parameter")

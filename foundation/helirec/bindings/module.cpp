@@ -1077,7 +1077,7 @@ class PySliceReconstructor {
 
 }  // namespace
 
-void bind_calib(nb::module_& m);  // bindings/calib_bindings.cpp
+void bind_intensity(nb::module_& m);  // bindings/intensity_bindings.cpp
 void bind_spectra(nb::module_& m);  // bindings/spectra_bindings.cpp
 void bind_calibration(nb::module_& m);  // bindings/calibration_bindings.cpp
 void bind_projection(nb::module_& m);  // bindings/projection_bindings.cpp
@@ -1088,7 +1088,7 @@ NB_MODULE(_core, m) {
         return std::make_unique<PythonFilter>(p);
     });
 
-    bind_calib(m);
+    bind_intensity(m);
     bind_spectra(m);
     bind_calibration(m);
     bind_projection(m);

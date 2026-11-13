@@ -1,5 +1,5 @@
 #pragma once
-// Kernels of the intensity calibration (python/helirec/calibration.py): the scipy-compatible Gaussian filter and the
+// The intensity calibration's kernels (python/helirec/calibration.py): the scipy-compatible Gaussian filter and the
 // borders of the weight maps, and the detector's blur field from the noise of the flats. CPU (OpenMP); the data
 // sizes are small. (The geometry is the geometry calibration's: helirec/calibration/, python/helirec/geometry.py.)
 #include <cstddef>
@@ -14,7 +14,7 @@ namespace helirec {
 class RawReader;
 }
 
-namespace helirec::calib {
+namespace helirec::calibration {
 
 // scipy.ndimage.gaussian_filter1d semantics: kernel exp(-x^2 / 2 sigma^2) normalised (double),
 // radius = int(truncate * sigma + 0.5), mode "reflect" (d c b a | a b c d) or "nearest",
@@ -91,4 +91,4 @@ struct DetectorBlurField {
 DetectorBlurField detector_blur_field_fit(const double* power, int ny, int nx, int tile, const int* ys, const int* xs,
                            std::size_t rows, std::size_t cols, double f_max = 0.30);
 
-}  // namespace helirec::calib
+}  // namespace helirec::calibration

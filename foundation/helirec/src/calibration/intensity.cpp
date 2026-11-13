@@ -1,4 +1,4 @@
-#include "helirec/calib.hpp"
+#include "helirec/calibration/intensity.hpp"
 
 #include <fftw3.h>
 
@@ -11,7 +11,7 @@
 
 #include "helirec/fourier.hpp"
 
-namespace helirec::calib {
+namespace helirec::calibration {
 
 namespace {
 
@@ -371,4 +371,4 @@ DetectorBlurField detector_blur_field_fit(const double* power, int ny, int nx, i
     return out;
 }
 
-}  // namespace helirec::calib
+}  // namespace helirec::calibration

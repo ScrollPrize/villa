@@ -1,13 +1,13 @@
-// helirec/calib.hpp: the reduction of darks and flats, the weight map and its apodisation widths, and detector
+// helirec/calibration/intensity.hpp: the reduction of darks and flats, the weight map and its apodisation widths, and detector
 // images at the reduced resolutions of frames stored as JPEG 2000.
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 
-#include "helirec/calib.hpp"
+#include "helirec/calibration/intensity.hpp"
 #include "helirec/raw_reader.hpp"
 
-namespace helirec::calib {
+namespace helirec::calibration {
 
 std::vector<float> mean_frames(RawReader& reader, const int32_t* file_index, const int32_t* frame_index, std::size_t n, const float* dark,
                                const double* control_A, double nominal_A, const std::function<void(std::size_t)>& progress) {
@@ -152,4 +152,4 @@ std::vector<float> at_resolution(const double* images, std::size_t n, int rows, 
     return out;
 }
 
-}  // namespace helirec::calib
+}  // namespace helirec::calibration

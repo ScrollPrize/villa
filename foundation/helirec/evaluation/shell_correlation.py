@@ -5,7 +5,7 @@
         --volume base=RUN/base/volume.zarr --volume unsharp=RUN/unsharp/volume.zarr --out OUT
     python evaluation/shell_correlation.py --volume even=A/volume.zarr --volume odd=B/volume.zarr --pair even odd --out OUT
 
-Volumes are OME-Zarr outputs of helirec-slices (float32 or uint8; their place in the scan's full volume is read from
+Volumes are OME-Zarr outputs of helirec-reconstruct (float32 or uint8; their place in the scan's full volume is read from
 their metadata) or any Zarr of the full volume (NAME=LOCATION@Z0,Y0,X0 gives an origin; remote ones use --cache).
 Everything is computed on cubic blocks (--block, a lattice of step --step) of the region the volumes share, with
 helirec.BlockCorrelator (C++ / CUDA): sums of |A|^2, |B|^2, Re(A conj B) in bins of |k| (shells) and of the angle of k

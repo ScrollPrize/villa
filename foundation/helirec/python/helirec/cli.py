@@ -1,16 +1,16 @@
-"""helirec-slices: reconstruct slices of an extended-FOV helical scan pair from the raw projection
+"""helirec-reconstruct: reconstruct slices of an extended-FOV helical scan pair from the raw projection
 folders with helirec (C++/CUDA).
 
 Two modes:
 
 * fractions (independent single slices, TIFF; PNG previews opt in with --previews):
-    helirec-slices PROJ -n 8 --tag baseline
-    helirec-slices PROJ --fractions 0.4 0.5 --set "filters=paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)" --tag db500
-    helirec-slices PROJ --fractions 0.5 --set "filters=paganin(delta_beta=2000)+median(radius=1,stage=log)"
+    helirec-reconstruct PROJ -n 8 --tag baseline
+    helirec-reconstruct PROJ --fractions 0.4 0.5 --set "filters=paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)" --tag db500
+    helirec-reconstruct PROJ --fractions 0.5 --set "filters=paganin(delta_beta=2000)+median(radius=1,stage=log)"
 
 * range (contiguous slices, reconstructed in chunks of --chunk slices; OME-Zarr by default):
-    helirec-slices PROJ --z Z0 Z1 --roi X0 X1 Y0 Y1 --uint8 --tag block
-    helirec-slices PROJ --heights H0 H1 --format tiff --tag block_tif
+    helirec-reconstruct PROJ --z Z0 Z1 --roi X0 X1 Y0 Y1 --uint8 --tag block
+    helirec-reconstruct PROJ --heights H0 H1 --format tiff --tag block_tif
 
   --z uses volume slice indices (z = view height - first doable height, z = 0 at the top);
   --heights uses helirec view heights; both are [start, end). --roi X0 X1 Y0 Y1 crops each slice ([start, end)).
@@ -401,7 +401,7 @@ def main(argv=None):
     effective = {k: v for k, v in vars(a).items() if k != "config" and v is not None}
     effective["projections"] = os.path.abspath(a.projections)
     effective["out_root"] = os.path.abspath(a.out_root)
-    with open(os.path.join(outdir, "config.json"), "w") as fh:  # rerun with: helirec-slices --config config.json
+    with open(os.path.join(outdir, "config.json"), "w") as fh:  # rerun with: helirec-reconstruct --config config.json
         json.dump(effective, fh, indent=2, default=_json_default)
     cache = a.cache_dir or os.path.join(a.out_root, "_calibration")
     t0 = time.time()

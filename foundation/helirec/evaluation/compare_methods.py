@@ -5,7 +5,7 @@
     python evaluation/compare_methods.py --projections PROJ --out OUT --roi 1700 2700 1700 2700 --z 1300 1400
 
 Config (JSON):
-  projections, cache_dir, device       the scan pair (as for helirec-slices; or --projections / --cache_dir)
+  projections, cache_dir, device       the scan pair (as for helirec-reconstruct; or --projections / --cache_dir)
   params                               HelicalRecon parameters shared by all methods, e.g. {"filters": []}
                                        (filters: a list of dicts or chain text, e.g. "paganin(delta_beta=1000)")
   slices                               one of {"z": [...]}, {"heights": [...]}, {"fractions": [...]},
@@ -117,7 +117,7 @@ def slice_heights(r, spec):
         if "z_range" in spec:
             z0, z1 = spec["z_range"]
             zs = [int(round(0.5 * (z0 + z1 - 1)))] if n == 1 else [int(round(z0 + (z1 - 1 - z0) * i / (n - 1))) for i in range(n)]
-        else:   # as helirec-slices: the middle 2/3 of the object extent
+        else:   # as helirec-reconstruct: the middle 2/3 of the object extent
             A, B = DEFAULT_OBJECT_EXTENT
             f0, f1 = A + (B - A) / 6, A + (B - A) * 5 / 6
             fr = [0.5 * (f0 + f1)] if n == 1 else [f0 + (f1 - f0) * i / (n - 1) for i in range(n)]
