@@ -146,6 +146,59 @@ The native tifxyz directory must contain `x.tif`, `y.tif`, `z.tif`, and
 `volume_source.txt`. Use `--plan-only` to inspect occupied-chunk and patch
 counts without creating output.
 
+## Live preview server
+
+`preview_server` runs flat inference on the part of a segment a viewer is
+showing. The Live preview group in VC3D's Ink Detection dock can show its
+output: VC3D samples the layer stack under the visible canvas rectangle,
+posts it to the server, and draws the reply over the segment. The preview is
+model output, like any flat inference map. Its reversed-layer view is a
+control: it shows how much of the output depends on the order of the layers.
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.preview_server \
+  --checkpoint /data/ink_9um/checkpoints/hybrid-best.pth --device auto --port 8765
+```
+
+The server listens on 127.0.0.1 only. It uses flat inference's own checkpoint
+loading, normalization, patch grid (`--overlap`, `--stride`), layer selection,
+blend window (`--blend-mode`), CUDA autocast dtype (`--amp-dtype`) and uint8
+truncation, so a preview pixel equals the pixel `infer.py --roi` writes for the
+same input array and settings, edges included. `torch.compile` is off unless
+`--compile` is given. `--cache-mb` caps the patch cache (default 256 MiB) and
+`--max-view-px` the view size. A preview equals a map only where the uploaded
+layers equal the map's input array; the 9 µm preparer pools a 2.4 µm volume
+(level 2, a mean of 4 planes), so on 2.4 µm scans a preview of single sampled
+layers approximates the map.
+
+Protocol (ink preview api 1; coordinates are canvas pixels, and the patch grid
+starts at canvas pixel (0, 0)):
+
+- `GET /health` returns JSON with `service`, `api`, `backend`
+  (`torch:<device>`), `model` (the checkpoint file stem, or `--name`), `patch`,
+  `stride`, `depth`, `voxel_um` (null unless the checkpoint config states
+  `voxel_size_um` or `--voxel-um` is given), `max_view_px`, `blend_mode` and
+  cache statistics.
+- `POST /preview?key=K&cw=CW&ch=CH&x=X&y=Y&w=W&h=H&variant=f&format=u8` asks
+  for the view `x, y, w, h` on a `cw` by `ch` canvas. `key` (at most 200
+  characters) names what decides the voxels under the canvas: surface, edit
+  state, volume, level and layer offsets; the client changes it when any of
+  them changes. `variant` is `f`, or `r` for the layers reversed as
+  `--direction reverse` does. `format` is `u8` (floor(255 p), as in the TIFF),
+  `f32` (little-endian float32) or `png` (8-bit gray).
+  - `200`: the view, with headers `X-Shape: h,w`, `X-Backend` and
+    `X-Tiles: computed,cached`. Pixels that no nonempty patch covers are 0.
+  - `409`: `{"need": {"x", "y", "w", "h"}, "depth": D, "missing": N}` when some
+    patches that overlap the view are neither cached nor inside the upload.
+    Nothing is computed. The client posts again with `sx`, `sy`, `sw`, `sh`
+    set to that rectangle, `dtype` (`uint8` or `uint16`) and a body of
+    `D * sh * sw` voxels, layers first, C order, little-endian. Patches are
+    cached by `(key, variant, row, column)`, so a pan uploads only the new
+    strip.
+  - `400`, `404`, `413` (a view over `max_view_px`, or an upload larger than
+    the view plus one patch on each side) and `500` return JSON
+    `{"error": TEXT}`; the server keeps running.
+
 ## Checkpoints and metrics
 
 Training embeds the resolved JSON config in each checkpoint. Inference

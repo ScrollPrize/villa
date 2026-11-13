@@ -202,6 +202,15 @@ def resolve_patch_stride(
     return max(1, int(round(patch_size * (1.0 - overlap))))
 
 
+def resolve_blend_mode(blend_mode: str, *, stride: int, patch_size: int) -> str:
+    """Resolve 'auto' to constant without overlap and Hann otherwise."""
+
+    blend_mode = str(blend_mode)
+    if blend_mode == "auto":
+        blend_mode = "constant" if stride >= patch_size else "hann"
+    return blend_mode
+
+
 def center_crop_layer_indices(
     layer_indices: np.ndarray,
     *,
@@ -298,6 +307,26 @@ def clip_block_to_roi(block: Block, bounds: tuple[int, int, int, int]) -> Block 
     if top >= bottom or left >= right:
         return None
     return Block(top - r0, left - c0, bottom - top, right - left)
+
+
+def clip_tile_to_roi(
+    block: Block,
+    tile: np.ndarray,
+    weights: np.ndarray,
+    bounds: tuple[int, int, int, int],
+) -> tuple[Block, np.ndarray, np.ndarray] | None:
+    """Clip one parent patch's probabilities and weights to the ROI frame."""
+
+    clipped = clip_block_to_roi(block, bounds)
+    if clipped is None:
+        return None
+    source_y0 = clipped.y0 + bounds[0] - block.y0
+    source_x0 = clipped.x0 + bounds[2] - block.x0
+    source = (
+        slice(source_y0, source_y0 + clipped.valid_h),
+        slice(source_x0, source_x0 + clipped.valid_w),
+    )
+    return clipped, tile[source], weights[source]
 
 
 def iter_blocks(
@@ -438,7 +467,11 @@ def build_lowres_block_mask(
 
 
 class FlatPatchReader:
-    """Read H/W/Z patches and apply only the legacy pre-quantization step."""
+    """Read H/W/Z patches and apply only the legacy pre-quantization step.
+
+    ``array`` is an already open input array (anything indexable like the
+    opened volume); when it is None the reader opens ``input_path`` lazily.
+    """
 
     def __init__(
         self,
@@ -452,6 +485,7 @@ class FlatPatchReader:
         output_depth: int,
         preprocessing: str,
         chunk_cache_size: int = 0,
+        array: Any | None = None,
     ) -> None:
         self.input_path = input_path
         self.chunk_cache_size = max(0, int(chunk_cache_size))
@@ -475,7 +509,7 @@ class FlatPatchReader:
         self.output_depth_start = (
             self.output_depth - self.layer_indices.size
         ) // 2
-        self._array = None
+        self._array = array
         self._read_mode = "fancy"
         self._z_start = int(self.layer_indices[0])
         self._z_stop = int(self.layer_indices[-1]) + 1
@@ -996,23 +1030,36 @@ def run_block_inference(
                         y0 : y0 + valid_h, x0 : x0 + valid_w
                     ]
                 if roi_bounds is not None:
-                    clipped = clip_block_to_roi(Block(y0, x0, valid_h, valid_w), roi_bounds)
+                    clipped = clip_tile_to_roi(
+                        Block(y0, x0, valid_h, valid_w), tile, weights, roi_bounds
+                    )
                     if clipped is None:
                         continue
-                    source_y0 = clipped.y0 + roi_bounds[0] - y0
-                    source_x0 = clipped.x0 + roi_bounds[2] - x0
-                    source = (
-                        slice(source_y0, source_y0 + clipped.valid_h),
-                        slice(source_x0, source_x0 + clipped.valid_w),
-                    )
-                    tile, weights = tile[source], weights[source]
-                    y0, x0 = clipped.y0, clipped.x0
+                    block, tile, weights = clipped
+                    y0, x0 = block.y0, block.x0
                 accumulator.add_tile(
                     y0=y0,
                     x0=x0,
                     tile=tile,
                     tile_weights=weights,
                 )
+
+
+def normalize_probability_sums(
+    probability: np.ndarray, weight: np.ndarray
+) -> np.ndarray:
+    """Divide float32 blend sums by their weights where covered and clip to [0, 1], in place."""
+
+    np.divide(probability, weight, out=probability, where=weight > 1e-6)
+    np.clip(probability, 0, 1, out=probability)
+    return probability
+
+
+def probabilities_to_uint8(probability: np.ndarray) -> np.ndarray:
+    """Scale float32 probabilities by 255 in place and truncate them to uint8."""
+
+    probability *= 255
+    return probability.astype(np.uint8, copy=False)
 
 
 def iter_probability_tiles(
@@ -1033,10 +1080,8 @@ def iter_probability_tiles(
             weight = np.asarray(
                 weight_sum_store[y0:y1, x0:x1], dtype=np.float32
             )
-            np.divide(probability, weight, out=probability, where=weight > 1e-6)
-            np.clip(probability, 0, 1, out=probability)
-            probability *= 255
-            yield probability.astype(np.uint8, copy=False)
+            normalize_probability_sums(probability, weight)
+            yield probabilities_to_uint8(probability)
 
 
 def write_output_tiff(
@@ -1267,9 +1312,9 @@ def infer_single_zarr(
         overlap=args.overlap,
         explicit_stride=args.stride,
     )
-    blend_mode = str(args.blend_mode)
-    if blend_mode == "auto":
-        blend_mode = "constant" if stride >= patch_size else "hann"
+    blend_mode = resolve_blend_mode(
+        args.blend_mode, stride=stride, patch_size=patch_size
+    )
     tile_shape = (patch_size, patch_size)
     if patch_size % 16:
         tile_shape = (chunk_h, chunk_w)
