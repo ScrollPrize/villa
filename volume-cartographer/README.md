@@ -357,8 +357,9 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
 
 - `-v` takes the URL itself, and nothing is written under a local directory.
   Since #1657 the renderer opens the remote volume the same way the
-  tracer does, so the chunks it fetches persist in the shared remote cache root; `--cache-gb` (default 16) sizes the volume's
-  decoded-chunk memory cache. The renderer fetches only the chunks its samples
+  tracer does, so the chunks it fetches persist in the shared remote cache root; `--cache-gb` (default 16, or half the memory
+  available to the process if that is less) sizes the volume's decoded-chunk
+  memory cache. The renderer fetches only the chunks its samples
   read, in parallel.
 - The renderer reads the voxel size from the remote volume's metadata, as the
   tracer does: without `--voxel-size` the log says
