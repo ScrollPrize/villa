@@ -171,8 +171,7 @@ inline double sum_squares(const std::vector<double>& r) {
 
 FitSummary fit_blur(const BlurFieldProblem& p, std::array<double,6>& th) {
     ceres::Problem fit;
-    fit.AddResidualBlock(new ceres::AutoDiffCostFunction<BlurFieldProblem,ceres::DYNAMIC,6>(
-        new BlurFieldProblem(p),p.tiles*p.bins),nullptr,th.data());
+    fit.AddResidualBlock(new fitting::BlurFieldCost(p),nullptr,th.data());
     ceres::Solver::Summary result;
     auto options = fitting::options(6);
     // A moderate initial radius avoids repeated rejected steps from the

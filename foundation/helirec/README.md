@@ -748,7 +748,7 @@ Refill timing (`calibration/refill.hpp`, `_core.calibration_fit_refill_shots`) s
 both row-time signs, fits the exposure-integrated dip model with positive decay and automatic derivatives,
 and uses Ceres covariance for row-time uncertainty. It requires 12 shots, at least five 20-row bands and
 positive finite quiet-frame noise. Unidentifiable uncertainty is explicitly unavailable. Detector-blur
-fitting also uses automatic derivatives, including spectral normalization and the eliminated nuisance
+fitting uses an analytic Jacobian of the complete residual, including spectral normalization and the eliminated nuisance
 spectrum. Its binding returns `(field, rms_none, rms_fit, solver)`.
 The bounded film-transfer and smear fits used by `evaluation/wiener_table.py` also live in C++
 (`calibration/transfer.hpp`), with automatic derivatives and the same solver diagnostics.

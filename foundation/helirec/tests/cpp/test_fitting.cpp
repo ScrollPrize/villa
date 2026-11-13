@@ -15,7 +15,7 @@ int main() {
         model.X.push_back(x*.7); model.Yr.push_back(y*.5);
         for (int b = 0; b < 8; ++b) model.Y.push_back(1.+.1*std::sin(2*x+3*y+b));
     }
-    ceres::AutoDiffCostFunction<BlurFieldProblem,ceres::DYNAMIC,6> cost(new BlurFieldProblem(model),72);
+    helirec::calibration::fitting::BlurFieldCost cost(model);
     for (auto q : {std::array<double,6>{2.,.2,-.1,1.,.3,-.2},std::array<double,6>{0,0,0,0,0,0}}) {
         double r[72], jac[72*6], *j[] = {jac};
         const double* parameters[] = {q.data()};
