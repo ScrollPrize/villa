@@ -343,9 +343,18 @@ nb::dict resample_tracks(
     report(progress, "resampling tracks", 0, track_count);
     {
         nb::gil_scoped_release release;
-#pragma omp parallel for schedule(dynamic, 1024) num_threads(workers) \
-    reduction(min : minimum_observed) reduction(max : maximum_observed) \
-    reduction(+ : undersized_gaps)
+        // The spacing extrema are reduced by hand, per thread and then under a
+        // critical section, instead of reduction(min:) / reduction(max:).
+        // Those clauses are OpenMP 3.1; MSVC's own runtime (/openmp, vcomp)
+        // implements 2.0 and rejects them, and this is the only construct in
+        // these kernels beyond 2.0. Keeping to 2.0 lets the Windows build use
+        // vcomp, which coexists with the libiomp5md that torch loads (#1633).
+#pragma omp parallel num_threads(workers)
+        {
+        double local_minimum = std::numeric_limits<double>::infinity();
+        double local_maximum = 0.0;
+        uint64_t local_undersized_gaps = 0;
+#pragma omp for schedule(dynamic, 1024)
         for (int64_t track = 0; track < static_cast<int64_t>(track_count); ++track) {
             const int64_t begin = offset_data[track];
             const int64_t end = offset_data[track + 1];
@@ -412,9 +421,9 @@ nb::dict resample_tracks(
                     ? static_cast<int64_t>(right) : static_cast<int64_t>(left);
                 if (output_local > 0) {
                     const double observed = position - positions[output_local - 1];
-                    minimum_observed = std::min(minimum_observed, observed);
-                    maximum_observed = std::max(maximum_observed, observed);
-                    undersized_gaps += observed < minimum_spacing - 1.e-9;
+                    local_minimum = std::min(local_minimum, observed);
+                    local_maximum = std::max(local_maximum, observed);
+                    local_undersized_gaps += observed < minimum_spacing - 1.e-9;
                 }
             }
 
@@ -435,6 +444,13 @@ nb::dict resample_tracks(
                 anchor_samples[static_cast<size_t>(anchor)]
                     = static_cast<int32_t>(sample);
             }
+        }
+#pragma omp critical(resample_tracks_spacing)
+        {
+            minimum_observed = std::min(minimum_observed, local_minimum);
+            maximum_observed = std::max(maximum_observed, local_maximum);
+            undersized_gaps += local_undersized_gaps;
+        }
         }
     }
     report(progress, "resampling tracks", track_count, track_count);
