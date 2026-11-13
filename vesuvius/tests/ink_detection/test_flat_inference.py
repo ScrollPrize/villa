@@ -77,12 +77,7 @@ def test_pyramid_substitution_and_mask_alignment_warn_factually(tmp_path, caplog
 def _floored_pyramid(path, level0, levels):
     """Write a surface-volume pyramid that keeps every layer and floors Y/X."""
 
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        group = zarr.open_group(path, mode="w", zarr_format=2)
-        create = group.create_array
-    else:
-        group = zarr.open_group(path, mode="w")
-        create = group.create_dataset
+    group = create_group(path)
     data = level0
     for level in range(levels):
         if level:
@@ -90,9 +85,9 @@ def _floored_pyramid(path, level0, levels):
             data = data[:, : height // 2 * 2, : width // 2 * 2]
             data = data.reshape(depth, height // 2, 2, width // 2, 2).max(axis=(2, 4))
         chunks = (data.shape[0], min(64, data.shape[1]), min(64, data.shape[2]))
-        create(str(level), shape=data.shape, chunks=chunks, dtype="u1")
-        group[str(level)][:] = data
-    return group
+        array = group.create_array(str(level), shape=data.shape, chunks=chunks, dtype="u1")
+        array[:] = data
+    return open_group(path)
 
 
 def test_user_mask_fits_a_pyramid_that_floors_odd_sizes(tmp_path):
