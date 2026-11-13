@@ -32,6 +32,11 @@
 #include <map>
 #include <numeric>
 
+#ifdef _WIN32  // empty macros from <windows.h>, which curl.h includes
+#undef near
+#undef far
+#endif
+
 namespace nb = nanobind;
 using namespace nb::literals;
 
@@ -180,7 +185,7 @@ NB_MODULE(_reader, m)
             PyErr_SetString(cls.ptr(), e.what());
         } catch (const std::filesystem::filesystem_error& e) {
             errno = e.code().value();
-            PyErr_SetFromErrnoWithFilename(PyExc_OSError, e.path1().c_str());
+            PyErr_SetFromErrnoWithFilename(PyExc_OSError, reinterpret_cast<const char*>(e.path1().u8string().c_str()));
         }
     });
 
