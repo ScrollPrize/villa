@@ -223,6 +223,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Rescaled to 7.91um fragment surfaces and labels](https://dl.ash2txt.org/community-uploads/jrudolph/rescaled-fragments/) by Johannes Rudolph
 
+- [first-letters-clean-sheets](https://github.com/Ahggggg/first-letters-clean-sheets) by Jack Gilman and Andrew Gilman. 173 traced patches (355 cm², 1-8 cm² each) on 13 First Letters scrolls, grown with villa's `vc_grow_seg_from_seed` on the m7 surface prediction and cut to the mesh-level clean part (one frame side, no folds, no stretched edges), as tifxyz with an index.csv. Each patch has a QA picture (flattened render, two CT cross-sections, ink map), a cross-section tilt measure (median 0.97°, like flat public surfaces; it rules out gross swirl but cannot confirm a single layer), ink maps in both depth orders (Reader v2 + d9v4C on all 173, Reader V3 on the 79 that pass [sheet-contrast-check](https://github.com/LynnHenry/sheet-contrast-check)) and the depth order to use with `vc_render_tifxyz`. No letters found. Includes the laptop tracing recipe (Windows, Docker).
+
 #### 🏷️ Volumetric Labels
 
 - [Instance segmentation labels](https://github.com/JamesDarby345/Vesuvius_3D_datasets) by James Darby
