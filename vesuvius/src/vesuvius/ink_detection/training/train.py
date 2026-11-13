@@ -406,7 +406,10 @@ def _run_training(request: TrainingRequest) -> int:
     from vesuvius.ink_detection.training.losses import create_loss
     from vesuvius.ink_detection.models.model import make_model
     from vesuvius.ink_detection.training.optimizers import create_training_optimizer
-    from vesuvius.ink_detection.training.samplers import build_sampling_policy
+    from vesuvius.ink_detection.training.samplers import (
+        build_sampling_policy,
+        training_batch_sampler,
+    )
 
     config = request.config
     canonical = config.to_mapping()
@@ -568,23 +571,18 @@ def _run_training(request: TrainingRequest) -> int:
     accelerator.print(
         "sampling_audit=" + json.dumps(policy.audit, sort_keys=True), flush=True
     )
-    if policy.batch_sampler is not None:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_sampler=policy.batch_sampler,
-            num_workers=config.dataloader_workers,
-            **dataloader_kwargs,
-        )
-    else:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            shuffle=policy.shuffle,
-            sampler=policy.sampler,
-            generator=policy.generator,
-            num_workers=config.dataloader_workers,
-            **dataloader_kwargs,
-        )
+    # One batch-sampler seam for every policy, so a resumed run can continue
+    # the index stream instead of replaying it from the first batch.
+    train_batch_sampler = training_batch_sampler(
+        policy, len(train_dataset), batch_size=config.batch_size
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_batch_sampler,
+        generator=policy.generator,
+        num_workers=config.dataloader_workers,
+        **dataloader_kwargs,
+    )
     # Validation consumes only val_steps batches, so shuffle to sample a
     # different deterministic subset on each pass.
     val_loader = DataLoader(
@@ -674,6 +672,15 @@ def _run_training(request: TrainingRequest) -> int:
         accelerator.print(
             f"Loaded checkpoint '{request.checkpoint_path}'{suffix}"
         )
+        if start_step > 0:
+            # The samplers are rebuilt from config.sampling.seed, so without
+            # this the resumed run would replay the first run's batches.
+            train_batch_sampler.fast_forward(start_step * accelerator.num_processes)
+            accelerator.print(
+                f"Fast-forwarded the training sampler by {start_step} steps "
+                "(indices only), so the resumed run continues its sample "
+                "stream instead of replaying it"
+            )
 
     fixed_batch_sampler = policy.batch_sampler
     gradient_health = {
@@ -697,6 +704,7 @@ def _run_training(request: TrainingRequest) -> int:
             return
         observed = fixed_batch_sampler.observed_audit()
         observed["training_step_completed"] = int(training_step)
+        observed["fast_forwarded_batches"] = int(train_batch_sampler.skipped_batches)
         observed["target"] = policy.audit
         _write_json_replace(
             config.out_dir / "sampling_observed.json", observed
