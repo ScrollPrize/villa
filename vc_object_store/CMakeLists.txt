@@ -48,7 +48,11 @@ if(VC_OBJECT_STORE_BUILD_TOOLS OR VC_OBJECT_STORE_BUILD_TESTS)
     add_executable(vc_object_import_afv apps/vc_object_import_afv.cpp)
     target_link_libraries(vc_object_import_afv PRIVATE vc_objects ${CMAKE_DL_LIBS})
     target_include_directories(vc_object_import_afv PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    install(TARGETS vc_object_import_afv RUNTIME DESTINATION bin)
+    # A tests-only build (VC3D with VC_TESTING) builds the tool for the tests
+    # but does not install it: such a build need not build it before packaging.
+    if(VC_OBJECT_STORE_BUILD_TOOLS)
+        install(TARGETS vc_object_import_afv RUNTIME DESTINATION bin)
+    endif()
 endif()
 if(VC_OBJECT_STORE_BUILD_TESTS)
     enable_testing()
