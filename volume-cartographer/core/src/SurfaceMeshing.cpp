@@ -255,22 +255,19 @@ void UvGridRasterizer::determineGridDimensions(float stretch_factor) {
         int gw_src = std::max(2, static_cast<int>(std::lround(uv_range[0] * src_scale[0])) + 1);
         int gh_src = std::max(2, static_cast<int>(std::lround(uv_range[1] * src_scale[1])) + 1);
         // Honor any further user decimation / pixel cap on top of source density.
-        gw_src = apply_decimation(gw_src, decim);
-        gh_src = apply_decimation(gh_src, decim);
-        grid_size[0] = gw_src;
-        grid_size[1] = gh_src;
-        scale[0] = src_scale[0];
-        scale[1] = src_scale[1];
+        grid_size[0] = apply_decimation(gw_src, decim);
+        grid_size[1] = apply_decimation(gh_src, decim);
+        // The source scale, divided by the decimation actually applied.
+        scale[0] = float(src_scale[0] * double(grid_size[0] - 1) / double(gw_src - 1));
+        scale[1] = float(src_scale[1] * double(grid_size[1] - 1) / double(gh_src - 1));
         std::cout << "Source-scale mode: grid " << grid_size[0] << " x " << grid_size[1]
                   << "  scale: " << scale[0] << ", " << scale[1]
                   << "  (matched to input tifxyz)" << std::endl;
     } else if (uv_is_metric) {
-        // --- Preserve physical pixel size (scale) from the RAW grid ---
-        // du_raw/dv_raw are UV units per pixel *before* decimation.
-        const float du_raw = (gw_raw > 1) ? uv_range[0] / float(gw_raw - 1) : 0.f;
-        const float dv_raw = (gh_raw > 1) ? uv_range[1] / float(gh_raw - 1) : 0.f;
-        scale[0] = du_raw * uv_to_obj; // OBJ units per pixel (unchanged by decimation)
-        scale[1] = dv_raw * uv_to_obj;
+        // The tifxyz scale is grid cells per OBJ unit (as QuadSurface::size, vc_render_tifxyz and
+        // vc_tifxyz2obj read it, and GrowPatch writes 1/step), on the grid actually written.
+        scale[0] = (uv_range[0] > 0.f) ? float((grid_size[0] - 1) / (double(uv_range[0]) * uv_to_obj)) : 1.f;
+        scale[1] = (uv_range[1] > 0.f) ? float((grid_size[1] - 1) / (double(uv_range[1]) * uv_to_obj)) : 1.f;
 
         std::cout << "UV-metric mode: grid " << grid_size[0] << " x " << grid_size[1]
                   << "  scale(OBJ units): " << scale[0] << ", " << scale[1] << std::endl;
@@ -349,9 +346,8 @@ QuadSurface* UvGridRasterizer::createQuadSurface(float mesh_units) {
         // Scale was adopted verbatim from the source tifxyz; do not rescale.
         std::cout << "Scale (from source tifxyz): " << scale[0] << ", " << scale[1] << std::endl;
     } else if (uv_is_metric) {
-        scale[0] *= mesh_units;
-        scale[1] *= mesh_units;
-        std::cout << "Scale from UV (micrometers): " << scale[0] << ", " << scale[1] << std::endl;
+        // Positions stay in OBJ units, so the scale (cells per OBJ unit) does not depend on mesh_units.
+        std::cout << "Scale from UV (grid cells per OBJ unit): " << scale[0] << ", " << scale[1] << std::endl;
     } else {
         // Measure from 3D to preserve anisotropy and noise-robustness (already compensated in determineGridDimensions)
         calculateScaleFromGrid(*points, mesh_units);
