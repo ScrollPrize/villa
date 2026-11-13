@@ -46,6 +46,9 @@ bash scripts/stop.sh NAME                                      # the trainer and
   identified by their store UUIDs; validation holds out whole fibers by UUID. Neighboring annotations of fiber-store
   sources supply foreign-path masks, synthetic wrong continuations and switch detection; Paris 4 has no neighbor
   paths.
+  Catalog rows and cache manifests retain complete source-owned versions. A training handle rejects subsequent
+  store changes (including cached reads and spatial queries); recreate the dataset after editing its source.
+  Fingerprints use `fibers_digest v3`, including owning-store identity; earlier caches must be regenerated.
 - `model` takes `type` plus any field of that type's configuration class (`RegressionConfig`, `FlowConfig`,
   `SequenceConfig`), including `fine` (the crop) and `frame_checkpoint` (the frozen heading/normal model; its path
   and SHA-256 are recorded with the model).
@@ -181,11 +184,16 @@ heads, whole-crop planes); there is no training support.
 `scripts/snap_fibers.py` (`data/fiber_snapping.py`) moves fiber labels onto the centre of a fiber presence prediction:
 at every point, the centroid of the upper half of the presence on a perpendicular disk (radius 2.5 voxels, averaged over
 +-1 voxel along the fiber), smoothed along the fiber (sigma 2), two passes. It reads a fiber store (writing a new store
-with the same UUIDs, names, families and meta, the snapping parameters in each fiber's `meta['snapping']`) or VC3D
+with the same UUIDs, names, families and application metadata, the snapping parameters in each fiber's `meta['snapping']`) or VC3D
 fiber JSONs (writing snapped
 `line_points`, controls moved onto the line, and `snapping.json`). The work is tiled over the presence volume and
 batched on the GPU. On the automated Paris4 fibers it brought labels from a median 1.46 to 0.68 trace voxels from the manual annotations
 (`output/paris4_annotation_audit_20261006/`).
+
+Snapping explicitly creates geometry-only derivatives: it does not copy source relationships, history, manual
+extension rows or artifact payloads. The source's complete reference and this policy are recorded in `meta.derivation`.
+The general `write_fibers` helper instead rejects managed extension/artifact metadata unless its caller explicitly
+selects `metadata_policy='geometry_only'`; use a collection copy when those data must remain available.
 
 ```bash
 ../../../../../.venv/bin/python scripts/snap_fibers.py datasets/automated_fiber_volumes/IN.vcobj OUT.vcobj \

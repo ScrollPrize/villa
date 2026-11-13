@@ -13,6 +13,7 @@
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/objects/GeometryRegion.hpp>
 #include <vc_object_store/objects/SurfaceCreate.hpp>
+#include <vc_object_store/objects/ResidentSurface.hpp>
 #include <nlohmann/json.hpp>
 #include <QObject>
 #include <QString>
@@ -94,14 +95,14 @@ public:
     bool loading() const { return loading_; }
     const QString& error() const { return error_; }
 
-    // The surface's geometry in the volume's voxels: current, or at object
-    // revision `revision` of its history (read-only); channels read on demand
-    // from the same revision. Throws when it cannot be read.
-    Opened open(const std::string& uuid, const std::optional<std::string>& revision = std::nullopt) const;
+    // The surface's geometry in the volume's voxels: current, or at numbered
+    // version `at` of its history (read-only); channels read on demand from
+    // the same geometry. Throws when it cannot be read.
+    Opened open(const std::string& uuid, const std::optional<vc::objects::ObjectVersion>& at = std::nullopt) const;
     // The same from an explicit source, for worker threads.
     static Opened open(const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
                        const vc::objects::AttachmentIdentity& attachment, const vc::objects::VolumeVoxels& volume,
-                       const std::string& uuid, const std::optional<std::string>& revision = std::nullopt);
+                       const std::string& uuid, const std::optional<vc::objects::ObjectVersion>& at = std::nullopt);
 
     // Where the surfaces of every source cross `slice` (in `volume`),
     // with `options` (uuids, budgets) per source; complete when every source's
@@ -112,11 +113,24 @@ public:
         std::vector<vc::objects::VisibleRun> runs;
         bool complete = true;
         std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> remote;
+        // Required before deriving persistent annotations from a query.
+        void requireComplete() const;
     };
     static Crossings region(vc::objects::ObjectStoreSession& session,
                             const std::vector<vc::objects::AttachmentIdentity>& sources,
                             const vc::objects::VolumeVoxels& volume, const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
                             const std::function<bool()>& cancelled = {});
+
+    // One explicitly selected query input (options.uuids must be supplied): displayed geometry wins over session drafts
+    // and stored heads. Keep these immutable grids alive for background reads.
+    struct RegionInput {
+        std::shared_ptr<vc::objects::ObjectStoreSession> session;
+        std::vector<vc::objects::AttachmentIdentity> sources;
+        vc::objects::VolumeVoxels volume;
+        vc::objects::RegionOptions options;
+        std::map<std::string, std::shared_ptr<const vc::objects::ResidentSurface>> displayed;
+        Crossings region(const vc::objects::RegionSlice& slice, const std::function<bool()>& cancelled = {}) const;
+    };
 
     // The nearest point of each of `uuids` (drafts or objects of the sources)
     // within `tolerance` of each of `points` (in `volume`): the hits per
@@ -128,7 +142,7 @@ public:
         const std::vector<std::array<double, 3>>& points, double tolerance);
 
     // Where tools launched for the open volume read and write: the user's store
-    // file (a hosted replica's local file) and the open volume's voxels
+    // file and the open volume's voxels
     // (--volume-uuid, --voxel-scale). Throws without a writable attachment and
     // an open volume.
     struct ToolStore {

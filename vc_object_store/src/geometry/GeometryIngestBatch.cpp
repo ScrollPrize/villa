@@ -1,15 +1,20 @@
 #include "geometry/GeometryIngestBatch.hpp"
 #include "imports/SourceRelationships.hpp"
 #include "internal/Database.hpp"
+#include "internal/RecordResolver.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/FiberJson.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include <set>
 namespace vc::objects {
 namespace {
 using Json = nlohmann::json;
 void normalizeMetadata(GeometrySource& p, const std::string& coordinateContext)
 {
+    detail::validateSourceTopology(p.object.kind, p.source);
     auto source = p.source;
     auto metadata = Json::parse(p.object.meta);
     const auto coordinates = mergeGeometryCoordinates(
@@ -46,6 +51,7 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
 {
     geometryCoordinates(nlohmann::json::parse(coordinateContext));
     auto* connection=ObjectStoreImplAccess::conn(write);
+    detail::Savepoint savepoint(connection);
     std::set<std::string> incoming;
     std::vector<std::string> clashes;
     // Check the entire batch under the writer lock before mutating any object.
@@ -55,12 +61,10 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
         if(!incoming.insert(p.object.uuid).second)
             throw GeometrySourceRejected("duplicate object UUID in import: "+p.object.uuid);
         const auto existing=db.objectByUuid(write,p.object.uuid);
-        detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1",
-            detail::parseUuid(p.object.uuid));
-        detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", p.object.uuid);
-        if (registeredInitial && (!existing || existing->retired || history.row()))
+        const bool previouslyImported = detail::objectSource(connection,p.object.uuid,false,true)!=nullptr;
+        if (registeredInitial && (!existing || existing->retired || db.currentGeometry(write,p.object.uuid)))
             throw GeometrySourceRejected("object already exists or was previously imported; re-import is unsupported: "+p.object.uuid);
-        if (!registeredInitial && (existing.has_value() || prior.row())) clashes.push_back(p.object.uuid);
+        if (!registeredInitial && (existing.has_value() || previouslyImported)) clashes.push_back(p.object.uuid);
     }
     if (!clashes.empty()) throw GeometryIdentitiesExist(std::move(clashes));
 
@@ -88,7 +92,11 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
 
     }
     // Source JSON that does not describe its relationships rejects the source.
-    try { return detail::importSourceRelationships(db, write, sources); }
+    try {
+        const auto count = detail::importSourceRelationships(db, write, sources);
+        savepoint.release();
+        return count;
+    }
     catch (const nlohmann::json::exception& error) { throw GeometrySourceRejected(error.what()); }
 }
 GeometryIdentitiesExist::GeometryIdentitiesExist(std::vector<std::string> existing)
@@ -99,4 +107,26 @@ int64_t ingestGeometryBatch(ObjectStore& db, WriteTxn& txn, std::vector<Geometry
 {
     return detail::ingestGeometryBatch(db, txn, std::move(batch), coordinateContext, false);
 }
+void addIngestOperation(TransactionRequest& request, const StoreReader& reader, std::vector<GeometrySource> batch,
+    const std::string& coordinateContext)
+{
+    geometryCoordinates(Json::parse(coordinateContext));
+    IngestGeometryOp op;
+    op.coordinateContext = Json::parse(coordinateContext).dump();
+    for (auto& p : batch) p.object.uuid = util::canonicalUuid(p.object.uuid);
+    // An existing object is expected at its current version, so importing it
+    // again is refused as a re-import rather than as a stale request.
+    auto expect = [&](const std::string& uuid) {
+        if (request.expectedObjects.contains(uuid)) return;
+        const auto current = reader.currentObject(uuid);
+        request.expectedObjects[uuid] = currentObjectExpectation(reader, uuid);
+    };
+    // Fiber branches name their existing endpoints; links resolved by source
+    // identity (point and winding links) stay within the batch.
+    for (const auto& p : batch) expect(p.object.uuid);
+    for (const auto& target : fiberBatchEndpoints(batch)) expect(target);
+    for (auto& p : batch) op.items.push_back({objectRecordJson(p.object), std::move(p.geometry), p.source.dump()});
+    request.operations.push_back(std::move(op));
+}
+
 }

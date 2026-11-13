@@ -82,8 +82,10 @@ rotating it) imports it into the user's store as the same surface
 first revision there, the user's copy hides the catalog one, and **Reset to Open
 Data Version** (surface panel context menu) restores that revision
 (`restoreImported`). **History...** views or restores any revision of a surface.
-Ink detections stay the published PNG/JPEG images; the ink overlay has the store
-download them into the surface's artifact directory (`publishedFile`).
+Ink detections stay the published PNG/JPEG images; the ink overlay downloads
+them into VC3D's remote cache by URL (`fetchPublishedFile`, at
+`vcr::zarr::decodedCachePath` of the cache root), never into the store, so it
+works for hosted stores too.
 
 The catalog window's **Refresh from Open Data** re-reads the published catalog
 into the sample's store (`refreshCatalog`): placeholder metadata follows it, new

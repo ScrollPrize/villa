@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <QObject>
@@ -45,7 +46,6 @@ private:
     void markRemoved(uint64_t collectionId);
     bool anchored(uint64_t collectionId) const;
     void onStoreEvent(const vc::objects::StoreSessionEvent& event);
-    void noteRevisions(const std::vector<std::string>& uuids);
 
     CState* state_;
     QTimer debounce_;
@@ -56,9 +56,8 @@ private:
     std::map<uint64_t, std::string> uuids_;
     std::set<uint64_t> changed_;
     std::set<std::string> removed_;
-    // The object revision of each collection as this sync last wrote or read
-    // it: a commit leaving another is someone else's.
-    std::map<std::string, std::string> revisions_;
+    // The complete version loaded or returned by a checked save.
+    std::map<std::string, vc::objects::AttachedCollection> selected_;
     // Installing from the store: the collection's change hooks are not edits.
     bool installing_ = false;
 };

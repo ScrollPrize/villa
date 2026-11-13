@@ -116,3 +116,40 @@ def test_inference_saves_with_partial_or_missing_scores(tmp_path, monkeypatch, i
     if coverage == 'full':
         assert score['stitched_node_distance_vox'] == dict(median=1., p95=1.)
     assert len(inference_setup[1]) == 1
+
+
+def test_ct_override_binds_the_normalization_record_to_that_ct(tmp_path):
+    from vesuvius.neural_tracing.tracers.fibers.tests.model_fixtures import array_at
+    from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import configure_volume
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling import normalization as norm
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
+    array_at(tmp_path/'train_ct'/'0', np.zeros((8, 8, 8)))
+    array_at(tmp_path/'other_ct'/'0', np.zeros((16, 8, 8)))
+    # The checkpoint's spec as a sheet-strip run records it: bound to the training CT.
+    trained = CTVolumeSpec(str(tmp_path/'train_ct'), ct_level=0, ct_grid_scale=4.)
+    norm.prepare_normalization(tmp_path/'train_run', [trained], known=None)
+    recorded = trained.to_dict()
+
+    unchanged = CTVolumeSpec.from_dict(json.loads(json.dumps(recorded)))
+    options = SimpleNamespace(ct=None, out=tmp_path/'kept')
+    configure_volume(options, unchanged, SimpleNamespace(), tmp_path/'checkpoint.pt')
+    infer.bind_ct_override_normalization(unchanged, options)
+    assert unchanged.ct_normalization == recorded['ct_normalization']
+    assert not (tmp_path/'kept').exists()
+
+    spec = CTVolumeSpec.from_dict(json.loads(json.dumps(recorded)))
+    options = SimpleNamespace(ct=str(tmp_path/'other_ct'), out=tmp_path/'out')
+    configure_volume(options, spec, SimpleNamespace(), tmp_path/'checkpoint.pt')
+    assert spec.ct_normalization['volume'] == norm.volume_key(trained)  # what main left bound
+    infer.bind_ct_override_normalization(spec, options)
+    assert spec.ct_normalization['volume'] == norm.volume_key(spec) != norm.volume_key(trained)
+    assert spec.ct_normalization['shape'] == [16, 8, 8]
+    document = json.loads((tmp_path/'out'/'ct_normalization.json').read_text())
+    assert document['volumes'] == {norm.volume_key(spec): spec.ct_normalization}
+
+    # Without an output folder the record is still bound, and nothing is left behind.
+    spec = CTVolumeSpec.from_dict(json.loads(json.dumps(recorded)))
+    options = SimpleNamespace(ct=str(tmp_path/'other_ct'))
+    configure_volume(options, spec, SimpleNamespace(), tmp_path/'checkpoint.pt')
+    infer.bind_ct_override_normalization(spec, options)
+    assert spec.ct_normalization['volume'] == norm.volume_key(spec)

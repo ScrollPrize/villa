@@ -3,6 +3,7 @@
 #include "LineAnnotationPolylineIndices.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/core/types/FiberView.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <algorithm>
 #include <cmath>
@@ -151,12 +152,12 @@ Scene loadStore(const StoreSource& source, const QueryOptions& options, const st
     if (!options.horizontal && !options.vertical && !options.unclassified)
         return scene;
     size_t bytes = 0;
-    source.session->read(source.attachment, [&](const auto& db, const auto& txn, const auto& detached) {
+    source.session->readStore(source.attachment, [&](const vc::objects::StoreReader& reader, const auto& detached) {
         auto check = [&] {
             checkCancelled(cancelled);
             checkCancelled(&detached);
         };
-        vc::objects::GeometrySnapshot snapshot(db, txn);
+        vc::objects::GeometrySnapshot snapshot(reader);
         vc::objects::ObjectSelection selection;
         selection.kind = "fiber";
         selection.volume = source.volume.volume;
@@ -171,7 +172,7 @@ Scene loadStore(const StoreSource& source, const QueryOptions& options, const st
         }
         if (source.onlyUuid)
             selection.uuids = {*source.onlyUuid};
-        const auto transforms = db.volumeTransforms(txn);
+        const auto transforms = reader.volumeTransforms();
         bool exhausted = false;
         auto append = [&](const vc::objects::ObjectRecord& record) {
             check();
@@ -182,7 +183,9 @@ Scene loadStore(const StoreSource& source, const QueryOptions& options, const st
                 exhausted = true;
                 return;
             }
-            const auto view = snapshot.viewTransformedAt(record.uuid, source.volume.volume, source.volume.scale, &transforms);
+            const auto selected = reader.selectedObject(record.uuid, {}, {}, record.reference());
+            if (!selected) throw std::runtime_error("Selected fiber revision is no longer retained");
+            const auto view = snapshot.viewTransformedAt(*selected, source.volume.volume, source.volume.scale, &transforms);
             const auto& canonical = std::get<vc::objects::FiberView>(view.canonical());
             const int64_t n = canonical.linePointCount() ? canonical.linePointCount() : canonical.controlPointCount();
             const auto nc = canonical.controlPointCount();
@@ -202,13 +205,11 @@ Scene loadStore(const StoreSource& source, const QueryOptions& options, const st
             fiber.source = Source::Store;
             fiber.fileName = QString::fromStdString(record.uuid + ".json");
             fiber.family = family(record.fiber->family);
-            fiber.lengthMm = (record.volumeLength ? *record.volumeLength
-                                                  : db.geometryLengthInVolume(txn, record.uuid, source.volume.volume, source.volume.scale)) *
-                             source.voxelSizeMm;
             for (const auto& tag : record.tags)
                 fiber.tags.push_back(QString::fromStdString(tag));
             const char* array = canonical.linePointCount() ? "line_points" : "control_points";
             const auto points = view.points(array, 0, n);
+            fiber.lengthMm = vc::geometry::polylineLength(points) * source.voxelSizeMm;
             std::vector<cv::Vec3d> displayed;
             displayed.reserve(points.size());
             for (const auto& p : points)
@@ -225,7 +226,7 @@ Scene loadStore(const StoreSource& source, const QueryOptions& options, const st
                     styleRange(fiber, a, b, SpanStyle::InferredGap);
                 }
                 const auto controls = canonical.controlPoints(0, nc);
-                auto attrs = Json::parse(db.geometryPointAnnotations(txn, canonical.revision().uuid, "control_points"));
+                auto attrs = reader.geometryPointAnnotations(canonical.revision().uuid, "control_points");
                 const auto attrBytes = attrs.dump().size();
                 const size_t overhead = sizeof(Fiber) + size_t(nc) * (3 * sizeof(Marker) + 2 * sizeof(std::optional<cv::Vec3d>)) +
                                         fiber.runs.size() * sizeof(Run) + size_t(n) * sizeof(SpanStyle) + attrBytes;
@@ -291,12 +292,12 @@ Scene loadStore(const StoreSource& source, const QueryOptions& options, const st
         if (!selected.empty() && (!source.onlyUuid || *source.onlyUuid == selected)) {
             auto first = selection;
             first.uuids = {selected};
-            for (const auto& record : db.selectObjects(txn, first, std::vector<std::string>{"name", "tags", "fiber", "meta"}))
+            for (const auto& record : reader.selectObjects(first, std::vector<std::string>{"name", "tags", "fiber", "meta"}))
                 append(record);
         }
         while (!exhausted) {
             check();
-            const auto records = db.selectObjects(txn, selection, std::vector<std::string>{"name", "tags", "fiber", "meta"});
+            const auto records = reader.selectObjects(selection, std::vector<std::string>{"name", "tags", "fiber", "meta"});
             for (const auto& record : records) {
                 if (record.uuid != selected)
                     append(record);

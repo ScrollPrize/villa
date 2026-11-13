@@ -122,6 +122,44 @@ def test_corrupt_boot_marker_cannot_retire_jobs(tmp_path):
     assert journal.read_bytes() == before
 
 
+@pytest.mark.parametrize("already_granted", [False, True])
+def test_monitored_recovery_cannot_grant_waiting_jobs_before_first_observation(tmp_path, already_granted):
+    path = tmp_path / "m.sock"
+    with Server(path, POOL, engine_options={"inspect": lambda p, u: "alive",
+                                           "discover": lambda p, u: []}) as server:
+        if not already_granted:
+            server.engine.update_blocked_gpus(POOL["gpus"])
+        registration = register(server.engine)
+        task_id = registration["task"]["task_id"]
+        grant = deepcopy(server.engine.tasks[task_id]["granted"])
+        save_journal(server.journal, server.engine.state)
+        server.close(force=True)
+
+    class UnavailableMonitor:
+        def poll(self, owned):
+            return set(POOL["gpus"])
+        def close(self):
+            pass
+
+    with Server(path, POOL, monitor=UnavailableMonitor(),
+                engine_options={"inspect": lambda p, u: "alive", "discover": lambda p, u: []}) as server:
+        task = server.engine.tasks[task_id]
+        assert task["granted"] == grant
+        if already_granted:
+            assert task["phase"] == "release"  # Retain real ownership until acknowledgement.
+            server.close(force=True)
+        else:
+            assert task["phase"] == "waiting"
+            assert task["reason"] == "inventory_unavailable"
+            server._before_io()
+            assert task["granted"] == empty()
+            # Only an actual usable-driver observation may unblock a new grant.
+            server.engine.update_blocked_gpus([])
+            assert task["phase"] == "initialize"
+            assert task["granted"]["gpus"]
+            server.close(force=True)
+
+
 def test_production_restart_uses_updated_constraints(tmp_path):
     path = tmp_path / "m.sock"
     with Server(path, POOL):

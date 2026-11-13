@@ -134,9 +134,13 @@ struct Level {
     ElementType type;
     std::array<double, 3> scale{1, 1, 1}, offset{0, 0, 0};
     std::optional<std::array<double, 9>> linear;
-    // The level's CUDA reader (uint8 3-D CT), when a request may sample it on the GPU;
+    // The level's scalar uint8 CUDA reader, when a request may sample it on the GPU;
     // null samples on the CPU. Builds without CUDA have none.
     reader_cuda::Reader* cuda = nullptr;
+    // Select a scalar channel of a CZYX array. Unset requires a ZYX array.
+    // Packed chunks remain shared in the array cache; no extracted volume is made.
+    // A CUDA reader must select this same array/channel.
+    std::optional<std::int64_t> channel;
 };
 
 // A level placed by a row-major 3x4 map, index (ZYX) = linear * p (XYZ) + offset: the
@@ -180,7 +184,7 @@ struct Result {
     // (see sample); empty otherwise.
     std::string cudaFailure;
     // Cached-only requests sampled on the CPU: per request level, the chunks (keys
-    // (z * grid[1] + y) * grid[2] + x over the level's chunk grid, ascending) a sample
+    // C-order flattened indices over the level's full chunk grid, ascending) a sample
     // needed and no cache held. Empty otherwise.
     std::vector<std::vector<std::int64_t>> missingChunks;
 };

@@ -1,0 +1,291 @@
+#include "TestSupport.hpp"
+#include "vc_object_store/objects/InitialImport.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include <atomic>
+#include <fstream>
+#include <future>
+#include <iostream>
+#include <sqlite3.h>
+#include <thread>
+
+using namespace vc::objects;
+namespace {
+std::atomic<size_t> connectionCount=0;
+int countConnection(sqlite3*,char**,const sqlite3_api_routines*) noexcept {
+    ++connectionCount;return SQLITE_OK;
+}
+struct CountConnections {
+    CountConnections(){connectionCount=0;require(sqlite3_auto_extension(reinterpret_cast<void(*)()>(countConnection))==SQLITE_OK,"install connection counter");}
+    ~CountConnections(){sqlite3_cancel_auto_extension(reinterpret_cast<void(*)()>(countConnection));}
+};
+InitialImportOptions options(size_t shards=1,bool packed=false)
+{
+    InitialImportOptions result;result.store.author="bulk-api-test";result.uuidHashRouting=false;result.shards.clear();
+    for(size_t i=0;i<shards;++i)result.shards.push_back({{int64_t(i*100+1),int64_t((i+1)*100)},
+        {int64_t(i*100+1),int64_t((i+1)*100)}});
+    if(packed){result.packed.emplace();result.packed->memoryFirst=true;result.packed->disposableBulk=true;
+        result.packed->backgroundFlush=false;result.packed->residentBytes=64*1024*1024;}
+    return result;
+}
+InitialObjectRecord fiber(const std::string& uuid)
+{
+    InitialObjectRecord row;row.record.uuid=uuid;row.record.kind="fiber";row.record.fiber.emplace();
+    row.record.fiber->family="H";row.record.meta=R"({"native":{"value":42}})";
+    vc::geometry::Fiber geometry;geometry.linePoints={{1,2,3},{4,5,6}};row.geometry=vc::geometry::encode(geometry);
+    return row;
+}
+void roundTrip(size_t shards,bool packed)
+{
+    TemporaryDirectory dir;auto opt=options(shards,packed);
+    const auto base=dir.path/"base.vcobj";ObjectKey reference;int64_t baseSequence=0;
+    {
+        auto store=ObjectStore::create(base,opt.store);auto w=store.write();auto row=fiber(util::newUuid());
+        reference={store.uuid(w),store.upsertObject(w,row.record)};store.putGeometry(w,reference.objectUuid,*row.geometry);
+        store.seal(w);w.commit();auto r=store.read();baseSequence=store.provisioning(r).commitSequence;
+    }
+    opt.dependencies={base};std::vector<std::string> uuids(shards),edges(shards);
+    for(size_t i=0;i<shards;++i){uuids[i]=util::newUuid();edges[i]=util::newUuid();}
+    const auto output=dir.path/"output";
+    auto result=importInitialCollection(output,opt,[&](size_t i,InitialShardImport& part){
+        auto row=fiber(uuids[i]);row.id=opt.shards[i].objectIds[0];
+        auto ids=part.appendObjects(std::span(&row,1));require(ids.size()==1,"identity result");
+        require(ids[0].key==ObjectKey{part.storeUuid(),uuids[i]},"qualified native identity");
+        require(ids[0].id==*row.id,"explicit numeric ID preserved");
+        bool sent=false;require(part.importEdges([&](auto& batch){
+            if(sent)return false;sent=true;EdgeRecord e;e.uuid=edges[i];e.kind="perpendicular";
+            e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;e.aAnchor.position=std::array<double,3>{1,2,3};
+            e.meta=R"({"source":{"measurement":1.25}})";batch.push_back({ids[0].key,reference,e});return true;
+        })==1,"native edge count");
+    });
+    require(result.path==(shards>1&&!packed?output/"collection.vcobj":output),"public root locator");
+    require(result.shards.size()==shards,"all shards reported");
+    require(result.totalSeconds>=result.ingestionSeconds && result.persistenceSeconds>=0,"timings reported");
+    {
+        auto native=ObjectStore::open(result.path,OpenOptions{.readOnly=true});auto read=native.read();
+        const auto graph=native.graphReadView(read);
+        require(graph.objectUuids.size()==shards+1&&graph.edgeUuids.size()==shards,
+            "ordinary graph API spans shards and their sealed dependency");
+        require(native.componentOf(read,reference.objectUuid).size()==shards+1,
+            "ordinary traversal reaches sibling-shard edges");
+        std::vector<ObjectVersion> versions;
+        for(const auto& uuid:graph.objectUuids)versions.push_back(native.currentObjectRevision(read,uuid)->reference());
+        require(native.graphReadViewAt(read,versions).edgeUuids.size()==shards,
+            "exact current-only graph retains cross-shard relationships");
+    }
+    auto store=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto r=store.read();
+    require(store.uuid(r)==result.storeUuid,"published logical owner");
+    require(store.provisioning(r).sealed && store.provisioning(r).commitSequence>baseSequence,
+        "sealed commit sequence follows dependencies");
+    const auto pin=store.provisioning(r);
+    for(const auto& member:store.members())if(member.storeUuid==result.storeUuid)
+        require(member.generation==pin.generation&&member.commitSequence==pin.commitSequence,
+            "parallel shards share the manifest lineage and commit sequence");
+    require(store.provisioning(r).history==HistoryMode::Off && !store.provisioning(r).spatialIndex,
+        "initial provisioning omits history and spatial structures");
+    for(size_t i=0;i<shards;++i){
+        require(result.shards[i].objects==1 && result.shards[i].edges==1,"reported row counts");
+        const ObjectKey key{result.storeUuid,uuids[i]};auto obj=store.object(r,key);
+        require(obj && obj->record.fiber->family=="H","typed fiber round trip");
+        require(store.readGeometryArray(r,key,"line_points").size()==6*sizeof(double),"local geometry readable");
+        require(store.readGeometryArray(r,reference,"line_points").size()==6*sizeof(double),"external geometry readable after publication");
+        const auto edge=store.edge(r,{result.storeUuid,edges[i]});
+        require(edge && (edge->a==reference || edge->b==reference),"dependency endpoint routed");
+        require(edge->record.uuid==edges[i],"independent relation identity retained");
+    }
+    // A sealed output cannot be reopened writable, independently of callback lifetime.
+    mustFail([&]{auto mutableStore=ObjectCollection::open(result.path,opt.store);auto w=mutableStore.write();mutableStore.seal(w);});
+    if(shards==1) {
+        const auto copied=dir.path/"copy.vcobj";
+        copyObjectCollection(result.path,copied,opt.store);
+        auto writable=ObjectStore::open(copied,opt.store);
+        auto w=writable.write();
+        writable.setMeta(w,uuids.front(),"review","true");
+        w.commit();
+        auto current=writable.read();
+        require(nlohmann::json::parse(writable.objectByUuid(current,uuids.front())->meta).at("review")==true,
+                "one-shard immutable import copies to an editable overlay");
+    }
+}
+void failures()
+{
+    TemporaryDirectory dir;auto opt=options();
+    auto failed=[&](const auto& callback){
+        const auto output=dir.path/"failure";
+        mustFail([&]{importInitialCollection(output,opt,callback);});
+        require(!std::filesystem::exists(output),"failed import is unpublished");
+        // Readonly SQLite opens can create WAL/SHM sidecars beside a dependency;
+        // those are not unpublished output owned by the builder.
+        for(const auto& entry:std::filesystem::directory_iterator(dir.path)){
+            const auto name=entry.path().filename().string();
+            require(!name.starts_with(".failure-")&&!name.starts_with("failure.building-"),"failed staging cleaned");
+        }
+    };
+    failed([](size_t,auto&){throw std::runtime_error("source error");});
+    failed([](size_t,auto& part){auto row=fiber(util::newUuid());row.id=101;
+        try{part.appendObjects(std::span(&row,1));}catch(const std::exception&){};});
+    failed([](size_t,auto& part){part.importEdges([](auto&){return false;});
+        try{part.appendObjects({});}catch(const std::exception&){};});
+    failed([](size_t,auto& part){part.importEdges([](auto&){return false;});
+        try{part.importEdges([](auto&){return false;});}catch(const std::exception&){};});
+    failed([](size_t,auto& part){try{part.importEdges([](auto&)->bool{throw std::runtime_error("edge reader failed");});}
+        catch(const std::exception&){};});
+    failed([](size_t,auto& part){auto job=std::async(std::launch::async,[&]{mustFail([&]{part.storeUuid();});});job.get();});
+    opt=options(2);failed([](size_t i,auto& part){if(i==0)throw std::runtime_error("peer failure");
+        auto row=fiber(util::newUuid());part.appendObjects(std::span(&row,1));});
+    opt=options();opt.store.creationStoreUuid=util::newUuid();failed([](size_t,auto&){});
+    opt=options();opt.store.creationGeneration=util::newUuid();failed([](size_t,auto&){});
+    opt=options(2);opt.shards[1]=opt.shards[0];failed([](size_t,auto&){});
+    opt=options();opt.store.history=HistoryMode::On;failed([](size_t,auto&){});
+    opt=options();opt.store.spatialIndex=true;failed([](size_t,auto&){});
+    opt=options(2,true);failed([](size_t i,auto&){if(i==0)throw std::runtime_error("packed source error");});
+    opt=options();const auto mutableBase=dir.path/"mutable-base";
+    {auto base=ObjectStore::create(mutableBase,opt.store);}
+    opt.dependencies={mutableBase};failed([](size_t,auto&){});
+    opt=options();const auto existing=dir.path/"existing";{std::ofstream file(existing);file<<"keep";}
+    mustFail([&]{importInitialCollection(existing,opt,[](size_t,auto&){});});
+    require(std::filesystem::file_size(existing)==4,"existing destination preserved");
+    // Destination appearing during construction is never overwritten.
+    const auto racing=dir.path/"racing";
+    mustFail([&]{importInitialCollection(racing,opt,[&](size_t,auto&){std::ofstream file(racing);file<<"winner";});});
+    require(std::filesystem::file_size(racing)==6,"publication does not clobber concurrent creator");
+    opt=options(2);const auto racingDir=dir.path/"racing-dir";
+    mustFail([&]{importInitialCollection(racingDir,opt,[&](size_t i,auto&){if(i==0)std::filesystem::create_directory(racingDir);});});
+    require(std::filesystem::is_empty(racingDir),"concurrent directory preserved");
+}
+void phased(bool packed)
+{
+    TemporaryDirectory dir;auto opt=options(2,packed);opt.uuidHashRouting=true;
+    std::vector<std::string> ids(2),edges(2);
+    for(size_t i=0;i<2;++i){
+        do{ids[i]=util::newUuid();}while(uuidShardIndex(ids[i],2)!=i);
+        do{edges[i]=util::newUuid();}while(uuidShardIndex(edges[i],2)!=i);
+    }
+    std::promise<void> firstEdgesImported;auto ready=firstEdgesImported.get_future();
+    std::atomic<bool> secondObjectStarted=false;
+    const auto result=importInitialCollection(dir.path/"phased",opt,[&](size_t i,auto& shard){
+        if(i==1){
+            require(ready.wait_for(std::chrono::seconds(5))==std::future_status::ready,
+                "one worker's edges must not wait for other object producers");
+            secondObjectStarted=true;
+        }
+        auto row=fiber(ids[i]);row.id=opt.shards[i].objectIds[0];shard.appendObjects(std::span(&row,1));
+    },[&](size_t i,auto& shard){
+        if(i==0)require(!secondObjectStarted,"referenced sibling object must not exist yet");
+        bool sent=false;shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
+            EdgeRecord edge;edge.uuid=edges[i];edge.kind="sibling";edge.aAnchor.points={{"line_points",{1}}};
+            edge.bAnchor.points={{"line_points",{0}}};edge.aAnchor.metadataKeys={"native"};
+            batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%2]},edge});return true;});
+        if(i==0)firstEdgesImported.set_value();
+    });
+    auto store=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto txn=store.read();
+    for(size_t i=0;i<2;++i) {
+        const auto edge=store.edge(txn,{result.storeUuid,edges[i]});require(bool(edge),"phased sibling edge published");
+        const ObjectKey a{result.storeUuid,ids[i]},b{result.storeUuid,ids[(i+1)%2]};
+        require((edge->a==a&&edge->b==b)||(edge->a==b&&edge->b==a),"phased endpoint identities retained");
+        require(store.readGeometryArray(txn,b,"line_points").size()==6*sizeof(double),"phased sibling geometry routes after publication");
+    }
+}
+void directConnections(bool packed) {
+    TemporaryDirectory dir;
+    for(size_t count:{1u,4u}) {
+        auto opt=options(count,packed);std::vector<std::string> ids(count);
+        for(auto& id:ids)id=util::newUuid();
+        InitialImportResult result;
+        {
+            CountConnections observed;
+            result=importInitialCollection(dir.path/("direct-"+std::to_string(count)),opt,
+                [&](size_t i,auto& shard){auto row=fiber(ids[i]);row.id=opt.shards[i].objectIds[0];shard.appendObjects(std::span(&row,1));},
+                [&](size_t i,auto& shard){if(count==1)return;bool sent=false;
+                    shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
+                        EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="direct";
+                        edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
+                        batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%count]},edge});return true;});});
+            require(connectionCount==count+(count>1?1:0),
+                "exactly one writer per new database: no reader pools or reopened shards/collection");
+        }
+        // Validation is deliberately outside construction, like a consumer.
+        auto collection=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto read=collection.read();
+        const auto pin=collection.provisioning(read);
+        require(collection.provisioning(read).sealed,"direct output sealed");
+        for(const auto& member:collection.members())if(member.storeUuid==result.storeUuid)
+            require(member.generation==pin.generation&&member.commitSequence==pin.commitSequence,
+                "direct manifest pins committed shard lineage and sequence");
+        for(size_t i=0;i<count;++i) {
+            const auto object=collection.objectById(read,result.storeUuid,opt.shards[i].objectIds[0]);
+            require(object&&object->key.objectUuid==ids[i],"direct range routing");
+        }
+    }
+}
+void phaseFailures()
+{
+    TemporaryDirectory dir;auto opt=options(3);
+    auto fail=[&](const auto& objects,const auto& edges){
+        mustFail([&]{importInitialCollection(dir.path/"failed",opt,objects,edges);});
+        require(!std::filesystem::exists(dir.path/"failed"),"failed phase never publishes");
+        require(std::filesystem::is_empty(dir.path),"failed phase cleans private shards");
+    };
+    fail([](size_t i,auto&){if(i==0)throw std::runtime_error("object producer failed");},[](size_t,auto&){});
+    fail([](size_t,auto&){},[](size_t i,auto&){if(i==0)throw std::runtime_error("edge producer failed");});
+    fail([](size_t,auto& shard){shard.importEdges([](auto&){return false;});},[](size_t,auto&){});
+    fail([](size_t,auto&){},[](size_t,auto& shard){shard.appendObjects({});});
+    // Per-shard primary key uniqueness remains enforced by SQLite.
+    fail([&](size_t,auto& shard){auto row=fiber(util::newUuid());shard.appendObjects(std::span(&row,1));
+        shard.appendObjects(std::span(&row,1));},[](size_t,auto&){});
+    // Malformed fields still fail without inspecting referenced geometry.
+    std::vector<std::string> ids(3);for(auto& id:ids)id=util::newUuid();
+    fail([&](size_t i,auto& shard){auto row=fiber(ids[i]);shard.appendObjects(std::span(&row,1));},[&](size_t i,auto& shard){
+        bool sent=false;shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
+            EdgeRecord edge;edge.kind="bad";edge.uuid="not-a-uuid";
+            batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});return true;});
+    });
+    // Uniqueness must reject even cross-batch duplicates before any
+    // ordinary or packed shard becomes visible, including when the producer
+    // catches the import exception itself.
+    for(bool packed:{false,true}){
+        opt=options(3,packed);
+        fail([&](size_t i,auto& shard){auto row=fiber(ids[i]);shard.appendObjects(std::span(&row,1));},
+            [&](size_t i,auto& shard){
+                int batchNumber=0;
+                const auto edgeUuid=util::newUuid();
+                try{shard.importEdges([&](auto& batch){
+                    if(batchNumber++==2)return false;
+                    EdgeRecord edge;edge.uuid=edgeUuid;edge.kind="duplicate";
+                    edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
+                    batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});
+                    return true;
+                });}catch(const std::exception&){}
+            });
+    }
+}
+
+void sourceCompletion(size_t shards,bool packed)
+{
+    TemporaryDirectory dir;auto opt=options(shards,packed);
+    const auto output=dir.path/"output";
+    const auto coordinator=std::this_thread::get_id();
+    std::atomic<size_t> finished=0;
+    size_t completions=0;bool reject=true;
+    opt.beforePublish=[&]{
+        ++completions;
+        require(std::this_thread::get_id()==coordinator,"source completion runs on the caller thread");
+        require(finished==shards,"source completion follows every shard producer");
+        require(!std::filesystem::exists(output),"source completion precedes publication");
+        if(reject)throw std::runtime_error("source aggregate mismatch");
+    };
+    const auto produce=[&](size_t,auto& shard){
+        auto row=fiber(util::newUuid());shard.appendObjects(std::span(&row,1));++finished;
+    };
+    mustFail([&]{importInitialCollection(output,opt,produce);});
+    require(completions==1,"source completion runs exactly once per successful ingestion");
+    require(std::filesystem::is_empty(dir.path),"source completion rejection removes all private staging");
+    reject=false;finished=0;
+    const auto result=importInitialCollection(output,opt,produce);
+    require(completions==2&&std::filesystem::exists(result.path),"corrected source can retry the same destination");
+    // A producer failure must not be followed by a successful completion hook.
+    opt.beforePublish=[&]{++completions;};
+    mustFail([&]{importInitialCollection(dir.path/"failed",opt,[](size_t,auto&){throw std::runtime_error("producer failed");});});
+    require(completions==2&&!std::filesystem::exists(dir.path/"failed"),"producer failure skips completion and publication");
+}
+}
+int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u}){roundTrip(count,packed);sourceCompletion(count,packed);}phased(packed);directConnections(packed);}failures();phaseFailures();
+    std::cout<<"initial import passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

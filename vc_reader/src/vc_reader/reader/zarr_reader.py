@@ -98,15 +98,15 @@ class ZarrReader:
 
     # -- construction -----------------------------------------------------------
 
-    def cuda(self, *, cache_bytes=512 << 20, device=0, pool=None):
-        """Optional CUDA adapter for 3-D uint8 CT; outputs remain on device.
+    def cuda(self, *, cache_bytes=512 << 20, device=0, pool=None, channel=None):
+        """CUDA adapter for uint8 ZYX or one CZYX channel; outputs remain on device.
 
         Owns a bounded device chunk cache, or shares ``pool`` (a ``CudaPool``, e.g.
         with the other levels of a pyramid). Create one per worker/device and reuse
         it across reads; close it or use it as a context manager.
         """
         from .cuda import CudaReader
-        return CudaReader(self, cache_bytes=cache_bytes, device=device, pool=pool)
+        return CudaReader(self, cache_bytes=cache_bytes, device=device, pool=pool, channel=channel)
 
     def grid_level(self, *, working_scale=(1, 1, 1), working_offset=(0, 0, 0), cuda=None, map=None):
         """This array as a :mod:`vc_reader.grid` level.
@@ -241,11 +241,33 @@ class ZarrReader:
         return reader
 
     def __getstate__(self):
+        self._check_process()
         return {"settings": dict(self._settings, attrs=self._attrs, store_metadata=self._metadata),
-                "memory_cache": self.memory_cache}
+                "memory_cache": self.memory_cache,
+                "cache_channels": (self._array.cache_channels if self._array.channel_cache_enabled else None)
+                    if self._array is not None else getattr(self, "_requested_cache_channels", None)}
 
     def __setstate__(self, state):
         self.__init__(state["settings"], state["memory_cache"])
+        if state.get("cache_channels") is not None:
+            self.request_channel_cache(state["cache_channels"])
+
+    def request_channel_cache(self, channels):
+        """Opt into leading-axis channel caching for this volume in this process.
+
+        Relevant channels accumulate across readers. Use read_many with several
+        channel regions to combine their reads into one physical-chunk operation.
+        The existing memory_cache budget is used; fixed-byte caching remains default.
+        """
+        self._check_process()
+        channels = [operator.index(c) for c in channels]
+        self._array.request_channel_cache(channels)
+        self._requested_cache_channels = self._array.cache_channels
+
+    @property
+    def cache_channels(self):
+        self._check_process()
+        return self._array.cache_channels
 
     @property
     def metadata(self) -> StoreMetadata:
@@ -276,8 +298,13 @@ class ZarrReader:
         """After a fork, rebuild the C++ engine in this process (see the module docstring)."""
         if self._pid == os.getpid() or self._array is None:
             return
+        # Snapshot the effective shared registration, not this wrapper's last
+        # request. Native registration snapshots never lock inherited mutexes.
+        channels = self._array.cache_channels if self._array.channel_cache_enabled else None
         self._abandon_inherited()
         self.__init__(dict(self._settings, attrs=self._attrs, store_metadata=self._metadata), self.memory_cache)
+        if channels is not None:
+            self.request_channel_cache(channels)
 
     def _abandon_inherited(self) -> None:
         self._finalizer.detach()  # the parent flushes and closes its own engine

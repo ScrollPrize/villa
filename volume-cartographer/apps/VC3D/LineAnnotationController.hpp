@@ -36,11 +36,13 @@
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationStoredFiber.hpp"
 #include "FiberMapAutoLink.hpp"
+#include "FiberMapStaleness.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/fiber_tracer/FiberSideStripIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/objects/Transactions.hpp>
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -388,9 +390,8 @@ public:
     // Default-constructed (no voxel size, zero extent) when no volume is loaded.
     // Holders of derived geometry compare it to know whether what they built is
     // still in a frame that means anything.
-    // The stored umbilicus of the current volume as uuid@revision, or why there
-    // is none: changes whenever the umbilicus derived views depend on does.
-    [[nodiscard]] QString umbilicusFingerprint() const;
+    // Complete selected identity, with unavailable status kept separately.
+    [[nodiscard]] vc3d::fiber_map::UmbilicusDependency umbilicusDependency() const;
     // The catalog volume the current volume shows and its orientation
     // (catalogVolumeSense); cheap enough for dependency checks.
     [[nodiscard]] std::optional<vc3d::opendata::CatalogVolumeSense> fiberMapCatalogVolume() const;
@@ -529,6 +530,16 @@ private:
         std::vector<FiberSummary::AlignmentMetrics> spans;
     };
     using StoredFiber = vc3d::line_annotation::StoredFiber;
+    using StoredFiberPtr = std::shared_ptr<const StoredFiber>;
+    // What a summary needs from a fiber's line, valid for one geometry
+    // revision read in one frame: summaries keep it instead of the points.
+    struct FiberLineDigest {
+        std::optional<std::string> geometryRevision;
+        std::optional<vc3d::line_annotation::FiberVolumeFrame> frame;
+        int linePointCount = 0;
+        double lineLengthVx = 0.0;
+        std::vector<ControlSpanRecord> spans;
+    };
 
     struct StoredFiberSessionSnapshot {
         StoredFiber fiber;
@@ -551,7 +562,10 @@ private:
         std::function<void(std::vector<SideStripMarker> markers)>;
     using SideStripCancelCallback = std::function<bool()>;
 
+    struct FiberReadContext;
+    struct SideStripLoadContext;
     struct SideStripIntersectionRequest {
+        std::shared_ptr<SideStripLoadContext> load;
         size_t unboundFibers = 0;
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
@@ -565,9 +579,11 @@ private:
         cv::Mat_<cv::Vec3f> stripPoints;
         std::vector<SideStripFiberSnapshot> fibers;
         std::vector<vc::fiber_tracer::FiberSideStripLineQuery> branchLinks;
+        std::set<uint64_t> sameHvBranchIds;
     };
 
     struct SideStripIntersectionTaskResult {
+        std::shared_ptr<SideStripLoadContext> load;
         size_t unboundFibers = 0;
         bool ok = false;
         bool suppressErrorDialogs = false;
@@ -908,6 +924,8 @@ private:
     // package; false makes the helper return false at once.
     bool ensureDatasetForSession(LineAnnotationSession& session, bool required = true,
                                  const std::function<bool()>& stillValid = {});
+    bool resolveDatasetForSession(LineAnnotationSession& session, bool required,
+                                  const std::function<bool()>& stillValid);
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session,
                                                const std::function<bool()>& stillValid = {});
     // Every backend a fiber-mode solve of the session needs (dataset, and
@@ -939,6 +957,9 @@ private:
     void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
     void handleLasagnaDatasetSelectionChanged(const std::string& location);
     void handleFiberInferenceDatasetSelectionChanged(const std::string& location);
+    void handleNormalSourceSelectionChanged(const std::string& source);
+    bool canChangeAnnotationInputs();
+    void invalidateAnnotationInputs(bool predictionsChanged, bool normalsChanged);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     // stillValid (optional): forwarded to the backend helpers and checked
     // once more after the solve, before the result is applied.
@@ -1089,6 +1110,7 @@ private:
     // "H"/"V" from the manual tag, falling back to the automatic classification;
     // empty when unknown or the fiber is not in the store.
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
+    static QString storedFiberHvDirectionTag(const StoredFiber&);
     // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
     void pushFiberUiState(const PaneRecord& pane) const;
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
@@ -1098,7 +1120,7 @@ private:
     // same snapshot; missing and retired objects are skipped. Line points are
     // read on request, otherwise loaded on demand by ensureFiberLines().
     struct StoredFiberDependencies {
-        std::map<std::string, std::optional<uint64_t>> peers;
+        std::map<std::string, std::optional<vc::objects::ObjectVersion>> peers;
         std::set<std::string> relationships;
     };
     using FiberDependencies = std::unordered_map<std::string, StoredFiberDependencies>;
@@ -1111,6 +1133,12 @@ private:
     // relationship endpoints; attachment and transform changes clear all.
     [[nodiscard]] std::vector<StoredFiber> readStoredFibersCached(
         const std::vector<std::string>& uuids, bool lines = false) const;
+    // The same, sharing the cached decodes; nullopt: every live fiber.
+    [[nodiscard]] std::vector<StoredFiberPtr> storedFibersShared(
+        const std::optional<std::vector<std::string>>& uuids, bool lines = false) const;
+    // The fibers' line points in their frames, read in one snapshot.
+    [[nodiscard]] std::vector<std::vector<cv::Vec3d>> readFiberLines(
+        const std::vector<const StoredFiber*>& fibers) const;
     void invalidateStoredFiberCaches(const vc::objects::StoreSessionEvent& event);
     [[nodiscard]] std::string storedFiberFileName(uint64_t fiberId) const;
     // A fiber read from the store in the open volume's voxels.
@@ -1118,7 +1146,8 @@ private:
     void registerFiberId(const std::string& uuid, uint64_t id) const;
     // Drops everything derived from the previous attachment.
     void resetStoreDerivedState();
-    [[nodiscard]] FiberSummary summarizeStoredFiber(const StoredFiber& fiber, int linkedFiberCount) const;
+    [[nodiscard]] FiberSummary summarizeStoredFiber(const StoredFiber& fiber, int linkedFiberCount,
+                                                    const FiberLineDigest& line) const;
     void ensureFiberLines(const StoredFiber&) const;
     // Match reciprocal references by control identities, positions and directions.
     [[nodiscard]] static bool isReciprocalBranchRef(const StoredFiber& fiber,
@@ -1153,6 +1182,15 @@ private:
     [[nodiscard]] std::vector<SideStripFiberSnapshot> fiberSnapshotsForSideStripQuery(
         const std::vector<StoredFiber>& stored) const;
     void startSideStripIntersectionQuery(SideStripIntersectionRequest request);
+    void calculateSideStripIntersections(SideStripIntersectionRequest request);
+    bool sideStripContextCurrent(const SideStripLoadContext&) const;
+    static std::vector<StoredFiber> readStoredFibersInContext(
+        FiberReadContext&, const std::optional<std::vector<std::string>>&, bool, FiberDependencies*);
+    static std::vector<StoredFiberPtr> storedFibersInContext(
+        FiberReadContext&, const std::optional<std::vector<std::string>>&, bool);
+    static void prepareSideStripSnapshots(SideStripIntersectionRequest&);
+    static SideStripFiberSnapshot makeSideStripSnapshot(uint64_t id, uint64_t generation,
+        const std::vector<cv::Vec3d>& points, const std::vector<cv::Vec3d>& controls);
     void updateSideStripIntersectionProgress(uint64_t token,
                                              const std::string& surfaceName,
                                              const std::string& stage,
@@ -1302,6 +1340,9 @@ private:
 
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
+    [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
+        const std::vector<vc3d::line_annotation::StoredControlPoint>& controlPoints,
+        const std::vector<cv::Vec3d>& linePoints);
     // Generation-keyed cache in front of controlSpansForFiber for GUI-thread
     // callers: the scan is O(controls x linePoints) per fiber. Workers keep
     // calling the static function directly.
@@ -1450,21 +1491,27 @@ private:
     QString _runningSideStripFingerprint;
     // Per-fiber snapshot caches behind fiberSnapshotsForSideStripQuery():
     // stored fibers keyed by generation, open sessions keyed by
-    // (lineRevision, solve-queue epoch). Entries for fibers that vanished
-    // are swept on each rebuild.
+    // (lineRevision, solve-queue epoch). Stored snapshots survive candidate
+    // changes within a 256 MiB budget; sessions are swept on each rebuild.
     struct SideStripSnapshotCacheEntry {
         uint64_t validityA = 0;
         uint64_t validityB = 0;
         SideStripFiberSnapshot snapshot;
+        uint64_t lastUse = 0;
     };
+    static void trimSideStripSnapshots(std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>&);
+    mutable uint64_t _sideStripSnapshotClock = 0;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
         _sideStripStoredSnapshotCache;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
         _sideStripSessionSnapshotCache;
     // See readStoredFibersCached: decoded fibers keyed by uuid.
-    mutable std::unordered_map<std::string, StoredFiber> _storedFiberDecodeCache;
+    mutable std::unordered_map<std::string, StoredFiberPtr> _storedFiberDecodeCache;
+    // Line digests for summaries, by fiber uuid; see FiberLineDigest.
+    mutable std::unordered_map<std::string, FiberLineDigest> _fiberLineDigests;
     mutable FiberDependencies _storedFiberDependencies;
-    mutable std::optional<int64_t> _storedFiberCacheJournalPosition;
+    // The store's feed position when the decode cache was last checked.
+    mutable std::optional<vc::objects::FeedCursor> _storedFiberCachePosition;
     // The voxels _storedFiberDecodeCache was decoded in.
     mutable vc::objects::VolumeVoxels _storedFiberDecodeVolume;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the

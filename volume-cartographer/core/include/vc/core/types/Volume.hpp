@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <nlohmann/json.hpp>
 
@@ -48,6 +49,12 @@ public:
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;
     [[nodiscard]] std::string name() const;
+    // Named scalar views share the source/coordinate frame, but have distinct
+    // display IDs. Channel zero retains the original ID for saved projects.
+    [[nodiscard]] std::shared_ptr<Volume> channelView(std::int64_t channel, const std::string& name) const;
+    [[nodiscard]] std::optional<std::int64_t> channel() const noexcept { return channel_; }
+    [[nodiscard]] std::optional<std::int64_t> channelCount() const noexcept { return channelCount_; }
+    [[nodiscard]] std::string sourceVolumeId() const { return sourceVolumeId_.empty() ? id() : sourceVolumeId_; }
     [[nodiscard]] const nlohmann::json& metadata() const noexcept { return metadata_; }
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const std::string& remoteLocator() const noexcept { return remoteLocator_; }
@@ -102,6 +109,8 @@ protected:
     std::string remoteSourceCacheId_;  // the cache of the physical (not rebased) pyramid
     int baseScaleLevel_ = 0;
     bool hasExplicitVoxelSizeOverride_ = false;
+    std::optional<std::int64_t> channel_, channelCount_;
+    std::string sourceVolumeId_;
     vcr::zarr::Access remoteAccess_;
     std::filesystem::path remoteCacheRoot_;
 };

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QStandardPaths>
 #include <QString>
 #include <QStringList>
 
@@ -32,6 +33,14 @@ inline QString reportedSurfaceUuid(const QString& line)
 {
     const QString trimmed = line.trimmed();
     return trimmed.startsWith(QStringLiteral("surface_uuid:")) ? trimmed.mid(13).trimmed() : QString();
+}
+
+// Where tools' local outputs for a surface go by default (renders, copies of
+// published OBJs): <application data>/exports/<surface UUID>. Outputs shared
+// through the store are published as artifacts instead.
+inline QString surfaceExportDirectory(const QString& surfaceUuid)
+{
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/exports/") + surfaceUuid;
 }
 
 } // namespace vc3d

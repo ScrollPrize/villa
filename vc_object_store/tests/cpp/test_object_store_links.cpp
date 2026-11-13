@@ -2,6 +2,8 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -61,7 +63,7 @@ std::string track(ObjectStore& db, const std::string& key, const std::vector<int
 
 GeometryEdgeEdit choice(ObjectStore& db, const Txn& txn, const EdgeRecord& edge, const std::string& action)
 {
-    GeometryEdgeEdit result; result.edgeUuid = edge.uuid; result.expectedGeneration = edge.generation; result.action = action;
+    GeometryEdgeEdit result; result.edgeUuid = edge.uuid; result.expectedVersion = edge.version.value(); result.action = action;
     if (const auto head = db.currentGeometry(txn, edge.aUuid)) result.aRevision = head->uuid;
     if (const auto head = db.currentGeometry(txn, edge.bUuid)) result.bRevision = head->uuid;
     return result;
@@ -108,17 +110,31 @@ void surfaceDiscoveryUsesCurrentRevisionsAndPreservesReview(const TemporaryDirec
 {
     auto db = create(directory, "overlaps.vcobj");
     const auto a = plane(db), b = plane(db);
-    const auto generations = [&] {
+    const auto snapshot = [&] {
         auto txn = db.read();
-        return std::pair{db.objectByUuid(txn, a)->generation, db.objectByUuid(txn, b)->generation};
+        return Json::parse(objectQueryResultToJson(db.status(txn),
+            {*db.objectByUuid(txn, a), *db.objectByUuid(txn, b)}, std::nullopt)).at("objects");
     };
-    const auto before = generations();
+    const auto before = snapshot();
     require(links::linkSurfaceOverlaps(db).edgesCreated == 1, "overlap found");
-    require(generations() == before, "discovery leaves the objects unchanged");
+    const auto after = snapshot();
+    for (size_t i=0;i<before.size();++i) {
+        require(after[i].at("version").get<int64_t>()==before[i].at("version").get<int64_t>()+1,
+                "publishing a new relationship advances each endpoint's numbered graph version");
+        require(after[i].at("commit_sequence").get<int64_t>()>before[i].at("commit_sequence").get<int64_t>(),
+                "new relationship publishes its endpoints in a newer commit");
+        auto content=after[i];content["version"]=before[i].at("version");content["commit_sequence"]=before[i].at("commit_sequence");
+        require(content==before[i],
+                "discovery preserves endpoint metadata, geometry, provenance, approval and lineage");
+    }
     const auto edge = edgesOf(db, a).at(0).uuid;
     const auto stale = [&] { auto txn = db.read(); return db.edgeGeometryState(txn, edge).stale; };
     require(!stale(), "a new link is current");
     require(links::linkSurfaceOverlaps(db).edgesSkippedExisting == 1, "a rerun keeps the link");
+    const auto unchanged=snapshot();
+    for(size_t i=0;i<after.size();++i)
+        require(unchanged[i]==after[i],
+                "no-op discovery preserves endpoint versions as well as content");
     // A new revision with identical coordinates still needs revalidation.
     {
         auto txn = db.write();
@@ -132,10 +148,103 @@ void surfaceDiscoveryUsesCurrentRevisionsAndPreservesReview(const TemporaryDirec
     require(links::linkSurfaceOverlaps(db).edgesSkippedExisting == 1 && edgesOf(db, a).at(0).uuid == edge, "same link after a rerun");
     require(!stale(), "still current");
     { auto txn = db.write(); db.setApproval(txn, edge, "approved"); txn.commit(); }
-    const auto approved = [&] { auto txn = db.read(); return db.edgeByUuid(txn, edge)->generation; }();
+    const auto approved = [&] { auto txn = db.read(); return db.edgeByUuid(txn, edge)->version; }();
     links::SurfaceOverlapParams strict; strict.minInliers = 10000;
     require(links::linkSurfaceOverlaps(db, strict).staleRemoved == 0, "reviewed links are never stale-removed");
-    require([&] { auto txn = db.read(); return db.edgeByUuid(txn, edge)->generation; }() == approved, "reviewed link untouched");
+    require([&] { auto txn = db.read(); return db.edgeByUuid(txn, edge)->version; }() == approved, "reviewed link untouched");
+}
+
+void callerCanCommitAfterFailedCandidateBatch(const TemporaryDirectory& directory)
+{
+    auto db = create(directory, "candidate-savepoint.vcobj");
+    const auto a = plane(db), b = plane(db), c = plane(db);
+    links::LinkCandidate candidate;
+    candidate.kind = "surface-overlap"; candidate.aUuid = a; candidate.bUuid = b;
+    candidate.aAnchor.wholeGeometry = candidate.bAnchor.wholeGeometry = true;
+    require(links::commitCandidates(db,"atomic-test",1,{candidate},false).edgesCreated == 1,
+            "candidate to be replaced is published");
+    const auto old = edgesOf(db,a).front().uuid;
+    candidate.bUuid = c;
+    candidate.meta = "[]";
+    auto txn = db.write();
+    mustFail([&] { links::commitCandidates(db,txn,"atomic-test",1,{candidate},true); });
+    txn.commit();
+    auto read = db.read();
+    require(db.edgeByUuid(read,old).has_value(),"failed candidate batch restores its stale edge before caller commits");
+}
+
+void staleScopesUseCanonicalIds(const TemporaryDirectory& directory)
+{
+    for (const auto history : {HistoryMode::On, HistoryMode::Off})
+        for (const bool callerOwned : {false, true})
+            for (const bool referenced : {false, true}) {
+                const auto name = std::string("scope-") + (history == HistoryMode::On ? "history" : "current") +
+                    (callerOwned ? "-caller" : "-standalone") + (referenced ? "-referenced" : "-local");
+                OpenOptions options; options.author = "scope-test"; options.history = history;
+                const auto path = directory.path / (name + ".vcobj");
+                std::string a, b;
+                {
+                    auto source = ObjectStore::create(path, options);
+                    auto txn = source.write();
+                    ObjectRecord object; object.kind = "surface";
+                    object.uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+                    a = source.upsertObject(txn, object);
+                    object.uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+                    b = source.upsertObject(txn, object);
+                    txn.commit();
+                    if (referenced) { auto seal = source.write(); source.seal(seal); seal.commit(); }
+                }
+                const auto overlay = directory.path / (name + "-overlay.vcobj");
+                if (referenced) { auto collection = ObjectCollection::create(overlay, {path}, options); }
+                auto db = ObjectStore::open(referenced ? overlay : path, options);
+                links::LinkCandidate candidate;
+                candidate.kind = "scope-link"; candidate.aUuid = a; candidate.bUuid = b;
+                candidate.aAnchor.wholeGeometry = candidate.bAnchor.wholeGeometry = true;
+                const auto add = [&] {
+                    require(links::commitCandidates(db,"scope-test",1,{candidate},false).edgesCreated == 1,
+                            "scope fixture creates one pending detector link");
+                    return edgesOf(db,a).front().uuid;
+                };
+                const auto remove = [&](const links::StaleEdgeScope& scope) {
+                    if (!callerOwned) return links::commitCandidates(db,"scope-test",1,{},true,&scope);
+                    auto txn = db.write();
+                    auto report = links::commitCandidates(db,txn,"scope-test",1,{},true,&scope);
+                    txn.commit(); return report;
+                };
+                auto edge = add();
+                links::StaleEdgeScope scope{{candidate.kind}, {}, {}};
+                require(remove(scope).staleRemoved == 0, "empty object scope removes nothing");
+                scope = {{}, {upper(a),upper(b)}, {}};
+                require(remove(scope).staleRemoved == 0, "empty kind scope removes nothing");
+                scope = {{candidate.kind}, {upper(a),upper(b),a}, {}};
+                require(remove(scope).staleRemoved == 1 && edgesOf(db,a).empty(),
+                        "uppercase object scope and empty touching remove the same link");
+                edge = add();
+                scope = {{candidate.kind}, {a,b}, {upper(a)}};
+                require(remove(scope).staleRemoved == 1 && edgesOf(db,a).empty(),
+                        "uppercase touching selects a canonical stored endpoint");
+                edge = add();
+                // Validation failures must not poison a caller's surrounding transaction.
+                for (const bool badTouching : {false, true}) {
+                    auto invalid = links::StaleEdgeScope{{candidate.kind}, {upper(a),upper(b)}, {}};
+                    (badTouching ? invalid.touching : invalid.objectUuids).push_back("not-a-uuid");
+                    auto txn = db.write();
+                    const auto before = db.status(txn).commitSequence;
+                    mustFail([&] { links::commitCandidates(db,txn,"scope-test",1,{},true,&invalid); });
+                    require(db.edgeByUuid(txn,edge).has_value(), "malformed scope preserves existing links");
+                    txn.commit();
+                    auto read = db.read();
+                    require(db.status(read).commitSequence == before && db.edgeByUuid(read,edge).has_value(),
+                            "caught malformed scope leaves no partial publication after outer commit");
+                }
+                scope = {{candidate.kind}, {upper(a),upper(b)}, {upper(b)}};
+                for (const auto* state : {"approved", "rejected"}) {
+                    { auto txn = db.write(); db.setApproval(txn,edge,state); txn.commit(); }
+                    const auto before = edgesOf(db,a).front().reference();
+                    require(remove(scope).staleRemoved == 0 && edgesOf(db,a).front().reference() == before,
+                            "canonical scope never removes or revises reviewed detector links");
+                }
+            }
 }
 
 void surfaceSelectionMissingGeometryAndStaleScope(const TemporaryDirectory& directory)
@@ -188,6 +297,37 @@ void storedTrackCrossingsSelectionAndAtomicFailure(const TemporaryDirectory& dir
     require(journal() == before, "a failed run writes nothing");
     params = {}; params.trackUuids = {badUuid}; params.datasetRef = "other";
     require(!links::linkTracksToTracks(db, params).problems.empty(), "a selection outside the dataset is a problem");
+}
+
+void referencedTrackDatasets(const TemporaryDirectory& directory)
+{
+    const auto root=directory.path/"dataset-routing";
+    for(const auto* name:{"a","b","overlay"})std::filesystem::create_directories(root/name);
+    OpenOptions options;options.author="link-test";
+    std::vector<int32_t> horizontal,vertical;
+    for(int32_t i=0;i<31;++i){horizontal.insert(horizontal.end(),{i,15,20});vertical.insert(vertical.end(),{15,i,20});}
+    std::string a,b;
+    {auto db=ObjectStore::create(root/"a/base.vcobj",options);
+        a=track(db,"11",horizontal,"horizontal","data.tracks");
+        b=track(db,"99",vertical,"vertical","data.tracks");
+        auto w=db.write();db.seal(w);w.commit();}
+    {auto db=ObjectStore::create(root/"b/base.vcobj",options);
+        // Same relative spelling/ordinal, but another owning dataset.
+        track(db,"11",vertical,"vertical","data.tracks");
+        auto w=db.write();db.seal(w);w.commit();}
+    {auto collection=ObjectCollection::create(root/"overlay/graph.vcobj",{root/"a/base.vcobj",root/"b/base.vcobj"},options);}
+    auto db=ObjectStore::open(root/"overlay/graph.vcobj",options);
+    {auto w=db.write();db.setMeta(w,a,"label","\"override\"");w.commit();}
+    {auto r=db.read();require(db.objectByUuid(r,a)->track->datasetRef!=db.objectByUuid(r,b)->track->datasetRef,
+        "override rebases one locator, without changing its source dataset");}
+    const auto report=links::linkTracksToTracks(db);
+    require(report.problems.empty()&&report.edgesCreated==1,"resolved dataset identity groups rebased tracks, separates other owners");
+    const auto edges=edgesOf(db,a);
+    require(edges.size()==1&&(edges.front().aUuid==b||edges.front().bUuid==b),"crossing joins only the same source dataset");
+    links::TrackTrackParams selected;selected.trackUuids={a,b};selected.datasetRef="data.tracks";
+    require(links::linkTracksToTracks(db,selected).problems.empty(),"raw dataset filter includes its rebased peers");
+    selected.datasetRef=(root/"a/data.tracks").string();
+    require(links::linkTracksToTracks(db,selected).problems.empty(),"resolved dataset filter identifies its group");
 }
 
 void storedCollectionIdsWindingScalingAndRerun(const TemporaryDirectory& directory)
@@ -272,8 +412,11 @@ int main()
 try {
     TemporaryDirectory directory;
     surfaceDiscoveryUsesCurrentRevisionsAndPreservesReview(directory);
+    callerCanCommitAfterFailedCandidateBatch(directory);
+    staleScopesUseCanonicalIds(directory);
     surfaceSelectionMissingGeometryAndStaleScope(directory);
     storedTrackCrossingsSelectionAndAtomicFailure(directory);
+    referencedTrackDatasets(directory);
     storedCollectionIdsWindingScalingAndRerun(directory);
     attachedCollectionsAreNotGraphLinks(directory);
     std::cout << "object links passed\n";

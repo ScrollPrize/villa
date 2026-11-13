@@ -50,7 +50,7 @@ def test_legacy_fibers_without_uuids(tmp_path, version):
     with ObjectStore.create(str(tmp_path / "derived.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", tmp_path / "fibers", uuid_namespace=NAMESPACE)
         ids = [derived("fiber:" + name) for name in names]
-        assert report == dict(ingested=2, edges_imported=1, problems=[], uuids=ids, existing=[],
+        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[], uuids=ids, existing=[],
                               cancelled=False, fatal_error=None)
         edge = store.edges_by_kind("fiber_branch")[0]
         assert {edge["a"], edge["b"]} == set(ids)
@@ -105,11 +105,40 @@ def test_patch_named_by_directory(db, tmp_path):
         report = store.ingest_geometry_source("surface", directory, uuid_namespace=NAMESPACE)
         assert report["ingested"] == 1 and not report["problems"], report
         assert store.object(derived("patch:0000_low_band_final"))["name"] == "0000_low_band_final"
+
     del meta["uuid"]
     (directory / "meta.json").write_text(json.dumps(meta))
     with ObjectStore.create(str(tmp_path / "unnamed.vcobj"), author="test") as store:
         assert store.ingest_geometry_source("surface", str(directory) + "/", uuid_namespace=NAMESPACE)["ingested"] == 1
         assert store.object(derived("patch:0000_low_band_final"))
+
+
+def edit_v3_fiber(directory, name, change):
+    path = directory / (name + ".json")
+    document = json.loads(path.read_text())
+    change(document)
+    path.write_text(json.dumps(document))
+
+
+@pytest.mark.parametrize("declared,ok", [
+    ({"volume_uuid": "B"}, True),
+    ({"volume_uuid": "A", "scale_factor": 2}, False),
+])
+def test_v3_coordinate_space_merges_with_declared_coordinates(tmp_path, declared, ok):
+    directory = tmp_path / "fibers"
+    names = write_v3_fibers(directory)
+    for name in names:
+        edit_v3_fiber(directory, name, lambda d: d.update(
+            coordinates=declared, vc_open_data_coordinate_space="PHerc/B@L0"))
+    with ObjectStore.create(str(tmp_path / "frames.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("fiber", directory, uuid_namespace=NAMESPACE)
+        if ok:
+            assert report["ingested"] == 2 and not report["problems"], report
+            coordinates = store.object(derived("fiber:" + names[0]))["meta"]["coordinates"]
+            assert coordinates == {"volume_uuid": "B", "scale_factor": 1}
+        else:
+            assert "coordinate conflict" in " ".join(report["problems"]), report
+            assert store.object_count("fiber") == 0
 
 
 @pytest.mark.parametrize("namespace", ["spiral", ""])

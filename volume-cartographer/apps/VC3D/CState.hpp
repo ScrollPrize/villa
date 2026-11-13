@@ -41,6 +41,7 @@ struct POI
     bool suppressViewerRecenter = false;
 };
 
+class SessionDrafts;
 // A store switch (detach, route, replace) was refused because pending edits
 // could not be saved or an edit operation is running; nothing changed.
 struct StoreSwitchRefused : std::runtime_error {
@@ -70,6 +71,7 @@ public:
     static bool storeAuthorConfigured();
     // Open Options for attaching stores to the viewer's session.
     static vc::objects::OpenOptions storeOpenOptions(const QString& author, bool readOnly);
+    static vc::objects::HostedSessionOptions hostedOptions(const QString& author);
 
     // Project references are stable IDs; attachments exist only for available stores.
     std::optional<vc::objects::AttachmentIdentity> storeReference(const std::string& id) const;
@@ -81,6 +83,9 @@ public:
     void closeProject();
     std::vector<vc::objects::AttachmentIdentity> attachedStores() const;
     vc::objects::AttachmentIdentity attachStore(const std::filesystem::path&, const QString& author, bool readOnly = false);
+    // A store served by vc_object_server (e.g. http://127.0.0.1:8750 through
+    // an SSH tunnel), added to the project as a hosted entry.
+    vc::objects::AttachmentIdentity attachHostedStore(const std::string& endpoint, const QString& author);
     void detachStore(const vc::objects::AttachmentIdentity&);
     void detachStoreReference(const std::string& id);
     void replaceStoreReference(const std::string& id, const std::filesystem::path& path);
@@ -92,6 +97,9 @@ public:
     // Called before a source is changed or detached; failure leaves it unchanged.
     std::function<bool()> prepareStoreSwitch;
     void pollObjectStoreChanges();
+    // Crash recovery of the session's drafts (not started until the
+    // application gives it a directory; the object-store owner's).
+    SessionDrafts* sessionDrafts() const;
 
     // --- VolumePkg ---
     std::shared_ptr<VolumePkg> vpkg() const;
@@ -133,20 +141,25 @@ public:
     // --- Collections ---
     VCCollection* pointCollection() const;
     // Write pending point-collection edits to the store now: the volume's,
-    // and (through pointCollectionsSaveRequested) the open surface's corrections.
+    // and the open surface's corrections. Failure vetoes close/switch.
     void savePointCollections();
+    std::function<bool()> saveSurfaceCorrections;
     // The store one of the volume's point collections is kept in; nullopt for
     // a surface's corrections and in windows without their own collections.
     std::optional<vc::objects::AttachmentIdentity> pointCollectionStore(uint64_t collectionId) const;
 
     // --- Teardown ---
-    void closeAll();
+    void closeAll(const std::function<void()>& afterSave = {});
 
     // --- Surfaces (inlined from CSurfaceCollection) ---
     void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
     // While an edit session publishes the open surface's changed rectangles to
     // its draft itself, edit updates do not re-draft the whole surface.
     void setActiveSurfaceEditing(bool editing) { _activeSurfaceEditing = editing; }
+    // The open surface's draft after a recovered draft of it was resolved:
+    // `restored` (the session's draft now holds the surface) or discarded
+    // (draft the open surface again).
+    void recoveredDraftResolved(const std::string& objectUuid, bool restored);
     // Apply catalog-style surface additions/replacements/removals atomically
     // from observers' perspective. Individual surface signals are suppressed
     // and one empty-name surfaceChanged signal is emitted after the map is final.
@@ -174,7 +187,9 @@ signals:
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
     // An umbilicus was committed, or a store was attached or detached.
     void umbilicusChanged();
-    void pointCollectionsSaveRequested();
+    // The open surface has a draft recovered from an earlier session; it
+    // stays undrafted until recoveredDraftResolved().
+    void recoveredDraftFound(const QString& objectUuid);
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
     void focusBoundsChanged();
     void surfacesLoaded();
@@ -190,8 +205,11 @@ private:
     // The open ("segmentation") surface is in memory: while open it is a
     // draft of the session (in the current volume's voxels), so store
     // queries read it there rather than from its store.
-    void draftActiveSurface(const std::shared_ptr<QuadSurface>& surface);
+    // `saved`: the surface holds its committed geometry (just opened), so its
+    // draft needs no checkpoint until it changes.
+    void draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, bool saved = false);
     std::string _activeSurfaceDraft;
+    SessionDrafts* _sessionDrafts = nullptr;
     bool _activeSurfaceEditing = false;
 
     void restoreStoreRoutes();

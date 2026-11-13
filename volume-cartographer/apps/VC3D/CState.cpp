@@ -1,6 +1,7 @@
 #include "CState.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include "PointCollectionSync.hpp"
+#include "SessionDrafts.hpp"
 
 #include "OpenDataResourceSelection.hpp"
 #include "VCSettings.hpp"
@@ -14,6 +15,13 @@
 #include <optional>
 #include <QSettings>
 #include <QTimer>
+#include <QCoreApplication>
+#include <QProcess>
+#include <QStandardPaths>
+#include <QEventLoop>
+#include <QThread>
+#include <future>
+#include <vc_reader/sftp.hpp>
 
 #include "vc/core/types/VolumePkg.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
@@ -26,6 +34,28 @@
 #include "vc/core/util/PlaneSurface.hpp"
 
 namespace {
+
+vc::objects::AttachmentIdentity connectHostedStore(
+    const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
+    const std::string& endpoint, const vc::objects::HostedSessionOptions& options)
+{
+    const auto* app = QCoreApplication::instance();
+    if (!vcr::sftp::isSftpUrl(endpoint) || !app || QThread::currentThread() != app->thread())
+        return session->attachHosted(endpoint, options);
+    // SSH asks the GUI for host trust/passwords. Keep its queued prompts alive
+    // while preventing another user-initiated project switch during attachment.
+    auto connection = std::async(std::launch::async, [session, endpoint, options] {
+        return session->attachHosted(endpoint, options);
+    });
+    QEventLoop loop;
+    QTimer timer;
+    QObject::connect(&timer, &QTimer::timeout, &loop, [&] {
+        if (connection.wait_for(std::chrono::seconds(0)) == std::future_status::ready) loop.quit();
+    });
+    timer.start(20);
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
+    return connection.get();
+}
 
 std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
 {
@@ -257,6 +287,13 @@ CState::CState(QObject* parent, CState* objectStoreOwner, std::size_t cacheBytes
     }
     _pointCollection = new VCCollection(this);
     if (!objectStoreOwner) _pointCollectionSync = new vc3d::PointCollectionSync(this);
+    if (!objectStoreOwner) {
+        _sessionDrafts = new SessionDrafts(_objectStoreSession, this);
+        // A store attached again may answer saves left pending.
+        connect(this, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+            if (event.kind == vc::objects::StoreSessionEvent::Kind::Attached) _sessionDrafts->resolvePending();
+        });
+    }
 
     setSurface("xy plane",
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,0,1}));
@@ -267,9 +304,7 @@ CState::CState(QObject* parent, CState* objectStoreOwner, std::size_t cacheBytes
     connect(this, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
         // The umbilicus is read through the store's volume mapping, so a
         // registration change moves it too.
-        if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub ||
-            !event.touches({"umbilicus", "volume_transform", "volume_transform_choice"}))
-            return;
+        if (!event.touches({"umbilicus", "volume_transform", "volume_transform_choice"})) return;
         emit umbilicusChanged();
     });
 }
@@ -297,6 +332,33 @@ QString CState::storeAuthor()
     if (!namesAuthor(author))
         author = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "vc3d"));
     return author;
+}
+
+vc::objects::HostedSessionOptions CState::hostedOptions(const QString& author)
+{
+    vc::objects::HostedSessionOptions options;
+    options.author = author.toStdString();
+    options.cacheDirectory = vc::settings::remoteCachePath();
+    options.diskCacheBytes = vc::settings::remoteCacheMaxBytes();
+    options.minFreeBytes = vc::settings::remoteCacheMinFreeBytes();
+    return options;
+}
+
+vc::objects::AttachmentIdentity CState::attachHostedStore(const std::string& endpoint, const QString& author)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->attachHostedStore(endpoint, author);
+    if (!_vpkg) throw std::runtime_error("Open a project first");
+    const auto attachment = connectHostedStore(_objectStoreSession, endpoint, hostedOptions(author));
+    const auto id = vc::objects::util::newUuid();
+    auto data = _vpkg->document().data();
+    data["stores"].push_back({{"id", id}, {"location", endpoint}, {"hosted", true}, {"read_only", false}});
+    try { _vpkg->document().replace(std::move(data)); }
+    catch (...) { _objectStoreSession->detach(attachment); throw; }
+    _attachedStores.push_back(attachment);
+    _storeReferences.emplace(id, attachment);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    return attachment;
 }
 
 bool CState::storeAuthorConfigured() { return namesAuthor(configuredAuthor()); }
@@ -335,6 +397,7 @@ std::optional<vc::objects::AttachmentIdentity> CState::sampleStore() const
 std::optional<vc::objects::AttachmentIdentity> CState::attachedAt(const std::filesystem::path& path) const
 {
     for (const auto& attachment : _objectStoreSession->attachments()) {
+        if (_objectStoreSession->hosted(attachment)) continue;
         std::error_code error;
         if (std::filesystem::equivalent(_objectStoreSession->path(attachment), path, error)) return attachment;
     }
@@ -411,6 +474,8 @@ void CState::replaceStoreReference(const std::string& id, const std::filesystem:
     auto data = _vpkg->document().data();
     auto entry = std::find_if(data["stores"].begin(), data["stores"].end(), [&](const auto& e) { return e.at("id") == id; });
     if (entry == data["stores"].end()) throw std::invalid_argument("Unknown store reference");
+    if (vc::project::ProjectDocument::hostedStore(*entry))
+        throw std::invalid_argument("A hosted store has no file to locate; detach it and attach its endpoint again");
     if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled");
     if (_pointCollectionSync && !_pointCollectionSync->flush())
         throw StoreSwitchRefused("Pending point-collection edits could not be saved");
@@ -471,10 +536,32 @@ void CState::restoreStoreRoutes()
 {
     if (!_vpkg) return;
     QStringList failures;
-    for (const auto& entry : _vpkg->document().data().at("stores")) {
+    const auto stores = _vpkg->document().data().at("stores");
+    for (size_t index = 0; index < stores.size(); ++index) {
+        const auto& entry = stores[index];
         try {
-            const auto path = _vpkg->document().resolve(entry.at("location"));
-            const auto attachment = prepareStore(path, storeAuthor(), entry.value("read_only", false));
+            vc::objects::AttachmentIdentity attachment;
+            try {
+                attachment = vc::project::ProjectDocument::hostedStore(entry)
+                    ? connectHostedStore(_objectStoreSession, entry.at("location").get<std::string>(), hostedOptions(storeAuthor()))
+                    : prepareStore(_vpkg->document().resolve(entry.at("location")), storeAuthor(), entry.value("read_only", false));
+            } catch (const std::exception& error) {
+                if (vc::project::ProjectDocument::hostedStore(entry) || entry.value("read_only", false) ||
+                    !_vpkg->writable() || !QString::fromUtf8(error.what()).contains(": convert it with vc_object_convert)")) throw;
+                // Reuse the offline converter; retain the original and its relative references.
+                const auto source = _vpkg->document().resolve(entry.at("location"));
+                const auto destination = source.parent_path() / (source.stem().string() + "-upgraded-" + vc::objects::util::newUuid() + ".vcobj");
+                QProcess converter;
+                converter.start(QStandardPaths::findExecutable("vc_object_convert", {QCoreApplication::applicationDirPath()}),
+                                {QString::fromStdString(source.string()), QString::fromStdString(destination.string())});
+                if (!converter.waitForFinished(-1) || converter.exitStatus() != QProcess::NormalExit || converter.exitCode() != 0)
+                    throw std::runtime_error("Store upgrade failed: " + converter.errorString().toStdString() + "\n" + converter.readAllStandardError().toStdString());
+                attachment = prepareStore(destination, storeAuthor());
+                auto data = _vpkg->document().data();
+                data["stores"][index]["location"] = _vpkg->document().location(destination);
+                try { _vpkg->document().replace(std::move(data)); }
+                catch (...) { releasePreparedStore(attachment); throw; }
+            }
             if (std::find(_attachedStores.begin(), _attachedStores.end(), attachment) != _attachedStores.end())
                 throw std::runtime_error("Store is referenced more than once");
             _attachedStores.push_back(attachment);
@@ -681,12 +768,14 @@ void CState::savePointCollections()
 {
     if (_pointCollectionSync && !_pointCollectionSync->flush())
         throw std::runtime_error("Pending point-collection edits could not be saved");
-    emit pointCollectionsSaveRequested();
+    if (saveSurfaceCorrections && !saveSurfaceCorrections())
+        throw std::runtime_error("Pending surface corrections could not be saved");
 }
 
-void CState::closeAll()
+void CState::closeAll(const std::function<void()>& afterSave)
 {
     savePointCollections();
+    if (afterSave) afterSave();
     emit volumeClosing();
 
     clearActiveSurface();
@@ -744,7 +833,8 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
 
     _surfs[name] = surf;
     if (name == "segmentation" && (!sameSurface || (isEditUpdate && !_activeSurfaceEditing))) {
-        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf));
+        // A surface newly set without an edit is the one opened from its store.
+        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf), !sameSurface && !isEditUpdate);
     }
     if (!sameSurface) {
         // Edit updates re-set the same pointer every frame; only a mapping
@@ -768,7 +858,7 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 }
 
-void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface)
+void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, bool saved)
 {
     // Workspaces sharing the main session draft their own surfaces.
     if (_objectStoreOwner || !_objectStoreSession) {
@@ -781,9 +871,32 @@ void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface)
     if (!surface || !_annotationVolume || !vc::objects::util::isUuid(surface->id)) {
         return;
     }
+    // Never replace unsaved edits recovered from an earlier session: the user decides.
+    if (_sessionDrafts && _sessionDrafts->recovered(surface->id)) {
+        _activeSurfaceDraft.clear();
+        const auto uuid = QString::fromStdString(surface->id);
+        QMetaObject::invokeMethod(this, [this, uuid] { emit recoveredDraftFound(uuid); }, Qt::QueuedConnection);
+        return;
+    }
     _objectStoreSession->setDraft(surface->id, quad_surface_grid(*surface),
                                   vc::objects::volumeCoordinates(*_annotationVolume));
+    if (saved) _objectStoreSession->markDraftSaved(surface->id, _objectStoreSession->draftRevision(surface->id));
     _activeSurfaceDraft = surface->id;
+}
+
+void CState::recoveredDraftResolved(const std::string& objectUuid, bool restored)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->recoveredDraftResolved(objectUuid, restored); return; }
+    if (_sessionDrafts) _sessionDrafts->forgetRecovered(objectUuid);
+    const auto open = std::dynamic_pointer_cast<QuadSurface>(surface("segmentation"));
+    if (!open || open->id != objectUuid) return;
+    if (restored) _activeSurfaceDraft = objectUuid;
+    else draftActiveSurface(open, true);
+}
+
+SessionDrafts* CState::sessionDrafts() const
+{
+    return _objectStoreOwner ? _objectStoreOwner->sessionDrafts() : _sessionDrafts;
 }
 
 void CState::setSurfacesBatch(

@@ -229,7 +229,10 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_state) {
         connect(_state, &CState::surfaceChanged,
                 this, &SegmentationModule::onSurfaceCollectionChanged);
-        connect(_state, &CState::pointCollectionsSaveRequested, this, &SegmentationModule::saveCorrections);
+        _state->saveSurfaceCorrections = [editor = QPointer<SegmentationModule>(this)] {
+            return !editor || editor->saveCorrections();
+        };
+        connect(_state, &CState::recoveredDraftFound, this, &SegmentationModule::offerRecoveredDraft);
     }
 
     if (_pointCollection) {
@@ -591,6 +594,10 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
 {
     qCInfo(lcSegModule) << "Active segment changed";
 
+    // Do not discard the loaded correction state if it cannot be committed.
+    if (_pointCollection && !saveCorrections())
+        throw std::runtime_error("Correction points were not saved; keep the current editor open");
+
     resetManualAddState(true);
 
     if (_surfaceMaskTool) {
@@ -598,15 +605,8 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
         _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
     }
 
-    // Save corrections for old segment and load for new segment
-    if (_pointCollection) {
-        saveCorrections();
-    }
     // The previous surface's pending saves are done: its store edit ends here.
-    if (_storeEdit && (!newSurface || newSurface->id != _storeEdit->uuid())) {
-        _storeEdit.reset();
-        _editLease = {};
-    }
+    _storeEdit.reset(); // A new selection may be another version of the same UUID.
     if (_pointCollection) {
         loadCorrections(newSurface);
     }
@@ -2716,10 +2716,12 @@ void SegmentationModule::performAutosave()
     }
 
     const auto autosaveTicket = _autosaveState.startSave();
+    // The draft revision this save holds (edits reach the draft as they are made).
+    const auto draftRevision = _state ? _state->objectStoreSession()->draftRevision(surfacePtr->id) : 0;
 
     emit statusMessageRequested(tr("Saving..."), kStatusShort);
 
-    _saveFuture = QtConcurrent::run([snapshot, storeEdit, rect, channels,
+    _saveFuture = QtConcurrent::run([snapshot, storeEdit, rect, channels, draftRevision,
                                       vertexUpdates = std::move(vertexUpdates)]() mutable -> std::shared_ptr<QuadSurface> {
         auto* points = snapshot->rawPointsPtr();
         if (!points || points->empty()) {
@@ -2735,7 +2737,7 @@ void SegmentationModule::performAutosave()
         if (!vertexUpdates.empty()) {
             snapshot->invalidateCache();
         }
-        storeEdit->save(*snapshot, rect, channels);
+        storeEdit->save(*snapshot, rect, channels, draftRevision);
         return snapshot;
     });
     auto saveFuture = _saveFuture;
@@ -2895,7 +2897,8 @@ bool SegmentationModule::saveSurface(QuadSurface* surface, bool vertices, const 
             _saveFuture.waitForFinished();
         }
         const auto* points = surface->rawPointsPtr();
-        storeEdit->save(*surface, vertices && points ? cv::Rect(0, 0, points->cols, points->rows) : cv::Rect(), loaded);
+        storeEdit->save(*surface, vertices && points ? cv::Rect(0, 0, points->cols, points->rows) : cv::Rect(), loaded,
+                        _state->objectStoreSession()->draftRevision(surface->id));
         return true;
     } catch (const std::exception& error) {
         qCWarning(lcSegModule) << "Saving surface channels failed:" << error.what();

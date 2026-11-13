@@ -37,6 +37,8 @@ struct HttpOptions {
     int retries = 5;
     Auth auth;
     long request_timeout_ms = 0;
+    bool path_as_is = false;
+    bool bypass_proxy = false;
 };
 
 struct HttpResponse {
@@ -44,7 +46,7 @@ struct HttpResponse {
     std::string etag, modified, content_range;
     std::size_t bytes = 0;
     std::optional<std::size_t> content_length;
-    std::string content_encoding;
+    std::string content_encoding, content_type;
 };
 
 // The CA bundle to use instead of libcurl's built-in one: empty when that one exists (or
@@ -171,6 +173,17 @@ public:
         return answer;
     }
 
+    // A request whose answer the caller interprets: the status and whole body of
+    // any final response. Connection errors, stalls, 429 and 5xx are retried
+    // like a read, so only for requests safe to repeat (idempotent, or carrying a
+    // durable request id the server deduplicates).
+    HttpResponse exchange(const char* method, const std::string& url, const void* data, std::size_t size,
+                          const std::vector<std::pair<std::string, std::string>>& headers, std::string& answer)
+    {
+        return perform(method, url, [&] { answer.clear(); }, [&](const char* p, std::size_t n) { answer.append(p, n); },
+                       headers, 200, {}, data, size, true);
+    }
+
     // Whether `url` exists (HEAD): false for 404.
     bool head(const std::string& url)
     {
@@ -187,7 +200,8 @@ private:
     HttpResponse perform(const char* method, const std::string& url, const std::function<void()>& reset,
                          std::function<void(const char*, std::size_t)> write,
                          const std::vector<std::pair<std::string, std::string>>& extra, long body_status,
-                         std::function<void(const HttpResponse&)> begin_body, const void* upload, std::size_t upload_size)
+                         std::function<void(const HttpResponse&)> begin_body, const void* upload, std::size_t upload_size,
+                         bool any_status = false)
     {
         Lease lease(*this);
         CURL* h = lease.handle;
@@ -196,12 +210,16 @@ private:
         float delay = 0.25f;
         std::string last_error;
         const bool get = std::strcmp(method, "GET") == 0, post = std::strcmp(method, "POST") == 0, put = std::strcmp(method, "PUT") == 0 || post;
+        const bool upload_body = put || (any_status && upload_size > 0);
         const std::string payload = put && auth->kind == "s3" ? payload_hash(upload, upload_size) : sigv4_empty_payload();
         for (int attempt = 0; attempt <= options_.retries; ++attempt) {
             reset();
             Transfer transfer{write, body_status, begin_body};
+            transfer.any_status = any_status;
             curl_easy_reset(h);
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+            if (options_.bypass_proxy) curl_easy_setopt(h, CURLOPT_PROXY, "");
+            curl_easy_setopt(h, CURLOPT_PATH_AS_IS, options_.path_as_is ? 1L : 0L);
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
             curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, get ? 1L : 0L);  // a redirected write is an error
             curl_easy_setopt(h, CURLOPT_USERAGENT, "vc_reader");
@@ -235,9 +253,9 @@ private:
             curl_easy_setopt(h, CURLOPT_HEADERDATA, &transfer);
             Upload body{static_cast<const char*>(upload), upload_size};
             HeaderList headers;
-            if (put) {
+            if (upload_body) {
                 curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
-                if (post) curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "POST");
+                if (std::strcmp(method, "PUT") != 0) curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
                 curl_easy_setopt(h, CURLOPT_READFUNCTION, &HttpClient::send);
                 curl_easy_setopt(h, CURLOPT_READDATA, &body);
                 curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(upload_size));
@@ -266,6 +284,8 @@ private:
                 long status = 0;
                 curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
                 transfer.response.status = status;
+                if (any_status && status != 429 && status < 500)
+                    return transfer.response;
                 if (status == body_status || status == 304 || status == 404 || (!get && status / 100 == 2))
                     return transfer.response;
                 if (status != 429 && status < 500) {
@@ -413,6 +433,7 @@ private:
         HttpResponse response;
         std::string snippet;
         std::exception_ptr error;
+        bool any_status = false;  // deliver every status's body to the sink
     };
 
     struct Upload {
@@ -437,7 +458,7 @@ private:
         try {
             if (t.body_status == 206 && t.response.status == 200)
                 throw std::runtime_error("server ignored HTTP Range; refusing a whole-shard download");
-            if (t.response.status == t.body_status) {
+            if (t.response.status == t.body_status || (t.any_status && t.response.status != 429 && t.response.status < 500)) {
                 if (!t.response.bytes && t.begin_body) t.begin_body(t.response);
                 t.sink(data, n);
                 t.response.bytes += n;
@@ -466,6 +487,7 @@ private:
                 if (name == "content-range") t.response.content_range = value;
                 if (name == "content-length") t.response.content_length = std::stoull(value);
                 if (name == "content-encoding") t.response.content_encoding = value;
+                if (name == "content-type") t.response.content_type = value;
             }
             return n;
         } catch (...) { t.error = std::current_exception(); return 0; }

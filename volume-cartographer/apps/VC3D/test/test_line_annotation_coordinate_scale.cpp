@@ -1,6 +1,7 @@
 #include <QtTest/QtTest>
 
 #include "LineAnnotationCoordinateScale.hpp"
+#include "LineAnnotationNormalSource.hpp"
 
 class TestLineAnnotationCoordinateScale : public QObject {
     Q_OBJECT
@@ -10,7 +11,30 @@ private slots:
     void acceptsDyadicNormalAndFiberDomains();
     void preservesLegacyUnspecifiedDomains();
     void rejectsIncompatibleDomains();
+    void normalSourceSelection();
 };
+
+void TestLineAnnotationCoordinateScale::normalSourceSelection()
+{
+    using vc3d::line_annotation::usePredictedFiberNormals;
+    auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
+        "version":3,"source_to_base":1,"groups":{"sd2":{
+        "zarr":"compound/sd2/2","scaledown":2,
+        "channels":["presence","nx","ny","width","sheet_nx","sheet_ny","sheet_grad_mag"]}}})");
+    QVERIFY_EXCEPTION_THROWN(usePredictedFiberNormals(manifest, "auto"), std::invalid_argument);
+    QVERIFY(usePredictedFiberNormals(manifest, "fiber"));
+    QVERIFY(!usePredictedFiberNormals(manifest, "lasagna"));
+    manifest.workingToBaseScale = 4;
+    const auto normals = vc::lasagna::fiberNormalManifest(manifest);
+    QCOMPARE(normals.workingToBaseScale, 4.0);
+    QCOMPARE(*normals.groupForChannel("nx")->channelIndex("nx"), size_t(4));
+    QCOMPARE(*normals.groupForChannel("ny")->channelIndex("ny"), size_t(5));
+    QCOMPARE(*normals.groupForChannel("grad_mag")->channelIndex("grad_mag"), size_t(6));
+    manifest.groups.front().channels.pop_back();
+    QVERIFY(!usePredictedFiberNormals(manifest, "lasagna"));
+    QVERIFY_EXCEPTION_THROWN(usePredictedFiberNormals(manifest, "fiber"), std::invalid_argument);
+    QVERIFY_EXCEPTION_THROWN(usePredictedFiberNormals(manifest, "typo"), std::invalid_argument);
+}
 
 void TestLineAnnotationCoordinateScale::acceptsSameLevelOffByOneDomains()
 {

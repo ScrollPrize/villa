@@ -1129,7 +1129,7 @@ def _omezarr_chunk_exists(omezarr_path: str, level: int, z: int, y: int, x: int,
 	if array is None:
 		try:
 			array = ZarrWriter.open(os.path.join(omezarr_path, str(level)))
-		except RuntimeError:
+		except (RuntimeError, FileNotFoundError):
 			return False
 		_chunk_stores[key] = array
 	try:

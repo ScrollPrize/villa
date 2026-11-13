@@ -107,6 +107,10 @@ class Server:
             # Never overwrite recovery evidence if inspection or migration fails.
             recovered = Engine(state["inventory"], controller_uids=self.controllers,
                                state=state, **options)
+            if self.monitor is not None:
+                # scan_processes also reconciles waiting jobs. No new grant may
+                # escape recovery before the driver's first valid observation.
+                recovered.blocked_gpus = set(state["inventory"]["gpus"])
             inspect, discover = recovered.inspect, recovered.discover
 
             def checked(identity, uid):

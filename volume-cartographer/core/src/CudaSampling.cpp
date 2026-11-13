@@ -77,13 +77,13 @@ bool onDevice(vcr::reader_cuda::Reader& reader, void* out, std::size_t bytes, Re
 }  // namespace
 
 std::shared_ptr<vcr::reader_cuda::Reader> makeReader(vcr::Array& array, const vcr::ElementType& type,
-                                                     std::size_t cacheBytes)
+                                                     std::size_t cacheBytes, std::optional<std::int64_t> channel)
 {
 #ifdef VC_READER_CUDA
-    if (cacheBytes && vcr::cuda::available() && array.ndim() == 3 && type.kind == 'u' && type.itemsize == 1)
-        return std::make_shared<vcr::reader_cuda::Reader>(array, cacheBytes, 0);
+    if (cacheBytes && vcr::cuda::available() && array.ndim() == (channel ? 4 : 3) && type.kind == 'u' && type.itemsize == 1)
+        return std::make_shared<vcr::reader_cuda::Reader>(array, cacheBytes, 0, channel);
 #else
-    (void)array, (void)type, (void)cacheBytes;
+    (void)array, (void)type, (void)cacheBytes, (void)channel;
 #endif
     return nullptr;
 }
@@ -100,19 +100,20 @@ std::shared_ptr<vcr::reader_cuda::Pool> makePool(std::size_t cacheBytes)
 }
 
 std::shared_ptr<vcr::reader_cuda::Reader> makeReader(vcr::Array& array, const vcr::ElementType& type,
-                                                     const std::shared_ptr<vcr::reader_cuda::Pool>& pool)
+                                                     const std::shared_ptr<vcr::reader_cuda::Pool>& pool,
+                                                     std::optional<std::int64_t> channel)
 {
 #ifdef VC_READER_CUDA
-    if (!pool || array.ndim() != 3 || type.kind != 'u' || type.itemsize != 1)
+    if (!pool || array.ndim() != (channel ? 4 : 3) || type.kind != 'u' || type.itemsize != 1)
         return nullptr;
-    if (vcr::reader_cuda::Reader::brick_bytes(array) > pool->slot_bytes()) {
+    if (vcr::reader_cuda::Reader::brick_bytes(array, channel) > pool->slot_bytes()) {
         Logger()->warn("GPU sampling: {}'s bricks exceed the shared cache's slots; it gets a cache of its own",
                        array.spec().identity);
-        return std::make_shared<vcr::reader_cuda::Reader>(array, pool->budget(), pool->device());
+        return std::make_shared<vcr::reader_cuda::Reader>(array, pool->budget(), pool->device(), channel);
     }
-    return std::make_shared<vcr::reader_cuda::Reader>(array, pool);
+    return std::make_shared<vcr::reader_cuda::Reader>(array, pool, channel);
 #else
-    (void)array, (void)type, (void)pool;
+    (void)array, (void)type, (void)pool, (void)channel;
     return nullptr;
 #endif
 }
@@ -125,6 +126,11 @@ void sampleLinear(vcr::Array& array, const vcr::ElementType& type, vcr::reader_c
             return reader->points(zyx, n, 64, {0, 0, 0}, 2, 1, "auto");
         }))
         return;
+    if (reader && reader->channel()) {
+        array.sample_linear_coordinates(vcr::ChannelCoordinates{vcr::PointCoordinates{zyx,std::size_t(3)},*reader->channel()},
+                                        n,type,false,out);
+        return;
+    }
 #else
     (void)reader;
 #endif
@@ -137,6 +143,10 @@ void sampleNearest(vcr::Array& array, vcr::reader_cuda::Reader* reader, const do
 #ifdef VC_READER_CUDA
     if (reader && onDevice(*reader, out, n, [&] { return reader->points(zyx, n, 64, {0, 0, 0}, 2, 0, "auto"); }))
         return;
+    if (reader && reader->channel()) {
+        array.sample_nearest_coordinates(vcr::ChannelCoordinates{vcr::PointCoordinates{zyx,std::size_t(3)},*reader->channel()},n,out);
+        return;
+    }
 #else
     (void)reader;
 #endif
@@ -207,32 +217,33 @@ const char* toolOptionsHelp()
            "  --cuda-cache-gb N               device memory shared by the opened levels, implies --cuda [4]\n";
 }
 
-vcr::reader_cuda::Reader* toolReader(const vcr::zarr::OpenedArray& level)
+vcr::reader_cuda::Reader* toolReader(const vcr::zarr::OpenedArray& level, std::optional<std::int64_t> channel)
 {
     const auto bytes = toolCacheBytes.load();
     if (!bytes)
         return nullptr;
     std::lock_guard lock(toolReadersMutex);
     const auto& spec = level.array->spec();
-    auto [entry, fresh] = toolReaders().try_emplace(spec.identity);
+    const auto key = spec.identity + (channel ? "|channel=" + std::to_string(*channel) : "");
+    auto [entry, fresh] = toolReaders().try_emplace(key);
     if (fresh) {
         entry->second.array = std::make_unique<vcr::Array>(spec, level.array->memory_cache());
         if (!toolPool())
             toolPool() = makePool(bytes);
-        entry->second.reader = makeReader(*entry->second.array, level.meta.type, toolPool());
+        entry->second.reader = makeReader(*entry->second.array, level.meta.type, toolPool(), channel);
         if (!entry->second.reader)
-            Logger()->warn("--cuda: {} stays on the CPU: the GPU samples 3-D uint8 volumes, this is {}-D {}",
+            Logger()->warn("--cuda: {} stays on the CPU: the GPU needs uint8 ZYX or a selected CZYX channel, this is {}-D {}",
                            level.location, level.meta.shape.size(), level.meta.dtype);
     }
     return entry->second.reader.get();
 }
 
-vcr::reader_cuda::Reader* toolReaderOf(const vcr::Array& array)
+vcr::reader_cuda::Reader* toolReaderOf(const vcr::Array& array, std::optional<std::int64_t> channel)
 {
     if (!toolCacheBytes.load())
         return nullptr;
     std::lock_guard lock(toolReadersMutex);
-    const auto found = toolReaders().find(array.spec().identity);
+    const auto found = toolReaders().find(array.spec().identity + (channel ? "|channel=" + std::to_string(*channel) : ""));
     return found == toolReaders().end() ? nullptr : found->second.reader.get();
 }
 

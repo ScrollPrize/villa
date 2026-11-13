@@ -12,6 +12,7 @@
 #include <QFontMetricsF>
 #include <iostream>
 #include <vc_object_store/geometry/ArrayBytes.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include "FiberOverlayColors.hpp"
 #include "CState.hpp"
@@ -177,18 +178,11 @@ struct LinkMark {
 };
 // Whether a link joins two fibers of the same known H/V family.
 std::function<bool(const vc::objects::EdgeRecord&)> sameFamilyTest(
-    const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
-    const std::vector<vc::objects::EdgeRecord>& edges)
+    const std::vector<vc::objects::ObjectRecord>& records)
 {
-    vc::objects::ObjectSelection selection;
-    for (const auto& edge : edges) {
-        selection.uuids.push_back(edge.aUuid);
-        selection.uuids.push_back(edge.bUuid);
-    }
     std::map<std::string, std::string> families;
-    if (!selection.uuids.empty())
-        for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"fiber"}))
-            if (object.fiber && !object.fiber->family.empty()) families[object.uuid] = object.fiber->family;
+    for (const auto& object : records)
+        if (object.fiber && !object.fiber->family.empty()) families[object.uuid] = object.fiber->family;
     return [families = std::move(families)](const vc::objects::EdgeRecord& edge) {
         const auto a = families.find(edge.aUuid), b = families.find(edge.bUuid);
         return a != families.end() && b != families.end() && a->second == b->second;
@@ -244,41 +238,27 @@ struct ChainResult {
     std::map<std::string, std::string> linkGroups;
 };
 // Smallest UUID of each linked component among the given fibers.
-std::map<std::string, std::string> linkGroupsOf(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
-                                                const std::set<std::string>& linked, const std::set<std::string>& drawn,
-                                                const std::atomic_bool& cancelled)
+template<class Component>
+std::map<std::string, std::string> linkGroupsOf(const Component& componentOf,
+                                                const std::set<std::string>& linked, const std::set<std::string>& drawn)
 {
     std::map<std::string, std::string> groups;
     for (const auto& uuid : linked) {
         if (groups.contains(uuid)) continue;
-        const auto component = db.componentOf(txn, uuid, {"fiber_branch"}, &cancelled);
+        const auto component = componentOf(uuid);
+        if (component.empty()) continue;
         const auto representative = *std::min_element(component.begin(), component.end());
         for (const auto& member : component)
             if (drawn.contains(member)) groups[member] = representative;
     }
     return groups;
 }
-// Stored coordinates -> volume voxels of each listed object bound to the volume.
-template <class Keys>
-std::map<std::string, vc::objects::VolumeAffine> volumeMappings(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
-                                                                const Keys& objects, const vc::objects::VolumeVoxels& volume)
-{
-    vc::objects::ObjectSelection selection;
-    for (const auto& [uuid, value] : objects) selection.uuids.push_back(uuid);
-    const auto transforms = db.volumeTransforms(txn);
-    std::map<std::string, vc::objects::VolumeAffine> mappings;
-    for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"meta"}))
-        if (const auto mapping = transforms.toVolume(Json::parse(object.meta), volume.volume, volume.scale))
-            mappings.emplace(object.uuid, *mapping);
-    return mappings;
-}
-
 // The control points of fiber geometry revisions in a volume's voxels
 // (`mappings[i]` maps revision i's stored frame).
-std::vector<std::vector<std::array<double, 3>>> controlsInVolume(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
+std::vector<std::vector<std::array<double, 3>>> controlsInVolume(const vc::objects::StoreReader& reader,
     const std::vector<std::string>& revisions, const std::vector<vc::objects::VolumeAffine>& mappings)
 {
-    const auto controls = db.readGeometryArrays(txn, revisions, "control_points");
+    const auto controls = reader.readGeometryArrays(revisions, "control_points");
     if (controls.dtype != "<f8") throw std::runtime_error("fiber control points must be float64");
     std::vector<std::vector<std::array<double, 3>>> result(revisions.size());
     for (size_t i = 0; i < revisions.size(); ++i)
@@ -374,9 +354,6 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
     options_.showLinked = settings.value("fiberCollections/showLinked", false).toBool();
     options_.sliceDistance = settings.value("fiberCollections/sliceDistance", 3.0).toDouble();
     connect(state_, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-        // Sync/lease status is not a data change. Pulled edits arrive through
-        // Committed events; status-only events must preserve warm views/selection.
-        if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
         if (event.kind == vc::objects::StoreSessionEvent::Kind::Committed &&
             event.attachment != displayedStore()) return;
         if (!event.touches({"fiber", "fiber_branch", "volume_transform", "volume_transform_choice"})) return;
@@ -523,8 +500,8 @@ void FiberCollectionController::projectChanged(bool preserveSelection)
     background<int64_t>(this,
         [connection, attachment=*attachment] {
             int64_t count = 0;
-            connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                count = db.objectCount(txn, "fiber");
+            connection->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+                count = reader.objectCount("fiber");
             });
             return count;
         },
@@ -628,10 +605,10 @@ void FiberCollectionController::listPage(bool reset)
          selection, none=noFamilies()]() {
             std::vector<CatalogRow> rows;
             if (none) return rows;
-            connection->read(attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
+            connection->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto& cancelled) {
                 std::vector<std::string> uuids;
-                const auto transforms = db.volumeTransforms(txn);
-                for (auto& record : db.selectObjects(txn, selection, std::vector<std::string>{"name", "tags", "fiber", "meta"})) {
+                const auto transforms = reader.volumeTransforms();
+                for (auto& record : reader.selectObjects(selection, std::vector<std::string>{"name", "tags", "fiber", "meta"})) {
                     CatalogRow row;
                     if (selection.volume)
                         row.mapping = transforms.toVolume(Json::parse(record.meta), *selection.volume, selection.targetScale);
@@ -645,7 +622,7 @@ void FiberCollectionController::listPage(bool reset)
                 vc::objects::EdgeSelection edges;
                 edges.kind = "fiber_branch";
                 edges.endpointUuids = uuids;
-                for (const auto& edge : db.selectEdges(txn, edges, std::vector<std::string>{"approval_state"})) {
+                for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{"approval_state"})) {
                     for (const auto& endpoint : {edge.aUuid, edge.bUuid}) {
                         const auto found = byUuid.find(endpoint);
                         if (found == byUuid.end()) continue;
@@ -653,9 +630,17 @@ void FiberCollectionController::listPage(bool reset)
                         if (edge.approvalState != "approved") ++found->second->pendingLinks;
                     }
                 }
-                for (auto& row : rows)
-                    if (row.links > 0)
-                        row.componentSize = int(db.componentOf(txn, row.record.uuid, {"fiber_branch"}, &cancelled).size());
+                // One graph query per linked network, not per row: every listed
+                // member of a component takes its size from the first answer.
+                for (auto& row : rows) {
+                    if (row.links <= 0 || row.componentSize > 0) continue;
+                    const auto component = reader.componentOf(row.record.uuid, {"fiber_branch"}, &cancelled);
+                    row.componentSize = int(component.size());
+                    for (const auto& member : component) {
+                        const auto found = byUuid.find(member);
+                        if (found != byUuid.end()) found->second->componentSize = row.componentSize;
+                    }
+                }
             });
             return rows;
         },
@@ -708,18 +693,24 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
         this,
         [connection=state_->objectStoreSession(),attachment=*displayedStore(),uuid,volume]() {
             SelectedFiber selected;
-            connection->read(attachment,[&](const auto& db,const auto& txn,const auto&) {
-                const auto revision=db.currentObjectRevision(txn,uuid);
+            connection->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+                const auto activeGeneration = reader.status().generation;
+                const auto revision=reader.currentObject(uuid);
                 if (!revision || revision->record.retired || !revision->record.fiber)
                     throw std::runtime_error("Fiber is no longer available");
                 auto& row=selected.row;
-                selected.pin={attachment,{attachment.storeUuid,uuid},revision->uuid,revision->geometryRevision};
+                selected.pin=vc::objects::pinOf(attachment,*revision,activeGeneration);
                 row.record=revision->record;
                 if (!volume.volume.empty())
-                    row.mapping = db.volumeTransforms(txn).toVolume(Json::parse(row.record.meta), volume.volume, volume.scale);
-                if (row.mapping) selected.volumeLength = db.geometryLengthInVolume(txn, uuid, volume.volume, volume.scale);
-                const auto& fiber=*row.record.fiber;
-                selected.pointCount=fiber.linePointCount ? fiber.linePointCount : fiber.controlPointCount;
+                    row.mapping = reader.volumeTransforms().toVolume(Json::parse(row.record.meta), volume.volume, volume.scale);
+                if (!revision->geometryRevision) throw std::runtime_error("Fiber has no geometry");
+                const auto fiber=vc::objects::GeometrySnapshot(reader).fiber(uuid,*revision->geometryRevision);
+                selected.pointCount=fiber.linePointCount() ? fiber.linePointCount() : fiber.controlPointCount();
+                if (row.mapping) {
+                    auto points=fiber.linePointCount() ? fiber.linePoints(0,selected.pointCount) : fiber.controlPoints(0,selected.pointCount);
+                    for(auto& point:points) point=row.mapping->apply(point);
+                    selected.volumeLength=vc::geometry::polylineLength(points);
+                }
             });
             return selected;
         },
@@ -733,7 +724,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
             const auto& row = result.value.row;
             // Region queries rank the selected fiber first; re-selecting the
             // same fiber (after a commit) leaves them as they are.
-            const bool reselected = selectedPin_ && selectedPin_->object == result.value.pin.object;
+            const bool reselected = selectedPin_ && selectedPin_->identity() == result.value.pin.identity();
             selectedPin_ = result.value.pin;
             selectedBound_ = row.mapping.has_value();
             emit fiberRevealed(row);
@@ -775,9 +766,11 @@ void FiberCollectionController::navigate(int index)
         [connection=state_->objectStoreSession(),pin=*selectedPin_,index,
          volume=vc::objects::VolumeVoxels(state_->annotationVolume().value_or(vc::project::AnnotationVolume{}))]() {
             Point point{};
-            connection->read(pin.attachment,[&](const auto& db,const auto& txn,const auto&) {
+            connection->readStore(pin.attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
                 // The fiber's point in the volume's voxels, through the store's mapping.
-                const auto fiber=vc::objects::GeometrySnapshot(db,txn).fiber(pin.object.objectUuid);
+                const auto selected=reader.selectedObject(pin.reference().objectUuid, {}, {}, pin.reference());
+                if (!selected || !selected->geometryRevision) throw std::runtime_error("Selected fiber is no longer retained");
+                const auto fiber=vc::objects::GeometrySnapshot(reader).fiber(*selected);
                 const auto shown=fiber.viewTransformedAt(volume.volume,volume.scale);
                 const auto name=fiber.linePointCount()>0 ? "line_points" : "control_points";
                 point=shown.points(name,index,1).front();
@@ -841,29 +834,36 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
         },
         [connection=state_->objectStoreSession(),attachment=*displayedStore(),
          volume=vc::objects::VolumeVoxels(state_->annotationVolume().value_or(vc::project::AnnotationVolume{})),
-         selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{},min,maximum,family,linked,
+         selectedUuid=selectedPin_ ? selectedPin_->reference().objectUuid : std::string{},min,maximum,family,linked,
          none=noFamilies()](const Slice& query, const std::atomic_bool& cancel) {
             RegionResult result;
             if (none || volume.volume.empty()) return result;
-            connection->read(attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
-                const auto slice = vc3d::store::regionSlice(query);
-                vc::objects::RegionOptions options;
-                options.kind="fiber"; options.volume=volume.volume; options.targetScale=volume.scale; options.maximumObjects=maximum; options.minLength=min;
-                if (!selectedUuid.empty()) options.selected=selectedUuid;
-                options.family=family;
-                auto region=db.geometryRegion(txn,slice,options,[&](const auto&) { return cancel.load() || cancelled.load(); });
+            // The region runs on the attachment's store (the host for a hosted
+            // one); the reads after it annotate what it drew.
+            const auto slice = vc3d::store::regionSlice(query);
+            vc::objects::RegionOptions options;
+            options.kind="fiber"; options.volume=volume.volume; options.targetScale=volume.scale; options.maximumObjects=maximum; options.minLength=min;
+            if (!selectedUuid.empty()) options.selected=selectedUuid;
+            options.family=family;
+            auto attached=connection->geometryRegion({attachment},slice,options,[&](const auto&) { return cancel.load(); });
+            if (attached.empty()) return result;
+            auto& region=attached.front().result;
+            connection->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto& cancelled) {
                 result.complete = region.complete();
                 result.limited = region.stop == vc::objects::RegionStop::ObjectLimit;
                 // Runs arrive in volume voxels, merged in UUID order with the selected fiber first.
                 std::map<std::string, std::optional<std::string>> drawn;
+                std::map<std::string, vc::objects::VolumeAffine> mappings;
+                std::map<std::string, vc::objects::ObjectVersion> references;
                 for (auto& run : region.runs) {
+                    references.emplace(run.objectUuid, run.objectReference);
+                    mappings.emplace(run.objectUuid, run.objectToVolume.value_or(vc::objects::VolumeAffine{}));
                     auto& sampledRevision = drawn[run.objectUuid];
                     // Control points are annotation markers only on fibers drawn from a sampled line.
                     if (run.arrayName == "line_points") sampledRevision = run.revisionUuid;
                 }
                 result.runs = std::move(region.runs);
                 if (drawn.empty()) return;
-                const auto mappings = volumeMappings(db, txn, drawn, volume);
                 std::vector<std::string> revisions, owners;
                 std::vector<vc::objects::VolumeAffine> ownerMappings;
                 for (const auto& [uuid, sampledRevision] : drawn)
@@ -873,21 +873,24 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                         ownerMappings.push_back(mappings.at(uuid));
                     }
                 if (!revisions.empty()) {
-                    const auto controls = controlsInVolume(db, txn, revisions, ownerMappings);
+                    const auto controls = controlsInVolume(reader, revisions, ownerMappings);
                     for (size_t i = 0; i < owners.size(); ++i)
                         for (size_t k = 0; k < controls[i].size(); ++k) result.controls.push_back({owners[i], int(k), controls[i][k]});
                 }
                 if (!linked) return;
                 vc::objects::EdgeSelection edges;
                 edges.kind = "fiber_branch";
-                edges.endpointUuids.emplace();
-                for (const auto& [uuid, fiber] : drawn) edges.endpointUuids->push_back(uuid);
+                std::vector<vc::objects::ObjectVersion> selected;
+                for (const auto& [uuid, reference] : references) selected.push_back(reference);
+                const auto graph = reader.graphReadViewAround(selected, edges, &cancelled);
+                std::vector<vc::objects::ObjectRecord> records;
+                for (const auto& object : graph.selectedObjects.value()) records.push_back(object.record);
                 std::set<std::string> linkedUuids;
-                const auto links = db.selectEdges(txn, edges);
-                const auto sameFamily = sameFamilyTest(db, txn, links);
+                const auto sameFamily = sameFamilyTest(records);
                 // One mark per linked control point, over every link on it.
                 std::map<std::pair<std::string, Point>, LinkMark> marks;
-                for (const auto& edge : links) {
+                for (const auto& relationship : graph.selectedRelationships.value()) {
+                    const auto& edge = relationship.record;
                     const bool sameHv = sameFamily(edge);
                     for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}}) {
                         // Anchors are in the fiber's stored frame.
@@ -901,7 +904,8 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 for (const auto& [key, mark] : marks) result.rings.push_back({key.second, mark});
                 std::set<std::string> drawnUuids;
                 for (const auto& [uuid, fiber] : drawn) drawnUuids.insert(uuid);
-                result.linkGroups = linkGroupsOf(db, txn, linkedUuids, drawnUuids, cancelled);
+                result.linkGroups = linkGroupsOf([&](const auto& uuid) { return graph.componentOf(uuid, &cancelled); },
+                                                linkedUuids, drawnUuids);
             });
             return result;
         },
@@ -1154,7 +1158,7 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
          linked=options_.showLinked, none=noFamilies()]() {
             ChainResult result;
             if (none || volume.volume.empty()) return result;
-            connection->read(attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
+            connection->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto& cancelled) {
                 // Fibers drawn from a sampled line carry annotation controls.
                 vc::objects::ObjectSelection selection;
                 selection.kind = "fiber";
@@ -1165,22 +1169,25 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                 selection.family = family;
                 if (maximum > 0) selection.limit = maximum;
                 std::vector<std::string> uuids, revisions;
+                std::vector<vc::objects::ObjectVersion> selected;
                 std::vector<vc::objects::VolumeAffine> mappings;
-                const auto transforms = db.volumeTransforms(txn);
-                for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"fiber", "meta"})) {
+                const auto transforms = reader.volumeTransforms();
+                for (const auto& object : reader.selectObjects(selection, std::vector<std::string>{"fiber", "meta"})) {
                     if (cancel->load() || cancelled.load()) return;
-                    if (!object.fiber || object.fiber->linePointCount == 0) continue;
                     // Fibers bound by scale or through a registration, in volume voxels.
                     const auto mapping = transforms.toVolume(Json::parse(object.meta), volume.volume, volume.scale);
-                    const auto head = db.currentGeometry(txn, object.uuid);
-                    if (!mapping || !head) continue;
+                    const auto head = reader.selectedObject(object.uuid, {}, {}, object.reference());
+                    if (!mapping || !head || !head->geometryRevision) continue;
+                    const auto view=vc::objects::GeometrySnapshot(reader).fiber(object.uuid,*head->geometryRevision);
+                    if (!view.linePointCount()) continue;
                     uuids.push_back(object.uuid);
-                    revisions.push_back(head->uuid);
+                    revisions.push_back(*head->geometryRevision);
+                    selected.push_back(head->reference());
                     mappings.push_back(*mapping);
                 }
                 if (revisions.empty()) return;
-                const auto controls = controlsInVolume(db, txn, revisions, mappings);
-                const auto ids = db.readGeometryArrays(txn, revisions, "control_point_ids");
+                const auto controls = controlsInVolume(reader, revisions, mappings);
+                const auto ids = reader.readGeometryArrays(revisions, "control_point_ids");
                 if (ids.dtype != "<i8") throw std::runtime_error("fiber control point IDs must be int64");
                 std::map<std::string, std::pair<size_t, std::unordered_map<int64_t, size_t>>> controlIndex;
                 for (size_t i = 0; i < uuids.size(); ++i) {
@@ -1197,11 +1204,13 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                 if (!linked) return;
                 vc::objects::EdgeSelection edges;
                 edges.kind = "fiber_branch";
-                edges.endpointUuids = uuids;
                 std::set<std::string> linkedUuids;
-                const auto links = db.selectEdges(txn, edges);
-                const auto sameFamily = sameFamilyTest(db, txn, links);
-                for (const auto& edge : links) {
+                const auto graph=reader.graphReadViewAround(selected,edges,&cancelled);
+                std::vector<vc::objects::ObjectRecord> records;
+                for(const auto& object:graph.selectedObjects.value()) records.push_back(object.record);
+                const auto sameFamily = sameFamilyTest(records);
+                for (const auto& relationship : graph.selectedRelationships.value()) {
+                    const auto& edge=relationship.record;
                     const bool sameHv = sameFamily(edge);
                     for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}}) {
                         const auto chain = controlIndex.find(endpoint);
@@ -1216,7 +1225,8 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                         }
                     }
                 }
-                result.linkGroups = linkGroupsOf(db, txn, linkedUuids, std::set<std::string>(uuids.begin(), uuids.end()), cancelled);
+                result.linkGroups = linkGroupsOf([&](const auto& uuid) { return graph.componentOf(uuid, &cancelled); },
+                                                linkedUuids, std::set<std::string>(uuids.begin(), uuids.end()));
             });
             return result;
         },

@@ -71,6 +71,14 @@ struct PointPlan {
 };
 class Reader {
     Array& array_;
+    const std::optional<std::int64_t> channel_;
+    // Only the requested scalar bricks are staged/uploaded. Their source remains
+    // the original array, whose decoded CZYX chunks/cache are shared by channels.
+    void selectRegions(std::vector<Index>& starts, std::vector<Index>& sizes) const {
+        if (!channel_) return;
+        for (auto& start : starts) start.insert(start.begin(), *channel_);
+        for (auto& size : sizes) size.insert(size.begin(), 1);
+    }
     Source source_{};
     int device_;
     pid_t pid_=getpid();
@@ -248,6 +256,7 @@ class Reader {
                 starts.push_back(std::move(idx)); outputs.push_back(staging.buffer.data()+i*brick_bytes_);
                 targets[i]=slot_pointer(missing[first+i].slot);
             }
+            selectRegions(starts,sizes);
             array_.read_many(starts,sizes,outputs,nullptr,true);
             auto* device=static_cast<unsigned char*>(staging.device->ptr);
             device::check(cudaMemcpyAsync(device,staging.buffer.data(),table(n)+n*sizeof(void*),cudaMemcpyHostToDevice,device::stream()));
@@ -333,10 +342,10 @@ class Reader {
     static void* mask(const Result& r) { return r.valid ? r.valid->ptr : nullptr; }
 public:
     // The bytes of one brick of `array` (its slots must hold at least this many).
-    static std::size_t brick_bytes(const Array& array) {
+    static std::size_t brick_bytes(const Array& array, std::optional<std::int64_t> channel = std::nullopt) {
         const auto& spec=array.spec();
         std::size_t bytes=std::max<std::size_t>(1,spec.itemsize);
-        for (std::size_t a=0;a<spec.chunks.size();++a) {
+        for (std::size_t a=channel ? 1 : 0;a<spec.chunks.size();++a) {
             auto brick=spec.chunks[a];
             while (brick>kBrick && brick%2==0) brick/=2;
             bytes*=std::size_t(std::max<std::int64_t>(1,brick));
@@ -348,22 +357,25 @@ public:
         return pool;
     }
     // A reader with a pool of its own.
-    Reader(Array& array, std::size_t budget, int device)
-        : Reader(array,std::make_shared<Pool>(budget,device,brick_bytes(array))) {}
+    Reader(Array& array, std::size_t budget, int device, std::optional<std::int64_t> channel = std::nullopt)
+        : Reader(array,std::make_shared<Pool>(budget,device,brick_bytes(array,channel)),channel) {}
     // A reader sharing `pool` (on the pool's device) with other readers.
-    Reader(Array& array, std::shared_ptr<Pool> pool)
-        : array_(array),device_(pool ? pool->device() : 0),pool_(pooled(std::move(pool))),mutex_(pool_->mutex_) {
+    Reader(Array& array, std::shared_ptr<Pool> pool, std::optional<std::int64_t> channel = std::nullopt)
+        : array_(array),channel_(channel),device_(pool ? pool->device() : 0),pool_(pooled(std::move(pool))),mutex_(pool_->mutex_) {
         const auto& spec=array.spec();
-        if (array.ndim()!=3 || spec.itemsize!=1) throw std::invalid_argument("CUDA reader requires 3-D uint8 CT");
+        if (array.ndim()!=(channel ? 4 : 3) || spec.itemsize!=1 ||
+            (channel && (*channel<0 || *channel>=spec.shape[0])))
+            throw std::invalid_argument("CUDA reader requires uint8 ZYX or a valid CZYX channel");
         device::Guard guard(device_);
         std::int64_t total=1;
         for (int a=0;a<3;++a) {
-            if (spec.shape[a]>(1LL<<30) || spec.chunks[a]>(1LL<<30)) throw std::invalid_argument("CUDA reader dimensions must be at most 2**30");
-            auto brick=spec.chunks[a];
+            const auto axis=a+(channel ? 1 : 0);
+            if (spec.shape[axis]>(1LL<<30) || spec.chunks[axis]>(1LL<<30)) throw std::invalid_argument("CUDA reader dimensions must be at most 2**30");
+            auto brick=spec.chunks[axis];
             while (brick>kBrick && brick%2==0) brick/=2;
-            source_.shape[a]=spec.shape[a]; source_.brick[a]=brick;
+            source_.shape[a]=spec.shape[axis]; source_.brick[a]=brick;
             source_.shift[a]=std::has_single_bit(std::uint64_t(brick)) ? std::countr_zero(std::uint64_t(brick)) : -1;
-            source_.grid[a]=(spec.shape[a]+brick-1)/brick;
+            source_.grid[a]=(spec.shape[axis]+brick-1)/brick;
             if (source_.grid[a] && total>INT64_MAX/source_.grid[a]) throw std::invalid_argument("chunk grid overflow");
             total*=source_.grid[a];
             if (brick_bytes_>SIZE_MAX/std::size_t(brick)) throw std::invalid_argument("chunk size overflow");
@@ -386,6 +398,8 @@ public:
         pool_->release_if_unused();
     }
     int device_id() const { return device_; }
+    std::optional<std::int64_t> channel() const { return channel_; }
+    const Array& array() const { return array_; }
     const std::shared_ptr<Pool>& pool() const { return pool_; }
     // Readers holding the same lock (one pool) share it; take several in this order.
     const void* lock_id() const { return &mutex_; }
@@ -429,6 +443,7 @@ public:
                 starts.push_back(std::move(idx)); outputs.push_back(host.data()+i*brick_bytes_);
             }
             std::vector<std::uint8_t> complete;
+            selectRegions(starts,sizes);
             try { array_.read_many(starts,sizes,outputs,nullptr,false,cancel,&complete); }
             catch (const Cancelled&) { cancelled=true; }
             if (cancelled) {
@@ -556,10 +571,11 @@ public:
             if (kind==0) {
                 std::vector<Index> starts,sizes; std::vector<std::uint8_t*> outs;
                 for (const auto& g:grids) { starts.emplace_back(g.base,g.base+3); sizes.emplace_back(g.shape,g.shape+3); outs.push_back(host.data()+g.offset); }
+                selectRegions(starts,sizes);
                 array_.read_many(starts,sizes,outs);
             } else for (const auto& g:grids) {
                 FloatAffine coords; for (int a=0;a<3;++a) { coords.shape[a]=g.shape[a]; coords.origin[a]=g.origin[a]; coords.offset[a]=g.base[a]; }
-                std::copy_n(g.axes,9,coords.axes.begin()); array_.sample_u8_float32(coords,g.count,order,host.data()+g.offset*(order ? 4 : 1));
+                std::copy_n(g.axes,9,coords.axes.begin()); array_.sample_u8_float32(coords,g.count,order,host.data()+g.offset*(order ? 4 : 1),channel_);
             }
             if (floating && (kind==0 || !order)) {
                 reserve(requests_,total); device::check(cudaMemcpyAsync(requests_->ptr,host.data(),total,cudaMemcpyHostToDevice,device::stream())); cast(requests_->ptr,result.storage->ptr,total,1,4);
@@ -730,7 +746,7 @@ private:
                     RebasedCoordinates<PointCoordinates<Coord>> coords;
                     coords.data=static_cast<const Coord*>(points); coords.ndim=3;
                     std::copy_n(base.begin(),3,coords.offset.begin());
-                    array_.sample_u8_float32(coords,count,order,host.data());
+                    array_.sample_u8_float32(coords,count,order,host.data(),channel_);
                 };
                 if (bits==64) sample.template operator()<double>();
                 else sample.template operator()<float>();
@@ -738,7 +754,9 @@ private:
                 std::vector<std::int64_t> wide;
                 const auto* ptr=static_cast<const std::int64_t*>(points);
                 if (bits==32) { auto* first=static_cast<const std::int32_t*>(points); wide.assign(first,first+3*count); ptr=wide.data(); }
-                array_.read_points(ptr,count,host.data());
+                if (channel_)
+                    array_.sample_nearest_coordinates(ChannelCoordinates{PointCoordinates{ptr,std::size_t(3)},*channel_},count,host.data());
+                else array_.read_points(ptr,count,host.data());
             }
             device::check(cudaMemcpyAsync(result.storage->ptr,host.data(),host.size(),cudaMemcpyHostToDevice,device::stream()));
             if (valid) {
