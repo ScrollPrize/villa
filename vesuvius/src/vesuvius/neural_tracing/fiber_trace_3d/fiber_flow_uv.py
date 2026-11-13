@@ -161,7 +161,7 @@ def prepare_data(config, data, labels, paths=None, *, supported_input=False):
     return d,selection
 
 
-def solve(config, data=None, selection=None):
+def solve(config, data=None, selection=None, *, snapshots=None):
     import torch
     from .fiber_shared_curve import SharedCurve
     from .fiber_scaled_lbfgs import uncertainty_joint
@@ -200,9 +200,15 @@ def solve(config, data=None, selection=None):
         return dict(mean=float(x.mean()),median=float(np.median(x)),p95=float(np.quantile(x,.95)),maximum=float(x.max()))
     history=[]
     def save(name):
-        np.savez(root/name,state=state.detach().cpu().numpy(),widths=soft.decode_widths(raw,config).detach().cpu().numpy(),
-            shared_u=curve.u.detach().cpu().numpy(),shared_v=curve.v.detach().cpu().numpy(),
-            **{k:d[k] for k in ('source_id','start','end','family','direction','fixed_winding','fixed_target')})
+        checkpoint=config.get('write_solver_checkpoints',True)
+        if not checkpoint and snapshots is None:return
+        host_copy=lambda value:value.detach().to(device='cpu',copy=True).numpy()
+        values=dict(state=host_copy(state),widths=host_copy(soft.decode_widths(raw,config)),
+                    shared_u=host_copy(curve.u),shared_v=host_copy(curve.v))
+        if snapshots is not None:snapshots[Path(name).stem]=values
+        if checkpoint:
+            np.savez(root/name,**values,
+                **{k:d[k] for k in ('source_id','start','end','family','direction','fixed_winding','fixed_target')})
     def record(step):
         with torch.no_grad():
             loss,terms=objective()
@@ -241,7 +247,7 @@ def solve(config, data=None, selection=None):
     return summary
 
 
-def visualize(config, data=None):
+def visualize(config, data=None, *, snapshots=None):
     import torch
     from .fiber_soft_winding import points
     from .fiber_uv_layout import q_to_u
@@ -250,8 +256,12 @@ def visualize(config, data=None):
     d=arrays(root/'tensors.npz') if data is None else data
     curves={};endpoints={}
     same=(d['fixed_target']==0)&~d['parallel']
+    def saved_for(name):
+        if name=='initial' and config.get('visual_initial'):return arrays(config['visual_initial'])
+        if snapshots is not None:return snapshots[name]
+        return arrays(root/(name+'.npz'))
     for name in ('initial','solution'):
-        s=arrays(config['visual_initial'] if name=='initial' and config.get('visual_initial') else root/(name+'.npz'))
+        s=saved_for(name)
         state=s['state'].copy();state[:,1]=s['shared_u'];state[:,2]=s['shared_v']
         def query(ids,ds):
             q,_,v=points(torch.tensor(state[ids]),torch.tensor(d['family'][ids]),torch.tensor(ds),torch.tensor(s['widths']))
@@ -265,7 +275,7 @@ def visualize(config, data=None):
     def xy(p):return np.stack(((p[...,0]-lo[0])*scale,(hi[1]-p[...,1])*scale),-1)
     for name in curves:
         sinks=[TiledRaster(width,height),VectorPDF(width,height)];draw=DrawingSinks(*sinks)
-        saved=arrays(config['visual_initial'] if name=='initial' and config.get('visual_initial') else root/(name+'.npz'))
+        saved=saved_for(name)
         for boundary in np.r_[0,np.cumsum(saved['widths'])]:
             x=(boundary-lo[0])*scale
             if 0<=x<width:draw.line((x,0,x,height-1),fill=(215,215,215,255),width=1)
@@ -292,8 +302,12 @@ def _solve_checkpoint(config):
     _checkpoint_binding(config,create=True)
     data,selection=prepare(config)
     write(root/'selection.json',selection)
-    result=solve(config,data,selection)
-    if config.get('visualize',True):visualize(config,data)
+    if config.get('visualize',True):
+        snapshots={}
+        result=solve(config,data,selection,snapshots=snapshots)
+        visualize(config,data,snapshots=snapshots)
+    else:
+        result=solve(config,data,selection)
     if config.get('write_geometry_store',True) and not (root/'fibers.vcobj').exists():
         # Explicit compatibility export only. Production store-to-store UV
         # sets this false and retains immutable source geometry by reference.

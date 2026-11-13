@@ -9,6 +9,16 @@ struct FixedFiberUvColumns {
     std::span<const int64_t> family,sampleOwner;
     std::span<const double> winding,direction,sampleDs,q,x,v,widths;
 };
+struct FiberResultColumn {
+    std::string name;
+    std::variant<std::span<const int64_t>,std::span<const double>> values;
+};
+InitialImportResult exportFiberResultColumns(const std::filesystem::path& destination,
+    const std::filesystem::path& dependency,const ExtensionSource& expectedSource,
+    const std::string& runUuid,const std::optional<std::string>& inputRunUuid,
+    const std::string& stage,const std::string& method,
+    const std::map<std::string,FiberGraphSetting>& settings,std::span<const FiberGraphUuid> uuids,
+    std::span<const FiberResultColumn> columns,std::span<const ExtensionRow> metrics={},size_t workers=32);
 
 // Native column-to-extension export through the same atomic initial import
 // API as other graph producers. Samples are grouped by their fiber owner.

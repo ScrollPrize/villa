@@ -59,11 +59,10 @@ def fiber_geometry(points, family, umbilicus):
 
 
 def signed_order(connector, inward_a, inward_b, cosine_min=.1):
-    length=np.linalg.norm(connector,axis=1)
-    unit=connector/np.maximum(length[:,None],1e-12)
-    a=-np.sum(unit*inward_a,axis=1);b=-np.sum(unit*inward_b,axis=1)
-    known=(a*b>0)&(np.minimum(abs(a),abs(b))>=cosine_min)&(length>0)
-    return np.where(known,np.sign(a),0).astype(np.float32)
+    from vc_object_store import fiber_signed_order
+    return fiber_signed_order(np.ascontiguousarray(connector,dtype=np.float64),
+        np.ascontiguousarray(inward_a,dtype=np.float64),np.ascontiguousarray(inward_b,dtype=np.float64),
+        float(cosine_min),1)
 
 
 def anchored(config):

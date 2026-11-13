@@ -174,6 +174,22 @@ template<class Visit> void detailTables(Visit visit)
 }
 }
 
+namespace {
+std::string readObjectVersionGeneration(sqlite3* db,const Statement& s,int generationColumn,const std::string* initialGeneration)
+{
+    if(!s.isNull(generationColumn))return s.uuid(generationColumn);
+    if(initialGeneration)return *initialGeneration;
+    Statement lineage(db,"SELECT initial_generation FROM store_manifest WHERE singleton=1");
+    return lineage.row()?lineage.uuid(0):std::string{};
+}
+}
+ObjectVersion readObjectReferenceColumns(sqlite3* db,const Statement& s,int uuidColumn,int versionColumn,int generationColumn,
+    const std::string* initialGeneration,const std::string* ownerStore,const std::string* selectedUuid)
+{
+    return {ownerStore?*ownerStore:storeUuidText(db),readObjectVersionGeneration(db,s,generationColumn,initialGeneration),
+            selectedUuid?*selectedUuid:s.uuid(uuidColumn),s.i64(versionColumn)};
+}
+
 ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details,
                            const std::string* initialGeneration, bool lifecycle, const std::string* ownerStore)
 {
@@ -185,15 +201,10 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details,
     rec.formatVersion = s.i64(16);
     rec.storageKind = s.text(17);
     rec.storageRef = s.text(18);
-    rec.version = s.i64(19);
+    rec.version=s.i64(19);
+    rec.versionGeneration=readObjectVersionGeneration(db,s,22,initialGeneration);
     rec.dataChecksum = s.optText(20);
     rec.meta = canonicalObjectJson(s.text(21));
-    if (!s.isNull(22)) rec.versionGeneration = s.uuid(22);
-    else if (initialGeneration) rec.versionGeneration = *initialGeneration;
-    else {
-        Statement lineage(db, "SELECT initial_generation FROM store_manifest WHERE singleton=1");
-        if (lineage.row()) rec.versionGeneration = lineage.uuid(0);
-    }
     if (lifecycle) readLifecycle(db, id, rec);
 
     if (!details) return rec;

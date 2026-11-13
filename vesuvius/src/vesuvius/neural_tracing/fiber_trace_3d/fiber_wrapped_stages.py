@@ -14,7 +14,7 @@ def _logit(p):
     return torch.logit(p.clamp(1e-7,1-1e-7))
 
 
-def solve_stage(config, stage):
+def solve_stage(config, stage, *, data=None, stats=None, return_solution=False):
     from . import fiber_hv_stage as hv
     from . import fiber_normal_sign as normal
     from .fiber_normal_convention import inward_solution
@@ -27,12 +27,22 @@ def solve_stage(config, stage):
     torch.set_num_threads(4)
     torch.manual_seed(config.get('seed',0))
     torch.use_deterministic_algorithms(True)
-    with np.load(config['tensor_cache']) as cache:
-        d={k:cache[k] for k in cache.files}
+    direct=data is not None
+    if direct:
+        if stats is None:raise ValueError('Direct wrapped solve requires preparation statistics')
+        if config.get('write_result_store',True):
+            raise ValueError('Direct wrapped solve returns columns; its caller owns result-store export')
+        d=data
+        if return_solution and (len(config.get('broken_penalties',[.1]))!=1 or
+                                len(config.get('cost_modes',['uniform']))!=1):
+            raise ValueError('One direct solution requires exactly one penalty and mode')
+    else:
+        with np.load(config['tensor_cache']) as cache:
+            d={k:cache[k] for k in cache.files}
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     if (root/'summary.json').exists():
         raise FileExistsError('Completed stage output exists')
-    stats=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text())
+    if not direct:stats=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text())
     tensor=lambda x:torch.as_tensor(x,device='cuda')
     a=tensor(d['prior' if stage=='normal_sign' else 'a'])
     i,j=tensor(d['i']),tensor(d['j'])
@@ -128,7 +138,7 @@ def solve_stage(config, stage):
                 runs.append(dict(name=name,cost_mode=mode,penalty=float(penalty),entropy_max=0.,initial=history[0],final=history[-1]))
             runs[-1].update(iterations=result['iterations'],cg_iterations=result['total_cg_iterations'],converged=result['converged'],
                             peak_allocated_bytes=torch.cuda.max_memory_allocated())
-            np.savez(root/f'solution_{name}.npz',**saved)
+            if not direct:np.savez(root/f'solution_{name}.npz',**saved)
             if config.get('write_result_store',True):
                 write_results(root/f'solution_{name}.vcobj',[config['database']],stage,'wrapped_irls',{'fibers':rows},
                               settings=dict(options,broken_penalty=float(penalty),prior_weight=weak,cost_mode=mode))
@@ -138,5 +148,5 @@ def solve_stage(config, stage):
     if stage=='classification':
         summary['baseline']=hv.readout_metrics(torch.stack((1-initial,initial,torch.zeros_like(initial)),-1).cpu().numpy(),d,stats)
         summary['labels']=['H','V','broken']
-    atomic_write(root/'summary.json',summary,durable=False)
-    return summary
+    atomic_write(root/('solver-summary.json' if direct else 'summary.json'),summary,durable=False)
+    return (summary,saved) if return_solution else summary

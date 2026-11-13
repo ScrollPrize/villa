@@ -49,16 +49,16 @@ def metrics(u, v, a, i, j, dot):
                     uncertain_signs_percent=float(100*((u.sigmoid()>.1)&(u.sigmoid()<.9)).float().mean()))
 
 
-def prepare(config, *, graph=None):
+def prepare(config, *, graph=None, return_arrays=False, prior=None):
     """Convert fixed evidence once; no geometry or model evaluation in optimization."""
     started = time.monotonic()
     db_path, prior_path = Path(config['database']), Path(config['priors'])
     signature = dict(version=3, database_sha256=store_digest(db_path), priors_sha256=sha256_file(prior_path))
-    cache = Path(config['tensor_cache'])
+    cache = Path(config.get('tensor_cache',Path(config.get('output_root','.'))/'tensors.npz'))
     stamp = cache.with_suffix('.json')
-    if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature'] == signature:
+    if not return_arrays and cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature'] == signature:
         return cache
-    prior = json.loads(prior_path.read_text())
+    prior = json.loads(prior_path.read_text()) if prior is None else prior
     graph = FiberGraph(db_path) if graph is None else graph
     from .fiber_graph_store import snapshot_digest
     if snapshot_digest(graph.source) != signature['database_sha256']:
@@ -81,15 +81,17 @@ def prepare(config, *, graph=None):
     if not np.isfinite(dot).all() or np.any(abs(dot)>1.000001):
         raise ValueError('Invalid normal dot products')
     dot=np.clip(dot,-1,1)
-    cache.parent.mkdir(parents=True,exist_ok=True)
-    temporary=cache.with_suffix('.partial.npz')
-    np.savez(temporary,ids=ids,lengths=graph.lengths,prior=a,i=indices[:,0],j=indices[:,1],dot=dot,event_ids=event_ids)
-    temporary.replace(cache)
+    data=dict(ids=ids,lengths=graph.lengths.copy() if return_arrays else graph.lengths,
+              prior=a,i=indices[:,0],j=indices[:,1],dot=dot,event_ids=event_ids)
     degree=np.bincount(indices.ravel(),minlength=len(ids))
     stats=dict(signature=signature,fibers=len(ids),perpendicular_events=total,
                used_events=len(dot),invalid_events_skipped=total-len(dot),
-               isolated_fibers=int((degree==0).sum()),tensor_bytes=cache.stat().st_size,
+               isolated_fibers=int((degree==0).sum()),tensor_bytes=0,
                seconds=time.monotonic()-started)
+    if return_arrays:return data,stats
+    cache.parent.mkdir(parents=True,exist_ok=True)
+    temporary=cache.with_suffix('.partial.npz');np.savez(temporary,**data);temporary.replace(cache)
+    stats['tensor_bytes']=cache.stat().st_size
     atomic_write(stamp,stats,durable=False)
     print('tensor preparation '+json.dumps(stats),flush=True)
     return cache

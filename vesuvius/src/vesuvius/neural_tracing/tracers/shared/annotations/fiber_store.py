@@ -72,6 +72,15 @@ def fiber_point_counts(path, *, source_version=None):
     return ids, columns['count']
 
 
+def fiber_count(path, *, source_version=None):
+    """Count live fibers natively without materializing their identities."""
+    with open_store(path) as store:
+        _require_source_version(store, source_version)
+        result = store.object_count('fiber')
+        _require_source_version(store, source_version)
+    return result
+
+
 def _catalog(store, volume):
     records = store.select_objects(object_kind='fiber', volume=volume, fields=['name', 'fiber', 'meta'])
     volume = volume or _fiber_records_volume(records, 'fiber store')
@@ -201,16 +210,7 @@ def read_polyline_arrays(path, fiber_ids, *, volume=None, source_version=None):
     """
     if fiber_ids is None:raise ValueError('Packed polyline reads require explicit fiber IDs')
     volume = volume or fiber_volume(path)
-    from vc_object_store import canonical_uuid_ascii
-    raw = np.asarray(fiber_ids, dtype=str)
-    if raw.ndim != 1:raise ValueError('Fiber IDs must be a one-dimensional column')
-    if len(raw):
-        encoded = np.char.encode(raw, 'ascii')
-        column = encoded.view(np.uint8).reshape(len(raw), encoded.dtype.itemsize)
-        canonical = canonical_uuid_ascii(column, workers=1)
-        selected = np.unique(canonical.view('S36').ravel().astype('U36')).tolist()
-    else:
-        selected = []
+    selected = _canonical_fiber_ids(fiber_ids)
     with open_store(path) as store:
         with store.geometry_read(object_kind='fiber', object_uuids=selected, volume=volume,
                                  limit=0 if not selected else None, expected_position=source_version) as view:
@@ -220,6 +220,18 @@ def read_polyline_arrays(path, fiber_ids, *, volume=None, source_version=None):
     return np.asarray(ids, dtype='U36'), packed
 
 
+def _canonical_fiber_ids(fiber_ids):
+    """Shared bulk identity adaptation without a Python per-object loop."""
+    from vc_object_store import canonical_uuid_ascii
+    raw = np.asarray(fiber_ids if isinstance(fiber_ids,np.ndarray) else list(fiber_ids), dtype=str)
+    if raw.ndim != 1:raise ValueError('Fiber IDs must be a one-dimensional column')
+    if not len(raw):return []
+    encoded = np.char.encode(raw, 'ascii')
+    column = encoded.view(np.uint8).reshape(len(raw), encoded.dtype.itemsize)
+    canonical = canonical_uuid_ascii(column, workers=1)
+    return np.unique(canonical.view('S36').ravel().astype('U36')).tolist()
+
+
 FIBERS_DIGEST_FORMAT = 'fibers_digest v3'
 
 
@@ -227,15 +239,12 @@ def fibers_digest(path, fiber_ids=None, *, source_version=None):
     """Content digest of a store's live fibers (all, or the given ones): SHA-256 over a format tag and each fiber's
     complete owning-store/generation/object/version identity, in UUID order, read in one snapshot.
     Format v3 includes source ownership, so divergent branches cannot collide at equal version counters."""
-    selected = [] if fiber_ids is None else sorted({canonical_uuid(str(fid)) for fid in fiber_ids})
+    selected = None if fiber_ids is None else _canonical_fiber_ids(fiber_ids)
     with open_store(path) as store:
         _require_source_version(store, source_version)
-        rows = (store.select_objects(object_kind='fiber', object_uuids=selected, fields=['name'])
-                if selected or fiber_ids is None else [])
+        result = store.selected_reference_digest(object_kind='fiber',object_uuids=selected,domain=FIBERS_DIGEST_FORMAT)
         _require_source_version(store, source_version)
-    if fiber_ids is not None and sorted(r['uuid'] for r in rows) != selected:
-        raise ValueError('Unknown requested fiber')
-    return _references_digest(object_reference(row) for row in rows)
+    return result
 
 
 def verify_fiber_source(path, digest, source_version=None):
@@ -255,10 +264,8 @@ def verify_fiber_signature(path, signature):
 
 
 def _references_digest(references):
-    digest = hashlib.sha256(f'{FIBERS_DIGEST_FORMAT}\n'.encode())
-    for ref in sorted(references, key=lambda r: r['object']):
-        digest.update(f"{ref['store']} {ref['generation']} {ref['object']} {ref['version']}\n".encode())
-    return digest.hexdigest()
+    from vc_object_store import object_references_digest
+    return object_references_digest(list(references),domain=FIBERS_DIGEST_FORMAT)
 
 
 def write_fibers(destination, fibers, *, volume, author=None, metadata_policy='portable', replace=False):

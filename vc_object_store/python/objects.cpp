@@ -8,6 +8,7 @@
 #include "FiberWindingBindings.hpp"
 #include "FiberUvEventBindings.hpp"
 #include "FiberUvExportBindings.hpp"
+#include "FiberAxialBindings.hpp"
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
@@ -1031,6 +1032,11 @@ NB_MODULE(_native, m)
     m.def("object_versions_from_json", [](const std::string& text) {
         return jsonLoads(vo::detail::objectVersionsJson(vo::detail::objectVersionsFrom(nlohmann::json::parse(text))).dump());
     }, nb::arg("json"), "Decode an array of exact references with the shared native codec.");
+    m.def("object_references_digest",[](const nb::list& references,const std::string& domain){
+        const auto selected=objectVersionsFromPy(references);
+        nb::gil_scoped_release release;return vo::objectReferencesDigest(selected,domain);
+    },nb::arg("references"),nb::arg("domain")="fibers_digest v3",
+       "SHA-256 over UUID-ordered complete owning-store/generation/object/version references.");
     m.def("relationship_version_from_json", [](const std::string& text) {
         return jsonLoads(vo::relationshipVersionToJson(vo::relationshipVersionFromJson(text)));
     }, nb::arg("json"), "Decode a complete selected relationship reference.");
@@ -1133,6 +1139,7 @@ NB_MODULE(_native, m)
     bindFiberWinding(m);
     bindFiberUvEvents(m);
     bindFiberUvExport(m);
+    bindFiberAxial(m);
     bindGeometryRegion(m);
     bindHostedStore(m);
     bindSessionOperations(bindObjectStoreSession(m));
@@ -1380,6 +1387,19 @@ NB_MODULE(_native, m)
            nb::arg("tag") = std::nullopt, nb::arg("limit") = std::nullopt,
            nb::arg("after_uuid") = std::nullopt, nb::arg("fields") = std::nullopt, nb::arg("include_retired") = false,
            nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
+        .def("selected_reference_digest",[](PyObjectStore& self,const std::optional<std::string>& kind,
+                                            const std::optional<std::vector<std::string>>& ids,const std::string& domain){
+            if(ids&&ids->empty()){
+                self.require();nb::gil_scoped_release release;
+                return vo::objectReferencesDigest({},domain);
+            }
+            vo::ObjectSelection selection;selection.kind=kind;if(ids)selection.uuids=*ids;
+            return self.withRead<true>([&](vo::ObjectStore& store,vo::ReadTxn& txn){
+                return store.selectedReferenceDigest(txn,selection,domain);
+            });
+        },nb::arg("object_kind")=std::nullopt,nb::arg("object_uuids")=std::nullopt,
+           nb::arg("domain")="fibers_digest v3",
+           "Stream live selected references into SHA-256 in one snapshot, without Python rows or geometry reads.")
         .def("geometry_array_counts", [](PyObjectStore& self, const std::string& kind, const std::string& name,
                                          const std::optional<int64_t>& limit) {
             auto counts=std::make_unique<vo::ObjectStore::GeometryArrayCounts>(

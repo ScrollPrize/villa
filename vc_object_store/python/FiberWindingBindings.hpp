@@ -1,5 +1,7 @@
 #pragma once
 #include "vc_object_store/geometry/FiberWinding.hpp"
+#include "vc_object_store/geometry/FiberWindingGraph.hpp"
+#include "FiberUvEventBindings.hpp"
 #include <nanobind/ndarray.h>
 #include <memory>
 #include <optional>
@@ -9,6 +11,8 @@ using WindingI64=nb::ndarray<const int64_t,nb::ndim<1>,nb::c_contig,nb::device::
 using WindingF64=nb::ndarray<const double,nb::ndim<1>,nb::c_contig,nb::device::cpu>;
 using WindingArc=nb::ndarray<const double,nb::ndim<1>,nb::device::cpu>;
 using WindingXYZ=nb::ndarray<const double,nb::ndim<2>,nb::c_contig,nb::device::cpu>;
+using WindingIndexView=nb::ndarray<const int64_t,nb::ndim<1>,nb::device::cpu>;
+using WindingFlag=nb::ndarray<const bool,nb::ndim<1>,nb::c_contig,nb::device::cpu>;
 
 template<class T>auto windingSpan(const T& value){return std::span(value.data(),value.shape(0));}
 template<class T>auto windingColumn(std::vector<T>& value,const nb::capsule& owner){
@@ -115,7 +119,49 @@ void bindFiberWinding(nb::module_& module){
         .def("fixed_target_columns",&windingTargets<int64_t>,"owners"_a,"labels"_a.noconvert(),
              "a"_a,"b"_a,"arc_a"_a,"arc_b"_a,"directions"_a=nb::none(),"workers"_a=32)
         .def("fixed_target_columns",&windingTargets<double>,"owners"_a,"labels"_a.noconvert(),
-             "a"_a,"b"_a,"arc_a"_a,"arc_b"_a,"directions"_a=nb::none(),"workers"_a=32);
+             "a"_a,"b"_a,"arc_a"_a,"arc_b"_a,"directions"_a=nb::none(),"workers"_a=32)
+        .def("prepare_winding_graph",[](const PyPackedWindingGeometry& self,WindingIndexView a,WindingIndexView b,
+            WindingI64 graphToCatalog,WindingI64 family,WindingI64 signs,WindingArc arcA,WindingArc arcB,
+            WindingArc distance,WindingFlag parallel,WindingXYZ normalA,WindingXYZ normalB,WindingXYZ connector,
+            WindingFlag validA,WindingFlag validB,WindingFlag validConnector,
+            double scale,double offset,double weight,size_t constraintBatch,size_t readBatch,size_t workers){
+            if(normalA.shape(1)!=3||normalB.shape(1)!=3||connector.shape(1)!=3)
+                throw std::invalid_argument("winding graph normals require XYZ triples");
+            vc::geometry::FiberWindingGraphInput input{
+                {a.data(),a.shape(0),a.stride(0)},{b.data(),b.shape(0),b.stride(0)},
+                windingSpan(graphToCatalog),windingSpan(family),windingSpan(signs),
+                {arcA.data(),arcA.shape(0),arcA.stride(0)},{arcB.data(),arcB.shape(0),arcB.stride(0)},
+                {distance.data(),distance.shape(0),distance.stride(0)},
+                windingSpan(parallel),windingSpan(validA),windingSpan(validB),windingSpan(validConnector),
+                std::span(normalA.data(),normalA.shape(0)*3),std::span(normalB.data(),normalB.shape(0)*3),
+                std::span(connector.data(),connector.shape(0)*3)};
+            vc::geometry::FiberWindingGraphOptions options{scale,offset,weight,constraintBatch,readBatch,workers};
+            vc::geometry::FiberWindingL1Columns output;
+            {nb::gil_scoped_release release;output=vc::geometry::prepareFiberWindingGraph(self.geometry,input,options);}
+            nb::dict result;
+            result["a"]=uvOwnedColumn(std::move(output.a),output.arcs);
+            result["b"]=uvOwnedColumn(std::move(output.b),output.arcs);
+            result["target"]=uvOwnedColumn(std::move(output.target),output.arcs);
+            result["weight"]=uvOwnedColumn(std::move(output.weight),output.arcs);
+            result["read"]=output.read;result["used"]=output.used;result["expanded"]=output.expanded;
+            return result;
+        },"i"_a,"j"_a,"graph_to_catalog"_a,"family"_a,"normal_sign"_a,"arc_a"_a,"arc_b"_a,
+          "distance"_a,"parallel"_a,"normal_a"_a,"normal_b"_a,"connector"_a,
+          "valid_a"_a,"valid_b"_a,"valid_connector"_a,
+          "lasagna_winding_scale"_a=1.,"perpendicular_offset"_a=.5,"perpendicular_relative_weight"_a=1.,
+          "constraint_batch"_a=500000,"read_batch"_a=32768,"workers"_a=32);
+    module.def("fiber_signed_order",[](WindingXYZ connector,WindingXYZ a,WindingXYZ b,double minimum,size_t workers){
+        const size_t n=connector.shape(0);
+        if(connector.shape(1)!=3||a.shape(1)!=3||b.shape(1)!=3||a.shape(0)!=n||b.shape(0)!=n||!std::isfinite(minimum))
+            throw std::invalid_argument("invalid fiber signed-order arrays");
+        auto output=std::make_unique_for_overwrite<float[]>(n);
+        {nb::gil_scoped_release release;
+            vc::objects::parallelFor((n+4095)/4096,workers,[&](size_t block){
+                for(size_t i=block*4096;i<std::min(n,(block+1)*4096);++i)
+                    output[i]=vc::geometry::fiberSignedOrder(windingPoint(connector,i),windingPoint(a,i),windingPoint(b,i),minimum);
+            });}
+        return uvOwnedColumn(std::move(output),n);
+    },"connector"_a,"inward_a"_a,"inward_b"_a,"cosine_min"_a=.1,"workers"_a=1);
     module.def("winding_grouped_medians",[](WindingI64 groups,WindingF64 input,size_t workers){
         auto values=std::make_unique<vc::geometry::GroupedMedians>();
         {nb::gil_scoped_release release;*values=vc::geometry::groupedMedians(windingSpan(groups),windingSpan(input),workers);}

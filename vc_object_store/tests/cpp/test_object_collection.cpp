@@ -5,6 +5,7 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
 #include "internal/CollectionReads.hpp"
+#include "internal/RecordSql.hpp"
 #include <iostream>
 #include <cstring>
 #include <algorithm>
@@ -12,6 +13,58 @@
 using namespace vc::objects;
 using namespace vc::objects::detail;
 ObjectRecord fiber(){ObjectRecord r;r.kind="fiber";r.fiber.emplace();return r;}
+
+void compactReferenceSelectionPlan()
+{
+    TemporaryDirectory dir;OpenOptions options;options.author="reference-plan";options.history=HistoryMode::Off;options.spatialIndex=false;
+    auto store=ObjectStore::create(dir.path/"local",options);
+    std::vector<std::string> ids{util::newUuid(),util::newUuid(),util::newUuid()};
+    {auto write=store.write();for(const auto& id:ids){ObjectRecord record;record.uuid=id;record.kind="note";store.upsertObject(write,record);}write.commit();}
+    {auto write=store.writeNumbered(VersionSelection{{ids[1],1},{ids[2],1}});
+        store.retireObject(write,ids[1]);store.deleteObject(write,ids[2]);write.commit();}
+    auto read=store.read();auto* db=ObjectStoreImplAccess::conn(read);
+    for(const bool retired:{false,true}){
+        ObjectSelection selection;selection.kind="note";selection.includeRetired=retired;
+        auto query=objectSelectionQuery(db,selection,"o.uuid,o.version,o.version_generation");
+        Statement plan(db,std::string("EXPLAIN QUERY PLAN ")+sqlite3_sql(query->value));
+        while(plan.row())require(plan.text(3).find("CORRELATED")==std::string::npos,
+            "ordinary local-row lifecycle selection does not repeat a correlated self-lookup");
+        const auto rows=store.selectObjects(read,selection,std::vector<std::string>{});
+        require(rows.size()==(retired?2:1)&&store.objectCount(read,"note",retired)==int64_t(rows.size()),
+            "compact identity/count selections preserve active, retired and deleted lifecycle semantics");
+        std::vector<ObjectVersion> references;for(const auto& row:rows)references.push_back(row.reference());
+        require(store.selectedReferenceDigest(read,selection,"test v1")==objectReferencesDigest(references,"test v1"),
+            "compact identity scanning shares exact generation and reference encoding with full selected records");
+    }
+}
+
+void interleavedPartitionScan()
+{
+    TemporaryDirectory dir;OpenOptions options;options.author="heap-scan";options.history=HistoryMode::Off;options.spatialIndex=false;
+    options.creationStoreUuid=util::newUuid();options.creationGeneration=util::newUuid();
+    constexpr size_t partitions=12,count=203;
+    std::vector<std::string> ids;
+    for(size_t i=0;i<count;++i)ids.push_back(util::nameUuid("interleaved-heap-"+std::to_string(i)));
+    std::sort(ids.begin(),ids.end());
+    std::vector<std::filesystem::path> paths;
+    for(size_t shard=0;shard<partitions;++shard){
+        auto opt=options;opt.objectIdRange={int64_t(1+shard*1000),int64_t((shard+1)*1000)};
+        const auto path=dir.path/("part-"+std::to_string(shard));paths.push_back(path);
+        auto store=ObjectStore::create(path,opt);auto txn=store.write();
+        for(size_t i=shard;i<count;i+=partitions){ObjectRecord row;row.uuid=ids[i];row.kind="note";store.upsertObject(txn,row);}
+        store.seal(txn);txn.commit();
+    }
+    const auto root=dir.path/"root";
+    {auto store=ObjectCollection::publishShards(root,paths,options);}
+    auto store=ObjectStore::open(root,OpenOptions{.readOnly=true});auto txn=store.read();
+    ObjectSelection selection;selection.kind="note";
+    const auto all=store.selectObjects(txn,selection,std::vector<std::string>{});
+    std::vector<std::string> found;for(const auto& row:all)found.push_back(row.uuid);
+    require(found==ids,"heap scan interleaves indexed partitions in global UUID order, including uneven exhausted cursors");
+    selection.afterUuid=ids[95];selection.limit=19;
+    const auto page=store.selectObjects(txn,selection,std::vector<std::string>{});
+    require(page.size()==19&&page.front().uuid==ids[96]&&page.back().uuid==ids[114],"heap scan retains cursor pagination across partitions");
+}
 
 void boundedVisibleScan()
 {
@@ -265,6 +318,8 @@ void metadataOverridesOfDeltaGeometry()
     }
 }
 int main()try{
+    compactReferenceSelectionPlan();
+    interleavedPartitionScan();
     boundedVisibleScan();
     metadataOverrides();
     metadataOverridesOfDeltaGeometry();

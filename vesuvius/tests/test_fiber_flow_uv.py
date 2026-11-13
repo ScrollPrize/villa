@@ -336,13 +336,14 @@ def test_checkpoint_runner_launches_before_loading_or_preparing_arrays(tmp_path,
     assert result==dict(run_uuid='result-run')
 
 
-def test_checkpoint_child_keeps_prepared_buffers_for_the_solver(tmp_path,monkeypatch):
+@pytest.mark.parametrize('visualize_enabled',[False,True])
+def test_checkpoint_child_keeps_prepared_buffers_for_the_solver(tmp_path,monkeypatch,visualize_enabled):
     import vc_object_store
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_flow_uv as uv
     source_snapshot=dict(store_uuid='store',generation='generation',commit_sequence=4)
     data=dict(source_id=np.array([uid(7),uid(8)]));selection=dict(global_integer_shift=3)
     config=dict(input_store='existing.vcobj',output_root=str(tmp_path/'fit'),
-                visualize=False,write_geometry_store=False)
+                visualize=visualize_enabled,write_geometry_store=False)
     class Reader:
         def __init__(self,path):assert path=='existing.vcobj'
         def __enter__(self):return self
@@ -351,10 +352,18 @@ def test_checkpoint_child_keeps_prepared_buffers_for_the_solver(tmp_path,monkeyp
     def prepare(value):
         assert value['input_source'] is source_snapshot
         return data,selection
-    def solve(value,actual_data,actual_selection):
+    def solve(value,actual_data,actual_selection,*,snapshots=None):
         assert actual_data is data and actual_selection is selection
         assert value['input_source'] is source_snapshot
+        if visualize_enabled:
+            assert snapshots=={}
+            snapshots['prepared-view']='owned'
+        else:assert snapshots is None
         return dict(run_uuid='result-run')
+    seen=[]
+    def visualize(value,actual_data,*,snapshots=None):
+        assert actual_data is data and snapshots=={'prepared-view':'owned'}
+        seen.append(True)
     def forbidden(*args,**kwargs):raise AssertionError('Child must not write intermediate NPZ tensor archives')
     def binding(value,*,create):
         assert value['input_source'] is source_snapshot
@@ -362,8 +371,10 @@ def test_checkpoint_child_keeps_prepared_buffers_for_the_solver(tmp_path,monkeyp
     monkeypatch.setattr(vc_object_store,'CollectionReader',Reader)
     monkeypatch.setattr(uv,'_checkpoint_binding',binding)
     monkeypatch.setattr(uv,'prepare',prepare);monkeypatch.setattr(uv,'solve',solve)
+    monkeypatch.setattr(uv,'visualize',visualize)
     monkeypatch.setattr(np,'savez',forbidden)
     assert uv._solve_checkpoint(config)==dict(run_uuid='result-run')
+    assert seen==([True] if visualize_enabled else [])
     assert not list((tmp_path/'fit').glob('*.npz'))
 
 
@@ -432,7 +443,17 @@ def test_solve_summary_identifies_persisted_result_run(tmp_path,monkeypatch):
     assert abs(positions[0][-3]-.1)<1e-12  # U excludes the selected k=2.
 
 
-def test_direct_solve_uses_owned_arrays_without_input_npz_and_pins_source_store(tmp_path,monkeypatch):
+def _direct_uv_solver_data():
+    return {key:np.asarray(value) for key,value in dict(
+        source_id=[uid(10),uid(20)],family=[0,1],start=[0.,0.],end=[10.,10.],
+        node_ds=[[0.,10.],[0.,10.]],direction=[1.,1.],i=[0],j=[1],ds_a=[5.],ds_b=[5.],
+        parallel=[False],fixed_target=[0.],fixed_winding=[2.,2.],phase=[.1,.1],z=[10.,10.],
+        width_initial=np.arange(1000.,1600.,100.),sample_owner=[0,0,1,1],sample_ds=[0.,10.,0.,10.],
+        sample_phase=[.1,.11,.1,.1],sample_z=[10.,10.,10.,20.]).items()}
+
+
+@pytest.mark.parametrize('write_checkpoints',[False,True])
+def test_direct_solve_uses_owned_arrays_without_input_npz_and_pins_source_store(tmp_path,monkeypatch,write_checkpoints):
     import json
     import uuid
     from pathlib import Path
@@ -442,12 +463,7 @@ def test_direct_solve_uses_owned_arrays_without_input_npz_and_pins_source_store(
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_shared_curve as shared,fiber_scaled_lbfgs as scaled
     source=measured_store(tmp_path,[(0,10,20,False,.5)])
     root=tmp_path/'fit';root.mkdir()
-    data={key:np.asarray(value) for key,value in dict(
-        source_id=[uid(10),uid(20)],family=[0,1],start=[0.,0.],end=[10.,10.],
-        node_ds=[[0.,10.],[0.,10.]],direction=[1.,1.],i=[0],j=[1],ds_a=[5.],ds_b=[5.],
-        parallel=[False],fixed_target=[0.],fixed_winding=[2.,2.],phase=[.1,.1],z=[10.,10.],
-        width_initial=np.arange(1000.,1600.,100.),sample_owner=[0,0,1,1],sample_ds=[0.,10.,0.,10.],
-        sample_phase=[.1,.11,.1,.1],sample_z=[10.,10.,10.,20.]).items()}
+    data=_direct_uv_solver_data()
     before={key:value.copy() for key,value in data.items()}
     original_tensor=torch.as_tensor;original_curve=shared.SharedCurve;original_savez=np.savez
     def cpu_tensor(value,*args,**kwargs):
@@ -455,6 +471,7 @@ def test_direct_solve_uses_owned_arrays_without_input_npz_and_pins_source_store(
         return original_tensor(value,*args,**kwargs)
     def forbidden_read(*args,**kwargs):raise AssertionError('Direct solve must not load imported tensor files')
     def result_checkpoint(path,*args,**kwargs):
+        assert write_checkpoints, 'Production solve must not write numeric checkpoint files'
         assert Path(path).name in ('initial.npz','solution.npz'), 'Only explicit result checkpoints may be NPZ'
         return original_savez(path,*args,**kwargs)
     monkeypatch.setattr(torch,'as_tensor',cpu_tensor)
@@ -464,12 +481,18 @@ def test_direct_solve_uses_owned_arrays_without_input_npz_and_pins_source_store(
     monkeypatch.setattr(uv,'arrays',forbidden_read);monkeypatch.setattr(np,'load',forbidden_read)
     monkeypatch.setattr(np,'savez',result_checkpoint)
     output=tmp_path/'uv.vcobj'
+    snapshots={}
     summary=uv.solve(dict(output_root=str(root),input_store=str(source),result_store=str(output),
-                          uv_optimizer='torch_lbfgs'),data,dict(global_integer_shift=3))
+                          uv_optimizer='torch_lbfgs',write_solver_checkpoints=write_checkpoints),
+                     data,dict(global_integer_shift=3),snapshots=snapshots)
     assert uuid.UUID(summary['run_uuid'])
     assert json.loads((root/'summary.json').read_text())['run_uuid']==summary['run_uuid']
     assert not (root/'tensors.npz').exists() and not (root/'selected_tensors.npz').exists()
     assert not (root/'fixed_input').exists()
+    assert set(snapshots)=={'initial','solution'}
+    assert not np.shares_memory(snapshots['initial']['state'],snapshots['solution']['state'])
+    assert (root/'initial.npz').exists() is write_checkpoints
+    assert (root/'solution.npz').exists() is write_checkpoints
     for key,value in before.items():np.testing.assert_array_equal(data[key],value)
     with CollectionReader(str(output)) as store:
         assert len(store.objects('fiber'))==2
@@ -479,6 +502,44 @@ def test_direct_solve_uses_owned_arrays_without_input_npz_and_pins_source_store(
     assert len(runs)==1 and len(inputs)==1
     assert all(row[2]==3 and row[3]==2 for row in positions)
     assert abs(positions[0][-3]-.1)<1e-12
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA requires managed host validation')
+def test_uv_cuda_solve_exports_native_result_without_numeric_files(tmp_path,monkeypatch):
+    """Exercise the real CUDA→host→native-writer boundary end to end."""
+    import uuid
+    from vc_object_store import CollectionReader
+    from .fiber_graph_fixture import measured_store
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_flow_uv as uv
+    source=measured_store(tmp_path,[(0,10,20,False,.5)])
+    root=tmp_path/'uv-work';root.mkdir();output=tmp_path/'uv.vcobj'
+    data=_direct_uv_solver_data()
+    before={key:value.copy() for key,value in data.items()}
+    def forbidden(*args,**kwargs):raise AssertionError('Production UV solve must not use numeric filesystem handoffs')
+    monkeypatch.setattr(uv,'arrays',forbidden)
+    monkeypatch.setattr(np,'savez',forbidden);monkeypatch.setattr(np,'save',forbidden)
+    monkeypatch.setattr(np,'load',forbidden);monkeypatch.setattr(np,'memmap',forbidden)
+    monkeypatch.setattr(np.lib.format,'open_memmap',forbidden)
+    result=uv.solve(dict(output_root=str(root),input_store=str(source),result_store=str(output),
+        workers=2,uv_optimizer='gauss_newton_cg',write_solver_checkpoints=False,
+        width_parameterization='monotone_relative',minimum_winding_width=100.,soft_minimum_width=True,
+        steps=2,uv_cg_iterations=20,uv_v_cg_iterations=30,log_every=1),
+        data,dict(global_integer_shift=3))
+    assert result['assignments_fixed'] is True
+    assert result['final']['winding_assignments_changed']==0
+    assert np.isfinite(result['final']['loss'])
+    assert result['final']['loss']<=result['initial']['loss']+1e-12
+    assert not list(root.glob('*.npz')) and not list(root.glob('*.npy'))
+    for key,value in before.items():np.testing.assert_array_equal(data[key],value)
+    with CollectionReader(str(output)) as store:
+        rows=store.extension_rows('ext_fiber_graph_solve_positions')
+        fibers=store.extension_rows('ext_fiber_graph_solve_fibers')
+        runs=store.extension_rows('ext_fiber_graph_solve_runs')
+    assert len(rows)==4 and len(fibers)==2 and len(runs)==1
+    assert runs[0][0]==uuid.UUID(result['run_uuid']).bytes
+    assert all(row[2]==3 and row[3]==2 for row in rows)
+    assert np.isfinite(np.array([row[-3:] for row in rows],dtype=np.float64)).all()
 
 
 def test_fixed_flow_objective_batches_preserve_full_loss_and_gradients():

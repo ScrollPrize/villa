@@ -213,6 +213,50 @@ class FiberGraph:
             yield slice(begin, min(begin+size, hi))
 
 
+def write_fiber_result_columns(path,dependency,expected_source,stage,method,ids,columns,settings=None,
+                               input_run=None,metrics=(),workers=32,run_uuid=None,timings_path=None):
+    """Write a result overlay from numeric columns, never Python corpus rows.
+
+    Only the fixed schema's column names and the small run-level metrics are
+    adapted in Python. UUID parsing, routing, validation and bounded row
+    construction execute in the native parallel initial-import path.
+    """
+    from vc_object_store import export_fiber_result_columns,fiber_uuid_bytes
+    import time
+    started=time.monotonic()
+    with CollectionReader(str(dependency)) as source:
+        if source.source!=expected_source:raise ValueError('Result export input snapshot changed')
+    ids=np.asarray(ids)
+    if ids.ndim==2 and ids.shape[1]==16 and ids.dtype==np.uint8:
+        binary=np.ascontiguousarray(ids)
+    else:
+        if ids.ndim!=1 or ids.dtype.kind not in 'US':raise ValueError('Expected a UUID string or binary [N,16] column')
+        text=np.char.encode(ids,'ascii') if ids.dtype.kind=='U' else ids
+        if text.dtype.itemsize!=36:raise ValueError('Expected canonical-width UUID strings')
+        binary=fiber_uuid_bytes(np.ascontiguousarray(text).view(np.uint8).reshape(-1,36),workers)
+    schema=fiber_graph_solve_table('fibers')
+    types={column['name']:column['type'] for column in schema['columns']}
+    typed={}
+    for name,values in columns.items():
+        if name not in types or types[name] not in ('integer','real'):
+            raise ValueError('Unknown or reserved numeric fiber result field: '+name)
+        array=np.asarray(values)
+        if array.ndim!=1:raise ValueError('Fiber result columns must be one-dimensional: '+name)
+        if types[name]=='integer' and (array.dtype.kind not in 'biu' or not np.can_cast(array.dtype,np.int64,casting='safe')):
+            raise ValueError('Fiber result field requires a safely representable integer column: '+name)
+        dtype=np.int64 if types[name]=='integer' else np.float64
+        typed[name]=np.ascontiguousarray(values,dtype=dtype)
+    result=export_fiber_result_columns(str(path),str(dependency),expected_source,
+        str(run_uuid or uuid.uuid4()),None if input_run is None else str(input_run),stage,method,
+        settings or {},binary,typed,metrics,workers)
+    if timings_path is not None:
+        from .fiber_min_flow_experiment import write
+        result['wall_seconds']=time.monotonic()-started
+        result['bytes']=Path(result['path']).stat().st_size
+        write(Path(timings_path),result)
+    return result['run_uuid']
+
+
 def write_results(path, dependencies, stage, method, tables, *, settings=None, run_uuid=None, input_runs=None):
     """Write only typed result rows in a sealed overlay; input geometry is shared.
 

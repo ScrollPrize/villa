@@ -46,6 +46,12 @@ void bindBbox(Statement& s, int firstIdx, const std::optional<std::array<double,
 ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details = true,
                            const std::string* initialGeneration = nullptr, bool lifecycle = true,
                            const std::string* ownerStore = nullptr);
+// Complete current publication identity, shared by record hydration and
+// compact reference-only scans. Supplied source defaults belong to the same
+// pinned physical snapshot; a non-NULL row generation always wins.
+ObjectVersion readObjectReferenceColumns(sqlite3*,const Statement&,int uuidColumn,int versionColumn,int generationColumn,
+    const std::string* initialGeneration=nullptr,const std::string* ownerStore=nullptr,
+    const std::string* selectedUuid=nullptr);
 
 std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
 // Hydrate one physical source's decoded rows in a bounded batch. IDs and rows

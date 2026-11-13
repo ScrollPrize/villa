@@ -159,6 +159,7 @@ target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_C
 target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF vc_geometry PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
 add_library(vc_object_geometry ${_vc_store_library_type} geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
+    imports/FiberAxialPriors.cpp
     formats/GeometryInput.cpp formats/FiberInput.cpp formats/SurfaceInput.cpp
     formats/PointCollectionInput.cpp formats/UmbilicusInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp formats/RemoteSource.cpp
     catalog/CatalogStore.cpp)

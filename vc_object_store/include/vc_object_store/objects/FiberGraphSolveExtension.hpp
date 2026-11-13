@@ -15,6 +15,9 @@ enum class FiberGraphTable {
 enum class FiberGraphLayer : int64_t { Shared = 0, Intermediate = 1, Final = 2, Refined = 3 };
 
 ExtensionTable fiberGraphSolveTable(FiberGraphTable);
+// One field's shared admission rules, also used by native typed-column
+// writers which already know the table/column layout and avoid row maps.
+void validateFiberGraphField(const ExtensionColumn&,const ExtensionValue&);
 
 // UUID-ordered numeric projection of one immutable run. NULL is represented
 // by a validity byte, never by inventing an enabled/sign/winding value.

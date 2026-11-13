@@ -51,15 +51,16 @@ class PackedPaths:
     def from_store(cls, config, ids):
         """One bulk native read and native arc/transport construction in RAM.
 
-        This is the explicit checkpoint adapter without a pre-existing packed
-        cache. It returns the same measured-geometry view, never a per-fiber
-        Python Paths implementation or temporary tensor file.
+        This is the production solver input API. It returns the measured
+        geometry directly, never a per-fiber Python Paths implementation or
+        temporary tensor file.
         """
         from vc_object_store import pack_winding_geometry
         from .fiber_normal_sign_visualization import load_umbilicus_frame
         source=config['input_store']
         volume=workflow_volume(dict(fibers=source,working_volume=config.get('working_volume')))
-        selected,packed=read_polyline_arrays(source,ids,volume=volume)
+        selected,packed=read_polyline_arrays(source,ids,volume=volume,
+                                            source_version=config.get('input_source'))
         result=cls.__new__(cls);result.root=None;result.data=None
         result.ids=selected;result.offset=np.asarray(packed.offsets,dtype=np.int64)
         result.xyz=packed.values

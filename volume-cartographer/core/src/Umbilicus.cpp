@@ -1,4 +1,5 @@
 #include "vc/core/util/Umbilicus.hpp"
+#include "vc_object_store/geometry/FiberAxialAlignment.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -59,61 +60,7 @@ void Umbilicus::interpolate_centers()
 
 cv::Vec3f Umbilicus::interpolate_center(double z) const
 {
-    if (control_points_.empty()) {
-        throw std::logic_error("Umbilicus interpolation requested without control points");
-    }
-
-    if (control_points_.size() == 1) {
-        cv::Vec3f result = control_points_.front();
-        result[2] = static_cast<float>(z);
-        return result;
-    }
-
-    const double min_z = control_points_.front()[2];
-    const double max_z = control_points_.back()[2];
-
-    if (z <= min_z) {
-        cv::Vec3f result = control_points_.front();
-        result[2] = static_cast<float>(z);
-        return result;
-    }
-    if (z >= max_z) {
-        cv::Vec3f result = control_points_.back();
-        result[2] = static_cast<float>(z);
-        return result;
-    }
-
-    const float target = static_cast<float>(z);
-    auto upper = std::lower_bound(control_points_.begin(), control_points_.end(), target,
-                                  [](const cv::Vec3f& lhs, float value) { return lhs[2] < value; });
-    if (upper == control_points_.begin()) {
-        cv::Vec3f result = *upper;
-        result[2] = static_cast<float>(z);
-        return result;
-    }
-
-    if (upper != control_points_.end() && std::abs((*upper)[2] - target) < 1e-5f) {
-        cv::Vec3f result = *upper;
-        result[2] = static_cast<float>(z);
-        return result;
-    }
-
-    const auto& right = (upper == control_points_.end()) ? control_points_.back() : *upper;
-    const auto& left = *(upper - 1);
-
-    const double z0 = left[2];
-    const double z1 = right[2];
-
-    if (std::abs(z1 - z0) < 1e-5) {
-        cv::Vec3f result = left;
-        result[2] = static_cast<float>(z);
-        return result;
-    }
-
-    const double t = (z - z0) / (z1 - z0);
-    const double x = left[0] + t * (right[0] - left[0]);
-    const double y = left[1] + t * (right[1] - left[1]);
-    return {static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)};
+    return vc::geometry::umbilicusCenter(control_points_,z);
 }
 
 int Umbilicus::clamp_z_index(double z) const

@@ -503,11 +503,19 @@ std::optional<size_t> ObjectCollection::Impl::locateSourceSql(const ObjectKey& k
     const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible,bool includeDeleted,
     sqlite3* knownLiveSource)const{
     // UUID is the complete key. The first present row wins, including deletion.
-    for(const auto n:uuidReadOrder(key.objectUuid,"objects"))if(n>=start&&(!eligible||eligible(n))){
+    // Walk the already compiled route plan directly. A known live row stops
+    // resolution after higher-precedence eligible layers, without allocating
+    // an included-node vector and materialized read order for every object.
+    const auto bytes=parseUuid(key.objectUuid);
+    const auto hash=util::uuidHash64(bytes);
+    for(const auto& step:readPlan){
+        const auto n=step.node;
+        if(step.objects&&hash%step.objects->first!=step.objects->second)continue;
+        if(n<start||(eligible&&!eligible(n)))continue;
         if(!nodes[n].objectsMayExist)continue;
         auto* sql=get(n);
         if(sql==knownLiveSource)return n;
-        Statement state(sql,"SELECT state FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
+        Statement state(sql,"SELECT state FROM objects WHERE uuid=?",bytes);
         if(!state.row())continue;
         if(state.i64(0)==2&&!includeDeleted)return {};
         return n;

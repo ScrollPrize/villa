@@ -21,7 +21,7 @@ def _adapt(result, ids, family, lengths):
 
 
 def prepare_events(paths, graph, workers=32, node_mask=None):
-    """Import the shared cached graph without Python event/batch iteration."""
+    """Consume native owned graph buffers without Python event/batch iteration."""
     if paths.graph_index is None:raise ValueError('Bind the graph to packed geometry before preparation')
     result=_select(dict(i=graph.i,j=graph.j,family=paths.catalog['family'],
                         ds_a=graph.arc_a,ds_b=graph.arc_b,parallel=graph.parallel),

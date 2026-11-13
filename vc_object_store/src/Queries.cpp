@@ -9,9 +9,62 @@
 #include "internal/RecordResolver.hpp"
 #include "internal/VisibleRows.hpp"
 #include "internal/ObjectScan.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
+#include <charconv>
 
 namespace vc::objects {
 using namespace detail;
+namespace {
+void appendReferenceDigest(PayloadHasher& hash,const std::string& store,const std::string& generation,
+                           const std::string& object,int64_t version,std::string& line)
+{
+    if(store.empty()||generation.empty()||object.empty()||version<=0)
+        throw std::invalid_argument("reference digest requires a complete published identity");
+    std::array<char,32> number;
+    const auto end=std::to_chars(number.data(),number.data()+number.size(),version);
+    if(end.ec!=std::errc{})throw std::runtime_error("reference digest version encoding failed");
+    line.clear();line.reserve(store.size()+generation.size()+object.size()+36);
+    line.append(store);line+=' ';line.append(generation);line+=' ';
+    line.append(object);line+=' ';line.append(number.data(),end.ptr);line+='\n';
+    hash.update(line.data(),line.size());
+}
+void beginReferenceDigest(PayloadHasher& hash,const std::string& domain)
+{
+    hash.update(domain.data(),domain.size());hash.update("\n",1);
+}
+}
+
+std::string objectReferencesDigest(std::span<const ObjectVersion> references,const std::string& domain)
+{
+    std::vector<const ObjectVersion*> ordered;ordered.reserve(references.size());
+    for(const auto& reference:references)ordered.push_back(&reference);
+    // Stable sorting matches the explicit-reference codec when object keys are
+    // repeated by a caller; current selected rows are already unique/ordered.
+    std::stable_sort(ordered.begin(),ordered.end(),[](const auto* a,const auto* b){return a->objectUuid<b->objectUuid;});
+    PayloadHasher hash;beginReferenceDigest(hash,domain);std::string line;
+    for(const auto* reference:ordered)appendReferenceDigest(hash,reference->storeUuid,reference->generation,
+        reference->objectUuid,reference->version,line);
+    return hash.finish();
+}
+
+std::string ObjectStore::selectedReferenceDigest(const Txn& txn,const ObjectSelection& selection,const std::string& domain)const
+{
+    if(selection.orderBy!="uuid"||selection.connectedTo||selection.volume||selection.includeUnbound||selection.minLength)
+        throw std::invalid_argument("reference digest requires an ordinary UUID-ordered object selection");
+    PayloadHasher hash;beginReferenceDigest(hash,domain);size_t count=0;std::string line;
+    scanVisibleObjectReferences(static_cast<sqlite3*>(connection(txn)),selection,
+        [&](ObjectVersion&& reference){
+            appendReferenceDigest(hash,reference.storeUuid,reference.generation,reference.objectUuid,
+                                  reference.version,line);++count;return true;
+        });
+    if(!selection.uuids.empty()){
+        std::set<std::string> requested;
+        for(const auto& id:selection.uuids)requested.insert(formatUuid(parseUuid(id)));
+        if(requested.size()!=count)throw std::invalid_argument("Unknown requested object in reference digest");
+    }
+    return hash.finish();
+}
+
 void validateObjectFields(const std::optional<std::vector<std::string>>& fields)
 {
     (void)projectedObjectColumns(fields ? ObjectFields(std::set<std::string>(fields->begin(), fields->end())) : std::nullopt);
@@ -70,8 +123,9 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection)
         connected.insert(ids.begin(), ids.end());
     }
     SelectionFilter filter;
-    filter.sql = " AND o.state<>2";
-    if (!selection.includeRetired) filter.sql += " AND " + activeObjectSql("o.id");
+    // The selected local row already supplies lifecycle state; a correlated
+    // self-lookup by its own ID would repeat the same test for every object.
+    filter.sql = selection.includeRetired?" AND o.state<>2":" AND o.state=0";
     auto bind = [&](const std::string& clause, const std::string& value) {
         filter.sql += clause; filter.parameters.push_back(value);
     };
@@ -352,6 +406,34 @@ void detail::scanVisibleObjects(sqlite3* db,const ObjectSelection& selection,con
     scanVisibleObjectRows(db,selection,fields,[&](ObjectRecord&& row,std::optional<SelectedGeometryHead>){
         return visit(std::move(row));
     },false);
+}
+
+void detail::scanVisibleObjectReferences(sqlite3* db,const ObjectSelection& selection,
+                                       const std::function<bool(ObjectVersion&&)>& visit)
+{
+    constexpr auto columns="o.uuid,o.version,o.version_generation";
+    if(selection.limit&&*selection.limit==0){
+        (void)objectSelectionQuery(db,selection,columns);return;
+    }
+    auto physical=selection;physical.limit.reset();physical.offset=0;
+    VisibleObjectRows rows(db,[&](auto* source){return objectSelectionQuery(source,physical,columns);},0);
+    struct SourceIdentity {std::string owner,initialGeneration;};
+    std::map<sqlite3*,SourceIdentity> sources;
+    for(auto* source:querySources(db)){
+        Statement identity(source,"SELECT s.uuid,m.initial_generation FROM store_identity s CROSS JOIN store_manifest m WHERE s.singleton=1 AND m.singleton=1");
+        if(!identity.row())throw std::runtime_error("reference scan: source identity is missing");
+        sources.emplace(source,SourceIdentity{identity.uuid(0),identity.uuid(1)});
+    }
+    int64_t skipped=0,emitted=0;
+    while(rows.row()){
+        if(skipped<selection.offset){++skipped;continue;}
+        const auto& source=sources.at(rows.source());
+        auto reference=readObjectReferenceColumns(rows.source(),rows.values(),0,1,2,
+            &source.initialGeneration,&source.owner,&rows.key());
+        ++emitted;
+        if(!visit(std::move(reference)))return;
+        if(selection.limit&&emitted==*selection.limit)return;
+    }
 }
 
 std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const ObjectSelection& requested,

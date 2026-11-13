@@ -278,6 +278,8 @@ or per tile), without geometry reconstruction.
 
 ## Selection records
 
+For a compact current-input identity, `ObjectStore.selected_reference_digest(object_kind="fiber", object_uuids=None, domain="fibers_digest v3")` streams the selected live objects in UUID order into SHA-256 within one read snapshot. It reads complete owning-store, generation, object UUID and numbered-version references, not geometry or Python record dictionaries. `None` selects all matching live objects; an explicit empty list hashes an empty selection, and missing explicitly requested UUIDs are rejected. The byte encoding is UTF-8 `domain + "\n"`, followed by `"store generation object version\n"` per object. `object_references_digest(references, domain=...)` applies the same codec to already selected references. A digest detects input changes; it does not replace the references or store-position pins required to reproduce a historical selection.
+
 A selection record freezes the exact result of an object selection at one
 commit, so a long job or training set can read its inputs back later at the
 same versions while the store moves on. It holds the query, store, generation,

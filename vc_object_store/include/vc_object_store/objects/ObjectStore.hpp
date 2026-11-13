@@ -19,6 +19,7 @@
 #include <memory>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -298,6 +299,9 @@ struct OpenOptions {
 // Validate projected top-level field names without selecting data. Exact graph
 // materializers and SQL selections use the same native field policy.
 void validateObjectFields(const std::optional<std::vector<std::string>>&);
+// SHA-256 over domain + newline, followed by UUID-ordered complete owning
+// references as "store generation object version\n". No geometry is read.
+std::string objectReferencesDigest(std::span<const ObjectVersion>, const std::string& domain);
 void validateEdgeFields(const std::optional<std::vector<std::string>>&);
 
 struct ObjectSelection {
@@ -692,6 +696,11 @@ public:
     GeometryArrayCounts geometryArrayCounts(const Txn&, const std::string& objectKind,
                                            const std::string& arrayName,
                                            const std::optional<int64_t>& limit=std::nullopt) const;
+    // Streaming current visible-reference digest in one snapshot, including
+    // source ownership across overlays/shards. Explicit UUID requests must all
+    // exist in the selection. Selection ordering must be UUID ascending.
+    std::string selectedReferenceDigest(const Txn&, const ObjectSelection&,
+                                        const std::string& domain) const;
 
     // One packed buffer, caller revision order (including duplicates).
     // Dtype and trailing dimensions must match. All chunks remain verified.

@@ -62,6 +62,33 @@ def run_features(config):
         raise RuntimeError('Feature input changed during export')
 
 
+def axial_feature_columns(config, *, graph,fiber_source,source_pin):
+    """Return shared-kernel axial evidence directly, without an output file."""
+    from vc_object_store import fiber_axial_prior_columns
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polyline_arrays
+    native=config.get('native_config',{})
+    if not isinstance(native,dict):native=json.loads(Path(native).read_text())
+    umbilicus=config.get('umbilicus',native.get('umbilicus'))
+    if not umbilicus:raise ValueError('Native axial priors require an umbilicus input')
+    before=sha256_file(umbilicus);started=time.monotonic()
+    ids,geometry=read_polyline_arrays(fiber_source,graph.ids,volume=graph.volume,source_version=source_pin)
+    if not np.array_equal(ids,graph.ids):raise ValueError('Axial geometry identity differs')
+    print(json.dumps(dict(stage='axial_geometry_read',seconds=time.monotonic()-started,
+        fibers=len(ids),points=len(geometry.values))),flush=True)
+    phase=time.monotonic()
+    agreement=fiber_axial_prior_columns(geometry.offsets,geometry.values,str(umbilicus),graph.volume,
+        config.get('base_shape_zyx',native.get('base_shape_zyx')),float(native.get('axial_sample_spacing',16.)),
+        int(config.get('workers',32)))
+    # No point arrays survive this function. Only N scalar priors are needed
+    # by the graph solve; all geometry and quadrature stay in native code.
+    del geometry
+    if sha256_file(umbilicus)!=before:raise ValueError('Umbilicus changed during axial prior computation')
+    print(json.dumps(dict(stage='axial_priors_computed',seconds=time.monotonic()-phase,fibers=len(ids))),flush=True)
+    return dict(format='fiber-axial-priors',version=1,source_ids=ids,agreement=agreement,
+                fibers_digest=fibers_digest(fiber_source,source_version=source_pin),fiber_source=source_pin,
+                umbilicus_sha256=before)
+
+
 def verify_feature_source(database,feature, *, graph=None):
     """Bind cached scores to the actual fiber store used by the immutable constraint DB."""
     graph = FiberGraph(database) if graph is None else graph
@@ -81,14 +108,15 @@ def verify_feature_source(database,feature, *, graph=None):
                 fiber_lengths_checked=len(graph.ids),fiber_source=pin,fiber_source_path=str(source))
 
 
-def prepare(config, *, graph=None):
-    start=time.monotonic();database=Path(config['database']);features=Path(config['features'])
+def prepare(config, *, graph=None, return_arrays=False, feature=None):
+    start=time.monotonic();database=Path(config['database'])
+    features=Path(config['features']) if config.get('features') else None
     stage1=Path(config['stage1']) if config.get('stage1') else None
-    signature=dict(version=1,database=store_digest(database),features=sha256_file(features),stage1=sha256_file(stage1) if stage1 else None)
-    cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
-    feature=json.loads(features.read_text())
+    signature=dict(version=1,database=store_digest(database),features=sha256_file(features) if features else None,stage1=sha256_file(stage1) if stage1 else None)
+    cache=Path(config.get('tensor_cache',Path(config.get('output_root','.'))/'tensors.npz'));stamp=cache.with_suffix('.json')
+    feature=json.loads(features.read_text()) if feature is None else feature
     if feature['format']!='fiber-axial-priors' or feature['version']!=1:raise ValueError('Wrong axial features')
-    if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
+    if not return_arrays and cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
     graph = FiberGraph(database) if graph is None else graph
     verify_feature_source(database,feature,graph=graph)
     if stage1:
@@ -107,22 +135,21 @@ def prepare(config, *, graph=None):
     relation=np.where(graph.parallel,1.,-1.)
     ties=int((relation==0).sum());original_parallel=int((relation>0).sum());original_perp=int((relation<0).sum())
     keep=~inherited[graph.i]&~inherited[graph.j]&(relation!=0)
-    chunks=[np.column_stack((graph.i[keep],graph.j[keep],relation[keep]))]
-    edges=np.concatenate(chunks) if chunks else np.empty((0,3))
     active=np.flatnonzero(~inherited)
     if not len(active):raise ValueError('No active fibers remain after stage1')
     remap=np.full(len(ids),-1,np.int64);remap[active]=np.arange(len(active))
-    i=remap[edges[:,0].astype(np.int64)];j=remap[edges[:,1].astype(np.int64)]
-    degree=np.bincount(np.concatenate([i,j]),minlength=len(active)).astype(np.float32)
-    cache.parent.mkdir(parents=True,exist_ok=True)
-    temporary=cache.with_suffix('.partial.npz')
-    np.savez(temporary,ids=ids,active=active,inherited=inherited,a=a[active],lengths=lengths[active],i=i,j=j,
-             relation=edges[:,2].astype(np.float32),degree=degree)
-    temporary.replace(cache)
+    i=remap[graph.i[keep]];j=remap[graph.j[keep]]
+    degree=(np.bincount(i,minlength=len(active))+np.bincount(j,minlength=len(active))).astype(np.float32)
+    data=dict(ids=ids,active=active,inherited=inherited,a=a[active],lengths=lengths[active],i=i,j=j,
+              relation=relation[keep].astype(np.float32),degree=degree)
     stats=dict(signature=signature,feature_identity=dict(fibers_digest=feature['fibers_digest'],umbilicus_sha256=feature['umbilicus_sha256']),
                all_fibers=len(ids),inherited_broken=int(inherited.sum()),active_fibers=len(active),active_events=len(i),
                original_parallel=original_parallel,original_perpendicular=original_perp,tied_events_skipped=ties,
                isolated_active_fibers=int((degree==0).sum()),seconds=time.monotonic()-start)
+    if return_arrays:return data,stats
+    cache.parent.mkdir(parents=True,exist_ok=True)
+    temporary=cache.with_suffix('.partial.npz')
+    np.savez(temporary,**data);temporary.replace(cache)
     atomic_write(stamp,stats,durable=False);print('H/V preparation '+json.dumps(stats),flush=True)
 
 

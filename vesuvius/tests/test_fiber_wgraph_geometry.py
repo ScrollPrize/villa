@@ -39,9 +39,11 @@ def test_uv_direct_child_passes_owned_arrays_to_solver_without_staging(tmp_path,
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_min_flow_full as full
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_flow_uv as uv
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_native_prepare as native
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_graph_store as graph_store
+    from types import SimpleNamespace
     ids=np.array(['first','second','unsupported'])
-    catalog=dict(source_id=ids,family=np.array([0,1,0]))
-    graph=object();events=dict(i=np.array([0]),j=np.array([1]),parallel=np.array([False]))
+    graph=SimpleNamespace(ids=ids,event_ids=np.array([1]))
+    events=dict(i=np.array([0]),j=np.array([1]),parallel=np.array([False]))
     chosen=np.array([0,1]);prepared=dict(source_id=ids[:2],i=events['i'])
     selection=dict(retained=2,global_integer_shift=5)
     config=dict(database='winding.vcobj',result_store='uv.vcobj',output_root=str(tmp_path/'work'),
@@ -52,13 +54,18 @@ def test_uv_direct_child_passes_owned_arrays_to_solver_without_staging(tmp_path,
         def __enter__(self):return self
         def __exit__(self,*args):return False
         source=input_source
-    def forbidden(*args,**kwargs):raise AssertionError('Direct preparation must not stage/reread NPZ or use Python event batches')
-    def prepare(c,**kwargs):
-        assert kwargs==dict(build_graph=False,in_memory=True)
-        assert c['normal_sign_run_uuid']=='sign-run'
-        return catalog,{},{}
+    def forbidden(*args,**kwargs):raise AssertionError('Direct preparation must not stage/reread tensor files or use Python event batches')
     class Paths:
-        def __init__(self,root):assert str(root).endswith('/work/geometry')
+        def __init__(self,*args,**kwargs):forbidden()
+        @classmethod
+        def from_store(cls,c,selected):
+            assert c['normal_sign_run_uuid']=='sign-run'
+            assert c['input_store']=='winding.vcobj'
+            assert c['input_source'] is input_source
+            assert c['working_volume']=='measured-volume'
+            np.testing.assert_array_equal(selected,ids)
+            value=cls.__new__(cls);value.ids=ids;value.catalog={};value.xyz=np.zeros((6,3))
+            return value
         def bind_graph(self,value):assert value is graph
     def native_events(paths,value,**kwargs):
         assert isinstance(paths,Paths) and value is graph
@@ -68,6 +75,7 @@ def test_uv_direct_child_passes_owned_arrays_to_solver_without_staging(tmp_path,
         assert data is events and isinstance(paths,Paths)
         assert kwargs==dict(supported_input=True)
         assert c['workers']==7 and c['input_store']=='winding.vcobj'
+        assert 'packed_geometry' not in c
         np.testing.assert_array_equal(labels,[2,3])
         return prepared,selection
     def solve(c,data,selected):
@@ -76,18 +84,29 @@ def test_uv_direct_child_passes_owned_arrays_to_solver_without_staging(tmp_path,
         assert c['input_run_uuid']=='winding-run'
         assert c['result_store']=='uv.vcobj'
         assert c['input_source'] is input_source
+        assert c['write_solver_checkpoints'] is False
         return dict(run_uuid='new-uv-run',assignments_fixed=True)
-    monkeypatch.setattr(adapter,'_prepare',prepare)
+    monkeypatch.setattr(adapter,'_prepare',forbidden)
     monkeypatch.setattr(vc_object_store,'CollectionReader',InputReader)
     monkeypatch.setattr(adapter,'_input_lineage',lambda *args:dict(classification='class-run',normal_sign='sign-run'))
     monkeypatch.setattr(stages,'_selected_run',lambda *args:'winding-run')
-    monkeypatch.setattr(stages,'_fiber_columns',lambda *args,**kwargs:dict(selected_winding=np.array([2,3,9]),component=np.array([0,0,1])))
+    def fiber_columns(database,run,selected,**kwargs):
+        assert database=='winding.vcobj'
+        np.testing.assert_array_equal(selected,ids)
+        if run=='class-run':return dict(family=np.array([0,1,0]),enabled=np.ones(3,dtype=np.int64))
+        if run=='sign-run':return dict(normal_sign=np.ones(3,dtype=np.int64))
+        assert run=='winding-run'
+        return dict(selected_winding=np.array([2,3,9]),component=np.array([0,0,1]))
+    monkeypatch.setattr(stages,'_fiber_columns',fiber_columns)
     monkeypatch.setattr(stages,'_base_database',lambda *args:'source.vcobj')
     monkeypatch.setattr(stages,'_graph',lambda *args:graph)
+    monkeypatch.setattr(graph_store,'workflow_volume',lambda *args:'measured-volume')
     monkeypatch.setattr(full,'PackedPaths',Paths);monkeypatch.setattr(full,'event_batches',forbidden)
     monkeypatch.setattr(native,'prepare_events',native_events)
     monkeypatch.setattr(uv,'prepare_data',prepare_data);monkeypatch.setattr(uv,'solve',solve)
-    monkeypatch.setattr(np,'savez',forbidden);monkeypatch.setattr(np,'load',forbidden)
+    monkeypatch.setattr(np,'savez',forbidden);monkeypatch.setattr(np,'save',forbidden)
+    monkeypatch.setattr(np,'load',forbidden);monkeypatch.setattr(np,'memmap',forbidden)
+    monkeypatch.setattr(np.lib.format,'open_memmap',forbidden)
     # Real timing/selection reports are small JSON metadata and remain allowed.
     (tmp_path/'work').mkdir()
     result=adapter._solve_uv_direct(config)
@@ -161,7 +180,9 @@ def test_winding_stage_uses_typed_inputs_and_writes_referenced_results(tmp_path,
     from vc_object_store import CollectionReader
     from .fiber_graph_fixture import measured_store,uid
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import write_results,PREFIX
-    from vesuvius.neural_tracing.fiber_trace_3d import fiber_min_flow_full as flow,fiber_normal_sign as normal
+    from types import SimpleNamespace
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_normal_sign as normal
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_linear_irls as linear,fiber_packed_priors as priors
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_wgraph_geometry as adapter
     graph=measured_store(tmp_path,[(0,10,20,False,.5)])
     ids=np.array([uid(10),uid(20)])
@@ -170,27 +191,41 @@ def test_winding_stage_uses_typed_inputs_and_writes_referenced_results(tmp_path,
         dict(fiber_uuid=fid,enabled=1,family=i) for i,fid in enumerate(ids)]})
     sign_run=write_results(signed,[classified],'normal_sign','test',{'fibers':[
         dict(fiber_uuid=fid,normal_sign=-1,sign_probability=.1) for fid in ids]},input_runs=[classification_run])
-    def prepare(settings):
-        root=Path(settings['output_root'])
-        assert settings['database']==str(Path(graph).resolve())
-        assert settings['fibers']==str(signed)
+    native_graph=SimpleNamespace(i=np.array([0]),j=np.array([1]),arc_a=np.array([0.]),arc_b=np.array([0.]),
+        distance=np.array([.5]),parallel=np.array([False]),normal_a=np.ones((1,3)),normal_b=np.ones((1,3)),
+        connector=np.ones((1,3)),valid_a=np.array([True]),valid_b=np.array([True]),valid_connector=np.array([True]))
+    paths=SimpleNamespace(graph_index=np.array([0,1]))
+    def inputs(settings,source,selected,*,stage):
+        assert settings['database']==str(signed)
         assert settings['graph_cache']==str(tmp_path/'graph-cache')
-        with np.load(settings['comparison']) as saved:
-            np.testing.assert_array_equal(saved['ids'],ids)
-            np.testing.assert_array_equal(saved['labels'],[0,1])
-        with np.load(settings['normal_solution']) as saved:
-            np.testing.assert_array_equal(saved['normal_sign'],[-1,-1])
-            assert saved['normal_convention'].item()=='inward'
-        parts=root/'graph_parts';parts.mkdir()
-        np.savez(parts/'000.npz',a=[0],b=[1],target=[0],weight=[1.])
-        return dict(source_id=ids,family=np.array([0,1]))
+        assert selected==dict(classification=classification_run,normal_sign=sign_run)
+        assert stage=='winding'
+        return native_graph,paths,ids,np.array([0,1]),np.array([-1,-1]),{}
+    class NativeGeometry:
+        def prepare_winding_graph(self,*args,**kwargs):
+            assert args[0] is native_graph.i
+            np.testing.assert_array_equal(args[2],[0,1])
+            np.testing.assert_array_equal(args[3],[0,1])
+            np.testing.assert_array_equal(args[4],[-1,-1])
+            return dict(a=np.array([0]),b=np.array([1]),target=np.array([0.]),weight=np.array([1.]))
     def managed(settings,module,source):
         assert settings['devices']==devices
         assert settings['gpu_manager']['exclusive'] is exclusive
-        np.savez(Path(settings['output_root'])/'solution.npz',winding=[4,4],continuous=[4.01,4.02],component=[0,0])
-        return dict(weighted_l1=.01,mean_residual=.01,max_residual=.01)
-    monkeypatch.setattr(flow,'prepare',prepare)
+        assert settings['stage_mode']=='winding_direct'
+        assert module==adapter.__name__ and source==adapter.__file__
+        return adapter.solve(settings)
+    def solve(*args,**kwargs):
+        assert args[0]==2
+        np.testing.assert_array_equal(args[1],[0]);np.testing.assert_array_equal(args[2],[1])
+        return np.array([4.01,4.02]),np.array([.01])
+    def forbidden(*args,**kwargs):raise AssertionError('Production winding arrays must not pass through tensor files')
+    monkeypatch.setattr(adapter,'_read_winding_inputs',inputs)
+    monkeypatch.setattr(priors,'_geometry',lambda value:NativeGeometry() if value is paths else forbidden())
+    monkeypatch.setattr(linear,'solve_l1',solve)
     monkeypatch.setattr(normal,'launch_tensor_solve',managed)
+    monkeypatch.setattr(np,'savez',forbidden);monkeypatch.setattr(np,'save',forbidden)
+    monkeypatch.setattr(np,'load',forbidden);monkeypatch.setattr(np,'memmap',forbidden)
+    monkeypatch.setattr(np.lib.format,'open_memmap',forbidden)
     output=tmp_path/'winding.vcobj'
     result=adapter.run_stage('winding',dict(database=str(signed),result_store=str(output),
         output_root=str(tmp_path/'work'),graph_cache=str(tmp_path/'graph-cache'),devices=devices,
@@ -201,12 +236,34 @@ def test_winding_stage_uses_typed_inputs_and_writes_referenced_results(tmp_path,
         columns=[c['name'] for c in definitions[PREFIX+'fibers']['columns']]
         rows=[dict(zip(columns,row)) for row in store.extension_rows(PREFIX+'fibers')
               if row[1]==uuid.UUID(result['run_uuid']).bytes]
+        rows.sort(key=lambda row:row['fiber_uuid'])
         assert len(rows)==2
         assert [r['selected_winding'] for r in rows]==[4,4]
         assert [r['winding_mean'] for r in rows]==[4.01,4.02]
         columns=[c['name'] for c in definitions[PREFIX+'inputs']['columns']]
         inputs=[dict(zip(columns,row)) for row in store.extension_rows(PREFIX+'inputs')]
         assert any(r['input_run_uuid']==uuid.UUID(sign_run).bytes for r in inputs)
+
+
+def test_current_graph_reader_ignores_obsolete_numeric_cache(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_wgraph_stages as stages
+    root=tmp_path/'obsolete-cache';root.mkdir()
+    (root/'manifest.json').write_text('{"obsolete":true}')
+    graph=SimpleNamespace(ids=np.array(['a','b']),event_ids=np.array([7]))
+    class NativeGraph:
+        def __new__(cls,path,**kwargs):
+            assert path=='source.vcobj' and kwargs==dict(workers=11,progress=True)
+            return graph
+        @classmethod
+        def cached(cls,*args,**kwargs):raise AssertionError('Solver must not load a numeric graph cache')
+    def forbidden(*args,**kwargs):raise AssertionError('Solver must not create/load numeric graph files')
+    monkeypatch.setattr(stages,'FiberGraph',NativeGraph)
+    monkeypatch.setattr(np,'save',forbidden);monkeypatch.setattr(np,'savez',forbidden)
+    monkeypatch.setattr(np,'load',forbidden);monkeypatch.setattr(np,'memmap',forbidden)
+    monkeypatch.setattr(np.lib.format,'open_memmap',forbidden)
+    assert stages._graph(dict(graph_cache=str(root),workers=11),'source.vcobj') is graph
+    assert list(root.iterdir())==[root/'manifest.json']
 
 
 def test_packed_worker_reuses_graph_cache_without_readback(tmp_path,monkeypatch):
@@ -273,7 +330,7 @@ def test_explicit_run_selectors_cannot_mix_classification_sign_and_winding(tmp_p
     # Multiple classification/sign runs exist; winding resolves its exact pins.
     assert adapter._input_lineage(config,runs['w1'])==dict(classification=runs['c1'],normal_sign=runs['s1'])
     with pytest.raises(ValueError,match='classification.*ancestry'):
-        adapter._prepare(dict(config,classification_run_uuid=runs['c1'],normal_sign_run_uuid=runs['s2']))
+        adapter._input_lineage(dict(config,classification_run_uuid=runs['c1'],normal_sign_run_uuid=runs['s2']))
     with pytest.raises(ValueError,match='normal-sign.*ancestry'):
         adapter._run_uv(dict(config,input_run_uuid=runs['w1'],normal_sign_run_uuid=runs['s2']))
     with pytest.raises(ValueError,match='classification.*ancestry'):

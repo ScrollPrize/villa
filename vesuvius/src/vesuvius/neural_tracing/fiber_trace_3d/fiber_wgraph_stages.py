@@ -5,12 +5,13 @@ typed result rows are persisted; geometry and measurements remain referenced.
 """
 import json
 from pathlib import Path
+import time
 import uuid
 
 import numpy as np
 from vc_object_store import CollectionReader
 
-from .fiber_graph_store import FiberGraph, PREFIX, write_results
+from .fiber_graph_store import FiberGraph, PREFIX
 
 
 def _uuid(value):
@@ -117,11 +118,14 @@ def _base_database(config, prior_source=None):
 
 
 def _graph(config, base):
-    root=Path(config.get('graph_cache',str(base)+'.graph-cache'))
-    if (root/'manifest.json').exists():return FiberGraph.cached(base,root)
-    graph=FiberGraph(base)
-    graph.save_cache(root)
-    return FiberGraph.cached(base,root)
+    """Read native owned columns directly; solver inputs never pass via files."""
+    started=time.monotonic()
+    print(json.dumps(dict(stage='native_graph_read_started')),flush=True)
+    graph=FiberGraph(base,workers=int(config.get('workers',32)),progress=True)
+    read_seconds=time.monotonic()-started
+    print(json.dumps(dict(stage='native_graph_read_complete',seconds=read_seconds,
+                          fibers=len(graph.ids),constraints=len(graph.event_ids))),flush=True)
+    return graph
 
 
 def _solver_config(config, root):
@@ -141,14 +145,31 @@ def _solver_config(config, root):
 
 
 def run_stage(stage, config):
-    """Execute a stage with ``database`` input and ``result_store`` output."""
+    """Start one managed process before preparing any solver arrays."""
     if stage in ('winding','uv'):
         from .fiber_wgraph_geometry import run_stage as geometry_stage
         return geometry_stage(stage,config)
     if stage not in ('hvb','sign'):raise ValueError(f'Unknown downstream stage {stage}')
-    from . import fiber_hv_stage as hv, fiber_normal_sign as normal
+    from .fiber_normal_sign import launch_tensor_solve
     destination=Path(config['result_store'])
     if destination.exists():raise FileExistsError(destination)
+    with CollectionReader(str(config['database'])) as source:input_source=source.source
+    root=Path(config.get('output_root',str(destination)+'.work'))
+    settings=_solver_config(config,root)
+    return launch_tensor_solve(dict(settings,workflow_stage=stage,input_source=input_source),__name__,__file__)
+
+
+def _run_direct_stage(stage, config):
+    """Execute a stage with ``database`` input and ``result_store`` output."""
+    if stage not in ('hvb','sign'):raise ValueError(f'Unknown downstream stage {stage}')
+    from . import fiber_hv_stage as hv, fiber_normal_sign as normal
+    from .fiber_wrapped_stages import solve_stage
+    from .fiber_min_flow_experiment import write
+    destination=Path(config['result_store'])
+    if destination.exists():raise FileExistsError(destination)
+    with CollectionReader(str(config['database'])) as source:
+        input_source=source.source
+    if input_source!=config['input_source']:raise ValueError('Stage input snapshot changed before preparation')
     root=Path(config.get('output_root',str(destination)+'.work'))
     settings=_solver_config(config,root)
     root.mkdir(parents=True,exist_ok=True)
@@ -156,7 +177,7 @@ def run_stage(stage, config):
     if stage=='hvb':
         base=_base_database(config)
         graph=_graph(config,base)
-        settings.update(database=str(base),tensor_cache=str(root/'tensors.npz'))
+        settings.update(database=str(base))
         if config.get('stage1'):raise ValueError('vc_wgraph hvb runs before normal-sign alignment')
         if not settings.get('features'):
             if not config.get('native_config'):
@@ -164,26 +185,17 @@ def run_stage(stage, config):
             native=(dict(config['native_config']) if isinstance(config['native_config'],dict)
                     else json.loads(Path(config['native_config']).read_text()))
             from .fiber_graph_store import original_fiber_source
-            from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
             fiber_source,pin=original_fiber_source(base)
-            if fibers_digest(base)!=fibers_digest(fiber_source,source_version=pin):
-                raise ValueError('Constraint graph contains geometry overrides; regenerate its evidence')
-            features=root/'axial_features.json'
-            native.pop('database',None)
-            for key in ('normal_prior_output','normal_curves_output','orient_database'):
-                native.pop(key,None)
-            native.update(fibers=str(fiber_source),fiber_ids=graph.ids.tolist(),axial_prior_output=str(features),axial_prior_only=True,orient_normals=False,
-                          output=str(root/'axial_report.json'),progress_file=str(root/'axial_progress.jsonl'))
-            hv.run_features(dict(settings,native_config=native))
-            settings['features']=str(features)
-        hv.prepare(settings,graph=graph)
-        summary=normal.launch_tensor_solve(settings,hv.__name__,hv.__file__)
-        mode=settings['cost_modes'][0];penalty=settings['broken_penalties'][0]
-        solution=root/f'solution_{mode}_b{penalty:g}_e0.npz'
-        with np.load(solution) as saved:
-            rows=[dict(fiber_uuid=str(fid),family=int(label),enabled=int(label!=2),
-                       p_h=float(p[0]),p_v=float(p[1]),p_broken=float(p[2]))
-                  for fid,label,p in zip(saved['ids'],saved['labels'],saved['probabilities'])]
+            feature=hv.axial_feature_columns(dict(settings,native_config=native),graph=graph,
+                fiber_source=fiber_source,source_pin=pin)
+        else:feature=None
+        data,stats=hv.prepare(settings,graph=graph,return_arrays=True,feature=feature)
+        expected_ids=graph.ids;del graph,feature
+        summary,saved=solve_stage(settings,'classification',data=data,stats=stats,return_solution=True)
+        ids=saved['ids'];labels=saved['labels'];probabilities=saved['probabilities']
+        if not np.array_equal(ids,expected_ids):raise ValueError('Classification output fiber identities differ')
+        columns=dict(family=labels.astype(np.int64),enabled=(labels!=2).astype(np.int64),
+                     p_h=probabilities[:,0],p_v=probabilities[:,1],p_broken=probabilities[:,2])
         result_stage='classification'
     else:
         selected=_selected_run(config['database'],'classification',config.get('input_run_uuid'))
@@ -193,21 +205,30 @@ def run_stage(stage, config):
         classifications=_fiber_columns(config['database'],selected,graph.ids,required=('enabled',),exact=True)
         keep=np.asarray(classifications['enabled'],np.float32)
         if not np.isin(keep,[0,1]).all():raise ValueError('Classification enabled mask is not binary')
-        settings.update(database=str(base),tensor_cache=str(root/'tensors.npz'),fixed_keep=True)
-        normal.prepare(settings,graph=graph)
-        cache=Path(settings['tensor_cache'])
-        with np.load(cache) as prepared:arrays={key:prepared[key] for key in prepared.files}
-        arrays['keep']=keep
-        np.savez(cache,**arrays)
-        summary=normal.launch_tensor_solve(settings,normal.__name__,normal.__file__)
-        solution=root/f"solution_{settings['broken_penalties'][0]:g}.npz"
-        with np.load(solution) as saved:
-            if not np.array_equal(saved['broken'],keep<=.5):raise RuntimeError('Sign alignment changed classification')
-            rows=[dict(fiber_uuid=str(fid),normal_sign=int(sign),sign_probability=float(p))
-                  for fid,sign,p in zip(saved['ids'],saved['normal_sign'],saved['sign_probability'])]
+        settings.update(database=str(base),fixed_keep=True)
+        data,stats=normal.prepare(settings,graph=graph,return_arrays=True,prior=prior)
+        data['keep']=keep
+        expected_ids=graph.ids;del graph,prior,classifications
+        summary,saved=solve_stage(settings,'normal_sign',data=data,stats=stats,return_solution=True)
+        if not np.array_equal(saved['broken'],keep<=.5):raise RuntimeError('Sign alignment changed classification')
+        ids=saved['ids']
+        if not np.array_equal(ids,expected_ids):raise ValueError('Normal-sign output fiber identities differ')
+        columns=dict(normal_sign=saved['normal_sign'].astype(np.int64),sign_probability=saved['sign_probability'])
         result_stage='normal_sign'
-    run=write_results(destination,[config['database']],result_stage,'wrapped_irls',{'fibers':rows},
+    from .fiber_graph_store import write_fiber_result_columns
+    run=write_fiber_result_columns(destination,config['database'],input_source,result_stage,'wrapped_irls',ids,columns,
                       settings=dict(fixed_keep=stage=='sign',prior_weight=float(settings.get('prior_weight',.001))),
-                      input_runs=[selected])
-    return dict(stage=stage,result_store=str(destination),run_uuid=run,input_run_uuid=selected,
-                solver_summary=summary)
+                      input_run=selected,workers=int(config.get('workers',32)),timings_path=root/'result-export-timings.json')
+    result=dict(stage=stage,result_store=str(destination),run_uuid=run,input_run_uuid=selected,solver_summary=summary)
+    write(root/'summary.json',result)
+    return result
+
+
+if __name__=='__main__':
+    import argparse
+    parser=argparse.ArgumentParser();parser.add_argument('--config',required=True)
+    parser.add_argument('--unmanaged',action='store_true');parser.add_argument('--devices')
+    args=parser.parse_args()
+    if not args.unmanaged:raise RuntimeError('Use the managed workflow entry point')
+    config=json.loads(Path(args.config).read_text())
+    _run_direct_stage(config['workflow_stage'],config)
