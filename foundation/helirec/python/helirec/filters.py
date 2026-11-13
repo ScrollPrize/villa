@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import copy
 import json
-import re
+
+from . import _core
 
 # default: no projection filters (no Paganin, no unsharp). The reference (Night Rail BM18) chain is REFERENCE_CHAIN.
 DEFAULT_CHAIN: list = []
@@ -35,69 +36,40 @@ def register(name, fn):
     _python_filters[name] = fn
 
 
+def _err(e, kind=ValueError):
+    return kind(str(e))
+
+
 def _value(v):
-    try:
-        f = float(v)
-        return int(f) if re.fullmatch(r"[+-]?\d+", v.strip()) else f
-    except (TypeError, ValueError):
-        return v
+    """a value as --set reads it: a whole number, a real, or the text (helirec::parse_value)"""
+    return json.loads(_core.parse_value(str(v)))
 
 
 def parse_chain(text):
-    """'paganin(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)' or JSON -> chain; '' or 'none' -> []."""
+    """'paganin(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)' or JSON -> chain; '' or 'none' -> [].
+    (helirec::parse_filter_chain)"""
     if isinstance(text, list):
         return copy.deepcopy(text)
-    text = text.strip()
-    if text in ("", "none", "[]"):
-        return []
-    if text.startswith("["):
-        return json.loads(text)
-    chain = []
-    for item in text.split("+"):
-        m = re.fullmatch(r"\s*([\w-]+)\s*(?:\((.*)\))?\s*", item)
-        if not m:
-            raise ValueError(f"cannot parse filter '{item}'")
-        f = {"type": m.group(1)}
-        for kv in filter(None, (m.group(2) or "").split(",")):
-            k, v = kv.split("=", 1)
-            f[k.strip()] = _value(v.strip())
-        chain.append(f)
-    return chain
+    try:
+        return json.loads(_core.parse_filter_chain(str(text)))
+    except RuntimeError as e:
+        raise _err(e) from None
 
 
 def chain_text(chain):
-    return "+".join(f["type"] + ("(" + ",".join(f"{k}={v:g}" if isinstance(v, (int, float)) else f"{k}={v}"
-                                                for k, v in f.items() if k != "type") + ")" if len(f) > 1 else "")
-                    for f in chain)
-
-
-def _locate(chain, ref):
-    m = re.fullmatch(r"([\w-]+)(?:\[(\d+)\])?", ref)
-    if not m:
-        raise KeyError(f"bad filter reference '{ref}'")
-    typ, k = m.group(1), int(m.group(2) or 0)
-    hits = [f for f in chain if f["type"] == typ]
-    if len(hits) <= k:
-        raise KeyError(f"no filter '{ref}' in chain {chain_text(chain)}")
-    return hits[k]
+    return _core.filter_chain_text(json.dumps(chain))
 
 
 def override(chain, changes):
-    """New chain with {"TYPE[.k].param": value} changes ("filters": a whole chain)."""
-    out = copy.deepcopy(chain)
-    for key, v in changes.items():
-        if key == "filters":
-            out = parse_chain(v)
-            continue
-        ref, _, param = key.rpartition(".")
-        if not ref:
-            raise KeyError(f"'{key}' is not TYPE.param")
-        _locate(out, ref)[param] = v
-    return out
+    """New chain with {"TYPE[.k].param": value} changes ("filters": a whole chain). (helirec::override_filter_chain)"""
+    try:
+        return json.loads(_core.override_filter_chain(json.dumps(chain), json.dumps(changes)))
+    except RuntimeError as e:
+        raise _err(e, KeyError) from None
 
 
 def is_filter_key(key):
-    return key == "filters" or "." in key
+    return _core.is_filter_key(key)
 
 
 def sweep_sets(items):

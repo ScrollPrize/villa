@@ -44,7 +44,13 @@ import time
 
 import numpy as np
 
-from helirec.cli import DEFAULT_OBJECT_EXTENT, write_png_gray
+from helirec._core import write_png
+
+DEFAULT_OBJECT_EXTENT = (0.0, 1.0)   # (helirec-reconstruct's --object_extent default)
+
+
+def write_png_gray(path, img):
+    write_png(path, np.ascontiguousarray(img, np.uint8))
 from helirec.filters import parse_chain
 from helirec.recon import HelicalRecon, DEFAULTS
 

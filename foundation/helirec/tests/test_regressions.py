@@ -119,47 +119,36 @@ def test_calibration_parameters():
     assert r.params["geometry"] == "/somewhere/geometry.json" and r.params["row_time_us"] == "-19.87"
     r._update({"mode": "corrected"})
     assert r.params["geometry"] == "/somewhere/geometry.json" and r.params["backprojector"] == "fbp"
-    r.cal = SimpleNamespace(rot_center=100.25)
-    r._geometry_data = dict(rolling_shutter=-0.72)
-    assert r.rot_center() == 100.25 and r.rolling_shutter() == -0.72
-    r._update({"mode": "legacy_reference"})
-    assert r.rolling_shutter() == 0.0                                        # (one angle per frame, as the reference)
     for gone in ("z_translation_scale", "companion_registration", "stationary_registration", "axis_refinement", "rolling_shutter"):
         with pytest.raises(KeyError, match="geometry calibration"):
             bare_recon()._update({gone: "auto"})
-    r = bare_recon()
-    r.cache_dir = None
-    with pytest.raises(ValueError, match="geometry"):
-        r._geometry_file()
+    with pytest.raises(RuntimeError, match="geometry"):      # neither given nor a cache directory to make it in
+        _core.geometry_calibration_file("", "", ["/data/HA/HA.h5", "/data/TA/TA.h5"])
 
 
-def test_geometry_calibration_is_made_once_and_kept(tmp_path, monkeypatch):
+def test_geometry_calibration_is_made_once_and_kept(tmp_path):
     """no geometry given: geometry.json of the cache directory, made by the geometry calibration step when it is not
-    there or is other scans', and read from then on; a given file is used as it is and nothing is made"""
-    from helirec import geometry
+    there or is other scans', and read from then on; a given file is used as it is and nothing is made
+    (helirec::geometry_calibration_file)"""
     made = []
 
-    def step(scans, row_time=None, device="auto", log=print, **kw):
+    def step(scans, row_time, device):
         made.append((list(scans), row_time, device))
-        return dict(scans=list(scans), row_time=dict(seconds_per_row=row_time))
+        return json.dumps(dict(scans=list(scans), row_time=dict(seconds_per_row=row_time)))
 
-    monkeypatch.setattr(geometry, "calibrate_geometry", step)
-    r = bare_recon()
-    r.cache_dir, r.device, r.log = str(tmp_path / "cache"), "cpu", lambda *a: None
-    r.main, r.companion = SimpleNamespace(master="/data/HA/HA.h5"), SimpleNamespace(master="/data/TA/TA.h5")
-    path, raw = r._geometry_file()
-    assert path == str(tmp_path / "cache" / "geometry.json") and json.loads(raw)["scans"] == ["/data/HA/HA.h5", "/data/TA/TA.h5"]
-    assert made == [(["/data/HA/HA.h5", "/data/TA/TA.h5"], None, "cpu")]
-    assert r._geometry_file() == (path, raw) and len(made) == 1                    # kept: not made again
-    r.params["row_time_us"] = "-19.87"                                             # (only for making it)
-    r.companion = SimpleNamespace(master="/data/TB/TB.h5")                         # other scans: made again, replaced
-    path2, raw2 = r._geometry_file()
+    cache = str(tmp_path / "cache")
+    pair = ["/data/HA/HA.h5", "/data/TA/TA.h5"]
+    path, raw = _core.geometry_calibration_file("", cache, pair, "", "cpu", None, step)
+    assert path == str(tmp_path / "cache" / "geometry.json") and json.loads(raw)["scans"] == pair
+    assert made == [(pair, None, "cpu")]
+    assert _core.geometry_calibration_file("", cache, pair, "", "cpu", None, step) == (path, raw) and len(made) == 1   # kept: not made again
+    other = ["/data/HA/HA.h5", "/data/TB/TB.h5"]                                   # other scans: made again, replaced
+    path2, raw2 = _core.geometry_calibration_file("", cache, other, "-19.87", "cpu", None, step)
     assert path2 == path and json.loads(raw2)["scans"][1] == "/data/TB/TB.h5" and len(made) == 2
-    assert made[1][1] == pytest.approx(-19.87e-6)
+    assert made[1][1] == pytest.approx(-19.87e-6)                                 # (row_time_us: only for making it)
     given = tmp_path / "given.json"
     given.write_text('{"scans": ["x.h5", "y.h5"]}')
-    r.params["geometry"] = str(given)
-    assert r._geometry_file() == (str(given), given.read_text()) and len(made) == 2
+    assert _core.geometry_calibration_file(str(given), cache, pair, "", "cpu", None, step) == (str(given), given.read_text()) and len(made) == 2
 
 
 # ---------------------------------------------------------------- output scale (attenuation)

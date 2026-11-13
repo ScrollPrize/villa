@@ -30,6 +30,12 @@ Outputs record the mode, its conventions and every resolved parameter (`manifest
 
 ## Slices and volumes (`helirec-reconstruct`)
 
+`helirec-reconstruct` is a C++ executable (`tools/helirec_reconstruct.cpp`; `cmake --build build/<tree> --target
+helirec-reconstruct`; installed into the environment's `bin` with the package). The reconstruction it runs is
+`helirec::Reconstruction` (`include/helirec/reconstruction.hpp`: the scans, both calibrations, the parameters and
+their rules, provenance), which Python's `helirec.recon.HelicalRecon` binds. `--config FILE` takes a JSON object of
+its options (names without the dashes); each run writes `config.json`, which reruns it.
+
 ```bash
 helirec-reconstruct PROJ -n 8 --tag unfiltered                                    # 8 slices, default mode
 helirec-reconstruct PROJ -n 8 --set mode=legacy_reference --tag reference         # the reference workflow
@@ -137,6 +143,7 @@ mx, mean = bc.composites(set=2)
 | 1 | raw row-window reads (`pread`, one HDF5 chunk per frame) | `raw_reader.hpp` | CPU (threads) |
 | 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame (`helirec-calibration intensity`) | `calibration/intensity.hpp` (Python: `helirec.calibration`) | CPU |
 | 2b | geometry calibration: layout, rows' timing, detector map, poses and motion (`helirec-calibration geometry`) | `calibration/geometry_calibration.hpp`, `python/helirec/geometry.py` | CPU, CUDA |
+| 2c | the reconstruction of a pair: parameters (modes, filter chains, `--set`), scan data from both calibrations, provenance (`helirec-reconstruct`) | `reconstruction.hpp` (Python: `helirec.recon`) | CPU |
 | 3 | helical geometry: span info, doable span, per-projection shifts and grid bins | `helical.hpp` | CPU |
 | 4 | gridding: flat-field, weights, vertical / horizontal kernels, angular bins (gather form) | `accumulate.hpp` | CPU, CUDA |
 | 5 | HA/TA luminosity equalisation, divide, mend | `accumulate.hpp` | CPU, CUDA |
@@ -329,7 +336,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   rechecked when changing the illuminated-border assumption. Existing scalar specs retain their old behavior,
   and SLD remains disabled unless requested. Python frame checks use `helirec.sld.correct(frames, spec)`.
 
-  Validation: `python -m pytest -q tests/test_sld.py tests/test_sld_bm18.py tests/test_fourier.py tests/test_provenance.py`.
+  Validation: `python -m pytest -q tests/test_sld.py tests/test_sld_bm18.py tests/test_fourier.py`.
   The small fixture `tests/reference/sld_bm18.json` is generated from Nabuxx commit
   `515e0df11cf34f669ae1cf918f219a8454c90e1c`, with NumPy FFTs replacing PyFFTW, by
   `python tests/reference/generate_sld_bm18.py /path/to/pinned/diffusion_digest.py` (source hash checked).

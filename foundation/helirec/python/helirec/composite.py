@@ -218,7 +218,8 @@ def write_surface_zarr(path, layers, good, u8_window, voxel_um, origin_rc):
 def write_set(out, layers, offsets, good, meta, u8_window, slices=None, surface_zarr=False):
     """One output folder: composites at the root, layers/, xy_slices/ (and surface_volume.zarr)."""
     import tifffile
-    from .cli import _json_default, write_png_gray
+    from ._core import write_png
+    write_png_gray = lambda path, img: write_png(path, np.ascontiguousarray(img, np.uint8))  # noqa: E731
     os.makedirs(os.path.join(out, "layers"), exist_ok=True)
     filled = np.where(good, layers, 0)
     comp = {"max": np.where(good, filled.max(0), np.nan).astype(np.float32),
@@ -338,7 +339,8 @@ def main(argv=None):
             eff[k] = os.path.abspath(eff[k])
     json.dump(eff, open(os.path.join(outdir, "config.json"), "w"), indent=2)
 
-    from .cli import parse_set
+    from ._core import parse_settings
+    parse_set = lambda items: json.loads(parse_settings(list(items)))  # noqa: E731  (--set KEY=VALUE, as helirec-reconstruct reads it)
     from .recon import display_window
     params = parse_set(a.set) if a.projections else {}
     if a.u8_window is None:

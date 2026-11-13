@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from evaluation import compare_methods as compare
-from helirec import cli, to_uint8
+from helirec import to_uint8
 from helirec.recon import CALIBRATION_KEYS, DEFAULTS, HelicalRecon, LEGACY_REFERENCE
 
 
@@ -91,79 +91,3 @@ def test_baseline_previews_opt_in(tmp_path, monkeypatch, previews):
     manifest = json.loads((out / "manifest_new.json").read_text())
     assert manifest["legacy"]["2"]["output_units"] == "reference_units (attenuation / 2)"
     assert not (out / "manifest.json").exists()
-
-
-@pytest.mark.parametrize("flag,expected", [([], True), (["--previews"], False), (["--no_preview"], True)])
-def test_slice_cli_previews_opt_in(tmp_path, monkeypatch, flag, expected):
-    monkeypatch.setattr("helirec.recon.HelicalRecon", FakeRecon)
-    seen = []
-    monkeypatch.setattr(cli, "run_fractions", lambda a, *args: seen.append(a.no_preview))
-    cli.main(["unused", "--out_root", str(tmp_path), "--tag", "test"] + flag)
-    assert seen == [expected]
-
-
-@pytest.mark.parametrize("fmt", ["zarr", "tiff"])
-@pytest.mark.parametrize("flags,kinds", [([], {"float32"}), (["--uint8"], {"float32", "uint8"}),
-                                         (["--uint8_only"], {"uint8"})])
-def test_slice_cli_uint8_only_skips_float32(tmp_path, monkeypatch, fmt, flags, kinds):
-    import tifffile
-    monkeypatch.setattr("helirec.recon.HelicalRecon", FakeRecon)
-    cli.main(["unused", "--out_root", str(tmp_path), "--tag", "t", "--z", "2", "5", "--format", fmt,
-              "--u8_window", "0", "63", "--u8_compression", "none"] + flags)
-    out = tmp_path / "t"
-    names = {"float32": "volume.zarr", "uint8": "volume_uint8.zarr"} if fmt == "zarr" else {"float32": "float32", "uint8": "uint8"}
-    assert {k for k, n in names.items() if (out / n).exists()} == kinds
-    assert set(json.loads((out / "manifest.json").read_text())["outputs"]) == kinds
-    if fmt == "tiff" and "uint8" in kinds:
-        want = to_uint8(np.arange(64, dtype=np.float32).reshape(8, 8), 0, 63, disk=(8, 0, 0))
-        assert sorted(f.name for f in (out / "uint8").iterdir()) == ["z00002.tif", "z00003.tif", "z00004.tif"]
-        np.testing.assert_array_equal(tifffile.imread(out / "uint8" / "z00003.tif"), want)
-
-
-def test_slice_cli_reference_volume_masks_the_uint8_output(tmp_path, monkeypatch):
-    import tifffile
-    from helirec.omezarr import OmeZarrWriter
-    monkeypatch.setattr("helirec.recon.HelicalRecon", FakeRecon)
-    ref = np.zeros((10, 8, 8), np.uint8)                                                # the volume's grid
-    ref[1:8, 2:7, 1:6] = 200
-    for name, vol in (("ref.zarr", ref), ("other.zarr", ref[:, :6])):
-        w = OmeZarrWriter(str(tmp_path / name), vol.shape, np.uint8, chunks=(4, 4, 4), levels=2)
-        w.write(0, vol)
-        w.close()
-    args = ["unused", "--out_root", str(tmp_path), "--z", "2", "7", "--chunk", "2", "--format", "tiff", "--u8_window", "0", "63"]
-    cli.main(args + ["--tag", "plain", "--uint8_only"])
-    cli.main(args + ["--tag", "masked", "--uint8", "--reference_volume", str(tmp_path / "ref.zarr")])
-    for z in range(2, 7):      # three chunks: the masks are read ahead into two buffers in turn
-        plain = tifffile.imread(tmp_path / "plain" / "uint8" / f"z{z:05d}.tif")
-        masked = tifffile.imread(tmp_path / "masked" / "uint8" / f"z{z:05d}.tif")
-        np.testing.assert_array_equal(masked, np.where(ref[z], plain, 0))
-        assert tifffile.imread(tmp_path / "masked" / "float32" / f"z{z:05d}.tiff").dtype == np.float32   # not masked
-    assert json.loads((tmp_path / "masked" / "manifest.json").read_text())["reference_volume"]["level_shape"] == [10, 8, 8]
-    # a coarser level of the reference decides the same area to within its voxels
-    w = OmeZarrWriter(str(tmp_path / "pyramid.zarr"), ref.shape, np.uint8, chunks=(4, 4, 4), levels=2)
-    w.write(0, ref)
-    w.close()
-    coarse = np.repeat(np.repeat(np.repeat(w.read(1, 0, 5), 2, 0), 2, 1), 2, 2)
-    cli.main(args + ["--tag", "coarse", "--uint8_only", "--reference_volume", str(tmp_path / "pyramid.zarr"),
-                     "--reference_scale", "1"])
-    for z in range(2, 7):
-        plain = tifffile.imread(tmp_path / "plain" / "uint8" / f"z{z:05d}.tif")
-        np.testing.assert_array_equal(tifffile.imread(tmp_path / "coarse" / "uint8" / f"z{z:05d}.tif"),
-                                      np.where(coarse[z], plain, 0))
-    assert json.loads((tmp_path / "coarse" / "manifest.json").read_text())["reference_volume"]["factors"] == [2, 2, 2]
-    with pytest.raises(SystemExit, match="same grid"):
-        cli.main(args + ["--tag", "wrong", "--uint8", "--reference_volume", str(tmp_path / "other.zarr")])
-    with pytest.raises(SystemExit, match="--uint8"):
-        cli.main(args + ["--tag", "float", "--reference_volume", str(tmp_path / "ref.zarr")])
-
-
-def test_slice_cli_bbox_is_passed_to_the_reconstructor(tmp_path, monkeypatch):
-    monkeypatch.setattr("helirec.recon.HelicalRecon", FakeRecon)
-    args = ["unused", "--out_root", str(tmp_path), "--z", "2", "6", "--chunk", "2", "--format", "tiff"]
-    cli.main(args + ["--tag", "box", "--bbox", "1", "5", "2", "8"])
-    assert FakeRecon.regions == [[1, 5, 2, 8]] * 2
-    assert json.loads((tmp_path / "box" / "manifest.json").read_text())["bbox_xyxy"] == [1, 5, 2, 8]
-    cli.main(args + ["--tag", "whole"])
-    assert FakeRecon.regions == [None] * 2
-    with pytest.raises(SystemExit, match="--bbox"):
-        cli.main(args + ["--tag", "bad", "--bbox", "1", "9", "2", "8"])

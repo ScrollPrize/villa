@@ -40,25 +40,6 @@ std::string fmt(const char* format, double v) {
     return b;
 }
 
-// a double as Python's repr writes it (the shortest text that reads back as the same number)
-std::string py_repr(double v) {
-    if (std::isnan(v)) return "nan";
-    if (std::isinf(v)) return v > 0 ? "inf" : "-inf";
-    char b[64];
-    int p = 1;
-    for (; p < 17; ++p) {
-        std::snprintf(b, sizeof b, "%.*e", p - 1, v);
-        if (std::strtod(b, nullptr) == v) break;
-    }
-    std::snprintf(b, sizeof b, "%.*e", p - 1, v);
-    const int exponent = std::atoi(std::strchr(b, 'e') + 1);
-    if (exponent < -4 || exponent >= 16) return b;
-    std::snprintf(b, sizeof b, "%.*f", std::max(p - 1 - exponent, 0), v);
-    std::string s = b;
-    if (s.find('.') == std::string::npos) s += ".0";
-    return s;
-}
-
 bool exists(const std::string& path) {
     struct stat st;
     return ::stat(path.c_str(), &st) == 0;
@@ -521,8 +502,8 @@ IntensityCalibration calibrate_intensity(const Scan& main, const Scan& companion
             if (std::rename(tmp.c_str(), json_path.c_str()) != 0) throw Error("cannot write " + json_path);
         }
     }
-    say(log, "merged frame: rotation axis " + fmt("%.3f", cal.cor_main_detector) + " in the main scan's columns, companion at (" + py_repr(cal.vector[0]) + ", " +
-                 py_repr(cal.vector[1]) + ") (rows, columns): axis " + fmt("%.3f", cal.rot_center) + " of " + std::to_string(cal.merged_width) + " merged columns");
+    say(log, "merged frame: rotation axis " + fmt("%.3f", cal.cor_main_detector) + " in the main scan's columns, companion at (" + python_repr(cal.vector[0]) + ", " +
+                 python_repr(cal.vector[1]) + ") (rows, columns): axis " + fmt("%.3f", cal.rot_center) + " of " + std::to_string(cal.merged_width) + " merged columns");
 
     // per scan: the weight map times its horizontal apodisation
     for (int s = 0; s < 2; ++s) {

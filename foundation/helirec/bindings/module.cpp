@@ -25,6 +25,10 @@
 #include "helirec/progress.hpp"
 #include "helirec/reference.hpp"
 #include "helirec/zarr.hpp"
+#include "helirec/reconstruction.hpp"
+#include "../src/io/image_files.hpp"
+#include "helirec/calibration/scan.hpp"
+#include "helirec/calibration/intensity.hpp"
 #include "ndarray_utils.hpp"
 
 #ifdef HELIREC_WITH_CUDA
@@ -871,8 +875,21 @@ SldParams sld_from(const nb::dict& c) {
     return p;
 }
 
+// the backprojector of type "python" a Reconstruction asks for (its parameters as text, read back as --set reads them)
+std::shared_ptr<ExternalBackprojector> python_backprojector(const FilterParams& p) {
+    nb::gil_scoped_acquire gil;
+    nb::object loads = nb::module_::import_("json").attr("loads");
+    nb::dict d;
+    for (const auto& [k, v] : p.values) d[k.c_str()] = loads(parse_value(v));
+    return std::make_shared<PyExternalBackprojector>(d);
+}
+
+nb::object json_loads(const std::string& text) { return nb::module_::import_("json").attr("loads")(text); }
+
 class PySliceReconstructor {
   public:
+    // the reconstructor a Reconstruction made (shared with it)
+    explicit PySliceReconstructor(std::shared_ptr<SliceReconstructor> rec) : impl_(std::move(rec)) {}
     PySliceReconstructor(std::vector<ScanData> scans, const nb::dict& c) {
         ReconConfig cfg;
         auto get = [&](const char* k) { return c.contains(k) ? nb::object(c[k]) : nb::object(); };
@@ -924,7 +941,7 @@ class PySliceReconstructor {
         f("voxel_size_m", cfg.pixel_size_m);
         f("axis_source_meters", cfg.axis_source_meters);
         nb::gil_scoped_release nogil;
-        impl_ = std::make_unique<SliceReconstructor>(std::move(scans), cfg);
+        impl_ = std::make_shared<SliceReconstructor>(std::move(scans), cfg);
     }
     nb::dict info() const {
         nb::dict d;
@@ -1072,7 +1089,7 @@ class PySliceReconstructor {
     }
 
   private:
-    std::unique_ptr<SliceReconstructor> impl_;
+    std::shared_ptr<SliceReconstructor> impl_;
 };
 
 }  // namespace
@@ -1570,6 +1587,90 @@ NB_MODULE(_core, m) {
         .def("describe", &PySliceReconstructor::describe, "chain"_a, "compiled steps of a filter chain")
         .def("sweep_margin", &PySliceReconstructor::sweep_margin, "sweep"_a,
              "phase margin (rows) a sweep uses: the largest any of its sets needs");
+
+    // ---------------------------------------------------------------- the reconstruction of a scan pair (reconstruction.hpp)
+    m.def("reconstruction_default_parameters", &default_parameters, "the default parameters (JSON text)");
+    m.def("reconstruction_legacy_parameters", &legacy_reference_parameters, "the parameters mode legacy_reference pins (JSON text)");
+    m.def("reconstruction_calibration_keys", &calibration_keys);
+    m.def("reconstruction_mode_conventions", &mode_conventions, "mode"_a);
+    m.def("reconstruction_display_window", &display_window, "mode"_a);
+    m.def("parse_filter_chain", &parse_filter_chain, "text"_a, "a filter chain from its text (JSON text of the list)");
+    m.def("parse_value", &parse_value, "text"_a, "--set's reading of a value (JSON text)");
+    m.def("override_filter_chain", &override_filter_chain, "chain"_a, "changes"_a, "a chain with TYPE[.k].param changes (JSON texts)");
+    m.def("filter_chain_text", &filter_chain_text, "chain"_a);
+    m.def("is_filter_key", &is_filter_key, "key"_a);
+    m.def("parse_settings", &parse_settings, "items"_a, "--set KEY=VALUE items as a JSON object of changes (text)");
+    m.def("update_parameters", &update_parameters, "params"_a, "changes"_a, "the parameters changed (JSON texts)");
+    m.def("sld_config", [](const std::string& spec) { std::string r; sld_params(spec, &r); return r; }, "spec"_a,
+          "a scintillator light diffusion model resolved to the reconstructor's keys (JSON text)");
+    m.def("backprojector_config", &backprojector_config, "spec"_a, "a backprojector spec as the reconstructor's settings (JSON text)");
+    m.def("angle_subset_config", &parse_angle_subset, "spec"_a);
+    m.def("build_revision", &build_revision);
+    m.def("write_png", [](const std::string& path, nb::ndarray<const std::uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> img) {
+        write_png(path, img.data(), static_cast<int>(img.shape(0)), static_cast<int>(img.shape(1)));
+    }, "path"_a, "img"_a, "(ny, nx) uint8 as an 8-bit grey PNG");
+    m.def(
+        "geometry_calibration_file",
+        [](const std::string& given, const std::string& cache_dir, const std::vector<std::string>& masters, const std::string& row_time_us, const std::string& device,
+           std::optional<std::function<void(const std::string&)>> log,
+           std::optional<std::function<std::string(std::vector<std::string>, std::optional<double>, std::string)>> make) {
+            std::function<void(const std::string&)> say;
+            if (log) say = [log](const std::string& line) { (*log)(line); };
+            GeometryMaker maker;
+            if (make)
+                maker = [make](const std::vector<std::string>& m, const calibration::geometry_calibration::Options& o) {
+                    return (*make)(m, std::isnan(o.row_time) ? std::nullopt : std::optional<double>(o.row_time), o.device == Device::CUDA ? "cuda" : "cpu");
+                };
+            const auto r = geometry_calibration_file(given, cache_dir, masters, row_time_us, parse_device(device), say, maker);
+            return nb::make_tuple(r.first, r.second);
+        },
+        "given"_a, "cache_dir"_a, "masters"_a, "row_time_us"_a = "", "device"_a = "cpu", "log"_a = nb::none(), "make"_a = nb::none(),
+        "(path, text) of the geometry calibration: given, or geometry.json of cache_dir made by make(masters, row_time_s, device) (default: the "
+        "geometry calibration step) when absent or of other scans (helirec::geometry_calibration_file)");
+
+    nb::class_<Reconstruction>(m, "Reconstruction",
+                               "The reconstruction of a scan pair from its raw folders: the scans, the geometry and intensity calibrations, "
+                               "and a SliceReconstructor of the parameters (helirec::Reconstruction, reconstruction.hpp)")
+        .def(
+            "__init__",
+            [](Reconstruction* self, const std::string& projections, const std::string& params, const std::string& cache_dir, const std::string& device,
+               std::optional<std::function<void(const std::string&)>> log, bool progress) {
+                Reconstruction::Options o;
+                o.cache_dir = cache_dir;
+                o.device = parse_device(device);
+                o.progress = progress;
+                if (log)
+                    o.log = [log](const std::string& line) {
+                        nb::gil_scoped_acquire gil;
+                        (*log)(line);
+                    };
+                o.external_backprojector = python_backprojector;
+                nb::gil_scoped_release nogil;
+                new (self) Reconstruction(projections, params, std::move(o));
+            },
+            "projections"_a, "params"_a = "{}", "cache_dir"_a = "", "device"_a = "cuda", "log"_a = nb::none(), "progress"_a = false)
+        .def("set_parameters", [](Reconstruction& r, const std::string& changes) {
+            nb::gil_scoped_release nogil;
+            r.set_parameters(changes);
+        }, "changes"_a)
+        .def_prop_ro("parameters", &Reconstruction::parameters)
+        .def_prop_ro("main", [](Reconstruction& r) -> const calibration::Scan& { return r.main(); }, nb::rv_policy::reference_internal)
+        .def_prop_ro("companion", [](Reconstruction& r) -> const calibration::Scan& { return r.companion(); }, nb::rv_policy::reference_internal)
+        .def_prop_ro("intensity", [](Reconstruction& r) -> const calibration::IntensityCalibration& { return r.intensity(); }, nb::rv_policy::reference_internal)
+        .def_prop_ro("reconstructor", [](Reconstruction& r) { return PySliceReconstructor(r.reconstructor()); })
+        .def_prop_ro("doable", &Reconstruction::doable)
+        .def_prop_ro("mode", &Reconstruction::mode)
+        .def("rot_center", &Reconstruction::rot_center)
+        .def("rolling_shutter", &Reconstruction::rolling_shutter)
+        .def("exposure_arc", &Reconstruction::exposure_arc)
+        .def("sharpness_weighting", &Reconstruction::sharpness_weighting)
+        .def("resolved_sld", &Reconstruction::resolved_sld)
+        .def("info", &Reconstruction::info)
+        .def("slice_info", [](const Reconstruction& r, double f) {
+            const SliceInfo s = r.slice_info(f);
+            return nb::make_tuple(s.fraction, s.view_height, s.nabu_index, s.height_mm);
+        }, "fraction"_a)
+        .def("provenance", &Reconstruction::provenance);
 
     nb::class_<BandSampler>(m, "BandSampler",
                             "Sample points for band reconstruction: zlo (int32, sorted), fz, y, x (float32), in view "

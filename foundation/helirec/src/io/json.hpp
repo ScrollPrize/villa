@@ -189,4 +189,26 @@ struct Json {
     }
 };
 
+// A double as Python's repr (and str) writes it: the shortest text that reads back as the same number, in fixed
+// notation from 1e-4 to 1e16, with ".0" on a whole number
+inline std::string python_repr(double v) {
+    if (std::isnan(v)) return "nan";
+    if (std::isinf(v)) return v > 0 ? "inf" : "-inf";
+    char b[64];
+    int p = 1;
+    for (; p < 17; ++p) {
+        std::snprintf(b, sizeof b, "%.*e", p - 1, v);
+        if (std::strtod(b, nullptr) == v) break;
+    }
+    std::snprintf(b, sizeof b, "%.*e", p - 1, v);
+    const char* e = b;
+    while (*e && *e != 'e') ++e;
+    const int exponent = std::atoi(e + 1);
+    if (exponent < -4 || exponent >= 16) return b;
+    std::snprintf(b, sizeof b, "%.*f", p - 1 - exponent > 0 ? p - 1 - exponent : 0, v);
+    std::string s = b;
+    if (s.find('.') == std::string::npos) s += ".0";
+    return s;
+}
+
 }  // namespace helirec
