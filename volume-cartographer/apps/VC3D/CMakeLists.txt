@@ -4,6 +4,7 @@ set(CMAKE_AUTORCC ON)
 qt6_wrap_cpp(vccollection_moc ${CMAKE_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 
 set(srcs
+    FileHash.hpp
     DisplayPalette.cpp
     Colormaps.cpp
     ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
@@ -63,6 +64,10 @@ set(srcs
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
+    SessionRecovery.cpp
+    SessionRecovery.hpp
+    SessionRecoveryDialog.cpp
+    SessionRecoveryDialog.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberDeletion.hpp
@@ -138,6 +143,8 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    elements/StatusMessageHistory.cpp
+    elements/StatusMessageHistory.hpp
     elements/GrowOnlyLabel.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
@@ -210,6 +217,8 @@ set(srcs
     overlays/ScreenSpacePointIndex.hpp
     overlays/InkDetectionOverlayController.cpp
     overlays/InkDetectionOverlayController.hpp
+    overlays/InkLabelOverlayController.cpp
+    overlays/InkLabelOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
@@ -218,12 +227,26 @@ set(srcs
     overlays/SpiralOverlayController.hpp
     overlays/SpiralFiberOverlayController.cpp
     overlays/SpiralFiberOverlayController.hpp
+    ink_labels/InkLabelAssist.cpp
+    ink_labels/InkLabelAssist.hpp
+    ink_labels/InkLabelController.cpp
+    ink_labels/InkLabelController.hpp
+    ink_labels/InkLabelImport.cpp
+    ink_labels/InkLabelImport.hpp
+    ink_labels/InkLabelRaster.cpp
+    ink_labels/InkLabelRaster.hpp
+    ink_labels/InkLabelStore.cpp
+    ink_labels/InkLabelStore.hpp
     SurfacePanelController.cpp
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
     SshPrompts.cpp
     SshPrompts.hpp
+    plugins/PluginController.cpp
+    plugins/PluginController.hpp
+    plugins/PluginManifest.cpp
+    plugins/PluginManifest.hpp
     ProjectResources.cpp
     ProjectResources.hpp
     StoreImportController.cpp
@@ -298,6 +321,8 @@ set(srcs
     viewer_controls/ViewerControlsPanel.hpp
     viewer_controls/panels/ViewerCompositePanel.cpp
     viewer_controls/panels/ViewerCompositePanel.hpp
+    viewer_controls/panels/InkLabelPanel.cpp
+    viewer_controls/panels/InkLabelPanel.hpp
     viewer_controls/panels/ViewerInkDetectionPanel.cpp
     viewer_controls/panels/ViewerInkDetectionPanel.hpp
     viewer_controls/panels/ViewerNavigationPanel.cpp
@@ -343,33 +368,53 @@ set(srcs
     agent_bridge/AgentBridgeMethod.hpp
     agent_bridge/AgentBridgeMethods_canvas.cpp
     agent_bridge/AgentBridgeMethods_editing.cpp
+    agent_bridge/AgentBridgeMethods_editsettings.cpp
     agent_bridge/AgentBridgeMethods_fiber.cpp
     agent_bridge/AgentBridgeMethods_flatten.cpp
+    agent_bridge/AgentBridgeMethods_inklabels.cpp
     agent_bridge/AgentBridgeMethods_jobs.cpp
     agent_bridge/AgentBridgeMethods_lasagna.cpp
     agent_bridge/AgentBridgeMethods_points.cpp
     agent_bridge/AgentBridgeMethods_seeding.cpp
+    agent_bridge/AgentBridgeMethods_segmentops.cpp
     agent_bridge/AgentBridgeMethods_session.cpp
     agent_bridge/AgentBridgeMethods_stores.cpp
     agent_bridge/AgentBridgeMethods_surfaceops.cpp
     agent_bridge/AgentBridgeMethods_viewer.cpp
+    agent_bridge/AgentBridgeMethods_viewerdisplay.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
     agent_bridge/AgentBridgeCommandError.hpp
+    agent_bridge/AgentBridgeAccessible.cpp
+    agent_bridge/AgentBridgeAccessible.hpp
+    agent_bridge/AgentBridgeEditSettings.hpp
+    agent_bridge/AgentBridgeInput.hpp
     agent_bridge/AgentBridgeInternal.hpp
+    agent_bridge/AgentBridgeKeyboard.cpp
+    agent_bridge/AgentBridgeKeyboard.hpp
+    agent_bridge/AgentBridgeObservation.cpp
+    agent_bridge/AgentBridgeObservation.hpp
+    agent_bridge/AgentBridgeUi.hpp
+    agent_bridge/AgentBridgeWorkspaces.cpp
     agent_bridge/AgentBridgeJobs.cpp
     agent_bridge/AgentBridgeHandlers_catalog.cpp
     agent_bridge/AgentBridgeHandlers_session.cpp
     agent_bridge/AgentBridgeHandlers_stores.cpp
     agent_bridge/AgentBridgeHandlers_editing.cpp
+    agent_bridge/AgentBridgeHandlers_editsettings.cpp
+    agent_bridge/AgentBridgeHandlers_input.cpp
+    agent_bridge/AgentBridgeHandlers_ui.cpp
     agent_bridge/AgentBridgeHandlers_wrap.cpp
     agent_bridge/AgentBridgeHandlers_fiber.cpp
     agent_bridge/AgentBridgeHandlers_seeding.cpp
     agent_bridge/AgentBridgeHandlers_lasagna.cpp
     agent_bridge/AgentBridgeHandlers_flatten.cpp
+    agent_bridge/AgentBridgeHandlers_inklabels.cpp
     agent_bridge/AgentBridgeHandlers_points.cpp
     agent_bridge/AgentBridgeHandlers_review.cpp
     agent_bridge/AgentBridgeHandlers_viewer.cpp
+    agent_bridge/AgentBridgeHandlers_viewerdisplay.cpp
     agent_bridge/AgentBridgeHandlers_surfaceops.cpp
+    agent_bridge/AgentBridgeHandlers_segmentops.cpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)

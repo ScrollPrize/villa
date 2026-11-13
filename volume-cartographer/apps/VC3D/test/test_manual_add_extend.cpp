@@ -401,22 +401,27 @@ void TestManualAddExtend::undoHistoryFollowsGridPadding()
 {
     segmentation::UndoHistory history;
     cv::Mat_<cv::Vec3f> snapshot(2, 3, cv::Vec3f(1.0f, 2.0f, 3.0f));
+    history.setGridSize(snapshot.size());
     QVERIFY(history.capture(snapshot));
     QVERIFY(history.captureDelta({{1, 2, cv::Vec3f(4.0f, 5.0f, 6.0f)}}));
 
     history.padGrid(1, 2, 3, 0);
+    // The grown grid is the size the history now addresses, so it is kept.
+    history.setGridSize(cv::Size(6, 5));
+    QCOMPARE(history.size(), std::size_t{2});
 
-    const auto deltas = history.takeLastDelta();
-    QVERIFY(deltas);
-    QCOMPARE((*deltas)[0].row, 2);
-    QCOMPARE((*deltas)[0].col, 5);
-    const auto padded = history.takeLast();
-    QVERIFY(padded);
-    QCOMPARE(padded->rows, 5);
-    QCOMPARE(padded->cols, 6);
-    QCOMPARE((*padded)(1, 3), cv::Vec3f(1.0f, 2.0f, 3.0f));
-    QCOMPARE((*padded)(0, 0), kInvalid);
-    QCOMPARE((*padded)(4, 5), kInvalid);
+    const auto deltas = history.takeUndo();
+    QVERIFY(deltas && deltas->isDelta());
+    QCOMPARE(deltas->deltas[0].row, 2);
+    QCOMPARE(deltas->deltas[0].col, 5);
+    const auto padded = history.takeUndo();
+    QVERIFY(padded && !padded->isDelta());
+    QCOMPARE(padded->points.rows, 5);
+    QCOMPARE(padded->points.cols, 6);
+    QCOMPARE(padded->points(1, 3), cv::Vec3f(1.0f, 2.0f, 3.0f));
+    QCOMPARE(padded->points(0, 0), kInvalid);
+    QCOMPARE(padded->points(4, 5), kInvalid);
+    QCOMPARE(history.bytes(), std::size_t{0});
 }
 
 namespace {

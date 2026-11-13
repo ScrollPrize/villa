@@ -29,6 +29,25 @@ public:
     // Expands the dock's panel (or raises it when detached), restoring its bar
     // button first if the user closed it.
     void showDock(QDockWidget* dock);
+    // The content can live in the attached page or in a detached dock. Callers
+    // must not infer ownership or detachment from the empty QDockWidget shell.
+    QWidget* contentForDock(QDockWidget* dock) const;
+    QWidget* panelWidgetForDock(QDockWidget* dock) const;
+    bool isDockDetached(QDockWidget* dock) const;
+    // Reuses the same lifecycle as the host's Detach/Attach menu, then shows it.
+    // Unknown docks are refused without changing any widget.
+    bool setDockDetached(QDockWidget* dock, bool detached);
+
+    // A dock added here is an empty, hidden QDockWidget; its content sits on
+    // a page of the panel that opens above its bar button. panelPage() is
+    // that page (nullptr when the dock is not here or is detached).
+    // expandedDock() is the dock whose panel is open. expandDock() opens a
+    // dock's panel as its bar button does (false when the dock is detached
+    // or closed from the bar); collapsePanel() closes the open panel.
+    QWidget* panelPage(const QDockWidget* dock) const;
+    QDockWidget* expandedDock() const;
+    bool expandDock(QDockWidget* dock);
+    void collapsePanel();
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -48,6 +67,7 @@ private:
     };
 
     Item* itemForDock(QDockWidget* dock);
+    const Item* itemForDock(QDockWidget* dock) const;
     int itemIndex(const Item& item) const;
     void toggleItem(Item& item);
     void expandItem(Item& item);

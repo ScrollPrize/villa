@@ -48,6 +48,14 @@ inline QJsonObject vec3ToJson(const cv::Vec3f& v)
         QStringLiteral("%1 %2").arg(QLatin1String(paramName), detail), data};
 }
 
+// The same error with a whole sentence as the message and extra error data;
+// data.param is set to paramName.
+[[noreturn]] inline void throwParamError(const QString& paramName, const QString& message, QJsonObject data = {})
+{
+    data["param"] = paramName;
+    throw AgentBridgeError{-32602, message, std::move(data)};
+}
+
 // Require a JSON number. Rejects strings, booleans, null, objects, arrays.
 inline double jsonRequireNumber(const QJsonValue& v, const char* paramName)
 {

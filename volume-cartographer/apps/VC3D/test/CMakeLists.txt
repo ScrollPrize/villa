@@ -1,5 +1,13 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
+add_executable(test_plugin_manifest test_plugin_manifest.cpp
+    ../plugins/PluginManifest.cpp ../plugins/PluginManifest.hpp)
+target_include_directories(test_plugin_manifest PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_plugin_manifest PRIVATE Qt6::Core)
+add_test(NAME plugin_manifest COMMAND test_plugin_manifest)
+vc_register_test_target(test_plugin_manifest)
+vc_register_ctest(plugin_manifest test_plugin_manifest)
+
 add_executable(test_project_store_counts test_project_store_counts.cpp)
 set_target_properties(test_project_store_counts PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_project_store_counts PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -48,6 +56,28 @@ vc_register_ctest(catalog_project_dialog test_catalog_project_dialog)
 set_tests_properties(catalog_project_dialog PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
 
+add_executable(test_status_message_history
+    test_status_message_history.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/StatusMessageHistory.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/StatusMessageHistory.hpp)
+
+set_target_properties(test_status_message_history PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_status_message_history PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_status_message_history PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME status_message_history COMMAND test_status_message_history)
+vc_register_test_target(test_status_message_history)
+vc_register_ctest(status_message_history test_status_message_history)
+set_tests_properties(status_message_history PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_line_annotation_coordinate_scale
     test_line_annotation_coordinate_scale.cpp)
@@ -126,6 +156,62 @@ add_test(NAME unified_browser_dialog COMMAND test_unified_browser_dialog)
 vc_register_test_target(test_unified_browser_dialog)
 vc_register_ctest(unified_browser_dialog test_unified_browser_dialog)
 set_tests_properties(unified_browser_dialog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# The VCCollection shim is not built into a library; compile it and its MOC here.
+qt6_wrap_cpp(session_recovery_vccollection_moc
+    ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+
+add_executable(test_session_recovery
+    test_session_recovery.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecovery.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecovery.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecoveryDialog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecoveryDialog.hpp
+    ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+    ${session_recovery_vccollection_moc})
+
+set_target_properties(test_session_recovery PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_session_recovery PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_session_recovery PRIVATE
+    vc_core
+    Qt6::Concurrent
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME session_recovery COMMAND test_session_recovery)
+vc_register_test_target(test_session_recovery)
+vc_register_ctest(session_recovery test_session_recovery)
+set_tests_properties(session_recovery PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
+
+add_executable(test_status_dock_panel_host
+    test_status_dock_panel_host.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.hpp)
+
+set_target_properties(test_status_dock_panel_host PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_status_dock_panel_host PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_status_dock_panel_host PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME status_dock_panel_host COMMAND test_status_dock_panel_host)
+vc_register_test_target(test_status_dock_panel_host)
+vc_register_ctest(status_dock_panel_host test_status_dock_panel_host)
+set_tests_properties(status_dock_panel_host PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_spiral_reload_comparison
@@ -210,6 +296,30 @@ add_test(NAME spiral_point_collection_edit COMMAND test_spiral_point_collection_
 vc_register_test_target(test_spiral_point_collection_edit)
 vc_register_ctest(spiral_point_collection_edit test_spiral_point_collection_edit)
 set_tests_properties(spiral_point_collection_edit PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_segmentation_undo_history
+    test_segmentation_undo_history.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/SegmentationUndoHistory.hpp)
+
+set_target_properties(test_segmentation_undo_history PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_segmentation_undo_history PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_segmentation_undo_history PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    opencv_core)
+
+add_test(NAME segmentation_undo_history COMMAND test_segmentation_undo_history)
+vc_register_test_target(test_segmentation_undo_history)
+vc_register_ctest(segmentation_undo_history test_segmentation_undo_history)
+set_tests_properties(segmentation_undo_history PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_spiral_store_inputs
@@ -806,3 +916,66 @@ add_test(NAME grow_patch_seed_dialog COMMAND test_grow_patch_seed_dialog)
 set_tests_properties(grow_patch_seed_dialog PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 vc_register_test_target(test_grow_patch_seed_dialog)
 vc_register_ctest(grow_patch_seed_dialog test_grow_patch_seed_dialog)
+
+# Ink labels: the GUI-free raster and store, and the controller, overlay and
+# panel against a stub ViewerManager (as core/test's ink detection test does).
+find_package(TIFF REQUIRED)
+# AUTOMOC does not pick up the VCCollection shim header; wrap it here as
+# test_session_recovery does.
+qt6_wrap_cpp(ink_labels_vccollection_moc
+    ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+
+add_executable(test_ink_labels
+    test_ink_labels.cpp
+    ../StatusDockPanelHost.cpp
+    ../StatusDockPanelHost.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelRaster.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelRaster.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelStore.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelStore.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelAssist.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelAssist.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelImport.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelImport.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelController.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ink_labels/InkLabelController.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkLabelOverlayController.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkLabelOverlayController.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/viewer_controls/panels/InkLabelPanel.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/viewer_controls/panels/InkLabelPanel.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralBrushCursorWidget.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralBrushCursorWidget.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/LabeledControlRow.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/LabeledControlRow.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.hpp
+    ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+    ${ink_labels_vccollection_moc}
+    ${PROJECT_SOURCE_DIR}/core/test/test_viewer_manager_stub.cpp)
+set_target_properties(test_ink_labels PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_ink_labels PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_compile_definitions(test_ink_labels PRIVATE VC_TESTING)
+target_link_libraries(test_ink_labels PRIVATE
+    vc_core vc_fiber_view vc_object_store::vc_objects vc_object_store::vc_object_geometry opencv_core opencv_imgproc opencv_imgcodecs TIFF::TIFF
+    Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test)
+add_test(NAME ink_labels COMMAND test_ink_labels)
+vc_register_test_target(test_ink_labels)
+vc_register_ctest(ink_labels test_ink_labels)
+set_tests_properties(ink_labels PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)

@@ -69,7 +69,15 @@ it takes a few seconds.
 `vc3d_push_pull_start` acts at the last recorded pointer position, not a
 position you pass it. Use `vc3d_drag` with `button="none"` to hover-position
 the cursor first (no press/release, just interpolated move events), then
-call `vc3d_push_pull_start`, wait, then `vc3d_push_pull_stop`.
+call `vc3d_push_pull_start`, wait, then `vc3d_push_pull_stop`. The same rule
+applies to keyboard holds: hover first, then `vc3d_key(key="A", hold_ms=...)`.
+A `vc3d_key(action="press")` stays down until a matching `action="release"`
+or until its `hold_ms` (10 s by default) runs out, and keys are also released
+if the MCP connection drops; `vc3d_get_state` lists held keys in `heldKeys`.
+A key that opens a dialog or menu has it answered as Escape would (listed in
+`dismissed`), and so is any dialog a person at the window opens during that
+call. Keys and wheel turns need a visible viewer: switch to its workspace
+first. Prefer the typed tool whenever one exists.
 
 ## 7. Fiber tracing (`vc3d_fiber_launch` + a fiber workspace pane)
 
@@ -98,7 +106,10 @@ workspace pane while the main tab is active, or vice versa), `vc3d_screenshot`
 now fails `-32009` instead of silently returning a near-zero-size image — this
 used to return a genuinely degenerate (e.g. 15×50px) but "successful" PNG,
 which cost real debugging time before anyone noticed. If you hit this, switch
-to the right tab/workspace (or activate that pane) before capturing.
+to the right tab/workspace (or activate that pane) before capturing, or pass
+`reveal=True` to switch and show it for that one capture and put the GUI back
+afterwards. A revealed viewer may still be loading tiles; for a reliable image
+of a viewer, switch first and capture on a later call.
 
 ## 9. Seeding batch runs (`vc3d_seeding_run`/`_expand`) need a writable surface store and a local `seed.json` — even on a remote volume
 
@@ -177,3 +188,34 @@ stores. `vc3d_get_state` lists the store references (`stores`, each with
 - **Store switches save first.** Route, detach and Save As save pending
   edits before switching and fail `-32004` (changing nothing) while growth
   or a line optimization runs; finish or wait for those first.
+
+
+## 10. Ink labels (`vc3d_ink_labels_*`)
+
+- Call `vc3d_ink_labels_open` after activating the segment; every other ink
+  label tool fails `-32007` (`data.kind:"ink_label_session"`) until then. Open
+  never prompts: an autosave newer than the last save fails `-32602`
+  (`data.kind:"autosave_pending"`) under the default `recover="fail"`, so
+  decide between `"restore"` and `"discard"` and call again.
+- Coordinates are label pixels by default: the segment's `vc_render_tifxyz`
+  canvas at full resolution, constants in `state.canvas`. Use
+  `space="volume"` for voxels on the segment (they must lie on the surface the
+  segmentation viewer shows). A `-32009` with `data.kind:"viewer"` means the
+  segmentation viewer is not showing the labeled segment flattened: call
+  `vc3d_activate_segment` for it, or work in label space.
+- The user may be labeling at the same time. Pass `expect={"segment",
+  "serial"}` from your last `vc3d_ink_labels_state` so a paint against a moved
+  session is refused instead of applied, and note that undo stops at the
+  user's edits unless `force=true`.
+- To check unsaved work, use `vc3d_ink_labels_read` (a PNG of a rectangle),
+  not `vc3d_ink_labels_save`, which overwrites the trainer TIFFs. Save blocks
+  until the write lands and returns `saved:false` when nothing changed.
+- To edit a region by hand, read it with `format="values"`, change the image,
+  and paint it back with `mask={"path", "origin", "format": "values"}`: one
+  undo entry with exactly those values.
+- `vc3d_ink_labels_fill`, `_suggest` and `_cleanup` answer when done.
+  Suggestions need the single-channel prediction in `state.prediction`
+  (`labelPxPerPixelX/Y` give its pixel size in label px); accept them with
+  `vc3d_ink_labels_accept_suggestions(ids=...)` or drop them with
+  `_discard_suggestions`. `vc3d_ink_labels_import`, `_versions`,
+  `_dataset_entry`, `_set_tool_state` and `_close` cover the rest of the dock.

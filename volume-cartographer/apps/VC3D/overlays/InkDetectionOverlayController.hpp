@@ -43,6 +43,9 @@ public:
     [[nodiscard]] bool horizontalFlip() const { return _horizontalFlip; }
     [[nodiscard]] bool verticalFlip() const { return _verticalFlip; }
     [[nodiscard]] bool selectedIsSingleChannel() const { return _selectedImage.singleChannel; }
+    // The selected prediction as drawn, before flips: 8-bit as is, other
+    // depths min-max scaled to 0..255. Empty for color predictions.
+    [[nodiscard]] const cv::Mat_<uint8_t>& selectedScalar() const { return _selectedImage.scalar; }
     [[nodiscard]] bool hasLoadedSelection() const;
 #ifdef VC_TESTING
     [[nodiscard]] const QImage& selectedImageForTesting() const { return _selectedImage.image; }
@@ -62,6 +65,7 @@ signals:
     void availableDetectionsChanged();
     void selectionChanged();
     void opacityChanged(int opacity);
+    void colormapChanged(const QString& colormapId);
     void flipChanged(bool horizontal, bool vertical);
 
 protected:

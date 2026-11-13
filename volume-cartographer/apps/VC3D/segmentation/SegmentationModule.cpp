@@ -730,6 +730,7 @@ void SegmentationModule::setGrowthInProgress(bool running)
         return;
     }
     _growthInProgress = running;
+    notifyUndoAvailability();
     if (_widget) {
         _widget->setGrowthInProgress(running);
     }
@@ -1524,6 +1525,7 @@ bool SegmentationModule::beginManualAdd()
         return false;
     }
     _manualAddMode = true;
+    notifyUndoAvailability();
     _manualAddHoverThrottle.invalidate();
     _widget->setManualAddActive(true);
     refreshOverlay();
@@ -1610,6 +1612,7 @@ bool SegmentationModule::finishManualAdd(bool apply)
 
     _manualAddMode = false;
     _manualAddSpanDrag = {};
+    notifyUndoAvailability();
     _manualAddHoverThrottle.invalidate();
     _manualAddTool->clear();
     if (_widget) {
@@ -1989,6 +1992,7 @@ void SegmentationModule::resetManualAddState(bool restorePreview)
 
     const bool wasManualAddMode = _manualAddMode;
     _manualAddMode = false;
+    notifyUndoAvailability();
     _manualAddHoverThrottle.invalidate();
 
     if (_widget) {
@@ -2377,6 +2381,13 @@ void SegmentationModule::finishDrag()
 
     refreshOverlay();
     emitPendingChanges();
+}
+
+bool SegmentationModule::editInProgress() const
+{
+    return _drag.active ||
+           (_pushPullTool && _pushPullTool->isActive()) ||
+           (_surfaceMaskTool && (_surfaceMaskTool->strokeActive() || _surfaceMaskTool->hasPendingStroke()));
 }
 
 void SegmentationModule::cancelDrag()

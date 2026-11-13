@@ -1,4 +1,5 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include "agent_bridge/AgentBridgeUi.hpp"
 
 namespace Params = AgentBridgeParams;
 namespace Mcp = AgentBridgeMcpTools;
@@ -116,16 +117,15 @@ void AgentBridgeServer::registerLasagnaHandlers()
         {
             .name = QStringLiteral("workspace.switch"),
             .params = {
+                // Workspace ids in tab order.
                 Params::requiredStringEnum(
                     QStringLiteral("name"),
-                    {
-                        QStringLiteral("main"),
-                        QStringLiteral("lasagna"),
-                        QStringLiteral("project"),
-                    }),
+                    agentBridgeWorkspaceIds()),
             },
-            .errors = {-32602, -32000},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_switch_workspace")),
+            .errors = {-32602, -32000, -32007},
+            .mcp = Mcp::exact(
+                QStringLiteral("vc3d_switch_workspace"),
+                {QStringLiteral("observe")}),
         },
         [this](const QJsonValue& p) { return handleWorkspaceSwitch(p); });
 }

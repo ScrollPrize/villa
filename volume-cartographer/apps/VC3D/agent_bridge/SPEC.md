@@ -79,14 +79,18 @@ VC3D-AGENT-BRIDGE: listening name=<serverName> path=<fullServerName>
   and is disconnected without affecting other clients.
 - Multiple clients may connect. Requests are dispatched in frame order;
   deferred responses may complete out of order and are correlated by `id`.
-- Handlers run serially on the Qt GUI thread.
+- Handlers run serially on the Qt GUI thread. A request that arrives while
+  another is being handled waits until that one finishes, even when its
+  handler runs a nested event loop.
 - Server notifications have no `id` and are broadcast to all connected
   clients.
 - A notification request never receives a response, including on error.
 
 Handlers must not open dialogs or run nested event loops. Operations that may
 outlive one GUI-thread turn return jobs or use a deferred response completed by
-an application signal.
+an application signal. The one exception is `canvas.key`: a key can reach a
+shortcut that opens a dialog or menu, which the bridge answers from inside its
+event loop (see Canvas and viewers).
 
 ## Method descriptions
 
@@ -125,11 +129,15 @@ does not lie on the selected viewer's current plane or surface.
 ### Viewer selection
 
 VC3D assigns every live base viewer a stable process-local id (`v1`, `v2`, …).
-Ids are never reused during that process. A viewer parameter resolves in this
-order:
+Viewers come from every workspace's viewer manager, so the Spiral workspace's
+panes are addressable too; the main window's own viewers are registered
+first. Ids are never reused during that process. A viewer parameter resolves
+in this order:
 
 1. exact bridge viewer id;
-2. unique `surfName`;
+2. `surfName`, unique among the main window's own viewers, else unique among
+   other workspaces' viewers (Spiral reuses the main slot names, so its panes
+   are addressed by id);
 3. the `segmentation` surface when the parameter is optional and omitted.
 
 An ambiguous surface name returns the matching viewer candidates. Canvas
@@ -141,6 +149,37 @@ Buttons are `left`, `right`, `middle`, or, where declared, `none`. Modifiers
 are arrays containing `shift`, `ctrl`, `alt`, `meta`, or `keypad`. The bridge
 delivers the corresponding Qt input to the real viewer so existing signal
 wiring and tool behavior remain authoritative.
+
+### Keyboard and wheel input
+
+`canvas.key` and `canvas.wheel` construct real `QKeyEvent` and `QWheelEvent`
+objects and send them through `QApplication::notify`. A key press is offered
+to the shortcut map first; the target viewer's view then receives it and
+propagates keys it does not handle to its parents, so
+`CWindow::keyPressEvent` and `SegmentationModule` stay authoritative. A wheel
+event goes to the viewer's viewport at the requested point, as for a pointer
+over it.
+
+A key is one key in Qt portable text (`E`, `Esc`, `Space`, `F5`, `Ctrl+Z`);
+bare modifier keys are `Shift`, `Ctrl` or `Control`, `Alt`, `Meta`. Modifiers
+spelled in the key merge with the `modifiers` array. Modifier keys are pressed
+before the key, in the order Shift, Control, Alt, Meta, and released after it
+in reverse order. Keyboard focus moves to the target viewer for the call, as a
+click into it would, so shortcuts scoped to the viewer match; afterwards it
+returns to the widget that had it, unless the key moved it. A synthesized
+press leaves its modifiers in `QGuiApplication::keyboardModifiers()`, which
+item views and other code read, so after keys are released the bridge resets
+that value to the modifiers of the keys still held. A key's event text is
+the key's own character, without a keyboard layout: `Shift+1` carries the text
+`1`, not `!`. Shortcuts match on the key and modifiers, so they are not
+affected; a widget that reads the event text gets the unshifted character.
+Wheel deltas use Qt angle units, 120 per notch.
+
+Synthesized events bypass Qt's modal blocking, so `canvas.click`,
+`canvas.shift_click`, `canvas.drag`, `canvas.key`, and `canvas.wheel` return
+-32009 with `data.window` (`class`, `title`) while a modal dialog or popup
+menu is open, as a person could not reach the viewers either; a `canvas.key`
+release is the exception.
 
 ### Identifiers
 
@@ -185,7 +224,7 @@ per source is tracked:
 
 | Source | Authority |
 |---|---|
-| `tool` | `CommandLineToolRunner` lifecycle |
+| `tool` | `CommandLineToolRunner` lifecycle; operations that post-process tool output or run several passes end on their own completion |
 | `growth` | segmentation growth lifecycle |
 | `lasagna` | Lasagna optimization lifecycle |
 | `catalog` | Open Data sample open lifecycle |
@@ -242,6 +281,43 @@ timer, and completes the response exactly once from the signal or timeout.
 Disconnecting a client discards its pending replies without affecting other
 clients or application work.
 
+## State changes
+
+`state.changed` is a notification broadcast to every client when observed
+application state differs from the previous check, whoever changed it: a
+bridge call, another client, or a person using the GUI. Its params are:
+
+```json
+{"revision": 12, "changed": ["volume", "workspace"]}
+```
+
+`changed` is a sorted subset of these fields:
+
+| Field | Changes when |
+|---|---|
+| `project` | a project opens or closes, or its stores or store routes change |
+| `volume` | the current volume changes |
+| `activeSegment` | the active segment changes |
+| `editing` | segmentation editing, manual add, its line or interpolation mode, correction points, same-wrap annotation, or axis-aligned slices change |
+| `viewers` | a viewer is created or closed, or changes workspace or visibility |
+| `workspace` | the current workspace tab changes |
+| `overlay` | the active workspace's overlay-volume settings, or the ink detection overlay's selection, opacity, colormap or flips, change |
+| `jobs` | a job starts or finishes |
+
+The bridge checks when an application signal reports a change (the project,
+the volume, a newly active segment, segmentation editing, same-wrap
+annotation, the workspace tab, a viewer created or closed, a job started or
+finished), after every request it handles, and inside every `state.get`; it
+does not poll. A person's change to a field without such a signal (manual
+add, corrections, axis-aligned slices, overlay settings, viewer visibility)
+is reported at the next request or `state.get`. A request's notification is
+sent before its response, and changes within one check are coalesced into
+one notification. `revision` starts at 0 when VC3D
+starts and increases by one per notification; `state.get` returns the
+revision that matches its snapshot. Zoom, pan, render settings, cursor, and
+point edits are not reported. Delivery is best-effort like `job.progress`; `state.get` is
+authoritative.
+
 ## Headless application behavior
 
 An explicit RPC is treated as consent for the requested mutation, never as
@@ -278,6 +354,17 @@ dialog.
   `segmentationGrowthMethod` reports the selected method even outside an active
   editing session. `manualAddFollowingSheet` indicates that an extension is
   computing; editing remains locked until its completed preview is available.
+  Each viewer entry names its `workspace` (null outside an addressable tab)
+  and whether it is `visible`. `workspace.current` is the current tab's id
+  (null for an unnamed line-annotation tab) and `workspace.available` lists
+  `{id, title}` in tab order. `heldKeys` lists the keys `canvas.key` holds
+  (`key`, `modifiers`, `viewerId`). `revision` is the observation revision
+  described under State changes, current as of this snapshot.
+- `workspace.switch` accepts every workspace id (`main`, `lasagna`, `spiral`,
+  `fiber-map`, `project`) and changes the tab exactly as the GUI does. Every
+  workspace but `project` needs an open project (-32000). It returns the id
+  and the previous id (null for an unnamed line-annotation tab). An id whose
+  tab is absent returns -32007 with `data.kind` `workspace`.
 - A project is a JSON `.vcproj` file referencing volumes, normal grids, Lasagna
   datasets, and one or more `.vcobj` stores. Each of surfaces, fibers, point
   collections, umbilici, and registrations selects one attached store for
@@ -315,6 +402,50 @@ dialog.
 - Resource selections may filter volume ids, derived-representation refs, and
   representation kinds. An explicit empty volume selection is invalid.
 
+### Inspection
+
+`ui.inspect` returns a read-only tree rooted at `window`, `focused`,
+`dock:<objectName>`, or `workspace:<id>`, plus the list of docks
+(`objectName`, `title`, `visible`, `floating`, `dockBar`, `workspace`) and
+the workspaces. The tree is read from Qt's accessibility interfaces, the model a
+screen reader uses, so roles, names, values, and states are Qt's own. Nodes
+report `role` (a `QAccessible::Role` name such as `SpinBox` or
+`EditableText`), `path`, `enabled`, `visible`, and where they apply `class`,
+`objectName`, `name` (the accessible name, else the buddy label's text, else
+the name of the form row it sits in), `description` (tooltip or
+placeholder), `value` (text, or a number with `minimum` and `maximum`),
+`checked`, `selected`, `focused`, `readOnly`, `items` with `rows` (and
+`columns`, `selectedRows`) for lists, trees, tables and combo boxes,
+`viewerId`, and `children`. Paths and object names describe where a widget
+is; they are not a stable contract.
+
+- Unnamed layout containers are replaced by their children and do not count
+  toward `depth`. Controls, item views, text views, and viewer panes are
+  leaves; item views list at most 200 rows. Nodes below `depth` are replaced
+  by `childrenOmitted: true`; more than 4000 nodes set `truncated`.
+- Without `includeHidden`, a widget is listed when it would be visible with
+  the root shown, so a workspace that is not current can still be read.
+- Other top-level windows, including dialogs such as Settings, are never
+  entered. A floating dock is read through `dock:<objectName>`. `focused`
+  requires the focus widget to belong to the main window (-32007 otherwise).
+- Most docks of the main workspace live in the bottom dock bar: their
+  `QDockWidget` is an empty hidden shell and their content sits on the panel
+  that opens above the dock's bar button. For these `dockBar` is true,
+  `visible` says whether that panel is open on this dock, and
+  `dock:<objectName>` reads the panel page (title row and content), open or
+  not.
+- A text entry (line edit, text edit, editable combo box) reports no value
+  when its echo mode hides input or when its name, row label, placeholder,
+  tooltip, or object name names a credential (password, passphrase, secret,
+  token, credential, API, access, private or secret key, auth, bearer,
+  cookie, matched as whole words). Any name, value, description, or item
+  that contains a credential itself (a URL with a password, a URL query with
+  a token, signature, key, secret or password, an AWS access key id, a
+  bearer token, or a private key block) is left out. Either sets
+  `redacted: true` on the node. Other text, such as program and checkpoint
+  paths, is reported as shown.
+- There is no generic setter; mutations stay typed methods.
+
 ### Segments and review state
 
 Segments are surfaces of the store surfaces are kept in: the project's, or the
@@ -340,6 +471,41 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
 
 - `canvas.click`, `canvas.shift_click`, and `canvas.drag` deliver real viewer
   input. A buttonless drag moves the cursor without starting a gesture.
+- `canvas.key` `tap` presses and releases. `press` leaves the key down until
+  a `release` on the same connection or until `holdMs` elapses (10000 ms when
+  omitted), and a second `press` of a held key is an auto-repeat. With `tap`,
+  `holdMs` keeps the key down for that long and answers after the release as
+  a deferred response; a second hold on the same connection while one is
+  pending returns -32004, and a `release` of the held key ends the hold early.
+  `release` rejects `holdMs`. Tapping a key the connection holds returns
+  -32009. Keys a connection holds are released when it disconnects, and a
+  held key is released with the modifiers it was pressed with; `state.get`
+  lists every held key in `heldKeys`. For `tap` and `press` the viewer must
+  be visible (-32009 otherwise): shortcuts are matched against the focused
+  widget, so a key for a hidden viewer would reach another widget's shortcut.
+  A `release` is always delivered, even behind a modal dialog or to a hidden
+  viewer, so a held key can always be let go. `accepted` reports
+  whether a widget or shortcut handled the key event.
+- A key can reach a shortcut that opens a dialog or menu. The bridge answers
+  it as Escape would, from inside its event loop: a message box gets its
+  escape button (its Cancel, No, or only button), or is closed without a
+  button when it has none; any other modal dialog is rejected; a menu is
+  closed. Each is listed in `dismissed` with `class`, `title`, and `answer`.
+  Non-modal windows and progress dialogs are left alone. The rule applies to
+  every modal dialog or menu shown while the key is delivered, whatever
+  opened it, so a message box raised at that moment by a background tool
+  finishing (such as its completion or error box) is answered too and is
+  listed in `dismissed`. So is a dialog or menu that a person using the
+  window opens during the call. Native dialogs are switched off for the call
+  (`Qt::AA_DontUseNativeDialogs`, an application-wide attribute, restored
+  afterwards), so file pickers are Qt dialogs. Requests from any client, the
+  bridge's key-release timers, and its queued state checks that come due
+  meanwhile wait until the call ends.
+- `canvas.wheel` rejects a zero `deltaY`. The viewer must be visible (-32009
+  otherwise), so a wheel never changes the zoom or slice of a pane on a
+  hidden workspace. It requires a current volume and,
+  for volume-space positions, a point on the viewer's current view. Partial
+  notches accumulate in the view as they do for a smooth-scrolling mouse.
 - `viewer.rotate` accepts normalized plane spellings and supports relative or
   absolute angles. Axis-aligned slices must be enabled.
 - Wrap annotation mode, commit, and undo target the selected chunked viewer and
@@ -354,6 +520,56 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
   volumes must resolve in the open package. Intersection sets always include
   the segmentation surface and are not applied to the segmentation viewer
   itself.
+- The ink detection overlay methods drive `InkDetectionOverlayController`,
+  which the Ink Detection panel follows. Only detections the surface catalog
+  publishes for the active segment are selectable; `refresh` rereads them
+  first. Opacity is
+  reported and set in `[0,1]` and stored as whole percent. Updates validate
+  every field before applying any; an empty or null `path` clears the
+  selection.
+- `viewer.reset` performs the Reset View shortcut on one viewer: it clears the
+  pan and normal offsets, applies `zOffset` as an absolute normal offset (the
+  viewer clamps it), then fits the surface (`fit: "surface"`, the default),
+  fits the current content like Zoom to Fit (`"content"`), or keeps the scale
+  (`"none"`). It returns the resulting normal offset and scale.
+- `viewer.set_render_settings` also covers the View dock's axis overlays,
+  coordinate frames, raw points and focus bounds, and the Composite dock:
+  method, layers, alpha controls, plane composites, and volumetric gamma,
+  lighting (`[0,1]`) and w scale. The View dock checkboxes are set the way
+  `viewer.set_axis_aligned_slices` sets its checkbox, and the Composite dock
+  fields go through `ViewerCompositePanel::applyControls`; either way each
+  control's own handler applies, clamps (silently, to the control's range) and
+  saves the value as a person's edit would. Focus bounds need a loaded volume;
+  `min` and `max` come together, are rounded to voxels and clamped to the
+  volume, and `enabled: true` fails until a box exists.
+- `viewer.set_overlay` accepts `interpolation` (`nearest` or `trilinear`), the
+  overlay sampling the Overlay panel's combo box sets.
+
+### Screenshots
+
+- `screenshot.capture` targets `window`, a viewer, `dock:<objectName>`, or
+  `workspace:<id>`; an unknown dock or workspace returns -32007.
+- `region` `{x, y, width, height}` is in the target's logical pixels and is
+  clipped to it; a region that starts outside the target returns -32602 with
+  `data.param` `region`. `maxDim` scaling applies after the crop.
+- A hidden target returns -32009 unless `reveal` is true. Reveal switches to
+  the target's workspace tab through the GUI's own switch path and shows
+  hidden docks around it, applies the pending layout requests, and captures.
+  It then hides those docks, restores the layout of their main windows,
+  returns to the previous tab the same way, and gives keyboard focus back,
+  also when the capture fails. A target inside a hidden floating dock returns
+  -32009, because showing it would open a separate window. A dock in the
+  bottom dock bar is captured as its panel page; reveal opens that panel the
+  way its bar button does and afterwards reopens the panel that was open
+  before, or closes it. It never shows the empty dock shell, so the dock
+  keeps its bar button. A dock closed from the bar returns -32009.
+  `revealed` in the result reports whether anything was switched, shown or
+  opened; a revealed viewer may still be loading tiles.
+- Entries and labels that `ui.inspect` would withhold (see Inspection) are
+  painted over in the image; `masked` counts them. This applies to every
+  target, the whole window included, so a label showing a URL with a signed
+  query is painted over too. Other content is captured as shown.
+- A target smaller than 8 logical pixels on a side returns -32009.
 
 ### Segmentation editing
 
@@ -368,6 +584,22 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
 - `segmentation.grow_surface_from_seed`, tracing, rendering, and reoptimization
   use the existing command-runner lifecycle and never open the interactive
   console or parameter dialogs.
+- `segmentation.get_settings` and `segmentation.set_settings` read and change
+  the Segmentation panel's settings. Brush, edit-scale and smoothing values go
+  through `SegmentationModule`'s setters, which the mouse-wheel shortcuts use
+  and which update and save the panel; the other values go through
+  `SegmentationWidget`'s panels, which clamp, save and signal the module.
+  Updates check the growth volume and Z range before
+  changing anything, and apply the growth volume
+  first, since the panel may not offer a volume the project has (-32007).
+  `zRange` is always `{enabled, min, max}`; a bound left out keeps its value.
+  A change that leaves `min` above `max` is refused (-32602, `zRange`), but
+  bounds the panel already holds are taken back as they are, since its spin
+  boxes do not keep them in order. `growthMethod` is the method growth uses, with `manualAddSelected` telling
+  whether Manual Fill or Manual Grow is selected, so the reply of `get_settings`
+  can be passed to `set_settings` unchanged (a null `growthVolumeId` leaves
+  the volume as it is). Neural tracer executable and checkpoint paths are not
+  exposed.
 
 ### Points
 
@@ -510,6 +742,28 @@ All of these persist in the `.vcproj` and survive reopening it.
 - Crop and area recalculation are synchronous.
 - Result paths are returned only after successful launch or completion.
 
+### Segment operations
+
+These methods drive the dialog-free cores that the segment context menu and
+Actions menu run with their dialogs, so validation, persistence and UI
+refresh are shared. Segments are surfaces in the project's object store,
+addressed by id. Methods that change a segment are refused with -32004 for the
+segment being edited while editing is on, and while a `tool` job runs. They
+are not idempotent: a caller that retries after a timeout reads the segment's
+state first.
+
+- `segment.transform` flips a segment's grid over U or V, or rotates it 90
+  degrees clockwise, and saves it to the store. The context menu's "Normals (H
+  Flip)" entry is `flip_v`. Flips are exact and their own inverse;
+  `rotate90` resamples the grid and requires `confirm: true`.
+- `segment.export_obj` converts one segment with `vc_tifxyz2obj` as a `tool`
+  job that writes into the surface's artifact folder. `objName` is a file name
+  ending in `.obj`, without folders. The job's terminal `outputPath` is the
+  OBJ file.
+- `segment.neighbor_copy` runs one `vc_grow_seg_from_seed` neighbor run, with
+  its local refinement, as a `tool` job. The new surface is tagged with
+  `outputTag` (default `paths`). `job.cancel` stops it.
+
 ## MCP behavior
 
 The MCP server connects to an explicit socket, discovers the newest live
@@ -537,6 +791,24 @@ still-running job id.
 
 `vc3d_wait_job` applies the same behavior to an existing job.
 
+`observe` is an MCP-only option, like `wait`, on the interaction tools:
+`vc3d_click`, `vc3d_shift_click`, `vc3d_drag`, `vc3d_key`, `vc3d_wheel`,
+`vc3d_center_viewer`, `vc3d_zoom_viewer`, `vc3d_rotate_viewer`, and
+`vc3d_switch_workspace`. `none`, the default, returns the bridge result
+unchanged. `state` reads `state.get` before and after the call and adds an
+`observation` object to the result: `stateDiff` (RFC 6902 add, remove and
+replace operations between the two snapshots, ignoring `revision` and running
+jobs' console and progress tails), `revision`, and `changed` (the
+`state.changed` fields the MCP connection received since the previous
+observation, read after the last bridge call). These tools keep returning a
+JSON object with their output schema. `vc3d_observe` makes the same
+observation without a call, diffing against the last snapshot an observation
+saw, so changes made in the GUI show up too; its `screenshot` and `both`
+modes add an image with a 1024-pixel longest side, and a failed capture is
+reported as `observation.screenshotError` rather than failing the call.
+Observation bookkeeping is per MCP server process, which serves one client
+over stdio.
+
 Without `file_path`, `vc3d_screenshot` decodes inline PNG data into FastMCP
 image content. With `file_path`, it returns the bridge's file result and does
 not include inline image data.
@@ -544,7 +816,8 @@ not include inline image data.
 ## MCP tool map
 
 The following rows are checked against the descriptor snapshot. `rpc.describe`
-is the sole bridge method without an MCP tool.
+is the sole bridge method without an MCP tool; `vc3d_wait_job` and
+`vc3d_observe` are the MCP-only tools.
 
 | MCP tool | RPC method | Agent-facing purpose |
 |---|---|---|
@@ -574,6 +847,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
 | `vc3d_export_object` | `objects.export` | Export one surface, fiber or point collection of an attached store as native files, in its stored frame. An `export` job. |
+| `vc3d_export_segment_obj` | `segment.export_obj` | Convert a segment to an OBJ file in the surface's artifact folder (`tool` job); `objName` names the file. |
 | `vc3d_fiber_delete` | `fiber.delete` |
 | `vc3d_fiber_export` | `fiber.export` |
 | `vc3d_fiber_launch` | `fiber.launch` |
@@ -584,14 +858,18 @@ is the sole bridge method without an MCP tool.
 | `vc3d_fiber_set_tag` | `fiber.set_tag` |
 | `vc3d_flatten_slim` | `flatten.slim` |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
+| `vc3d_get_ink_overlay` | `viewer.get_ink_overlay` | Read the ink detection overlay: available detections for the active segment, selection, opacity, colormap, flips. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, highlighted surfaces). |
-| `vc3d_get_state` | `state.get` | Snapshot of VC3D: open project and its stores, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
+| `vc3d_get_segmentation_settings` | `segmentation.get_settings` | Read the Segmentation panel settings: brushes, smoothing, growth options. |
+| `vc3d_get_state` | `state.get` | Snapshot of VC3D: open project and its stores, current volume, active segment, viewers (ids/names, workspace, visibility), workspaces, editing mode, running job, revision. Call this first. |
 | `vc3d_grow_surface_from_seed` | `segmentation.grow_surface_from_seed` | Create a new surface by growing it from a 3D seed point (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the finished job's output. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections; direction; steps). Async: returns a jobId. |
 | `vc3d_import_objects` | `objects.import` | Import tifxyz surfaces, fiber JSON or point collections into a project store as new objects. An `import` job reporting new UUIDs, existing identities and problems. |
 | `vc3d_import_umbilicus` | `umbilicus.import` | Import an umbilicus file for the current volume. |
+| `vc3d_inspect_ui` | `ui.inspect` | Read the accessibility tree of the window, a dock, a workspace, or the focused widget, with credentials withheld. |
 | `vc3d_job_status` | `job.status` | Poll a job by id (or the latest job): state, message, console tail. |
+| `vc3d_key` | `canvas.key` | Press, release, tap, or hold a key in a viewer; keybindings behave as for a keyboard. |
 | `vc3d_lasagna_cancel` | `lasagna.cancel` |
 | `vc3d_lasagna_ensure_service` | `lasagna.ensure_service` |
 | `vc3d_lasagna_jobs` | `lasagna.jobs` |
@@ -612,6 +890,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
 | `vc3d_manual_add_undo_constraint` | `segmentation.manual_add.undo_constraint` |
+| `vc3d_neighbor_copy_segment` | `segment.neighbor_copy` | Grow the neighboring sheet from a segment as a new surface (one `tool` job; cancellable). |
 | `vc3d_open_catalog_sample` | `catalog.open_sample` | Open a sample returned by `vc3d_list_catalog_samples`, using its manifest sample id. |
 | `vc3d_open_volume` | `volume.open` | Open a project (.vcproj) and optionally select a volume id. |
 | `vc3d_ping` | `ping` | Check the VC3D bridge is alive; returns pid, app version, and protocol version. |
@@ -626,6 +905,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_rename_segment` | `segments.rename` | Rename a surface (its UUID stays). `new_name` must differ from the current name. Fails in a read-only store. |
 | `vc3d_render_tifxyz` | `render.tifxyz` |
 | `vc3d_reoptimize_segment` | `segment.reoptimize` | Resume-opt local reoptimization of a segment. Asynchronous (`source:"tool"`); supports `wait: bool = false` (30-minute cap). |
+| `vc3d_reset_viewer` | `viewer.reset` | Reset one viewer's pan and normal offset, optionally set an absolute normal offset, then fit the surface or the current content (Reset View and Zoom to Fit shortcuts). |
 | `vc3d_reset_windings` | `points.reset_windings` |
 | `vc3d_review_segments` | `segments.review` | List segments with review-tag state and optional server-side filtering (the programmatic equivalent of the surface panel's review filter checkboxes). |
 | `vc3d_rotate_viewer` | `viewer.rotate` | Rotate the "seg xz"/"seg yz" axis-aligned slice plane (middle-drag equivalent). Relative delta by default. |
@@ -633,7 +913,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_run_trace` | `tracer.run_trace` |
 | `vc3d_save_project_as` | `project.save_as` | Save the open project to a new file and reopen it. |
 | `vc3d_save_segment` | `segmentation.save` | Write the active segment's pending edits to the store now. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
-| `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window or one viewer pane. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
+| `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window, one viewer pane, one dock, or one workspace, optionally a region of it, revealing a hidden target for the capture. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
 | `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |
 | `vc3d_seeding_cancel` | `seeding.cancel` |
 | `vc3d_seeding_expand` | `seeding.expand` |
@@ -643,19 +923,23 @@ is the sole bridge method without an MCP tool.
 | `vc3d_select_volume` | `volume.select` |
 | `vc3d_set_auto_fill_mode` | `points.set_auto_fill_mode` |
 | `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
+| `vc3d_set_ink_overlay` | `viewer.set_ink_overlay` | Select, clear, recolor, fade or flip the ink detection overlay; any subset. |
 | `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines viewers draw; stored surfaces (UUIDs) are drawn on every plane viewer. |
-| `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, window, intensity-as-alpha, resolution cap, composite); any subset. |
+| `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, window, intensity-as-alpha, resolution cap, composite, interpolation); any subset. |
 | `vc3d_set_point_collection_color` | `points.set_collection_color` |
 | `vc3d_set_point_collection_metadata` | `points.set_collection_metadata` |
 | `vc3d_set_point_collection_tag` | `points.set_collection_tag` |
 | `vc3d_set_point_windings_linked` | `points.set_windings_linked` |
-| `vc3d_set_render_settings` | `viewer.set_render_settings` | Set any subset of the viewer render/overlay settings; returns the full settings after applying. Viewer-specific toggle fields are no-ops when no viewer is open; highlighted surface ids are retained by the surface panel. |
+| `vc3d_set_render_settings` | `viewer.set_render_settings` | Set any subset of the viewer render/overlay settings; returns the full settings after applying. Viewer-specific toggle fields are no-ops when no viewer is open; highlighted surface ids are retained by the surface panel. Also sets the View dock (axis overlays, coordinate frames, raw points, focus bounds) and Composite dock controls. |
 | `vc3d_set_segment_tag` | `tags.set` |
+| `vc3d_set_segmentation_settings` | `segmentation.set_settings` | Change any subset of the Segmentation panel settings; accepts the reply of `vc3d_get_segmentation_settings` unchanged. |
 | `vc3d_set_wrap_annotation_mode` | `wrap_annotation.set_mode` | Enable/disable "Same-wrap annotation mode" (prerequisite for the shift+E commit workflow; seed the preview via `vc3d_shift_click`). |
 | `vc3d_shift_click` | `canvas.shift_click` | Shift+click convenience: the canonical place-point / set-focus gesture. |
-| `vc3d_switch_workspace` | `workspace.switch` |
+| `vc3d_switch_workspace` | `workspace.switch` | Switch to any of the seven workspace tabs, as a tab click does. |
+| `vc3d_transform_segment` | `segment.transform` | Flip a segment's surface grid, or rotate it 90 degrees clockwise (`confirm` required), in place. Synchronous. |
 | `vc3d_undo_wrap_annotation` | `wrap_annotation.undo` | Undo the same-wrap annotation (Ctrl+Z equivalent): clear the preview or undo the last committed collection. |
 | `vc3d_update_point` | `points.update_point` |
+| `vc3d_wheel` | `canvas.wheel` | Turn the mouse wheel over a viewer point (zoom, slice step with Shift, tool radius with Ctrl). |
 | `vc3d_zoom_viewer` | `viewer.zoom` | Multiply a viewer's zoom by a factor (>1 zooms in). Returns the new scale. |
 
 ## Verification
@@ -699,3 +983,112 @@ volume-package fixtures and is intentionally separate from hermetic CI.
   geometry require their corresponding runtime resources.
 - The local bridge is a trusted-user control surface, not a remote security
   boundary.
+- `screenshot.capture` with `reveal` changes the visible tab for the
+  duration of one capture; a person at the screen sees it switch and back.
+- Synthesized keys share the live focus chain with a person at the keyboard.
+  They never reach the platform, but Qt's cached keyboard modifiers follow
+  them until the bridge resets them. Window-context shortcuts match only while
+  VC3D's window is active, as for hardware keys; after answering a dialog the
+  bridge activates the previously active window again if no window is active.
+- While `canvas.key` delivers a key, any modal dialog that opens is answered
+  as Escape would, including one raised by unrelated application code at
+  that moment, and native dialogs are off application-wide for the call.
+
+### Ink labels
+
+Ink labels are the ink, background and validation pixels drawn on a segment's
+flattened view for the ink detection trainer. The methods drive the same
+`InkLabelController` as the label section of the Ink Detection dock, so the
+GUI shows every bridge edit live, and the GUI and the bridge share one undo
+history.
+
+- A session belongs to the active segment and is stored in
+  `<project dir>/ink_labels/<segment folder>/`. `ink_labels.open` opens it
+  (or reuses the open one); `ink_labels.state` reports it. Switching segment
+  closes the session and keeps unsaved edits as an autosave checkpoint.
+- Label space is the `vc_render_tifxyz` canvas of the segment at full
+  resolution: label pixel `(c, r)` covers `[c, c+1) x [r, r+1)`, and a grid
+  position `g` maps to `canvas.centerX + (renderScale / scaleX) *
+  (g.x - gridCols / 2)`, likewise in y. `state.canvas` carries the constants.
+  Volume-space points go through the segmentation viewer's `volumeToScene`,
+  round-tripped within 2 voxels as in `canvas.click`, then scene to surface to
+  grid to label pixels; a point off the labeled segment is -32003.
+- `open` never prompts. `recover` decides what happens to an autosave newer
+  than the last save (`fail` by default, with `data.kind:"autosave_pending"`
+  and `data.autosaveAtUtc`); `readOnlyIfLocked` decides whether a store held
+  by another VC3D opens read-only. A store saved for a different grid,
+  scale or segment uuid is locked (-32009 `label_layer_locked`, with
+  `data.expected` and `data.got`) and is never painted over. `version`
+  opens `<seg>_inklabels_vN.tif`; omitted, the newest version opens.
+  `startNewVersion` starts empty labels as the next version instead, which is
+  also the way past a locked store. An open that arrives while the dock's
+  restore question is showing is -32009 `open_pending`.
+- `paint` applies exactly one of `stroke`, `polygon` or `mask` as one undo
+  entry recorded with actor `agent`. Classes and the eraser follow the GUI:
+  ink sets ink and supervision, background sets supervision and clears ink
+  (unless `backgroundKeepsInk`), validation sets the validation bit, and the
+  eraser returns ink or background to unknown. A mask is an absolute
+  single-channel 8-bit PNG or TIFF of at most 8192 x 8192 px, painted where
+  nonzero; with `mask.format: "values"` it holds label values 0 to 7 as
+  `read` writes them, every pixel of its rectangle is set to its value, and
+  `class` is not needed. A point farther than 2^22 label px from the origin
+  is -32602. A brush stroke the user is drawing is -32009 `stroke_open`.
+  `expect: {segment, serial}` refuses the paint (-32602 `expect_mismatch`
+  with `data.current`) when the session moved on.
+- `read` writes the current label values of a rectangle, saved or not, to a
+  PNG or TIFF, so callers inspect unsaved work without touching the trainer
+  files. It is limited to 4096 x 4096 px because the wire limit is 1 MiB.
+- `history` undoes or redoes label edits, separately from segmentation undo.
+  Undo stops at an entry another actor made unless `force` is true; when the
+  first entry is the user's the call fails with -32009 `other_actor_entry`
+  (the refusal is a policy, not a busy job).
+- `save` writes the trainer files (`<seg>_inklabels.tif`,
+  `<seg>_supervision_mask.tif`, and `<seg>_validation_mask.tif` when used)
+  and the JSON sidecar, keeping the replaced files as `.prev`. It is a
+  deferred response completed by the save's own completion (300 s cap); a
+  clean session answers `saved:false` at once. A trainer file changed outside
+  VC3D since it was loaded is -32602 `external_edit` with `data.files` unless
+  `overwriteExternalEdits` is true. `asNewVersion` writes all three files as
+  the next version and moves the session to it.
+- `fill`, `suggest` and `cleanup` run the dock's assist tools to completion
+  before answering (they are bounded to 4096 x 4096, or 8192 x 8192 for
+  cleanup, label px; `bound` defaults to the visible part of the segment
+  view). Settings given in the call (threshold, guide, median and so on)
+  become the dock's settings. Fill and suggestions need the single-channel
+  ink prediction selected in the Ink Detection dock (-32009 `no_prediction`);
+  an assist started from the dock and still running is -32004
+  `ink_label_assist`. Suggestions leave out pixels already labeled ink or
+  background, and `accept_suggestions` never changes them; it takes `ids`,
+  `all`, or the user's picks. Results are one undo entry with actor `agent`;
+  `fill` reports `reachedBound` when the bound cut the region.
+- `import` reads a label TIFF, PNG or label zarr into one bit (by default
+  from the file name) on a worker and answers when it lands (deferred, 300
+  s). A half or quarter resolution render needs `allowResample` (-32602
+  `resample_needed`), a legacy PNG pair needs `legacyMaskAs` (-32602
+  `legacy_mask`).
+- `set_tool_state` sets what the dock shows (label mode, class, eraser, tool,
+  radius, display, assist settings). Label mode needs an open session and is
+  -32009 `label_mode_refused` while segmentation editing is on. `versions`,
+  `dataset_entry` (the trainer's dataset entry as JSON) and `close` (unsaved
+  edits kept as an autosave) complete the set, so every label control of the
+  dock has a method.
+
+| `vc3d_ink_labels_accept_suggestions` | `ink_labels.accept_suggestions` | Paint ink suggestions (given ids, all, or the user's picks) as one undo entry, never over labeled pixels. |
+| `vc3d_ink_labels_cleanup` | `ink_labels.cleanup` | Remove specks, fill holes, grow, shrink or ring ink labels with background in a region. |
+| `vc3d_ink_labels_close` | `ink_labels.close` | Close the ink label session, keeping unsaved edits as an autosave. |
+| `vc3d_ink_labels_dataset_entry` | `ink_labels.dataset_entry` | The ink detection trainer's dataset entry for the open labels. |
+| `vc3d_ink_labels_discard_suggestions` | `ink_labels.discard_suggestions` | Drop the shown ink suggestions and any running assist. |
+| `vc3d_ink_labels_fill` | `ink_labels.fill` | Flood-fill a region from a point, guided by the ink prediction or by equal labels, as one undo entry. |
+| `vc3d_ink_labels_history` | `ink_labels.history` | Undo or redo ink label edits; undo stops at the user's entries unless forced. |
+| `vc3d_ink_labels_import` | `ink_labels.import` | Import a label TIFF, PNG or label zarr into one label bit and wait for it. |
+| `vc3d_ink_labels_open` | `ink_labels.open` | Open the active segment's ink labels with an explicit autosave policy (never prompts). |
+| `vc3d_ink_labels_paint` | `ink_labels.paint` | Paint ink, background or validation labels from a stroke, polygon or mask in label or volume space, as one undo entry. |
+| `vc3d_ink_labels_read` | `ink_labels.read` | Write the current (also unsaved) label pixels of a rectangle to a PNG or TIFF. |
+| `vc3d_ink_labels_save` | `ink_labels.save` | Save the labels as the trainer's TIFFs (optionally as a new version) and wait for the write. |
+| `vc3d_ink_labels_set_tool_state` | `ink_labels.set_tool_state` | Set label mode, class, eraser, tool, radius, display and assist settings. |
+| `vc3d_ink_labels_panel` | `ink_labels.panel` | Show a named section of the native Ink Labels dock; optional floating window. |
+| `vc3d_ink_labels_control` | `ink_labels.control` | Operate an allowlisted, visible label control through its Qt signal, guarded by expected state. |
+| `vc3d_ink_labels_viewport_stroke` | `ink_labels.viewport_stroke` | Send 1..256 logical viewport positions through the label event filter, with per-event consumption and agent attribution. |
+| `vc3d_ink_labels_state` | `ink_labels.state` | Report the ink label session: store, canvas mapping, versions, tool, history, counts, assist, prediction and last save. |
+| `vc3d_ink_labels_suggest` | `ink_labels.suggest` | Find ink suggestions from the prediction, leaving labeled pixels out. |
+| `vc3d_ink_labels_versions` | `ink_labels.versions` | List the label versions in the store. |

@@ -145,6 +145,14 @@ public:
     bool handleKeyPress(QKeyEvent* event);
     bool handleKeyRelease(QKeyEvent* event);
 
+    // Undo or redo the last segmentation edit, as the keys do. Both refuse,
+    // with a status message, during Manual Add, growth, or an unfinished drag
+    // or stroke.
+    bool undo();
+    bool redo();
+    [[nodiscard]] bool canUndo() const;
+    [[nodiscard]] bool canRedo() const;
+
     [[nodiscard]] std::optional<std::vector<SegmentationGrowthDirection>> takeShortcutDirectionOverride();
 
     void markNextEditsFromGrowth();
@@ -257,6 +265,8 @@ signals:
     void annotationSelectionCleared();
     void annotationCollectionSelected(uint64_t collectionId);
     void annotationPointFocused(vc::PointRef point);
+    // Emitted when canUndo() or canRedo() changes.
+    void undoAvailabilityChanged(bool canUndo, bool canRedo);
 
 private:
     friend class SegmentationPushPullTool;
@@ -418,8 +428,12 @@ private:
     [[nodiscard]] bool captureUndoSnapshot();
     [[nodiscard]] bool captureUndoDelta();  // Capture delta from current edited vertices
     void discardLastUndoSnapshot();
-    bool restoreUndoSnapshot();
+    bool applyHistoryEntry(bool redo);
+    bool stepHistory(bool redo);
+    // True while a drag, push-pull, line stroke or mask stroke is unfinished.
+    [[nodiscard]] bool editInProgress() const;
     void clearUndoStack();
+    void notifyUndoAvailability();
 
     [[nodiscard]] float gridStepWorld() const;
 
@@ -521,6 +535,7 @@ private:
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};
+    std::pair<bool, bool> _undoAvailability{false, false};
 
     static constexpr int kAutosaveIntervalMs = 10000;
     QTimer* _autosaveTimer{nullptr};

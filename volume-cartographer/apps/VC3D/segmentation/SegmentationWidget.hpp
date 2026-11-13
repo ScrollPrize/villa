@@ -44,6 +44,10 @@ public:
     [[nodiscard]] float smoothingStrength() const;
     [[nodiscard]] int smoothingIterations() const;
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
+    // The last method selected that is not Manual Fill or Manual Grow: the
+    // one growth uses once Manual Add ends. The agent bridge reports it so
+    // its settings can be passed back unchanged.
+    [[nodiscard]] SegmentationGrowthMethod lastNonManualGrowthMethod() const { return _lastNonManualGrowthMethod; }
     [[nodiscard]] int growthSteps() const;
     [[nodiscard]] QString customParamsText() const;
     [[nodiscard]] QString customParamsProfile() const;
@@ -106,7 +110,12 @@ public:
     void setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
                                    std::optional<uint64_t> activeId);
     void setGrowthSteps(int steps, bool persist = true);
+    void setGrowthScale(int scale);
+    void setCorrectionsZRange(bool enabled, int zMin, int zMax);
+    void setAllowedGrowthDirections(const std::vector<SegmentationGrowthDirection>& directions);
+    bool selectGrowthVolume(const QString& volumeId);
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
+    [[nodiscard]] std::pair<int, int> correctionsZBounds() const;
 
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
 
@@ -204,6 +213,7 @@ private:
     void restoreSettings();
     void writeSetting(const QString& key, const QVariant& value);
     void updateEditingState(bool enabled, bool notifyListeners);
+    void noteGrowthMethod(SegmentationGrowthMethod method);
 
     bool _editingEnabled{false};
     bool _drawMaskEnabled{false};
@@ -222,6 +232,7 @@ private:
     SegmentationManualAddPanel* _manualAddPanel{nullptr};
     bool _manualAddActive{false};
     bool _manualAddBusy{false};
+    SegmentationGrowthMethod _lastNonManualGrowthMethod{SegmentationGrowthMethod::Tracer};
     QWidget* _manualAddProgress{nullptr};
 
 };
