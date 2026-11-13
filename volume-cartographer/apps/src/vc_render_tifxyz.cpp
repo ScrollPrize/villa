@@ -1,8 +1,8 @@
-#include <vc_reader/display.hpp>
 #include <iostream>
 #include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/RenderCanvas.hpp"
+#include "vc/core/util/RenderLayers.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -155,89 +155,8 @@ static void rotateFlipIfNeeded(cv::Mat& m, int rotQuad, int flip_axis)
 }
 
 // ============================================================
-// Surface generation helpers
+// Tile images (the sampling is core's vc/core/util/RenderLayers.hpp)
 // ============================================================
-
-static void computeCanvasOrigin(const cv::Size& size, float& u0, float& v0)
-{
-    const cv::Vec2f o = vc::renderCanvasOrigin(size);
-    u0 = o[0];
-    v0 = o[1];
-}
-
-// Surface coordinates (working-level voxels, XYZ) to indices of the rendered
-// pyramid level: index = scale * c + offset per axis, from the two levels' placements.
-struct LevelMap {
-    cv::Vec3f scale{1, 1, 1}, offset{0, 0, 0};
-};
-
-static LevelMap mapToLevel(const vcr::zarr::LevelPlacement& working, const vcr::zarr::LevelPlacement& rendered)
-{
-    const auto m = rendered.indexMapFrom(working);
-    LevelMap map;
-    for (int a = 0; a < 3; ++a) {
-        map.scale[a] = float(m.scale[2 - a]);
-        map.offset[a] = float(m.offset[2 - a]);
-    }
-    return map;
-}
-
-// The surface with its vertices in rendered-level index space (XYZ): the segmentation
-// scale, the affine and the level placement applied to each vertex once. Bilinear and
-// Hermite patches commute with affine maps, so positions are those of the mapped
-// vertex grid; normals are its patch normals and offsets along them are in
-// rendered-level voxels.
-struct RenderSurface {
-    cv::Mat_<cv::Vec3f> vertices;
-    std::unique_ptr<vcr::grid::Surface> grid;
-};
-
-static RenderSurface renderSurface(const QuadSurface& surf, vcr::grid::Interpolation interpolation, float scaleSeg,
-                                   bool hasAffine, const Affine& aff, const LevelMap& level)
-{
-    RenderSurface r;
-    std::vector<std::uint8_t> valid;
-    surf.gridVertices(valid);
-    r.vertices = surf.rawPointsPtr()->clone();
-    for (auto& v : r.vertices) {
-        if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) {
-            v = cv::Vec3f(NAN, NAN, NAN);
-            continue;
-        }
-        v *= scaleSeg;
-        if (hasAffine) {
-            const auto q = aff.apply({v[0], v[1], v[2]});
-            v = cv::Vec3f(float(q[0]), float(q[1]), float(q[2]));
-        }
-        for (int a = 0; a < 3; ++a)
-            v[a] = v[a] * level.scale[a] + level.offset[a];
-    }
-    auto options = surf.gridOptions();
-    options.interpolation = interpolation;
-    r.grid = std::make_unique<vcr::grid::Surface>(
-        vcr::grid::Vertices{reinterpret_cast<const float*>(r.vertices.ptr()), r.vertices.rows, r.vertices.cols,
-                            r.vertices.step1(), nullptr, valid.data()},
-        std::move(options));
-    return r;
-}
-
-// A tile's layers at `offsets` along the (--flip-normals: negated) normal, linear or
-// nearest, optionally reduced to one image; NaN where the surface has no point.
-static vcr::grid::Result sampleTile(const RenderSurface& surface, const vcr::grid::Raster& raster,
-                                    vcr::Array& volume, const vcr::ElementType& type, const std::vector<float>& offsets,
-                                    int order, const std::optional<vcr::composite::Options>& composite)
-{
-    vcr::grid::Request request;
-    request.levels = {vcr::grid::Level{&volume, type}};
-    request.levels.front().cuda = vc::cuda::toolReaderOf(volume);
-    request.order = order;
-    request.offsets = offsets;
-    if (g_flipNormals)
-        for (auto& o : request.offsets)
-            o = -o;
-    request.composite = composite;
-    return vcr::grid::sample(*surface.grid, raster, request);
-}
 
 // One image of a result: pixels without a value read 0; integer intensities
 // round to nearest, ties to even.
@@ -245,14 +164,7 @@ template <typename T>
 static cv::Mat toImage(const vcr::grid::Result& result, int layer)
 {
     cv::Mat_<T> out(result.height, result.width);
-    const std::size_t n = std::size_t(result.width) * std::size_t(result.height);
-    const float* v = result.values.data() + std::size_t(layer) * n;
-    if constexpr (std::is_same_v<T, uint16_t>)
-        vcr::display::toUint16(v, n, out[0]);
-    else if constexpr (std::is_same_v<T, uint8_t>)
-        vcr::display::toUint8(v, n, out[0], nullptr, {1, vcr::display::Rounding::NearestEven, true});
-    else
-        static_assert(std::is_same_v<T, uint8_t> || std::is_same_v<T, uint16_t>);
+    vc::renderLayerPixels(result, layer, out[0]);
     return out;
 }
 
@@ -265,30 +177,6 @@ enum class AccumType { Max, Mean, Median, Alpha, BeerLambert };
 // ============================================================
 // Sample offsets along the surface normal
 // ============================================================
-
-// Build the flat offset vector sampled by sampleLayers. Offsets are distances along the
-// unit surface normal, in level-g voxels: base points are already scaled into level-g
-// index space (prepareBaseAndDirs) and dirs are unit length, so a step of sliceStep
-// advances exactly one level-g voxel. (Do NOT scale by ds_scale here — that would make
-// the through-normal spacing the native/level-0 resolution while the in-plane spacing is
-// level-g, yielding an anisotropic stack that mismatches the isotropic .zattrs scale.)
-static std::vector<float> buildOffsetList(int numSlices, double sliceStep,
-                                           const std::vector<float>& accumOffsets)
-{
-    double center = 0.5 * (std::max(1, numSlices) - 1.0);
-    size_t sps = std::max<size_t>(1, accumOffsets.size());
-    std::vector<float> out;
-    out.reserve(numSlices * sps);
-    for (int zi = 0; zi < numSlices; zi++) {
-        float base = float((zi - center) * sliceStep);
-        if (accumOffsets.empty())
-            out.push_back(base);
-        else
-            for (float ao : accumOffsets)
-                out.push_back(base + ao);
-    }
-    return out;
-}
 
 static std::vector<float> buildCompositeOffsetList(
     int compositeStart, int compositeEnd, double sliceStep)
@@ -404,7 +292,7 @@ static cv::Rect sourceRect(int x0, int y0, int x1, int y1, const cv::Size& sourc
 // tile to the zarr level 0 and/or each slice's TIFF.
 template <typename T>
 static void renderTiles(
-    const QuadSurface& surf, const RenderSurface& surface, vcr::Array& volume, const vcr::ElementType& type,
+    const QuadSurface& surf, const vc::RenderSurface& surface, vcr::Array& volume, const vcr::ElementType& type,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale,
     int numSlices, double sliceStep,
@@ -417,7 +305,9 @@ static void renderTiles(
     std::vector<std::unique_ptr<vcr::sources::TiffWriter>>* tifWriters,      // null: no TIFF output
     bool quickTif, bool resume)
 {
-    const auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
+    vcr::grid::Level level{&volume, type};
+    level.cuda = vc::cuda::toolReaderOf(volume);
+    const auto allOffsets = vc::renderLayerOffsets(numSlices, sliceStep, accumOffsets);
     const std::size_t sps = std::max<std::size_t>(1, accumOffsets.size());
     // --accum: each slice reduces its sub-steps.
     std::optional<vcr::composite::Options> accumMethod;
@@ -456,25 +346,21 @@ static void renderTiles(
             const int w = std::min(int(CW), outSize.width - x0), h = std::min(int(CH), outSize.height - y0);
             const cv::Rect src = sourceRect(x0, y0, x0 + w - 1, y0 + h - 1, tgtSize, rotQuad, flipAxis);
 
-            // The tile's framebuffer pixels, the top-left one at canvas offset (u0, v0).
-            float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
-            u0 += float(crop.x + src.x);
-            v0 += float(crop.y + src.y);
-            const auto raster = surf.gridRaster(double(u0 / renderScale), double(v0 / renderScale), renderScale,
-                                                src.size());
+            const auto raster = vc::renderRaster(surf, fullSize, renderScale,
+                                                 {crop.x + src.x, crop.y + src.y, src.width, src.height});
 
             std::vector<cv::Mat> slices;
             if (isComposite) {
                 // Composite mode: nearest voxels, always u8 (the caller rejects uint16 sources).
-                slices = {toImage<uint8_t>(sampleTile(surface, raster, volume, type, compositeOffsets, 0, compositeMethod), 0)};
+                slices = {toImage<uint8_t>(vc::sampleRenderTile(surface, raster, level, compositeOffsets, g_flipNormals, 0, compositeMethod), 0)};
             } else if (accumMethod) {
                 for (int zi = 0; zi < numSlices; ++zi) {
                     const std::vector<float> steps(allOffsets.begin() + std::ptrdiff_t(zi * sps),
                                                    allOffsets.begin() + std::ptrdiff_t((zi + 1) * sps));
-                    slices.push_back(toImage<T>(sampleTile(surface, raster, volume, type, steps, 1, accumMethod), 0));
+                    slices.push_back(toImage<T>(vc::sampleRenderTile(surface, raster, level, steps, g_flipNormals, 1, accumMethod), 0));
                 }
             } else {
-                const auto layers = sampleTile(surface, raster, volume, type, allOffsets, 1, std::nullopt);
+                const auto layers = vc::sampleRenderTile(surface, raster, level, allOffsets, g_flipNormals, 1);
                 for (int zi = 0; zi < numSlices; ++zi)
                     slices.push_back(toImage<T>(layers, zi));
             }
@@ -1154,14 +1040,14 @@ int main(int argc, char *argv[])
     // The array keeps decoded chunks in its own memory cache of --cache-gb.
     sourceOptions.memoryCache = std::make_shared<vcr::MemoryCache>(cache_bytes);
     std::shared_ptr<vcr::zarr::OpenedArray> source;
-    LevelMap levelMap;
+    vc::RenderLevelMap levelMap;
     try {
         source = std::make_shared<vcr::zarr::OpenedArray>(
             vcr::zarr::openPyramidLevel(sourceLocation, workingLevel + group_idx, sourceOptions));
         const auto working = group_idx == 0
             ? source->placement
             : vcr::zarr::openPyramidLevel(sourceLocation, workingLevel, sourceOptions).placement;
-        levelMap = mapToLevel(working, source->placement);
+        levelMap = vc::renderLevelMap(working, source->placement);
     } catch (const std::exception& e) {
         logPrintf(stderr, "Error opening %s zarr: group index %d: %s\n", useRemoteCache ? "remote" : "local",
                   group_idx, e.what());
@@ -1169,7 +1055,7 @@ int main(int argc, char *argv[])
     }
     // Rendered-level voxels per working level-0 voxel, from the pyramid's placement of the
     // group (the mean over the axes: the renderer's scale is one number).
-    const float ds_scale = (levelMap.scale[0] + levelMap.scale[1] + levelMap.scale[2]) / 3.0f;
+    const float ds_scale = levelMap.voxelScale();
     const vcr::ElementType sourceType = source->meta.type;
     if (source->meta.shape.size() != 3 || sourceType.kind != 'u' ||
         (sourceType.itemsize != 1 && sourceType.itemsize != 2)) {
@@ -1301,7 +1187,7 @@ int main(int argc, char *argv[])
         // Physical size of one *level-g* voxel, stated in `zarr_voxel_unit`. The
         // output raster is not necessarily isotropic in it: in-plane, one output
         // pixel spans 1/tgt_scale level-g voxels (--scale), and through-plane,
-        // adjacent layers sit --slice-step level-g voxels apart (buildOffsetList).
+        // adjacent layers sit --slice-step level-g voxels apart (vc::renderLayerOffsets).
         // writeZarrAttrs derives the per-axis .zattrs scale from this base value,
         // so this argument MUST be in the same unit as zarr_voxel_unit -- and 0
         // when there is no size to declare, which is the flag that switches
@@ -1414,7 +1300,7 @@ int main(int argc, char *argv[])
         const int cvType = useU16 ? CV_16UC1 : CV_8UC1;
 
         // ---- Output tiles: the zarr chunks (and TIFF tiles) of the rotated output ----
-        const size_t CH = 128, CW = 128;
+        const size_t CH = vc::kRenderTile, CW = vc::kRenderTile;
         size_t baseZ = isCompositeMode ? 1 : size_t(std::max(1, num_slices));
         cv::Size outXY = tgt_size;
         if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(outXY.width, outXY.height);
@@ -1536,7 +1422,7 @@ int main(int argc, char *argv[])
 
         // ---- Render pass ----
         {
-            const auto surface = renderSurface(*surf, interpolation, scale_seg, hasAffine, affineTransform, levelMap);
+            const auto surface = vc::renderSurface(*surf, interpolation, scale_seg, hasAffine, affineTransform, levelMap);
             auto* tifs = tifWriters.empty() ? nullptr : &tifWriters;
             if (useU16)
                 renderTiles<uint16_t>(*surf, surface, volume, sourceType,
