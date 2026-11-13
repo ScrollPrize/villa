@@ -116,6 +116,48 @@ vc_add_test(NAME test_ink_detection_overlay
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 
+qt6_wrap_cpp(ink_preview_client_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkPreviewClient.hpp)
+qt6_wrap_cpp(ink_preview_overlay_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkPreviewOverlayController.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/viewer_controls/panels/ViewerInkDetectionPanel.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/LabeledControlRow.hpp)
+vc_add_test(NAME test_ink_preview_client
+    SOURCES test_ink_preview_client.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkPreviewClient.cpp
+            ${ink_preview_client_moc}
+    LIBS doctest::doctest Qt6::Core Qt6::Network vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+vc_add_test(NAME test_ink_preview_overlay
+    SOURCES test_ink_preview_overlay.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/Colormaps.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkPreviewClient.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkPreviewOverlayController.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/viewer_controls/panels/ViewerInkDetectionPanel.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/LabeledControlRow.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            test_viewer_manager_stub.cpp
+            ${ink_preview_client_moc}
+            ${ink_preview_overlay_moc}
+            ${ink_detection_overlay_moc}
+            ${viewer_overlay_base_ink_moc}
+            ${viewer_manager_overlay_test_moc}
+            ${cstate_ink_detection_moc}
+            ${vccollection_ink_detection_moc}
+            ${surface_catalog_ink_detection_moc}
+    LIBS opencv_imgcodecs vc_object_store::vc_objects vc_object_store::vc_object_geometry doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Concurrent vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
+    DEFS VC_TESTING)
+set_tests_properties(test_ink_preview_overlay PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
 qt6_wrap_cpp(points_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.hpp)
 qt6_wrap_cpp(vccollection_surface_primitives_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)

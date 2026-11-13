@@ -7,7 +7,7 @@
 #include <vc_object_store/objects/CatalogStore.hpp>
 #include "../SurfaceCatalog.hpp"
 
-#include "Colormaps.hpp"
+#include "ScalarOverlayImage.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include "vc/core/util/ImageMat.hpp"
@@ -445,38 +445,7 @@ QImage InkDetectionOverlayController::renderSingleChannelImage(
     const cv::Mat_<uint8_t>& scalar,
     const std::string& colormapId) const
 {
-    if (scalar.empty()) {
-        return {};
-    }
-
-    QImage image(scalar.cols, scalar.rows, QImage::Format_ARGB32);
-    if (colormapId.empty()) {
-        for (int y = 0; y < scalar.rows; ++y) {
-            auto* out = reinterpret_cast<QRgb*>(image.scanLine(y));
-            const auto* in = scalar.ptr<uint8_t>(y);
-            for (int x = 0; x < scalar.cols; ++x) {
-                const int v = in[x];
-                out[x] = qRgba(v, v, v, v);
-            }
-        }
-        return image;
-    }
-
-    vc::makeColors(
-        scalar,
-        vc::resolve(colormapId),
-        reinterpret_cast<uint32_t*>(image.bits()),
-        image.bytesPerLine() / 4);
-
-    for (int y = 0; y < scalar.rows; ++y) {
-        auto* out = reinterpret_cast<QRgb*>(image.scanLine(y));
-        const auto* in = scalar.ptr<uint8_t>(y);
-        for (int x = 0; x < scalar.cols; ++x) {
-            const QRgb color = out[x];
-            out[x] = qRgba(qRed(color), qGreen(color), qBlue(color), in[x]);
-        }
-    }
-    return image;
+    return vc3d::scalarOverlayImage(scalar, colormapId);
 }
 
 bool InkDetectionOverlayController::imageMatchesSurface(const QuadSurface& surface) const

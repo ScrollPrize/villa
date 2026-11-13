@@ -32,6 +32,7 @@ class BBoxOverlayController;
 class VectorOverlayController;
 class VolumeOverlayController;
 class InkDetectionOverlayController;
+class InkPreviewOverlayController;
 class SegmentationModule;
 class ViewerOverlayControllerBase;
 class VolumeViewerBase;
@@ -79,6 +80,8 @@ public:
     void setVolumeOverlay(VolumeOverlayController* overlay);
     void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
     InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
+    void setInkPreviewOverlay(InkPreviewOverlayController* overlay);
+    InkPreviewOverlayController* inkPreviewOverlay() const { return _inkPreviewOverlay; }
 
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
@@ -278,4 +281,5 @@ private:
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
+    InkPreviewOverlayController* _inkPreviewOverlay{nullptr};
 };
