@@ -1,6 +1,7 @@
 // The few types the reader's interfaces share, without the reader itself.
 #pragma once
 
+#include "vc_reader/exception_type.hpp"
 #include "element_type.hpp"
 
 #include <cstdint>
@@ -64,17 +65,17 @@ struct Auth {
 };
 
 // 401/403: the request was not allowed (missing, wrong or expired credentials).
-struct HttpDenied : std::runtime_error {
+struct VCR_EXCEPTION_TYPE HttpDenied : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
 // A chunk an offline read needs is in none of the disk layers.
-struct CacheMiss : std::runtime_error {
+struct VCR_EXCEPTION_TYPE CacheMiss : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
 // A read stopped because its cancel flag was set: chunks not started by then were not read.
-struct Cancelled : std::runtime_error {
+struct VCR_EXCEPTION_TYPE Cancelled : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
