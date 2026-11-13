@@ -499,17 +499,7 @@ Options: `--projections`, `--cache_dir`, `-n`, `--z Z0 Z1`, `--roi X0 X1 Y0 Y1` 
 `evaluation/343p_baselines.json` compares FBP and SIRT (20 iterations from gridrec), each with no projection
 filters and with Paganin δ/β 1000 + unsharp σ 1.2, coefficient 4, over the same five full slices of the local PHerc0343P projections.
 It uses the corrected mode and CUDA backend, requiring a CUDA-enabled build and host.
-The calibration cache lives under the output directory. Ceres must already be installed; configuration uses `find_package(Ceres 2.2 REQUIRED COMPONENTS EigenSparse)`
-and links `Ceres::ceres`. There is no bundled download or fallback solver. On Ubuntu use the distribution's
-`libceres-dev` package if it provides version 2.2 or newer (`sudo apt install libceres-dev`); on macOS use
-`brew install ceres-solver`. For a separate installation, pass `-DCeres_DIR=/prefix/lib/cmake/Ceres`
-(or the directory containing `CeresConfig.cmake`). A Ceres source build must enable `EIGENSPARSE`.
-
-For an already configured build, use `cmake --build build/<configuration> -j 4` and
-`ctest --test-dir build/<configuration> --output-on-failure`. The native fitting test checks the complete
-blur-model Jacobian against numerical derivatives. Python fitting coverage is in `tests/test_solve.py`,
-`tests/test_refill.py`, `tests/test_geometry.py`, and `tests/test_regressions.py`; registration is covered by
-`tests/test_calibration.py` and `tests/test_block_spectra.py` on each available backend.
+The calibration cache lives under the output directory.
 
 Run from `foundation/helirec`:
 
@@ -998,6 +988,12 @@ in `development_notes/calibration/05_experiments.md`, section 33.
 
 ## Tests
 
+For an already configured build, use `cmake --build build/<configuration> -j 4` and
+`ctest --test-dir build/<configuration> --output-on-failure`. The native fitting test checks the complete
+blur-model Jacobian against numerical derivatives. Python fitting coverage is in `tests/test_solve.py`,
+`tests/test_refill.py`, `tests/test_transfer.py`, `tests/test_geometry.py`, and `tests/test_regressions.py`; registration is covered by
+`tests/test_calibration.py` and `tests/test_block_spectra.py` on each available backend.
+
 `pytest` runs the unit tests: CPU vs CUDA vs NumPy references for every kernel, projector adjointness, the
 whole-slice methods, and regression checks of the corrected conventions (`tests/test_regressions.py`).
 `tests/test_calibration.py` covers `helirec::calibration` on synthetic blocks and a synthetic acquisition record.
@@ -1013,6 +1009,12 @@ map's arguments) on rows of noise without the transfers, and returns the seconds
 the transform plans).
 
 ## Build
+
+Ceres must already be installed; configuration uses `find_package(Ceres 2.2 REQUIRED COMPONENTS EigenSparse)`
+and links `Ceres::ceres`. There is no bundled download or fallback solver. On Ubuntu use the distribution's
+`libceres-dev` package if it provides version 2.2 or newer (`sudo apt install libceres-dev`); on macOS use
+`brew install ceres-solver`. For a separate installation, pass `-DCeres_DIR=/prefix/lib/cmake/Ceres`
+(or the directory containing `CeresConfig.cmake`). A Ceres source build must enable `EIGENSPARSE`.
 
 Requirements: CMake ≥ 3.24, a C++20 compiler, **Ceres ≥ 2.2 with EigenSparse**, FFTW3 (float + double), HDF5 (C), zlib, libcurl, Python ≥ 3.10, and
 optionally the CUDA toolkit and OpenJPEG ≥ 2.5 (`apt install libopenjp2-7-dev`, `brew install openjpeg`; found
