@@ -329,6 +329,45 @@ def clip_tile_to_roi(
     return clipped, tile[source], weights[source]
 
 
+def feed_patch(
+    accumulator: Any,
+    block: Block,
+    probability: np.ndarray | None,
+    weight_map: np.ndarray,
+    *,
+    mask: np.ndarray | None = None,
+    roi_bounds: tuple[int, int, int, int] | None = None,
+) -> None:
+    """Feed one parent patch to an accumulator, clipped to the ROI frame.
+
+    ``probability`` is the patch's probability plane, or None for a raw-empty
+    patch, which only completes the chunks it overlaps. ``mask`` is a float32
+    weight mask in the parent frame.
+    """
+
+    if probability is None:
+        if roi_bounds is not None:
+            block = clip_block_to_roi(block, roi_bounds)
+            if block is None:
+                return
+        accumulator.skip_tile(
+            y0=block.y0, x0=block.x0, valid_h=block.valid_h, valid_w=block.valid_w
+        )
+        return
+    y0, x0, valid_h, valid_w = block.y0, block.x0, block.valid_h, block.valid_w
+    tile = probability[:valid_h, :valid_w]
+    weights = weight_map[:valid_h, :valid_w]
+    if mask is not None:
+        weights = weights * mask[y0 : y0 + valid_h, x0 : x0 + valid_w]
+    if roi_bounds is not None:
+        clipped = clip_tile_to_roi(block, tile, weights, roi_bounds)
+        if clipped is None:
+            return
+        block, tile, weights = clipped
+        y0, x0 = block.y0, block.x0
+    accumulator.add_tile(y0=y0, x0=x0, tile=tile, tile_weights=weights)
+
+
 def iter_blocks(
     image_shape: tuple[int, int],
     patch_size: int,
@@ -987,17 +1026,12 @@ def run_block_inference(
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
             for values in metadata[~keep].numpy():
-                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
-                if roi_bounds is not None:
-                    clipped = clip_block_to_roi(
-                        Block(y0, x0, valid_h, valid_w), roi_bounds
-                    )
-                    if clipped is None:
-                        continue
-                    y0, x0 = clipped.y0, clipped.x0
-                    valid_h, valid_w = clipped.valid_h, clipped.valid_w
-                accumulator.skip_tile(
-                    y0=y0, x0=x0, valid_h=valid_h, valid_w=valid_w
+                feed_patch(
+                    accumulator,
+                    Block(*(int(value) for value in values[:4])),
+                    None,
+                    weight_map,
+                    roi_bounds=roi_bounds,
                 )
             if not bool(keep.any()):
                 continue
@@ -1022,26 +1056,13 @@ def run_block_inference(
                 )
             probabilities_np = probabilities.cpu().numpy()[:, 0]
             for probability, values in zip(probabilities_np, metadata.numpy()):
-                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
-                tile = probability[:valid_h, :valid_w]
-                weights = weight_map[:valid_h, :valid_w]
-                if mask_f32 is not None:
-                    weights = weights * mask_f32[
-                        y0 : y0 + valid_h, x0 : x0 + valid_w
-                    ]
-                if roi_bounds is not None:
-                    clipped = clip_tile_to_roi(
-                        Block(y0, x0, valid_h, valid_w), tile, weights, roi_bounds
-                    )
-                    if clipped is None:
-                        continue
-                    block, tile, weights = clipped
-                    y0, x0 = block.y0, block.x0
-                accumulator.add_tile(
-                    y0=y0,
-                    x0=x0,
-                    tile=tile,
-                    tile_weights=weights,
+                feed_patch(
+                    accumulator,
+                    Block(*(int(value) for value in values[:4])),
+                    probability,
+                    weight_map,
+                    mask=mask_f32,
+                    roi_bounds=roi_bounds,
                 )
 
 

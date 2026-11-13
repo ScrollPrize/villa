@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import http.client
+import inspect
 import io
 import json
+import socket
 import threading
 from urllib.parse import urlencode
 
@@ -292,6 +294,99 @@ def test_displaced_grid_control(shift, should_match):
         assert np.mean(floor255(moved) != floor255(expected)) > 0.5
 
 
+def test_keys_never_share_patches():
+    """A view cached under one key is a miss under another, and each key gets its own data's result."""
+
+    configured = tiny_configured()
+    first, second = random_stack(seed=5), random_stack(seed=6)
+    view = (9, 7, 30, 20)
+    x, y, w, h = view
+    engine = preview_server.PreviewEngine(configured)
+    with serving(engine) as port:
+        result_a, _ = fetch(port, first, view, key="surface-a")
+        status, _, data = call(port, "POST", "/preview", view_params(second, view, key="surface-b"))
+        assert status == 409, data
+        assert json.loads(data)["missing"] == len(infer.iter_blocks(CANVAS_HW, PATCH, STRIDE, roi_bounds=(y, y + h, x, x + w)))
+        result_b, _ = fetch(port, second, view, key="surface-b")
+        again, headers = fetch(port, first, view, key="surface-a")
+    assert headers["X-Tiles"].startswith("0,")  # key A is still cached, untouched by key B
+    np.testing.assert_array_equal(result_a, villa_roi_reference(configured, first, (y, y + h, x, x + w)))
+    np.testing.assert_array_equal(result_b, villa_roi_reference(configured, second, (y, y + h, x, x + w)))
+    np.testing.assert_array_equal(again, result_a)
+    assert np.mean(floor255(result_a) != floor255(result_b)) > 0.5
+
+
+def test_server_binds_loopback_only_with_a_large_backlog():
+    assert "host" not in inspect.signature(preview_server.make_server).parameters
+    server = preview_server.make_server(preview_server.PreviewEngine(tiny_configured()), port=0)
+    try:
+        assert server.server_address[0] == "127.0.0.1"
+        assert server.request_queue_size >= 64
+    finally:
+        server.server_close()
+
+
+def test_a_burst_of_concurrent_connections_is_answered():
+    """120 clients connect at once; the stdlib backlog of 5 resets some of them in most runs."""
+
+    clients = 120  # below the backlog, so every connection fits in the queue
+    stack = random_stack()
+    barrier = threading.Barrier(clients)
+    statuses, errors = [], []
+
+    def client(index, port):
+        params = view_params(stack, (index % 40, index % 30, 20, 15), key=f"k{index % 4}", fmt="u8")
+        barrier.wait()
+        try:
+            statuses.append(call(port, "POST", "/preview", params)[0])
+        except OSError as exc:
+            errors.append(repr(exc))
+
+    with serving(preview_server.PreviewEngine(tiny_configured())) as port:
+        threads = [threading.Thread(target=client, args=(index, port)) for index in range(clients)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    assert errors == []
+    assert statuses == [409] * clients
+
+
+def test_canvas_and_upload_limits_are_checked_before_any_work():
+    engine = preview_server.PreviewEngine(tiny_configured())
+    side = preview_server.MAX_CANVAS_SIDE
+    with serving(engine) as port:
+        for cw, ch in ((side + 1, 45), (61, side + 1), (10**18, 10**18)):
+            status, _, data = call(port, "POST", "/preview", {"key": "k", "cw": cw, "ch": ch, "x": 0, "y": 0,
+                                                              "w": 1, "h": 1})
+            assert status == 400 and "at most" in json.loads(data)["error"], (cw, ch, data)
+        status, _, data = call(port, "POST", "/preview", {"key": "k", "cw": side, "ch": side, "x": 0, "y": 0,
+                                                          "w": 1, "h": 1})
+        assert status == 409 and json.loads(data)["missing"] == 1
+        # A thin view inside max_view_px whose patches would need a 6.9 GB upload is refused from
+        # its headers alone: the server answers without reading the body.
+        thin = {"key": "thin", "cw": 16_000_000, "ch": 64, "x": 0, "y": 20, "w": 16_000_000, "h": 1,
+                "sx": 0, "sy": 5, "sw": 16_000_000, "sh": 2 * PATCH - 1, "dtype": "uint16"}
+        assert thin["w"] * thin["h"] <= engine.max_view_px
+        length = DEPTH * thin["sh"] * thin["sw"] * 2
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+            connection.sendall(f"POST /preview?{urlencode(thin)} HTTP/1.1\r\nHost: test\r\n"
+                               f"Content-Length: {length}\r\n\r\n".encode())
+            assert connection.recv(64).startswith(b"HTTP/1.0 413")
+        status, _, data = call(port, "POST", "/preview", {k: v for k, v in thin.items() if not k.startswith("s")
+                                                          and k != "dtype"})
+        assert status == 413 and "max_upload_mb" in json.loads(data)["error"]
+    # The bound is the view plus one patch on each side, at 2 bytes per voxel.
+    exact = (10 + 2 * PATCH) * (10 + 2 * PATCH) * DEPTH * 2
+    tight = preview_server.PreviewEngine(tiny_configured(), max_upload_mb=exact / 2**20)
+    with serving(tight) as port:
+        stack = random_stack()
+        assert call(port, "POST", "/preview", view_params(stack, (0, 0, 10, 10)))[0] == 409
+        assert call(port, "POST", "/preview", view_params(stack, (0, 0, 11, 10)))[0] == 413
+        result, _ = fetch(port, stack, (0, 0, 10, 10))
+    np.testing.assert_array_equal(result, villa_roi_reference(tiny_configured(), stack, (0, 10, 0, 10)))
+
+
 def test_health_and_error_codes():
     engine = preview_server.PreviewEngine(
         tiny_configured(), cache_mb=1, max_view_px=500, model_name="tiny", voxel_um=9.36
@@ -303,9 +398,9 @@ def test_health_and_error_codes():
         health = json.loads(data)
         assert status == 200
         assert {key: health[key] for key in ("service", "api", "backend", "model", "patch", "stride", "depth",
-                                             "voxel_um", "max_view_px")} == {
+                                             "voxel_um", "max_view_px", "max_upload_mb")} == {
             "service": "ink-preview", "api": 1, "backend": "torch:cpu", "model": "tiny", "patch": PATCH,
-            "stride": STRIDE, "depth": DEPTH, "voxel_um": 9.36, "max_view_px": 500,
+            "stride": STRIDE, "depth": DEPTH, "voxel_um": 9.36, "max_view_px": 500, "max_upload_mb": 1024.0,
         }
         assert set(health["cache"]) == {"tiles", "mb", "cap_mb", "hits", "misses"}
         assert call(port, "GET", "/nowhere")[0] == 404
@@ -412,6 +507,8 @@ def test_checkpoint_server_equals_flat_inference_cli_roi(tmp_path, direction, va
         preview_server.parse_args(["--checkpoint", str(checkpoint), "--device", "cpu"])
     )
     assert engine.health()["model"] == "tiny-ink" and engine.health()["voxel_um"] is None
+    stated = preview_server.parse_args(["--checkpoint", str(checkpoint), "--voxel-um", "9.36"])
+    assert preview_server.load_engine(stated).health()["voxel_um"] == 9.36
     assert (engine.patch, engine.stride, engine.depth, engine.blend_mode) == (16, 8, 3, "hann")
     with serving(engine) as port:
         result, _ = fetch(port, volume, (roi[2], roi[0], roi[3] - roi[2], roi[1] - roi[0]),
@@ -419,13 +516,3 @@ def test_checkpoint_server_equals_flat_inference_cli_roi(tmp_path, direction, va
     assert expected.shape == result.shape
     np.testing.assert_array_equal(result, expected)
     assert expected.any()
-
-
-def test_checkpoint_voxel_size_is_reported_when_stated(tmp_path):
-    mapping = config_mapping("vesuvius_unet_2p5d", depth=3, side=16)
-    mapping["image_normalization"] = "robust_mad"
-    checkpoint = tmp_path / "stated.pth"
-    torch.save({"config": dict(mapping, voxel_size_um=9.36), "model": {}}, checkpoint)
-    assert preview_server.checkpoint_voxel_um(checkpoint) == 9.36
-    torch.save({"config": mapping, "model": {}}, checkpoint)
-    assert preview_server.checkpoint_voxel_um(checkpoint) is None

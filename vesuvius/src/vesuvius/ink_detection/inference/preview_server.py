@@ -19,8 +19,9 @@ uploaded stack is sampled on, and the patch grid starts at its pixel (0, 0)):
 
 ``GET /health``
     JSON with ``service``, ``api``, ``backend`` ("torch:<device>"), ``model``,
-    ``patch``, ``stride``, ``depth``, ``voxel_um`` (null when unknown),
-    ``max_view_px``, ``blend_mode`` and ``cache`` statistics.
+    ``patch``, ``stride``, ``depth``, ``voxel_um`` (null unless
+    ``--voxel-um`` is given), ``max_view_px``, ``max_upload_mb``,
+    ``blend_mode`` and ``cache`` statistics.
 
 ``POST /preview?key=K&cw=CW&ch=CH&x=X&y=Y&w=W&h=H&variant=f&format=u8``
     Optional body: ``depth * SH * SW`` voxels, layers first, C order,
@@ -35,6 +36,9 @@ uploaded stack is sampled on, and the patch grid starts at its pixel (0, 0)):
     ``X-Tiles: computed,cached``. 409: JSON ``{"need": {x, y, w, h},
     "depth": D, "missing": N}``, the canvas rectangle the client must upload
     next; nothing is computed. 400, 404, 413 and 500 carry JSON ``error``.
+    413 means the view is over ``max_view_px``, the layers of the patches
+    around it could exceed ``max_upload_mb``, or the upload is larger than
+    the view plus one patch on each side.
 
 The server listens on 127.0.0.1 only. Its output is model output.
 """
@@ -70,19 +74,19 @@ from vesuvius.ink_detection.inference.infer import (
     FlatBlockDataset,
     FlatPatchReader,
     clip_block_to_roi,
-    clip_tile_to_roi,
     compute_chunk_contribution_counts,
     compute_importance_map_2d,
     configure_model,
+    feed_patch,
     iter_blocks,
     normalize_probability_sums,
     probabilities_to_uint8,
     resolve_blend_mode,
     resolve_patch_stride,
+    resolve_roi_bounds,
     run_block_inference,
     select_layer_indices,
 )
-from vesuvius.ink_detection.models.checkpoint import load_checkpoint
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -93,7 +97,10 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_CACHE_MB = 256.0
 DEFAULT_MAX_VIEW_PX = 4096 * 4096
+DEFAULT_MAX_UPLOAD_MB = 1024.0
+MAX_CANVAS_SIDE = 1 << 24  # far above any segment; bounds the grid a request schedules
 MAX_KEY_CHARS = 200
+LISTEN_BACKLOG = 128
 VARIANTS = {"f": "forward", "r": "reverse"}
 FORMATS = ("u8", "f32", "png")
 UPLOAD_DTYPES = {"uint8": np.dtype("<u1"), "uint16": np.dtype("<u2")}
@@ -222,7 +229,9 @@ def _single(query: Mapping[str, Sequence[str]], name: str, default: str | None =
     return values[0]
 
 
-def _integer(query: Mapping[str, Sequence[str]], name: str, *, minimum: int) -> int:
+def _integer(
+    query: Mapping[str, Sequence[str]], name: str, *, minimum: int, maximum: int | None = None
+) -> int:
     text = _single(query, name)
     if text is None:
         raise _bad_request(f"missing parameter {name!r}")
@@ -232,12 +241,19 @@ def _integer(query: Mapping[str, Sequence[str]], name: str, *, minimum: int) -> 
         raise _bad_request(f"parameter {name!r} must be an integer, got {text!r}") from None
     if value < minimum:
         raise _bad_request(f"parameter {name!r} must be at least {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise _bad_request(f"parameter {name!r} must be at most {maximum}, got {value}")
     return value
 
 
 def _inside(rect: tuple[int, int, int, int], canvas_hw: tuple[int, int]) -> bool:
-    y0, y1, x0, x1 = rect
-    return 0 <= y0 < y1 <= canvas_hw[0] and 0 <= x0 < x1 <= canvas_hw[1]
+    """Whether ``rect`` is nonempty and inside the canvas, by the ``--roi`` rule."""
+
+    try:
+        resolve_roi_bounds(rect, height=canvas_hw[0], width=canvas_hw[1])
+    except ValueError:
+        return False
+    return True
 
 
 def _covers(rect: tuple[int, int, int, int], block: Block) -> bool:
@@ -264,6 +280,7 @@ class PreviewEngine:
         batch_size: int = 1,
         cache_mb: float = DEFAULT_CACHE_MB,
         max_view_px: int = DEFAULT_MAX_VIEW_PX,
+        max_upload_mb: float = DEFAULT_MAX_UPLOAD_MB,
         model_name: str = "model",
         voxel_um: float | None = None,
     ) -> None:
@@ -271,6 +288,8 @@ class PreviewEngine:
             raise ValueError("batch_size must be positive")
         if max_view_px <= 0:
             raise ValueError("max_view_px must be positive")
+        if not max_upload_mb > 0:
+            raise ValueError("max_upload_mb must be positive")
         if cache_mb < 0:
             raise ValueError("cache_mb must be nonnegative")
         self.configured = configured
@@ -288,6 +307,10 @@ class PreviewEngine:
         ).numpy()
         self.batch_size = int(batch_size)
         self.max_view_px = int(max_view_px)
+        self.max_upload_mb = float(max_upload_mb)
+        self.max_upload_bytes = int(round(self.max_upload_mb * 2**20))
+        # The widest voxel a client may upload: uint8 only for divide-by-255 checkpoints.
+        self.max_itemsize = 1 if configured.preprocessing == "divide_255" else 2
         self.model_name = str(model_name)
         self.voxel_um = None if voxel_um is None else float(voxel_um)
         self.backend = f"torch:{self.device}"
@@ -305,6 +328,7 @@ class PreviewEngine:
             "depth": self.depth,
             "voxel_um": self.voxel_um,
             "max_view_px": self.max_view_px,
+            "max_upload_mb": self.max_upload_mb,
             "blend_mode": self.blend_mode,
             "cache": self.cache.stats(),
         }
@@ -317,8 +341,8 @@ class PreviewEngine:
             raise _bad_request("missing parameter 'key'")
         if len(key) > MAX_KEY_CHARS:
             raise _bad_request(f"key is longer than {MAX_KEY_CHARS} characters")
-        cw = _integer(query, "cw", minimum=1)
-        ch = _integer(query, "ch", minimum=1)
+        cw = _integer(query, "cw", minimum=1, maximum=MAX_CANVAS_SIDE)
+        ch = _integer(query, "ch", minimum=1, maximum=MAX_CANVAS_SIDE)
         x = _integer(query, "x", minimum=0)
         y = _integer(query, "y", minimum=0)
         w = _integer(query, "w", minimum=1)
@@ -334,6 +358,16 @@ class PreviewEngine:
             raise _bad_request(f"format must be one of {', '.join(FORMATS)}, got {fmt!r}")
         if w * h > self.max_view_px:
             raise PreviewError(413, {"error": f"view of {w * h} pixels exceeds max_view_px {self.max_view_px}"})
+        # Every patch that touches the view lies within one patch of it, so
+        # this rectangle bounds both the upload a 409 can ask for and the
+        # patches the request schedules. A thin view can be inside
+        # max_view_px and still need far more.
+        padded_px = (w + 2 * self.patch) * (h + 2 * self.patch)
+        if padded_px * self.depth * self.max_itemsize > self.max_upload_bytes:
+            raise PreviewError(413, {
+                "error": f"the patches around a {w}x{h} view can need more than max_upload_mb "
+                         f"{self.max_upload_mb:g} of layers; ask for a smaller view",
+            })
         names = ("sx", "sy", "sw", "sh")
         given = [name for name in names if _single(query, name) is not None]
         upload = None
@@ -348,8 +382,8 @@ class PreviewEngine:
             upload = (sy, sy + sh, sx, sx + sw)
             if not _inside(upload, (ch, cw)):
                 raise _bad_request(f"upload {sw}x{sh} at ({sx}, {sy}) is not inside the {cw}x{ch} canvas")
-            # Every patch that touches the view lies within one patch of it.
-            if sw * sh > (w + 2 * self.patch) * (h + 2 * self.patch):
+            # Within padded_px, so the body is within max_upload_bytes too.
+            if sw * sh > padded_px:
                 raise PreviewError(413, {"error": "upload is larger than the view plus one patch on each side"})
             dtype_name = _single(query, "dtype", "uint8")
             if dtype_name not in UPLOAD_DTYPES:
@@ -520,17 +554,7 @@ class PreviewEngine:
             ),
         )
         for block in blocks:
-            tile = tiles[(block.y0, block.x0)]
-            if tile is None:
-                clipped = clip_block_to_roi(block, view)
-                accumulator.skip_tile(
-                    y0=clipped.y0, x0=clipped.x0, valid_h=clipped.valid_h, valid_w=clipped.valid_w
-                )
-                continue
-            clipped, part, part_weights = clip_tile_to_roi(
-                block, tile, self.weight_map[: block.valid_h, : block.valid_w], view
-            )
-            accumulator.add_tile(y0=clipped.y0, x0=clipped.x0, tile=part, tile_weights=part_weights)
+            feed_patch(accumulator, block, tiles[(block.y0, block.x0)], self.weight_map, roi_bounds=view)
         accumulator.flush_remaining()
         return normalize_probability_sums(probability_sum, weight_sum)
 
@@ -608,28 +632,23 @@ class PreviewRequestHandler(BaseHTTPRequestHandler):
         self._send(200, reply.body, reply.content_type, reply.headers)
 
 
-def make_server(engine: PreviewEngine, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
-    """Bind a threaded HTTP server for ``engine`` to 127.0.0.1 only."""
+class PreviewHTTPServer(ThreadingHTTPServer):
+    """A threaded HTTP server whose listen backlog takes a burst of clients.
 
-    server = ThreadingHTTPServer((HOST, int(port)), PreviewRequestHandler)
-    server.daemon_threads = True
-    server.engine = engine
-    return server
-
-
-def checkpoint_voxel_um(checkpoint: str | Path) -> float | None:
-    """The training voxel size the checkpoint config states, else None.
-
-    Flat checkpoints carry no voxel size field today; a positive number under
-    ``voxel_size_um`` in the embedded config is reported.
+    socketserver's default backlog of 5 resets connections when many clients
+    connect at once.
     """
 
-    payload = load_checkpoint(Path(checkpoint))
-    config = payload.get("config") if isinstance(payload, Mapping) else None
-    value = config.get("voxel_size_um") if isinstance(config, Mapping) else None
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
-        return float(value)
-    return None
+    daemon_threads = True
+    request_queue_size = LISTEN_BACKLOG
+
+
+def make_server(engine: PreviewEngine, port: int = DEFAULT_PORT) -> PreviewHTTPServer:
+    """Bind a threaded HTTP server for ``engine`` to 127.0.0.1 only."""
+
+    server = PreviewHTTPServer((HOST, int(port)), PreviewRequestHandler)
+    server.engine = engine
+    return server
 
 
 def load_engine(args: argparse.Namespace) -> PreviewEngine:
@@ -649,7 +668,6 @@ def load_engine(args: argparse.Namespace) -> PreviewEngine:
         compile_model=args.compile,
         compile_mode=args.compile_mode,
     )
-    voxel_um = args.voxel_um if args.voxel_um is not None else checkpoint_voxel_um(args.checkpoint)
     return PreviewEngine(
         replace(configured, model=model),
         device=device,
@@ -659,8 +677,9 @@ def load_engine(args: argparse.Namespace) -> PreviewEngine:
         batch_size=args.batch_size,
         cache_mb=args.cache_mb,
         max_view_px=args.max_view_px,
+        max_upload_mb=args.max_upload_mb,
         model_name=args.name or Path(args.checkpoint).stem,
-        voxel_um=voxel_um,
+        voxel_um=args.voxel_um,
     )
 
 
@@ -683,9 +702,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-view-px", type=int, default=DEFAULT_MAX_VIEW_PX,
                         help="Largest view (w * h) answered; larger views get 413.")
+    parser.add_argument("--max-upload-mb", type=float, default=DEFAULT_MAX_UPLOAD_MB,
+                        help="Largest layer upload in MiB that a view may need, counting every patch "
+                             "that touches it at 2 bytes per voxel (1 for uint8-only checkpoints); "
+                             "views that could need more get 413. Default: 1024.")
     parser.add_argument("--name", help="Model name for /health (default: the checkpoint file stem).")
     parser.add_argument("--voxel-um", type=float,
-                        help="Training voxel size for /health when the checkpoint does not state one.")
+                        help="The model's training voxel size in um, reported in /health "
+                             "(9.36 for ink_9um). VC3D's Auto level picks the volume level nearest "
+                             "to it, and level 0 without it. Default: unknown (null).")
     parser.add_argument("--compile", action="store_true",
                         help="Wrap the model in torch.compile, as infer.py does by default.")
     parser.add_argument("--compile-mode", default="reduce-overhead")
@@ -696,6 +721,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--cache-mb must be nonnegative")
     if args.max_view_px <= 0:
         parser.error("--max-view-px must be positive")
+    if not args.max_upload_mb > 0:
+        parser.error("--max-upload-mb must be positive")
+    if args.voxel_um is not None and not (math.isfinite(args.voxel_um) and args.voxel_um > 0):
+        parser.error("--voxel-um must be a positive number")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
     return args

@@ -157,16 +157,24 @@ control: it shows how much of the output depends on the order of the layers.
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.preview_server \
-  --checkpoint /data/ink_9um/checkpoints/hybrid-best.pth --device auto --port 8765
+  --checkpoint /data/ink_9um/checkpoints/hybrid-best.pth --voxel-um 9.36 \
+  --device auto --port 8765
 ```
+
+`--voxel-um` states the model's training voxel size, which flat checkpoints do
+not record. VC3D's Auto level picks the volume level whose voxel size is
+nearest to it; without it the server reports `voxel_um` as null and Auto uses
+level 0.
 
 The server listens on 127.0.0.1 only. It uses flat inference's own checkpoint
 loading, normalization, patch grid (`--overlap`, `--stride`), layer selection,
 blend window (`--blend-mode`), CUDA autocast dtype (`--amp-dtype`) and uint8
 truncation, so a preview pixel equals the pixel `infer.py --roi` writes for the
 same input array and settings, edges included. `torch.compile` is off unless
-`--compile` is given. `--cache-mb` caps the patch cache (default 256 MiB) and
-`--max-view-px` the view size. A preview equals a map only where the uploaded
+`--compile` is given. `--cache-mb` caps the patch cache (default 256 MiB),
+`--max-view-px` the view size and `--max-upload-mb` (default 1024 MiB) the
+layer upload a view may need: every patch that touches the view, at 2 bytes
+per voxel (1 for a checkpoint that needs uint8 layers). A preview equals a map only where the uploaded
 layers equal the map's input array; the 9 µm preparer pools a 2.4 µm volume
 (level 2, a mean of 4 planes), so on 2.4 µm scans a preview of single sampled
 layers approximates the map.
@@ -176,11 +184,11 @@ starts at canvas pixel (0, 0)):
 
 - `GET /health` returns JSON with `service`, `api`, `backend`
   (`torch:<device>`), `model` (the checkpoint file stem, or `--name`), `patch`,
-  `stride`, `depth`, `voxel_um` (null unless the checkpoint config states
-  `voxel_size_um` or `--voxel-um` is given), `max_view_px`, `blend_mode` and
-  cache statistics.
+  `stride`, `depth`, `voxel_um` (null unless `--voxel-um` is given),
+  `max_view_px`, `max_upload_mb`, `blend_mode` and cache statistics.
 - `POST /preview?key=K&cw=CW&ch=CH&x=X&y=Y&w=W&h=H&variant=f&format=u8` asks
-  for the view `x, y, w, h` on a `cw` by `ch` canvas. `key` (at most 200
+  for the view `x, y, w, h` on a `cw` by `ch` canvas (each side at most
+  16777216 pixels). `key` (at most 200
   characters) names what decides the voxels under the canvas: surface, edit
   state, volume, level and layer offsets; the client changes it when any of
   them changes. `variant` is `f`, or `r` for the layers reversed as
@@ -195,9 +203,10 @@ starts at canvas pixel (0, 0)):
     `D * sh * sw` voxels, layers first, C order, little-endian. Patches are
     cached by `(key, variant, row, column)`, so a pan uploads only the new
     strip.
-  - `400`, `404`, `413` (a view over `max_view_px`, or an upload larger than
-    the view plus one patch on each side) and `500` return JSON
-    `{"error": TEXT}`; the server keeps running.
+  - `400`, `404`, `413` (a view over `max_view_px`, a view whose patches could
+    need an upload over `max_upload_mb`, or an upload larger than the view
+    plus one patch on each side) and `500` return JSON `{"error": TEXT}`; the
+    server keeps running. Both size checks come before the body is read.
 
 ## Checkpoints and metrics
 
