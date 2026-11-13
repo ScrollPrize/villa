@@ -491,11 +491,12 @@ class ZarrReader:
                 res[...] = tgt
         return results
 
-    def render_points(self, xyz, normals, valid, *, offsets=(0,), scale_zyx=(1, 1, 1)):
+    def render_points(self, xyz, normals, valid, *, offsets=(0,), scale_zyx=(1, 1, 1), offset_zyx=(0, 0, 0)):
         """Maximum-composite prepared H,W,3 XYZ geometry through the native grid renderer.
 
-        Directions are XYZ displacement per offset unit. ``scale_zyx`` maps XYZ
-        geometry (reversed to ZYX) into this array's indices. Outside neighbours
+        Directions are XYZ displacement per offset unit. ``scale_zyx`` and ``offset_zyx`` map
+        XYZ geometry (reversed to ZYX) into this array's indices, ``index = scale * p + offset``;
+        for a pyramid level with placement ``(s, o)`` pass ``1 / s`` and ``-o / s``. Outside neighbours
         read the array fill value. The default composite cutoff excludes negative
         values; pixels without an accepted layer return NaN.
         """
@@ -503,7 +504,7 @@ class ZarrReader:
         return _reader.render_points(
             self._array, self.dtype.kind, self.dtype.itemsize, not self.dtype.isnative,
             np.ascontiguousarray(xyz, dtype=np.float32), np.ascontiguousarray(normals, dtype=np.float32),
-            np.ascontiguousarray(valid, dtype=np.uint8), tuple(scale_zyx), list(offsets))
+            np.ascontiguousarray(valid, dtype=np.uint8), tuple(scale_zyx), tuple(offset_zyx), list(offsets))
 
     def read_points(self, points: Any) -> np.ndarray:
         """The values at integer points: ``points`` of shape ``(..., ndim)`` -> values of shape ``(...)``.

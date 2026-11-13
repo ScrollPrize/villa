@@ -88,6 +88,11 @@ class ZarrLevel:
     def open(self, **reader_options):
         return open_zarr(_remote_join(self.remote, self.level), **reader_options)
 
+    def index_map(self) -> dict[str, tuple[float, float, float]]:
+        """render_points arguments taking level 0 XYZ into this level's indices (mean levels are centred on their blocks)."""
+        scale, offset = open_group(self.remote).placement(self.level)
+        return {"scale_zyx": tuple(1.0 / s for s in scale), "offset_zyx": tuple(-o / s for o, s in zip(offset, scale))}
+
 
 def _array_metadata(array) -> dict[str, Any]:
     return {"shape": list(array.shape), "chunks": list(array.chunks), "dtype": str(array.dtype)}

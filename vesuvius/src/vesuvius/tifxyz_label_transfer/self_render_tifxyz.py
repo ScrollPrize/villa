@@ -721,7 +721,7 @@ def _run_source_only(
             source_sampler.render_points(
                 xyz, normals, valid,
                 offsets=[0.0],
-                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+                **source_raw_info.index_map(),
             ),
             source_raw_info,
         )
@@ -729,7 +729,7 @@ def _run_source_only(
             source_sampler.render_points(
                 xyz, normals, valid,
                 offsets=source_offsets,
-                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+                **source_raw_info.index_map(),
             ),
             source_raw_info,
         )
@@ -1085,7 +1085,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_sampler.render_points(
                 xyz, normals, valid,
                 offsets=[0.0],
-                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+                **source_raw_info.index_map(),
             ),
             source_raw_info,
         )
@@ -1093,7 +1093,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_sampler.render_points(
                 xyz, normals, valid,
                 offsets=source_offsets,
-                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+                **source_raw_info.index_map(),
             ),
             source_raw_info,
         )
@@ -1106,7 +1106,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_sampler.render_points(
                 source_xyz, source_normals, valid,
                 offsets=[0.0],
-                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+                **source_raw_info.index_map(),
             ),
             source_raw_info,
         )
@@ -1114,7 +1114,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_sampler.render_points(
                 source_xyz, source_normals, valid,
                 offsets=source_offsets,
-                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+                **source_raw_info.index_map(),
             ),
             source_raw_info,
         )
@@ -1122,7 +1122,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             target_sampler.render_points(
                 target_xyz, target_normals, valid,
                 offsets=[0.0],
-                scale_zyx=1 / np.asarray(target_raw_info.scale_zyx),
+                **target_raw_info.index_map(),
             ),
             target_raw_info,
         )
@@ -1130,7 +1130,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             target_sampler.render_points(
                 target_xyz, target_normals, valid,
                 offsets=target_offsets,
-                scale_zyx=1 / np.asarray(target_raw_info.scale_zyx),
+                **target_raw_info.index_map(),
             ),
             target_raw_info,
         )
