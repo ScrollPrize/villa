@@ -127,6 +127,34 @@ def _read_flat_surface(volume, *, y0: int, y1: int, x0: int, x1: int):
     return patch[0]
 
 
+def canvas_grid_mismatch_message(segment_id, image, canvases, grid_shape=None):
+    """Describe label canvases whose y/x extent differs from the image or tifxyz grid.
+
+    `grid_shape` is the tifxyz extent in render pixels. Returns None when every
+    canvas matches. The implied centred-crop offset is `(grid - canvas) / 2`.
+    """
+    image_yx = tuple(int(v) for v in image.shape[-2:])
+    reference = tuple(grid_shape) if grid_shape is not None else image_yx
+    bad = {}
+    for name, canvas in canvases.items():
+        canvas_yx = tuple(int(v) for v in canvas.shape[-2:])
+        if canvas_yx != image_yx or (grid_shape is not None and canvas_yx != reference):
+            bad[name] = canvas_yx
+    if not bad:
+        return None
+    details = "; ".join(
+        f"{name} canvas {yx} implied centred-crop offset "
+        f"({(reference[0] - yx[0]) / 2:g}, {(reference[1] - yx[1]) / 2:g})"
+        for name, yx in bad.items()
+    )
+    return (
+        f"Segment {segment_id}: label canvas y/x differs from the "
+        f"{'tifxyz grid' if grid_shape is not None else 'image'}; {details}; "
+        f"image {image_yx}, tifxyz grid {tuple(grid_shape) if grid_shape else 'n/a'} "
+        "(y, x). Out-of-range reads are zero-padded, so labels may sit at the wrong place."
+    )
+
+
 class InkDataset(Dataset):
     """Assemble samples using resolved data settings and an optional patch list."""
 
@@ -152,6 +180,7 @@ class InkDataset(Dataset):
         )
         self._zarr_cache: dict[tuple, object] = {}
         self._tifxyz_cache: dict[str, object] = {}
+        self._canvas_checked: set[str] = set()
         self._stored_resolution_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._stored_resolution_index_cache: dict[
             tuple[str, float], StoredResolutionIndex
@@ -276,6 +305,17 @@ class InkDataset(Dataset):
             self._tifxyz_cache[key] = value
         return value
 
+    def _check_canvas_grid(self, segment: Segment, image, canvases, grid_shape=None):
+        key = str(segment.segment_dir)
+        if key in self._canvas_checked:
+            return
+        self._canvas_checked.add(key)
+        message = canvas_grid_mismatch_message(
+            segment.segment_name, image, canvases, grid_shape
+        )
+        if message is not None:
+            warnings.warn(message, RuntimeWarning, stacklevel=3)
+
     def _coarse_positions(self, segment: Segment, patch_tifxyz):
         key = str(segment.segment_dir)
         value = self._stored_resolution_cache.get(key)
@@ -345,6 +385,11 @@ class InkDataset(Dataset):
         else:
             supervision_volume = self._open(patch.supervision_mask, patch.segment.scale)
             labels_volume = self._open(patch.inklabels, patch.segment.scale)
+            self._check_canvas_grid(
+                patch.segment,
+                image_volume,
+                {"supervision": supervision_volume, "inklabels": labels_volume},
+            )
             supervision_bbox = label_z_window_bbox(bbox, image_volume, supervision_volume)
             labels_bbox = label_z_window_bbox(bbox, image_volume, labels_volume)
             if self.config.jitter.enabled:
@@ -386,6 +431,13 @@ class InkDataset(Dataset):
         patch_tifxyz = self._tifxyz(patch.segment)
         stride, coordinate_scale, _ = native_tifxyz_pyramid_params(
             patch.segment.scale
+        )
+        full_h, full_w = patch_tifxyz.full_resolution_shape
+        self._check_canvas_grid(
+            patch.segment,
+            image_volume,
+            {"supervision": supervision_volume, "inklabels": labels_volume},
+            ((full_h + stride - 1) // stride, (full_w + stride - 1) // stride),
         )
         patch_positions, patch_valid = read_tifxyz_on_flat_grid(
             patch_tifxyz,
