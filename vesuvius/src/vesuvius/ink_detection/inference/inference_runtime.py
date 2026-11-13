@@ -225,18 +225,12 @@ def maybe_compile_model(
 DEVICE_CHOICES = ("auto", "cpu", "mps", "cuda")
 
 
-def prepare_model_for_inference(
-    model: nn.Module,
-    *,
-    gpu_ids: Sequence[int],
-    compile_model: bool,
-    compile_mode: str,
-    device_type: str = "auto",
-) -> tuple[nn.Module, torch.device]:
-    """Move, optionally wrap, and optionally compile an inference model."""
+def resolve_inference_device(
+    *, gpu_ids: Sequence[int], device_type: str = "auto"
+) -> torch.device:
+    """Resolve --gpus and --device to the device inference runs on."""
 
     requested = tuple(int(device_id) for device_id in gpu_ids)
-    compile_enabled = bool(compile_model)
     if device_type not in DEVICE_CHOICES:
         raise ValueError(
             f"--device must be one of {', '.join(DEVICE_CHOICES)}, got {device_type!r}"
@@ -268,7 +262,28 @@ def prepare_model_for_inference(
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+    return device
 
+
+def prepare_model_for_inference(
+    model: nn.Module,
+    *,
+    gpu_ids: Sequence[int],
+    compile_model: bool,
+    compile_mode: str,
+    device_type: str = "auto",
+    device: torch.device | None = None,
+) -> tuple[nn.Module, torch.device]:
+    """Move, optionally wrap, and optionally compile an inference model.
+
+    ``device`` is the result of ``resolve_inference_device`` for the same
+    ``gpu_ids`` and ``device_type``, when the caller has already resolved it.
+    """
+
+    requested = tuple(int(device_id) for device_id in gpu_ids)
+    compile_enabled = bool(compile_model)
+    if device is None:
+        device = resolve_inference_device(gpu_ids=requested, device_type=device_type)
     model = model.to(device)
     if len(requested) > 1:
         compile_enabled = False

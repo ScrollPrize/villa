@@ -460,7 +460,7 @@ the second output.
 | `--stride` | Explicit pixel stride; overrides `--overlap`. |
 | `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto` (constant without overlap, Hann otherwise). |
 | `--layer-start`, `--layer-end` | Half-open source-Z selection before centered depth cropping; negative indices count from the end. The window is clamped to the source depth, and if nothing is left of it (empty, inverted, or entirely out of range) the full depth is used instead and a warning is logged. |
-| `--batch-size` | Batch size per selected device, default `1`. |
+| `--batch-size` | PyTorch batch size per selected device, default `1`. `--engine inkrs` keeps its own batch (64 tiles of 128 px, or 8 of 384 px). |
 | `--direction` | `forward`, `reverse`, or `both`; default `forward`. |
 | `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |
 | `--tta-mirror` | Average valid mirror variants. |
@@ -469,6 +469,8 @@ the second output.
 | `--device` | `auto` (default), `cpu`, `mps` or `cuda`. `auto` picks CUDA, then MPS, then CPU; `--gpus` selects CUDA devices and cannot be combined with `cpu` or `mps`. |
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
+| `--engine` | `torch` (default) or `inkrs`; see [Optional inkrs engine](#optional-inkrs-engine). |
+| `--engine-fallback` | `torch` (default) runs PyTorch and logs why when `--engine` cannot run an input; `error` stops instead. |
 
 Flat inference requires a checkpoint with `mode: "flat"` and a square Y/X
 crop. It prefers `ema_model`, then common flat state-dict aliases, then
@@ -479,6 +481,60 @@ Flat inference has a narrower preprocessing contract than training. It accepts
 `robust_mad` only with the default 1st and 99th percentiles, and `divide` only
 with `divisor: 255`. Other normalization modes are rejected rather than being
 silently replaced with robust normalization.
+
+### Optional inkrs engine
+
+`--engine inkrs` runs flat inference with [inkrs](https://github.com/praveenperera/inkrs),
+a native GPU engine (CUDA on NVIDIA GPUs, Metal on Apple silicon), for the
+models and options it supports. villa still selects the layers, schedules the
+tiles and writes the TIFF; inkrs normalizes, runs the model and blends on the
+GPU. The default engine is PyTorch, and villa does not import inkrs unless
+`--engine inkrs` is given.
+
+inkrs is an optional dependency, installed by the `inkrs` extra. inkrs loads
+cuDNN 9 and cuBLAS 12; PyTorch's CUDA 13 build provides the cuDNN, and on
+Linux the extra adds cuBLAS 12 (`nvidia-cublas-cu12`). inkrs runs from a
+safetensors export of the checkpoint. The first run with a `.pth` exports it
+into inkrs's cache (`~/.cache/inkrs/weights/` unless `INKRS_CACHE_DIR` or
+`XDG_CACHE_HOME` is set), and later runs reuse it:
+
+```bash
+uv run --extra models --extra inkrs python -m vesuvius.ink_detection.inference.infer \
+  segment.zarr hybrid_3d2d-seed42.pth out.tif \
+  --overlap 0.5 --blend-mode hann --direction both --engine inkrs
+```
+
+inkrs supports a subset of flat inference. When a command or an input is
+outside it, villa logs the reason and runs that input with PyTorch; pass
+`--engine-fallback error` to stop instead. inkrs itself decides which
+models, GPUs and volumes it supports, and reports the rest as unsupported:
+in its current release, `hybrid_3d2d-seed42`'s `robust_mad` architecture on
+17 x 128 x 128 tiles, or 17 x 384 x 384 for reader-v3, uint8 volumes at least
+one tile on each side, and a 17-layer window under 4 GiB. villa checks those
+volume limits from the input's metadata before it reads a window, so it never
+reads a whole window that inkrs will refuse. It adds its own limits for the
+options inkrs never sees:
+
+- one CUDA device, or the MPS device on macOS (inkrs needs macOS 26 there)
+- fp16 autocast (PyTorch's CUDA default, so `--amp-dtype default` qualifies)
+- Hann blending (the default with overlap) and a stride from 1 to the tile
+  size (128, or 384 for reader-v3)
+- a `.pth` checkpoint
+- at least 17 layers in the input
+- no `--mask-path`, `--roi`, `--tta-mirror` or `--ensemble-checkpoint`
+
+inkrs exports a checkpoint's weights only when they match the model exactly,
+while villa loads them with `strict=False`. A checkpoint with missing or
+unexpected keys falls back to PyTorch, and the logged reason names the keys.
+A tensor of another shape is declined the same way, and PyTorch then fails to
+load it, as it does without `--engine inkrs`. Other inkrs errors, such as
+missing CUDA libraries or running out of GPU memory, stop the command rather
+than fall back.
+
+On the checkpoints tested, each inkrs map matched PyTorch's to within 4/255,
+with the same covered pixels. inkrs's
+[`scripts/villa_parity.py`](https://github.com/praveenperera/inkrs/blob/master/scripts/villa_parity.py)
+runs both engines on your own data and GPU and compares the maps.
 
 ## Native 3D inference
 
