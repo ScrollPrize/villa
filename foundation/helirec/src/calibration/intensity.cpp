@@ -1,3 +1,6 @@
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include "calibration/blur_model.hpp"
 #include "calibration/ceres_support.hpp"
 #include "helirec/calibration/intensity.hpp"
@@ -175,6 +178,7 @@ FitSummary fit_blur(const BlurFieldProblem& p, std::array<double,6>& th) {
         new BlurFieldProblem(p),p.tiles*p.bins),nullptr,th.data());
     ceres::Solver::Summary result;
     ceres::Solve(fitting::options(6),&fit,&result);
+    if (std::getenv("HELIREC_PROFILE_BLUR")) std::fprintf(stderr,"%s\n",result.FullReport().c_str());
     return fitting::summary(result);
 }
 
@@ -182,6 +186,7 @@ FitSummary fit_blur(const BlurFieldProblem& p, std::array<double,6>& th) {
 
 DetectorBlurField detector_blur_field_fit(const double* power, int ny, int nx, int tile, const int* ys, const int* xs,
                            std::size_t rows, std::size_t cols, double f_max) {
+    const auto profile_start = std::chrono::steady_clock::now();
     if (ny < 2 || nx < 2 || ny * nx < 6) throw Error("detector_blur_field_fit: at least 6 tiles spanning both detector axes are needed");
     if (tile < 32 || tile % 2) throw Error("detector_blur_field_fit: an even tile of at least 32 pixels is needed");
     if (!(f_max > 0.15 && f_max <= 0.42)) throw Error("detector_blur_field_fit: f_max must be in (0.15, 0.42] cycles per pixel");
@@ -248,6 +253,7 @@ DetectorBlurField detector_blur_field_fit(const double* power, int ny, int nx, i
         p.X.push_back((xs[t % nx] + 0.5 * tile - 0.5 * (static_cast<double>(cols) - 1)) / 1000.0);
         p.Yr.push_back((ys[t / nx] + 0.5 * tile - 0.5 * (static_cast<double>(rows) - 1)) / 1000.0);
     }
+    if (std::getenv("HELIREC_PROFILE_BLUR")) std::fprintf(stderr,"prep %.6f\n",std::chrono::duration<double>(std::chrono::steady_clock::now()-profile_start).count());
     DetectorBlurField out;
     std::vector<double> r;
     const double none[6] = {1e-9, 0, 0, 1e-9, 0, 0};
