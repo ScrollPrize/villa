@@ -210,6 +210,14 @@ set(srcs
     overlays/ScreenSpacePointIndex.hpp
     overlays/InkDetectionOverlayController.cpp
     overlays/InkDetectionOverlayController.hpp
+    inklabels/InkLabelController.cpp
+    inklabels/InkLabelController.hpp
+    inklabels/InkLabelIO.cpp
+    inklabels/InkLabelIO.hpp
+    inklabels/InkLabelLayer.cpp
+    inklabels/InkLabelLayer.hpp
+    inklabels/InkLabelPanel.cpp
+    inklabels/InkLabelPanel.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
@@ -529,7 +537,7 @@ if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
 endif()
 
 if(VC_TESTING)
-    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp scene3d/Scene3DPanel.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
+    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp scene3d/Scene3DPanel.cpp inklabels/InkLabelController.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
     # The in-binary store tests build their fixture volumes with core/test/support.
     target_include_directories(vc3d_app PUBLIC ${PROJECT_SOURCE_DIR}/core/test)
 endif()

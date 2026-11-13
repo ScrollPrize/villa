@@ -173,6 +173,20 @@ void InkDetectionOverlayController::setSelectedPath(const std::filesystem::path&
     refreshAll();
 }
 
+void InkDetectionOverlayController::addLocalDetection(const std::filesystem::path& path)
+{
+    const std::string segmentKey = activeSegmentKey();
+    if (segmentKey.empty() || path.empty()) {
+        return;
+    }
+    auto& local = _localOptionsBySegment[segmentKey];
+    if (std::none_of(local.begin(), local.end(), [&](const Option& option) { return option.localPath == path; })) {
+        local.push_back({QString::fromStdString(path.filename().string()), path.filename().string(), {}, path});
+    }
+    refreshOptionsForActiveSurface();
+    setSelectedPath(path);
+}
+
 void InkDetectionOverlayController::clearSelection()
 {
     setSelectedPath({});
@@ -338,6 +352,9 @@ void InkDetectionOverlayController::refreshOptionsForActiveSurface()
         } catch (const std::exception&) {
             next.clear();
         }
+    }
+    if (const auto local = _localOptionsBySegment.find(nextSegmentKey); local != _localOptionsBySegment.end()) {
+        next.insert(next.end(), local->second.begin(), local->second.end());
     }
 
     std::filesystem::path nextSelectedPath;
