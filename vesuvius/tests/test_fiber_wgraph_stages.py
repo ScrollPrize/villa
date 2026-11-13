@@ -87,19 +87,18 @@ def test_axial_only_request_cannot_reorient_or_overwrite_normal_priors(tmp_path,
     prior=tmp_path/'normal-priors.json';prior.write_text('existing normal priors')
     native=dict(orient_normals=True,database='original-graph.vcobj',normal_prior_output=str(prior),
                 orient_database='original-orientation.vcobj',normal_curves_output='original-curves.json')
-    def features(config,*,graph,fiber_source,source_pin):
+    def features(config,*,graph):
         generated=config['native_config']
-        original,pin=original_fiber_source(source)
-        assert fiber_source==original and source_pin==pin
+        assert config['database']==str(source)
         assert np.array_equal(graph.ids,ids)
         assert generated==native
         assert 'axial_prior_output' not in generated
-        return dict(format='fiber-axial-priors',version=1,source_ids=ids,agreement=np.array([-1,1]),
-                    fibers_digest=fibers_digest(original),fiber_source=pin,umbilicus_sha256='test')
+        return hv.AxialEvidence(graph.source,ids,np.array([-1,1]),'test')
     def solver(config,stage,**kwargs):
         return {},dict(ids=ids,labels=np.array([0,1]),probabilities=np.array([[1.,0.,0.],[0.,1.,0.]]))
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_wrapped_stages as wrapped
-    monkeypatch.setattr(hv,'axial_feature_columns',features)
+    monkeypatch.setattr(hv,'axial_evidence',features)
+    monkeypatch.setattr(hv,'fibers_digest',lambda *a,**k:pytest.fail('Native evidence must not audit every fiber'))
     monkeypatch.setattr(wrapped,'solve_stage',solver)
     monkeypatch.setattr(normal,'launch_tensor_solve',lambda config,*args:stages._run_direct_stage(config['workflow_stage'],config))
     stages.run_stage('hvb',dict(database=str(source),result_store=str(tmp_path/'hvb.vcobj'),
@@ -115,7 +114,7 @@ def test_generated_axial_columns_own_their_data_without_a_feature_file(tmp_path,
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
     source=measured_store(tmp_path,[(0,10,20,False,.5)],curves={
         10:[[10.,10.,5.],[30.,10.,5.]],20:[[10.,10.,0.],[10.,10.,60.]]})
-    graph=FiberGraph(source);fiber_source,pin=original_fiber_source(source)
+    graph=FiberGraph(source)
     axis=tmp_path/'axis.json'
     axis.write_text(json.dumps(dict(metadata=dict(volume=uid(999)+'-scan',volume_width=100,
         volume_height=100,volume_slices=80,voxelsize_um=2.),control_points=[
@@ -125,9 +124,11 @@ def test_generated_axial_columns_own_their_data_without_a_feature_file(tmp_path,
     def forbidden(*args,**kwargs):raise AssertionError('Axial preparation must not stage numeric arrays')
     monkeypatch.setattr(np,'load',forbidden);monkeypatch.setattr(np,'save',forbidden)
     monkeypatch.setattr(np,'savez',forbidden);monkeypatch.setattr(np.lib.format,'open_memmap',forbidden)
-    result=hv.axial_feature_columns(dict(native_config=native,workers=2,output_root=str(tmp_path/'no-output')),
-                                    graph=graph,fiber_source=fiber_source,source_pin=pin)
-    score=result['agreement'];expected=score.copy()
+    monkeypatch.setattr(hv,'fibers_digest',forbidden)
+    result=hv.axial_evidence(dict(database=str(source),native_config=native,workers=2,output_root=str(tmp_path/'no-output')),
+                             graph=graph)
+    assert result.source==graph.source
+    score=result.agreement;expected=score.copy()
     del result,graph
     gc.collect()
     np.testing.assert_array_equal(score,expected)

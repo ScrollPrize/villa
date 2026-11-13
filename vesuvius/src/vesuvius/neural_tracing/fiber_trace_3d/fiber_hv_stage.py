@@ -1,5 +1,6 @@
 """Second-stage whole-fiber H/V assignment after fixed normal-stage exclusions."""
 import argparse
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import time
@@ -62,8 +63,17 @@ def run_features(config):
         raise RuntimeError('Feature input changed during export')
 
 
-def axial_feature_columns(config, *, graph,fiber_source,source_pin):
-    """Return shared-kernel axial evidence directly, without an output file."""
+@dataclass(frozen=True)
+class AxialEvidence:
+    """In-process scores for the exact immutable graph snapshot consumed."""
+    source: dict
+    ids: np.ndarray
+    agreement: np.ndarray
+    umbilicus_sha256: str
+
+
+def axial_evidence(config, *, graph):
+    """Evaluate current graph geometry, not an external evidence-file artifact."""
     from vc_object_store import fiber_axial_prior_columns
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polyline_arrays
     native=config.get('native_config',{})
@@ -71,7 +81,8 @@ def axial_feature_columns(config, *, graph,fiber_source,source_pin):
     umbilicus=config.get('umbilicus',native.get('umbilicus'))
     if not umbilicus:raise ValueError('Native axial priors require an umbilicus input')
     before=sha256_file(umbilicus);started=time.monotonic()
-    ids,geometry=read_polyline_arrays(fiber_source,graph.ids,volume=graph.volume,source_version=source_pin)
+    ids,geometry=read_polyline_arrays(config['database'],graph.ids,volume=graph.volume,source_version=graph.source,
+                                    workers=int(config.get('workers',32)),trusted_immutable=True)
     if not np.array_equal(ids,graph.ids):raise ValueError('Axial geometry identity differs')
     print(json.dumps(dict(stage='axial_geometry_read',seconds=time.monotonic()-started,
         fibers=len(ids),points=len(geometry.values))),flush=True)
@@ -84,9 +95,7 @@ def axial_feature_columns(config, *, graph,fiber_source,source_pin):
     del geometry
     if sha256_file(umbilicus)!=before:raise ValueError('Umbilicus changed during axial prior computation')
     print(json.dumps(dict(stage='axial_priors_computed',seconds=time.monotonic()-phase,fibers=len(ids))),flush=True)
-    return dict(format='fiber-axial-priors',version=1,source_ids=ids,agreement=agreement,
-                fibers_digest=fibers_digest(fiber_source,source_version=source_pin),fiber_source=source_pin,
-                umbilicus_sha256=before)
+    return AxialEvidence(dict(graph.source),ids,agreement,before)
 
 
 def verify_feature_source(database,feature, *, graph=None):
@@ -122,15 +131,41 @@ def prepare(config, *, graph=None, return_arrays=False, feature=None):
     if stage1:
         prior_summary=json.loads((stage1.parent/'summary.json').read_text())
         if prior_summary['input']['signature']['database_sha256']!=signature['database']:raise ValueError('Stage1/DB mismatch')
-    ids, lengths = graph.ids, graph.lengths
-    if not len(ids) or not np.all(ids[1:]>ids[:-1]):raise ValueError('Expected nonempty ascending source IDs')
-    inherited=np.zeros(len(ids),dtype=bool)
+    inherited=np.zeros(len(graph.ids),dtype=bool)
     if stage1:
         with np.load(stage1,allow_pickle=False) as initial:
-            if not np.array_equal(ids,initial['ids']):raise ValueError('Stage1 IDs mismatch')
+            if not np.array_equal(graph.ids,initial['ids']):raise ValueError('Stage1 IDs mismatch')
             inherited=initial['broken'].copy()
-    if not np.array_equal(ids,feature['source_ids']):raise ValueError('Axial IDs mismatch')
-    a=np.asarray(feature['agreement'],np.float32)
+    data,stats=_prepare_columns(graph,feature['source_ids'],feature['agreement'],inherited,
+        signature,dict(fibers_digest=feature['fibers_digest'],umbilicus_sha256=feature['umbilicus_sha256']),start)
+    if return_arrays:return data,stats
+    cache.parent.mkdir(parents=True,exist_ok=True)
+    temporary=cache.with_suffix('.partial.npz')
+    np.savez(temporary,**data);temporary.replace(cache)
+    atomic_write(stamp,stats,durable=False);print('H/V preparation '+json.dumps(stats),flush=True)
+
+
+def prepare_evidence(config, evidence, *, graph):
+    """Admit native in-process evidence with snapshot and ordered-ID checks."""
+    from vc_object_store import CollectionReader
+    if not isinstance(evidence,AxialEvidence):raise TypeError('Expected in-process AxialEvidence')
+    start=time.monotonic()
+    with CollectionReader(str(config['database'])) as store:
+        if store.source!=graph.source or evidence.source!=graph.source:
+            raise ValueError('Axial evidence belongs to another graph snapshot')
+    if config.get('stage1'):raise ValueError('In-process H/V evidence precedes normal-sign alignment')
+    from .fiber_graph_store import snapshot_digest
+    signature=dict(version=1,database=snapshot_digest(graph.source),features=None,stage1=None)
+    return _prepare_columns(graph,evidence.ids,evidence.agreement,np.zeros(len(graph.ids),bool),
+        signature,dict(source=evidence.source,umbilicus_sha256=evidence.umbilicus_sha256),start)
+
+
+def _prepare_columns(graph, evidence_ids, agreement, inherited, signature, feature_identity, start):
+    """Shared numerical preparation for validated file and in-process evidence."""
+    ids,lengths=graph.ids,graph.lengths
+    if not len(ids) or not np.all(ids[1:]>ids[:-1]):raise ValueError('Expected nonempty ascending source IDs')
+    if not np.array_equal(ids,evidence_ids):raise ValueError('Axial IDs mismatch')
+    a=np.asarray(agreement,np.float32)
     if a.shape!=ids.shape or not np.isfinite(a).all() or np.any(abs(a)>1.00001):raise ValueError('Invalid axial scores')
     relation=np.where(graph.parallel,1.,-1.)
     ties=int((relation==0).sum());original_parallel=int((relation>0).sum());original_perp=int((relation<0).sum())
@@ -142,15 +177,11 @@ def prepare(config, *, graph=None, return_arrays=False, feature=None):
     degree=(np.bincount(i,minlength=len(active))+np.bincount(j,minlength=len(active))).astype(np.float32)
     data=dict(ids=ids,active=active,inherited=inherited,a=a[active],lengths=lengths[active],i=i,j=j,
               relation=relation[keep].astype(np.float32),degree=degree)
-    stats=dict(signature=signature,feature_identity=dict(fibers_digest=feature['fibers_digest'],umbilicus_sha256=feature['umbilicus_sha256']),
+    stats=dict(signature=signature,feature_identity=feature_identity,
                all_fibers=len(ids),inherited_broken=int(inherited.sum()),active_fibers=len(active),active_events=len(i),
                original_parallel=original_parallel,original_perpendicular=original_perp,tied_events_skipped=ties,
                isolated_active_fibers=int((degree==0).sum()),seconds=time.monotonic()-start)
-    if return_arrays:return data,stats
-    cache.parent.mkdir(parents=True,exist_ok=True)
-    temporary=cache.with_suffix('.partial.npz')
-    np.savez(temporary,**data);temporary.replace(cache)
-    atomic_write(stamp,stats,durable=False);print('H/V preparation '+json.dumps(stats),flush=True)
+    return data,stats
 
 
 def readout_metrics(probs,data,stats):

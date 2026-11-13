@@ -39,6 +39,34 @@ def test_direct_stage_preparation_returns_arrays_without_tensor_files(tmp_path,m
     assert stats['tensor_bytes']==0 and not (tmp_path/'no-work-files').exists()
 
 
+def test_inprocess_axial_evidence_shares_math_without_reference_audits(tmp_path,monkeypatch):
+    from dataclasses import replace
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_hv_stage as hv
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
+    source=measured_store(tmp_path,[(0,10,20,False,.5),(1,10,30,True,1.)])
+    graph=FiberGraph(source);ids=graph.ids
+    evidence=hv.AxialEvidence(graph.source,ids,np.asarray([-1,1,0],np.float32),'axis')
+    config=dict(database=str(source),output_root=str(tmp_path/'no-files'))
+    def forbidden(*args,**kwargs):raise AssertionError('In-process evidence must not audit or stage full corpora')
+    monkeypatch.setattr(hv,'fibers_digest',forbidden)
+    monkeypatch.setattr(hv,'verify_feature_source',forbidden)
+    monkeypatch.setattr(np,'load',forbidden);monkeypatch.setattr(np,'savez',forbidden)
+    data,stats=hv.prepare_evidence(config,evidence,graph=graph)
+    np.testing.assert_array_equal(data['a'],evidence.agreement)
+    np.testing.assert_array_equal(data['relation'],[-1,1])
+    np.testing.assert_array_equal(data['degree'],[2,1,1])
+    assert data['a'].dtype==np.float32 and data['relation'].dtype==np.float32
+    assert stats['active_fibers']==3 and stats['active_events']==2
+    assert stats['feature_identity']==dict(source=graph.source,umbilicus_sha256='axis')
+    with pytest.raises(ValueError,match='snapshot'):
+        hv.prepare_evidence(config,replace(evidence,source={}),graph=graph)
+    with pytest.raises(ValueError,match='IDs'):
+        hv.prepare_evidence(config,replace(evidence,ids=ids[::-1]),graph=graph)
+    with pytest.raises(TypeError,match='AxialEvidence'):
+        hv.prepare_evidence(config,{},graph=graph)
+    assert not (tmp_path/'no-files').exists()
+
+
 def _centers(control,n):
     """Independent transcription of the pre-extraction VC float32 centers."""
     points=np.asarray(control,np.float32);points=points[np.argsort(points[:,2])]

@@ -53,6 +53,7 @@ def run_stage(stage,config):
     if destination.exists():raise FileExistsError(destination)
     root=Path(config.get('output_root',str(destination)+'.work'))
     settings=dict(config,output_root=str(root),devices=config.get('devices','1'))
+    settings.setdefault('sqlite_memory_statistics',False)
     manager=dict(settings.get('gpu_manager',{}));manager.setdefault('exclusive',False);settings['gpu_manager']=manager
     if stage=='uv':return _run_uv(settings)
     if stage!='winding':raise ValueError(stage)
@@ -226,4 +227,7 @@ if __name__=='__main__':
     parser.add_argument('--unmanaged',action='store_true');parser.add_argument('--devices')
     args=parser.parse_args()
     if not args.unmanaged:raise RuntimeError('Use the managed workflow')
-    solve(json.loads(Path(args.config).read_text()))
+    config=json.loads(Path(args.config).read_text())
+    from .fiber_graph_store import configure_solver_sqlite
+    configure_solver_sqlite(config)
+    solve(config)

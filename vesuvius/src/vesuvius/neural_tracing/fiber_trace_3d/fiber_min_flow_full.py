@@ -60,7 +60,8 @@ class PackedPaths:
         source=config['input_store']
         volume=workflow_volume(dict(fibers=source,working_volume=config.get('working_volume')))
         selected,packed=read_polyline_arrays(source,ids,volume=volume,
-                                            source_version=config.get('input_source'))
+                                            source_version=config.get('input_source'),
+                                            workers=int(config.get('workers',32)),trusted_immutable=True)
         result=cls.__new__(cls);result.root=None;result.data=None
         result.ids=selected;result.offset=np.asarray(packed.offsets,dtype=np.int64)
         result.xyz=packed.values

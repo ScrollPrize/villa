@@ -130,6 +130,7 @@ def _graph(config, base):
 
 def _solver_config(config, root):
     settings=dict(config)
+    settings.setdefault('sqlite_memory_statistics',False)
     if settings.get('optimizer','wrapped_irls')!='wrapped_irls':
         raise ValueError('vc_wgraph hvb/sign currently use the existing wrapped_irls backend')
     manager=dict(settings.get('gpu_manager',{}))
@@ -184,12 +185,11 @@ def _run_direct_stage(stage, config):
                 raise ValueError('hvb needs axial features, or native_config to generate them with the existing extractor')
             native=(dict(config['native_config']) if isinstance(config['native_config'],dict)
                     else json.loads(Path(config['native_config']).read_text()))
-            from .fiber_graph_store import original_fiber_source
-            fiber_source,pin=original_fiber_source(base)
-            feature=hv.axial_feature_columns(dict(settings,native_config=native),graph=graph,
-                fiber_source=fiber_source,source_pin=pin)
-        else:feature=None
-        data,stats=hv.prepare(settings,graph=graph,return_arrays=True,feature=feature)
+            feature=hv.axial_evidence(dict(settings,native_config=native),graph=graph)
+            data,stats=hv.prepare_evidence(settings,feature,graph=graph)
+        else:
+            feature=None
+            data,stats=hv.prepare(settings,graph=graph,return_arrays=True)
         expected_ids=graph.ids;del graph,feature
         summary,saved=solve_stage(settings,'classification',data=data,stats=stats,return_solution=True)
         ids=saved['ids'];labels=saved['labels'];probabilities=saved['probabilities']
@@ -231,4 +231,6 @@ if __name__=='__main__':
     args=parser.parse_args()
     if not args.unmanaged:raise RuntimeError('Use the managed workflow entry point')
     config=json.loads(Path(args.config).read_text())
+    from .fiber_graph_store import configure_solver_sqlite
+    configure_solver_sqlite(config)
     _run_direct_stage(config['workflow_stage'],config)

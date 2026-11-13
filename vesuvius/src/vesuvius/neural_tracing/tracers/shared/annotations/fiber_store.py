@@ -201,23 +201,27 @@ def read_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
     return list(iter_polylines(path, fiber_ids, volume=volume, source_version=source_version))
 
 
-def read_polyline_arrays(path, fiber_ids, *, volume=None, source_version=None):
+def read_polyline_arrays(path, fiber_ids, *, volume=None, source_version=None, workers=1, trusted_immutable=False):
     """Current packed XYZ and UUID columns, without Python per-fiber records.
 
     Native reading captures metadata/geometry together and performs coordinate
     mapping under the same source-position guard. Returned buffers own their
     data after the store transaction closes.
     """
+    from vc_object_store import CollectionReader,fiber_uuid_bytes
     if fiber_ids is None:raise ValueError('Packed polyline reads require explicit fiber IDs')
     volume = volume or fiber_volume(path)
-    selected = _canonical_fiber_ids(fiber_ids)
-    with open_store(path) as store:
-        with store.geometry_read(object_kind='fiber', object_uuids=selected, volume=volume,
-                                 limit=0 if not selected else None, expected_position=source_version) as view:
-            ids = view.object_uuids
-            if ids != selected:raise ValueError('Unknown requested fiber')
-            packed = view.read_geometry_arrays('line_points', volume=volume)
-    return np.asarray(ids, dtype='U36'), packed
+    raw=np.asarray(fiber_ids if isinstance(fiber_ids,np.ndarray) else list(fiber_ids),dtype=str)
+    if raw.ndim!=1:raise ValueError('Fiber IDs must be a one-dimensional column')
+    if len(raw):
+        encoded=np.char.encode(raw,'ascii')
+        binary=fiber_uuid_bytes(encoded.view(np.uint8).reshape(len(raw),encoded.dtype.itemsize),workers)
+    else:binary=np.empty((0,16),np.uint8)
+    with CollectionReader(str(path)) as store:
+        columns=store.geometry_array_columns(binary,'line_points',object_kind='fiber',volume=volume,
+                                             expected_position=source_version,workers=workers,
+                                             trusted_immutable=trusted_immutable)
+    return columns['uuid_ascii'].view('S36').reshape(-1).astype('U36'),columns['geometry']
 
 
 def _canonical_fiber_ids(fiber_ids):

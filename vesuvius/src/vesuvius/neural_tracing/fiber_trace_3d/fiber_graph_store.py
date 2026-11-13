@@ -17,6 +17,17 @@ CACHE_COLUMNS = ('ids','uuid_bytes','lengths','event_ids','edge_uuid_bytes','i',
                  'normal_a','normal_b','connector','distance','parallel','valid_a','valid_b','valid_connector')
 
 
+def configure_solver_sqlite(config):
+    """Bulk-worker startup only: avoid SQLite's global allocator counters.
+
+    This must run before opening a connection, not inside a live read API.
+    Ordinary library users retain their existing SQLite runtime defaults.
+    """
+    from vc_object_store import configure_sqlite_runtime
+    configure_sqlite_runtime(memory_statistics=bool(config.get('sqlite_memory_statistics',False)),
+        pagecache_bulk_bytes=int(config.get('sqlite_pagecache_bulk_bytes',0)))
+
+
 def workflow_volume(config):
     """The measurement frame, or an explicit frame for already-prepared inputs.
 
