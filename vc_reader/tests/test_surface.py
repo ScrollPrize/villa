@@ -53,6 +53,19 @@ class SurfaceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'explicit'):
                     reader.read((0,0,0),(1,1,1))
 
+    def test_bicubic_patch_matches_containing_patch(self):
+        # A curved sheet: a patch's window must carry the vertices its Hermite derivatives need,
+        # so its border cells render as the same pixels of a larger patch.
+        y,x=np.indices((8,9),dtype=np.float32)
+        xyz=np.stack((x+3,y+2,6+1.5*np.sin(x/1.7)*np.cos(y/2.3)))
+        coords=self.source('curved',xyz,('c','y','x'),role='scalar')
+        surface=self.surface.replace(id='curved',geometry=coords.storage)
+        with open_sample(self.reference) as reader:
+            whole=reader.render_surface(surface,(0,0),(8,9),offsets_um=(-2,0,2),interpolation='bicubic')
+            part=reader.render_surface(surface,(2,3),(3,3),offsets_um=(-2,0,2),interpolation='bicubic')
+            np.testing.assert_array_equal(host(part['image'].valid),host(whole['image'].valid)[:,:,2:5,3:6])
+            np.testing.assert_allclose(host(part['image'].data),host(whole['image'].data)[:,:,2:5,3:6],rtol=0,atol=1e-3)
+
     def test_projection_crop_padding_thickness_and_tiling(self):
         results=[]
         for backend in self.backends():
