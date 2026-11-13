@@ -222,7 +222,7 @@ def maybe_compile_model(
     return _CompiledWithEagerFallback(model, compiled_model), True
 
 
-DEVICE_CHOICES = ("auto", "cpu", "mps", "cuda")
+DEVICE_CHOICES = ("auto", "cpu", "mps", "cuda", "xpu")
 
 
 def prepare_model_for_inference(
@@ -256,7 +256,7 @@ def prepare_model_for_inference(
         device = torch.device(f"cuda:{requested[0]}")
     elif device_type == "auto":
         # get_accelerator() tries cuda first, so CUDA hosts resolve exactly as before;
-        # it adds mps for Apple Silicon, which otherwise fell back to cpu here.
+        # it adds mps for Apple Silicon and xpu for Intel GPUs, which otherwise fell back to cpu here.
         device = get_accelerator()
     elif device_type == "cuda":
         if not torch.cuda.is_available():
@@ -266,6 +266,10 @@ def prepare_model_for_inference(
         if not torch.backends.mps.is_available():
             raise ValueError("--device mps was requested, but MPS is unavailable")
         device = torch.device("mps")
+    elif device_type == "xpu":
+        if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+            raise ValueError("--device xpu was requested, but XPU is unavailable")
+        device = torch.device("xpu")
     else:
         device = torch.device("cpu")
 
