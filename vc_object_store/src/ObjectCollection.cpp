@@ -4,6 +4,7 @@
 #include "internal/ImmutableImport.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/ObjectScan.hpp"
 #include "internal/EdgeSql.hpp"
 #include "vc_object_store/objects/EdgeKinds.hpp"
 #include "internal/CollectionSchema.hpp"
@@ -739,10 +740,11 @@ std::optional<CollectionObject> ObjectCollection::objectById(const CollectionTxn
     return found?object(t,*found):std::nullopt;
 }
 void ObjectCollection::scanObjects(const CollectionTxn& t,const std::function<bool(const CollectionObject&)>& visit,const std::optional<std::string>& kind)const{
-    ObjectSelection selection;selection.kind=kind;selection.limit=4096;
-    while(true){const auto rows=impl_->nodes[0].store->selectObjects(impl_->txn(t,0),selection);if(rows.empty())break;
-        for(const auto& row:rows){const auto resolved=object(t,{uuid(t),row.uuid});if(resolved&&!visit(*resolved))return;}
-        selection.afterUuid=rows.back().uuid;}
+    ObjectSelection selection;selection.kind=kind;
+    scanVisibleObjects(impl_->db(t,0),selection,std::nullopt,[&](ObjectRecord&& row){
+        const ObjectKey key{row.versionStoreUuid,row.uuid};
+        return visit(CollectionObject{key,std::move(row)});
+    });
 }
 std::optional<GeometryRevision> ObjectCollection::currentGeometry(const CollectionTxn& t,const ObjectKey& key)const{
     return impl_->nodes[0].store->currentGeometry(impl_->txn(t,0),canonical(key).objectUuid);

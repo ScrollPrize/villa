@@ -65,7 +65,9 @@ std::string projectedObjectColumns(const ObjectFields& fields)
     std::string sql = "id";
     for (const auto& [name, fallback] : columns) {
         valid.insert(name);
-        sql += "," + (wants(fields, name) ? name : fallback);
+        // Publication identity accompanies every listing, independently of
+        // the requested content projection, in the same indexed row read.
+        sql += "," + ((wants(fields, name)||name=="version"||name=="version_generation") ? name : fallback);
     }
     for (const auto& field : *fields)
         if (!valid.contains(field)) throw std::invalid_argument("unknown object projection field: " + field);
@@ -173,10 +175,10 @@ template<class Visit> void detailTables(Visit visit)
 }
 
 ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details,
-                           const std::string* initialGeneration, bool lifecycle)
+                           const std::string* initialGeneration, bool lifecycle, const std::string* ownerStore)
 {
     ObjectRecord rec;
-    rec.versionStoreUuid=storeUuidText(db);
+    rec.versionStoreUuid=ownerStore?*ownerStore:storeUuidText(db);
     const int64_t id = s.i64(0);
     readCommon(rec, s, 1, 2, 4);
     rec.name = s.text(3);
@@ -212,22 +214,39 @@ std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const Obj
 {
     const bool hydrate = wants(fields, "tags") || wants(fields, "fiber") || wants(fields, "surface") || wants(fields, "track");
     const bool lifecycle = wants(fields, "retired") || wants(fields, "lifecycle_epoch");
-    std::string initialGeneration;
-    Statement lineage(db, "SELECT initial_generation FROM store_manifest WHERE singleton=1");
-    if (lineage.row()) initialGeneration = lineage.uuid(0);
+    std::string initialGeneration,ownerStore;
+    Statement lineage(db, "SELECT m.initial_generation,i.uuid FROM store_manifest m CROSS JOIN store_identity i WHERE m.singleton=1");
+    if (!lineage.row()) throw std::runtime_error("object store: missing publication identity");
+    initialGeneration = lineage.uuid(0);ownerStore = lineage.uuid(1);
     std::vector<ObjectRecord> result;
-    nlohmann::json ids = nlohmann::json::array();
-    std::unordered_map<int64_t, size_t> positions;
-    std::set<std::string> kinds;
+    std::vector<int64_t> ids;
     while (rows.row()) {
-        if (hydrate || lifecycle) { positions.emplace(rows.i64(0), result.size()); ids.push_back(rows.i64(0)); }
-        result.push_back(readObjectRow(db, rows, false, &initialGeneration, false));
-        if (!wants(fields, "retired")) result.back().retired = false;
-        if (!wants(fields, "lifecycle_epoch")) result.back().lifecycleEpoch.clear();
-        if (hydrate) kinds.insert(result.back().kind);
+        if (hydrate || lifecycle) ids.push_back(rows.i64(0));
+        result.push_back(readObjectRow(db, rows, false, &initialGeneration, false, &ownerStore));
     }
-    if (result.empty() || (!hydrate && !lifecycle)) return result;
-    const auto selection = ids.dump();
+    hydrateObjectRows(db,result,ids,fields);
+    return result;
+}
+
+void hydrateObjectRows(sqlite3* db,std::vector<ObjectRecord>& result,std::span<const int64_t> ids,
+                       const ObjectFields& fields)
+{
+    const bool hydrate = wants(fields, "tags") || wants(fields, "fiber") || wants(fields, "surface") || wants(fields, "track");
+    const bool lifecycle = wants(fields, "retired") || wants(fields, "lifecycle_epoch");
+    for(auto& record:result){
+        if(!wants(fields,"retired"))record.retired=false;
+        if(!wants(fields,"lifecycle_epoch"))record.lifecycleEpoch.clear();
+    }
+    if (result.empty() || (!hydrate && !lifecycle)) return;
+    if(result.size()!=ids.size())throw std::invalid_argument("object row hydration needs one ID per row");
+    std::unordered_map<int64_t,size_t> positions;
+    positions.reserve(ids.size());
+    std::set<std::string> kinds;
+    for(size_t i=0;i<ids.size();++i){
+        positions.emplace(ids[i],i);
+        if(hydrate)kinds.insert(result[i].kind);
+    }
+    const auto selection = nlohmann::json(std::vector<int64_t>(ids.begin(),ids.end())).dump();
     if (lifecycle) {
         Statement states(db, "SELECT id,state,lifecycle_epoch FROM objects WHERE id IN (SELECT value FROM json_each(?))", selection);
         while (states.row()) {
@@ -248,7 +267,6 @@ std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const Obj
         Statement detail(db, sql, selection);
         while (detail.row()) result.at(positions.at(detail.i64(idColumn))).*member = read(detail);
     });
-    return result;
 }
 
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid)

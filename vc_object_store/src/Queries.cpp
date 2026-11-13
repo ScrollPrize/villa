@@ -8,6 +8,7 @@
 #include "geometry/GeometryToken.hpp"
 #include "internal/RecordResolver.hpp"
 #include "internal/VisibleRows.hpp"
+#include "internal/ObjectScan.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -257,13 +258,12 @@ std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const Objec
 
 namespace {
 std::vector<ObjectRecord> selectPhysicalObjects(sqlite3* db, const ObjectSelection& selection,
-    const ObjectFields& fields, bool published)
+    const ObjectFields& fields)
 {
     if(selection.bbox)requireSpatial(db);
     if (!selection.volume && !selection.includeUnbound && !selection.minLength && selection.orderBy!="length_desc") {
         auto rows = objectSelectionQuery(db, selection, projectedObjectColumns(fields));
         auto records = readObjectRows(db, *rows, fields);
-        if (published) attachObjectVersions(db, records);
         return records;
     }
     const auto order = measuredSelection(db, selection);
@@ -281,7 +281,6 @@ std::vector<ObjectRecord> selectPhysicalObjects(sqlite3* db, const ObjectSelecti
     if (selection.orderBy == "length_desc")
         for (auto& record : records)
             if (const auto& row = order[position.at(record.uuid)]; row.bound) record.volumeLength=row.volume;
-    if (published) attachObjectVersions(db, records);
     return records;
 }
 
@@ -295,6 +294,54 @@ bool restrictConnected(const ObjectStore& store,const Txn& txn,ObjectSelection& 
 }
 }
 
+void detail::scanVisibleObjects(sqlite3* db,const ObjectSelection& selection,const ObjectFields& fields,
+                                const std::function<bool(ObjectRecord&&)>& visit)
+{
+    if(selection.limit&&*selection.limit==0) {
+        (void)objectSelectionQuery(db,selection,projectedObjectColumns(fields));
+        return;
+    }
+    auto physical=selection;physical.limit.reset();physical.offset=0;
+    const auto columns=projectedObjectColumns(fields);
+    VisibleObjectRows rows(db,[&](auto* source){return objectSelectionQuery(source,physical,columns);},1);
+    struct Batch {
+        std::vector<ObjectRecord> records;
+        std::vector<int64_t> ids;
+        std::vector<size_t> positions;
+        std::string owner,generation;
+    };
+    std::map<sqlite3*,Batch> batches;
+    for(auto* source:querySources(db)) {
+        auto& batch=batches[source];
+        Statement identity(source,"SELECT s.uuid,m.initial_generation FROM store_identity s CROSS JOIN store_manifest m WHERE s.singleton=1 AND m.singleton=1");
+        if(!identity.row())throw std::runtime_error("object scan: source identity is missing");
+        batch.owner=identity.uuid(0);batch.generation=identity.uuid(1);
+    }
+    int64_t skipped=0,emitted=0;
+    const size_t capacity=selection.limit?size_t(std::min<int64_t>(*selection.limit,256)):256;
+    std::vector<ObjectRecord> ordered;ordered.reserve(capacity);
+    auto flush=[&]{
+        for(auto& [source,batch]:batches) {
+            if(batch.records.empty())continue;
+            hydrateObjectRows(source,batch.records,batch.ids,fields);
+            for(size_t i=0;i<batch.records.size();++i)ordered[batch.positions[i]]=std::move(batch.records[i]);
+            batch.records.clear();batch.ids.clear();batch.positions.clear();
+        }
+        for(auto& record:ordered)if(!visit(std::move(record)))return false;
+        ordered.clear();return true;
+    };
+    while(rows.row()) {
+        if(skipped<selection.offset){++skipped;continue;}
+        auto& batch=batches.at(rows.source());
+        batch.ids.push_back(rows.values().i64(0));batch.positions.push_back(ordered.size());
+        batch.records.push_back(readObjectRow(rows.source(),rows.values(),false,&batch.generation,false,&batch.owner));
+        ordered.emplace_back();++emitted;
+        if(ordered.size()==capacity&&!flush())return;
+        if(selection.limit&&emitted==*selection.limit)break;
+    }
+    if(!ordered.empty())flush();
+}
+
 std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const ObjectSelection& requested,
     const std::optional<std::vector<std::string>>& projection) const
 {
@@ -303,10 +350,16 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     if(selection.offset<0||(selection.limit&&*selection.limit<0))throw std::invalid_argument("selection limit and offset must be nonnegative");
     if(selection.volume&&!selection.transforms)selection.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     const ObjectFields fields=projection?ObjectFields(std::in_place,projection->begin(),projection->end()):std::nullopt;
-    if(querySources(db).size()==1)return selectPhysicalObjects(db,selection,fields,!txn.write_);
-    if(!restrictConnected(*this,txn,selection))return {};
+    const bool composed=querySources(db).size()>1;
+    if(composed&&!restrictConnected(*this,txn,selection))return {};
+    if(!selection.volume&&!selection.includeUnbound&&!selection.minLength&&selection.orderBy=="uuid") {
+        std::vector<ObjectRecord> result;
+        scanVisibleObjects(db,selection,fields,[&](ObjectRecord&& row){result.push_back(std::move(row));return true;});
+        return result;
+    }
+    if(!composed)return selectPhysicalObjects(db,selection,fields);
     auto physical=selection;physical.limit.reset();physical.offset=0;
-    return selectVisibleRecords(db,[&](auto* source){return selectPhysicalObjects(source,physical,fields,!txn.write_);},
+    return selectVisibleRecords(db,[&](auto* source){return selectPhysicalObjects(source,physical,fields);},
         [&](const auto& record,auto* source){return objectSource(db,record.uuid)==source;},[&](const auto& a,const auto& b){
         if(selection.orderBy=="length_desc"){
             const auto x=a.volumeLength,y=b.volumeLength;

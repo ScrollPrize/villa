@@ -44,9 +44,14 @@ std::optional<std::array<double, 6>> readBbox(const Statement& s, int firstCol);
 void bindBbox(Statement& s, int firstIdx, const std::optional<std::array<double, 6>>& box);
 
 ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details = true,
-                           const std::string* initialGeneration = nullptr, bool lifecycle = true);
+                           const std::string* initialGeneration = nullptr, bool lifecycle = true,
+                           const std::string* ownerStore = nullptr);
 
 std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
+// Hydrate one physical source's decoded rows in a bounded batch. IDs and rows
+// are in the same order; complete owner/version identities are retained.
+void hydrateObjectRows(sqlite3*, std::vector<ObjectRecord>&, std::span<const int64_t>,
+                       const ObjectFields& fields = std::nullopt);
 
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 

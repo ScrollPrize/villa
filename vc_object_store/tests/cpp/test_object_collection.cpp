@@ -4,11 +4,78 @@
 #include "vc_object_store/objects/StoreConversion.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
+#include "internal/CollectionReads.hpp"
 #include <iostream>
 #include <cstring>
+#include <algorithm>
+#include <string_view>
 using namespace vc::objects;
 using namespace vc::objects::detail;
 ObjectRecord fiber(){ObjectRecord r;r.kind="fiber";r.fiber.emplace();return r;}
+
+void boundedVisibleScan()
+{
+    TemporaryDirectory dir;OpenOptions options;options.author="scan-test";options.history=HistoryMode::Off;options.spatialIndex=false;
+    constexpr size_t count=5000;
+    std::vector<std::string> ids;for(size_t i=0;i<count;++i)ids.push_back(util::nameUuid("bounded-scan-"+std::to_string(i)));
+    std::sort(ids.begin(),ids.end());
+    const auto base=dir.path/"base",early=dir.path/"early",late=dir.path/"late",root=dir.path/"root";
+    std::string baseOwner,lateOwner,lateGeneration;int64_t lateCommit=0;
+    {auto store=ObjectStore::create(base,options);auto txn=store.write();baseOwner=store.uuid(txn);
+        for(const auto& id:ids){ObjectRecord record;record.uuid=id;record.kind="note";record.tags={"eligible"};store.upsertObject(txn,record);}
+        store.seal(txn);txn.commit();}
+    auto lateOptions=options;lateOptions.objectIdRange={101,200};
+    {auto store=ObjectCollection::create(late,{base},lateOptions);auto txn=store.write();lateOwner=store.uuid(txn);
+        auto changed=store.object(txn,{{},ids[0]})->record;changed.name="late override";changed.tags.clear();
+        store.replaceObject(txn,{{},ids[0]},changed);store.deleteObject(txn,{{},ids[1]});store.seal(txn);txn.commit();
+        auto read=store.read();const auto p=store.provisioning(read);lateGeneration=p.generation;lateCommit=p.commitSequence;}
+    // Both partitions form one logical layer. An earlier partition's base
+    // must not win over a later partition's override or deletion.
+    auto earlyOptions=options;earlyOptions.objectIdRange={1,100};
+    earlyOptions.creationStoreUuid=lateOwner;earlyOptions.creationGeneration=lateGeneration;
+    {auto store=ObjectCollection::create(early,{base},earlyOptions);auto txn=store.write();store.seal(txn);txn.commit();
+        auto read=store.read();require(store.provisioning(read).commitSequence==lateCommit,"partition fixtures share the publication pin");}
+    {auto store=ObjectCollection::publishShards(root,{early,late},options);}
+    auto store=ObjectCollection::open(root,OpenOptions{.readOnly=true});auto txn=store.read();
+    struct RowCount {
+        std::vector<sqlite3*> sources;size_t count=0;
+        RowCount(const ObjectCollection& store,const CollectionTxn& txn) {
+            for(const auto& source:CollectionScanAccess::partitions(store,txn)) {
+                sources.push_back(source.db);
+                sqlite3_trace_v2(source.db,SQLITE_TRACE_ROW,[](unsigned,void* context,void* statement,void*){
+                    auto* query=static_cast<sqlite3_stmt*>(statement);
+                    if(sqlite3_column_count(query)>=23&&std::string_view(sqlite3_column_name(query,0))=="id"&&
+                       std::string_view(sqlite3_column_name(query,1))=="uuid")++static_cast<RowCount*>(context)->count;
+                    return 0;
+                },this);
+            }
+        }
+        ~RowCount(){for(auto* source:sources)sqlite3_trace_v2(source,0,nullptr,nullptr);}
+    } work(store,txn);
+    size_t seen=0;
+    store.scanObjects(txn,[&](const CollectionObject& row){
+        require(row.record.uuid==ids[0]&&row.record.name=="late override"&&row.key.storeUuid==lateOwner,
+                "early scan sees the late-sibling override and its actual owner");++seen;return false;
+    },"note");
+    require(seen==1&&work.count<=260,"early-stop scan decodes only one bounded batch, not the whole store");
+    work.count=0;std::vector<std::string> found;
+    store.scanObjects(txn,[&](const CollectionObject& row){
+        require(row.record.versionStoreUuid==row.key.storeUuid,"streamed record retains its selected owner reference");
+        require(row.key.storeUuid==(row.record.uuid==ids[0]?lateOwner:baseOwner),"source ownership does not become root ownership");
+        found.push_back(row.record.uuid);return true;
+    },"note");
+    auto expected=ids;expected.erase(expected.begin()+1);
+    require(found==expected,"one-pass scan is UUID ordered and suppresses tombstones and shadowed duplicates");
+    require(work.count<=count+4,"one-pass scan neither rescans pages nor rereads emitted full records");
+    txn.commit();
+    auto ordinary=ObjectStore::open(root,OpenOptions{.readOnly=true});auto read=ordinary.read();
+    ObjectSelection selection;selection.kind="note";selection.tag="eligible";selection.limit=1;
+    const auto selected=ordinary.selectObjects(read,selection,std::vector<std::string>{"name"});
+    require(selected.size()==1&&selected[0].uuid==ids[2],"filtered upper overrides and tombstones still suppress matching lower records");
+    selection.tag.reset();selection.afterUuid=ids[4095];selection.limit=3;
+    const auto page=ordinary.selectObjects(read,selection,std::vector<std::string>{});
+    require(page.size()==3&&page[0].uuid==ids[4096]&&page[2].uuid==ids[4098],"cursor pagination seeks directly past its UUID boundary");
+}
 
 void metadataOverrides()
 {
@@ -187,6 +254,7 @@ void metadataOverridesOfDeltaGeometry()
     }
 }
 int main()try{
+    boundedVisibleScan();
     metadataOverrides();
     metadataOverridesOfDeltaGeometry();
     TemporaryDirectory dir;
