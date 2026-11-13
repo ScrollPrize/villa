@@ -164,20 +164,31 @@ void normalize_crop(T* values, std::size_t n, const Normalize& t, const std::uin
 // Surface volumes are uint8, so their float crops hold at most 256 distinct
 // values. Then every order statistic is a histogram bin, and the output is a
 // 256-entry table of the same per-value expression: the result is identical
-// to the general path below. Returns false, without touching values, for
-// other data (including -0.0, whose sign the general path keeps) and for a
-// degenerate robust scale (its std fallback is an ordered float64 sum over
-// the voxels).
+// to the general path below. The CUDA backend counts the bins on the device
+// and builds the same table with uint8_order_table.
+// The bin of a value that is an integer in [0, 255]; -0.0 has none, because
+// the general path keeps its sign.
+template<class T> VCR_HD bool uint8_bin(T v, unsigned& b) {
+    if (!(v >= T(0) && v <= T(255)) || std::signbit(v)) return false;
+    b = static_cast<unsigned>(v);
+    return T(b) == v;
+}
+// Counts the selected values into 256 bins; false, when a value has no bin.
 template<class T>
-bool normalize_order_uint8(T* values, std::size_t n, const Normalize& t, const std::uint8_t* valid) {
-    std::array<std::size_t, 256> count{};
+bool uint8_histogram(const T* values, std::size_t n, const std::uint8_t* valid, unsigned long long* count) {
+    std::fill(count, count + 256, 0ull);
     for (std::size_t i = 0; i < n; ++i) {
-        const T v = values[i];
-        if (!(v >= T(0) && v <= T(255)) || std::signbit(v)) return false;
-        const auto b = static_cast<unsigned>(v);
-        if (T(b) != v) return false;
+        unsigned b;
+        if (!uint8_bin(values[i], b)) return false;
         if (!valid || valid[i]) ++count[b];
     }
+    return true;
+}
+// The output value of each bin. False selects the general path: no value is
+// selected, or the robust scale is degenerate (its std fallback is an ordered
+// float64 sum over the voxels). Options holds Normalize's mode and percentiles.
+template<class T, class Options>
+bool uint8_order_table(const unsigned long long* count, const Options& t, T* table) {
     std::array<std::size_t, 256> below{};  // number of selected values < bin + 1
     std::size_t selected = 0;
     for (std::size_t b = 0; b < 256; ++b) below[b] = selected += count[b];
@@ -198,13 +209,13 @@ bool normalize_order_uint8(T* values, std::size_t n, const Normalize& t, const s
     if (t.mode == Normalization::Percentile) {
         scale = percentile_scale(low, high, t.median);
         center = t.median ? order(clipped, 50) : low;
-        if (scale == 0) { std::fill(values, values + n, T{0}); return true; }
+        if (scale == 0) { std::fill(table, table + 256, T{0}); return true; }
     } else {
         center = order(clipped, 50);
         std::array<std::pair<double, std::size_t>, 256> deviations;
         std::size_t used = 0;
         for (std::size_t b = 0; b < 256; ++b)
-            if (count[b]) deviations[used++] = {std::abs(clipped(b) - center), count[b]};
+            if (count[b]) deviations[used++] = {std::abs(clipped(b) - center), std::size_t(count[b])};
         std::sort(deviations.begin(), deviations.begin() + used);
         std::array<std::size_t, 256> upto{};
         for (std::size_t j = 0, total = 0; j < used; ++j) upto[j] = total += deviations[j].second;
@@ -214,8 +225,15 @@ bool normalize_order_uint8(T* values, std::size_t n, const Normalize& t, const s
         scale = 1.4826 * mad;
         if (!(std::isfinite(scale) && scale >= 1e-6)) return false;
     }
-    std::array<T, 256> table;
     for (std::size_t b = 0; b < 256; ++b) table[b] = finite_or_zero<T>((clipped(b) - center) / scale);
+    return true;
+}
+// Returns false, without touching values, when the general path must run.
+template<class T>
+bool normalize_order_uint8(T* values, std::size_t n, const Normalize& t, const std::uint8_t* valid) {
+    std::array<unsigned long long, 256> count;
+    std::array<T, 256> table;
+    if (!uint8_histogram(values, n, valid, count.data()) || !uint8_order_table(count.data(), t, table.data())) return false;
     for (std::size_t i = 0; i < n; ++i) values[i] = table[static_cast<unsigned>(values[i])];
     return true;
 }

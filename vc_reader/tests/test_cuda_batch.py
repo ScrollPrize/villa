@@ -190,6 +190,34 @@ class CudaBatchTests(unittest.TestCase):
             with self.subTest(transform=repr(transform)):
                 self.compare(transform, {'image': image})
 
+    def test_uint8_valued_order_normalization_matches_cpu(self):
+        # Integer values in [0, 255] take the histogram path on both backends,
+        # so CUDA returns the CPU's bytes. Batches mix it with the sorted path.
+        rng = np.random.default_rng(91)
+        tiny = rng.integers(0, 256, (3, 1, 1, 3)).astype(np.float32)  # percentiles interpolate
+        crop = rng.integers(0, 256, (9, 37, 41)).astype(np.float32)
+        skewed = np.clip(np.round(rng.normal(90, 25, crop.shape)), 0, 255).astype(np.float32)
+        sparse = skewed.copy(); sparse[:, :, 30:] = 0  # zeros below half: MAD > 0
+        targets = {'image': A.Image(valid='valid', refill=False), 'valid': A.ValidMask()}
+        for image in (tiny, np.stack([crop, skewed, sparse])[:, None]):
+            valid = rng.random(image.shape) > .3
+            for mode, options in (('robust', {}), ('robust', dict(clip=False)), ('robust', dict(lower=5, upper=95)),
+                                  ('percentile', {}), ('percentile', dict(median=True))):
+                for dtype in (np.float32, np.float64):
+                    x = image.astype(dtype)
+                    for masked in (False, True):
+                        transform = A.Normalize(mode, masked=masked, **options)
+                        sample = {'image': x, 'valid': valid} if masked else {'image': x}
+                        kwargs = dict(targets=targets) if masked else {}
+                        with self.subTest(shape=x.shape, mode=mode, options=options, dtype=dtype, masked=masked):
+                            gpu = A.Pipeline([transform], backend='cuda', compact=False, **kwargs).batch(
+                                {k: torch.from_numpy(v.copy()).cuda() for k, v in sample.items()}, seeds=[0, 1, 2])
+                            cpu = transform.batch({k: torch.from_numpy(v.copy()) for k, v in sample.items()}, **kwargs)
+                            self.assertEqual(gpu['image'].cpu().numpy().tobytes(), cpu['image'].numpy().tobytes())
+                    mixed = x.copy(); mixed[1] += dtype(.25)
+                    with self.subTest(shape=x.shape, mode=mode, options=options, dtype=dtype, mixed=True):
+                        self.compare(A.Normalize(mode, **options), {'image': mixed})
+
     def test_device_array_batches_match_torch(self):
         # DeviceArray batches run natively (no Torch), through Pipeline.batch and direct .batch.
         rng = np.random.default_rng(5)

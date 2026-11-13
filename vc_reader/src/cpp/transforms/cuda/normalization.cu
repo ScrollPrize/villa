@@ -225,6 +225,48 @@ template<class T> __device__ void fixed_values(KernelIndex vcr_launch, View<T> d
 struct fixed_values_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { fixed_values(index,args...); }
 };
+// Integer counts give the same histogram in any order. count[256] is set when a
+// value has no bin.
+template<class T> __device__ void uint8_counts(KernelIndex vcr_launch, View<T> data, const std::uint8_t* valid, unsigned long long* count) {
+    __shared__ unsigned local[256];
+    __shared__ bool done;
+    local[threadIdx.x] = 0;
+    // Blocks starting after another found an unbinned value skip the data.
+    if (!threadIdx.x) done = *static_cast<volatile unsigned long long*>(&count[256]) != 0;
+    __syncthreads();
+    if (done) return;
+    bool binned = true;
+    // Warps step through the data together so that neighbouring voxels, which
+    // mostly share a value, are added with one atomic per distinct value.
+    const unsigned lane = threadIdx.x % 32;
+    const std::size_t stride = std::size_t(blockDim.x) * vcr_launch.blocks;
+    for (std::size_t base = std::size_t(vcr_launch.block) * blockDim.x + threadIdx.x - lane; base < data.size; base += stride) {
+        const std::size_t i = base + lane;
+        unsigned b = 256;
+        const bool bad = i < data.size && !uint8_bin(data.ptr[i],b);
+        if (__any_sync(0xffffffffu,bad)) { binned = false; break; }
+        if (i >= data.size || (valid && !valid[i])) b = 256;
+        const unsigned peers = __match_any_sync(0xffffffffu,b);
+        if (b < 256 && lane == unsigned(__ffs(peers)) - 1) atomicAdd(&local[b],unsigned(__popc(peers)));
+    }
+    if (__syncthreads_or(!binned)) {
+        if (!threadIdx.x) atomicExch(&count[256],1ull);
+        return;
+    }
+    if (local[threadIdx.x]) atomicAdd(&count[threadIdx.x],(unsigned long long)local[threadIdx.x]);
+}
+struct uint8_counts_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { uint8_counts(index,args...); }
+};
+template<class T> __device__ void uint8_values(KernelIndex vcr_launch, View<T> data, const T* table) {
+    __shared__ T local[256];
+    local[threadIdx.x] = table[threadIdx.x];
+    __syncthreads();
+    EACH_INDEX(data.size) data.ptr[i] = local[static_cast<unsigned>(data.ptr[i])];
+}
+struct uint8_values_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { uint8_values(index,args...); }
+};
 // Mean/standard deviation (and bounds) of the selected values.
 template<class T> void moments(View<T> data, Selection select, ParametersGPU* params, int* invalid, double eps, bool zscore) {
     const unsigned count = std::min(blocks(data.size),1024u);
@@ -243,6 +285,82 @@ template<class T> void moments(View<T> data, Selection select, ParametersGPU* pa
     launch(count,256,0,vcr::device::stream(), collect_normalization_launch2<T,2>{}, data,partial.ptr,params,select,invalid,false);
     launch(1,256,0,vcr::device::stream(), finish_normalization_launch1<2>{}, partial.ptr,count,params,true,eps,false);
 }
+// Robust and percentile normalization by sorting every selected value.
+template<class T> void normalize_sorted(View<T> data, const std::uint8_t* valid, unsigned long long* selected, const Options& t, int* invalid) {
+    const Selection select{valid,false};
+    Buffer<ParametersGPU> params(1);
+    if (t.mode == Normalization::Robust) moments(data,select,params.ptr,invalid,0.,true);
+    Buffer<T> keys(data.size); Buffer<OrderGPU> order(1);
+    launch(blocks(data.size),256,0,vcr::device::stream(), order_keys_launch{}, data,select.valid,keys.ptr,invalid);
+    sort_keys(keys,data.size);
+    launch(1,1,0,vcr::device::stream(), order_parameters_launch{}, keys.ptr,selected,data.size,order.ptr,t,params.ptr);
+    if (t.mode == Normalization::Robust) {
+        Buffer<double> deviations(data.size);
+        launch(blocks(data.size),256,0,vcr::device::stream(), deviation_keys_launch{}, data,select.valid,deviations.ptr,order.ptr);
+        sort_keys(deviations,data.size);
+        launch(1,1,0,vcr::device::stream(), robust_parameters_launch{}, deviations.ptr,order.ptr);
+    }
+    launch(blocks(data.size),256,0,vcr::device::stream(), order_values_launch{}, data,order.ptr,t.mode == Normalization::Percentile || t.clip);
+    check(cudaGetLastError());
+}
+// Robust/percentile normalization of one channel. A batch reads all its
+// histograms back with one copy; the host builds each table with the CPU
+// backend's uint8_order_table, so table outputs equal the CPU's. Channels
+// without a table are sorted, batched as before.
+template<class T> struct OrderJob {
+    View<T> data;
+    const std::uint8_t* valid;
+    unsigned long long* selected;
+    Options options;
+    int* invalid;
+    bool compatible(const OrderJob&) const { return true; }
+    static void run(const std::vector<const OrderJob*>& jobs) {
+        const std::size_t m = jobs.size();
+        const auto stream = vcr::device::stream();
+        Buffer<unsigned long long> counts(257*m);
+        check(cudaMemsetAsync(counts.ptr,0,counts.size*sizeof(unsigned long long),stream));
+        {
+            BatchQueue queue(m);
+            for (std::size_t j = 0; j < m; ++j) {
+                queue.lane(j);
+                // Few blocks: each adds its 256 bins to the shared counts once.
+                launch(std::min(blocks(jobs[j]->data.size),128u),256,0,stream, uint8_counts_launch{}, jobs[j]->data,jobs[j]->valid,counts.ptr+257*j);
+            }
+            queue.flush();
+        }
+        check(cudaGetLastError());
+        std::vector<unsigned long long> host(counts.size);
+        check(cudaMemcpyAsync(host.data(),counts.ptr,counts.size*sizeof(unsigned long long),cudaMemcpyDeviceToHost,stream));
+        check(cudaStreamSynchronize(stream));
+        std::vector<T> tables(256*m);
+        std::vector<std::size_t> table, sorted;
+        for (std::size_t j = 0; j < m; ++j) {
+            const auto* c = host.data()+257*j;
+            if (!c[256] && uint8_order_table(c,jobs[j]->options,tables.data()+256*j)) table.push_back(j);
+            else sorted.push_back(j);
+        }
+        if (!table.empty()) {
+            Buffer<T> device(tables);
+            BatchQueue queue(table.size());
+            for (std::size_t k = 0; k < table.size(); ++k) {
+                queue.lane(k);
+                const auto j = table[k];
+                launch(blocks(jobs[j]->data.size),256,0,stream, uint8_values_launch{}, jobs[j]->data,(const T*)device.ptr+256*j);
+            }
+            queue.flush();
+            check(cudaGetLastError());
+        }
+        if (!sorted.empty()) {
+            BatchQueue queue(sorted.size());
+            for (std::size_t k = 0; k < sorted.size(); ++k) {
+                queue.lane(k);
+                const auto& job = *jobs[sorted[k]];
+                normalize_sorted(job.data,job.valid,job.selected,job.options,job.invalid);
+            }
+            queue.flush();
+        }
+    }
+};
 } // namespace
 
 void apply_cuda(const Normalize& t, Sample& s, const Parameters& p, Session& session) {
@@ -255,26 +373,16 @@ void apply_cuda(const Normalize& t, Sample& s, const Parameters& p, Session& ses
         Buffer<unsigned long long> selected(1);
         auto valid = t.masked ? valid_voxels(s, c, session, selected.ptr) : nullptr;
         const Selection select{valid ? valid->ptr : nullptr,t.mode == Normalization::ZScore && t.nonzero};
-        Buffer<ParametersGPU> params(1);
         if (t.mode == Normalization::MinMax || t.mode == Normalization::ZScore) {
             const bool zscore = t.mode == Normalization::ZScore;
+            Buffer<ParametersGPU> params(1);
             moments(data,select,params.ptr,invalid,t.eps,zscore);
             launch(blocks(data.size),256,0,vcr::device::stream(), normalize_values_launch{}, data,params.ptr,select.nonzero,!zscore);
             check(cudaGetLastError()); return;
         }
-        if (t.mode == Normalization::Robust) moments(data,select,params.ptr,invalid,0.,true);
-        Buffer<T> keys(data.size); Buffer<OrderGPU> order(1);
-        launch(blocks(data.size),256,0,vcr::device::stream(), order_keys_launch{}, data,select.valid,keys.ptr,invalid);
-        sort_keys(keys,data.size);
-        launch(1,1,0,vcr::device::stream(), order_parameters_launch{}, keys.ptr,valid ? selected.ptr : nullptr,data.size,order.ptr,Options(t),params.ptr);
-        if (t.mode == Normalization::Robust) {
-            Buffer<double> deviations(data.size);
-            launch(blocks(data.size),256,0,vcr::device::stream(), deviation_keys_launch{}, data,select.valid,deviations.ptr,order.ptr);
-            sort_keys(deviations,data.size);
-            launch(1,1,0,vcr::device::stream(), robust_parameters_launch{}, deviations.ptr,order.ptr);
-        }
-        launch(blocks(data.size),256,0,vcr::device::stream(), order_values_launch{}, data,order.ptr,t.mode == Normalization::Percentile || t.clip);
-        check(cudaGetLastError());
+        const OrderJob<T> job{data,valid ? valid->ptr : nullptr,valid ? selected.ptr : nullptr,Options(t),invalid};
+        if (BatchQueue::current) BatchQueue::current->append(job);
+        else OrderJob<T>::run({&job});
     });
 }
 } // namespace vcr::transforms::cuda
