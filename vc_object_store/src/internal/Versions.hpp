@@ -41,6 +41,11 @@ private:
     std::string generation_;
     int64_t publishedAtUs_;
     std::optional<int64_t> sequence_;
+    // Next store_changes position of this commit. Counted once in begin() and
+    // advanced per change: counting the commit's rows on every insert made
+    // publishing N changes cost O(N^2). This publisher is the only writer of
+    // the commit's store_changes rows.
+    int64_t position_ = 0;
     bool baseline_ = false;
 };
 

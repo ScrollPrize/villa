@@ -185,6 +185,9 @@ void CommitPublisher::begin()
     }
     execute(db_, "INSERT INTO store_commits VALUES(?,?,?,?,?,?)", *sequence_, parseUuid(generation_),
         parseOptionalUuid(request), author, host, publishedAtUs_);
+    Statement count(db_, "SELECT count(*) FROM store_changes WHERE seq=?", *sequence_);
+    count.row();
+    position_ = count.i64(0);
 }
 
 int64_t CommitPublisher::object(const std::string& objectUuid, const std::string& revisionUuid, bool deleted)
@@ -199,8 +202,8 @@ int64_t CommitPublisher::object(const std::string& objectUuid, const std::string
     const auto version = writeObjectVersion(db_, objectUuid);
     execute(db_, "INSERT INTO object_versions VALUES(?,?,?,?,?)", parseUuid(objectUuid), version, parseUuid(generation_),
         *sequence_, parseUuid(revisionUuid));
-    execute(db_, "INSERT INTO store_changes VALUES(?,(SELECT count(*) FROM store_changes WHERE seq=?),'object',?,?,?)",
-        *sequence_, *sequence_, parseUuid(objectUuid), version, int64_t(deleted));
+    execute(db_, "INSERT INTO store_changes VALUES(?,?,'object',?,?,?)",
+        *sequence_, position_++, parseUuid(objectUuid), version, int64_t(deleted));
     return version;
 }
 
@@ -216,8 +219,8 @@ int64_t CommitPublisher::relationship(const std::string& edgeUuid, const std::op
     const auto version = writeRecordVersion(db_, "edges", edgeUuid);
     execute(db_, "INSERT INTO relationship_versions VALUES(?,?,?,?,?,?)", parseUuid(edgeUuid), version, parseUuid(generation_),
         *sequence_, parseOptionalUuid(revisionUuid), int64_t(!revisionUuid));
-    execute(db_, "INSERT INTO store_changes VALUES(?,(SELECT count(*) FROM store_changes WHERE seq=?),'relationship',?,?,?)",
-        *sequence_, *sequence_, parseUuid(edgeUuid), version, int64_t(!revisionUuid));
+    execute(db_, "INSERT INTO store_changes VALUES(?,?,'relationship',?,?,?)",
+        *sequence_, position_++, parseUuid(edgeUuid), version, int64_t(!revisionUuid));
     return version;
 }
 
