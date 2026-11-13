@@ -5,10 +5,12 @@ from __future__ import annotations
 from vesuvius.ink_detection.data.normalization import normalize_image
 
 import argparse
+import ctypes
 import json
 import logging
 import math
 import shutil
+import sys
 import tempfile
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1740,6 +1742,27 @@ def parse_args(argv: Sequence[str] | None = None):
     return args
 
 
+def keep_freed_memory_in_heap() -> bool:
+    """Stop glibc from unmapping large freed buffers; return whether it applied.
+
+    glibc serves blocks above its mmap threshold with mmap and unmaps them on
+    free, so each CPU batch page-faults its activation buffers in again. Kept
+    in the heap, they are reused: byte-identical output, and at --batch-size 8
+    CPU inference ran 1.20x faster on Linux than the fastest measured run
+    without it (no change at batch 1). The setting is process-wide, so main()
+    applies it only to command-line CPU runs.
+    """
+
+    if sys.platform != "linux":
+        return False
+    try:
+        mallopt = ctypes.CDLL(None).mallopt
+    except (AttributeError, OSError):
+        return False
+    m_trim_threshold, m_mmap_max = -1, -4
+    return bool(mallopt(m_mmap_max, 0)) and bool(mallopt(m_trim_threshold, 2**31 - 1))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the flat inference command."""
 
@@ -1758,6 +1781,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
     )
+    # argv is None only when parsing sys.argv; callers passing argv (tests,
+    # scripts) keep their process allocator settings.
+    if argv is None and device.type == "cpu" and keep_freed_memory_in_heap():
+        LOGGER.info("CPU run: keeping freed buffers in the glibc heap")
     configured = replace(configured, model=prepared_model)
     if args.folder is not None:
         infer_folder(args, configured, device=device)
