@@ -2,7 +2,7 @@ import numpy as np
 import json
 import pytest
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter, open_zarr
 from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import FiberTrace3DPredictAdapter
 from vesuvius.neural_tracing.fiber_trace_3d.inference_cache import validate_cached_model
 from vesuvius.neural_tracing.fiber_trace_3d.model import build_fiber_trace_3d_model
@@ -23,18 +23,11 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal,
     checkpoint = tmp_path / 'model.pt'
     torch.save({'config': cfg, 'step': 123}, checkpoint)
     source = tmp_path / 'input.zarr'
-    kwargs = dict(mode='w', shape=(16, 16, 16), chunks=(8, 8, 8), dtype='uint8')
-    try:
-        array = zarr.open_array(str(source), zarr_format=2, **kwargs)
-    except TypeError:  # Zarr 2 uses v2 by default.
-        array = zarr.open_array(str(source), **kwargs)
-    array[:] = 100
+    kwargs = dict(shape=(16, 16, 16), chunks=(8, 8, 8), dtype='uint8')
+    ZarrWriter.create(source, **kwargs)[:] = 100
     base = tmp_path / 'base.zarr'
     base_kwargs = dict(kwargs, shape=(16*input_scale,)*3)
-    try:
-        zarr.open_array(str(base), zarr_format=2, **base_kwargs)
-    except TypeError:
-        zarr.open_array(str(base), **base_kwargs)
+    ZarrWriter.create(base, **base_kwargs)
     for fmt in ('compact', 'legacy'):
         output = tmp_path / fmt / 'prediction.lasagna.json'
         infer.run_fiber_trace_3d_inference(
@@ -59,7 +52,7 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal,
         assert provenance['inference']['native_output_stride'] == 2
     if normal:
         level = 1 if input_scale == 1 else 2
-        array = zarr.open_array(str(tmp_path / f'compact/prediction.zarr/sd{level}/{level}'), mode='r')
+        array = open_zarr(tmp_path / f'compact/prediction.zarr/sd{level}/{level}')
         assert array.shape[1:] == (8,8,8)
         assert array.shape[0] == array.chunks[0] == 7
         assert np.any(array[-1] == 255)

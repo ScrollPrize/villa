@@ -35,6 +35,9 @@ std::vector<std::string> remoteSurfacesIn(sqlite3*, const Bounds& bounds, const 
 void setSpatialBounds(sqlite3*, int64_t objectId, const std::optional<Bounds>&,
                       const std::optional<std::string>& revision = std::nullopt);
 void refreshGeometryBounds(sqlite3*, const std::string& objectUuid);
+// Preserve an overridden record's optional spatial accelerator without reading
+// or copying geometry payloads. Rebuild only if the source had no accelerator.
+void inheritSpatialBounds(sqlite3* source,sqlite3* target,const ObjectRecord&,int64_t targetId);
 // A surface revision's area in stored units squared (geometry::surfaceGridArea
 // over its valid vertices, read in row bands) and grid size as the object's
 // surface detail; nothing for other kinds.

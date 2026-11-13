@@ -9,7 +9,7 @@ inward and ``--max-outward`` voxels outward of it. A fiber is a thin tube on its
 patch; the next sheet is about 12 voxels away. (On the automated Paris4 fibers, matched horizontal fibers sit at
 +0.1 voxels on average with a +-2 window.) Runs of consecutive on-patch samples at least ``--min-run`` voxels long are
 written, one JSON line each: fiber key (``fiber:<UUID>`` of a store fiber, ``json:<file stem>`` of a JSON fiber),
-patch (root, name), the run's arc-length start and end on the fiber (voxels), mean outward offset, and each sample's
+the complete selected ``fiber_reference`` for store fibers, patch (root, name), the run's arc-length start and end on the fiber (voxels), mean outward offset, and each sample's
 patch grid position (row, col of its node) and position (xyz). A summary of how many patches have runs long enough
 for each front size follows.
 
@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import fiber_tag
@@ -40,7 +40,7 @@ _STATE = {}  # node arrays and tree, shared with forked workers
 
 def patch_nodes(info) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Valid nodes (N, 3), their unit normals (N, 3) and grid (row, col) (N, 2) of one patch."""
-    xyz = np.stack([np.asarray(tifffile.memmap(info.path/f'{c}.tif'), np.float32) for c in 'xyz'], -1)
+    xyz = tifxyz.read(info.path, mask=False).xyz
     if min(xyz.shape[:2]) < 2:  # a single row or column has no surface normal
         return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32), np.zeros((0, 2), np.int32)
     ok = np.all(xyz != -1, -1) & np.all(np.isfinite(xyz), -1)
@@ -56,10 +56,13 @@ def match_fiber(job) -> list[dict]:
     """``job``: a fiber-store catalog index (geometry read in this process, on its own handle), or (fiber key,
     points)."""
     s = _STATE
+    reference = None
     if isinstance(job, tuple):
         fiber_key, points = job
     else:
-        fiber_key, points = f"fiber:{s['fibers'].catalog[job]['id']}", s['fibers'].geometry(job).points
+        row = s['fibers'].catalog[job]
+        fiber_key, points = f"fiber:{row['id']}", s['fibers'].geometry(job).points
+        reference = row['reference']
     samples = resample_polyline(points, s['sample'])  # shared.geometry
     at = np.arange(len(samples))*s['sample'] if len(samples) > 2 or arclength(points)[-1] >= s['sample'] \
         else arclength(points)[[0, -1]]
@@ -85,6 +88,8 @@ def match_fiber(job) -> list[dict]:
             out.append(dict(fiber=fiber_key, root=s['roots'][p], patch=s['names'][p], start=float(at[a]),
                             end=float(at[b-1]), offset=float(offset[np.arange(a, b), best[a:b]].mean()),
                             rc=s['rc'][node].tolist(), xyz=np.round(samples[a:b], 2).tolist()))
+            if reference is not None:
+                out[-1]['fiber_reference'] = reference
     return out
 
 

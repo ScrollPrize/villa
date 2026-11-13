@@ -1,3 +1,4 @@
+#include "linking/Detectors.hpp"
 #include "linking/StoredGeometry.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
@@ -11,6 +12,8 @@
 #include <limits>
 #include <future>
 #include <thread>
+#include <tuple>
+#include <functional>
 #include <map>
 #include <set>
 #include <unordered_set>
@@ -20,8 +23,8 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
-#include "spatial/SurfaceGrid.hpp"
-#include "spatial/SurfaceIndex.hpp"
+#include <vc_object_store/geometry/SurfaceGrid.hpp>
+#include <vc_object_store/geometry/SurfaceIndex.hpp>
 #include "vc_object_store/Uuid.hpp"
 
 namespace vc::object_links {
@@ -73,6 +76,7 @@ struct Pose {
 };
 
 struct SamplePoint {
+    int row = 0, col = 0;  // stored grid vertex
     Vec2 uv;  // metric (voxel) parameterization: grid index / scale
     cv::Vec3f xyz;
     cv::Vec3f tangentU;  // d(xyz)/d(u), d(xyz)/d(v)
@@ -81,8 +85,10 @@ struct SamplePoint {
 
 struct LoadedSurface {
     std::string uuid;
+    std::string revision; // the geometry revision loaded (overlap correspondences)
     std::shared_ptr<SurfaceGrid> grid;
     const cv::Mat_<cv::Vec3f>* points = nullptr; // stable for this read-only detector run
+    nlohmann::json coordinateProvenance;
     cv::Vec2f scale = {1.0f, 1.0f};
     std::vector<SamplePoint> samples;                  // strided by sampleSpacing
     cv::Vec3f bboxLow, bboxHigh;
@@ -148,12 +154,15 @@ std::optional<cv::Vec3f> sampleXyz(const LoadedSurface& surface, Vec2 uv)
                      interp(p00[2], p10[2], p01[2], p11[2])};
 }
 
-std::optional<LoadedSurface> loadSurface(detail::StoredGeometry& inputs, const objects::ObjectRecord& object, const SurfaceOverlapParams& params,
-                                     DetectorReport& report)
+std::optional<LoadedSurface> loadSurface(const detail::GeometryLoader& load, const objects::ObjectRecord& object,
+                                     const SurfaceOverlapParams& params, DetectorReport& report, double sourceScale,
+                                     const std::optional<std::string>& geometryRevision = std::nullopt)
 {
     LoadedSurface surface;
     try {
-        surface.grid = detail::surfaceGrid(inputs.load(object));
+        surface.grid = detail::scaledSurfaceGrid(detail::surfaceGrid(load(object, geometryRevision)), sourceScale,
+                                                 params.volumeUuid.has_value());
+        surface.coordinateProvenance = detail::coordinateProvenance(object, params);
         surface.uuid = object.uuid;
         surface.scale = surface.grid->scale();
         if (!(surface.scale[0] > 0) || !(surface.scale[1] > 0)) {
@@ -181,6 +190,8 @@ std::optional<LoadedSurface> loadSurface(detail::StoredGeometry& inputs, const o
             auto tangents = tangentsAt(*points, row, col, surface.scale);
             if (!tangents) continue;
             SamplePoint sample;
+            sample.row = row;
+            sample.col = col;
             sample.uv = {col / double(surface.scale[0]), row / double(surface.scale[1])};
             sample.xyz = p;
             sample.tangentU = tangents->first;
@@ -579,27 +590,40 @@ FitResult fitPair(const std::vector<Correspondence>& values, const SurfaceOverla
     return result;
 }
 
-// Dense 3D agreement of one surface against another under a pose mapping
-// target UV -> seed UV: {overlap samples, agreements, total samples}.
+// Dense 3D agreement counts: {overlap samples, agreements, total samples}.
 struct Consistency {
     std::size_t samples = 0, agreements = 0, total = 0;
 };
 
-Consistency overlapConsistency(const LoadedSurface& seed, const LoadedSurface& target, const Pose& targetToSeed,
-                               double agreementRadius)
+// Traverse seed UV -> target UV once, sharing validity and distance gates
+// between detector statistics and materialized correspondences.
+template <class Accept>
+Consistency visitOverlapAgreements(const LoadedSurface& seed, const LoadedSurface& target, const Pose& seedToTarget,
+                                   double agreementRadius, Accept accept)
 {
     Consistency result;
-    const Pose seedToTarget = targetToSeed.inverse();
     const double agreementSq = agreementRadius * agreementRadius;
     for (const auto& sample : seed.samples) {
         ++result.total;
-        const auto other = sampleXyz(target, seedToTarget.apply(sample.uv));
+        const Vec2 uv = seedToTarget.apply(sample.uv);
+        const auto other = sampleXyz(target, uv);
         if (!other) continue;
         ++result.samples;
         const cv::Vec3f d = *other - sample.xyz;
-        if (double(d.dot(d)) <= agreementSq) ++result.agreements;
+        const double distanceSq = double(d.dot(d));
+        if (distanceSq <= agreementSq) {
+            ++result.agreements;
+            accept(sample, uv, *other, distanceSq);
+        }
     }
     return result;
+}
+
+Consistency overlapConsistency(const LoadedSurface& seed, const LoadedSurface& target, const Pose& targetToSeed,
+                               double agreementRadius)
+{
+    return visitOverlapAgreements(seed, target, targetToSeed.inverse(), agreementRadius,
+        [](const SamplePoint&, Vec2, const cv::Vec3f&, double) {});
 }
 
 bool bboxOverlap(const LoadedSurface& a, const LoadedSurface& b, double pad)
@@ -637,32 +661,76 @@ void validateParams(const SurfaceOverlapParams& params)
 
 }  // namespace
 
-DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
-                                 const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
+detail::Detection detail::detectSurfaceOverlaps(StoredGeometry& inputs,
+                                                const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
 {
     validateParams(params);
     Profile profile;
     const auto& progress = params.progress;
     objects::util::reportProgress(progress, "selecting stored surfaces");
-    DetectorReport report;
+    Detection detection;
+    detection.detector = kSurfaceOverlapDetector; detection.version = kSurfaceOverlapVersion;
+    detection.replaceStalePending = params.replaceStalePending;
+    DetectorReport& report = detection.report;
     auto cancelled = [&] { return cancel && cancel->load(); };
 
-    detail::StoredGeometry inputs(db);
-    const auto objects = inputs.select("surface", params.surfaceUuids);
+    const auto selected = inputs.select("surface", params.surfaceUuids);
+    const auto fresh = detail::newAmong(params.newUuids, {&selected}, "surface-overlap");
+    const auto scales = detail::coordinateScales(selected, params);
+    std::set<std::string> failed; // surfaces that could not be loaded (their edges stay)
+    const detail::GeometryLoader loader = [&inputs](const objects::ObjectRecord& object,
+                                                    const std::optional<std::string>& revision) {
+        return inputs.load(object, revision);
+    };
+
+    // An incremental run loads the new surfaces and the selected surfaces
+    // whose stored bounds come within the pair search's bbox pad of one.
+    // Each keeps its index in the selection, which seeds its pairs' fits.
+    std::vector<objects::ObjectRecord> objects;
+    std::vector<size_t> selectionIndex;
+    if (fresh) {
+        objects::util::reportProgress(progress, "finding partners of new surfaces");
+        std::set<std::string> wanted = *fresh, all;
+        for (const auto& object : selected) all.insert(object.uuid);
+        for (const auto& object : selected) {
+            if (!fresh->contains(object.uuid)) continue;
+            const auto box = inputs.workingBounds(object, params);
+            if (!box) { wanted = all; break; }  // no stored bounds: every surface is a partner
+            for (const auto& uuid : inputs.objectsNear("surface", *box, params.tolerance, params))
+                if (all.contains(uuid)) wanted.insert(uuid);
+        }
+        for (size_t i = 0; i < selected.size(); ++i)
+            if (wanted.contains(selected[i].uuid)) { objects.push_back(selected[i]); selectionIndex.push_back(i); }
+    } else {
+        objects = selected;
+    }
 
     std::vector<LoadedSurface> surfaces;
+    std::vector<size_t> seedIndex;  // per loaded surface: its index for pair seeds
     size_t loadedCount = 0;
-    for (const auto& object : objects) {
+    for (size_t oi = 0; oi < objects.size(); ++oi) {
+        const auto& object = objects[oi];
         objects::util::reportProgress(progress, "loading surfaces", loadedCount++, objects.size(), object.uuid);
         if (cancelled()) {
             report.problems.push_back("surface-overlap: cancelled during loading");
-            return report;
+            detection.publish = false;
+            return detection;
         }
         PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
-        if (auto loaded = loadSurface(inputs, object, params, report))
+        if (auto loaded = loadSurface(loader, object, params, report, scales.at(object.uuid))) {
             surfaces.push_back(std::move(*loaded));
+            seedIndex.push_back(fresh ? selectionIndex[oi] : surfaces.size() - 1);
+        } else failed.insert(object.uuid);
     }
     objects::util::reportProgress(progress, "loading surfaces", objects.size(), objects.size());
+    std::vector<char> isNew(surfaces.size(), 0);
+    if (fresh)
+        for (size_t i = 0; i < surfaces.size(); ++i) isNew[i] = fresh->contains(surfaces[i].uuid);
+    // Pairs examined: all of them, or those with a new surface.
+    auto pairsAfter = [&](size_t si) -> uint64_t {
+        if (!fresh || isNew[si]) return surfaces.size() - si - 1;
+        return uint64_t(std::count(isNew.begin() + si + 1, isNew.end(), 1));
+    };
     report.objectsConsidered = int64_t(surfaces.size());
     for (const auto& surface : surfaces) profile.samples += surface.samples.size();
 
@@ -682,7 +750,8 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
     const double agreementRadius = params.tolerance + params.uvInlierTolerance;
     std::vector<LinkCandidate> candidates;
     std::map<std::string, std::size_t> rejections;
-    const uint64_t totalPairs = surfaces.empty() ? 0 : uint64_t(surfaces.size()) * (surfaces.size() - 1) / 2;
+    uint64_t totalPairs = 0;
+    for (size_t si = 0; si < surfaces.size(); ++si) totalPairs += pairsAfter(si);
     uint64_t processedPairs = 0;
     objects::util::reportProgress(progress, "checking surface pairs", 0, totalPairs);
     for (std::size_t si = 0; si < surfaces.size(); ++si) {
@@ -692,7 +761,8 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
             processedPairs, totalPairs, item);
         std::vector<size_t> targets;
         for (size_t ti = si + 1; ti < surfaces.size(); ++ti)
-            if (bboxOverlap(seed, surfaces[ti], params.tolerance)) targets.push_back(ti);
+            if ((!fresh || isNew[si] || isNew[ti]) && bboxOverlap(seed, surfaces[ti], params.tolerance))
+                targets.push_back(ti);
         profile.bboxPairs += targets.size();
         auto matches = [&] {
             PhaseTimer timer(profile.enabled ? &profile.harvest : nullptr);
@@ -700,18 +770,21 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
         }();
         if (cancelled()) {
             report.problems.push_back("surface-overlap: cancelled");
-            return report;
+            detection.publish = false;
+            return detection;
         }
         objects::util::reportProgress(surfaceProgress, "fitting overlaps");
         for (auto& [ti, collector] : matches) {
             if (cancelled()) {
                 report.problems.push_back("surface-overlap: cancelled");
-                return report;
+                detection.publish = false;
+                return detection;
             }
             const LoadedSurface& target = surfaces[ti];
             const auto correspondences = collector.take();
             if (correspondences.size() < params.minInliers) continue;
-            const std::uint64_t pairSeed = splitmix64(std::uint64_t(si + 1) * 0x9E3779B9ULL ^ std::uint64_t(ti + 1));
+            const std::uint64_t pairSeed = splitmix64(std::uint64_t(seedIndex[si] + 1) * 0x9E3779B9ULL ^
+                                                      std::uint64_t(seedIndex[ti] + 1));
             ++profile.fitPairs;
             FitResult fit = [&] {
                 PhaseTimer timer(profile.enabled ? &profile.fit : nullptr);
@@ -764,29 +837,253 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
                                    {"pose", {fit.pose.r00, fit.pose.r01, fit.pose.tx,
                                              fit.pose.r10, fit.pose.r11, fit.pose.ty}}};
             if (params.minOverlapFraction > 0.0) fitMeta["overlap_fraction"] = overlapFraction;
-            candidate.meta = nlohmann::json{{"fit", std::move(fitMeta)}}.dump();
+            auto metadata = nlohmann::json{{"fit", std::move(fitMeta)}, {"coordinate_frame", nullptr}};
+            if (params.volumeUuid) {
+                metadata["coordinate_frame"] = {{"volume_uuid", *params.volumeUuid},
+                    {"objects", {{seed.uuid, seed.coordinateProvenance}, {target.uuid, target.coordinateProvenance}}}};
+                metadata["fit"]["pose_units"] = "volume_voxels";
+                // Stored edges reorder endpoints, so name the pose direction by UUID.
+                metadata["fit"]["pose_from"] = target.uuid;
+                metadata["fit"]["pose_to"] = seed.uuid;
+                metadata["fit"]["grid_scales"] = {{seed.uuid, {seed.scale[0], seed.scale[1]}},
+                                                  {target.uuid, {target.scale[0], target.scale[1]}}};
+                metadata["fit"]["agreement_radius"] = agreementRadius;
+            }
+            candidate.meta = metadata.dump();
             candidates.push_back(std::move(candidate));
         }
-        processedPairs += surfaces.size() - si - 1;
+        processedPairs += pairsAfter(si);
         objects::util::reportProgress(progress, "checking surface pairs", processedPairs, totalPairs, item);
     }
     objects::util::reportProgress(progress, "checking surface pairs", totalPairs, totalPairs);
     for (const auto& [reason, count] : rejections)
         report.problems.push_back("surface-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason);
 
-    StaleEdgeScope scope{{params.edgeKind}, {}};
-    for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
-    auto txn = db.write();
-    DetectorReport committed = detail::commitStoredCandidates(db, inputs, txn, kSurfaceOverlapDetector, 1, candidates, params.replaceStalePending, &scope, progress);
-    if (cancelled()) throw std::runtime_error("surface-overlap: cancelled before commit");
-    txn.commit();
-    report.candidatesFound = committed.candidatesFound;
-    report.edgesCreated = committed.edgesCreated;
-    report.edgesUpdated = committed.edgesUpdated;
-    report.edgesSkippedExisting = committed.edgesSkippedExisting;
-    report.staleRemoved = committed.staleRemoved;
-    return report;
+    if (fresh) {
+        // Edges of a new surface, with both endpoints selected and loaded or
+        // not examined (a partner that failed to load keeps its edges).
+        std::vector<std::string> selectedUuids;
+        for (const auto& object : selected) selectedUuids.push_back(object.uuid);
+        detection.scope = detail::incrementalScope(params.edgeKind, selectedUuids, *fresh, failed);
+    } else {
+        detection.scope = StaleEdgeScope{{params.edgeKind}, {}};
+        for (const auto& surface : surfaces) detection.scope.objectUuids.push_back(surface.uuid);
+    }
+    detection.candidates = std::move(candidates);
+    return detection;
+}
+
+DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
+                                 const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
+{
+    detail::StoredGeometry inputs(db);
+    const auto detection = detail::detectSurfaceOverlaps(inputs, params, cancel);
+    return detail::publishDetection(db, inputs, detection, params.progress, cancel);
+}
+
+namespace {
+// One overlap edge to materialize: its record's endpoints, anchors and
+// metadata, its endpoints' objects, and their geometry revisions (current
+// ones when unset).
+struct OverlapEdgeView {
+    std::string uuid, aUuid, bUuid;
+    bool wholeGeometry = false;
+    bool stale = false;
+    std::string meta;
+    std::function<objects::ObjectRecord(const std::string& uuid)> object;  // read when first needed
+    std::optional<std::string> aGeometryRevision, bGeometryRevision;
+};
+
+class OverlapMaterializer {
+public:
+    OverlapMaterializer(detail::GeometryLoader load, const OverlapCorrespondenceParams& params)
+        : load_(std::move(load)), params_(params)
+    {
+        if (params.volumeUuid.empty()) throw std::invalid_argument("overlap correspondences: volumeUuid is required");
+        if (!(params.spacing > 0) || !std::isfinite(params.spacing) || params.maxPairs == 0)
+            throw std::invalid_argument("overlap correspondences: spacing and maxPairs must be positive");
+        loading_.volumeUuid = params.volumeUuid;
+        loading_.sampleSpacing = params.spacing;
+    }
+
+    // Throws the edge's error; `out` names the edge and its endpoints.
+    void materialize(const std::function<OverlapEdgeView()>& read, OverlapCorrespondences& out)
+    {
+        using Json = nlohmann::json;
+        const OverlapEdgeView edge = read();
+        out.edgeUuid = edge.uuid; out.aUuid = edge.aUuid; out.bUuid = edge.bUuid;
+        if (!edge.wholeGeometry || edge.aUuid == edge.bUuid)
+            throw std::runtime_error("not a whole-surface overlap edge");
+        const auto meta = Json::parse(edge.meta);
+        const auto fit = meta.value("fit", Json());
+        if (!fit.is_object() || !fit.contains("pose")) throw std::runtime_error("edge has no overlap pose");
+        const auto frame = meta.value("coordinate_frame", Json());
+        if (!frame.is_object() || frame.value("volume_uuid", "") != params_.volumeUuid ||
+            fit.value("pose_units", "") != "volume_voxels")
+            throw std::runtime_error("edge pose is not in volume " + params_.volumeUuid +
+                " voxels; rerun surface-overlap detection with that volume_uuid");
+        if (!fit.contains("pose_from") || !fit.contains("pose_to") || !fit.contains("grid_scales") ||
+            !fit.contains("agreement_radius"))
+            throw std::runtime_error("edge does not record its pose direction, grid scales and agreement radius; "
+                                     "rerun surface-overlap detection");
+        const auto from = fit.at("pose_from").get<std::string>(), to = fit.at("pose_to").get<std::string>();
+        const auto& scales = fit.at("grid_scales");
+        const auto agreementRadius = fit.at("agreement_radius").get<double>();
+        if (!(agreementRadius > 0) || !std::isfinite(agreementRadius))
+            throw std::runtime_error("invalid overlap agreement radius");
+        if (std::minmax(from, to) != std::minmax(edge.aUuid, edge.bUuid))
+            throw std::runtime_error("pose endpoints do not match the edge");
+        if (edge.stale) throw std::runtime_error("edge geometry is stale");
+        const auto& a = surface(edge, edge.aUuid, edge.aGeometryRevision);
+        const auto& b = surface(edge, edge.bUuid, edge.bGeometryRevision);
+        for (const auto* loaded : {&a, &b}) {
+            const auto recorded = scales.at(loaded->uuid).get<std::array<double, 2>>();
+            for (int axis = 0; axis < 2; ++axis)
+                if (std::abs(recorded[axis] - loaded->scale[axis]) > 1e-6 * std::abs(recorded[axis]))
+                    throw std::runtime_error(loaded->uuid + ": grid scale differs from the detected pose; refresh the edge");
+        }
+        const auto values = fit.at("pose").get<std::vector<double>>();
+        if (values.size() != 6 || !std::all_of(values.begin(), values.end(), [](double v) { return std::isfinite(v); }))
+            throw std::runtime_error("invalid overlap pose");
+        const Pose pose{values[0], values[1], values[3], values[4], values[2], values[5]};
+        const Pose aToB = from == edge.aUuid ? pose : pose.inverse();
+        std::vector<OverlapCorrespondence> agreeing;
+        visitOverlapAgreements(a, b, aToB, agreementRadius,
+            [&](const SamplePoint& sample, Vec2 uv, const cv::Vec3f& other, double distanceSq) {
+                OverlapCorrespondence pair;
+                pair.aGrid = {double(sample.row), double(sample.col)};
+                pair.bGrid = {uv.y * b.scale[1], uv.x * b.scale[0]};
+                pair.aXyz = {sample.xyz[0], sample.xyz[1], sample.xyz[2]};
+                pair.bXyz = {other[0], other[1], other[2]};
+                pair.distance = std::sqrt(distanceSq);
+                agreeing.push_back(pair);
+            });
+        if (agreeing.empty()) throw std::runtime_error("no agreeing correspondences under the stored pose");
+        const auto count = std::min(agreeing.size(), params_.maxPairs);
+        for (size_t i = 0; i < count; ++i) out.pairs.push_back(agreeing[i * agreeing.size() / count]);
+        out.aGeometryRevision = a.revision;
+        out.bGeometryRevision = b.revision;
+    }
+
+private:
+    const LoadedSurface& surface(const OverlapEdgeView& edge, const std::string& uuid,
+                                 const std::optional<std::string>& revision)
+    {
+        const auto object = edge.object(uuid);
+        const auto key = std::pair{object.reference(), revision};
+        if (const auto found = surfaces_.find(key); found != surfaces_.end()) return found->second;
+        double scale;
+        try {
+            scale = objects::geometryScaleToFrame(nlohmann::json::parse(object.meta), params_.volumeUuid);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(object.uuid + ": " + error.what());
+        }
+        DetectorReport report;
+        std::string loadedRevision;
+        const detail::GeometryLoader load = [&](const objects::ObjectRecord& record, const std::optional<std::string>& named) {
+            auto snapshot = load_(record, named);
+            loadedRevision = snapshot.revision.uuid;
+            return snapshot;
+        };
+        auto loaded = loadSurface(load, object, loading_, report, scale, revision);
+        if (!loaded)
+            throw std::runtime_error(report.problems.empty() ? object.uuid + ": surface could not be loaded"
+                                                             : report.problems.front());
+        loaded->revision = loadedRevision;
+        return surfaces_.emplace(key, std::move(*loaded)).first->second;
+    }
+
+    detail::GeometryLoader load_;
+    const OverlapCorrespondenceParams& params_;
+    SurfaceOverlapParams loading_;
+    std::map<std::pair<objects::ObjectVersion,std::optional<std::string>>, LoadedSurface> surfaces_;
+};
+
+template <typename Edge>
+std::vector<OverlapCorrespondences> materializeEach(OverlapMaterializer& materializer, const std::vector<Edge>& edges,
+    const std::function<std::string(const Edge&)>& name, const std::function<OverlapEdgeView(const Edge&)>& read)
+{
+    std::vector<OverlapCorrespondences> result;
+    for (const auto& edge : edges) {
+        OverlapCorrespondences out;
+        out.edgeUuid = name(edge);
+        try {
+            materializer.materialize([&] { return read(edge); }, out);
+        } catch (const std::exception& error) {
+            out.pairs.clear();
+            out.error = error.what();
+        }
+        result.push_back(std::move(out));
+    }
+    return result;
+}
+}  // namespace
+
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
+    const std::vector<std::string>& edgeUuids, const OverlapCorrespondenceParams& params)
+{
+    detail::StoredGeometry inputs(db);
+    OverlapMaterializer materializer(
+        [&inputs](const objects::ObjectRecord& object, const std::optional<std::string>& revision) {
+            return inputs.load(object, revision);
+        }, params);
+    return materializeEach<std::string>(materializer, edgeUuids, [](const std::string& id) { return id; },
+        [&](const std::string& id) {
+            const auto edge = db.edgeByUuid(inputs.txn(), id);
+            if (!edge) throw std::runtime_error("edge not found");
+            OverlapEdgeView view;
+            view.uuid = edge->uuid; view.aUuid = edge->aUuid; view.bUuid = edge->bUuid;
+            view.wholeGeometry = edge->aAnchor.wholeGeometry && edge->bAnchor.wholeGeometry;
+            view.stale = db.edgeGeometryState(inputs.txn(), edge->uuid).stale;
+            view.meta = edge->meta;
+            view.object = [&inputs](const std::string& uuid) { return inputs.select("surface", {uuid}).front(); };
+            return view;
+        });
+}
+
+namespace {
+std::vector<OverlapCorrespondences> materializePinned(OverlapMaterializer& materializer,
+    const objects::StoreReader& reader, const std::vector<OverlapEdgeAt>& edges)
+{
+    return materializeEach<OverlapEdgeAt>(materializer, edges, [](const OverlapEdgeAt& edge) { return edge.uuid; },
+        [&reader](const OverlapEdgeAt& edge) {
+            const auto selected = reader.objectsAtVersions({edge.a, edge.b});
+            if (!selected[0] || !selected[1] || selected[0]->deleted || selected[1]->deleted ||
+                !selected[0]->geometryRevision || !selected[1]->geometryRevision)
+                throw std::runtime_error("overlap endpoint version is unavailable");
+            OverlapEdgeView view;
+            view.uuid = edge.uuid; view.aUuid = selected[0]->objectUuid; view.bUuid = selected[1]->objectUuid;
+            view.wholeGeometry = edge.wholeGeometry;
+            view.meta = edge.meta;
+            view.object = [a = selected[0]->record, b = selected[1]->record](const std::string& uuid) {
+                return uuid == a.uuid ? a : b;
+            };
+            view.aGeometryRevision = selected[0]->geometryRevision;
+            view.bGeometryRevision = selected[1]->geometryRevision;
+            return view;
+        });
+}
+}  // namespace
+
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
+    const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params)
+{
+    detail::StoredGeometry inputs(db);
+    OverlapMaterializer materializer(
+        [&inputs](const objects::ObjectRecord& object, const std::optional<std::string>& revision) {
+            return inputs.load(object, revision);
+        }, params);
+    return materializePinned(materializer, objects::LocalStoreReader(db, inputs.txn()), edges);
+}
+
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(const objects::StoreReader& reader,
+    const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params)
+{
+    OverlapMaterializer materializer(
+        [&reader](const objects::ObjectRecord& object, const std::optional<std::string>& revision) {
+            return detail::loadGeometrySnapshot(reader, object, revision);
+        }, params);
+    return materializePinned(materializer, reader, edges);
 }
 
 }  // namespace vc::object_links
-

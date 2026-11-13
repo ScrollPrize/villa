@@ -220,12 +220,21 @@ shared behavior into a reusable helper/library first, then make both callers use
 that shared implementation. If extraction is genuinely impossible in the current
 task, treat that as an explicit deviation and report it before proceeding.
 
+Before writing code that reads, samples, interpolates, parses, caches or writes
+Vesuvius data (Zarr, tifxyz surfaces, images, catalog metadata, display kernels,
+transforms), check the [`vc_reader` capability map](vc_reader/README.md#capability-map)
+and call what it lists.
+
 ### 4.3 Document anything that affects developer workflow
 If you add:
 - new scripts
 - new dependencies
 - new benchmark harnesses
 document how to use them and how they’re validated.
+
+Keep committed documentation focused on current usage, supported formats, contracts and design intentions. Do not commit task trackers, implementation plans, review/audit reports, finding inventories, agent adjudications or one-off validation logs. Keep those working artifacts under ignored `local/` storage; promote only their durable conclusions into the relevant documentation. Do not link permanent docs to local or historical review artifacts.
+
+For changes involving vcobj stores or their consumers, read the [store API contract](vc_object_store/docs/store-api-contract.md), [reading guide](vc_object_store/docs/reading.md), and [versioned-reference contract](vc_object_store/docs/versioned-reference-contract.md).
 
 ---
 

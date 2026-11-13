@@ -27,7 +27,6 @@ from vesuvius.neural_tracing.tracers.fibers.heading_model.evaluate import (
 from vesuvius.neural_tracing.tracers.fibers.heading_model.model import HeadingConfig, HeadingNet, save_heading_model
 from vesuvius.neural_tracing.tracers.fibers.heading_model.normals import normal_loss, normal_target_policy
 from vesuvius.neural_tracing.tracers.fibers.heading_model.frames import roll_supervision
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.prefetch import attach_remote_prefetch
 from vesuvius.neural_tracing.tracers.shared.system import raise_open_file_limit
 
 DEFAULTS = dict(name='heading_model', steps=30000, batch=128, workers=8, lr=3e-3, weight_decay=1e-4, warmup=500,
@@ -36,10 +35,7 @@ DEFAULTS = dict(name='heading_model', steps=30000, batch=128, workers=8, lr=3e-3
                 # 'cosine' decays to zero at the final step; 'constant' holds lr after warmup.
                 lr_schedule='cosine', lr_decay_start=None,
                 # Weights (same architecture and model config) to start a new run from; ignored by --resume.
-                init_checkpoint=None, normal_loss_weight=.25, roll_loss_weight=.25,
-                # The follower trainer's remote CT prefetch (separate async process; workers read the cache only).
-                remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=16,
-                remote_prefetch_timeout=120.)
+                init_checkpoint=None, normal_loss_weight=.25, roll_loss_weight=.25)
 
 
 PACKAGE = Path(__file__).resolve().parents[1]  # tracers/fibers/
@@ -201,23 +197,13 @@ def main(argv=None):
     (run/'config.json').write_text(json.dumps(dict(config, model_cfg=cfg.to_dict(), **provenance), indent=2)+'\n')
     print(f'Model: {sum(p.numel() for p in model.parameters())} parameters; training from step {step}', flush=True)
     workers = config['workers']
-    dataset, per_source = mixed_heading_states(sources, cfg, sampling, config['batch'], seed=config['seed']+step,
-                                               cache_bytes=int(config['worker_cache_gb']*(1 << 30)))
-    prefetcher, remote = attach_remote_prefetch(per_source, config['remote_prefetch_connections'],
-                                                config['remote_prefetch_queue_size'], config['remote_prefetch_timeout'],
-                                                config['remote_prefetch_lookahead'], workers)
-    if prefetcher is not None:
-        print(f"Remote CT prefetch for {len(remote)} sources: {config['remote_prefetch_connections']} connections, "
-              f"{config['remote_prefetch_lookahead']} planned batches per source/worker", flush=True)
+    dataset = mixed_heading_states(sources, cfg, sampling, config['batch'], seed=config['seed']+step,
+                                   cache_bytes=int(config['worker_cache_gb']*(1 << 30)))
     loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=workers,
                                          pin_memory=device.startswith('cuda'), persistent_workers=workers > 0,
                                          prefetch_factor=4 if workers else None)
-    try:
-        train(config, run, model, opt, step, best, loader, held_out, provenance, device,
-              best_normal=best_normal, best_frame=best_frame)
-    finally:
-        if prefetcher is not None:
-            prefetcher.close()
+    train(config, run, model, opt, step, best, loader, held_out, provenance, device,
+          best_normal=best_normal, best_frame=best_frame)
 
 
 def train(config, run, model, opt, step, best, loader, held_out, provenance, device, *,

@@ -2,10 +2,10 @@
 mode built on them."""
 import numpy as np
 import pytest
-from vc_object_store import ObjectStore
+from vc_object_store import ObjectStore, object_reference
 
 from vesuvius.neural_tracing.inference import infer_rowcol_triplet_wraps as copy
-from vesuvius.tifxyz.store import create_surface, read_surface
+from vesuvius.neural_tracing.inference.surface_store import create_surface, read_surface
 
 
 def _store_with_surface(path, *, scale_factor=1, valid=None):
@@ -29,10 +29,10 @@ def test_read_surface_applies_validity_and_volume_scale(tmp_path):
     uid, _, points = _store_with_surface(tmp_path / 'objects.vcobj', scale_factor=2, valid=valid)
     surface = read_surface(tmp_path / 'objects.vcobj', uid, volume='vol')
     assert surface.uuid == uid
-    assert surface.get_scale_tuple() == (1.0, 1.0)  # stored scale 0.5 per stored unit = 1 per voxel
-    assert not surface._mask[0, 0] and not surface._mask[2, 3] and surface._mask[1, 1]
-    assert surface._x[2, 3] == -1 and surface._x[0, 0] == -1
-    assert surface._x[1, 1] == pytest.approx(points[1, 1, 0] / 2)
+    assert surface.scale == (1.0, 1.0)  # stored scale 0.5 per stored unit = 1 per voxel
+    assert not surface.valid[0, 0] and not surface.valid[2, 3] and surface.valid[1, 1]
+    assert surface.xyz[..., 0][2, 3] == -1 and surface.xyz[..., 0][0, 0] == -1
+    assert surface.xyz[..., 0][1, 1] == pytest.approx(points[1, 1, 0] / 2)
     with pytest.raises(ValueError, match='does not map'):
         read_surface(tmp_path / 'objects.vcobj', uid, volume='other')
 
@@ -49,7 +49,7 @@ def test_read_surface_uses_the_store_missing_vertex_rule(tmp_path):
         db.put_geometry(uid, dict(kind='surface', attributes=dict(scale=[1, 1]), arrays=[
             dict(name='points', dtype='<f4', shape=list(points.shape), data=points.tobytes())]))
     surface = read_surface(tmp_path / 'objects.vcobj', uid, volume='vol')
-    assert surface._mask.tolist() == [[True, False, False], [False, True, True]]
+    assert surface.valid.tolist() == [[True, False, False], [False, True, True]]
 
 
 def test_create_surface_records_binding_provenance_and_missing_vertices(tmp_path):
@@ -64,32 +64,53 @@ def test_create_surface_records_binding_provenance_and_missing_vertices(tmp_path
         assert record['name'] == 'copy'
         assert record['meta']['coordinates'] == {'volume_uuid': 'vol', 'scale_factor': 1}
         assert record['meta']['provenance'] == {'tool': 'test-tool', 'parameters': {'k': 1}, 'sources': [source]}
-        assert record['meta']['area_vx2'] == 4
+        # The store computes area from geometry and removes stale TIFXYZ area metadata.
+        assert 'area_vx2' not in record['meta']
+        assert record['surface']['area'] == 0
     surface = read_surface(tmp_path / 'objects.vcobj', uid, volume='vol')
-    assert surface.get_scale_tuple() == (0.25, 0.25)
-    assert not surface._mask[1, 1] and not surface._mask[2, 2] and surface._mask[0, 0]
-    assert surface._z[0, 0] == 5.0  # zyx in, xyz stored
+    assert surface.scale == (0.25, 0.25)
+    assert not surface.valid[1, 1] and not surface.valid[2, 2] and surface.valid[0, 0]
+    assert surface.xyz[..., 2][0, 0] == 5.0  # zyx in, xyz stored
 
 
-def test_copy_store_mode_reads_the_pinned_revision_and_creates_sourced_outputs(tmp_path):
+def test_copy_store_mode_reads_the_pinned_version_and_creates_sourced_outputs(tmp_path):
     store = tmp_path / 'objects.vcobj'
     source, revision, _ = _store_with_surface(store)
-    with ObjectStore.open(str(store), author='test') as db:  # a later revision must not be read
+    with ObjectStore.open(str(store), author='test') as db:  # a later version must not be read
+        pinned = db.current_version(source)
+        generation = db.status()['generation']
+        exact = object_reference(db.object(source))
         edited = np.zeros((6, 8, 3), '<f4')
         db.put_geometry(source, dict(kind='surface', attributes=dict(scale=[0.5, 0.5]),
                                      arrays=[dict(name='points', dtype='<f4', shape=[6, 8, 3], data=edited.tobytes())]),
-                        expected_revision=revision)
-    surfaces = copy._StoredSurfaces(str(store), 'vol', source, revision)
+                        expected_version=pinned)
+    surfaces = copy._StoredSurfaces(str(store), 'vol', source, pinned)
     _, grid, valid = surfaces.load(source, 1)
-    assert grid[1, 1, 2] == pytest.approx(12.0)  # zyx of the pinned revision (x = 1*2 + 10)
+    assert grid[1, 1, 2] == pytest.approx(12.0)  # zyx of the pinned version (x = 1*2 + 10)
+    assert surfaces.source_version == exact
     assert not valid[0, 0]
     assert surfaces.name(source) == 'source'
     created = surfaces.save(grid, valid, 'source_front', step_size=2, voxel_size_um=8.0, source='ckpt',
                             metadata={'surface_role': 'front'}, apply_mesh_cleanup=False)
     with ObjectStore.open(str(store), read_only=True) as db:
-        meta = db.object(created)['meta']
+        record = db.object(created)
+        meta = record['meta']
         assert meta['provenance']['sources'] == [source]
-        assert meta['surface_role'] == 'front' and meta['area_vx2'] > 0
+        assert meta['provenance']['parameters']['input'] == {'reference': exact}
+        assert meta['surface_role'] == 'front'
+        assert 'area_vx2' not in meta
+        assert record['surface']['area'] > 0
+
+    # The next copy must cite its actual preceding output, not the first ancestor.
+    _, next_grid, next_valid = surfaces.load(created, 1)
+    previous = surfaces.loaded_version
+    following = surfaces.save(next_grid, next_valid, 'second', step_size=2, voxel_size_um=8.0,
+                              source='ckpt', metadata={}, apply_mesh_cleanup=False)
+    with ObjectStore.open(str(store), read_only=True) as db:
+        provenance = db.object(following)['meta']['provenance']
+        assert provenance['sources'] == [created]
+        assert provenance['parameters']['input'] == {'reference': previous}
+        assert previous['object'] != exact['object']
 
 
 def test_copy_cli_takes_exactly_one_input_mode():
@@ -100,6 +121,38 @@ def test_copy_cli_takes_exactly_one_input_mode():
                 base + ['--tifxyz-path', 't', '--surface', 'u']):
         with pytest.raises(SystemExit):
             copy.parse_args(bad)
+    for bad in (base + ['--store', 's', '--surface', 'u', '--volume-uuid', 'v', '--surface-version', '0'],
+                base + ['--store', 's', '--surface', 'u', '--volume-uuid', 'v', '--surface-generation', 'g'],
+                base + ['--tifxyz-path', 't', '--surface-version', '2']):
+        with pytest.raises(SystemExit):
+            copy.parse_args(bad)
     argv = copy._copy_args_to_argv({'store': 's.vcobj', 'surface_uuid': 'u', 'volume_uuid': 'vol',
-                                    'geometry_revision': 'r'})
-    assert argv == ['--store', 's.vcobj', '--surface', 'u', '--geometry-revision', 'r', '--volume-uuid', 'vol']
+                                    'surface_version': 3, 'surface_generation': 'g'})
+    assert argv == ['--store', 's.vcobj', '--surface', 'u', '--surface-version', '3', '--surface-generation', 'g',
+                    '--volume-uuid', 'vol']
+    with pytest.raises(RuntimeError, match='geometry_revision'):
+        copy._copy_args_to_argv({'store': 's.vcobj', 'surface_uuid': 'u', 'geometry_revision': 'r'})
+
+
+@pytest.mark.parametrize('deleted', [False, True])
+def test_queued_copy_carries_complete_selected_reference(tmp_path, deleted):
+    path = tmp_path / 'objects.vcobj'
+    source, _, points = _store_with_surface(path)
+    with ObjectStore.open(str(path), author='test') as db:
+        exact = object_reference(db.object(source))
+        db.set_meta(source, 'coordinates', dict(volume_uuid='vol', scale_factor=2))
+        if deleted:
+            db.delete_object(source)
+    argv = copy._copy_args_to_argv(dict(store=str(path), surface_uuid=source, volume_uuid='vol',
+                                      surface_reference=exact, volume_path='v', checkpoint_path='c'))
+    args = copy.parse_args(argv)
+    assert args.surface_reference == exact
+    selected = copy._StoredSurfaces(args.store, args.volume_uuid, args.surface_uuid,
+                                     reference=args.surface_reference)
+    selected.load(source, 1)
+    assert selected.source_version == exact
+    assert selected.name(source) == 'source'
+    surface = read_surface(path, source, volume='vol', reference=exact)
+    np.testing.assert_allclose(surface.xyz[1, 1], points[1, 1])
+    with pytest.raises(SystemExit):
+        copy.parse_args(argv + ['--surface-version', str(exact['version'])])

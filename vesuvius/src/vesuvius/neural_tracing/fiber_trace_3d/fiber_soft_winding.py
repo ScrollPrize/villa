@@ -324,7 +324,7 @@ def sample_arcs(arc, angle, start, end, step):
     return np.unique(np.r_[start, interior, end])
 
 
-def prepare_samples(config, d, existing=None):
+def prepare_samples(config, d, existing=None, *, source_version=None):
     """Reuse the fiber store reader and resolved curve geometry, not old three-node sampling."""
     from .fiber_normal_sign_visualization import load_umbilicus_frame
     from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
@@ -354,7 +354,7 @@ def prepare_samples(config, d, existing=None):
     ordered = d['source_id'][order]
     grouped = np.split(order, np.flatnonzero(ordered[1:] != ordered[:-1]) + 1)
     groups = dict(zip(sources.tolist(), grouped))
-    for row, xyz in fiber_store.read_polylines(config['fibers'], sources, volume=volume):
+    for row, xyz in fiber_store.read_polylines(config['fibers'], sources, volume=volume, source_version=source_version):
         ids = groups[row['id']]
         family = int(d['family'][ids[0]])
         arc, _, angle, _ = uv.fiber_geometry(xyz, family, axis)
@@ -697,17 +697,23 @@ def run(config):
     return run_prepared(config)
 
 
-def run_prepared(config):
+def run_prepared(config, *, source_version=None):
     """Launch on an explicitly prepared graph without rebuilding its selection."""
     config = dict(config, layout_mode='shared_anchor')
     validate(config)
     if Path(config['output_root'], 'summary.json').exists():
         raise FileExistsError('Completed output exists')
-    with np.load(config['tensor_cache']) as src:
+    cache = Path(config['tensor_cache'])
+    stamp = cache.with_suffix('.json')
+    if source_version is None and stamp.exists():
+        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_signature
+        signature = json.loads(stamp.read_text())['signature']
+        _, source_version = verify_fiber_signature(config['fibers'], signature)
+    with np.load(cache) as src:
         d = {k: src[k] for k in src.files}
     root = Path(config['output_root']); root.mkdir(parents=True, exist_ok=True)
     samples = root / 'soft_samples.npz'
-    np.savez(samples, **prepare_samples(config, d))
+    np.savez(samples, **prepare_samples(config, d, source_version=source_version))
     config.update(soft_samples=str(samples), tensor_sha256=sha256_file(config['tensor_cache']),
                   samples_sha256=sha256_file(samples))
     return uv.launch_tensor_solve(config, __name__, Path(__file__))

@@ -1,0 +1,95 @@
+# Store references and sharded stores
+
+`ObjectStore` reads and edits the logical store, including its pinned dependencies and partitions. `ObjectCollection` provides collection construction, routing inspection and store-qualified convenience APIs over that same implementation. It does not rely on SQLite ATTACH limits or pretend that multiple tables permit independent writers. Every write is one ordinary transaction in the local overlay; dependencies and published partitions are sealed. Plain unsharded SQLite databases remain valid inputs. The optional packed VFS uses exactly the same manifest and routing. `OpenOptions::physicalPartitionOnly` is an explicit maintenance escape hatch, not the consumer read path.
+
+A `store_reference` is a pinned, read-only reference to another store. It is collection-level provisioning, not an object/graph link or an edge between stored objects. Existing graph-link APIs and relationship kinds are unchanged.
+
+## Manifest and identity
+
+| Table | Purpose |
+| --- | --- |
+| `collection_members` | Ordered dependency/partition database UUID, owning store UUID, pinned lineage UUID and commit sequence, and locator; reservation bounds only for local partitions |
+| `collection_routes` | Structured object/edge key-space partition rules and physical destinations |
+
+These tables require the `collection-v1` feature in schema 21. Database and table identities are registered in the common provisioning directory. Locators are relative to the manifest file where possible; packed-internal members use `@packed:<database UUID>`, not staging or absolute paths. A dependency's UUID, lineage UUID, commit sequence, sealed policy and reservations must match. Missing dependencies, incompatible formats, cycles, conflicting pins or ambiguous ownership fail at open. Moving a complete directory tree or a self-contained packed file preserves identity.
+
+### Relocating referenced stores
+
+`OpenOptions::storeReferenceFiles` supplies ordered candidate store files; `storeReferenceDirectories` supplies ordered search directories. A referenced dependency is first opened at its recorded relative/absolute locator. If that is missing, unreadable, or does not match its pin, lookup tries the explicit files, then regular files in each directory in sorted pathname order. Directory search is nonrecursive and does not assume a filename extension. Relative search options are relative to the process working directory, whereas a serialized relative locator remains relative to its containing store. Root paths are explicit and are never substituted through this search.
+
+Every accepted candidate must have the recorded physical database UUID, logical store UUID, lineage UUID, commit sequence, sealed policy and, for a partition, numeric reservations. A same-name unrelated database, changed lineage or newer commit is not a match. The first valid candidate wins; a valid recorded path always has priority. A packed candidate selects the pinned physical database member, allowing a plain dependency to be located inside a packed copy with the same identities. These options propagate through nested store_references and collection creation. They do not edit manifests, repin dependencies, discover by object keys, or add a per-object directory. The successful candidate's open connection and snapshot are retained rather than reopened.
+
+```cpp
+OpenOptions options;
+options.readOnly = true;
+options.storeReferenceFiles = {"/datasets/renamed-base.vcobj", "/datasets/archive.pack"};
+options.storeReferenceDirectories = {"/datasets/referenced-stores"};
+auto collection = ObjectCollection::open("derived.vcobj", options);
+```
+
+Search is opt-in. Without these options, missing or mismatched recorded dependencies fail as before. Offline maintenance and packing entry points without `OpenOptions` still require their recorded locators to resolve.
+
+Ordinary store_references do not duplicate the parent's ranges: their bound fields are zero and ownership is loaded from the dependency manifest. Only physical partition entries carry local reservations, which are checked against their independently created database.
+
+The object or edge UUID is its complete logical key. `ObjectKey::storeUuid` is a routing/provenance hint, not another identity component: the same entity UUID resolves to the same visible record regardless of that hint. Numeric row IDs remain scoped to their reserved store key space and are not edge endpoint identities. An override stores the original UUID with the overlay's ordinary lineage and object version; no alias is generated. Creating a dependent store publishes at a commit sequence above every parent's sequence. All referenced parents must be sealed before creating a store_reference; opening a mutable store readonly is not sufficient.
+
+`members()` reports the manifest identities, lineage UUIDs and commit sequences observed when the collection was opened. Dependency pins cannot change; the mutable root may advance afterward. Use `provisioning(transaction).commitSequence` for the root's current snapshot sequence, not the cached root entry in `members()`. The separate `generation` field is the lineage UUID, not another numeric change counter.
+
+## Overlay reads and writes
+
+Immutable references have one transaction-scoped resolver. Geometry descriptors, delta parents, payload hashes, archived owner versions and extension snapshots all use the same pinned dependency scope, including sibling partitions. Storage-specific SQL stays in the corresponding backend reader; consumers do not locate databases or copy referenced records. Batched geometry reads retain batched descriptor/payload lookup. Exact references do not fall back to a different version when missing.
+
+Resolution checks the local record by UUID first, then referenced stores in explicit manifest order. A local replacement wins; a local Deleted (`state=2`) record stops fallback. Only an absent key falls through. The same rules apply recursively, so a deeper deletion does not accidentally resurrect an ancestor record. Enumeration deduplicates by UUID under the same precedence. The ordered bases are deliberate precedence, not unordered filesystem discovery. Repeated references to one physical database are coalesced after validating the pin. Duplicate UUIDs in independent import shards are rejected as duplicate records in one initial dataset, not reinterpreted as different entities.
+
+Unchanged records and geometry come directly from dependencies. Editing inherited metadata creates an ordinary local typed record with the same UUID; it does not copy geometry. A relation stores the original endpoint UUIDs directly in `edges.a_uuid` and `edges.b_uuid` as 16-byte BLOBs. Local, sibling-shard and endpoints in referenced stores use the identical row representation: no endpoint registration, negative handle, alias, proxy object or per-reference metadata. Native endpoint validation resolves the UUIDs through the collection and rejects missing or retired objects. This is not a SQLite foreign key across databases. Reverse adjacency queries every relevant edge partition: incident edges do not have to live beside the endpoint object. Results exclude deleted edges and deleted endpoints.
+
+Creating a writable object override is not data materialization. It copies the object's `geometry_manifest` descriptor verbatim, preserving `storage_kind`, `storage_ref`, checksum and extension snapshot references. The descriptor is small metadata (array names, shapes, types and chunk references), not coordinate payloads. Relative `file` references are rebased to the overlay's directory so they still identify the same file; absolute paths and opaque dataset/URL references are unchanged. Metadata-only overrides preserve the existing geometry UUID and create no geometry revisions or payload chunks. History records the edited metadata with that same storage reference; the sealed base remains unchanged. Referenced payloads and archived/delta geometry remain readable through pinned dependencies. An explicit geometry edit uses that same referenced descriptor as its parent and writes only its new revision/delta and changed payloads; it does not synthesize a local base revision. Only an explicit extension-row replacement writes that extension's new owner rows/snapshot; unrelated extension data remains borrowed. These are separate operations, not an implicit “make local” operation.
+
+Endpoint references resolve the visible object's current lifecycle and are not separately addressable records. A same-content `setMeta` or `replaceObject` does not create an override or advance the commit sequence. Changes to anchored metadata require an explicit relationship decision in the same transaction, just as for locally owned endpoints. Validation checks the final transaction state. Revalidation or editing creates an ordinary edge override preserving its identity and continuing its version, rather than removing and recreating the relationship. Unanchored classification fields remain editable. Indexed anchors validate against visible geometry without acquiring local descriptors or chunk registrations.
+
+Deleting an inherited object requires first removing its visible incident edges. The overlay stores `state=2` on an `objects` record at that original UUID; removing an inherited edge similarly stores `state=2` in `edges` at the original edge UUID. There are no separate object-reference or edge-tombstone tables. History-on records local edits using the existing history machinery; it does not copy the parent's history. External relationship endpoints retain sealed-store/lineage/commit-sequence provenance in historical version references, not fabricated local endpoint object histories. Global historical snapshots across arbitrary collection commits are not part of this version.
+
+Initial geometry uses `putGeometry`; sparse edits use `editGeometry` and the observed geometry UUID. On the first inherited edit, the local object descriptor directly references unchanged parent chunk hashes; no chunk registration or NULL payload row is created. Resolution searches pinned readonly dependencies, including deeper store_references. Only chunks that need materializing or changing acquire local bytes. Metadata, verification, normal geometry editing and dependency validation use the common reader. Geometry decisions (`retain`, update/remove, and history-on `keep_recorded`) apply identically to inherited and local incident relationships. Missing decisions fail atomically. New geometry UUIDs are local publications; the parent's data remains unchanged. Native low-level access without the collection resolver fails when it reaches external payloads.
+
+```cpp
+using namespace vc::objects;
+OpenOptions options;
+options.author = "classification";
+options.history = HistoryMode::Off;
+options.spatialIndex = false;
+auto derived = ObjectCollection::create("classification.vcobj", {"fibers.vcobj"}, options);
+auto write = derived.write();
+derived.setMeta(write, {baseStoreUuid, fiberUuid}, "family", R"("H")");
+derived.seal(write); // a later normals overlay may now depend on this layer
+write.commit();
+```
+
+Spatial selections, region cuts and nearest-surface queries use each source's existing accelerator and merge visible results. No collection-wide duplicate index is created. Every queried source must have spatial indexing enabled; missing capabilities raise an error rather than silently omitting data. Metadata overrides preserve optional local bounds/regions while retaining their original geometry references. Viewport budgets and selected-object priority apply across the merged query.
+
+Object/edge selection, adjacency, traversal, graph snapshots and JSON export use the same visible-state routing. Filtering cannot expose a shadowed base record; ordering and pagination operate on merged results. Exact graph snapshots use full store/lineage/entity/version references and work with history-off current states, without inventing archive UUIDs. An `ObjectRevision` reports its owning `storeUuid` (`store` on the wire), so reconstructing its exact reference remains correct after an overlay shadows it. Tombstones stop lookup instead of exposing an older dependency record.
+
+Artifacts are also content-addressed references: validation, size lookup and range reads search the transaction's pinned store scope through one resolver. Metadata-only overrides do not copy artifact sidecars. `ObjectCollection::artifactLength` and `readArtifact` use the same reader as native stores. Structural sequence edits merge retained point-ID allocations from current descriptors and archived states in that scope, so restoring an earlier geometry or editing it in an overlay cannot reuse previously allocated stable point IDs. No endpoint or allocation directory is created.
+
+## Independent import shards
+
+The [initial batch API](initial-import.md) owns the shared logical store UUID, lineage UUID, commit sequence and disjoint object/edge reservations. Each worker seals its shard and returns its descriptor through the existing writer. The coordinator directly writes a history-off, sealed routing manifest at that same logical state; physical database and table UUIDs remain distinct. It does not reopen the shards or invoke `publishShards`. Partitions are not parent dependencies, so their common final commit sequence is intentional.
+
+The initial batch API defaults to UUID-hash routing: producers send each object and edge to `uuidShardIndex(uuid, shardCount)`. The manifest stores one `objects.uuid` and one `edges.uuid` routing row per shard, plus numeric reservations. UUID lookup checks the overlay first and exactly the designated shard at each partitioned layer; a miss does not trigger a sibling scan. Dependencies remain in manifest precedence order. The `uuid-hash-routing-v1` required feature identifies this contract. `InitialImportOptions::uuidHashRouting=false` is explicit compatibility for arbitrarily partitioned sources; those stores use indexed UUID fanout. The AFV streaming command uses bounded parallel UUID dispatch; the prepared benchmark repartitions by UUID before timing ingestion.
+
+Numeric lookups independently use disjoint inclusive positive-ID ranges. `ObjectStore::insertObjectWithId` and `insertEdgeWithId` support predetermined import IDs within their respective reservations; occupied IDs/UUIDs cannot be overwritten. Explicit edge insertion uses ordinary current-endpoint dependency validation, history and numbered-version handling, without persistent duplicate current-binding rows. `ObjectCollection::insertEdgeWithId` accepts original endpoint UUIDs with store routing hints, including objects in referenced stores. Failed insertions and transaction rollback restore the allocation state; out-of-order explicit insertion never moves the ordinary cursor backward or reopens an exhausted range. Unpopulated IDs inside a reservation remain owned, never become free allocation space in another shard. Manifest-only databases have exhausted local allocators.
+
+Explicit `KeyRoute` declarations additionally support multiple numeric ranges per destination, modulo, selected bits, and a versioned hash. For each key space, one authoritative rule kind/divisor/shift is allowed; overlapping rules are rejected. The separate checked publisher validates custom routes against stored keys once; the controlled batch importer writes its producer-owned routing metadata directly without reopening or scanning shards. Opening checks the compact declaration, not every key. Edge identity routing and adjacency scattering are separate operations: adjacency still queries relevant edge partitions because edges need not live beside either endpoint. An endpoint reference never needs translation into the destination's row ID.
+
+For positive ID `x`, modulo routes on `x % divisor`; bit routing uses `(x >> shift) % divisor` with a power-of-two divisor. HashV1 applies unsigned 64-bit overflow arithmetic: `x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9; x = (x ^ (x >> 27)) * 0x94d049bb133111eb; x ^= x >> 31;` then modulo. Never substitute implementation-dependent `std::hash`.
+
+UuidHashV1 applies FNV-1a64 to the 16 UUID bytes in canonical textual order: initialize `h=14695981039346656037`, then for each byte `h=(h ^ byte)*1099511628211` with unsigned 64-bit overflow. The destination is `h % shardCount`. UUID route rows use `kind=4`, `lower_bound=1`, `upper_bound=INT64_MAX`, `shift=0`, `divisor=shardCount` and one unique remainder/destination per shard. These bounds are canonical placeholders, not a truncation of the 128-bit key. No per-object routing directory is stored or constructed.
+
+`publishShards` is the separate discovery/validation operation for caller-supplied existing databases, not a batch-finalization step. It checks those inputs before constructing their manifest. Ordinary file completion uses a same-directory stage and atomic no-overwrite exposure with directory sync. A failed manifest is not a usable partially completed collection. For packed builds, `PackedStoreBuilder::finalize` is the single outer completion boundary; all independent SQLite handles must close first. This flushes retained data and finalizes the container, without reopening its SQLite databases.
+
+`packObjectCollection(source, destination)` packages a sealed dependency closure into one packed file, preserving logical/database/table UUIDs, lineage UUIDs and commit sequences while replacing physical locator strings. A writable derived overlay can subsequently hold a store_reference to the packed source.
+
+`copyObjectCollection(source, destination, options)` creates an independent mutable copy, including the resolved dependency closure and artifact payloads. `copyProject` uses this API and then sets the project name. The destination is an ordinary SQLite root with dependencies in `<destination>.stores` and content-addressed artifacts in `<destination>.artifacts`; move those together. Sources can be plain, packed, referenced or sharded. The ordinary unpartitioned root keeps its copied history under a new store/database identity. A sharded root remains sealed in the copied closure behind a new writable overlay, because editing the manifest independently of its sealed partitions would invalidate their common publication pin. No per-object or geometry payload remapping is performed. External dataset files are not part of this export.
+
+## Limits and safety
+
+There are no distributed transactions, mutable published shards, automatic parent-following, implicit ID renumbering or default spatial fallbacks. Sealing is an API contract and change-detection boundary, not cryptographic protection against malicious raw file edits. Keep a collection and its dependency closure alive for the lifetime of its transactions. Transactions are thread-confined, as with `ObjectStore`. One transaction holds read snapshots for the immutable dependencies it actually touches; it does not reopen databases for every lookup.

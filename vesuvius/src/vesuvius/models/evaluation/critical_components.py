@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from typing import Dict, Tuple, Set, List
 from collections import deque
-from scipy.ndimage import label
+from vc_reader.geometry import label_components
 from numba import njit, prange
 import numba as nb
 from .base_metric import BaseMetric
@@ -239,7 +239,7 @@ def get_foreground(img: np.ndarray) -> np.ndarray:
 def detect_critical_3d(y_target: np.ndarray, y_pred: np.ndarray, visited_mask: np.ndarray = None) -> int:
     """Detects critical components in a 3D segmentation using JIT-compiled BFS."""
     y_mistakes = false_negative_mask(y_target, y_pred)
-    y_target_minus_mistakes, _ = label(y_target * (1 - y_mistakes))
+    y_target_minus_mistakes, _ = label_components(y_target * (1 - y_mistakes), connectivity=6)
     n_criticals = 0
     
     # Get foreground coordinates as numpy array

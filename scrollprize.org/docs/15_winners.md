@@ -40,6 +40,161 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
 
 Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
+### \$40,750 Progress Prizes (October 2026)
+
+**Goal:** Improve the tools and training methods needed to read the scrolls.
+
+<div className="flex flex-row flex-wrap">
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/jimmylomro/hercUNet/tree/hercuvit">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$20,000</div><span className="font-semibold">Virtual unwrapping</span>: Jaime Lomeli-Rodriguez / @jaimelomro_79060</div>
+    <div className="text-sm text-dim">Assorted interesting work on virtual unwrapping, including HercUNet and HercuViT.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/DomRusso2/reader-v3">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$5,000</div><span className="font-semibold">reader-v3 ink model</span>: Domenico Russo / @klavis223</div>
+    <div className="text-sm text-dim">An updated version of the 9.6 µm ink model, now used in the majority of First Letters submissions.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/2309">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,500</div><span className="font-semibold">Automated fiber extraction</span>: Samir Lerognon / @qualzz</div>
+    <div className="text-sm text-dim">Further work on automated fiber extraction, with improvements to the models and tracing, and new fiber visualisation capabilities in VC3D.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/LimeGS/winding-field">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">winding-field</span>: Leonel Wainer / @LimeGS</div>
+    <div className="text-sm text-dim">A new segmentation approach that fits a scalar field whose integer isosurfaces correspond to winding surfaces.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/2274">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Extending patches in VC3D</span>: Chase Hendrick / @Chase</div>
+    <div className="text-sm text-dim">An addition to VC3D that extends patches using heuristics operating directly on the raw CT volume.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Hob3rMallow/scrollfiesta_public">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">ScrollFiesta pipeline</span>: Ben Kyles / @hari_seldon and colleagues</div>
+    <div className="text-sm text-dim">Further work on the ScrollFiesta pipeline, including fiber-guided UV flattening.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/SuperOptimizer/ufsm">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">UFSM</span>: Forrest McDonald / @forrest</div>
+    <div className="text-sm text-dim">An attempt at fast end-to-end unwrapping that produces some large stretches of coherent surface across multiple windings.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/LimeGS/ink-sdk">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">ink-sdk</span>: Leonel Wainer / @LimeGS and Paulo Sergio Camillo / @pscamillo</div>
+    <div className="text-sm text-dim">A tool that makes it easy to run a battery of team and community ink models on a segment.</div>
+  </a>
+  <div className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Discord chat search</span>: Leonel Wainer / @LimeGS</div>
+    <div className="text-sm text-dim">A chat search service giving an up-to-date summary of Discord content.</div>
+  </div>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/vc-delta3d/pull/6">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Lossless CT compression</span>: Chase Hendrick / @Chase</div>
+    <div className="text-sm text-dim">A ~10% improvement to lossless compression of CT volumes in vc-delta3d.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Aevilaliv3+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Assorted villa PRs</span>: Giovanni Pellerano / @evilaliv3</div>
+    <div className="text-sm text-dim">Various merged villa PRs, mostly correctness fixes to in-use tooling.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3AAndreasHad04+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Apple Silicon support</span>: Andreas Hadjinicolaou / @AndreasHad</div>
+    <div className="text-sm text-dim">Various merged PRs making frequently used tools work on Apple Silicon.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/2123">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Umbilici for crushed scrolls</span>: Jude Wallis / @Jude</div>
+    <div className="text-sm text-dim">Geometric improvements to the automatic umbilicus generator.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Ateddywasserman+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Ink pipeline improvements</span>: Teddy Ove Johannes Wasserman / @biggiejuke02</div>
+    <div className="text-sm text-dim">Convenience and performance improvements to the ink pipeline, including faster data loading and running several checkpoints on the same input in one go.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/praysimanjuntak/windcon">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">windcon</span>: Pray Apostel</div>
+    <div className="text-sm text-dim">Extracts same-winding constraints directly from CT data, for use in spiral fits.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Aphippsrtyler+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Assorted villa speed-ups</span>: Tyler Phipps / @mlkman29</div>
+    <div className="text-sm text-dim">A number of small speed-ups to in-use villa code.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/WillStevens/scrollreading/tree/main/pipeline9">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Patch stitching optimisation</span>: William Stevens / @Will Stevens</div>
+    <div className="text-sm text-dim">Incremental improvements to the optimisation that stitches small patches into surfaces.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/yupengtang/vesuvius-scroll-inference/blob/main/eval/report/comparison.md">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Comparing surface models</span>: Yupeng Tang / @ytang454</div>
+    <div className="text-sm text-dim">Quantitative measurements, via GrowPatch consistency, of how well three 9 µm surface models work in practice for segmentation.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://huggingface.co/evilaliv3/rectina">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Rectina ink model</span>: Giovanni Pellerano / @evilaliv3</div>
+    <div className="text-sm text-dim">A new 9 µm ink model.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Aalexxxmur+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">VC3D on Windows</span>: Alexey Murashkin / @alexmur6692</div>
+    <div className="text-sm text-dim">Windows compatibility fixes to VC3D.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3ASirProdigle+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Assorted villa PRs</span>: Liam Warner / @Prodigle</div>
+    <div className="text-sm text-dim">Three useful bug-fixes to in-use tools.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://huggingface.co/scrollprize/hecate/discussions/2">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Hecate on DirectML</span>: Mohamad Al-Zawahreh</div>
+    <div className="text-sm text-dim">A DirectML backend for the Hecate ink model.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Aprotonjls+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">VC3D platform fixes</span>: Junlong Shen / @Jason</div>
+    <div className="text-sm text-dim">Platform compatibility fixes to VC3D.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/EhimenNathan/vesuvius-ink-generalization">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Zarr downsampling issue</span>: Ehimen Nathaniel</div>
+    <div className="text-sm text-dim">Found a problem in the released data where downsampled zarr levels kept only the first depth slices, and trained a smaller version of the ink9um recipe.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Avincentl065+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Windows & ROCm fixes</span>: Vincent Lemonnier / @vskinox</div>
+    <div className="text-sm text-dim">Windows and ROCm compatibility fixes.</div>
+  </a>
+  <div className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Spiral fitter on Mac</span>: Lucas Young / @LucasY</div>
+    <div className="text-sm text-dim">Fixed a spiral-fitter bug on Mac, plus a small Mac build fix.</div>
+  </div>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Aslchicoineau-creator+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Windows & AMD fixes</span>: Sebastien Chicoineau / @Seb_Chic and Chris Thomas</div>
+    <div className="text-sm text-dim">Windows compatibility fixes to VC3D, and AMD support fixes for the spiral fitter and Lasagna.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3ARano200+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Assorted Windows PRs</span>: Alex Haeseker</div>
+    <div className="text-sm text-dim">Several merged Windows compatibility PRs.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Acampbelltron1+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Mean-teacher training fixes</span>: Ryan Campbell / @campbelltron1</div>
+    <div className="text-sm text-dim">Correctness fixes to mean-teacher semi-supervised training.</div>
+  </a>
+  <div className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Copy displacement tracer fix</span>: Hyojun Kwon / @jamiolrangmalrang4936</div>
+    <div className="text-sm text-dim">Fixes a genuine bug in the Copy displacement neural tracer models.</div>
+  </div>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Anerln+merged%3A2026-10-01..2026-11-12">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Assorted villa PRs</span>: Eugenio Giuseppe Nerelli / @nerln</div>
+    <div className="text-sm text-dim">Useful platform and compatibility PRs for VC3D and vesuvius.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/2007">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Faster GrowPatch tracing</span>: Matteo Bulloni / @matteobulloni_73362</div>
+    <div className="text-sm text-dim">Small performance improvements to surface tracing in GrowPatch.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/2393">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Spiral fitter on Apple Silicon</span>: Antonio Alonso-Stepanov</div>
+    <div className="text-sm text-dim">An Apple Silicon (MPS) compatibility fix for the spiral fitter.</div>
+  </a>
+</div>
+
+### \$50,000 First Letters: PHerc. 306B (October, 2026)
+
+**Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.
+
+<div className="flex flex-row flex-wrap">
+  <PrizeCard
+    href="https://scrollprize.substack.com/p/writing-seen-in-pherc-306b-for-the"
+    prizeAmount="$50,000"
+    title="Winners"
+    description="Liam Warner (@Prodigle) and Nicola Bodill (@polytrope) found writing in PHerc. 306B, likely reading “τὸ δι᾽ αὑτὸ αἱρ̣ε̣τ̣όν̣”, “that which is in itself desirable”"
+    mediaSrc="/img/firstletters/pherc0306b-warner-bodill.webp"
+    mediaAlt="Ink detected in PHerc. 306B by Liam Warner and Nicola Bodill, with the reading τὸ δι᾽ αὑτὸ αἱρετόν"
+    wide
+  />
+</div>
+
 ### \$50,000 First Letters: PHerc. 343 (October, 2026)
 
 **Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.

@@ -5,22 +5,35 @@ The service binds to loopback by default. Non-loopback binds are explicit and
 always carry bearer authentication; every client — including VC3D talking to a
 process it launched itself — uses the same authenticated HTTP protocol.
 
-Every service is bound to one dataset at startup: ``--dataset`` (inputs,
-resolved once and advertised through ``/dataset``) and ``--output`` (all
-generated state) are required; ``--cache`` defaults to the documented user
-cache (``$XDG_CACHE_HOME/vc3d/spiral``). Both --output and --cache must
-resolve outside the dataset root — the dataset holds inputs only.
+Every service binds its host paths once at startup and advertises them
+through ``/bindings``: ``--output`` (all generated state) is required;
+``--cache`` defaults to the documented user cache
+(``$XDG_CACHE_HOME/vc3d/spiral``); the optional ``--winding-inference`` is
+the winding-inference artifact winding-model supervision reads. There is no
+dataset: the scroll's facts, umbilicus, Lasagna dataset and fiber-inference
+dataset are the project's that each session request carries.
 
-The service starts ``Uninitialized``. Dataset and checkpoint discovery remain
+The service starts ``Uninitialized``. Binding and checkpoint discovery remain
 available without importing the fitting runtime; ``POST /session/initialize``
 creates the first resident session, and ``POST /session/rebuild`` replaces an
 existing one.
 
+Patch, PCL and fiber inputs come from the object store bound at launch
+(``--object-store``), never from an upload. A fit reads the inputs of a
+linked, pinned position of it, and ``POST /session/update-inputs`` replaces
+a resident fit's inputs with a newer position's in place, keeping its model
+and optimiser. A position is a commit of the bound store: the store file
+the service opens, which clients on its host attach too, or a store served
+by vc_object_server, bound by its endpoint. Without a position (a rebuild
+of an old checkpoint's inputs) the
+inputs are frozen for a resident session, and
+changing them is an edit in the store followed by a full-input rebuild. One
+client owns the mutation surface through the session lease
+(``POST /session/lease/claim``).
+
 Generated display data (previews, downloadable
 checkpoints) is published as immutable, opaque artifacts and transferred
-through ``/artifacts/...`` instead of host filesystem paths. Session inputs
-(patches, fibers, PCL documents) can be uploaded into a dataset-scoped
-editing workspace and explicitly applied or committed into the dataset.
+through ``/artifacts/...`` instead of host filesystem paths.
 
 Host filesystem paths are the service's business. A client never invents
 one: a saved checkpoint is a name the service places under the session
@@ -39,11 +52,12 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from input_workspace import MutationCoordinator
+from service_mutations import MutationCoordinator
+from session_lease import SessionLease
 from workspace_storage import reclaim_workspaces
-from service_editing import EditingWorkspace
 from collections import OrderedDict, deque
 from collections.abc import Mapping
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -59,31 +73,35 @@ import signal
 import socket
 import stat
 import sys
-import tempfile
 import threading
 import time
 from http import HTTPStatus
+from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
-                         SESSION_BUSY_STATES, SCROLL_SPEC_FILENAME,
-                         SCROLL_SPEC_OWNED_RUN_KEYS, PclRole, ScrollSpecError,
-                         SessionState, SpiralInputPaths, default_user_cache_dir,
-                         input_source_enabled, pcl_input_enabled,
-                         winding_inference_enabled, load_scroll_spec,
-                         scroll_spec_config_defaults,
-                         parse_session_request, resolve_dataset_root,
-                         validate_session_request)
-from checkpoint_migrations import tolerate_config
+from fit_session import (API_VERSION, FIT_INPUT_CATALOG,
+                         SESSION_BUSY_STATES,
+                         SCROLL_SPEC_OWNED_RUN_KEYS,
+                         PROJECT_LASAGNA_INPUTS, VOLUME_INPUT_KEYS,
+                         ScrollSpecError, SessionScroll, SessionState,
+                         SpiralProject, default_user_cache_dir,
+                         fiber_directions_required, input_source_enabled,
+                         lasagna_enabled,
+                         winding_inference_enabled, winding_inference_error,
+                         parse_session_request,
+                         validate_session_request, write_project_umbilicus)
+from lasagna_source import load_lasagna_source, write_lasagna_source
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, describe_catalog,
                     filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
+from service_commits import (CommitContext, CommitRefused, commit_in_place,
+                             read_published_generation)
 from preview_index import PublishedPreviewIndex
 from service_files import ExclusiveFileLock, FileLockUnavailable
-from service_uploads import (PCL_ROLE_FILES, UPLOADED_CHECKPOINTS_DIRNAME,
+from service_uploads import (UPLOADED_CHECKPOINTS_DIRNAME,
                              UploadEnvironment, UploadManager)
 from lasagna_publish import (LasagnaPublisher, PreviewPublication,
                              stop_process_group)
@@ -97,30 +115,20 @@ from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
 
 
 SERVICE_VERSION = "10.0.0"
-# Per editable PCL role: the /session/status key carrying its display
-# artifact, the artifact registry kind, the artifact directory prefix, and the
-# human label used in client-facing messages.
-PCL_ARTIFACT_STATUS_KEYS = {
-    PclRole.SAME_WINDING.value: "same_winding_artifact",
-    PclRole.RELATIVE.value: "relative_winding_artifact",
-}
-PCL_ARTIFACT_KINDS = {
-    PclRole.SAME_WINDING.value: "spiral-same-winding-pcl",
-    PclRole.RELATIVE.value: "spiral-relative-winding-pcl",
-}
-PCL_ARTIFACT_DIR_PREFIXES = {
-    PclRole.SAME_WINDING.value: "same-winding",
-    PclRole.RELATIVE.value: "relative-winding",
-}
-PCL_ROLE_LABELS = {
-    PclRole.SAME_WINDING.value: "same-winding",
-    PclRole.RELATIVE.value: "relative-winding",
-}
+# The current session's object-store input manifest, as one immutable
+# artifact per input digest: too large for every status poll, and what a
+# client resolves the fitted inputs' revision pins from.
+INPUT_MANIFEST_ARTIFACT_KIND = "spiral-input-manifest"
+INPUT_MANIFEST_FILE_NAME = "object_store_inputs.json"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
-# Upper bound on the checkpoint listing /dataset advertises. A client offers
+# Parallel chunk reads when extracting missing fiber directions.
+FIBER_DIRECTION_WORKERS = 64
+# Parallel object fetches when copying remote Lasagna arrays to pack them.
+FETCH_WORKERS = 64
+# Upper bound on the checkpoint listing /bindings advertises. A client offers
 # this as a choice, so it is a menu, not an inventory.
 SESSION_CHECKPOINTS_LISTED = 200
 MAX_LOG_ENTRY_CHARS = 8192
@@ -137,10 +145,30 @@ EVENT_COALESCE_SECONDS = 1.0
 
 _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
-# Base input paths are owned by the service (every launch carries --dataset);
-# a load request may only choose among service-advertised values for these
-# keys.
-_DATASET_CLIENT_SELECTABLE = ("checkpoint", "tracks_dbm")
+# The stable code of a refused input upload: patches, PCLs and fibers come
+# from the object store, so an upload is never how inputs change.
+INPUTS_IN_OBJECT_STORE = "inputs_in_object_store"
+# Stable codes of refused input updates (POST /session/update-inputs), and
+# of verbs refused while one is in flight.
+INPUT_UPDATE_UNAVAILABLE = "input_update_unavailable"  # no store, or no session
+INPUT_UPDATE_BUSY = "input_update_busy"                # not an idle session
+INPUT_GENERATION_STALE = "input_generation_stale"      # expected_input_generation
+INPUT_UPDATE_IN_PROGRESS = "input_update_in_progress"  # another verb waits for one
+LEASE_TOKEN_HEADER = "X-Spiral-Session-Token"
+
+
+def input_upload_error():
+    return ApiError(
+        HTTPStatus.BAD_REQUEST,
+        "Fit inputs are not uploaded: patches, PCLs and fibers come from the "
+        "service's object store. Change them there, then update the fit's "
+        "inputs (POST /session/update-inputs) or rebuild it with inputs "
+        "reloaded.",
+        payload={"code": INPUTS_IN_OBJECT_STORE})
+
+# Input paths are the service's (its bindings) and the project's; a session
+# request may specify only these, each among service-advertised values.
+_CLIENT_SELECTABLE_PATHS = ("checkpoint",)
 
 
 def parse_gpu_ids(value):
@@ -182,17 +210,232 @@ def parse_session_name(value):
     return name
 
 
-def bind_service_paths(resolution, output_directory, cache_directory):
-    """Attach the startup-resolved output/cache roots to the advertisement.
+class ObjectStoreBindingError(RuntimeError):
+    """The launch object store is unusable, and why."""
 
-    Dataset resolution describes inputs only; where generated state lives
-    (--output) and where derived host caches live (--cache) are service
-    startup decisions. /dataset advertises the bound result so clients see
-    one immutable set of paths.
+
+@dataclasses.dataclass(frozen=True)
+class ObjectStoreBinding:
+    """The object store this service reads fit inputs from.
+
+    Bound once at launch (``--object-store``) and never chosen by a client:
+    patch, PCL and fiber inputs, and the links the service's refresh writes,
+    live in this one store. ``location`` is where the service opened it: a
+    store file on the service host, which clients on that host attach too,
+    or (``served``) the endpoint of the vc_object_server holding it, which
+    clients anywhere attach. Clients identify the store by ``uuid`` and the
+    history ``generation`` positions belong to. ``author`` identifies the service
+    in the store when it refreshes links and commits; ``link_timeout_s`` is
+    how long a served store's link refresh may take (its server's
+    --request-deadline).
     """
-    resolution.resolved["output_directory"] = str(output_directory)
-    resolution.resolved["cache_directory"] = str(cache_directory)
-    return resolution
+
+    location: str
+    uuid: str
+    generation: str
+    author: str
+    served: bool = False
+    link_timeout_s: int = 300
+
+    def config(self):
+        """The service-owned configuration a session request receives."""
+        return {"object_store_location": self.location,
+                "object_store_author": self.author,
+                "object_store_link_timeout_s": self.link_timeout_s,
+                "object_store_input_position": None}
+
+    def open(self, *, read_only=False, cache_directory=None):
+        """Open the local or served store for a context block.
+
+        Writes use the service's author; local files can be opened read-only.
+        """
+        from object_store_inputs import open_store
+        return open_store(self.config(), read_only=read_only, cache_directory=cache_directory)
+
+    def head(self):
+        """``(commit_sequence, error)``: the store's head, read now (not the
+        fitted position, which is status ``input_position``), or why it
+        could not be read."""
+        try:
+            with self.open(read_only=True) as store:
+                return int(store.status()["commit_sequence"]), None
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def advertisement(self, head=None):
+        """The /bindings entry; ``head`` is ``self.head()`` when the caller
+        read it already (one read per request)."""
+        head, error = head if head is not None else self.head()
+        return {"uuid": self.uuid, "generation": self.generation, "location": self.location,
+                "served": self.served, "author": self.author,
+                "commit_sequence": head, "position_error": error}
+
+
+# Configuration keys the launch binding owns. A session request or --config
+# naming one is refused, as the scroll-specification keys are, rather than
+# quietly overruled: a client cannot repoint the inputs a service reads, or
+# choose the position a build pins (it asks with ``inputs_position``).
+SERVICE_OWNED_CONFIG_KEYS = ("object_store_location", "object_store_author",
+                             "object_store_link_timeout_s", "object_store_input_position")
+
+
+# What /bindings tells a client this service supports, so it can enable or
+# explain controls before any session exists.
+SERVICE_CAPABILITIES = {
+    # Patches, PCLs and fibers are read from the bound object store.
+    "input_source": "object_store",
+    # A resident session's inputs never change (a service without
+    # positions); one with positions updates them in place instead.
+    "inputs_frozen": True,
+    # POST /session/rebuild {"inputs": "reload"} rereads the store.
+    "input_reload_rebuild": True,
+    # Initialize and full-input rebuilds link and pin a position, including
+    # at least the request's ``inputs_position`` (bindings with positions).
+    "input_positions": False,
+    # POST /session/update-inputs replaces a resident fit's inputs with a
+    # position's, keeping its model and optimiser (bindings with positions).
+    "input_updates": False,
+    # POST /session/commit writes a published preview to the bound store as
+    # a surface (service_commits).
+    "commits": False,
+}
+
+
+def _stat_or_none(path):
+    try:
+        return path.stat()
+    except OSError:
+        return None
+
+
+def default_object_store_author():
+    return f"spiral-service@{socket.gethostname()}"
+
+
+# What a writable open of a store file says when vc_object_server holds it
+# (vc_object_store's OwnershipGuard); other open failures are reported as
+# they are.
+SERVED_FILE_MESSAGE = "owned by its hosting service"
+
+
+def bind_object_store(location, author=None, link_timeout_s=300):
+    """Open the launch object store once; return its binding.
+
+    ``location`` is a store file on this host, or the endpoint of the
+    vc_object_server serving one (``http://host:port``, or ``ssh://`` for
+    a server on another host's loopback port), which is attached writable
+    and whose link requests may take ``link_timeout_s``. A file another
+    process serves (vc_object_server holds its writer lock) is refused:
+    bind that server's endpoint instead.
+
+    Raises ObjectStoreBindingError when the vc_object_store module is not
+    importable or the store cannot be opened, so startup fails with the
+    cause instead of the first fit failing later.
+    """
+    author = author or default_object_store_author()
+    try:
+        from vc_object_store import ObjectStore
+        from vc_object_store.locations import is_endpoint, open_store
+    except ImportError as exc:
+        raise ObjectStoreBindingError(
+            f"the vc_object_store Python module is unavailable ({exc}); put "
+            "its build's python directory on PYTHONPATH") from exc
+    if is_endpoint(location):
+        try:
+            with open_store(str(location), author=author, link_timeout_s=link_timeout_s) as store:
+                status = store.status()
+        except Exception as exc:  # noqa: BLE001 - every failure refuses the binding
+            raise ObjectStoreBindingError(
+                f"cannot attach the served object store {location}: {exc}") from exc
+        return ObjectStoreBinding(str(location), str(status["store"]), str(status["generation"]),
+                                  author, served=True, link_timeout_s=int(link_timeout_s))
+    if "://" in str(location):
+        raise ObjectStoreBindingError(
+            f"{location} is neither a store file nor a vc_object_server endpoint "
+            "(http://, https:// or ssh://)")
+    resolved = Path(location).expanduser().resolve(strict=False)
+    if not resolved.is_file():
+        raise ObjectStoreBindingError(f"no object store at {resolved}")
+    try:
+        with ObjectStore.open(str(resolved), read_only=True) as store:
+            status = store.status()
+    except Exception as exc:
+        raise ObjectStoreBindingError(
+            f"cannot open the object store {resolved}: {exc}") from exc
+    # Writable: the service links and commits into it. A file a server
+    # holds refuses the writable open.
+    try:
+        with ObjectStore.open(str(resolved), author=author):
+            pass
+    except Exception as exc:
+        message = str(exc)
+        if SERVED_FILE_MESSAGE in message:
+            raise ObjectStoreBindingError(
+                f"{resolved} is served by vc_object_server; bind its endpoint "
+                f"({message})") from exc
+        raise ObjectStoreBindingError(
+            f"cannot open the object store {resolved} for writing: {message}") from exc
+    return ObjectStoreBinding(str(resolved), str(status["store"]), str(status["generation"]), author,
+                              link_timeout_s=int(link_timeout_s))
+
+
+
+class ServiceBindingError(ValueError):
+    """A launch path binding is unusable, and why."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ServiceBindings:
+    """The host paths a service binds once at launch; no client can repoint
+    them. ``output_directory`` holds all generated state, ``cache_directory``
+    the derived host caches (prepared Lasagna packs and fiber directions),
+    and ``winding_inference`` ('' when unbound) the winding-inference
+    artifact winding-model supervision reads directly: a supervision input,
+    not a cache and not a project asset. /bindings advertises them."""
+
+    output_directory: str
+    cache_directory: str
+    winding_inference: str = ""
+
+    def winding_inference_status(self):
+        """``{bound, path, available, error}``: whether the bound artifact is
+        usable now (it is read when a fit needs it, so it is checked again)."""
+        if not self.winding_inference:
+            return {"bound": False, "path": None, "available": False,
+                    "error": "the service was launched without --winding-inference"}
+        error = winding_inference_error(self.winding_inference)
+        return {"bound": True, "path": self.winding_inference,
+                "available": not error, "error": error or None}
+
+    def advertisement(self):
+        return {"output_directory": self.output_directory,
+                "cache_directory": self.cache_directory,
+                "winding_inference": self.winding_inference_status()}
+
+    def provenance(self, project):
+        """Where a session's inputs come from: the client's project and
+        these bindings."""
+        result = {"project": project.name,
+                  "output_directory": self.output_directory,
+                  "cache_directory": self.cache_directory}
+        if self.winding_inference:
+            result["winding_inference"] = self.winding_inference
+        return result
+
+
+def bind_service_inputs(output_directory, cache_directory, winding_inference=None):
+    """Resolve the launch path bindings once. A configured winding-inference
+    artifact must exist; one that is unusable for another reason is
+    advertised as unavailable (``ServiceBindings.winding_inference_status``)
+    and fails only the fits that need it."""
+    winding = ""
+    if winding_inference:
+        winding = str(Path(winding_inference).expanduser().resolve(strict=False))
+        if not Path(winding).is_dir():
+            raise ServiceBindingError(
+                f"--winding-inference {winding} is not a directory: specify the "
+                "winding-inference artifact (the directory holding its manifest.json)")
+    return ServiceBindings(str(output_directory), str(cache_directory), winding)
 
 
 def _validate_dt_loss_schedule(value):
@@ -417,25 +660,23 @@ class ServiceState:
     command generations, artifacts, and uploads.
     """
 
-    def __init__(self, dataset_root=None, dataset_resolution=None,
+    def __init__(self, bindings=None,
                  service_name=None, session_name="", logs=None, events=None,
-                 gpu_ids=(0,), startup_run=None):
+                 gpu_ids=(0,), startup_run=None, object_store=None,
+                 build_missing_lasagna_packs=False):
+        self.build_missing_lasagna_packs = bool(build_missing_lasagna_packs)
         self.lock = threading.RLock()
-        self._workspace_condition = threading.Condition(self.lock)
-        self._workspace_closing = False
+        self._service_condition = threading.Condition(self.lock)
+        self._closing = False
         self._service_closed = False
-        self._workspace_users = 0
+        self._service_users = 0
         self._background_jobs = set()
         self._retiring_sessions = []
         self._teardown_lock = threading.Lock()
         self._release_receipts = MutationCoordinator()
-        self._pcl_publication_locks = {
-            role: threading.Lock() for role in EDITABLE_PCL_ROLES
-        }
         self.session = None
-        self.editing_workspace = None
-        self._input_content_artifacts = {}
-        self._input_content_artifact_lock = threading.Lock()
+        # The SessionLease of the client that owns this service, if any.
+        self.session_lease = None
         self.session_id = None
         self.session_paths = None
         self.session_request = None
@@ -450,9 +691,32 @@ class ServiceState:
         self._session_phase = "Waiting for fit initialization"
         self._session_error = None
         self._building = False
+        self._build_serial = 0
+        # Store positions: the one being linked and pinned before a build,
+        # the last preparation that failed (the resident fit is then
+        # unchanged), and the position the session reads.
+        self._input_preparation = None
+        self._input_preparation_error = None
+        self._input_position = None
+        self._session_scroll = None
+        # The project the session was built from (fit_session.SpiralProject):
+        # what a rebuild the service starts itself sends again.
+        self._session_project = None
+        # An input update of the resident session in flight (its build ID).
+        self._input_update = None
         self.startup_run = dict(startup_run or {})
-        self.dataset_root = str(dataset_root) if dataset_root else None
-        self.dataset_resolution = dataset_resolution
+        # ServiceBindings of the launch; None only in tests that never build
+        # a fit.
+        self.bindings = bindings
+        # ObjectStoreBinding of the launch --object-store; None only in
+        # tests that never build a fit.
+        self.object_store = object_store
+        self._startup_inputs = None
+        self._startup_inputs_lock = threading.Lock()
+        # The store key a background read of startup_inputs is reading, and
+        # the lock that lets one read run at a time.
+        self._startup_inputs_reading = None
+        self._startup_inputs_read_lock = threading.Lock()
         self.service_name = service_name or socket.gethostname()
         self.session_name = str(session_name or "")
         self.events = events if events is not None else ServiceEventBuffer()
@@ -467,14 +731,21 @@ class ServiceState:
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
+        self._event_input_lines = {}
         self.gpu_ids = tuple(gpu_ids)
         self.artifacts = ArtifactRegistry()
         self.checkpoint_uploads = UploadManager(self._upload_environment())
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
-        # Display artifacts of the editable PCL roles, keyed by role value.
-        self.pcl_artifacts = {}
+        # The published input manifest of this session: (digest, artifact).
+        self._input_manifest = None
+        # Serializes this service's writes to the bound store: link refreshes
+        # (_prepare_position) and commits.
+        self._store_write_lock = threading.Lock()
+        # The latest commit (POST /session/commit): what /session/status
+        # reports as "commit", guarded by self.lock.
+        self._commit = None
         # A preview export runs off the HTTP thread (it costs minutes); this
         # is what makes the verb single-flight and what /session/status
         # reports so a client reconnecting mid-export can see one is running.
@@ -498,215 +769,139 @@ class ServiceState:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def workspace_use(self):
-        with self._workspace_condition:
-            if self._workspace_closing or self._service_closed:
-                raise ApiError(410, "The editing workspace is closing")
-            self._workspace_users += 1
+    def service_use(self):
+        """Count one request or job that teardown must wait for."""
+        with self._service_condition:
+            if self._closing or self._service_closed:
+                raise ApiError(410, "The session lease is being released")
+            self._service_users += 1
         try:
             yield
         finally:
-            with self._workspace_condition:
-                self._workspace_users -= 1
-                self._workspace_condition.notify_all()
+            with self._service_condition:
+                self._service_users -= 1
+                self._service_condition.notify_all()
 
     def _start_background(self, *, target, args=(), name, daemon=True):
         def run():
             try:
                 target(*args)
             finally:
-                with self._workspace_condition:
+                with self._service_condition:
                     self._background_jobs.discard(threading.current_thread())
-                    self._workspace_condition.notify_all()
-        with self._workspace_condition:
-            if self._workspace_closing or self._service_closed:
-                raise ApiError(410, "The editing workspace is closing")
+                    self._service_condition.notify_all()
+        with self._service_condition:
+            if self._closing or self._service_closed:
+                raise ApiError(410, "The session lease is being released")
             thread = threading.Thread(target=run, name=name, daemon=daemon)
             self._background_jobs.add(thread)
             thread.start()
 
-    def release_editing(self, token, command_id):
+    def release_lease(self, token, command_id):
+        """Give up ownership and tear the resident session down."""
         def release(_):
             with self._teardown_lock:
-                workspace = self.editing_workspace
-                if workspace is None:
-                    raise ApiError(403, "This client does not own an editing workspace")
-                workspace.require(token)
-                self._teardown_workspace()
+                lease = self.session_lease
+                if lease is None:
+                    raise ApiError(403, "This client does not own the session lease")
+                lease.require(token)
+                self._teardown()
                 return {"released": True}
         return self._release_receipts.execute(command_id, 'release',
             {'token_digest': hashlib.sha256(str(token).encode()).hexdigest()},
             release, recoverable=lambda exc: isinstance(exc, (TimeoutError, OSError)))
 
-    def _teardown_workspace(self):
+    def _teardown(self):
         try:
-            self._drain_and_remove_workspace()
+            self._drain_and_close()
         except Exception:
-            root = self.editing_workspace.root if self.editing_workspace else self._output_root()
-            logging.exception("Spiral teardown failed; retained workspace %s", root)
+            logging.exception("Spiral teardown failed; the lease is retained")
             raise
 
-    def _drain_and_remove_workspace(self):
-        # Do not drop any references or locks until every file user has stopped.
-        with self._workspace_condition:
-            self._workspace_closing = True
-            self._workspace_condition.notify_all()
+    def _drain_and_close(self):
+        # Do not drop any references or locks until every user has stopped.
+        with self._service_condition:
+            self._closing = True
+            self._service_condition.notify_all()
             deadline = time.monotonic() + 15
-            while self._workspace_users or self._background_jobs:
+            while self._service_users or self._background_jobs:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("Workspace users did not stop; files retained")
-                self._workspace_condition.wait(remaining)
-            workspace, session = self.editing_workspace, self.session
+                    raise TimeoutError("Service users did not stop; the lease is retained")
+                self._service_condition.wait(remaining)
+            lease, session = self.session_lease, self.session
             process = self._preview.process
-        if workspace is not None:
-            workspace.coordinator.shutdown(lambda: None)
         stop_process_group(process)
         if process is not None and process.poll() is None:
-            raise TimeoutError("Preview process did not stop; workspace retained")
+            raise TimeoutError("Preview process did not stop; the lease is retained")
         for retiring in tuple(self._retiring_sessions):
             retiring.close()
             self._retiring_sessions.remove(retiring)
         if session is not None:
             session.close()
-        if workspace is not None:
-            self.artifacts.retire_root(workspace.root)
-            # Publication recovery lives beside dataset targets, outside root.
-            for transaction in workspace.transactions.values():
-                for path in transaction.recovery_paths():
-                    self.logs.write('stderr', f'Retained Commit recovery: {path}\n')
-            workspace.close()
+        if lease is not None:
+            lease.close()
         with self.lock:
             self.session = None
             self.session_id = None
-            self.editing_workspace = None
-            self._input_content_artifacts.clear()
+            self.session_lease = None
             self._session_state = SessionState.Uninitialized
             self._session_phase = "Waiting for fit initialization"
             self._session_error = None
-            self._workspace_closing = False
+            self._closing = False
 
-    def editing(self, *, create=True):
-        """The dataset workspace survives resident generations and disconnects."""
+    def lease(self, *, create=True):
+        """The session lease; it survives resident generations and disconnects."""
         with self.lock:
-            if self._workspace_closing or self._service_closed:
-                raise ApiError(410, "The editing workspace is closing")
-            if self.editing_workspace is None:
+            if self._closing or self._service_closed:
+                raise ApiError(410, "The session lease is being released")
+            if self.session_lease is None:
                 if not create:
-                    raise ApiError(409, "Claim an editing workspace first")
-                if self.dataset_root is None or self._output_root() is None:
-                    raise ApiError(409, "A managed dataset and output are required")
-                sources = (self.dataset_resolution.to_dict()
-                           if self.dataset_resolution is not None else {})
-                self.editing_workspace = EditingWorkspace(
-                    self.dataset_root, self._output_root(), sources,
-                    self._editing_resident)
-            return self.editing_workspace
+                    raise ApiError(409, "Claim the session lease first")
+                if self._output_root() is None:
+                    raise ApiError(409, "A service output root is required")
+                self.session_lease = SessionLease(self._output_root())
+            return self.session_lease
 
-    def input_content_artifact(self, input_id, revision_number):
-        with self.workspace_use():
-            return self._input_content_artifact(input_id, revision_number)
+    def lease_lifecycle(self, token, operation, request, callback):
+        """Run one lifecycle command for the lease owner, at most once.
 
-    def _input_content_artifact(self, input_id, revision_number):
-        workspace = self.editing(create=False)
-        revision, = workspace._selection([{'id': input_id, 'revision': int(revision_number)}])
-        if revision.content is None:
-            raise ApiError(410, "This input revision is a deletion")
-        identity = workspace.catalog.entry(input_id).identity
-        siblings = ()
-        if identity.kind == 'fiber':
-            desired = tuple(r for r in workspace.catalog.desired()
-                            if r.content is not None and
-                            workspace.catalog.entry(r.id).identity.kind == 'fiber')
-            by_name = {Path(workspace.catalog.entry(r.id).identity.source).name: r
-                       for r in desired}
-            # Resolve the requested revision's links, including transitive and
-            # pending links, against immutable desired peers. Never substitute
-            # the current revision for the explicitly requested entry point.
-            selected = {input_id}
-            pending = [revision]
-            while pending:
-                current = pending.pop()
-                document = json.loads(Path(current.content.json()['path']).read_text())
-                for key in ('branches', 'adjacent_branches'):
-                    for branch in document.get(key, []):
-                        peer = by_name.get(branch.get('branch_file'))
-                        if peer is not None and peer.id not in selected:
-                            selected.add(peer.id)
-                            pending.append(peer)
-            siblings = tuple(r for r in desired if r.id in selected and r.id != input_id)
-        key = (input_id, revision.number, tuple((r.id, r.number) for r in siblings))
-        with self._input_content_artifact_lock:
-            if key not in self._input_content_artifacts:
-                content = revision.content.json()
-                source = Path(content['path'])
-                if source.is_dir():
-                    root, entry = source, 'meta.json'
-                    artifact = self.artifacts.register_directory(
-                        'input-content', workspace.id, revision.number, root, entry)
-                else:
-                    parent = workspace.root / 'artifacts' / input_id
-                    parent.mkdir(parents=True, exist_ok=True)
-                    root = Path(tempfile.mkdtemp(dir=parent))
-                    entry = Path(identity.source).name
-                    try:
-                        workspace._copy(source, root / entry)
-                        for sibling in siblings:
-                            name = Path(workspace.catalog.entry(sibling.id).identity.source).name
-                            workspace._copy(sibling.content.json()['path'], root / name)
-                        artifact = self.artifacts.register_directory(
-                            'input-content', workspace.id, revision.number, root, entry)
-                    except BaseException:
-                        shutil.rmtree(root)
-                        raise
-                self._input_content_artifacts[key] = artifact
-            return {'workspace_id': workspace.id, 'artifact': self._input_content_artifacts[key]}
-
-    def _editing_resident(self):
-        with self.lock:
-            if self.session is None or self._building:
-                raise ApiError(409, "Wait for the resident fit to finish loading")
-            return self.session
-
-    def input_upload_manager(self, upload_id):
-        if upload_id in self.checkpoint_uploads.uploads:
-            return self.checkpoint_uploads
-        return self.editing(create=False).uploads
-
-    def editing_lifecycle(self, token, operation, request, callback):
-        workspace = self.editing()
-        workspace.require(token)
+        Initialize and rebuild hold the request until the resident build
+        settles, so a construction failure is the command's answer.
+        """
+        lease = self.lease()
+        lease.require(token)
         def perform(captured):
-            workspace.require(token)
-            rebuilding = operation in {"session_initialize", "session_rebuild"}
+            lease.require(token)
+            rebuilding = operation in {"session_initialize", "session_rebuild",
+                                       "session_update_inputs"}
             command_id = captured.get("command_id")
-            if rebuilding and command_id in workspace.lifecycle_started:
-                response = workspace.lifecycle_started[command_id]
+            if rebuilding and command_id in lease.lifecycle_started:
+                response = lease.lifecycle_started[command_id]
             else:
-                if operation == "session_rebuild":
-                    workspace.refresh_clean(f'{command_id}:refresh')
                 response = callback(captured)
                 if rebuilding:
-                    workspace.lifecycle_started[command_id] = response
-            # Keep the coordinator until background construction and desired
-            # input replay finish. Read-only status remains responsive.
-            if operation in {"session_initialize", "session_rebuild"}:
+                    lease.lifecycle_started[command_id] = response
+            if rebuilding:
                 while True:
                     with self.lock:
                         building, session = self._building, self.session
+                        updating = self._input_update is not None
                         state = self._session_state if session is None else session.status()["state"]
-                    if not building and state != SessionState.Loading:
+                    if not building and not updating and state != SessionState.Loading:
                         break
                     time.sleep(0.05)
                 if state == SessionState.Error:
                     raise ApiError(409, "Resident construction failed", payload=self.status())
-                if session is not None:
-                    result = workspace.replay_resident(self.session_generation)
-                    if not result.get("applied"):
-                        raise ApiError(409, "Desired inputs could not be restored", payload=result)
-                response = {**self.status(), "accepted": True}
+                with self.lock:
+                    failed = self._input_preparation_error
+                if failed and failed.get("build_id") == response.get("build_id"):
+                    raise ApiError(409, "The inputs could not be prepared; the "
+                                   "resident fit is unchanged", payload=self.status())
+                response = {**self.status(), "accepted": True,
+                            "build_id": response.get("build_id")}
             return response
-        return workspace.coordinator.execute(request.get("command_id"), operation,
+        return lease.coordinator.execute(request.get("command_id"), operation,
             request, perform, recoverable=lambda exc: isinstance(exc, TimeoutError))
 
     def _base(self):
@@ -768,15 +963,21 @@ class ServiceState:
                     for key, value in response["progress"].items()
                     if key != "eta_seconds"
                 }
-            response["workspace_id"] = self.editing_workspace.id if self.editing_workspace else None
+            response["lease_id"] = (self.session_lease.id
+                                    if self.session_lease else None)
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview.artifact
             # Published separately from, and after, the surface: a client that
             # never opens an overlay never waits for one.
             response["preview_diagnostics_artifact"] = (
                 self._preview.diagnostics_artifact)
-            for role_value, status_key in PCL_ARTIFACT_STATUS_KEYS.items():
-                response[status_key] = self.pcl_artifacts.get(role_value)
+            response["input_manifest_artifact"] = (
+                self._input_manifest[1] if self._input_manifest else None)
+            response["input_position"] = copy.deepcopy(self._input_position)
+            response["input_preparation"] = self._input_preparation_status()
+            response["input_preparation_error"] = copy.deepcopy(
+                self._input_preparation_error)
+            response["input_update"] = copy.deepcopy(self._input_update)
             response["preview_publish"] = (
                 dict(self._preview.progress)
                 if self._preview.progress else None)
@@ -786,6 +987,8 @@ class ServiceState:
                 self._preview.pending_generation)
             response["preview_source_iteration"] = (
                 self._preview.source_fit_iteration)
+            response["preview_input_position"] = copy.deepcopy(
+                self._preview.input_position)
             response["preview_active_source_iteration"] = (
                 self._preview.active_source_fit_iteration)
             response["preview_pending_source_iteration"] = (
@@ -801,12 +1004,8 @@ class ServiceState:
             if publishing is not None:
                 response["phase"] = publishing["stage_name"]
                 response["progress"] = publishing
-            available = (self.editing_workspace is not None
-                         and any(entry.accepted > entry.persisted
-                                 for entry in self.editing_workspace.catalog.entries()))
-            response["commit_available"] = available
-            response["commit_unavailable_reason"] = "" if available else "No uncommitted revisions"
             response["preview_exporting"] = self._preview_export_active
+            response["commit"] = copy.deepcopy(self._commit)
             return response
 
     def session_state(self):
@@ -825,7 +1024,6 @@ class ServiceState:
         response.update({
             "ready": True,
             "process_id": os.getpid(),
-            "dataset_root": self.dataset_root,
             "session_state": state,
             "cuda_ready": (None if state == SessionState.Loading else
                            state not in {SessionState.Uninitialized,
@@ -837,41 +1035,145 @@ class ServiceState:
         # Descriptions are re-read per request, so edited text reaches a
         # client when it reconnects, without restarting the service.
         catalog = {**self._base(), **describe_catalog(self.config_catalog)}
-        generic = self.config_catalog["defaults"]
-        scroll_defaults = scroll_spec_config_defaults(self.scroll_spec, generic)
-        if scroll_defaults:
-            # The panel seeds its form from these, so a winding count in
-            # spiral-scroll.json reaches interactive fits as it reaches the
-            # CLI. A preset still holding the generic value inherits it; one
-            # that chose its own value keeps it.
-            catalog["defaults"] = {**generic, **scroll_defaults}
-            catalog["presets"] = {
-                name: {**preset, **{
-                    key: value for key, value in scroll_defaults.items()
-                    if preset.get(key) == generic.get(key)}}
-                for name, preset in self.config_catalog["presets"].items()}
+        if self.object_store is not None:
+            # The launch binding owns these: advertise its values, and mark
+            # them so a client shows them without sending them back.
+            fields = dict(catalog["schema"]["fields"])
+            for key in SERVICE_OWNED_CONFIG_KEYS:
+                fields[key] = {**fields[key], "service_owned": True}
+            catalog["schema"] = {**catalog["schema"], "fields": fields}
+            catalog["defaults"] = {**catalog["defaults"],
+                                   **self.object_store.config()}
+        if self.bindings is None \
+                or not self.bindings.winding_inference_status()["available"]:
+            # Winding-model supervision cannot run here, so a client starting
+            # from these defaults leaves the source out rather than having
+            # preparation refuse it.
+            catalog["defaults"] = {**catalog["defaults"],
+                                   "input_use_winding_inference": False}
         return catalog
 
-    def dataset(self):
-        return {**self._base(), **self.dataset_resolution.to_dict(),
-                "session_checkpoints": self.session_checkpoints()}
+    def binding_advertisement(self):
+        """GET /bindings: the launch host bindings, what the service can do
+        with them, the checkpoints it can load and the bound store's
+        selection."""
+        capabilities = dict(SERVICE_CAPABILITIES)
+        positioned = self._positioned()
+        capabilities["build_missing_lasagna_packs"] = self.build_missing_lasagna_packs
+        capabilities["input_positions"] = positioned
+        # A service with a store updates a resident fit's inputs in place.
+        capabilities["inputs_frozen"] = not positioned
+        capabilities["input_updates"] = positioned
+        capabilities["commits"] = self._commits_supported()
+        bindings = (self.bindings.advertisement() if self.bindings is not None
+                    else {"output_directory": None, "cache_directory": None,
+                          "winding_inference": {"bound": False, "path": None,
+                                                "available": False, "error": None}})
+        # Whether winding-model supervision can run here.
+        capabilities["winding_inference"] = bindings["winding_inference"]["available"]
+        response = {**self._base(), "bindings": bindings,
+                    "session_checkpoints": self.session_checkpoints(),
+                    "capabilities": capabilities}
+        if self.object_store is not None:
+            # One head read serves the advertisement and the summary's key.
+            head = self.object_store.head() if self.object_store.served else None
+            response["object_store"] = self.object_store.advertisement(head)
+            response["inputs"] = self.startup_inputs(wait=False, head=head)
+        return response
 
-    @property
-    def scroll_spec(self):
-        """The parsed spiral-scroll.json manifest, or None if it is invalid."""
-        if self.dataset_resolution is None:
-            return None
-        return self.dataset_resolution.scroll_spec
+    def startup_inputs(self, *, wait=True, head=None):
+        """What the launch configuration selects from the bound store.
+
+        Patches, PCLs and fibers with their revision pins, labels, frames
+        and metadata PCL roles, plus counts, consumed relationship families,
+        exclusions and the fit volume (object_store_inputs.snapshot_summary).
+        Read-only: no link refresh, no materialization and no Torch. The
+        result is reused until the store's files change.
+
+        Reading a large store takes minutes. Without ``wait`` (GET
+        /bindings) the caller never reads it: a summary not yet read for the
+        store as it stands is read in the background, and meanwhile
+        ``{"pending": True}`` is returned; ask again for the result. A served
+        store whose server cannot be reached has no summary: the result says
+        so (``{"pending": True, "error"}``), or the call fails when it waits.
+        ``head`` is the served store's ``head()`` when the caller read it.
+        """
+        key, error = self._startup_inputs_key(head)
+        if key is None:
+            message = f"The service's object store cannot be read: {error}"
+            if not wait:
+                return {"pending": True, "error": message}
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, message)
+        with self._startup_inputs_lock:
+            cached = self._startup_inputs
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            if not wait:
+                if self._startup_inputs_reading != key:
+                    self._startup_inputs_reading = key
+                    threading.Thread(target=self._read_startup_inputs_logged,
+                                     args=(key,), name="spiral-startup-inputs",
+                                     daemon=True).start()
+                return {"pending": True}
+        return self._read_startup_inputs(key)
+
+    def _startup_inputs_key(self, head=None):
+        """``(key, error)``: what the startup summary is current for (a store
+        file's size and modification times, or a served store's head, read
+        now unless ``head`` gives it), or ``(None, why)`` when a served
+        store's server cannot be reached. None is never a key: nothing is
+        cached or read for an unreachable store, and the next request asks
+        again."""
+        if self.object_store.served:
+            head, error = head if head is not None else self.object_store.head()
+            if head is None:
+                return None, error
+            return ("served", self.object_store.generation, head), None
+        path = Path(self.object_store.location)
+        # An empty WAL (a read-only open after the last writer closed
+        # creates one) holds no writes: it keys as an absent one.
+        return tuple((info.st_size, info.st_mtime_ns) if info and info.st_size else None
+                     for info in (_stat_or_none(path),
+                                  _stat_or_none(Path(f"{path}-wal")))), None
+
+    def _read_startup_inputs(self, key):
+        """Read the summary for the store as ``key`` stated it, once: a
+        concurrent reader of the same key waits for it instead."""
+        with self._startup_inputs_read_lock:
+            with self._startup_inputs_lock:
+                cached = self._startup_inputs
+                if cached is not None and cached[0] == key:
+                    return cached[1]
+            from object_store_inputs import describe_selection
+            config = Config(self.startup_run.get("config") or {}).as_dict()
+            config.update(self.object_store.config())
+            summary = describe_selection(config)
+            with self._startup_inputs_lock:
+                self._startup_inputs = (key, summary)
+            return summary
+
+    def _read_startup_inputs_logged(self, key):
+        try:
+            self._read_startup_inputs(key)
+        except Exception as exc:
+            # Not cached: the next GET /bindings tries again.
+            self.events.append(
+                "log", f"Could not read the store's selection: "
+                f"{type(exc).__name__}: {exc}", severity="warning",
+                source="service")
+        finally:
+            with self._startup_inputs_lock:
+                if self._startup_inputs_reading == key:
+                    self._startup_inputs_reading = None
 
     def session_checkpoints(self):
         """Checkpoints under the session output directory, newest first.
 
-        Between this and ``detected_checkpoints`` a client has the whole set
-        of checkpoints it may name: the dataset root holds the ones that came
-        with the dataset, and the output directory holds everything this
-        service wrote or received (saves, autosaves, uploads). Advertising
-        both is what lets a client offer a choice instead of asking the user
-        to type a path on a host it may never have seen.
+        These are the host checkpoints a client may select: everything this
+        service wrote or received (saves, autosaves, uploads) lives under the
+        output directory. Advertising them is what lets a client offer a
+        choice instead of asking the user to type a path on a host it may
+        never have seen.
         """
         root = self._output_root()
         if root is None or not root.is_dir():
@@ -895,8 +1197,11 @@ class ServiceState:
     # Session lifecycle
     # ------------------------------------------------------------------
 
-    def _dataset_session_request(self, request, *, include_input_config=False):
-        """Build a dataset-owned request and select its active inputs.
+    def _bound_session_request(self, request, project, *, include_input_config=False):
+        """Resolve a request's inputs from its project and this service's
+        bindings (the service adapter of the shared input contract; the
+        project's umbilicus and fiber directions join once the build knows
+        the fit volume, _resolve_session_scroll).
 
         A checkpoint-backed request intentionally carries no UI profile
         overrides: the checkpoint owns its durable configuration. Input
@@ -906,36 +1211,39 @@ class ServiceState:
         erased, and only then does the fitter discover that the checkpoint
         requires it.
         """
-        resolution = self.dataset_resolution.to_dict()
+        bindings = self.bindings
         requested_paths = request.get("paths") or {}
         offending = sorted(
             key for key, value in requested_paths.items()
-            if key not in _DATASET_CLIENT_SELECTABLE
+            if key not in _CLIENT_SELECTABLE_PATHS
             and (value or (isinstance(value, list) and value))
         )
         if offending:
             raise ApiError(
                 HTTPStatus.BAD_REQUEST,
-                "This service owns its base inputs; the load request must not "
-                "carry input paths",
-                [{"field": key, "message": "Base input paths are owned by the service"}
+                "The service configures input paths; requests may specify only "
+                "a checkpoint",
+                [{"field": f"paths.{key}",
+                  "message": "Input paths are the service's bindings and the project's"}
                  for key in offending])
-        paths = {"dataset_root": resolution["root"], "scroll_zarr": ""}
-        for key in (*(spec.key for spec in FIT_INPUT_CATALOG
-                      if spec.kind != "pcl-set"),
-                    "output_directory", "cache_directory"):
-            paths[key] = resolution["resolved"].get(key, "")
-        paths["pcls"] = resolution["pcl_inputs"]
+        paths = {"output_directory": bindings.output_directory,
+                 "cache_directory": bindings.cache_directory,
+                 "winding_inference": bindings.winding_inference,
+                 "provenance": bindings.provenance(project)}
+        # The Lasagna dataset is the project's selected one, written as the
+        # source document the fit reads (its packs are this service's cache's).
+        if project.lasagna is not None and not project.lasagna.error:
+            paths["lasagna"] = write_lasagna_source(
+                Path(paths["output_directory"]) / "project-inputs",
+                project.lasagna.source())
         checkpoint = str(requested_paths.get("checkpoint") or "").strip()
         if checkpoint:
-            allowed = set(resolution.get("detected_checkpoints", []))
             resolved_checkpoint = str(Path(checkpoint).resolve(strict=False))
             output_root = Path(paths["output_directory"]).resolve(strict=False)
-            if resolved_checkpoint not in allowed and \
-                    not Path(resolved_checkpoint).is_relative_to(output_root):
+            if not Path(resolved_checkpoint).is_relative_to(output_root):
                 raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "Checkpoint must be one the service advertises or "
-                               "one under the session output directory",
+                               "Checkpoint must be one under the session output "
+                               "directory",
                                [{"field": "checkpoint", "message": "Not a service-advertised checkpoint"}])
             paths["checkpoint"] = resolved_checkpoint
 
@@ -943,47 +1251,39 @@ class ServiceState:
             (request.get("run") or {}).get("config") or {})
         config = requested_config
         if checkpoint:
-            checkpoint_config, _, _ = self._checkpoint_durable_cfg(
+            checkpoint_config, *_ = self._checkpoint_durable_cfg(
                 paths["checkpoint"])
             if checkpoint_config is not None:
                 config = {**checkpoint_config, **requested_config}
+        if ("input_use_winding_inference" not in requested_config
+                and winding_inference_enabled(config)
+                and not bindings.winding_inference_status()["available"]):
+            # Winding-model supervision cannot run here. A checkpoint's
+            # configuration or the Python default enables it without the
+            # request asking, so leave the source out rather than refuse the
+            # fit; an explicit request is still refused, saying why.
+            enabled_by = ("the checkpoint it resumes was fitted with it"
+                          if checkpoint and config is not requested_config
+                          else "the default configuration enables it")
+            config = {**config, "input_use_winding_inference": False}
+            request = {**request, "run": {
+                **(request.get("run") or {}),
+                "config": {**requested_config,
+                           "input_use_winding_inference": False}}}
+            self.events.append(
+                "log", f"Warning: this fit leaves winding-model supervision "
+                f"out, though {enabled_by}: the service has no usable winding "
+                f"inference ({bindings.winding_inference_status()['error']}). "
+                f"Restart it with --winding-inference PATH to include it.",
+                severity="warning", source="service")
 
-        # The service owns conventional paths, while the session config owns
-        # which optional sources participate. Clear disabled paths before
-        # validating any client-selectable override so the manifest, validator,
-        # and fitter all describe the same source set.
-        selected_paths = {
-            "verified_patches": "verified_patches",
-            "fibers": "fibers",
-            "outer_shell": "outer_shell",
-            "tracks_dbm": "tracks_dbm",
-            "normal_x": "normals",
-            "normal_y": "normals",
-            "gradient_magnitude": "gradient_magnitude",
-            "winding_inference": "winding_inference",
-        }
-        for path_key, source in selected_paths.items():
-            if not input_source_enabled(config, source):
-                paths[path_key] = ""
+        # The session config owns which optional sources participate. Clear
+        # disabled paths before validation so the manifest, validator, and
+        # fitter all describe the same source set.
+        if not lasagna_enabled(config):
+            paths.pop("lasagna", None)
         if not winding_inference_enabled(config):
             paths["winding_inference"] = ""
-        paths["pcls"] = [
-            spec for spec in paths["pcls"]
-            if pcl_input_enabled(config, spec.get("role"), spec.get("path", ""))
-        ]
-
-        tracks = str(requested_paths.get("tracks_dbm") or "").strip()
-        if not input_source_enabled(config, "tracks_dbm"):
-            tracks = ""
-        if tracks:
-            candidates = set(resolution.get("ambiguities", {}).get("tracks_dbm", []))
-            if resolution["resolved"].get("tracks_dbm"):
-                candidates.add(resolution["resolved"]["tracks_dbm"])
-            if str(Path(tracks).resolve(strict=False)) not in candidates:
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "tracks_dbm must be one of the service-advertised candidates",
-                               [{"field": "tracks_dbm", "message": "Not a service-advertised candidate"}])
-            paths["tracks_dbm"] = str(Path(tracks).resolve(strict=False))
 
         resolved_request = {**request, "paths": paths}
         if include_input_config:
@@ -994,24 +1294,24 @@ class ServiceState:
         """Validate one session request into the arguments a build needs."""
         input_config = None
         try:
-            # The scroll specification in the dataset root owns these. A
-            # request that names one is refused rather than quietly overruled
-            # by the file.
+            # The project (its fit volume and Lasagna dataset) owns these. A
+            # request that overrides one is rejected.
             scroll_owned = sorted(
                 key for key in SCROLL_SPEC_OWNED_RUN_KEYS
                 if key in (request.get("run") or {}))
             if scroll_owned:
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    f"{SCROLL_SPEC_FILENAME} in the dataset root owns these "
-                    "values; the request must not carry them",
+                    "The project owns these values; the request must not carry them",
                     [{"field": f"run.{key}",
-                      "message": (f"Owned by {SCROLL_SPEC_FILENAME} as "
+                      "message": (f"Owned by the project's scroll as "
                                   f"{SCROLL_SPEC_OWNED_RUN_KEYS[key]!r}")}
                      for key in scroll_owned])
-            if self.dataset_resolution is not None:
-                request, input_config = self._dataset_session_request(
-                    request, include_input_config=True)
+            request = self._bind_service_owned_config(request)
+            project = self._request_project(request)
+            if self.bindings is not None:
+                request, input_config = self._bound_session_request(
+                    request, project, include_input_config=True)
             paths, run, preview = parse_session_request(request)
         except (KeyError, TypeError, ValueError) as exc:
             # An unparseable request field (an unknown PCL role, say) is the
@@ -1019,7 +1319,7 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            f"Malformed session request: {exc}") from exc
         if restore_checkpoint_z and paths.checkpoint:
-            _, _, checkpoint_z_range = self._checkpoint_durable_cfg(
+            _, _, checkpoint_z_range, _ = self._checkpoint_durable_cfg(
                 paths.checkpoint)
             if checkpoint_z_range is not None:
                 run = dataclasses.replace(
@@ -1037,18 +1337,147 @@ class ServiceState:
         validation_run = (
             dataclasses.replace(run, config=input_config)
             if input_config is not None else run)
-        errors = validate_session_request(paths, validation_run)
-        # The scroll specification is resolved from the dataset root; it
-        # carries the physical scroll facts (including the outward sense,
-        # which is not part of the session request).
-        scroll = None
-        try:
-            scroll = load_scroll_spec(paths.dataset_root)
-        except ScrollSpecError as exc:
-            errors.append({"field": "scroll_spec", "message": str(exc)})
+        # The project supplies the umbilicus once the fit volume is known.
+        errors = validate_session_request(
+            paths, validation_run, supplied=VOLUME_INPUT_KEYS,
+            build_lasagna_packs=self.build_missing_lasagna_packs,
+            missing={"winding_inference": (
+                "winding-model supervision reads the service's winding-inference "
+                "binding, and this service has none: restart it with "
+                "--winding-inference PATH and prepare a new fit")})
+        # Lasagna stores the configuration needs and the project cannot give.
+        if lasagna_error := project.lasagna_error():
+            needed = [spec.key for spec in FIT_INPUT_CATALOG
+                      if spec.key in PROJECT_LASAGNA_INPUTS
+                      and spec.required(validation_run.config)]
+            errors = [error for error in errors if error["field"] not in needed]
+            errors.extend({"field": key, "message": lasagna_error} for key in needed)
+        # The project's scroll, resolved for the fit volume when the build
+        # knows it (_resolve_session_scroll).
+        scroll = SessionScroll(project)
+        errors.extend(self._early_volume_problems(
+            scroll, paths, validation_run.config))
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         return paths, run, preview, scroll
+
+    def _early_volume_problems(self, scroll, paths, config):
+        """What the project lacks for a fit volume known before the inputs
+        are read: the configured fit_volume_uuid, else the volume a resumed
+        checkpoint recorded. When the selected store objects determine the volume
+        instead, a project with no volumes, or with no umbilicus for any of
+        them, cannot serve it either. Reading the store can take minutes on
+        a large one, so these are refused on the request, not after it
+        (_resolve_session_scroll repeats the check once the volume is
+        known)."""
+        project = scroll.project
+        volume = config.get("fit_volume_uuid")
+        if not volume and paths.checkpoint:
+            *_, manifest = self._checkpoint_durable_cfg(paths.checkpoint)
+            volume = ((manifest or {}).get("object_store") or {}).get("volume_uuid")
+        try:
+            if volume:
+                scroll.umbilicus(str(volume))
+            elif not project.volumes:
+                raise ScrollSpecError(
+                    f"the project {project.name!r} has no volumes: attach the "
+                    "volume the fit reads")
+            elif not any(entry.umbilicus is not None
+                         for entry in project.volumes.values()):
+                raise ScrollSpecError(
+                    f"the project {project.name!r} has no umbilicus for any of "
+                    f"its volumes ({', '.join(sorted(project.volumes))}): import "
+                    "one for the fit volume (File > Import Umbilicus)")
+        except ScrollSpecError as exc:
+            return [{"field": "project", "message": str(exc)}]
+        return []
+
+    @staticmethod
+    def _request_project(request):
+        """The request's ``project`` block (fit_session.SpiralProject): the
+        VC3D project whose inputs the session fits. Every session request
+        carries it; the service cannot read the project file itself."""
+        value = request.get("project")
+        if value is None:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "The request carries no project: this service fits the inputs "
+                "of the VC3D project that asks for the session",
+                [{"field": "project", "message": "Required"}])
+        try:
+            return SpiralProject.from_mapping(value)
+        except ScrollSpecError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid project: {exc}",
+                           [{"field": "project", "message": str(exc)}]) from exc
+
+    def _effective_config(self, paths, run):
+        """The configuration a build applies: a resumed checkpoint's stored
+        one under the request's overrides."""
+        from spiral_runtime import merge_session_config
+        config, _, overrides = merge_session_config(
+            paths.checkpoint, run, warn=lambda warning: None)
+        config.update(overrides)
+        return config
+
+    def _resolve_session_scroll(self, scroll, volume, paths, config):
+        """Complete a build's SessionScroll for its fit volume: the scroll it
+        fits (with ``config``'s spiral_outward_sense, and the Lasagna scale
+        when it reads the stores), its umbilicus (the project's, written
+        under the output directory as the file the fit reads) and, when its
+        losses need them, the fiber directions the cache holds for the
+        project's fiber-inference dataset at the volume's scale. The fit infers
+        the same volume from the same inputs, and an input update that would
+        read another is refused (InputReplacementRefused). Returns ``(paths,
+        ScrollSpec)``; raises ScrollSpecError."""
+        spec = scroll.resolve(volume, config.get("spiral_outward_sense"),
+                              lasagna=bool(paths.lasagna))
+        umbilicus = write_project_umbilicus(
+            Path(paths.output_directory) / "project-inputs", volume,
+            scroll.umbilicus(volume))
+        # Loaded whenever enabled, as the CLI loads its manifest's, so a later
+        # run with the loss on finds them resident; required with the loss.
+        fiber_directions = ""
+        level = config.get("fit_volume_level", 0)
+        if fiber_directions_required(config):
+            fiber_directions = scroll.fiber_directions(volume, paths.cache_directory, level)
+        elif input_source_enabled(config, "fiber_directions"):
+            try:
+                fiber_directions = scroll.fiber_directions(
+                    volume, paths.cache_directory, level)
+            except ScrollSpecError:
+                pass
+        return dataclasses.replace(paths, volume_uuid=volume, umbilicus=umbilicus,
+                                   fiber_directions=fiber_directions), spec
+
+    def _bind_service_owned_config(self, request):
+        """Refuse client values for SERVICE_OWNED_CONFIG_KEYS, then set them
+        from the launch binding.
+
+        A client may leave them out, send them unset (a complete default
+        configuration) or echo the binding's own values back; any other
+        value is refused. Request overrides are applied after a resumed
+        checkpoint's stored cfg (spiral_runtime._resolve_session_config), so
+        the binding also wins over whatever store that checkpoint was
+        written against.
+        """
+        run = dict(request.get("run") or {})
+        config = dict(run.get("config") or {})
+        bound = self.object_store.config() if self.object_store else {}
+        owned = sorted(key for key in SERVICE_OWNED_CONFIG_KEYS
+                       if config.get(key) is not None
+                       and config[key] != bound.get(key))
+        if owned:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "This service is bound to its object store at launch; the "
+                "request must not carry these",
+                [{"field": f"run.config.{key}",
+                  "message": "Owned by the service's --object-store binding"}
+                 for key in owned])
+        if self.object_store is None:
+            return request
+        config.update(bound)
+        return {**request, "run": {**run, "config": config}}
 
     def startup_session_request(self):
         """The launch defaults used by explicit recovery rebuilds."""
@@ -1058,6 +1487,7 @@ class ServiceState:
         """Create the first resident fit session on explicit client request."""
         request = dict(request or {})
         request.pop("command_id", None)
+        minimum = self._inputs_position(request.pop("inputs_position", None))
         with self.lock:
             if self._building or self.session_id is not None \
                     or self._session_state != SessionState.Uninitialized:
@@ -1069,8 +1499,74 @@ class ServiceState:
         if paths.checkpoint and run.config:
             self._reject_overrides_the_checkpoint_contradicts(
                 paths.checkpoint, run.config)
-        self._begin_build(paths, run, preview, scroll)
-        return {**self.status(), "accepted": True, "initializing": True}
+        build_id = self._begin_build(paths, run, preview, scroll, minimum=minimum)
+        return {**self.status(), "accepted": True, "initializing": True,
+                "build_id": build_id}
+
+    def _refuse_during_input_update(self, verb):
+        with self.lock:
+            if self._input_update is not None:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               f"{verb} waits for the input update in progress",
+                               payload={"code": INPUT_UPDATE_IN_PROGRESS})
+
+    def _positioned(self):
+        return self.object_store is not None
+
+    def _inputs_position(self, value):
+        """A request's ``inputs_position``: the position (M) the build's
+        inputs must include, e.g. where a client's saved edits reached:
+        ``{store, generation, commit_sequence}`` of the service's store, at
+        or below its head, and, when the client has one, the
+        ``request_uuid`` of its last save's receipt, which the service's
+        store must hold (a copy of the store with the same identity does
+        not). Returns an InputPosition."""
+        from object_store_inputs import InputPosition
+        if value is None:
+            return None
+        if not self._positioned():
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "This service's object store records no positions")
+        from vc_object_store import store_position_from_json
+        try:
+            position = InputPosition.of_status(store_position_from_json(json.dumps(value)))
+        except (ValueError, TypeError, RuntimeError) as error:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "inputs_position must be {store, generation, commit_sequence}") from error
+        store = self.object_store
+        if position.store != store.uuid or position.generation != store.generation:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"inputs_position belongs to store {position.store} (generation "
+                f"{position.generation}); this service's store is {store.uuid} "
+                f"(generation {store.generation})",
+                payload={"code": INPUT_UPDATE_UNAVAILABLE})
+        request_uuid = value.get("request_uuid")
+        if request_uuid is not None and (not isinstance(request_uuid, str) or not request_uuid):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "request_uuid must be a string")
+        # One open (one attachment of a served store) reads the head and
+        # looks the receipt up.
+        try:
+            with store.open(read_only=True) as handle:
+                head = int(handle.status()["commit_sequence"])
+                receipt = handle.receipt(request_uuid) if request_uuid is not None else None
+        except Exception as exc:  # noqa: BLE001 - reported to the client
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE,
+                           f"The service's object store cannot be read: "
+                           f"{type(exc).__name__}: {exc}") from exc
+        if position.commit_sequence > head:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"inputs_position specifies commit {position.commit_sequence}, after the "
+                f"service's store head {head}: these edits are not in the service's "
+                "store (a copy with the same UUID?)")
+        if request_uuid is not None:
+            if receipt is None:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"the save {request_uuid} is not in the service's store (a copy "
+                    "with the same UUID?): its edits cannot reach the fit")
+        return position
 
     def rebuild(self, request):
         """Rebuild the resident session, from the model stage or from nothing.
@@ -1084,7 +1580,12 @@ class ServiceState:
         A request that changes nothing but model configuration keeps the
         loaded host inputs and the brick pools and replaces the model stage
         alone (see ``_rebuild_stage_locked``); everything else is the full
-        teardown and reconstruction it has always been.
+        teardown and reconstruction it has always been, which rereads the
+        object store. ``{"inputs": "reload"}`` asks for that full rebuild
+        whatever the configuration change: it picks up new store revisions
+        under an unchanged configuration. The response's ``inputs`` says
+        whether the rebuild rereads the inputs ("reload") or keeps the frozen
+        ones ("keep").
         """
         request = dict(request or {})
         request.pop("command_id", None)
@@ -1093,16 +1594,27 @@ class ServiceState:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
                     "There is no fit session to rebuild; initialize it first")
+        self._refuse_during_input_update("A rebuild")
+        inputs = request.pop("inputs", "keep")
+        if inputs not in ("keep", "reload"):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           'inputs must be "keep" or "reload"')
+        minimum = self._inputs_position(request.pop("inputs_position", None))
+        if minimum is not None:
+            # A position to include is a reread of the inputs.
+            inputs = "reload"
         defaults = request.pop("defaults", False)
         if not isinstance(defaults, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "defaults must be true or false")
         if defaults:
+            # The project is the client's to send, as with any session request.
+            project = request.pop("project", None)
             if set(request):
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    "A defaults rebuild takes no other request fields")
-            request = self.startup_session_request()
+                    "A defaults rebuild takes no other request fields than the project")
+            request = {**self.startup_session_request(), "project": project}
         paths, run, preview, scroll = self._prepare_session_request(request)
         if paths.checkpoint and run.config:
             self._reject_overrides_the_checkpoint_contradicts(
@@ -1114,25 +1626,195 @@ class ServiceState:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A session build is already in progress")
+            if self._input_update is not None:  # began after the check above
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A rebuild waits for the input update in progress",
+                               payload={"code": INPUT_UPDATE_IN_PROGRESS})
             state = self.session.status()["state"] if self.session else None
             if state in SESSION_BUSY_STATES:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
                     f"A rebuild requires an idle or failed session (state is "
                     f"{SessionState(state).name})")
-            stage = ("all" if defaults
-                     else self._rebuild_stage_locked(paths, run, preview, state))
+            # Rereading the inputs is the whole build: a model-only rebuild
+            # keeps the frozen inputs it loaded.
+            stage = ("all" if defaults or inputs == "reload"
+                     else self._rebuild_stage_locked(paths, run, preview, scroll, state))
+            live_request = self.session_request or {}
+            live_config = (live_request.get("run") or {}).get("config", {})
+            live_paths = self.session_paths
+        build_id = None
         if stage == "model":
+            # The model stage keeps the frozen inputs, at their position, and
+            # the project's umbilicus.
+            run = dataclasses.replace(run, config={
+                **run.config,
+                "object_store_input_position": live_config.get("object_store_input_position")})
+            paths = dataclasses.replace(paths, umbilicus=live_paths.umbilicus)
             self._begin_model_rebuild(paths, run, preview)
         else:
-            self._begin_build(paths, run, preview, scroll)
+            build_id = self._begin_build(paths, run, preview, scroll,
+                                         minimum=minimum,
+                                         reload_inputs=inputs == "reload")
         return {**self.status(), "accepted": True, "rebuilding": True,
-                "stage": stage}
+                "stage": stage, "inputs": "reload" if stage == "all" else "keep",
+                "build_id": build_id}
 
-    def _rebuild_stage_locked(self, paths, run, preview, state):
+    def update_inputs(self, request):
+        """Update the resident fit's inputs to a position, keeping its
+        model and optimiser state (stage 2b).
+
+        ``inputs_position`` (M) is the position the inputs must include,
+        e.g. where a client's saved edits reached; the service links and
+        pins N at the store's head (at least M), then every rank replaces its
+        inputs with N's at an iteration boundary. ``expected_input_generation``
+        refuses an update computed against another generation than the
+        session's. The response returns at once; the work runs off the HTTP
+        thread, and a lease-holding client's command is answered when it
+        settles. A refusal leaves the fit as it was (input_preparation_error);
+        a failure past the release fails the session, which then needs a
+        rebuild or a checkpoint load.
+        """
+        request = dict(request or {})
+        request.pop("command_id", None)
+        minimum = self._inputs_position(request.pop("inputs_position", None))
+        expected = request.pop("expected_input_generation", None)
+        if request:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"Unknown input update fields: {', '.join(sorted(request))}")
+        if not self._positioned():
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "This service's object store records no positions; rebuild "
+                           "the fit with current inputs instead",
+                           payload={"code": INPUT_UPDATE_UNAVAILABLE})
+        with self.lock:
+            session = self.session
+            if session is None:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "There is no fit session to update; initialize it first",
+                               payload={"code": INPUT_UPDATE_UNAVAILABLE})
+            if self._building or self._input_update is not None:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "The fit session is being built, or its inputs updated",
+                               payload={"code": INPUT_UPDATE_BUSY})
+            status = session.status()
+            if status["state"] != SessionState.Idle:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"An input update requires an idle session (state is "
+                    f"{SessionState(status['state']).name})",
+                    payload={"code": INPUT_UPDATE_BUSY})
+            generation = int(status.get("input_generation") or 0)
+            if expected is not None and expected != generation:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"The update was computed against input generation {expected}; "
+                    f"the session is at {generation}",
+                    payload={"code": INPUT_GENERATION_STALE})
+            config = dict(status.get("applied_config") or {})
+            paths, scroll = self.session_paths, self._session_scroll
+            self._build_serial += 1
+            update_id = self._build_serial
+            requested = None if minimum is None else minimum.provenance()
+            self._input_update = {"build_id": update_id, "requested_position": requested,
+                                  "from_generation": generation}
+            self._input_preparation = {"build_id": update_id, "requested_position": requested}
+            self._input_preparation_error = None
+            self.status_generation += 1
+            session_id = self.session_id
+        try:
+            self._start_background(
+                target=self._update_inputs_job,
+                args=(update_id, session_id, session, config, paths, scroll, minimum),
+                name="spiral-input-update", daemon=True)
+        except BaseException:
+            with self.lock:
+                self._input_update = self._input_preparation = None
+            raise
+        return {**self.status(), "accepted": True, "updating_inputs": True,
+                "build_id": update_id}
+
+    def _update_inputs_job(self, update_id, session_id, session, config, paths, scroll,
+                           minimum):
+        from spiral_runtime import InputUpdateFailed, InputUpdateRefused
+
+        requested = None if minimum is None else minimum.provenance()
+
+        def refused(exc, phase):
+            cause = _cause(exc)
+            with self.lock:
+                self._input_update = None
+                self._input_preparation = None
+                self._input_preparation_error = {
+                    "build_id": update_id, "requested_position": requested,
+                    "phase": phase, "recovery_required": False, "message": cause,
+                    "problems": list(getattr(exc, "problems", None) or [cause])}
+                self.status_generation += 1
+            self.events.append(
+                "error", f"The inputs could not be updated; the fit is unchanged: {cause}",
+                severity="error", source="service", operation="updating_inputs")
+        try:
+            prepared = self._prepare_position(config, paths, scroll, minimum,
+                                              incremental=True)
+        except BaseException as exc:
+            refused(exc, "linking")
+            return
+        for line in prepared.lines:
+            self.events.append("log", line, source="service", operation="updating_inputs")
+        with self.lock:
+            self._input_preparation = None
+            self._input_update = {**self._input_update, "position": prepared.position.provenance()}
+            self.status_generation += 1
+        try:
+            result = session.update_inputs(prepared.pins.provenance())
+        except InputUpdateRefused as exc:
+            refused(exc, "preparing")
+            return
+        except BaseException as exc:
+            if not isinstance(exc, InputUpdateFailed) \
+                    and session.status()["state"] != SessionState.Error:
+                # Not past the release (InputUpdateFailed is), and the fit
+                # did not fail: it still holds its inputs.
+                refused(exc, "preparing")
+                return
+            cause = _cause(exc)
+            with self.lock:
+                self._input_update = None
+                self._input_preparation_error = {
+                    "build_id": update_id, "requested_position": requested,
+                    "phase": "installing", "recovery_required": True, "message": cause,
+                    "problems": [cause]}
+                self.status_generation += 1
+            self.events.append(
+                "error", f"The input update failed after the fit released its inputs; "
+                f"rebuild the fit or load a checkpoint: {cause}", severity="error",
+                source="service", operation="updating_inputs")
+            return
+        with self.lock:
+            if self.session_id == session_id:
+                # Record the currently loaded inputs so a later
+                # model-only rebuild (and its checkpoints) keeps this position.
+                if self.session_request:
+                    run = dict(self.session_request.get("run") or {})
+                    run["config"] = {**(run.get("config") or {}),
+                                     "object_store_input_position": prepared.position.provenance()}
+                    self.session_request = {**self.session_request, "run": run}
+                self._input_position = {
+                    **prepared.position.provenance(), "requested": requested,
+                    "head": prepared.head, "attempts": prepared.attempts,
+                    "source": "update",
+                    "input_generation": result.get("input_generation")}
+            self._input_update = None
+            self.status_generation += 1
+        self.events.append(
+            "log", f"Inputs updated to {prepared.position.describe()} "
+            f"(input generation {result.get('input_generation')})",
+            source="service", operation="updating_inputs")
+
+    def _rebuild_stage_locked(self, paths, run, preview, scroll, state):
         """How much of the resident session this request has to replace.
 
-        Everything outside ``run.config`` is ``all``. Paths name host inputs
+        Everything outside ``run.config`` is ``all``. Paths refer to host inputs
         whose contents another process may have changed, so retaining a stage
         across one would need a content fingerprint nothing computes; the
         preview block, the run tag, the z window and the storage backend are
@@ -1140,7 +1822,7 @@ class ServiceState:
         ``config.rebuild_stage`` over the keys whose requested value differs
         from the live session's, which is "model" only for the audited
         allowlist and "all" for everything else. The shell atlas keys widen
-        to "all" when the session loaded both a tracks store and an outer
+        to "all" when the session loaded both a tracks store and the outer
         shell, because it filtered the tracks against the shell then.
 
         Call with the lock held.
@@ -1151,8 +1833,24 @@ class ServiceState:
             # Nothing to keep: there is no resident session, or it has no
             # model to rebuild around (Error), or it is not quiescent.
             return "all"
-        if (paths.manifest() != current.get("paths")
+        if paths.checkpoint and int(self.session.status().get("input_generation") or 0):
+            # The model stage resumes from the checkpoint, whose inputs an
+            # update has since replaced: its manifest no longer matches the
+            # resident inputs, and the refusal would come after the model was
+            # released. The full rebuild reads the checkpoint's position.
+            return "all"
+        # The project supplies VOLUME_INPUT_KEYS (and the build the fit
+        # volume itself) once the build knows the fit volume; they and the
+        # scroll change with the project's facts of that volume.
+        live_paths = dict(current.get("paths") or {})
+        live_paths.update(dict.fromkeys(VOLUME_INPUT_KEYS, ""), volume_uuid="")
+        if (paths.manifest() != live_paths
                 or preview.manifest() != current.get("preview")):
+            return "all"
+        live_project = current.get("project") or {}
+        volume = live_project.get("volume")
+        if (volume not in scroll.project.volumes
+                or scroll.project.record(volume) != live_project):
             return "all"
         live_run = dict(current.get("run") or {})
         new_run = run.manifest()
@@ -1164,21 +1862,23 @@ class ServiceState:
             key for key in set(live_config) | set(new_config)
             if live_config.get(key) != new_config.get(key)
         }
-        # _prepare_session_request already blanked either path when its
-        # input toggle is off, so both being named means the resident
-        # session filtered its tracks against the shell at load: the fitter
-        # refuses the shell atlas settings there, and only the full rebuild
-        # can apply them.
+        # The service pins the position; a request never carries the live one.
+        changed.discard("object_store_input_position")
+        # A session that read tracks and the store's outer shell filtered
+        # its tracks against the shell at load: the fitter refuses the shell
+        # atlas settings there, and only the full rebuild can apply them.
+        summary = self.session.status().get("input_summary") or {}
         return rebuild_stage(
             changed,
-            shell_filtered_tracks=bool(paths.tracks_dbm and paths.outer_shell))
+            shell_filtered_tracks=bool(
+                (summary.get("selection") or {}).get("track")
+                and summary.get("outer_shell")))
 
     def _begin_model_rebuild(self, paths, run, preview):
         """Publish the new request and rebuild the model off the HTTP thread.
 
-        The session object, its generation, and its resident inputs survive.
-        The editing workspace retains revisions across every rebuild; the
-        session reports ``Loading`` while the fitter thread works.
+        The session object, its generation, and its resident inputs survive;
+        the session reports ``Loading`` while the fitter thread works.
         """
         with self.lock:
             if self._building:
@@ -1187,6 +1887,7 @@ class ServiceState:
             self._building = True
             self.session_paths = paths
             self.session_request = {
+                **self.session_request,
                 "paths": paths.manifest(),
                 "run": run.manifest(),
                 "preview": preview.manifest(),
@@ -1211,49 +1912,367 @@ class ServiceState:
             self._building = False
             self.status_generation += 1
 
-    def _begin_build(self, paths, run, preview, scroll):
-        """Publish ``Loading`` and construct the runtime off the HTTP thread."""
-        # The build binds the workspace's unchanged baseline identities while
-        # it loads, so the replay after it does not relink the whole fit.
-        workspace = self.editing_workspace
-        bindings = workspace.build_bindings() if workspace is not None else []
+    def _begin_build(self, paths, run, preview, scroll, *, minimum=None,
+                     reload_inputs=False):
+        """Publish ``Loading`` and construct the runtime off the HTTP thread.
+
+        With a bound store the build reads a position. A checkpoint resume
+        reads the pins the checkpoint recorded of this store, unless the
+        request reloads the inputs or specifies a minimum position;
+        otherwise the inputs are linked and pinned first
+        (``_prepare_then_build``), while the resident session, if any, is
+        left alone. Returns the build's ID.
+        """
+        record = None
+        if self._positioned():
+            pins = None
+            if paths.checkpoint and minimum is None and not reload_inputs:
+                pins = self._checkpoint_pins(paths.checkpoint)
+            if pins is None:
+                return self._begin_prepared_build(paths, run, preview, scroll,
+                                                  minimum)
+            if self.build_missing_lasagna_packs:
+                return self._begin_prepared_build(
+                    paths, run, preview, scroll, minimum, checkpoint_pins=pins)
+            run = self._pin_run(run, pins)
+            record = {**pins.position.provenance(), "requested": None, "head": None,
+                      "attempts": 0, "source": "checkpoint"}
+        # Use the fit volume recorded in the checkpoint's inputs.
+        project = scroll.project
+        try:
+            volume = self._unprepared_volume(paths, scroll)
+            paths, scroll = self._resolve_session_scroll(
+                scroll, volume, paths, self._effective_config(paths, run))
+        except ScrollSpecError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"Session validation failed: {exc}",
+                           [{"field": "project", "message": str(exc)}]) from exc
         with self.lock:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A session build is already in progress")
-            previous = self.session
-            if previous is not None:
-                self._retiring_sessions.append(previous)
-            self.session = None
             self._building = True
-            self.session_generation += 1
-            self.session_id = f"spiral-{self.session_generation}-{secrets.token_hex(5)}"
-            self.session_paths = paths
-            self.session_request = {
-                "paths": paths.manifest(),
-                "run": run.manifest(),
-                "preview": preview.manifest(),
-            }
-            self.session_revision += 1
-            self._reset_session_scope()
-            self._session_state = SessionState.Loading
-            self._session_phase = "Building the fit session"
-            self._session_error = None
-            self.status_generation += 1
-            session_id = self.session_id
-            if workspace is not None:
-                workspace.note_build_bindings(self.session_generation, bindings)
+            build_id, session_id, previous = self._publish_build_locked(
+                paths, run, preview, record, scroll, project, volume)
         self._start_background(
             target=self._build,
-            args=(session_id, previous, paths, run,
-                  preview, scroll, bindings),
+            args=(session_id, previous, paths, run, preview, scroll),
             name="spiral-session-build", daemon=True)
-        self._start_background(
-            target=self._refresh_pcl_artifacts,
-            name="spiral-pcl-artifact-publish", daemon=True)
+        return build_id
 
-    def _build(self, session_id, previous, paths, run,
-               preview, scroll, bindings=()):
+    @staticmethod
+    def _pin_run(run, pins):
+        """Store the pinned position and object versions in the run config.
+
+        Client requests and status responses carry only the position.
+        """
+        return dataclasses.replace(run, config={
+            **run.config, "object_store_input_position": pins.provenance()})
+
+    def _unprepared_volume(self, paths, scroll):
+        """The fit volume of a build that prepares no position: the one its
+        checkpoint's inputs were read in. A build without one (on a service
+        without an object store, which only tests construct) fits the
+        project's only volume."""
+        if paths.checkpoint:
+            *_, manifest = self._checkpoint_durable_cfg(paths.checkpoint)
+            volume = ((manifest or {}).get("object_store") or {}).get("volume_uuid")
+            if volume:
+                return str(volume)
+        volumes = sorted(scroll.project.volumes)
+        if len(volumes) != 1:
+            raise ScrollSpecError(
+                "the build reads no fit volume from its inputs, so it must be the "
+                f"project's only volume (it has {len(volumes)})")
+        return volumes[0]
+
+    def _checkpoint_pins(self, path):
+        """The pins (object_store_inputs.InputPins) a checkpoint's inputs
+        were read at, when they are of this service's store, or None."""
+        from object_store_inputs import InputPins
+        *_, manifest = self._checkpoint_durable_cfg(path)
+        pins = InputPins.from_manifest((manifest or {}).get("object_store"))
+        if pins is None or pins.position.store != self.object_store.uuid \
+                or pins.position.generation != self.object_store.generation:
+            return None
+        return pins
+
+    def _begin_prepared_build(self, paths, run, preview, scroll, minimum,
+                              checkpoint_pins=None):
+        """Prepare packs and a position off the HTTP thread, then build.
+
+        A checkpoint keeps its recorded position without refreshing links.
+        """
+        with self.lock:
+            if self._building:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A session build is already in progress")
+            self._building = True
+            self._build_serial += 1
+            build_id = self._build_serial
+            self._input_preparation = {"build_id": build_id,
+                                       "requested_position": minimum}
+            self._input_preparation_error = None
+            self.status_generation += 1
+        try:
+            self._start_background(
+                target=self._prepare_then_build,
+                args=(build_id, paths, run, preview, scroll, minimum, checkpoint_pins),
+                name="spiral-input-position", daemon=True)
+        except BaseException:
+            with self.lock:
+                self._building = False
+                self._input_preparation = None
+            raise
+        return build_id
+
+    def _prepare_inputs(self, paths, run, scroll, minimum):
+        """Resolve the fit volume, then link and pin the selected inputs.
+
+        Resolve the scroll first so linking uses the correct Lasagna scale.
+        Check that preparation keeps the same fit volume.
+        Returns ``(prepared, volume, paths, ScrollSpec)``.
+        """
+        from object_store_inputs import read_snapshot, reading_stage, request_from_config
+        config = self._effective_config(paths, run)
+        progress = self._input_progress()
+        try:
+            with self.object_store.open(read_only=True, cache_directory=paths.cache_directory) as store, \
+                    reading_stage(progress, "Reading the selected inputs", "fit volume"):
+                volume = read_snapshot(store, request_from_config(config)).volume_uuid
+        finally:
+            progress.close()
+        self._prepare_fiber_directions(scroll, volume, paths, config)
+        paths, spec = self._resolve_session_scroll(scroll, volume, paths, config)
+        prepared, pinned = self._prepare_position(config, paths, spec, minimum, volume=True)
+        if pinned != volume:
+            raise ScrollSpecError(
+                f"the inputs' fit volume changed from {volume} to {pinned} while "
+                "they were linked; retry")
+        return prepared, volume, paths, spec
+
+    def _input_progress(self):
+        """A ProgressReporter publishing to the input preparation's status
+        (``input_preparation.progress``) while one is active."""
+        from spiral_progress import ProgressReporter
+
+        def publish(snapshot):
+            with self.lock:
+                if self._input_preparation is not None:
+                    self._input_preparation["progress"] = snapshot
+                    # A stage without steps (a store read) publishes once:
+                    # its elapsed time is recomputed for every status.
+                    self._input_preparation_progress_started = (
+                        None if snapshot is None
+                        else time.monotonic() - snapshot["elapsed_seconds"])
+                    self.status_generation += 1
+        return ProgressReporter(publish, stream=sys.stderr)
+
+    def _input_preparation_status(self):
+        """``input_preparation`` for /session/status (call with the lock
+        held), its progress's elapsed time current."""
+        preparation = copy.deepcopy(self._input_preparation)
+        started = getattr(self, "_input_preparation_progress_started", None)
+        if preparation and preparation.get("progress") and started is not None:
+            preparation["progress"]["elapsed_seconds"] = time.monotonic() - started
+        return preparation
+
+    def _prepare_position(self, config, paths, scroll, minimum, *, volume=False,
+                          incremental=False):
+        """Link and pin a position for ``config`` on the bound store; with
+        ``volume``, also the fit volume pinned there (``(prepared,
+        volume)``). ``incremental`` (an input update) links only objects
+        selected since the store's last refresh, when nothing else changed."""
+        from fit_session import lasagna_normal_inputs
+        from object_store_inputs import (fit_volume_at, prepare_position,
+                                         request_from_config)
+        self._prepare_lasagna_packs(paths, config)
+        lasagna = lasagna_normal_inputs(
+            load_lasagna_source(paths.lasagna) if paths.lasagna else None,
+            config, scroll.lasagna_scale, paths.cache_directory)
+
+        def log(line):
+            self.events.append("log", line, source="service",
+                               operation="preparing_inputs")
+        request = request_from_config(config)
+        progress = self._input_progress()
+        with self._store_write_lock:
+            try:
+                with self.object_store.open(cache_directory=paths.cache_directory) as store:
+                    prepared = prepare_position(
+                        store, config, request, lasagna=lasagna,
+                        minimum=minimum, cache_directory=paths.cache_directory, log=log,
+                        incremental=incremental, progress=progress)
+                    if not volume:
+                        return prepared
+                    return prepared, fit_volume_at(store, request, prepared,
+                                                   progress)
+            finally:
+                progress.close()
+
+    def _prepare_fiber_directions(self, scroll, volume, paths, config):
+        """Unless it requires prepared inputs, a host extracts the fiber
+        directions a fit with the fiber-direction loss reads, when the cache
+        lacks them, from the project's fiber-inference dataset (whose own
+        problems the scroll's resolution reports)."""
+        if not self.build_missing_lasagna_packs or not fiber_directions_required(config):
+            return
+        try:
+            level = config.get("fit_volume_level", 0)
+            path = scroll.fiber_directions_cache_path(volume, paths.cache_directory, level)
+        except ScrollSpecError:
+            return
+        if os.path.isfile(path):
+            return
+        from fiber_direction_samples import extract
+
+        def log(line):
+            self.events.append("log", f"Fiber directions: {line}", source="service",
+                               operation="preparing_inputs")
+        dataset = scroll.project.fiber_inference
+        location = dataset.extraction_location()
+        log(f"extracting from {location} into {path}")
+        extract(location, None, path, identity=dataset.identity,
+                output_scale=scroll.fiber_scale(volume, level),
+                workers=FIBER_DIRECTION_WORKERS, log=log)
+
+    def required_lasagna_packs(self, request):
+        """``{"packs": [...]}``: the Lasagna pack kinds a build of this
+        session request (as /session/initialize or /session/rebuild takes
+        it) reads, so a client caches only the remote arrays they are built
+        from."""
+        request = dict(request or {})
+        request.pop("command_id", None)
+        paths, run, _, _ = self._prepare_session_request(request, restore_checkpoint_z=True)
+        if not paths.lasagna:
+            return {"packs": []}
+        return {"packs": sorted(_lasagna_pack_kinds(
+            self._effective_config(paths, run), load_lasagna_source(paths.lasagna)))}
+
+    def _prepare_lasagna_packs(self, paths, config):
+        """Unless it requires prepared packs, a host builds missing pools
+        before linking: from local arrays, or from remote ones whose objects
+        vc_reader lists (s3://, or a virtual-hosted Amazon S3 URL) and first
+        fetches whole into the cache (beside the pack, removed once it is
+        built; an interrupted fetch resumes)."""
+        if not self.build_missing_lasagna_packs or not paths.lasagna:
+            return
+        from lasagna_source import is_remote_location
+        from remote_zarr import is_listable
+        source = load_lasagna_source(paths.lasagna)
+        kinds = _lasagna_pack_kinds(config, source)
+        if not kinds:
+            return
+        for kind in sorted(kinds):
+            if os.path.isfile(os.path.join(
+                    source.pack_directory(paths.cache_directory, kind), "meta.json")):
+                continue
+            for array in source.arrays(kind):
+                if is_remote_location(array) and not is_listable(array):
+                    raise ValueError(
+                        f"Cannot build missing Lasagna {kind} pack: {array} is remote "
+                        "and its objects cannot be listed (not an s3:// location or a "
+                        "virtual-hosted Amazon S3 URL). Prepare the pack where the "
+                        "arrays are and copy it into the service cache.")
+                if not is_remote_location(array) and not os.path.isdir(array):
+                    raise ValueError(
+                        f"Cannot build missing Lasagna {kind} pack: {array} is not "
+                        "an accessible local array. Prepare the pack where the "
+                        "arrays are and copy it into the service cache.")
+        from lasagna_data import ensure_fit_sparse_stores, _require_sidecar
+
+        progress = self._input_progress()
+        try:
+            ensure_fit_sparse_stores(
+                source=source, cache_directory=paths.cache_directory,
+                use_normals="normals" in kinds, use_spacing="grad_mag" in kinds,
+                progress=progress, local_arrays=_fetched_lasagna_arrays)
+            for kind in sorted(kinds):
+                _require_sidecar(source, paths.cache_directory, kind)
+        finally:
+            progress.close()
+
+    def _prepare_then_build(self, build_id, paths, run, preview, scroll, minimum,
+                            checkpoint_pins=None):
+        try:
+            project = scroll.project
+            if checkpoint_pins is None:
+                prepared, volume, paths, scroll = self._prepare_inputs(
+                    paths, run, scroll, minimum)
+                for line in prepared.lines:
+                    self.events.append("log", line, source="service",
+                                       operation="preparing_inputs")
+                record = {**prepared.position.provenance(),
+                          "requested": None if minimum is None else minimum.provenance(),
+                          "head": prepared.head, "attempts": prepared.attempts,
+                          "source": "prepared"}
+                run = self._pin_run(run, prepared.pins)
+            else:
+                run = self._pin_run(run, checkpoint_pins)
+                volume = self._unprepared_volume(paths, scroll)
+                config = self._effective_config(paths, run)
+                self._prepare_fiber_directions(scroll, volume, paths, config)
+                paths, scroll = self._resolve_session_scroll(scroll, volume, paths, config)
+                self._prepare_lasagna_packs(paths, config)
+                record = {**checkpoint_pins.position.provenance(), "requested": None,
+                          "head": None, "attempts": 0, "source": "checkpoint"}
+        except BaseException as exc:
+            cause = _cause(exc)
+            with self.lock:
+                self._building = False
+                self._input_preparation = None
+                self._input_preparation_error = {
+                    "build_id": build_id,
+                    "requested_position": None if minimum is None else minimum.provenance(),
+                    "message": cause,
+                    "problems": list(getattr(exc, "problems", None) or [cause])}
+                self.status_generation += 1
+            self.events.append(
+                "error", f"The inputs could not be prepared; the resident fit "
+                f"is unchanged: {cause}", severity="error", source="service",
+                operation="preparing_inputs")
+            return
+        with self.lock:
+            self._input_preparation = None
+            _, session_id, previous = self._publish_build_locked(
+                paths, run, preview, record, scroll, project, volume,
+                build_id=build_id)
+        self._build(session_id, previous, paths, run, preview, scroll)
+
+    def _publish_build_locked(self, paths, run, preview, input_position, scroll,
+                              project, volume, *, build_id=None):
+        """Retire the resident session and publish ``Loading`` for a new one,
+        fitting ``scroll`` (_resolve_session_scroll's ScrollSpec) of the
+        ``project`` (a SpiralProject) in the fit volume ``volume``. Call with
+        the lock held and ``_building`` claimed."""
+        if build_id is None:
+            self._build_serial += 1
+            build_id = self._build_serial
+        previous = self.session
+        if previous is not None:
+            self._retiring_sessions.append(previous)
+        self.session = None
+        self.session_generation += 1
+        self.session_id = f"spiral-{self.session_generation}-{secrets.token_hex(5)}"
+        self.session_paths = paths
+        self.session_request = {
+            "paths": paths.manifest(),
+            "run": run.manifest(),
+            "preview": preview.manifest(),
+            "project": project.record(volume),
+            "scroll": scroll.manifest(),
+        }
+        self._session_project = project
+        self.session_revision += 1
+        self._reset_session_scope()
+        self._input_position = input_position
+        self._session_scroll = scroll
+        self._session_state = SessionState.Loading
+        self._session_phase = "Building the fit session"
+        self._session_error = None
+        self.status_generation += 1
+        return build_id, self.session_id, previous
+
+    def _build(self, session_id, previous, paths, run, preview, scroll):
         """Close the old resident session, then construct the new one.
 
         A rebuild is an all-rank teardown and reconstruction: the previous
@@ -1270,8 +2289,7 @@ class ServiceState:
             from spiral_runtime import create_session
             session = create_session(
                 paths, run, preview, scroll, self._status_changed,
-                gpu_ids=self.gpu_ids, event_callback=self._session_event,
-                input_bindings=bindings)
+                gpu_ids=self.gpu_ids, event_callback=self._session_event)
         except BaseException as exc:
             self._fail_session(session_id, _cause(exc))
             return
@@ -1310,111 +2328,12 @@ class ServiceState:
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
-        self.pcl_artifacts = {}
+        self._event_input_lines = {}
+        self._input_manifest = None
         stale_raw = self._preview.reset_session_scope()
         for manifest in stale_raw:
             shutil.rmtree(
                 Path(manifest).parent, ignore_errors=True)
-
-    def _publish_pcl_artifact(self, role, source_path=None):
-        """Snapshot one editable role's PCL file without exposing host paths."""
-        role = PclRole(role)
-        if role not in EDITABLE_PCL_ROLES:
-            raise ValueError(f"{role.value} PCLs have no display artifact")
-        # Keep snapshot creation, registration, installation and retention in
-        # one role-scoped transaction, including concurrent session refreshes.
-        with self._pcl_publication_locks[role]:
-            return self._publish_pcl_artifact_locked(role, source_path)
-
-    def _publish_pcl_artifact_locked(self, role, source_path):
-        with self.lock:
-            session_id = self.session_id
-            paths = self.session_paths
-            generation = self.session_revision
-            resolution = self.dataset_resolution
-        if not session_id or paths is None:
-            return None
-        source = Path(source_path) if source_path else None
-        if source is None:
-            for pcl in paths.pcls:
-                if pcl.role == role and pcl.path:
-                    source = Path(pcl.path)
-                    break
-        if source is None:
-            candidate = Path(paths.dataset_root) / PCL_ROLE_FILES[role.value]
-            if candidate.is_file():
-                source = candidate
-        if source is None or not source.is_file():
-            with self.lock:
-                self.pcl_artifacts.pop(role.value, None)
-            return None
-        base_shape = None
-        if resolution is not None and resolution.scroll_spec is not None:
-            base_shape = resolution.scroll_spec.get("base_shape_zyx")
-        if base_shape is None:
-            with self.lock:
-                self.pcl_artifacts.pop(role.value, None)
-            return None
-        kind = PCL_ARTIFACT_KINDS[role.value]
-        root = (Path(paths.output_directory) / ".spiral-artifacts" /
-                f"{PCL_ARTIFACT_DIR_PREFIXES[role.value]}-{generation}-"
-                f"{secrets.token_hex(6)}")
-        root.mkdir(parents=True, exist_ok=False)
-        try:
-            pcl_name = PCL_ROLE_FILES[role.value]
-            shutil.copy2(source, root / pcl_name)
-            # Hash the snapshot, not the live source: publishing runs without
-            # the commit lock, and a write landing between the copy and the
-            # hash would advertise the newer document's revision for the
-            # older bytes, letting a client edit the stale snapshot and still
-            # pass the revision check.
-            source_revision = self._file_sha256(root / pcl_name)
-            editable = self._pcl_source_editable(role, source)
-            descriptor = {
-                "schema_version": 1,
-                "kind": kind,
-                "role": role.value,
-                "base_shape_zyx": list(base_shape),
-                "pcl_file": pcl_name,
-                "source": str(source.resolve()),
-                "source_revision": source_revision,
-                "editable": editable,
-            }
-            (root / "manifest.json").write_text(
-                json.dumps(descriptor, indent=2) + "\n", encoding="utf-8")
-            ref = self.artifacts.register_directory(
-                kind, session_id, generation, root,
-                "manifest.json", delete_root_on_prune=True)
-            ref["role"] = role.value
-            ref["base_shape_zyx"] = list(base_shape)
-            ref["source_revision"] = source_revision
-            ref["editable"] = editable
-            with self.lock:
-                if self.session_id != session_id:
-                    shutil.rmtree(root, ignore_errors=True)
-                    return None
-                self.pcl_artifacts[role.value] = ref
-                self.status_generation += 1
-            self.artifacts.prune(kind, session_id, 1)
-            return ref
-        except BaseException:
-            shutil.rmtree(root, ignore_errors=True)
-            raise
-
-    def _refresh_pcl_artifact(self, role, source_path=None):
-        role = PclRole(role)
-        try:
-            self._publish_pcl_artifact(role, source_path)
-        except Exception as exc:
-            self.events.append(
-                "log", f"{PCL_ROLE_LABELS[role.value].capitalize()} overlay "
-                f"could not be published: {type(exc).__name__}: {exc}",
-                severity="warning", source="service",
-                operation=f"publishing_{role.value}")
-
-    def _refresh_pcl_artifacts(self):
-        for role in EDITABLE_PCL_ROLES:
-            self._refresh_pcl_artifact(role)
 
     def _status_changed(self, status):
         # Runs on the fitter thread. It may only claim immutable raw work;
@@ -1429,17 +2348,72 @@ class ServiceState:
         except Exception as exc:
             print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
+        try:
+            self._note_input_manifest(status)
+        except Exception as exc:
+            print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
         with self.lock:
-            applied_manifest = status.get("input_manifest")
-            if (self.session_paths is not None
-                    and isinstance(applied_manifest, dict)
-                    and applied_manifest != self.session_paths.manifest()):
-                self.session_paths = SpiralInputPaths.from_mapping(
-                    applied_manifest)
-                if self.session_request is not None:
-                    self.session_request["paths"] = \
-                        self.session_paths.manifest()
             self.status_generation += 1
+
+    def _note_input_manifest(self, status):
+        """Publish the session's input manifest once its inputs are frozen.
+
+        Runs on the fitter thread: it claims the inputs (their digest and
+        input generation: an update to another position with identical
+        inputs still records the new position) and leaves copying and hashing to
+        a background thread.
+        """
+        digest = status.get("input_digest")
+        path = status.get("input_manifest_path")
+        if not digest or not path:
+            return
+        key = (digest, int(status.get("input_generation") or 0))
+        with self.lock:
+            if self.session_id is None or (
+                    self._input_manifest and self._input_manifest[0] == key):
+                return
+            self._input_manifest = (key, None)
+            session_id = self.session_id
+            generation = self.session_generation
+            output = self._output_root()
+        threading.Thread(
+            target=self._publish_input_manifest,
+            args=(session_id, generation, key, Path(path), output),
+            name="spiral-input-manifest-publish", daemon=True).start()
+
+    def _publish_input_manifest(self, session_id, generation, key, source,
+                                output):
+        digest = key[0]
+        root = (Path(output) / ".spiral-artifacts" /
+                f"inputs-{digest[:12]}-{secrets.token_hex(6)}")
+        try:
+            root.mkdir(parents=True)
+            shutil.copy2(source, root / INPUT_MANIFEST_FILE_NAME)
+            ref = self.artifacts.register_directory(
+                INPUT_MANIFEST_ARTIFACT_KIND, session_id, generation, root,
+                INPUT_MANIFEST_FILE_NAME, delete_root_on_prune=True)
+            ref["input_digest"] = digest
+        except Exception as exc:
+            shutil.rmtree(root, ignore_errors=True)
+            self.events.append(
+                "log", f"The input manifest could not be published: "
+                f"{type(exc).__name__}: {exc}", severity="warning",
+                source="service", operation="loading_inputs")
+            return
+        with self.lock:
+            current = (self.session_id == session_id and self._input_manifest
+                       and self._input_manifest[0] == key)
+            if current:
+                self._input_manifest = (key, ref)
+                self.status_generation += 1
+        if not current:
+            # The session was replaced meanwhile: withdraw only this copy.
+            self.artifacts.prune(
+                INPUT_MANIFEST_ARTIFACT_KIND, session_id, 0,
+                retain=lambda artifact: Path(artifact.root) != root)
+            return
+        self.artifacts.prune(INPUT_MANIFEST_ARTIFACT_KIND, session_id, 1)
 
     def _session_event(self, rank, status):
         """Derive structured event records from one rank's status snapshot.
@@ -1447,7 +2421,7 @@ class ServiceState:
         The single-GPU runtime reports as rank 0; child ranks of a
         distributed session publish their snapshots through the parent
         queue and arrive here tagged with their originating rank, so every
-        record names the process that produced it.
+        record identifies the process that produced it.
         """
         if not isinstance(status, dict):
             return
@@ -1475,6 +2449,20 @@ class ServiceState:
                     payload={key: value for key, value in progress.items()
                              if key != "eta_seconds"},
                     coalesce_key=("progress", rank), force=finished)
+        report = status.get("input_report")
+        if isinstance(report, list):
+            # The object-store adapter's report while it loads the inputs:
+            # selection, refresh outcomes, constraint counts and warnings.
+            with self.lock:
+                published = self._event_input_lines.get(rank, 0)
+                self._event_input_lines[rank] = max(published, len(report))
+            for line in report[published:]:
+                self.events.append(
+                    "inputs", str(line),
+                    severity=("warning" if str(line).startswith("WARNING")
+                              else "info"),
+                    source="fitter", rank=rank, session_generation=generation,
+                    operation="loading_inputs")
         metrics = status.get("latest_metrics")
         iteration = status.get("current_iteration")
         if metrics and isinstance(iteration, int):
@@ -1497,9 +2485,11 @@ class ServiceState:
                 if emit:
                     self._event_errors[rank] = error
             if emit:
+                problems = status.get("input_problems")
                 self.events.append(
                     "error", str(error), severity="error", source="fitter",
-                    rank=rank, session_generation=generation)
+                    rank=rank, session_generation=generation,
+                    payload={"input_problems": problems} if problems else None)
 
     def _maybe_register_artifacts(self, status):
         """Offer a raw snapshot to the bounded background publisher.
@@ -1578,14 +2568,30 @@ class ServiceState:
                         "Indexing preview files")
             model_state = (published.raw_manifest or {}).get(
                 "model_state_sha256")
+            input_digest = (published.raw_manifest or {}).get("input_digest")
+            input_position = (published.raw_manifest or {}).get("input_position")
+            # An input update may have landed while this was publishing: a
+            # surface fitted to replaced inputs stays indexed (viewable as
+            # old) but never displaces the active inputs' display.
+            current_digest = self._current_input_digest()
+            superseded = bool(input_digest and current_digest
+                              and input_digest != current_digest)
             with self.lock:
-                if self.session_id == session_id:
+                if self.session_id == session_id and not superseded:
                     self._preview.artifact = ref
                     self._preview.error = None
                     self._preview.source_fit_iteration = (
                         published.source_fit_iteration)
                     self._preview.model_state_sha256 = model_state
+                    self._preview.input_position = copy.deepcopy(input_position)
                 self.status_generation += 1
+            if superseded:
+                self.events.append(
+                    "log", f"The preview of iteration {published.source_fit_iteration} "
+                    f"was fitted to inputs the fit has since replaced; it is kept "
+                    f"as an old preview, not shown as current",
+                    severity="warning", source="service",
+                    operation="publishing_preview")
             # Remember which model state this surface belongs to, so a
             # checkpoint load that lands on it can re-show it (see
             # _note_checkpoint_state) instead of flattening it again.
@@ -1596,7 +2602,8 @@ class ServiceState:
                         model_state,
                         manifest_path=published.manifest_path,
                         session_id=session_id, generation=preview_generation,
-                        source_fit_iteration=published.source_fit_iteration)
+                        source_fit_iteration=published.source_fit_iteration,
+                        input_digest=input_digest, input_position=input_position)
                 except Exception as exc:
                     self.events.append(
                         "log", "Could not index the published preview by "
@@ -1620,7 +2627,7 @@ class ServiceState:
                         diagnostics_manifest.name,
                         "Indexing preview diagnostics")
                     with self.lock:
-                        if self.session_id == session_id:
+                        if self.session_id == session_id and not superseded:
                             self._preview.diagnostics_artifact = diagnostics_ref
                     self.artifacts.prune("spiral-preview-diagnostics",
                                          session_id, PREVIEW_ARTIFACTS_KEPT)
@@ -1687,6 +2694,17 @@ class ServiceState:
                     args=(next_status,), name="spiral-preview-publish",
                     daemon=True).start()
 
+    def _current_input_digest(self):
+        """The resident fit's input digest now (None without a session)."""
+        with self.lock:
+            session = self.session
+        if session is None:
+            return None
+        try:
+            return session.status().get("input_digest")
+        except Exception:  # noqa: BLE001 - a closing session has no inputs
+            return None
+
     def _published_preview_index(self):
         """The on-disk model-state index for this session's output root."""
         with self.lock:
@@ -1696,7 +2714,7 @@ class ServiceState:
         return PublishedPreviewIndex(paths.output_directory)
 
     def _retain_pinned_previews(self):
-        """A prune exemption for surfaces a saved checkpoint still names."""
+        """Protect surfaces referenced by a saved checkpoint from pruning."""
         preview_index = self._published_preview_index()
         if preview_index is None:
             return None
@@ -1736,11 +2754,13 @@ class ServiceState:
         threading.Thread(
             target=self._restore_published_preview,
             args=(session_id, path, digest, shown,
-                  state.get("completed_iterations")),
+                  state.get("completed_iterations"),
+                  status.get("input_digest")),
             name="spiral-preview-restore", daemon=True).start()
 
     def _restore_published_preview(self, session_id, checkpoint_path, digest,
-                                   shown_digest, completed_iterations):
+                                   shown_digest, completed_iterations,
+                                   input_digest=None):
         preview_index = self._published_preview_index()
         if preview_index is None:
             return
@@ -1749,7 +2769,10 @@ class ServiceState:
             if shown_digest == digest:
                 # The surface on display already is this model state.
                 return
-            entry = preview_index.lookup(digest)
+            # Only a surface published from these same inputs: one fitted to
+            # other inputs is not this session's preview, however equal the
+            # model state.
+            entry = preview_index.lookup(digest, input_digest=input_digest)
             if entry is None:
                 return
             manifest_path = Path(str(entry["manifest_path"]))
@@ -1776,6 +2799,7 @@ class ServiceState:
                 self._preview.source_fit_iteration = entry.get(
                     "source_fit_iteration")
                 self._preview.model_state_sha256 = digest
+                self._preview.input_position = copy.deepcopy(entry.get("input_position"))
                 self.status_generation += 1
             self.events.append(
                 "log",
@@ -1816,6 +2840,7 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "autosave_on_pause must be true or false")
         session = self._require_session()
+        self._refuse_during_input_update("Running")
         if session.status().get("state") != SessionState.Idle:
             raise ApiError(HTTPStatus.CONFLICT,
                            "Running requires an idle session")
@@ -1875,6 +2900,9 @@ class ServiceState:
         for key in ("z_begin", "z_end"):
             configuration[key] = current.get(
                 key, request_run.get(key, configuration[key]))
+        # Nor does it own the launch binding: the resident values stand.
+        for key in SERVICE_OWNED_CONFIG_KEYS:
+            configuration[key] = current.get(key, configuration[key])
         changes = {key: value for key, value in configuration.items()
                    if current.get(key) != value}
         fields = self.config_catalog["schema"]["fields"]
@@ -1894,7 +2922,7 @@ class ServiceState:
         if input_manifest is not None and input_manifest != current_manifest:
             raise ApiError(
                 HTTPStatus.CONFLICT,
-                "Static dataset inputs cannot be changed by a run")
+                "Static fit inputs cannot be changed by a run")
         run_config = changes
         with self.lock:
             current_iteration = int(
@@ -1926,13 +2954,8 @@ class ServiceState:
     def save_checkpoint(self, request):
         """Write a named checkpoint into this session's checkpoint folder.
 
-        The client names the file; the service decides where it lives. A
-        checkpoint has only ever been allowed under the session output
-        directory, so asking the client for an absolute path on a host it may
-        never have seen only ever meant "type the prefix I am about to check
-        for". A name says the same thing without the path policing, and it is
-        the same name ``/session/status`` reports back as
-        ``checkpoint_path``.
+        The client supplies a filename. The service saves it under the
+        session output directory and returns the path as ``checkpoint_path``.
         """
         session = self._require_session()
         name = self._checkpoint_file_name(request.get("name"))
@@ -2029,31 +3052,23 @@ class ServiceState:
                 self.status_generation += 1
 
     def _resolve_load_source(self, request):
-        """The single checkpoint a load request names, resolved by its host.
+        """Resolve a checkpoint from exactly one service-provided reference.
 
-        A load names exactly one of two things, and both are strings this
-        service handed out: ``host_checkpoint`` is one of the checkpoints
-        ``/dataset`` advertises, and ``uploaded_checkpoint`` is the path a
-        checkpoint upload returned. Neither asks the client to reason about a
-        filesystem it may never have seen — that is why they are separate
-        fields rather than one free path: they are checked against different
-        sets, and the client knows which it has without inspecting the string.
+        ``host_checkpoint`` must appear in ``/bindings``;
+        ``uploaded_checkpoint`` must be a path returned by an upload.
         """
         host = str(request.get("host_checkpoint") or "").strip()
         uploaded = str(request.get("uploaded_checkpoint") or "").strip()
         if bool(host) == bool(uploaded):
             raise ApiError(
                 HTTPStatus.BAD_REQUEST,
-                "A load names exactly one of host_checkpoint or "
+                "Specify exactly one of host_checkpoint or "
                 "uploaded_checkpoint")
         if host:
-            advertised = set(
-                self.dataset_resolution.to_dict()["detected_checkpoints"])
-            advertised.update(self.session_checkpoints())
-            if host not in advertised:
+            if host not in set(self.session_checkpoints()):
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    "host_checkpoint must be one of the checkpoints /dataset "
+                    "host_checkpoint must be one of the checkpoints /bindings "
                     "advertises",
                     [{"field": "host_checkpoint",
                       "message": "Not a service-advertised checkpoint"}])
@@ -2101,6 +3116,7 @@ class ServiceState:
         if not isinstance(allow_rebuild, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "allow_rebuild must be true or false")
+        self._refuse_during_input_update("Loading a checkpoint")
         path = self._resolve_load_source(request)
         with self.lock:
             session = self.session
@@ -2145,7 +3161,9 @@ class ServiceState:
                 "config_revision": result.get("config_revision")}
 
     def _checkpoint_durable_cfg(self, path):
-        """The durable configuration, dataset and z window a checkpoint records.
+        """The durable configuration, fit volume, z window and input manifest
+        a checkpoint records: ``(cfg, volume_uuid, z_range, input_manifest)``
+        (``volume_uuid`` '' when its manifest does not record one).
 
         CPU-only and read afresh: the same bytes an escalated rebuild would
         apply, so nothing here can go stale between the refusal and the
@@ -2153,14 +3171,16 @@ class ServiceState:
         reports no configuration, which every caller treats as "no rebuild
         can help".
         """
+        # Both import Torch: the service does not until it reads a checkpoint.
         from checkpoint_io import load_checkpoint_cpu
+        from checkpoint_migrations import tolerate_config
         try:
             payload = load_checkpoint_cpu(path)
         except Exception:
-            return None, "", None
+            return None, "", None, {}
         try:
             if not isinstance(payload, dict):
-                return None, "", None
+                return None, "", None, {}
             cfg = payload.get("cfg")
             if isinstance(cfg, Mapping):
                 # The same normalisation the preflight applies, so the
@@ -2189,7 +3209,8 @@ class ServiceState:
                 except (TypeError, ValueError):
                     pass
             return (dict(cfg) if isinstance(cfg, Mapping) else None,
-                    str(manifest.get("dataset_root") or ""), z_range)
+                    str(manifest.get("volume_uuid") or ""), z_range,
+                    dict(manifest) if isinstance(manifest, Mapping) else {})
         finally:
             # A refusal must not leave a whole model + optimiser archive
             # mapped for the lifetime of the service.
@@ -2199,7 +3220,7 @@ class ServiceState:
         """Turn a preflight refusal into the 409 a client can act on.
 
         The stage comes from the *whole* cfg diff, not from the invariants the
-        preflight named. Two reasons. Some model-shaping keys the preflight
+        preflight reported. Some model-shaping keys the preflight
         reports (model_flow_bounds_z_margin) are read during host preparation,
         so "only shape keys mismatched" would not imply a model-stage rebuild.
         And a checkpoint's stored cfg overrides host-affecting keys the
@@ -2209,29 +3230,77 @@ class ServiceState:
         z_begin/z_end on this same path rather than through a special case.
         """
         reasons = [line for line in str(cause).splitlines() if line.strip()]
-        checkpoint_cfg, checkpoint_dataset, _ = \
+        checkpoint_cfg, checkpoint_volume, _, checkpoint_inputs = \
             self._checkpoint_durable_cfg(path)
         with self.lock:
             status = self.session.status() if self.session else {}
-            dataset_root = str(
-                getattr(self.session_paths, "dataset_root", "") or "")
+            volume_uuid = str(
+                getattr(self.session_paths, "volume_uuid", "") or "")
         live = dict(status.get("applied_config") or {})
-        # What no rebuild can fix: a checkpoint from another dataset, or one
+        inputs = (None if live.get("object_store_allow_changed_inputs")
+                  else self._checkpoint_input_refusal(checkpoint_inputs, status))
+        # What no rebuild can fix: a checkpoint fitted in another volume, or one
         # whose configuration is not this schema's at all.
         if checkpoint_cfg is None or set(checkpoint_cfg) != set(live):
             return ApiError(
                 HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
                 payload={"reasons": reasons, "refused": True})
-        if checkpoint_dataset and dataset_root \
-                and checkpoint_dataset != dataset_root:
+        if checkpoint_volume and volume_uuid \
+                and checkpoint_volume != volume_uuid:
             return ApiError(
                 HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
                 payload={"reasons": reasons, "refused": True})
+        if inputs is not None and inputs["legacy"]:
+            # Written before inputs came from the object store: no rebuild
+            # can recreate what it fitted, only the explicit opt-in resumes it.
+            return ApiError(
+                HTTPStatus.CONFLICT,
+                "Checkpoint refused: it records no object-store inputs (written "
+                "before the service read them from a store); only a rebuild with "
+                "object_store_allow_changed_inputs can resume it",
+                payload={"reasons": reasons, "refused": True, "inputs": inputs})
+        # The binding is the service's, whatever store the checkpoint was
+        # written against; it is not a difference a rebuild could apply.
         changed = {key for key, value in checkpoint_cfg.items()
-                   if live.get(key) != value}
+                   if live.get(key) != value
+                   and key not in SERVICE_OWNED_CONFIG_KEYS}
+        payload = {"reasons": reasons, "stage": rebuild_stage(changed)}
+        if inputs is not None:
+            # A full-input rebuild rereads the store, which is what resumes
+            # it if the store now holds the checkpoint's inputs; otherwise
+            # only object_store_allow_changed_inputs does.
+            payload.update(stage="all", inputs=inputs)
         return ApiError(
-            HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
-            payload={"reasons": reasons, "stage": rebuild_stage(changed)})
+            HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}", payload=payload)
+
+    def _checkpoint_input_refusal(self, checkpoint_inputs, status):
+        """How a checkpoint's object-store inputs differ from the session's.
+
+        None when they agree (or the session's manifest is not readable, in
+        which case the preflight's reasons stand alone); otherwise
+        ``{"legacy", "problems", "rebuild", "allow_changed_inputs"}``: whether
+        the checkpoint predates object-store inputs, what differs, the
+        full-input rebuild that rereads the store, and the configuration key
+        that resumes against changed inputs anyway.
+        """
+        remedies = {"rebuild": {"inputs": "reload"},
+                    "allow_changed_inputs": "object_store_allow_changed_inputs"}
+        if checkpoint_inputs.get("object_store") is None:
+            return {"legacy": True, "problems": [
+                "the checkpoint records no object-store inputs"], **remedies}
+        path = status.get("input_manifest_path")
+        try:
+            with open(path, encoding="utf-8") as stream:
+                current = json.load(stream)["manifest"]
+        except (OSError, TypeError, ValueError, KeyError):
+            return None
+        from object_store_inputs import resume_problems
+        problems = resume_problems(
+            checkpoint_inputs, SimpleNamespace(manifest=current),
+            log=lambda line: None)
+        if not problems:
+            return None
+        return {"legacy": False, "problems": problems, **remedies}
 
     def _reject_overrides_the_checkpoint_contradicts(self, path, overrides):
         """Refuse a rebuild whose overrides fight the checkpoint it resumes.
@@ -2247,7 +3316,7 @@ class ServiceState:
         loss weights, sample counts, schedules — is a legitimate change to
         make while resuming, and the fit is built to take them.
         """
-        checkpoint_cfg, _, _ = self._checkpoint_durable_cfg(path)
+        checkpoint_cfg, *_ = self._checkpoint_durable_cfg(path)
         if not checkpoint_cfg:
             return
         conflicts = sorted(
@@ -2277,26 +3346,30 @@ class ServiceState:
         """
         with self.lock:
             current = copy.deepcopy(self.session_request or {})
-        if not current:
+            project = self._session_project
+        if not current or project is None:
             raise ApiError(HTTPStatus.CONFLICT,
                            "There is no session request to rebuild from")
+        # The live request records the project; the rebuild sends it whole.
+        current.pop("scroll", None)
+        current["project"] = project.to_mapping()
         paths = dict(current.get("paths") or {})
-        if self.dataset_resolution is not None:
+        if self.bindings is not None:
             # ``session_request`` is the canonical manifest the service built,
-            # so it contains every resolved base-input path.  ``rebuild``
-            # deliberately accepts the narrower client request shape in
-            # dataset mode and rejects those same service-owned paths.  Turn
-            # the canonical manifest back into that shape before re-entering
-            # request validation; the dataset resolver will restore the base
-            # inputs.  This matters especially after a failed checkpoint
-            # build, when this is the recovery path for trying another one.
+            # so it contains every resolved input path.  ``rebuild``
+            # deliberately accepts the narrower client request shape and
+            # rejects those same service-owned paths.  Turn the canonical
+            # manifest back into that shape before re-entering request
+            # validation; the bindings and the project restore the inputs.
+            # This matters especially after a failed checkpoint build, when
+            # this is the recovery path for trying another one.
             paths = {
                 key: value for key, value in paths.items()
-                if key in _DATASET_CLIENT_SELECTABLE and value
+                if key in _CLIENT_SELECTABLE_PATHS and value
             }
         paths["checkpoint"] = path
         run = dict(current.get("run") or {})
-        _, _, checkpoint_z_range = self._checkpoint_durable_cfg(path)
+        _, _, checkpoint_z_range, _ = self._checkpoint_durable_cfg(path)
         if checkpoint_z_range is not None:
             run["z_begin"], run["z_end"] = checkpoint_z_range
         run["config"] = {}
@@ -2322,6 +3395,144 @@ class ServiceState:
             Path(saved).name, delete_root_on_prune=True)
         self.artifacts.prune("spiral-checkpoint", session_id, CHECKPOINT_ARTIFACTS_KEPT)
         return {**self.status(), "checkpoint_artifact": ref}
+
+    # ------------------------------------------------------------------
+    # Commits: a published preview as a store surface
+    # ------------------------------------------------------------------
+
+    def _commits_supported(self):
+        return self.object_store is not None
+
+    def commit(self, request):
+        """Start committing one published preview to the bound store.
+
+        ``artifact`` identifies the preview artifact (status ``preview_artifact``)
+        to commit. The artifact is held from here until the worker has read
+        it, so pruning cannot delete it underneath; one already pruned
+        answers 410 and commits nothing. Committing the same model state,
+        inputs and flatten profile again reuses the surface already
+        committed. The result is status ``commit``: ``state`` (running, done
+        or failed), ``surface_uuid``, ``geometry_revision``, ``version``
+        (the surface's object version in the store), ``reused`` or
+        ``error``.
+        """
+        artifact_id = (request or {}).get("artifact")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "artifact must refer to a published preview")
+        if not self._commits_supported():
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "This service cannot commit to its object store")
+        self._require_session()
+        with self.lock:
+            if self._commit is not None and self._commit["state"] == "running":
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A commit is already in progress")
+            session_id = self.session_id
+        artifact, _, _ = self.artifacts.acquire_file(artifact_id, "manifest.json")
+        try:
+            if artifact.kind != "spiral-preview" or artifact.session_id != session_id:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "The artifact is not a preview of this session")
+            with self.lock:
+                self._commit = {"state": "running", "artifact": artifact_id,
+                                "generation": artifact.generation,
+                                "stage_name": "Reading the published preview",
+                                "surface_uuid": None, "geometry_revision": None,
+                                "version": None, "reused": None, "error": None}
+                self.status_generation += 1
+            self._start_background(target=self._commit_job,
+                                   args=(session_id, artifact),
+                                   name="spiral-commit", daemon=True)
+        except BaseException:
+            self.artifacts.release(artifact)
+            with self.lock:
+                if self._commit is not None and self._commit["artifact"] == artifact_id:
+                    self._commit = None
+            raise
+        return {**self.status(), "accepted": True}
+
+    def _commit_job(self, session_id, artifact):
+        outcome = {}
+        try:
+            try:
+                generation = read_published_generation(artifact.root,
+                                                       artifact.entry_point)
+            finally:
+                self.artifacts.release(artifact)
+            context = self._commit_context(session_id, artifact.generation,
+                                           generation.key.model_state_sha256)
+            self._commit_stage("Waiting for the object store")
+            with self._store_write_lock:
+                result = commit_in_place(self.object_store.location, generation, context,
+                                         stage=self._commit_stage)
+            outcome = {"state": "done", "surface_uuid": result.surface_uuid,
+                       "geometry_revision": result.geometry_revision,
+                       "version": result.version, "reused": result.reused}
+            if generation.unrepresentable:
+                self.events.append(
+                    "log", f"{generation.unrepresentable} vertices of the preview are "
+                    "invalid in the store (a coordinate of -1, or z not positive) and "
+                    "were committed as invalid", severity="warning",
+                    source="service", operation="committing")
+            self.events.append(
+                "log", f"Committed the preview of iteration "
+                f"{generation.source_fit_iteration} as {context.name} "
+                f"({result.surface_uuid})"
+                + (", committed before" if result.reused else ""),
+                source="service", operation="committing")
+        except Exception as exc:
+            error = (str(exc) if isinstance(exc, CommitRefused)
+                     else f"{type(exc).__name__}: {exc}")
+            outcome = {"state": "failed", "error": error}
+            self.events.append("error", f"Commit failed: {error}",
+                               severity="error", source="service",
+                               operation="committing")
+        finally:
+            with self.lock:
+                if self._commit is not None and self._commit["artifact"] == artifact.artifact_id:
+                    self._commit.update(outcome, stage_name=None)
+                    if not outcome:
+                        self._commit.update(state="failed", error="interrupted")
+                self.status_generation += 1
+
+    def _commit_stage(self, stage_name):
+        with self.lock:
+            if self._commit is not None:
+                self._commit["stage_name"] = stage_name
+                self.status_generation += 1
+
+    def _commit_context(self, session_id, generation, model_state_sha256):
+        """What the session records with a commit: its fit volume, anchors
+        and project facts (the configuration is the generation's own)."""
+        with self.lock:
+            if self.session_id != session_id or self.session is None:
+                raise CommitRefused("the session changed before the commit")
+            session = self.session
+            request = copy.deepcopy(self.session_request or {})
+        status = session.status()
+        manifest_path = status.get("input_manifest_path")
+        if not status.get("input_digest") or not manifest_path:
+            raise CommitRefused("the session's inputs are not from the object store")
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))["manifest"]
+        volume = manifest["volume_uuid"]
+        shell = (manifest.get("outer_shell") or {}).get("uuid")
+        project = request.get("project") or {}
+        umbilicus = project.get("umbilicus")
+        checkpoint = status.get("checkpoint_state") or {}
+        return CommitContext(
+            volume_uuid=volume,
+            name=(f"{project.get('name') or 'spiral'}-spiral-"
+                  f"{session_id.removeprefix('spiral-')}-g{generation}"),
+            author=self.object_store.author,
+            input_digest=status["input_digest"],
+            sources=(volume,) + ((shell,) if shell else ()),
+            checkpoint=(checkpoint.get("path")
+                        if checkpoint.get("model_state_sha256") == model_state_sha256
+                        else None),
+            base_shape_zyx=project.get("base_shape_zyx"),
+            umbilicus=({'reference': umbilicus['reference']} if umbilicus else None),
+            api_version=API_VERSION)
 
     def _require_session(self):
         """The resident session, or why there is nothing to operate on.
@@ -2365,9 +3576,9 @@ class ServiceState:
         """
         with self.lock:
             output_directory = self.session_paths.output_directory
-        # The physical resolution of the preview is the scroll's own, read from
-        # the specification the dataset root carries.
-        voxel_size_um = (self.scroll_spec or {}).get("voxel_size_um")
+            # The physical resolution of the preview is the session's scroll's.
+            voxel_size_um = (self._session_scroll.voxel_size_um
+                             if self._session_scroll is not None else None)
 
         def attach_process(process):
             with self.lock:
@@ -2418,13 +3629,11 @@ class ServiceState:
         return self.checkpoint_uploads.uploads
 
     def _output_root(self):
-        """Output directory known before any session in dataset mode."""
+        """Output directory known before any session: the bound one."""
         if self.session_paths is not None and self.session_paths.output_directory:
             return Path(self.session_paths.output_directory)
-        if self.dataset_resolution is not None:
-            output = self.dataset_resolution.resolved.get("output_directory")
-            if output:
-                return Path(output)
+        if self.bindings is not None and self.bindings.output_directory:
+            return Path(self.bindings.output_directory)
         return None
 
     def _staging_root(self):
@@ -2450,30 +3659,20 @@ class ServiceState:
                 digest.update(block)
         return digest.hexdigest()
 
-    def _pcl_source_editable(self, role, source):
-        role = PclRole(role)
-        with self.lock:
-            paths = self.session_paths
-        if paths is None:
-            return False
-        configured = (Path(paths.dataset_root) /
-                      PCL_ROLE_FILES[role.value])
-        try:
-            return (Path(source).resolve() == configured.resolve()
-                    and Path(source).is_file()
-                    and os.access(source, os.R_OK | os.W_OK)
-                    and os.access(Path(source).parent, os.W_OK))
-        except OSError:
-            return False
-
     def _active_checkpoint(self):
         with self.lock:
             return self.session_paths.checkpoint if self.session_paths else ""
 
+    def input_upload_manager(self, upload_id):
+        if upload_id not in self.checkpoint_uploads.uploads:
+            raise ApiError(HTTPStatus.NOT_FOUND, "Unknown upload")
+        return self.checkpoint_uploads
+
     def begin_upload(self, request):
-        manager = (self.checkpoint_uploads if request.get("kind") == "checkpoint"
-                   else self.editing().uploads)
-        return {**self._base(), **manager.begin(request)}
+        """Begin a checkpoint upload; fit inputs are never uploaded."""
+        if request.get("kind") in ("patch", "fiber", "pcl"):
+            raise input_upload_error()
+        return {**self._base(), **self.checkpoint_uploads.begin(request)}
 
     def receive_upload_file(self, upload_id, relative_name, stream, length, *, offset=None):
         received = self.input_upload_manager(upload_id).receive(
@@ -2484,24 +3683,10 @@ class ServiceState:
         finalized = self.input_upload_manager(upload_id).finalize(upload_id)
         return {**self._base(), "accepted": True, "input": finalized.record}
 
-    def commit_input_revisions(self, token, request):
-        result = self.editing().commit(token, request)
-        with self.lock:
-            if self.dataset_resolution is not None:
-                previous = self.dataset_resolution
-                self.dataset_resolution = bind_service_paths(
-                    resolve_dataset_root(previous.root),
-                    previous.resolved.get("output_directory", ""),
-                    previous.resolved.get("cache_directory", ""))
-        self._refresh_pcl_artifacts()
-        return {**self.status(), **result}
-
     def gc_uploads(self):
         try:
-            with self.workspace_use():
+            with self.service_use():
                 self.checkpoint_uploads.collect_garbage()
-                if self.editing_workspace is not None:
-                    self.editing_workspace.uploads.collect_garbage()
         except ApiError as exc:
             if exc.status != 410:
                 raise
@@ -2546,7 +3731,7 @@ class ServiceState:
         with self._teardown_lock:
             with self.lock:
                 self._service_closed = True
-            self._teardown_workspace()
+            self._teardown()
 
 
 class SpiralServer(ThreadingHTTPServer):
@@ -2665,38 +3850,60 @@ def _route_upload_file(ctx):
         ctx.args[0], ctx.args[1], handler.rfile, length, offset=offset)
 
 
+@contextlib.contextmanager
+def _fetched_lasagna_arrays(arrays, sidecar, progress):
+    """``arrays`` made local for building ``sidecar``: each remote one
+    fetched whole into ``<sidecar>.arrays`` (vc_reader's cache layout,
+    remote_zarr.mirror_array), removed once the pack is built and kept, to
+    resume, when building fails."""
+    from lasagna_source import is_remote_location
+    from remote_zarr import mirror_array
+
+    root = Path(f"{sidecar}.arrays")
+    local = []
+    for array in arrays:
+        if not is_remote_location(array):
+            local.append(array)
+            continue
+        if progress is not None:
+            progress.begin("fetching", "Fetching remote Lasagna arrays", step=0,
+                           total_steps=0, unit="objects", detail=array)
+        local.append(mirror_array(
+            array, root, workers=FETCH_WORKERS,
+            progress=(None if progress is None else
+                      lambda done, total: progress.update(done, total_steps=total))))
+    yield local
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _lasagna_pack_kinds(config, source):
+    """The Lasagna pack kinds a build of ``config`` reads from ``source``:
+    the fit's (lasagna_packs_required), and normals for the link refresh
+    even when their dense loss is disabled."""
+    from fit_session import lasagna_packs_required, input_source_enabled
+    kinds = set(lasagna_packs_required(config))
+    if (input_source_enabled(config, "normals")
+            and source.stores.get("normal_x") and source.stores.get("normal_y")):
+        kinds.add("normals")
+    return kinds
+
+
 _UPLOAD_ID = r"[0-9a-f]{32}"
+
+_LEASE_OPERATIONS = frozenset({"lease_claim", "lease_release"})
 
 # The whole HTTP surface, declared once. Dispatch walks this table; there is
 # no hand-written if-ladder, so a route's method, path, handler and retry
 # semantics are visible in one place.
 ROUTES = (
-    Route("POST", "/session/editing/claim", "editing_claim",
-          lambda ctx: ctx.state.editing().claim(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
-                                                ctx.body.get("command_id")),
+    Route("POST", "/session/lease/claim", "lease_claim",
+          lambda ctx: ctx.state.lease().claim(ctx.handler.headers.get(LEASE_TOKEN_HEADER),
+                                              ctx.body.get("command_id")),
           Idempotency.NONE, reads_body=True),
-    Route("POST", "/session/editing/release", "editing_release",
-          lambda ctx: ctx.state.release_editing(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
-                                                  ctx.body.get("command_id")),
-          Idempotency.NONE, reads_body=True),
-    Route("GET", re.compile(r"/session/input-content/([0-9a-f-]+)/([0-9]+)"), "input_content",
-          lambda ctx: ctx.state.input_content_artifact(ctx.args[0], ctx.args[1]), Idempotency.NONE),
-    Route("GET", "/session/input-catalog", "input_catalog",
-          lambda ctx: (ctx.state.editing_workspace.status() if ctx.state.editing_workspace else
-                       {"workspace_id": None, "ready": False, "inputs": [], "transactions": {}}), Idempotency.NONE),
-    Route("GET", re.compile(r"/session/input-commands/([^/]+)"), "input_command",
-          lambda ctx: ctx.state.editing(create=False).coordinator.outcome(ctx.args[0]), Idempotency.NONE),
-    Route("POST", "/session/input-changes", "input_changes",
-          lambda ctx: ctx.state.editing().change(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
-          Idempotency.NONE, reads_body=True),
-    Route("POST", "/session/discard-inputs", "discard_inputs",
-          lambda ctx: ctx.state.editing().discard(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
-          Idempotency.NONE, reads_body=True),
-    Route("POST", "/session/resolve-input", "resolve_input",
-          lambda ctx: ctx.state.editing().resolve_conflict(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
-          Idempotency.NONE, reads_body=True),
-    Route("POST", "/session/apply-inputs", "apply_inputs",
-          lambda ctx: ctx.state.editing().apply(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
+    Route("POST", "/session/lease/release", "lease_release",
+          lambda ctx: ctx.state.release_lease(ctx.handler.headers.get(LEASE_TOKEN_HEADER),
+                                              ctx.body.get("command_id")),
           Idempotency.NONE, reads_body=True),
     Route("GET", "/health", "health",
           lambda ctx: ctx.state.health(), Idempotency.NONE),
@@ -2705,8 +3912,8 @@ ROUTES = (
     Route("GET", "/session/status", "session_status",
           lambda ctx: ctx.state.status(), Idempotency.NONE),
     Route("GET", "/events", "events", _route_events, Idempotency.NONE),
-    Route("GET", "/dataset", "dataset",
-          lambda ctx: ctx.state.dataset(), Idempotency.NONE),
+    Route("GET", "/bindings", "bindings",
+          lambda ctx: ctx.state.binding_advertisement(), Idempotency.NONE),
     Route("GET", re.compile(r"/artifacts/([A-Za-z0-9._-]+)/manifest"),
           "artifact_manifest",
           lambda ctx: ctx.state.artifacts.manifest(ctx.args[0]),
@@ -2732,11 +3939,18 @@ ROUTES = (
     Route("POST", "/session/inputs", "upload_begin",
           lambda ctx: ctx.state.begin_upload(ctx.body), Idempotency.NONE,
           reads_body=True),
+    # A query, not a mutation: POST only to carry a session request.
+    Route("POST", "/session/lasagna-packs", "lasagna_packs",
+          lambda ctx: ctx.state.required_lasagna_packs(ctx.body), Idempotency.NONE,
+          reads_body=True),
     Route("POST", "/session/initialize", "session_initialize",
           lambda ctx: ctx.state.initialize(ctx.body), Idempotency.COMMAND_ID,
           reads_body=True),
     Route("POST", "/session/rebuild", "session_rebuild",
           lambda ctx: ctx.state.rebuild(ctx.body), Idempotency.COMMAND_ID,
+          reads_body=True),
+    Route("POST", "/session/update-inputs", "session_update_inputs",
+          lambda ctx: ctx.state.update_inputs(ctx.body), Idempotency.COMMAND_ID,
           reads_body=True),
     Route("POST", "/session/run", "session_run",
           lambda ctx: ctx.state.run(ctx.body), Idempotency.COMMAND_ID,
@@ -2756,10 +3970,9 @@ ROUTES = (
     Route("POST", "/session/download-checkpoint", "download_checkpoint",
           lambda ctx: ctx.state.download_checkpoint(),
           Idempotency.COMMAND_ID, reads_body=True),
-    Route("POST", "/session/commit-inputs", "commit_inputs",
-          lambda ctx: ctx.state.commit_input_revisions(
-              ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body), Idempotency.NONE,
-          reads_body=True),
+    Route("POST", "/session/commit", "session_commit",
+          lambda ctx: ctx.state.commit(ctx.body),
+          Idempotency.COMMAND_ID, reads_body=True),
 )
 
 # Methods whose body is read before the route is resolved, so a malformed or
@@ -2903,9 +4116,9 @@ class SpiralHandler(BaseHTTPRequestHandler):
     def _dispatch(self):
         self._authorise()
         path = unquote(urlparse(self.path).path).rstrip("/")
-        if self.command == "POST" and path == "/session/editing/release":
+        if self.command == "POST" and path == "/session/lease/release":
             return self._dispatch_active()
-        with self.server.state.workspace_use():
+        with self.server.state.service_use():
             return self._dispatch_active()
 
     def _dispatch_active(self):
@@ -2925,18 +4138,18 @@ class SpiralHandler(BaseHTTPRequestHandler):
             body = self._body()
         context = RouteContext(self, state, args,
                                parse_qs(parsed_url.query), body)
-        workspace = state.editing_workspace
-        if (state.dataset_root is not None and workspace is None
+        lease = state.session_lease
+        if (state.bindings is not None and lease is None
                 and self.command != "GET"
-                and route.operation not in {"editing_claim", "editing_release"}):
-            raise ApiError(403, "Claim an editing workspace first")
-        if workspace is not None and self.command != "GET" and route.operation not in {"editing_claim", "editing_release"}:
-            token = self.headers.get("X-Spiral-Workspace-Token")
-            workspace.require(token)
+                and route.operation not in _LEASE_OPERATIONS):
+            raise ApiError(403, "Claim the session lease first")
+        if lease is not None and self.command != "GET" and route.operation not in _LEASE_OPERATIONS:
+            token = self.headers.get(LEASE_TOKEN_HEADER)
+            lease.require(token)
             if route.idempotency == Idempotency.COMMAND_ID:
-                return state.editing_lifecycle(token, route.operation, body or {},
-                                                lambda captured: route.handler(RouteContext(
-                                                    self, state, args, context.query, captured)))
+                return state.lease_lifecycle(token, route.operation, body or {},
+                                             lambda captured: route.handler(RouteContext(
+                                                 self, state, args, context.query, captured)))
         if route.idempotency == Idempotency.COMMAND_ID:
             return state.replay_command(
                 route.operation, (body or {}).get("command_id"),
@@ -3037,18 +4250,48 @@ def main(argv=None):
     parser.add_argument("--nonce", default=None,
                         help="Ephemeral credential for a VC3D-owned local process")
     parser.add_argument("--parent-pid", type=int, default=0)
-    parser.add_argument("--dataset", required=True,
-                        help="Dataset root owned by this service (inputs only; "
-                             "resolved once at startup and advertised through "
-                             "/dataset). Clients cannot repoint base inputs.")
     parser.add_argument("--output", required=True,
                         help="Root for all generated state (run directories, "
                              "autosaves, previews, input revisions, upload "
-                             "staging, uploaded checkpoints). Must resolve "
-                             "outside the dataset root.")
+                             "staging, uploaded checkpoints)")
+    parser.add_argument("--winding-inference", default=None, metavar="PATH",
+                        help="Winding-inference artifact (a directory holding "
+                             "its manifest.json) that winding-model supervision "
+                             "reads directly. Bound at launch: clients cannot "
+                             "repoint it, and changing it needs a restart and a "
+                             "new fit. Without it, fits needing it are refused.")
+    parser.add_argument("--object-store", required=True, metavar="STORE",
+                        help="Object store this service reads patch, PCL and "
+                             "fiber inputs from, and writes link refreshes and "
+                             "commits to: a store file (.vcobj) on this host, or "
+                             "the endpoint of the vc_object_server serving one "
+                             "(http://host:port, or ssh://host:port for a server "
+                             "on another host's loopback port). Opened once at "
+                             "startup; clients cannot repoint it. A file "
+                             "vc_object_server serves is refused: bind its "
+                             "endpoint.")
+    parser.add_argument("--object-store-author", default=None, metavar="NAME",
+                        help="Author of the links this service's refresh "
+                             "writes (default: spiral-service@<host>)")
+    parser.add_argument("--object-store-link-timeout", type=int, default=300,
+                        metavar="SECONDS",
+                        help="How long one link refresh of a served store may "
+                             "take: its detectors run on vc_object_server, which "
+                             "answers when they are done. Set it with that "
+                             "server's --request-deadline (both default to 300)")
+    parser.add_argument("--require-prepared-lasagna-packs", action="store_true",
+                        help="Require Lasagna packs and fiber directions prepared in "
+                             "--cache (for a shared host whose cache is curated). By "
+                             "default missing packs are built from accessible local "
+                             "arrays, and missing fiber directions extracted from the "
+                             "project's fiber-inference dataset, during input "
+                             "preparation")
+    # The former opt-in, now the default; older VC3D builds still pass it.
+    parser.add_argument("--build-missing-lasagna-packs", action="store_true",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--cache", default=None,
-                        help="Directory for derived host caches; must resolve "
-                             "outside the dataset root (default: "
+                        help="Directory for derived host caches: prepared "
+                             "Lasagna packs and fiber directions (default: "
                              "$XDG_CACHE_HOME/vc3d/spiral, i.e. "
                              "~/.cache/vc3d/spiral)")
     parser.add_argument("--service-name", default=None)
@@ -3087,6 +4330,11 @@ def main(argv=None):
             parser.error(f"--config must be a JSON object: {exc}")
         if not isinstance(startup_config, dict):
             parser.error("--config must be a JSON object")
+        owned = sorted(key for key in SERVICE_OWNED_CONFIG_KEYS
+                       if key in startup_config)
+        if owned:
+            parser.error(f"--config must not set {', '.join(owned)}: "
+                         "--object-store binds the service's inputs")
         try:
             Config(startup_config)
         except (ValueError, AttributeError, TypeError) as exc:
@@ -3097,21 +4345,18 @@ def main(argv=None):
         parser.error("--nonce is only for VC3D-owned loopback processes; use the "
                      "API key file for network binds")
 
-    # Deployment roots are bound once at startup. --output owns every piece
-    # of generated state; the dataset root holds inputs only, so both the
-    # output and cache roots must resolve (realpath) outside it.
-    dataset_root = Path(args.dataset).expanduser().resolve(strict=False)
+    # Host paths are bound once at startup. --output owns every piece of
+    # generated state.
     output_root = Path(args.output).expanduser().resolve(strict=False)
-    if output_root == dataset_root or output_root.is_relative_to(dataset_root):
-        parser.error(f"--output must resolve outside the dataset root: "
-                     f"{output_root} is inside {dataset_root}")
     if args.session_name:
         output_root = output_root / args.session_name
     cache_root = Path(args.cache).expanduser().resolve(strict=False) \
         if args.cache else Path(default_user_cache_dir())
-    if cache_root == dataset_root or cache_root.is_relative_to(dataset_root):
-        parser.error(f"--cache must resolve outside the dataset root: "
-                     f"{cache_root} is inside {dataset_root}")
+    try:
+        bindings = bind_service_inputs(output_root, cache_root,
+                                       args.winding_inference)
+    except ServiceBindingError as exc:
+        parser.error(str(exc))
 
     credentials = []
     if args.nonce:
@@ -3125,20 +4370,14 @@ def main(argv=None):
         print(f"Spiral API key ({'generated' if created else 'reused'}; copy "
               f"into VC3D): {key}", flush=True)
 
-    session_lease = None
-    dataset_resolution = resolve_dataset_root(args.dataset)
-    if not dataset_resolution.ok:
-        print("Refusing to start: the launch dataset is incomplete.",
-              file=sys.stderr, flush=True)
-        for key in dataset_resolution.missing_required:
-            print(f"  missing required: {key}", file=sys.stderr, flush=True)
-        for key, options in dataset_resolution.ambiguities.items():
-            print(f"  ambiguous {key}: {', '.join(options)}",
-                  file=sys.stderr, flush=True)
+    try:
+        object_store = bind_object_store(args.object_store, args.object_store_author,
+                                         args.object_store_link_timeout)
+    except ObjectStoreBindingError as exc:
+        print(f"Refusing to start: {exc}", file=sys.stderr, flush=True)
         return 2
-    for warning in dataset_resolution.warnings:
-        print(f"  dataset warning: {warning}", file=sys.stderr, flush=True)
-    bind_service_paths(dataset_resolution, output_root, cache_root)
+
+    session_lease = None
     if args.session_name:
         # The named-session exclusive lease lives under the corresponding
         # output namespace (<output>/<session-name>).
@@ -3165,13 +4404,14 @@ def main(argv=None):
     original_stdout, original_stderr = sys.stdout, sys.stderr
     sys.stdout = _TeeStream(original_stdout, logs, "stdout")
     sys.stderr = _TeeStream(original_stderr, logs, "stderr")
-    state = ServiceState(dataset_root=str(dataset_root),
-                         dataset_resolution=dataset_resolution,
+    state = ServiceState(bindings=bindings,
                          service_name=args.service_name,
                          session_name=args.session_name or "",
                          logs=logs,
                          events=events,
                          gpu_ids=args.gpus,
+                         object_store=object_store,
+                         build_missing_lasagna_packs=not args.require_prepared_lasagna_packs,
                          startup_run={"z_begin": args.z_begin,
                                       "z_end": args.z_end,
                                       "config": startup_config})
@@ -3205,9 +4445,16 @@ def main(argv=None):
     # remote attach validate compatibility through one code path.
     print(f"Spiral CUDA devices: {','.join(str(gpu_id) for gpu_id in args.gpus)}",
           flush=True)
-    print(f"Spiral dataset root: {dataset_root}", flush=True)
+    print(f"Spiral object store: {object_store.location} ({object_store.uuid}, "
+          f"generation {object_store.generation}"
+          f"{', served by vc_object_server' if object_store.served else ''})", flush=True)
     print(f"Spiral output root: {output_root}", flush=True)
     print(f"Spiral cache root: {cache_root}", flush=True)
+    winding = bindings.winding_inference_status()
+    print(f"Spiral winding inference: "
+          + (f"{winding['path']}" + ("" if winding["available"]
+                                     else f" (unavailable: {winding['error']})")
+             if winding["bound"] else "not bound"), flush=True)
     if args.session_name:
         print(f"Spiral session name: {args.session_name}", flush=True)
     print(f"Spiral z-range: [{args.z_begin}, {args.z_end})", flush=True)

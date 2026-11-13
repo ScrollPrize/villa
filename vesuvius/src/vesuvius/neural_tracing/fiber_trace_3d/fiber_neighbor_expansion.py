@@ -122,12 +122,18 @@ def run(settings):
         return finish_existing(settings)
     from .fiber_workflows import run as dispatch
     from .fiber_gt_constraint_score import run as extract_cross
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog,fiber_volume,fibers_digest,read_polylines,write_fibers
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
+        fiber_catalog,fiber_volume,verify_fiber_signature,read_polylines,write_fibers)
     torch.set_num_threads(4)
     started=time.monotonic();root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     seed=Path(settings['seed_solve']);cfg=clean_config(json.loads((seed/'config.json').read_text()))
-    paths=[seed/'solution.npz',seed/'config.json',Path(settings['parent_tensors']),Path(__file__)]
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},fibers=fibers_digest(settings['fibers']))
+    parent_path=Path(settings['parent_tensors'])
+    parent_stamp=parent_path.with_suffix('.json')
+    if not parent_stamp.exists():
+        raise ValueError('Parent tensors have no saved source signature; regenerate them before expanding')
+    digest,source_version=verify_fiber_signature(settings['fibers'],json.loads(parent_stamp.read_text())['signature'])
+    paths=[seed/'solution.npz',seed/'config.json',parent_path,parent_stamp,Path(__file__)]
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},fibers=digest,fiber_source=source_version)
     stamp=root/'inputs.json'
     if stamp.exists():
         prior=json.loads(stamp.read_text())
@@ -142,11 +148,11 @@ def run(settings):
             atomic_write(revisions,records,durable=False)
     atomic_write(stamp,signature,durable=False)
     if (root/'summary.json').exists():return json.loads((root/'summary.json').read_text())
-    parent=arrays(settings['parent_tensors'])
+    parent=arrays(parent_path)
     parent,_=soft.constraint_family_filter(parent,True)
     if len(np.unique(parent['source_id']))!=len(parent['source_id']):raise ValueError('Whole-fiber parent required')
     volume=fiber_volume(settings['fibers']);zlo,zhi=settings['z_range']
-    eligible=np.asarray([r['id'] for r in fiber_catalog(settings['fibers'],volume)
+    eligible=np.asarray([r['id'] for r in fiber_catalog(settings['fibers'],volume,source_version=source_version)
                          if r['bbox'] is not None and r['bbox'][5]>=zlo and r['bbox'][2]<=zhi],dtype=str)
     # Cheap Z bounding selection only; exact physical slab spans are checked later.
     parent=induced_graph(parent,eligible,cfg)
@@ -158,7 +164,8 @@ def run(settings):
     curves={r['id']:(r,x) for r,x in read_polylines(gcfg['fibers'],gt_ids,volume=volume)}
     def load_curves(ids):
         missing=sorted({str(s) for s in ids}-set(curves))
-        for row,xyz in read_polylines(settings['fibers'],missing,volume=volume) if missing else []:curves[row['id']]=(row,xyz)
+        for row,xyz in read_polylines(settings['fibers'],missing,volume=volume,source_version=source_version) if missing else []:
+            curves[row['id']]=(row,xyz)
     load_curves(previous_d['source_id'])
     selected,selection=select(previous_d,previous,cfg,gt_ids,curves,settings['z_range'],settings.get('confidence',.5))
     history=[];seen=[];stable=0

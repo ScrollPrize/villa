@@ -153,7 +153,7 @@ export const creators = [
   },
   {
     name: "Brent Seales",
-    role: "Principal Advisor",
+    role: "Founder & Principal Advisor",
     image: "/img/landing/brent.webp",
     href: "https://educelab.engr.uky.edu/people-6",
   },
@@ -451,6 +451,13 @@ export const projectLeads = [
 ];
 
 export const team = {
+  media: [
+    {
+      name: "Christy Chapman",
+      title: "Media & Communications Manager",
+      href: "https://educelab.engr.uky.edu/people-6",
+    },
+  ],
   challenge: [
     {
       name: "Sean Johnson",
@@ -634,11 +641,6 @@ export const team = {
     },
   ],
   papyrology: [
-    {
-      name: "Federica Nicolardi",
-      title: "Associate Professor, University of Naples Federico II",
-      href: "https://www.docenti.unina.it/federica.nicolardi",
-    },
     {
       name: "Marzia D'Angelo",
       title:

@@ -1,5 +1,6 @@
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/TrackCrossings.hpp"
+#include "linking/Detectors.hpp"
 #include "linking/StoredGeometry.hpp"
 #include "formats/TrackInput.hpp"
 
@@ -22,8 +23,8 @@ void checkCancelled(const std::atomic_bool* cancel)
 
 }
 
-DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackParams& params,
-                                  const std::atomic_bool* cancel)
+detail::Detection detail::detectTracksToTracks(StoredGeometry& inputs, const TrackTrackParams& params,
+                                               const std::atomic_bool* cancel)
 {
     track_crossings::Parameters crossingParams{
         params.minAngleDegrees, params.tangentRadiusVoxels, params.clusterIndexRadius};
@@ -33,27 +34,36 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
 
     const auto& progressCallback = params.progress;
     objects::util::reportProgress(progressCallback, "loading track registrations");
-    DetectorReport report;
+    Detection detection;
+    detection.detector = kTrackTrackDetector; detection.version = kTrackTrackVersion;
+    detection.replaceStalePending = params.replaceStalePending;
+    DetectorReport& report = detection.report;
     std::vector<LinkCandidate> candidates;
     StaleEdgeScope scope{{params.edgeKind}, {}};
     try {
         checkCancelled(cancel);
         std::map<std::string, std::vector<objects::ObjectRecord>> datasets;
-        detail::StoredGeometry inputs(db);
         for (auto& object : inputs.select("track", params.trackUuids)) {
-            if (!params.datasetRef.empty() && (!object.track || object.track->datasetRef != params.datasetRef)) {
-                if (!params.trackUuids.empty()) throw std::runtime_error("selected track is outside dataset_ref");
-                continue;
-            }
-            ++report.objectsConsidered;
             if (!object.track || object.track->datasetRef.empty())
                 throw std::runtime_error("track has no dataset_ref: " + object.uuid);
-            datasets[object.track->datasetRef].push_back(std::move(object));
+            datasets[inputs.sourcePath(object).generic_string()].push_back(std::move(object));
         }
-        if (!params.datasetRef.empty() && datasets.empty())
-            throw std::runtime_error("no registered tracks for dataset_ref: " + params.datasetRef);
+        if (!params.datasetRef.empty()) {
+            const auto requested = std::filesystem::weakly_canonical(params.datasetRef).generic_string();
+            for (auto it = datasets.begin(); it != datasets.end();) {
+                // A raw spelling identifies its whole resolved group, including
+                // inherited/overridden peers whose locators were rebased.
+                const bool matches = it->first == requested || std::any_of(it->second.begin(), it->second.end(),
+                    [&](const auto& object) { return object.track->datasetRef == params.datasetRef; });
+                if (matches) { ++it; continue; }
+                if (!params.trackUuids.empty()) throw std::runtime_error("selected track is outside dataset_ref");
+                it = datasets.erase(it);
+            }
+            if (datasets.empty()) throw std::runtime_error("no registered tracks for dataset_ref: " + params.datasetRef);
+        }
 
         for (auto& [dataset, objects] : datasets) {
+            report.objectsConsidered += objects.size();
             checkCancelled(cancel);
             std::map<uint64_t, objects::ObjectRecord*> byId;
             for (auto& object : objects) {
@@ -186,23 +196,31 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
             }
         }
         checkCancelled(cancel);
-        auto transaction = db.write();
-        const auto committed = detail::commitStoredCandidates(db, inputs, transaction, kTrackTrackDetector, 1, candidates,
-                                                 params.replaceStalePending, &scope, progressCallback);
-        checkCancelled(cancel);
-        objects::util::reportProgress(progressCallback, "committing links");
-        transaction.commit();
-        report.candidatesFound = committed.candidatesFound;
-        report.edgesCreated = committed.edgesCreated;
-        report.edgesUpdated = committed.edgesUpdated;
-        report.edgesSkippedExisting = committed.edgesSkippedExisting;
-        report.staleRemoved = committed.staleRemoved;
-        report.problems = committed.problems;
+        detection.candidates = std::move(candidates);
+        detection.scope = std::move(scope);
     } catch (const Cancelled&) {
         report.problems.push_back("track-track linking cancelled; no edges changed");
+        detection.publish = false;
     } catch (const std::exception& error) {
         report.problems.push_back(std::string("track-track linking failed; no edges changed: ") + error.what());
+        detection.publish = false;
     }
-    return report;
+    return detection;
+}
+
+DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackParams& params,
+                                  const std::atomic_bool* cancel)
+{
+    detail::StoredGeometry inputs(db);
+    const auto detection = detail::detectTracksToTracks(inputs, params, cancel);
+    try {
+        return detail::publishDetection(db, inputs, detection, params.progress, cancel);
+    } catch (const std::exception& error) {
+        auto report = detection.report;
+        report.problems.push_back(cancel && cancel->load()
+            ? std::string("track-track linking cancelled; no edges changed")
+            : std::string("track-track linking failed; no edges changed: ") + error.what());
+        return report;
+    }
 }
 } // namespace vc::object_links

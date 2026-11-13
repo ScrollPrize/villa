@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from vesuvius.ink_detection.data.normalization import normalize_image
+
 import argparse
+import json
 import logging
 import math
 import shutil
@@ -18,12 +21,12 @@ from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-import zarr
+from vc_reader.reader import ZarrWriter
 
 from vesuvius.ink_detection.models.checkpoint import (
     load_checkpoint,
@@ -31,6 +34,7 @@ from vesuvius.ink_detection.models.checkpoint import (
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.inference_runtime import (
+    DEVICE_CHOICES,
     TargetModel,
     flip_spatial,
     iter_mirror_axes,
@@ -40,12 +44,12 @@ from vesuvius.ink_detection.inference.inference_runtime import (
 )
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
-    ZARR_V3,
     open_volume,
     open_volume_root,
     select_volume_level,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
+
 
 
 LOGGER = logging.getLogger(__name__)
@@ -114,9 +118,7 @@ def normalize_flat_patch(
     """Normalize one reader-processed ZYX patch by the legacy flat contract."""
 
     if preprocessing == "tifxyz_robust":
-        from vesuvius.image_proc.intensity.normalization import normalize_robust
-
-        return np.ascontiguousarray(normalize_robust(patch_ZYX))
+        return normalize_image(patch_ZYX, NormalizationConfig(mode="robust_mad"))
     if preprocessing == "divide_255":
         normalized = np.ascontiguousarray(patch_ZYX, dtype=np.float32)
         normalized *= 1.0 / 255.0
@@ -272,22 +274,56 @@ def _sliding_positions_1d(length: int, patch_size: int, stride: int) -> list[int
     return positions
 
 
+def resolve_roi_bounds(
+    values: Sequence[int] | None, *, height: int, width: int
+) -> tuple[int, int, int, int]:
+    """Half-open row-start/stop, column-start/stop in the selected input level."""
+
+    if values is None:
+        return (0, height, 0, width)
+    if len(values) != 4 or any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) for v in values):
+        raise ValueError("--roi requires four integer grid indices")
+    r0, r1, c0, c1 = (int(value) for value in values)
+    if not (0 <= r0 < r1 <= height and 0 <= c0 < c1 <= width):
+        raise ValueError(f"--roi must be nonempty and inside shape {(height, width)!r}")
+    return r0, r1, c0, c1
+
+
+def clip_block_to_roi(block: Block, bounds: tuple[int, int, int, int]) -> Block | None:
+    """Clip a parent block and translate its output into the ROI frame."""
+
+    r0, r1, c0, c1 = bounds
+    top, bottom = max(block.y0, r0), min(block.y0 + block.valid_h, r1)
+    left, right = max(block.x0, c0), min(block.x0 + block.valid_w, c1)
+    if top >= bottom or left >= right:
+        return None
+    return Block(top - r0, left - c0, bottom - top, right - left)
+
+
 def iter_blocks(
     image_shape: tuple[int, int],
     patch_size: int,
     stride: int,
     mask_lowres: np.ndarray | None = None,
     occupancy_scale: tuple[int, int] = (1, 1),
+    *,
+    roi_bounds: tuple[int, int, int, int] | None = None,
 ) -> list[Block]:
     """Schedule flat patches, including a final boundary-aligned position."""
 
     height, width = (int(value) for value in image_shape)
     scale_y, scale_x = (max(1, int(value)) for value in occupancy_scale)
+    if roi_bounds is not None:
+        roi_bounds = resolve_roi_bounds(roi_bounds, height=height, width=width)
     blocks: list[Block] = []
     for y0 in _sliding_positions_1d(height, patch_size, stride):
         valid_h = min(patch_size, height - y0)
+        if roi_bounds is not None and (y0 >= roi_bounds[1] or y0 + valid_h <= roi_bounds[0]):
+            continue
         for x0 in _sliding_positions_1d(width, patch_size, stride):
             valid_w = min(patch_size, width - x0)
+            if roi_bounds is not None and (x0 >= roi_bounds[3] or x0 + valid_w <= roi_bounds[2]):
+                continue
             if mask_lowres is not None:
                 low_y0 = y0 // scale_y
                 low_x0 = x0 // scale_x
@@ -810,11 +846,27 @@ class ChunkAccumulator:
             weights = tile_weights[source]
             probability_buffer[destination] += tile[source] * weights
             weight_buffer[destination] += weights
-            seen = self.seen_counts.get(key, 0) + 1
-            if seen >= self.contribution_counts[key]:
+            self._finish_contribution(key)
+
+    def skip_tile(
+        self, *, y0: int, x0: int, valid_h: int, valid_w: int
+    ) -> None:
+        """Complete a raw-empty tile without allocating or adding weights."""
+
+        for key in iter_overlapping_chunks(
+            y0, x0, valid_h, valid_w, (self.chunk_h, self.chunk_w)
+        ):
+            self._finish_contribution(key)
+
+    def _finish_contribution(self, key: ChunkKey) -> None:
+        seen = self.seen_counts.get(key, 0) + 1
+        if seen >= self.contribution_counts[key]:
+            if key in self.buffers:
                 self._flush(key)
             else:
-                self.seen_counts[key] = seen
+                self.seen_counts.pop(key, None)
+        else:
+            self.seen_counts[key] = seen
 
     def _flush(self, key: ChunkKey) -> None:
         probability, weight = self.buffers.pop(key)
@@ -824,7 +876,7 @@ class ChunkAccumulator:
         self.weight_sum_store[y0:y1, x0:x1] = weight
 
     def flush_remaining(self) -> None:
-        """Flush chunks whose skipped raw-empty blocks prevented early completion."""
+        """Flush any remaining accumulation buffers."""
 
         for key in tuple(self.buffers):
             self._flush(key)
@@ -885,6 +937,7 @@ def run_block_inference(
     amp_dtype: torch.dtype | None,
     tta_axes: Sequence[int],
     tta_batch_size: int | None,
+    roi_bounds: tuple[int, int, int, int] | None = None,
 ) -> None:
     """Forward nonempty flat patches and feed their weighted probabilities."""
 
@@ -899,6 +952,19 @@ def run_block_inference(
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
+            for values in metadata[~keep].numpy():
+                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
+                if roi_bounds is not None:
+                    clipped = clip_block_to_roi(
+                        Block(y0, x0, valid_h, valid_w), roi_bounds
+                    )
+                    if clipped is None:
+                        continue
+                    y0, x0 = clipped.y0, clipped.x0
+                    valid_h, valid_w = clipped.valid_h, clipped.valid_w
+                accumulator.skip_tile(
+                    y0=y0, x0=x0, valid_h=valid_h, valid_w=valid_w
+                )
             if not bool(keep.any()):
                 continue
             # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can
@@ -929,6 +995,18 @@ def run_block_inference(
                     weights = weights * mask_f32[
                         y0 : y0 + valid_h, x0 : x0 + valid_w
                     ]
+                if roi_bounds is not None:
+                    clipped = clip_block_to_roi(Block(y0, x0, valid_h, valid_w), roi_bounds)
+                    if clipped is None:
+                        continue
+                    source_y0 = clipped.y0 + roi_bounds[0] - y0
+                    source_x0 = clipped.x0 + roi_bounds[2] - x0
+                    source = (
+                        slice(source_y0, source_y0 + clipped.valid_h),
+                        slice(source_x0, source_x0 + clipped.valid_w),
+                    )
+                    tile, weights = tile[source], weights[source]
+                    y0, x0 = clipped.y0, clipped.x0
                 accumulator.add_tile(
                     y0=y0,
                     x0=x0,
@@ -970,17 +1048,12 @@ def write_output_tiff(
     """Write one tiled, LZW, BigTIFF-compatible flat probability image."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(
-        output_path,
-        iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
-        shape=tuple(int(value) for value in prob_sum_store.shape),
-        dtype=np.uint8,
-        compression="lzw",
-        tile=tuple(int(value) for value in tile_shape),
-        bigtiff=True,
-        metadata=None,
-        software="vesuvius.ink_detection.inference.infer",
-    )
+    height, width = (int(value) for value in prob_sum_store.shape)
+    tile_h, tile_w = (int(value) for value in tile_shape)
+    positions = ((y0, x0) for y0 in range(0, height, tile_h) for x0 in range(0, width, tile_w))
+    with images.TiffWriter(output_path, (height, width), np.uint8, compression="lzw", tile=(tile_h, tile_w)) as writer:
+        for (y0, x0), tile in zip(positions, iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape)):
+            writer.write_tile(y0, x0, tile)
 
 
 def open_temp_zarr_array(
@@ -991,25 +1064,13 @@ def open_temp_zarr_array(
 ):
     """Create one explicit-v2 float32 accumulation array."""
 
-    format_keyword = (
-        {"zarr_format": 2}
-        if ZARR_V3
-        else {"zarr_version": 2}
-    )
-    return zarr.open(
-        str(path),
-        mode="w",
-        shape=shape,
-        chunks=chunks,
-        dtype=np.float32,
-        **format_keyword,
-    )
+    return ZarrWriter.create(path, shape=shape, chunks=chunks, dtype=np.float32, overwrite=True, auth=None)
 
 
 def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:
     """Read a nonzero foreground TIFF with top-left crop/pad alignment."""
 
-    image = np.squeeze(np.asarray(tifffile.imread(path)))
+    image = np.squeeze(np.asarray(images.read(path)))
     if image.ndim == 3:
         image = image[..., 0]
     if image.ndim != 2:
@@ -1195,6 +1256,11 @@ def infer_single_zarr(
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
+    roi_values = getattr(args, "roi", None)
+    output_bounds = resolve_roi_bounds(roi_values, height=height, width=width)
+    roi_bounds = output_bounds if roi_values is not None else None
+    r0, r1, c0, c1 = output_bounds
+    output_shape = (r1 - r0, c1 - c0)
     patch_size = configured_model.patch_size
     stride = resolve_patch_stride(
         patch_size=patch_size,
@@ -1283,8 +1349,11 @@ def infer_single_zarr(
         stride,
         occupancy,
         occupancy_scale,
+        roi_bounds=roi_bounds,
     )
     LOGGER.info("Selected %d patches for inference", len(blocks))
+    output_blocks = blocks if roi_bounds is None else [clip_block_to_roi(block, roi_bounds) for block in blocks]
+    LOGGER.info("Output bounds=(%d, %d, %d, %d) shape=%s; parent patch grid retained", *output_bounds, output_shape)
     dataset = FlatBlockDataset(
         reader=reader,
         blocks=blocks,
@@ -1329,36 +1398,36 @@ def infer_single_zarr(
     temporary = Path(tempfile.mkdtemp(prefix="ink_flat_infer_"))
     try:
         accumulation_chunks = (
-            min(tile_shape[0], height),
-            min(tile_shape[1], width),
+            min(tile_shape[0], output_shape[0]),
+            min(tile_shape[1], output_shape[1]),
         )
-        accumulation_bytes = 2 * 4 * height * width
+        accumulation_bytes = 2 * 4 * output_shape[0] * output_shape[1]
         if accumulation_bytes <= args.max_ram_accumulation_gb * 1024**3:
             # Two float32 planes in RAM avoid one temp-zarr write per chunk
             # here and one read per chunk when the TIFF is encoded.
             LOGGER.info(
                 "Accumulating in RAM (%.2f GiB)", accumulation_bytes / 1024**3
             )
-            probability_sum = np.zeros((height, width), dtype=np.float32)
-            weight_sum = np.zeros((height, width), dtype=np.float32)
+            probability_sum = np.zeros(output_shape, dtype=np.float32)
+            weight_sum = np.zeros(output_shape, dtype=np.float32)
         else:
             probability_sum = open_temp_zarr_array(
                 temporary / "probability.zarr",
-                shape=(height, width),
+                shape=output_shape,
                 chunks=accumulation_chunks,
             )
             weight_sum = open_temp_zarr_array(
                 temporary / "weight.zarr",
-                shape=(height, width),
+                shape=output_shape,
                 chunks=accumulation_chunks,
             )
         accumulator = ChunkAccumulator(
-            shape=(height, width),
+            shape=output_shape,
             chunk_shape=accumulation_chunks,
             prob_sum_store=probability_sum,
             weight_sum_store=weight_sum,
             contribution_counts=compute_chunk_contribution_counts(
-                blocks, chunk_shape=accumulation_chunks
+                output_blocks, chunk_shape=accumulation_chunks
             ),
         )
         if blocks:
@@ -1372,18 +1441,32 @@ def infer_single_zarr(
                 amp_dtype=configured_model.amp_dtype,
                 tta_axes=tta_axes,
                 tta_batch_size=args.tta_batch_size,
+                roi_bounds=roi_bounds,
             )
             accumulator.flush_remaining()
         else:
             LOGGER.warning(
                 "No occupied blocks were found; writing an all-zero output"
             )
+        metadata_path = output_tiff.with_suffix(output_tiff.suffix + ".roi.json")
+        # An overwritten full-frame image must not inherit a previous ROI's frame.
+        # Invalidate the old metadata before replacing its associated image.
+        metadata_path.unlink(missing_ok=True)
         write_output_tiff(
             probability_sum,
             weight_sum,
             output_tiff,
             tile_shape,
         )
+        if roi_bounds is not None:
+            metadata_path.write_text(json.dumps({
+                "input": str(input_zarr), "input_resolution": resolution,
+                "parent_shape_yx": [height, width],
+                "roi_row_start_stop_col_start_stop": list(roi_bounds),
+                "patch_size": patch_size, "stride": stride, "blend_mode": blend_mode,
+                "layer_indices": layer_indices.tolist(), "direction": layer_direction,
+                "parent_grid_retained": True,
+            }, indent=2) + "\n", encoding="utf-8")
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
 
@@ -1566,6 +1649,11 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--output-prefix", default="")
     parser.add_argument("--mask-path", type=Path)
+    parser.add_argument(
+        "--roi", nargs=4, type=int,
+        metavar=("ROW_START", "ROW_STOP", "COL_START", "COL_STOP"),
+        help="Half-open output rectangle at --resolution; retain original parent patches and CT context.",
+    )
     parser.add_argument("--resolution", default="0")
     parser.add_argument(
         "--num-workers", "--workers", dest="num_workers", type=int, default=4
@@ -1622,6 +1710,12 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--tta-mirror", action="store_true")
     parser.add_argument("--tta-batch-size", type=int)
+    parser.add_argument(
+        "--device",
+        choices=DEVICE_CHOICES,
+        default="auto",
+        help="Device for the model. auto picks CUDA, then MPS, then CPU; --gpus implies CUDA.",
+    )
     parser.add_argument("--gpus")
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
@@ -1660,6 +1754,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepared_model, device = prepare_model_for_inference(
         configured.model,
         gpu_ids=args.gpu_ids,
+        device_type=args.device,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
     )

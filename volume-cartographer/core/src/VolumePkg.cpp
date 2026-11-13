@@ -21,8 +21,8 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "utils/sftp_fetch.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
+#include <vc_reader/zarr.hpp>
 
 namespace fs = std::filesystem;
 
@@ -42,16 +42,6 @@ bool usesAnonymousRemoteAuth(const Entry& entry)
 bool isFiberLasagnaEntry(const Entry& entry)
 {
     return hasEntryTag(entry, kFiberLasagnaTag);
-}
-
-bool isLocationRemote(const std::string& location)
-{
-    if (utils::is_sftp_url(location)) return true;
-    if (location.rfind("s3://", 0) == 0) return true;
-    if (location.rfind("s3+", 0) == 0) return true;
-    if (location.rfind("http://", 0) == 0) return true;
-    if (location.rfind("https://", 0) == 0) return true;
-    return false;
 }
 
 fs::path resolveLocalPath(const std::string& location, const fs::path& base)
@@ -75,25 +65,17 @@ std::string asciiLower(std::string value)
     return value;
 }
 
-bool hasZarrMarkerAtRoot(const fs::path& dir)
-{
-    return fs::exists(dir / ".zarray")
-        || fs::exists(dir / ".zgroup")
-        || fs::exists(dir / ".zattrs")
-        || fs::exists(dir / "zarr.json");
-}
-
 bool isSingleZarrVolumeDir(const fs::path& dir)
 {
     if (!fs::is_directory(dir)) return false;
-    if (fs::exists(dir / ".zarray") || fs::exists(dir / "zarr.json"))
+    if (vcr::zarr::isLocalZarrArray(dir))
         return true;
     bool meta = fs::exists(dir / "meta.json")
              || fs::exists(dir / "metadata.json")
-             || hasZarrMarkerAtRoot(dir);
+             || vcr::zarr::isLocalZarrNode(dir);
     if (!meta) return false;
     for (const auto& e : fs::directory_iterator(dir)) {
-        if (e.is_directory() && hasZarrMarkerAtRoot(e.path())) return true;
+        if (e.is_directory() && vcr::zarr::isLocalZarrNode(e.path())) return true;
     }
     return false;
 }
@@ -125,15 +107,24 @@ constexpr const char* kDirectRemoteZarrRequired =
 
 std::shared_ptr<Volume> openRemoteVolumeEntry(
     const vc::project::Entry& entry,
-    const vcr::catalog::OpenDataManifest* catalog,
-    const vc::HttpAuth& auth = {})
+    const vcr::catalog::OpenDataManifest* catalog)
 {
-    const bool anonymous = vc::project::usesAnonymousRemoteAuth(entry);
     return Volume::NewFromUrl(
         entry.location,
-        anonymous ? vc::HttpAuth{} : auth,
         vc::project::catalogVolumeMetadata(catalog, entry.location),
-        !anonymous);
+        !vc::project::usesAnonymousRemoteAuth(entry));
+}
+
+std::vector<std::shared_ptr<Volume>> volumeViews(
+    const std::shared_ptr<Volume>& volume, const std::vector<std::string>& channels)
+{
+    if (channels.empty()) return {volume};
+    if (!volume->channelCount() || *volume->channelCount() != static_cast<std::int64_t>(channels.size()))
+        throw std::invalid_argument("display channels do not match CZYX volume " + volume->sourceLocation());
+    std::vector<std::shared_ptr<Volume>> views;
+    for (std::size_t i = 0; i < channels.size(); ++i)
+        views.push_back(volume->channelView(static_cast<std::int64_t>(i), channels[i]));
+    return views;
 }
 
 std::string validateRemoteVolumeLocation(
@@ -168,7 +159,7 @@ bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
 {
     if (a == b)
         return true;
-    if (!vc::project::isLocationRemote(a) || !vc::project::isLocationRemote(b))
+    if (!vcr::zarr::isRemote(a) || !vcr::zarr::isRemote(b))
         return false;
     try {
         const auto aSpec = vc::parseRemoteVolumeSpec(a);
@@ -210,8 +201,8 @@ bool sameAttachmentLocation(
     const std::string& b,
     const fs::path& projectDirectory)
 {
-    const bool aRemote = vc::project::isLocationRemote(a);
-    const bool bRemote = vc::project::isLocationRemote(b);
+    const bool aRemote = vcr::zarr::isRemote(a);
+    const bool bRemote = vcr::zarr::isRemote(b);
     if (aRemote != bRemote)
         return false;
     if (!aRemote) {
@@ -238,8 +229,8 @@ bool entryBacksAttachmentLocation(
             entryLocation, attachmentLocation, projectDirectory)) {
         return true;
     }
-    if (vc::project::isLocationRemote(entryLocation) ||
-        vc::project::isLocationRemote(attachmentLocation)) {
+    if (vcr::zarr::isRemote(entryLocation) ||
+        vcr::zarr::isRemote(attachmentLocation)) {
         return false;
     }
     const auto entryPath = absoluteLocalPath(entryLocation, projectDirectory);
@@ -265,7 +256,7 @@ bool loadedVolumeMatchesLocation(
     if (volume->isRemote())
         return sameAttachmentLocation(
             volume->remoteLocator(), location, projectDirectory);
-    if (vc::project::isLocationRemote(location))
+    if (vcr::zarr::isRemote(location))
         return false;
     auto loadedPath = volume->path();
     if (loadedPath.is_relative())
@@ -332,7 +323,7 @@ namespace vc::project {
 std::optional<vcr::catalog::OpenDataVolumeView> catalogVolumeView(const vcr::catalog::OpenDataManifest* catalog,
                                                                   const std::string& location)
 {
-    if (!catalog || !isLocationRemote(location)) return std::nullopt;
+    if (!catalog || !vcr::zarr::isRemote(location)) return std::nullopt;
     try {
         const auto spec = vc::parseRemoteVolumeSpec(location);
         return catalog->volumeAt(spec.sourceUrl, spec.baseScaleLevel);
@@ -341,14 +332,14 @@ std::optional<vcr::catalog::OpenDataVolumeView> catalogVolumeView(const vcr::cat
     }
 }
 
-utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest* catalog, const std::string& location)
+nlohmann::json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest* catalog, const std::string& location)
 {
-    auto metadata = utils::Json::object();
+    auto metadata = nlohmann::json::object();
     const auto view = catalogVolumeView(catalog, location);
     if (!view) return metadata;
+    // Identity only: the voxel size comes through vcr::zarr::volumeMetadata, where the
+    // store's documents win and the catalog fills what they lack.
     const auto* volume = catalog->findSample(view->sampleId)->findVolume(view->volumeId);
-    if (volume->pixelSizeUm && std::isfinite(*volume->pixelSizeUm) && *volume->pixelSizeUm > 0)
-        metadata["voxelsize"] = std::ldexp(*volume->pixelSizeUm, view->level);
     std::string name = volume->suffix.empty() ? volume->id : volume->suffix;
     if (!view->source) name = view->artifact->type + " of " + name;
     if (view->level) name += " [L" + std::to_string(view->level) + "]";
@@ -363,7 +354,7 @@ std::string validateLocation(Category category, const std::string& location)
 {
     if (location.empty()) return "Location is empty.";
 
-    if (isLocationRemote(location)) {
+    if (vcr::zarr::isRemote(location)) {
         if (category != Category::Volumes) {
             return "Remote locations are only supported for volumes.";
         }
@@ -391,7 +382,7 @@ std::string validateLocation(Category category, const std::string& location)
 std::string validateSingleVolumeLocation(const std::string& location)
 {
     if (location.empty()) return "Location is empty.";
-    if (isLocationRemote(location))
+    if (vcr::zarr::isRemote(location))
         return validateRemoteVolumeLocation(location, true);
 
     const auto path = resolveLocalPath(location);
@@ -446,7 +437,8 @@ void VolumePkg::readDocument()
     const auto entries = [&](const char* key) {
         std::vector<vc::project::Entry> out;
         for (const auto& entry : data.at(key))
-            out.push_back({entry.at("location"), entry.at("tags").get<std::vector<std::string>>()});
+            out.push_back({entry.at("location"), entry.at("tags").get<std::vector<std::string>>(),
+                           entry.value("channels", std::vector<std::string>{})});
         return out;
     };
     volumes_ = entries("volumes");
@@ -459,6 +451,10 @@ void VolumePkg::readDocument()
     };
     selectedLasagnaDataset_ = selection("selected_lasagna_dataset");
     selectedFiberInferenceDataset_ = selection("selected_fiber_inference_dataset");
+    annotationNormalSource_ = selection("annotation_normal_source");
+    if (annotationNormalSource_ && *annotationNormalSource_ != "fiber" &&
+        *annotationNormalSource_ != "lasagna")
+        throw std::invalid_argument("Unknown project annotation normal source");
     currentVolumeId_ = view.value("current_volume", std::string{});
     focusBounds_.reset();
     focusBoundsEnabled_ = false;
@@ -473,7 +469,7 @@ std::string VolumePkg::entryOwner(const std::string&) const { return {}; }
 namespace {
 // Keep resources inside the project tree portable; external paths stay absolute.
 std::string portableResource(const std::string& location, const fs::path& directory) {
-    if (location.empty() || vc::project::isLocationRemote(location)) return location;
+    if (location.empty() || vcr::zarr::isRemote(location)) return location;
     const auto path = vc::project::resolveLocalPath(location);
     if (!path.is_absolute()) return location;
     const auto relative = path.lexically_normal().lexically_relative(directory);
@@ -492,7 +488,9 @@ const char* resourceKey(const std::string& kind) {
     return "lasagna_datasets";
 }
 nlohmann::json entryJson(const vc::project::Entry& entry) {
-    return {{"location", entry.location}, {"tags", entry.tags}};
+    nlohmann::json json{{"location", entry.location}, {"tags", entry.tags}};
+    if (!entry.channels.empty()) json["channels"] = entry.channels;
+    return json;
 }
 }
 bool VolumePkg::writeEntry(const char* kind, const vc::project::Entry& entry)
@@ -512,10 +510,24 @@ nlohmann::json VolumePkg::viewJson() const
     auto view = nlohmann::json::object();
     if (selectedLasagnaDataset_) view["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) view["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
+    if (annotationNormalSource_) view["annotation_normal_source"] = *annotationNormalSource_;
     if (!currentVolumeId_.empty()) view["current_volume"] = currentVolumeId_;
     if (focusBounds_) view["focus_bounds"] = boundsJson(*focusBounds_, focusBoundsEnabled_);
     return view;
 }
+std::string VolumePkg::annotationNormalSource() const
+{
+    return annotationNormalSource_.value_or("lasagna");
+}
+
+void VolumePkg::setAnnotationNormalSource(std::string source)
+{
+    if (source != "fiber" && source != "lasagna")
+        throw std::invalid_argument("Annotation normal source must be fiber or lasagna");
+    annotationNormalSource_ = std::move(source);
+    writeView();
+}
+
 void VolumePkg::writeView()
 {
     if (!writable()) return; // Read-only projects may still be explored.
@@ -547,7 +559,9 @@ void VolumePkg::followEntries(const std::vector<vc::project::Entry>& previous)
     };
     for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end();) {
         const auto* entry = it->second ? backingEntry(*it->second) : nullptr;
-        if (!entry) {
+        const bool channelsChanged = entry && std::any_of(previous.begin(), previous.end(),
+            [&](const auto& old) { return old.location == entry->location && old.channels != entry->channels; });
+        if (!entry || channelsChanged) {
             volumeTagsByID_.erase(it->first);
             it = loadedVolumes_.erase(it);
             continue;
@@ -558,7 +572,7 @@ void VolumePkg::followEntries(const std::vector<vc::project::Entry>& previous)
     }
     for (const auto& entry : volumes_)
         if (std::none_of(previous.begin(), previous.end(),
-                         [&](const auto& old) { return old.location == entry.location; }))
+                         [&](const auto& old) { return old.location == entry.location && old.channels == entry.channels; }))
             resolveVolumeEntry(entry);
     resolvedNormalGridPaths_.clear();
     for (const auto& entry : normalGrids_) resolveNormalGridEntry(entry);
@@ -608,7 +622,7 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
 {
     if (location.empty()) return false;
     std::string persistedLocation = portableResource(location, directory());
-    if (vc::project::isLocationRemote(location)) {
+    if (vcr::zarr::isRemote(location)) {
         const auto spec = vc::parseRemoteVolumeSpec(location);
         if (spec.hasBaseScaleSelector)
             persistedLocation = spec.portableLocator;
@@ -618,7 +632,7 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
         // to a selector-free locator, which dedupes only by exact string.
         if (samePersistedVolumeIdentity(e.location, persistedLocation) ||
             samePersistedVolumeIdentity(e.location, location) ||
-            (!vc::project::isLocationRemote(e.location) && !vc::project::isLocationRemote(persistedLocation) &&
+            (!vcr::zarr::isRemote(e.location) && !vcr::zarr::isRemote(persistedLocation) &&
              vc::project::resolveLocalPath(e.location, directory()).lexically_normal() == vc::project::resolveLocalPath(persistedLocation, directory()).lexically_normal())) return false;
     }
     vc::project::Entry entry{persistedLocation, portableTags(std::move(tags), directory())};
@@ -638,7 +652,7 @@ VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
         throw std::invalid_argument("volume location and prepared volume are required");
 
     std::string persistedLocation = portableResource(location, directory());
-    if (vc::project::isLocationRemote(location)) {
+    if (vcr::zarr::isRemote(location)) {
         const auto spec = vc::parseRemoteVolumeSpec(location);
         if (spec.hasBaseScaleSelector)
             persistedLocation = spec.portableLocator;
@@ -768,11 +782,11 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
             throw std::invalid_argument(
                 "prepared Lasagna volume does not match its attachment location");
         }
-        auto loaded = loadedVolumes_.find(prepared.volume->id());
-        if (loaded != loadedVolumes_.end() &&
-            !loadedVolumeMatchesLocation(
-                loaded->second, prepared.location, directory())) {
-            return AttachLasagnaResult::VolumeIdConflict;
+        for (const auto& view : volumeViews(prepared.volume, prepared.channels)) {
+            auto loaded = loadedVolumes_.find(view->id());
+            if (loaded != loadedVolumes_.end() &&
+                !loadedVolumeMatchesLocation(loaded->second, prepared.location, directory()))
+                return AttachLasagnaResult::VolumeIdConflict;
         }
     }
 
@@ -782,6 +796,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     const auto oldVolumeTags = volumeTagsByID_;
     const auto oldSelected = selectedLasagnaDataset_;
     const auto oldSelectedFiber = selectedFiberInferenceDataset_;
+    const auto oldNormalSource = annotationNormalSource_;
     bool changed = false;
     try {
         auto manifest = std::find_if(lasagnaDatasets_.begin(), lasagnaDatasets_.end(), [&](const auto& entry) {
@@ -801,6 +816,19 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
             }
         }
 
+        if (updateSelection && !annotationNormalSource_) {
+            const bool hasFiberNormals = std::any_of(
+                preparedVolumes.begin(), preparedVolumes.end(), [&](const auto& volume) {
+                    return hasTag(volume.tags, vc::project::kPredictedFiberNormalsTag);
+                });
+            // Do not override a legacy project's existing Lasagna selection,
+            // nor select normals from an incoming but unselected fiber dataset.
+            annotationNormalSource_ = fiberInference && hasFiberNormals &&
+                !selectedLasagnaDataset_ &&
+                (!selectedFiberInferenceDataset_ || selectedFiberInferenceDataset_ == manifestLocation)
+                ? "fiber" : "lasagna";
+            changed = true;
+        }
         if (updateSelection && fiberInference) {
             if (!selectedFiberInferenceDataset_) {
                 selectedFiberInferenceDataset_ = manifestLocation;
@@ -824,19 +852,21 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         for (const auto& prepared : preparedVolumes) {
             std::string persistedLocation = portableResource(prepared.location, directory());
             const auto tags = portableTags(prepared.tags, directory());
-            if (vc::project::isLocationRemote(prepared.location)) {
+            if (vcr::zarr::isRemote(prepared.location)) {
                 const auto spec = vc::parseRemoteVolumeSpec(prepared.location);
                 if (spec.hasBaseScaleSelector)
                     persistedLocation = spec.portableLocator;
             }
             auto entry = std::find_if(
                 volumes_.begin(), volumes_.end(), [&](const auto& candidate) {
+                    if (!prepared.channels.empty())
+                        return sameAttachmentLocation(candidate.location, persistedLocation, directory());
                     return entryBacksAttachmentLocation(
                         candidate.location, persistedLocation,
                         directory());
                 });
             if (entry == volumes_.end()) {
-                volumes_.push_back({persistedLocation, tags});
+                volumes_.push_back({persistedLocation, tags, prepared.channels});
                 entry = std::prev(volumes_.end());
                 changed = true;
             } else {
@@ -848,18 +878,11 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
                         changed = true;
                 }
             }
-            auto loaded = loadedVolumes_.find(prepared.volume->id());
-            if (loaded == loadedVolumes_.end()) {
-                loadedVolumes_.emplace(prepared.volume->id(), prepared.volume);
-                changed = true;
-            } else if (loaded->second != prepared.volume &&
-                       !loadedVolumeMatchesLocation(
-                           loaded->second, persistedLocation,
-                           directory())) {
-                loaded->second = prepared.volume;
+            if (entry->channels != prepared.channels) {
+                entry->channels = prepared.channels;
                 changed = true;
             }
-            volumeTagsByID_[prepared.volume->id()] = entry->tags;
+            changed |= registerVolumeViews(prepared.volume, *entry);
         }
         if (!changed)
             return AttachLasagnaResult::AlreadyAttached;
@@ -877,6 +900,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         volumeTagsByID_ = oldVolumeTags;
         selectedLasagnaDataset_ = oldSelected;
         selectedFiberInferenceDataset_ = oldSelectedFiber;
+        annotationNormalSource_ = oldNormalSource;
         // Some of the writes may have landed: follow what the store holds.
         try { reload(); } catch (...) {}
         throw;
@@ -930,7 +954,7 @@ bool VolumePkg::setVolumeLevel(const std::string& volumeId, int level)
     // Opened before the entry changes: a level that fails to open leaves the
     // project and the loaded volume as they were.
     auto reopened = openRemoteVolumeEntry(updated, opts_.catalog.get());
-    if (reopened->id() != volumeId)
+    if (reopened->id() != loaded->second->sourceVolumeId())
         throw std::runtime_error("volume " + volumeId + " opens as " + reopened->id() + " at level " +
                                  std::to_string(level));
     auto data = document_.data();
@@ -938,7 +962,7 @@ bool VolumePkg::setVolumeLevel(const std::string& volumeId, int level)
         if (e.at("location") == entry->location) e["location"] = updated.location;
     document_.replace(std::move(data));
     readDocument();
-    loadedVolumes_[volumeId] = std::move(reopened);
+    registerVolumeViews(reopened, updated, true);
     return true;
 }
 
@@ -1022,46 +1046,6 @@ std::shared_ptr<Volume> VolumePkg::volume() const
     return loadedVolumes_.begin()->second;
 }
 
-bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
-{
-    if (volumeDirName.empty()) return false;
-    for (const auto& e : volumes_) {
-        if (vc::project::isLocationRemote(e.location)) continue;
-        const auto base = vc::project::resolveLocalPath(e.location, directory());
-        const auto candidate = base / volumeDirName;
-        if (!isSingleZarrVolumeDir(candidate)) continue;
-        try {
-            auto v = Volume::New(candidate, vc::project::catalogVolumeMetadata(opts_.catalog.get(), e.location));
-            const auto id = v->id();
-            if (loadedVolumes_.count(id) > 0) return false;
-            loadedVolumes_.emplace(id, v);
-            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
-            return true;
-        } catch (const std::exception& ex) {
-            Logger()->warn("addSingleVolume('{}'): {}", volumeDirName, ex.what());
-            return false;
-        }
-    }
-    return false;
-}
-
-bool VolumePkg::removeSingleVolume(const std::string& volumeIdOrDirName)
-{
-    if (loadedVolumes_.erase(volumeIdOrDirName) > 0) {
-        volumeTagsByID_.erase(volumeIdOrDirName);
-        return true;
-    }
-    for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end(); ++it) {
-        if (it->second && it->second->path().filename().string() == volumeIdOrDirName) {
-            const auto id = it->first;
-            loadedVolumes_.erase(it);
-            volumeTagsByID_.erase(id);
-            return true;
-        }
-    }
-    return false;
-}
-
 std::vector<fs::path> VolumePkg::normalGridPaths() const
 {
     return resolvedNormalGridPaths_;
@@ -1092,7 +1076,7 @@ bool VolumePkg::isRemote() const
 {
     auto anyRemote = [](const std::vector<vc::project::Entry>& v) {
         return std::any_of(v.begin(), v.end(),
-                           [](const auto& e) { return vc::project::isLocationRemote(e.location); });
+                           [](const auto& e) { return vcr::zarr::isRemote(e.location); });
     };
     return anyRemote(volumes_) || anyRemote(normalGrids_);
 }
@@ -1110,7 +1094,7 @@ void VolumePkg::resolveAll()
     std::vector<std::size_t> remoteIndices;
     remoteIndices.reserve(volumes_.size());
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
-        if (vc::project::isLocationRemote(volumes_[i].location)) {
+        if (vcr::zarr::isRemote(volumes_[i].location)) {
             remoteIndices.push_back(i);
         }
     }
@@ -1120,7 +1104,9 @@ void VolumePkg::resolveAll()
         auto loadRemote = [this, &remoteResults](std::size_t i) {
             const auto& entry = volumes_[i];
             try {
-                if (!isDirectRemoteZarrLocation(entry.location)) {
+                // Explicit channel views can reference a compound pyramid's
+                // subgroup (e.g. compound.zarr/sd2), not just a .zarr root.
+                if (entry.channels.empty() && !isDirectRemoteZarrLocation(entry.location)) {
                     remoteResults[i] = {nullptr, kDirectRemoteZarrRequired};
                     return;
                 }
@@ -1166,7 +1152,7 @@ void VolumePkg::resolveAll()
 
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
         const auto& entry = volumes_[i];
-        if (!vc::project::isLocationRemote(entry.location)) {
+        if (!vcr::zarr::isRemote(entry.location)) {
             resolveVolumeEntry(entry);
             continue;
         }
@@ -1181,14 +1167,11 @@ void VolumePkg::resolveAll()
                            entry.location, resolved.error);
             continue;
         }
-        const auto id = resolved.volume->id();
-        if (loadedVolumes_.count(id) > 0) {
-            Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping",
-                           id, entry.location);
-            continue;
+        try { registerVolumeViews(resolved.volume, entry); }
+        catch (const std::exception& ex) {
+            if (opts_.failOnRemoteError) throw;
+            Logger()->warn("Failed to load remote volume '{}': {}", entry.location, ex.what());
         }
-        loadedVolumes_.emplace(id, std::move(resolved.volume));
-        if (!entry.tags.empty()) volumeTagsByID_[id] = entry.tags;
     }
 
     for (const auto& e : normalGrids_) resolveNormalGridEntry(e);
@@ -1200,23 +1183,50 @@ void VolumePkg::resolveDeferredEntries()
     resolveAll();
 }
 
+bool VolumePkg::registerVolumeViews(const std::shared_ptr<Volume>& volume,
+                                   const vc::project::Entry& entry, bool replace)
+{
+    const auto views = volumeViews(volume, entry.channels);
+    std::set<std::string> ids;
+    for (const auto& view : views) {
+        ids.insert(view->id());
+        const auto existing = loadedVolumes_.find(view->id());
+        if (existing != loadedVolumes_.end() &&
+            !loadedVolumeMatchesLocation(existing->second, loadedVolumeLocation(*volume), directory()) &&
+            !(replace && existing->second->sourceLocation() == volume->sourceLocation()))
+            throw std::runtime_error("duplicate volume id from different sources: " + view->id());
+    }
+    bool changed = false;
+    // Reattaching a changed channel declaration also retires obsolete views.
+    for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end();) {
+        if (it->second->sourceVolumeId() == volume->sourceVolumeId() && !ids.contains(it->first)) {
+            volumeTagsByID_.erase(it->first);
+            it = loadedVolumes_.erase(it);
+            changed = true;
+        } else ++it;
+    }
+    for (const auto& view : views) {
+        auto& current = loadedVolumes_[view->id()];
+        if (!current || replace || current->channel() != view->channel() || current->name() != view->name()) {
+            current = view;
+            changed = true;
+        }
+        volumeTagsByID_[view->id()] = entry.tags;
+    }
+    return changed;
+}
+
 void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 {
-    if (vc::project::isLocationRemote(e.location)) {
+    if (vcr::zarr::isRemote(e.location)) {
         try {
-            if (!isDirectRemoteZarrLocation(e.location)) {
+            if (e.channels.empty() && !isDirectRemoteZarrLocation(e.location)) {
                 Logger()->warn("Skipping remote volume location '{}': {}",
                                e.location, kDirectRemoteZarrRequired);
                 return;
             }
             auto v = openRemoteVolumeEntry(e, opts_.catalog.get());
-            const auto id = v->id();
-            if (loadedVolumes_.count(id) > 0) {
-                Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);
-                return;
-            }
-            loadedVolumes_.emplace(id, v);
-            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
+            registerVolumeViews(v, e);
             return;
         } catch (const std::exception& ex) {
             if (opts_.failOnRemoteError) {
@@ -1236,13 +1246,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
     auto loadOne = [&](const fs::path& vp) {
         try {
             auto v = Volume::New(vp, vc::project::catalogVolumeMetadata(opts_.catalog.get(), e.location));
-            const auto id = v->id();
-            if (loadedVolumes_.count(id) > 0) {
-                Logger()->warn("Duplicate volume id '{}' from '{}', skipping", id, vp.string());
-                return;
-            }
-            loadedVolumes_.emplace(id, v);
-            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
+            registerVolumeViews(v, e);
         } catch (const std::exception& ex) {
             Logger()->warn("Failed to load volume '{}': {}", vp.string(), ex.what());
         }
@@ -1258,7 +1262,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 
 void VolumePkg::resolveNormalGridEntry(const vc::project::Entry& e)
 {
-    if (vc::project::isLocationRemote(e.location)) {
+    if (vcr::zarr::isRemote(e.location)) {
         Logger()->warn("Remote normal_grid entry '{}' not yet supported.", e.location);
         return;
     }
@@ -1309,5 +1313,5 @@ vc::project::AnnotationVolume vc::project::annotationVolume(const VolumePkg* pkg
                 positive(sample->findVolume(view->volumeId)->pixelSizeUm)};
     }
     const double scale = std::ldexp(1.0, -volume.baseScaleLevel());
-    return {{volume.id(), scale}, positive(volume.voxelSize() * scale)};
+    return {{volume.sourceVolumeId(), scale}, positive(volume.voxelSize() * scale)};
 }

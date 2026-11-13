@@ -1,11 +1,14 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/fiber_tracer/FiberStreamVolume.hpp"
 #include "vc/fiber_tracer/FiberVolumeCoverage.hpp"
 #include "vc/fiber_tracer/FiberAttributes.hpp"
+#include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include "vc/fiber_tracer/detail/FiberPackedStorage.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkedPlaneSampler.hpp"
-#include "vc/core/render/ChunkCache.hpp"
+#include <vc_reader/array.hpp>
+#include <vc_reader/array.hpp>
+#include <vc_reader/zarr.hpp>
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
@@ -22,6 +25,28 @@
 #include <ctime>
 
 namespace vc::fiber_tracer {
+FiberTraceConfig fiberStreamTraceConfig(FiberTraceConfig t,bool enabled) {
+    if(!enabled) {
+        t.replayReverseIntervalBase=0;
+        t.replayReverseDelaySteps=0;
+        t.replayReverseConvergenceMinBase=0;
+        return t;
+    }
+    if(t.replayReverseIntervalBase<=0) {
+        t.replayReverseIntervalBase=512;
+        t.replayReverseDelaySteps=4;
+        t.replayReverseConvergenceMinBase=1024;
+        t.replayReverseConvergenceDistanceBase=8;
+        t.replayReverseConvergenceAngleDegrees=10;
+        t.replayReverseConvergenceSteps=1;
+    }
+    t.replayReverseToStart=true;t.replayReverseAllEndpoints=true;
+    t.replayReverseHistorySteps=0;
+    validateFiberTraceConfig(t);
+    if(t.replayReverseDelaySteps*t.stepVoxels*t.traceToBaseScale>=t.replayReverseIntervalBase)
+        throw std::invalid_argument("stream reverse history must be shorter than its checkpoint interval");
+    return t;
+}
 namespace {
 using Json=nlohmann::json;
 using Vec=cv::Vec3d;
@@ -76,77 +101,32 @@ public:
     }
 };
 
+// Collision checks against the CT volume: nearest voxels of one opened level, with a
+// plain blocking read. Zero is outside the scroll, and so is any point outside the array.
 class CTChecks {
-    // Cache notifications can already have been copied by a publisher when
-    // removeChunkReadyListener runs. Keep their lifetime separate from ours.
-    struct ListenerGate {std::mutex mutex; CTChecks* owner=nullptr;};
-    std::shared_ptr<ListenerGate> listenerGate=std::make_shared<ListenerGate>();
     std::shared_ptr<Volume> volume;
-    vc::render::IChunkedArray* cache;
-    int level;double baseScale;
-    WorkQueue& pool;
-    std::mutex mutex;
-    std::unordered_map<vc::render::ChunkKey,std::vector<std::function<void()>>,vc::render::ChunkKeyHash> waiting;
-    std::atomic_bool wakeQueued{false};
-    vc::render::IChunkedArray::ChunkReadyCallbackId listener;
-    void wake() {
-        if(wakeQueued.exchange(true))return;
-        pool.push(0,[this]{
-            std::vector<std::function<void()>> ready;
-            {
-                std::lock_guard lock(mutex);wakeQueued=false;
-                for(auto i=waiting.begin();i!=waiting.end();) {
-                    // A notification is not a lease: pressure can evict the
-                    // chunk before this queued wake runs. Re-request it rather
-                    // than waiting forever on a fetch that already completed.
-                    const auto& k=i->first;auto r=cache->tryGetChunk(k.level,k.iz,k.iy,k.ix);
-                    if(r.status==vc::render::ChunkStatus::MissQueued){++i;continue;}
-                    for(auto& f:i->second)ready.push_back(std::move(f));i=waiting.erase(i);
-                }
-            }
-            for(auto& f:ready)pool.push(0,std::move(f));
-        });
+    vcr::zarr::OpenedArray ct;
+    static vcr::zarr::OpenedArray open(const Volume& v,int level,std::size_t cacheBytes) {
+        auto options=v.sourceOpenOptions();options.memoryCache=std::make_shared<vcr::MemoryCache>(cacheBytes);
+        try {
+            return vcr::zarr::openPyramidLevel(v.sourceLocation(),level,options);
+        } catch(const std::out_of_range&) {
+            throw std::invalid_argument("CT level unavailable");
+        }
     }
 public:
-    std::atomic<uint64_t> suspensions{0};
-    CTChecks(const std::string& path,int requestedLevel,WorkQueue& q):
+    CTChecks(const std::string& path,int requestedLevel,std::size_t cacheBytes):
         volume(path.find("://")==std::string::npos ? Volume::New(path) : Volume::NewFromUrl(path)),
-        cache(volume->chunkedCache()),level(requestedLevel-volume->baseScaleLevel()),
-        baseScale(std::pow(2.,volume->baseScaleLevel())),pool(q) {
-        if(level<0||level>=cache->numLevels())throw std::invalid_argument("CT level unavailable");
-        listenerGate->owner=this;
-        listener=cache->addChunkReadyListener([gate=listenerGate]{
-            std::lock_guard lock(gate->mutex);
-            if(gate->owner)gate->owner->wake();
-        });
+        ct(open(*volume,requestedLevel,cacheBytes)) {
+        if(ct.meta.type.kind!='u'||ct.meta.itemsize()!=1)throw std::invalid_argument("CT checks read uint8 volumes");
     }
-    ~CTChecks(){
-        {std::lock_guard lock(listenerGate->mutex);listenerGate->owner=nullptr;}
-        cache->removeChunkReadyListener(listener);
-    }
-    bool sample(const std::vector<Vec>& points,std::vector<uint8_t>& outside,std::function<void()> retry) {
-        using Sampler=vc::render::ChunkedPlaneSampler;
-        cv::Mat_<cv::Vec3f> coords(1,int(points.size()));
-        for(size_t i=0;i<points.size();++i)coords(0,int(i))=cv::Vec3f(points[i]/baseScale);
-        cv::Mat_<uint8_t> coverage(1,int(points.size()),uint8_t{0}),values(1,int(points.size()),uint8_t{0});
-        Sampler::Options opts(vc::Sampling::Nearest,64);opts.parallelThreads=1;
-        const auto keys=Sampler::collectCoordsDependencies(*cache,level,coords,coverage,opts);
-        std::vector<vc::render::ChunkResult> pinned;bool pending=false;vc::render::ChunkKey missing;
-        for(const auto& k:keys) {
-            auto r=cache->tryGetChunk(k.level,k.iz,k.iy,k.ix);
-            if(r.status==vc::render::ChunkStatus::Error)throw std::runtime_error(r.error);
-            if(r.status==vc::render::ChunkStatus::MissQueued){if(!pending)missing=k;pending=true;}
-            pinned.push_back(std::move(r));
-        }
-        if(pending) {
-            {std::lock_guard lock(mutex);waiting[missing].push_back(std::move(retry));}
-            ++suspensions;wake(); // close the ready-before-registration race
-            return false;
-        }
-        Sampler::sampleCoordsLevelBlockingRequestedLevel(*cache,level,coords,values,coverage,opts);
+    void sample(const std::vector<Vec>& points,std::vector<uint8_t>& outside) {
+        std::vector<double> coords;coords.reserve(points.size()*3);
+        for(const auto& p:points)for(int axis=0;axis<3;++axis)coords.push_back(ct.placement.fromLevel0(axis,p[2-axis]));
+        std::vector<uint8_t> values(points.size());
+        vc::cuda::sampleNearest(*ct.array,vc::cuda::toolReader(ct),coords.data(),points.size(),values.data());
         outside.resize(points.size());
-        for(size_t i=0;i<points.size();++i)outside[i]=values(0,int(i))==0;
-        return true;
+        for(size_t i=0;i<points.size();++i)outside[i]=values[i]==0;
     }
 };
 
@@ -165,6 +145,8 @@ struct Direction {
     bool traceDone=false;
     std::string reason;
     double widthMean=0;uint64_t widthCount=1;
+    std::optional<FiberReverseCheckSchedule> reverse;
+    bool reverseFinished=false;
 };
 struct Tile {
     std::array<int,3> key;
@@ -214,6 +196,8 @@ class Stream {
     std::atomic<uint64_t> epoch{1},finishedTiles{0},pieces{0},startedPairs{0},finishedPairs{0},candidates{0},covered{0},checks{0};
     std::atomic<size_t> peakActive{0};
     std::atomic<double> kept{0};
+    std::atomic<uint64_t> reverseChecks{0},reverseFailed{0},reverseConverged{0},reverseTailChecks{0},reverseHistoryOnly{0};
+    std::atomic<double> reverseSeconds{0},reverseTravel{0};
     std::mutex reasonMutex;
     std::map<std::string,uint64_t> reasons;
     Clock::time_point began=Clock::now();
@@ -230,8 +214,7 @@ class Stream {
                 const auto* field=dynamic_cast<const FiberPredictionField*>(&predictions);
                 const auto* normalField=dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(&normals);
                 if(!field||!normalField)throw std::invalid_argument("native seeds require channel fields");
-                detail::FiberChunkTensor tensor(*field,*normalField,bounds.lo/scale,bounds.hi/scale,true,
-                    chunks.channelHints,chunks.workerCacheBytes);
+                detail::FiberChunkTensor tensor(*field,*normalField,bounds.lo/scale,bounds.hi/scale,true);
                 tile->seeds=findFiberChunkSeeds(tensor,tensor,predictions,bounds,chunks,scale,true);
                 std::erase_if(tile->seeds,[&](const auto& seed){
                     for(int a=0;a<3;++a)if(seed.point[a]<tile->key[a]*chunks.coreBase||seed.point[a]>=(tile->key[a]+1)*chunks.coreBase)return true;
@@ -252,7 +235,8 @@ class Stream {
         std::erase(open,tile);
         pool.push(1,[this,tile]{
             detail::writeFiberPacked(output/"tiles"/(tileName(tile->key)+".msgpack.zst"),
-                Json{{"version",2},{"attribute_schema_version",1},{"coordinate_units","base_voxels"},{"pieces",std::move(tile->pieces)}});
+                Json{{"version",2},{"attribute_schema_version",1},{"reverse_policy",reversePolicy()},
+                    {"coordinate_units","base_voxels"},{"pieces",std::move(tile->pieces)}});
             ++finishedTiles;
         });
     }
@@ -279,6 +263,8 @@ class Stream {
                 auto& d=pair->half[half];d.pair=pair.get();d.half=half;d.direction=half?-dir:dir;d.previous=p;
                 d.points.push_back(p);d.widths.push_back(width);d.widthMean=width;
                 d.attributes.widths.push_back(width);d.attributes.normals.push_back({});d.attributes.normalValid.push_back(false);
+                if(trace.replayReverseIntervalBase>0)
+                    d.reverse.emplace(trace.replayReverseIntervalBase,trace.replayReverseDelaySteps);
                 pool.push(0,[this,pair,half]{check(pair,half);});
             }
         }
@@ -304,6 +290,7 @@ class Stream {
             d.points.push_back(c.point*scale);d.widths.push_back(c.widthMean*scale);
             d.widthMean=c.widthMean*scale;d.widthCount=uint64_t(c.step)+1;
             d.direction=unit(d.points.back()-d.points[d.points.size()-2]);
+            if(!verifyReverse(d,false)){end(pair,half);return;}
             if(c.step%decisionSteps==0){pool.push(0,[this,pair,half]{check(pair,half);});return;}
         }
         if(d.traceDone) {
@@ -322,20 +309,53 @@ class Stream {
     }
     void check(const std::shared_ptr<Pair>& pair,int half) {
         auto& d=pair->half[half];const auto p=d.points.back();std::vector<uint8_t> outside;
-        if(!ct.sample({p},outside,[this,pair,half]{check(pair,half);} ))return;
+        ct.sample({p},outside);
         const auto generation=epoch.fetch_add(1);
-        const bool near=coverage.owner(p,d.direction,radius,d.widthMean,tolerance)>=0 ||
+        const bool nearHit=coverage.owner(p,d.direction,radius,d.widthMean,tolerance)>=0 ||
             coverage.liveHit(p,d.direction,radius,pair->id,generation,d.widthMean,tolerance);
         coverage.addLive(d.previous,p,pair->id,generation,d.widthMean);d.previous=p;
-        d.streak=near?d.streak+1:0;d.outsideStreak=outside[0]?d.outsideStreak+1:0;++checks;
+        d.streak=nearHit?d.streak+1:0;d.outsideStreak=outside[0]?d.outsideStreak+1:0;++checks;
         for(int a=0;a<3;++a)if(p[a]<lo[a]-4*grid||p[a]>hi[a]+4*grid)d.reason="bounds";
         if(d.reason.empty()&&d.outsideStreak>=2)d.reason="outside_ct";
         if(d.reason.empty()&&d.streak>=3)d.reason="owned_or_live";
         if(!d.reason.empty()){end(pair,half);return;}
         pool.push(2,[this,pair,half]{advance(pair,half);});
     }
+    bool verifyReverse(Direction& d,bool terminal) {
+        if(!d.reverse || d.reverseFinished)return true;
+        const auto verify=[&](size_t target,size_t checked,bool){
+            const auto r=verifyFiberReverseCheckpoint(predictions,normals,trace,d.points,
+                target,checked,d.widthMean/scale);
+            ++reverseChecks;reverseSeconds.fetch_add(r.seconds);reverseTravel.fetch_add(r.travelled);
+            if(r.converged)++reverseConverged;
+            if(!r.passed)++reverseFailed;
+            return r.passed;
+        };
+        const bool tail=terminal && trace.replayReverseDelaySteps>0 &&
+            (d.reason=="presence_cutoff" || d.reason=="width_cutoff" || d.reason=="invalid_width");
+        bool passed;
+        if(tail) {
+            passed=d.reverse->stopTail(d.points,[&](size_t target,size_t checked,bool end){
+                ++reverseTailChecks;return verify(target,checked,end);
+            });
+            if(d.reverse->historyOnly())++reverseHistoryOnly;
+        } else passed=d.reverse->check(d.points,terminal,verify);
+        if(terminal || !passed)d.reverseFinished=true;
+        if(!passed) {
+            const size_t n=d.reverse->checked()+1;
+            d.points.resize(n);d.widths.resize(n);
+            auto& a=d.attributes;
+            a.widths.resize(n);a.normals.resize(n);a.normalValid.resize(n);
+            a.quality.resize(n-1);a.costs.resize(n-1);a.lengths.resize(n-1);
+            d.widthMean=d.widths.back();d.widthCount=n;
+            d.reason="reverse_consistency_filtered";
+        }
+        return passed;
+    }
     void end(const std::shared_ptr<Pair>& pair,int half) {
-        auto& d=pair->half[half];d.cursor.reset();d.pending.clear();
+        auto& d=pair->half[half];
+        verifyReverse(d,true);
+        d.cursor.reset();d.pending.clear();
         {std::lock_guard lock(reasonMutex);++reasons[d.reason];}
         if(pair->unfinished.fetch_sub(1)==1)pool.push(1,[this,pair]{finish(pair);});
     }
@@ -368,7 +388,7 @@ class Stream {
             pair->attributes=joinFiberAttributes(bw.attributes,fw.attributes);pair->resampled=true;}
         std::vector<Vec> p(bw.points.rbegin(),bw.points.rend());p.insert(p.end(),fw.points.begin()+1,fw.points.end());
         if(!pair->prepared) {
-            if(p.size()>=48 && !ct.sample(p,pair->combinedOutside,[this,pair]{finish(pair);} )){fw.outside={1};return;}
+            if(p.size()>=48)ct.sample(p,pair->combinedOutside);
             pair->prepared=true;
             std::lock_guard lock(publish);publishQueue.push_back(pair);
             if(!publishing){publishing=true;pool.push(1,[this]{publishNext();});}
@@ -427,6 +447,16 @@ class Stream {
         loadMore();
     }
 public:
+    Json reversePolicy() const {
+        return {{"version",1},{"enabled",trace.replayReverseIntervalBase>0},
+            {"interval_base",trace.replayReverseIntervalBase},{"delay_steps",trace.replayReverseDelaySteps},
+            {"normal_radius_base",trace.replayReverseNormalRadiusBase},
+            {"tangential_radius_base",trace.replayReverseTangentialRadiusBase},
+            {"convergence_min_base",trace.replayReverseConvergenceMinBase},
+            {"convergence_distance_base",trace.replayReverseConvergenceDistanceBase},
+            {"convergence_angle_degrees",trace.replayReverseConvergenceAngleDegrees},
+            {"convergence_steps",trace.replayReverseConvergenceSteps}};
+    }
     Stream(const FiberPredictionSource& p,const vc::lasagna::NormalSampler& n,FiberTraceConfig t,FiberChunkTraceConfig c,
         Json cfg,const std::vector<std::array<int,3>>& k,std::filesystem::path out,std::atomic_bool& stop):
         predictions(p),normals(n),trace(t),chunks(c),options(cfg),keys(k),output(std::move(out)),cancel(stop),
@@ -436,7 +466,7 @@ public:
         lo(vectorOf(cfg.at("box_base_xyz")[0])),hi(vectorOf(cfg.at("box_base_xyz")[1])),
         workers(cfg.value("workers",size_t{128})),capacity(cfg.value("active_fibers",10*workers)),
         seedWorkers(cfg.value("seed_workers",size_t{8})),maxOpen(cfg.value("max_open",size_t{32})),
-        pool(workers,cancel),ct(cfg.at("ct_locator").get<std::string>(),cfg.value("ct_level",2),pool),coverage(c.coreBase) {
+        pool(workers,cancel),ct(cfg.at("ct_locator").get<std::string>(),cfg.value("ct_level",2),cfg.value("ct_cache_bytes",size_t(4)<<30)),coverage(c.coreBase) {
         if(workers==0||capacity==0||decisionSteps<1||seedWorkers==0||maxOpen==0||tolerance<=0)
             throw std::invalid_argument("invalid native stream settings");
         std::filesystem::create_directories(output/"tiles");
@@ -445,6 +475,8 @@ public:
             const auto data=detail::readFiberPacked(file.path());
             if(data.value("version",0)!=2 || data.value("attribute_schema_version",0)!=1)
                 throw std::invalid_argument("stream resume requires version 2 recorded fiber attributes; old outputs cannot be reused");
+            if(data.value("reverse_policy",Json{})!=reversePolicy())
+                throw std::invalid_argument("stream reverse policy differs or is absent; use a fresh output directory");
             for(const auto& piece:data.at("pieces")) {
                 validateStreamFiberAttributes(piece);
                 const auto& coverageWidth=piece.at("fiber_attributes").at("coverage_width_reference");
@@ -470,17 +502,15 @@ public:
             {"next_fiber_id",nextFiber.load()},{"wall_seconds",seconds(began)},
             {"cpu_seconds",double(std::clock()-cpuBegin)/CLOCKS_PER_SEC},
             {"workers",workers},{"active_fiber_limit",capacity},{"peak_active_fibers",peakActive.load()},
-            {"busy_workers",pool.busy.load()},{"ct_suspensions",ct.suspensions.load()},{"complete",complete}};
+            {"busy_workers",pool.busy.load()},{"complete",complete}};
+        r["reverse_policy"]=reversePolicy();r["reverse_checks"]=reverseChecks.load();
+        r["reverse_failed"]=reverseFailed.load();r["reverse_converged"]=reverseConverged.load();
+        r["reverse_seconds"]=reverseSeconds.load();r["reverse_travel_base"]=reverseTravel.load();
+        r["reverse_tail_checks"]=reverseTailChecks.load();r["reverse_history_only"]=reverseHistoryOnly.load();
         {std::lock_guard lock(admission);r["active_fibers"]=active.size();r["open_tiles"]=open.size();}
         {std::lock_guard lock(reasonMutex);for(const auto&[reason,count]:reasons)r["stop_"+reason]=count;}
         for(size_t i=0;i<4;++i){r["worker_tier_seconds"].push_back(pool.workSeconds[i].load());r["worker_tier_jobs"].push_back(pool.jobs[i].load());}
-        const auto budget=vc::render::processChunkCacheService()->decodedByteBudget()->stats();
-        r["decoded_cache"]={{"bytes",budget.decodedBytes},{"capacity",budget.maximumBytes},
-            {"recycled_bytes",budget.recycledBytes},{"reserve_bytes",budget.reserveBytes},
-            {"pending_requests",budget.pendingRequests},{"background_passes",budget.backgroundPasses},
-            {"background_evicted_bytes",budget.backgroundEvictedBytes},{"hard_limit_passes",budget.hardLimitPasses}};
-        auto path=output/(complete?"summary.json":"progress.json"),tmp=path;tmp+=".partial";
-        {std::ofstream f(tmp);f<<r.dump(2)<<'\n';}std::filesystem::rename(tmp,path);std::cout<<r.dump()<<std::endl;return r;
+        vcr::zarr::atomicWrite(output/(complete?"summary.json":"progress.json"),r.dump(2)+'\n');std::cout<<r.dump()<<std::endl;return r;
     }
     Json run() {
         {std::lock_guard lock(admission);loadMore();}
@@ -496,6 +526,7 @@ public:
 Json runFiberStreamVolume(const FiberPredictionSource& p,const vc::lasagna::NormalSampler& n,
     const FiberTraceConfig& t,const FiberChunkTraceConfig& c,const Json& options,
     const std::vector<std::array<int,3>>& keys,const std::filesystem::path& output,std::atomic_bool& cancel) {
-    Stream stream(p,n,t,c,options,keys,output,cancel);return stream.run();
+    Stream stream(p,n,fiberStreamTraceConfig(t,options.value("reverse_consistency",true)),c,options,keys,output,cancel);
+    return stream.run();
 }
 } // namespace vc::fiber_tracer

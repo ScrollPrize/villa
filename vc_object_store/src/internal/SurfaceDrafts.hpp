@@ -1,6 +1,6 @@
 #pragma once
 #include "internal/Spatial.hpp"
-#include "spatial/BoundsIndex.hpp"
+#include <vc_object_store/geometry/BoundsIndex.hpp>
 #include "spatial/SurfaceTiles.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
@@ -37,6 +37,8 @@ struct SurfaceDraft {
 
 std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface&, const CoordinateJson& coordinates,
                                                      const std::optional<AttachmentIdentity>&);
+// The draft's whole grid: points and its valid channel (scale is not kept: {1, 1}).
+vc::geometry::Surface draftGrid(const SurfaceDraft&);
 std::shared_ptr<const SurfaceDraft> editSurfaceDraft(const SurfaceDraft&, int64_t row, int64_t column, int64_t rows,
                                                      int64_t columns, std::span<const vc::geometry::SurfacePoint>,
                                                      std::span<const uint8_t> validity);

@@ -5,6 +5,12 @@
 Fibers live in the open project's store (`.vcobj`), or in a store attached beside
 it and chosen for fibers (**File → Stores**). **Attach Read-only Store** supports
 browsing without permitting writes.
+Opening a writable project automatically converts supported old local stores
+with the bundled `vc_object_convert` and saves the new store location in the
+project. The original database is retained beside the upgraded copy, conversion
+report and revision mapping. Read-only entries and hosted stores are not converted.
+Close clients using the old database before opening the project; conversion runs
+synchronously and may take time for large stores.
 VC3D edits geometry, annotations, relationships and retirement directly through
 the database APIs in one `ObjectStoreSession::act` transaction. Splits create two
 objects and retire the original in that transaction. VC3D retains pinned working
@@ -68,6 +74,102 @@ ninja -C build VC3D test_fiber_side_strip_intersections
 QT_QPA_PLATFORM=offscreen build/bin/VC3D --test-object-store
 build/bin/test_fiber_side_strip_intersections
 ```
+
+With `VC_TESTING` enabled, verify automatic conversion, read-only behavior and
+reopening against a copy of a closed legacy store (the supplied file is untouched):
+
+```sh
+QT_QPA_PLATFORM=offscreen VC3D_UPGRADE_STORE_TEST=/path/to/legacy.vcobj \
+  build/bin/VC3D --test-object-store
+```
+
+## Normal sources for compound fiber volumes
+
+Use **File → Attach Lasagna / Compound Dataset…**, select the compound prediction
+Zarr directory (containing the embedded `lasagna` manifest in `.zattrs`), and
+choose the **Fiber inference** role. The browser accepts directories as well as
+JSON manifests, locally or remotely. In the annotation
+window's menu, **Tracing / annotation normals** selects:
+
+- **Predicted fiber normals** — requires `sheet_nx`, `sheet_ny`, and
+  `sheet_grad_mag`; reports an error rather
+  than silently falling back when they are unavailable.
+- **Lasagna normals** — explicitly uses the external Lasagna dataset even when
+  the fiber volume supplies normals.
+
+There is no Automatic option. Attaching the first dataset initializes an unset
+project choice to **Predicted fiber normals** when the selected fiber dataset
+contains `sheet_nx`, `sheet_ny`, and `sheet_grad_mag`; otherwise it selects
+**Lasagna normals**. An existing Lasagna selection is preserved. Subsequent
+attachments and dataset changes never override the saved choice. User changes
+are persisted in the `.vcproj` view field `annotation_normal_source` (`fiber`
+or `lasagna`), independently for each project and across reopening. Legacy
+projects without that field use Lasagna until initial attachment setup or an
+explicit user selection. Tracing never silently switches sources.
+
+A compound volume with predicted normals needs **no attached Lasagna volume**
+for seeding, tracing, reoptimization, generated views, or alignment metrics.
+The same policy applies to headless optimization initiated by the GUI. It is
+independent of the Fiber model / Lasagna interpolation selection. The compound
+`nx/ny` channels are fiber **directions**, not normals: the normal sampler uses
+the `sheet_*` channels at their original packed offsets, with separate base- and
+trace-coordinate adapters. Existing normal sampling/interpolation is reused.
+
+Attaching a manifest exposes every named packed CZYX channel in the regular
+volume dropdown (for example `presence`, `width`, `nx`, and `sheet_nx`). Each
+view is labeled `source / channel`; the project stores the source once with its
+channel names and restores the views and selected channel on reopening. Channel
+zero retains the old volume ID, and all views share the source's annotation
+coordinate frame. Existing separate ZYX channel volumes are unchanged. Reattach
+a manifest to add the channel views to an older project; opening a bare packed
+volume without a manifest continues to display channel zero.
+
+Display reads the shared packed chunk cache directly,
+without extracting or writing separate channel volumes. Uint8 channel views use
+the existing CUDA display path when enabled: selected scalar bricks are uploaded
+from the shared decoded CZYX cache, with CPU fallback on GPU failure. Other dtypes
+remain CPU sampled, as for separate volumes. Sparse
+pyramids starting at `/2` do not require a physical `/0` array. As with other
+OME pyramids, display coordinates refer to the finest declared grid. The GUI
+maps annotation coordinates into the prediction/normal manifest's base grid,
+so displaying the downscaled compound does not shift tracing to another location.
+
+Dataset selection is available in read-only inspection panes as well as editable
+ones. Changes share one dependency-based invalidation path: switching a compound
+fiber dataset also invalidates normal-derived state when predicted normals are
+selected; switching an inactive Lasagna dataset does not. Normal changes clear
+cached/pending alignment metrics, reject late old-source metric results, and
+resample the existing line geometry to refresh open strips. Prediction changes
+also reset the trace-scale normal adapter, even with a separate Lasagna source.
+Historical segment solve metadata is preserved; affected sessions are marked as
+needing optimization. Input changes are refused while a line solve is running. The recorded
+segment `normal_manifest` identifies the actual source, including the compound
+Zarr when predicted normals were used.
+
+Regression checks include `test_line_annotation_coordinate_scale`,
+`test_fiber_prediction_channels`, `test_line_annotation_generated_views`,
+`test_lasagna_project_volumes`, and the reader's `test_native_grid` (including
+nonzero packed channels and progressive cache fills).
+With `VC_TESTING=ON`, the actual GUI controller also has an opt-in real-data
+check (the seed is from the PHerc0332 run named below):
+
+```sh
+VC3D_CONFIG_DIR="$(mktemp -d)" QT_QPA_PLATFORM=offscreen \
+VC3D_COMPOUND_TEST_VOLUME=/data/hendrik/las_manager_inference/PHerc0332-20251211183505-las-sd1-4c4f7467/artifacts/PHerc0332-20251211183505-las-sd1-4c4f7467.zarr \
+build/bin/VC3D --test-object-store
+```
+
+This creates a temporary project, attaches only the real compound prediction,
+checks both coordinate frames and interactive/headless source selection, and
+runs a short native trace. The source data is read-only.
+
+With a CUDA build and a GPU grant, add `VC3D_COMPOUND_TEST_CUDA=1` to also
+compare progressive GPU display and all packed channel samplers against CPU
+sampling. The reader's `test_native_grid_cuda` covers packed synthetic chunks,
+missing chunks, channel selection and CPU fallback. Setting
+`VC_READER_COMPOUND_CUDA_TEST_ARRAY` to the above volume's `/sd2/2` array adds
+real-data checks for all seven channels; the same variable enables
+`vc_reader/tests/test_cuda_channels.py`.
 
 ## CP direction annotations
 

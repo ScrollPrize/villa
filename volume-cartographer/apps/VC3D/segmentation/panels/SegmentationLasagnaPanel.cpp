@@ -30,6 +30,7 @@
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
@@ -50,7 +51,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -61,6 +62,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <vc_object_store/objects/StoreReader.hpp>
 
 namespace
 {
@@ -107,17 +109,13 @@ QJsonArray volumeShapeZyxForState(CState* state)
 }
 
 // A stored surface for a Lasagna job: the service reads it from the store by
-// UUID (at `revision` when given); the name is for display.
-QJsonObject surfaceRef(const std::string& uuid, const std::string& name,
-                       const std::optional<std::string>& revision = std::nullopt)
+// UUID; the name is for display. The active surface is pinned below.
+QJsonObject surfaceRef(const std::string& uuid, const std::string& name)
 {
     QJsonObject ref;
     ref[QStringLiteral("type")] = QStringLiteral("surface");
     ref[QStringLiteral("uuid")] = QString::fromStdString(uuid);
     ref[QStringLiteral("name")] = QString::fromStdString(name);
-    if (revision) {
-        ref[QStringLiteral("revision")] = QString::fromStdString(*revision);
-    }
     return ref;
 }
 
@@ -1470,7 +1468,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     const SurfaceCatalog::Row* activeRow = activeSurfaceRow(state, _surfaceCatalog);
     const bool isOffsetMode = (launchMode == LasagnaMode::Offset);
     const std::string activeUuid = activeRow ? activeRow->record.uuid : std::string{};
-    const bool hasModel = activeRow && mgr.surfaceModel(activeUuid).has_value();
+    const bool hasModel = activeRow && mgr.surfaceHasModel(activeUuid);
 
     QString rootName = QStringLiteral("new_model");
     if (isNewModel) {
@@ -1624,16 +1622,19 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     QJsonObject jobSpec;
     QJsonArray linkedSurfaces;
     if (activeRow) {
-        // The job reads the revision on screen now; earlier links read their current one.
-        std::optional<std::string> revision;
-        _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
-            if (const auto head = db.currentGeometry(txn, activeUuid)) revision = head->uuid;
+        // Pin the active surface's object version and its generation together;
+        // an unchanged head can predate the store's active history generation.
+        std::optional<vc::objects::ObjectRevision> revision;
+        _surfaceCatalog->session()->readStore(*_surfaceCatalog->attachment(),
+                                              [&](const vc::objects::StoreReader& reader, const auto&) {
+            revision = reader.currentObject(activeUuid);
         });
         linkedSurfaces = linkedSurfacesOf(*activeRow, *_surfaceCatalog);
         for (qsizetype i = 0; i < linkedSurfaces.size(); ++i) {
             QJsonObject link = linkedSurfaces[i].toObject();
             if (link[QStringLiteral("uuid")].toString() == QString::fromStdString(activeUuid) && revision) {
-                link[QStringLiteral("revision")] = QString::fromStdString(*revision);
+                link[QStringLiteral("reference")] = QJsonDocument::fromJson(QByteArray::fromStdString(
+                    vc::objects::objectVersionToJson(revision->reference()))).object();
                 linkedSurfaces[i] = link;
             }
         }
@@ -1920,21 +1921,21 @@ QString SegmentationLasagnaPanel::lasagnaConfigText() const
     return QString::fromUtf8(raw);
 }
 
-utils::Json SegmentationLasagnaPanel::lasagnaConfigJson() const
+nlohmann::json SegmentationLasagnaPanel::lasagnaConfigJson() const
 {
     QString text = lasagnaConfigText().trimmed();
-    if (text.isEmpty()) return utils::Json{};
+    if (text.isEmpty()) return nlohmann::json{};
 
     try {
         QByteArray utf8 = text.toUtf8();
-        utils::Json parsed = utils::Json::parse(
+        nlohmann::json parsed = nlohmann::json::parse(
             std::string_view(utf8.constData(), utf8.size()));
         if (parsed.is_object()) return parsed;
     } catch (const std::exception& e) {
         std::cerr << "[lasagna] ERROR: invalid config JSON: " << e.what() << std::endl;
     }
 
-    return utils::Json{};
+    return nlohmann::json{};
 }
 
 // ---------------------------------------------------------------------------

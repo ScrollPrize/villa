@@ -38,10 +38,10 @@ import json
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 import torch
+from vc_reader.reader import open_zarr
 
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import EpisodeSampler, split_of
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
@@ -229,7 +229,7 @@ def switch_summary(switches, reals, off_points: int, steps: int) -> dict:
 
 
 def _read_xyz(path: Path) -> np.ndarray:
-    return np.stack([tifffile.imread(path/f'{c}.tif') for c in 'xyz'], -1).astype(np.float32)
+    return np.asarray(tifxyz.read(path).xyz)
 
 
 def rescore(folder: Path, tolerance: float = C.LossConfig.sheet_tolerance) -> None:
@@ -297,7 +297,7 @@ def seed_figure(path, w, spec, cfg0, results, names, steps):
     t, a, n = surface_frame(Sum, Svm)[0, 0].T
     centre = Sm[0, 0]
     span = steps*d.step+120
-    volume = ChunkedArray(f'{d.volume}/{d.volume_level}', 256 << 20)
+    volume = open_zarr(d.volume, level=d.volume_level, memory_cache=256 << 20)
     pts_all = np.concatenate([S[0][ok[0]].numpy()]+[results[nm]['rows'].reshape(-1, 3) for nm in names])
     block, origin = read_block(volume, pts_all, 60, d.volume_level)
     img = sample_plane(torch.from_numpy(block).float()[None], torch.from_numpy(origin), d.volume_level, centre,

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import open_group
 
 from vesuvius.ink_detection.inference import infer_full3d_tifxyz as native
 
@@ -227,6 +227,28 @@ def test_probability_rules_resize_and_exact_eight_way_tta():
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-7)
 
 
+def test_native_model_pads_input_depth_and_resizes_like_training(monkeypatch):
+    from vesuvius.ink_detection.training.train import prepare_loss_inputs
+
+    class EchoInk(torch.nn.Module):
+        def forward(self, image):
+            return {"ink": image}
+
+    monkeypatch.setattr(native, "make_model", lambda config: EchoInk())
+    monkeypatch.setattr(native, "load_model_state", lambda model, state: None)
+    config = SimpleNamespace(model=SimpleNamespace(input_pad_depth_to=4))
+    args = native.parse_args(["tifxyz", "memory.pth", "out.zarr", "--no-compile"])
+    bundle = native._load_native_model({"model": {}}, config, args)
+    logits = bundle.model(torch.randn(1, 1, 3, 8, 8).to(bundle.device)).cpu()
+    assert logits.shape[2] == 4  # the depth the model was trained on
+
+    patch = torch.zeros(1, 1, 3, 8, 8)
+    batch = {"image": patch, "inklabels": patch, "supervision_mask": patch + 1}
+    expected = prepare_loss_inputs(logits, batch, mode="full_3d")[0].sigmoid()
+    actual = native.logits_to_probabilities(logits, patch_size_zyx=(3, 8, 8))
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=1e-6)
+
+
 def test_importance_maps_and_sparse_accumulator_round_half_to_even():
     gaussian = native.create_importance_map((3, 4, 5), mode="gaussian")
     assert gaussian.shape == (3, 4, 5)
@@ -309,24 +331,19 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
     assert torch.all(image[0, 1:, 1:, 1:] == 1)
 
     class FakeTifxyz:
-        full_resolution_shape = (2, 2)
+        full_shape = (2, 2)
+        scale = (1.0, 1.0)
 
         def __init__(self):
             yy, xx = np.mgrid[:2, :2]
-            self.x = xx.astype(np.float32)
-            self.y = yy.astype(np.float32)
-            self.z = np.zeros((2, 2), dtype=np.float32)
+            self.xyz = np.stack((xx, yy, np.zeros((2, 2))), axis=-1).astype(np.float32)
+            self.valid = np.ones((2, 2), dtype=bool)
 
-        def get_zyxs(self, stored_resolution=False):
-            return np.stack((self.z, self.y, self.x), axis=-1)
-
-        def __getitem__(self, slices):
-            return (
-                self.x[slices],
-                self.y[slices],
-                self.z[slices],
-                np.ones(self.x[slices].shape, dtype=bool),
-            )
+        def resample(self, origin, step, size, *, interpolation, normals=False):
+            rows = int(origin[0]) + int(step[0]) * np.arange(size[0])
+            columns = int(origin[1]) + int(step[1]) * np.arange(size[1])
+            xyz = self.xyz[rows[:, None], columns[None, :]]
+            return xyz, np.ones(xyz.shape[:2], dtype=bool)
 
     wrap_config = SimpleNamespace(
         data=SimpleNamespace(
@@ -354,6 +371,94 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
     assert restored._volume is None
     assert restored._tifxyz is None
     assert restored._coarse_positions is None
+
+
+@pytest.mark.parametrize("mode", ["full_3d", "full_3d_single_wrap"])
+@pytest.mark.parametrize(
+    "normalization", ["none", "minmax", "robust_mad", {"mode": "divide", "divisor": 7}]
+)
+def test_native_dataset_batch_reads_match_single_reads(monkeypatch, normalization, mode):
+    from vesuvius.ink_detection.config import NormalizationConfig
+
+    class CountingVolume:
+        def __init__(self, values):
+            self.values = values
+            self.shape = values.shape
+            self.dtype = values.dtype
+            self.reads = 0
+
+        def __getitem__(self, key):
+            self.reads += 1
+            return self.values[key]
+
+        def read_regions(self, regions, out):
+            self.reads += 1
+            for (start, size), destination in zip(regions, out):
+                selection = tuple(slice(a, a + n) for a, n in zip(start, size))
+                destination[...] = self.values[selection]
+            return out
+
+    rng = np.random.default_rng(0)
+    volume = CountingVolume(rng.integers(0, 256, (20, 24, 28), dtype=np.uint8))
+    monkeypatch.setattr(
+        native, "_open_shared_volume", lambda *args, **kwargs: volume
+    )
+    monkeypatch.setattr(
+        native.NativePatchDataset, "_surface_mask",
+        lambda self, bbox: np.full(self.patch_size_zyx, bbox[0], dtype=np.float32),
+    )
+    config = SimpleNamespace(
+        data=SimpleNamespace(
+            mode=mode,
+            normalization=NormalizationConfig.from_value(normalization),
+        )
+    )
+    patches = native.build_patch_plan_for_chunks(
+        target_chunks=[native.ChunkId(0, 0, 0), native.ChunkId(1, 1, 1)],
+        array_shape_zyx=volume.shape,
+        chunk_shape_zyx=(10, 12, 14),
+        patch_size_zyx=(8, 8, 8),
+        stride_zyx=(4, 4, 4),
+    )
+    patches = [*patches, native.PatchSpec(-3, 20, 25), native.PatchSpec(30, 0, 0)]
+    dataset = native.NativePatchDataset(
+        tifxyz_dir=Path("unused"),
+        volume_path="memory://native",
+        resolution="0",
+        patches=patches,
+        patch_size_zyx=(8, 8, 8),
+        config=config,
+    )
+    indices = list(range(len(patches)))
+    single = [dataset[index] for index in indices]
+    volume.reads = 0
+    batched = dataset.__getitems__(indices)
+    assert volume.reads == 1
+    assert len(batched) == len(single)
+    for (image, metadata), (expected, expected_metadata) in zip(batched, single):
+        assert torch.equal(metadata, expected_metadata)
+        assert torch.equal(image, expected)
+    assert dataset.__getitems__([]) == []
+    reordered = [len(patches) - 1, 2, 0, 2]
+    for actual, index in zip(dataset.__getitems__(reordered), reordered):
+        assert torch.equal(actual[0], single[index][0])
+        assert torch.equal(actual[1], single[index][1])
+    loader = torch.utils.data.DataLoader(dataset, batch_size=5)
+    images = torch.cat([batch[0] for batch in loader])
+    assert torch.equal(images, torch.stack([image for image, _ in single]))
+
+    local = native.NativePatchDataset(
+        tifxyz_dir=Path("unused"),
+        volume_path="local.zarr",
+        resolution="0",
+        patches=patches,
+        patch_size_zyx=(8, 8, 8),
+        config=config,
+    )
+    volume.reads = 0
+    local_batch = local.__getitems__(indices)
+    assert volume.reads == len(patches) - 1  # the outside patch reads nothing
+    assert all(torch.equal(a[0], b[0]) for a, b in zip(local_batch, single))
 
 
 def test_explicit_v2_sparse_ome_zarr_and_encoded_uint8_pyramid(tmp_path):
@@ -405,20 +510,29 @@ def test_explicit_v2_sparse_ome_zarr_and_encoded_uint8_pyramid(tmp_path):
     native.build_downsample_levels(arrays, level0_written_chunks={target}, workers=2)
     expected = np.zeros((5, 4, 3), dtype=np.uint8)
     expected[:2, :2, :2] = values
-    multiscales = zarr.open_group(path, mode="r").attrs["multiscales"][0]
+    multiscales = open_group(path).attrs["multiscales"][0]
     assert multiscales["version"] == "0.4"
-    assert multiscales["axes"] == native.AXES
+    assert [axis["name"] for axis in multiscales["axes"]] == ["z", "y", "x"]
     assert [dataset["path"] for dataset in multiscales["datasets"]] == [
         str(level) for level in range(6)
     ]
     for level, array in enumerate(arrays):
         assert array.attrs["_ARRAY_DIMENSIONS"] == ["z", "y", "x"]
-        assert np.array_equal(np.asarray(array), expected)
-        assert multiscales["datasets"][level]["coordinateTransformations"] == [
-            {"type": "scale", "scale": [float(2**level)] * 3}
-        ]
+        assert np.array_equal(array[...], expected)
+        assert multiscales["datasets"][level]["coordinateTransformations"][0] == {
+            "type": "scale", "scale": [float(2**level)] * 3
+        }
         if level + 1 < len(arrays):
-            expected = native.downsample_mean_3d(expected)
+            expected = _downsample_mean_3d(expected)
+
+
+def _downsample_mean_3d(block):
+    """Rounded mean of each 2x2x2 block, clipped at the array's end."""
+    shape = tuple((value + 1) // 2 for value in block.shape)
+    output = np.zeros(shape, block.dtype)
+    for index in np.ndindex(shape):
+        output[index] = np.rint(block[tuple(slice(2 * i, 2 * i + 2) for i in index)].mean())
+    return output
 
 
 def test_output_reject_overwrite_and_coherent_rerun(tmp_path):
@@ -450,7 +564,7 @@ def test_output_reject_overwrite_and_coherent_rerun(tmp_path):
         overwrite=True,
     )
     assert not np.asarray(second[0]).any()
-    assert len(list(zarr.open_group(output, mode="r").array_keys())) == 6
+    assert len(list(open_group(output).array_keys())) == 6
 
 
 def test_plan_only_does_not_load_runtime_or_touch_existing_output(tmp_path, monkeypatch):
@@ -506,7 +620,11 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
             volume_cache_max_gb=120.0,
         )
     )
-    volume = np.zeros((2, 2, 2), dtype=np.uint8)
+    from vc_reader.reader import ZarrReader, ZarrWriter
+
+    volume_path = tmp_path / "input.zarr"
+    ZarrWriter.create(volume_path, shape=(2, 2, 2), chunks=(2, 2, 2), dtype="uint8")
+    volume = ZarrReader.open(volume_path)
     monkeypatch.setattr(
         native,
         "_plan_from_args",
@@ -554,15 +672,15 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         downsample_workers=1,
     )
     assert native.run_command(args) == 0
-    group = zarr.open_group(output, mode="r")
+    group = open_group(output)
     assert sorted(group.array_keys()) == [str(level) for level in range(6)]
     assert all(np.all(np.asarray(group[str(level)]) == 128) for level in range(6))
     with pytest.raises(FileExistsError):
         native.run_command(args)
-    assert np.all(np.asarray(zarr.open_group(output, mode="r")["0"]) == 128)
+    assert np.all(np.asarray(open_group(output)["0"]) == 128)
     args.overwrite = True
     assert native.run_command(args) == 0
     assert all(
-        np.all(np.asarray(zarr.open_group(output, mode="r")[str(level)]) == 128)
+        np.all(np.asarray(open_group(output)[str(level)]) == 128)
         for level in range(6)
     )

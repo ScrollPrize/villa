@@ -86,6 +86,7 @@ class RunFibers(Sequence):
 
     def __init__(self, fibers, index: StripIndex, grid_scale, length_power=1.):
         self.fibers = FiberStore(fibers, fiber_volume(fibers), grid_scale, split='all', cache_size=64)
+        self.fibers.require_digest(index.meta.get('fibers_digest'))
         self.index = index
         self.lengths = index.unit_length**length_power
 
@@ -227,8 +228,8 @@ class StripBuilder(IdentityObservationBuilder):
             local = local[np.linspace(0, len(local)-1, self.tube_points).round().astype(np.int64)]
         return local
 
-    def __call__(self, items, vol):
-        batch = super().__call__(items, vol)
+    def __call__(self, items, ct, spec):
+        batch = super().__call__(items, ct, spec)
         crop = self.cfg.fine
         height = (crop.width-1)*crop.spacing/2
         points = np.zeros((len(items), self.tube_points, 3), np.float32)

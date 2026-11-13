@@ -1,3 +1,4 @@
+#include <vc_reader/zarr.hpp>
 #include "InkDetectionOverlayController.hpp"
 
 #include "../CState.hpp"
@@ -6,10 +7,10 @@
 #include <vc_object_store/objects/CatalogStore.hpp>
 #include "../SurfaceCatalog.hpp"
 
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
@@ -219,7 +220,6 @@ void InkDetectionOverlayController::setColormapId(const std::string& id)
     if (_selectedImage.singleChannel && !_selectedImage.scalar.empty()) {
         _selectedImage.baseImage = renderSingleChannelImage(_selectedImage.scalar, _colormapId);
         _selectedImage.image = applyImageFlips(_selectedImage.baseImage);
-        _selectedImage.colormapId = _colormapId;
     }
     refreshAll();
 }
@@ -310,6 +310,14 @@ void InkDetectionOverlayController::collectPrimitives(
                      kInkDetectionZ);
 }
 
+namespace {
+// Published images are copies of Open Data files, kept in VC3D's remote cache by URL.
+std::filesystem::path publishedFileLocation(const vc::objects::CatalogFile& file)
+{
+    return vcr::zarr::decodedCachePath(vcr::zarr::selectedVc3dCacheRoot(), file.url);
+}
+}
+
 void InkDetectionOverlayController::refreshOptionsForActiveSurface()
 {
     if (!_selectedSegmentKey.empty()) {
@@ -319,12 +327,13 @@ void InkDetectionOverlayController::refreshOptionsForActiveSurface()
     // The detections a catalog surface was published with, kept in its artifacts.
     const std::string nextSegmentKey = activeSegmentKey();
     std::vector<Option> next;
-    if (const auto* row = _catalog && !nextSegmentKey.empty() ? _catalog->row(nextSegmentKey) : nullptr) {
+    if (const auto surface = _state ? _state->surface("segmentation") : nullptr) {
         try {
-            if (const auto reference = vc::objects::catalogReference(row->record)) {
-                const auto artifacts = _catalog->session()->artifactDirectory(row->source, nextSegmentKey, false);
+            vc::objects::ObjectRecord selected;
+            selected.meta = surface->meta.dump();
+            if (const auto reference = vc::objects::catalogReference(selected)) {
                 for (const auto& file : reference->files)
-                    next.push_back({QString::fromStdString(file.label), file.name, artifacts / file.name});
+                    next.push_back({QString::fromStdString(file.label), file.name, file.url, publishedFileLocation(file)});
             }
         } catch (const std::exception&) {
             next.clear();
@@ -379,19 +388,17 @@ void InkDetectionOverlayController::loadSelectedImage()
 
     std::error_code ec;
     if (!std::filesystem::is_regular_file(_selectedPath, ec)) {
-        // Published images are downloaded into the surface's artifacts when first shown.
+        // Published images are downloaded into the published-file cache when first shown.
         const auto option = std::find_if(_options.begin(), _options.end(), [&](const Option& candidate) {
             return candidate.localPath == _selectedPath;
         });
         if (option == _options.end() || _fetchingPath == _selectedPath) {
             return;
         }
-        const auto* row = _catalog ? _catalog->row(_selectedSegmentKey) : nullptr;
-        if (!row) return;
         _fetchingPath = _selectedPath;
         vc3d::store::background<bool>(this,
-            [session = _catalog->session(), attachment = row->source, uuid = _selectedSegmentKey, name = option->name]() {
-                vc::objects::publishedFile(*session, attachment, uuid, name);
+            [file = vc::objects::CatalogFile{option->name, option->label.toStdString(), option->url}, path = _selectedPath]() {
+                vc::objects::fetchPublishedFile(file, path);
                 return true;
             },
             [this, path = _selectedPath](vc3d::store::Outcome<bool> result) {
@@ -403,18 +410,21 @@ void InkDetectionOverlayController::loadSelectedImage()
             });
         return;
     }
-    const cv::Mat src = cv::imread(_selectedPath.string(), cv::IMREAD_UNCHANGED);
+    // TIFF, PNG or JPEG by suffix, in OpenCV's colour order; a palette PNG stays indices.
+    cv::Mat src;
+    try {
+        src = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(_selectedPath).string(), 0));
+    } catch (const std::exception&) {
+    }
     if (src.empty()) {
         return;
     }
 
     LoadedImage loaded;
-    loaded.path = _selectedPath;
     loaded.singleChannel = imageLooksSingleChannel(src);
     if (loaded.singleChannel) {
         loaded.scalar = toU8Scalar(src);
         loaded.baseImage = renderSingleChannelImage(loaded.scalar, _colormapId);
-        loaded.colormapId = _colormapId;
     } else {
         loaded.baseImage = colorMatToImage(src);
     }

@@ -158,8 +158,10 @@ class FiberWorkerFactory:
 class FiberTrainingWorker:
     def __init__(self, factory, rank, grant, state):
         import torch
-        from .train import _load_raw_config
+        from .train import _load_raw_config, _reviewed_trace_test_config
         raw = _load_raw_config(factory.config_path)
+        trace = _reviewed_trace_test_config(raw.get("training", {}))
+        self.trace_weights = trace.get("weights", "ema_0p999") if trace is not None else "raw"
         self.factory, self.rank = factory, rank
         self.gpu_uuid = sorted(grant["gpus"])[rank]
         self._measurement_initialization = 0
@@ -178,9 +180,6 @@ class FiberTrainingWorker:
                 raise ValueError("PyTorch version differs from the measured memory calibration")
             if factory.calibrated_cuda_versions and torch.version.cuda not in factory.calibrated_cuda_versions:
                 raise ValueError("CUDA version differs from the measured memory calibration")
-            from .cooperative_resources import initialize_worker_volume_cache
-            if raw.get("datasets"):
-                initialize_worker_volume_cache(raw)
             if factory.measure_startup_memory:
                 torch.cuda.reset_peak_memory_stats(0)
         from .train import training_units
@@ -200,6 +199,7 @@ class FiberTrainingWorker:
             yield_initialized=True,
             enable_reviewed_trace=not factory.measure_startup_memory,
             on_model_ready=lambda model: setattr(self, "model", model),
+            on_ema_ready=lambda ema: setattr(self, "ema", ema),
             on_failure=lambda detail: self._error_reporter(detail) if hasattr(self, "_error_reporter") else None,
         )
         self.boundary = next(self.units)
@@ -242,7 +242,8 @@ class FiberTrainingWorker:
             if kind != "trace":
                 raise RuntimeError(f"invalid resident trace command: {kind}")
             arguments = connection.recv()
-            serve_resident(connection, self.model, self.rank, arguments)
+            serve_resident(connection, self.model, self.rank, arguments,
+                           ema=self.ema, ema_name=None if self.trace_weights == "raw" else self.trace_weights)
             self._check_memory()
             return {"step": self.boundary.step, "done": False,
                     "phase": "reviewed_trace_complete", "samples_seen": self.boundary.samples_seen}

@@ -756,26 +756,10 @@ static FiberReplayTraceResult replayBeamCase(
         (trace.replayReverseDelaySteps > 0 || trace.replayReverseConvergenceMinBase > 0)) {
         policy.delaySteps=static_cast<size_t>(trace.replayReverseDelaySteps);
         policy.verifyCheckpoint=[&](const auto& points,size_t checkpoint,size_t checked,bool) {
-            const auto begin=std::chrono::steady_clock::now();
             auto reverse=trace;
             reverse.traceToBaseScale=scale;
-            if(reverse.widthRelativeTolerance>0) reverse.widthReferenceMean=widthMean;
-            const auto path=makePolylineArcGeometry(points);
-            // Arc geometry keeps vertices (including zero-length edges), so the
-            // checkpoint and verified indices refer to the exact committed path.
-            ReverseSpanOptions options;
-            options.initialDirections=fiberReverseFutureHistory(path,checkpoint,policy.delaySteps);
-            options.verifiedThroughArc=path.vertexArcs.at(checked);
-            options.minimumTravel=trace.replayReverseConvergenceMinBase;
-            options.convergenceDistance=trace.replayReverseConvergenceDistanceBase;
-            options.convergenceAngleDegrees=trace.replayReverseConvergenceAngleDegrees;
-            options.convergenceSteps=trace.replayReverseConvergenceSteps;
-            const auto check=verifyFiberReverseSpanDetailed(predictions,tracingNormals,reverse,path,
-                path.vertexArcs.at(checkpoint),trace.replayReverseNormalRadiusBase,
-                trace.replayReverseTangentialRadiusBase,0,options);
-            return ReplayReverseCheck{check.passed,check.travelled,check.converged,
-                options.initialDirections.size(),
-                std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()};
+            return verifyFiberReverseCheckpoint(predictions,tracingNormals,reverse,points,
+                checkpoint,checked,widthMean);
         };
     }
     const ReplaySegmentRunner run = [&](const PolylineArcSample& seed, double remaining,

@@ -130,134 +130,6 @@ class Patch:
         mask = valid.reshape(ij.shape[:-1])
         return zyx, mask
 
-    def project(self, zyx: torch.Tensor, chunk_size: int = 64):
-        """Project 3D points to the closest location on the valid patch surface.
-
-        Returns:
-            (ij_coords, dists) where ij_coords has shape (..., 2) with projected
-            (i, j) coordinates in patch space (filled with -1 when invalid) and
-            dists has shape (...) with the Euclidean distance from each input
-            point to its closest surface point (inf when invalid).
-        """
-        if zyx.shape[-1] != 3:
-            raise ValueError(f"zyx must have shape (..., 3), got {zyx.shape}")
-
-        device = zyx.device
-        h, w, _ = self.zyxs.shape
-        vertices = self.zyxs.to(device=device, dtype=torch.float32).reshape(-1, 3)
-
-        faces_all = self._get_face_indices().to(device)
-        valid_quads = self.valid_quad_mask.flatten()
-        face_mask = torch.cat([valid_quads, valid_quads], dim=0)
-        faces = faces_all[face_mask]
-        if faces.numel() == 0:
-            out_shape = (*zyx.shape[:-1], 2)
-            ij = torch.full(out_shape, -1.0, device=device)
-            dist_shape = zyx.shape[:-1]
-            dists = torch.full(dist_shape, float('inf'), device=device, dtype=torch.float32)
-            return ij, dists
-
-        base_grid = torch.stack(
-            torch.meshgrid(
-                torch.arange(h - 1, device=device),
-                torch.arange(w - 1, device=device),
-                indexing='ij',
-            ),
-            dim=-1,
-        ).reshape(-1, 2)
-        base_faces = torch.cat([base_grid, base_grid], dim=0)[face_mask]
-        face_type = torch.cat([
-            torch.zeros_like(valid_quads, dtype=torch.long),
-            torch.ones_like(valid_quads, dtype=torch.long)
-        ], dim=0)[face_mask]
-
-        a = vertices[faces[:, 0]]
-        b = vertices[faces[:, 1]]
-        c = vertices[faces[:, 2]]
-        ab = b - a
-        ac = c - a
-
-        flat = zyx.reshape(-1, 3).to(device=device, dtype=torch.float32)
-        out_ij = torch.full((flat.shape[0], 2), -1.0, device=device, dtype=torch.float32)
-        out_dist = torch.full((flat.shape[0],), float('inf'), device=device, dtype=torch.float32)
-        eps = 1e-8
-
-        for start in range(0, flat.shape[0], chunk_size):
-            pts = flat[start:start + chunk_size]
-            P = pts[:, None, :]
-
-            AP = P - a
-            BP = P - b
-            CP = P - c
-
-            d1 = (AP * ab).sum(-1)
-            d2 = (AP * ac).sum(-1)
-            d3 = (BP * ab).sum(-1)
-            d4 = (BP * ac).sum(-1)
-            d5 = (CP * ab).sum(-1)
-            d6 = (CP * ac).sum(-1)
-
-            vc = d1 * d4 - d3 * d2
-            vb = d5 * d2 - d1 * d6
-            va = d3 * d6 - d5 * d4
-
-            mask_a = (d1 <= 0) & (d2 <= 0)
-            mask_b = (d3 >= 0) & (d4 <= d3)
-            mask_ab = (vc <= 0) & (d1 >= 0) & (d3 <= 0)
-            mask_c = (d6 >= 0) & (d5 <= d6)
-            mask_ac = (vb <= 0) & (d2 >= 0) & (d6 <= 0)
-            mask_bc = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0)
-            mask_face = ~(mask_a | mask_b | mask_ab | mask_c | mask_ac | mask_bc)
-
-            bary = torch.zeros((pts.shape[0], faces.shape[0], 3), device=device, dtype=torch.float32)
-            bary[..., 0][mask_a] = 1.0
-            bary[..., 1][mask_b] = 1.0
-
-            v_ab = d1 / (d1 - d3 + eps)
-            bary[..., 0][mask_ab] = 1 - v_ab[mask_ab]
-            bary[..., 1][mask_ab] = v_ab[mask_ab]
-
-            bary[..., 2][mask_c] = 1.0
-
-            w_ac = d2 / (d2 - d6 + eps)
-            bary[..., 0][mask_ac] = 1 - w_ac[mask_ac]
-            bary[..., 2][mask_ac] = w_ac[mask_ac]
-
-            w_bc = (d4 - d3) / ((d4 - d3) + (d5 - d6) + eps)
-            bary[..., 1][mask_bc] = 1 - w_bc[mask_bc]
-            bary[..., 2][mask_bc] = w_bc[mask_bc]
-
-            denom = (va + vb + vc) + eps
-            v_face = vb / denom
-            w_face = vc / denom
-            bary[..., 1][mask_face] = v_face[mask_face]
-            bary[..., 2][mask_face] = w_face[mask_face]
-            bary[..., 0][mask_face] = 1 - v_face[mask_face] - w_face[mask_face]
-
-            closest = (
-                bary[..., 0:1] * a
-                + bary[..., 1:2] * b
-                + bary[..., 2:3] * c
-            )
-            dist2 = ((closest - P) ** 2).sum(-1)
-            idx = dist2.argmin(dim=1)
-
-            batch_idx = torch.arange(pts.shape[0], device=device)
-            best_bary = bary[batch_idx, idx]
-            best_base = base_faces[idx]
-            best_type = face_type[idx]
-
-            i_offset = torch.where(best_type == 0, best_bary[:, 0], best_bary[:, 0] + best_bary[:, 2])
-            j_offset = torch.where(best_type == 0, best_bary[:, 2], best_bary[:, 1] + best_bary[:, 2])
-
-            out_ij[start:start + pts.shape[0], 0] = best_base[:, 0].float() + i_offset
-            out_ij[start:start + pts.shape[0], 1] = best_base[:, 1].float() + j_offset
-            out_dist[start:start + pts.shape[0]] = dist2[batch_idx, idx].sqrt()
-
-        ij_shape = (*zyx.shape[:-1], 2)
-        dist_shape = zyx.shape[:-1]
-        return out_ij.reshape(ij_shape), out_dist.reshape(dist_shape)
-
     def to_trimesh(self):
         import trimesh
         h, w, _ = self.zyxs.shape
@@ -304,69 +176,12 @@ class Patch:
                 f.write(f"f {bl + 1} {tr + 1} {br + 1}\n")
 
 
-def patch_to_payload(patch):
-    """Convert a Patch into a picklable dict of numpy arrays / plain values.
-
-    Used to move patches out of loader worker processes. Numpy transport is
-    deliberate: torch registers ForkingPickler reductions, so pickling torch
-    tensors through multiprocessing queues would route every tensor through
-    its own shared-memory segment, which is wasteful for many small patches.
-    """
-    winding = patch.winding
-    if isinstance(winding, torch.Tensor):
-        winding = winding.numpy()
-    return {
-        'zyxs': patch.zyxs.numpy(),
-        'scale': patch.scale.numpy(),
-        'overlapping_ids': patch.overlapping_ids,
-        'winding': winding,
-        'uuid': patch.uuid,
-        'erosion_cells_override': patch.erosion_cells_override,
-        'valid_vertex_mask': patch.valid_vertex_mask.numpy(),
-        'valid_quad_mask': patch.valid_quad_mask.numpy(),
-        'area': patch.area.numpy(),
-    }
-
-
-def patch_from_payload(payload):
-    """Rebuild a Patch from patch_to_payload() output.
-
-    Bypasses __init__/__post_init__ so the parent process does not redo the
-    mask/area computations already performed in the worker; torch.from_numpy
-    is zero-copy, so the arrays are adopted verbatim.
-    """
-    patch = object.__new__(Patch)
-    patch.zyxs = torch.from_numpy(payload['zyxs'])
-    patch.scale = torch.from_numpy(payload['scale'])
-    patch.overlapping_ids = payload['overlapping_ids']
-    winding = payload['winding']
-    if isinstance(winding, np.ndarray):
-        winding = torch.from_numpy(winding)
-    patch.winding = winding
-    patch.uuid = payload['uuid']
-    patch.erosion_cells_override = payload['erosion_cells_override']
-    patch.valid_vertex_mask = torch.from_numpy(payload['valid_vertex_mask'])
-    patch.valid_quad_mask = torch.from_numpy(payload['valid_quad_mask'])
-    patch.area = torch.from_numpy(payload['area'])
-    patch._valid_vertex_indices = None
-    patch._valid_quad_indices = None
-    patch._valid_zyxs = None
-    return patch
-
-
-def load_tifxyz(path, *, z_range=None):
-    """Load a patch, optionally rejecting it before x/y TIFF decoding.
-
-    The z plane and validity mask are sufficient to prove that a patch cannot
-    intersect the half-open fit interval.  Coordinate data is used instead of
-    historical metadata bboxes because producers have emitted multiple bbox
-    axis orders.
-    """
+def load_tifxyz(path):
+    """Load a tifxyz surface directory as a Patch."""
 
     with open(f'{path}/meta.json', 'r') as meta_json:
         metadata = json.load(meta_json)
-        # Reject input errors before tensor construction so live preparation
-        # can discard the batch without masking worker/device failures.
+        # Reject input errors before tensor construction.
         if not isinstance(metadata, dict):
             raise ValueError(f'{path}/meta.json must contain an object')
         scale_values = metadata.get('scale')
@@ -389,14 +204,6 @@ def load_tifxyz(path, *, z_range=None):
         mask = np.array(Image.open(mask_path))
         if mask.ndim == 3:
             mask = mask[..., 0]
-
-    if z_range is not None:
-        z_begin, z_end = z_range
-        in_range = (z_np >= z_begin) & (z_np < z_end)
-        if mask is not None:
-            in_range &= mask != 0
-        if not in_range.any():
-            return None
 
     y_np = np.array(Image.open(f'{path}/y.tif'))
     x_np = np.array(Image.open(f'{path}/x.tif'))
@@ -428,13 +235,31 @@ def load_tifxyz(path, *, z_range=None):
                  erosion_cells_override)
 
 
-def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_metadata=None):
+def _to_written_voxels(zyxs, step_size, voxel_size_um, coordinate_scale):
+    """``zyxs`` (with their grid step and voxel size) in the voxels of a
+    volume ``coordinate_scale`` times finer; -1 sentinels are kept."""
+    if coordinate_scale == 1:
+        return zyxs, step_size, voxel_size_um
+    zyxs = np.asarray(zyxs, dtype=np.float32)
+    invalid = np.all(zyxs == -1, axis=-1)
+    zyxs = zyxs * np.float32(coordinate_scale)
+    zyxs[invalid] = -1.0
+    return zyxs, step_size * coordinate_scale, voxel_size_um / coordinate_scale
+
+
+def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_metadata=None,
+                coordinate_scale=1):
     """Write a NEW tifxyz surface to ``path/uuid``.
 
     ``uuid`` names the directory only; meta.json gets a fresh random
     identity, never one derived from the name. ``layout_metadata`` describes
-    the export layout of the supplied grid.
+    the export layout of the supplied grid. ``zyxs``, ``step_size`` and
+    ``voxel_size_um`` are in fit voxels; the surface is written in the
+    voxels of the volume ``coordinate_scale`` times finer (the fit volume's
+    own, for a fit at one of its pyramid levels).
     """
+    zyxs, step_size, voxel_size_um = _to_written_voxels(
+        zyxs, step_size, voxel_size_um, coordinate_scale)
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)
     Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
@@ -478,6 +303,7 @@ def save_combined_tifxyz(
     first_winding=10,
     cleanup_erosion_cells=None,
     base_shape_zyx=None,
+    coordinate_scale=1,
 ):
     """Atomically write consecutive winding grids as one QuadSurface.
 
@@ -489,7 +315,10 @@ def save_combined_tifxyz(
     half-open column bounds, in the written grid, for display filtering, but
     they are not QuadSurface components: adjacent windings remain joined by
     quads across their shared seam. ``winding_column_ranges`` pairs with
-    ``component_winding_ids`` and runs left to right.
+    ``component_winding_ids`` and runs left to right. The grids, ``step_size``
+    and ``voxel_size_um`` are in fit voxels; the surface is written in those
+    of the volume ``coordinate_scale`` times finer, whose shape
+    ``base_shape_zyx`` is.
     """
     import os
     import shutil
@@ -535,6 +364,8 @@ def save_combined_tifxyz(
         cursor += block.shape[1]
         components.append([start, cursor])
     combined = np.concatenate(blocks, axis=1)
+    combined, step_size, voxel_size_um = _to_written_voxels(
+        combined, step_size, voxel_size_um, coordinate_scale)
     cleanup_metadata = None
     if cleanup_erosion_cells is not None:
         import scipy.ndimage

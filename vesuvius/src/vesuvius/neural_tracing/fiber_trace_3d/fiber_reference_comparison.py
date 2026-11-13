@@ -178,12 +178,14 @@ def visualization_offset(settings,reference,fitted,weights):
     return int(np.rint(weighted_median(reference-fitted,weights)))
 
 
-def load_metric_projection(path,d,config=None):
+def load_metric_projection(path,d,config=None,*,source=None):
     """Load existing geometry-only projection; fail on mismatched piece identity."""
     if config is not None:
-        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_source
         signature=json.loads(Path(path).with_name('projection_signature.json').read_text())
-        if signature['fibers']!=fibers_digest(config['fibers']):
+        digest=signature['fibers']
+        version=verify_fiber_source(config['fibers'],digest,signature.get('fiber_source'))
+        if source is not None and source!=(digest,version):
             raise ValueError('Reference projection fiber provenance mismatch')
     with np.load(path) as src:
         for key in ('source_id','start','end'):
@@ -270,12 +272,12 @@ def triangle_projection(p, vertices, coords):
 
 class Surface:
     def __init__(self, root, scale=4., stride=2, workers=32, candidates=4):
-        from vesuvius.tifxyz.reader import TifxyzReader
+        from vc_reader import tifxyz
         self.root = Path(root); self.meta = json.loads((self.root/'meta.json').read_text())
         self.x, self.q = landmarks(self.meta['winding_bounds'])
         self.limits=(self.q[0]-.5,self.q[-1]+.5)
-        reader = TifxyzReader(root)
-        self.full = [reader.read_coordinate(c) for c in 'xyz']
+        points = tifxyz.read(root, mask=False).xyz
+        self.full = [points[..., axis] for axis in range(3)]
         self.stride = stride; self.workers = workers; self.candidates = candidates
         self.xyz = np.stack([a[::stride, ::stride] for a in self.full], axis=-1)*scale
         # Every original grid vertex inside each coarse cell must be valid.
@@ -322,9 +324,10 @@ class Surface:
         return result, distances
 
 
-def samples(d, cfg, spacing):
+def samples(d, cfg, spacing, *, source_version=None):
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
-    source_ids = np.unique(d['source_id']); curves = read_polylines(cfg['fibers'], source_ids)
+    source_ids = np.unique(d['source_id'])
+    curves = read_polylines(cfg['fibers'], source_ids, source_version=source_version)
     counts=[]; xyzs=[]; arcs=[]; weights=[]
     # Source pieces are sorted by source and arc in the tensor cache.
     if np.any(d['source_id'][1:] < d['source_id'][:-1]): raise ValueError('Unsorted source pieces')
@@ -464,7 +467,7 @@ def affine_vertical_setup(settings,surface,sample):
 
 
 def render_reference(surface,root,height,z_range=None,xyz_scale=4.,v_transform=None):
-    import tifffile
+    from vc_reader import images
     if v_transform is not None:
         pitch=surface.meta['output_step_vx']*xyz_scale
         factor=(height-1)/(z_range[1]-z_range[0]);a,b=v_transform
@@ -481,8 +484,8 @@ def render_reference(surface,root,height,z_range=None,xyz_scale=4.,v_transform=N
                     image=np.full((tile,tile,3),255,np.uint8)
                     image[:len(r),:len(c)]=np.where(valid[...,None],palette(winding_at(c,surface.x,surface.q))[None],255)
                     yield image
-        tifffile.imwrite(root/'reference_own.tif',tiles_affine(),shape=(height,width,3),dtype=np.uint8,
-                         tile=(tile,tile),photometric='rgb',compression='lzw',bigtiff=True,metadata=None)
+        with images.TiffWriter(root/'reference_own.tif',(height,width,3),np.uint8,tile=(tile,tile),compression='lzw') as writer:
+            writer.write_tiles(tiles_affine())
         return
     if z_range is not None:
         pitch=surface.meta['output_step_vx']*xyz_scale
@@ -498,7 +501,7 @@ def render_reference(surface,root,height,z_range=None,xyz_scale=4.,v_transform=N
                 mask=physical_z_column_mask(surface.full[2][:,cols]*xyz_scale,valid,z_range,height)
                 colors=palette(winding_at(cols,surface.x,surface.q))
                 strip[:,left:left+len(cols)]=np.where(mask[...,None],colors[None],255)
-            tifffile.imwrite(root/'reference_own.tif',strip,tile=(512,512),photometric='rgb',compression='lzw',bigtiff=True,metadata=None)
+            images.write_tiff(root/'reference_own.tif', strip, tile=(512,512), compression='lzw')
         finally:
             del strip
             (root/'reference_z_raster.tmp').unlink(missing_ok=True)
@@ -516,24 +519,23 @@ def render_reference(surface,root,height,z_range=None,xyz_scale=4.,v_transform=N
                 color=palette(winding_at(c,surface.x,surface.q))
                 image[:len(r),:len(c)]=np.where(valid[...,None],color[None],255)
                 yield image
-    tifffile.imwrite(root/'reference_own.tif',tiles(),shape=(height,width,3),dtype=np.uint8,
-                     tile=(tile,tile),photometric='rgb',compression='lzw',bigtiff=True,metadata=None)
+    with images.TiffWriter(root/'reference_own.tif',(height,width,3),np.uint8,tile=(tile,tile),compression='lzw') as writer:
+        writer.write_tiles(tiles())
 
 
 def preview(path):
     """Small central crop for checking output; full map remains TIFF/SVG."""
-    import tifffile
+    from vc_reader import images
     from PIL import Image
-    image=tifffile.imread(path)
+    image=images.read(path)
     h,w=image.shape[:2];left=max(0,w//2-h//2)
     detail=np.asarray(Image.fromarray(image[:,left:min(left+h,w)]).resize((1000,1000)))
-    tifffile.imwrite(path.with_name(path.stem+'_detail.tif'),detail,
-                     photometric='rgb',compression='lzw',metadata=None)
+    images.write_tiff(path.with_name(path.stem+'_detail.tif'), detail, compression='lzw')
 
 
 def convert_detail_pngs(root):
     """Migrate only known comparison detail crops; verify before removing PNG."""
-    import tifffile
+    from vc_reader import images
     from PIL import Image
     root=Path(root); converted=[]
     paths=[root/'reference_own_detail.png']
@@ -546,12 +548,11 @@ def convert_detail_pngs(root):
         target=path.with_suffix('.tif'); temporary=target.with_suffix('.partial.tif')
         if target.is_symlink() or temporary.exists() or temporary.is_symlink():
             raise ValueError('Unsafe or unfinished detail TIFF target')
-        if target.exists() and not np.array_equal(tifffile.imread(target),pixels):
+        if target.exists() and not np.array_equal(images.read(target),pixels):
             raise ValueError('Existing detail TIFF has different pixels')
-        tifffile.imwrite(temporary,pixels,photometric='rgb',compression='lzw',metadata=None)
-        with tifffile.TiffFile(temporary) as image:
-            if image.pages[0].compression.name!='LZW' or not np.array_equal(image.asarray(),pixels):
-                raise ValueError('Detail TIFF verification failed')
+        images.write_tiff(temporary, pixels, compression='lzw')
+        if not np.array_equal(images.read(temporary),pixels):
+            raise ValueError('Detail TIFF verification failed')
         temporary.replace(target)
         path.unlink()
         converted.append(str(target))
@@ -571,9 +572,10 @@ def metric_report(settings):
     """CPU-only saved-state diagnostics; no rendering or optimization."""
     result={'solutions':[]}
     if settings.get('reference'):
-        import tifffile
-        xyz=np.stack([tifffile.imread(Path(settings['reference'])/(c+'.tif'))[::32,::8] for c in 'xyz'],axis=-1)
-        valid=np.isfinite(xyz).all(-1)&(xyz>=0).all(-1)
+        from vc_reader import tifxyz
+        surface=tifxyz.read(settings['reference'],mask=False)
+        xyz=surface.xyz[::32,::8]
+        valid=surface.valid[::32,::8]
         xyz=xyz*settings.get('xyz_scale',4.)
         control=json.loads(Path(settings['umbilicus']).read_text())['control_points']
         axis=np.array([[p['x'],p['y'],p['z']] for p in control]);axis=axis[np.argsort(axis[:,2])]
@@ -587,9 +589,9 @@ def metric_report(settings):
             ccw_tangential_weight_percent=float(100*positive),direction='ccw' if positive>.5 else 'cw',
             sampled_valid_segments=int(ok.sum()))
     for entry in settings.get('solutions',[]):
-        root=Path(entry['run_root']);cfg=json.loads((root/'summary.json').read_text())['config']
+        root=Path(entry['run_root']);summary=json.loads((root/'summary.json').read_text());cfg=summary['config']
         with np.load(cfg['tensor_cache']) as src:d={k:src[k] for k in src.files}
-        projection=load_metric_projection(settings['projection_cache'],d,cfg)
+        projection=load_metric_projection(settings['projection_cache'],d,cfg,source=_verified_run_source(summary))
         if entry.get('initial_state',False):
             state,widths=uv.fresh_initial_state(d,cfg)
             metrics=reference_winding_metrics(d,state,widths,cfg,projection)
@@ -604,13 +606,13 @@ def metric_report(settings):
 
 def projection_coverage_report(settings):
     """Read-only diagnosis of gray samples, in physical base-voxel Z."""
-    import tifffile
     root=Path(settings['run_root']);cfg=json.loads((root/'summary.json').read_text())['config']
     with np.load(cfg['tensor_cache']) as src:d={k:src[k] for k in src.files}
     with np.load(root/'solution.npz') as src:
         _,_,keep,*_=uv.hard_geometry(d,src['state'],src['widths'],cfg)
-    z=tifffile.imread(Path(settings['reference'])/'z.tif')
-    valid=np.isfinite(z)&(z>0)
+    from vc_reader import tifxyz
+    surface=tifxyz.read(settings['reference'],mask=False)
+    z,valid=surface.xyz[...,2],surface.valid
     zmin=float(z[valid].min()*settings.get('xyz_scale',4.))
     zmax=float(z[valid].max()*settings.get('xyz_scale',4.))
     with np.load(settings['projection_cache']) as src:
@@ -638,6 +640,11 @@ def projection_coverage_report(settings):
     return result
 
 
+def _verified_run_source(summary):
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_signature
+    return verify_fiber_signature(summary['config']['fibers'], summary.get('input', {}).get('signature', {}))
+
+
 def run(settings):
     if settings.get('projection_coverage_only'):return projection_coverage_report(settings)
     if settings.get('metrics_only'):return metric_report(settings)
@@ -647,12 +654,15 @@ def run(settings):
     started=time.monotonic(); maximum=settings.get('max_distance_base',200.)
     surface=Surface(settings['reference'],settings.get('xyz_scale',4.),settings.get('surface_stride',2),
                     settings.get('workers',32),settings.get('candidates',4))
-    first=Path(settings['solutions'][0]['run_root']);cfg=json.loads((first/'summary.json').read_text())['config']
+    first=Path(settings['solutions'][0]['run_root'])
+    first_summary=json.loads((first/'summary.json').read_text())
+    cfg=first_summary['config']
+    fiber_digest,source_version=_verified_run_source(first_summary)
     if not uv.anchored(cfg):raise ValueError('Reference comparison requires shared-anchor geometry')
     keys=('source_id','start','end','family','node_ds','lengths','phase','z')
     with np.load(cfg['tensor_cache']) as src:d={k:src[k] for k in keys}
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
-    signature=dict(fibers=fibers_digest(cfg['fibers']),reference={c:uv.sha256_file(surface.root/(c+'.tif')) for c in 'xyz'},
+    signature=dict(fibers=fiber_digest,fiber_source=source_version,
+                   reference={c:uv.sha256_file(surface.root/(c+'.tif')) for c in 'xyz'},
                    metadata=uv.sha256_file(surface.root/'meta.json'),
                    parameters={k:settings.get(k) for k in ('xyz_scale','surface_stride','sample_spacing_base','max_distance_base','candidates')},
                    version=2)
@@ -671,7 +681,7 @@ def run(settings):
             placed=src['placed_rc'];placed_dist=src['placed_distance']
     else:
         print('reference: sampling original source fiber curves',flush=True)
-        sample=samples(d,cfg,settings.get('sample_spacing_base',200.))
+        sample=samples(d,cfg,settings.get('sample_spacing_base',200.),source_version=source_version)
         print(f'reference: {len(sample["xyz"]):,} curve samples',flush=True)
         rc,distance=surface.project(sample['xyz'])
         ref_q=winding_at(rc[:,1],surface.x,surface.q)
@@ -705,7 +715,10 @@ def run(settings):
     reports=[]
     for entry in settings['solutions']:
         source=Path(entry['run_root']);dest=root/entry['label'].lower();dest.mkdir(exist_ok=True)
-        cfg=json.loads((source/'summary.json').read_text())['config']
+        summary=json.loads((source/'summary.json').read_text())
+        cfg=summary['config']
+        if _verified_run_source(summary) != (fiber_digest,source_version):
+            raise ValueError('Compared layouts do not use the same frozen fiber source')
         if not uv.anchored(cfg):raise ValueError('Reference comparison requires shared-anchor geometry')
         with np.load(cfg['tensor_cache']) as src:
             for key in ('source_id','start','end','family'):

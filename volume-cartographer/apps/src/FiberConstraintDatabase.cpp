@@ -1,7 +1,7 @@
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include <sqlite3.h>
 #include <algorithm>
 #include <chrono>
@@ -198,7 +198,9 @@ nlohmann::json orientFiberConstraintDatabase(
     if((priorUmbilicus || exportNormalCurves) && metaValue("normal_orientation").at("sample_spacing_base")!=sampleSpacing)
         throw std::runtime_error("Prior sweep spacing must match baked orientation");
     const auto original=metaValue("provenance");
-    for(const char* key:{"fibers_store_uuid","normal_manifest","normal_provenance"})
+    if(!original.contains("fiber_source"))
+        throw std::runtime_error("Missing fiber source version; regenerate frozen evidence");
+    for(const char* key:{"fiber_source","normal_manifest","normal_provenance"})
         if(original.at(key)!=provenance.at(key))throw std::runtime_error(std::string("Source mismatch: ")+key);
 
     struct Endpoint { size_t slot; double arc; cv::Vec3d point; };
@@ -348,7 +350,7 @@ nlohmann::json orientFiberConstraintDatabase(
                 {"columns",{"arc","nx","ny","nz","valid"}},
                 {"index",curveIndex},{"statistics",stats},{"provenance",provenance},
                 {"normal_convention","fiber-local baked gauge; apply stage1 normal_sign"}};
-            vc::core::util::ephemeralWriteString(partial/"index.json",doc.dump()+"\n");
+            vcr::zarr::atomicWrite(partial/"index.json",doc.dump()+"\n");
             std::filesystem::rename(partial,output);return stats;
         }
         std::vector<double> agreement(lines.size());
@@ -362,7 +364,7 @@ nlohmann::json orientFiberConstraintDatabase(
             {"source_ids",sourceIds},{"agreement",agreement},{"valid_arc_weight",priorWeight},
             {"provenance",provenance},{"statistics",stats}};
         std::filesystem::create_directories(output.parent_path());
-        vc::core::util::ephemeralWriteString(output,document.dump()+"\n");
+        vcr::zarr::atomicWrite(output,document.dump()+"\n");
         return stats;
     }
     std::filesystem::create_directories(output.parent_path());

@@ -1,6 +1,9 @@
 #include "TestSupport.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/SurfaceGrid.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/objects/UmbilicusFile.hpp"
@@ -14,11 +17,33 @@ using namespace vc::objects;
 int main() try {
     TemporaryDirectory directory;OpenOptions options;options.author="transform-test";
     auto db=ObjectStore::create(directory.path/"transforms.vcobj",options);
+    {
+        auto separate=ObjectStore::create(directory.path/"choice-race.vcobj",options);
+        {auto w=separate.write();separate.registerVolumeTransform(w,"a","b",VolumeAffine{},"route");w.commit();}
+        TransactionRequest first,second;
+        {auto r=separate.read();LocalStoreReader reader(separate,r);const auto status=reader.status();
+            for(auto* request:{&first,&second}) {
+                request->requestUuid=util::newUuid();request->storeUuid=status.storeUuid;
+                request->generation=status.generation;request->author="transform-test";
+                const auto path=reader.volumeTransforms().resolve("a","b").resolved().path;
+                chooseVolumeTransformRequest(reader,*request,"a","b",path);
+            }
+        }
+        separate.submit(first);
+        mustFail([&]{separate.submit(second);});
+        auto r=separate.read();require(separate.volumeTransforms(r).choices.size()==1,
+            "concurrent route-choice creation preserves one selection");
+    }
     std::string fiber,track,surface,points,umbilicus,registration;
     VolumeAffine matrix;matrix(0,0)=2;matrix(0,1)=.5;matrix(0,3)=10;matrix(2,3)=20;
     {
         auto txn=db.write();
         registration=db.registerVolumeTransform(txn,"a","b",matrix,"scan registration");
+        VolumeAffine translated;
+        translated(0,3)=-3; translated(2,3)=-3;
+        db.registerVolumeTransform(txn,"a","negative",translated,"negative target coordinates");
+        translated(1,3)=-3;
+        db.registerVolumeTransform(txn,"a","sentinel",translated,"all-negative target coordinates");
         bool pending=false;
         try { (void)db.volumeTransforms(txn); } catch(const std::runtime_error&) { pending=true; }
         require(pending,"new registrations must have a published revision before resolving views");
@@ -41,6 +66,17 @@ int main() try {
         const auto ordered=db.selectObjects(txn,select);
         require(ordered.size()==1&&ordered.front().volumeLength==db.geometryLengthInVolume(txn,fiber,"b"),
                 "registered rows carry the target length they were ordered by");
+        auto upper=fiber;
+        for(auto& c:upper) if(c>='a'&&c<='f')c=char(c-'a'+'A');
+        select.afterUuid=upper;select.afterLength=ordered.front().volumeLength;
+        require(db.selectObjects(txn,select).empty(),"length cursor accepts uppercase UUID");
+        select.orderBy="uuid";select.afterLength.reset();
+        require(db.selectObjects(txn,select).empty(),"volume cursor accepts uppercase UUID");
+        // A reader measures the same lengths from the array bytes it reads.
+        const LocalStoreReader reader(db,txn);
+        require(reader.geometryLengthInVolume(fiber,"b")==db.geometryLengthInVolume(txn,fiber,"b")&&
+                reader.geometryLengthInVolume(track,"b",.5)==db.geometryLengthInVolume(txn,track,"b",.5),"reader lengths");
+        mustFail([&]{(void)reader.geometryLengthInVolume(surface,"b");});
         SurfaceProximityQuery query;query.volume="b";query.point={12.5,1,21.5};query.tolerance=.51;
         const auto hits=db.nearestSurfaces(txn,query);require(hits.size()==1,"registered nearest surface");
         require(std::abs(hits.front().distance-.5)<1e-10,"target-space Euclidean distance");
@@ -71,7 +107,7 @@ int main() try {
         surfaces.targetScale=.5;cut.origin={6.5,.5,10.5};cut.localBounds={-.25,-.5,-.5,.25,.5,.5};
         clippedEnds(.5);
     }
-    std::string objectRevision,geometryRevision;
+    std::optional<int64_t> objectVersion;std::string geometryRevision;
     std::vector<GeometryArrayEdit> changes;
     {
         GeometrySnapshot snapshot(db);const auto view=snapshot.track(track).viewTransformedAt("b");
@@ -118,13 +154,28 @@ int main() try {
         require(surfaceChanges.size()==1,"surface inverse edits supplied by store");
         const auto changedPoint=vc::objects::xyzFromBytes<float>(surfaceChanges.front().bytes).front();
         require(changedPoint==std::array<float,3>{1,0,1},"surface inverse uses registration");
-        changes=surfaceChanges;objectRevision=surfaceView.objectRevision();geometryRevision=surfaceView.revision().uuid;
+        const auto negative=snapshot.surface(surface).viewTransformedAt("negative");
+        require(negative.readTile(0,0,1,1).validity[0],"negative target coordinate remains valid");
+        const auto negativeEdit=negative.surfaceEdits(0,0,1,1,{{-1,0,-1}});
+        require(negativeEdit.size()==1 && vc::objects::xyzFromBytes<float>(negativeEdit[0].bytes).front()==
+            std::array<float,3>{2,0,2},"target components equal to -1 do not delete a vertex");
+        const auto deleted=negative.surfaceEdits(0,0,1,1,{{-1,-1,-1}});
+        require(deleted.size()==1 && vc::objects::xyzFromBytes<float>(deleted[0].bytes).front()==
+            std::array<float,3>{-1,-1,-1},"full missing sentinel deletes a vertex");
+        vc::geometry::Surface explicitValid;
+        explicitValid.rows=explicitValid.columns=1;
+        explicitValid.points={{-1,-1,-1}};
+        explicitValid.validity={255};
+        const auto sentinel=snapshot.surface(surface).viewTransformedAt("sentinel");
+        require(sentinel.canonicalSurface(explicitValid).points.front()==std::array<float,3>{2,2,2},
+            "an explicitly valid full-surface point may coincide with the display sentinel");
+        changes=surfaceChanges;objectVersion=surfaceView.version();geometryRevision=surfaceView.revision().uuid;
         snapshot.close();
         bool closed=false;try{view.points("points",0,1);}catch(const std::exception&){closed=true;}require(closed,"snapshot lifetime retained");
     }
     {
         GeometrySnapshot snapshot(db);const auto view=snapshot.surface(surface).viewTransformedAt("b");
-        auto txn=db.write({{surface,objectRevision}});view.validateForWrite(db,txn);
+        auto txn=db.writeNumbered({{surface,objectVersion}});view.validateForWrite(db,txn);
         db.editGeometry(txn,surface,changes,geometryRevision);txn.commit();
     }
     GeometrySnapshot pinned(db);const auto stale=pinned.surface(surface).viewTransformedAt("b");
@@ -148,10 +199,10 @@ int main() try {
         {auto read=db.read();for(const auto& c:db.volumeTransforms(read).graph.resolve("a","b").candidates)paths.push_back(c.path);}
         require(paths.size()==2,"two candidate routes");
         const auto choice=vc::objects::util::newUuid();
-        {auto txn=db.write({{choice,std::nullopt}});require(db.chooseVolumeTransform(txn,"a","b",paths[1],choice)==choice,"choice takes the given uuid");txn.commit();}
+        {auto txn=db.writeNumbered({{choice,std::nullopt}});require(db.chooseVolumeTransform(txn,"a","b",paths[1],choice)==choice,"choice takes the given uuid");txn.commit();}
         {auto read=db.read();require(db.volumeTransforms(read).resolve("a","b").status==vcr::catalog::TransformStatus::Resolved,"a choice resolves the pair");}
-        {auto read=db.read();const auto head=db.currentObjectRevision(read,choice)->uuid;
-         auto txn=db.write({{choice,head}});require(db.chooseVolumeTransform(txn,"a","b",paths[0])==choice,"choosing again updates the choice");txn.commit();}
+        {auto read=db.read();const auto head=db.currentVersion(read,choice);
+         auto txn=db.writeNumbered({{choice,head}});require(db.chooseVolumeTransform(txn,"a","b",paths[0])==choice,"choosing again updates the choice");txn.commit();}
         auto read=db.read();
         require(db.volumeTransforms(read).resolve("a","b").resolved().path==paths[0],"the latest choice wins");
         // One choice settles both directions: b -> a follows the chosen route backwards.
@@ -180,7 +231,7 @@ int main() try {
         require(context.resolve("a","b").resolved().path!=other,"the forward choice is unchanged");
         const auto choice=volumeTransformChoice(db,read,"b","a");
         require(choice.has_value(),"the explicit reverse choice is stored");
-        {auto txn=db.write({{choice->uuid,db.currentObjectRevision(read,choice->uuid)->uuid}});db.retireObject(txn,choice->uuid);txn.commit();}
+        {auto txn=db.writeNumbered({{choice->uuid,db.currentVersion(read,choice->uuid)}});db.retireObject(txn,choice->uuid);txn.commit();}
         {auto after=db.read();require(db.volumeTransforms(after).resolve("b","a").resolved().path==implied,"retiring it restores the implied choice");}
         // A b -> a registration equal to the chosen route's inverse folds the
         // implied route into it; the related listing names the listed route.
@@ -199,33 +250,38 @@ int main() try {
         ObjectRecord first;first.kind="umbilicus";first.name="first";first.uuid=vc::objects::util::newUuid();
         first.meta=R"({"coordinates":{"volume_uuid":"c","scale_factor":2}})";
         vc::geometry::Umbilicus u;u.points={{2,4,6},{4,6,8}};
-        {auto txn=db.write({{first.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",first,u);txn.commit();}
+        {auto txn=db.writeNumbered({{first.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",first,u);txn.commit();}
         {
-            auto read=db.read();const auto found=volumeUmbilicus(db,read,{"c"});
+            auto read=db.read();const auto found=volumeUmbilicus(LocalStoreReader(db,read),{"c"});
             require(found&&found->uuid==first.uuid&&found->points.front()==std::array<double,3>{1,2,3},
                     "the volume's umbilicus in its voxels");
-            require(!volumeUmbilicus(db,read,{"d"}),"a volume without one has none");
+            require(found->version.version==db.currentVersion(read,first.uuid)&&found->version.objectUuid==first.uuid&&
+                    found->version.generation==db.status(read).generation,"the umbilicus carries the version read");
+            require(!volumeUmbilicus(LocalStoreReader(db,read),{"d"}),"a volume without one has none");
         }
         auto second=first;second.uuid=vc::objects::util::newUuid();second.name="second";
-        RevisionSelection pins;{auto read=db.read();pins=volumeUmbilicusRevisions(db,read,"c");}
-        require(pins.size()==1&&pins.contains(first.uuid),"the replacement pins the umbilicus it replaces");
-        pins[second.uuid]=std::nullopt;
+        TransactionContext pins;
+        {
+            auto read=db.read();const auto replaced=volumeUmbilici(LocalStoreReader(db,read),"c");
+            require(replaced.size()==1&&replaced[0].uuid==first.uuid,"the replacement expects the umbilicus it replaces");
+            pins.expectedObjects={{first.uuid,db.currentObjectRevision(read,first.uuid)->reference()},{second.uuid,std::nullopt}};
+        }
         {auto txn=db.write(pins);setVolumeUmbilicus(db,txn,"c",second,u);txn.commit();}
         {
             auto read=db.read();
-            require(volumeUmbilicus(db,read,{"c"})->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
+            require(volumeUmbilicus(LocalStoreReader(db,read),{"c"})->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
                     "importing replaces the volume's umbilicus");
         }
         auto elsewhere=first;elsewhere.uuid=vc::objects::util::newUuid();
         elsewhere.meta=R"({"coordinates":{"volume_uuid":"d","scale_factor":1}})";
         bool refused=false;
-        try{auto txn=db.write({{elsewhere.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",elsewhere,u);}
+        try{auto txn=db.writeNumbered({{elsewhere.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",elsewhere,u);}
         catch(const std::invalid_argument&){refused=true;}
         require(refused,"an umbilicus bound elsewhere is not made a volume's umbilicus");
         auto extra=first;extra.uuid=vc::objects::util::newUuid();
         {auto txn=db.write();db.upsertObject(txn,extra);db.putGeometry(txn,extra.uuid,vc::geometry::encode(u));txn.commit();}
         bool several=false;
-        try{auto read=db.read();(void)volumeUmbilicus(db,read,{"c"});}catch(const std::runtime_error&){several=true;}
+        try{auto read=db.read();(void)volumeUmbilicus(LocalStoreReader(db,read),{"c"});}catch(const std::runtime_error&){several=true;}
         require(several,"several umbilici for one volume are refused");
     }
     {
@@ -271,12 +327,13 @@ int main() try {
         {auto r=db.read();const auto area=db.objectByUuid(r,uuid)->surface->area;
          require(std::abs(area-complete)<=1e-12*complete,"an edit updates the area by its cells' change");}
     }
-    {
+    for(const auto policy:{HistoryMode::On,HistoryMode::Off}) {
         // Importing an umbilicus file: the store reads it, decides its frame
         // against the volume, and replaces the volume's umbilicus.
-        const auto storePath=directory.path/"umbilicus-import.vcobj";
-        {auto created=ObjectStore::create(storePath,options);}
-        ObjectStoreSession session;const auto attachment=session.attach(storePath,options);
+        const auto storePath=directory.path/(policy==HistoryMode::On ? "umbilicus-import.vcobj" : "umbilicus-direct.vcobj");
+        auto importOptions=options; importOptions.history=policy;
+        {auto created=ObjectStore::create(storePath,importOptions);}
+        ObjectStoreSession session;const auto attachment=session.attach(storePath,importOptions);
         const auto write=[&](const std::string& name,const std::string& text){
             const auto path=directory.path/name;std::ofstream(path)<<text;return path;};
         const auto stamped=readUmbilicusFile(write("stamped.json",
@@ -287,6 +344,8 @@ int main() try {
         require(!binding.refusal&&!binding.confirm&&binding.storedUnitsPerVoxel==2.0,"a stamped grid binds as stated");
         importVolumeUmbilicus(session,attachment,"v",stamped,*binding.storedUnitsPerVoxel,"stamped",{{"tool","test"}});
         auto found=volumeUmbilicus(session,attachment,{"v"});
+        require(found && found->version.version > 0 && !found->version.generation.empty(),
+                "umbilici carry ordinary numbered versions with or without retained history");
         require(found&&found->name=="stamped"&&found->points.front()==std::array<double,3>{10,5,0},"imported in the volume's voxels");
         require(volumeUmbilicus(session,attachment,{"v",0.5})->points.front()==std::array<double,3>{5,2.5,0},
                 "an umbilicus is read at a scale of the volume's voxels");
@@ -301,13 +360,15 @@ int main() try {
         require(umbilicusBinding(stamped,{{150,150,600},std::nullopt},std::nullopt).refusal.has_value(),
                 "a stamped grid that is no rescale of the volume is refused");
     }
-    {
+    for(const auto policy:{HistoryMode::On,HistoryMode::Off}) {
         // A volume's point collections: written in its voxels, revised keeping
         // point identity, retired; read through views (here a registration).
-        const auto storePath=directory.path/"collections.vcobj";
-        {auto created=ObjectStore::create(storePath,options);
-         auto txn=created.write();(void)created.registerVolumeTransform(txn,"w","w2",VolumeAffine::scale(2),"twice");txn.commit();}
-        ObjectStoreSession session;const auto attachment=session.attach(storePath,options);
+        const auto storePath=directory.path/(policy==HistoryMode::On ? "collections.vcobj" : "collections-direct.vcobj");
+        auto collectionOptions=options; collectionOptions.history=policy;
+        std::string collectionRegistration;
+        {auto created=ObjectStore::create(storePath,collectionOptions);
+         auto txn=created.write();collectionRegistration=created.registerVolumeTransform(txn,"w","w2",VolumeAffine::scale(2),"twice");txn.commit();}
+        ObjectStoreSession session;const auto attachment=session.attach(storePath,collectionOptions);
         AttachedCollection collection;collection.uuid=vc::objects::util::newUuid();collection.name="seeds";
         collection.points.ids={4,9};collection.points.points={{1,2,3},{4,5,6}};
         collection.annotations=nlohmann::json::array({{{"wind_a",1}},{{"wind_a",2}}});
@@ -328,10 +389,59 @@ int main() try {
         // Attached data (a surface's corrections) is no volume collection.
         ObjectRecord surface;surface.kind="surface";surface.uuid=vc::objects::util::newUuid();
         surface.meta=R"({"coordinates":{"volume_uuid":"w","scale_factor":1}})";
-        session.act(attachment,{{surface.uuid,std::nullopt}},[&](auto& db,auto& txn){db.upsertObject(txn,surface);});
+        auto create=session.newRequest(attachment);create.expectedObjects[surface.uuid]=std::nullopt;
+        create.operations.push_back(CreateObjectOp{objectRecordJson(surface)});session.submit(attachment,create);
         AttachedCollection corrections=collection;corrections.uuid=vc::objects::util::newUuid();
-        replaceAttachedCollections(session,attachment,surface.uuid,"corrections",{corrections},volumeCoordinates("w",1));
+        auto correctionSnapshot=attachedCollections(session,attachment,surface.uuid,"corrections");
+        replaceAttachedCollections(session,attachment,correctionSnapshot,{corrections},volumeCoordinates("w",1));
+        auto uppercase=surface.uuid;std::transform(uppercase.begin(),uppercase.end(),uppercase.begin(),[](unsigned char c){return std::toupper(c);});
+        require(attachedCollections(session,attachment,uppercase,"corrections").collections.front().uuid==corrections.uuid,
+                "attachment readers use canonical opposite endpoints");
+        auto staleCorrections = correctionSnapshot;
+        session.editCurrent(attachment, {corrections.uuid}, [&](const StoreReader& reader, const auto&) {
+            auto record = reader.currentObject(corrections.uuid)->record; record.name = "concurrent edit";
+            std::vector<TransactionOperation> edits{UpdateObjectOp{objectRecordJson(record)}};
+            for (const auto& edge : attachments(reader, surface.uuid, "corrections")) edits.push_back(RetainRelationshipOp{edge.uuid});
+            return edits;
+        });
+        mustFail([&]{replaceAttachedCollections(session,attachment,staleCorrections,{corrections},volumeCoordinates("w",1));});
+        require(staleCorrections.owner == correctionSnapshot.owner, "a rejected edit preserves the loaded correction baseline");
+        correctionSnapshot=attachedCollections(session,attachment,surface.uuid,"corrections");
+        staleCorrections=correctionSnapshot;
+        auto secondCorrection=corrections;secondCorrection.uuid=vc::objects::util::newUuid();
+        replaceAttachedCollections(session,attachment,correctionSnapshot,{correctionSnapshot.collections.front(),secondCorrection},volumeCoordinates("w",1));
+        mustFail([&]{replaceAttachedCollections(session,attachment,staleCorrections,{},volumeCoordinates("w",1));});
+        require(attachedCollections(session,attachment,surface.uuid,"corrections").collections.size()==2,
+                "stale replacement cannot retire an unseen attachment");
+        auto mappedCorrections=attachedCollections(session,attachment,surface.uuid,"corrections",ViewFrame{"w2",1});
+        session.editCurrent(attachment,{collectionRegistration},[&](const StoreReader& reader,const auto&){
+            return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(volumeTransformRecord(
+                reader.currentObject(collectionRegistration)->record,"w","w2",VolumeAffine::scale(3),"changed"))}};
+        });
+        mustFail([&]{replaceAttachedCollections(session,attachment,mappedCorrections,mappedCorrections.collections,volumeCoordinates("w2",1));});
+        session.editCurrent(attachment,{collectionRegistration},[&](const StoreReader& reader,const auto&){
+            return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(volumeTransformRecord(
+                reader.currentObject(collectionRegistration)->record,"w","w2",VolumeAffine::scale(2),"twice"))}};
+        });
+        correctionSnapshot=attachedCollections(session,attachment,uppercase,"corrections");
+        replaceAttachedCollections(session,attachment,correctionSnapshot,{},volumeCoordinates("w",1));
+        session.readStore(attachment,[&](const StoreReader& reader,const auto&){
+            require(!reader.currentObject(surface.uuid)->record.retired,"removing attachments never retires their owner");
+        });
         require(volumeCollections(session,attachment,{"w"}).size()==1,"attached collections are not the volume's");
+        // Changing registration must not reinterpret points loaded before it,
+        // even though the collection's complete object reference stays unchanged.
+        auto loaded=volumeCollections(session,attachment,{"w2"}).front();
+        loaded.points.points[0][0]+=1;
+        session.editCurrent(attachment,{collectionRegistration},[&](const StoreReader& reader,const auto&){
+            return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(volumeTransformRecord(
+                reader.currentObject(collectionRegistration)->record,"w","w2",VolumeAffine::scale(3),"changed"))}};
+        });
+        mustFail([&]{writeVolumeCollections(session,attachment,{"w2"},{loaded},{});});
+        auto reloaded=volumeCollections(session,attachment,{"w2"}).front();
+        require(reloaded.reference==loaded.reference,"registration change alone preserves collection identity");
+        reloaded.points.points[0][0]+=1;
+        writeVolumeCollections(session,attachment,{"w2"},{reloaded},{});
         writeVolumeCollections(session,attachment,{"w"},{},{collection.uuid});
         require(volumeCollections(session,attachment,{"w"}).empty(),"a removed collection is retired");
         // At a working level: written and read at a scale of the volume's voxels.
@@ -342,6 +452,69 @@ int main() try {
                 "a collection written at a scale is bound at that scale");
         const auto again=volumeCollections(session,attachment,{"w",0.25});
         require(again.size()==1&&again[0].points.points[0]==std::array<double,3>{7,8,9},"and reads back at it");
+    }
+    // Several numbered object versions can share one geometry payload. Each
+    // historical read must use the coordinate metadata of the selected version.
+    {
+        auto history = ObjectStore::create(directory.path / "surface-history.vcobj", options);
+        std::string uuid;
+        vc::geometry::Surface grid{1, 2, {1, 1}, {{2, 4, 6}, {8, 10, 12}}};
+        {
+            auto txn = history.write();
+            ObjectRecord record; record.kind = "surface";
+            record.meta = R"({"coordinates":{"volume_uuid":"a","scale_factor":1}})";
+            uuid = history.upsertObject(txn, record);
+            history.putGeometry(txn, uuid, vc::geometry::encode(grid));
+            txn.commit();
+        }
+        {
+            auto txn = history.write();
+            history.setMeta(txn, uuid, "coordinates", R"({"volume_uuid":"c","scale_factor":2})");
+            txn.commit();
+        }
+        auto check = [&] {
+            auto txn = history.read();
+            LocalStoreReader reader(history, txn);
+            const auto first = readSurfaceGrid(reader, uuid, "a", 1, 1);
+            const auto second = readSurfaceGrid(reader, uuid, "c", 1, 2);
+            require(first.points == std::vector<float>{2, 4, 6, 8, 10, 12} &&
+                    second.points == std::vector<float>{1, 2, 3, 4, 5, 6}, "historical coordinate metadata");
+            require(first.scale == std::array<double, 2>{1, 1} && second.scale == std::array<double, 2>{2, 2},
+                    "historical grid scale");
+            require(first.geometryRevision == second.geometryRevision && first.reference().version == 1 && second.reference().version == 2,
+                    "metadata-only versions share geometry");
+            require(nlohmann::json::parse(first.record.meta).at("coordinates").at("volume_uuid") == "a",
+                    "record and geometry use the same numbered version");
+            const auto scaled = readSurfaceGrid(reader, uuid, "a", .5, 1);
+            require(scaled.points == second.points, "historical reads respect target scale");
+            const auto selected = reader.objectsAtVersions({reader.currentObject(uuid)->reference(1)}).front();
+            const auto stored = readSurfaceGrid(reader, *selected);
+            require(stored.points == first.points && stored.record.meta == first.record.meta,
+                    "stored-coordinate adapters retain the selected metadata too");
+        };
+        check();
+        {
+            auto txn = history.write();
+            grid.points[0][0] = 20;
+            history.putGeometry(txn, uuid, vc::geometry::encode(grid), history.currentGeometry(txn, uuid)->uuid);
+            txn.commit();
+        }
+        check(); // The historical payload is no longer the current geometry.
+    }
+    {
+        auto masked = ObjectStore::create(directory.path / "masked-grid.vcobj", options);
+        auto txn = masked.write(); ObjectRecord record; record.kind = "surface";
+        const auto uuid = masked.upsertObject(txn, record);
+        vc::geometry::Surface shape{1, 2, {1, 1}, {{2, 4, 6}, {8, 10, 12}}};
+        shape.validity = {0, 1};
+        masked.putGeometry(txn, uuid, vc::geometry::encode(shape)); txn.commit();
+        auto read = masked.read(); LocalStoreReader reader(masked, read);
+        const auto selected = *reader.currentObject(uuid);
+        const auto visible = readSurfaceGrid(reader, selected);
+        const auto editable = readSurfaceGrid(reader, selected, nullptr, false);
+        require(visible.points == std::vector<float>{-1,-1,-1,8,10,12} &&
+                editable.points == std::vector<float>{2,4,6,8,10,12} && visible.valid == editable.valid,
+                "shared surface materialization masks for display but preserves coordinates for editing");
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

@@ -4,7 +4,20 @@
 
 namespace vc::objects::detail {
 extern const char* kObjectCols;
-void createLifecycleSchema(sqlite3*);
+// Stage one caller-supplied ID for the ordinary native insertion path. The
+// savepoint rolls back allocator/record changes on failure; finish preserves
+// monotonic allocation and cannot reopen an exhausted range.
+class ExplicitRecordId {
+public:
+    ExplicitRecordId(sqlite3*, const char* keySpace, const std::string& uuid, int64_t id);
+    void finish();
+private:
+    sqlite3* db_;
+    std::string keySpace_;
+    int64_t id_;
+    std::optional<int64_t> next_;
+    Savepoint save_;
+};
 void readLifecycle(sqlite3*, int64_t id, ObjectRecord&);
 void writeLifecycle(sqlite3*, int64_t id, const ObjectRecord&);
 std::string activeObjectSql(const std::string& id);
@@ -13,25 +26,15 @@ std::pair<std::string, std::string> lifecycleBinding(sqlite3*, const EdgeRecord&
 bool lifecycleBindingMatches(sqlite3*, const EdgeRecord&);
 void bindLifecycle(sqlite3*, const EdgeRecord&, const std::string& aEpoch, const std::string& bEpoch);
 // Shared selection semantics for records and compact graph topology.
-// Internal frame filters of a volume selection, in stored units.
-struct FrameCursor {
-    double tieLow = 0, tieHigh = 0; // stored range of the cursor's volume length
-    double stored = 0;              // the cursor object's stored length
-    std::string uuid;
-};
-struct FrameFilter {
-    std::optional<FrameCursor> cursor;
-    std::optional<std::string> unboundVolume; // objects not bound to this volume
-};
 std::unique_ptr<Statement> objectSelectionQuery(sqlite3* db, const ObjectSelection& selection,
-                                               const std::string& columns, const FrameFilter* frame = nullptr);
+                                               const std::string& columns);
 
 using ObjectFields = std::optional<std::set<std::string>>;
 bool wants(const ObjectFields& fields, const std::string& name);
 std::string projectedObjectColumns(const ObjectFields& fields);
 
 void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
-                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind,
+                   const std::array<unsigned char, 16>& uuid, int64_t commitSequence, const char* changeKind,
                    const std::string& deletedKind = {});
 
 void readCommon(RecordCommon& rec, const Statement& s, int uuidCol, int kindCol, int genCol);
@@ -47,18 +50,28 @@ std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const Obj
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 
 void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
+void insertObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
+ObjectRecord prepareObjectRecord(const ObjectRecord&);
+bool preciseObjectTimestamp(std::string_view kind);
+void normalizeObjectCoordinates(ObjectRecord&,bool addDefaultCoordinates,sqlite3* existingStore=nullptr);
+void normalizeObjectCoordinates(nlohmann::json& meta,const std::string& kind,bool addDefaultCoordinates);
+void insertObjectRow(sqlite3*,const ObjectRecord&,int64_t id,int64_t commitSequence,
+    const std::string& author,const std::string& host,const std::string& time,bool preserveRecord=false,
+    const std::string* geometryManifest=nullptr);
 
 void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags);
+void insertTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags);
 
 void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec);
 
 std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
-                             bool preserveRecord = false, const char* importOperation = "import");
+                             bool preserveRecord = false, const char* importOperation = "import",
+                             bool restoringExtensions = false);
 
 std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 
-// Shared content-mutation stamp for setMeta/removeMeta: bumps
-// generation, restamps changed_*, resets approval, journals.
+// Shared content-mutation stamp: advances the ordinary record version once per transaction,
+// restamps changed_*, resets approval and journals.
 void stampContentChange(sqlite3* db, const std::string& author, const std::string& host, const char* table,
                         int64_t id, const std::array<unsigned char, 16>& uuid, const char* changeKind);
 

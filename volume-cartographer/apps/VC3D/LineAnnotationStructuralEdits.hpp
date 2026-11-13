@@ -58,7 +58,7 @@ struct MergePlan {
     [[nodiscard]] int farRemap(int index) const;
 };
 
-// Plans the merge of `far` onto `clicked` at the given stored control-point
+// Plans the merge of `farFiber` onto `clicked` at the given stored control-point
 // indices (both must be endpoints). Refuses, with the user-facing reason in
 // `*error`, when: an index is not an endpoint; the fibers are linked
 // anywhere other than exactly between the two endpoints; that endpoint link
@@ -70,7 +70,7 @@ struct MergePlan {
 [[nodiscard]] std::optional<MergePlan> planFiberMerge(
     const StoredFiber& clicked,
     int clickedIndex,
-    const StoredFiber& far,
+    const StoredFiber& farFiber,
     int candidateIndex,
     FiberOptimizationMode mode,
     const NewFiberIdentity& identity,

@@ -162,10 +162,10 @@ QString metricTooltip(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
                       bool showMetrics)
 {
     if (!showMetrics) {
-        return QObject::tr("Enable Calc metrics to sample Lasagna normal alignment errors.");
+        return QObject::tr("Enable Calc metrics to sample alignment errors using the annotation normal source.");
     }
     if (metric.pending) {
-        return QObject::tr("Sampling Lasagna normals.");
+        return QObject::tr("Sampling annotation normals.");
     }
     if (!metric.error.empty()) {
         return QString::fromStdString(metric.error);
@@ -372,7 +372,7 @@ void CFiberWidget::setupUi()
     _calcMetricsCheckBox = new QCheckBox(tr("Calc metrics"), mainWidget);
     _calcMetricsCheckBox->setObjectName(QStringLiteral("fiberCalcMetricsCheckBox"));
     _calcMetricsCheckBox->setToolTip(
-        tr("Sample Lasagna normal alignment errors for the listed fibers."));
+        tr("Sample normal alignment errors for the listed fibers using the annotation normal source."));
     layout->addWidget(_calcMetricsCheckBox);
     connect(_calcMetricsCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
         refreshMetricDisplays();
@@ -546,6 +546,10 @@ void CFiberWidget::setupUi()
             this, &CFiberWidget::onRecalculateHvScoreClicked);
 
     auto* buttonLayout = new QHBoxLayout();
+    auto* generate = new QPushButton(tr("Generate automated fibers…"), mainWidget);
+    generate->setObjectName("fiberCollectionCreate");
+    buttonLayout->addWidget(generate);
+    connect(generate, &QPushButton::clicked, this, &CFiberWidget::generateFibersRequested);
     _importButton = new QPushButton(tr("Import"), mainWidget);
     _importButton->setObjectName(QStringLiteral("fiberImportButton"));
     buttonLayout->addWidget(_importButton);
@@ -1293,6 +1297,7 @@ void CFiberWidget::onSelectionChanged()
         emit fiberDetailsRequested(fiber.id);
     _deleteButton->setEnabled(!selected.empty());
     updateClassificationUi();
+    emit fiberSelectionChanged(_selectedFiberId);
 }
 
 void CFiberWidget::onDoubleClicked(const QModelIndex& index)

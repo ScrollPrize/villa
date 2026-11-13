@@ -1,4 +1,5 @@
 // Stored fiber adapter for the shared line-to-surface linker.
+#include "linking/Detectors.hpp"
 #include "linking/LineSurface.hpp"
 #include "linking/StoredGeometry.hpp"
 #include <algorithm>
@@ -15,6 +16,7 @@ std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
         detail::LineData fiber;
         fiber.uuid = object.uuid;
         fiber.object = object;
+        fiber.sourceScale = scale;
         auto points = [&](const char* name, auto& output) {
             const auto xyz = geometry.values<double>(name);
             for (size_t i = 0; i < xyz.size(); i += 3) {
@@ -70,23 +72,85 @@ std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
     }
 }
 
-} // namespace
 
-DetectorReport linkFibersToSurfaces(objects::ObjectStore& db, const std::filesystem::path& ctVolume,
-    const FiberSurfaceParams& params, const std::atomic_bool* cancel)
+// Select the fibers (and, for an incremental run, their partners) and run
+// `run(count, loader, incremental)` with their loader (strip caching when
+// configured).
+template <class Run> auto withFibers(detail::StoredGeometry& inputs, const FiberSurfaceParams& params, Run&& run)
 {
     detail::validateLineSurfaceParams(params, params.fiberScale);
-    detail::StoredGeometry inputs(db);
-    const auto fibers = inputs.select("fiber", params.fiberUuids);
-    auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
-        auto fiber = loadFiber(inputs, fibers[index], params.fiberScale, report);
+    const auto selected = inputs.select("fiber", params.fiberUuids);
+    // Fibers and surfaces are checked together before any work, so one
+    // refusal names every object of the run without a frame.
+    auto frames = detail::resolveCoordinateScales(selected, params, params.fiberScale);
+    detail::appendCoordinateScales(frames,
+        detail::resolveCoordinateScales(inputs.select("surface", params.surfaceUuids), params, params.surfaceScale));
+    frames.check(params);
+    const auto& scales = frames.scales;
+    std::optional<detail::LineIncremental> incremental;
+    auto fibers = selected;
+    if (params.newUuids) {
+        // New fibers load the selected surfaces within contact proximity of
+        // their stored bounds; new surfaces, the fibers within it of theirs.
+        const auto surfaces = inputs.select("surface", params.surfaceUuids);
+        incremental.emplace();
+        incremental->fresh = *detail::newAmong(params.newUuids, {&selected, &surfaces}, kFiberSurfaceDetector);
+        std::set<std::string> allSurfaces, allFibers, wantedSurfaces, wantedFibers;
+        for (const auto& object : surfaces) allSurfaces.insert(object.uuid);
+        for (const auto& object : selected) allFibers.insert(object.uuid);
+        auto near = [&](const objects::ObjectRecord& object, double scale, const std::string& kind,
+                        double otherScale, const std::set<std::string>& among, std::set<std::string>& into) {
+            const auto box = inputs.workingBounds(object, params, scale);
+            if (!box) { into.insert(among.begin(), among.end()); return; }  // no stored bounds: all
+            for (const auto& uuid : inputs.objectsNear(kind, *box, params.proximity, params, otherScale))
+                if (among.contains(uuid)) into.insert(uuid);
+        };
+        for (const auto& object : selected)
+            if (incremental->fresh.contains(object.uuid)) {
+                wantedFibers.insert(object.uuid);
+                near(object, params.fiberScale, "surface", params.surfaceScale, allSurfaces, wantedSurfaces);
+            }
+        for (const auto& object : surfaces)
+            if (incremental->fresh.contains(object.uuid)) {
+                wantedSurfaces.insert(object.uuid);
+                near(object, params.surfaceScale, "fiber", params.fiberScale, allFibers, wantedFibers);
+            }
+        for (const auto& object : surfaces) {
+            incremental->selected.push_back(object.uuid);
+            if (wantedSurfaces.contains(object.uuid)) incremental->surfaces.push_back(object);
+        }
+        for (const auto& object : selected) incremental->selected.push_back(object.uuid);
+        std::erase_if(fibers, [&](const objects::ObjectRecord& object) { return !wantedFibers.contains(object.uuid); });
+        for (const auto& object : fibers) incremental->lines.push_back(object.uuid);
+    }
+    const detail::LineLoader load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
+        auto fiber = loadFiber(inputs, fibers[index], scales.at(fibers[index].uuid), report);
         if (fiber && !params.cacheDirectory.empty()) {
             fiber->stripCacheFile = params.cacheDirectory / (fiber->uuid + ".cbor");
             fiber->rebuildStrip = params.rebuildStrips;
         }
         return fiber;
     };
-    return detail::linkLinesToSurfaces(db, inputs, fibers.size(), load, ctVolume,
-        params, params.fiberScale, kFiberSurfaceDetector, 3, cancel);
+    return run(fibers.size(), load, incremental ? &*incremental : nullptr);
+}
+} // namespace
+
+detail::Detection detail::detectFibersToSurfaces(StoredGeometry& inputs, const std::filesystem::path& ctVolume,
+    const FiberSurfaceParams& params, const std::atomic_bool* cancel)
+{
+    return withFibers(inputs, params, [&](size_t count, const LineLoader& load, const LineIncremental* incremental) {
+        return detectLinesToSurfaces(inputs, count, load, ctVolume, params, params.fiberScale, kFiberSurfaceDetector,
+                                     kFiberSurfaceVersion, cancel, incremental);
+    });
+}
+
+DetectorReport linkFibersToSurfaces(objects::ObjectStore& db, const std::filesystem::path& ctVolume,
+    const FiberSurfaceParams& params, const std::atomic_bool* cancel)
+{
+    detail::StoredGeometry inputs(db);
+    return withFibers(inputs, params, [&](size_t count, const detail::LineLoader& load, const detail::LineIncremental* incremental) {
+        return detail::linkLinesToSurfaces(db, inputs, count, load, ctVolume, params, params.fiberScale, kFiberSurfaceDetector,
+                                           kFiberSurfaceVersion, cancel, incremental);
+    });
 }
 } // namespace vc::object_links
