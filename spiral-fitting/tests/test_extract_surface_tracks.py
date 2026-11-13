@@ -481,6 +481,27 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
     assert _read_dbm(out) == {**entries, 'h:16': pickle.dumps(['kept'])}
 
 
+def test_cpu_slabs_thinner_than_downsample_factor_have_no_tracks(monkeypatch):
+    # z 0..18 (18 % z_chunk_stride_h == 2) clips the last ribbon, h:16, to 2 slices; z 16..18
+    # makes every vertical slab 2 slices deep. With a surface in those slices, such a slab has
+    # no tracks, rather than reaching prepare_cc_labels with nothing left after the max-pool crop.
+    assert est.downsample_factor == 4 and est.z_chunk_stride_h == 16
+    volume = np.zeros((18, 64, 64), np.uint8)
+    volume[16:18, 8:56, 20:24] = 1
+    monkeypatch.setattr(est, 'z_min', 0)
+    monkeypatch.setattr(est, 'z_max', 18)
+    database = {}
+    est.extract_horizontal(volume, database)
+    assert database == {'h:0': pickle.dumps([]), 'h:16': pickle.dumps([])}
+
+    monkeypatch.setattr(est, 'z_min', 16)
+    min_yx, max_yx = est.find_yx_range(volume)
+    database = {}
+    est.extract_vertical(volume, database, axis='y', min_yx=min_yx, max_yx=max_yx)
+    est.extract_vertical(volume, database, axis='x', min_yx=min_yx, max_yx=max_yx)
+    assert database == {'vy:8': pickle.dumps([]), 'vx:20': pickle.dumps([])}
+
+
 # ------------------------------------------------------------------------------------------
 # GPU backend, end to end
 
