@@ -142,6 +142,17 @@ TEST_CASE("vc_render_tifxyz writes, resumes and partitions a Zarr pyramid")
             render(out, "--resume");
             for (int level = 0; level < 6; ++level) CHECK(readLevel(out / std::to_string(level)) == reference[level]);
 
+            // Resuming an output that does not exist yet renders it in full, and can be repeated.
+            const auto fresh = root / "fresh";
+            render(fresh, "--resume");
+            render(fresh, "--resume");
+            for (int level = 0; level < 6; ++level) CHECK(readLevel(fresh / std::to_string(level)) == reference[level]);
+            CHECK(fs::exists(fresh / ".zattrs"));
+            // So can a run stopped before its last pyramid level was created.
+            fs::remove_all(fresh / "5");
+            render(fresh, "--resume");
+            CHECK(readLevel(fresh / "5") == reference[5]);
+
             // --pre creates arrays; separate workers reopen them for writes.
             const auto parts = root / "parts";
             render(parts, "--pre");
