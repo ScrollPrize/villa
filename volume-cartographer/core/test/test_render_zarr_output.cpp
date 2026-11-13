@@ -165,6 +165,16 @@ TEST_CASE("vc_render_tifxyz writes, resumes and partitions a Zarr pyramid")
             CHECK(reversed);
             const auto coarse = readLevel(root / "rotated" / "5");
             CHECK(std::ranges::any_of(coarse.bytes, [](std::uint8_t b) { return b != 0; }));
+
+            // An output the writer cannot create fails the run, with and without --pre.
+            for (const std::string pre : {"", " --pre"}) {
+                const std::string command = std::string("\"") + renderer + "\" -v \"" + volume.string() + "\" -s \"" +
+                    surface.string() + "\" -g 0 --scale 1 --zarr-compressor snappy --zarr-output \"" +
+                    (root / "snappy").string() + "\"" + pre + " > \"" + (root / "log.txt").string() + "\" 2>&1";
+                CHECK(std::system(command.c_str()) != 0);
+                std::ifstream log(root / "log.txt");
+                CHECK(std::string(std::istreambuf_iterator<char>(log), {}).find("Error creating") != std::string::npos);
+            }
             std::error_code ignored;
             fs::remove_all(root, ignored);
         }

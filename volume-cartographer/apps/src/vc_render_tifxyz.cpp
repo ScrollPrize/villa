@@ -1445,7 +1445,7 @@ int main(int argc, char *argv[])
                     vcr::zarr::Writer::create(outFilePath / "0", outputOptions);
                 } catch (const std::exception& e) {
                     logPrintf(stderr, "Error creating %s: %s\n", (outFilePath / "0").string().c_str(), e.what());
-                    return EXIT_FAILURE;
+                    return false;
                 }
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
@@ -1470,7 +1470,7 @@ int main(int argc, char *argv[])
                         vcr::zarr::Writer::create(outFilePath / "0", outputOptions));
                 } catch (const std::exception& e) {
                     logPrintf(stderr, "Error creating %s: %s\n", (outFilePath / "0").string().c_str(), e.what());
-                    return EXIT_FAILURE;
+                    return false;
                 }
             }
         }
