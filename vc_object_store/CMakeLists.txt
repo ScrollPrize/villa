@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(vc_object_store VERSION 0.1.0 LANGUAGES CXX)
+project(vc_object_store VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 if(APPLE)
     set(CMAKE_INSTALL_RPATH "@loader_path/../lib")
