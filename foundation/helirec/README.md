@@ -133,7 +133,7 @@ mx, mean = bc.composites(set=2)
 
 | # | stage | module (C++ `include/helirec/…`) | backends |
 |---|---|---|---|
-| 0 | Bliss master parsing: entries, angles, z, machine current, frame→file map | `python/helirec/bliss.py` | Python |
+| 0 | Bliss master parsing: entries, angles, z, machine current, frame→file map (as nxtomomill + nx2etf, bit for bit) | `calibration/scan.hpp` (Python: `helirec.bliss`) | CPU |
 | 1 | raw row-window reads (`pread`, one HDF5 chunk per frame) | `raw_reader.hpp` | CPU (threads) |
 | 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame | `calibration/intensity.hpp`, `python/helirec/calibration.py` | CPU |
 | 2b | geometry calibration: layout, rows' timing, detector map, poses and motion (`helirec-calibration geometry`) | `calibration/geometry_calibration.hpp`, `python/helirec/geometry.py` | CPU, CUDA |

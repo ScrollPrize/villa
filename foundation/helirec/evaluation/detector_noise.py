@@ -69,11 +69,18 @@ def smooth(a, sigma):
     return _core.gaussian_filter1d(_core.gaussian_filter1d(np.ascontiguousarray(a, np.float64), 0, sigma, "reflect"), 1, sigma, "reflect")
 
 
+def read_frames(scan, refs, n, rows, cols):
+    """the first n frames of refs, rows [rows[0], rows[1]) and columns [cols[0], cols[1]), as float64"""
+    reader = _core.RawReader(list(refs.files), refs.dataset, *scan.frame_shape)
+    fi, fr = refs.file_index[:n], refs.frame_index[:n]
+    out = reader.read_rows(np.ascontiguousarray(fi), np.ascontiguousarray(fr), np.full(n, rows[0], np.int32), rows[1] - rows[0])
+    return out[:, :, cols[0]:cols[1]].astype(np.float64)
+
+
 def measure(scan, a):
-    rows, cols = slice(*a.rows), slice(*a.cols)
     n = min(a.frames, len(scan.flats[0]), len(scan.darks))
-    dark = scan.read_frames(scan.darks, slice(0, n), rows, cols).astype(np.float64)
-    flat = scan.read_frames(scan.flats[0], slice(0, n), rows, cols).astype(np.float64)
+    dark = read_frames(scan, scan.darks, n, a.rows, a.cols)
+    flat = read_frames(scan, scan.flats[0], n, a.rows, a.cols)
     out = dict(scan=scan.name, frames=n, region=dict(rows=list(a.rows), cols=list(a.cols)))
     dmean = dark.mean(0)
     out["dark"] = dict(offset=float(dmean.mean()), temporal_std=float(np.sqrt(dark.var(0, ddof=1).mean())),
@@ -99,8 +106,8 @@ def measure(scan, a):
     # flat stability: the fixed pattern of the first and of the last series
     first, last = scan.flats[0], scan.flats[-1]
     m = min(a.frames, len(first), len(last))
-    fa = scan.read_frames(first, slice(0, m), rows, cols).astype(np.float64).mean(0) - dmean
-    fb = scan.read_frames(last, slice(0, m), rows, cols).astype(np.float64).mean(0) - dmean
+    fa = read_frames(scan, first, m, a.rows, a.cols).mean(0) - dmean
+    fb = read_frames(scan, last, m, a.rows, a.cols).mean(0) - dmean
     ratio = fb / fa
     high = ratio / smooth(ratio, a.pattern_sigma) - 1
     rel = np.sqrt(var) / mean.mean()

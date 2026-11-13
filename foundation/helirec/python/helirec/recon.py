@@ -82,7 +82,7 @@ DEFAULTS = dict(
 #   exposure arc is not deconvolved (exposure_arc is disabled for now; info["exposure_arc_bins"] is 0).
 # exposure_arc: fraction of the angular step swept during an exposure, deconvolved along the angle; 0 (default since
 #   2026-11-11) leaves the sinogram as recorded; "auto" takes it from the scan
-#   (bliss.BlissScan.exposure_arc; 0 for step scans). Disabled for now with angle_interp=views (the default): the
+#   (bliss.Scan.exposure_arc; 0 for step scans). Disabled for now with angle_interp=views (the default): the
 #   filter runs along one turn of grid angles and is not carried over to a row per view; angle_interp=nearest has it.
 # angle_subset: "" (default: every projection) or "I/N": subset I of N interleaved subsets of the projections, chosen
 #   by angle (the same angles in every scan), reconstructed on a grid of 1 / N of the angles. The subsets have

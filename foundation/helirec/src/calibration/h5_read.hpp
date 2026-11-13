@@ -2,6 +2,7 @@
 // Reading values out of an HDF5 file with the C library: what the acquisition record needs (record.cpp).
 // libhdf5 (serial build) is not thread safe: everything here is called from one thread.
 #include <hdf5.h>
+#include <sys/types.h>
 
 #include <cstdint>
 #include <cstring>
@@ -202,6 +203,105 @@ inline double read_double(hid_t loc, const std::string& path) {
     const auto v = read_doubles(loc, path);
     if (v.empty()) throw Error("dataset " + path + " is empty");
     return v[0];
+}
+
+// the first value of the string attribute `name` of the object at `path`; "" when there is none or it is not text
+inline std::string attribute_text(hid_t loc, const std::string& path, const std::string& name) {
+    if (H5Aexists_by_name(loc, path.c_str(), name.c_str(), H5P_DEFAULT) <= 0) return std::string();
+    Id a(H5Aopen_by_name(loc, path.c_str(), name.c_str(), H5P_DEFAULT, H5P_DEFAULT), H5Aclose);
+    if (!a) return std::string();
+    Id t(H5Aget_type(a.id), H5Tclose);
+    if (H5Tget_class(t.id) != H5T_STRING) return std::string();
+    Id s(H5Aget_space(a.id), H5Sclose);
+    const hssize_t n = H5Sget_simple_extent_npoints(s.id);
+    if (n <= 0) return std::string();
+    std::string out;
+    if (H5Tis_variable_str(t.id) > 0) {
+        Id mem(H5Tcopy(H5T_C_S1), H5Tclose);
+        H5Tset_size(mem.id, H5T_VARIABLE);
+        H5Tset_cset(mem.id, H5Tget_cset(t.id));
+        std::vector<char*> ptr(static_cast<std::size_t>(n), nullptr);
+        if (H5Aread(a.id, mem.id, ptr.data()) < 0) return std::string();
+        if (ptr[0]) out = ptr[0];
+        H5Treclaim(mem.id, s.id, H5P_DEFAULT, ptr.data());
+    } else {
+        const std::size_t size = H5Tget_size(t.id);
+        std::vector<char> raw(static_cast<std::size_t>(n) * size);
+        if (H5Aread(a.id, t.id, raw.data()) < 0) return std::string();
+        out.assign(raw.data(), strnlen(raw.data(), size));
+    }
+    return out;
+}
+
+// A dataset of frames (frames, rows, columns) and, when it is virtual, its pieces in the order of its mapping:
+// frames [first, first + count) of the dataset are frames [source_first, source_first + source_count) of
+// `dataset` in the file `file_name` (as the mapping names it: ".", relative to the master's directory, or
+// absolute). spans_frames: the bounds of the piece in the dataset span whole frames; whole_frames: also, both
+// sides select every pixel of their frames (no strides or gaps).
+struct VirtualPiece {
+    std::string file_name, dataset;
+    std::int64_t first = 0, count = 0, source_first = 0, source_count = 0;
+    bool spans_frames = true, whole_frames = true;
+};
+struct FrameDataset {
+    std::int64_t frames = 0;
+    int rows = 0, cols = 0;
+    bool is_virtual = false;
+    std::vector<VirtualPiece> pieces;
+};
+
+inline std::string virtual_name(hid_t dcpl, std::size_t i, ssize_t (*get)(hid_t, size_t, char*, size_t)) {
+    const ssize_t len = get(dcpl, i, nullptr, 0);
+    if (len < 0) throw Error("cannot read a virtual dataset mapping");
+    std::string s(static_cast<std::size_t>(len) + 1, '\0');
+    get(dcpl, i, s.data(), s.size());
+    s.resize(static_cast<std::size_t>(len));
+    return s;
+}
+
+inline FrameDataset frame_dataset(hid_t loc, const std::string& dataset) {
+    Id d(H5Dopen2(loc, dataset.c_str(), H5P_DEFAULT), H5Dclose);
+    if (!d) throw Error("no dataset " + dataset);
+    Id space(H5Dget_space(d.id), H5Sclose);
+    hsize_t dims[3] = {0, 0, 0};
+    if (H5Sget_simple_extent_ndims(space.id) != 3) throw Error(dataset + " is not (frames, rows, columns)");
+    H5Sget_simple_extent_dims(space.id, dims, nullptr);
+    FrameDataset out;
+    out.frames = static_cast<std::int64_t>(dims[0]);
+    out.rows = static_cast<int>(dims[1]);
+    out.cols = static_cast<int>(dims[2]);
+    Id dcpl(H5Dget_create_plist(d.id), H5Pclose);
+    if (H5Pget_layout(dcpl.id) != H5D_VIRTUAL) return out;
+    out.is_virtual = true;
+    std::size_t n = 0;
+    H5Pget_virtual_count(dcpl.id, &n);
+    for (std::size_t i = 0; i < n; ++i) {
+        VirtualPiece p;
+        p.file_name = virtual_name(dcpl.id, i, H5Pget_virtual_filename);
+        p.dataset = virtual_name(dcpl.id, i, H5Pget_virtual_dsetname);
+        Id vs(H5Pget_virtual_vspace(dcpl.id, i), H5Sclose);
+        hsize_t a[3], b[3];
+        if (H5Sget_select_bounds(vs.id, a, b) < 0) throw Error(dataset + ": unreadable virtual mapping");
+        p.spans_frames = a[1] == 0 && a[2] == 0 && b[1] + 1 == dims[1] && b[2] + 1 == dims[2];
+        p.whole_frames = p.spans_frames &&
+                         static_cast<hsize_t>(H5Sget_select_npoints(vs.id)) == (b[0] - a[0] + 1) * dims[1] * dims[2];
+        p.first = static_cast<std::int64_t>(a[0]);
+        p.count = static_cast<std::int64_t>(b[0] - a[0] + 1);
+        Id ss(H5Pget_virtual_srcspace(dcpl.id, i), H5Sclose);
+        hsize_t sa[3] = {0, 0, 0}, sb[3] = {0, 0, 0};
+        if (H5Sget_simple_extent_ndims(ss.id) == 3 && H5Sget_select_bounds(ss.id, sa, sb) >= 0) {
+            p.source_first = static_cast<std::int64_t>(sa[0]);
+            p.source_count = static_cast<std::int64_t>(sb[0] - sa[0] + 1);
+            hsize_t sd[3] = {0, 0, 0};
+            H5Sget_simple_extent_dims(ss.id, sd, nullptr);
+            p.whole_frames = p.whole_frames && sa[1] == 0 && sa[2] == 0 &&
+                             static_cast<hsize_t>(H5Sget_select_npoints(ss.id)) == static_cast<hsize_t>(p.source_count) * dims[1] * dims[2];
+        } else {
+            p.source_count = p.count;
+        }
+        out.pieces.push_back(std::move(p));
+    }
+    return out;
 }
 
 }  // namespace helirec::calibration::h5

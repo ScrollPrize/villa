@@ -1083,6 +1083,7 @@ void bind_calibration(nb::module_& m);  // bindings/calibration_bindings.cpp
 void bind_projection(nb::module_& m);  // bindings/projection_bindings.cpp
 void bind_geometry(nb::module_& m);  // bindings/geometry_bindings.cpp
 void bind_geometry_calibration(nb::module_& m);  // bindings/geometry_calibration_bindings.cpp
+void bind_scan(nb::module_& m);  // bindings/scan_bindings.cpp
 
 NB_MODULE(_core, m) {
     register_filter("python", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
@@ -1095,6 +1096,7 @@ NB_MODULE(_core, m) {
     bind_projection(m);
     bind_geometry(m);
     bind_geometry_calibration(m);
+    bind_scan(m);
     m.doc() = "helirec C++/CUDA kernels";
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {

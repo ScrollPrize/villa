@@ -134,50 +134,26 @@ std::string directory_of(const std::string& path) {
     return i == std::string::npos ? std::string(".") : path.substr(0, i);
 }
 
-std::string virtual_name(hid_t dcpl, std::size_t i, ssize_t (*get)(hid_t, size_t, char*, size_t)) {
-    const ssize_t len = get(dcpl, i, nullptr, 0);
-    if (len < 0) throw Error("cannot read a virtual dataset mapping");
-    std::string s(static_cast<std::size_t>(len) + 1, '\0');
-    get(dcpl, i, s.data(), s.size());
-    s.resize(static_cast<std::size_t>(len));
-    return s;
-}
-
 // where the frames of `dataset` are stored: the pieces of a virtual dataset, or the dataset itself
 void frame_pieces(hid_t file, const std::string& file_path, const std::string& dataset, Stretch& s) {
-    h5::Id d(H5Dopen2(file, dataset.c_str(), H5P_DEFAULT), H5Dclose);
-    if (!d) throw Error("no dataset " + dataset);
-    h5::Id space(H5Dget_space(d.id), H5Sclose);
-    hsize_t dims[3] = {0, 0, 0};
-    if (H5Sget_simple_extent_ndims(space.id) != 3) throw Error(dataset + " is not (frames, rows, columns)");
-    H5Sget_simple_extent_dims(space.id, dims, nullptr);
-    s.n_frames = static_cast<std::int64_t>(dims[0]);
-    s.rows = static_cast<int>(dims[1]);
-    s.cols = static_cast<int>(dims[2]);
-    h5::Id dcpl(H5Dget_create_plist(d.id), H5Pclose);
-    if (H5Pget_layout(dcpl.id) != H5D_VIRTUAL) {
+    const h5::FrameDataset fd = h5::frame_dataset(file, dataset);
+    s.n_frames = fd.frames;
+    s.rows = fd.rows;
+    s.cols = fd.cols;
+    if (!fd.is_virtual) {
         s.pieces.push_back({file_path, dataset, 0, s.n_frames, 0, true});
         return;
     }
-    std::size_t n = 0;
-    H5Pget_virtual_count(dcpl.id, &n);
     const std::string dir = directory_of(file_path);
-    for (std::size_t i = 0; i < n; ++i) {
+    for (const h5::VirtualPiece& v : fd.pieces) {
         FramePiece p;
-        const std::string name = virtual_name(dcpl.id, i, H5Pget_virtual_filename);
+        const std::string& name = v.file_name;
         p.file = name == "." ? file_path : (!name.empty() && name[0] == '/' ? name : dir + "/" + name);
-        p.dataset = virtual_name(dcpl.id, i, H5Pget_virtual_dsetname);
-        h5::Id vs(H5Pget_virtual_vspace(dcpl.id, i), H5Sclose);
-        hsize_t a[3], b[3];
-        if (H5Sget_select_bounds(vs.id, a, b) < 0) throw Error(dataset + ": unreadable virtual mapping");
-        if (a[1] != 0 || a[2] != 0 || b[1] + 1 != dims[1] || b[2] + 1 != dims[2])
-            throw Error(dataset + ": a virtual piece does not hold whole frames");
-        p.first = static_cast<std::int64_t>(a[0]);
-        p.count = static_cast<std::int64_t>(b[0] - a[0] + 1);
-        h5::Id ss(H5Pget_virtual_srcspace(dcpl.id, i), H5Sclose);
-        hsize_t sa[3] = {0, 0, 0}, sb[3] = {0, 0, 0};
-        if (H5Sget_simple_extent_ndims(ss.id) == 3 && H5Sget_select_bounds(ss.id, sa, sb) >= 0)
-            p.source_first = static_cast<std::int64_t>(sa[0]);
+        p.dataset = v.dataset;
+        if (!v.spans_frames) throw Error(dataset + ": a virtual piece does not hold whole frames");
+        p.first = v.first;
+        p.count = v.count;
+        p.source_first = v.source_first;
         struct stat st;
         p.present = ::stat(p.file.c_str(), &st) == 0 && S_ISREG(st.st_mode);
         s.pieces.push_back(std::move(p));

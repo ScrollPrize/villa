@@ -24,16 +24,16 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 
 from . import _core
-from .bliss import BlissScan, FrameRefs
+from .bliss import FrameList, Scan
 
 NOMINAL_CURRENT_A = 0.2
 
 
 # ============================================================================ raw access
 class FrameSource:
-    """Fast row-window access to one FrameRefs sequence (C++ pread reader)."""
+    """Fast row-window access to one FrameList sequence (C++ pread reader)."""
 
-    def __init__(self, refs: FrameRefs, shape):
+    def __init__(self, refs: FrameList, shape):
         self.refs = refs
         self.rows, self.cols = shape
         self.reader = _core.RawReader(list(refs.files), refs.dataset, self.rows, self.cols)
@@ -64,7 +64,7 @@ def _bar(show, total, desc, unit):
     return contextlib.nullcontext(types.SimpleNamespace(update=lambda n=1: None))
 
 
-def reduce_darks_flats(scan: BlissScan, progress=None):
+def reduce_darks_flats(scan: Scan, progress=None):
     """dark (rows, cols) and flats (n_series, rows, cols) exactly as nx2etf stores them.
     progress(k): called as k more of the len(scan.darks) + sum(len(series)) frames are done."""
     dark = _mean_frames(FrameSource(scan.darks, scan.frame_shape), progress=progress)
@@ -72,7 +72,7 @@ def reduce_darks_flats(scan: BlissScan, progress=None):
     return dark, np.stack(flats)
 
 
-def reduced_darks_flats(scan: BlissScan, cache_dir=None, log=print):
+def reduced_darks_flats(scan: Scan, cache_dir=None, log=print):
     """reduce_darks_flats(scan), kept in cache_dir: one file per scan, named after the scan and valid for the
     dark and flat files it was made from (path, size, time of change), the frames taken from them and the flats'
     ring current. Reducing a scan's 1200 frames takes most of a minute; reading the file a fraction of a second.
@@ -171,7 +171,7 @@ class Calibration:
         return json.dumps(asdict(self), indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))
 
 
-def acquisition_fingerprint(main: BlissScan, companion: BlissScan) -> str:
+def acquisition_fingerprint(main: Scan, companion: Scan) -> str:
     """sha256 over everything the calibration depends on: calibration version, scan identities, metadata, frame
     geometry, trajectories and the referenced raw files (path, size, mtime). A replaced acquisition (even under the
     same name) or a different pair invalidates the cache."""
@@ -241,7 +241,7 @@ def _load_cache(cache_dir, fp, log):
     return cal, arrays
 
 
-def calibrate(main: BlissScan, companion: BlissScan, layout, cache_dir=None, log=print, progress=None):
+def calibrate(main: Scan, companion: Scan, layout, cache_dir=None, log=print, progress=None):
     """The intensity calibration from raw data, in the merged frame of `layout`. Returns (Calibration, arrays dict).
 
     layout: dict(cor_main_detector, vector = (dy, dx) main -> companion): the rotation axis in the main scan's
@@ -334,7 +334,7 @@ BLUR_MIN_PX = 0.5        # a field whose blur nowhere reaches this many pixels i
 BLUR_MIN_GAIN = 0.97     # ... nor one that does not bring the residual of the noise spectra below this share
 
 
-def flat_noise_spectra(scan: BlissScan, dark, n_flats=200, tile=BLUR_TILE):
+def flat_noise_spectra(scan: Scan, dark, n_flats=200, tile=BLUR_TILE):
     """Noise power spectra of the scan's first flat series on a lattice of tiles (_core.tile_power_spectra): of the
     differences of consecutive flats, each less the dark and scaled to its mean (what is the same in both, the beam's
     profile and the fixed pattern, drops out; the noise stays). Returns (power (ny, nx, tile, tile / 2 + 1), tile
@@ -347,15 +347,16 @@ def flat_noise_spectra(scan: BlissScan, dark, n_flats=200, tile=BLUR_TILE):
     ys = list(range((rows % tile) // 2, rows - tile + 1, tile))
     xs = list(range((cols % tile) // 2, cols - tile + 1, tile))
     dark = np.asarray(dark, np.float32)
+    src = FrameSource(refs, scan.frame_shape)
     power = np.zeros((len(ys), len(xs), tile, tile // 2 + 1))
     for k0 in range(0, n, 40):
-        fl = scan.read_frames(refs, slice(k0, min(n, k0 + 40))).astype(np.float32) - dark
+        fl = src.frames(np.arange(k0, min(n, k0 + 40))).astype(np.float32) - dark
         fl /= fl.mean((1, 2), keepdims=True)
         power += _core.tile_power_spectra(np.ascontiguousarray(fl[0::2] - fl[1::2]), tile, ys, xs)
     return power, ys, xs, n
 
 
-def measure_detector_blur(scan: BlissScan, dark, n_flats=200, log=print):
+def measure_detector_blur(scan: Scan, dark, n_flats=200, log=print):
     """The detector's blur field of a scan, from the noise of its flats (_core.detector_blur_field_fit: helirec/calibration/intensity.hpp). The field is kept
     only if it explains the noise spectra (residual below BLUR_MIN_GAIN of the residual without it) and reaches
     BLUR_MIN_PX somewhere on the detector; otherwise "field" is [] and nothing changes in the reconstruction."""
