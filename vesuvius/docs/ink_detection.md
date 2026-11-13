@@ -516,7 +516,9 @@ volume limits from the input's metadata before it reads a window, so it never
 reads a whole window that inkrs will refuse. It adds its own limits for the
 options inkrs never sees:
 
-- one CUDA device, or the MPS device on macOS (inkrs needs macOS 26 there)
+- one CUDA device, or the MPS device on macOS (inkrs needs macOS 26 there).
+  On MPS, villa's PyTorch runs fp32 while inkrs runs fp16 on Metal; on an
+  M4 Pro, inkrs's maps were within 2/255 of PyTorch's.
 - a checkpoint that stores `mixed_precision: fp16`, since inkrs runs the
   precision the checkpoint stores and ignores `--amp-dtype`
 - fp16 autocast (PyTorch's CUDA default, so `--amp-dtype default` qualifies)
