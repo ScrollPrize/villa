@@ -28,8 +28,13 @@ if(TARGET vc_delta3d)
     set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 # Embedding builds (the object store's Python module) link the reader statically so
-# the module carries no shared library of its own to install.
-option(VC_READER_SHARED_READER "Build the native reader as a shared library" ON)
+# the module carries no shared library of its own to install. So do builds for the
+# Microsoft linker by default: its DLLs export only annotated symbols, and the reader has none.
+set(_vc_reader_shared_default ON)
+if(MSVC)
+    set(_vc_reader_shared_default OFF)
+endif()
+option(VC_READER_SHARED_READER "Build the native reader as a shared library" ${_vc_reader_shared_default})
 if(VC_READER_SHARED_READER)
     add_library(vc_reader_native SHARED)
 else()

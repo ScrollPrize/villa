@@ -272,3 +272,7 @@ if(VC_READER_BUILD_READER)
     endif()
     install(TARGETS _reader LIBRARY DESTINATION vc_reader)
 endif()
+if(WIN32)
+    # Windows has no RPATH: a module loads the DLLs it links from its own directory.
+    install(FILES $<TARGET_FILE:vc_reader_sftp> DESTINATION vc_reader)
+endif()
