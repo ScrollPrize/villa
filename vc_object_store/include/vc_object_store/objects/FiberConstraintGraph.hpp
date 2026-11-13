@@ -12,10 +12,31 @@ struct CompactFiberConstraint {
     bool parallel=false,validA=false,validB=false,validConnector=false;
     size_t measurementPartition=0;
 };
+struct FiberGraphNodeColumn {
+    FiberGraphUuid uuid{};
+    double length=0;
+};
+struct FiberGraphColumns {
+    std::string volume;
+    size_t nodes=0,events=0;
+    std::unique_ptr<FiberGraphUuid[]> fiberUuids,edgeUuids;
+    std::unique_ptr<double[]> lengths;
+    std::unique_ptr<int64_t[]> eventIds;
+    std::unique_ptr<std::array<int64_t,2>[]> endpoints;
+    std::unique_ptr<std::array<double,2>[]> arcs;
+    std::unique_ptr<std::array<double,3>[]> normalA,normalB,connector;
+    std::unique_ptr<double[]> distance;
+    std::unique_ptr<uint8_t[]> parallel,validA,validB,validConnector;
+};
 // Numeric projection only. Output is UUID ordered and gets dense runtime indices;
 // source indices/endpoint XYZ are not part of the compact persisted format.
 std::vector<CompactFiberConstraint> readCompactFiberConstraintGraph(
     const ObjectCollection&,const CollectionTxn&,size_t workers=32,
+    const std::function<void(const char*,size_t,size_t)>& progress={});
+// One coherent numeric snapshot, including the extraction-selected fibers and
+// their lengths in the measurement frame. UUID joins and all corpus loops are
+// native; endpoints are dense indices, never repeated UUID text columns.
+FiberGraphColumns readFiberGraphColumns(const ObjectCollection&,const CollectionTxn&,size_t workers=32,
     const std::function<void(const char*,size_t,size_t)>& progress={});
 // Stream original rows only when a caller needs to publish modified measurements.
 // Visitor calls are concurrent, batches bounded, and winning overlay rows only.
@@ -25,6 +46,7 @@ std::function<void()> prepareFiberConstraintMeasurementScan(const ObjectCollecti
     const std::function<void(FiberMeasurementBatch&&)>&);
 FiberGraphUuid fiberGraphUuid(const std::string&);
 std::string fiberGraphUuid(const FiberGraphUuid&);
+std::unique_ptr<uint8_t[]> fiberGraphUuidAscii(std::span<const FiberGraphUuid>,size_t workers=32);
 // A measured constraint in canonical core-edge endpoint order.
 struct FiberConstraintRecord {
     EdgeRecord edge;

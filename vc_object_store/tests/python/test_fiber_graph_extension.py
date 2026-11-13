@@ -24,6 +24,45 @@ def unpack(spec, row):
     return dict(zip((c["name"] for c in spec["columns"]), row))
 
 
+@pytest.mark.parametrize('workers,packed',[(1,False),(3,True)])
+def test_bulk_fiber_result_columns_match_filtered_overlay_rows(tmp_path,workers,packed):
+    import numpy as np
+    from vc_object_store import CollectionReader, import_initial_records, write_extension_store
+    spec=fiber_graph_solve_table('fibers');run=str(uuid.uuid4());other=str(uuid.uuid4())
+    ids=sorted(str(uuid.uuid4()) for _ in range(4))
+    objects=[]
+    for i,fiber in enumerate(ids):
+        row=fiber_graph_solve_row('fibers',dict(fiber_uuid=extension_uuid(fiber),run_uuid=extension_uuid(run),
+            family=i%3,enabled=int(i!=2)))
+        alternate=fiber_graph_solve_row('fibers',dict(fiber_uuid=extension_uuid(fiber),run_uuid=extension_uuid(other),normal_sign=1))
+        objects.append(dict(record=dict(uuid=fiber,kind='fiber'),extensions=[row,alternate]))
+    base=tmp_path/'base.vcobj'
+    import_initial_records(base,objects,extensions=[spec],workers=workers,packed=packed)
+    changed=fiber_graph_solve_row('fibers',dict(fiber_uuid=extension_uuid(ids[1]),run_uuid=extension_uuid(run),
+        family=1,enabled=0,normal_sign=-1,selected_winding=-3,component=7))
+    overlay=tmp_path/'overlay.vcobj'
+    write_extension_store(overlay,[base],[spec],{spec['name']:[changed['values']]})
+    for path in (base,overlay):
+        with CollectionReader(path) as store:
+            rows=store.extension_rows(spec['name'],key_filter={'run_uuid':extension_uuid(run)})
+            result=store.fiber_result_columns(run)
+        actual=np.frombuffer(result['uuid_ascii'],dtype='S36').astype('U36')
+        assert actual.tolist()==ids
+        assert result['fiber_uuid'].shape==(4,16) and result['values'].shape==(4,5)
+        assert not result['values'].flags.writeable and not result['valid'].flags.writeable
+        by_id={extension_uuid(row[0]):row for row in rows}
+        for i,fiber in enumerate(ids):
+            assert bytes(result['fiber_uuid'][i])==uuid.UUID(fiber).bytes
+            for j,value in enumerate(by_id[fiber][2:7]):
+                assert bool(result['valid'][i,j])==(value is not None)
+                if value is not None:assert result['values'][i,j]==value
+        assert result['values'][1,1]==(0 if path==overlay else 1)
+    with CollectionReader(overlay) as store:
+        alternative=store.fiber_result_columns(other)
+        assert alternative['valid'][:,2].all() and not alternative['valid'][:,0].any()
+        assert store.fiber_result_columns(str(uuid.uuid4()))['values'].shape==(0,5)
+
+
 def append(tx, row):
     tx.append_extension_rows(row["table"], [row["values"]])
 

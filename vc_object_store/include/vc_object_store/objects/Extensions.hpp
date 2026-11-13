@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -21,6 +22,9 @@ std::vector<ExtensionSource> extensionSourcesFromJson(const std::string&);
 
 using ExtensionValue = std::variant<std::monostate, int64_t, double, std::string, std::vector<uint8_t>>;
 using ExtensionRow = std::vector<ExtensionValue>;
+// Equality on any subset of PRIMARY KEY columns, including non-prefix keys.
+// Restricting this to immutable keys makes SQL pushdown overlay-safe.
+using ExtensionKeyFilter = std::map<std::string, ExtensionValue>;
 ExtensionValue extensionUuid(const std::string&);
 std::string extensionUuid(const ExtensionValue&);
 enum class ExtensionType { Integer, Real, Text, Blob };

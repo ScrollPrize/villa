@@ -4,6 +4,10 @@
 #include "ExtensionBindings.hpp"
 #include "CollectionBindings.hpp"
 #include "ObjectReadBindings.hpp"
+#include "PolylineArcBindings.hpp"
+#include "FiberWindingBindings.hpp"
+#include "FiberUvEventBindings.hpp"
+#include "FiberUvExportBindings.hpp"
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
@@ -1125,6 +1129,10 @@ NB_MODULE(_native, m)
     }, nb::arg("path"), "Explicitly remove all retained history and disable future history; close all handles first.");
 
     bindGraphReadView(m);
+    bindPolylineArcIndex(m);
+    bindFiberWinding(m);
+    bindFiberUvEvents(m);
+    bindFiberUvExport(m);
     bindGeometryRegion(m);
     bindHostedStore(m);
     bindSessionOperations(bindObjectStoreSession(m));
@@ -1372,11 +1380,51 @@ NB_MODULE(_native, m)
            nb::arg("tag") = std::nullopt, nb::arg("limit") = std::nullopt,
            nb::arg("after_uuid") = std::nullopt, nb::arg("fields") = std::nullopt, nb::arg("include_retired") = false,
            nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
+        .def("geometry_array_counts", [](PyObjectStore& self, const std::string& kind, const std::string& name,
+                                         const std::optional<int64_t>& limit) {
+            auto counts=std::make_unique<vo::ObjectStore::GeometryArrayCounts>(
+                self.withRead<true>([&](vo::ObjectStore& store,vo::ReadTxn& txn){
+                    return store.geometryArrayCounts(txn,kind,name,limit);
+                }));
+            auto* raw=counts.release();
+            nb::capsule owner(raw,[](void* p) noexcept {delete static_cast<vo::ObjectStore::GeometryArrayCounts*>(p);});
+            nb::dict result;
+            result["object_uuid"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<2>>(
+                reinterpret_cast<const uint8_t*>(raw->uuids.data()),{raw->uuids.size(),size_t(16)},owner);
+            result["count"]=nb::ndarray<const int64_t,nb::numpy,nb::ndim<1>>(
+                raw->counts.data(),{raw->counts.size()},owner);
+            // One contiguous text column for clients with existing U36 keys;
+            // no millions of individual Python strings/dictionaries.
+            std::string text;text.reserve(raw->uuids.size()*36);
+            for(const auto& key:raw->uuids)text+=vo::fiberGraphUuid(key);
+            result["uuid_ascii"]=nb::bytes(text.data(),text.size());
+            return result;
+        },nb::arg("object_kind"),nb::arg("array_name"),nb::arg("limit")=std::nullopt,
+           "UUID-ordered binary UUID/count NumPy columns from selected descriptors, without reading coordinate chunks.")
+        .def("geometry_read", [](PyObjectStore& self,const std::optional<std::string>& kind,
+            const std::vector<std::string>& ids,const std::optional<std::string>& volume,
+            const std::optional<int64_t>& limit,const std::optional<std::string>& after,
+            const std::optional<nb::dict>& expected) {
+            self.require();
+            const auto position=expected?std::optional(vo::detail::storePositionFrom(nlohmann::json::parse(jsonDumps(*expected)))):std::nullopt;
+            auto view=std::make_unique<PyGraphReadView>();view->store=self.db;
+            vo::ObjectSelection selection;selection.kind=kind;selection.uuids=ids;selection.volume=volume;
+            selection.limit=limit;selection.afterUuid=after;
+            {nb::gil_scoped_release release;
+                view->txn=std::make_unique<vo::ReadTxn>(view->store->read());
+                view->graph=std::make_shared<vo::GraphReadView>(view->store->geometryReadView(*view->txn,selection,position));
+            }
+            return view.release();
+        },nb::rv_policy::take_ownership,nb::arg("object_kind")=std::nullopt,
+           nb::arg("object_uuids")=std::vector<std::string>{},nb::arg("volume")=std::nullopt,
+           nb::arg("limit")=std::nullopt,nb::arg("after_uuid")=std::nullopt,nb::arg("expected_position")=std::nullopt,
+           "Current selected metadata and geometry in one pinned read, without relationship/history queries. Explicit versions use graph_read.")
         .def("graph_read", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::vector<std::string>& ids, const std::optional<std::string>& edgeKind,
             const std::vector<std::string>& states, const std::optional<std::array<double, 6>>& bbox,
             const std::optional<std::string>& tag, bool includeRetired, std::optional<bool> adjacent,
-            bool applicableOnly, const std::optional<nb::list>& versionRefs) {
+            bool applicableOnly, const std::optional<nb::list>& versionRefs,
+            const std::optional<int64_t>& edgeLimit) {
             self.require();
             if (versionRefs && (kind || !ids.empty() || bbox || includeRetired))
                 throw std::invalid_argument("versions specifies the complete graph object selection; cannot combine with object filters or include_retired");
@@ -1384,7 +1432,7 @@ NB_MODULE(_native, m)
             auto view = std::make_unique<PyGraphReadView>(); view->store = self.db;
             vo::ObjectSelection objects; objects.kind = kind; objects.uuids = ids; objects.bbox = bbox; objects.includeRetired = includeRetired;
             vo::EdgeSelection edges; edges.kind = edgeKind; edges.approvalStates = states; edges.tag = tag;
-            edges.adjacent = adjacent; edges.applicableOnly = applicableOnly;
+            edges.adjacent = adjacent; edges.applicableOnly = applicableOnly;edges.limit=edgeLimit;
             { nb::gil_scoped_release release;
               view->txn = std::make_unique<vo::ReadTxn>(view->store->read());
               view->graph = std::make_shared<vo::GraphReadView>(versions ? view->store->graphReadViewAt(*view->txn, *versions, edges)
@@ -1395,8 +1443,10 @@ NB_MODULE(_native, m)
            nb::arg("approval_states") = std::vector<std::string>{"approved"},
            nb::arg("bbox") = std::nullopt, nb::arg("edge_tag") = std::nullopt, nb::arg("include_retired") = false,
            nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false, nb::arg("versions") = std::nullopt,
+           nb::arg("edge_limit")=std::nullopt,
            "Pin a store graph read view; use as a context manager and close before checkpointing. versions: "
-           "numbered references {store, generation, object, version}, the complete closed object selection.")
+           "numbered references {store, generation, object, version}, the complete closed object selection. "
+           "edge_limit=0 reads the selected geometry without enumerating relationships.")
         .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
             const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,

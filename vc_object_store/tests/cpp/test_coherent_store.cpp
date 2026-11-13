@@ -21,6 +21,7 @@
 #include "vc_object_store/objects/ManifestReferences.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "internal/Database.hpp"
+#include "internal/RecordResolver.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include <fstream>
 #include <iostream>
@@ -35,6 +36,16 @@ namespace {
 OpenOptions options(HistoryMode mode){OpenOptions o;o.author="coherent-api";o.history=mode;o.spatialIndex=false;return o;}
 ObjectRecord track(const std::string& id){ObjectRecord r;r.uuid=id;r.kind="track";r.track.emplace();r.track->externalKey="0";r.track->datasetRef=id;r.meta=R"({"quality":7})";return r;}
 GeometryData shape(){return vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,6},{7,8,9}}});}
+struct DenyRelationshipReads {
+    std::vector<sqlite3*> sources;
+    explicit DenyRelationshipReads(sqlite3* db):sources(querySources(db)) {
+        for(auto* source:sources)sqlite3_set_authorizer(source,
+            [](void*,int action,const char* table,const char*,const char*,const char*){
+                return action==SQLITE_READ&&table&&std::string_view(table)=="edges"?SQLITE_DENY:SQLITE_OK;
+            },nullptr);
+    }
+    ~DenyRelationshipReads(){for(auto* source:sources)sqlite3_set_authorizer(source,nullptr,nullptr);}
+};
 ExtensionTable extension(){
     ExtensionTable spec;spec.name="ext_manual_edges";spec.extension="manual";spec.keySpace="edges";spec.versioned=true;
     spec.columns={{"owner",ExtensionType::Blob},{"value",ExtensionType::Integer}};spec.primaryKey={"owner"};return spec;
@@ -87,6 +98,11 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
         require(store.graphReadView(r).objectUuids.size()==3,"ordinary graph includes inherited objects");
         const auto graph=store.graphReadViewAt(r,std::vector<ObjectVersion>{f.av,f.bv});
         require(graph.objectUuids.size()==2&&graph.edgeUuids.size()==1,"exact graphs work for current-only and archived sources");
+        {DenyRelationshipReads guard(ObjectStoreImplAccess::conn(r));EdgeSelection noEdges;noEdges.limit=0;
+            const auto geometry=store.graphReadViewAt(r,{f.av,f.bv},noEdges);
+            require(geometry.objectUuids==graph.objectUuids&&geometry.geometryRevisions==graph.geometryRevisions&&
+                    geometry.edgeUuids.empty()&&geometry.selectedObjects->size()==2,
+                    "zero edge limit retains selected geometry/identity without any relationship read");}
         require(store.resolveStoragePath(r,f.file)==f.base.parent_path()/"fiber.json","relative sources use their owner's path");
         std::vector<ExtensionRow> rows;store.scanExtensionRows(r,extension().name,[&](const auto& row){rows.push_back(row);return true;});
         require(rows.size()==1&&std::get<int64_t>(rows[0][1])==4,"ordinary extension reader resolves inherited snapshots");

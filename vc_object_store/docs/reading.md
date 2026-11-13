@@ -35,6 +35,20 @@ context manager, or call `store.close()` after closing snapshots and graphs.
 
 ## Listing and selecting records
 
+For measured fiber-graph computation, `CollectionReader.fiber_graph_columns(workers=32, progress=False)` reads one coherent snapshot into owned NumPy buffers. The native `readFiberGraphColumns` API is declared in `objects/FiberConstraintGraph.hpp`. It resolves visible records, extraction-run membership, measurement-frame lengths and endpoint UUID joins before returning; consumers need not materialize object dictionaries or UUID strings per constraint. `progress=True` emits coarse native stage/row markers without Python callbacks in worker threads. These numeric arrays are analysis projections, not edit-authorizing references; retain the reader's source snapshot when publishing derived results.
+
+| Columns | Representation |
+| --- | --- |
+| `fiber_uuid`, `fiber_uuid_ascii`, `lengths` | Binary UUIDs `[N,16]`, ASCII UUIDs `[N,36]`, float64 lengths in the declared measurement frame |
+| `edge_uuid`, `event_ids` | Binary UUIDs `[M,16]` and int64 runtime indices, in UUID order |
+| `endpoints`, `arcs` | Int64 dense fiber indices `[M,2]` and float64 endpoint arclengths `[M,2]` |
+| `normal_a`, `normal_b`, `connector`, `distance` | Decoded float64 measurement columns, preserving their validity masks |
+| `parallel`, `valid_a`, `valid_b`, `valid_connector` | Byte-valued flags; consumers may view them as NumPy booleans |
+
+For numeric setup that needs array sizes rather than lengths or bounds, `ObjectStore.geometry_array_counts(object_kind, array_name, limit=None)` returns UUID-ordered, owned NumPy columns: `object_uuid` (`uint8[N,16]`) and `count` (`int64[N]`), plus a contiguous `uuid_ascii` byte string for clients using textual UUID arrays. The C++ equivalent is `ObjectStore::geometryArrayCounts` in one caller-owned transaction. Counts come from selected geometry descriptors, not ingestion summaries, and no coordinate chunks are loaded. Missing geometry/arrays have count zero; deleted and retired objects are omitted. The buffers remain valid after closing the read. These are numeric values from a snapshot, not edit-authorizing object references; retain complete references when an operation requires them. Use the ordinary geometry API to obtain measured lengths, bounds or coordinates.
+
+When reading selected geometry through a graph snapshot, use `store.graph_read(versions=references, edge_limit=0)` to explicitly omit relationships. This preserves the complete selected object identities and their geometry revisions, but does not enumerate relationship evidence merely to discard it. The C++ equivalent is `StoreReader::graphReadViewAt` with `EdgeSelection.limit=0`. A normal graph read still includes its requested relationships. Geometry-only consumers should not pay for incident-edge searches, particularly when the source deliberately omits adjacency indexes.
+
 ```python
 store.object(uuid)                       # current record, or None
 store.objects_by_kind("surface")         # live records of a kind
@@ -151,6 +165,17 @@ checksum-verified: damaged payloads raise instead of returning bytes.
 `geometry_point_annotations` returns per-point annotations aligned with that
 revision's sequence (by stable ID, not array order).
 
+For resident packed polylines, `geometry/PolylineArc.hpp` provides a non-owning
+`vc::geometry::PolylineArcIndex` over point offsets and a possibly strided
+float64 arc column. Python `PolylineArcIndex(offsets, arc).locate(owner, arc)`
+retains its buffers and returns read-only NumPy `segment` and `fraction` columns.
+Owner indices refer to this packed array, not persistent object identities.
+Each polyline must contain at least two finite, nondecreasing arc values from
+zero. Lookup searches only the selected polyline and preserves right-sided
+selection at duplicate knots; bounded endpoint representation roundoff is
+clamped to the first/last arc. The caller uses the returned intervals to read
+and interpolate the required point rows without constructing UUID queries.
+
 ## History reads
 
 ```python
@@ -174,6 +199,23 @@ selection are read with `relationships_at_versions(refs)`, and the whole graph
 with `graph_read` — see [graph edges](graph-edges.md#traversal-and-graph-reads).
 
 Inside a graph read, use `graph.geometry_snapshot()` for typed geometry or transformed views of its selected references. This borrows the graph's existing pinned transaction instead of acquiring another reader-pool slot. Closing the graph invalidates the borrowed snapshot and its views, which then reject reads. A separate `store.geometry_snapshot()` owns another transaction and should not be nested inside a single-reader graph operation.
+
+### Current bulk geometry without graph/history work
+
+For current geometry rather than a saved version selection, `geometry_read` captures metadata and geometry heads together in one read transaction. It does not enumerate relationships or resolve each object through numbered history. This works with either history policy, including referenced, packed and sharded stores:
+
+```python
+with store.geometry_read(object_kind="fiber", object_uuids=fiber_uuids,
+                         volume="target-volume", expected_position=source_position) as view:
+    rows = view.objects(["name", "fiber", "meta"])
+    packed = view.read_geometry_arrays("line_points", volume="target-volume")
+    xyz, offsets = packed.values, packed.offsets
+    position = view.status()  # this same pinned transaction
+```
+
+Omit `expected_position` for current discovery. When supplied, it is the ordinary `{store, generation, commit_sequence}` source position and is checked inside the geometry read's transaction. `limit` and `after_uuid` provide UUID-ordered pages; `volume` filters to fibers with a resolvable frame before applying the limit. This geometry-only API does not support measured-length, spatial or connection filters. Exact saved object references still use `graph_read(versions=..., edge_limit=0)`; a current read never substitutes for an explicitly requested historical version.
+
+Packed coordinate mapping currently supports float64 fiber `line_points`. It uses the captured metadata and native transform context, checks the current descriptor against the resolved immutable payload, and retains ordinary chunk-checksum verification. Direct same-volume scales use scalar multiplication; registered frames use the native affine mapping. Other arrays remain available as canonical packed reads without `volume`. Packed arrays own their storage and stay valid after closing the view; an absent selected geometry head does not fall through to a retained archive or base.
 
 ## Spatial queries
 

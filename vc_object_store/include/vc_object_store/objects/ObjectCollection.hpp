@@ -93,7 +93,8 @@ public:
     // owner, including clears and deletions. A routed UUID prefix visits only the
     // relevant partition in each layer. Unfiltered scans visit all partitions.
     void scanExtensionRows(const CollectionTxn&, const std::string&,
-        const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {}) const;
+        const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {},
+        const ExtensionKeyFilter& keyFilter = {}) const;
     // Exact version references retain their meaning across overlays. No
     // substitution of a newer local owner or dependency version is allowed.
     std::optional<ObjectRevision> objectAtVersion(const CollectionTxn&, const ObjectVersion&) const;

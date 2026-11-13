@@ -5,8 +5,12 @@
 #include "vc_object_store/objects/FiberConstraintGraph.hpp"
 #include "vc_object_store/objects/VolumeTransforms.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
+#include "FiberResultBindings.hpp"
+#include "FiberGraphBindings.hpp"
 #include "internal/Publication.hpp"
 #include <nanobind/stl/unique_ptr.h>
+#include <iostream>
+#include <chrono>
 
 namespace {
 // One pinned composed-store snapshot; no connection is shared between processes.
@@ -121,6 +125,18 @@ inline void bindCollectionApi(nb::module_& module) {
         self.check();const auto edge=self.collection->edge(*self.txn,{"",uuid});
         return edge?nb::object(recordToPy(edge->record)):nb::object(nb::none());
     },"uuid"_a)
+    .def("fiber_graph_columns",[](PyCollectionReader& self,size_t workers,bool progress){
+        self.check();vo::FiberGraphColumns columns;
+        std::function<void(const char*,size_t,size_t)> report;
+        const auto started=std::chrono::steady_clock::now();
+        if(progress)report=[started](const char* stage,size_t rows,size_t partition){
+            std::clog<<"{\"stage\":\"fiber_graph_"<<stage<<"\",\"rows\":"<<rows
+                     <<",\"partition\":"<<partition<<",\"seconds\":"
+                     <<std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()<<"}\n"<<std::flush;
+        };
+        {nb::gil_scoped_release release;columns=vo::readFiberGraphColumns(*self.collection,*self.txn,workers,report);}
+        return fiberGraphColumnsToPy(std::move(columns),workers);
+    },"workers"_a=32,"progress"_a=false,"One native parallel numeric graph snapshot; dense endpoints, binary edge UUIDs and selected node lengths.")
     .def("fiber_constraints",[](PyCollectionReader& self){
         self.check();std::vector<vo::CompactFiberConstraint> records;
         {nb::gil_scoped_release release;records=vo::readCompactFiberConstraintGraph(*self.collection,*self.txn);}
@@ -140,10 +156,15 @@ inline void bindCollectionApi(nb::module_& module) {
     .def("extension_tables",[](PyCollectionReader& self){
         self.check();nb::list result;for(const auto& table:self.collection->extensionTables(*self.txn))result.append(extensionTableToPy(table));return result;
     })
-    .def("extension_rows",[](PyCollectionReader& self,const std::string& name,const nb::sequence& key){
-        self.check();const auto prefix=extensionRowFromPy(key);nb::list result;
-        self.collection->scanExtensionRows(*self.txn,name,[&](const auto& row){result.append(extensionRowToPy(row));return true;},prefix);return result;
-    },"table"_a,"key_prefix"_a=nb::tuple());
+    .def("fiber_result_columns",[](PyCollectionReader& self,const std::string& run){
+        self.check();vo::FiberGraphResultColumns columns;
+        {nb::gil_scoped_release release;columns=vo::readFiberGraphResultColumns(*self.collection,*self.txn,run);}
+        return fiberResultColumnsToPy(std::move(columns));
+    },"run_uuid"_a,"Owned UUID-ordered NumPy numeric columns for one run, with explicit NULL masks.")
+    .def("extension_rows",[](PyCollectionReader& self,const std::string& name,const nb::sequence& key,const nb::dict& filter){
+        self.check();const auto prefix=extensionRowFromPy(key);const auto selection=extensionKeyFilterFromPy(filter);nb::list result;
+        self.collection->scanExtensionRows(*self.txn,name,[&](const auto& row){result.append(extensionRowToPy(row));return true;},prefix,selection);return result;
+    },"table"_a,"key_prefix"_a=nb::tuple(),"key_filter"_a=nb::dict());
 
     // These records are already decoded/prepared. Native source imports use
     // the same InitialImport and ParallelImportStream, not another SQL writer.

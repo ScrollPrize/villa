@@ -137,6 +137,8 @@ matches = store.extension_rows("ext_fiber_classification",
 
 `extension_rows` materializes its result; use `scan_extension_rows(table, visitor, key_prefix=...)` for streaming. A callback returning `False` stops the scan; `None` continues. `extension_rows_at_version` takes the ordinary version-reference dictionary with `store`, `generation`, `version` and exactly one of `object` or `relationship`.
 
+Both current-row methods also accept `key_filter={column: value, ...}` for equality on any subset of primary-key columns, including non-prefix columns such as a run UUID. Immutable scans push these predicates into SQLite, allowing a declared run index to serve the query without materializing other runs. Only primary-key columns are accepted: filtering mutable payload columns before overlay resolution could incorrectly reveal an older row. Versioned fields apply the same key predicates to the selected owner's snapshot rows. A prefix and a key filter are combined with AND.
+
 ## Parallel construction and store_reference reads
 
 Extension payloads use the existing bounded object/edge import stream and are written beside their owning object or edge in the same transaction. They do not require another source scan, a per-object routing directory or cross-shard endpoint reads.
@@ -218,6 +220,8 @@ Every following table name begins with `ext_fiber_graph_solve`. Multiple runs sh
 | `_metrics` | `run_uuid, iteration, scope, name` | One floating value or integer count, with units |
 
 Fiber-owned tables route with object UUIDs and relation results with edge UUIDs. Run-oriented tables are not object aliases; each run/input/width/metric record is stored once in a chosen database and found by ordinary collection scans. Run-to-fiber and run-to-edge indexes support lookup from the result as well as from its source entity.
+
+For numerical stage setup, `CollectionReader.fiber_result_columns(run_uuid)` returns owned, read-only NumPy columns in fiber-UUID order: `fiber_uuid` (`uint8[N,16]`), contiguous `uuid_ascii` bytes (36 bytes per UUID), `values` (`int64[N,5]`) and `valid` (`uint8[N,5]`). `columns` names the five integer fields: family, enabled, normal sign, selected winding and component. A false validity byte means SQL NULL; zero in the value buffer does not imply a resolved label. The native reader selects only the requested run and applies the same referenced/sharded overlay semantics as ordinary extension scans. These are result projections, not replacements for the run's recorded source/input references.
 
 `fiberGraphRunRow` accepts a stage/method identifier and a map of boolean, integer or finite real settings. It does not accept an arbitrary configuration/report object. `fiberGraphInputRow` stores each input pin as a typed row. A later run can reference an earlier result by its store/lineage/commit plus `input_run_uuid`; this does not overwrite the earlier run or update its source pins. Role names distinguish multiple inputs to one run. Per-run input pins are not repeated in every table's provisioning.
 

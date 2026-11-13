@@ -3,6 +3,8 @@
 #include <map>
 
 namespace vc::objects {
+class ObjectCollection;
+class CollectionTxn;
 
 // All are optional: requesting a definition does not create tables. Importers
 // create only sources/constraints; solve writers create the tables they use.
@@ -13,6 +15,18 @@ enum class FiberGraphTable {
 enum class FiberGraphLayer : int64_t { Shared = 0, Intermediate = 1, Final = 2, Refined = 3 };
 
 ExtensionTable fiberGraphSolveTable(FiberGraphTable);
+
+// UUID-ordered numeric projection of one immutable run. NULL is represented
+// by a validity byte, never by inventing an enabled/sign/winding value.
+struct FiberGraphResultColumns {
+    static constexpr std::array<const char*,5> names{
+        "family","enabled","normal_sign","selected_winding","component"};
+    std::vector<std::array<unsigned char,16>> fiberUuids;
+    std::vector<std::array<int64_t,5>> integers;
+    std::vector<std::array<uint8_t,5>> valid;
+};
+FiberGraphResultColumns readFiberGraphResultColumns(const ObjectCollection&,const CollectionTxn&,
+                                                   const std::string& runUuid);
 
 // Named construction for workflow writers, using the same typed SQL values as
 // the batch API. Missing nullable fields become NULL; unknown fields fail.

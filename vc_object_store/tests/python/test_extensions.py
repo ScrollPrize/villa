@@ -49,6 +49,15 @@ def test_typed_rows_and_transactional_registration(db):
     assert info["columns"] == [dict(nullable=False, **c) if "nullable" not in c else c for c in spec["columns"]]
     assert info["based_on"] == [] and info["last_modified_commit"] == db.status()["commit_sequence"]
     assert db.extension_rows(spec["name"], [extension_uuid(owner), 2]) == [expected[1]]
+    assert db.extension_rows(spec["name"], key_filter={"run":2}) == [expected[1]]
+    filtered=[]
+    assert db.scan_extension_rows(spec['name'],lambda item:filtered.append(item),key_filter={'run':2})==1
+    assert filtered==[expected[1]]
+    assert db.extension_rows(spec['name'],[extension_uuid(owner)],key_filter={'run':3})==[]
+    with pytest.raises(ValueError,match='primary-key'):
+        db.extension_rows(spec['name'],key_filter={'value':1.25})
+    with pytest.raises(ValueError,match='wrong value type'):
+        db.extension_rows(spec['name'],key_filter={'run':'2'})
     assert isinstance(expected[0][0], bytes) and len(expected[0][0]) == 16
     assert extension_uuid(expected[0][0]) == owner
     visited = []
@@ -97,6 +106,8 @@ def test_manual_fields_follow_owner_versions(tmp_path, history, owner_kind):
         with db.write(expected_versions=db.select_expected_versions({owner: 2})) as txn:
             txn.replace_extension_rows(spec["name"], owner, newer)
         assert db.current_version(owner) == 3 and db.extension_rows(spec["name"]) == newer
+        assert db.extension_rows(spec['name'],key_filter={'run':1})==[]
+        assert db.extension_rows(spec['name'],key_filter={'run':2})==newer
         if history:
             assert db.extension_rows_at_version(spec["name"], ref) == expected
             with db.write(expected_versions=db.select_expected_versions({owner: 3})) as txn:

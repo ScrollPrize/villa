@@ -2,6 +2,9 @@
 #include "internal/History.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/ObjectScan.hpp"
+#include "geometry/GeometryDelta.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/EdgeKinds.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
 
@@ -261,6 +264,58 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     return result;
 }
 
+GraphReadView ObjectStore::geometryReadView(const Txn& txn,const ObjectSelection& selection,
+                                         const std::optional<StoreStatus>& expectedPosition) const
+{
+    requirePublishedGraphRead(txn);
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    if(selection.minLength||selection.bbox||selection.connectedTo||!selection.edgeKinds.empty()||
+       selection.orderBy!="uuid"||selection.afterLength||selection.includeUnbound)
+        throw std::invalid_argument("geometry read supports UUID-ordered metadata selection, not measured/connected filters");
+    if(selection.offset<0||(selection.limit&&*selection.limit<0)||(selection.afterUuid&&selection.offset))
+        throw std::invalid_argument("geometry read has invalid pagination");
+    if(selection.volume&&selection.coordinates)
+        throw std::invalid_argument("geometry read volume and coordinates filters are exclusive");
+    if(!std::isfinite(selection.targetScale)||selection.targetScale<=0)
+        throw std::invalid_argument("geometry read target scale must be finite and positive");
+    if(expectedPosition){
+        const auto current=status(txn);
+        if(expectedPosition->commitSequence<0||current.storeUuid!=util::canonicalUuid(expectedPosition->storeUuid)||
+           current.generation!=util::canonicalUuid(expectedPosition->generation)||current.commitSequence!=expectedPosition->commitSequence)
+            throw StoreBusy("geometry read: source position changed");
+    }
+    auto physical=selection;physical.volume.reset();physical.limit.reset();physical.offset=0;
+    std::optional<VolumeTransforms> transforms=selection.transforms?std::optional(*selection.transforms):std::nullopt;
+    GraphReadView result;result.selectedObjects.emplace();result.selectedRelationships.emplace();
+    int64_t skipped=0;
+    if(!selection.limit||*selection.limit>0)
+        scanVisibleObjectRows(db,physical,std::nullopt,[&](ObjectRecord&& row,std::optional<SelectedGeometryHead> head){
+            if(selection.volume){
+                const auto metadata=nlohmann::json::parse(row.meta);
+                if(!geometryScaleToVolume(metadata,*selection.volume)){
+                    if(!transforms)transforms=volumeTransforms(txn);
+                    if(!transforms->toVolume(metadata,*selection.volume,selection.targetScale))return true;
+                }
+            }
+            if(skipped<selection.offset){++skipped;return true;}
+            if(head)(void)loadGeometryManifest(head->source,head->reference,head->manifest,row.dataChecksum.value_or(""));
+            ObjectRevision selected;
+            selected.metadataComplete=true; // complete current record, not an imported historical baseline
+            selected.storeUuid=row.versionStoreUuid;selected.generation=row.versionGeneration;
+            selected.objectUuid=row.uuid;selected.version=row.version.value_or(0);
+            selected.commitSequence=row.commitSequence;
+            if(head)selected.geometryRevision=head->reference;
+            selected.record=std::move(row);
+            result.objectUuids.push_back(selected.objectUuid);result.versions.push_back(selected.version);
+            result.geometryRevisions.push_back(selected.geometryRevision);result.selectedObjects->push_back(std::move(selected));
+            return !selection.limit||result.objectUuids.size()<size_t(*selection.limit);
+        });
+    // The empty graph's indexing is useful to existing bounded geometry views;
+    // no relationship tables or numbered history are consulted.
+    result.offsets.resize(result.objectUuids.size()+1,0);
+    return result;
+}
+
 GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<ObjectVersion>& versions,
                                          const EdgeSelection& edges) const
 {
@@ -292,9 +347,12 @@ GraphReadView StoreReader::graphReadViewAt(const std::vector<ObjectVersion>& ver
     }
     auto graphEdges = edges;
     if (!graphEdges.kind) graphEdges.attachments = false;
-    for (auto& selected : relationshipsAt(versions))
-        if (selected.applicable && matchesEdgeSelection(selected.relationship.record, graphEdges))
-            result.selectedRelationships->push_back(std::move(selected.relationship));
+    // A zero relationship limit is an explicit geometry-only selection. Do
+    // not enumerate incident evidence merely to discard every row afterward.
+    if(!edges.limit||*edges.limit!=0)
+        for (auto& selected : relationshipsAt(versions))
+            if (selected.applicable && matchesEdgeSelection(selected.relationship.record, graphEdges))
+                result.selectedRelationships->push_back(std::move(selected.relationship));
     auto& relationships = *result.selectedRelationships;
     std::sort(relationships.begin(), relationships.end(), [](const auto& a, const auto& b) { return a.record.uuid < b.record.uuid; });
     if (edges.limit && relationships.size() > static_cast<size_t>(*edges.limit)) relationships.resize(*edges.limit);

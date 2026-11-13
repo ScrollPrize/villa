@@ -89,6 +89,18 @@ void validateValue(const ExtensionColumn& column,const ExtensionValue& value) {
     if(const auto* real=std::get_if<double>(&value);real&&!std::isfinite(*real))
         throw std::invalid_argument("extension: nonfinite real value");
 }
+std::vector<std::pair<size_t,const ExtensionValue*>> keyFilterColumns(
+    const ExtensionTableInfo& table,const ExtensionKeyFilter& filter) {
+    std::vector<std::pair<size_t,const ExtensionValue*>> result;
+    for(const auto& [name,value]:filter) {
+        if(std::find(table.primaryKey.begin(),table.primaryKey.end(),name)==table.primaryKey.end())
+            throw std::invalid_argument("extension: key filter is not a primary-key column: "+name);
+        const auto found=std::find_if(table.columns.begin(),table.columns.end(),[&](const auto& c){return c.name==name;});
+        validateValue(*found,value);
+        result.emplace_back(size_t(found-table.columns.begin()),&value);
+    }
+    return result;
+}
 void insertRows(sqlite3* db,const ExtensionTableInfo& info,std::span<const ExtensionRow* const> rows,
                 const std::string& target={},bool track=true,
                 std::span<const InitialExtensionRow* const> stagedRows={}) {
@@ -319,13 +331,16 @@ int64_t detail::transferInitialExtensionStage(sqlite3* db,const std::string& nam
     exec(db,("DROP TABLE temp."+identifier(stage)).c_str());save.release();return count;
 }
 void detail::scanExtensionRows(sqlite3* db,const std::string& name,const std::function<bool(const ExtensionRow&)>& visitor,
-                               std::span<const ExtensionValue> prefix) {
+                               std::span<const ExtensionValue> prefix,const ExtensionKeyFilter& filter) {
     const auto info=extensionTable(db,name,false);if(!info)throw std::invalid_argument("extension: unregistered table "+name);
     if(!visitor||prefix.size()>info->primaryKey.size())throw std::invalid_argument("extension: invalid scan");
     std::string where;
     for(size_t i=0;i<prefix.size();++i){where+=i?" AND ":" WHERE ";where+=identifier(info->primaryKey[i])+"=?";}
+    const auto filters=keyFilterColumns(*info,filter);
+    for(const auto& [column,value]:filters){where+=where.empty()?" WHERE ":" AND ";where+=identifier(info->columns[column].name)+"=?";}
     Statement rows(db,"SELECT * FROM "+identifier(name)+where+" ORDER BY "+joined(info->primaryKey));
     for(size_t i=0;i<prefix.size();++i)bindValue(rows,int(i+1),prefix[i]);
+    for(size_t i=0;i<filters.size();++i)bindValue(rows,int(prefix.size()+i+1),*filters[i].second);
     while(rows.row())if(!visitor(readRow(rows)))break;
 }
 void detail::rejectExtensionLoss(sqlite3* db,const char* operation){if(hasExtensionTables(db))
@@ -360,12 +375,15 @@ std::vector<ExtensionTableInfo> ObjectStore::extensionTables(const Txn& t) const
     return result;
 }
 void ObjectStore::appendExtensionRows(WriteTxn& t,const std::string& name,std::span<const ExtensionRow> rows){detail::appendExtensionRows(static_cast<sqlite3*>(connection(t)),name,rows);}
-void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix) const {
+void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const std::function<bool(const ExtensionRow&)>& visitor,
+                                  std::span<const ExtensionValue> prefix,const ExtensionKeyFilter& filter) const {
     auto* db=static_cast<sqlite3*>(connection(t));
     const auto table=resolvedExtensionTable(db,name);
     const auto sources=querySources(db);
     if(!table)throw std::invalid_argument("extension: unregistered table "+name);
     if(!visitor||prefix.size()>table->primaryKey.size())throw std::invalid_argument("extension: invalid scan");
+    const auto filters=keyFilterColumns(*table,filter);
+    const auto matches=[&](const ExtensionRow& row){for(const auto& [column,value]:filters)if(row.at(column)!=*value)return false;return true;};
     if(table->versioned){
         std::set<std::string> seen;bool more=true;
         for(auto* source:sources){
@@ -374,7 +392,7 @@ void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const s
                 std::optional<std::string> meta;
                 if(table->keySpace=="objects") {if(auto record=objectByUuid(t,owner))meta=record->meta;}
                 else if(auto record=edgeByUuid(t,owner))meta=record->meta;
-                if(meta)more=scanExtensionSnapshot(db,*table,owner,*meta,visitor,prefix);
+                if(meta)more=scanExtensionSnapshot(db,*table,owner,*meta,[&](const ExtensionRow& row){return !matches(row)||visitor(row);},prefix);
                 return more;
             });
             if(!more)return;
@@ -390,7 +408,7 @@ void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const s
         detail::scanExtensionRows(source,name,[&](const ExtensionRow& row){
             ExtensionRow key;for(auto i:keys)key.push_back(row.at(i));
             if(seen.insert(std::move(key)).second)more=visitor(row);return more;
-        },prefix);
+        },prefix,filter);
         if(!more)return;
     }
 }

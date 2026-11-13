@@ -29,9 +29,7 @@ namespace vc::objects {
 using namespace detail;
 std::size_t uuidShardIndex(const std::string& uuid,std::size_t shardCount) {
     if(!shardCount)throw std::invalid_argument("collection: UUID shard count must be positive");
-    uint64_t hash=UINT64_C(14695981039346656037);
-    for(const auto byte:parseUuid(uuid)){hash^=byte;hash*=UINT64_C(1099511628211);}
-    return hash%shardCount;
+    return util::uuidHash64(parseUuid(uuid))%shardCount;
 }
 bool KeyRoute::matchesUuid(const std::string& uuid) const {
     if(kind!=RoutingKind::UuidHashV1)return false;
@@ -177,32 +175,49 @@ void validateRoutes(const std::vector<KeyRoute>& routes,const std::vector<Collec
 }
 
 struct ObjectCollection::Impl {
-    struct Node { std::unique_ptr<ObjectStore> store; CollectionMember member; bool collection=false; std::vector<KeyRoute> routes; std::vector<std::string> children; };
+    struct Node { std::unique_ptr<ObjectStore> store; CollectionMember member; bool collection=false; std::vector<KeyRoute> routes; std::vector<std::string> children;
+        // Immutable table-level facts, never per-object routing/cache entries.
+        // Mutable stores remain conservative so later inserts stay visible.
+        bool objectsMayExist=true,edgesMayExist=true;
+    };
     std::vector<Node> nodes;
     OpenOptions options;
     // DFS insertion order is explicit precedence: local, then bases in manifest order.
     // Originals are resolved only after considering all overrides/tombstones.
     std::map<std::string,size_t> byDatabase;
     std::map<std::string,std::pair<std::string,int64_t>> pinned;
-    std::vector<size_t> readOrder(const std::string* uuid=nullptr,const char* space=nullptr)const{
-        std::vector<size_t> order;std::set<size_t> included;std::set<std::pair<size_t,bool>> visited;
-        const std::string keySpace=space?std::string(space)+".uuid":std::string{};
+    struct ReadStep {
+        size_t node;
+        std::optional<std::pair<uint64_t,uint64_t>> objects,edges;
+    };
+    std::vector<ReadStep> readPlan;
+    std::vector<size_t> scanOrder;
+    // Compile only the immutable database/route topology, never object keys.
+    // Keep conditional duplicate steps: the first eligible occurrence wins.
+    void buildReadPlan(){
+        readPlan.clear();scanOrder.clear();
+        std::vector<bool> included(nodes.size(),false);
+        std::set<std::pair<size_t,bool>> visited;
+        const auto add=[&](ReadStep step){
+            if(!included[step.node]){included[step.node]=true;scanOrder.push_back(step.node);}
+            readPlan.push_back(std::move(step));
+        };
         std::function<void(size_t,bool)> visit=[&](size_t n,bool local){
             if(!visited.emplace(n,local).second)return;
-            if(local&&included.insert(n).second)order.push_back(n);
-            std::optional<std::string> routed;
-            std::optional<size_t> remainder;
-            for(const auto& r:nodes[n].routes)if(uuid&&r.keySpace==keySpace){
-                if(!remainder)remainder=uuidShardIndex(*uuid,r.divisor);
-                if(*remainder==r.remainder)routed=r.databaseUuid;
-            }
+            if(local)add({n,{},{}});
             // Sibling partitions are one overlay layer, not ordered bases.
             // Query its local rows (only the routed partition for a UUID
             // lookup, all partitions for a scan) before ANY dependencies;
             // otherwise an earlier unselected shard can expose a base record
             // that incorrectly shadows the selected shard's replacement.
             for(const auto& child:nodes[n].children){const auto i=byDatabase.at(child);
-                if(nodes[i].member.partition&&(!routed||*routed==child)&&included.insert(i).second)order.push_back(i);
+                if(!nodes[i].member.partition)continue;
+                ReadStep step{i,{},{}};
+                for(const auto& r:nodes[n].routes)if(r.databaseUuid==child){
+                    if(r.keySpace=="objects.uuid")step.objects=std::pair{r.divisor,r.remainder};
+                    if(r.keySpace=="edges.uuid")step.edges=std::pair{r.divisor,r.remainder};
+                }
+                add(std::move(step));
             }
             for(const auto& child:nodes[n].children){const auto i=byDatabase.at(child);
                 // Even an unselected shard can hold store_references to readonly dependencies.
@@ -210,7 +225,20 @@ struct ObjectCollection::Impl {
                 visit(i,!nodes[i].member.partition);
             }
         };
-        visit(0,true);return order;
+        visit(0,true);
+    }
+    std::vector<size_t> readOrder(const std::string* uuid=nullptr,const char* space=nullptr)const{
+        if(!uuid)return scanOrder;
+        const auto hash=util::uuidHash64(parseUuid(*uuid));
+        std::vector<unsigned char> included(nodes.size(),0);
+        std::vector<size_t> order;order.reserve(scanOrder.size());
+        for(const auto& step:readPlan){
+            const auto* rule=space&&std::string_view(space)=="objects"?&step.objects:
+                             space&&std::string_view(space)=="edges"?&step.edges:nullptr;
+            if(rule&&*rule&&hash%(*rule)->first!=(*rule)->second)continue;
+            if(!included[step.node]){included[step.node]=1;order.push_back(step.node);}
+        }
+        return order;
     }
     std::vector<size_t> uuidReadOrder(const std::string& uuid,const char* space)const{
         return readOrder(&uuid,space);
@@ -245,17 +273,19 @@ struct ObjectCollection::Impl {
             }
             return nullptr;
         };
-        pool->objectSource=[this,n,get,scope](const std::string& uuid,bool inherited,bool includeDeleted)->sqlite3*{
+        pool->objectSource=[this,n,get,scope](const std::string& uuid,bool inherited,bool includeDeleted,sqlite3* knownLiveSource)->sqlite3*{
             const auto found=locateSourceSql({{},uuid},get,0,[&](size_t i){
                 return scope.contains(i)&&(!inherited||i!=n);
-            },includeDeleted);
+            },includeDeleted,knownLiveSource);
             return found?get(*found):nullptr;
         };
         // Edges and objects have the same UUID/tombstone routing semantics.
         const auto visibleScope=scope;
-        pool->edgeSource=[this,n,get,visibleScope](const std::string& uuid,bool inherited,bool includeDeleted)->sqlite3*{
+        pool->edgeSource=[this,n,get,visibleScope](const std::string& uuid,bool inherited,bool includeDeleted,sqlite3* knownLiveSource)->sqlite3*{
             for(const auto i:uuidReadOrder(uuid,"edges"))if(visibleScope.contains(i)&&(!inherited||i!=n)){
-                auto* source=get(i);Statement row(source,"SELECT "+edgeReadColumn(source,"state")+" FROM edges WHERE uuid=?",parseUuid(uuid));
+                if(!nodes[i].edgesMayExist)continue;
+                auto* source=get(i);if(source==knownLiveSource)return source;
+                Statement row(source,"SELECT "+edgeReadColumn(source,"state")+" FROM edges WHERE uuid=?",parseUuid(uuid));
                 if(row.row())return includeDeleted||row.i64(0)!=2?source:nullptr;
             }
             return nullptr;
@@ -273,7 +303,8 @@ struct ObjectCollection::Impl {
         return {nodes[n].member.storeUuid,uuid};
     }
     std::optional<size_t> locateSourceSql(const ObjectKey&,const std::function<sqlite3*(size_t)>&,size_t start=0,
-                                         const std::function<bool(size_t)>& eligible={},bool includeDeleted=false) const;
+                                         const std::function<bool(size_t)>& eligible={},bool includeDeleted=false,
+                                         sqlite3* knownLiveSource=nullptr) const;
     ObjectKey insertEdge(CollectionTxn&,const ObjectKey&,const ObjectKey&,const EdgeRecord&);
 };
 struct CollectionTxn::Impl {
@@ -406,7 +437,12 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
         if(!routes.empty()||std::any_of(children.begin(),children.end(),[](auto& c){return c.partition;}))validateRoutes(routes,children);
     }
     if(read)read->commit();byDatabase[id.uuid]=nodes.size();std::vector<std::string> childIds;for(auto& c:children)childIds.push_back(c.databaseUuid);
-    nodes.push_back({std::move(store),member,composed,routes,childIds});visiting.insert(id.uuid);
+    bool objectsMayExist=true,edgesMayExist=true;
+    if(header.i64(4)!=0){
+        Statement present(sql,"SELECT EXISTS(SELECT 1 FROM objects),EXISTS(SELECT 1 FROM edges)");present.row();
+        objectsMayExist=present.i64(0)!=0;edgesMayExist=present.i64(1)!=0;
+    }
+    nodes.push_back({std::move(store),member,composed,routes,childIds,objectsMayExist,edgesMayExist});visiting.insert(id.uuid);
     for(const auto& child:children)load(child.locator,false,child,visiting);
     visiting.erase(id.uuid);
 }
@@ -416,13 +452,13 @@ struct detail::CollectionReadContext {
     std::unique_ptr<StatementPool> rootPool;
     StatementPool* borrowedPool=nullptr;
     std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> previousReferences;
-    std::function<sqlite3*(const std::string&,bool,bool)> previousObjects;
-    std::function<sqlite3*(const std::string&,bool,bool)> previousEdges;
+    std::function<sqlite3*(const std::string&,bool,bool,sqlite3*)> previousObjects;
+    std::function<sqlite3*(const std::string&,bool,bool,sqlite3*)> previousEdges;
     std::function<std::vector<sqlite3*>()> previousQueries;
     std::map<size_t,std::unique_ptr<ReadTxn>> readers;
     std::set<StatementPool*> configured;
     CollectionReadContext(sqlite3* sql,const std::filesystem::path& path,const OpenOptions& options):root(sql){
-        collection.options=readonlyOptions(options);std::set<std::string> visiting;collection.load(path,true,{},visiting,sql);
+        collection.options=readonlyOptions(options);std::set<std::string> visiting;collection.load(path,true,{},visiting,sql);collection.buildReadPlan();
         if(const auto found=activeStatementPools.find(root);found!=activeStatementPools.end()) {
             borrowedPool=found->second;previousReferences=borrowedPool->referenceSource;previousObjects=borrowedPool->objectSource;
             previousEdges=borrowedPool->edgeSource;previousQueries=borrowedPool->querySources;
@@ -464,10 +500,13 @@ std::shared_ptr<void> detail::attachCollectionReferenceResolver(sqlite3* db,cons
     return hasCollection(db)?std::make_shared<CollectionReadContext>(db,path,options):std::shared_ptr<void>{};
 }
 std::optional<size_t> ObjectCollection::Impl::locateSourceSql(const ObjectKey& key,
-    const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible,bool includeDeleted)const{
+    const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible,bool includeDeleted,
+    sqlite3* knownLiveSource)const{
     // UUID is the complete key. The first present row wins, including deletion.
     for(const auto n:uuidReadOrder(key.objectUuid,"objects"))if(n>=start&&(!eligible||eligible(n))){
+        if(!nodes[n].objectsMayExist)continue;
         auto* sql=get(n);
+        if(sql==knownLiveSource)return n;
         Statement state(sql,"SELECT state FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
         if(!state.row())continue;
         if(state.i64(0)==2&&!includeDeleted)return {};
@@ -480,7 +519,7 @@ ObjectCollection::ObjectCollection(std::unique_ptr<Impl> p):impl_(std::move(p)){
 ObjectCollection::ObjectCollection(ObjectCollection&&) noexcept=default;
 ObjectCollection::~ObjectCollection()=default;
 ObjectCollection ObjectCollection::open(const std::filesystem::path& path,const OpenOptions& options){
-    auto p=std::make_unique<Impl>();p->options=options;std::set<std::string> visiting;p->load(path,true,{},visiting);return ObjectCollection(std::move(p));
+    auto p=std::make_unique<Impl>();p->options=options;std::set<std::string> visiting;p->load(path,true,{},visiting);p->buildReadPlan();return ObjectCollection(std::move(p));
 }
 ObjectCollection ObjectCollection::create(const std::filesystem::path& path,const std::vector<std::filesystem::path>& bases,const OpenOptions& options){
     std::vector<CollectionMember> members;int64_t commitSequence=options.initialCommitSequence;
@@ -527,7 +566,7 @@ ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::
     // Pre-existing external dependencies still require their ordinary readers.
     std::set<std::string> visiting{p->nodes[0].member.databaseUuid};
     for(const auto& m:members)p->load(m.locator,false,m,visiting);
-    p->nodes[0].store=std::move(store);return ObjectCollection(std::move(p));
+    p->nodes[0].store=std::move(store);p->buildReadPlan();return ObjectCollection(std::move(p));
 }
 CollectionMember detail::InitialCollectionAccess::sealShard(ObjectCollection& collection,CollectionTxn& transaction) {
     if(hasInitialExtensionStages(collection.impl_->db(transaction,0)))
@@ -615,8 +654,9 @@ std::vector<ExtensionTableInfo> ObjectCollection::extensionTables(const Collecti
     return impl_->nodes[0].store->extensionTables(impl_->txn(t,0));
 }
 void ObjectCollection::scanExtensionRows(const CollectionTxn& t,const std::string& name,
-    const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix)const{
-    impl_->nodes[0].store->scanExtensionRows(impl_->txn(t,0),name,visitor,prefix);
+    const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix,
+    const ExtensionKeyFilter& filter)const{
+    impl_->nodes[0].store->scanExtensionRows(impl_->txn(t,0),name,visitor,prefix,filter);
 }
 std::vector<CollectionMember> ObjectCollection::members()const{std::vector<CollectionMember> r;for(const auto& n:impl_->nodes)r.push_back(n.member);return r;}
 

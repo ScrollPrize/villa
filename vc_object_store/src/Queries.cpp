@@ -294,15 +294,16 @@ bool restrictConnected(const ObjectStore& store,const Txn& txn,ObjectSelection& 
 }
 }
 
-void detail::scanVisibleObjects(sqlite3* db,const ObjectSelection& selection,const ObjectFields& fields,
-                                const std::function<bool(ObjectRecord&&)>& visit)
+void detail::scanVisibleObjectRows(sqlite3* db,const ObjectSelection& selection,const ObjectFields& fields,
+    const std::function<bool(ObjectRecord&&,std::optional<SelectedGeometryHead>)>& visit,bool includeGeometryHeads)
 {
     if(selection.limit&&*selection.limit==0) {
         (void)objectSelectionQuery(db,selection,projectedObjectColumns(fields));
         return;
     }
     auto physical=selection;physical.limit.reset();physical.offset=0;
-    const auto columns=projectedObjectColumns(fields);
+    const auto columns=projectedObjectColumns(fields)+(includeGeometryHeads?
+        ",CASE WHEN geometry_manifest IS NOT NULL THEN storage_ref ELSE NULL END,geometry_manifest":",NULL,NULL");
     VisibleObjectRows rows(db,[&](auto* source){return objectSelectionQuery(source,physical,columns);},1);
     struct Batch {
         std::vector<ObjectRecord> records;
@@ -320,6 +321,7 @@ void detail::scanVisibleObjects(sqlite3* db,const ObjectSelection& selection,con
     int64_t skipped=0,emitted=0;
     const size_t capacity=selection.limit?size_t(std::min<int64_t>(*selection.limit,256)):256;
     std::vector<ObjectRecord> ordered;ordered.reserve(capacity);
+    std::vector<std::optional<SelectedGeometryHead>> heads;heads.reserve(capacity);
     auto flush=[&]{
         for(auto& [source,batch]:batches) {
             if(batch.records.empty())continue;
@@ -327,19 +329,29 @@ void detail::scanVisibleObjects(sqlite3* db,const ObjectSelection& selection,con
             for(size_t i=0;i<batch.records.size();++i)ordered[batch.positions[i]]=std::move(batch.records[i]);
             batch.records.clear();batch.ids.clear();batch.positions.clear();
         }
-        for(auto& record:ordered)if(!visit(std::move(record)))return false;
-        ordered.clear();return true;
+        for(size_t i=0;i<ordered.size();++i)if(!visit(std::move(ordered[i]),std::move(heads[i])))return false;
+        ordered.clear();heads.clear();return true;
     };
     while(rows.row()) {
         if(skipped<selection.offset){++skipped;continue;}
         auto& batch=batches.at(rows.source());
         batch.ids.push_back(rows.values().i64(0));batch.positions.push_back(ordered.size());
         batch.records.push_back(readObjectRow(rows.source(),rows.values(),false,&batch.generation,false,&batch.owner));
+        if(rows.values().isNull(24))heads.emplace_back();
+        else heads.push_back(SelectedGeometryHead{rows.source(),readGeometryTokenColumn(rows.values(),23),rows.values().text(24)});
         ordered.emplace_back();++emitted;
         if(ordered.size()==capacity&&!flush())return;
         if(selection.limit&&emitted==*selection.limit)break;
     }
     if(!ordered.empty())flush();
+}
+
+void detail::scanVisibleObjects(sqlite3* db,const ObjectSelection& selection,const ObjectFields& fields,
+                                const std::function<bool(ObjectRecord&&)>& visit)
+{
+    scanVisibleObjectRows(db,selection,fields,[&](ObjectRecord&& row,std::optional<SelectedGeometryHead>){
+        return visit(std::move(row));
+    },false);
 }
 
 std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const ObjectSelection& requested,

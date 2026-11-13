@@ -1,7 +1,10 @@
 #include "vc_object_store/objects/FiberGraphSolveExtension.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
+#include "vc_object_store/objects/FiberConstraintGraph.hpp"
 #include <nlohmann/json.hpp>
 #include <cmath>
 #include <stdexcept>
+#include <algorithm>
 
 namespace vc::objects {
 namespace {
@@ -114,6 +117,36 @@ ExtensionTable fiberGraphSolveTable(FiberGraphTable kind)
         throw std::invalid_argument("fiber graph: unknown table");
     }
     return table;
+}
+
+FiberGraphResultColumns readFiberGraphResultColumns(const ObjectCollection& store,const CollectionTxn& txn,
+                                                   const std::string& runUuid)
+{
+    const auto expected=fiberGraphSolveTable(FiberGraphTable::FiberResults);
+    bool found=false;
+    for(const auto& table:store.extensionTables(txn))if(table.name==expected.name){
+        if(table.extension!=expected.extension||table.formatVersion!=expected.formatVersion||
+           table.columns!=expected.columns||table.primaryKey!=expected.primaryKey||table.keySpace!=expected.keySpace||table.versioned)
+            throw std::invalid_argument("fiber graph: unsupported fiber result table layout");
+        found=true;
+    }
+    if(!found)throw std::invalid_argument("fiber graph: no fiber result table");
+    struct Row {std::array<unsigned char,16> uuid;std::array<int64_t,5> values{};std::array<uint8_t,5> valid{};};
+    std::vector<Row> rows;
+    store.scanExtensionRows(txn,expected.name,[&](const ExtensionRow& source){
+        Row row;const auto& key=std::get<std::vector<uint8_t>>(source[0]);
+        if(key.size()!=16)throw std::invalid_argument("fiber graph: invalid fiber UUID");
+        std::copy(key.begin(),key.end(),row.uuid.begin());
+        for(size_t i=0;i<5;++i)if(!std::holds_alternative<std::monostate>(source[i+2])){
+            row.values[i]=std::get<int64_t>(source[i+2]);row.valid[i]=1;
+        }
+        rows.push_back(row);return true;
+    },{},{{"run_uuid",extensionUuid(runUuid)}});
+    std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){return a.uuid<b.uuid;});
+    FiberGraphResultColumns result;
+    result.fiberUuids.reserve(rows.size());result.integers.reserve(rows.size());result.valid.reserve(rows.size());
+    for(auto& row:rows){result.fiberUuids.push_back(row.uuid);result.integers.push_back(row.values);result.valid.push_back(row.valid);}
+    return result;
 }
 
 InitialExtensionRow fiberGraphSolveRow(FiberGraphTable kind,

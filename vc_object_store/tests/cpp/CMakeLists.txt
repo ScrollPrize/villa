@@ -243,4 +243,5 @@ if(TARGET vc_object_server)
     # Large-store selection benchmark; run by hand, not by ctest.
     add_executable(bench_object_store_selection bench_object_store_selection.cpp)
     target_link_libraries(bench_object_store_selection PRIVATE vc_object_server)
+    target_include_directories(bench_object_store_selection PRIVATE ../../src)
 endif()

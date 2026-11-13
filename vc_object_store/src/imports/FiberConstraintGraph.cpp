@@ -1,8 +1,14 @@
 #include "vc_object_store/objects/FiberConstraintGraph.hpp"
+#include "vc_object_store/Uuid.hpp"
+#include "vc_object_store/ParallelFor.hpp"
 #include "internal/CollectionReads.hpp"
 #include "internal/Extensions.hpp"
 #include "internal/Sqlite.hpp"
 #include "internal/EdgeLayout.hpp"
+#include "internal/VolumeFrames.hpp"
+#include "internal/TransformedLength.hpp"
+#include "geometry/GeometryToken.hpp"
+#include "vc_object_store/objects/FiberGraphSolveExtension.hpp"
 #include <algorithm>
 #include <atomic>
 #include <climits>
@@ -15,18 +21,18 @@
 namespace vc::objects {
 FiberGraphUuid fiberGraphUuid(const std::string& value){return detail::parseUuid(value);}
 std::string fiberGraphUuid(const FiberGraphUuid& value){return detail::formatUuid(value);}
+std::unique_ptr<uint8_t[]> fiberGraphUuidAscii(std::span<const FiberGraphUuid> values,size_t workers){
+    auto text=std::make_unique_for_overwrite<uint8_t[]>(values.size()*36);
+    parallelFor((values.size()+4095)/4096,workers,[&](size_t task){
+        for(size_t i=task*4096;i<std::min(values.size(),(task+1)*4096);++i){
+            const auto id=fiberGraphUuid(values[i]);std::copy(id.begin(),id.end(),text.get()+i*36);
+        }
+    });return text;
+}
 namespace {
 struct UuidHash {size_t operator()(const FiberGraphUuid& key)const {
-    uint64_t h=UINT64_C(14695981039346656037);for(auto b:key){h^=b;h*=UINT64_C(1099511628211);}return h;
+    return util::uuidHash64(key);
 }};
-template<class F>void parallelPartitions(size_t count,size_t workers,const F& work){
-    std::atomic<size_t> next{0};std::atomic<bool> failed{false};std::vector<std::future<void>> jobs;
-    for(size_t i=0;i<std::min(count,workers);++i)jobs.push_back(std::async(std::launch::async,[&]{
-        try{for(size_t n;!failed.load()&&(n=next.fetch_add(1))<count;)work(n);}catch(...){failed.store(true);throw;}
-    }));
-    std::exception_ptr error;for(auto& job:jobs)try{job.get();}catch(...){if(!error)error=std::current_exception();}
-    if(error)std::rethrow_exception(error);
-}
 std::span<const uint8_t> blob(const detail::Statement& row,int column,size_t size){
     if(sqlite3_column_type(row.value,column)!=SQLITE_BLOB||sqlite3_column_bytes(row.value,column)!=int(size))
         throw std::invalid_argument("invalid compact fiber measurement BLOB size/type");
@@ -38,8 +44,9 @@ void requireFormat(const ExtensionTableInfo& info){
         throw std::invalid_argument("unsupported fiber measurement format; explicitly convert to compact format 4");
 }
 }
-std::vector<CompactFiberConstraint> readCompactFiberConstraintGraph(const ObjectCollection& store,const CollectionTxn& txn,size_t workers,
-    const std::function<void(const char*,size_t,size_t)>& progress){
+static std::vector<CompactFiberConstraint> readCompactFiberConstraintGraphImpl(const ObjectCollection& store,const CollectionTxn& txn,size_t workers,
+    const std::function<void(const char*,size_t,size_t)>& progress,std::vector<FiberGraphNodeColumn>* nodes=nullptr,
+    std::string* targetVolume=nullptr){
     using namespace detail;if(!workers)throw std::invalid_argument("graph read workers must be positive");
     const auto parts=CollectionScanAccess::partitions(store,txn);
     struct Edge {FiberGraphUuid a,b;int state=0,kind=-1,measurementOwner=INT_MAX;};
@@ -60,9 +67,40 @@ std::vector<CompactFiberConstraint> readCompactFiberConstraintGraph(const Object
         schema=info;data[n].schema=std::move(info);
     }
     if(!schema)throw std::invalid_argument("store has no fiber constraint measurements");
+    std::string volume;std::optional<std::vector<FiberGraphUuid>> selected;
+    if(nodes){
+        const auto provisioning=nlohmann::json::parse(schema->provisioning);
+        if(!provisioning.contains("coordinate_space")||!provisioning["coordinate_space"].is_string())
+            throw std::invalid_argument("compact format-4 graph must name its measurement volume");
+        const auto frame=provisioning["coordinate_space"].get<std::string>();
+        volume=frame.substr(frame.find_last_of('/')==std::string::npos?0:frame.find_last_of('/')+1);
+        if(volume.empty())throw std::invalid_argument("empty fiber measurement volume");
+        const auto runTable=fiberGraphSolveTable(FiberGraphTable::Runs);
+        const auto fiberTable=fiberGraphSolveTable(FiberGraphTable::FiberResults);
+        const auto tables=store.extensionTables(txn);
+        if(std::any_of(tables.begin(),tables.end(),[&](const auto& t){return t.name==runTable.name;})){
+            std::optional<ExtensionValue> extraction;
+            store.scanExtensionRows(txn,runTable.name,[&](const ExtensionRow& row){
+                if(std::get<std::string>(row[1])=="constraint_extraction"){
+                    if(extraction)throw std::invalid_argument("select one extraction graph, not multiple independent graphs");
+                    extraction=row[0];
+                }return true;
+            });
+            if(extraction){
+                selected.emplace();
+                store.scanExtensionRows(txn,fiberTable.name,[&](const ExtensionRow& row){
+                    const auto& key=std::get<std::vector<uint8_t>>(row[0]);
+                    if(key.size()!=16)throw std::invalid_argument("invalid extraction fiber UUID");
+                    FiberGraphUuid uuid;std::copy(key.begin(),key.end(),uuid.begin());selected->push_back(uuid);return true;
+                },{},{{"run_uuid",*extraction}});
+                std::sort(selected->begin(),selected->end());
+            }
+        }
+        if(targetVolume)*targetVolume=volume;
+    }
     std::mutex progressMutex;std::atomic<size_t> readEdges{0},readRows{0};
     const auto report=[&](const char* phase,size_t count,size_t node){if(progress){std::lock_guard lock(progressMutex);progress(phase,count,node);}};
-    parallelPartitions(parts.size(),workers,[&](size_t n){auto* db=parts[n].db;auto& p=data[n];
+    parallelFor(parts.size(),workers,[&](size_t n){auto* db=parts[n].db;auto& p=data[n];
         Statement objects(db,"SELECT uuid,state FROM objects");while(objects.row())p.states.emplace(objects.blob16(0),int(objects.i64(1)));
         Statement count(db,"SELECT count(*) FROM edges");count.row();p.edges->reserve(count.i64(0));
         Statement edges(db,"SELECT uuid,a_uuid,b_uuid,"+edgeReadColumn(db,"state")+",kind FROM edges");size_t local=0;
@@ -88,12 +126,46 @@ std::vector<CompactFiberConstraint> readCompactFiberConstraintGraph(const Object
             auto it=data[n].edges->find(uuid);if(it!=data[n].edges->end())return {n,&it->second};
         }return {data.size(),nullptr};
     };
-    const auto active=[&](const FiberGraphUuid& uuid){const auto hash=UuidHash{}(uuid);
+    const auto objectOwner=[&](const FiberGraphUuid& uuid){const auto hash=UuidHash{}(uuid);
         for(auto n:objectCandidates[hash%objectCandidates.size()])if(eligible(n,hash,"objects.uuid")){
-            auto it=data[n].states.find(uuid);if(it!=data[n].states.end())return it->second==0;
-        }return false;
+            auto it=data[n].states.find(uuid);if(it!=data[n].states.end())return std::pair{n,it->second};
+        }return std::pair{data.size(),-1};
     };
-    parallelPartitions(parts.size(),workers,[&](size_t n){if(!data[n].schema)return;auto* db=parts[n].db;auto& rows=data[n].rows;
+    const auto active=[&](const FiberGraphUuid& uuid){return objectOwner(uuid).second==0;};
+    if(nodes){
+        const auto transforms=store.volumeTransforms(txn);
+        std::vector<std::vector<FiberGraphNodeColumn>> batches(parts.size());
+        parallelFor(parts.size(),workers,[&](size_t n){
+            auto* db=parts[n].db;auto& output=batches[n];
+            Statement rows(db,"SELECT o.uuid,f.length,o.coordinate_volume,o.coordinate_scale,o.storage_ref,o.geometry_manifest IS NOT NULL "
+                "FROM objects o LEFT JOIN fibers f ON f.object_id=o.id WHERE o.kind='fiber' AND o.state=0 ORDER BY o.uuid");
+            while(rows.row()){
+                const auto uuid=rows.blob16(0);
+                if(objectOwner(uuid).first!=n||(selected&&!std::binary_search(selected->begin(),selected->end(),uuid)))continue;
+                const auto source=rows.text(2);const auto scale=rows.f64(3);
+                if(rows.isNull(2)||source.empty()||rows.isNull(3)||!std::isfinite(scale)||scale<=0)
+                    throw std::invalid_argument("fiber has no valid coordinate frame");
+                double length;
+                if(source==volume&&!rows.isNull(1))length=rows.f64(1)*(1./scale);
+                else{
+                    const auto mapping=source==volume?std::optional(VolumeAffine::scale(1./scale)):
+                        frameMapping(nlohmann::json{{"volume_uuid",source},{"scale_factor",scale}},volume,&transforms);
+                    if(!mapping)throw std::invalid_argument("fiber is not mapped to the measurement volume");
+                    if(rows.isNull(4)||!rows.i64(5))throw std::invalid_argument("mapped fiber has no geometry");
+                    length=transformedLength(db,readGeometryTokenColumn(rows,4),*mapping,"fiber");
+                }
+                if(!std::isfinite(length)||length<0)throw std::invalid_argument("invalid measured fiber length");
+                output.push_back({uuid,length});
+            }
+        });
+        for(auto& batch:batches)nodes->insert(nodes->end(),std::make_move_iterator(batch.begin()),std::make_move_iterator(batch.end()));
+        std::sort(nodes->begin(),nodes->end(),[](const auto& a,const auto& b){return a.uuid<b.uuid;});
+        if(std::adjacent_find(nodes->begin(),nodes->end(),[](const auto& a,const auto& b){return a.uuid==b.uuid;})!=nodes->end())
+            throw std::invalid_argument("duplicate selected graph fiber");
+        if(selected&&nodes->size()!=selected->size())throw std::invalid_argument("extraction selects missing or inactive fibers");
+        report("fibers",nodes->size(),parts.size());
+    }
+    parallelFor(parts.size(),workers,[&](size_t n){if(!data[n].schema)return;auto* db=parts[n].db;auto& rows=data[n].rows;
         Statement count(db,std::string("SELECT count(*) FROM ")+kFiberConstraintTable);count.row();rows.reserve(count.i64(0));
         Statement scan(db,std::string("SELECT edge_uuid,arc_a,arc_b,normal_a,normal_b,connector,winding_distance FROM ")+kFiberConstraintTable);size_t local=0;
         while(scan.row()){
@@ -110,9 +182,9 @@ std::vector<CompactFiberConstraint> readCompactFiberConstraintGraph(const Object
             if(++local%1000000==0)report("measurements",readRows.fetch_add(1000000)+1000000,n);
         }report("measurements",readRows.fetch_add(local%1000000)+local%1000000,n);
     });
-    parallelPartitions(parts.size(),workers,[&](size_t n){auto& rows=data[n].rows;std::erase_if(rows,[&](const auto& r){return edgeOwner(r.uuid).second->measurementOwner!=int(n);});});
+    parallelFor(parts.size(),workers,[&](size_t n){auto& rows=data[n].rows;std::erase_if(rows,[&](const auto& r){return edgeOwner(r.uuid).second->measurementOwner!=int(n);});});
     report("resolved",readRows.load(),parts.size());
-    parallelPartitions(data.size(),workers,[&](size_t n){auto& p=data[n];p.edges.reset();p.arena.reset();p.states.clear();p.states.rehash(0);});
+    parallelFor(data.size(),workers,[&](size_t n){auto& p=data[n];p.edges.reset();p.arena.reset();p.states.clear();p.states.rehash(0);});
     report("indexes_released",readRows.load(),parts.size());
     size_t total=0;for(const auto& p:data)total+=p.rows.size();std::vector<CompactFiberConstraint> result;result.reserve(total);
     for(auto& p:data){result.insert(result.end(),std::make_move_iterator(p.rows.begin()),std::make_move_iterator(p.rows.end()));std::vector<CompactFiberConstraint>().swap(p.rows);}
@@ -120,10 +192,47 @@ std::vector<CompactFiberConstraint> readCompactFiberConstraintGraph(const Object
     for(size_t i=0;i<result.size();++i){if(i&&result[i-1].uuid==result[i].uuid)throw std::invalid_argument("duplicate compact edge UUID");result[i].runtimeIndex=i;}
     report("complete",result.size(),parts.size());return result;
 }
+std::vector<CompactFiberConstraint> readCompactFiberConstraintGraph(const ObjectCollection& store,const CollectionTxn& txn,size_t workers,
+    const std::function<void(const char*,size_t,size_t)>& progress){
+    return readCompactFiberConstraintGraphImpl(store,txn,workers,progress);
+}
+
+FiberGraphColumns readFiberGraphColumns(const ObjectCollection& store,const CollectionTxn& txn,size_t workers,
+    const std::function<void(const char*,size_t,size_t)>& progress){
+    FiberGraphColumns out;std::vector<FiberGraphNodeColumn> nodes;
+    auto records=readCompactFiberConstraintGraphImpl(store,txn,workers,progress,&nodes,&out.volume);
+    const size_t n=nodes.size(),m=records.size();
+    if(progress)progress("column_projection",0,workers);
+    out.nodes=n;out.events=m;
+    out.fiberUuids=std::make_unique_for_overwrite<FiberGraphUuid[]>(n);out.lengths=std::make_unique_for_overwrite<double[]>(n);
+    out.edgeUuids=std::make_unique_for_overwrite<FiberGraphUuid[]>(m);out.eventIds=std::make_unique_for_overwrite<int64_t[]>(m);
+    out.endpoints=std::make_unique_for_overwrite<std::array<int64_t,2>[]>(m);out.arcs=std::make_unique_for_overwrite<std::array<double,2>[]>(m);
+    out.normalA=std::make_unique_for_overwrite<std::array<double,3>[]>(m);out.normalB=std::make_unique_for_overwrite<std::array<double,3>[]>(m);
+    out.connector=std::make_unique_for_overwrite<std::array<double,3>[]>(m);out.distance=std::make_unique_for_overwrite<double[]>(m);
+    out.parallel=std::make_unique_for_overwrite<uint8_t[]>(m);out.validA=std::make_unique_for_overwrite<uint8_t[]>(m);
+    out.validB=std::make_unique_for_overwrite<uint8_t[]>(m);out.validConnector=std::make_unique_for_overwrite<uint8_t[]>(m);
+    parallelFor((n+4095)/4096,workers,[&](size_t task){
+        for(size_t i=task*4096;i<std::min(n,(task+1)*4096);++i){out.fiberUuids[i]=nodes[i].uuid;out.lengths[i]=nodes[i].length;}
+    });
+    const auto index=[&](const FiberGraphUuid& key){
+        const auto found=std::lower_bound(nodes.begin(),nodes.end(),key,[](const auto& row,const auto& value){return row.uuid<value;});
+        if(found==nodes.end()||found->uuid!=key)throw std::invalid_argument("constraint refers to a fiber outside the extracted graph");
+        return int64_t(found-nodes.begin());
+    };
+    parallelFor((m+65535)/65536,workers,[&](size_t task){
+        for(size_t i=task*65536;i<std::min(m,(task+1)*65536);++i){const auto& r=records[i];
+            out.edgeUuids[i]=r.uuid;out.eventIds[i]=int64_t(r.runtimeIndex);out.endpoints[i]={index(r.a),index(r.b)};
+            out.arcs[i]={r.arcA,r.arcB};out.normalA[i]=r.normalA;out.normalB[i]=r.normalB;out.connector[i]=r.connector;
+            out.distance[i]=r.windingDistance;out.parallel[i]=r.parallel;out.validA[i]=r.validA;out.validB[i]=r.validB;out.validConnector[i]=r.validConnector;
+        }
+    });
+    if(progress)progress("columns_complete",m,workers);
+    return out;
+}
 std::function<void()> prepareFiberConstraintMeasurementScan(const ObjectCollection& store,const CollectionTxn& txn,
     std::span<const CompactFiberConstraint> records,size_t workers,const std::function<void(FiberMeasurementBatch&&)>& visit){
     using namespace detail;if(!workers||!visit)throw std::invalid_argument("invalid measurement stream");const auto parts=CollectionScanAccess::partitions(store,txn);
-    return [parts,records,workers,visit]{parallelPartitions(parts.size(),workers,[&](size_t n){auto* db=parts[n].db;
+    return [parts,records,workers,visit]{parallelFor(parts.size(),workers,[&](size_t n){auto* db=parts[n].db;
         const auto schema=extensionTable(db,kFiberConstraintTable);if(!schema)return;requireFormat(*schema);FiberMeasurementBatch batch;batch.reserve(4096);
         scanExtensionRows(db,kFiberConstraintTable,[&](const ExtensionRow& row){const auto& bytes=std::get<std::vector<uint8_t>>(row.at(0));
             if(bytes.size()!=16)throw std::invalid_argument("invalid measurement UUID");FiberGraphUuid uuid;std::copy(bytes.begin(),bytes.end(),uuid.begin());

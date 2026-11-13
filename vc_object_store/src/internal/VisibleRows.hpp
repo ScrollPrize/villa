@@ -53,7 +53,7 @@ public:
                 if(cursors_[i].key&&(!current_||*cursors_[i].key<*cursors_[*current_].key))current_=i;
             if(!current_)return false;
             auto& cursor=cursors_[*current_];
-            if(objectSource(root_,*cursor.key)==cursor.source)return true;
+            if(objectSource(root_,*cursor.key,false,false,cursor.source)==cursor.source)return true;
             advance(cursor);
         }
     }

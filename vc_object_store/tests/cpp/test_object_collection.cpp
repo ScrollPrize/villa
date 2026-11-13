@@ -38,13 +38,16 @@ void boundedVisibleScan()
     {auto store=ObjectCollection::publishShards(root,{early,late},options);}
     auto store=ObjectCollection::open(root,OpenOptions{.readOnly=true});auto txn=store.read();
     struct RowCount {
-        std::vector<sqlite3*> sources;size_t count=0;
+        std::vector<sqlite3*> sources;size_t count=0,stateProbes=0;
         RowCount(const ObjectCollection& store,const CollectionTxn& txn) {
             for(const auto& source:CollectionScanAccess::partitions(store,txn)) {
                 sources.push_back(source.db);
-                sqlite3_trace_v2(source.db,SQLITE_TRACE_ROW,[](unsigned,void* context,void* statement,void*){
+                sqlite3_trace_v2(source.db,SQLITE_TRACE_ROW|SQLITE_TRACE_STMT,[](unsigned event,void* context,void* statement,void*){
                     auto* query=static_cast<sqlite3_stmt*>(statement);
-                    if(sqlite3_column_count(query)>=23&&std::string_view(sqlite3_column_name(query,0))=="id"&&
+                    if(event==SQLITE_TRACE_STMT){
+                        if(std::string_view(sqlite3_sql(query)).starts_with("SELECT state FROM objects WHERE uuid="))
+                            ++static_cast<RowCount*>(context)->stateProbes;
+                    }else if(sqlite3_column_count(query)>=23&&std::string_view(sqlite3_column_name(query,0))=="id"&&
                        std::string_view(sqlite3_column_name(query,1))=="uuid")++static_cast<RowCount*>(context)->count;
                     return 0;
                 },this);
@@ -58,7 +61,7 @@ void boundedVisibleScan()
                 "early scan sees the late-sibling override and its actual owner");++seen;return false;
     },"note");
     require(seen==1&&work.count<=260,"early-stop scan decodes only one bounded batch, not the whole store");
-    work.count=0;std::vector<std::string> found;
+    work.count=0;work.stateProbes=0;std::vector<std::string> found;
     store.scanObjects(txn,[&](const CollectionObject& row){
         require(row.record.versionStoreUuid==row.key.storeUuid,"streamed record retains its selected owner reference");
         require(row.key.storeUuid==(row.record.uuid==ids[0]?lateOwner:baseOwner),"source ownership does not become root ownership");
@@ -67,6 +70,7 @@ void boundedVisibleScan()
     auto expected=ids;expected.erase(expected.begin()+1);
     require(found==expected,"one-pass scan is UUID ordered and suppresses tombstones and shadowed duplicates");
     require(work.count<=count+4,"one-pass scan neither rescans pages nor rereads emitted full records");
+    require(work.stateProbes<=count,"sealed empty layers and already selected rows need no repeated existence probes");
     txn.commit();
     auto ordinary=ObjectStore::open(root,OpenOptions{.readOnly=true});auto read=ordinary.read();
     ObjectSelection selection;selection.kind="note";selection.tag="eligible";selection.limit=1;
@@ -75,6 +79,13 @@ void boundedVisibleScan()
     selection.tag.reset();selection.afterUuid=ids[4095];selection.limit=3;
     const auto page=ordinary.selectObjects(read,selection,std::vector<std::string>{});
     require(page.size()==3&&page[0].uuid==ids[4096]&&page[2].uuid==ids[4098],"cursor pagination seeks directly past its UUID boundary");
+    read.commit();
+    auto mutableStore=ObjectCollection::create(dir.path/"mutable",{root},options);
+    {auto before=mutableStore.read();require(!mutableStore.object(before,{{},util::nameUuid("new-local")}),"new UUID begins absent");}
+    {auto write=mutableStore.write();ObjectRecord record;record.uuid=util::nameUuid("new-local");record.kind="note";
+        mutableStore.upsertObject(write,record);write.commit();}
+    {auto after=mutableStore.read();require(bool(mutableStore.object(after,{{},util::nameUuid("new-local")})),
+        "a mutable initially empty layer still exposes later insertions");}
 }
 
 void metadataOverrides()

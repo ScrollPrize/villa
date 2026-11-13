@@ -486,7 +486,8 @@ public:
     void appendExtensionRows(WriteTxn&, const std::string& table, std::span<const ExtensionRow>);
     // Stream in primary-key order; optional equality prefix uses the PK index.
     void scanExtensionRows(const Txn&, const std::string& table,
-        const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {}) const;
+        const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {},
+        const ExtensionKeyFilter& keyFilter = {}) const;
     void replaceExtensionRows(WriteTxn&, const std::string& table, const std::string& ownerUuid, std::span<const ExtensionRow>);
     void scanExtensionRowsAtVersion(const Txn&, const std::string& table, const ObjectVersion&,
         const std::function<bool(const ExtensionRow&)>&) const;
@@ -682,10 +683,24 @@ public:
     std::vector<std::vector<uint8_t>> readGeometryRanges(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName, const std::vector<std::array<int64_t, 2>>& ranges) const;
 
+    // Descriptor-only catalog in selection order. No coordinate chunks are read.
+    // The UUID/count columns belong to this transaction, not edit references.
+    struct GeometryArrayCounts {
+        std::vector<std::array<unsigned char,16>> uuids;
+        std::vector<int64_t> counts; // first dimension; zero for absent arrays
+    };
+    GeometryArrayCounts geometryArrayCounts(const Txn&, const std::string& objectKind,
+                                           const std::string& arrayName,
+                                           const std::optional<int64_t>& limit=std::nullopt) const;
+
     // One packed buffer, caller revision order (including duplicates).
     // Dtype and trailing dimensions must match. All chunks remain verified.
     PackedGeometryArray readGeometryArrays(const Txn&, const std::vector<std::string>& revisionUuids,
         const std::string& arrayName) const;
+    // Captured selected metadata and payload identities stay paired. Optional
+    // mapping currently supports fiber line_points and returns float64 XYZ.
+    PackedGeometryArray readSelectedGeometryArrays(const Txn&, std::span<const ObjectRevision>,
+        const std::string& arrayName, const std::optional<std::string>& volume = std::nullopt) const;
 
     // Owned pinned payload with an explicit aggregate byte bound. Reads are
     // chunked; callers needing larger objects should use ranges/rectangles.
@@ -790,6 +805,13 @@ public:
     // object versions and geometry heads from the caller's consistent snapshot.
     GraphReadView graphReadView(const Txn&, const ObjectSelection& = {},
                                const EdgeSelection& = {}) const;
+    // Current geometry-only selection: captures selected records and their
+    // geometry heads together in one read snapshot, without history or edges.
+    // Supports UUID/kind/tag/family/coordinate filters and UUID pagination;
+    // volume eligibility uses the same snapshot's native transform context.
+    // Measured-length, bounds and connection filters are not accepted here.
+    GraphReadView geometryReadView(const Txn&, const ObjectSelection& = {},
+                                  const std::optional<StoreStatus>& expectedPosition = std::nullopt) const;
     // Requires a ReadTxn. Closed selection of exact recorded versions (one per
     // object; deleted versions and unknown references fail).
     // Always includes only applicable relationships. Retains isolated objects,

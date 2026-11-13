@@ -12,19 +12,22 @@ struct ResolvedObject {
 // Inherited lookup is for an overlay's before-state only; ordinary consumers
 // use visible lookup, where a tombstone stops fallback.
 // includeDeleted returns the winning tombstone's owner, never an older live row.
-inline sqlite3* recordSource(sqlite3* db,const std::string& uuid,bool object,bool inherited,bool includeDeleted)
+inline sqlite3* recordSource(sqlite3* db,const std::string& uuid,bool object,bool inherited,bool includeDeleted,
+                            sqlite3* knownLiveSource=nullptr)
 {
     if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end()) {
         const auto& source=object?pool->second->objectSource:pool->second->edgeSource;
-        if(source)return source(uuid,inherited,includeDeleted);
+        if(source)return source(uuid,inherited,includeDeleted,knownLiveSource);
     }
     if(inherited)return nullptr;
+    if(knownLiveSource==db)return db;
     Statement row(db,object?"SELECT state FROM objects WHERE uuid=?":
         "SELECT "+edgeReadColumn(db,"state")+" FROM edges WHERE uuid=?",parseUuid(uuid));
     return row.row()&&(includeDeleted||row.i64(0)!=2)?db:nullptr;
 }
-inline sqlite3* objectSource(sqlite3* db,const std::string& uuid,bool inherited=false,bool includeDeleted=false)
-{return recordSource(db,uuid,true,inherited,includeDeleted);}
+inline sqlite3* objectSource(sqlite3* db,const std::string& uuid,bool inherited=false,bool includeDeleted=false,
+                            sqlite3* knownLiveSource=nullptr)
+{return recordSource(db,uuid,true,inherited,includeDeleted,knownLiveSource);}
 inline std::optional<ResolvedObject> resolveObject(sqlite3* db,const std::string& uuid,bool inherited=false)
 {
     auto* source=objectSource(db,uuid,inherited);
