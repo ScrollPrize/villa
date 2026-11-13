@@ -2004,6 +2004,12 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     TraceParameters trace_params;
     int snapshot_interval = params.value("snapshot-interval", 0);
     int stop_gen = params.value("generations", 100);
+    // Optional budget for growth, in seconds of this function's growth timer (0: none). It is checked between
+    // generations, so a trace stops at a generation boundary and its surface is returned and saved as usual.
+    const double time_limit_s = std::max(0.0, params.value("time_limit_s", 0.0));
+    // Why growth ended, written to meta.json: "running" in a snapshot, else "generations", "time_limit" or
+    // "fringe_empty".
+    std::string stop_reason = "running";
 
     // Load normal grid first if provided, so we can use its spiral-step
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
@@ -2399,6 +2405,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
                                    static_cast<double>(voxelsize));
         surf->meta["max_gen"] = generation;
+        surf->meta["stop_reason"] = stop_reason;
         if (anchor_requested) {
             auto a = nlohmann::json::object();
             a["version"] = 1; a["mode"] = "fixed-vertex";
@@ -2494,6 +2501,9 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     int loss_count = 0;
     double last_elapsed_seconds = 0.0;
     int last_succ = 0;
+    // Wall time of the last four generations. Late generations solve locally around new points on every
+    // fourth row and column, so one generation in four can take ten times as long as the others.
+    std::array<double, 4> recent_gen_seconds{};
     int start_gen = 0;
 
     std::cout << "lets go! " << std::endl;
@@ -3106,8 +3116,23 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
         int phys_fail_count_gen = 0;
         generation++;
-        if (stop_gen && generation >= stop_gen)
+        if (stop_gen && generation >= stop_gen) {
+            stop_reason = "generations";
             break;
+        }
+        if (time_limit_s > 0.0) {
+            // Generations get slower as the patch grows, so the slowest of the last four is a cheap estimate
+            // of the next one: stop before a generation that would not end within the budget.
+            const double used_s = f_timer.seconds();
+            const double next_s = *std::max_element(recent_gen_seconds.begin(), recent_gen_seconds.end());
+            if (used_s + next_s >= time_limit_s) {
+                std::cout << "stopping before generation " << generation << ": " << used_s << " s used, the next "
+                          << "generation would take about " << next_s << " s, time_limit_s " << time_limit_s
+                          << std::endl;
+                stop_reason = "time_limit";
+                break;
+            }
+        }
 
         auto is_loc_valid = [&](const cv::Vec2i& p) {
             return bounds.contains(cv::Point(p[1], p[0])) &&
@@ -3425,6 +3450,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
         last_elapsed_seconds = elapsed_seconds;
         last_succ = succ;
+        recent_gen_seconds[generation % recent_gen_seconds.size()] = seconds_this_gen;
 
         timer_gen.unit = succ_gen * vx_per_quad;
         timer_gen.unit_string = "vx^2";
@@ -3437,9 +3463,12 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
         }
 
     }  // end while fringe is non-empty
-    delete timer;
+    if (stop_reason == "running")
+        stop_reason = "fringe_empty";
 
+    // create_surface_from_state reads its elapsed time from *timer, so delete timer only after it.
     QuadSurface* surf = create_surface_from_state();
+    delete timer;
 
     const double area_est_vx2 = ([&] { const auto& points = *std::as_const(*surf).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
             [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
