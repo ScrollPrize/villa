@@ -884,6 +884,13 @@
                                                            &exportError, nullptr) && !exportError.isEmpty(),
                             "an export that would omit edits queued behind an unconfirmed save is refused");
                 }
+                {
+                    // Save-all (quit) reports that not everything is stored.
+                    const auto failures = publishing._fiberSaveFailureCount;
+                    require(!publishing.saveOpenFibers() && publishing._publication && live->fiberWidth == later,
+                            "save-all behind an unconfirmed save reports the edits it could not store");
+                    publishing._fiberSaveFailureCount = failures;
+                }
                 publishing.refreshChangedStoreFibers();
                 // Removing the pane now would lose the later edit with its
                 // refused close save: the pane stays until the install.
@@ -962,6 +969,22 @@
                         "an edit of the second of two controls at one position is queued");
                 settle("the queued edit is replayed");
                 require(appliedAt == std::vector<size_t>{twin}, "the replay names the control it was queued for");
+                // Its control deleted meanwhile: the edit is dropped, the
+                // control left at that position does not get it.
+                controls[twin].volumePoint = position;
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "the save the second edit queues behind starts");
+                controls[twin].volumePoint = controls[twin - 1].volumePoint;
+                bool replayed = false;
+                require(publishing.deferControlEdit(*live, {twin}, [&](const std::vector<size_t>&) { replayed = true; }),
+                        "an edit of a control that is then deleted is queued");
+                const auto deleted = controls[twin];
+                controls.pop_back();
+                settle("the queued edit of the deleted control is dropped");
+                require(!replayed && publishing._deferredControlEdits.empty(),
+                        "an edit whose control is gone is not applied to the control at its position");
+                controls.push_back(deleted);
                 controls[twin].volumePoint = position;
             }
             // A tag edit whose background save is refused (a commit by
@@ -1230,6 +1253,10 @@
         editor.detach(editing);
         viewing.closeProject();
     } else {
+        // Named by the build (ctest sets it when the server is part of the
+        // build): its absence is a failure, not a reason to skip.
+        if (std::getenv("VC3D_OBJECT_SERVER_BIN"))
+            throw std::runtime_error("hosted fiber tests: no vc_object_server at " + serverBinary.string());
         std::cout << "fiber read test: no vc_object_server at " << serverBinary << ", hosted part skipped" << std::endl;
     }
 }

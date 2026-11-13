@@ -1624,7 +1624,7 @@ CWindow::~CWindow()
     setStatusBar(nullptr);
 
     if (_lineAnnotationController) {
-        _lineAnnotationController->saveOpenFibers();
+        (void)_lineAnnotationController->saveOpenFibers();
     }
     CloseVolume();
 }
@@ -3994,8 +3994,21 @@ void CWindow::closeEvent(QCloseEvent* event)
         return;
     }
     _destroyingWindow = true;
-    if (_lineAnnotationController) {
-        _lineAnnotationController->saveOpenFibers();
+    if (_lineAnnotationController && !_lineAnnotationController->saveOpenFibers()) {
+        // Quitting abandons what could not be stored (a save the object
+        // store has not confirmed and the edits behind it): only on request.
+        const auto answer = QMessageBox::warning(
+            this, tr("Fiber edits not saved"),
+            tr("Some fiber edits could not be saved to the object store. Quitting now loses them.\n\n"
+               "Cancel to keep VC3D open and try again once the store answers."),
+            QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (answer != QMessageBox::Discard) {
+            // The close is off: a later one asks about Spiral work again.
+            _destroyingWindow = false;
+            _spiralCloseGuardBypass = false;
+            event->ignore();
+            return;
+        }
     }
     saveWindowState();
     event->accept();

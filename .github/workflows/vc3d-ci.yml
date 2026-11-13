@@ -328,7 +328,9 @@ jobs:
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
             -DVC_TESTING=ON -DVC_BUILD_APPS=ON \
             -DVC_BUILD_FLATBOI=OFF
-          cmake --build build/ci-fast-vc3d --target VC3D --parallel 4
+          # vc_object_server_app: the controller test's hosted part runs
+          # against it (and fails without it).
+          cmake --build build/ci-fast-vc3d --target VC3D vc_object_server_app --parallel 4
           python3 -m venv build/ci-fast-vc3d/smoke-venv
           build/ci-fast-vc3d/smoke-venv/bin/pip install ../vc_reader
           QT_QPA_PLATFORM=offscreen build/ci-fast-vc3d/smoke-venv/bin/python apps/VC3D/agent_bridge/test/smoke_offscreen.py \

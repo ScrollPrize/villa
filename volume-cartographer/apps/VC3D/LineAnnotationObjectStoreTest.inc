@@ -886,7 +886,7 @@ int runObjectStoreControllerTests()
             require(controller._fiberSaveFailureCount==failures,"completed manual interaction commits without solver");
             require(live->storePin->reference().version!=merged.storePin->reference().version,"interaction advances pin immediately");
             const auto savedPin=live->storePin;
-            controller.saveOpenFibers();
+            (void)controller.saveOpenFibers();
             require(live->storePin==savedPin,"Save barrier does not create another revision");
             {
                 // Split and merge plan from session snapshots; new fibers must keep the stored frame.

@@ -4641,12 +4641,13 @@ void LineAnnotationController::addFibersToPointCollections(std::vector<uint64_t>
     }
 }
 
-void LineAnnotationController::saveOpenFibersCore()
+bool LineAnnotationController::saveOpenFibersCore()
 {
+    const auto failures = _fiberSaveFailureCount;
     // A window closed moments ago may still be storing its session, with no
     // pane left to save below: made and awaited here (quit detaches the
     // store right after this).
-    settleClosedPanes();
+    const bool closedPanesStored = settleClosedPanes();
     std::vector<std::string> surfaces;
     for (const auto& pane : _panes) if (pane.session) surfaces.push_back(pane.surfaceName);
     for (const auto& surface : surfaces) {
@@ -4665,13 +4666,20 @@ void LineAnnotationController::saveOpenFibersCore()
         if (pane && pane->session && !pane->session->suppressFiberSave)
             saveSessionAsFiber(*pane->session, false);
     }
+    // What is still queued behind a save (one whose pane is gone included).
+    settlePublicationWork();
     if (_state) _state->objectStoreSession()->finalize();
+    // Not everything is stored: a save failed, or one is stored but not
+    // confirmed by the store and holds the later edits behind it.
+    return closedPanesStored && !_publication && _afterPublication.empty() && _closingSurfaces.empty() &&
+           _deferredControlEdits.empty() && _fiberSaveFailureCount == failures;
 }
 
-void LineAnnotationController::saveOpenFibers()
+bool LineAnnotationController::saveOpenFibers()
 {
-    saveOpenFibersCore();
+    const bool stored = saveOpenFibersCore();
     waitForFiberSaves();
+    return stored;
 }
 
 void LineAnnotationController::saveOpenFibersHeadless(FiberSaveCompletion onFinished)
@@ -4679,7 +4687,7 @@ void LineAnnotationController::saveOpenFibersHeadless(FiberSaveCompletion onFini
     auto batch = std::make_shared<FiberSaveBatchTracker>(std::move(onFinished));
     _activeFiberSaveBatch = batch;
     try {
-        saveOpenFibersCore();
+        (void)saveOpenFibersCore();
     } catch (const std::exception& ex) {
         batch->addError(QString::fromUtf8(ex.what()));
     }
@@ -13400,7 +13408,6 @@ bool LineAnnotationController::deferControlEdit(const LineAnnotationSession& ses
         if (index >= session.controlPoints.size()) return false;
         const auto& control = session.controlPoints[index];
         if (control.identity == 0) control.identity = _nextControlIdentity++;
-        edit.controls.push_back(control.volumePoint);
         edit.identities.push_back(control.identity);
     }
     edit.replay = std::move(replay);
@@ -13509,19 +13516,15 @@ void LineAnnotationController::drainDeferredControlEdits()
         _deferredControlEdits.erase(_deferredControlEdits.begin() + std::ptrdiff_t(i));
         const auto& controls = pane->session->controlPoints;
         std::vector<size_t> indices;
-        for (size_t c = 0; c < edit.controls.size(); ++c) {
-            // The control itself; after a reload of the session (new
-            // identities), the one control at its position, if only one is.
-            auto found = std::find_if(controls.begin(), controls.end(),
-                                      [&](const auto& control) { return control.identity == edit.identities[c]; });
-            if (found == controls.end()) {
-                const auto there = [&](const auto& control) { return control.volumePoint == edit.controls[c]; };
-                if (std::count_if(controls.begin(), controls.end(), there) == 1)
-                    found = std::find_if(controls.begin(), controls.end(), there);
-            }
+        for (const auto identity : edit.identities) {
+            // The control itself, never another one at its position: a
+            // control that is gone (deleted, or its session loaded again)
+            // takes its queued edit with it.
+            const auto found = std::find_if(controls.begin(), controls.end(),
+                                            [&](const auto& control) { return control.identity == identity; });
             if (found != controls.end()) indices.push_back(size_t(found - controls.begin()));
         }
-        if (indices.size() != edit.controls.size()) {
+        if (indices.size() != edit.identities.size()) {
             // The warning is modal: the pane can be gone when it returns.
             showError(tr("A queued tag change was not applied: its control point changed in the meantime."),
                       pane->session->suppressErrorDialogs);

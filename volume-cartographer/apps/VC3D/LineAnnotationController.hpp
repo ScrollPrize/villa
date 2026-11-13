@@ -364,7 +364,10 @@ public:
     void requestFiberAlignmentMetrics(uint64_t fiberId);
     void addFiberToPointCollection(uint64_t fiberId);
     void addFibersToPointCollections(std::vector<uint64_t> fiberIds);
-    void saveOpenFibers();
+    // False when an edit could not be stored (a failed save, or a save the
+    // store has not confirmed with edits waiting behind it): quitting now
+    // would lose it.
+    [[nodiscard]] bool saveOpenFibers();
     using FiberSaveCompletion = std::function<void(bool, const QString&)>;
     void saveOpenFibersHeadless(FiberSaveCompletion onFinished);
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
@@ -1508,12 +1511,10 @@ private:
     // Tag and span-tag edits (break, kollesis termination, gap, damaged)
     // requested while their session is still being published or solved: they
     // are applied, in order, once it is neither, to the controls they named
-    // (found again by LineControlPoint::identity, or by position when the
-    // session was loaded again and exactly one control is there; an edit
-    // whose control is gone is dropped with a message).
+    // (found again by LineControlPoint::identity; an edit whose control is
+    // gone is dropped with a message).
     struct DeferredControlEdit {
         std::string surfaceName;
-        std::vector<cv::Vec3d> controls;
         std::vector<uint64_t> identities;
         std::function<void(const std::vector<size_t>&)> replay;
     };
@@ -1641,7 +1642,7 @@ private:
     void discardFiberPanes(const std::vector<uint64_t>& fiberIds);
     std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> generatedBranchLinkMarkers(
         const std::vector<FiberBranchRef>& branches) const;
-    void saveOpenFibersCore();
+    bool saveOpenFibersCore();
     [[nodiscard]] std::shared_ptr<LineAnnotationSession> makeIntersectionLineSession(
         const StoredFiber& fiber,
         double focusLinePosition,
