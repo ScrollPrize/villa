@@ -1,9 +1,17 @@
 #pragma once
+#include <stdexcept>
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 namespace vc::objects {
 class TransformedGeometryView;
+// The object's recorded coordinates have no unambiguous transform to the
+// requested volume (a registration removed or made ambiguous): a property of
+// the store's state, not a transport failure.
+class MappingUnavailable : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 class StoreReader;
 namespace detail { struct GeometryReadState; struct GeometryViewState; }
 
