@@ -17,6 +17,7 @@ struct Json {
     Type type = Null;
     bool boolean = false;
     double number = 0;
+    bool whole = false;  // a number written without fraction or exponent: it is written so again
     std::string string;
     std::vector<Json> array;
     std::vector<std::pair<std::string, Json>> object;
@@ -31,6 +32,8 @@ struct Json {
     bool is(Type t) const { return type == t; }
 
     static Json of(double v) { Json j; j.type = Number; j.number = v; return j; }
+    static Json whole_number(long long v) { Json j; j.type = Number; j.number = static_cast<double>(v); j.whole = true; return j; }
+    static Json of_bool(bool v) { Json j; j.type = Bool; j.boolean = v; return j; }
     static Json of(const std::string& v) { Json j; j.type = String; j.string = v; return j; }
     static Json list() { Json j; j.type = Array; return j; }
     static Json dict() { Json j; j.type = Object; return j; }
@@ -38,7 +41,7 @@ struct Json {
     Json& add(Json v) { array.push_back(std::move(v)); return *this; }
 
     // The value as JSON text. Numbers are written with 17 significant digits (they read back as they are) and
-    // always as reals; NaN and Infinity as NumPy and Python write them.
+    // as reals unless they are whole numbers (`whole`); NaN and Infinity as NumPy and Python write them.
     std::string text() const {
         std::string s;
         write(s);
@@ -74,6 +77,12 @@ struct Json {
             case Number: {
                 if (std::isnan(number)) { s += "NaN"; break; }
                 if (std::isinf(number)) { s += number > 0 ? "Infinity" : "-Infinity"; break; }
+                if (whole && std::fabs(number) < 9.0e15) {
+                    char w[32];
+                    std::snprintf(w, sizeof w, "%lld", static_cast<long long>(number));
+                    s += w;
+                    break;
+                }
                 char b[40];
                 std::snprintf(b, sizeof b, "%.17g", number);
                 std::string t = b;
@@ -172,6 +181,9 @@ struct Json {
         v.number = std::strtod(t.c_str() + i, &end);   // (also NaN / Infinity, as NumPy-written metadata may hold)
         if (end == t.c_str() + i) throw Error("JSON: unexpected character");
         v.type = Number;
+        v.whole = true;
+        for (const char* c = t.c_str() + i; c < end; ++c)
+            if (!((*c >= '0' && *c <= '9') || *c == '-' || *c == '+')) v.whole = false;
         i = static_cast<std::size_t>(end - t.c_str());
         return v;
     }

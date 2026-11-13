@@ -3,7 +3,16 @@
 //   helirec-calibration check-record <scan.h5> [<more scans.h5> ...] [--no-frames] [--checks LIST] [--out DIR]
 //                                    [--inventory DIR] [--json FILE] [--threads N] [--frames N] [--rows N] [--blocks N]
 //                                    [--position-target PX] [--radius PX] [--device cpu|cuda|auto]
+//   helirec-calibration geometry <scan.h5> <companion.h5> --out FILE [--row-time-us US] [--order N] [--passes N]
+//                                [--patch N] [--no-motion] [--threads N] [--device cpu|cuda|auto]
 //   helirec-calibration selftest [--device cpu|cuda|auto]
+//
+// geometry measures the detector's map and the poses of a two-scan helical acquisition from its own frames (the
+// scan with the rotation axis inside the detector's field first) and writes them as JSON, which the
+// reconstruction reads (helirec/geometry.hpp). --row-time-us: the time of a stored row within the frame, signed,
+// if known for this camera configuration; measured from a refill otherwise. --patch N: the plan's blocks cut into
+// patches of N x N (try 128); 0 registers them whole, over several passes. It is
+// helirec::calibration::geometry_calibration::calibrate_geometry (helirec/calibration/geometry_calibration.hpp).
 //
 // check-record checks what the acquisition record states, against itself and against the raw frames; it writes
 // findings and changes nothing. --no-frames: the record against itself alone (the same as --checks record).
@@ -24,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "helirec/calibration/geometry_calibration.hpp"
 #include "helirec/calibration/registration.hpp"
 #include "helirec/calibration/record_checks.hpp"
 
@@ -39,8 +49,46 @@ int usage() {
                  "                                   [--out DIR] [--inventory DIR] [--json FILE] [--threads N] [--frames N] [--rows N] [--blocks N]\n"
                  "                                   [--columns N (0: full)] [--column-fraction F (0..1)]\n"
                  "                                   [--position-target PX (default 0.01)] [--radius PX] [--inventory-step N] [--device cpu|cuda|auto]\n"
+                 "  helirec-calibration geometry <scan.h5> <companion.h5> --out FILE [--row-time-us US] [--order N] [--passes N]\n"
+                 "                               [--patch N] [--no-motion] [--threads N] [--device cpu|cuda|auto]\n"
                  "  helirec-calibration selftest [--device cpu|cuda|auto]\n");
     return 2;
+}
+
+// helirec-calibration geometry: the arguments after the command
+int run_geometry_calibration(int argc, char** argv) {
+    namespace gc = helirec::calibration::geometry_calibration;
+    std::vector<std::string> scans;
+    std::string out, device = "auto";
+    gc::Options opt;
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        const auto value = [&]() -> std::string {
+            if (i + 1 >= argc) throw Error("option " + a + " needs a value");
+            return argv[++i];
+        };
+        if (a == "--out") out = value();
+        else if (a == "--row-time-us") opt.row_time = std::stod(value()) * 1e-6;
+        else if (a == "--order") opt.order = std::stoi(value());
+        else if (a == "--passes") opt.passes = std::stoi(value());
+        else if (a == "--patch") opt.patch = std::stoi(value());
+        else if (a == "--threads") opt.threads = std::stoi(value());
+        else if (a == "--no-motion") opt.motion = false;
+        else if (a == "--device") device = value();
+        else if (!a.empty() && a[0] == '-') throw Error("unknown option " + a);
+        else scans.push_back(a);
+    }
+    if (scans.size() != 2 || out.empty()) return usage();
+    if (device != "cpu" && device != "cuda" && device != "auto") throw Error("--device is cpu, cuda or auto");
+    opt.device = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
+    opt.log = [](const std::string& line) {
+        std::printf("%s\n", line.c_str());
+        std::fflush(stdout);
+    };
+    const std::string cal = gc::calibrate_geometry(scans, opt);
+    gc::save_text(cal, out);
+    std::printf("written to %s\n", out.c_str());
+    return 0;
 }
 
 }  // namespace
@@ -49,6 +97,7 @@ int main(int argc, char** argv) {
     if (argc < 2) return usage();
     const std::string command = argv[1];
     try {
+        if (command == "geometry") return run_geometry_calibration(argc, argv);
         if (command != "check-record" && command != "selftest") return usage();
 
         std::vector<std::string> scans;
