@@ -7,6 +7,9 @@
 #include "sigv4.hpp"
 #include "vc_reader/sftp.hpp"
 
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX  // curl.h includes <windows.h>
+#endif
 #include <curl/curl.h>
 
 #include <algorithm>
