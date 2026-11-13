@@ -5,12 +5,14 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 #include <limits>
+#include "fit_summary.hpp"
 #include <memory>
 
 #include "helirec/calibration/registration.hpp"
 #include "helirec/calibration/solve.hpp"
 #include "helirec/calibration/record_checks.hpp"
 #include "helirec/calibration/session.hpp"
+#include "helirec/calibration/refill.hpp"
 #include "helirec/raw_reader.hpp"
 
 namespace nb = nanobind;
@@ -50,6 +52,11 @@ std::string check_record_json(const std::vector<std::string>& scans, const std::
 
 nb::dict registration_dict(const Registration& r) {
     nb::dict out;
+    out["solver"] = fit_summary_dict(r.solver);
+    out["function_evaluations"] = r.function_evaluations;
+    nb::list curvature;
+    for (int i = 0; i < 3; ++i) curvature.append(nb::make_tuple(r.curvature[i][0], r.curvature[i][1], r.curvature[i][2]));
+    out["curvature"] = curvature;
     out["shift"] = nb::make_tuple(r.shift[0], r.shift[1], r.shift[2]);
     out["whole"] = nb::make_tuple(r.whole[0], r.whole[1], r.whole[2]);
     out["correlation"] = r.correlation;
@@ -311,6 +318,8 @@ struct PySession {
         d["du"] = r.du;
         d["correlation"] = r.correlation;
         d["evaluations"] = r.evaluations;
+        d["function_evaluations"] = r.function_evaluations;
+        d["solver"] = fit_summary_dict(r.solver);
         d["slope_a"] = r.slope_a;
         d["slope_b"] = r.slope_b;
         d["step_deg"] = r.step_deg;
@@ -444,8 +453,9 @@ void bind_calibration(nb::module_& m) {
     m.def("calibration_solve", [](nb::ndarray<const std::int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> row,
                                   nb::ndarray<const std::int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> col,
                                   nb::ndarray<const double, nb::ndim<1>, nb::c_contig, nb::device::cpu> value,
-                                  nb::ndarray<const double, nb::ndim<1>, nb::c_contig, nb::device::cpu> y, std::size_t unknowns, double huber, bool relative,
-                                  int iterations, double rcond) {
+                                  nb::ndarray<const double, nb::ndim<1>, nb::c_contig, nb::device::cpu> y, std::size_t unknowns, double huber, int max_iterations, double rcond,
+                                  const std::vector<std::int64_t>& fixed, const std::vector<double>& fixed_value,
+                                  double function_tolerance, double gradient_tolerance, double parameter_tolerance) {
         LinearProblem p;
         p.unknowns = unknowns;
         p.row.assign(row.data(), row.data() + row.shape(0));
@@ -453,24 +463,44 @@ void bind_calibration(nb::module_& m) {
         p.value.assign(value.data(), value.data() + value.shape(0));
         p.y.assign(y.data(), y.data() + y.shape(0));
         SolveOptions o;
-        o.huber = huber, o.relative = relative, o.iterations = iterations, o.rcond = rcond;
+        o.huber = huber; o.max_iterations = max_iterations; o.rcond = rcond;
+        o.function_tolerance = function_tolerance; o.gradient_tolerance = gradient_tolerance; o.parameter_tolerance = parameter_tolerance;
+        p.fixed = fixed; p.fixed_value = fixed_value;
         LinearSolution s;
         {
             nb::gil_scoped_release nogil;
             s = solve_linear(p, o);
         }
-        nb::dict d;
+        nb::dict d = fit_summary_dict(s);
+        d["active"] = s.active;
+        d["unused"] = s.unused;
         d["x"] = vector_array(s.x);
         d["residual"] = vector_array(s.residual);
         d["weight"] = vector_array(s.weight);
         d["spread"] = s.spread;
         d["rank"] = s.rank;
         return d;
-    }, "row"_a, "col"_a, "value"_a, "y"_a, "unknowns"_a, "huber"_a = 0.0, "relative"_a = false, "iterations"_a = 8, "rcond"_a = 1e-12,
-       "The solver of the geometry steps (helirec/calibration/solve.hpp): y = A x fitted by least squares under a Huber loss. row, col, value: the entries of "
-       "A (int64, int64, float64; any order, repeated entries add); y: one measurement per equation. huber: the loss's threshold in the equations' units (0: "
-       "plain least squares), or, with relative, as a multiple of the residuals' own robust spread. Returns x, residual (y - A x), weight (of the last "
-       "solve), spread and rank (unknowns the equations determine; the others are zero).");
+    }, "row"_a, "col"_a, "value"_a, "y"_a, "unknowns"_a, "huber"_a = 0.0, "max_iterations"_a = 100, "rcond"_a = 1e-12,
+       "fixed"_a = std::vector<std::int64_t>(), "fixed_value"_a = std::vector<double>(),
+       "function_tolerance"_a = 1e-7, "gradient_tolerance"_a = 1e-12, "parameter_tolerance"_a = 1e-12,
+       "Ceres scalar Huber fit of y = A x; duplicate entries add. Fixed indices have explicit values; unused columns are frozen. "
+       "Returns parameters, y - prediction, final sqrt robust weights, rank and Ceres diagnostics; check usable before using a fit.");
+    m.def("calibration_fit_refill_shots", [](nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::cpu> x,
+                                             double T, double E, int pre) {
+        RefillSolution s;
+        { nb::gil_scoped_release nogil; s = fit_refill_shots(x.data(), x.shape(0), static_cast<int>(x.shape(1)), T, E, pre); }
+        auto d = fit_summary_dict(s);
+        d["x"] = vector_array(s.x); d["residual"] = vector_array(s.residual); d["shots"] = nb::cast(s.shots);
+        d["noise"] = s.noise; d["row_time_se"] = s.row_time_se; d["uncertainty_available"] = s.uncertainty_available;
+        return d;
+    }, "x"_a, "period"_a, "exposure"_a, "pre"_a, "Ceres exposure-integrated refill fit of (frames, rows) logarithmic levels, with covariance diagnostics.");
+    m.def("calibration_fit_line", [](const std::vector<double>& x, const std::vector<double>& y) {
+        LineFit s;
+        { nb::gil_scoped_release nogil; s = fit_line(x, y); }
+        auto d = fit_summary_dict(s);
+        d["slope"] = s.slope; d["intercept"] = s.intercept; d["rms"] = s.rms;
+        return d;
+    }, "x"_a, "y"_a, "Centred and scaled Ceres straight-line fit; check usable before using the coefficients.");
     m.def("calibration_measure_timing", [](bool reset) {
         const MeasureTiming t = measure_timing(reset);
         nb::dict d;

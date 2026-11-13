@@ -192,30 +192,3 @@ def test_second_scan_fit():
     assert P["columns"]["offset"]["helix"] == pytest.approx(0.5, abs=1e-3) and P["columns"]["per_row"]["rest1"] == pytest.approx(2e-5, abs=2e-6)
     assert P["rows"]["once_per_turn"] == pytest.approx([0.03, -0.1], abs=5e-4) and P["columns"]["left"]["with_once_per_turn"] < 2e-3
 
-
-def test_row_time_from_beam_dips():
-    """fit_refill_shots: injection shots on a raster dip the beam for a few milliseconds; which rows of which frame
-    record a shot depends on the row time. Made-up levels from a known row time, decay and raster (two shots
-    missing from the raster) give them back; too few shots give nothing."""
-    rng = np.random.default_rng(7)
-    n_rows, T, E = 1200, 0.033, 0.021
-    tau, theta, raster, amp = -1.9e-5, 0.0031, 1.0731, 0.011
-    frames = 1100
-    v = np.arange(n_rows)
-    when = np.arange(frames)[:, None] * T + tau * v[None, :]                     # the instant row v of a frame opens
-    u = (v - (n_rows - 1) / 2) / (n_rows / 2)
-    P = lambda z: np.where(z > 0, 1 - np.exp(-np.clip(z, 0, None) / theta), 0.0)
-    x = 9.0 + 0.02 * np.sin(np.arange(frames) / 90.0)[:, None] + np.zeros((frames, n_rows))
-    shots = 0
-    for k in range(40):
-        ts = 420 * T + 0.004 + k * raster
-        if ts > (frames - 30) * T or k in (5, 11):
-            continue
-        x += -amp * (1 + 0.1 * u)[None, :] * (P(when + E - ts) - P(when - ts))
-        shots += 1
-    x += 0.0006 * rng.standard_normal(x.shape)
-    f = G.fit_refill_shots(x, T, E, 400)
-    assert f is not None and shots - 1 <= len(f["shots"]) <= shots               # (a shot in the last frames is not looked for)
-    assert f["p"][0] == pytest.approx(tau, abs=max(4 * f["se"], 5e-8)) and 0 < f["se"] < 2e-7
-    assert abs(f["p"][1]) == pytest.approx(theta, rel=0.1) and f["p"][3] == pytest.approx(raster, rel=1e-4)
-    assert G.fit_refill_shots(x[:520], T, E, 400) is None                         # three shots: not enough

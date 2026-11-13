@@ -13,6 +13,7 @@
 
 #include "helirec/calibration/frames.hpp"
 #include "helirec/calibration/record.hpp"
+#include "helirec/calibration/solve.hpp"
 
 namespace helirec::calibration {
 
@@ -51,7 +52,8 @@ struct ViewMeasurement {
     int frames = 0, row_a = 0, rows = 0, row_offset = 0, col_a = 0, col_b = 0, cols = 0;
     double stated_dq = 0, dq = 0, stated_dv = 0, dv = 0, stated_D = 0, D = 0, du = 0;
     double correlation = 0;
-    int evaluations = 0;
+    int evaluations = 0, function_evaluations = 0;
+    FitSummary solver;  // final continuous peak; ok also requires measurement validation
     double slope_a = 0, slope_b = 0, step_deg = 0, angle_a_deg = 0;
 };
 

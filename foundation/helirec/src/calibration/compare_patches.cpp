@@ -338,7 +338,7 @@ void measure_patches(const Pairing& P, const BlockPlan& plan, const std::vector<
                     m.d[0] = r.shift[0];
                     m.d[1] = s.extra[1] + r.shift[1];
                     m.d[2] = s.extra[2] + r.shift[2];
-                    keep_curvature(r, m);
+                    keep_registration(r, m);
                     if (r.whole[0] || r.whole[1] || r.whole[2]) {
                         for (int j = 0; j < 3; ++j) s.extra[j] += r.whole[j];
                         // other frames of B: planned again, as measure() does before it cuts

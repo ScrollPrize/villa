@@ -1,3 +1,5 @@
+#include "calibration/blur_model.hpp"
+#include "calibration/ceres_support.hpp"
 #include "helirec/calibration/intensity.hpp"
 
 #include <fftw3.h>
@@ -159,50 +161,7 @@ void tile_power_spectra(const float* img, std::size_t n, std::size_t rows, std::
 
 namespace {
 
-inline double sinc_pi(double a) {
-    const double pa = M_PI * a;
-    return std::fabs(pa) < 1e-9 ? 1.0 : std::sin(pa) / pa;
-}
-
-// the normalised noise spectra of the tiles and the model of detector_blur_field_fit
-struct BlurFieldProblem {
-    int tiles = 0, bins = 0;
-    std::vector<double> Y;                 // (tiles, bins)
-    std::vector<double> X, Yr;             // tile centres (units of 1000 px from the detector's centre)
-    std::vector<double> FX, FY, wgt;       // per bin
-    std::vector<char> low;
-    mutable std::vector<double> M, num, den;
-
-    void residual(const double* th, std::vector<double>& r) const {
-        M.resize(static_cast<std::size_t>(tiles) * bins);
-        num.assign(bins, 0.0);
-        den.assign(bins, 0.0);
-        for (int t = 0; t < tiles; ++t) {
-            const double sx = th[0] * X[t] + th[1] * Yr[t] + th[4], sy = th[2] * X[t] + th[3] * Yr[t] + th[5];
-            double* mt = &M[static_cast<std::size_t>(t) * bins];
-            double lo = 0;
-            int nlo = 0;
-            for (int b = 0; b < bins; ++b) {
-                const double s = sinc_pi(sx * FX[b] + sy * FY[b]);
-                mt[b] = s * s;
-                if (low[b]) { lo += mt[b]; ++nlo; }
-            }
-            lo /= nlo;
-            const double* yt = &Y[static_cast<std::size_t>(t) * bins];
-            for (int b = 0; b < bins; ++b) {
-                mt[b] /= lo;
-                num[b] += yt[b] * mt[b];
-                den[b] += mt[b] * mt[b];
-            }
-        }
-        r.resize(M.size());
-        for (int t = 0; t < tiles; ++t)
-            for (int b = 0; b < bins; ++b) {
-                const std::size_t i = static_cast<std::size_t>(t) * bins + b;
-                r[i] = (Y[i] - M[i] * num[b] / std::max(den[b], 1e-30)) * wgt[b];
-            }
-    }
-};
+using fitting::BlurFieldProblem;
 
 inline double sum_squares(const std::vector<double>& r) {
     double s = 0;
@@ -210,89 +169,27 @@ inline double sum_squares(const std::vector<double>& r) {
     return s;
 }
 
-// a x = b for a 6 x 6 system (partial pivoting); false: singular
-bool solve6(std::array<std::array<double, 7>, 6> a, double* x) {
-    for (int c = 0; c < 6; ++c) {
-        int p = c;
-        for (int r = c + 1; r < 6; ++r)
-            if (std::fabs(a[r][c]) > std::fabs(a[p][c])) p = r;
-        if (std::fabs(a[p][c]) < 1e-300) return false;
-        std::swap(a[c], a[p]);
-        for (int r = c + 1; r < 6; ++r) {
-            const double f = a[r][c] / a[c][c];
-            for (int k = c; k < 7; ++k) a[r][k] -= f * a[c][k];
-        }
-    }
-    for (int c = 5; c >= 0; --c) {
-        double v = a[c][6];
-        for (int k = c + 1; k < 6; ++k) v -= a[c][k] * x[k];
-        x[c] = v / a[c][c];
-    }
-    return true;
-}
-
-// Levenberg-Marquardt from `th` (forward-difference Jacobian); returns the sum of squares reached
-double blur_levenberg(const BlurFieldProblem& p, std::array<double, 6>& th) {
-    std::vector<double> r, r2, J;
-    p.residual(th.data(), r);
-    double cost = sum_squares(r), lam = 1e-2;
-    const std::size_t n = r.size();
-    const double h = 1e-4;
-    for (int it = 0; it < 60; ++it) {
-        J.resize(n * 6);
-        for (int k = 0; k < 6; ++k) {
-            auto t2 = th;
-            t2[k] += h;
-            p.residual(t2.data(), r2);
-            for (std::size_t i = 0; i < n; ++i) J[i * 6 + k] = (r2[i] - r[i]) / h;
-        }
-        double g[6] = {0, 0, 0, 0, 0, 0}, H[6][6] = {};
-        for (std::size_t i = 0; i < n; ++i) {
-            const double* ji = &J[i * 6];
-            for (int a = 0; a < 6; ++a) {
-                g[a] += ji[a] * r[i];
-                for (int b = a; b < 6; ++b) H[a][b] += ji[a] * ji[b];
-            }
-        }
-        for (int a = 0; a < 6; ++a)
-            for (int b = 0; b < a; ++b) H[a][b] = H[b][a];
-        bool better = false;
-        std::array<double, 6> cand{};
-        double c2 = cost;
-        for (int tries = 0; tries < 12 && !better; ++tries) {
-            std::array<std::array<double, 7>, 6> sys;
-            for (int a = 0; a < 6; ++a) {
-                for (int b = 0; b < 6; ++b) sys[a][b] = H[a][b];
-                sys[a][a] += lam * (H[a][a] + 1e-12);
-                sys[a][6] = -g[a];
-            }
-            double step[6];
-            if (solve6(sys, step)) {
-                for (int a = 0; a < 6; ++a) cand[a] = th[a] + step[a];
-                p.residual(cand.data(), r2);
-                c2 = sum_squares(r2);
-                better = c2 < cost;
-            }
-            if (!better) lam *= 4;
-        }
-        if (!better) break;
-        const bool done = cost - c2 < 1e-9 * cost;
-        th = cand;
-        r.swap(r2);
-        cost = c2;
-        lam /= 3;
-        if (done) break;
-    }
-    return cost;
+FitSummary fit_blur(const BlurFieldProblem& p, std::array<double,6>& th) {
+    ceres::Problem fit;
+    fit.AddResidualBlock(new fitting::BlurFieldCost(p),nullptr,th.data());
+    ceres::Solver::Summary result;
+    auto options = fitting::options(6);
+    // A moderate initial radius avoids repeated rejected steps from the
+    // original, deliberately different field candidates.
+    options.initial_trust_region_radius = 100.;
+    ceres::Solve(options,&fit,&result);
+    return fitting::summary(result);
 }
 
 }  // namespace
 
 DetectorBlurField detector_blur_field_fit(const double* power, int ny, int nx, int tile, const int* ys, const int* xs,
                            std::size_t rows, std::size_t cols, double f_max) {
-    if (ny < 1 || nx < 1 || ny * nx < 6) throw Error("detector_blur_field_fit: at least 6 tiles are needed");
+    if (ny < 2 || nx < 2 || ny * nx < 6) throw Error("detector_blur_field_fit: at least 6 tiles spanning both detector axes are needed");
     if (tile < 32 || tile % 2) throw Error("detector_blur_field_fit: an even tile of at least 32 pixels is needed");
     if (!(f_max > 0.15 && f_max <= 0.42)) throw Error("detector_blur_field_fit: f_max must be in (0.15, 0.42] cycles per pixel");
+    if (!rows || !cols || !power || !ys || !xs) throw Error("detector_blur_field_fit: invalid input");
+    if (ys[0] == ys[ny-1] || xs[0] == xs[nx-1]) throw Error("detector_blur_field_fit: tile centres do not span the field");
     const int nc = tile / 2 + 1, nbx = 8, nby = 16, nb = nbx * nby;
     const std::size_t per = static_cast<std::size_t>(tile) * nc;
     // frequency bins of the half plane fx > 0 (and fx = 0, fy > 0), and the frequencies of the white floor
@@ -336,8 +233,10 @@ DetectorBlurField detector_blur_field_fit(const double* power, int ny, int nx, i
         const double* s = power + static_cast<std::size_t>(t) * per;
         double fl = 0;
         std::size_t nfl = 0;
-        for (std::size_t q = 0; q < per; ++q)
+        for (std::size_t q = 0; q < per; ++q) {
+            if (!std::isfinite(s[q]) || s[q] < 0) throw Error("detector_blur_field_fit: invalid power");
             if (floor_at[q]) { fl += s[q]; ++nfl; }
+        }
         fl /= nfl;
         std::fill(binned.begin(), binned.end(), 0.0);
         for (std::size_t q = 0; q < per; ++q)
@@ -360,13 +259,17 @@ DetectorBlurField detector_blur_field_fit(const double* power, int ny, int nx, i
     const std::array<double, 6> starts[3] = {{2.0, 0, 0, 1.0, 0, 0}, {1.0, 0, 0, 1.0, 0.3, 0}, {3.0, 0.3, 0, 0.5, -0.3, 0.2}};
     double best = std::numeric_limits<double>::infinity();
     for (auto th : starts) {
-        const double c = blur_levenberg(p, th);
+        const auto solver = fit_blur(p, th);
+        if (!solver.usable) continue;
+        const double c = 2*solver.cost;
         if (c < best) {
             best = c;
+            out.solver = solver;
             const double sign = th[0] >= 0 ? 1.0 : -1.0;
             for (int k = 0; k < 6; ++k) out.field[k] = sign * th[k];
         }
     }
+    if (!out.solver.usable) throw Error("detector_blur_field_fit: no usable Ceres fit");
     out.rms_fit = std::sqrt(best / r.size());
     return out;
 }

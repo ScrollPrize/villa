@@ -90,7 +90,7 @@ std::string plan_json(const std::string& layout) {
 
 // rows: [{kind, scan_a, stretch_a (name), frame_a, row_a, rows, row_offset, col_a, col_b, cols, stated_dq, dq,
 //         stated_D, D, du, slope_a, slope_b}, ..]
-std::string fit_json(const std::string& rows_text, const std::string& layout, const std::string& map, double tau, double period, double huber, int iterations) {
+std::string fit_json(const std::string& rows_text, const std::string& layout, const std::string& map, double tau, double period, double huber, int max_iterations) {
     const Json rows_j = Json::parse(rows_text);
     std::vector<gc::Row> rows;
     for (const Json& r : rows_j.array) {
@@ -111,7 +111,7 @@ std::string fit_json(const std::string& rows_text, const std::string& layout, co
         const gc::Layout lay = layout_of(layout);
         const geometry::Map m = map_of(map);
         nb::gil_scoped_release nogil;
-        f = gc::fit(rows, lay, m, tau, period, huber, iterations);
+        f = gc::fit(rows, lay, m, tau, period, huber, max_iterations);
     }
     const auto list = [](const std::vector<double>& v) {
         Json j = Json::list();
@@ -130,7 +130,11 @@ std::string fit_json(const std::string& rows_text, const std::string& layout, co
         groups.add(Json::list().add(Json::of(key.kind)).add(whole(key.scan)).add(Json::of(std::string(gc::kNames[key.a]))).add(whole(key.frame)).add(Json::of(uv[0])).add(Json::of(uv[1])));
     Json out = Json::dict();
     out.set("eu", list(f.eu)).set("ev", list(f.ev)).set("psi", Json::of(f.psi)).set("rho", rho).set("lines", lines).set("n", whole(static_cast<long long>(f.n)));
-    out.set("left", left).set("groups", groups);
+    Json solver = Json::dict();
+    solver.set("cost", Json::of(f.solver.cost)).set("iterations", whole(f.solver.iterations)).set("evaluations", whole(f.solver.evaluations)).set("usable", Json::of_bool(f.solver.usable));
+    solver.set("termination", Json::of(f.solver.termination)).set("message", Json::of(f.solver.message)).set("solver_version", Json::of(f.solver.solver_version));
+    solver.set("rank", whole(f.rank)).set("active", whole(f.active)).set("unused", whole(f.unused));
+    out.set("left", left).set("groups", groups).set("solver", solver);
     return out.text();
 }
 
@@ -160,7 +164,7 @@ void bind_geometry_calibration(nb::module_& m) {
         "(helirec::calibration::geometry_calibration::calibrate_geometry; helirec-calibration geometry).");
     m.def("geometry_calibration_save", &gc::save_text, "text"_a, "path"_a, "The text written whole or not at all.");
     m.def("geometry_calibration_plan", &plan_json, "layout"_a, "The comparisons of one pass: [[request, what it compares], ..] as JSON text.");
-    m.def("geometry_calibration_fit", &fit_json, "rows"_a, "layout"_a, "map"_a, "tau"_a, "period"_a, "huber"_a = 0.03, "iterations"_a = 8,
+    m.def("geometry_calibration_fit", &fit_json, "rows"_a, "layout"_a, "map"_a, "tau"_a, "period"_a, "huber"_a = 0.03, "max_iterations"_a = 100,
           "What the comparisons leave, as a correction of the map and the poses beside it (JSON text).");
     m.def("geometry_calibration_update_range",
           [](const std::string& map, const std::vector<double>& eu, const std::vector<double>& ev) {
@@ -189,21 +193,4 @@ void bind_geometry_calibration(nb::module_& m) {
               return gc::second_scan_fit(table, rows, total);
           },
           "stretch"_a, "t"_a, "th"_a, "v"_a, "du"_a, "y"_a, "q"_a, "rows"_a, "total"_a);
-    m.def("geometry_calibration_fit_refill_shots",
-          [](nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::cpu> x, double T, double E, int pre) -> nb::object {
-              std::optional<gc::RefillFit> f;
-              {
-                  const std::vector<double> levels(x.data(), x.data() + x.shape(0) * x.shape(1));
-                  const std::size_t frames = x.shape(0);
-                  const int n_rows = static_cast<int>(x.shape(1));
-                  nb::gil_scoped_release nogil;
-                  f = gc::fit_refill_shots(levels, frames, n_rows, T, E, pre);
-              }
-              if (!f) return nb::none();
-              nb::dict d;
-              d["p"] = f->p, d["se"] = f->se, d["noise"] = f->noise, d["cost"] = f->cost, d["shots"] = f->shots;
-              return d;
-          },
-          "x"_a, "T"_a, "E"_a, "pre"_a,
-          "The time of a row from the beam dips of a refill: x (frames, rows) the logarithm of each row's level; None if fewer than 12 shots are found.");
 }

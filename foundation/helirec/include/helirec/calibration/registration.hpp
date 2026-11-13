@@ -18,6 +18,7 @@
 #include <memory>
 
 #include "helirec/common.hpp"
+#include "helirec/calibration/solve.hpp"
 
 namespace helirec::calibration {
 
@@ -48,7 +49,9 @@ struct Registration {
     double curvature[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
     bool at_edge = false;         // the integer maximum lies on the border of the search window
     bool converged = false;
-    int evaluations = 0;
+    int evaluations = 0;  // outer window recenterings
+    int function_evaluations = 0;
+    FitSummary solver;
 };
 
 // One registration geometry (block sizes, margins, band) on one device, kept for many pairs of blocks: the

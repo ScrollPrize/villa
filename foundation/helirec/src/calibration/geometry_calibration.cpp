@@ -81,6 +81,20 @@ std::vector<std::int64_t> whole(const std::vector<double>& v) {
 
 Json num(double v) { return Json::of(v); }
 Json count(long long v) { return Json::whole_number(v); }
+// how a solve ended, as the passes record it
+Json solver_json(const Fit& f) {
+    Json d = Json::dict();
+    d.set("cost", num(f.solver.cost)).set("iterations", count(f.solver.iterations)).set("evaluations", count(f.solver.evaluations)).set("usable", Json::of_bool(f.solver.usable));
+    d.set("termination", Json::of(f.solver.termination)).set("message", Json::of(f.solver.message)).set("solver_version", Json::of(f.solver.solver_version));
+    d.set("rank", count(f.rank)).set("active", count(f.active)).set("unused", count(f.unused));
+    return d;
+}
+// a straight line through points, or an error if there is none
+Line line_through(const std::vector<double>& x, const std::vector<double>& y) {
+    const Line l = fit_line(x, y, 0, x.size());
+    if (!l.usable) throw Error(l.termination + ": " + l.message);
+    return l;
+}
 Json numbers(const std::vector<double>& v) {
     Json j = Json::list();
     for (double x : v) j.add(num(x));
@@ -384,12 +398,14 @@ std::vector<double> least_squares(const std::vector<double>& X, std::size_t n, s
         p.y.push_back(y[i]);
         ++eq;
     }
+    if (p.y.empty()) throw Error("INSUFFICIENT_SUPPORT: no observations for regression");
     const LinearSolution s = solve_linear(p);
+    if (!s.usable) throw Error(s.termination + ": " + s.message);
     for (std::size_t c = 0; c < cols.size(); ++c) b[static_cast<std::size_t>(cols[c])] = s.x[c];
     return b;
 }
 
-Fit fit(const std::vector<Row>& rows, const Layout& lay, const geometry::Map& m, double tau, double period, double huber, int iterations) {
+Fit fit(const std::vector<Row>& rows, const Layout& lay, const geometry::Map& m, double tau, double period, double huber, int max_iterations) {
     const std::size_t nt = m.i.size(), n = rows.size();
     // the stretches with pairs, in the order of their names; the frame positions
     std::vector<int> pair_st;
@@ -446,11 +462,15 @@ Fit fit(const std::vector<Row>& rows, const Layout& lay, const geometry::Map& m,
             }
         }
     }
+    for (std::size_t k = 0; k < nt; ++k)  // the gauge, stated: Eu's line in the column stays zero
+        if (m.i[k] == 1 && m.j[k] == 0) p.fixed.push_back(static_cast<std::int64_t>(o_eu + k)), p.fixed_value.push_back(0.0);
     SolveOptions opt;
-    opt.huber = huber, opt.iterations = iterations;
+    opt.huber = huber, opt.max_iterations = max_iterations;
     const LinearSolution sol = solve_linear(p, opt);
+    if (!sol.usable) throw Error(sol.termination + ": " + sol.message);
     Fit f;
     f.n = n;
+    f.solver = sol, f.rank = sol.rank, f.active = sol.active, f.unused = sol.unused;
     f.eu.assign(sol.x.begin() + static_cast<std::ptrdiff_t>(o_eu), sol.x.begin() + static_cast<std::ptrdiff_t>(o_eu + nt));
     f.ev.assign(sol.x.begin() + static_cast<std::ptrdiff_t>(o_ev), sol.x.begin() + static_cast<std::ptrdiff_t>(o_ev + nt));
     f.psi = sol.x[o_psi];
@@ -551,7 +571,7 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
             left.set(kind, Json::dict().set("n", count(static_cast<long long>(found->second.n))).set("px", num(found->second.px)).set("rows", num(found->second.rows)));
             report += fmt("%s%s %.3f px / %.3f rows", report.empty() ? "" : ", ", kind, found->second.px, found->second.rows);
         }
-        history.add(Json::dict().set("accepted", count(static_cast<long long>(f.n))).set("correction_px", num(du)).set("correction_rows", num(dv)).set("line_change_px", num(dl)).set("left", left));
+        history.add(Json::dict().set("accepted", count(static_cast<long long>(f.n))).set("correction_px", num(du)).set("correction_rows", num(dv)).set("line_change_px", num(dl)).set("left", left).set("solver", solver_json(f)));
         say(log, fmt("  pass %d: %zu comparisons; the map is corrected by up to %.3f px and %.3f rows, the second scan's lines by %.3f; left %s", it + 1, f.n, du, dv, dl,
                      report.c_str()));
         if (std::max({du, dv, dl}) < options.tolerance && it) {
@@ -603,7 +623,7 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
             for (const auto& [key, uv] : f.groups)
                 if (key.kind == "resthelix" && key.scan == scan && key.a == a) x.push_back(stated_D_of("resthelix", scan, a, key.frame)), y.push_back(uv[1]);
             if (x.size() >= 4) {
-                const Line l = fit_line(x, y, 0, x.size());
+                const Line l = line_through(x, y);
                 heights.set(fmt("scan %d %s", scan, kNames[a]), Json::dict().set("offset_rows", num(l.intercept)).set("scale_error", num(l.slope)));
             }
         }
@@ -657,7 +677,7 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     cal.set("step", Json::of(std::string("geometry"))).set("scans", names).set("seconds", num(std::nearbyint(seconds * 10) / 10)).set("layout", layout);
     cal.set("row_time", Json::dict().set("seconds_per_row", num(row_time)).set("frame_period_s", num(period)).set("measured", timing));
     cal.set("map", map).set("poses", poses).set("passes", history).set("converged", Json::of_bool(std::max({du, dv, dl}) < options.tolerance));
-    cal.set("patch", count(options.patch));
+    cal.set("patch", count(options.patch)).set("solver", solver_json(f));
     return cal.text();
 }
 

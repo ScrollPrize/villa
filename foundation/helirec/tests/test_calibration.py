@@ -358,6 +358,8 @@ def test_session_reads_and_measures(tmp_path, monkeypatch):
     assert [r["label"] for r in res] == ["self", "outside"]
     me = res[0]
     assert me["planned"] and me["ok"] and (me["frame_a"], me["frame_b"], me["frames"], me["rows"], me["cols"], me["row_offset"]) == (12, 12, 16, 16, 32, 0)
+    assert me["solver"]["usable"] and me["solver"]["solver_version"]
+    assert me["function_evaluations"] >= me["evaluations"]
     assert abs(me["dq"]) < 1e-3 and abs(me["D"]) < 1e-3 and abs(me["du"]) < 1e-3 and me["correlation"] > 0.999 and me["stated_dq"] == 0
     assert not res[1]["planned"] and not res[1]["ok"]
     with pytest.raises(Exception):
@@ -830,3 +832,26 @@ def test_measure_patches_equals_measure(tmp_path, monkeypatch):
         for g, r in zip(on_device, mirrored):
             assert all(g[key] == r[key] for key in integers if key != "evaluations") and all(g[key] == pytest.approx(r[key], abs=1e-4) for key in reals), (g, r)
         check(s, dict(base, mirror=True, **stated), "cuda")
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_ceres_peak_curvature_inactive_axis_and_no_texture(device):
+    if device == "cuda" and not _core.cuda_available():
+        pytest.skip("no CUDA device")
+    rng = np.random.default_rng(71)
+    shape = (1, 128, 128)
+    ky, kx = np.meshgrid(np.fft.fftfreq(128), np.fft.fftfreq(128), indexing="ij")
+    spectrum = np.fft.fft2(rng.normal(size=shape)) * np.exp(-(ky*ky+kx*kx)/.01)
+    a = np.fft.ifft2(spectrum).real.astype(np.float32)
+    shift = (.27,-.38)
+    b = np.fft.ifft2(spectrum*np.exp(-2j*np.pi*(shift[0]*ky+shift[1]*kx))).real.astype(np.float32)
+    reg = _core.CalibrationRegistrar([1,96,96],[0,16,16],stripe_notch=0,device=device)
+    result = reg.run(a[:,16:-16,16:-16].copy(), b)
+    assert result["converged"] and result["shift"] == pytest.approx([0,*shift], abs=.003)
+    H = np.asarray(result["curvature"])
+    assert np.all(H[0] == 0) and np.all(H[:,0] == 0)
+    assert np.linalg.eigvalsh(H[1:,1:]).max() < 0
+    assert result["solver"]["usable"] and result["solver"]["solver_version"]
+    assert result["function_evaluations"] >= result["evaluations"]
+    for field in [np.zeros(shape,np.float32), np.ones(shape,np.float32)]:
+        assert not reg.run(field[:,16:-16,16:-16].copy(),field)["converged"]

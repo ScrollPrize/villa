@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "helirec/calibration/session.hpp"
+#include "helirec/calibration/solve.hpp"
 #include "helirec/geometry.hpp"
 
 namespace helirec::calibration::geometry_calibration {
@@ -122,16 +123,19 @@ struct Fit {
     };
     std::map<std::string, Left> left;  // per kind: what the fit leaves [rms]
     std::map<GroupKey, std::array<double, 2>> groups;  // per frame position: (u0, v0)
+    FitSummary solver;                 // how the solve ended (solve.hpp)
+    int rank = 0, active = 0, unused = 0;
 };
 // What the comparisons leave, as a correction of the map `m` (same terms), the poses beside it, and the residuals
 // (python/helirec/geometry.py states the model).
-Fit fit(const std::vector<Row>& rows, const Layout& lay, const geometry::Map& m, double tau, double period, double huber = 0.03, int iterations = 8);
+// It is an error if the solve is not usable (a model whose active unknowns depend on each other, no support).
+Fit fit(const std::vector<Row>& rows, const Layout& lay, const geometry::Map& m, double tau, double period, double huber = 0.03, int max_iterations = 100);
 // the largest displacement the correction (eu, ev) makes anywhere on the detector [px, rows]
 std::array<double, 2> update_range(const geometry::Map& m, const std::vector<double>& eu, const std::vector<double>& ev);
 
 // b of X b = y by least squares, through the steps' solver. X: (n, k) row-major. columns: the unknowns fitted (the
-// others stay zero; empty: all); rows: the equations used (empty: all). An unknown the equations do not determine
-// comes out zero.
+// others stay zero; empty: all); rows: the equations used (empty: all). Columns no equation uses are held at
+// zero; it is an error if the fitted columns depend on each other or there is no equation.
 std::vector<double> least_squares(const std::vector<double>& X, std::size_t n, std::size_t k, const std::vector<double>& y, const std::vector<int>& columns = {},
                                   const std::vector<std::uint8_t>& rows = {});
 // Design of [d(t2) - d(t1)] . (cos, sin)(th), d at the nodes h, 2h, .. (d(0) = 0), a line between; then n_extra
@@ -153,17 +157,9 @@ std::string second_scan_fit(const std::vector<PairRow>& table, int rows, double 
 // Returns the step's "motion" as JSON text.
 std::string measure_motion(Session& session, const Layout& lay, const geometry::Map& m, const double lines[3][2], double tau, double period, Device device, const Log& log);
 
-// The time of a row from the beam dips of a refill. x: (frames, n_rows), the logarithm of each row's level in
-// frames around the refill; T, E: the frame period and the gate [s]; pre: the frames at the start that lie before
-// the refill. Nothing if fewer than 12 shots are found.
-struct RefillFit {
-    std::vector<double> p;  // the row time [s per row, signed], the dips' decay, the first shot's time, the raster, ..
-    double se = 0, noise = 0, cost = 0;
-    std::vector<int> shots;
-};
-std::optional<RefillFit> fit_refill_shots(const std::vector<double>& x, std::size_t frames, int n_rows, double T, double E, int pre);
 // Seconds per stored row from a refill in one of the stretches, as the step saves it (JSON text; "null" if no
-// stretch holds one).
+// stretch holds one): the frames around the refill are found and reduced to the rows' levels here, the dips are
+// fitted by calibration::fit_refill_shots (helirec/calibration/refill.hpp).
 std::string row_time_from_refill(Session& session, const Layout& lay, const Log& log);
 
 // ---- small numerics the stages share (as numpy does them)

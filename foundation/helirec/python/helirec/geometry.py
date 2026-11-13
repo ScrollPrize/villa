@@ -131,7 +131,7 @@ def plan(lay):
 _FIT_KEYS = ("kind", "scan_a", "stretch_a", "frame_a", "row_a", "rows", "row_offset", "col_a", "col_b", "cols", "stated_dq", "dq", "stated_D", "D", "du", "slope_a", "slope_b")
 
 
-def fit(rows, lay, m, tau, period, huber=0.03, iterations=8):
+def fit(rows, lay, m, tau, period, huber=0.03, max_iterations=100):
     """What the comparisons leave, as a correction of the map `m` (same terms), the poses beside it, and the residuals.
 
     A feature seen at A and at B obeys, with E the part of the detector's map the grid does not hold yet:
@@ -142,10 +142,13 @@ def fit(rows, lay, m, tau, period, huber=0.03, iterations=8):
     per frame position (whatever the sample and the stages did between positions is theirs, not the map's). psi:
     the roll of the first scan's axis. Between the scans, per stretch, rho (a rotation of the second scan's content
     about the beam) and a line in the column (a, b), whose mean over the stretches is left to the detector.
-    (helirec::calibration::geometry_calibration::fit, on the steps' solver)"""
+    (helirec::calibration::geometry_calibration::fit, on the steps' solver; an unusable solve is an error)"""
     from . import _core
     text = json.dumps([{k: (r[k] if isinstance(r[k], str) else float(r[k])) for k in _FIT_KEYS} for r in rows])
-    out = json.loads(_core.geometry_calibration_fit(text, _layout_text(lay), json.dumps(m, default=float), float(tau), float(period), float(huber), int(iterations)))
+    try:
+        out = json.loads(_core.geometry_calibration_fit(text, _layout_text(lay), json.dumps(m, default=float), float(tau), float(period), float(huber), int(max_iterations)))
+    except RuntimeError as e:
+        raise ValueError(str(e)) from None
     out["groups"] = {(k, s_, a, f): (u, v) for k, s_, a, f, u, v in out["groups"]}
     return out
 
@@ -181,14 +184,16 @@ def second_scan_fit(table, rows, total):
     return json.loads(_core.geometry_calibration_second_scan_fit([str(r[0]) for r in table], col(1), col(2), col(3), col(4), col(5), col(6), int(rows), float(total)))
 
 
-def fit_refill_shots(x, T, E, pre):
-    """The time of a row from the beam dips of a refill. x: (frames, rows), the logarithm of each row's level in
-    frames around the refill; T, E: the frame period and the gate [s]; pre: the number of frames at the start that
-    lie before the refill. Returns dict(p, se, noise, cost, shots), p starting with the row time [s per row,
-    signed] and the dips' decay, or None if fewer than 12 shots are found.
-    (helirec::calibration::geometry_calibration::fit_refill_shots)"""
+def fit_refill_shots(x, n_rows, T, E, pre):
+    """Fit exposure-integrated beam dips in C++; return parameters and Ceres diagnostics.
+    Insufficient shots, invalid noise and unusable fits return None. Unavailable
+    row-time uncertainty is reported as NaN with uncertainty_available=False."""
     from . import _core
-    return _core.geometry_calibration_fit_refill_shots(np.ascontiguousarray(x, np.float64), float(T), float(E), int(pre))
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] != n_rows:
+        raise ValueError("refill levels must have shape (frames, n_rows)")
+    fit = _core.calibration_fit_refill_shots(x, T, E, pre)
+    return fit if fit["usable"] else None
 
 
 # ---------------------------------------------------------------- the pose of every frame

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "helirec/calibration/frames.hpp"
+#include "helirec/calibration/solve.hpp"
 #include "helirec/calibration/record.hpp"
 
 namespace helirec::calibration {

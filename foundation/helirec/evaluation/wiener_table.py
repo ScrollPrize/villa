@@ -39,19 +39,18 @@ import os
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
-from scipy.optimize import least_squares
+from helirec import _core
 
 
 def model(p, nu):
-    A, a, s1, s2 = p
-    k2 = (2 * np.pi * nu) ** 2
-    return (1 + A * k2) * (a * np.exp(-0.5 * s1 * s1 * k2) + (1 - a) * np.exp(-0.5 * s2 * s2 * k2))
+    return np.asarray(_core.calibration_transfer_model(np.asarray(p).tolist(), np.asarray(nu).tolist()))
 
 
 def fit_transfer(nu, G):
-    r = least_squares(lambda p: np.log(model(p, nu)) - np.log(G), [18.0, 0.5, 0.9, 1.9],
-                      bounds=([1.0, 0.0, 0.2, 0.2], [100.0, 1.0, 4.0, 6.0]))
-    return r.x, float(np.sqrt(np.mean(r.fun ** 2)))
+    fit = _core.calibration_fit_transfer(np.asarray(nu).tolist(), np.asarray(G).tolist())
+    if not fit["usable"]:
+        raise ValueError(f"transfer fit unavailable: {fit['message']}")
+    return np.asarray(fit["x"]), fit["rms"], fit
 
 
 def row_interpolation_response(name, nu, steps=64):
@@ -113,11 +112,12 @@ def main(argv=None):
     fg = np.array(film["frequency"])
     G = np.array(film[a.subset]["G"])
     ok = np.array(film[a.subset]["valid"], bool) & (G > 0)
-    par, rms = fit_transfer(fg[ok], G[ok])
+    par, rms, transfer_fit = fit_transfer(fg[ok], G[ok])
     print(f"transfer '{a.subset}': {ok.sum()} points; model A = {par[0]:.2f} px^2, {par[1]:.2f} of sigma {par[2]:.2f} px + "
           f"{1 - par[1]:.2f} of sigma {par[3]:.2f} px; rms misfit {100 * rms:.1f} %")
     nu = np.arange(1, int(round(a.nu_max / a.step)) + 1) * a.step
     smear = 0.0
+    smear_fit = None
     if a.sharp:
         bins = [b for b in film["by_column"][a.sharp[0]]["bins"]
                 if len(b["columns"]) == 1 and float(a.sharp[1]) <= b["columns"][0] <= float(a.sharp[2])]
@@ -125,8 +125,10 @@ def main(argv=None):
             raise SystemExit("--sharp: no bin of one column in that range")
         Gs = np.exp(np.mean([np.log(b["G"]) for b in bins], 0))
         oks = ok & np.all([b["valid"] for b in bins], 0) & (fg >= 0.2)
-        r = least_squares(lambda q: np.sinc(q[0] * fg[oks]) - G[oks] / Gs[oks], [1.0], bounds=([0.0], [2.0]))
-        smear = float(r.x[0])
+        smear_fit = _core.calibration_fit_smear(fg[oks].tolist(), (G[oks] / Gs[oks]).tolist())
+        if not smear_fit["usable"]:
+            raise ValueError(f"smear fit unavailable: {smear_fit['message']}")
+        smear = float(smear_fit["x"][0])
         print(f"sharp place ({len(bins)} bins, columns {[round(b['columns'][0]) for b in bins]}): G / G_sharp at "
               f"{fg[oks].round(3)} = {(G[oks] / Gs[oks]).round(2)}; as a smear of {smear:.2f} px: {np.sinc(smear * fg[oks]).round(2)}")
 
@@ -165,7 +167,7 @@ def main(argv=None):
     fu, fz = np.minimum(nu[:, None] * np.sin(th), 0.5), np.minimum(nu[:, None] * np.cos(th), 0.5)
     L = np.interp(fz, np.r_[0, nu], np.r_[1, row_interpolation_response(a.z_interp, nu)]) if a.row_response == "restore" else 1.0
     T = model(par, nu)[:, None] / np.sinc(smear * nu)[:, None] * np.sinc(smear * fu) * L
-    result = dict(nu=nu.tolist(), theta=theta.tolist(), transfer=T.tolist(),
+    result = dict(solver=dict(transfer=transfer_fit, smear=smear_fit), nu=nu.tolist(), theta=theta.tolist(), transfer=T.tolist(),
                   model=dict(A_px2=par[0], fraction=par[1], sigma1_px=par[2], sigma2_px=par[3], rms=rms, subset=a.subset,
                              smear_px=smear, z_interp=a.z_interp, row_response=a.row_response,
                              snr_direction=a.snr_direction),

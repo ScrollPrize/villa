@@ -499,7 +499,9 @@ Options: `--projections`, `--cache_dir`, `-n`, `--z Z0 Z1`, `--roi X0 X1 Y0 Y1` 
 `evaluation/343p_baselines.json` compares FBP and SIRT (20 iterations from gridrec), each with no projection
 filters and with Paganin δ/β 1000 + unsharp σ 1.2, coefficient 4, over the same five full slices of the local PHerc0343P projections.
 It uses the corrected mode and CUDA backend, requiring a CUDA-enabled build and host.
-The calibration cache lives under the output directory. Run from `foundation/helirec`:
+The calibration cache lives under the output directory.
+
+Run from `foundation/helirec`:
 
 ```bash
 AGENTS_AGENT_MODE=1 .venv/bin/python -u evaluation/compare_methods.py evaluation/343p_baselines.json \
@@ -717,23 +719,54 @@ five columns off: three of four found without it, all four with it). Where the p
 it costs more than it saves (Paris4, 128 opposite-view blocks across tiles: 137 ms a block with it, 102 ms
 without, 76 ms for the blocks alone), so it is off unless asked for.
 
-**The solver.** A geometry step's model is stated as equations over named unknowns and solved by helirec's own
-solver; there is no outside one. `helirec.solve.Problem` takes blocks of unknowns (`unknowns("axis", n)`),
-equations with their terms (`e = equations(measured, fit=...)`, `e.add("axis", tile, coefficient)`: one line of
-code per term of the model, for all measurements at once) and returns the unknowns by name and what every
-equation leaves, fitted or held out. Underneath, `helirec::calibration::solve_linear`
-(`include/helirec/calibration/solve.hpp`, `calibration_solve` in Python) is a linear least squares under a Huber
-loss: the columns scaled to unit length (a calibration's unknowns run from 1e-7 to thousands), weighted solves
-repeated with the weights of the solve before, the normal equations factored by a Cholesky decomposition with
-pivoting and each solve refined against the equations; an unknown the equations do not determine comes out zero
-and is counted out of `rank`. A model that is not a line in its unknowns (an angle that multiplies a place) is
-written as a line about the values in hand and solved again. Every fit of the geometry
-calibration is written on it and there is no other solve: the two-scan step's `fit` (on the saved PHerc0343P
-comparisons, 17 284 patches, it gives the numbers of the reweighted numpy least squares it replaced to 1e-8 px,
-in 0.2 s against 10 s), `second_scan_fit` and the motion stage's solves (`least_squares` of
-`helirec/calibration/geometry_calibration.hpp`). The row time from a refill (`fit_refill_shots`) is not a line in
-its unknowns: it is fitted by damped steps, each of them a linear solve of the same solver
-(`tests/test_solve.py`, `tests/test_geometry.py`).
+**The solver.** Ceres is the sole parameter-fitting and continuous-optimization engine. The C++
+API (`helirec/calibration/solve.hpp`) and `helirec.solve.Problem` expose equations over named unknowns:
+`unknowns("axis", n)`, `e = equations(measured, fit=...)`, `e.add("axis", tile, coefficient)`.
+Duplicate coefficients add; held-out equations are predicted without affecting the fit, rank or cost.
+Residuals are always measured minus predicted. `p.fix("axis", index, value)` chooses an explicit gauge.
+Unused columns are frozen at zero (or their fixed values); dependent active columns cause an unavailable
+fit, rather than an arbitrary choice of parameters. Python calibration steps reject unavailable fits.
+
+Least-squares fits use Ceres Levenberg–Marquardt, dense QR up to 64 active parameters, and EigenSparse
+normal Cholesky above that. Scalar parameter dependencies remain sparse. Linear designs are scaled to
+unit column norm. Equations with the same dependencies share assembly; each scalar residual receives
+its own Huber loss in residual units. The batched residual is `sign(r) sqrt(rho(r²))`, differentiated
+including the loss; the returned residuals remain the original `y - prediction`. A Ceres least-squares
+initialization precedes robust fitting. Eigen QR is used only to diagnose rank, with orthogonal row
+compression preserving the design's singular values.
+
+`solve(huber=0, max_iterations=100, function_tolerance=1e-7, gradient_tolerance=1e-12,
+parameter_tolerance=1e-12, rcond=1e-12)` controls convergence. Fits run in double precision on one thread;
+independent measurements may run concurrently. Obsolete IRLS `iterations` and `relative` controls have
+been removed. Solutions include parameters, residuals, final square-root robust weights, robust spread
+(1.4826 MAD, diagnostic only), cost (half the robust sum of squares), iteration/evaluation counts,
+termination, a diagnostic message and Ceres version. `Solution.diagnostics` carries the metadata.
+The low-level C++/Python results expose `usable`; `NO_CONVERGENCE` records an iteration limit even when
+the current finite solution is usable. Geometry pass records retain these diagnostics.
+
+Refill timing (`calibration/refill.hpp`, `_core.calibration_fit_refill_shots`) selects shots, initializes
+both row-time signs, fits the exposure-integrated dip model with positive decay and automatic derivatives,
+and uses Ceres covariance for row-time uncertainty. It requires 12 shots, at least five 20-row bands and
+positive finite quiet-frame noise. Unidentifiable uncertainty is explicitly unavailable. Detector-blur
+fitting uses an analytic Jacobian of the complete residual, including spectral normalization and the eliminated nuisance
+spectrum. Its binding returns `(field, rms_none, rms_fit, solver)`.
+The bounded film-transfer and smear fits used by `evaluation/wiener_table.py` also live in C++
+(`calibration/transfer.hpp`), with automatic derivatives and the same solver diagnostics.
+
+Registration and block-spectrum alignment use Ceres BFGS with a Wolfe line search on negative normalized
+correlation. Integer initialization, registration window recentering, shift signs and whole-pixel recut
+requests retain their measurement conventions. A fixed curvature-based coordinate scaling conditions
+BFGS; exact final curvature and stationarity validate the peak independently of solver termination.
+Image buffers and correlation evaluations remain on the selected CPU/CUDA backend. CUDA returns only ten
+scalars per correlation evaluation, using a fixed double-precision reduction tree; CPU/CUDA comparisons
+retain their existing floating-point accuracy tolerances.
+Session measurements expose the final peak's `solver` diagnostics and total `function_evaluations` across
+recuts; `evaluations` retains its meaning as the number of outer window recenterings. A usable solver result
+still needs the measurement's curvature, search-window and correlation checks to set `ok`.
+
+The geometry calibration itself (`helirec/calibration/geometry_calibration.hpp`, `helirec-calibration geometry`)
+states its fits on the same C++ API: the pass's `fit`, `second_scan_fit` and the motion stage's regressions
+(`least_squares`), and takes the rows' timing from `fit_refill_shots`.
 
 **Partial copies.** Frame files that are not on disk are reported (`map from frame to file`, with the frames
 that are there) and their frames are never read: the master file's virtual dataset would return zeros for them.
@@ -962,6 +995,12 @@ in `development_notes/calibration/05_experiments.md`, section 33.
 
 ## Tests
 
+For an already configured build, use `cmake --build build/<configuration> -j 4` and
+`ctest --test-dir build/<configuration> --output-on-failure`. The native fitting test checks the complete
+blur-model Jacobian against numerical derivatives. Python fitting coverage is in `tests/test_solve.py`,
+`tests/test_refill.py`, `tests/test_transfer.py`, `tests/test_geometry.py`, and `tests/test_regressions.py`; registration is covered by
+`tests/test_calibration.py` and `tests/test_block_spectra.py` on each available backend.
+
 `pytest` runs the unit tests: CPU vs CUDA vs NumPy references for every kernel, projector adjointness, the
 whole-slice methods, and regression checks of the corrected conventions (`tests/test_regressions.py`).
 `tests/test_calibration.py` covers `helirec::calibration` on synthetic blocks and a synthetic acquisition record.
@@ -978,7 +1017,13 @@ the transform plans).
 
 ## Build
 
-Requirements: CMake ≥ 3.24, a C++20 compiler, FFTW3 (float + double), HDF5 (C), zlib, libcurl, Python ≥ 3.10, and
+Ceres must already be installed; configuration uses `find_package(Ceres 2.2 REQUIRED COMPONENTS EigenSparse)`
+and links `Ceres::ceres`. There is no bundled download or fallback solver. On Ubuntu use the distribution's
+`libceres-dev` package if it provides version 2.2 or newer (`sudo apt install libceres-dev`); on macOS use
+`brew install ceres-solver`. For a separate installation, pass `-DCeres_DIR=/prefix/lib/cmake/Ceres`
+(or the directory containing `CeresConfig.cmake`). A Ceres source build must enable `EIGENSPARSE`.
+
+Requirements: CMake ≥ 3.24, a C++20 compiler, **Ceres ≥ 2.2 with EigenSparse**, FFTW3 (float + double), HDF5 (C), zlib, libcurl, Python ≥ 3.10, and
 optionally the CUDA toolkit and OpenJPEG ≥ 2.5 (`apt install libopenjp2-7-dev`, `brew install openjpeg`; found
 through pkg-config, `-DHELIREC_OPENJPEG=OFF` to build without). OpenJPEG is needed only for frames stored as
 uint16 JPEG 2000 (see `helirec-calibration`); without it such scans are refused with a message that names the package.

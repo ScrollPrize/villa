@@ -62,7 +62,8 @@ struct Measured {
     // of the correlation at the registration (registration.hpp): frames^2, frames rows, frames columns, rows^2,
     // rows columns, columns^2
     double curvature[6] = {0, 0, 0, 0, 0, 0};
-    int evaluations = 0;
+    int evaluations = 0, function_evaluations = 0;
+    FitSummary solver;
     bool ok = false;
 };
 
@@ -86,7 +87,7 @@ struct ViewTiming {
 };
 ViewTiming& view_timing();
 
-void keep_curvature(const Registration& r, Measured& m);
+void keep_registration(const Registration& r, Measured& m);
 
 // cut both blocks, register, and cut B again by whole samples until less than a sample is left
 bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const RegistrationOptions& ropt, const ViewOptions& opt, Measured& m);

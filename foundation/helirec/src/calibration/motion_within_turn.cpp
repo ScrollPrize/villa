@@ -317,6 +317,7 @@ std::string measure_motion(Session& session, const Layout& lay, const geometry::
                     D.push_back(r.m.stated_D), y.push_back(r.y), qa.push_back(r.q + tau / period * r.m.row_offset), fb.push_back(static_cast<double>(r.m.frame_b));
             if (D.size() < 8) continue;
             const Line ly = fit_line(D, y, 0, D.size()), lq = fit_line(D, qa, 0, D.size());  // the helix' angle beyond the rows' timing [frames]
+            if (!ly.usable || !lq.usable) throw Error((ly.usable ? lq : ly).termination + ": " + (ly.usable ? lq : ly).message);
             std::vector<double> ry(D.size()), rq(D.size());
             Json table = Json::list();
             for (std::size_t i = 0; i < D.size(); ++i) {

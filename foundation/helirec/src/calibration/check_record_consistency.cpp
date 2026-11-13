@@ -427,6 +427,10 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
                       counts.max_abs, arc_err, center_err, std::fabs(counts.slope), 360.0 / std::fabs(counts.slope), steps.slope, steps.max_abs, steps.rms,
                       nominal, end_error, std::fabs(end_error) / 57.29577951308232 * tol.R);
         f.verdict = counts.max_abs < 1e-6 && arc_err < 1e-6 && center_err < 1e-6 ? "verified" : "fails";
+        if (!counts.usable || !steps.usable) {
+            f.verdict = "unverified";
+            f.found = "angle fit unavailable: " + (!counts.usable ? counts.message : steps.message);
+        }
         f.note = fmt("verdict: the derived angles are the raw encoder counts. Diagnostic target on the angle itself: %.6g deg", tol.angle_deg());
         f.numbers = {{"step_deg", steps.slope}, {"deg_per_count", counts.slope}, {"nonuniform_max_deg", steps.max_abs}, {"count_error_end_deg", end_error},
                      {"first_deg", angle.front()}, {"last_deg", angle.back()}};
@@ -475,6 +479,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
             f.found = fmt("derived heights reproduce the raw counts to %.1e mm; %.6g mm per count = %.4f rows at %.4g um; travel during an exposure %.3f um = %.4f rows",
                           counts.max_abs, std::fabs(counts.slope), std::fabs(counts.slope) / px_mm, px_mm * 1e3, dz.mean * 1e3, dz.mean / px_mm);
             f.verdict = counts.max_abs < 1e-9 ? "verified" : "fails";
+            if (!counts.usable) { f.verdict = "unverified"; f.found = "encoder fit unavailable: " + counts.message; }
             f.note = "verdict: the derived heights are the raw encoder counts. Rows follow only through the stated pixel size";
         }
         {
@@ -484,6 +489,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
                           travel.slope, travel.slope / px_mm, px_mm * 1e3, commanded / px_mm, (travel.slope - commanded) / px_mm,
                           tol.eps * std::fabs(travel.slope / px_mm) / tol.H);
             assess_residuals(f, {(travel.slope - commanded) / px_mm}, tol.eps * std::fabs(travel.slope / px_mm) / tol.H, "rows/turn");
+            if (!travel.usable) { f.verdict = "unverified"; f.found = "travel fit unavailable: " + travel.message; }
             f.note = "verdict: commanded against recorded travel. Whether the recorded travel is the sample's, in rows, is for the frames to show";
             f.numbers = {{"mm_per_turn", travel.slope}, {"rows_per_turn", travel.slope / px_mm}, {"commanded_mm_per_turn", commanded}};
         }
@@ -494,6 +500,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
                           "scatter %.3f rows rms (%.3f to %+.3f), of which %.3f rows rms repeat once per turn",
                           settle, r0.mean, r1.mean, r_end.mean, r_all.sd, r_all.min, r_all.max, once);
             assess_residuals(f, res, tol.rows(), "rows");
+            if (!travel.usable) { f.verdict = "unverified"; f.found = "travel fit unavailable: " + travel.message; }
             f.note = "Residuals test a constant-pitch model, not the validity of the per-frame encoders. Startup transients, periodic structure and scatter all require an explicit trajectory and uncertainty model";
         }
     }
