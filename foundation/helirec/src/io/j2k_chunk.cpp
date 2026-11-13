@@ -4,7 +4,6 @@
 #include <cstring>
 #include <array>
 #include <cmath>
-#include <limits>
 
 #include "helirec/common.hpp"
 
@@ -138,6 +137,36 @@ Info info(const Codestream& cs) {
     return out;
 }
 
+Info info(const ReadAt& read, const ChunkHeader& chunk) {
+    auto take = [&](void* dst, std::size_t n, std::size_t off) {
+        if (off > chunk.size || n > chunk.size - off) bad("truncated main header");
+        read(dst, n, chunk.offset + off);
+    };
+    std::array<std::uint8_t, 6> marker;
+    take(marker.data(), marker.size(), 0);
+    if (be32(marker.data()) != 0xff4fff51u) bad("missing SIZ marker");
+    const auto siz_length = be16(marker.data() + 4);
+    if (siz_length < 41) bad("invalid SIZ marker length");
+    std::vector<std::uint8_t> header(4 + siz_length);
+    take(header.data(), header.size(), 0);
+    // Inspect only SIZ and COD. Comment and other marker bodies may be large;
+    // seeking past them keeps storage() cheap even on a remote filesystem.
+    std::size_t at = header.size();
+    for (;;) {
+        take(marker.data(), 4, at);
+        if (marker[0] != 0xff || marker[1] == 0x90 || marker[1] == 0x93) bad("missing COD marker");
+        const std::size_t length = be16(marker.data() + 2);
+        if (length < 2 || length + 2 > chunk.size - at) bad("truncated main header");
+        if (marker[1] == 0x52) {
+            const auto tail = header.size();
+            header.resize(tail + 2 + length);
+            take(header.data() + tail, 2 + length, at);
+            return info({header.data(), header.size()});
+        }
+        at += 2 + length;
+    }
+}
+
 bool available() {
 #if HELIREC_WITH_OPENJPEG
     return true;
@@ -205,7 +234,7 @@ class SeekableInput final : public ojph::infile_base {
 #endif
 
 void decode_htj2k(const ReadAt& read, std::size_t size, std::size_t nbytes, int sample_bytes,
-                  int stored_width, int stored_height, int reduce, void* out, bool selective) {
+                  int stored_width, int stored_height, int reduce, void* out, bool selective) try {
 #if HELIREC_WITH_OPENJPH
     if (reduce < 0 || reduce > 3 || stored_width < 1 || stored_height < 1) bad("invalid shape or resolution");
     const auto h = chunk_header(read, size, nbytes, sample_bytes);
@@ -254,6 +283,8 @@ void decode_htj2k(const ReadAt& read, std::size_t size, std::size_t nbytes, int 
     (void)read; (void)size; (void)nbytes; (void)sample_bytes; (void)stored_width; (void)stored_height; (void)reduce; (void)out; (void)selective;
     bad("float32 HTJ2K needs a build with HELIREC_OPENJPH=ON");
 #endif
+} catch (const char* error) {
+    bad(std::string("OpenJPH: ") + error);
 }
 
 #if HELIREC_WITH_OPENJPEG

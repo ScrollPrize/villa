@@ -435,6 +435,8 @@ def fit(rows, lay, m, tau, period, huber=0.03, iterations=8):
     per frame position (whatever the sample and the stages did between positions is theirs, not the map's). psi:
     the roll of the first scan's axis. Between the scans, per stretch, rho (a rotation of the second scan's content
     about the beam) and a line in the column (a, b), whose mean over the stretches is left to the detector."""
+    from .solve import Problem
+
     tm = list(zip(m["i"], m["j"]))
     nt = len(tm)
     fit_u = [k for k, t in enumerate(tm) if t != (1, 0)]            # Eu's line in the column is a scale: not observable
@@ -443,59 +445,68 @@ def fit(rows, lay, m, tau, period, huber=0.03, iterations=8):
     cref = overlap_centre(lay)
     groups = sorted({(r["kind"], r["scan_a"], r["stretch_a"], int(r["frame_a"])) for r in rows})
     gi = {g: k for k, g in enumerate(groups)}
-    names = [f"eu {tm[k]}" for k in fit_u] + [f"ev {t}" for t in tm] + ["psi"] + [f"rho {s}" for s in pair_st] + [f"a {s}" for s in pair_st[:-1]] + [f"b {s}" for s in pair_st[:-1]]
-    col = {n: k for k, n in enumerate(names)}
-    n0 = len(names)
     n = len(rows)
-    X = np.zeros((2 * n, n0 + 2 * len(groups)))
-    y = np.zeros(2 * n)
-    vmid = m["v0"]
-    for i, r in enumerate(rows):
-        cA, cB = r["col_a"] + (r["cols"] - 1) / 2, r["col_b"] + (r["cols"] - 1) / 2
-        vA = r["row_a"] + (r["rows"] - 1) / 2
-        vB = vA + r["row_offset"]
-        mirror = r["kind"] == "opposite"
-        q = r["dq"] - r["stated_dq"]
-        y[i] = (r["col_a"] + r["col_b"] + r["cols"] - 1 - r["du"]) if mirror else r["du"]
-        y[n + i] = (r["D"] - r["stated_D"]) - r["slope_b"] * q - tau / period * (r["slope_b"] * vB - r["slope_a"] * vA)
-        for k, (ti, tj) in enumerate(tm):
-            a, b = _phi(m, cA, vA, ti, tj), _phi(m, cB, vB, ti, tj)
-            if k in fit_u:
-                X[i, col[f"eu {(ti, tj)}"]] = -(b + a) if mirror else -(b - a)
-            X[n + i, col[f"ev {(ti, tj)}"]] = -(b - a)
-        g = gi[(r["kind"], r["scan_a"], r["stretch_a"], int(r["frame_a"]))]
-        X[i, n0 + 2 * g] = 1.0
-        X[n + i, n0 + 2 * g + 1] = 1.0
-        if mirror:
-            X[i, col["psi"]] = 2.0 * (vA - vmid)
-            X[n + i, col["psi"]] = 2.0 * (cA - lay.axis)
-        if r["kind"] == "pair":
-            st = r["stretch_a"]
-            X[i, col[f"rho {st}"]] = -(vA - vmid)
-            X[n + i, col[f"rho {st}"]] = cA - cref
-            for key, row_ in (("a", i), ("b", n + i)):
-                if st in pair_st[:-1]:
-                    X[row_, col[f"{key} {st}"]] = cA - cref
-                else:                                   # the last stretch's line is minus the sum of the others
-                    for s_ in pair_st[:-1]:
-                        X[row_, col[f"{key} {s_}"]] = -(cA - cref)
-    w = np.ones(2 * n)
-    for _ in range(iterations):
-        b, *_ = np.linalg.lstsq(X * w[:, None], y * w, rcond=None)
-        res = y - X @ b
-        w = np.sqrt(np.minimum(1.0, huber / np.maximum(np.abs(res), 1e-12)))
-    out = dict(eu=[0.0] * nt, ev=[float(b[col[f"ev {t}"]]) for t in tm], psi=float(b[col["psi"]]), rho={s: float(b[col[f"rho {s}"]]) for s in pair_st}, lines={}, n=n)
-    for k in fit_u:
-        out["eu"][k] = float(b[col[f"eu {tm[k]}"]])
-    for key in ("a", "b"):
-        vals = [float(b[col[f"{key} {s}"]]) for s in pair_st[:-1]]
-        vals.append(-sum(vals))
-        for s, v_ in zip(pair_st, vals):
-            out["lines"].setdefault(s, [0.0, 0.0])[0 if key == "a" else 1] = v_
+    of = lambda key: np.array([r[key] for r in rows], float)
     kinds = np.array([r["kind"] for r in rows])
+    mirror, pair = kinds == "opposite", kinds == "pair"
+    cA, cB = of("col_a") + (of("cols") - 1) / 2, of("col_b") + (of("cols") - 1) / 2
+    vA = of("row_a") + (of("rows") - 1) / 2
+    vB = vA + of("row_offset")
+    q = of("dq") - of("stated_dq")
+    vmid = m["v0"]
+    g = np.array([gi[(r["kind"], r["scan_a"], r["stretch_a"], int(r["frame_a"]))] for r in rows], np.int64)
+    st = np.array([pair_st.index(r["stretch_a"]) if r["kind"] == "pair" else 0 for r in rows], np.int64)
+    p = Problem()
+    for name, size in (("eu", nt), ("ev", nt), ("psi", 1), ("rho", K), ("a", max(K - 1, 0)), ("b", max(K - 1, 0)), ("u0", len(groups)), ("v0", len(groups))):
+        p.unknowns(name, size)
+    columns = p.equations(np.where(mirror, of("col_a") + of("col_b") + of("cols") - 1 - of("du"), of("du")))
+    lines_ = p.equations((of("D") - of("stated_D")) - of("slope_b") * q - tau / period * (of("slope_b") * vB - of("slope_a") * vA))
+    for k, (ti, tj) in enumerate(tm):
+        fa, fb = _phi(m, cA, vA, ti, tj), _phi(m, cB, vB, ti, tj)
+        if k in fit_u:
+            columns.add("eu", k, np.where(mirror, -(fb + fa), -(fb - fa)))
+        lines_.add("ev", k, -(fb - fa))
+    columns.add("u0", g, 1.0)
+    lines_.add("v0", g, 1.0)
+    columns.add("psi", 0, 2.0 * (vA - vmid), mirror)
+    lines_.add("psi", 0, 2.0 * (cA - lay.axis), mirror)
+    if K:
+        columns.add("rho", st, -(vA - vmid), pair)
+        lines_.add("rho", st, cA - cref, pair)
+    for key, e in (("a", columns), ("b", lines_)):
+        for s_ in range(K - 1):                         # the last stretch's line is minus the sum of the others
+            e.add(key, s_, np.where(st == s_, cA - cref, -(cA - cref)), pair & ((st == s_) | (st == K - 1)))
+    sol = p.solve(huber=huber, iterations=iterations)
+    res = np.concatenate([sol.left(columns), sol.left(lines_)])
+    out = dict(eu=[float(x) for x in sol["eu"]], ev=[float(x) for x in sol["ev"]], psi=float(sol["psi"][0]), rho={s_: float(x) for s_, x in zip(pair_st, sol["rho"])}, lines={}, n=n)
+    for i_, key in enumerate(("a", "b")):
+        vals = [float(x) for x in sol[key]]
+        vals.append(-sum(vals))
+        for s_, v_ in zip(pair_st, vals):
+            out["lines"].setdefault(s_, [0.0, 0.0])[i_] = v_
     out["left"] = {k: dict(n=int((kinds == k).sum()), px=float(np.sqrt(np.mean(res[:n][kinds == k] ** 2))), rows=float(np.sqrt(np.mean(res[n:][kinds == k] ** 2)))) for k in KINDS if (kinds == k).any()}
-    out["groups"] = {g: (float(b[n0 + 2 * k]), float(b[n0 + 2 * k + 1])) for g, k in gi.items()}
+    out["groups"] = {g_: (float(sol["u0"][k]), float(sol["v0"][k])) for g_, k in gi.items()}
     return out
+
+
+def _least_squares(X, y, columns=None, rows=None):
+    """b of X b = y by least squares, through the steps' solver (helirec.solve, as every fit of the calibration).
+    columns: the unknowns fitted (the others stay zero); rows: the equations used (the others are left to be
+    predicted). An unknown the equations do not determine comes out zero."""
+    from .solve import Problem
+
+    X = np.asarray(X, float)
+    cols = np.arange(X.shape[1]) if columns is None else np.asarray(columns, np.int64)
+    b = np.zeros(X.shape[1])
+    if not len(cols) or not len(X):
+        return b
+    p = Problem()
+    p.unknowns("b", len(cols))
+    e = p.equations(y, fit=True if rows is None else rows)
+    for k, c in enumerate(cols):
+        e.add("b", k, X[:, c])
+    b[cols] = p.solve()["b"]
+    return b
 
 
 def _update_range(m, d):
@@ -573,9 +584,7 @@ def second_scan_fit(table, rows, total):
     for key, val, harm in (("columns", du, course), ("rows", y, once), ("angle_frames", q, once)):
         Xf = np.stack(base + harm + twice, 1)
         nh = len(harm)
-        b, *_ = np.linalg.lstsq(Xf, val, rcond=None)
-        b1, *_ = np.linalg.lstsq(Xf[:, :n1 + nh], val, rcond=None)
-        b0, *_ = np.linalg.lstsq(Xf[:, :n1], val, rcond=None)
+        b, b1, b0 = _least_squares(Xf, val), _least_squares(Xf[:, :n1 + nh], val), _least_squares(Xf[:, :n1], val)
         P[key] = dict(offset={a: float(b1[i]) for i, a in enumerate(names)}, per_row={a: float(b1[len(names) + i]) for i, a in enumerate(names)}, per_turn_of_travel=float(b1[n1 - 1]),
                       twice_per_turn=[float(b[n1 + nh]), float(b[n1 + nh + 1])],
                       left=dict(offsets_only=rms(val - Xf[:, :n1] @ b0), with_once_per_turn=rms(val - Xf[:, :n1 + nh] @ b1), with_twice_per_turn=rms(val - Xf @ b)),
@@ -733,11 +742,7 @@ def measure_motion(session, lay, m, lines, tau, period, device="auto", log=print
         kind = np.array(kind)
         use = np.nonzero(np.abs(X).sum(0) > 0)[0]
 
-        def solve(sel, cols_):
-            b = np.zeros(X.shape[1])
-            b[cols_] = np.linalg.lstsq(X[sel][:, cols_], y[sel], rcond=None)[0]
-            return b
-
+        solve = lambda sel, cols_: _least_squares(X, y, cols_, sel)
         every = np.ones(len(y), bool)
         b, b0 = solve(every, use), solve(every, use[use >= 2 * K])
         half = np.arange(len(y)) % 2 == 0
@@ -756,7 +761,7 @@ def measure_motion(session, lay, m, lines, tau, period, device="auto", log=print
         th = np.array([r["th"] for r in ho])
         t = np.array([r["t1"] for r in ho])
         H = np.stack([np.ones_like(th), t - t.mean(), np.array([r["vA"] for r in ho]) - (R - 1) / 2, np.cos(th), np.sin(th)], 1)
-        bz, *_ = np.linalg.lstsq(H, np.array([r["y"] for r in ho]), rcond=None)
+        bz = _least_squares(H, np.array([r["y"] for r in ho]))
         A = dict(z_cos=float(-bz[3] / 2), z_sin=float(-bz[4] / 2), amplitude_rows=float(np.hypot(bz[3], bz[4]) / 2), blocks=len(ho), drift_rows_per_turn={})
         for a in ("rest1", "rest2"):
             g = [r for r in rows if r["kind"] == "opposite" and r["a"] == a]

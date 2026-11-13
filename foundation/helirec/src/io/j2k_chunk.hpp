@@ -3,8 +3,9 @@
 // 32026 with the JPEG 2000 codec, as ESRF BM18 writes projections: chunks of (1, r, cols), HTJ2K, irreversible).
 //
 // The container is parsed here (no blosc2 library): a blosc2 frame that holds one chunk of one block whose only
-// stream is the codestream. The codestream is decoded with OpenJPEG (>= 2.5 for HTJ2K) when helirec is built
-// with it (HELIREC_WITH_OPENJPEG); without it, available() is false and decode() throws.
+// stream is the codestream or a B2JPF32 float wrapper around it. OpenJPEG (>= 2.5) handles uint16 detector
+// frames; OpenJPH handles seekable HTJ2K reads and the 32-bit samples of reconstructed float32 volumes.
+// available() reports OpenJPEG support; openjph_available() reports OpenJPH support.
 //
 // An irreversible codestream does not define its decoded integers to the last count: they are OpenJPEG's
 // (rounded to nearest, held to 0..65535). Another decoder may differ by a count.
@@ -50,6 +51,7 @@ struct Info {
     int levels = 0, layers = 0;
 };
 Info info(const Codestream& cs);
+Info info(const ReadAt& read, const ChunkHeader& chunk);
 
 // One unsigned component of width x height values -> out. Throws if the codestream is something else.
 // Always the whole chunk: OpenJPEG 2.5.4 returns only the level shift (32768) for a decode area of an HTJ2K

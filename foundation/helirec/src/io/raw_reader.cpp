@@ -413,9 +413,7 @@ RawReader::Storage RawReader::storage(int file) {
     };
     const auto h = j2k::chunk_header(read, fi.chunk_bytes[0], static_cast<std::size_t>(fi.stored_chunk_rows) * stored_cols_ * sample_bytes_, sample_bytes_);
     if (h.constant) { st.codec = "B2JPF32 (constant)"; return st; }
-    std::vector<std::uint8_t> raw(std::min<std::size_t>(h.size, 4096));
-    read(raw.data(), raw.size(), h.offset);
-    const auto ji = j2k::info({raw.data(), raw.size()});
+    const auto ji = j2k::info(read, h);
     st.reversible = ji.reversible;
     st.bit_depth = ji.bit_depth;
     st.codec = ji.high_throughput ? "JPEG 2000 (HTJ2K)" : "JPEG 2000";

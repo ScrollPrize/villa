@@ -727,10 +727,12 @@ loss: the columns scaled to unit length (a calibration's unknowns run from 1e-7 
 repeated with the weights of the solve before, the normal equations factored by a Cholesky decomposition with
 pivoting and each solve refined against the equations; an unknown the equations do not determine comes out zero
 and is counted out of `rank`. A model that is not a line in its unknowns (an angle that multiplies a place) is
-written as a line about the values in hand and solved again. The mosaic step's `fit` is written on it and is that
-step's only fit (on Paris4 1025 unknowns and about 12 000 equations, a second or two a round); against the
-hand-built matrices it replaces it gives the same numbers where they were right and a lower sum of squares where numpy's least squares on unscaled
-columns was not (`tests/test_solve.py`, `tests/test_mosaic.py`). The two-scan step's fit is to follow.
+written as a line about the values in hand and solved again. Every fit of the geometry
+calibration is written on it and there is no other solve: the two-scan step's `fit` (on the saved PHerc0343P
+comparisons, 17 284 patches, it gives the numbers of the reweighted numpy least squares it replaced to 1e-8 px,
+in 0.2 s against 10 s), `second_scan_fit` and the motion stage's solves (`geometry._least_squares`). The row
+time from a refill (`fit_refill_shots`) is not a line in its unknowns and stays with scipy's `least_squares`
+(`tests/test_solve.py`, `tests/test_geometry.py`).
 
 **Partial copies.** Frame files that are not on disk are reported (`map from frame to file`, with the frames
 that are there) and their frames are never read: the master file's virtual dataset would return zeros for them.
@@ -768,6 +770,38 @@ have no such resolutions and are refused; rows, columns and rows per chunk must 
 `helirec.mosaic.tile_reconstructor(..., reduce=)` reconstructs a tile on it (below); the calibration session and
 the pair pipeline read at full resolution only.
 
+**Reduced reads of reconstructed float32 volumes.** `RawReader(..., dtype="float32", reduce=0 | 1 | 2 | 3)`
+reads ESRF's B2JPF32 HTJ2K chunks, including the signed 32-bit codestreams in Paris4. This uses
+[OpenJPH](https://github.com/aous72/OpenJPH), fetched and compiled automatically by CMake; neither Kakadu nor
+an HDF5 filter plugin is needed. The C++ API has the same constructor options and `float*` overloads for
+`read_rows` and `read_frames`. Decoding and I/O run on the CPU, in parallel over chunks.
+
+```python
+import numpy as np
+from helirec import RawReader
+
+reader = RawReader(
+    ["tile.hdf5"], "entry0000/reconstruction/results/data",
+    rows=8223, cols=8223, dtype="float32", reduce=3,
+)
+slices = reader.read_frames(np.array([0], np.int32), np.array([0], np.int32))
+# slices.shape == (1, 1028, 1028); slices.dtype == np.float32
+print(reader.bytes_read)
+```
+
+Odd frame sizes round up. Reduction acts on X/Y within each slice; choose frame indices separately for Z.
+With `selective=True` (default), a seekable stream skips unused resolution packets instead of loading the
+whole compressed chunk. On a Paris4 8223 × 8223 slice, full/half/quarter/eighth reads requested
+18.03/8.52/3.47/1.57 MB. Savings depend on packet order and chunk layout. `bytes_read` counts payload bytes
+requested by the reader, excluding HDF5 metadata; a mounted filesystem such as rclone may fetch more through
+read-ahead. Row windows still decode the touched chunks at the requested resolution. Internal chunk boundaries
+must be multiples of 2^reduce; whole-frame chunks can have odd dimensions.
+
+`selective=False` preloads the full codestream for the same OpenJPH decode, useful for comparison or storage
+that favors sequential I/O. The selective and preloaded results are identical. Irreversible JPEG 2000 results
+can differ slightly between decoder implementations. The existing uint16 projection path continues to use
+OpenJPEG and load each touched compressed chunk in full.
+
 **Mosaics.** Scans that differ in where the sample sits on the rotation stage (the tomo configuration's
 `sample_u`, `sample_v`) and not in the lateral stage of the axis are checked as tiles, any number of them:
 which motors differ, the place of each tile and its agreement with the laboratory pseudo-motors, which lines
@@ -784,43 +818,16 @@ frame by cubic convolution) and the registration returns what is left of it. Wit
 takes each row of B at its own angle (rows exposed one after another: between two tiles that is a shear of the
 tiles' distance times the angle per row).
 
-`helirec.mosaic` is the geometry step for a mosaic, in work: `calibrate_mosaic(masters)` finds the layout from
-the frames (the helix of each tile, the rows' sense, axis columns, which tiles are neighbours and their places),
-then registers the four kinds of comparison on the current map's grid and fits, pass by pass, one detector map,
-the roll, the rows' timing and per tile an axis column, a place on the stage, a height, and courses of the
-column and the height along the frames, with one course of the angle for all tiles (they repeat the stages'
-errors along the trajectory) and each tile's own turn about the axis against the first (`yaw_rad`: up to 0.12
-frames on Paris4, which the frame shifts between tiles ask for). The fit is one model on helirec's solver
-(above); `fit(..., terms=...)` also holds terms that were tried on Paris4 and left out of the step (a lean with
-depth, the fan's scale, a tilt per tile, courses shared by the tiles, a field on the detector beside the map).
-`calibrate_mosaic(..., patch=128)` registers the plan's blocks as patches (Paris4: 3433 blocks as 46 687
-patches in 420 s on an RTX 5090; the blocks alone take about four minutes), which leaves the same residuals as
-the blocks do. `frame_pose(cal, tile, angle, frame)` gives a frame's angle, column and height;
-`tile_reconstructor(master, cal, tile)` a `SliceReconstructor` of one tile alone on that geometry, for checking
-the calibration on slices; with `cache_dir=` the tile's reduced darks and flats are kept there
-(`calibration.reduced_darks_flats`: 46 s of a tile's start otherwise, 0.5 s read back). `overlaps(cal, masters)`
-is that check for every pair of neighbours (Paris4: 12 overlaps in two slabs each, 4 minutes; a slab not read
-before costs 8 to 10 s, of which 6 to 7 s is decoding its 10 400 frames, a further overlap of the same slab 2 s).
-Both take `reduce=1 | 2 | 3` (a half, a quarter, an eighth: the frames read at the codestream's lower
-resolution, the geometry divided by 2^reduce; a reduced reconstruction is the full one's low band, pixel for
-pixel from the axis, to under 0.01 of a reduced pixel in the slice). `overlaps` reports in full-resolution
-pixels at every `reduce`. With `coarse=` it first registers the two slabs of an overlap whole, for a
-calibration whose tiles are still pixels from their places. `place_tiles(cal, table)` is the simplest fit on that
-table: one shift per tile (in the slice and along the axis) by least squares on the overlaps' median
-displacements, returned with what the shifts leave; `overlap_means(table)` gives those medians. The axis column
-along the scan is measured, not fitted:
-`mirror_along(session, layout, model)` registers each tile's opposite views at positions along the frames on disk
-and `axis_course(cal, table)` writes what the tiles show in common into every tile's `column_course`
-(`course_of_mirror`: a comparison of the frames p and p + N/2 gives the mean of the axis column at the two; a
-drift and what repeats every half turn come out exactly, what changes sign after half a turn is not in opposite
-views); its summary says how well each tile follows the others.
-On Paris4 (7 tiles) it converges in three passes and predicts held-out comparisons
-to 0.13–0.25 px and 0.14–0.27 rows; the overlap of two tiles reconstructed from each still differs by half a
-pixel to a pixel on average. Most of what the fit leaves is not a missing term: blocks compared at the same
-frames in different places on the detector disagree with each other by about 0.1 px, in a way that changes
-over a few hundred frames, and the stages move by 0.2 px between the positions the plan compares (500 frames).
-It is not a finished calibration and has no command line yet; the reconstruction
-of a mosaic as one volume does not exist (see Limitations).
+**A mosaic's geometry is not calibrated at present.** The geometry step that was in `helirec.mosaic` (its fits
+and its check of two tiles' overlap in the volume) was removed in November 2026 and is to be done anew. What is
+left there reconstructs one tile alone from a description of the tiles' geometry (the module's docstring gives
+its form; nothing in helirec makes one): `frame_pose(cal, tile, angle, frame)` gives a frame's angle, column and
+height, and `tile_reconstructor(master, cal, tile)` a `SliceReconstructor` of that tile; with `cache_dir=` the
+tile's reduced darks and flats are kept there (`calibration.reduced_darks_flats`: 46 s of a tile's start
+otherwise, 0.5 s read back), and with `reduce=1 | 2 | 3` it reconstructs at a half, a quarter, an eighth (the
+frames read at the codestream's lower resolution, the geometry divided by 2^reduce; a reduced reconstruction is
+the full one's low band, pixel for pixel from the axis, to under 0.01 of a reduced pixel in the slice). The
+reconstruction of a mosaic as one volume does not exist (see Limitations).
 
 For measurement-support diagnostics, `--columns N --column-fraction F` selects a narrower
 window within each overlap (`N=0` keeps the full overlap; `F=0`, `0.5`, `1` selects left,
@@ -933,7 +940,10 @@ the transform plans).
 Requirements: CMake ≥ 3.24, a C++20 compiler, FFTW3 (float + double), HDF5 (C), zlib, libcurl, Python ≥ 3.10, and
 optionally the CUDA toolkit and OpenJPEG ≥ 2.5 (`apt install libopenjp2-7-dev`, `brew install openjpeg`; found
 through pkg-config, `-DHELIREC_OPENJPEG=OFF` to build without). OpenJPEG is needed only for frames stored as
-JPEG 2000 (see `helirec-calibration`); without it such scans are refused with a message that names the package. The vc-delta3d codec is fetched at configure time (offline:
+uint16 JPEG 2000 (see `helirec-calibration`); without it such scans are refused with a message that names the package.
+For float32 HTJ2K, CMake FetchContent downloads OpenJPH 0.32.0 with a SHA-256 check and links it statically.
+Its BSD-2-Clause license is included with installed artifacts. Use `-DHELIREC_OPENJPH=OFF` to omit it, or
+`-DFETCHCONTENT_SOURCE_DIR_OPENJPH=<src>` for an offline build with existing sources. The vc-delta3d codec is fetched at configure time (offline:
 `-DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>`). CUDA code is compiled for the build machine's GPU (`native`); override with
 `-DCMAKE_CUDA_ARCHITECTURES=...`. `HELIREC_CUDA=AUTO` (default) builds CUDA only if `nvcc` is found, so put it on
 `PATH` (or pass `-C cmake.define.HELIREC_CUDA=ON`); check with `helirec.devices()`.
@@ -956,8 +966,8 @@ These raise explicit errors:
 * an acquisition the geometry calibration step can read: a helix whose travel per turn is less than the
   detector's height, a turn at rest before and after it, two scans of equally long stretches;
 * a mosaic (tiles that differ in the sample's place on the rotation stage) is checked by `helirec-calibration`
-  and calibrated, in work, by `helirec.mosaic`; `helirec-geometry` and `helirec-slices` do not take one, and a
-  tile can only be reconstructed alone (`helirec.mosaic.tile_reconstructor`);
+  and nothing calibrates its geometry; `helirec-geometry` and `helirec-slices` do not take one, and a tile can
+  only be reconstructed alone, from a geometry given to it (`helirec.mosaic.tile_reconstructor`);
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.
 

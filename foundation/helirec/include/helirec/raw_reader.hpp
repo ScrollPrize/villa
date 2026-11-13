@@ -50,7 +50,7 @@ class RawReader {
     std::uint64_t bytes_read() const;
     std::size_t n_files() const { return files_.size(); }
 
-    // How a file stores its frames (the file is inspected; a compressed file's first chunk is read).
+    // How a file stores its frames (only headers of the first compressed chunk are read).
     struct Storage {
         bool compressed = false;
         int chunk_rows = 0;         // rows per chunk of a compressed file
