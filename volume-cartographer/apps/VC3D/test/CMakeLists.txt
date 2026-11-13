@@ -684,7 +684,13 @@ if(TARGET VC3D)
     set_tests_properties(scene_3d_panel PROPERTIES TIMEOUT 180)
     add_test(NAME object_store_vc3d_controller COMMAND VC3D --test-object-store)
     set_tests_properties(object_store_vc3d_controller PROPERTIES
-        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 180)
+    # Its hosted part runs against vc_object_server: named here so that a
+    # build without the binary fails the test instead of skipping that part.
+    if(TARGET vc_object_server_app)
+        set_property(TEST object_store_vc3d_controller APPEND PROPERTY
+            ENVIRONMENT "VC3D_OBJECT_SERVER_BIN=$<TARGET_FILE:vc_object_server_app>")
+    endif()
     vc_register_test_target(VC3D)
     vc_register_ctest(scene_3d_panel VC3D)
     vc_register_ctest(object_store_vc3d_controller VC3D)

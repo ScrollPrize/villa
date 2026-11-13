@@ -76,6 +76,11 @@ struct StoreSessionEvent {
     // or a history-off store changed without retaining a feed. Any record
     // may have changed; reread what is shown.
     bool revalidate = false;
+    // Committed, hosted: the completed change-feed cursor after this event's
+    // commits (store, history generation, sequence; offset 0): every commit
+    // up to it was delivered in this event or an earlier one. Unset for local
+    // attachments, revalidations and partial deliveries.
+    std::optional<FeedCursor> feedPosition;
     // Whether it may have changed records of these kinds: a commit or draft
     // touching one (or a change of unknown kind), a revalidation, or any
     // attachment event.
@@ -120,6 +125,17 @@ struct HostedFreshness {
     std::optional<StoreStatus> status;
     std::optional<int64_t> checkedAtUs; // UTC Unix microseconds of that check
     std::string error;                  // empty when the last check succeeded
+};
+
+// The transactions this session sends to a hosted attachment: `generation`
+// changes when one starts, when one ends (however it ends) and when a pending
+// one is found committed; `active` counts those in flight. A status read while
+// none was in flight and the state did not change across the read describes
+// the store with every write of this session either complete or not begun.
+struct HostedWriteState {
+    uint64_t generation = 0;
+    int active = 0;
+    bool operator==(const HostedWriteState&) const = default;
 };
 
 // A session-owned download survives Project row rebuilds. snapshot() is safe
@@ -246,6 +262,8 @@ public:
     // Check a hosted attachment now (blocking); its commits then arrive
     // through takeEvents(). A failed check is reported by freshness().
     void refresh(const AttachmentIdentity&);
+    // nullopt for local attachments.
+    std::optional<HostedWriteState> hostedWriteState(const AttachmentIdentity&) const;
 
     // One sequential background transfer per hosted attachment. Repeated starts
     // return the active job; after completion a start captures a new revision.
@@ -258,6 +276,10 @@ public:
     // generation, by the attachment's author (OpenOptions::author, or
     // HostedSessionOptions::author).
     TransactionRequest newRequest(const AttachmentIdentity&);
+    // The same for a caller that already knows the store's uuid and history
+    // generation (from a status it read or an event it was delivered): no
+    // status read. A request for another generation is refused by the store.
+    TransactionRequest newRequest(const AttachmentIdentity&, const std::string& storeUuid, const std::string& generation);
     // Checked atomic request (objects/Transactions.hpp); conflicts throw
     // TransactionConflict. Hosted: transport failures leave the outcome
     // unknown; recover it with receipt() or submit the identical request again.
