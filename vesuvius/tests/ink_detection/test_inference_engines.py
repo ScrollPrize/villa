@@ -4,6 +4,7 @@ import gc
 import sys
 import threading
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -314,6 +315,31 @@ def test_inkrs_loads_on_the_device_pytorch_uses(tmp_path, monkeypatch, device, e
 
     assert opened == [expected]
     assert engine.device_index == expected
+
+
+def test_inkrs_loads_the_checkpoint_pytorch_would_after_expanding_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    checkpoint = tmp_path / "models" / "m.pth"
+    checkpoint.parent.mkdir()
+    checkpoint.touch()
+    opened = []
+
+    def load(path, *, device):
+        # inkrs checks the file itself and raises InkrsError, not UnsupportedError
+        if not Path(path).is_file():
+            raise _InkrsError(f"checkpoint not found: {path}")
+        opened.append(Path(path))
+        return object()
+
+    monkeypatch.setitem(sys.modules, "inkrs", _fake_inkrs(load))
+    # a quoted ~ reaches villa unexpanded, and the PyTorch loader expands it
+    args = normalize_inference_paths(
+        parse_args(["in.zarr", "~/models/m.pth", "out.tif", "--engine", "inkrs"])
+    )
+    engine = select_engine(args, _inkrs_shaped_model(), torch.device("cuda", 0))
+
+    assert engine is not None
+    assert opened == [checkpoint]
 
 
 def test_inkrs_load_falls_back_only_when_inkrs_calls_it_unsupported(

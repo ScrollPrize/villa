@@ -27,6 +27,8 @@ from typing import Any, Callable, Protocol
 import numpy as np
 import torch
 
+from vesuvius.ink_detection.models.checkpoint import resolve_checkpoint_path
+
 LOGGER = logging.getLogger(__name__)
 
 ENGINE_CHOICES = ("torch", "inkrs")
@@ -286,7 +288,10 @@ class InkrsEngine:
             ) from exc
 
         device_index = _engine_device_index(device)
-        handle = _inkrs_open(module, Path(args.checkpoint), device_index)
+        # resolve the path as the PyTorch loader does, so a quoted ~ reaches inkrs
+        # expanded instead of failing inkrs's own file check
+        checkpoint = resolve_checkpoint_path(args.checkpoint)
+        handle = _inkrs_open(module, checkpoint, device_index)
         LOGGER.info(
             "Using the inkrs engine %s on device %d",
             getattr(module, "__version__", "(unknown version)"),
