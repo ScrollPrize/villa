@@ -2,14 +2,15 @@
 // The measurement of one pair of blocks that, according to the record, hold the same lines: cut from raw frames
 // at whole frames, rows and columns (view_plan.hpp), converted to line integrals with the scan's own dark and
 // mean flat (frames.hpp), and registered (registration.hpp), cutting B again by whole samples until less than a
-// sample is left. check_views (verify_views.cpp) and measure_views (verify.hpp) both measure through this.
+// sample is left. check_views (check_overlapping_views.cpp) and Session::measure (session.hpp) both measure through this.
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "calibration/view_plan.hpp"
 #include "helirec/calibration/registration.hpp"
-#include "helirec/calibration/verify.hpp"
+#include "helirec/calibration/record_checks.hpp"
+#include "helirec/calibration/session.hpp"
 
 namespace helirec::calibration {
 
@@ -44,7 +45,7 @@ struct Pairing {
     const DetectorMap* map = nullptr;  // A's block is cut on the map's ideal grid, and B's too unless map_b is set
     const DetectorMap* map_b = nullptr;  // B's own map: what differs between two scans is tested on one of them
     double frame_shear = 0;            // B's frames are read at an angle that changes by this many frames per column
-    double sway_px = 0, sway_phase_deg = 0;  // B's frames are read sway_px cos(angle - phase) columns further on (verify.hpp)
+    double sway_px = 0, sway_phase_deg = 0;  // B's frames are read sway_px cos(angle - phase) columns further on (session.hpp)
     double sway_row_deg = 0;                 // ... each row at its own angle, this many degrees per row from the frame's
 };
 

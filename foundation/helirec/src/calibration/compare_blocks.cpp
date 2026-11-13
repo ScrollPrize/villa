@@ -1,6 +1,6 @@
-// One pair of blocks cut, converted and registered (view_measure.hpp), and comparisons placed by the caller
-// (Session::measure, verify.hpp).
-#include "calibration/view_measure.hpp"
+// One pair of blocks cut, converted and registered (compare_blocks.hpp), and comparisons placed by the caller
+// (Session::measure, session.hpp).
+#include "calibration/compare_blocks.hpp"
 
 #include <algorithm>
 #include <chrono>

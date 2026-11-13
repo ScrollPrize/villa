@@ -10,10 +10,11 @@
 #include <memory>
 
 #include "calibration/util.hpp"
-#include "calibration/view_measure.hpp"
+#include "calibration/compare_blocks.hpp"
 #include "calibration/view_plan.hpp"
 #include "helirec/calibration/registration.hpp"
-#include "helirec/calibration/verify.hpp"
+#include "helirec/calibration/record_checks.hpp"
+#include "helirec/calibration/session.hpp"
 
 namespace helirec::calibration {
 

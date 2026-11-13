@@ -3,7 +3,8 @@
 #include <fstream>
 #include <memory>
 
-#include "helirec/calibration/verify.hpp"
+#include "helirec/calibration/record_checks.hpp"
+#include "helirec/calibration/session.hpp"
 
 namespace helirec::calibration {
 
@@ -28,8 +29,8 @@ void write_file(const std::string& path, const std::string& text) {
 
 }  // namespace
 
-Report verify(const std::vector<std::string>& scans, const VerifyOptions& opt) {
-    if (scans.empty()) throw Error("verify: no scan");
+Report run_record_checks(const std::vector<std::string>& scans, const RecordCheckOptions& opt) {
+    if (scans.empty()) throw Error("check-record: no scan");
     std::vector<Record> records;
     for (const std::string& path : scans) records.push_back(read_record(path));
     // two scans that differ in the lateral stage of the rotation axis are the pair this was first written for;

@@ -638,17 +638,17 @@ files directly, and the only processing is a dark subtraction and a division by 
 ```bash
 cmake --build build/<tree> --target helirec-calibration
 helirec-calibration selftest [--device cpu|cuda]          # the registration estimator on synthetic data
-helirec-calibration record <scan.h5> [<more scans.h5> ...]   # the record against itself; no frame is read
-helirec-calibration verify <scan.h5> [<more scans.h5> ...] --out DIR [--checks record,inventory,series,beam,views]
+helirec-calibration check-record <scan.h5> [<more scans.h5> ...] --no-frames   # the record against itself; no frame is read
+helirec-calibration check-record <scan.h5> [<more scans.h5> ...] --out DIR [--checks record,inventory,series,beam,views]
 ```
 
 The scans are one scan; two scans of one acquisition that differ in the lateral stage of the rotation axis, the
 one with the axis inside the detector's field first; or the tiles of a mosaic (below), the reference tile first.
-`verify` prints one finding per check (what the record states, what was found, and `verified`, `fails`, `unverified` or `note`) and
+`check-record` prints one finding per check (what the record states, what was found, and `verified`, `fails`, `unverified` or `note`) and
 writes `report.txt`, `report.json` and `views.tsv` (every registered block) to `DIR`.
 
 The geometry target is **0.01 pixel** (`--position-target PX`, Python `position_target=...`, C++
-`VerifyOptions::view.eps`); angle, axis and pitch targets follow from their geometric lever arms. Every accepted
+`RecordCheckOptions::view.eps`); angle, axis and pitch targets follow from their geometric lever arms. Every accepted
 block is checked: any residual above target fails, even if the mean is small or its uncertainty overlaps zero.
 Reports retain min/max, RMS, maximum absolute residual, counts above target, and the descriptive block SEM.
 Smaller discrepancies remain visible and require explanation; sampled agreement alone is `unverified`.
@@ -684,7 +684,7 @@ there is one). On the 428 blocks of the 343P pair (32 frames Ã— up to 256 rows Ã
 takes 0.151 s on the CPU (8 FFT threads) and 0.016 s on an RTX 5090, uploads included; the two agree to 1e-5 of a
 sample on every block.
 
-The same is available from Python as `helirec._core.calibration_verify(...)` (the report as JSON),
+The same is available from Python as `helirec._core.calibration_check_record(...)` (the report as JSON),
 `calibration_register_blocks` and `calibration_selftest`, each with a `device` argument.
 
 For measurements the fixed checks do not make, `helirec._core.CalibrationSession(scans)` keeps the scans of an
@@ -704,7 +704,7 @@ What differs is the work: the frames of a block are read and converted once for 
 the registration moves by whole frames, rows or columns is cut again from that reading (B is read once more only
 where patches drift past a margin of 1 frame and 4 rows and columns), and the patches are registered side by
 side, one per thread on the CPU and four at a time on a CUDA device (C++: `Session::measure_patches`,
-`PatchMeasurement`; `src/calibration/view_patches.cpp`). Each patch also returns `curvature`, the second
+`PatchMeasurement`; `src/calibration/compare_patches.cpp`). Each patch also returns `curvature`, the second
 derivatives of the correlation at its maximum over frames, rows and columns: how sharply each shift is determined
 and how the three are tied. `calibration_measure_timing(reset)` says where the time of `measure` and
 `measure_patches` went. On PHerc0343P the 1320 blocks of the geometry step's plan as 20 256 patches of

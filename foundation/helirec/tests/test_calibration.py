@@ -221,7 +221,7 @@ def _by_quantity(report, text):
 def test_record_and_inventory(tmp_path):
     rng = np.random.default_rng(1)
     master = _write_record(tmp_path, rng)
-    report = json.loads(_core.calibration_verify([str(master)], checks="record,inventory"))
+    report = json.loads(_core.calibration_check_record([str(master)], checks="record,inventory"))
     for text in ("frame counts of the stretches", "map from frame to file", "hardware timer", "role of each stretch", "every frame on disk"):
         for f in _by_quantity(report, text):
             assert f["verdict"] == "verified" and not f["requires_follow_up"], f
@@ -236,7 +236,7 @@ def test_record_and_inventory(tmp_path):
     # one altered value in one frame: the inventory finds the frame
     with h5py.File(tmp_path / "scan0005" / "det3_0000.h5", "r+") as g:
         g["/entry_0000/instrument/det3/data"][7, 10, 10] += 1
-    report = json.loads(_core.calibration_verify([str(master)], checks="inventory"))
+    report = json.loads(_core.calibration_check_record([str(master)], checks="inventory"))
     f = _by_quantity(report, "every frame on disk")[0]
     assert f["verdict"] == "fails" and f["numbers"]["mismatched"] == 1 and "5.1 frame 7" in f["found"]
 
@@ -280,8 +280,8 @@ def test_position_target_controls_record_checks(tmp_path):
     master = _write_record(tmp_path, np.random.default_rng(2))
     with h5py.File(master, 'r+') as f:
         f['1.1/technique/scan/z_step'][...] = -1.6 + 0.008 * 0.2
-    loose = json.loads(_core.calibration_verify([str(master)], checks='record', position_target=0.1))
-    tight = json.loads(_core.calibration_verify([str(master)], checks='record'))
+    loose = json.loads(_core.calibration_check_record([str(master)], checks='record', position_target=0.1))
+    tight = json.loads(_core.calibration_check_record([str(master)], checks='record'))
     assert tight['position_target_px'] == 0.01
     assert loose['position_target_px'] == 0.1
     a = _by_quantity(loose, 'travel along the axis per turn')[0]
@@ -577,7 +577,7 @@ def test_frames_stored_as_jpeg2000(tmp_path):
     assert np.array_equal(again, stored[frames, 3:17]) and after["decoded"] == before["decoded"] and after["hits"] == before["hits"] + 6
     s.set_cache(0.0)
     assert np.array_equal(s.read_rows(0, 2, frames, 3, 14), again) and s.cache_counts()["decoded"] == after["decoded"] + 6
-    report = json.loads(_core.calibration_verify([str(master)], checks="record,inventory"))
+    report = json.loads(_core.calibration_check_record([str(master)], checks="record,inventory"))
     f = _by_quantity(report, "every frame on disk")[0]
     assert f["verdict"] == "verified" and f["numbers"]["mismatched"] == 0, f       # the recorded sums are of these values
     f_all = f["numbers"]["frames"]
@@ -588,7 +588,7 @@ def test_frames_stored_as_jpeg2000(tmp_path):
     # in 16 is decoded, every chunk is located, and the report says so
     with h5py.File(master, "r+") as f:
         del f["5.1/instrument/det3_full"]
-    sparse = _by_quantity(json.loads(_core.calibration_verify([str(master)], checks="inventory")), "every frame on disk")[0]
+    sparse = _by_quantity(json.loads(_core.calibration_check_record([str(master)], checks="inventory")), "every frame on disk")[0]
     assert sparse["verdict"] == "unverified" and "5.1: one frame in 16 (2 of 32 on disk)" in sparse["found"], sparse
     assert sparse["numbers"]["located"] == 2 * PER_TURN and sparse["numbers"]["frames"] == f_all - 2 * PER_TURN + 2 and sparse["numbers"]["mismatched"] == 0
     # a container that is not what is read is refused, not guessed at
@@ -632,7 +632,7 @@ def test_frames_not_on_disk(tmp_path):
     (tmp_path / "scan0006" / "det3_0000.h5").unlink()
     with h5py.File(master) as f:
         assert not f["6.1/instrument/det3/image"][0].any()                           # what must not be used
-    report = json.loads(_core.calibration_verify([str(master)], checks="record,inventory,series"))
+    report = json.loads(_core.calibration_check_record([str(master)], checks="record,inventory,series"))
     f = _by_quantity(report, "map from frame to file")[0]
     assert f["verdict"] == "unverified" and f["requires_follow_up"] and "6.1: none" in f["found"] and "5.1: 0-31" in f["found"]
     assert f["numbers"]["frames_on_disk"] == f["numbers"]["frames"] - PER_TURN and f["numbers"]["files_missing"] == 1
@@ -657,7 +657,7 @@ def test_tiles_of_a_mosaic(tmp_path):
         d = tmp_path / label
         d.mkdir()
         masters.append(str(_write_record(d, np.random.default_rng(30 + k), name="sample_" + label, place=place)))
-    report = json.loads(_core.calibration_verify(masters, checks="record"))
+    report = json.loads(_core.calibration_check_record(masters, checks="record"))
     which = _by_quantity(report, "the scans of the acquisition and what differs between them")[0]
     assert which["scan"] == "T0+2" and which["numbers"] == {"scans": 3, "mosaic": 1} and "tiles of a mosaic" in which["found"]
     where = _by_quantity(report, "place of the sample on the rotation stage")[0]
@@ -675,7 +675,7 @@ def test_tiles_of_a_mosaic(tmp_path):
         for e in ("4.1", "5.1", "6.1"):
             for where_ in ("positioners_start", "positioners_end"):
                 f[f"{e}/instrument/{where_}/yrot"][...] = 3.0
-    pair = json.loads(_core.calibration_verify(masters[:2], checks="record"))
+    pair = json.loads(_core.calibration_check_record(masters[:2], checks="record"))
     assert _by_quantity(pair, "lateral move between the scans")[0]["numbers"]["move_mm"] == 2.0
 
 

@@ -1,4 +1,4 @@
-// Many small blocks (patches) of one pair of views measured from one reading of the frames (view_measure.hpp,
+// Many small blocks (patches) of one pair of views measured from one reading of the frames (compare_blocks.hpp,
 // measure_patches). Every step is measure()'s own, on the part of the block a patch occupies: the values a patch
 // is registered on are those measure() would read for it, so the two agree to the rounding of the transforms.
 #include <omp.h>
@@ -9,7 +9,7 @@
 #include <cstring>
 #include <mutex>
 
-#include "calibration/view_measure.hpp"
+#include "calibration/compare_blocks.hpp"
 
 namespace helirec::calibration {
 

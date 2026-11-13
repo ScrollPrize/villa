@@ -9,7 +9,8 @@
 
 #include "helirec/calibration/registration.hpp"
 #include "helirec/calibration/solve.hpp"
-#include "helirec/calibration/verify.hpp"
+#include "helirec/calibration/record_checks.hpp"
+#include "helirec/calibration/session.hpp"
 #include "helirec/raw_reader.hpp"
 
 namespace nb = nanobind;
@@ -29,9 +30,9 @@ Device device_from(const std::string& name) {
     throw Error("device is 'cpu', 'cuda' or 'auto'");
 }
 
-std::string verify_json(const std::vector<std::string>& scans, const std::string& checks, const std::string& out_dir, const std::string& inventory_dir,
+std::string check_record_json(const std::vector<std::string>& scans, const std::string& checks, const std::string& out_dir, const std::string& inventory_dir,
                         int frames, int rows, int blocks, int threads, const std::string& device, double position_target, int columns, double column_fraction) {
-    VerifyOptions opt;
+    RecordCheckOptions opt;
     opt.view.device = device_from(device);
     opt.checks = checks;
     opt.out_dir = out_dir;
@@ -44,7 +45,7 @@ std::string verify_json(const std::vector<std::string>& scans, const std::string
     opt.view.columns = columns;
     opt.view.column_fraction = column_fraction;
     nb::gil_scoped_release nogil;
-    return verify(scans, opt).json();
+    return run_record_checks(scans, opt).json();
 }
 
 nb::dict registration_dict(const Registration& r) {
@@ -374,7 +375,7 @@ nb::dict register_py(Block a, Block b, const std::vector<int>& margin, const std
 }  // namespace
 
 void bind_calibration(nb::module_& m) {
-    m.def("calibration_verify", &verify_json, "scans"_a, "checks"_a = "record,inventory,series,beam,views", "out_dir"_a = "", "inventory_dir"_a = "",
+    m.def("calibration_check_record", &check_record_json, "scans"_a, "checks"_a = "record,inventory,series,beam,views", "out_dir"_a = "", "inventory_dir"_a = "",
           "frames"_a = 32, "rows"_a = 256, "blocks"_a = 8, "threads"_a = 0, "device"_a = "auto", "position_target"_a = default_position_target_px, "columns"_a = 0, "column_fraction"_a = 0.5,
           "Verify what the acquisition record of one scan, or of the two scans of one acquisition (axis inside the field first), states: against itself "
           "(checks 'record') and against the raw frames ('inventory', 'series', 'beam', 'views'). Returns the report as JSON: a list of findings, each with "
