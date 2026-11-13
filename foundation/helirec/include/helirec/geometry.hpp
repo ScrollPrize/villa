@@ -88,6 +88,10 @@ class Calibration {
     int rows() const;
     int cols() const;
     double row_sign() const;
+    // the scans it was made from, as named there (the first: the one with the rotation axis in its field)
+    std::vector<std::string> scans() const;
+    // The record's height of every frame in rows, as the calibration counts them: row_sign x height / pixel size.
+    std::vector<double> heights_rows(const std::vector<double>& z_translation_m, double pixel_size_m) const;
     Map map() const;
     // The rows' timing as the reconstruction takes it: the time from the first stored row to the last, in frame periods.
     double rolling_shutter() const;

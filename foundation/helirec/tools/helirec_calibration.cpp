@@ -5,7 +5,15 @@
 //                                    [--position-target PX] [--radius PX] [--device cpu|cuda|auto]
 //   helirec-calibration geometry <scan.h5> <companion.h5> --out FILE [--row-time-us US] [--order N] [--passes N]
 //                                [--patch N] [--no-motion] [--threads N] [--device cpu|cuda|auto]
+//   helirec-calibration intensity <scan> <companion> --geometry FILE --out DIR [--no-progress]
 //   helirec-calibration selftest [--device cpu|cuda|auto]
+//
+// intensity makes the intensity calibration of a two-scan acquisition in the frame its geometry calibration (FILE,
+// made by `geometry`) merges the scans in: the darks and flats reduced, the weight maps, the detector's blur field
+// and the placement of both scans. It writes calibration_arrays.bin and calibration.json to DIR, which the
+// reconstruction takes as its cache directory, and reuses what is there when it is of the same acquisition. The
+// scans: master files or scan directories, in the order the geometry calibration has them. It is
+// helirec::calibration::calibrate_intensity (helirec/calibration/intensity.hpp).
 //
 // geometry measures the detector's map and the poses of a two-scan helical acquisition from its own frames (the
 // scan with the rotation axis inside the detector's field first) and writes them as JSON, which the
@@ -34,6 +42,8 @@
 #include <vector>
 
 #include "helirec/calibration/geometry_calibration.hpp"
+#include "helirec/calibration/intensity.hpp"
+#include "helirec/calibration/scan.hpp"
 #include "helirec/calibration/registration.hpp"
 #include "helirec/calibration/record_checks.hpp"
 
@@ -51,6 +61,7 @@ int usage() {
                  "                                   [--position-target PX (default 0.01)] [--radius PX] [--inventory-step N] [--device cpu|cuda|auto]\n"
                  "  helirec-calibration geometry <scan.h5> <companion.h5> --out FILE [--row-time-us US] [--order N] [--passes N]\n"
                  "                               [--patch N] [--no-motion] [--threads N] [--device cpu|cuda|auto]\n"
+                 "  helirec-calibration intensity <scan> <companion> --geometry FILE --out DIR [--no-progress]\n"
                  "  helirec-calibration selftest [--device cpu|cuda|auto]\n");
     return 2;
 }
@@ -91,6 +102,48 @@ int run_geometry_calibration(int argc, char** argv) {
     return 0;
 }
 
+std::string base_name(const std::string& p) {
+    const std::size_t i = p.find_last_of('/');
+    return i == std::string::npos ? p : p.substr(i + 1);
+}
+
+// helirec-calibration intensity: the arguments after the command
+int run_intensity_calibration(int argc, char** argv) {
+    std::vector<std::string> paths;
+    std::string geometry_path, out;
+    bool progress = true;
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        const auto value = [&]() -> std::string {
+            if (i + 1 >= argc) throw Error("option " + a + " needs a value");
+            return argv[++i];
+        };
+        if (a == "--geometry") geometry_path = value();
+        else if (a == "--out") out = value();
+        else if (a == "--no-progress") progress = false;
+        else if (!a.empty() && a[0] == '-') throw Error("unknown option " + a);
+        else paths.push_back(a);
+    }
+    if (paths.size() != 2 || geometry_path.empty() || out.empty()) return usage();
+    const auto log = [](const std::string& line) {
+        std::printf("%s\n", line.c_str());
+        std::fflush(stdout);
+    };
+    const Scan main = open_scan(paths[0]), companion = open_scan(paths[1]);
+    const geometry::Calibration geo = geometry::Calibration::load(geometry_path);
+    const std::vector<std::string> made = geo.scans();
+    if (made.size() != 2 || base_name(made[0]) != base_name(main.master) || base_name(made[1]) != base_name(companion.master))
+        throw Error("the geometry calibration " + geometry_path + " was made from other scans (or in the other order)");
+    const std::array<std::vector<double>, 2> heights = {geo.heights_rows(main.z_translation_m, main.pixel_size_m),
+                                                        geo.heights_rows(companion.z_translation_m, companion.pixel_size_m)};
+    const auto poses = geo.frame_poses({main.unwrapped_angles_deg, companion.unwrapped_angles_deg}, heights);
+    const geometry::MergedLayout layout = geo.merged_layout(poses, heights);
+    const IntensityCalibration cal = calibrate_intensity(main, companion, layout, out, log, progress);
+    std::printf("written to %s (calibration_arrays.bin, calibration.json)\n", out.c_str());
+    (void)cal;
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -98,6 +151,7 @@ int main(int argc, char** argv) {
     const std::string command = argv[1];
     try {
         if (command == "geometry") return run_geometry_calibration(argc, argv);
+        if (command == "intensity") return run_intensity_calibration(argc, argv);
         if (command != "check-record" && command != "selftest") return usage();
 
         std::vector<std::string> scans;

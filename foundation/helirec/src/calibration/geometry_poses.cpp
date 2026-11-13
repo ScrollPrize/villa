@@ -208,6 +208,19 @@ int Calibration::rows() const { return static_cast<int>(number(member(*doc_, "la
 int Calibration::cols() const { return static_cast<int>(number(member(*doc_, "layout", "the geometry"), "cols", "the layout")); }
 double Calibration::row_sign() const { return number(member(*doc_, "layout", "the geometry"), "row_sign", "the layout"); }
 Map Calibration::map() const { return map_of(*doc_); }
+std::vector<std::string> Calibration::scans() const {
+    const Json& v = member(*doc_, "scans", "the geometry");
+    if (!v.is(Json::Array)) throw Error("geometry: \"scans\" is not a list");
+    std::vector<std::string> out;
+    for (const Json& s : v.array) out.push_back(s.is(Json::String) ? s.string : std::string());
+    return out;
+}
+std::vector<double> Calibration::heights_rows(const std::vector<double>& z_translation_m, double pixel_size_m) const {
+    const double sign = row_sign();
+    std::vector<double> h(z_translation_m.size());
+    for (std::size_t i = 0; i < h.size(); ++i) h[i] = sign * z_translation_m[i] / pixel_size_m;
+    return h;
+}
 double Calibration::rolling_shutter() const {
     return number(member(*doc_, "row_time", "the geometry"), "seconds_per_row", "the rows' timing") * (rows() - 1) / period_of(*doc_);
 }

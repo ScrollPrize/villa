@@ -3,6 +3,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/array.h>
 
 #include "fit_summary.hpp"
 #include "helirec/calibration/intensity.hpp"
@@ -37,9 +38,194 @@ nb::ndarray<nb::numpy, T> gauss(Arr<T> a, int axis, double sigma, const std::str
     return out;
 }
 
+template <class T>
+nb::object array_of(const std::vector<T>& v, std::vector<std::size_t> shape) {
+    auto a = new_array_t<T>(shape);
+    std::copy(v.begin(), v.end(), static_cast<T*>(a.data()));
+    return nb::cast(a, nb::rv_policy::move);
+}
+
+nb::object darks_flats_tuple(const calibration::DarksFlats& d) {
+    const std::size_t r = static_cast<std::size_t>(d.rows), c = static_cast<std::size_t>(d.cols);
+    return nb::make_tuple(array_of(d.dark, {r, c}), array_of(d.flats, {d.series(), r, c}));
+}
+
+// a log line handed to a Python callable (None: silent), with the GIL taken for it
+std::function<void(const std::string&)> python_log(const std::optional<std::function<void(const std::string&)>>& log) {
+    if (!log) return nullptr;
+    return [log](const std::string& line) {
+        nb::gil_scoped_acquire gil;
+        (*log)(line);
+    };
+}
+
+nb::object json_loads(const std::string& text) { return nb::module_::import_("json").attr("loads")(text); }
+
+calibration::Scan scan_of(nb::handle h) { return nb::cast<calibration::Scan>(h); }
+
 }  // namespace
 
 void bind_intensity(nb::module_& m) {
+    nb::class_<calibration::ScanPlacement>(m, "ScanPlacement",
+                                           "Where a scan lies in the merged frame: its column 0 at merged column shift_x - x_readjustment, its rows "
+                                           "z_readjustment rows from the first scan's (helirec::calibration::ScanPlacement)")
+        .def_ro("shift_x", &calibration::ScanPlacement::shift_x)
+        .def_ro("x_readjustment", &calibration::ScanPlacement::x_readjustment)
+        .def_ro("z_readjustment", &calibration::ScanPlacement::z_readjustment)
+        .def("__repr__", [](const calibration::ScanPlacement& p) {
+            return "ScanPlacement(shift_x=" + std::to_string(p.shift_x) + ", x_readjustment=" + std::to_string(p.x_readjustment) +
+                   ", z_readjustment=" + std::to_string(p.z_readjustment) + ")";
+        });
+    using IC = calibration::IntensityCalibration;
+    nb::class_<IC>(m, "IntensityCalibration",
+                   "The intensity calibration of a scan pair in its merged frame (helirec::calibration::calibrate_intensity)")
+        .def_ro("main", &IC::main)
+        .def_ro("companion", &IC::companion)
+        .def_ro("cor_main_detector", &IC::cor_main_detector)
+        .def_prop_ro("vector", [](const IC& c) { return nb::make_tuple(c.vector[0], c.vector[1]); })
+        .def_ro("rot_center", &IC::rot_center)
+        .def_ro("merged_width", &IC::merged_width)
+        .def_prop_ro("placement", [](const IC& c) {
+            nb::dict d;
+            d[nb::str(c.main.c_str())] = nb::cast(c.placement[0]);
+            d[nb::str(c.companion.c_str())] = nb::cast(c.placement[1]);
+            return d;
+        })
+        .def_prop_ro("apodisation", [](const IC& c) {
+            nb::dict d;
+            d[nb::str(c.main.c_str())] = nb::make_tuple(c.apodisation[0][0], c.apodisation[0][1]);
+            d[nb::str(c.companion.c_str())] = nb::make_tuple(c.apodisation[1][0], c.apodisation[1][1]);
+            return d;
+        })
+        .def_prop_ro("estimated_cor_from_motor_pix", [](const IC& c) {
+            nb::dict d;
+            d[nb::str(c.main.c_str())] = c.estimated_cor_from_motor_pix[0];
+            d[nb::str(c.companion.c_str())] = c.estimated_cor_from_motor_pix[1];
+            return d;
+        })
+        .def_prop_ro("detector_blur_field", [](const IC& c) { return c.detector_blur.field; })
+        .def_prop_ro("details", [](const IC& c) -> nb::object {
+            nb::object d = json_loads(c.json());
+            return d["details"];
+        })
+        .def_ro("fingerprint", &IC::fingerprint)
+        .def_ro("version", &IC::version)
+        .def("to_json", &IC::json, "calibration.json: everything but the arrays")
+        .def(
+            "arrays",
+            [](const IC& c) {
+                const std::size_t r = static_cast<std::size_t>(c.rows), k = static_cast<std::size_t>(c.cols);
+                nb::dict d;
+                d["main_dark"] = array_of(c.main_reduced.dark, {r, k});
+                d["main_flats"] = array_of(c.main_reduced.flats, {c.main_reduced.series(), r, k});
+                d["companion_dark"] = array_of(c.companion_reduced.dark, {r, k});
+                d["companion_flats"] = array_of(c.companion_reduced.flats, {c.companion_reduced.series(), r, k});
+                d["weight_map"] = array_of(c.weight_map, {r, k});
+                d["main_weight"] = array_of(c.main_weight, {r, k});
+                d["companion_weight"] = array_of(c.companion_weight, {r, k});
+                return d;
+            },
+            "the darks and flats reduced, the weight map and each scan's weights (the weight map times its apodisation)");
+
+    m.def(
+        "calibrate_intensity",
+        [](nb::handle main, nb::handle companion, double cor_main_detector, std::array<double, 2> vector, nb::dict measured, const std::string& cache_dir,
+           std::optional<std::function<void(const std::string&)>> log, bool progress) {
+            const calibration::Scan a = scan_of(main), b = scan_of(companion);
+            geometry::MergedLayout layout;
+            layout.cor_main_detector = cor_main_detector;
+            layout.vector = vector;
+            const auto get = [&](const char* k) { return measured.contains(k) ? nb::cast<double>(measured[k]) : 0.0; };
+            layout.axis_first_scan = get("axis_first_scan"), layout.axis_second_scan = get("axis_second_scan");
+            layout.second_scan_rows = get("second_scan_rows"), layout.quantum = get("quantum");
+            const auto say = python_log(log);
+            nb::gil_scoped_release nogil;
+            return calibration::calibrate_intensity(a, b, layout, cache_dir, say, progress);
+        },
+        "main"_a, "companion"_a, "cor_main_detector"_a, "vector"_a, "measured"_a = nb::dict(), "cache_dir"_a = "", "log"_a = nb::none(), "progress"_a = false,
+        "The intensity calibration of a scan pair in the merged frame of one axis (in the main scan's columns) and one vector (rows, columns) to the "
+        "companion; cache_dir: calibration_arrays.bin and calibration.json kept there. (helirec::calibration::calibrate_intensity)");
+    m.def(
+        "reduce_darks_flats",
+        [](nb::handle scan, std::optional<std::function<void(std::size_t)>> progress) {
+            const calibration::Scan s = scan_of(scan);
+            std::function<void(std::size_t)> p;
+            if (progress)
+                p = [progress](std::size_t k) {
+                    nb::gil_scoped_acquire gil;
+                    (*progress)(k);
+                };
+            calibration::DarksFlats d;
+            {
+                nb::gil_scoped_release nogil;
+                d = calibration::reduce_darks_flats(s, p);
+            }
+            return darks_flats_tuple(d);
+        },
+        "scan"_a, "progress"_a = nb::none(),
+        "(dark (rows, cols), flats (series, rows, cols)) of a scan exactly as nx2etf stores them (helirec::calibration::reduce_darks_flats)");
+    m.def(
+        "reduced_darks_flats",
+        [](nb::handle scan, const std::string& cache_dir, std::optional<std::function<void(const std::string&)>> log) {
+            const calibration::Scan s = scan_of(scan);
+            const auto say = python_log(log);
+            calibration::DarksFlats d;
+            {
+                nb::gil_scoped_release nogil;
+                d = calibration::reduced_darks_flats(s, cache_dir, say);
+            }
+            return darks_flats_tuple(d);
+        },
+        "scan"_a, "cache_dir"_a = "", "log"_a = nb::none(),
+        "reduce_darks_flats(scan), kept in cache_dir as darks_flats_<scan>.bin (helirec::calibration::reduced_darks_flats)");
+    m.def(
+        "placement_from_vector",
+        [](std::array<double, 2> vector, int cols) {
+            const calibration::MergedPlacement p = calibration::placement_from_vector(vector, cols);
+            nb::list scans;
+            for (const auto& s : p.scans) scans.append(nb::cast(s));
+            return nb::make_tuple(scans, p.width, p.anchor);
+        },
+        "vector"_a, "cols"_a,
+        "nabuxx check_companion: ([main, companion] placements, merged width, anchor) (helirec::calibration::placement_from_vector)");
+    m.def(
+        "acquisition_fingerprint", [](nb::handle main, nb::handle companion) { return calibration::acquisition_fingerprint(scan_of(main), scan_of(companion)); },
+        "main"_a, "companion"_a, "sha256 over what the calibration of a pair depends on (helirec::calibration::acquisition_fingerprint)");
+    m.def(
+        "flat_noise_spectra",
+        [](nb::handle scan, Arr<float> dark, int n_flats, int tile) {
+            const calibration::Scan s = scan_of(scan);
+            require(dark.ndim() == 2 && dark.shape(0) == static_cast<std::size_t>(s.rows) && dark.shape(1) == static_cast<std::size_t>(s.cols), "the dark is not a frame");
+            calibration::FlatNoise f;
+            {
+                nb::gil_scoped_release nogil;
+                f = calibration::flat_noise_spectra(s, dark.data(), n_flats, tile);
+            }
+            return nb::make_tuple(array_of(f.power, {f.ys.size(), f.xs.size(), static_cast<std::size_t>(tile), static_cast<std::size_t>(tile / 2 + 1)}), f.ys, f.xs,
+                                  f.n_flats);
+        },
+        "scan"_a, "dark"_a, "n_flats"_a = 200, "tile"_a = calibration::kBlurTile,
+        "Noise power spectra of the scan's first flat series on tiles -> (power, ys, xs, flats used) (helirec::calibration::flat_noise_spectra)");
+    m.def(
+        "measure_detector_blur",
+        [](nb::handle scan, Arr<float> dark, int n_flats, std::optional<std::function<void(const std::string&)>> log) -> nb::object {
+            const calibration::Scan s = scan_of(scan);
+            require(dark.ndim() == 2 && dark.shape(0) == static_cast<std::size_t>(s.rows) && dark.shape(1) == static_cast<std::size_t>(s.cols), "the dark is not a frame");
+            const auto say = python_log(log);
+            calibration::IntensityCalibration c;
+            {
+                nb::gil_scoped_release nogil;
+                c.detector_blur = calibration::measure_detector_blur(s, dark.data(), n_flats, say);
+            }
+            nb::object d = json_loads(c.json());
+            nb::object details = d["details"];
+            return nb::object(details["detector_blur"]);
+        },
+        "scan"_a, "dark"_a, "n_flats"_a = 200, "log"_a = nb::none(),
+        "The detector's blur field of a scan from the noise of its flats, as a dict (helirec::calibration::measure_detector_blur)");
+    m.attr("INTENSITY_CALIBRATION_VERSION") = calibration::kIntensityCalibrationVersion;
+    m.attr("NOMINAL_CURRENT_A") = calibration::kNominalCurrentA;
+
     const auto curve = [](const calibration::TransferFit& fit) {
         auto d = fit_summary_dict(fit);
         d["x"] = nb::cast(fit.x); d["residual"] = nb::cast(fit.residual); d["rms"] = fit.rms;

@@ -84,47 +84,6 @@ def test_projector_transpose_on_boundaries(device, projector):
                 assert np.abs(A - B.T).max() < 1e-5, (N, nd, rot)
 
 
-# ---------------------------------------------------------------- calibration cache identity
-def fake_scan(tmp_path, name, nproj=10):
-    f = tmp_path / f"{name}.h5"
-    f.write_bytes(b"x" * 100)
-    refs = SimpleNamespace(files=[str(f)], file_index=np.zeros(nproj, np.int32), __len__=lambda: nproj)
-    sc = SimpleNamespace(name=name, master=str(f), frame_shape=(4, 6), dtype=np.uint16,
-                         projections=list(range(nproj)), darks=[0], flats=[[0, 1]], energy_kev=116.0, distance_m=1.19,
-                         pixel_size_m=8.64e-6, estimated_cor_from_motor_pix=0.0,
-                         unwrapped_angles_deg=np.arange(nproj, dtype=float), z_translation_m=np.zeros(nproj),
-                         control_A=np.ones(nproj), flats_unwrapped_angles_deg=np.zeros(1),
-                         referenced_files=lambda: [str(f)])
-    return sc, f
-
-
-def test_calibration_cache_fingerprint(tmp_path):
-    m, fm = fake_scan(tmp_path, "HA")
-    c, _ = fake_scan(tmp_path, "TA")
-    fp = calibration.acquisition_fingerprint(m, c)
-    assert calibration.acquisition_fingerprint(m, c) == fp
-    fm.write_bytes(b"y" * 101)                           # replaced data under the same name
-    fp2 = calibration.acquisition_fingerprint(m, c)
-    assert fp2 != fp
-    cache = tmp_path / "cache"
-    cache.mkdir()
-    arrays = {k: np.zeros(3, np.float32) for k in calibration.REDUCTION_KEYS}
-    with open(cache / "calibration_arrays.npz", "wb") as fh:
-        np.savez(fh, _fingerprint=np.array(fp), **arrays)
-    meas = dict(fingerprint=fp, version=calibration.CALIBRATION_VERSION, rot_center=2528.25)
-    (cache / "calibration.json").write_text(json.dumps(meas))
-    log = []
-    cal, arr = calibration._load_cache(str(cache), fp, log.append)
-    assert cal is not None and arr is not None
-    cal, arr = calibration._load_cache(str(cache), fp2, log.append)     # another acquisition: nothing reused
-    assert cal is None and arr is None
-    (cache / "calibration.json").write_text(json.dumps(dict(meas, version=calibration.CALIBRATION_VERSION + 1)))
-    cal, arr = calibration._load_cache(str(cache), fp, log.append)      # another version of the calibration
-    assert cal is None and arr is not None
-    (cache / "calibration.json").write_text(json.dumps({k: v for k, v in meas.items() if k != "fingerprint"}))
-    assert calibration._load_cache(str(cache), fp, log.append)[0] is None   # pre-fingerprint caches are stale
-
-
 # ---------------------------------------------------------------- the merged frame
 def test_merged_frame_from_the_geometry_calibration():
     """the frame the scans are merged in: one axis and one vector from the poses (medians over the helix, on a

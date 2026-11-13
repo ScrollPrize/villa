@@ -135,7 +135,7 @@ mx, mean = bc.composites(set=2)
 |---|---|---|---|
 | 0 | Bliss master parsing: entries, angles, z, machine current, frame→file map (as nxtomomill + nx2etf, bit for bit) | `calibration/scan.hpp` (Python: `helirec.bliss`) | CPU |
 | 1 | raw row-window reads (`pread`, one HDF5 chunk per frame) | `raw_reader.hpp` | CPU (threads) |
-| 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame | `calibration/intensity.hpp`, `python/helirec/calibration.py` | CPU |
+| 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame (`helirec-calibration intensity`) | `calibration/intensity.hpp` (Python: `helirec.calibration`) | CPU |
 | 2b | geometry calibration: layout, rows' timing, detector map, poses and motion (`helirec-calibration geometry`) | `calibration/geometry_calibration.hpp`, `python/helirec/geometry.py` | CPU, CUDA |
 | 3 | helical geometry: span info, doable span, per-projection shifts and grid bins | `helical.hpp` | CPU |
 | 4 | gridding: flat-field, weights, vertical / horizontal kernels, angular bins (gather form) | `accumulate.hpp` | CPU, CUDA |
@@ -468,11 +468,15 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     rows (the filters' too) are gridded from every projection that sees them, not only from those of the chunk's
     own heights, so that the window, and therefore the result, does not depend on the chunking (about 0.2 s more
     per chunk on the PHerc0343P pair).
-* **Calibration cache** (`--cache_dir`): the darks / flats reduction and the detector's blur field, keyed by a
-  fingerprint of the acquisition and the calibration version, and `geometry.json`, the geometry calibration of the
-  two scans, made there by the geometry calibration step when it is missing or is other scans' (about 13 minutes
-  on PHerc0343P; `--set geometry=PATH` uses one made before and makes nothing). Written atomically. A
-  `calibration.json` of the earlier calibration is read for its blur field and otherwise left alone.
+* **Calibration cache** (`--cache_dir`): `calibration_arrays.bin` (the darks / flats reduction and the weight map)
+  and `calibration.json` (the merged frame and the detector's blur field), keyed by a fingerprint of the
+  acquisition and the calibration version (`helirec-calibration intensity` writes the same two files), and
+  `geometry.json`, the geometry calibration of the two scans, made there by the geometry calibration step when it
+  is missing or is other scans' (about 13 minutes on PHerc0343P; `--set geometry=PATH` uses one made before and
+  makes nothing). Written atomically. The `.bin` files are helirec's array files: a first line of JSON naming each
+  array, its shape and its byte offset, then the values as float32 little-endian (`src/io/array_file.hpp`;
+  `numpy.frombuffer(data, "<f4", count, offset)` reads one). Caches of the `.npz` form (calibration version 2,
+  before 13 November 2026) are not read: the reduction is made again (seconds) and the blur field measured again.
 * **New kernels**: add a function with the same signature in `src/cpu` and `src/cuda`; shared per-element
   arithmetic lives in `src/common/*_core.hpp` so the backends cannot drift apart.
 
@@ -912,14 +916,37 @@ count, which can be rounded down to a suitable FFT size. These options change on
 measurement support; they apply no geometric correction. Narrow windows may lack sample
 texture, so compare accepted matches and retain rejected attempts.
 
+## Intensity calibration step (`helirec-calibration intensity`)
+
+The darks and flats of both scans reduced as the reference (nx2etf) reduces them (each flat taken to the nominal
+ring current of 0.2 A), the weight map and each scan's horizontal apodisation (prepare_weights_double), the
+detector's blur field from the noise of the main scan's flats, and the placement of both scans in the frame the
+geometry calibration merges them in. It writes `calibration_arrays.bin` and `calibration.json` to the output
+directory, which the reconstruction takes as its cache directory (`--cache_dir`), and reuses what is there when it
+is of the same acquisition (the blur field does not depend on the merged frame and is kept when only that changes).
+
+```bash
+helirec-calibration intensity <main> <companion> --geometry geometry.json --out CACHE_DIR   # scan directories or masters
+```
+
+```python
+from helirec import calibration
+cal, arrays = calibration.calibrate(main, companion, layout, cache_dir="CACHE_DIR")   # layout: geometry.merged_layout(...)
+```
+
+It is `helirec::calibration::calibrate_intensity` (`helirec/calibration/intensity.hpp`); the scans are
+`helirec::calibration::Scan` (`helirec/calibration/scan.hpp`, Python `helirec.bliss`), read from the BLISS master
+as nxtomomill and nx2etf read it. Both were checked bit for bit against the Python they replaced on PHerc0343P and
+Paris4 (13 November 2026).
+
 ## Geometry calibration step (`helirec-calibration geometry`)
 
 Measures the geometry of a two-scan helical acquisition from its own frames, with nothing typed in: the detector
 map and the poses that a reconstruction needs before it can assign a raw value to the line it measured. It is a
 step that writes what it measured (JSON), and it is the reconstruction's only geometry calibration:
 `helirec-reconstruct` makes it on first use and keeps it in its calibration cache, or takes the file it is given
-(`--set geometry=...`, below). The darks, flats, weights and the detector's blur field are
-`python/helirec/calibration.py`'s.
+(`--set geometry=...`, below). The darks, flats, weights and the detector's blur field are the intensity
+calibration's (`helirec-calibration intensity`, below).
 
 ```bash
 helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json            # main: the scan with the axis inside the field
