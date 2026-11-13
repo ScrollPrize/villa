@@ -136,7 +136,7 @@ mx, mean = bc.composites(set=2)
 | 0 | Bliss master parsing: entries, angles, z, machine current, frame→file map | `python/helirec/bliss.py` | Python |
 | 1 | raw row-window reads (`pread`, one HDF5 chunk per frame) | `raw_reader.hpp` | CPU (threads) |
 | 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame | `calibration/intensity.hpp`, `python/helirec/calibration.py` | CPU |
-| 2b | geometry calibration: layout, rows' timing, detector map, poses and motion (`helirec-geometry`) | `calibration/`, `python/helirec/geometry.py` | CPU, CUDA |
+| 2b | geometry calibration: layout, rows' timing, detector map, poses and motion (`helirec-calibration geometry`) | `calibration/geometry_calibration.hpp`, `python/helirec/geometry.py` | CPU, CUDA |
 | 3 | helical geometry: span info, doable span, per-projection shifts and grid bins | `helical.hpp` | CPU |
 | 4 | gridding: flat-field, weights, vertical / horizontal kernels, angular bins (gather form) | `accumulate.hpp` | CPU, CUDA |
 | 5 | HA/TA luminosity equalisation, divide, mend | `accumulate.hpp` | CPU, CUDA |
@@ -417,7 +417,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     3 % (Paganin only) to 7 % (with the unsharp mask); as the removed blurs also averaged noise, the noise in the outer
     air rises by 16 % (Paganin) to 33 % (unsharp).
   * `geometry=PATH` (default: `geometry.json` in the calibration cache, made there on first use), `row_time_us`:
-    the geometry calibration (`helirec-geometry`, below), the only one. Every projection is read on the grid of its
+    the geometry calibration (`helirec-calibration geometry`, below), the only one. Every projection is read on the grid of its
     detector map, at the row, axis column, roll and scales it gives that frame and at the angle of each of its
     rows (the rows' timing), in a merged frame laid out from the same poses. It holds what the earlier calibration's
     options stood for, which are gone and refused by name: the helical pitch (`z_translation_scale`), the turns at
@@ -730,8 +730,9 @@ and is counted out of `rank`. A model that is not a line in its unknowns (an ang
 written as a line about the values in hand and solved again. Every fit of the geometry
 calibration is written on it and there is no other solve: the two-scan step's `fit` (on the saved PHerc0343P
 comparisons, 17 284 patches, it gives the numbers of the reweighted numpy least squares it replaced to 1e-8 px,
-in 0.2 s against 10 s), `second_scan_fit` and the motion stage's solves (`geometry._least_squares`). The row
-time from a refill (`fit_refill_shots`) is not a line in its unknowns and stays with scipy's `least_squares`
+in 0.2 s against 10 s), `second_scan_fit` and the motion stage's solves (`least_squares` of
+`helirec/calibration/geometry_calibration.hpp`). The row time from a refill (`fit_refill_shots`) is not a line in
+its unknowns: it is fitted by damped steps, each of them a linear solve of the same solver
 (`tests/test_solve.py`, `tests/test_geometry.py`).
 
 **Partial copies.** Frame files that are not on disk are reported (`map from frame to file`, with the frames
@@ -878,7 +879,7 @@ count, which can be rounded down to a suitable FFT size. These options change on
 measurement support; they apply no geometric correction. Narrow windows may lack sample
 texture, so compare accepted matches and retain rejected attempts.
 
-## Geometry calibration step (`helirec-geometry`)
+## Geometry calibration step (`helirec-calibration geometry`)
 
 Measures the geometry of a two-scan helical acquisition from its own frames, with nothing typed in: the detector
 map and the poses that a reconstruction needs before it can assign a raw value to the line it measured. It is a
@@ -888,9 +889,9 @@ step that writes what it measured (JSON), and it is the reconstruction's only ge
 `python/helirec/calibration.py`'s.
 
 ```bash
-helirec-geometry <main.h5> <companion.h5> --out geometry.json            # main: the scan with the axis inside the field
-helirec-geometry <main.h5> <companion.h5> --out geometry.json --row-time-us -19.87   # if no stretch holds a refill
-helirec-geometry <main.h5> <companion.h5> --out geometry.json --patch 128 --passes 1  # the map from patches, measured once
+helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json            # main: the scan with the axis inside the field
+helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json --row-time-us -19.87   # if no stretch holds a refill
+helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json --patch 128 --passes 1  # the map from patches, measured once
 ```
 
 ```python
@@ -1006,7 +1007,7 @@ These raise explicit errors:
 * an acquisition the geometry calibration step can read: a helix whose travel per turn is less than the
   detector's height, a turn at rest before and after it, two scans of equally long stretches;
 * a mosaic (tiles that differ in the sample's place on the rotation stage) is checked by `helirec-calibration`
-  and nothing calibrates its geometry; `helirec-geometry` and `helirec-reconstruct` do not take one, and a tile can
+  and nothing calibrates its geometry; `helirec-calibration geometry` and `helirec-reconstruct` do not take one, and a tile can
   only be reconstructed alone, from a geometry given to it (`helirec.mosaic.tile_reconstructor`);
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.

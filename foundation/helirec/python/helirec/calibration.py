@@ -7,7 +7,7 @@ two scans are merged in.
   * the placement of both scans in the merged frame and the rotation axis there, from one axis and one vector.
 
 The geometry is not measured here: the rotation axis, the second scan's place, the pitch, the rows' timing, the
-detector map and the pose of every frame are the geometry calibration's (geometry.py, helirec-geometry), which
+detector map and the pose of every frame are the geometry calibration's (geometry.py, helirec-calibration geometry), which
 hands this module the merged frame's axis and vector (geometry.merged_layout).
 Heavy kernels are C++ (helirec._core); the bookkeeping is numpy.
 """

@@ -18,7 +18,7 @@ Modes (params["mode"]):
                      be changed in this mode. Of the geometry calibration it takes the merged frame alone: one rotation
                      axis and one vector between the scans, with the recorded angles and heights.
 
-The geometry of every projection is the geometry calibration's (geometry.py, helirec-geometry: geometry.json, made
+The geometry of every projection is the geometry calibration's (geometry.py, helirec-calibration geometry: geometry.json, made
 on first use and kept in the cache directory, or given: params["geometry"]); the darks, flats, weights and the
 detector's blur field are calibration.py's.
 """
@@ -49,7 +49,7 @@ DEFAULTS = dict(
     geometry="", row_time_us="",
 )
 # geometry: "" (default: geometry.json in the cache directory, made there on first use by the geometry calibration
-#   step: geometry.calibrate_geometry, helirec-geometry; about 13 minutes on PHerc0343P) | the path of one made
+#   step: geometry.calibrate_geometry, helirec-calibration geometry; about 13 minutes on PHerc0343P) | the path of one made
 #   before. It is the only geometry calibration: every projection is read on the grid of its detector map (rows by
 #   the row kernel at the mapped row, columns resampled exactly) at the pose it gives the frame
 #   (geometry.frame_poses: row, axis column, their slopes and scales), at the angle of its rows (the calibration's
@@ -295,7 +295,7 @@ class HelicalRecon:
             with open(path) as fh:
                 return os.path.abspath(path), fh.read()
         if not self.cache_dir:
-            raise ValueError("no geometry calibration: give geometry=PATH (made by helirec-geometry), or a cache directory "
+            raise ValueError("no geometry calibration: give geometry=PATH (made by helirec-calibration geometry), or a cache directory "
                              "to make it in and keep it")
         path = os.path.join(self.cache_dir, "geometry.json")
         masters = [str(s.master) for s in (self.main, self.companion)]
@@ -311,7 +311,7 @@ class HelicalRecon:
                 return os.path.abspath(path), raw
             self.log(f"geometry calibration {path}: other scans or unreadable, made again")
         rt = str(self.params.get("row_time_us") or "").strip()
-        self.log("geometry calibration of the scans (helirec-geometry: layout, rows' timing, detector map, poses, motion) ...")
+        self.log("geometry calibration of the scans (helirec-calibration geometry: layout, rows' timing, detector map, poses, motion) ...")
         cal = G.calibrate_geometry(masters, None if not rt else float(rt) * 1e-6, device=self.device, log=self.log)
         os.makedirs(self.cache_dir, exist_ok=True)
         G.save(cal, path)
@@ -423,7 +423,7 @@ class HelicalRecon:
         gone = sorted(set(kw) & set(REMOVED))
         if gone:
             raise KeyError(f"{gone}: removed with the calibration they belonged to; the geometry calibration "
-                           f"(params['geometry'], helirec-geometry) holds what they stood for")
+                           f"(params['geometry'], helirec-calibration geometry) holds what they stood for")
         regular = {k: v for k, v in kw.items() if not is_filter_key(k) or k == "filters"}
         unknown = set(regular) - set(DEFAULTS)
         if unknown:

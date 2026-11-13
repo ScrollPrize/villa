@@ -12,7 +12,6 @@ dependencies = ["numpy>=1.24", "h5py>=3.8", "tifffile", "vc-reader"]
 [project.scripts]
 helirec-reconstruct = "helirec.cli:main"
 helirec-composite = "helirec.composite:main"
-helirec-geometry = "helirec.geometry:main"
 helirec-download-projections = "helirec.download_projections:main"
 
 [project.optional-dependencies]
