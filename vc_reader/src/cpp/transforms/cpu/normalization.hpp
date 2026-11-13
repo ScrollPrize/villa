@@ -3,6 +3,11 @@
 #include "../core.hpp"
 #include "../shared/percentile.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <utility>
+
 namespace vcr::transforms {
 inline ChannelPlan channel_parameters(const Normalize&, const Array&, Random&) { return {}; }
 
@@ -156,9 +161,68 @@ void normalize_crop(T* values, std::size_t n, const Normalize& t, const std::uin
                 : static_cast<T>((static_cast<double>(values[i]) / scale - center) / divisor);
     });
 }
+// Surface volumes are uint8, so their float crops hold at most 256 distinct
+// values. Then every order statistic is a histogram bin, and the output is a
+// 256-entry table of the same per-value expression: the result is identical
+// to the general path below. Returns false, without touching values, for
+// other data (including -0.0, whose sign the general path keeps) and for a
+// degenerate robust scale (its std fallback is an ordered float64 sum over
+// the voxels).
+template<class T>
+bool normalize_order_uint8(T* values, std::size_t n, const Normalize& t, const std::uint8_t* valid) {
+    std::array<std::size_t, 256> count{};
+    for (std::size_t i = 0; i < n; ++i) {
+        const T v = values[i];
+        if (!(v >= T(0) && v <= T(255)) || std::signbit(v)) return false;
+        const auto b = static_cast<unsigned>(v);
+        if (T(b) != v) return false;
+        if (!valid || valid[i]) ++count[b];
+    }
+    std::array<std::size_t, 256> below{};  // number of selected values < bin + 1
+    std::size_t selected = 0;
+    for (std::size_t b = 0; b < 256; ++b) below[b] = selected += count[b];
+    if (!selected) return false;
+    const auto bin_at = [&](std::size_t k) {  // value of rank k
+        return std::size_t(std::upper_bound(below.begin(), below.end(), k) - below.begin());
+    };
+    const auto order = [&](auto&& map, double percent) {
+        return sorted_percentile([&](std::size_t k) { return map(bin_at(k)); }, selected, percent);
+    };
+    const auto raw = [](std::size_t b) { return double(T(b)); };
+    const bool clip = t.mode == Normalization::Percentile || t.clip;
+    double low = raw(bin_at(0)), high = raw(bin_at(selected - 1));
+    if (clip) { low = order(raw, t.lower); high = order(raw, t.upper); }
+    // Clamping is monotone, so ranks of the clipped values are ranks of the bins.
+    const auto clipped = [&](std::size_t b) { return double(clip ? clamp_to(T(b), low, high) : T(b)); };
+    double center, scale;
+    if (t.mode == Normalization::Percentile) {
+        scale = percentile_scale(low, high, t.median);
+        center = t.median ? order(clipped, 50) : low;
+        if (scale == 0) { std::fill(values, values + n, T{0}); return true; }
+    } else {
+        center = order(clipped, 50);
+        std::array<std::pair<double, std::size_t>, 256> deviations;
+        std::size_t used = 0;
+        for (std::size_t b = 0; b < 256; ++b)
+            if (count[b]) deviations[used++] = {std::abs(clipped(b) - center), count[b]};
+        std::sort(deviations.begin(), deviations.begin() + used);
+        std::array<std::size_t, 256> upto{};
+        for (std::size_t j = 0, total = 0; j < used; ++j) upto[j] = total += deviations[j].second;
+        const double mad = sorted_percentile([&](std::size_t k) {
+            return deviations[std::size_t(std::upper_bound(upto.begin(), upto.begin() + used, k) - upto.begin())].first;
+        }, selected, 50);
+        scale = 1.4826 * mad;
+        if (!(std::isfinite(scale) && scale >= 1e-6)) return false;
+    }
+    std::array<T, 256> table;
+    for (std::size_t b = 0; b < 256; ++b) table[b] = finite_or_zero<T>((clipped(b) - center) / scale);
+    for (std::size_t i = 0; i < n; ++i) values[i] = table[static_cast<unsigned>(values[i])];
+    return true;
+}
 template<class T>
 void normalize_order(T* values, std::size_t n, const Normalize& t, const std::uint8_t* valid) {
     if (!n) return;
+    if (normalize_order_uint8(values, n, t, valid)) return;
     std::vector<T> selected;
     double sum = 0;
     for (std::size_t i = 0; i < n; ++i) {

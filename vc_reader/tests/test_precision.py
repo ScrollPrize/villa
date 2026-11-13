@@ -634,5 +634,80 @@ class PrecisionTests(unittest.TestCase):
             np.testing.assert_array_equal(result['mask'], replay['mask'])
 
 
+def order_normalize_reference(x, mode, lower=1., upper=99., clip=True, median=False):
+    """Robust/percentile normalization in NumPy: float64 linear percentiles,
+    clipping in the input dtype, float64 arithmetic, one rounding at the end."""
+    values = x.astype(np.float64).ravel()
+    clip = clip or mode == 'percentile'
+    low, high = values.min(), values.max()
+    if clip:
+        low, high = np.percentile(values, [lower, upper])
+        x = np.clip(x, x.dtype.type(low), x.dtype.type(high))
+    clipped = x.astype(np.float64)
+    if mode == 'percentile':
+        scale = .5*(high - low) if median else high - low
+        if not (np.isfinite(scale) and scale >= 1e-6):
+            scale = 1. if median else 0.
+        if scale == 0:
+            return np.zeros_like(x)
+        center = np.percentile(clipped, 50) if median else low
+    else:
+        center = np.percentile(clipped, 50)
+        scale = 1.4826*np.percentile(np.abs(clipped - center), 50)
+        assert np.isfinite(scale) and scale >= 1e-6  # cases here avoid the std fallback
+    return ((clipped - center)/scale).astype(x.dtype)
+
+
+class OrderNormalizationTests(unittest.TestCase):
+    """uint8-valued crops take a histogram path; it must give the same bytes
+    as the general path, which other values take."""
+
+    cases = [('robust', {}), ('robust', dict(clip=False)), ('robust', dict(lower=5, upper=95)),
+             ('percentile', {}), ('percentile', dict(median=True)), ('percentile', dict(lower=10, upper=90))]
+
+    def check(self, x):
+        for mode, options in self.cases:
+            with self.subTest(mode=mode, options=options, dtype=x.dtype, shape=x.shape):
+                actual = np.asarray(A.Normalize(mode, **options)(x[None].copy()))[0]
+                expected = order_normalize_reference(x, mode, **options)
+                self.assertEqual(actual.dtype, expected.dtype)
+                if x.dtype == np.float32:  # float64: NumPy's percentile rounds differently by a few ulp
+                    self.assertEqual(actual.tobytes(), expected.tobytes())
+                else:
+                    np.testing.assert_array_max_ulp(actual, expected, maxulp=8)
+
+    def test_uint8_valued_and_general_crops_match_the_reference(self):
+        rng = np.random.default_rng(7)
+        skewed = np.clip(rng.normal(90, 25, (17, 48, 48)), 0, 255).round()
+        sparse = skewed.copy(); sparse[:, :, 30:] = 0
+        crops = [rng.integers(0, 256, (17, 40, 40)), skewed, sparse, rng.integers(0, 256, (1, 1, 3))]
+        for crop in crops:
+            for dtype in (np.float32, np.float64):
+                x = np.asarray(crop, dtype=dtype)
+                self.check(x)          # histogram path
+                self.check(x + .25)    # general path: not integer-valued
+                self.check(x - 300)    # general path: outside [0, 255]
+
+    def test_signed_zero_keeps_its_sign(self):
+        x = np.random.default_rng(3).integers(0, 256, (4, 16, 16)).astype(np.float32)
+        x[x == 0] = -0.
+        x.flat[:7] = -0.
+        self.check(x)
+
+    def test_zero_mad_uses_the_fallback_scale(self):
+        x = np.zeros((4, 16, 16), np.float32)
+        x[0, 0, :5] = 255
+        binary = (np.random.default_rng(5).random((9, 20, 20)) > .5).astype(np.float32)*255
+        for crop in (x, x + np.float32(.5), binary):
+            out = np.asarray(A.Normalize('robust')(crop[None].copy()))[0]
+            values = crop.astype(np.float64)
+            low, high = np.percentile(values, [1, 99])
+            clipped = np.clip(crop, np.float32(low), np.float32(high)).astype(np.float64)
+            center = np.percentile(clipped, 50)
+            scale = np.sqrt(np.mean((values - values.mean())**2))  # MAD is 0: population std
+            expected = ((clipped - center)/scale).astype(np.float32)
+            np.testing.assert_allclose(out, expected, rtol=1e-6, atol=1e-6)
+
+
 if __name__ == '__main__':
     unittest.main()
