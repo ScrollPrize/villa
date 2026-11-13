@@ -753,3 +753,133 @@ def test_engine_runs_leave_pytorch_off_the_device_until_an_input_falls_back(
             tifffile.imread(tmp_path / f"fallback{name}.tif"),
             tifffile.imread(tmp_path / f"torch{name}.tif"),
         )
+
+
+class _WindowHandle(_RecordingHandle):
+    """A recording stand-in whose map depends on the window it is sent."""
+
+    def run(self, volume, windows, *, stride, occupancy, coverage):
+        super().run(volume, windows, stride=stride, occupancy=occupancy, coverage=coverage)
+        weights = np.arange(1, volume.shape[0] + 1, dtype=np.int64)[:, None, None]
+        probability = ((volume * weights).sum(axis=0) % 251).astype(np.uint8)
+        return [(probability, np.ones(volume.shape[1:], dtype=np.uint8))]
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_layer_starts_write_each_single_window_runs_bytes_with_one_load(tmp_path, monkeypatch, engine):
+    import vesuvius.ink_detection.inference.infer as infer_module
+
+    surface, volume = _write_surface(tmp_path / "surface.zarr", layers=6)
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    loads, handles, builds = [], [], []
+    # every PyTorch model build or preparation, so the multi-window run must show one of each at most
+    for name in ("configure_model", "prepare_model_for_inference"):
+        real = getattr(infer_module, name)
+        monkeypatch.setattr(infer_module, name, lambda *a, _real=real, _name=name, **k: builds.append(_name) or _real(*a, **k))
+
+    def factory(*_):
+        handles.append(_WindowHandle())
+        loads.append(1)
+        return InkrsEngine(_fake_inkrs(None), handles[-1], device_index=0)
+
+    def infer(out, *window):
+        args = normalize_inference_paths(
+            parse_args([str(surface), str(checkpoint), str(out), *COMMON, "--direction", "both", *window])
+        )
+        assert run(args, engine_factory=factory if engine else None) == 0
+
+    infer(tmp_path / "multi" / "map.tif", "--layer-starts", "2,0,1")
+    multi_loads = len(loads)
+    # one reference contract read, which checks the windows; PyTorch then builds and prepares its
+    # model once, the engine path never
+    torch_build = ["configure_model", "prepare_model_for_inference"]
+    assert builds == ["configure_model"] + ([] if engine else torch_build), builds
+    for start in (0, 1, 2):
+        infer(tmp_path / "single" / f"map_L{start}.tif", "--layer-start", str(start), "--layer-end", str(start + DEPTH))
+
+    names = sorted(p.name for p in (tmp_path / "multi").iterdir())
+    assert names == sorted(f"map_L{s}{r}.tif" for s in (0, 1, 2) for r in ("", "_reverse"))
+    for name in names:
+        multi = (tmp_path / "multi" / name).read_bytes()
+        assert multi == (tmp_path / "single" / name).read_bytes(), name
+    # the maps differ by window, so a run that wrote one window everywhere would fail above
+    assert len({(tmp_path / "multi" / n).read_bytes() for n in names}) == len(names)
+    if engine:
+        # one engine for all six maps, sent windows in the order given, each pair forward then reverse
+        assert multi_loads == 1
+        sent = [call[0] for call in handles[0].calls]
+        want = [volume[s : s + DEPTH][::step] for s in (2, 0, 1) for step in (1, -1)]
+        assert len(sent) == len(want)
+        for got, expected in zip(sent, want):
+            np.testing.assert_array_equal(got, expected)
+
+
+def test_layer_starts_parse_and_refuse_conflicts(tmp_path):
+    from vesuvius.ink_detection.inference.infer import parse_layer_starts, resolve_layer_runs
+
+    assert parse_layer_starts("21:24") == [21, 22, 23]
+    assert parse_layer_starts("5,3,1") == [5, 3, 1]
+    for bad in ("4:4", "1,1", "a:b", "-1:2", "5,-3"):
+        with pytest.raises(ValueError):
+            parse_layer_starts(bad)
+    base = [str(tmp_path / "in.zarr"), str(tmp_path / "m.pth"), str(tmp_path / "o.tif")]
+    for extra in (
+        ["--layer-starts", "0:2", "--layer-start", "0"],
+        ["--layer-starts", "0:2", "--layer-end", "3"],
+        ["--layer-starts", "3,3"],
+        ["--layer-starts", "0:0"],
+    ):
+        with pytest.raises(SystemExit):
+            parse_args([*base, *extra])
+    with pytest.raises(SystemExit):
+        parse_args([str(tmp_path / "m.pth"), "--folder", str(tmp_path), "--layer-starts", "0:2"])
+    args = normalize_inference_paths(parse_args([*base, "--layer-starts", "20,4"]))
+    runs = resolve_layer_runs(args, 17)
+    assert [(w.layer_start, w.layer_end, w.layer_starts, o.name) for w, o in runs] == [
+        (20, 37, None, "o_L20.tif"),
+        (4, 21, None, "o_L4.tif"),
+    ]
+    # the caller's namespace is left as parsed
+    assert args.layer_starts == [20, 4] and args.layer_start is None
+    # without --layer-starts, the one run is the command itself
+    plain = normalize_inference_paths(parse_args(base))
+    assert resolve_layer_runs(plain, 17) == [(plain, plain.output_tiff)]
+
+
+@pytest.mark.parametrize("engine", [False, True])
+@pytest.mark.parametrize("starts", ["1000", "0,1000", "2:5"])
+def test_layer_starts_refuse_windows_past_the_input_before_any_work(tmp_path, monkeypatch, engine, starts):
+    # 6 layers hold starts 0..3 at the 3-layer test depth; a window past that would clamp to nothing
+    # and fall back to the full depth under its own name, so the whole list is refused before the
+    # model or engine loads and before any map is written
+    import vesuvius.ink_detection.inference.infer as infer_module
+
+    surface, _ = _write_surface(tmp_path / "surface.zarr", layers=6)
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    loads = []
+    real_configure = infer_module.configure_model
+
+    def counting_configure(*a, **k):
+        loads.append("configure")
+        return real_configure(*a, **k)
+
+    def factory(*_):
+        loads.append("engine")
+        return InkrsEngine(_fake_inkrs(None), _WindowHandle(), device_index=0)
+
+    def counting_make(config):
+        loads.append("make_model")
+        return real_make(config)
+
+    real_make = infer_module.make_model
+    monkeypatch.setattr(infer_module, "configure_model", counting_configure)
+    monkeypatch.setattr(infer_module, "make_model", counting_make)
+    out = tmp_path / "multi" / "map.tif"
+    args = normalize_inference_paths(
+        parse_args([str(surface), str(checkpoint), str(out), *COMMON, "--direction", "both", "--layer-starts", starts])
+    )
+    with pytest.raises(ValueError, match="end past"):
+        run(args, engine_factory=factory if engine else None)
+    # only the reference contract was read; no engine, no PyTorch model build, no output
+    assert loads == ["configure"]
+    assert not out.parent.exists() or not any(out.parent.iterdir())

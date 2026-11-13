@@ -460,6 +460,7 @@ the second output.
 | `--stride` | Explicit pixel stride; overrides `--overlap`. |
 | `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto` (constant without overlap, Hann otherwise). |
 | `--layer-start`, `--layer-end` | Half-open source-Z selection before centered depth cropping; negative indices count from the end. The window is clamped to the source depth, and if nothing is left of it (empty, inverted, or entirely out of range) the full depth is used instead and a warning is logged. |
+| `--layer-starts` | Several windows in one run, as `START:STOP` (half-open) or a comma list such as `21,25,29`. Each start `S` runs exactly as `--layer-start S --layer-end S+DEPTH` would, where `DEPTH` is the model's input depth, and writes `<stem>_L<S><suffix>` (with `_reverse` after it for `--direction both`). The model, or the `--engine`, loads once for every window, which saves the per-process startup of a depth sweep. Single mode only; it replaces `--layer-start` and `--layer-end`. Starts must be distinct and not negative, and every window must fit in the input's depth: the run checks them all before the model loads and writes nothing if one does not fit. |
 | `--batch-size` | PyTorch batch size per selected device, default `1`. `--engine inkrs` keeps its own batch (64 tiles of 128 px, or 8 of 384 px). |
 | `--direction` | `forward`, `reverse`, or `both`; default `forward`. |
 | `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |

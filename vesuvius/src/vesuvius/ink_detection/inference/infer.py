@@ -5,6 +5,7 @@ from __future__ import annotations
 from vesuvius.ink_detection.data.normalization import normalize_image
 
 import argparse
+import copy
 import functools
 import importlib.util
 import json
@@ -1639,14 +1640,16 @@ def prefetch_engine_window(
     """
 
     try:
+        # with --layer-starts, the first window's, which runs first
+        first, _ = resolve_layer_runs(args, configured_model.input_depth)[0]
         root = open_volume_root(args.input_zarr)
         resolution = "0" if hasattr(root, "shape") else str(args.resolution)
         volume = select_volume_level(root, resolution, source=str(args.input_zarr))
         depth_first, depth, height, width, *_ = _volume_axes(volume)
         layer_indices = select_layer_indices(
             depth,
-            layer_start=args.layer_start,
-            layer_end=args.layer_end,
+            layer_start=first.layer_start,
+            layer_end=first.layer_end,
             output_depth=configured_model.input_depth,
             direction=resolve_run_directions(args.direction)[0],
         )
@@ -1693,6 +1696,80 @@ def run_with_engine(
     output_tiff.with_suffix(output_tiff.suffix + ".roi.json").unlink(missing_ok=True)
     write_uint8_tiff(result.probability, output_tiff, tile_shape)
     return True
+
+
+def parse_layer_starts(value: str) -> list[int]:
+    """Parse ``--layer-starts``: ``START:STOP`` (half-open) or a comma list.
+
+    The starts must be distinct, since each one names its own output, and
+    not negative: ``--layer-end`` is ``S+DEPTH``, which for a negative S can
+    cross zero and select a different window than S names.
+    """
+
+    if ":" in value:
+        start, stop = (int(part) for part in value.split(":"))
+        starts = list(range(start, stop))
+    else:
+        starts = [int(part) for part in value.split(",")]
+    if not starts:
+        raise ValueError(f"--layer-starts {value!r} selects no window")
+    if len(set(starts)) != len(starts):
+        raise ValueError(f"--layer-starts {value!r} repeats a start")
+    if min(starts) < 0:
+        raise ValueError(f"--layer-starts {value!r} has a negative start")
+    return starts
+
+
+def check_layer_windows(args: argparse.Namespace, input_depth: int) -> None:
+    """Refuse a ``--layer-starts`` window the input cannot hold, before any work.
+
+    A single ``--layer-start`` run falls back to the full depth when its
+    window is empty after clamping; one window of a multi-window run doing
+    that would write a map under a start it did not read, and a later bad
+    window would fail only after earlier maps were written. So every window
+    must lie inside the input's depth at the selected level, checked before
+    the model or engine loads.
+    """
+
+    starts = getattr(args, "layer_starts", None)
+    if starts is None:
+        return
+    root = open_volume_root(args.input_zarr)
+    resolution = "0" if hasattr(root, "shape") else str(args.resolution)
+    volume = select_volume_level(root, resolution, source=str(args.input_zarr))
+    _, depth, *_ = _volume_axes(volume)
+    outside = [s for s in starts if s + int(input_depth) > depth]
+    if outside:
+        raise ValueError(
+            f"--layer-starts: windows {outside} of {input_depth} layers end past "
+            f"the input's {depth} layers; the last start that fits is "
+            f"{depth - int(input_depth)}"
+        )
+
+
+def resolve_layer_runs(
+    args: argparse.Namespace, input_depth: int
+) -> list[tuple[argparse.Namespace, Path]]:
+    """The single-mode runs: one per ``--layer-starts`` window, else ``args``.
+
+    Window S runs exactly as ``--layer-start S --layer-end S+input_depth``
+    would, into ``<stem>_L<S><suffix>``, so one process can replace one
+    invocation per depth with the model or engine loaded once.
+    """
+
+    starts = getattr(args, "layer_starts", None)
+    if starts is None:
+        return [(args, args.output_tiff)]
+    runs = []
+    for start in starts:
+        window = copy.copy(args)
+        window.layer_start, window.layer_end = start, start + int(input_depth)
+        window.layer_starts = None
+        output = args.output_tiff
+        runs.append(
+            (window, output.with_name(f"{output.stem}_L{start}{output.suffix}"))
+        )
+    return runs
 
 
 def resolve_run_directions(direction: str) -> tuple[str, ...]:
@@ -1923,6 +2000,15 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--layer-start", type=int)
     parser.add_argument("--layer-end", type=int)
+    parser.add_argument(
+        "--layer-starts",
+        help=(
+            "Several source-Z windows in one run, as START:STOP (half-open) or "
+            "a comma list. Window S runs as --layer-start S --layer-end "
+            "S+DEPTH (the model's input depth) and writes <stem>_L<S><suffix>; "
+            "the model or engine loads once for all of them. Single mode only."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--direction", choices=("forward", "reverse", "both"), default="forward"
@@ -1958,6 +2044,15 @@ def parse_args(argv: Sequence[str] | None = None):
         parser.error("--batch-size must be positive")
     if args.tta_batch_size is not None and args.tta_batch_size <= 0:
         parser.error("--tta-batch-size must be positive")
+    if args.layer_starts is not None:
+        if args.layer_start is not None or args.layer_end is not None:
+            parser.error("--layer-starts replaces --layer-start and --layer-end")
+        if args.folder is not None:
+            parser.error("--layer-starts is for single mode, not --folder")
+        try:
+            args.layer_starts = parse_layer_starts(args.layer_starts)
+        except ValueError as exc:
+            parser.error(str(exc))
     try:
         args.gpu_ids = parse_gpu_ids(args.gpus)
     except ValueError as exc:
@@ -2013,15 +2108,18 @@ def run_inputs(
         )
     if args.folder is not None:
         infer_folder(args, configured, device=device)
-    else:
+        return
+    # window by window, both directions of each together, so a direction
+    # pair still shares its source-layer read
+    for window, output in resolve_layer_runs(args, configured.input_depth):
         for direction in resolve_run_directions(args.direction):
             infer_single_zarr(
-                args=args,
+                args=window,
                 input_zarr=args.input_zarr,
                 configured_model=configured,
                 device=device,
                 output_tiff=resolve_single_output_path(
-                    args.output_tiff,
+                    output,
                     direction=direction,
                     requested_direction=args.direction,
                 ),
@@ -2049,7 +2147,11 @@ def run(
     engine_requested = (
         engine_factory is not None or str(getattr(args, "engine", "torch")) != "torch"
     )
-    configured = configure_model(args, build_model=not engine_requested)
+    # --layer-starts windows are checked from the contract alone, so a bad one
+    # fails before any model is built; PyTorch builds it for the first input it runs
+    build_now = not engine_requested and getattr(args, "layer_starts", None) is None
+    configured = configure_model(args, build_model=build_now)
+    check_layer_windows(args, configured.input_depth)
     device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
     window_cache = WindowCache()
     if engine_requested and engine_window_wanted(args, configured, device, engine_factory):
