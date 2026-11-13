@@ -390,10 +390,19 @@ def inkrs_command_reasons(
         reasons.append("it does not run --ensemble-checkpoint")
     if getattr(args, "tta_mirror", False):
         reasons.append("it does not run --tta-mirror")
-    # --amp-dtype can override the checkpoint's dtype, which is all inkrs
-    # sees; no dtype means torch.autocast's CUDA default, fp16 unless changed
+    # inkrs's export reads the precision the checkpoint stores, never
+    # --amp-dtype, and refuses anything but fp16; --amp-dtype still sets
+    # PyTorch's own dtype, so the effective dtype must be fp16 as well (no
+    # dtype means torch.autocast's CUDA default, fp16 unless changed)
     amp_dtype = configured_model.amp_dtype or torch.get_autocast_dtype("cuda")
-    if amp_dtype != torch.float16:
+    if configured_model.stored_amp_dtype != torch.float16:
+        stored = configured_model.stored_mixed_precision
+        reasons.append(
+            "it runs the precision the checkpoint stores and needs mixed_precision "
+            f"fp16, but {checkpoint.name} stores "
+            + ("none" if stored is None else repr(stored))
+        )
+    elif amp_dtype != torch.float16:
         reasons.append(f"it reproduces fp16 autocast only, got {amp_dtype}")
     # an ROI, a mask and the tiling hold for every input, so a command inkrs
     # would decline for them never loads it

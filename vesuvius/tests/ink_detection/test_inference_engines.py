@@ -145,6 +145,8 @@ def test_maps_differ_when_the_adapter_drops_villas_occupancy(tmp_path, monkeypat
 def _inkrs_shaped_model(**overrides):
     values = dict(
         amp_dtype=torch.float16,
+        stored_mixed_precision="fp16",
+        stored_amp_dtype=torch.float16,
         preprocessing="tifxyz_robust",
         input_depth=17,
         patch_size=128,
@@ -739,6 +741,55 @@ def test_inkrs_accepts_autocast_without_an_explicit_dtype(tmp_path, monkeypatch)
 
     assert "not installed" in str(raised.value)
     assert "fp16" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("stored", "reason"),
+    [
+        (None, "needs mixed_precision fp16, but stored.pth stores none"),
+        ("bf16", "needs mixed_precision fp16, but stored.pth stores 'bf16'"),
+        ("fp16", None),
+    ],
+)
+def test_inkrs_needs_the_checkpoint_to_store_fp16_whatever_amp_dtype_says(
+    tmp_path, monkeypatch, caplog, stored, reason
+):
+    # inkrs's export reads the stored mixed_precision and refuses all but fp16, so --amp-dtype fp16
+    # makes PyTorch run fp16 without changing what inkrs would load
+    from vesuvius.ink_detection.inference.infer import configure_model
+
+    payload = torch.load(_save_checkpoint(tmp_path / "model.pth"), weights_only=True)
+    if stored is not None:
+        payload["config"]["mixed_precision"] = stored
+    checkpoint = tmp_path / "stored.pth"
+    torch.save(payload, checkpoint)
+    opened = []
+
+    def load(path, *, device):
+        opened.append(path)
+        return object()
+
+    monkeypatch.setitem(sys.modules, "inkrs", _fake_inkrs(load))
+
+    def select(*extra):
+        args = normalize_inference_paths(
+            parse_args(["in.zarr", str(checkpoint), "out.tif", "--engine", "inkrs", "--amp-dtype", "fp16", *extra])
+        )
+        configured = configure_model(args, build_model=False)
+        assert configured.amp_dtype == torch.float16
+        return select_engine(args, configured, torch.device("cuda", 0))
+
+    with caplog.at_level("WARNING"):
+        engine = select()
+    if reason is None:
+        assert engine is not None and opened == [checkpoint]
+        return
+    # declined before inkrs loads, with the stored value named
+    assert engine is None and opened == []
+    assert reason in caplog.text and "Continuing with PyTorch" in caplog.text
+    with pytest.raises(EngineUnavailable, match=reason):
+        select("--engine-fallback", "error")
+    assert opened == []
 
 
 def test_engine_runs_leave_pytorch_off_the_device_until_an_input_falls_back(

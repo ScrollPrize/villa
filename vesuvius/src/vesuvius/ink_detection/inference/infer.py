@@ -54,6 +54,7 @@ from vesuvius.ink_detection.inference.engines import (
 from vesuvius.ink_detection.inference.inference_runtime import (
     DEVICE_CHOICES,
     TargetModel,
+    checkpoint_amp_dtype,
     flip_spatial,
     iter_mirror_axes,
     parse_gpu_ids,
@@ -108,6 +109,10 @@ class ConfiguredModel:
     input_depth: int
     preprocessing: str
     amp_dtype: torch.dtype | None
+    # the checkpoint's own mixed_precision before --amp-dtype applies: the
+    # raw config value (None when absent) and the autocast dtype it names
+    stored_mixed_precision: Any = None
+    stored_amp_dtype: torch.dtype | None = None
     # an optional alternative to the PyTorch forward and blend; see engines.py
     engine: FlatEngine | None = None
     # with an engine, PyTorch runs only the inputs the engine declines, so the
@@ -1320,6 +1325,8 @@ def configure_single_model(
         input_depth=crop_z,
         preprocessing=flat_preprocessing_from_config(config.data.normalization),
         amp_dtype=resolve_amp_dtype(amp_dtype, payload, checkpoint),
+        stored_mixed_precision=payload["config"].get("mixed_precision"),
+        stored_amp_dtype=checkpoint_amp_dtype(payload, checkpoint),
     )
 
 

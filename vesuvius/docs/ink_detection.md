@@ -517,6 +517,8 @@ reads a whole window that inkrs will refuse. It adds its own limits for the
 options inkrs never sees:
 
 - one CUDA device, or the MPS device on macOS (inkrs needs macOS 26 there)
+- a checkpoint that stores `mixed_precision: fp16`, since inkrs runs the
+  precision the checkpoint stores and ignores `--amp-dtype`
 - fp16 autocast (PyTorch's CUDA default, so `--amp-dtype default` qualifies)
 - Hann blending (the default with overlap) and a stride from 1 to the tile
   size (128, or 384 for reader-v3)
