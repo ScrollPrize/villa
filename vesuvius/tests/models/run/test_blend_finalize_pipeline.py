@@ -51,8 +51,9 @@ def test_blend_then_finalize(tmp_path, parts):
     assert merged.attrs["sigma_scale"] == 8.0
     assert merged.attrs["overlap"] == 0.5
     values = merged[...]
-    # Patch corners have almost no Gaussian weight; a patch's centre keeps its value.
-    np.testing.assert_allclose(values[1][1:3, 1:3, 1:3], 2.0, atol=1e-2)
+    # Each voxel is covered by one patch, so it keeps that patch's value, also at the
+    # patch corners, where the Gaussian weight is only ~4e-11.
+    np.testing.assert_allclose(values[1], 2.0, atol=1e-2)
     np.testing.assert_allclose(values[0], 0.0)
     # The empty patches of part 1 contributed nothing, and that is cached with the part.
     assert (tmp_path / "logits_part_1.zarr" / ".non_empty_patch_idxs.json").is_file()

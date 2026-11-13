@@ -341,7 +341,7 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.
 
 
 def _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, num_classes,
-                         finalize_config=None, epsilon=1e-8):
+                         finalize_config=None):
     """Normalise one chunk's weighted logit sum and write it to the output store.
 
     `chunk_logits` (C, Z, Y, X) holds sum(w * logits) and `chunk_weights` (Z, Y, X) holds
@@ -360,8 +360,10 @@ def _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, 
 
     # Divide in place: voxels with weight==0 had no contributions so
     # chunk_logits is already 0 there, and `where=...` leaves them untouched.
+    # No epsilon in the denominator: the Gaussian weight at a patch corner is ~4e-11,
+    # so dividing by `weight + 1e-8` pulled the logits there towards 0.
     weights_b = chunk_weights[np.newaxis, :, :, :]
-    np.divide(chunk_logits, weights_b + epsilon,
+    np.divide(chunk_logits, weights_b,
               out=chunk_logits, where=weights_b > 0)
 
     if finalize_config is not None:
@@ -403,7 +405,7 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
     })
 
 
-def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
+def process_chunk(chunk_info, chunk_patches):
     """
     Process a single chunk using worker-cached zarr stores.
 
@@ -413,7 +415,6 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         chunk_info: Dictionary with chunk boundaries
         chunk_patches: Dict {part_id: [(patch_idx, z, y, x), ...]} precomputed
                        for this chunk (non-empty, intersecting patches only)
-        epsilon: Small value for numerical stability
     """
     part_files = _worker_state['part_files']
     gaussian_map = _worker_state['gaussian_map']
@@ -510,7 +511,7 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
 
     if patches_processed > 0:
         _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, num_classes,
-                             _worker_state.get('finalize_config'), epsilon)
+                             _worker_state.get('finalize_config'))
 
     return {
         'chunk': chunk_info,
@@ -738,7 +739,7 @@ class InMemoryBlender:
                                    part_id=part_id, run_id=run_id)
 
     def write(self, output_path, chunk_size=None, finalize_config=None,
-              verbose=True, epsilon=1e-8, num_workers=None):
+              verbose=True, num_workers=None):
         """Normalise, optionally finalize, and write to an already prepared output.
 
         Chunks are disjoint, so they are finalized and written by `num_workers` threads
@@ -769,7 +770,7 @@ class InMemoryBlender:
                           'y_start': chunk[1][0], 'y_end': chunk[1][1],
                           'x_start': chunk[2][0], 'x_end': chunk[2][1]}
             _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights,
-                                 self.num_classes, finalize_config, epsilon)
+                                 self.num_classes, finalize_config)
             return True
 
         if num_workers is None:
