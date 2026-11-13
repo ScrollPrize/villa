@@ -5167,6 +5167,10 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
             updateGeneratedViewMetricsForFiber(fiberId);
             continue;
         }
+        // This request reads now: a worker read in flight for the fiber
+        // (a landing's request) is older than it and is made again.
+        if (const auto reading = _alignmentMetricWorkerReads.find(fiberId); reading != _alignmentMetricWorkerReads.end())
+            reading->second = true;
         if (auto uuid = fiberUuidForId(fiberId); !uuid.empty()) uuids.push_back(std::move(uuid));
     }
     std::vector<StoredFiber> fibers;
@@ -5177,6 +5181,11 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
                   suppressErrorDialogs);
         return;
     }
+    beginFiberAlignmentMetrics(std::move(fibers), suppressErrorDialogs);
+}
+
+void LineAnnotationController::beginFiberAlignmentMetrics(std::vector<StoredFiber> fibers, bool suppressErrorDialogs)
+{
     std::erase_if(fibers, [](const StoredFiber& fiber) { return !fiber.editorError.empty(); });
     std::vector<uint64_t> requestTokens;
     requestTokens.reserve(fibers.size());
@@ -5363,6 +5372,9 @@ void LineAnnotationController::invalidateFiberAlignmentMetrics(uint64_t fiberId,
     _fiberAlignmentMetrics.erase(fiberId);
     _pendingFiberAlignmentMetrics.erase(fiberId);
     _pendingFiberAlignmentMetricTokens.erase(fiberId);
+    // A read in flight for this fiber's metrics is as stale as a pending result.
+    if (const auto reading = _alignmentMetricWorkerReads.find(fiberId); reading != _alignmentMetricWorkerReads.end())
+        reading->second = true;
     _fiberMetricsPending = !_pendingFiberAlignmentMetrics.empty();
     if (notify) {
         publishUnavailableFiberAlignmentMetrics(fiberId);
@@ -13349,13 +13361,16 @@ void LineAnnotationController::drainDeferredControlEdits()
     }
 }
 
-void LineAnnotationController::requestFiberAlignmentMetricsAfterWorkerRead(uint64_t fiberId)
+void LineAnnotationController::requestFiberAlignmentMetricsAfterWorkerRead(uint64_t fiberId, int attempt)
 {
-    // A landing asks for the metrics of the fiber it shows. On a hosted
-    // store the stored fiber may have to be decoded first (several requests):
-    // that read runs on a worker and is merged into the decode cache, and
-    // the ordinary request, made afterwards, finds it there. The request
-    // itself is unchanged: it still validates what it reads.
+    // A landing asks for the metrics of the fiber it shows. The request reads
+    // the stored fiber from the store itself (several requests on a hosted
+    // store): here that same read runs on a worker and the metrics start from
+    // its answer. Every request is answered by a read made after it: one that
+    // arrives during a read, like whatever would have dropped the request's
+    // pending result meanwhile (the fiber's metrics invalidated, a store
+    // change, another normal source or volume), makes the read again. After a
+    // few such reads in a row the request reads on the GUI thread as before.
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
     const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     const auto uuid = fiberUuidForId(fiberId);
@@ -13364,10 +13379,15 @@ void LineAnnotationController::requestFiberAlignmentMetricsAfterWorkerRead(uint6
         requestFiberAlignmentMetrics(fiberId);
         return;
     }
-    if (!_alignmentMetricWorkerReads.insert(fiberId).second) return;
+    if (const auto [reading, started] = _alignmentMetricWorkerReads.emplace(fiberId, false); !started) {
+        reading->second = true;
+        return;
+    }
+    ++_alignmentMetricWorkerReadCount;
     struct Load {
         FiberReadContext read;
         WorkerFiberIds ids;
+        std::vector<StoredFiber> fibers;
         bool ok = false;
     };
     auto load = std::make_shared<Load>();
@@ -13375,19 +13395,22 @@ void LineAnnotationController::requestFiberAlignmentMetricsAfterWorkerRead(uint6
     load->read.attachment = attachment;
     load->read.hasVolume = bool(_state->currentVolume());
     load->read.target = _state->annotationVolume().value_or(vc::project::AnnotationVolume{});
+    // Known ids only: like the request's own read, this one uses no decode cache.
     seedWorkerFiberRead(load->read, load->ids);
+    load->read.cache.clear(); load->read.dependencies.clear(); load->read.position.reset();
     const auto generation = _packageGeneration;
+    const auto metricsGeneration = _fiberMetricsGeneration;
+    // Any store change this controller learns of during the read (its own
+    // saves, other clients' commits) may have replaced what the read saw.
+    const auto dataGeneration = _fiberDataGeneration;
     auto* watcher = new QFutureWatcher<void>(this);
-    connect(watcher, &QFutureWatcher<void>::finished, this, [this, watcher, load, fiberId, generation] {
+    connect(watcher, &QFutureWatcher<void>::finished, this,
+            [this, watcher, load, fiberId, generation, metricsGeneration, dataGeneration, attempt] {
         watcher->deleteLater();
-        _alignmentMetricWorkerReads.erase(fiberId);
+        const auto reading = _alignmentMetricWorkerReads.find(fiberId);
+        const bool again = reading != _alignmentMetricWorkerReads.end() && reading->second;
+        if (reading != _alignmentMetricWorkerReads.end()) _alignmentMetricWorkerReads.erase(reading);
         if (generation != _packageGeneration || !_state || _state->storeFor("fiber") != load->read.attachment) return;
-        if (load->ok) {
-            assignWorkerFiberIds(load->ids);
-            remapWorkerFiberCache(load->read, load->ids);
-            mergeWorkerFiberRead(load->read);
-            if (load->read.snapshotsInvalidated) _sideStripStoredSnapshotCache.clear();
-        }
         // Asked again as the landing asked: only for a pane that still shows
         // the stored fiber, and only if nothing answered in the meantime.
         const auto pane = std::find_if(_panes.begin(), _panes.end(), [&](const PaneRecord& candidate) {
@@ -13396,13 +13419,30 @@ void LineAnnotationController::requestFiberAlignmentMetricsAfterWorkerRead(uint6
                 !candidate.session->modelOnly;
         });
         if (pane == _panes.end() || hasCachedAlignmentForFiber(fiberId) || isAlignmentPendingForFiber(fiberId)) return;
-        requestFiberAlignmentMetricsForFibers({fiberId});
+        const bool sameVolume = load->read.hasVolume == bool(_state->currentVolume()) &&
+            load->read.target == vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
+        const bool overtaken = again || metricsGeneration != _fiberMetricsGeneration ||
+            dataGeneration != _fiberDataGeneration || !sameVolume;
+        if (overtaken && attempt < 3) {
+            requestFiberAlignmentMetricsAfterWorkerRead(fiberId, attempt + 1);
+            return;
+        }
+        if (overtaken || !load->ok) {
+            // The request reads again itself and reports what fails.
+            requestFiberAlignmentMetricsForFibers({fiberId});
+            return;
+        }
+        assignWorkerFiberIds(load->ids);
+        for (auto& fiber : load->fibers) {
+            fiber.id = load->ids.runtimeIds.at(fiber.id);
+            for (auto& branch : fiber.branches) branch.branchFiberId = load->ids.runtimeIds.at(branch.branchFiberId);
+        }
+        beginFiberAlignmentMetrics(std::move(load->fibers), pane->session->suppressErrorDialogs || _errorDialogsSuppressed);
     });
     watcher->setFuture(QtConcurrent::run([load, uuid] {
-        // Best effort: without it the request decodes what it needs itself.
         try {
             useWorkerFiberIds(load->read, load->ids);
-            (void)storedFibersInContext(load->read, std::vector<std::string>{uuid}, true);
+            load->fibers = readStoredFibersInContext(load->read, std::vector<std::string>{uuid}, true, nullptr);
             load->ok = true;
         } catch (const std::exception&) {
         }

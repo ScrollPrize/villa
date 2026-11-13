@@ -1566,9 +1566,14 @@ private:
     [[nodiscard]] std::shared_ptr<vc::lasagna::LasagnaDataset>
         resolveAlignmentMetricsDataset();
     void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
-    // A landing's request: the stored fiber is read on a worker first.
-    void requestFiberAlignmentMetricsAfterWorkerRead(uint64_t fiberId);
-    std::unordered_set<uint64_t> _alignmentMetricWorkerReads;
+    // The request once its fibers are read: pending state, then the worker.
+    void beginFiberAlignmentMetrics(std::vector<StoredFiber> fibers, bool suppressErrorDialogs);
+    // A landing's request on a hosted store: the request's read runs on a worker.
+    void requestFiberAlignmentMetricsAfterWorkerRead(uint64_t fiberId, int attempt = 0);
+    // Fibers with such a read in flight; true once they were requested again
+    // or their metrics invalidated during it (the read is then made again).
+    std::unordered_map<uint64_t, bool> _alignmentMetricWorkerReads;
+    uint64_t _alignmentMetricWorkerReadCount = 0;  // reads started (tests)
     // stillValid (optional): a failed metadata save shows a modal; false
     // right after it returns without scheduling the autosave.
     void saveFiberDisplayAnnotations(LineAnnotationSession& session,

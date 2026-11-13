@@ -660,6 +660,69 @@
                         "an open makes a queued close save before it reads");
                 settle("the queued close finds its pane gone");
             }
+            // A landing's metrics request leaves the stored fiber's read to
+            // a worker and starts the metrics from that read; metrics
+            // invalidated meanwhile make the read again.
+            {
+                const bool matched = live->fiberMetricsMatchStoredFiber;
+                live->fiberMetricsMatchStoredFiber = true;
+                const auto id = live->fiberId;
+                const auto pump = [&](const auto& done) {
+                    QElapsedTimer waited;
+                    waited.start();
+                    while (!done() && waited.elapsed() < 30000) {
+                        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                        if (!done()) QThread::msleep(2);
+                    }
+                    require(done(), "the metrics read ends");
+                };
+                const auto idle = [&] { return publishing._alignmentMetricWorkerReads.empty(); };
+                // (A commit event still on its way may add a read: counts are lower bounds.)
+                publishing.invalidateFiberAlignmentMetrics(id, false);
+                auto tokens = publishing._nextFiberAlignmentMetricToken;
+                auto reads = publishing._alignmentMetricWorkerReadCount;
+                publishing.requestFiberAlignmentMetricsAfterWorkerRead(id);
+                require(publishing._alignmentMetricWorkerReads.count(id) == 1 &&
+                        publishing._nextFiberAlignmentMetricToken == tokens,
+                        "a landing's metrics request leaves the store read to a worker");
+                pump(idle);
+                require(publishing._alignmentMetricWorkerReadCount >= reads + 1 &&
+                        publishing._nextFiberAlignmentMetricToken == tokens + 1, "the metrics start from the worker's read");
+                const auto overtaken = [&](const char* what, const auto& during) {
+                    publishing.invalidateFiberAlignmentMetrics(id, false);
+                    tokens = publishing._nextFiberAlignmentMetricToken;
+                    reads = publishing._alignmentMetricWorkerReadCount;
+                    publishing.requestFiberAlignmentMetricsAfterWorkerRead(id);
+                    during();
+                    require(publishing._alignmentMetricWorkerReads.size() == 1, "one metrics read per fiber at a time");
+                    pump(idle);
+                    require(publishing._alignmentMetricWorkerReadCount >= reads + 2 &&
+                            publishing._nextFiberAlignmentMetricToken == tokens + 1, what);
+                };
+                overtaken("a request during the read is answered by a read made after it",
+                          [&] { publishing.requestFiberAlignmentMetricsAfterWorkerRead(id); });
+                overtaken("a read whose metrics were invalidated is made again, and only the last starts the metrics",
+                          [&] { publishing.invalidateFiberAlignmentMetrics(id, false); });
+                overtaken("a read that a store change overtook is made again", [&] { ++publishing._fiberDataGeneration; });
+                // A synchronous request for the fiber during the read reads
+                // later than it: the worker read is made again. (That request
+                // starts metrics itself, dropped here as an invalidation would.)
+                publishing.invalidateFiberAlignmentMetrics(id, false);
+                tokens = publishing._nextFiberAlignmentMetricToken;
+                reads = publishing._alignmentMetricWorkerReadCount;
+                publishing.requestFiberAlignmentMetricsAfterWorkerRead(id);
+                publishing.requestFiberAlignmentMetricsForFibers({id});
+                require(publishing._alignmentMetricWorkerReads.at(id) &&
+                        publishing._nextFiberAlignmentMetricToken == tokens + 1,
+                        "a synchronous request marks the read in flight");
+                publishing.invalidateFiberAlignmentMetrics(id, false);
+                pump(idle);
+                require(publishing._alignmentMetricWorkerReadCount >= reads + 2 &&
+                        publishing._nextFiberAlignmentMetricToken == tokens + 2,
+                        "a synchronous request during the read supersedes it");
+                publishing.invalidateFiberAlignmentMetrics(id, false);
+                live->fiberMetricsMatchStoredFiber = matched;
+            }
             // A tag edit whose background save is refused (a commit by
             // another client that this controller has not seen) is reported
             // and stays in the session, like a placement whose save failed.
