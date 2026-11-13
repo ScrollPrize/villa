@@ -108,6 +108,12 @@ class FlatEngine(Protocol):
         Raises EngineUnavailable to decline the request before any work.
         """
 
+    def close(self) -> None:
+        """Free the engine's device memory; the engine is not used again.
+
+        Optional: ``EngineSlot.release`` calls it when the engine has it.
+        """
+
 
 EngineFactory = Callable[[argparse.Namespace, Any, torch.device], FlatEngine]
 
@@ -135,6 +141,43 @@ def add_engine_arguments(parser: argparse.ArgumentParser) -> None:
             "continue with PyTorch and log why (default), or stop with an error."
         ),
     )
+
+
+class EngineSlot:
+    """The run's engine and its window reads, held until an input falls back.
+
+    The first input that falls back to PyTorch releases the engine before
+    PyTorch builds its model on the same device, so the two never hold GPU
+    memory at once, and every later input runs on PyTorch. The slot is the
+    engine's only owner in villa, so releasing it frees the engine.
+    """
+
+    def __init__(self, engine: FlatEngine, window_cache: WindowCache) -> None:
+        self._engine: FlatEngine | None = engine
+        self.window_cache = window_cache
+
+    @property
+    def engine(self) -> FlatEngine | None:
+        """The engine, or None once it has been released."""
+
+        return self._engine
+
+    def release(self) -> None:
+        """Free the engine and any kept window; later calls do nothing."""
+
+        engine, self._engine = self._engine, None
+        if engine is None:
+            return
+        LOGGER.info(
+            "Releasing %s for PyTorch fallback; remaining inputs run on PyTorch",
+            engine.name,
+        )
+        # an engine from a factory may have nothing of its own to free
+        close = getattr(engine, "close", None)
+        if close is not None:
+            close()
+        # PyTorch reads its own tiles, so a kept span would only hold memory
+        self.window_cache.close()
 
 
 SpanKey = tuple[str, str, bool, int, int]
@@ -312,6 +355,16 @@ class InkrsEngine:
         return inkrs_window_reason(
             request.volume, request.input_depth, request.height, request.width, request.patch_size
         )
+
+    def close(self) -> None:
+        """Drop the inkrs engine, which frees its GPU memory.
+
+        inkrs 0.2 has no close of its own: its engine frees every device
+        buffer, its cuDNN and cuBLAS handles and its context when the last
+        reference goes, and this holds the only one.
+        """
+
+        self._handle = None
 
     def predict(self, request: FlatEngineRequest) -> FlatEngineResult:
         started = time.perf_counter()

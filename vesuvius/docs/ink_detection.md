@@ -534,6 +534,12 @@ load it, as it does without `--engine inkrs`. Other inkrs errors, such as
 missing CUDA libraries or running out of GPU memory, stop the command rather
 than fall back.
 
+When an input falls back, villa releases inkrs and its GPU memory before
+PyTorch builds its model, so the two never share the GPU, and runs every
+remaining input on PyTorch: later segments in folder mode, later
+`--layer-starts` windows and the other direction. It logs this once, as
+"Releasing inkrs for PyTorch fallback; remaining inputs run on PyTorch".
+
 On the checkpoints tested, each inkrs map matched PyTorch's to within 4/255,
 with the same covered pixels. inkrs's
 [`scripts/villa_parity.py`](https://github.com/praveenperera/inkrs/blob/master/scripts/villa_parity.py)

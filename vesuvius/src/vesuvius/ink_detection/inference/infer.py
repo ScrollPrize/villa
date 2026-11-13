@@ -39,6 +39,7 @@ from vesuvius.ink_detection.models.checkpoint import (
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.engines import (
     EngineFactory,
+    EngineSlot,
     EngineUnavailable,
     FlatEngine,
     FlatEngineRequest,
@@ -113,14 +114,13 @@ class ConfiguredModel:
     # raw config value (None when absent) and the autocast dtype it names
     stored_mixed_precision: Any = None
     stored_amp_dtype: torch.dtype | None = None
-    # an optional alternative to the PyTorch forward and blend; see engines.py
-    engine: FlatEngine | None = None
+    # an optional alternative to the PyTorch forward and blend, with the
+    # source-layer reads its directions share; see engines.py
+    engine_slot: EngineSlot | None = None
     # with an engine, PyTorch runs only the inputs the engine declines, so the
     # model reaches the device on first use rather than sitting beside the
     # engine's own copy in GPU memory
     prepare_model: Callable[[], nn.Module] | None = None
-    # the engine's source-layer reads, shared by the directions of an input
-    window_cache: WindowCache | None = None
 
     def pytorch_model(self) -> nn.Module:
         """The device-ready PyTorch model, prepared on first use if deferred."""
@@ -1451,8 +1451,9 @@ def infer_single_zarr(
     LOGGER.info("Selected %d patches for inference", len(blocks))
     output_blocks = blocks if roi_bounds is None else [clip_block_to_roi(block, roi_bounds) for block in blocks]
     LOGGER.info("Output bounds=(%d, %d, %d, %d) shape=%s; parent patch grid retained", *output_bounds, output_shape)
-    if configured_model.engine is not None and run_with_engine(
-        configured_model.engine,
+    slot = configured_model.engine_slot
+    if slot is not None and slot.engine is not None and run_with_engine(
+        slot.engine,
         FlatEngineRequest(
             input_zarr=input_zarr,
             resolution=resolution,
@@ -1468,7 +1469,7 @@ def infer_single_zarr(
             preprocessing=configured_model.preprocessing,
             blocks=tuple(blocks),
             occupancy=occupancy,
-            window_cache=configured_model.window_cache,
+            window_cache=slot.window_cache,
         ),
         output_tiff=output_tiff,
         tile_shape=tile_shape,
@@ -1481,6 +1482,10 @@ def infer_single_zarr(
         ),
     ):
         return
+    if slot is not None:
+        # PyTorch runs this input, so the engine goes before PyTorch builds its
+        # model on the same device; later inputs then run on PyTorch too
+        slot.release()
     dataset = FlatBlockDataset(
         reader=reader,
         blocks=blocks,
@@ -2109,10 +2114,11 @@ def run_inputs(
     else:
         configured = replace(
             configured,
-            engine=engine,
+            engine_slot=EngineSlot(engine, window_cache),
             prepare_model=functools.cache(prepare),
-            window_cache=window_cache,
         )
+        # the slot must be the engine's only owner, so a fallback can free it
+        del engine
     if args.folder is not None:
         infer_folder(args, configured, device=device)
         return

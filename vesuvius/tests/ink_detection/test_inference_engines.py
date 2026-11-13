@@ -660,6 +660,63 @@ def test_folder_runs_load_the_engine_once_and_fall_back_per_segment(tmp_path, mo
     np.testing.assert_array_equal(tifffile.imread(b_forward), tifffile.imread(tmp_path / "torch.tif"))
 
 
+def test_a_fallback_frees_the_engine_before_pytorch_builds_and_later_inputs_stay_on_pytorch(
+    tmp_path, monkeypatch, caplog
+):
+    # segment a (uint16) falls back; inkrs's GPU memory must be gone before PyTorch's model reaches the
+    # device, so segment b runs on PyTorch even though the engine could take it
+    from vesuvius.ink_detection.inference import infer
+
+    _, volume = _write_surface(tmp_path / "u8.zarr")
+    folder = tmp_path / "segments"
+    (folder / "a").mkdir(parents=True)
+    ZarrWriter.create(folder / "a" / "a.zarr", shape=volume.shape, chunks=(volume.shape[0], 16, 16), dtype="u2")[:] = (
+        volume.astype(np.uint16) * 200
+    )
+    _write_surface(folder / "b" / "b.zarr")
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    sent, handles = [], []
+
+    class _Handle:
+        def run(self, volume, windows, *, stride, occupancy, coverage):
+            sent.append(volume.shape)
+            shape = volume.shape[1:]
+            return [(np.full(shape, 9, np.uint8), np.ones(shape, np.uint8))]
+
+    def factory(*_):
+        # the test keeps only a weak reference, as villa's run must hold the only strong one
+        handle = _Handle()
+        handles.append(weakref.ref(handle))
+        return InkrsEngine(_fake_inkrs(None), handle, device_index=0)
+
+    alive_at_prepare = []
+    real_prepare = infer.prepare_model_for_inference
+
+    def checking_prepare(model, **kwargs):
+        alive_at_prepare.append(handles[0]() is not None)
+        return real_prepare(model, **kwargs)
+
+    monkeypatch.setattr(infer, "prepare_model_for_inference", checking_prepare)
+    args = normalize_inference_paths(parse_args(["--folder", str(folder), str(checkpoint), *COMMON, "--direction", "both"]))
+    gc.disable()
+    try:
+        with caplog.at_level("INFO"):
+            assert run(args, engine_factory=factory) == 0
+    finally:
+        gc.enable()
+
+    # freed by reference counting alone, before the one PyTorch build both segments share
+    assert alive_at_prepare == [False]
+    assert sent == []
+    assert caplog.text.count("Releasing inkrs for PyTorch fallback; remaining inputs run on PyTorch") == 1
+    monkeypatch.setattr(infer, "prepare_model_for_inference", real_prepare)
+    for segment in ("a", "b"):
+        zarr = folder / segment / f"{segment}.zarr"
+        assert main([str(zarr), str(checkpoint), str(tmp_path / f"torch_{segment}.tif"), *COMMON]) == 0
+        [forward] = (folder / segment / "preds").glob(f"{segment}_model_forward_*.tif")
+        np.testing.assert_array_equal(tifffile.imread(forward), tifffile.imread(tmp_path / f"torch_{segment}.tif"))
+
+
 def test_window_cache_keeps_one_span_and_never_a_failed_read():
     cache = WindowCache()
     calls = []
