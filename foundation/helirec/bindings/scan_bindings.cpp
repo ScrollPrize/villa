@@ -40,6 +40,8 @@ void bind_scan(nb::module_& m) {
         .def_ro("dataset", &hc::FrameList::dataset)
         .def_prop_ro("file_index", [](const hc::FrameList& f) { return arr(f.file_index); })
         .def_prop_ro("frame_index", [](const hc::FrameList& f) { return arr(f.frame_index); })
+        .def("subset", [](const hc::FrameList& f, const std::vector<std::int64_t>& idx) { return f.subset(idx); }, "idx"_a,
+             "the frames idx, with the same files")
         .def("__len__", &hc::FrameList::size);
 
     nb::class_<hc::Scan>(m, "Scan",

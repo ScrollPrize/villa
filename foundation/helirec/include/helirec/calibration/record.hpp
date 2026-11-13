@@ -152,6 +152,12 @@ inline std::vector<double> stated_height(const Record& rec, const Stretch& s) {
 
 inline double pixel_um(const Record& rec) { return rec.technique.number("scan/sample_pixel_size"); }
 
+// the alias of a motor of the tomo configuration ("sample_u" -> "sx"); "" if the record does not name it
+inline std::string tomo_motor(const Record& rec, const std::string& key) {
+    const auto& v = rec.technique.texts("tomoconfig/" + key);
+    return v.empty() ? std::string() : v.back();
+}
+
 // What the record states per frame of a stretch: the angle [deg, cumulative] and the position along the axis in
 // detector rows, counted so that a larger value puts the sample's content on a higher row (row_sign: +1 if a larger
 // axis-stage position does that, -1 if it puts it on a lower one).

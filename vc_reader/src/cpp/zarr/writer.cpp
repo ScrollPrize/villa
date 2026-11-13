@@ -11,6 +11,9 @@
 #include <charconv>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string_view>
 #include <unistd.h>
@@ -242,18 +245,22 @@ struct Writer::Impl {
         return (meta.v3 ? meta.v3->prefix : "") + vcr::chunkKey(stored, meta.separator);
     }
 
-    // A remote shard edited as a local file: downloaded, patched and uploaded whole.
-    bool updateShard(const std::string& key, std::size_t target, const std::vector<std::uint8_t>* replacement)
+    // One stored position of a shard and its new encoded payload; null removes it.
+    using ShardEdit = std::pair<std::size_t, const std::vector<std::uint8_t>*>;
+
+    // Applies every edit in one rewrite of the shard. A remote shard is edited as a local
+    // file: downloaded, patched and uploaded whole. Whether any edited position was stored.
+    bool updateShard(const std::string& key, std::span<const ShardEdit> edits)
     {
         if (!store->remote()) {
             std::lock_guard lock(shardMutex((canonicalPath / key).string()));
-            return patchShard(path / key, target, replacement);
+            return patchShard(path / key, edits);
         }
         std::lock_guard lock(shardMutex(store->location() + "/" + key));
         TemporaryFile local;
         if (const auto stored = store->read(key))
             atomicWrite(local.path, *stored);
-        const bool result = patchShard(local.path, target, replacement);
+        const bool result = patchShard(local.path, edits);
         std::ifstream in(local.path, std::ios::binary);
         if (in) {
             std::ostringstream text;
@@ -267,21 +274,32 @@ struct Writer::Impl {
 
     // Keep encoded neighbors intact and bound scratch memory to one payload
     // and the index. A failed copy never replaces the existing shard.
-    bool patchShard(const fs::path& file, std::size_t target, const std::vector<std::uint8_t>* replacement)
+    bool patchShard(const fs::path& file, std::span<const ShardEdit> edits)
     {
         const auto& layout = *shards;
+        const std::size_t count = layout.indexBytes / 16;
         LocalShard previous(file, layout);
-        bool existed = false;
+        std::vector<const std::vector<std::uint8_t>*> replacement(count, nullptr);
+        std::vector<char> edited(count, 0);
+        for (const auto& [position, payload] : edits) {
+            if (position >= count) throw std::out_of_range("shard index position outside grid");
+            edited[position] = 1;
+            replacement[position] = payload;
+        }
+        bool existed = false, stores = false;
         std::size_t remaining = 0;
-        if (!previous.index.empty()) {
-            for (std::size_t i = 0; i < layout.indexBytes / 16; ++i) {
-                const bool present = layout.entry(previous.index, i, previous.total).has_value();
-                if (i == target) existed = present;
-                else remaining += present;
+        for (std::size_t i = 0; i < count; ++i) {
+            const bool present = !previous.index.empty() && layout.entry(previous.index, i, previous.total).has_value();
+            if (edited[i]) {
+                existed |= present;
+                stores |= replacement[i] != nullptr;
+                remaining += replacement[i] != nullptr;
+            } else {
+                remaining += present;
             }
         }
-        if (!replacement && !existed) return false;
-        if (!replacement && !remaining) {
+        if (!stores && !existed) return false;
+        if (!remaining) {
             fs::remove(file);
             return true;
         }
@@ -289,10 +307,10 @@ struct Writer::Impl {
             std::vector<std::uint8_t> index(layout.indexBytes, 255), buffer;
             if (!layout.indexEnd)
                 out.write(reinterpret_cast<const char*>(index.data()), std::streamsize(index.size()));
-            for (std::size_t i = 0; i < layout.indexBytes / 16; ++i) {
-                const std::vector<std::uint8_t>* payload = replacement;
-                if (i == target) {
-                    if (!replacement) continue;
+            for (std::size_t i = 0; i < count; ++i) {
+                const std::vector<std::uint8_t>* payload = replacement[i];
+                if (edited[i]) {
+                    if (!payload) continue;
                 } else {
                     if (!previous.readEntry(i, buffer)) continue;
                     payload = &buffer;
@@ -310,6 +328,14 @@ struct Writer::Impl {
             out.write(reinterpret_cast<const char*>(index.data()), std::streamsize(index.size()));
         });
         return existed;
+    }
+
+    bool isFill(const std::uint8_t* data, std::size_t size) const
+    {
+        bool allFill = size % meta.fill.size() == 0;
+        for (std::size_t i = 0; allFill && i < size; i += meta.fill.size())
+            allFill = std::memcmp(data + i, meta.fill.data(), meta.fill.size()) == 0;
+        return allFill;
     }
 };
 
@@ -586,7 +612,8 @@ void Writer::writeChunk(const Index& chunk, const std::uint8_t* data, std::size_
     const auto key = impl_->chunkKey(chunk);
     const auto bytes = encode(impl_->codec, impl_->encode, data, size, meta.itemsize(), meta.chunks);
     if (impl_->shards) {
-        impl_->updateShard(key, impl_->shards->locate(chunk).second, &bytes);
+        const Impl::ShardEdit edit{impl_->shards->locate(chunk).second, &bytes};
+        impl_->updateShard(key, {&edit, 1});
         return;
     }
     impl_->store->write(key, std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
@@ -596,11 +623,7 @@ bool Writer::writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, s
 {
     if (size != impl_->meta.chunkBytes())
         throw std::invalid_argument("wrong chunk data size");
-    const auto& fill = impl_->meta.fill;
-    bool allFill = size % fill.size() == 0;
-    for (std::size_t i = 0; allFill && i < size; i += fill.size())
-        allFill = std::memcmp(data + i, fill.data(), fill.size()) == 0;
-    if (allFill) {
+    if (impl_->isFill(data, size)) {
         if (impl_->shards)
             removeChunk(chunk);
         else
@@ -614,8 +637,10 @@ bool Writer::writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, s
 bool Writer::removeChunk(const Index& chunk)
 {
     const auto key = impl_->chunkKey(chunk);
-    if (impl_->shards)
-        return impl_->updateShard(key, impl_->shards->locate(chunk).second, nullptr);
+    if (impl_->shards) {
+        const Impl::ShardEdit edit{impl_->shards->locate(chunk).second, nullptr};
+        return impl_->updateShard(key, {&edit, 1});
+    }
     return impl_->store->remove(key);
 }
 
@@ -639,6 +664,8 @@ void Writer::writeRegion(const Index& start, const Index& shape, const std::uint
         c1[i] = (start[i] + shape[i] - 1) / meta.chunks[i];
     }
     std::vector<std::uint8_t> buffer(meta.chunkBytes());
+    // A shard is rewritten once for all of the region's chunks in it, not once per chunk.
+    std::map<std::string, std::vector<std::pair<std::size_t, std::optional<std::vector<std::uint8_t>>>>> shardEdits;
     Index idx = c0;
     do {
         Index base(nd), lo(nd), extent(nd);
@@ -666,11 +693,23 @@ void Writer::writeRegion(const Index& start, const Index& shape, const std::uint
         }
         copy_box(data + offset_of(src, regionStrides), regionStrides, buffer.data() + offset_of(dst, chunkStrides),
                  chunkStrides, extent, itemsize);
-        if (skipEmpty)
+        if (impl_->shards) {
+            auto& edits = shardEdits[impl_->chunkKey(idx)];
+            edits.emplace_back(impl_->shards->locate(idx).second, std::nullopt);
+            if (!skipEmpty || !impl_->isFill(buffer.data(), buffer.size()))
+                edits.back().second = encode(impl_->codec, impl_->encode, buffer.data(), buffer.size(), itemsize, meta.chunks);
+        } else if (skipEmpty) {
             writeChunkSkipEmpty(idx, buffer.data(), buffer.size());
-        else
+        } else {
             writeChunk(idx, buffer.data(), buffer.size());
+        }
     } while (nextIndex(idx, c0, c1));
+    for (const auto& [key, chunks] : shardEdits) {
+        std::vector<Impl::ShardEdit> edits;
+        for (const auto& [position, payload] : chunks)
+            edits.emplace_back(position, payload ? &*payload : nullptr);
+        impl_->updateShard(key, edits);
+    }
 }
 
 bool removeNode(const fs::path& path, const Access& access)

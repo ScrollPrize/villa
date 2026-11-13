@@ -120,9 +120,9 @@ using RowList = nb::ndarray<const std::int32_t, nb::ndim<1>, nb::c_contig, nb::d
 // and mean flat, and comparisons of blocks placed by the caller.
 struct PySession {
     std::unique_ptr<Session> s;
-    PySession(const std::vector<std::string>& scans, int threads) {
+    PySession(const std::vector<std::string>& scans, int threads, int reduce) {
         nb::gil_scoped_release nogil;
-        s = std::make_unique<Session>(scans, threads);
+        s = std::make_unique<Session>(scans, threads, reduce);
     }
     const Stretch& stretch(int scan, int index) const { return s->record(scan).stretches.at(static_cast<std::size_t>(index)); }
 
@@ -418,7 +418,9 @@ void bind_calibration(nb::module_& m) {
     nb::class_<PySession>(m, "CalibrationSession",
                           "The scans of one acquisition kept open (axis inside the field first): what the record states per frame, the raw frames as stored, "
                           "each scan's dark and mean flat, and registrations of blocks placed by the caller. Nothing of the reconstruction's calibration is used.")
-        .def(nb::init<const std::vector<std::string>&, int>(), "scans"_a, "threads"_a = 0)
+        .def(nb::init<const std::vector<std::string>&, int, int>(), "scans"_a, "threads"_a = 0, "reduce"_a = 0,
+             "reduce = 1, 2, 3: the same acquisition on a detector with pixels 2^reduce times as large, the frames read at a half, a quarter, an eighth from their "
+             "JPEG 2000 codestreams: rows, columns, the dark and gain, the pixel size and every measurement are then in reduced pixels (stored position / 2^reduce).")
         .def("info", &PySession::info, "scan"_a)
         .def("stretches", &PySession::stretches, "scan"_a)
         .def("series", &PySession::series, "scan"_a, "stretch"_a, "name"_a,

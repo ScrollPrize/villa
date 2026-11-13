@@ -1611,8 +1611,9 @@ NB_MODULE(_core, m) {
         "tile_reconstructor",
         [](const std::string& master, const std::string& description, const std::string& tile, const std::string& device, const std::string& params,
            std::optional<double> row_origin, nb::object weight, double cache_gb, nb::object reduced, const std::string& cache_dir, int reduce,
-           std::optional<std::function<void(const std::string&)>> log) {
+           std::optional<std::function<void(const std::string&)>> log, const std::string& projections) {
             TileOptions o;
+            o.projections = projections;
             o.device = parse_device(device);
             o.params = params;
             o.row_origin = row_origin;
@@ -1682,7 +1683,7 @@ NB_MODULE(_core, m) {
             return nb::make_tuple(PySliceReconstructor(t.reconstructor), info);
         },
         "master"_a, "description"_a, "tile"_a, "device"_a = "cuda", "params"_a = "{}", "row_origin"_a = nb::none(), "weight"_a = nb::none(), "cache_gb"_a = 0.0,
-        "reduced"_a = nb::none(), "cache_dir"_a = "", "reduce"_a = 0, "log"_a = nb::none(),
+        "reduced"_a = nb::none(), "cache_dir"_a = "", "reduce"_a = 0, "log"_a = nb::none(), "projections"_a = "",
         "A reconstructor of one tile of a mosaic alone -> (SliceReconstructor, dict(rot_center, frames, scan, terms, row_origin, reduced, reduce, params)) "
         "(helirec::tile_reconstructor)");
     m.def(

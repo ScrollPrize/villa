@@ -76,10 +76,6 @@ void bind_geometry(nb::module_& m) {
               return nb::make_tuple(u, w);
           },
           "i"_a, "j"_a, "eu"_a, "ev"_a, "c0"_a, "cs"_a, "v0"_a, "vs"_a, "c"_a, "v"_a);
-    m.def("geometry_with_line",
-          [](const std::vector<int>& i, const std::vector<int>& j, const std::vector<double>& eu, const std::vector<double>& ev, double c0, double cs, double v0, double vs,
-             double a, double b, double about) { return map_dict(hg::with_line(map_of(i, j, eu, ev, c0, cs, v0, vs), a, b, about)); },
-          "i"_a, "j"_a, "eu"_a, "ev"_a, "c0"_a, "cs"_a, "v0"_a, "vs"_a, "a"_a, "b"_a, "about"_a);
     m.def("geometry_overlap_centre", &hg::overlap_centre, "cols"_a, "move"_a);
     m.def("geometry_reconstruction_terms",
           [](DoubleIn row, DoubleIn row_per_col, DoubleIn axis, DoubleIn col_per_row, DoubleIn col_scale, DoubleIn row_scale, DoubleIn angle_deg, double scale_col,

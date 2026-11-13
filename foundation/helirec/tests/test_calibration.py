@@ -82,10 +82,11 @@ def _write_frames(path, data, chunk_rows=None):
                 d.write_direct_chunk((k, r0, 0), _core.jpeg2000_chunk(tile))
 
 
-def _write_record(tmp_path, rng, name="sample_XX", place=None, compressed=(), frames=None):
+def _write_record(tmp_path, rng, name="sample_XX", place=None, compressed=(), frames=None, chunk_rows=10):
     """one scan: darks, flats, a turn at rest, a helix of two turns, a turn at rest, flats.
     place: (sx, sy) [mm], the sample's place on the rotation stage (a tile of a mosaic); compressed: the entries
-    whose frames are stored as JPEG 2000; frames: {entry: (n, ROWS, COLS) uint16} to use instead of noise."""
+    whose frames are stored as JPEG 2000, in chunks of chunk_rows rows; frames: {entry: (n, ROWS, COLS) uint16} to
+    use instead of noise."""
     master = tmp_path / (name + "_0001.h5")
     stretches = [  # entry, title, image_key (None: absent), type, frames, level
         ("2.1", "dark images", 2, "tomo:dark", 4, 290),
@@ -132,7 +133,7 @@ def _write_record(tmp_path, rng, name="sample_XX", place=None, compressed=(), fr
             data = _frames(rng, n, level) if frames is None or entry not in frames else frames[entry]
             scan_dir = tmp_path / f"scan{k + 2:04d}"
             scan_dir.mkdir()
-            _write_frames(scan_dir / "det3_0000.h5", data, 10 if entry in compressed else None)
+            _write_frames(scan_dir / "det3_0000.h5", data, chunk_rows if entry in compressed else None)
             e = f.create_group(entry)
             e["title"] = title
             e["start_time"] = "2025-01-01T00:00:00"
@@ -317,6 +318,63 @@ def test_registrar_matches_register_blocks():
     assert r2["shift"][0] == 0 and np.allclose(r2["shift"][1:], d[1:], atol=0.02), r2
     with pytest.raises(Exception):
         kept.run(a, a)
+
+
+def _blocks_of_deep_content(rng, depth_lo, depth_hi, later, moved, n=(32, 128, 128), margin=(8, 16, 16), sigma=2.0):
+    """Two blocks as a detector records points of a sample that turns at 10 000 frames per turn and climbs 0.23 rows
+    a frame (Paris4), each frame exposed over 0.88 of its period: blobs of `sigma` px spread over the depths
+    depth_lo .. depth_hi [px] along the beam from the rotation axis. A blob at the depth t crosses t x 6.28e-4
+    columns per frame. Block b (with its margins) is a's content `later` frames later, moved (rows, columns)."""
+    step, travel, exposed, steps = 2 * np.pi / 10000, 0.2303, 0.884, 6
+    reach = step * (n[0] + 2 * margin[0]) * max(abs(depth_lo), abs(depth_hi)) + 5 * sigma
+    width, height = n[2] + 2 * margin[2] + 2 * reach, n[1] + 2 * margin[1] + 2 * (travel * (n[0] + 2 * margin[0]) + 5 * sigma)
+    count = int(width * height / 12)
+    u, t, z = rng.uniform(-width / 2, width / 2, count), rng.uniform(depth_lo, depth_hi, count), rng.uniform(-height / 2, height / 2, count)
+    amp = rng.uniform(0.5, 1.5, count)
+
+    def render(frames, rows, cols, later):
+        out = np.empty((len(frames), len(rows), len(cols)), np.float32)
+        for i, q in enumerate(frames):
+            r = z + travel * (q + later)
+            mid = u * np.cos(step * (q + later)) + t * np.sin(step * (q + later))
+            near = (np.abs(mid - cols.mean()) < np.ptp(cols) / 2 + 5 * sigma + np.abs(t) * step) & (np.abs(r - rows.mean()) < np.ptp(rows) / 2 + 5 * sigma)   # the blobs this frame holds
+            C = np.zeros((int(near.sum()), len(cols)))
+            for part in (np.arange(steps) + 0.5) / steps - 0.5:               # the exposure, in equal parts
+                th = step * (q + later + exposed * part)
+                c = u[near] * np.cos(th) + t[near] * np.sin(th)
+                C += np.exp(-0.5 * ((cols[None, :] - c[:, None]) / sigma) ** 2) / steps
+            out[i] = (np.exp(-0.5 * ((rows[None, :] - r[near, None]) / sigma) ** 2) * amp[near, None]).T @ C
+        return out
+
+    centred = lambda k, m=0: np.arange(-m, n[k] + m) - n[k] / 2.0
+    a = render(centred(0), centred(1), centred(2), 0.0)
+    b = render(centred(0, margin[0]), centred(1, margin[1]) - moved[0], centred(2, margin[2]) - moved[1], later)
+    noise = 0.05 * a.std()
+    return a + rng.normal(0, noise, a.shape).astype(np.float32), b + rng.normal(0, noise, b.shape).astype(np.float32)
+
+
+def test_a_fraction_of_a_frame_on_deep_content():
+    """Whether the registration measures a fraction of a frame where the sample is deep (a mosaic: material
+    16 000 px from the axis crosses 10 columns per frame, more than the band samples along the frames). It does
+    while the content lies within a few thousand pixels of the axis; spread over the whole depth the frames come
+    back pulled towards zero by a tenth, and about an axis off the middle of the sample (an outer tile) that
+    error of the frames is also one of the columns. Rows are not touched."""
+    registrar = _core.CalibrationRegistrar([32, 128, 128], [8, 16, 16])
+    later, moved = 0.3, (0.4, -0.3)            # b is a's content 0.3 frames later: a(q) is at b(q - 0.3)
+
+    def measured(lo, hi, seed):
+        a, b = _blocks_of_deep_content(np.random.default_rng(seed), lo, hi, later, moved)
+        r = registrar.run(np.ascontiguousarray(a), np.ascontiguousarray(b))
+        assert r["converged"] and r["whole"] == (0, 0, 0), r
+        return r["shift"]
+
+    near = measured(-2000, 2000, 51)
+    assert near == pytest.approx([-later, *moved], abs=0.005), near
+    deep = measured(-16000, 16000, 52)
+    assert -0.295 < deep[0] < -0.24 and deep[1] == pytest.approx(moved[0], abs=0.02) and deep[2] == pytest.approx(moved[1], abs=0.03), deep
+    off_axis = measured(-9000, 23000, 53)      # the mean depth is 7000 px: 4.4 columns per frame
+    assert -0.295 < off_axis[0] < -0.22 and off_axis[1] == pytest.approx(moved[0], abs=0.03), off_axis
+    assert 0.04 < off_axis[2] - moved[1] < 0.16, off_axis                          # (a frame is 4.4 columns there)
 
 
 def test_session_reads_and_measures(tmp_path, monkeypatch):
@@ -525,6 +583,55 @@ def test_frames_at_reduced_resolution(tmp_path):
     _write_frames(tmp_path / "small.h5", small, chunk_rows=32)
     with pytest.raises(Exception, match="levels"):
         _core.RawReader([str(tmp_path / "small.h5")], dataset, 64, 96, reduce=1).read_frames(zero[:1], zero[:1])
+
+
+def test_session_at_reduced_resolution(tmp_path, monkeypatch):
+    """CalibrationSession(reduce=1): the acquisition as a detector with pixels twice as large would have recorded it.
+    Frames, dark and gain at half the size, the pixel size doubled, and a registration in reduced pixels: content
+    displaced by x stored columns is found x / 2 reduced columns further on."""
+    if not _core.jpeg2000_frames_supported():
+        pytest.skip("built without OpenJPEG")
+    import sys
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "ROWS", 128)
+    monkeypatch.setattr(module, "COLS", 256)
+    monkeypatch.setattr(module, "PER_TURN", 40)
+    rng = np.random.default_rng(43)
+    n, moved_by = 40, (2.6, -1.4)                              # stored rows and columns
+    k = np.meshgrid(np.fft.fftfreq(n), np.fft.fftfreq(ROWS), np.fft.fftfreq(COLS), indexing="ij")
+    spectrum = np.fft.fftn(rng.standard_normal((n, ROWS, COLS))) * np.exp(-((k[0] / 0.12) ** 2 + (k[1] / 0.04) ** 2 + (k[2] / 0.04) ** 2))
+    field = np.fft.ifftn(spectrum).real
+    field *= 0.2 / field.std()
+    moved = np.fft.ifftn(spectrum * np.exp(-2j * np.pi * (k[1] * moved_by[0] + k[2] * moved_by[1]))).real * 0.2 / np.fft.ifftn(spectrum).real.std()
+    counts = lambda f: np.round(300 + 15000 * np.exp(-f)).astype(np.uint16)
+    a_dir, b_dir = tmp_path / "A", tmp_path / "B"
+    a_dir.mkdir(), b_dir.mkdir()
+    ma = _write_record(a_dir, np.random.default_rng(1), name="sample_A", frames={"4.1": counts(field)}, compressed=("4.1",), chunk_rows=64)
+    mb = _write_record(b_dir, np.random.default_rng(1), name="sample_B", frames={"4.1": counts(moved)}, compressed=("4.1",), chunk_rows=64)
+    full, half = _core.CalibrationSession([str(ma), str(mb)]), _core.CalibrationSession([str(ma), str(mb)], reduce=1)
+    assert (half.info(0)["rows"], half.info(0)["cols"], half.info(0)["pixel_um"]) == (ROWS // 2, COLS // 2, 16.0) and full.info(0)["pixel_um"] == 8.0
+    # a reduced value sits at the stored pixel of twice its index: smooth frames, dark and gain are the stored ones there
+    frames = np.array([3, 17], dtype=np.int64)
+    assert np.abs(half.read_rows(0, 2, frames, 0, ROWS // 2).astype(float) - full.read_rows(0, 2, frames, 0, ROWS)[:, ::2, ::2]).max() < 0.03 * 15000
+    assert half.dark(0).shape == half.gain(0).shape == (ROWS // 2, COLS // 2)
+    assert np.abs(half.dark(0) - full.dark(0)[::2, ::2])[4:-4, 4:-4].max() < 30 and np.abs(half.gain(0) / full.gain(0)[::2, ::2] - 1)[4:-4, 4:-4].max() < 0.01
+    # the same piece of the detector, registered in each session's own pixels
+    base = dict(scan_a=0, scan_b=1, stretch_a=2, stretch_b=2, frame_a=12, frames=16)
+    whole = full.measure([dict(base, rows=32, cols=64, row_a=48, col_a=96, col_b=96)], -1.0, "cpu")[0]
+    reduced = half.measure([dict(base, rows=32, cols=64, row_a=16, col_a=32, col_b=32)], -1.0, "cpu")[0]
+    assert whole["ok"] and whole["D"] == pytest.approx(moved_by[0], abs=0.02) and whole["du"] == pytest.approx(moved_by[1], abs=0.02), whole
+    assert reduced["ok"] and reduced["correlation"] > 0.98, reduced
+    assert reduced["D"] == pytest.approx(moved_by[0] / 2, abs=0.02) and reduced["du"] == pytest.approx(moved_by[1] / 2, abs=0.02), reduced
+    assert (reduced["rows"], reduced["cols"], reduced["col_a"]) == (32, 64, 32)
+    assert np.array_equal(full.series(0, 3, "height_mm"), half.series(0, 3, "height_mm"))       # what the record states in millimetres stays
+    # plain frames hold no lower resolution
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    mp = _write_record(plain, np.random.default_rng(1), name="sample_P", frames={"4.1": counts(field)})
+    with pytest.raises(Exception, match="JPEG 2000|compressed|reduce"):
+        _core.CalibrationSession([str(mp)], reduce=1).dark(0)
+    with pytest.raises(Exception, match="reduce is 0, 1, 2 or 3"):
+        _core.CalibrationSession([str(ma)], reduce=4)
 
 
 def test_images_at_reduced_resolution():

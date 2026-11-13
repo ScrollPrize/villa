@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "helirec/projection_store.hpp"
 #include "io/j2k_chunk.hpp"
 
 namespace helirec {
@@ -32,7 +33,9 @@ struct RawReader::FileInfo {
     int chunks_per_frame = 0;
     std::vector<std::int64_t> chunk_offset;  // (frame, chunk)
     std::vector<std::uint32_t> chunk_bytes;
-    std::size_t frames() const { return chunk_rows ? chunk_offset.size() / static_cast<std::size_t>(chunks_per_frame) : frame_offset.size(); }
+    // A scan group of a projection store (helirec/projection_store.hpp): chunks of chunk_rows rows of its level
+    ProjectionStoreLevel store;
+    std::size_t frames() const { return store.impl ? static_cast<std::size_t>(store.frames) : chunk_rows ? chunk_offset.size() / static_cast<std::size_t>(chunks_per_frame) : frame_offset.size(); }
 };
 
 struct RawReader::Sync {
@@ -182,6 +185,19 @@ const RawReader::FileInfo& RawReader::info(int file) {
     if (file < 0 || static_cast<std::size_t>(file) >= files_.size()) throw Error("RawReader: bad file index");
     if (infos_[file]) return *infos_[file];
     const std::string& path = files_[file];
+    if (is_projection_store_scan(path)) {
+        auto fi = std::make_unique<FileInfo>();
+        fi->store = open_projection_store(path, reduce_);
+        const ProjectionStoreLevel& s = fi->store;
+        if (s.dtype != dtype_) throw Error("RawReader: " + path + ": values are not " + dtype_);
+        if (s.stored_rows != stored_rows_ || s.stored_cols != stored_cols_ || s.rows != rows_ || s.cols != cols_)
+            throw Error("RawReader: " + path + ": unexpected frame shape");
+        fi->chunk_rows = s.chunk_rows;
+        fi->stored_chunk_rows = s.source_chunk_rows;
+        fi->chunks_per_frame = (rows_ + s.chunk_rows - 1) / s.chunk_rows;
+        infos_[file] = std::move(fi);
+        return *infos_[file];
+    }
     H5Handle f(H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
     if (f.id < 0) throw Error("RawReader: cannot open " + path);
     H5Handle d(H5Dopen2(f.id, dataset_.c_str(), H5P_DEFAULT), H5Dclose);
@@ -325,6 +341,12 @@ struct OpenFile {
 
 void RawReader::decode_chunk(int fd, int file, const FileInfo& fi, std::size_t at,
                              std::vector<std::uint8_t>& raw, void* tile) {
+    if (fi.store.impl) {
+        fi.store.read_chunk(static_cast<std::int64_t>(at / fi.chunks_per_frame), static_cast<int>(at % fi.chunks_per_frame), tile);
+        sync_->bytes_read.fetch_add(static_cast<std::size_t>(fi.chunk_rows) * cols_ * sample_bytes_, std::memory_order_relaxed);  // decoded bytes
+        return;
+    }
+    (void)fd;
     const auto bytes = fi.chunk_bytes[at];
     const auto nbytes = static_cast<std::size_t>(fi.stored_chunk_rows) * stored_cols_ * sample_bytes_;
     const j2k::ReadAt read = [&](void* dst, std::size_t n, std::size_t offset) {
@@ -425,6 +447,17 @@ void RawReader::prefetch_rows(const int32_t* file_index, const int32_t* frame_in
 }
 
 RawReader::Storage RawReader::storage(int file) {
+    if (file >= 0 && static_cast<std::size_t>(file) < files_.size() && is_projection_store_scan(files_[file])) {
+        // of the group as a whole: no level is opened, so a reader at a level the store does not hold can ask too
+        const ProjectionStoreLevel s = open_projection_store(files_[file], -1);
+        Storage st;
+        st.codec = "projection store (Zarr)";
+        st.chunk_rows = s.source_chunk_rows;
+        st.reversible = false;
+        st.frames = s.frames;
+        st.bytes_per_frame = static_cast<double>(rows_) * cols_ * sample_bytes_;
+        return st;
+    }
     const FileInfo& fi = info(file);
     Storage st;
     st.frames = static_cast<std::int64_t>(fi.frames());

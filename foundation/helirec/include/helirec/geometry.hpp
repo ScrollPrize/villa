@@ -4,7 +4,9 @@
 //
 // Two kinds of description are read, both JSON as the calibration steps save them:
 //
-//   Calibration   a two-scan helical acquisition (helirec-geometry's geometry.json, with its motion stage)
+//   Calibration   a two-scan helical acquisition: helirec-calibration geometry's file ("model": "joint";
+//                 geometry_calibration.hpp states the model), of which the two scans of a pair are read here; and
+//                 still a file of the earlier two-scan step (with its motion stage), which nothing writes any more
 //   TileGeometry  the tiles of a mosaic (python/helirec/mosaic.py states its form; nothing makes one at present)
 //
 // Nothing here reads frames: the record's angle and height of every frame are given by the caller.
@@ -33,11 +35,10 @@ struct Map {
 // other linear ones are a scale, a shear and a rotation of the grid, which cannot be told from the poses.
 std::vector<std::array<int, 2>> map_terms(int order);
 Map empty_map(int rows, int cols, int order = 3);
+// the value of each of the map's terms at the detector position (c, v): phi[k] = ((c - c0) / cs)^i_k ((v - v0) / vs)^j_k
+void map_basis(const Map& m, double c, double v, double* phi);
 // (Eu, Ev) at n detector positions (c, v)
 void map_displacement(const Map& m, const double* c, const double* v, std::size_t n, double* eu, double* ev);
-// The map with a line in the column added for one scan: its blocks are read a (c - about) columns and
-// b (c - about) rows further on.
-Map with_line(const Map& m, double a, double b, double about);
 
 // Where every frame of one scan holds the sample, one value per frame. The ray at u columns from the rotation
 // axis (towards higher columns) in the slice at height h (rows) is recorded by frame k at the position (X, Y) of
@@ -97,6 +98,8 @@ class Calibration {
     double rolling_shutter() const;
     // The middle of the columns both scans hold, in the first scan's columns.
     double overlap_centre() const;
+    // The first scan's helix among its projection frames (all its projection stretches one after the other): [first, end).
+    std::array<std::size_t, 2> helix_frames() const;
 
     // angles_deg[s], heights_rows[s]: the record's angle (unwrapped) and height (rows: row_sign x height / pixel)
     // of every frame of scan s, the stretches one after the other (rest1, helix, rest2).
@@ -106,6 +109,15 @@ class Calibration {
     // each stretch with the rotating body's place against it, the height once per turn. The second scan is the
     // first one's model at the same frame plus what the comparison of the two scans at equal frames measured.
     // not_applied: receives, as JSON, the terms the step measured and this does not use.
+    //
+    // A joint calibration's poses are its model's, frame by frame (th and H the record's angle and height):
+    //     row         height + the stretch's height + (1 + axial_scale) H + the stage's lift once per turn - roll d . n(th),
+    //                 counted from the first scan's row at its helix' first frame (the slices are numbered from there)
+    //     axis        axis + axis_slope (H - H_mid) + the stage's axis column twice per turn + d . n(th)
+    //     the slopes  col_per_row = roll, row_per_col = -roll
+    //     the rows' timing: angle_deg_per_row the angle's step x the frames per row, and row_scale minus the
+    //                 travel per frame x the frames per row about the middle row (the sample travels while the
+    //                 rows are read)
     std::array<Poses, 2> frame_poses(const std::array<std::vector<double>, 2>& angles_deg,
                                      const std::array<std::vector<double>, 2>& heights_rows,
                                      std::string* not_applied = nullptr) const;

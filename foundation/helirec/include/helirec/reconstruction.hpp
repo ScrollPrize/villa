@@ -25,6 +25,10 @@
 //   exposure_arc         0 (default) | "auto" (the scan's recorded fraction) | a fraction; disabled with
 //                        angle_interp=views
 //   angle_subset         "" | "I/N": subset I of N interleaved subsets of the projections
+//   only_scan            "" (default: both scans, merged) | "main" | "companion": that scan's projections alone, at
+//                        the poses the geometry calibration gives them, on a slice grid centred on the rotation
+//                        axis as that scan's columns hold it (2 x axis + 1 across unless grid_size says otherwise).
+//                        Two scans reconstructed apart show where a calibration puts them against each other.
 //   sld                  "" | a scintillator light diffusion model (sld_params)
 //   and the reconstructor's own (ReconConfig): margin, n_grid, angular_tolerance_steps, luminosity_repartition,
 //   mend_threshold, log_clip_min, log_clip_max, block_angles, grid_size (0: 2 x axis rounded to even, + 1),
@@ -187,6 +191,11 @@ struct TileOptions {
     // 1, 2 or 3: at a half, a quarter, an eighth, from the codestream's own lower resolutions (RawReader(reduce=)),
     // the darks and flats through the same low-pass (at_resolution) and the whole geometry divided by 2^reduce
     int reduce = 0;
+    // The tile's group of a projection store (STORE.zarr/<tile>, helirec/projection_store.hpp): the helix frames
+    // are read from its level `reduce` instead of the detector's files, which then need not be on disk. The values
+    // are the OpenJPH decoder's, which differ from this reader's default decoder by at most one count. Darks and
+    // flats are still read from the detector's files.
+    std::string projections;
     std::function<void(const std::string&)> log;
     ExternalBackprojectorFactory external_backprojector;
 };

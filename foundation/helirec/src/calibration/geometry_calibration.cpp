@@ -1,5 +1,5 @@
-// helirec/calibration/geometry_calibration.hpp: the layout of the two scans, the plan of comparisons, a pass of
-// them, the fit of the detector's map and the poses, and the step that runs them (calibrate_geometry).
+// helirec/calibration/geometry_calibration.hpp: the layout of the scans, the plan of their comparisons, their
+// measurement, and the step that runs them with the solve (calibrate_geometry; the solve is geometry_fit.cpp).
 #include "helirec/calibration/geometry_calibration.hpp"
 
 #include <unistd.h>
@@ -21,13 +21,6 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 
 void say(const Log& log, const std::string& line) {
     if (log) log(line);
-}
-
-DetectorMap session_map(const geometry::Map& m) {
-    DetectorMap d;
-    d.i = m.i, d.j = m.j, d.eu = m.eu, d.ev = m.ev;
-    d.c0 = m.c0, d.cs = m.cs, d.v0 = m.v0, d.vs = m.vs;
-    return d;
 }
 
 // -ln((raw - dark) / mean flat) of rows [row0, row0 + nrows) of one frame, the whole width: (nrows, cols)
@@ -89,26 +82,6 @@ std::vector<std::int64_t> whole(const std::vector<double>& v) {
 
 Json num(double v) { return Json::of(v); }
 Json count(long long v) { return Json::whole_number(v); }
-// how a solve ended, as the passes record it
-Json solver_json(const Fit& f) {
-    Json d = Json::dict();
-    d.set("cost", num(f.solver.cost)).set("iterations", count(f.solver.iterations)).set("evaluations", count(f.solver.evaluations)).set("usable", Json::of_bool(f.solver.usable));
-    d.set("termination", Json::of(f.solver.termination)).set("message", Json::of(f.solver.message)).set("solver_version", Json::of(f.solver.solver_version));
-    d.set("rank", count(f.rank)).set("active", count(f.active)).set("unused", count(f.unused));
-    return d;
-}
-// a straight line through points, or an error if there is none
-Line line_through(const std::vector<double>& x, const std::vector<double>& y) {
-    const Line l = fit_line(x, y, 0, x.size());
-    if (!l.usable) throw Error(l.termination + ": " + l.message);
-    return l;
-}
-Json numbers(const std::vector<double>& v) {
-    Json j = Json::list();
-    for (double x : v) j.add(num(x));
-    return j;
-}
-
 }  // namespace
 
 bool Blocked::holds(double frame, int row_lo, int row_hi) const {
@@ -121,11 +94,6 @@ bool Blocked::holds(double frame, int row_lo, int row_hi) const {
     for (int r = lo; r < hi; ++r)
         if (mask[k * static_cast<std::size_t>(rows) + static_cast<std::size_t>(r)]) return true;
     return false;
-}
-
-bool Layout::is_blocked(int scan, int name, double frame, int row_lo, int row_hi) const {
-    const auto it = blocked.find({scan, name});
-    return it != blocked.end() && it->second.holds(frame, row_lo, row_hi);
 }
 
 namespace {
@@ -203,214 +171,7 @@ RowSense row_sense(Session& session, const std::vector<ViewRequest>& reqs, Devic
 
 }  // namespace
 
-// ---------------------------------------------------------------- the layout
-
-Layout read_layout(Session& session, Device device, const Log& log) {
-    Layout lay;
-    lay.rows = session.frames(0).rows(), lay.cols = session.frames(0).cols();
-    lay.pixel_um = pixel_um(session.record(0));
-    const int rows = lay.rows, cols = lay.cols;
-    // {rest1, helix, rest2} from the record's own order of its projection stretches
-    for (int k = 0; k < 2; ++k) {
-        const Record& rec = session.record(k);
-        int rest = 0;
-        bool helix = false;
-        std::string found;
-        for (std::size_t i = 0; i < rec.stretches.size(); ++i) {
-            const Stretch& st = rec.stretches[i];
-            if (st.role != Role::Projection || !st.latched()) continue;
-            int a = -1;
-            if (!st.z_center.empty()) {
-                a = Helix, helix = true;
-                found += " helix";
-            } else {
-                ++rest;
-                if (rest <= 2) a = rest == 1 ? Rest1 : Rest2;
-                found += " rest" + std::to_string(rest);
-            }
-            if (a >= 0) lay.stretch[k][a] = static_cast<int>(i), lay.length[k][a] = st.n_frames;
-        }
-        if (rest != 2 || !helix)
-            throw Error("the geometry step needs a rest turn, a helix and a rest turn; the record of scan " + std::to_string(k) + " holds" + (found.empty() ? " none" : found));
-    }
-    {
-        const std::vector<double> angle = stated_angle(session.record(0).stretches[static_cast<std::size_t>(lay.stretch[0][Helix])]);
-        if (angle.size() < 2) throw Error("geometry calibration: the helix holds fewer than two frames");
-        std::vector<double> d(angle.size() - 1);
-        for (std::size_t i = 0; i + 1 < angle.size(); ++i) d[i] = angle[i + 1] - angle[i];
-        lay.per_turn = static_cast<int>(std::nearbyint(360.0 / std::fabs(median_of(d))));
-    }
-    lay.width = static_cast<int>(std::pow(2.0, std::floor(std::log2(0.45 * cols))));
-    // rows that hold something across the whole width
-    for (int k = 0; k < 2; ++k)
-        for (int a = 0; a < 3; ++a) {
-            Blocked b = blocked_rows(session, k, lay.stretch[k][a], 0, lay.length[k][a], lay.per_turn, fmt("scan %d %s", k, kNames[a]), log);
-            if (!b.frames.empty()) lay.blocked[{k, a}] = std::move(b);
-        }
-    // the axis column and the lateral move, coarsely: profiles of single frames in rows free of that
-    std::vector<std::uint8_t> free_row(static_cast<std::size_t>(rows), 1);
-    for (int k = 0; k < 2; ++k) {
-        const auto it = lay.blocked.find({k, Rest1});
-        if (it == lay.blocked.end()) continue;
-        for (std::size_t i = 0; i < it->second.frames.size(); ++i)
-            for (int r = 0; r < rows; ++r)
-                if (it->second.mask[i * static_cast<std::size_t>(rows) + static_cast<std::size_t>(r)]) free_row[static_cast<std::size_t>(r)] = 0;
-    }
-    if (rows < 256) throw Error("geometry calibration: the detector has fewer than 256 rows");
-    int r0 = std::clamp(rows / 2 - 128, 0, rows - 256);
-    const auto all_free = [&](int from) {
-        for (int r = from; r < from + 256; ++r)
-            if (!free_row[static_cast<std::size_t>(r)]) return false;
-        return true;
-    };
-    if (!all_free(r0)) {
-        std::vector<int> runs;
-        for (int r = 0; r + 256 <= rows; ++r)
-            if (all_free(r)) runs.push_back(r);
-        if (runs.empty()) throw Error("geometry calibration: no 256 rows of the first rest turns are free of what lies across the whole width");
-        r0 = runs[runs.size() / 2];
-    }
-    const int N = lay.per_turn;
-    std::vector<double> cc_axis(2 * static_cast<std::size_t>(cols), 0.0), cc_move(2 * static_cast<std::size_t>(cols), 0.0);
-    for (const std::int64_t p : whole(linspace(N / 20, N / 2 - N / 20, 4))) {
-        const std::vector<double> a = profile(session, 0, lay.stretch[0][Rest1], p, r0, 256, cols);
-        std::vector<double> b = profile(session, 0, lay.stretch[0][Rest1], p + N / 2, r0, 256, cols);
-        const std::vector<double> t = profile(session, 1, lay.stretch[1][Rest1], p, r0, 256, cols);
-        std::reverse(b.begin(), b.end());
-        add_lag(a, b, cc_axis);
-        add_lag(a, t, cc_move);
-    }
-    lay.axis = (cols - 1 - (static_cast<double>(argmax(cc_axis)) - cols)) / 2.0;
-    lay.move = static_cast<int>(argmax(cc_move)) - cols;
-    // which way the rows run against the axis stage: the sense in which the helix a turn apart registers
-    std::vector<ViewRequest> reqs;
-    for (const std::int64_t p : whole(linspace(N, static_cast<double>(lay.length[0][Helix] - 2 * N - 64), 3))) {
-        ViewRequest q;
-        q.scan_a = q.scan_b = 0;
-        q.stretch_a = q.stretch_b = lay.stretch[0][Helix];
-        q.frame_a = p, q.frame_hint = N;
-        q.frames = 32, q.rows = 128, q.cols = lay.width, q.row_a = -1;
-        q.col_a = q.col_b = (cols - lay.width) / 2;
-        reqs.push_back(q);
-    }
-    const RowSense sense = row_sense(session, reqs, device);
-    if (sense.score < 0.3)
-        throw Error("the helix a turn apart does not register in either sense of the rows: the travel per turn must be less than the detector's height");
-    lay.row_sign = sense.sign;
-    say(log, fmt("  %d x %d px, %d frames per turn; mirror column about %.1f; second scan %+d columns; row sense %+.0f; windows of %d columns", rows, cols, lay.per_turn,
-                 lay.axis, lay.move, lay.row_sign, lay.width));
-    return lay;
-}
-
-// ---------------------------------------------------------------- the comparisons
-
-std::vector<Planned> plan(const Layout& lay, int n_opp, int n_rest, int n_turn, int n_pair) {
-    const int R = lay.rows, C = lay.cols, N = lay.per_turn, W = lay.width;
-    const int nrows = std::min(256, R / 4);
-    const std::vector<std::int64_t> bands = whole(linspace(24, R - nrows - 24, 5));
-    const int axis2 = static_cast<int>(std::nearbyint(2 * lay.axis));
-    std::vector<Planned> out;
-    const auto add = [&](const char* kind, int sa, int a, int sb, int b, std::int64_t frame, std::int64_t hint, std::int64_t col_a, std::int64_t col_b, int rows_,
-                         std::int64_t row_a, bool mirror = false) {
-        Planned p;
-        p.kind = kind, p.scan_a = sa, p.scan_b = sb, p.a = a, p.b = b;
-        ViewRequest& q = p.request;
-        q.label = kind;
-        q.scan_a = sa, q.scan_b = sb, q.stretch_a = lay.stretch[sa][a], q.stretch_b = lay.stretch[sb][b];
-        q.frame_a = frame, q.frame_hint = hint;
-        q.angle_offset_deg = mirror ? 180.0 : 0.0, q.mirror = mirror;
-        q.frames = 32, q.rows = rows_, q.cols = W;
-        q.row_a = static_cast<int>(row_a), q.col_a = static_cast<int>(col_a), q.col_b = static_cast<int>(col_b);
-        out.push_back(p);
-    };
-    int lo = std::max(0, axis2 - (W - 1) - (C - W)), hi = std::min(C - W, axis2 - (W - 1));  // windows whose mirror image lies on the detector
-    if (hi - lo < 32) throw Error("the rotation axis is too close to the detector's edge for opposite views in the first scan");
-    for (const int a : {Rest1, Rest2})
-        for (const std::int64_t p : whole(linspace(16, N / 2 - 80, n_opp)))
-            for (const std::int64_t row_a : bands)
-                for (const std::int64_t ca : whole(linspace(lo + 16, hi - 16, 3))) add("opposite", 0, a, 0, a, p, N / 2, ca, axis2 - (W - 1) - ca, nrows, row_a, true);
-    const std::vector<std::int64_t> across = whole(linspace(13, C - W - 13, 3));
-    for (int scan = 0; scan < 2; ++scan) {
-        const std::vector<double>& hrows = lay.heights[scan][Helix];
-        for (const int a : {Rest1, Rest2}) {
-            const std::int64_t hint = a == Rest1 ? 0 : lay.length[scan][Helix] - lay.length[scan][a];
-            const std::vector<double>& rrows = lay.heights[scan][a];
-            for (const std::int64_t p : whole(linspace(16, static_cast<double>(lay.length[scan][a] - 50), n_rest))) {
-                const int Nr = static_cast<int>(std::nearbyint(hrows.at(static_cast<std::size_t>(p + 16 + hint)) - rrows.at(static_cast<std::size_t>(p + 16))));
-                if (std::abs(Nr) < 48 || std::abs(Nr) > R - 128 - 60) continue;  // too near (a pattern fixed to the detector would register) or off the detector
-                const int nr = std::abs(Nr) <= R - nrows - 84 ? nrows : 128;
-                const int m = 40;
-                const int a0 = std::max(0, m - Nr), a1 = std::min(R - nr, R - nr - m - Nr);
-                if (a1 < a0) continue;
-                std::vector<int> row_as;
-                if (a1 - a0 > 300) row_as = {a0, (a0 + a1) / 2, a1};
-                else if (a1 - a0 > 120) row_as = {a0, a1};
-                else row_as = {(a0 + a1) / 2};
-                for (const int row_a : row_as)
-                    for (const std::int64_t ca : across) add("resthelix", scan, a, scan, Helix, p, hint, ca, ca, nr, row_a);
-            }
-        }
-        for (const std::int64_t p : whole(linspace(16, static_cast<double>(lay.length[scan][Helix] - N - 100), n_turn)))
-            for (const std::int64_t ca : across) add("turn", scan, Helix, scan, Helix, p, N, ca, ca, 128, -1);
-    }
-    lo = std::max(0, -lay.move), hi = std::min(C - W, C - W - lay.move);  // windows both scans hold
-    if (hi - lo < 32) throw Error("the two scans do not overlap by a window's width");
-    for (int a = 0; a < 3; ++a)
-        for (const std::int64_t p : whole(linspace(16, static_cast<double>(std::min(lay.length[0][a], lay.length[1][a]) - 64), n_pair)))
-            for (const std::int64_t row_a : bands)
-                for (const std::int64_t ca : whole(linspace(lo + 13, hi - 13, 4))) add("pair", 0, a, 1, a, p, 0, ca, ca + lay.move, nrows, row_a);
-    return out;
-}
-
-std::vector<Row> measure(Session& session, const Layout& lay, const geometry::Map& m, const double lines[3][2], Device device, int patch) {
-    const std::vector<Planned> all = plan(lay);
-    // the comparisons within a scan on the map alone; one scan against the other per stretch, the second scan
-    // with its line of that stretch added
-    std::vector<std::pair<int, std::vector<Planned>>> groups;  // (-1 or the stretch, its comparisons), in the plan's order
-    for (const Planned& p : all) {
-        const int key = p.kind == "pair" ? p.a : -1;
-        auto it = std::find_if(groups.begin(), groups.end(), [&](const auto& g) { return g.first == key; });
-        if (it == groups.end()) groups.emplace_back(key, std::vector<Planned>()), it = groups.end() - 1;
-        it->second.push_back(p);
-    }
-    std::vector<Row> out;
-    for (auto& [key, items] : groups) {
-        session.set_detector_map(session_map(m));
-        if (key >= 0) session.set_detector_map(session_map(geometry::with_line(m, lines[key][0], lines[key][1], overlap_centre(lay) + lay.move)), 1);
-        if (patch)  // the blocks in the order of their frames: neighbours read the same part of the files
-            std::stable_sort(items.begin(), items.end(), [](const Planned& x, const Planned& y) {
-                if (x.scan_a != y.scan_a) return x.scan_a < y.scan_a;
-                const std::string nx = kNames[x.a], ny = kNames[y.a];
-                if (nx != ny) return nx < ny;
-                return x.request.frame_a < y.request.frame_a;
-            });
-        for (std::size_t i0 = 0; i0 < items.size(); i0 += 400) {
-            const std::size_t i1 = std::min(items.size(), i0 + 400);
-            std::vector<ViewRequest> reqs;
-            for (std::size_t i = i0; i < i1; ++i) reqs.push_back(items[i].request);
-            std::vector<std::pair<const Planned*, ViewMeasurement>> results;
-            if (patch) {
-                for (const PatchMeasurement& r : session.measure_patches(reqs, patch, patch, lay.row_sign, device))
-                    if (r.i >= 0) results.emplace_back(&items[i0 + static_cast<std::size_t>(r.request)], r.m);
-            } else {
-                const std::vector<ViewMeasurement> got = session.measure(reqs, lay.row_sign, device);
-                for (std::size_t i = 0; i < got.size(); ++i) results.emplace_back(&items[i0 + i], got[i]);
-            }
-            for (const auto& [p, r] : results) {
-                if (!(r.planned && r.ok && r.correlation > 0.3)) continue;
-                if (lay.is_blocked(p->scan_a, p->a, static_cast<double>(r.frame_a), r.row_a - 8, r.row_a + r.rows + 8)) continue;
-                if (lay.is_blocked(p->scan_b, p->b, static_cast<double>(r.frame_b), r.row_a + r.row_offset - 8, r.row_a + r.row_offset + r.rows + 8)) continue;
-                Row row;
-                row.kind = p->kind, row.scan_a = p->scan_a, row.scan_b = p->scan_b, row.a = p->a, row.b = p->b;
-                row.m = r;
-                out.push_back(row);
-            }
-        }
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------- any number of scans: the layout, the plan, a pass
+// ---------------------------------------------------------------- the layout, the plan, the measurement
 
 namespace {
 
@@ -485,7 +246,46 @@ ViewRequest opposite_request(const StretchLayout& st, int scan, std::int64_t fra
     return q;
 }
 
+// How many columns higher scan k holds what scan j holds at equal frames, coarsely: the column profiles of four
+// frames of a stretch both have (a rest turn if there is one), correlated over all lags that leave 256 columns in
+// common. score: their mean correlation at the lag found (0: no stretch of the same name with frames in common).
+struct CoarseMove {
+    int move = 0;
+    double score = 0;
+};
+CoarseMove coarse_move(Session& session, const Acquisition& acq, int j, int k) {
+    const ScanLayout& A = acq.scans[static_cast<std::size_t>(j)];
+    const ScanLayout& B = acq.scans[static_cast<std::size_t>(k)];
+    const int rows = acq.rows, cols = acq.cols, band = 256;
+    const StretchLayout* sa = nullptr;
+    const StretchLayout* sb = nullptr;
+    for (const bool helix : {false, true})
+        for (const StretchLayout& a : A.stretches)
+            for (const StretchLayout& b : B.stretches)
+                if (!sa && a.helix == helix && a.name == b.name && std::min(a.end, b.end) - std::max(a.first, b.first) > 64) sa = &a, sb = &b;
+    if (!sa) return {};
+    const std::int64_t first = std::max(sa->first, sb->first), end = std::min(sa->end, sb->end);
+    std::vector<double> cc(2 * static_cast<std::size_t>(cols), 0.0);
+    int pairs = 0;
+    for (const std::int64_t p : whole(linspace(static_cast<double>(first + (end - first) / 10), static_cast<double>(first + (end - first) / 2), 4))) {
+        // the rows nearest the middle that hold nothing across the whole width in either scan
+        int r0 = -1;
+        for (int r = 0; r + band <= rows; r += 16)
+            if (!sa->blocked.holds(static_cast<double>(p), r, r + band) && !sb->blocked.holds(static_cast<double>(p), r, r + band) &&
+                (r0 < 0 || std::abs(r - (rows - band) / 2) < std::abs(r0 - (rows - band) / 2)))
+                r0 = r;
+        if (r0 < 0) continue;
+        add_lag(profile(session, j, sa->index, p, r0, band, cols), profile(session, k, sb->index, p, r0, band, cols), cc, 256);
+        ++pairs;
+    }
+    if (!pairs) return {};
+    const std::size_t at = argmax(cc);
+    return {static_cast<int>(at) - cols, cc[at] / pairs};
+}
+
 }  // namespace
+
+bool axis_in_field(const ScanLayout& scan, int cols) { return !std::isnan(scan.axis) && window_width(scan.axis, cols) > 0; }
 
 Acquisition read_acquisition(Session& session, Device device, const Log& log) {
     Acquisition acq;
@@ -502,10 +302,15 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
         sc.name = rec.label.empty() ? "scan" + std::to_string(k) : rec.label;
         int rest = 0, helices = 0;
         std::string found, absent;
+        std::int64_t before = 0;  // projection frames of the stretches before this one
         for (std::size_t i = 0; i < rec.stretches.size(); ++i) {
             const Stretch& st = rec.stretches[i];
-            if (st.role != Role::Projection || !st.latched()) continue;
+            if (st.role != Role::Projection) continue;
+            const std::int64_t offset = before;
+            before += st.n_frames;
+            if (!st.latched()) continue;
             StretchLayout sl;
+            sl.offset = offset;
             sl.helix = !st.z_center.empty();
             sl.name = sl.helix ? "helix" : "rest" + std::to_string(++rest);
             sl.index = static_cast<int>(i);
@@ -542,6 +347,13 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
     }
     const int N = acq.per_turn;
     acq.fan = acq.pixel_um * 1e-3 / session.record(0).technique.number("scan/source_sample_distance") / (std::fabs(step_deg) * (kPi / 180.0));
+    {
+        const StretchLayout* st = &acq.scans[0].stretches.front();
+        for (const StretchLayout& t : acq.scans[0].stretches)
+            if (t.helix) st = &t;
+        const std::vector<double>& period = session.record(0).stretches[static_cast<std::size_t>(st->index)].timer_period;
+        if (!period.empty()) acq.period_s = median_of(period);
+    }
     // rows that hold something across the whole width
     for (int k = 0; k < S; ++k)
         for (StretchLayout& st : acq.scans[static_cast<std::size_t>(k)].stretches)
@@ -609,9 +421,71 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
     if (!senses) throw Error("geometry calibration: no scan has a helix whose views register with each other: the sense of the rows is not known");
     if (std::fabs(sense_sum) != senses) throw Error("geometry calibration: the scans disagree about the sense of the rows against the axis stage: " + said);
     acq.row_sign = sense_sum > 0 ? 1.0 : -1.0;
+    // what the motors say of each scan's place, and the anchor
+    const double px_mm = acq.pixel_um * 1e-3;
+    for (int k = 0; k < S; ++k) {
+        const Record& rec = session.record(k);
+        ScanLayout& sc = acq.scans[static_cast<std::size_t>(k)];
+        const auto& at_start = rec.stretches[static_cast<std::size_t>(sc.stretches.front().index)].positioners_start;
+        const auto place = [&](const std::string& motor) {
+            const auto it = at_start.find(motor);
+            return motor.empty() || it == at_start.end() ? std::nan("") : it->second / px_mm;
+        };
+        sc.on_stage[0] = place(tomo_motor(rec, "sample_u")), sc.on_stage[1] = place(tomo_motor(rec, "sample_v"));
+        sc.across_beam = place(rec.translation_y[1]);
+    }
+    // (a record that does not name the stages on the rotation says nothing against the same place)
+    const auto apart = [&](int j, int k) {
+        const ScanLayout& a = acq.scans[static_cast<std::size_t>(j)];
+        const ScanLayout& b = acq.scans[static_cast<std::size_t>(k)];
+        const double d = std::hypot(a.on_stage[0] - b.on_stage[0], a.on_stage[1] - b.on_stage[1]);
+        return std::isnan(d) ? 0.0 : d;
+    };
+    {
+        bool mosaic = false;
+        double middle[2] = {0, 0};
+        int known = 0;
+        for (int k = 0; k < S; ++k) {
+            mosaic = mosaic || apart(0, k) > 1.0;
+            const ScanLayout& sc = acq.scans[static_cast<std::size_t>(k)];
+            if (!std::isnan(sc.on_stage[0]) && !std::isnan(sc.on_stage[1])) middle[0] += sc.on_stage[0], middle[1] += sc.on_stage[1], ++known;
+        }
+        acq.anchor = -1;
+        double nearest = 0;
+        for (int k = 0; k < S; ++k) {
+            const ScanLayout& sc = acq.scans[static_cast<std::size_t>(k)];
+            if (!axis_in_field(sc, cols)) continue;
+            const double away = mosaic && known ? std::hypot(sc.on_stage[0] - middle[0] / known, sc.on_stage[1] - middle[1] / known) : 0.0;
+            if (acq.anchor < 0 || away < nearest) acq.anchor = k, nearest = away;  // of scans at one place: the first
+        }
+        if (acq.anchor < 0) throw Error("geometry calibration: no scan has its rotation axis inside the detector's field");
+        for (int k = 0; k < S; ++k) acq.scans[static_cast<std::size_t>(k)].moved_on_stage = apart(acq.anchor, k) > 1.0;
+    }
+    // a scan whose axis is not in its field: from where its content lies against a scan at the same place
+    for (int k = 0; k < S; ++k) {
+        ScanLayout& sc = acq.scans[static_cast<std::size_t>(k)];
+        if (!std::isnan(sc.axis)) continue;
+        int ref = -1;
+        for (int j = 0; j < S && ref < 0; ++j)
+            if (j != k && axis_in_field(acq.scans[static_cast<std::size_t>(j)], cols) && apart(j, k) <= 1.0) ref = j;
+        if (ref < 0) {
+            say(log, fmt("  scan %d (%s): no scan with its axis in the field shares its place on the rotation stage: its axis column is not known", k, sc.name.c_str()));
+            continue;
+        }
+        const ScanLayout& other = acq.scans[static_cast<std::size_t>(ref)];
+        const CoarseMove found = coarse_move(session, acq, ref, k);
+        const double motors = sc.across_beam - other.across_beam;
+        if (found.score < 0.2) {
+            say(log, fmt("  scan %d (%s): its content was not found in scan %d (profiles at equal frames correlate %.2f): its axis column is not known", k, sc.name.c_str(), ref, found.score));
+            continue;
+        }
+        sc.axis = other.axis + found.move;
+        say(log, fmt("  scan %d (%s): its content lies %+d columns from scan %d's (profiles at equal frames correlate %.2f; the stage across the beam moved %+.1f px by its motor): axis column about %.1f",
+                     k, sc.name.c_str(), found.move, ref, found.score, motors, sc.axis));
+    }
     acq.width = 512;
     for (ScanLayout& sc : acq.scans) {
-        if (!std::isnan(sc.axis)) acq.width = std::min(acq.width, window_width(sc.axis, cols));
+        if (axis_in_field(sc, cols)) acq.width = std::min(acq.width, window_width(sc.axis, cols));
         const StretchLayout* ref = &sc.stretches.front();
         for (StretchLayout& st : sc.stretches) {
             for (double& v : st.course.rows) v *= acq.row_sign;
@@ -619,7 +493,8 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
         }
         sc.mid_height = ref->course.rows[static_cast<std::size_t>((ref->first + ref->end) / 2)];
     }
-    say(log, fmt("  %d x %d px, %d frames per turn; row sense %+.0f: %s; windows of %d columns", rows, cols, N, acq.row_sign, said.c_str(), acq.width));
+    say(log, fmt("  %d x %d px, %d frames per turn; row sense %+.0f: %s; windows of %d columns; anchor: scan %d (%s)", rows, cols, N, acq.row_sign, said.c_str(), acq.width, acq.anchor,
+                 acq.scans[static_cast<std::size_t>(acq.anchor)].name.c_str()));
     return acq;
 }
 
@@ -630,14 +505,17 @@ std::string acquisition_json(const Acquisition& acq) {
         for (const StretchLayout& st : sc.stretches) {
             Json d = Json::dict();
             d.set("name", Json::of(st.name)).set("index", count(st.index)).set("helix", Json::of_bool(st.helix)).set("frames", count(static_cast<long long>(st.course.rows.size())));
-            d.set("first", count(st.first)).set("end", count(st.end)).set("blocked_frames", count(static_cast<long long>(st.blocked.frames.size())));
+            d.set("first", count(st.first)).set("end", count(st.end)).set("offset", count(st.offset)).set("blocked_frames", count(static_cast<long long>(st.blocked.frames.size())));
             stretches.add(d);
         }
-        scans.add(Json::dict().set("name", Json::of(sc.name)).set("mid_height", num(sc.mid_height)).set("coarse_axis", num(sc.axis)).set("stretches", stretches));
+        Json d = Json::dict();
+        d.set("name", Json::of(sc.name)).set("mid_height", num(sc.mid_height)).set("coarse_axis", num(sc.axis)).set("axis_in_field", Json::of_bool(axis_in_field(sc, acq.cols)));
+        d.set("on_stage_px", Json::list().add(num(sc.on_stage[0])).add(num(sc.on_stage[1]))).set("across_beam_px", num(sc.across_beam)).set("moved_on_stage", Json::of_bool(sc.moved_on_stage));
+        scans.add(d.set("stretches", stretches));
     }
     Json out = Json::dict();
     out.set("rows", count(acq.rows)).set("cols", count(acq.cols)).set("frames_per_turn", count(acq.per_turn)).set("pixel_um", num(acq.pixel_um)).set("row_sign", num(acq.row_sign));
-    out.set("row_time", num(acq.row_time)).set("fan", num(acq.fan)).set("window_columns", count(acq.width)).set("scans", scans);
+    out.set("row_time", num(acq.row_time)).set("frame_period_s", num(acq.period_s)).set("fan", num(acq.fan)).set("window_columns", count(acq.width)).set("anchor", count(acq.anchor)).set("scans", scans);
     return out.text();
 }
 
@@ -646,12 +524,35 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
     const int nrows = std::min(256, R / 4);
     if (n.angles_per_turn < 1 || n.max_positions < 2) throw Error("geometry calibration: a plan needs an angle per turn and two positions");
     std::vector<Planned> out;
-    const auto add = [&](const char* kind, int scan, int a, int b, const ViewRequest& q, bool from_block = false) {
+    const auto add_between = [&](const char* kind, int scan_a, int a, int scan_b, int b, const ViewRequest& q, bool from_block) {
         Planned p;
-        p.kind = kind, p.scan_a = p.scan_b = scan, p.a = a, p.b = b, p.from_block = from_block;
+        p.kind = kind, p.scan_a = scan_a, p.scan_b = scan_b, p.a = a, p.b = b, p.from_block = from_block;
         p.request = q;
         p.request.label = kind;
         out.push_back(p);
+    };
+    const auto add = [&](const char* kind, int scan, int a, int b, const ViewRequest& q, bool from_block = false) { add_between(kind, scan, a, scan, b, q, from_block); };
+    // Frames from p_lo to p_hi at the angles a turn / angles_per_turn apart. Where that is more than `most`, the
+    // positions are spread evenly over the span and each moved to the nearest frame at its angle: the angles in
+    // turn, so that they stay evenly spread around the turn.
+    const auto around_the_turn = [&](std::int64_t p_lo, std::int64_t p_hi, int most) {
+        const double base = static_cast<double>(N) / n.angles_per_turn, span = static_cast<double>(p_hi - p_lo);
+        std::vector<std::int64_t> positions;
+        if (std::floor(span / base) + 1 <= most) {
+            for (double at = 0; at <= span; at += base) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
+            return positions;
+        }
+        const int count = std::max(n.angles_per_turn, most - most % n.angles_per_turn);
+        for (int j = 0; j < count; ++j) {
+            const double phase = (j % n.angles_per_turn) * base;
+            double at = N * std::round((j * span / (count - 1) - phase) / N) + phase;
+            if (at < 0) at += N;
+            if (at > span) at -= N;
+            if (at >= 0 && at <= span) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
+        }
+        std::sort(positions.begin(), positions.end());
+        positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+        return positions;
     };
     // First rows of A's block for which it and B's, Nr rows higher and with its margins, lie on the detector: as
     // many bands as fit side by side, up to five.
@@ -678,33 +579,14 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
         for (int a = 0; a < static_cast<int>(sc.stretches.size()); ++a)
             if (sc.stretches[static_cast<std::size_t>(a)].helix) helix = a;
         // opposite views
-        if (!std::isnan(sc.axis)) {
+        if (axis_in_field(sc, C)) {
             const std::vector<std::int64_t> windows = mirrored_windows(sc.axis, C, W);
             if (windows.empty()) throw Error("the rotation axis of scan " + sc.name + " is too close to the detector's edge for opposite views");
             for (int a = 0; a < static_cast<int>(sc.stretches.size()); ++a) {
                 const StretchLayout& st = sc.stretches[static_cast<std::size_t>(a)];
                 const std::int64_t p_lo = st.first + 16, p_hi = st.end - N / 2 - 80;
                 if (p_hi < p_lo) continue;
-                // The angles a turn / angles_per_turn apart. Along a helix too long for every such angle of every
-                // turn, the positions are spread evenly along it and each moved to the nearest frame at its angle:
-                // the angles in turn, so that they stay evenly spread around the turn.
-                const double base = static_cast<double>(N) / n.angles_per_turn, span = static_cast<double>(p_hi - p_lo);
-                std::vector<std::int64_t> positions;
-                if (std::floor(span / base) + 1 <= n.max_positions) {
-                    for (double at = 0; at <= span; at += base) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
-                } else {
-                    const int count = std::max(n.angles_per_turn, n.max_positions - n.max_positions % n.angles_per_turn);
-                    for (int j = 0; j < count; ++j) {
-                        const double phase = (j % n.angles_per_turn) * base;
-                        double at = N * std::round((j * span / (count - 1) - phase) / N) + phase;
-                        if (at < 0) at += N;
-                        if (at > span) at -= N;
-                        if (at >= 0 && at <= span) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
-                    }
-                    std::sort(positions.begin(), positions.end());
-                    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
-                }
-                for (const std::int64_t p : positions) {
+                for (const std::int64_t p : around_the_turn(p_lo, p_hi, n.max_positions)) {
                     const int Nr = static_cast<int>(std::lround(st.course.rows[static_cast<std::size_t>(p + 16 + N / 2)] - st.course.rows[static_cast<std::size_t>(p + 16)]));
                     for (const std::int64_t row_a : bands(Nr, nrows))
                         for (const std::int64_t ca : windows) add("opposite", k, a, a, opposite_request(st, k, p, N, sc.axis, W, ca, nrows, static_cast<int>(row_a), acq.fan), st.helix);
@@ -738,6 +620,42 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
             }
         }
     }
+    // one scan against another with the same place on the rotation stage: the stretches of the same name at equal
+    // angle, across the columns both hold
+    for (int j = 0; j < static_cast<int>(acq.scans.size()); ++j)
+        for (int k = j + 1; k < static_cast<int>(acq.scans.size()); ++k) {
+            const ScanLayout& A = acq.scans[static_cast<std::size_t>(j)];
+            const ScanLayout& B = acq.scans[static_cast<std::size_t>(k)];
+            if (std::isnan(A.axis) || std::isnan(B.axis) || A.moved_on_stage || B.moved_on_stage) continue;
+            const int move = static_cast<int>(std::lround(B.axis - A.axis));  // B holds A's content this many columns higher
+            const int lo = std::max(0, -move) + 13, hi = std::min(C - W, C - W - move) - 13;
+            if (hi < lo) continue;
+            const std::vector<std::int64_t> windows = whole(linspace(lo, hi, std::clamp((hi - lo + 2 * W - 1) / W, 1, 6)));
+            for (int a = 0; a < static_cast<int>(A.stretches.size()); ++a)
+                for (int b = 0; b < static_cast<int>(B.stretches.size()); ++b) {
+                    const StretchLayout& sa = A.stretches[static_cast<std::size_t>(a)];
+                    const StretchLayout& sb = B.stretches[static_cast<std::size_t>(b)];
+                    if (sa.name != sb.name) continue;
+                    const std::int64_t p_lo = std::max(sa.first, sb.first) + 16, p_hi = std::min(sa.end, sb.end) - 80;
+                    if (p_hi < p_lo) continue;
+                    const std::vector<std::int64_t> positions =
+                        sa.helix ? around_the_turn(p_lo, p_hi, n.pair_positions) : whole(linspace(static_cast<double>(p_lo), static_cast<double>(p_hi), n.n_pair_rest));
+                    for (const std::int64_t p : positions) {
+                        const int Nr = static_cast<int>(std::lround(sb.course.rows[static_cast<std::size_t>(p + 16)] - sa.course.rows[static_cast<std::size_t>(p + 16)]));
+                        if (std::abs(move) < 48 && std::abs(Nr) < 48) continue;  // a pattern fixed to the detector would register
+                        for (const std::int64_t row_a : bands(Nr, nrows))
+                            for (const std::int64_t ca : windows) {
+                                ViewRequest q;
+                                q.scan_a = j, q.scan_b = k;
+                                q.stretch_a = sa.index, q.stretch_b = sb.index;
+                                q.frame_a = p, q.frame_hint = 0;
+                                q.frames = 32, q.rows = nrows, q.cols = W;
+                                q.row_a = static_cast<int>(row_a), q.col_a = static_cast<int>(ca), q.col_b = static_cast<int>(ca) + move;
+                                add_between("pair", j, a, k, b, q, true);
+                            }
+                    }
+                }
+        }
     return out;
 }
 
@@ -791,140 +709,6 @@ std::vector<Comparison> measure(Session& session, const Acquisition& acq, const 
     return out;
 }
 
-// ---------------------------------------------------------------- the fit
-
-std::vector<double> least_squares(const std::vector<double>& X, std::size_t n, std::size_t k, const std::vector<double>& y, const std::vector<int>& columns,
-                                  const std::vector<std::uint8_t>& rows) {
-    std::vector<double> b(k, 0.0);
-    std::vector<int> cols = columns;
-    if (cols.empty() && columns.empty())
-        for (std::size_t c = 0; c < k; ++c) cols.push_back(static_cast<int>(c));
-    if (cols.empty() || !n) return b;
-    LinearProblem p;
-    p.unknowns = cols.size();
-    std::int64_t eq = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        if (!rows.empty() && !rows[i]) continue;
-        for (std::size_t c = 0; c < cols.size(); ++c) {
-            const double v = X[i * k + static_cast<std::size_t>(cols[c])];
-            if (v == 0) continue;
-            p.row.push_back(eq), p.col.push_back(static_cast<std::int64_t>(c)), p.value.push_back(v);
-        }
-        p.y.push_back(y[i]);
-        ++eq;
-    }
-    if (p.y.empty()) throw Error("INSUFFICIENT_SUPPORT: no observations for regression");
-    const LinearSolution s = solve_linear(p);
-    if (!s.usable) throw Error(s.termination + ": " + s.message);
-    for (std::size_t c = 0; c < cols.size(); ++c) b[static_cast<std::size_t>(cols[c])] = s.x[c];
-    return b;
-}
-
-Fit fit(const std::vector<Row>& rows, const Layout& lay, const geometry::Map& m, double tau, double period, double huber, int max_iterations) {
-    const std::size_t nt = m.i.size(), n = rows.size();
-    // the stretches with pairs, in the order of their names; the frame positions
-    std::vector<int> pair_st;
-    for (const int a : {Helix, Rest1, Rest2})  // "helix" < "rest1" < "rest2"
-        if (std::any_of(rows.begin(), rows.end(), [&](const Row& r) { return r.kind == "pair" && r.a == a; })) pair_st.push_back(a);
-    const std::size_t K = pair_st.size();
-    const double cref = overlap_centre(lay), vmid = m.v0;
-    std::map<GroupKey, std::size_t> gi;
-    for (const Row& r : rows) gi[GroupKey{r.kind, r.scan_a, r.a, r.m.frame_a}] = 0;
-    {
-        std::size_t k = 0;
-        for (auto& g : gi) g.second = k++;
-    }
-    const std::size_t G = gi.size();
-    // the unknowns: eu, ev (the map's terms), psi, rho, the lines a and b of all but the last stretch, u0, v0
-    const std::size_t o_eu = 0, o_ev = nt, o_psi = 2 * nt, o_rho = o_psi + 1, o_a = o_rho + K, o_b = o_a + (K ? K - 1 : 0), o_u0 = o_b + (K ? K - 1 : 0), o_v0 = o_u0 + G;
-    LinearProblem p;
-    p.unknowns = o_v0 + G;
-    p.y.assign(2 * n, 0.0);
-    const auto put = [&](std::size_t eq, std::size_t unknown, double v) {
-        if (v == 0) return;
-        p.row.push_back(static_cast<std::int64_t>(eq)), p.col.push_back(static_cast<std::int64_t>(unknown)), p.value.push_back(v);
-    };
-    const auto phi = [&](double c, double v, std::size_t k) { return std::pow((c - m.c0) / m.cs, m.i[k]) * std::pow((v - m.v0) / m.vs, m.j[k]); };
-    for (std::size_t i = 0; i < n; ++i) {
-        const Row& r = rows[i];
-        const ViewMeasurement& q = r.m;
-        const bool mirror = r.kind == "opposite", pair = r.kind == "pair";
-        const double cA = q.col_a + (q.cols - 1) / 2.0, cB = q.col_b + (q.cols - 1) / 2.0;
-        const double vA = q.row_a + (q.rows - 1) / 2.0, vB = vA + q.row_offset;
-        const double dq = q.dq - q.stated_dq;
-        p.y[i] = mirror ? static_cast<double>(q.col_a + q.col_b + q.cols - 1) - q.du : q.du;
-        p.y[n + i] = (q.D - q.stated_D) - q.slope_b * dq - tau / period * (q.slope_b * vB - q.slope_a * vA);
-        for (std::size_t k = 0; k < nt; ++k) {
-            const double fa = phi(cA, vA, k), fb = phi(cB, vB, k);
-            if (!(m.i[k] == 1 && m.j[k] == 0)) put(i, o_eu + k, mirror ? -(fb + fa) : -(fb - fa));  // Eu's line in the column is a scale: not observable
-            put(n + i, o_ev + k, -(fb - fa));
-        }
-        const std::size_t g = gi.at(GroupKey{r.kind, r.scan_a, r.a, q.frame_a});
-        put(i, o_u0 + g, 1.0);
-        put(n + i, o_v0 + g, 1.0);
-        if (mirror) {
-            put(i, o_psi, 2.0 * (vA - vmid));
-            put(n + i, o_psi, 2.0 * (cA - lay.axis));
-        }
-        if (pair) {
-            const std::size_t st = static_cast<std::size_t>(std::find(pair_st.begin(), pair_st.end(), r.a) - pair_st.begin());
-            put(i, o_rho + st, -(vA - vmid));
-            put(n + i, o_rho + st, cA - cref);
-            for (std::size_t s = 0; s + 1 < K; ++s) {  // the last stretch's line is minus the sum of the others
-                const double v = st == s ? cA - cref : (st == K - 1 ? -(cA - cref) : 0.0);
-                put(i, o_a + s, v);
-                put(n + i, o_b + s, v);
-            }
-        }
-    }
-    for (std::size_t k = 0; k < nt; ++k)  // the gauge, stated: Eu's line in the column stays zero
-        if (m.i[k] == 1 && m.j[k] == 0) p.fixed.push_back(static_cast<std::int64_t>(o_eu + k)), p.fixed_value.push_back(0.0);
-    SolveOptions opt;
-    opt.huber = huber, opt.max_iterations = max_iterations;
-    const LinearSolution sol = solve_linear(p, opt);
-    if (!sol.usable) throw Error(sol.termination + ": " + sol.message);
-    Fit f;
-    f.n = n;
-    f.solver = sol, f.rank = sol.rank, f.active = sol.active, f.unused = sol.unused;
-    f.eu.assign(sol.x.begin() + static_cast<std::ptrdiff_t>(o_eu), sol.x.begin() + static_cast<std::ptrdiff_t>(o_eu + nt));
-    f.ev.assign(sol.x.begin() + static_cast<std::ptrdiff_t>(o_ev), sol.x.begin() + static_cast<std::ptrdiff_t>(o_ev + nt));
-    f.psi = sol.x[o_psi];
-    for (std::size_t s = 0; s < K; ++s) f.rho[pair_st[s]] = sol.x[o_rho + s];
-    for (int key = 0; key < 2; ++key) {
-        const std::size_t o = key == 0 ? o_a : o_b;
-        double sum = 0;
-        for (std::size_t s = 0; s < K; ++s) {
-            const double v = s + 1 < K ? sol.x[o + s] : -sum;
-            sum += v;
-            f.lines[pair_st[s]][static_cast<std::size_t>(key)] = v;
-        }
-    }
-    for (const char* kind : kKinds) {
-        double su = 0, sv = 0;
-        std::size_t c = 0;
-        for (std::size_t i = 0; i < n; ++i)
-            if (rows[i].kind == kind) su += sol.residual[i] * sol.residual[i], sv += sol.residual[n + i] * sol.residual[n + i], ++c;
-        if (c) f.left[kind] = {c, std::sqrt(su / static_cast<double>(c)), std::sqrt(sv / static_cast<double>(c))};
-    }
-    for (const auto& [key, g] : gi) f.groups[key] = {sol.x[o_u0 + g], sol.x[o_v0 + g]};
-    return f;
-}
-
-std::array<double, 2> update_range(const geometry::Map& m, const std::vector<double>& eu, const std::vector<double>& ev) {
-    geometry::Map d = m;
-    d.eu = eu, d.ev = ev;
-    const std::vector<double> cs = linspace(0, 2 * m.c0 - 1, 40), vs = linspace(0, 2 * m.v0, 24);
-    std::vector<double> c, v;
-    for (const double y : vs)
-        for (const double x : cs) c.push_back(x), v.push_back(y);
-    std::vector<double> u(c.size()), w(c.size());
-    geometry::map_displacement(d, c.data(), v.data(), c.size(), u.data(), w.data());
-    const double mu = mean_of(u), mw = mean_of(w);
-    double du = 0, dv = 0;
-    for (std::size_t i = 0; i < u.size(); ++i) du = std::max(du, std::fabs(u[i] - mu)), dv = std::max(dv, std::fabs(w[i] - mw));
-    return {du, dv};
-}
-
 // ---------------------------------------------------------------- the step
 
 void save_text(const std::string& text, const std::string& path) {
@@ -939,160 +723,102 @@ void save_text(const std::string& text, const std::string& path) {
 }
 
 std::string calibrate_geometry(const std::vector<std::string>& scans, const Options& options) {
-    if (scans.size() != 2) throw Error("the geometry calibration takes two scans: the one with the rotation axis inside the detector's field first");
+    if (scans.empty()) throw Error("the geometry calibration takes the master files of the scans of one sample");
     const Log& log = options.log;
     const auto t_start = std::chrono::steady_clock::now();
+    const auto seconds_since = [](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); };
     Session session(scans, options.threads);
     say(log, "layout");
-    Layout lay = read_layout(session, options.device, log);
-    for (int k = 0; k < 2; ++k)
-        for (int a = 0; a < 3; ++a) {
-            const Record& rec = session.record(k);
-            std::vector<double> h = stated_height(rec, rec.stretches[static_cast<std::size_t>(lay.stretch[k][a])]);
-            for (double& v : h) v = lay.row_sign * v / (lay.pixel_um * 1e-3);
-            lay.heights[k][a] = std::move(h);
-        }
-    const double period = median_of(session.record(0).stretches[static_cast<std::size_t>(lay.stretch[0][Helix])].timer_period);
+    Acquisition acq = read_acquisition(session, options.device, log);
+    if (!(acq.period_s > 0)) throw Error("geometry calibration: the record does not hold the frames' period");
     double row_time = options.row_time;
     Json timing;
     if (std::isnan(row_time)) {
         say(log, "rows' timing");
-        timing = Json::parse(row_time_from_refill(session, lay, log));
+        timing = Json::parse(row_time_from_refill(session, acq, log));
         if (!timing.is(Json::Object))
-            throw Error("no stretch holds a refill to measure the rows' timing from: give the row time (seconds per stored row) for this camera configuration");
+            throw Error("no stretch on disk holds a refill to measure the rows' timing from: give the row time (seconds per stored row; 0 if it is not known) for this camera configuration");
         row_time = timing.find("seconds_per_row")->number;
     }
-    geometry::Map m = geometry::empty_map(lay.rows, lay.cols, options.order);
-    double lines[3][2] = {{0, 0}, {0, 0}, {0, 0}};
-    Json history = Json::list();
-    say(log, "map");
-    std::vector<Row> rows;
-    Fit f;
-    double du = 0, dv = 0, dl = 0;
-    bool ended = false;
-    for (int it = 0; it < options.passes; ++it) {
-        rows = measure(session, lay, m, lines, options.device, options.patch);
-        f = fit(rows, lay, m, row_time, period);
-        const std::array<double, 2> range = update_range(m, f.eu, f.ev);
-        du = range[0], dv = range[1];
-        dl = 0;
-        for (const auto& [a, l] : f.lines) dl = std::max({dl, std::fabs(l[0]), std::fabs(l[1])});
-        dl *= lay.cols / 2.0;
-        Json left = Json::dict();
-        std::string report;
-        for (const char* kind : kKinds) {
-            const auto found = f.left.find(kind);
-            if (found == f.left.end()) continue;
-            left.set(kind, Json::dict().set("n", count(static_cast<long long>(found->second.n))).set("px", num(found->second.px)).set("rows", num(found->second.rows)));
-            report += fmt("%s%s %.3f px / %.3f rows", report.empty() ? "" : ", ", kind, found->second.px, found->second.rows);
+    acq.row_time = row_time / acq.period_s;
+    say(log, "comparisons");
+    auto t = std::chrono::steady_clock::now();
+    const std::vector<Planned> planned = plan(acq);
+    const int patch = options.patch;
+    if (patch < 32) throw Error("geometry calibration: patches of at least 32 x 32");
+    measure_timing(true);
+    const std::vector<Comparison> comparisons = measure(session, acq, planned, options.device, patch);
+    const MeasureTiming spent = measure_timing();
+    std::map<std::string, long long> accepted;
+    for (const Comparison& c : comparisons) ++accepted[c.kind];
+    std::string said;
+    for (const auto& [kind, n] : accepted) said += fmt("%s%s %lld", said.empty() ? "" : ", ", kind.c_str(), n);
+    say(log, fmt("  %zu blocks planned, %zu patches of %d accepted (%s) in %.0f s (reading %.0f, converting %.0f, registering %.0f)", planned.size(), comparisons.size(), patch, said.c_str(),
+                 seconds_since(t), spent.read, spent.integrals, spent.registration));
+    say(log, "solve");
+    Parameters start = empty_parameters(acq);
+    for (std::size_t k = 0; k < acq.scans.size(); ++k)
+        if (!std::isnan(acq.scans[k].axis)) start.scans[k].axis = acq.scans[k].axis;
+    GeometryOptions how;
+    if (options.order > 0) {
+        start.map = geometry::empty_map(acq.rows, acq.cols, options.order);
+        how.freed.push_back("map");
+    }
+    const GeometrySolution solution = solve_geometry(acq, comparisons, start, how);
+    for (const GeometrySolution::Left& l : solution.left)
+        if (l.scan_a >= 0)
+            say(log, fmt("  %-9s scan %d%s: %5zu left %.3f frames, %.3f rows, %.3f px rms", l.kind.c_str(), l.scan_a, l.scan_b == l.scan_a ? "" : fmt(" against %d", l.scan_b).c_str(), l.n, l.rms[0], l.rms[1],
+                         l.rms[2]));
+    for (std::size_t k = 0; k < acq.scans.size(); ++k) {
+        const ScanParameters& p = solution.parameters.scans[k];
+        say(log, fmt("  scan %zu (%s): axis column %.3f, %+.2e per row of travel; axial scale %+.5f; height %+.3f rows", k, acq.scans[k].name.c_str(), p.axis, p.axis_slope, p.axial_scale, p.height));
+    }
+    if (!solution.unused.empty()) {
+        std::string names;
+        for (const std::string& n : solution.unused) names += (names.empty() ? "" : ", ") + n;
+        say(log, "  no comparison gives: " + names);
+    }
+    const GeometryReport told = report(acq, solution, comparisons);
+    say(log, "report");
+    const auto polar = [](const double* v) { return std::hypot(v[0], v[1]); };
+    for (std::size_t k = 0; k < acq.scans.size(); ++k) {
+        const ScanReport& r = told.scans[k];
+        const ScanParameters& p = solution.parameters.scans[k];
+        if (r.stretch >= 0) {
+            say(log, fmt("  scan %zu (%s): %zu opposite views of %s leave, once | twice per turn: rows %.3f | %.3f, columns %.3f | %.3f px, frames %.3f | %.3f about %+.3f", k, acq.scans[k].name.c_str(), r.n,
+                         acq.scans[k].stretches[static_cast<std::size_t>(r.stretch)].name.c_str(), polar(r.once[1]), polar(r.twice[1]), polar(r.once[2]), polar(r.twice[2]), polar(r.once[0]), polar(r.twice[0]),
+                         r.mean[0]));
+            if (std::isfinite(r.row_time))
+                say(log, fmt("    the views lie %.0f rows apart: by their frames a row is exposed %+.3f us after the one before (the model has %+.3f)", r.rows_apart, r.row_time * acq.period_s * 1e6, row_time * 1e6));
+            if (std::isfinite(r.height_slope))
+                say(log, fmt("    the recorded height leaves a straight line by %.3f rows rms (%.3f between the views); as the sample's motion it has the slope %.2f +- %.2f (1: it is; 0: the line is)", r.departure,
+                             r.departure_between_views, r.height_slope, r.height_slope_error));
         }
-        history.add(Json::dict().set("accepted", count(static_cast<long long>(f.n))).set("correction_px", num(du)).set("correction_rows", num(dv)).set("line_change_px", num(dl)).set("left", left).set("solver", solver_json(f)));
-        say(log, fmt("  pass %d: %zu comparisons; the map is corrected by up to %.3f px and %.3f rows, the second scan's lines by %.3f; left %s", it + 1, f.n, du, dv, dl,
-                     report.c_str()));
-        if (std::max({du, dv, dl}) < options.tolerance && it) {
-            ended = true;
-            break;
-        }
-        for (std::size_t k = 0; k < m.eu.size(); ++k) m.eu[k] += f.eu[k], m.ev[k] += f.ev[k];
-        for (int a = 0; a < 3; ++a) {
-            const auto found = f.lines.find(a);
-            if (found == f.lines.end()) throw Error("geometry calibration: no comparison of the two scans was accepted in " + std::string(kNames[a]));
-            lines[a][0] += found->second[0], lines[a][1] += found->second[1];
-        }
+        if (std::isfinite(r.from_anchor))
+            say(log, fmt("  scan %zu (%s): %.0f px from the anchor; its own views' height once per turn %.3f rows: the axis leans at least %.0f urad towards the beam (its direction less the scan's: %+.0f deg)", k,
+                         acq.scans[k].name.c_str(), r.from_anchor, polar(p.height_once), r.pitch * 1e6, r.pitch_phase_deg));
     }
-    if (!ended) say(log, fmt("  not converged to %g in %d passes", options.tolerance, options.passes));
-    // the poses of the last pass
-    const auto mean_or_null = [](const std::vector<double>& v) { return v.empty() ? Json() : num(mean_of(v)); };
-    Json rho = Json::dict();
-    for (const auto& [a, v] : f.rho) rho.set(kNames[a], num(v));  // (a map by stretch index: helix, rest1, rest2 by name below)
-    {
-        Json ordered = Json::dict();
-        for (const int a : {Helix, Rest1, Rest2})
-            if (const Json* v = rho.find(kNames[a])) ordered.set(kNames[a], *v);
-        rho = ordered;
-    }
-    Json mirror_column = Json::dict();
-    for (const int a : {Rest1, Rest2}) {
-        std::vector<double> u;
-        for (const auto& [key, uv] : f.groups)
-            if (key.kind == "opposite" && key.a == a) u.push_back(uv[0] / 2);
-        mirror_column.set(kNames[a], mean_or_null(u));
-    }
-    Json second = Json::dict();
-    for (int a = 0; a < 3; ++a) {
-        std::vector<double> u, v;
-        for (const auto& [key, uv] : f.groups)
-            if (key.kind == "pair" && key.a == a) u.push_back(uv[0]), v.push_back(uv[1]);
-        if (u.empty()) throw Error("geometry calibration: no comparison of the two scans was accepted in " + std::string(kNames[a]));
-        second.set(kNames[a], Json::dict().set("columns", num(lay.move + mean_of(u))).set("rows_beyond_record", num(mean_of(v))).set("line", numbers({lines[a][0], lines[a][1]})));
-    }
-    Json heights = Json::dict();
-    const auto stated_D_of = [&](const char* kind, int scan, int a, std::int64_t frame) {
-        for (const Row& r : rows)
-            if (r.kind == kind && r.scan_a == scan && (a < 0 || r.a == a) && r.m.frame_a == frame) return r.m.stated_D;
-        throw Error("geometry calibration: a frame position without its comparison");
-    };
-    for (int scan = 0; scan < 2; ++scan) {
-        for (const int a : {Rest1, Rest2}) {
-            std::vector<double> x, y;
-            for (const auto& [key, uv] : f.groups)
-                if (key.kind == "resthelix" && key.scan == scan && key.a == a) x.push_back(stated_D_of("resthelix", scan, a, key.frame)), y.push_back(uv[1]);
-            if (x.size() >= 4) {
-                const Line l = line_through(x, y);
-                heights.set(fmt("scan %d %s", scan, kNames[a]), Json::dict().set("offset_rows", num(l.intercept)).set("scale_error", num(l.slope)));
-            }
-        }
-        std::vector<double> ratio, sum;
-        for (const auto& [key, uv] : f.groups)
-            if (key.kind == "turn" && key.scan == scan) {
-                const double d = stated_D_of("turn", scan, -1, key.frame);
-                ratio.push_back(uv[1] / d), sum.push_back(uv[1] + d);
-            }
-        if (!ratio.empty()) heights.set(fmt("scan %d helix", scan), Json::dict().set("scale_error", num(mean_of(ratio))).set("rows_per_turn", num(mean_of(sum))));
-    }
-    Json poses = Json::dict();
-    poses.set("axis_roll_rad", num(f.psi)).set("rotation_about_beam_rad", rho).set("mirror_column", mirror_column).set("second_scan", second).set("heights", heights);
-    if (options.motion) {
-        say(log, "motion within a turn");
-        poses.set("motion", Json::parse(measure_motion(session, lay, m, lines, row_time, period, options.device, log)));
-    }
-    Json frames = Json::list(), blocked = Json::dict();
-    for (int k = 0; k < 2; ++k) {
-        Json l = Json::dict();
-        for (int a = 0; a < 3; ++a) l.set(kNames[a], count(lay.length[k][a]));
-        frames.add(l);
-    }
-    for (const auto& [key, b] : lay.blocked) {
-        Json fr = Json::list(), first = Json::list(), last = Json::list();
-        for (std::size_t i = 0; i < b.frames.size(); ++i) {
-            int lo = -1, hi = -1;
-            for (int r = 0; r < lay.rows; ++r)
-                if (b.mask[i * static_cast<std::size_t>(lay.rows) + static_cast<std::size_t>(r)]) {
-                    if (lo < 0) lo = r;
-                    hi = r;
-                }
-            if (lo < 0) continue;
-            fr.add(count(b.frames[i])), first.add(count(lo)), last.add(count(hi));
-        }
-        blocked.set(fmt("scan %d %s", key.first, kNames[key.second]), Json::dict().set("frames", fr).set("first_row", first).set("last_row", last));
-    }
-    Json layout = Json::dict();
-    layout.set("rows", count(lay.rows)).set("cols", count(lay.cols)).set("frames", frames).set("frames_per_turn", count(lay.per_turn)).set("pixel_um", num(lay.pixel_um));
-    layout.set("row_sign", num(lay.row_sign)).set("coarse_mirror_column", num(lay.axis)).set("coarse_move", count(lay.move)).set("window_columns", count(lay.width));
-    layout.set("blocked_rows", blocked);
-    Json map = Json::dict();
-    Json mi = Json::list(), mj = Json::list();
-    for (const int v : m.i) mi.add(count(v));
-    for (const int v : m.j) mj.add(count(v));
-    map.set("c0", num(m.c0)).set("cs", num(m.cs)).set("v0", num(m.v0)).set("vs", num(m.vs)).set("i", mi).set("j", mj).set("eu", numbers(m.eu)).set("ev", numbers(m.ev));
+    if (told.axis.n > 1)
+        say(log, fmt("  over the %d scans with opposite views: axis column %.3f px (%.3f rms), its slope %.2e per row (%.2e rms), axial scale %.0f ppm (%.0f rms, mean %.0f)", told.axis.n, told.axis.range, told.axis.sd,
+                     told.axis_slope.range, told.axis_slope.sd, told.axial_scale.range * 1e6, told.axial_scale.sd * 1e6, told.axial_scale.mean * 1e6));
+    if (acq.scans.size() > 1) say(log, fmt("  %zu pairs of scans reconstruct a part of the sample in common; %zu triangles of them", told.neighbours.edges.size(), told.neighbours.triangles.size()));
     Json names = Json::list();
     for (const std::string& s : scans) names.add(Json::of(s));
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    Json counts = Json::dict();
+    for (const auto& [kind, n] : accepted) counts.set(kind, count(n));
+    Json found = Json::parse(solution_json(acq, solution));
+    Json parameters = Json::dict(), solve = Json::dict(), map;
+    for (const auto& [key, value] : found.object) {
+        if (key == "map") map = value;
+        else if (key == "roll" || key == "stage" || key == "scans") parameters.set(key, value);
+        else solve.set(key, value);
+    }
     Json cal = Json::dict();
-    cal.set("step", Json::of(std::string("geometry"))).set("scans", names).set("seconds", num(std::nearbyint(seconds * 10) / 10)).set("layout", layout);
-    cal.set("row_time", Json::dict().set("seconds_per_row", num(row_time)).set("frame_period_s", num(period)).set("measured", timing));
-    cal.set("map", map).set("poses", poses).set("passes", history).set("converged", Json::of_bool(std::max({du, dv, dl}) < options.tolerance));
-    cal.set("patch", count(options.patch)).set("solver", solver_json(f));
+    cal.set("step", Json::of(std::string("geometry"))).set("model", Json::of(std::string("joint"))).set("scans", names).set("seconds", num(std::nearbyint(seconds_since(t_start) * 10) / 10));
+    cal.set("layout", Json::parse(acquisition_json(acq)));
+    cal.set("row_time", Json::dict().set("seconds_per_row", num(row_time)).set("frame_period_s", num(acq.period_s)).set("frames_per_row", num(acq.row_time)).set("measured", timing));
+    cal.set("map", map).set("parameters", parameters).set("solution", solve).set("report", Json::parse(report_json(acq, told)));
+    cal.set("comparisons", Json::dict().set("blocks", count(static_cast<long long>(planned.size()))).set("patch", count(patch)).set("accepted", counts));
     return cal.text();
 }
 

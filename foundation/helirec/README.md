@@ -147,7 +147,7 @@ mx, mean = bc.composites(set=2)
 | 0 | Bliss master parsing: entries, angles, z, machine current, frame→file map (as nxtomomill + nx2etf, bit for bit) | `calibration/scan.hpp` (Python: `helirec.bliss`) | CPU |
 | 1 | raw row-window reads (`pread`, one HDF5 chunk per frame) | `raw_reader.hpp` | CPU (threads) |
 | 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame (`helirec-calibration intensity`) | `calibration/intensity.hpp` (Python: `helirec.calibration`) | CPU |
-| 2b | geometry calibration: layout, rows' timing, detector map, poses and motion (`helirec-calibration geometry`) | `calibration/geometry_calibration.hpp`, `python/helirec/geometry.py` | CPU, CUDA |
+| 2b | geometry calibration: layout, rows' timing, comparisons, one solve for the detector map and the scans' places (`helirec-calibration geometry`) | `calibration/geometry_calibration.hpp`, `python/helirec/geometry.py` | CPU, CUDA |
 | 2d | surface composites: layers along a tifxyz surface from a volume or the projections (`helirec-composite`) | `surface_composite.hpp` (Python: `helirec.band`) | CPU, CUDA |
 | 2c | the reconstruction of a pair: parameters (modes, filter chains, `--set`), scan data from both calibrations, provenance (`helirec-reconstruct`) | `reconstruction.hpp` (Python: `helirec.recon`) | CPU |
 | 3 | helical geometry: span info, doable span, per-projection shifts and grid bins | `helical.hpp` | CPU |
@@ -438,6 +438,9 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     scan's frames on the first's (`companion_registration`) and the rolling shutter (`rolling_shutter`).
     `row_time_us`: the time of a detector row within the frame in microseconds per stored row (signed), for making
     the calibration when no stretch of the scans holds a refill of the ring to measure it from.
+  * `only_scan=main` or `companion` (default: both, merged): that scan's projections alone, at the poses the
+    geometry calibration gives them, on a slice grid centred on the rotation axis. The two scans reconstructed
+    apart show where a calibration puts them against each other.
   * `angle_subset=I/N` (default: every projection): subset I of N interleaved subsets of the projections, chosen
     by angle (the same angles in every scan) and reconstructed on a grid of 1 / N of the angles. `0/2` and `1/2`
     are two reconstructions of one scan with independent noise and everything else in common
@@ -726,7 +729,7 @@ side, one per thread on the CPU and four at a time on a CUDA device (C++: `Sessi
 `PatchMeasurement`; `src/calibration/compare_patches.cpp`). Each patch also returns `curvature`, the second
 derivatives of the correlation at its maximum over frames, rows and columns: how sharply each shift is determined
 and how the three are tied. `calibration_measure_timing(reset)` says where the time of `measure` and
-`measure_patches` went. On PHerc0343P the 1320 blocks of the geometry step's plan as 20 256 patches of
+`measure_patches` went. On PHerc0343P 1320 blocks of 1024 columns (an earlier plan of the geometry step) as 20 256 patches of
 32 frames × 128 × 128 take 91 s on an RTX 5090 (22 s reading, 9 s converting, 58 s registering) and 218 s on 24
 cores (183 s registering); half of those patches as requests of their own through `measure` took 448 s on the
 CPU. `tests/test_calibration.py::test_measure_patches_equals_measure` holds the two routes together. With
@@ -782,8 +785,8 @@ recuts; `evaluations` retains its meaning as the number of outer window recenter
 still needs the measurement's curvature, search-window and correlation checks to set `ok`.
 
 The geometry calibration itself (`helirec/calibration/geometry_calibration.hpp`, `helirec-calibration geometry`)
-states its fits on the same C++ API: the pass's `fit`, `second_scan_fit` and the motion stage's regressions
-(`least_squares`), and takes the rows' timing from `fit_refill_shots`.
+solves on the same engine (`solve_geometry`, a Ceres problem with a block of unknowns per owner; its rank test is
+`solve_linear`'s) and takes the rows' timing from `fit_refill_shots`.
 
 **Partial copies.** Frame files that are not on disk are reported (`map from frame to file`, with the frames
 that are there) and their frames are never read: the master file's virtual dataset would return zeros for them.
@@ -818,8 +821,10 @@ nothing added. Darks, flats and weights are taken to the same grid by `helirec::
 (`helirec.calibration.at_resolution(image, reduce, chunk_rows)` in Python) (the same low-pass; it reproduces a Paris4 frame read at reduce 1, 2, 3 to 0.3 counts rms,
 the rounding), so that a flat divides the fixed pattern out as at full resolution. Plain (uncompressed) frames
 have no such resolutions and are refused; rows, columns and rows per chunk must be multiples of 2^reduce.
-`helirec.mosaic.tile_reconstructor(..., reduce=)` reconstructs a tile on it (below); the calibration session and
-the pair pipeline read at full resolution only.
+`helirec.mosaic.tile_reconstructor(..., reduce=)` reconstructs a tile on it (below), and the calibration session
+reads on it (`CalibrationSession(scans, threads, reduce)`, `Session(scans, threads, reduce)`: the acquisition as a
+detector with pixels 2^reduce times as large would have recorded it; the geometry step's section says what that
+measures); the pair pipeline reads at full resolution only.
 
 **Reduced reads of reconstructed float32 volumes.** `RawReader(..., dtype="float32", reduce=0 | 1 | 2 | 3)`
 reads ESRF's B2JPF32 HTJ2K chunks, including the signed 32-bit codestreams in Paris4. This uses
@@ -882,6 +887,52 @@ only names the files and must stay the same between runs of one output folder.
 Projection stacks are uncompressed uint16 HDF5. Darks and flats are read at full resolution, reduced with
 `calibration.at_resolution` on the same chunk boundaries, and saved uncompressed as float32 to preserve the
 fractional low-pass values. Their sources have no stored pyramid, so their full pixels must be read.
+
+### One multiscale Zarr store of the reduced copies (`helirec-projections-zarr`)
+
+```bash
+helirec-projections-zarr projections.zarr scale_0.125 scale_0.25 [--tiles T1-03 ...] [--threads N] [--no_verify]
+```
+
+Each folder is one output folder of the downloader (its `plan.json` and files). The store is Zarr v3:
+
+```
+projections.zarr/<tile>/<scan>/     darks (scan0002), flats (scan0003, scan0007), projections (scan0005)
+    0  1  2  3                      (frame, row, col) at 1, 1/2, 1/4, 1/8 of the detector, every frame at every level
+    angle_deg  epoch  height_mm  original_frame_index      one value per frame
+```
+
+A level comes from the folder of its `reduce`; a level no folder gives is declared without chunks (it reads as
+zeros), and the scan group's `helirec` attribute says which levels are stored, the scan's role and the original
+index of frame 0. Value (j, k) of level l is the low band at the stored pixel (j, k) 2^l, as `RawReader(reduce=)`
+gives it, so the `multiscales` attribute declares scales and no translation. Arrays are blosc (bitshuffle, lz4,
+level 1) in chunks of one frame by 128 rows by all columns, one shard per 100 frames, and hold the files' values
+(uint16 projections, float32 reduced darks and flats). Each file becomes one shard, written once through
+vc_reader's `zarr::Writer` and read back and compared unless `--no_verify`. A file that is missing or not marked
+complete is left out and reported (exit status 1); running the command again writes only what is not yet stored.
+`tests/test_projections_zarr.py` checks the layout, the values and the second run on two made-up scales.
+
+### Reading frames from the store
+
+A scan group of the store stands for the detector's files of that scan directory. `RawReader` takes its path where
+it takes a file; the frame index counts the group's frames and `reduce` selects the level (a level the store
+declares and does not hold is refused, with a message that says so). The HDF5 files are read as before.
+
+```python
+from helirec import _core
+scan = _core.open_scan(master)                                   # the BLISS master, as always
+frames = scan.projections.subset([120000, 120001])               # frames of the detector's files
+there = _core.frames_in_projection_store(frames, "projections.zarr/T1-03")     # the same frames, in the store
+reader = _core.RawReader(list(there.files), there.dataset, *scan.frame_shape, reduce=2)
+quarter = reader.read_frames(there.file_index, there.frame_index)              # (2, 592, 1104) uint16
+```
+
+`frames_in_projection_store` uses the table of source files the store keeps (`helirec.files` of a scan group) and
+throws for a frame the store does not hold. `mosaic.tile_reconstructor(..., reduce=2, projections="projections.zarr/T1-03")`
+(`TileOptions::projections`) reads the helix frames of a tile that way; its darks and flats still come from the
+detector's files. The store's values are those of `RawReader(reduce=, decoder="openjph")` on the JPEG 2000 files,
+bit for bit (checked on 48 frames of T1-03 at 1/4 and 1/8); the default OpenJPEG decoder differs from them by one
+count in 1.2 % of the values. `tests/test_projection_store.py` checks the reader on a made-up store.
 The output payload is approximately 209 GB; the plan reports the exact size before starting.
 
 `download.log` records starts, completions, retries, and progress every five seconds: file counts, bytes written,
@@ -960,17 +1011,18 @@ Paris4 (13 November 2026).
 
 ## Geometry calibration step (`helirec-calibration geometry`)
 
-Measures the geometry of a two-scan helical acquisition from its own frames, with nothing typed in: the detector
-map and the poses that a reconstruction needs before it can assign a raw value to the line it measured. It is a
-step that writes what it measured (JSON), and it is the reconstruction's only geometry calibration:
-`helirec-reconstruct` makes it on first use and keeps it in its calibration cache, or takes the file it is given
-(`--set geometry=...`, below). The darks, flats, weights and the detector's blur field are the intensity
-calibration's (`helirec-calibration intensity`, below).
+Measures the geometry of the scans of one sample from their own frames, with nothing typed in: the detector's map
+and where every scan holds the sample, which a reconstruction needs before it can assign a raw value to the line it
+measured. One model for a scan alone, a pair moved sideways and the tiles of a mosaic, solved as one Ceres problem
+(`helirec/calibration/geometry_calibration.hpp` states it). It is a step that writes what it found (JSON), and it
+is the reconstruction's only geometry calibration: `helirec-reconstruct` makes it on first use and keeps it in its
+calibration cache, or takes the file it is given (`--set geometry=...`, below). The darks, flats, weights and the
+detector's blur field are the intensity calibration's (`helirec-calibration intensity`, above).
 
 ```bash
-helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json            # main: the scan with the axis inside the field
-helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json --row-time-us -19.87   # if no stretch holds a refill
-helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json --patch 128 --passes 1  # the map from patches, measured once
+helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json            # main: a scan with the axis inside its field
+helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json --row-time-us -19.87   # if no stretch holds a refill (0: not known)
+helirec-calibration geometry <tile.h5> [<tile.h5> ..] --out geometry.json --order 0 --row-time-us 0   # a mosaic's tiles: their own parameters
 ```
 
 ```python
@@ -979,54 +1031,137 @@ cal = geometry.calibrate_geometry([main_h5, companion_h5])
 geometry.save(cal, "geometry.json")
 ```
 
-What it needs of the acquisition: a helix whose travel per turn is less than the detector's height, a turn at rest
-before and after it, the axis inside the field in the first scan, a second scan moved sideways, and, for the rows'
-timing, a refill of the ring during one of the stretches (otherwise `--row-time-us`, which belongs to the camera's
-configuration and not to the scan).
+What it needs of the acquisition: a helix; in at least one scan the rotation axis inside the field; and, for the
+rows' timing, a refill of the ring during one of the stretches on disk (otherwise `--row-time-us`, which belongs to
+the camera's configuration and not to the scan). Turns at rest before and after the helix are used where they
+are on disk and are not needed.
 
-What it does (`python/helirec/geometry.py`):
+What it does:
 
-1. **Layout**, from the record and single frames: frames per turn, the stretches, the sense of the rows against
-   the axis stage, a coarse axis column and lateral move (profiles correlated), and the rows that hold something
-   across the whole width (the mount), which are kept out of every comparison.
+1. **Layout**, from the record and single frames: frames per turn, the stretches on disk, the sense of the rows
+   against the axis stage, a coarse axis column per scan, the rows that hold something across the whole width
+   (the mount), which are kept out of every comparison, and from the record's motors each scan's place and the
+   anchor (the scan whose place is the origin).
 2. **Rows' timing**: the time of a detector row within the frame, from the beam dips of a refill.
-3. **Map**: pixel (c, v) looks along the ray at (c + Eu, v + Ev), polynomials of order 3. Views that hold the same
-   lines on different parts of the detector (opposite views, a rest turn against the helix, the helix a turn
-   apart, one scan against the other) are registered on the current map's grid, what they still disagree by is
-   fitted as a correction, and that is repeated until nothing is left (0.02 px).
-4. **Poses**, from the same fit: the axis column per rest turn, the second scan's place against the first per
-   stretch with its own line in the column, the heights of the rest turns against the helix, the axial scale.
-5. **Motion within a turn**, on the finished map's grid (about 1400 full-width registrations): the rotating body's
-   place against the rotation axis as a function of time (a point every half turn in the first scan, every turn
-   in the second), the sample's height once per turn and its drift at rest, and how far the helix is further on
-   in angle than the rows' timing gives.
+3. **Comparisons**: blocks of frames that hold the same lines on different parts of the detector (opposite views
+   from rest turns and from the helix at twelve angles a turn, a rest turn against the helix, the helix a turn
+   apart, one scan against another at equal angle), in windows of at most 512 columns, cut into patches of
+   128 x 128 and registered once on the frames as stored.
+4. **Solve**: the detector's map (pixel (c, v) looks along the ray at (c + Eu, v + Ev), polynomials of order 3;
+   `--order 0` for none), each scan's axis column, its slope along the axis stage's travel and its axial scale,
+   the rest turns' heights, the place and height of every scan but the anchor against the anchor's, the roll,
+   and what the rotation stage does within a turn, shared by every scan on it: the sample's height once per turn
+   and the axis column twice per turn (PHerc0343P 0.03 rows and 0.01 px; Paris4 0.25 rows and 0.25 px). A
+   mosaic's tile has one thing more, `height_once`: the height once per turn that its own opposite views show
+   beyond the stage's. A rotation axis pitched towards the beam makes every ray climb with the depth, so views
+   half a turn apart are not the same rays, and their rows differ by twice the pitch x the depth of what they
+   register: for a tile off the middle of the sample a sinusoid of the angle that follows the tile (Paris4: 0.21
+   to 0.30 rows on the six tiles around the middle one, which says the axis leans at least 31 to 43 urad).
+   Nothing applies a pitch (the reconstruction takes no ray's inclination); the term keeps that sinusoid out of
+   the tile's axial scale, which holds it wherever the views do not cover whole turns (Paris4's seven tiles: 68
+   ppm from the smallest to the largest with it, 183 without). No comparison has an offset of its own: what the
+   model does not explain stays in the residuals, which the file holds per kind.
+5. **Report** (`report`, `neighbours`): what the solution leaves of each scan's opposite views as a mean, once and
+   twice per turn of the angle; the rows' timing their frames would give (the two views lie half a turn's travel
+   apart on the detector, so a rolling shutter shows as a fraction of a frame between them); whether the recorded
+   height's departure from a straight line is the sample's motion (a regression's slope: 1 if it is, 0 if the
+   encoder's); per tile the pitch its `height_once` bounds; the spread of the axis column, its slope and the axial
+   scale over the scans; and which scans' reconstructions overlap (a mosaic's edges and their triangles; the two
+   scans of a pair).
 
-`geometry.json` holds the layout, the row time, the map (`i`, `j`, `eu`, `ev` with its normalisation), the poses
-and what every pass left per kind of comparison. On PHerc0343P (two scans of 49,202 frames, RTX 5090) it takes
-10 minutes: 20 s for the layout and the rows' timing, five passes for the map (44 s for the first, on the frames
-as stored, 72 s each for the others) and 4 minutes for the motion; `development_notes/calibration/05_experiments.md`, experiment 31, sets its result
-beside the one found by hand and tests it on slices reconstructed twice from disjoint frames.
+`geometry.json` (`"model": "joint"`) holds the layout, the row time, the map (`i`, `j`, `eu`, `ev` with its
+normalisation), the parameters by name, how the solve ended with what it left per kind of comparison, the
+report, and the counts of comparisons. On PHerc0343P (two scans of 48 000 projections, RTX 5090) it takes 2 minutes 20 s with the
+frames in the page cache and 5 minutes without: 30 s for the layout and the rows' timing, 9858 patches from 1724
+blocks, 33 unknowns. Nothing calibrates a mosaic's places with it yet: a mosaic's tiles are solved for their own
+parameters only. Paris4's seven tiles on disk (3 of 25 turns each; `--order 0 --row-time-us 0`) take 4 minutes
+18 s: 6944 patches from 868 blocks measured in 168 s, 38 unknowns; the rows are left at 0.38 to 0.41 rms and the
+columns at 0.36 to 0.47 px, which belong to the frame position and not to a place on the detector.
 
-**Patches (`--patch 128`, `calibrate_geometry(..., patch=128)`).** The passes exist because a block of 1024
-columns is registered as one rigid displacement while the map stretches it by up to a pixel: the blocks have to
-be cut on a grid that already holds the map. A patch of 128 x 128 is stretched by a tenth of that, so the plan's
-blocks cut into patches (`CalibrationSession.measure_patches`: the frames of a block read once) give the map
-from the frames as stored. On PHerc0343P the first pass (20 256 patches, 15 008 accepted) takes 99 s with its
-fit, and the step with `--passes 1` 6 minutes in all, the motion as before. Slices reconstructed twice from
-disjoint frames agree as well with that calibration as with the passes' (within a scan 0.073, 0.056, 0.065 px
-rms at three heights against 0.072, 0.058, 0.070; between the scans 0.099, 0.145, 0.102, 0.117 against 0.105,
-0.143, 0.102, 0.119; the test's floor is 0.013 to 0.020). Left to run to the tolerance, the patches measured
-again on the map's grid correct it by up to 0.066 px and then 0.007 (three passes), which that test does not
-see. The default is the blocks (`--patch 0`), whose result is unchanged. The step uses
-`helirec::calibration`'s session (raw frames, the scan's own dark and mean flat, the registration on CPU or CUDA)
-and none of the pipeline's calibration.
+Paris4's rows' timing is not in its record and is taken as zero. What the data say of it: the frames of each
+tile's opposite views lie 0.20 to 0.24 frames from half a turn, -2.2 to -2.9 us per stored row (0.36 to 0.47 of the
+frame period from the first row to the last), and the dips of the one refill on disk gave -3.9 us. Unapplied, that
+is a turn of 0.9 to 1.6 px at the edge of a tile's disc between the first and the last row, which shows where two
+tiles' reconstructions overlap as a displacement in the plane that is a sawtooth along the height.
+
+**At a half.** The session reads the frames at a half, a quarter or an eighth (above), and the step's stages run on
+it unchanged, in reduced pixels. On Paris4's seven tiles a half measures in 39 s what the stored frames take
+141 s for (patches of 64 reduced pixels: the same piece of detector as 128 stored). Every tile's axis column comes
+out 0.083 to 0.089 px lower, the tiles against each other as on the stored frames, and the axial scales 4 to 17
+ppm lower. A common offset of that size is what the registration's band gives (it is in cycles per sample, so at
+a half it holds detail twice as coarse, and the axis column depends on the detail it is read from by about
+0.1 px). `calibrate_geometry` itself runs on the stored frames; nothing turns a calibration made at a half into
+stored pixels.
+
+**A fraction of a frame on deep content.** The registration samples the frames; material 16 000 px from the axis
+crosses 10 columns from one frame to the next. On blocks rendered from such content (blobs of 2 px spread over the
+whole depth, exposed as Paris4's frames are) 0.30 frames come back as 0.27 to 0.28, and as 0.26 about an axis
+6944 px off the middle of the sample, where the columns are then off by 0.08 px; content within 5000 px of the
+axis, or blobs of 8 px, give 0.30. So the frames are reported and not fitted, and a rows' timing read from them is
+low by up to a tenth (`tests/test_calibration.py::test_a_fraction_of_a_frame_on_deep_content`).
+
+On PHerc0343P the second scan holds the sample 0.13 px from where the first does, though the stages on the
+rotation did not move between them; and each scan reconstructed alone (`only_scan`), the second scan's volume lies
+within 0.08 to 0.10 px (median) of the first's in the plane and is tilted against it by about 165 urad, which the
+model has no term for (0.09 to 0.17 slices rms along the axis).
+
+* `read_acquisition(session)`: the layout of the session's scans, each with whatever projection stretches are on
+  disk (a helix alone, of which only a part may be on disk, or rest turns beside it): the record's angle and height
+  per frame, the sense of the rows (from helix views a turn apart where a turn's travel leaves a patch of rows in
+  common, from opposite views otherwise), the rows that hold the mount, and a coarse axis column per scan. What
+  the motors say of each scan's place (the stages on the rotation, the rotation stage across the beam) gives the
+  anchor (the scan whose place is the origin) and which scans were moved on the rotation stage; a scan whose axis
+  lies outside its field is placed by where its content lies against a scan at the same place (profiles at equal
+  frames), with the motor's move beside it in the log.
+* `plan(acquisition)` and `measure(session, acquisition, plan, device, patch)`: each scan's comparisons with itself
+  (opposite views from rest turns and from the helix at twelve angles a turn, the helix a turn apart, rest turns
+  against the helix), and one scan against another at the same place on the rotation stage (`pair`: the stretches
+  of the same name at equal angle, across the columns both hold), in windows of at most 512 columns, registered
+  once in patches. A measurement becomes a `Comparison`: two sightings (scan, stretch, frame, row, column) of the
+  same lines.
+* `solve_geometry(acquisition, comparisons, start, options)`: each sighting is taken back to the ray it records
+  (through the detector's map, if `start` has one) and a comparison's residual is the two rays' difference in the
+  sample (columns, rows); the frames' difference is reported and not fitted. A block of unknowns per owner
+  (detector, map, stage, scan, stretch); a stage of a calibration holds or frees unknowns by name or by a name's
+  beginning (`GeometryOptions::held`, `freed`: `"map"`, `"stage"`, `"scan1.d0"`). Free by default: what the header
+  lists, among it the place and height of every scan but the anchor (PHerc0343P's second scan holds the sample
+  0.13 px from where the first does, though the stages on the rotation did not move); the map only when freed.
+  Unknowns no comparison depends on are held and named (`unused`: a scan's place counts as depended on only by
+  comparisons with another scan); free unknowns that depend on each other are an error that
+  names them (the rank check `solve_linear` uses, `fitting::design_rank`). `residuals` and
+  `GeometrySolution::left` give what is left per comparison and per kind.
+* `report(acquisition, solution, comparisons)` and `neighbours(acquisition)`: step 5 above (`geometry.report`,
+  `geometry.neighbours` in Python). Two scans are neighbours where their axes, by the motors, lie closer than the
+  radii of the two discs they reconstruct alone (a disc reaches from the axis to the detector's far edge): 12
+  edges and 6 triangles for Paris4's seven tiles, 42 and 24 for all nineteen.
+* `row_time_from_refill(session, acquisition)`: the rows' timing from a refill in any of the scans' stretches
+  (`fit_refill_shots`).
+
+
+```python
+from helirec import _core, geometry
+session = _core.CalibrationSession([main_h5, companion_h5], 8)           # the step's stages
+acq = _core.geometry_read_acquisition(session, "auto", print)            # GeometryAcquisition
+acq.row_time = seconds_per_row / frame_period                            # frames per stored row; 0 if unknown
+comparisons, blocks = geometry.measure_comparisons(session, acq)
+start = dict(roll=0.0, scans=[dict(axis=a) for a in coarse_axes], map=geometry.empty_map(rows, cols, 3))
+solution = geometry.solve_geometry(acq, comparisons, start=start, freed=["map"])
+```
+
+A frames' error of a registration shows in the columns, not in the rows: content at the depth `t` from the rotation
+axis crosses `t` times the angle per frame columns per frame. And the residuals hold what the model does not:
+between PHerc0343P's two scans 0.07 to 0.12 rows once per turn, which the model has no term for: reconstructed
+apart (`only_scan`), the second scan's volume is tilted against the first's by about 165 urad. (The pitch of the
+rotation axis towards the beam is measured in each tile's `height_once` and not applied.)
 
 **In the reconstruction:** `helirec-reconstruct ...` with nothing said (the cache's `geometry.json`, made if it is not
 there), or `--set geometry=OUT/geometry.json` (`params["geometry"]`). Every
 projection is read on the grid of the calibration's detector map (the rows at the mapped row by the row
 kernel, the columns resampled exactly: `resample_rows`, a non-uniform transform of the interpolant the exact shift
 uses, within 1e-6 of the direct sum), at the pose `geometry.frame_poses` gives its frame, and at the angle of its
-rows. The frame the two scans are merged in is laid out from the same poses (`geometry.merged_layout`: the medians
+rows. `helirec/geometry.hpp` reads a pair's calibration (and still a file of the earlier two-scan step, which
+nothing writes any more); the poses are the model's, frame by frame, and the slices are numbered from the first
+scan's row at its helix' first frame. The frame the two scans are merged in is laid out from the same poses (`geometry.merged_layout`: the medians
 over the helix of the axis' column and of the second scan's place, on a quarter-pixel grid; PHerc0343P: axis
 1684.75 in the first scan's columns, the second scan 843.5 columns and 1.0 rows from it, the axis at 2528.25 of
 3372 merged columns, as the earlier searches had it but for the rows, which they put at 0.5): a nominal frame,
@@ -1039,54 +1174,17 @@ no time (7.5 s per 32 slices against 7.3–8.4 s); with Paganin and unsharp a sl
 rows; views a turn apart are backprojected each at its own angle since `angle_interp=views`, section 34) is listed
 in `development_notes/calibration/05_experiments.md`, section 33.
 
-### One model for any number of scans (`solve_geometry`)
-
-Beside the two-scan step, `helirec/calibration/geometry_calibration.hpp` holds a model for any number of scans of
-one sample (a scan alone, a pair moved sideways, the tiles of a mosaic), solved as one Ceres problem; the header
-states it. `helirec-calibration geometry` does not run it yet, and so far it holds each scan's own parameters (the
-axis column, its slope along the axis stage's travel, the axial scale, the rest turns' heights), the roll, and what
-the rotation stage does within a turn, shared by every scan on it: the sample's height once per turn and the axis
-column twice per turn (PHerc0343P 0.03 rows and 0.01 px; Paris4 0.26 rows and 0.25 px).
-Nothing calibrates a mosaic's places with it yet.
-
-* `read_acquisition(session)`: the layout of the session's scans, each with whatever projection stretches are on
-  disk (a helix alone, of which only a part may be on disk, or rest turns beside it): the record's angle and height
-  per frame, the sense of the rows (from helix views a turn apart where a turn's travel leaves a patch of rows in
-  common, from opposite views otherwise), the rows that hold the mount, and a coarse axis column per scan.
-* `plan(acquisition)` and `measure(session, acquisition, plan, device, patch)`: each scan's comparisons with itself
-  (opposite views from rest turns and from the helix at twelve angles a turn, the helix a turn apart, rest turns
-  against the helix), in windows of at most 512 columns inside the strip a scan's opposite views share, registered
-  once in patches. A measurement becomes a `Comparison`: two sightings (scan, stretch, frame, row, column) of the
-  same lines.
-* `solve_geometry(acquisition, comparisons, start, options)`: each sighting is taken back to the ray it records and
-  a comparison's residual is the two rays' difference in the sample (columns, rows); the frames' difference is
-  reported and not fitted. A block of unknowns per owner (detector, scan, stretch); a stage of a calibration holds
-  or frees unknowns by name (`GeometryOptions::held`, `freed`). Unknowns no comparison depends on are held and
-  named (`unused`); free unknowns that depend on each other are an error that names them (the rank check
-  `solve_linear` uses, `fitting::design_rank`). `residuals` and `GeometrySolution::left` give what is left per
-  comparison and per kind.
-
-```python
-from helirec import _core, geometry
-session = _core.CalibrationSession([master_h5], 8)
-acq = _core.geometry_read_acquisition(session, "auto", print)       # GeometryAcquisition
-acq.row_time = seconds_per_row / frame_period                       # frames per stored row; 0 if unknown
-comparisons, blocks = geometry.measure_comparisons(session, acq)
-solution = geometry.solve_geometry(acq, comparisons, start=dict(roll=0.0, scans=[dict(axis=coarse_axis)]))
-```
-
-A frames' error of a registration shows in the columns, not in the rows: content at the depth `t` from the rotation
-axis crosses `t` times the angle per frame columns per frame. And the residuals of opposite views hold what the
-model does not: on a detector position they are the detector's map, and per scan a sinusoid of the angle in the rows
-where the rotation axis is pitched towards the beam (Paris4's outer tiles: 0.5 to 0.6 rows, the phase following the
-tile; measured, not applied).
-
 ## Tests
 
 `tests/test_geometry_solve.py` and the native `geometry_solve` test check the model for any number of scans against
-a projection of points in 3D written apart from it (explicit rotation matrices, parallel rays), which is what fixes
-its signs: every sighting is the line through its point, a solve finds the parameters again, dependent unknowns are
-refused, and the plan stays inside the strip for a helix alone with its axis at the detector's edge.
+a projection of points in 3D written apart from it (explicit rotation matrices, parallel rays; the detector's map
+taken off by iteration, the direction the model does not have), which is what fixes its signs: every sighting is
+the line through its point, a solve finds the parameters again (a scan alone; a pair moved sideways with the
+detector's map; three tiles about an axis pitched towards the beam, whose own views give the pitch and an axial
+scale free of it), dependent unknowns are refused, the plan stays inside the strip for a helix alone with its axis at
+the detector's edge and covers the columns two scans share, a pixel put through the poses the reconstruction
+reads from a joint calibration is the ray the model gives it, and the report tells a recorded height that is the
+sample's motion from one that is the encoder's and finds a mosaic's edges and triangles.
 
 For an already configured build, use `cmake --build build/<configuration> -j 4` and
 `ctest --test-dir build/<configuration> --output-on-failure`. The native fitting test checks the complete

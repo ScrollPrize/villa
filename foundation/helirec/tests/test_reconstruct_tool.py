@@ -176,3 +176,31 @@ def test_bbox_computes_part_of_the_slice(tmp_path, acquisition):
     assert not box.any()
     p = _run(tmp_path, acquisition, "--fractions", "0.5", "--bbox", "1", "9999", "2", "8", "--tag", "bad", check=False)
     assert p.returncode and "--bbox must lie within" in p.stderr
+
+
+def test_one_scan_alone(tmp_path, acquisition):
+    """only_scan: each scan reconstructed alone at the poses the calibration gives it, on a grid about the rotation
+    axis. The second scan's axis is at its detector's edge: a half acquisition, every line once, and it holds what
+    the first holds."""
+    proj, geometry = acquisition
+    r = HelicalRecon(proj, cache_dir=str(tmp_path / "cache"), device="cpu", params=dict(geometry=geometry), log=lambda *a: None)
+    h = r.slice_info(0.5).view_height
+    axis = r.rot_center()                                                        # of the merged frame; the scans lie 70.5 columns apart in it
+    assert r.info["grid_size"] == 423 and r.info["merged_width"] == 311
+    sizes = {}
+    for which in ("main", "companion"):
+        r.set_params(only_scan=which)
+        assert r.info["merged_width"] == COLS and r.info["projections"] == [600]   # that scan's columns and frames, no others
+        sizes[which] = r.info["grid_size"]
+    assert sizes == {"main": 2 * round(axis - 70.5) + 1, "companion": 423}        # twice each scan's own axis column, + 1
+    slices = {}
+    for which in ("main", "companion", ""):
+        r.set_params(only_scan=which, grid_size=161)
+        slices[which] = r.reconstruct_heights(h, h + 1)[0]
+        assert np.isfinite(slices[which]).all() and slices[which].max() > 1
+    yy, xx = np.mgrid[:161, :161] - 80.0
+    inside = np.hypot(yy, xx) < 75
+    agree = lambda a, b: np.corrcoef(slices[a][inside], slices[b][inside])[0, 1]
+    assert agree("main", "companion") > 0.99 and agree("main", "") > 0.995 and agree("companion", "") > 0.995
+    with pytest.raises(ValueError, match="only_scan must be"):
+        r.set_params(only_scan="first")

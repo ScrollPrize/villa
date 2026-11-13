@@ -9,6 +9,7 @@
 #include <thread>
 
 #include "calibration/util.hpp"
+#include "helirec/calibration/intensity.hpp"
 
 namespace helirec::calibration {
 
@@ -198,7 +199,7 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
 // ---------------------------------------------------------------- a session: scans kept open for many measurements
 
 struct Session::Impl {
-    int threads = 0;
+    int threads = 0, reduce = 0;
     std::vector<std::unique_ptr<Record>> records;
     std::vector<std::unique_ptr<Frames>> frames;
     std::vector<std::unique_ptr<FlatField>> flats;
@@ -268,24 +269,55 @@ void fill(ViewMeasurement& res, const Measured& m, const Trajectory& ta) {
 
 }  // namespace
 
-Session::Session(const std::vector<std::string>& scans, int threads) : impl_(std::make_unique<Impl>()) {
+Session::Session(const std::vector<std::string>& scans, int threads, int reduce) : impl_(std::make_unique<Impl>()) {
     if (scans.empty()) throw Error("calibration session: no scan");
-    impl_->threads = threads;
+    if (reduce < 0 || reduce > 3) throw Error("calibration session: reduce is 0, 1, 2 or 3");
+    impl_->threads = threads, impl_->reduce = reduce;
     for (const std::string& path : scans) {
         impl_->records.push_back(std::make_unique<Record>(read_record(path)));
-        impl_->frames.push_back(std::make_unique<Frames>(*impl_->records.back(), threads));
+        Record& rec = *impl_->records.back();
+        impl_->frames.push_back(std::make_unique<Frames>(rec, threads, reduce));
+        if (reduce) {  // the record of a detector whose pixels are 2^reduce times as large
+            const auto size = rec.technique.items.find("scan/sample_pixel_size");
+            if (size == rec.technique.items.end()) throw Error("calibration session: the record of " + path + " states no pixel size");
+            for (double& v : size->second.num) v *= static_cast<double>(1 << reduce);
+        }
         impl_->flats.emplace_back();
     }
     impl_->maps.resize(impl_->records.size());
 }
 Session::~Session() = default;
+int Session::reduce() const { return impl_->reduce; }
 
 std::size_t Session::size() const { return impl_->records.size(); }
 const Record& Session::record(int scan) const { return *impl_->records.at(static_cast<std::size_t>(scan)); }
 Frames& Session::frames(int scan) { return *impl_->frames.at(static_cast<std::size_t>(scan)); }
 const FlatField& Session::flat_field(int scan) {
     auto& ff = impl_->flats.at(static_cast<std::size_t>(scan));
-    if (!ff) ff = std::make_unique<FlatField>(make_flat_field(frames(scan)));
+    if (ff) return *ff;
+    if (!impl_->reduce) {
+        ff = std::make_unique<FlatField>(make_flat_field(frames(scan)));
+        return *ff;
+    }
+    // At a reduced resolution: the stored dark and mean flat through the low-pass the frames' codestreams have
+    // (darks and flats may be stored plain, and a flat reduced as the frames are divides their fixed pattern out).
+    const Record& rec = record(scan);
+    int chunk_rows = 0;
+    for (std::size_t i = 0; i < rec.stretches.size() && !chunk_rows; ++i) {
+        if (rec.stretches[i].role != Role::Projection) continue;
+        const Frames::Stored how = frames(scan).stored(static_cast<int>(i));
+        if (how.on_disk && how.compressed) chunk_rows = how.chunk_rows;
+    }
+    if (!chunk_rows) throw Error("calibration session: no projection stretch of " + rec.path + " is on disk as JPEG 2000: its frames hold no lower resolution");
+    Frames stored(rec, impl_->threads);
+    const FlatField full = make_flat_field(stored);
+    const std::vector<double> dark(full.dark.begin(), full.dark.end()), gain(full.gain.begin(), full.gain.end());
+    FlatField reduced;
+    reduced.dark = at_resolution(dark.data(), 1, full.rows, full.cols, impl_->reduce, chunk_rows, &reduced.rows, &reduced.cols);
+    reduced.gain = at_resolution(gain.data(), 1, full.rows, full.cols, impl_->reduce, chunk_rows);
+    for (float& g : reduced.gain) g = std::max(1.0f, g);
+    if (reduced.rows != frames(scan).rows() || reduced.cols != frames(scan).cols()) throw Error("calibration session: the reduced dark and flat are not of the reduced frames' size");
+    ff = std::make_unique<FlatField>(std::move(reduced));  // (the series' statistics are of the stored frames and are not kept)
     return *ff;
 }
 

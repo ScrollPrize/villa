@@ -78,9 +78,19 @@ MeasureTiming measure_timing(bool reset = false);
 
 // The scans of one acquisition kept open: records, raw frames, and each scan's dark and mean flat (made when
 // first needed: every dark and flat frame is read once).
+//
+// reduce = 1, 2, 3: the session is of the same acquisition on a detector with pixels 2^reduce times as large, the
+// frames read at a half, a quarter, an eighth from their JPEG 2000 codestreams (Frames; decoded 3 to 40 times
+// faster). Everything it gives is then in reduced pixels: frames(k).rows() and cols(), every row and column of a
+// request and of a measurement, the dark and mean flat (the stored ones through the frames' own low-pass,
+// at_resolution of helirec/calibration/intensity.hpp), and the record's pixel size: record(k) states
+// scan/sample_pixel_size as that of a reduced pixel, so that what the record gives in millimetres (the heights,
+// the motors) comes out in reduced pixels wherever it is turned into pixels. The record's stretches keep the
+// stored frame size. The stored position (c, v) is the reduced position (c, v) / 2^reduce, nothing added.
 class Session {
   public:
-    explicit Session(const std::vector<std::string>& scans, int threads = 0);
+    explicit Session(const std::vector<std::string>& scans, int threads = 0, int reduce = 0);
+    int reduce() const;
     ~Session();
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;

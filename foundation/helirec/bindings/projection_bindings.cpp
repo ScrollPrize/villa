@@ -1,5 +1,6 @@
 #include "ndarray_utils.hpp"
 #include "helirec/projection_subset.hpp"
+#include "helirec/projection_store.hpp"
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 namespace nb = nanobind;
@@ -7,6 +8,11 @@ using namespace nb::literals;
 using namespace helirec;
 using namespace helirec::py;
 void bind_projection(nb::module_& m) {
+    m.def("is_projection_store_scan", &is_projection_store_scan, "path"_a,
+          "True when path is a scan group of a projection store (helirec/projection_store.hpp)");
+    m.def("frames_in_projection_store", &frames_in_projection_store, "frames"_a, "tile_group"_a,
+          "The frames of a FrameList (detector files .../scanNNNN/<file>) as frames of the scan groups of STORE.zarr/<tile>: "
+          "read them with RawReader(list(f.files), f.dataset, rows, cols, reduce). (helirec::frames_in_projection_store)");
     m.def("plan_projection_subset", [](const std::string& master, double center, int slices, double turns) {
         ProjectionSubset p;
         { nb::gil_scoped_release nogil; p = plan_projection_subset(master, center, slices, turns); }

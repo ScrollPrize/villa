@@ -66,6 +66,7 @@ Json shared(const char* backprojector, const char* x_interp, const char* z_inter
         .set("angle_interp", text(angle_interp))
         .set("exposure_arc", num(0.0))
         .set("angle_subset", text(""))
+        .set("only_scan", text(""))
         .set("sharpness_weighting", text(sharpness_weighting))
         .set("sharp_f", num(0.35))
         .set("sharp_band", text("0.15:0.30"));

@@ -326,6 +326,17 @@ void shardEditing(const fs::path& root)
                 "neighbor's encoded bytes survive editing unchanged");
         require(read(w.reader(), {0, 0, 0}, o.chunks, 1) == fill, "removed entry reads fill");
         require(!w.removeChunk({0, 0, 0}), "absent entry removal is a no-op");
+        // A region is one rewrite per shard: stored chunks, omitted fill chunks and neighbors together.
+        std::vector<uint8_t> block(4 * 3 * 4, 3);
+        for (size_t i = 0; i < 2 * 3 * 4; ++i) block[i] = uint8_t(7 + i);
+        w.writeRegion({0, 0, 0}, {4, 3, 4}, block.data(), true);
+        require(w.chunkExists({0, 0, 0}) && !w.chunkExists({1, 0, 0}) && w.chunkExists({1, 1, 1}),
+                "region stores, omits and keeps chunks of one shard");
+        require(read(w.reader(), {0, 0, 0}, {4, 3, 4}, 1) == block, "region within a shard reads back");
+        require(vcr::LocalShard(w.chunkPath({0, 0, 1}), layout).readEntry(1, after) && after == before,
+                "region write keeps the neighbor's encoded bytes");
+        require(w.writeChunkSkipEmpty({0, 0, 0}, fill.data(), fill.size()) == false && !w.chunkExists({0, 0, 0}),
+                "chunk removed again");
 
         // Corrupt input cannot be silently overwritten or damage other chunks.
         const auto file = w.chunkPath({0, 0, 1});

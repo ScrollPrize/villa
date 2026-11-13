@@ -36,33 +36,7 @@ double number(const Json& j, const char* key, double fallback) {
     return v && v->is(Json::Number) ? v->number : fallback;
 }
 
-// {rows, cols, per_turn, pixel_um, stretches: [{rest1, helix, rest2}, ..], lengths: [..], row_sign, axis, move,
-//  width, heights: {"<scan> <stretch>": [rows per frame]}}
-gc::Layout layout_of(const std::string& text) {
-    const Json j = Json::parse(text);
-    gc::Layout lay;
-    lay.rows = static_cast<int>(number(j, "rows")), lay.cols = static_cast<int>(number(j, "cols")), lay.per_turn = static_cast<int>(number(j, "per_turn"));
-    lay.pixel_um = number(j, "pixel_um", 0.0);
-    lay.row_sign = number(j, "row_sign", -1.0), lay.axis = number(j, "axis", 0.0);
-    lay.move = static_cast<int>(number(j, "move", 0.0)), lay.width = static_cast<int>(number(j, "width", 1024.0));
-    const Json& st = member(j, "stretches");
-    const Json& len = member(j, "lengths");
-    for (std::size_t k = 0; k < 2; ++k)
-        for (int a = 0; a < 3; ++a) {
-            lay.stretch[k][a] = static_cast<int>(number(st.array.at(k), gc::kNames[a]));
-            lay.length[k][a] = static_cast<std::int64_t>(number(len.array.at(k), gc::kNames[a]));
-        }
-    if (const Json* h = j.find("heights"))
-        for (const auto& [key, values] : h->object) {
-            const int scan = key.at(0) - '0';
-            std::vector<double>& out = lay.heights[scan][gc::name_index(key.substr(2))];
-            for (const Json& v : values.array) out.push_back(v.number);
-        }
-    return lay;
-}
-
-geometry::Map map_of(const std::string& text) {
-    const Json j = Json::parse(text);
+geometry::Map map_of(const Json& j) {
     geometry::Map m;
     for (const Json& v : member(j, "i").array) m.i.push_back(static_cast<int>(v.number));
     for (const Json& v : member(j, "j").array) m.j.push_back(static_cast<int>(v.number));
@@ -71,82 +45,15 @@ geometry::Map map_of(const std::string& text) {
     m.c0 = number(j, "c0"), m.cs = number(j, "cs"), m.v0 = number(j, "v0"), m.vs = number(j, "vs");
     return m;
 }
+geometry::Map map_of(const std::string& text) { return map_of(Json::parse(text)); }
 
 Json whole(long long v) { return Json::whole_number(v); }
 
-std::string plan_json(const std::string& layout) {
-    Json out = Json::list();
-    for (const gc::Planned& p : gc::plan(layout_of(layout))) {
-        const calibration::ViewRequest& q = p.request;
-        Json d = Json::dict();
-        d.set("label", Json::of(q.label)).set("scan_a", whole(q.scan_a)).set("scan_b", whole(q.scan_b)).set("stretch_a", whole(q.stretch_a)).set("stretch_b", whole(q.stretch_b));
-        d.set("frame_a", whole(q.frame_a)).set("frame_hint", whole(q.frame_hint)).set("angle_offset_deg", Json::of(q.angle_offset_deg)).set("mirror", Json::of_bool(q.mirror));
-        d.set("frames", whole(q.frames)).set("rows", whole(q.rows)).set("cols", whole(q.cols)).set("row_a", whole(q.row_a)).set("col_a", whole(q.col_a)).set("col_b", whole(q.col_b));
-        Json meta = Json::dict();
-        meta.set("kind", Json::of(p.kind)).set("scan_a", whole(p.scan_a)).set("scan_b", whole(p.scan_b)).set("stretch_a", Json::of(std::string(gc::kNames[p.a])));
-        meta.set("stretch_b", Json::of(std::string(gc::kNames[p.b])));
-        out.add(Json::list().add(d).add(meta));
-    }
-    return out.text();
-}
-
-// rows: [{kind, scan_a, stretch_a (name), frame_a, row_a, rows, row_offset, col_a, col_b, cols, stated_dq, dq,
-//         stated_D, D, du, slope_a, slope_b}, ..]
-std::string fit_json(const std::string& rows_text, const std::string& layout, const std::string& map, double tau, double period, double huber, int max_iterations) {
-    const Json rows_j = Json::parse(rows_text);
-    std::vector<gc::Row> rows;
-    for (const Json& r : rows_j.array) {
-        gc::Row row;
-        row.kind = member(r, "kind").string;
-        row.scan_a = static_cast<int>(number(r, "scan_a", 0.0));
-        row.a = gc::name_index(member(r, "stretch_a").string);
-        calibration::ViewMeasurement& m = row.m;
-        m.frame_a = static_cast<std::int64_t>(number(r, "frame_a"));
-        m.row_a = static_cast<int>(number(r, "row_a")), m.rows = static_cast<int>(number(r, "rows")), m.row_offset = static_cast<int>(number(r, "row_offset"));
-        m.col_a = static_cast<int>(number(r, "col_a")), m.col_b = static_cast<int>(number(r, "col_b")), m.cols = static_cast<int>(number(r, "cols"));
-        m.stated_dq = number(r, "stated_dq"), m.dq = number(r, "dq"), m.stated_D = number(r, "stated_D"), m.D = number(r, "D"), m.du = number(r, "du");
-        m.slope_a = number(r, "slope_a"), m.slope_b = number(r, "slope_b");
-        rows.push_back(row);
-    }
-    gc::Fit f;
-    {
-        const gc::Layout lay = layout_of(layout);
-        const geometry::Map m = map_of(map);
-        nb::gil_scoped_release nogil;
-        f = gc::fit(rows, lay, m, tau, period, huber, max_iterations);
-    }
-    const auto list = [](const std::vector<double>& v) {
-        Json j = Json::list();
-        for (double x : v) j.add(Json::of(x));
-        return j;
-    };
-    Json rho = Json::dict(), lines = Json::dict(), left = Json::dict(), groups = Json::list();
-    for (const int a : {gc::Helix, gc::Rest1, gc::Rest2}) {
-        if (const auto it = f.rho.find(a); it != f.rho.end()) rho.set(gc::kNames[a], Json::of(it->second));
-        if (const auto it = f.lines.find(a); it != f.lines.end()) lines.set(gc::kNames[a], list({it->second[0], it->second[1]}));
-    }
-    for (const char* kind : gc::kKinds)
-        if (const auto it = f.left.find(kind); it != f.left.end())
-            left.set(kind, Json::dict().set("n", whole(static_cast<long long>(it->second.n))).set("px", Json::of(it->second.px)).set("rows", Json::of(it->second.rows)));
-    for (const auto& [key, uv] : f.groups)
-        groups.add(Json::list().add(Json::of(key.kind)).add(whole(key.scan)).add(Json::of(std::string(gc::kNames[key.a]))).add(whole(key.frame)).add(Json::of(uv[0])).add(Json::of(uv[1])));
-    Json out = Json::dict();
-    out.set("eu", list(f.eu)).set("ev", list(f.ev)).set("psi", Json::of(f.psi)).set("rho", rho).set("lines", lines).set("n", whole(static_cast<long long>(f.n)));
-    Json solver = Json::dict();
-    solver.set("cost", Json::of(f.solver.cost)).set("iterations", whole(f.solver.iterations)).set("evaluations", whole(f.solver.evaluations)).set("usable", Json::of_bool(f.solver.usable));
-    solver.set("termination", Json::of(f.solver.termination)).set("message", Json::of(f.solver.message)).set("solver_version", Json::of(f.solver.solver_version));
-    solver.set("rank", whole(f.rank)).set("active", whole(f.active)).set("unused", whole(f.unused));
-    out.set("left", left).set("groups", groups).set("solver", solver);
-    return out.text();
-}
-
-// ---- the joint model (solve_geometry)
-
 using Table = nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
-// {rows, cols, per_turn, pixel_um, row_sign, row_time, fan, width, scans: [{name, mid_height, axis, stretches:
-//  [{name, index, helix, first, end, angle_deg: [..], rows: [..]}]}]}; what is left out keeps its default (a
-//  stretch's frames on disk: all of them)
+// {rows, cols, per_turn, pixel_um, row_sign, row_time, fan, width, anchor, period_s, scans: [{name, mid_height, axis,
+//  moved_on_stage, on_stage: [px, px], stretches: [{name, index, helix, first, end, angle_deg: [..], rows: [..]}]}]}; what is left out
+//  keeps its default (a stretch's frames on disk: all of them)
 gc::Acquisition acquisition_of(const std::string& text) {
     const Json j = Json::parse(text);
     gc::Acquisition acq;
@@ -154,11 +61,14 @@ gc::Acquisition acquisition_of(const std::string& text) {
     acq.per_turn = static_cast<int>(number(j, "per_turn", 0.0)), acq.pixel_um = number(j, "pixel_um", 0.0);
     acq.row_sign = number(j, "row_sign", -1.0), acq.row_time = number(j, "row_time", 0.0), acq.fan = number(j, "fan", 0.0);
     acq.width = static_cast<int>(number(j, "width", 512.0));
+    acq.anchor = static_cast<int>(number(j, "anchor", 0.0)), acq.period_s = number(j, "period_s", 0.0);
     for (const Json& sj : member(j, "scans").array) {
         gc::ScanLayout sc;
         if (const Json* n = sj.find("name")) sc.name = n->string;
         sc.mid_height = number(sj, "mid_height", 0.0);
         sc.axis = number(sj, "axis", std::nan(""));
+        if (const Json* moved = sj.find("moved_on_stage")) sc.moved_on_stage = moved->boolean;
+        if (const Json* at = sj.find("on_stage"); at && at->array.size() == 2) sc.on_stage[0] = at->array[0].number, sc.on_stage[1] = at->array[1].number;
         for (const Json& tj : member(sj, "stretches").array) {
             gc::StretchLayout st;
             st.name = member(tj, "name").string;
@@ -169,6 +79,7 @@ gc::Acquisition acquisition_of(const std::string& text) {
             if (st.course.angle_deg.size() != st.course.rows.size()) throw Error("geometry: a stretch's angles and heights differ in length");
             st.first = static_cast<std::int64_t>(number(tj, "first", 0.0));
             st.end = static_cast<std::int64_t>(number(tj, "end", static_cast<double>(st.course.rows.size())));
+            st.offset = sc.stretches.empty() ? 0 : sc.stretches.back().offset + static_cast<std::int64_t>(sc.stretches.back().course.rows.size());
             if (st.first < 0 || st.end > static_cast<std::int64_t>(st.course.rows.size()) || st.end < st.first) throw Error("geometry: a stretch's frames on disk are not among its frames");
             sc.stretches.push_back(std::move(st));
         }
@@ -178,12 +89,14 @@ gc::Acquisition acquisition_of(const std::string& text) {
 }
 
 // as solution_json writes them: {roll, stage: {height_once: [cos, sin], axis_twice: [cos, sin]}, scans: [{axis,
-//  axis_slope, axial_scale, d: [d0, d1], height, stretch_height: {name: rows}}]}
+//  axis_slope, axial_scale, d: [d0, d1], height, height_once: [cos, sin], stretch_height: {name: rows}}],
+//  map: {i, j, eu, ev, c0, cs, v0, vs}}
 gc::Parameters parameters_of(const gc::Acquisition& acq, const std::string& text) {
     gc::Parameters p = gc::empty_parameters(acq);
     if (text.empty()) return p;
     const Json j = Json::parse(text);
     p.roll = number(j, "roll", 0.0);
+    if (const Json* map = j.find("map"); map && map->is(Json::Object)) p.map = map_of(*map);
     if (const Json* st = j.find("stage")) {
         const auto pair = [&](const char* key, double* out) {
             if (const Json* v = st->find(key))
@@ -200,6 +113,8 @@ gc::Parameters parameters_of(const gc::Acquisition& acq, const std::string& text
         q.height = number(sj, "height", 0.0);
         if (const Json* d = sj.find("d"))
             for (std::size_t i = 0; i < 2 && i < d->array.size(); ++i) q.d[i] = d->array[i].number;
+        if (const Json* d = sj.find("height_once"))
+            for (std::size_t i = 0; i < 2 && i < d->array.size(); ++i) q.height_once[i] = d->array[i].number;
         if (const Json* h = sj.find("stretch_height"))
             for (std::size_t a = 0; a < acq.scans[k].stretches.size(); ++a) q.stretch_height[a] = number(*h, acq.scans[k].stretches[a].name.c_str(), 0.0);
     }
@@ -248,6 +163,22 @@ void bind_geometry_calibration(nb::module_& m) {
         "The layout of a CalibrationSession's scans, each with whatever projection stretches it has on disk\n"
         "(helirec::calibration::geometry_calibration::read_acquisition).");
     m.def(
+        "geometry_row_time_from_refill",
+        [](nb::handle session, const gc::Acquisition& acq, std::optional<std::function<void(const std::string&)>> log) {
+            calibration::Session& s = bound_session(session);
+            gc::Log say;
+            if (log)
+                say = [&](const std::string& line) {
+                    nb::gil_scoped_acquire gil;
+                    (*log)(line);
+                };
+            nb::gil_scoped_release nogil;
+            return gc::row_time_from_refill(s, acq, say);
+        },
+        "session"_a, "acquisition"_a, "log"_a = nb::none(),
+        "Seconds per stored row from a refill in one of the acquisition's stretches, as JSON text (\"null\": none holds one)\n"
+        "(helirec::calibration::geometry_calibration::row_time_from_refill).");
+    m.def(
         "geometry_plan",
         [](const gc::Acquisition& acq, int angles_per_turn, int max_positions, int n_rest, int n_turn) {
             Json out = Json::list();
@@ -255,6 +186,7 @@ void bind_geometry_calibration(nb::module_& m) {
                 const calibration::ViewRequest& q = p.request;
                 Json d = Json::dict();
                 d.set("kind", Json::of(p.kind)).set("scan_a", whole(p.scan_a)).set("scan_b", whole(p.scan_b)).set("a", whole(p.a)).set("b", whole(p.b)).set("from_block", Json::of_bool(p.from_block));
+                d.set("request_scan_a", whole(q.scan_a)).set("request_scan_b", whole(q.scan_b));
                 d.set("stretch_a", whole(q.stretch_a)).set("stretch_b", whole(q.stretch_b)).set("frame_a", whole(q.frame_a)).set("frame_hint", whole(q.frame_hint));
                 d.set("angle_offset_deg", Json::of(q.angle_offset_deg)).set("mirror", Json::of_bool(q.mirror)).set("frames", whole(q.frames)).set("rows", whole(q.rows)).set("cols", whole(q.cols));
                 d.set("row_a", whole(q.row_a)).set("col_a", whole(q.col_a)).set("col_b", whole(q.col_b)).set("frame_shear", Json::of(q.frame_shear));
@@ -350,6 +282,33 @@ void bind_geometry_calibration(nb::module_& m) {
         "What the parameters leave of each comparison: (n, 3) frames, rows, columns.\n"
         "(helirec::calibration::geometry_calibration::residuals)");
     m.def(
+        "geometry_report",
+        [](const gc::Acquisition& acq, const std::string& parameters, Table a, Table b, const std::vector<bool>& opposite) {
+            const std::size_t n = opposite.size();
+            if (a.shape(0) != n || b.shape(0) != n || a.shape(1) != 5 || b.shape(1) != 5) throw Error("geometry_report: two sightings (scan, stretch, frame, row, column) and one flag per comparison");
+            std::vector<gc::Comparison> comparisons(n);
+            for (std::size_t i = 0; i < n; ++i) comparisons[i].a = sighting_of(a.data() + 5 * i), comparisons[i].b = sighting_of(b.data() + 5 * i), comparisons[i].opposite = opposite[i];
+            gc::GeometrySolution s;
+            s.parameters = parameters_of(acq, parameters);
+            nb::gil_scoped_release nogil;
+            s.residual = gc::residuals(acq, s.parameters, comparisons);
+            return gc::report_json(acq, gc::report(acq, s, comparisons));
+        },
+        "acquisition"_a, "parameters"_a, "a"_a, "b"_a, "opposite"_a,
+        "What the parameters leave of each scan's opposite views and what that says (the rows' timing, whose the recorded\n"
+        "height's departure is, the pitch a tile's own views bound), the spread over the scans, and which scans overlap,\n"
+        "as JSON text. (helirec::calibration::geometry_calibration::report)");
+    m.def(
+        "geometry_neighbours", [](const gc::Acquisition& acq) {
+            const gc::Neighbours n = gc::neighbours(acq);
+            nb::list edges, triangles;
+            for (const auto& e : n.edges) edges.append(nb::make_tuple(e[0], e[1]));
+            for (const auto& t : n.triangles) triangles.append(nb::make_tuple(t[0], t[1], t[2]));
+            return nb::make_tuple(edges, triangles);
+        },
+        "acquisition"_a, "The scans whose reconstructions overlap, and the triangles of them: (edges, triangles) as tuples of scan indices.\n"
+                         "(helirec::calibration::geometry_calibration::neighbours)");
+    m.def(
         "geometry_rays",
         [](const gc::Acquisition& acq, const std::string& parameters, Table sightings) {
             if (sightings.shape(1) != 5) throw Error("geometry_rays: a sighting is scan, stretch, frame, row, column");
@@ -368,13 +327,13 @@ void bind_geometry_calibration(nb::module_& m) {
         "(helirec::calibration::geometry_calibration::ray_of)");
     m.def(
         "calibrate_geometry",
-        [](const std::vector<std::string>& scans, std::optional<double> row_time, const std::string& device, int order, int passes, double tolerance, int threads, bool motion,
-           int patch, std::optional<std::function<void(const std::string&)>> log) {
+        [](const std::vector<std::string>& scans, std::optional<double> row_time, const std::string& device, int order, int threads, int patch,
+           std::optional<std::function<void(const std::string&)>> log) {
             gc::Options opt;
             opt.row_time = row_time ? *row_time : std::nan("");
             if (device != "cpu" && device != "cuda" && device != "auto") throw Error("device is cpu, cuda or auto");
             opt.device = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
-            opt.order = order, opt.passes = passes, opt.tolerance = tolerance, opt.threads = threads, opt.motion = motion, opt.patch = patch;
+            opt.order = order, opt.threads = threads, opt.patch = patch;
             if (log)
                 opt.log = [&](const std::string& line) {
                     nb::gil_scoped_acquire gil;
@@ -383,39 +342,8 @@ void bind_geometry_calibration(nb::module_& m) {
             nb::gil_scoped_release nogil;
             return gc::calibrate_geometry(scans, opt);
         },
-        "scans"_a, "row_time"_a = nb::none(), "device"_a = "auto", "order"_a = 3, "passes"_a = 6, "tolerance"_a = 0.02, "threads"_a = 8, "motion"_a = true, "patch"_a = 0,
-        "log"_a = nb::none(),
-        "The geometry calibration of a two-scan helical acquisition, as JSON text\n"
+        "scans"_a, "row_time"_a = nb::none(), "device"_a = "auto", "order"_a = 3, "threads"_a = 8, "patch"_a = 128, "log"_a = nb::none(),
+        "The geometry calibration of the scans of one sample (a scan with the rotation axis inside its field first), as JSON text\n"
         "(helirec::calibration::geometry_calibration::calibrate_geometry; helirec-calibration geometry).");
     m.def("geometry_calibration_save", &gc::save_text, "text"_a, "path"_a, "The text written whole or not at all.");
-    m.def("geometry_calibration_plan", &plan_json, "layout"_a, "The comparisons of one pass: [[request, what it compares], ..] as JSON text.");
-    m.def("geometry_calibration_fit", &fit_json, "rows"_a, "layout"_a, "map"_a, "tau"_a, "period"_a, "huber"_a = 0.03, "max_iterations"_a = 100,
-          "What the comparisons leave, as a correction of the map and the poses beside it (JSON text).");
-    m.def("geometry_calibration_update_range",
-          [](const std::string& map, const std::vector<double>& eu, const std::vector<double>& ev) {
-              const std::array<double, 2> r = gc::update_range(map_of(map), eu, ev);
-              return nb::make_tuple(r[0], r[1]);
-          },
-          "map"_a, "eu"_a, "ev"_a);
-    m.def("geometry_calibration_nodes",
-          [](DoubleIn t1, DoubleIn t2, DoubleIn th, int n_extra, double h, double total) {
-              const std::size_t n = th.shape(0);
-              if (t1.shape(0) != n || t2.shape(0) != n) throw Error("geometry_calibration_nodes: the three series differ in length");
-              int K = 0;
-              const std::vector<double> X = gc::nodes_design(std::vector<double>(t1.data(), t1.data() + n), std::vector<double>(t2.data(), t2.data() + n),
-                                                             std::vector<double>(th.data(), th.data() + n), n_extra, h, total, K);
-              auto out = helirec::py::new_array_t<double>({n, static_cast<std::size_t>(2 * K + n_extra)});
-              std::copy(X.begin(), X.end(), static_cast<double*>(out.data()));
-              return nb::make_tuple(out, K);
-          },
-          "t1"_a, "t2"_a, "th"_a, "n_extra"_a, "h"_a, "total"_a);
-    m.def("geometry_calibration_block_size", &gc::block_size, "limit"_a);
-    m.def("geometry_calibration_second_scan_fit",
-          [](const std::vector<std::string>& stretch, DoubleIn t, DoubleIn th, DoubleIn v, DoubleIn du, DoubleIn y, DoubleIn q, int rows, double total) {
-              std::vector<gc::PairRow> table(stretch.size());
-              for (std::size_t i = 0; i < table.size(); ++i)
-                  table[i] = gc::PairRow{gc::name_index(stretch[i]), t.data()[i], th.data()[i], v.data()[i], du.data()[i], y.data()[i], q.data()[i]};
-              return gc::second_scan_fit(table, rows, total);
-          },
-          "stretch"_a, "t"_a, "th"_a, "v"_a, "du"_a, "y"_a, "q"_a, "rows"_a, "total"_a);
 }

@@ -66,7 +66,7 @@ def reconstruction_terms(cal, label, angle_deg, height_rows, frame, rot_center, 
     return _tiles(cal).reconstruction_terms(label, f(angle_deg), f(height_rows), f(frame), float(rot_center), float(row_origin))
 
 
-def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origin=None, weight=None, cache_gb=0.0, reduced=None, log=print, cache_dir=None, reduce=0):
+def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origin=None, weight=None, cache_gb=0.0, reduced=None, log=print, cache_dir=None, reduce=0, projections=None):
     """A reconstructor (helirec SliceReconstructor) of one tile alone, on a description `cal` of the tiles' geometry
     (the module's description): the detector map, the pose and the angle of every frame, the rows' timing. The tile's own frame (see
     reconstruction_terms); only the helix frames on disk are used. The first step towards reconstructing a mosaic; the intensity side is the pair pipeline's (the scan's own
@@ -87,6 +87,9 @@ def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origi
     added: slice h of a reduced reconstruction is slice h 2^reduce of the full one, and its pixel at (x, y) from
     the axis is the full one's at (x, y) 2^reduce from the axis. The result's rot_center, where the axis lies in
     the slice, is in reduced pixels. row_origin stays in stored rows.
+    projections: the tile's group of a projection store (STORE.zarr/<tile>, made by helirec-projections-zarr): the
+    helix frames are read from its level `reduce` instead of the detector's files (values within one count of those). Darks
+    and flats are still read from the detector's files.
     Returns (reconstructor, dict(rot_center, frames, scan, terms, row_origin, reduced, reduce, params)).
     (helirec::tile_reconstructor, helirec/reconstruction.hpp)"""
     import json
@@ -95,6 +98,6 @@ def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origi
     try:
         return _core.tile_reconstructor(str(master), cal if isinstance(cal, str) else json.dumps(cal, default=float), str(label), device,
                                         json.dumps(params or {}, default=float), row_origin, weight, float(cache_gb), reduced, str(cache_dir or ""),
-                                        int(reduce), log)     # helirec::tile_reconstructor
+                                        int(reduce), log, str(projections or ""))     # helirec::tile_reconstructor
     except RuntimeError as e:
         raise ValueError(str(e)) from None

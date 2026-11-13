@@ -17,15 +17,7 @@ namespace {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
-// a per-frame series at a fraction of a frame: a line between frames, continued beyond the ends
-double at_frame(const std::vector<double>& v, double f) {
-    const long n = static_cast<long>(v.size());
-    if (n < 1) throw Error("geometry: a stretch without frames");
-    if (n == 1) return v[0];
-    const long i = std::clamp(static_cast<long>(std::floor(f)), 0L, n - 2);
-    const double w = f - static_cast<double>(i);
-    return v[static_cast<std::size_t>(i)] * (1.0 - w) + v[static_cast<std::size_t>(i) + 1] * w;
-}
+using model::at_frame;
 
 const StretchLayout& stretch_of(const Acquisition& acq, const Sighting& g) {
     if (g.scan < 0 || g.scan >= static_cast<int>(acq.scans.size())) throw Error("geometry: a sighting names scan " + std::to_string(g.scan) + ", which the acquisition does not hold");
@@ -36,8 +28,7 @@ const StretchLayout& stretch_of(const Acquisition& acq, const Sighting& g) {
 
 double mid_row(const Acquisition& acq) { return (acq.rows - 1) / 2.0; }
 
-// the frame at whose time the sighting's row was exposed
-double time_of(const Acquisition& acq, const Sighting& g) { return g.frame + acq.row_time * (g.row - mid_row(acq)); }
+double time_of(const Acquisition& acq, const Sighting& g) { return exposure_frame(acq, g); }
 
 model::At at_of(const Acquisition& acq, const Sighting& g) {
     const StretchLayout& st = stretch_of(acq, g);
@@ -55,16 +46,30 @@ double fan_angle(const Acquisition& acq, const Sighting& g) {
     return acq.fan * std::fabs(step) * (g.col - (acq.cols - 1) / 2.0);
 }
 
+// the terms of a map, or an error if its lists differ in length
+int terms_of(const geometry::Map& m) {
+    if (m.j.size() != m.i.size() || m.eu.size() != m.i.size() || m.ev.size() != m.i.size()) throw Error("geometry: the map's lists differ in length");
+    return static_cast<int>(m.i.size());
+}
+
 // The unknowns as the problem holds them: a block per owner.
 struct Blocks {
     double detector[1] = {0};
     double stage[4] = {0, 0, 0, 0};
+    geometry::Map shape;      // the map's terms and normalisation
+    std::vector<double> map;  // Eu's coefficients, then Ev's (empty: no map)
     std::vector<std::array<double, 3>> own, place;       // per scan
+    std::vector<std::array<double, 2>> once;             // per scan: the height once per turn of its own views
     std::vector<std::vector<std::array<double, 1>>> stretch;  // per scan, per stretch
+    int terms() const { return static_cast<int>(shape.i.size()); }
 };
 Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
     if (p.scans.size() != acq.scans.size()) throw Error("geometry: the parameters hold " + std::to_string(p.scans.size()) + " scans, the acquisition " + std::to_string(acq.scans.size()));
     Blocks b;
+    terms_of(p.map);
+    b.shape = p.map;
+    b.map = p.map.eu;
+    b.map.insert(b.map.end(), p.map.ev.begin(), p.map.ev.end());
     b.detector[0] = p.roll;
     b.stage[0] = p.stage.height_once[0], b.stage[1] = p.stage.height_once[1], b.stage[2] = p.stage.axis_twice[0], b.stage[3] = p.stage.axis_twice[1];
     for (std::size_t k = 0; k < p.scans.size(); ++k) {
@@ -72,6 +77,7 @@ Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
         if (s.stretch_height.size() != acq.scans[k].stretches.size()) throw Error("geometry: the parameters of scan " + acq.scans[k].name + " do not hold one height per stretch");
         b.own.push_back({s.axis, s.axis_slope, s.axial_scale});
         b.place.push_back({s.d[0], s.d[1], s.height});
+        b.once.push_back({s.height_once[0], s.height_once[1]});
         b.stretch.emplace_back();
         for (double h : s.stretch_height) b.stretch.back().push_back({h});
     }
@@ -79,12 +85,16 @@ Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
 }
 Parameters parameters_of(const Blocks& b) {
     Parameters p;
+    p.map = b.shape;
+    p.map.eu.assign(b.map.begin(), b.map.begin() + b.terms());
+    p.map.ev.assign(b.map.begin() + b.terms(), b.map.end());
     p.roll = b.detector[0];
     p.stage.height_once[0] = b.stage[0], p.stage.height_once[1] = b.stage[1], p.stage.axis_twice[0] = b.stage[2], p.stage.axis_twice[1] = b.stage[3];
     for (std::size_t k = 0; k < b.own.size(); ++k) {
         ScanParameters s;
         s.axis = b.own[k][0], s.axis_slope = b.own[k][1], s.axial_scale = b.own[k][2];
         s.d[0] = b.place[k][0], s.d[1] = b.place[k][1], s.height = b.place[k][2];
+        s.height_once[0] = b.once[k][0], s.height_once[1] = b.once[k][1];
         for (const auto& h : b.stretch[k]) s.stretch_height.push_back(h[0]);
         p.scans.push_back(s);
     }
@@ -97,18 +107,37 @@ struct Slot {
     double* block = nullptr;
     int size = 0, index = 0;
     bool free = false;
+    int place_of = -1;   // the scan whose place (d, height) it is part of; -1: none
+    bool gauge = false;  // never free: nothing can tell it from another unknown
 };
 std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b) {
+    if (acq.anchor < 0 || acq.anchor >= static_cast<int>(acq.scans.size())) throw Error("geometry: the acquisition's anchor is not one of its scans");
     std::vector<Slot> out;
     out.push_back({"roll", b.detector, 1, 0, true});
     const char* stage[4] = {"height_once_cos", "height_once_sin", "axis_twice_cos", "axis_twice_sin"};
     for (int i = 0; i < 4; ++i) out.push_back({std::string("stage.") + stage[i], b.stage, 4, i, true});
+    const int nt = b.terms();
+    for (int half = 0; half < 2; ++half)
+        for (int k = 0; k < nt; ++k) {
+            const std::size_t t = static_cast<std::size_t>(k);
+            Slot s{fmt("map.%s.i%dj%d", half ? "ev" : "eu", b.shape.i[t], b.shape.j[t]), b.map.data(), 2 * nt, half * nt + k, false};
+            s.gauge = !half && b.shape.i[t] == 1 && b.shape.j[t] == 0;  // Eu's line in the column: a scale of the columns
+            out.push_back(s);
+        }
     for (std::size_t k = 0; k < acq.scans.size(); ++k) {
         const std::string scan = "scan" + std::to_string(k) + ".";
+        const bool anchor = static_cast<int>(k) == acq.anchor;
         const char* own[3] = {"axis", "axis_slope", "axial_scale"};
         for (int i = 0; i < 3; ++i) out.push_back({scan + own[i], b.own[k].data(), 3, i, true});
         const char* place[3] = {"d0", "d1", "height"};
-        for (int i = 0; i < 3; ++i) out.push_back({scan + place[i], b.place[k].data(), 3, i, false});
+        for (int i = 0; i < 3; ++i) {
+            Slot s{scan + place[i], b.place[k].data(), 3, i, !anchor};
+            s.place_of = static_cast<int>(k);
+            out.push_back(s);
+        }
+        // a tile's own views beside the anchor's: the anchor's are the stage's
+        const char* once[2] = {"height_once_cos", "height_once_sin"};
+        for (int i = 0; i < 2; ++i) out.push_back({scan + once[i], b.once[k].data(), 2, i, !anchor && acq.scans[k].moved_on_stage});
         for (std::size_t a = 0; a < acq.scans[k].stretches.size(); ++a) {
             const StretchLayout& st = acq.scans[k].stretches[a];
             out.push_back({scan + st.name + ".height", b.stretch[k][a].data(), 1, 0, !st.helix});
@@ -116,21 +145,33 @@ std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b) {
     }
     return out;
 }
+// whether a name of GeometryOptions names the unknown: the unknown's own name, or its beginning up to a dot
+bool names(const std::string& given, const std::string& unknown) {
+    return unknown == given || (unknown.size() > given.size() && unknown.compare(0, given.size(), given) == 0 && unknown[given.size()] == '.');
+}
 
 // One comparison's residual: the two rays' difference in the sample (columns, rows).
 struct SameLines {
     model::At a, b;
-    double xa = 0, ya = 0, xb = 0, yb = 0;  // ideal positions
+    double ca = 0, va = 0, cb = 0, vb = 0;  // the stored pixels
+    std::vector<double> phi_a, phi_b;       // the map's terms there
     bool opposite = false;
-    int at_a[3] = {0, 0, 0}, at_b[3] = {0, 0, 0};  // where the residual's parameters hold own, place, stretch (0 is the detector, 1 the stage)
+    int at_map = -1;                               // where the residual's parameters hold the map; -1: none
+    int at_once = -1;                              // and the scan's height once per turn in its own views; -1: two scans
+    int at_a[3] = {0, 0, 0}, at_b[3] = {0, 0, 0};  // and own, place, stretch of each side (0 is the detector, 1 the stage)
 
     template <class T>
     bool operator()(T const* const* p, T* r) const {
-        T sa, za, sb, zb;
-        model::ray_of(p[0], p[1], p[at_a[0]], p[at_a[1]], p[at_a[2]], a, T(xa), T(ya), sa, za);
-        model::ray_of(p[0], p[1], p[at_b[0]], p[at_b[1]], p[at_b[2]], b, T(xb), T(yb), sb, zb);
+        const int terms = static_cast<int>(phi_a.size());
+        const T* map = at_map < 0 ? nullptr : p[at_map];
+        T xa, ya, xb, yb, sa, za, sb, zb;
+        model::ideal_position(map, phi_a.data(), terms, ca, va, xa, ya);
+        model::ideal_position(map, phi_b.data(), terms, cb, vb, xb, yb);
+        model::ray_of(p[0], p[1], p[at_a[0]], p[at_a[1]], p[at_a[2]], a, xa, ya, sa, za);
+        model::ray_of(p[0], p[1], p[at_b[0]], p[at_b[1]], p[at_b[2]], b, xb, yb, sb, zb);
         r[0] = opposite ? sb + sa : sb - sa;
         r[1] = zb - za;
+        if (at_once >= 0) r[1] -= model::own_lift(p[at_once], a, b);
         return true;
     }
 };
@@ -144,10 +185,17 @@ struct Wiring {
 Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
     Wiring w;
     w.f.a = at_of(acq, c.a), w.f.b = at_of(acq, c.b);
-    w.f.xa = c.a.col, w.f.ya = c.a.row, w.f.xb = c.b.col, w.f.yb = c.b.row;
+    w.f.ca = c.a.col, w.f.va = c.a.row, w.f.cb = c.b.col, w.f.vb = c.b.row;
     w.f.opposite = c.opposite;
     w.blocks.push_back(b.detector), w.sizes.push_back(1);
     w.blocks.push_back(b.stage), w.sizes.push_back(4);
+    if (const int nt = b.terms()) {
+        w.f.phi_a.resize(static_cast<std::size_t>(nt)), w.f.phi_b.resize(static_cast<std::size_t>(nt));
+        geometry::map_basis(b.shape, c.a.col, c.a.row, w.f.phi_a.data());
+        geometry::map_basis(b.shape, c.b.col, c.b.row, w.f.phi_b.data());
+        w.f.at_map = static_cast<int>(w.blocks.size());
+        w.blocks.push_back(b.map.data()), w.sizes.push_back(2 * nt);
+    }
     const auto place = [&](double* block, int size) {
         for (std::size_t i = 0; i < w.blocks.size(); ++i)
             if (w.blocks[i] == block) return static_cast<int>(i);
@@ -159,6 +207,7 @@ Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
         at[0] = place(b.own[k].data(), 3), at[1] = place(b.place[k].data(), 3), at[2] = place(b.stretch[k][a].data(), 1);
     };
     side(c.a, w.f.at_a), side(c.b, w.f.at_b);
+    if (c.a.scan == c.b.scan) w.f.at_once = place(b.once[static_cast<std::size_t>(c.a.scan)].data(), 2);
     return w;
 }
 
@@ -170,7 +219,9 @@ std::array<double, 3> residual_of(const Acquisition& acq, const Parameters& p, c
     const double step = at_frame(sb.course.angle_deg, t + 0.5) - at_frame(sb.course.angle_deg, t - 0.5);
     double dth = b.angle_deg - a.angle_deg - (c.opposite ? 180.0 : 0.0);
     dth -= 360.0 * std::round(dth / 360.0);
-    return {step != 0 ? dth / step : 0.0, b.z - a.z, c.opposite ? b.s + a.s : b.s - a.s};
+    double rows = b.z - a.z;
+    if (c.a.scan == c.b.scan) rows -= model::own_lift(p.scans[static_cast<std::size_t>(c.a.scan)].height_once, at_of(acq, c.a), at_of(acq, c.b));
+    return {step != 0 ? dth / step : 0.0, rows, c.opposite ? b.s + a.s : b.s - a.s};
 }
 
 double median(std::vector<double> v) { return median_of(std::move(v)); }
@@ -195,9 +246,15 @@ Ray ray_of(const Acquisition& acq, const Parameters& p, const Sighting& g) {
     const double detector[1] = {p.roll}, own[3] = {sp.axis, sp.axis_slope, sp.axial_scale}, place[3] = {sp.d[0], sp.d[1], sp.height};
     const double stage[4] = {p.stage.height_once[0], p.stage.height_once[1], p.stage.axis_twice[0], p.stage.axis_twice[1]};
     const double stretch[1] = {sp.stretch_height.at(static_cast<std::size_t>(g.stretch))};
+    const int nt = terms_of(p.map);
+    std::vector<double> map = p.map.eu, phi(static_cast<std::size_t>(nt));
+    map.insert(map.end(), p.map.ev.begin(), p.map.ev.end());
+    geometry::map_basis(p.map, g.col, g.row, phi.data());
+    double X, Y;
+    model::ideal_position(map.data(), phi.data(), nt, g.col, g.row, X, Y);
     Ray r;
     r.angle_deg = at.th * (180.0 / kPi) + fan_angle(acq, g);
-    model::ray_of(detector, stage, own, place, stretch, at, g.col, g.row, r.s, r.z);
+    model::ray_of(detector, stage, own, place, stretch, at, X, Y, r.s, r.z);
     return r;
 }
 
@@ -241,14 +298,17 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
     Blocks blocks = blocks_of(acq, start);
     std::vector<Slot> slots = slots_of(acq, blocks);
     {
-        std::set<std::string> known;
-        for (const Slot& s : slots) known.insert(s.name);
         for (const auto* list : {&options.held, &options.freed})
             for (const std::string& name : *list)
-                if (!known.count(name)) throw Error("geometry: no unknown is named " + name);
+                if (std::none_of(slots.begin(), slots.end(), [&](const Slot& s) { return names(name, s.name); })) throw Error("geometry: no unknown is named " + name);
+        const auto among = [](const std::vector<std::string>& list, const Slot& s) { return std::any_of(list.begin(), list.end(), [&](const std::string& n) { return names(n, s.name); }); };
         for (Slot& s : slots) {
-            if (std::count(options.freed.begin(), options.freed.end(), s.name)) s.free = true;
-            if (std::count(options.held.begin(), options.held.end(), s.name)) s.free = false;
+            if (among(options.freed, s)) s.free = true;
+            if (among(options.held, s)) s.free = false;
+            if (s.gauge && s.free) {
+                if (std::count(options.freed.begin(), options.freed.end(), s.name)) throw Error("geometry: " + s.name + " cannot be told from the pixel size and is not solved for");
+                s.free = false;
+            }
         }
     }
     std::vector<Wiring> wiring;
@@ -322,7 +382,15 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
 
     GeometrySolution out;
     out.solver.solver_version = CERES_VERSION_STRING;
-    // unknowns asked free that no comparison depends on are held where they started, and said
+    // unknowns asked free that no comparison depends on are held where they started, and said: first a scan's place,
+    // which only comparisons with another scan give
+    {
+        std::vector<std::uint8_t> joined(acq.scans.size(), 0);
+        for (const Comparison& c : comparisons)
+            if (c.a.scan != c.b.scan) joined[static_cast<std::size_t>(c.a.scan)] = joined[static_cast<std::size_t>(c.b.scan)] = 1;
+        for (Slot& s : slots)
+            if (s.free && s.place_of >= 0 && !joined[static_cast<std::size_t>(s.place_of)]) s.free = false, out.unused.push_back(s.name);
+    }
     {
         Built first = build();
         std::set<std::size_t> used(first.column_slot.begin(), first.column_slot.end());
@@ -375,23 +443,51 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
     return out;
 }
 
+namespace {
+Json num(double v) { return Json::of(v); }
+Json numbers(const std::vector<double>& v) {
+    Json j = Json::list();
+    for (double x : v) j.add(num(x));
+    return j;
+}
+// the parameters by name, the map apart (a calibration file holds it at its top, where the reconstruction reads it)
+void parameters_json(const Acquisition& acq, const Parameters& p, Json& out, Json& map) {
+    if (p.scans.size() != acq.scans.size()) throw Error("geometry: the parameters and the acquisition differ in their scans");
+    Json scans = Json::list();
+    for (std::size_t k = 0; k < p.scans.size(); ++k) {
+        const ScanParameters& q = p.scans[k];
+        Json heights = Json::dict();
+        for (std::size_t a = 0; a < q.stretch_height.size(); ++a) heights.set(acq.scans[k].stretches[a].name, num(q.stretch_height[a]));
+        Json d = Json::dict();
+        d.set("name", Json::of(acq.scans[k].name)).set("axis", num(q.axis)).set("axis_slope", num(q.axis_slope)).set("axial_scale", num(q.axial_scale));
+        d.set("d", Json::list().add(num(q.d[0])).add(num(q.d[1]))).set("height", num(q.height)).set("stretch_height", heights).set("mid_height", num(acq.scans[k].mid_height));
+        d.set("height_once", Json::list().add(num(q.height_once[0])).add(num(q.height_once[1])));
+        scans.add(d);
+    }
+    Json stage = Json::dict();
+    stage.set("height_once", Json::list().add(num(p.stage.height_once[0])).add(num(p.stage.height_once[1]))).set("axis_twice", Json::list().add(num(p.stage.axis_twice[0])).add(num(p.stage.axis_twice[1])));
+    out.set("roll", num(p.roll)).set("stage", stage).set("scans", scans);
+    Json mi = Json::list(), mj = Json::list();
+    for (const int v : p.map.i) mi.add(Json::whole_number(v));
+    for (const int v : p.map.j) mj.add(Json::whole_number(v));
+    map = Json::dict();
+    map.set("c0", num(p.map.c0)).set("cs", num(p.map.cs)).set("v0", num(p.map.v0)).set("vs", num(p.map.vs)).set("i", mi).set("j", mj).set("eu", numbers(p.map.eu)).set("ev", numbers(p.map.ev));
+}
+}  // namespace
+
+std::string parameters_json(const Acquisition& acq, const Parameters& p) {
+    Json out = Json::dict(), map;
+    parameters_json(acq, p, out, map);
+    out.set("map", map);
+    return out.text();
+}
+
 std::string solution_json(const Acquisition& acq, const GeometrySolution& s) {
-    const auto num = [](double v) { return Json::of(v); };
     const auto names = [](const std::vector<std::string>& v) {
         Json j = Json::list();
         for (const std::string& x : v) j.add(Json::of(x));
         return j;
     };
-    Json scans = Json::list();
-    for (std::size_t k = 0; k < s.parameters.scans.size(); ++k) {
-        const ScanParameters& p = s.parameters.scans[k];
-        Json heights = Json::dict();
-        for (std::size_t a = 0; a < p.stretch_height.size(); ++a) heights.set(acq.scans[k].stretches[a].name, num(p.stretch_height[a]));
-        Json d = Json::dict();
-        d.set("name", Json::of(acq.scans[k].name)).set("axis", num(p.axis)).set("axis_slope", num(p.axis_slope)).set("axial_scale", num(p.axial_scale));
-        d.set("d", Json::list().add(num(p.d[0])).add(num(p.d[1]))).set("height", num(p.height)).set("stretch_height", heights).set("mid_height", num(acq.scans[k].mid_height));
-        scans.add(d);
-    }
     Json left = Json::list();
     for (const GeometrySolution::Left& l : s.left) {
         Json d = Json::dict();
@@ -403,11 +499,9 @@ std::string solution_json(const Acquisition& acq, const GeometrySolution& s) {
     solver.set("cost", num(s.solver.cost)).set("iterations", Json::whole_number(s.solver.iterations)).set("evaluations", Json::whole_number(s.solver.evaluations));
     solver.set("usable", Json::of_bool(s.solver.usable)).set("termination", Json::of(s.solver.termination)).set("message", Json::of(s.solver.message));
     solver.set("solver_version", Json::of(s.solver.solver_version)).set("rank", Json::whole_number(s.rank));
-    Json out = Json::dict();
-    const StageParameters& st = s.parameters.stage;
-    Json stage = Json::dict();
-    stage.set("height_once", Json::list().add(num(st.height_once[0])).add(num(st.height_once[1]))).set("axis_twice", Json::list().add(num(st.axis_twice[0])).add(num(st.axis_twice[1])));
-    out.set("roll", num(s.parameters.roll)).set("stage", stage).set("scans", scans).set("free", names(s.free)).set("unused", names(s.unused)).set("solver", solver).set("left", left);
+    Json out = Json::dict(), map;
+    parameters_json(acq, s.parameters, out, map);
+    out.set("map", map).set("free", names(s.free)).set("unused", names(s.unused)).set("solver", solver).set("left", left);
     return out.text();
 }
 

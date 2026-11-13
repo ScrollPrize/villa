@@ -49,9 +49,9 @@ find_package(ZLIB REQUIRED)   # zlib chunks of Zarr arrays (zarr.hpp)
 
 find_package(CURL REQUIRED)   # Zarr arrays at http(s):// and s3:// locations (reference volumes)
 
-# vc_reader's native library (surfaces, volume sampling, image files): an installed package, or the sibling
-# checkout built statically into helirec (its Python modules and install rules stay out of helirec's). Only
-# helirec_surfaces (below) uses it.
+# vc_reader's native library (surfaces, volume sampling, image files, Zarr): an installed package, or the sibling
+# checkout built statically into helirec (its Python modules and install rules stay out of helirec's).
+# helirec_surfaces (below) uses it, and the core library's projection store (src/io/projection_store.cpp).
 if(NOT TARGET vc_reader::reader)
   find_package(vc_reader CONFIG QUIET)
 endif()
@@ -139,7 +139,9 @@ if(HELIREC_CPU_ARCH)
 endif()
 target_link_libraries(helirec
   PUBLIC OpenMP::OpenMP_CXX Ceres::ceres
-  PRIVATE PkgConfig::FFTW3F PkgConfig::FFTW3 ${FFTW3F_OMP_LIB} HDF5::HDF5 ZLIB::ZLIB CURL::libcurl)
+  PRIVATE PkgConfig::FFTW3F PkgConfig::FFTW3 ${FFTW3F_OMP_LIB} HDF5::HDF5 ZLIB::ZLIB CURL::libcurl vc_reader::reader)
+# (vc_reader's headers are not written for -Wextra)
+set_source_files_properties(src/io/projection_store.cpp PROPERTIES COMPILE_OPTIONS "-Wno-extra;-Wno-missing-field-initializers")
 if(HELIREC_DELTA3D)
   target_link_libraries(helirec PRIVATE vc_delta3d::vc_delta3d)
   target_compile_definitions(helirec PRIVATE HELIREC_WITH_DELTA3D=1)
@@ -195,7 +197,12 @@ if(HELIREC_TOOLS)
   target_include_directories(helirec-composite PRIVATE src)
   target_link_libraries(helirec-composite PRIVATE helirec_surfaces)
   target_compile_options(helirec-composite PRIVATE -O2 -Wall -Wno-missing-field-initializers)
-  install(TARGETS helirec-calibration helirec-reconstruct helirec-composite RUNTIME DESTINATION "${HELIREC_TOOLS_DESTINATION}")
+  # helirec-projections-zarr: reduced projection copies (helirec.download_projections) as one multiscale Zarr store
+  add_executable(helirec-projections-zarr tools/helirec_projections_zarr.cpp)
+  target_compile_features(helirec-projections-zarr PRIVATE cxx_std_20)
+  target_link_libraries(helirec-projections-zarr PRIVATE vc_reader::reader HDF5::HDF5)
+  target_compile_options(helirec-projections-zarr PRIVATE -O2 -Wall -Wno-missing-field-initializers)
+  install(TARGETS helirec-calibration helirec-reconstruct helirec-composite helirec-projections-zarr RUNTIME DESTINATION "${HELIREC_TOOLS_DESTINATION}")
   include(CTest)
   if(BUILD_TESTING)
     add_test(NAME calibration_selftest COMMAND helirec-calibration selftest)

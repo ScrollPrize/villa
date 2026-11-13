@@ -730,12 +730,6 @@ bool lateral_stage_differs(const Record& a, const Record& b) {
 
 namespace {
 
-// the first and second name of a motor of the tomo configuration ("sample_u" -> {"mrsx", "sx"}); "" if absent
-std::string config_motor(const Record& rec, const std::string& key) {
-    const auto& v = rec.technique.texts("tomoconfig/" + key);
-    return v.empty() ? std::string() : v.back();
-}
-
 struct Placement {
     bool have = false;
     double u = 0, v = 0;  // mm, the stages on the rotation
@@ -744,7 +738,7 @@ struct Placement {
 
 Placement placement_of(const Record& rec) {
     Placement p;
-    const std::string mu = config_motor(rec, "sample_u"), mv = config_motor(rec, "sample_v");
+    const std::string mu = tomo_motor(rec, "sample_u"), mv = tomo_motor(rec, "sample_v");
     const auto proj = rec.stretches_with(Role::Projection);
     if (mu.empty() || mv.empty() || proj.empty()) return p;
     const Stretch& s0 = rec.stretches[proj[0]];
@@ -803,7 +797,7 @@ void check_record_tiles(const std::vector<Record>& recs, Report& rep, double eps
         }
         f.stated = join(names, ", ");
         f.found = "motor positions that differ at the start of the first projection stretch: " + (diff.empty() ? std::string("none") : join(diff));
-        const std::string mu = config_motor(first, "sample_u"), mv = config_motor(first, "sample_v");
+        const std::string mu = tomo_motor(first, "sample_u"), mv = tomo_motor(first, "sample_v");
         const bool lateral = values.count(first.translation_y[1]) > 0, sample = values.count(mu) > 0 || values.count(mv) > 0;
         f.found += lateral ? "; the lateral stage of the rotation axis differs: scans at different places of the axis against the detector"
                  : sample ? "; the sample's stages on the rotation differ and the axis stays: tiles of a mosaic"
@@ -824,7 +818,7 @@ void check_record_tiles(const std::vector<Record>& recs, Report& rep, double eps
     double lever = reach;
     if (placed) {
         Finding& f = rep.add("6.1.1", all, "place of the sample on the rotation stage in each scan (stage readings)");
-        const std::string mu = config_motor(first, "sample_u"), mv = config_motor(first, "sample_v");
+        const std::string mu = tomo_motor(first, "sample_u"), mv = tomo_motor(first, "sample_v");
         std::vector<std::string> parts;
         bool constant = true;
         for (std::size_t k = 0; k < recs.size(); ++k) {
@@ -840,7 +834,7 @@ void check_record_tiles(const std::vector<Record>& recs, Report& rep, double eps
         f.found = join(parts) + fmt("; the readings are %s at the start and end of every projection stretch; %.4g px is %.1e of the distance between neighbours",
                                     constant ? "the same" : "NOT the same", eps, eps / std::max(1.0, lever - reach));
         // the stage's own statement of the sample's place in the laboratory: the pseudo-motors, which turn with the rotation
-        const std::string mx = config_motor(first, "sample_x"), my = config_motor(first, "sample_y"), rot = first.rotation[1];
+        const std::string mx = tomo_motor(first, "sample_x"), my = tomo_motor(first, "sample_y"), rot = first.rotation[1];
         double worst[2] = {0, 0};
         bool have_lab = !mx.empty() && !my.empty();
         for (std::size_t k = 0; k < recs.size() && have_lab; ++k)

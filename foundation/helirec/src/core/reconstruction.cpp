@@ -15,6 +15,7 @@
 #include "helirec/calibration/record.hpp"
 #include "helirec/raw_reader.hpp"
 #include "helirec/reconstruction.hpp"
+#include "helirec/projection_store.hpp"
 #include "io/json.hpp"
 #include "io/sha256.hpp"
 
@@ -195,7 +196,7 @@ std::pair<std::string, std::string> geometry_calibration_file(const std::string&
         }
         say(log, "geometry calibration " + path + ": other scans or unreadable, made again");
     }
-    say(log, "geometry calibration of the scans (helirec-calibration geometry: layout, rows' timing, detector map, poses, motion) ...");
+    say(log, "geometry calibration of the scans (helirec-calibration geometry: layout, rows' timing, comparisons, solve) ...");
     calibration::geometry_calibration::Options opt;
     if (!row_time_us.empty()) opt.row_time = number_of(Json::of(row_time_us), "row_time_us") * 1e-6;
     opt.device = device;
@@ -260,8 +261,7 @@ struct Reconstruction::Impl {
         layout = geometry->merged_layout(poses, H);
         intensity = calibration::calibrate_intensity(main, companion, layout, options.cache_dir, options.log, options.progress);
         const Json& lay = member(geometry_doc, "layout");
-        const int first_helix = static_cast<int>(member(member(lay, "frames").array.at(0), "rest1").number);
-        const double origin = H[0].at(static_cast<std::size_t>(first_helix)) - H[0][0];  // the helix's first frame lies where the record puts it
+        const double origin = H[0].at(geometry->helix_frames()[0]) - H[0][0];  // the helix's first frame lies where the record puts it
         for (int k = 0; k < 2; ++k) {
             const calibration::ScanPlacement& pl = intensity.placement[static_cast<std::size_t>(k)];
             terms[static_cast<std::size_t>(k)] =
@@ -367,11 +367,25 @@ struct Reconstruction::Impl {
         cfg.rot_center = static_cast<float>(intensity.rot_center);
         cfg.legacy_reference = legacy_mode;
         apply_parameters(params, cfg, options.external_backprojector, &resolved_sld);
-        if (!cfg.grid_size) cfg.grid_size = static_cast<int>(std::nearbyint(2.0 * intensity.rot_center)) + 1;  // 2 x axis rounded to even, + 1
+        std::vector<ScanData> scans;
+        double axis = intensity.rot_center;
+        const std::string only = lower(strip(text_of(member(params, "only_scan"))));
+        if (only.empty()) {
+            scans = {scan_data(0), scan_data(1)};
+        } else {
+            if (only != "main" && only != "companion") throw Error("only_scan must be '', 'main' or 'companion'");
+            // The scan alone in its own columns, the axis where the merged frame has it against them. Every
+            // projection's terms are counted from the axis, so they stay as they are.
+            ScanData d = scan_data(only == "companion" ? 1 : 0);
+            axis -= static_cast<double>(d.traj.shift_x) - d.traj.x_readjustment;
+            d.traj.shift_x = 0, d.traj.x_readjustment = 0;
+            cfg.rot_center = static_cast<float>(axis);
+            scans.push_back(std::move(d));
+        }
+        if (!cfg.grid_size) cfg.grid_size = static_cast<int>(std::nearbyint(2.0 * axis)) + 1;  // 2 x axis rounded to even, + 1
         cfg.exposure_arc = exposure_arc();
         cfg.sharpness_weighting = legacy_mode ? std::string() : sharpness_weighting();
         cfg.rolling_shutter = legacy_mode ? 0.0 : rolling_shutter;
-        std::vector<ScanData> scans = {scan_data(0), scan_data(1)};
         rec = std::make_shared<SliceReconstructor>(std::move(scans), cfg);
         std::tie(lo, hi) = rec->doable();
         if (rec->angle_interp() == "views" && exposure_arc() != 0)
@@ -565,6 +579,15 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         frame_index.push_back(scan.projections.frame_index.at(i));
     }
     if (frame.empty()) throw Error("tile " + label + ": no frames on disk");
+    // where the helix frames are read: the detector's files, or the same frames of a projection store
+    calibration::FrameList source;
+    source.files = scan.projections.files, source.dataset = scan.projections.dataset;
+    source.file_index = file_index, source.frame_index = frame_index;
+    if (!o.projections.empty()) {
+        source = frames_in_projection_store(source, o.projections);
+        file_index = source.file_index, frame_index = source.frame_index;
+        say(o.log, "[" + label + "] projections from " + o.projections);
+    }
     const Json& t = member(member(cal, "tiles"), label);
     const double axis_column = member(t, "axis_column").number;
     const int f = 1 << o.reduce;
@@ -603,7 +626,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     int rows = rows_full, cols = cols_full;
     if (o.reduce) {
         // every position of the stored detector and of the full reconstruction over f; slopes and scales are ratios
-        RawReader probe(scan.projections.files, scan.projections.dataset, rows_full, cols_full);
+        RawReader probe(source.files, source.dataset, rows_full, cols_full);
         const int chunk_rows = probe.storage(file_index[0]).chunk_rows;
         const std::vector<double> d64(dark.begin(), dark.end()), f64(flats.begin(), flats.end());
         int ry = 0, rx = 0;
@@ -659,7 +682,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     d.flats.resize(flats.size());
     for (std::size_t i = 0; i < flats.size(); ++i) d.flats[i] = flats[i] - dark[i % px];
     d.weight = w;
-    d.reader = std::make_shared<RawReader>(scan.projections.files, scan.projections.dataset, rows_full, cols_full, o.reduce);
+    d.reader = std::make_shared<RawReader>(source.files, source.dataset, rows_full, cols_full, o.reduce);
     if (o.cache_gb > 0) d.reader->set_cache_bytes(static_cast<std::size_t>(o.cache_gb * (1ull << 30)));
     d.file_index = file_index;
     d.frame_index = frame_index;
@@ -676,6 +699,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     put("sld", Json::of(std::string("")));
     put("sharpness_weighting", Json::of(std::string("off")));
     put("angle_subset", Json::of(std::string("")));
+    put("only_scan", Json::of(std::string("")));
     Json filter_changes = Json::dict();
     for (const auto& [key, v] : Json::parse(o.params.empty() ? "{}" : o.params).object) {
         if (key == "mode") {

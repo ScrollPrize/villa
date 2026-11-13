@@ -20,11 +20,15 @@ namespace helirec::calibration {
 
 class Frames {
   public:
-    explicit Frames(const Record& rec, int n_threads = 0);
+    // reduce = 1, 2, 3: every frame at a half, a quarter, an eighth, from the lower resolutions its JPEG 2000
+    // codestream holds (helirec/raw_reader.hpp: value (j, k) sits at the stored pixel (j, k) 2^reduce; plain frames
+    // have none and are refused when read). rows(), cols() and every row below are then the reduced frame's.
+    explicit Frames(const Record& rec, int n_threads = 0, int reduce = 0);
     ~Frames();
     const Record& record() const { return *rec_; }
     int rows() const { return rows_; }
     int cols() const { return cols_; }
+    int reduce() const { return reduce_; }
 
     // rows [row0[i], row0[i] + nrows) of frame frame[i] of stretch `stretch` -> out (n, nrows, cols).
     // Rows outside the detector are 0.
@@ -64,7 +68,7 @@ class Frames {
   private:
     void locate(int stretch, std::int64_t frame, std::int32_t& file, std::int32_t& index) const;
     const Record* rec_;
-    int rows_ = 0, cols_ = 0, n_threads_ = 0;
+    int rows_ = 0, cols_ = 0, n_threads_ = 0, reduce_ = 0;
     std::unique_ptr<RawReader> reader_;
     std::vector<std::vector<std::int32_t>> piece_file_;  // per stretch, per piece: index into the reader's files
 };

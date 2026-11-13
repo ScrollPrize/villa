@@ -10,7 +10,7 @@
 
 namespace helirec::calibration {
 
-Frames::Frames(const Record& rec, int n_threads) : rec_(&rec), n_threads_(n_threads) {
+Frames::Frames(const Record& rec, int n_threads, int reduce) : rec_(&rec), n_threads_(n_threads), reduce_(reduce) {
     std::vector<std::string> files;
     std::map<std::string, std::int32_t> index;
     std::string dataset;
@@ -30,7 +30,8 @@ Frames::Frames(const Record& rec, int n_threads) : rec_(&rec), n_threads_(n_thre
         }
         piece_file_.push_back(std::move(of_piece));
     }
-    reader_ = std::make_unique<RawReader>(std::move(files), dataset, rows_, cols_);
+    reader_ = std::make_unique<RawReader>(std::move(files), dataset, rows_, cols_, reduce);
+    rows_ = reader_->rows(), cols_ = reader_->cols();  // of a frame as it is read
     reader_->set_cache_bytes(default_cache_bytes);
 }
 

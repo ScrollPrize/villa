@@ -18,6 +18,13 @@
 // compressed frames have such resolutions (plain ones are refused), and the stored rows, columns and rows per
 // chunk must be multiples of 2^reduce for uint16.
 //
+// Also read: a scan group of a projection store (helirec/projection_store.hpp: a multiscale Zarr of frames made
+// from such files) given in place of a file. Its frame indices count the group's frames, reduce = 0 .. 3 selects
+// the level (one the store does not hold is refused), and the values are those the files give at that reduce
+// with decoder="openjph".
+// storage() of a group reports codec "projection store (Zarr)", compressed false and the chunk_rows of the files
+// the store was made from.
+//
 // dtype="float32": also reads reconstructed B2JPF32 HTJ2K volumes using OpenJPH
 // (fetched by CMake). Odd frame dimensions round up at lower resolutions. Whole
 // frame chunks may be odd; internal chunk boundaries must align with 2^reduce.
