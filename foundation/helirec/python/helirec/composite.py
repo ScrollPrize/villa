@@ -34,6 +34,10 @@ import time
 
 import numpy as np
 
+def _json_default(o):
+    return o.tolist() if hasattr(o, "tolist") else str(o)
+
+
 def volume_mode(path):
     """units mode of an OME-Zarr volume: the helirec mode in its provenance; volumes without one (written by the
     reference workflow) are in legacy reference units"""
