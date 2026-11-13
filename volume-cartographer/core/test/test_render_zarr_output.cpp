@@ -23,6 +23,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -104,16 +105,19 @@ TEST_CASE("vc_render_tifxyz writes, resumes and partitions a Zarr pyramid")
                 {"format", "tifxyz"}, {"type", "seg"}, {"uuid", "surface"}, {"scale", {1, 1}},
                 {"bbox", {{4, 4.5, 8}, {width + 3, height + 3.5, 8}}}}.dump();
 
-            const auto render = [&](const fs::path& out, const std::string& extra = "", bool pyramid = true) {
+            // Returns the exit status and the command followed by its output.
+            const auto run = [&](const fs::path& out, const std::string& extra = "", bool pyramid = true, const std::string& compressor = "none") {
                 const std::string command = std::string("OMP_NUM_THREADS=2 \"") + renderer + "\" -v \"" + volume.string() +
-                    "\" -s \"" + surface.string() + "\" -g 0 --scale 1 --num-slices 3 --zarr-compressor none --zarr-separator " +
+                    "\" -s \"" + surface.string() + "\" -g 0 --scale 1 --num-slices 3 --zarr-compressor " + compressor + " --zarr-separator " +
                     separator + " --pyramid " + (pyramid ? "true" : "false") + " --zarr-output \"" + out.string() + "\" " + extra +
                     " > \"" + (root / "log.txt").string() + "\" 2>&1";
                 const int status = std::system(command.c_str());
-                if (status != 0) {
-                    std::ifstream log(root / "log.txt");
-                    MESSAGE(command << "\n" << std::string(std::istreambuf_iterator<char>(log), {}));
-                }
+                std::ifstream log(root / "log.txt");
+                return std::pair{status, command + "\n" + std::string(std::istreambuf_iterator<char>(log), {})};
+            };
+            const auto render = [&](const fs::path& out, const std::string& extra = "", bool pyramid = true) {
+                const auto [status, log] = run(out, extra, pyramid);
+                if (status != 0) MESSAGE(log);
                 REQUIRE(status == 0);
             };
 
@@ -167,13 +171,10 @@ TEST_CASE("vc_render_tifxyz writes, resumes and partitions a Zarr pyramid")
             CHECK(std::ranges::any_of(coarse.bytes, [](std::uint8_t b) { return b != 0; }));
 
             // An output the writer cannot create fails the run, with and without --pre.
-            for (const std::string pre : {"", " --pre"}) {
-                const std::string command = std::string("\"") + renderer + "\" -v \"" + volume.string() + "\" -s \"" +
-                    surface.string() + "\" -g 0 --scale 1 --zarr-compressor snappy --zarr-output \"" +
-                    (root / "snappy").string() + "\"" + pre + " > \"" + (root / "log.txt").string() + "\" 2>&1";
-                CHECK(std::system(command.c_str()) != 0);
-                std::ifstream log(root / "log.txt");
-                CHECK(std::string(std::istreambuf_iterator<char>(log), {}).find("Error creating") != std::string::npos);
+            for (const std::string pre : {"", "--pre"}) {
+                const auto [status, log] = run(root / "snappy", pre, true, "snappy");
+                CHECK(status != 0);
+                CHECK(log.find("Error creating") != std::string::npos);
             }
             std::error_code ignored;
             fs::remove_all(root, ignored);
