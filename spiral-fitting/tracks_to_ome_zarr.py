@@ -106,8 +106,15 @@ class TrackDatabase:
 
     def _sqlite(self):
         # immutable=1 is important for read-only inputs and prevents large
-        # source DBMs from acquiring sidecar journal/WAL files.
-        uri = f'file:{Path(self.path).as_posix()}?mode=ro&immutable=1'
+        # source DBMs from acquiring sidecar journal/WAL files. It also makes
+        # SQLite ignore an existing WAL, which may hold committed records (an
+        # interrupted or still running extraction), so use it only when there
+        # is none, as tracks._SQLiteTrackDBM does. SQLite opens a symlink's
+        # target; check that target's WAL as well.
+        path = Path(self.path).resolve()
+        uri = path.as_uri() + '?mode=ro'
+        if not Path(str(path) + '-wal').exists():
+            uri += '&immutable=1'
         return sqlite3.connect(uri, uri=True)
 
 
