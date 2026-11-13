@@ -15,9 +15,9 @@ namespace
 constexpr int kWidth = vcr::sheet_normal::width; // 109 voxel patch
 constexpr int kHalf = 54;                         // patch start = lattice point - 54
 constexpr std::size_t kPatchCacheBytes = 512ULL * 1024 * 1024;
-// CpuPatch owns six gradient arrays, each with `count` floats.
+// CpuPatch owns six gradient arrays and one divisor array, each with `count` floats.
 constexpr std::size_t kPatchBytes = sizeof(vcr::sheet_normal::CpuPatch) +
-                                    6ULL * vcr::sheet_normal::count * sizeof(float);
+                                    7ULL * vcr::sheet_normal::count * sizeof(float);
 constexpr std::size_t kPatchCacheCapacity = kPatchCacheBytes / kPatchBytes;
 static_assert(kPatchCacheCapacity > 0, "The normal cache must hold at least one patch");
 
