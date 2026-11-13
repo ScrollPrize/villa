@@ -114,9 +114,10 @@ bool htj2k_float_frames_supported() { return j2k::openjph_available(); }
 bool jpeg2000_frames_supported() { return j2k::available(); }
 std::vector<std::uint8_t> jpeg2000_chunk(const std::uint16_t* values, int rows, int cols) { return j2k::encode_chunk(values, cols, rows); }
 
-RawReader::RawReader(std::vector<std::string> files, std::string dataset, int rows, int cols, int reduce, std::string dtype, bool selective)
-    : dtype_(std::move(dtype)), sample_bytes_(dtype_ == "float32" ? 4 : 2), selective_(selective), files_(std::move(files)), dataset_(std::move(dataset)), rows_(rows), cols_(cols), stored_rows_(rows), stored_cols_(cols), reduce_(reduce),
+RawReader::RawReader(std::vector<std::string> files, std::string dataset, int rows, int cols, int reduce, std::string dtype, bool selective, std::string decoder)
+    : dtype_(std::move(dtype)), sample_bytes_(dtype_ == "float32" ? 4 : 2), selective_(selective), use_openjph_(decoder == "openjph" || (decoder == "auto" && sample_bytes_ == 4)), files_(std::move(files)), dataset_(std::move(dataset)), rows_(rows), cols_(cols), stored_rows_(rows), stored_cols_(cols), reduce_(reduce),
       sync_(std::make_unique<Sync>()), cache_(std::make_unique<Cache>()) {
+    if (decoder != "auto" && decoder != "openjph") throw Error("RawReader: decoder must be auto or openjph");
     if (dtype_ != "uint16" && dtype_ != "float32") throw Error("RawReader: dtype must be uint16 or float32");
     if (rows < 1 || cols < 1) throw Error("RawReader: rows and cols must be positive");
     if (reduce < 0 || reduce > 3) throw Error("RawReader: reduce must be 0 (as stored), 1 (a half), 2 (a quarter) or 3 (an eighth)");
@@ -187,9 +188,9 @@ const RawReader::FileInfo& RawReader::info(int file) {
             throw Error("RawReader: " + path + ": compressed chunks must be whole rows of one frame");
         if (cdims[1] % (1u << reduce_) && (sample_bytes_ == 2 || cdims[1] != dims[1]))
             throw Error("RawReader: " + path + ": chunks of " + std::to_string(cdims[1]) + " rows cannot be read at 1/" + std::to_string(1 << reduce_));
-        if (sample_bytes_ == 4 && !j2k::openjph_available())
-            throw Error("RawReader: float32 HTJ2K needs a build with HELIREC_OPENJPH=ON");
-        if (sample_bytes_ == 2 && !j2k::available())
+        if (use_openjph_ && !j2k::openjph_available())
+            throw Error("RawReader: HTJ2K with OpenJPH needs a build with HELIREC_OPENJPH=ON");
+        if (!use_openjph_ && !j2k::available())
             throw Error("RawReader: " + path + ": the frames are stored as JPEG 2000; build helirec with OpenJPEG (libopenjp2 >= 2.5: apt install libopenjp2-7-dev, brew install openjpeg)");
         fi->stored_chunk_rows = static_cast<int>(cdims[1]);
         fi->chunk_rows = 1 + ((fi->stored_chunk_rows - 1) >> reduce_);
@@ -301,7 +302,7 @@ void RawReader::decode_chunk(int fd, int file, const FileInfo& fi, std::size_t a
         pread_all(fd, dst, n, fi.chunk_offset[at] + offset, files_[file]);
         sync_->bytes_read.fetch_add(n, std::memory_order_relaxed);
     };
-    if (sample_bytes_ == 4) {
+    if (use_openjph_) {
         j2k::decode_htj2k(read, bytes, nbytes, sample_bytes_, stored_cols_, fi.stored_chunk_rows, reduce_, tile, selective_);
     } else {
         raw.resize(bytes);

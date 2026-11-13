@@ -47,16 +47,27 @@ KINDS = ("opposite", "resthelix", "turn", "pair")
 
 # ---------------------------------------------------------------- the map
 
+def _text(cal):
+    """A calibration as the JSON text the C++ side reads (helirec/geometry.hpp)."""
+    return cal if isinstance(cal, str) else json.dumps(cal, default=float)
+
+
+def _map_args(m):
+    return [int(x) for x in m["i"]], [int(x) for x in m["j"]], [float(x) for x in m["eu"]], [float(x) for x in m["ev"]], float(m["c0"]), float(m["cs"]), float(m["v0"]), float(m["vs"])
+
+
 def terms(order):
     """Powers (i, j) of the map's polynomial in the column and the row: all of total order 2 to `order`. The linear
     ones are left out (a scale, a shear and a rotation of the grid cannot be told from the poses), but for the
-    rows' slope across the columns, which the opposite views of one scan and the overlap of two do measure."""
-    return [(i, j) for i in range(order + 1) for j in range(order + 1) if 2 <= i + j <= order] + [(1, 0)]
+    rows' slope across the columns, which the opposite views of one scan and the overlap of two do measure.
+    (helirec::geometry::map_terms)"""
+    from . import _core
+    return [tuple(t) for t in _core.geometry_map_terms(int(order))]
 
 
 def empty_map(rows, cols, order=3):
-    t = terms(order)
-    return dict(c0=cols / 2.0, cs=cols / 2.0, v0=(rows - 1) / 2.0, vs=rows / 2.0, i=[a for a, _ in t], j=[b for _, b in t], eu=[0.0] * len(t), ev=[0.0] * len(t))
+    from . import _core
+    return _core.geometry_empty_map(int(rows), int(cols), int(order))
 
 
 def _phi(m, c, v, i, j):
@@ -64,19 +75,18 @@ def _phi(m, c, v, i, j):
 
 
 def map_displacement(m, c, v):
-    """(Eu, Ev) of the map at detector position (c, v)."""
-    eu = sum(a * _phi(m, c, v, i, j) for a, i, j in zip(m["eu"], m["i"], m["j"]))
-    ev = sum(a * _phi(m, c, v, i, j) for a, i, j in zip(m["ev"], m["i"], m["j"]))
-    return eu, ev
+    """(Eu, Ev) of the map at detector position (c, v). (helirec::geometry::map_displacement)"""
+    from . import _core
+    c, v = np.broadcast_arrays(np.asarray(c, np.float64), np.asarray(v, np.float64))
+    eu, ev = _core.geometry_map_displacement(*_map_args(m), np.ascontiguousarray(c.ravel()), np.ascontiguousarray(v.ravel()))
+    return eu.reshape(c.shape)[()], ev.reshape(c.shape)[()]
 
 
 def with_line(m, a, b, about):
     """The map with a line in the column added for one scan: its blocks are read a (c - about) columns and
-    b (c - about) rows further on."""
-    out = dict(m, i=list(m["i"]) + [1, 0], j=list(m["j"]) + [0, 0], eu=list(m["eu"]), ev=list(m["ev"]))
-    for key, k in (("eu", a), ("ev", b)):
-        out[key] += [-k * m["cs"], -k * (m["c0"] - about)]
-    return out
+    b (c - about) rows further on. (helirec::geometry::with_line)"""
+    from . import _core
+    return _core.geometry_with_line(*_map_args(m), float(a), float(b), float(about))
 
 
 def _set_map(session, m, scan=-1):
@@ -550,13 +560,7 @@ def _nodes(t1, t2, th, n_extra, h, total):
     return X, K
 
 
-def _course(nodes, h, t, th):
-    """d(t) . (cos, sin)(th) of a course given at its nodes h, 2h, .. (d(0) = 0)."""
-    d = np.vstack([[0.0, 0.0], np.asarray(nodes, float)])
-    x = np.clip(np.asarray(t, float) / h, 0, len(d) - 1 - 1e-9)
-    k = np.floor(x).astype(int)
-    v = d[k] * (1 - (x - k))[:, None] + d[k + 1] * (x - k)[:, None]
-    return v[:, 0] * np.cos(th) + v[:, 1] * np.sin(th)
+
 
 
 def second_scan_fit(table, rows, total):
@@ -800,115 +804,15 @@ def frame_poses(cal, angles_deg, heights_rows):
     stretch with the rotating body's place against it, the height once per turn. The second scan is the first one's
     model at the same frame plus what the comparison of the two scans at equal frames measured. Terms the step
     measured and this does not use are listed under "not_applied"."""
-    lay, po = cal["layout"], cal["poses"]
-    mo = po.get("motion")
-    if not mo or "second_scan" not in mo:
-        raise ValueError("the geometry holds no motion stage with the second scan's place: run the step with motion")
-    R, N = lay["rows"], lay["frames_per_turn"]
-    mid = (R - 1) / 2
-    tau = cal["row_time"]["seconds_per_row"]
-    period = cal["row_time"].get("frame_period_s") or (cal["row_time"].get("measured") or {}).get("period_s")
-    if not period:
-        raise ValueError("the geometry does not say the frame period")
-    L = lay["frames"]
-    if any(L[0][a] != L[1][a] for a in ("rest1", "helix", "rest2")):
-        raise ValueError("the second scan is placed against the first at equal frames: the stretches must be equally long")
-    L = L[0]
-    cut = dict(rest1=slice(0, L["rest1"]), helix=slice(L["rest1"], L["rest1"] + L["helix"]), rest2=slice(L["rest1"] + L["helix"], L["rest1"] + L["helix"] + L["rest2"]))
-    n = cut["rest2"].stop
-    ang = [np.asarray(a_, float) for a_ in angles_deg]
-    H = [np.asarray(h_, float) for h_ in heights_rows]
-    if any(len(x) != n for x in ang + H):
-        raise ValueError(f"the record holds {[len(x) for x in ang]} frames, the geometry {n}")
-    S0, S1, P2 = mo["scan 0"], mo["scan 1"], mo["second_scan"]
-    start = mo["turns_at_start"][0]
-    psi = po["axis_roll_rad"]
-    mc = S0["sideways"]["mirror_column"]
-    tx = S0["sideways"]["travel_px_per_row"]
-    A = mo["along_axis"]
-
-    # the helix of the first scan against its encoder: views a turn apart give e(t + 1) - e(t) as a line in t
-    tb = np.array(S0["helix"]["table"])
-    th_ = tb[:, 0] / N
-    c1, c0 = np.polyfit(th_, tb[:, 2], 1)
-    g1, g0 = np.polyfit(th_, tb[:, 3], 1)
-    e = lambda t_: (c0 - c1 / 2) * t_ + (c1 / 2) * t_ ** 2          # rows beyond the encoder, 0 at the helix's first frame
-    G = lambda t_: (g0 - g1 / 2) * t_ + (g1 / 2) * t_ ** 2          # frames beyond the encoder's angle and the rows' timing
-    Hh0 = H[0][cut["helix"]][0]
-    hint = dict(rest1=0, rest2=L["helix"] - L["rest2"])
-
-    def first(k_frames, st, enc_deg):
-        """The first scan's model at frames `k_frames` of stretch st seen at the angles enc_deg: row, axis, G."""
-        kk = np.asarray(k_frames)
-        th = np.radians(enc_deg)
-        z = A["z_cos"] * np.cos(th) + A["z_sin"] * np.sin(th)
-        t_abs = start[st] + (kk + 0.5) / N
-        body = _course(S0["sideways"]["nodes_px"], S0["sideways"]["node_spacing_turns"], t_abs, th)
-        Hs = H[0][cut[st]]
-        if st == "helix":
-            P = Hs[kk] - Hh0
-            return P + e((kk + 0.5) / N) + z, mc["helix"] + (tx - mc["per_row"]) * P + body, G((kk + 0.5) / N)
-        f = kk + hint[st]                                          # the helix frame at the same angle, in the next turn
-        Hf = H[0][cut["helix"]][f]
-        D = Hf - Hs[kk]
-        row = (Hf - Hh0) + e((f + 0.5) / N) - D * (1 + S0[st]["scale_error"]) - S0[st]["offset_rows"] + z
-        return row, mc[st] + body, G((f + 0.5) / N) - (S0[st]["angle_frames"] + S0[st]["angle_frames_per_row"] * D)
-
-    out = []
-    for s in (0, 1):
-        d = {k_: np.zeros(n) for k_ in ("row", "row_per_col", "axis", "col_per_row", "col_scale", "row_scale", "angle_deg", "angle_deg_per_row")}
-        # per frame, within each stretch (the record steps between the stretches): the angular step, and the travel
-        # as a line through the 33 frames around (the registration's blocks are 32 frames; the encoder's own
-        # frame-to-frame differences are noise against a stage that moves steadily)
-        step, travel = np.zeros(n), np.zeros(n)
-        for sl in cut.values():
-            step[sl] = np.gradient(ang[s][sl])
-            hs = H[s][sl]
-            k_ = np.arange(-16, 17)
-            pad = np.concatenate([hs[0] + (hs[1] - hs[0]) * np.arange(-16, 0), hs, hs[-1] + (hs[-1] - hs[-2]) * np.arange(1, 17)])
-            travel[sl] = np.convolve(pad, (k_ / (k_ ** 2).sum())[::-1], "valid")
-        d["row_scale"] = -travel * tau / period                    # the sample travels while the rows are read
-        d["angle_deg_per_row"] = step * tau / period
-        helix_mid = start["helix"] + 0.5 * L["helix"] / N
-        for st, sl in cut.items():
-            kk = np.arange(sl.stop - sl.start)
-            row, axis, Gk = first(kk, st, ang[s][sl])
-            rpc, cpr = -psi, mc["per_row"]
-            if s == 1:
-                th = np.radians(ang[1][sl])
-                t_abs = start[st] + (kk + 0.5) / N
-                trav = (t_abs - helix_mid) if st == "helix" else 0.0
-                once = lambda key: P2[key]["once_per_turn"][0] * np.cos(th) + P2[key]["once_per_turn"][1] * np.sin(th)
-                rho, (la, lb) = po["rotation_about_beam_rad"][st], po["second_scan"][st]["line"]
-                u_ref = overlap_centre_of(lay) - mc[st if st != "helix" else "helix"]
-                # columns: the second scan's axis = the first's (with the first body's course) + the move + what the
-                # comparison at equal frames holds: the stretch's offset and the course once per turn
-                nodes = np.array(P2["columns"]["once_per_turn_nodes"])
-                x = np.clip(t_abs, 0, len(nodes) - 1 - 1e-9)
-                k0 = np.floor(x).astype(int)
-                E = nodes[k0] * (1 - (x - k0))[:, None] + nodes[k0 + 1] * (x - k0)[:, None]
-                axis = axis + lay["coarse_move"] + P2["columns"]["offset"][st] + P2["columns"]["per_turn_of_travel"] * trav + E[:, 0] * np.cos(th) + E[:, 1] * np.sin(th)
-                cpr = cpr + P2["columns"]["per_row"][st]
-                rpc = rpc + rho + lb
-                row = row + (H[1][sl] - H[0][sl]) + P2["rows"]["offset"][st] + P2["rows"]["per_turn_of_travel"] * trav + once("rows") - (rho + lb) * u_ref
-                # the comparison's line in the row: the second scan's rows lie b (Y - middle) further on, which is a
-                # scale of its rows about the middle row (as a scale about row 0 and an offset)
-                bv = P2["rows"]["per_row"][st]
-                d["row_scale"][sl] -= bv
-                row = row - bv * mid
-                d["col_scale"][sl] = la
-            d["row"][sl], d["axis"][sl], d["row_per_col"][sl], d["col_per_row"][sl] = row, axis, rpc, cpr
-            d["angle_deg"][sl] = ang[s][sl] - step[sl] * Gk
-        d["scale_col"] = float(overlap_centre_of(lay) + lay["coarse_move"]) if s == 1 else 0.0
-        out.append(d)
-    not_applied = {
-        "second scan, twice per turn [px, rows]": [P2["columns"]["twice_per_turn"], P2["rows"]["twice_per_turn"]],
-        "second scan, angle against the first at equal frames [frames] (the stage's angle repeats; the comparison's angle holds the beam's divergence, which a detector-plane term cannot express)":
-            dict(offset=P2["angle_frames"]["offset"], per_turn_of_travel=P2["angle_frames"]["per_turn_of_travel"], once_per_turn=P2["angle_frames"]["once_per_turn"]),
-        "first scan, drift at rest from opposite views [rows per turn] (the rest turns are placed by the helix instead)": A.get("drift_rows_per_turn"),
-        "second scan's own helix and rest turns (it is placed by the first's)": {k_: {q_: v_ for q_, v_ in S1[k_].items() if q_ != "table"} for k_ in ("rest1", "rest2", "helix") if k_ in S1},
-    }
-    return out, not_applied
+    from . import _core
+    C = _core.GeometryCalibration(_text(cal))          # helirec::geometry::Calibration::frame_poses
+    ang = [np.ascontiguousarray(a_, np.float64) for a_ in angles_deg]
+    H = [np.ascontiguousarray(h_, np.float64) for h_ in heights_rows]
+    try:
+        poses, not_applied = C.frame_poses(ang[0], ang[1], H[0], H[1])
+    except RuntimeError as e:
+        raise ValueError(str(e)) from None
+    return poses, json.loads(not_applied)
 
 
 def reconstruction_terms(pose, heights_rows, layout, rot_center, column_offset, z_readjustment=0.0, row_origin=0.0):
@@ -919,15 +823,11 @@ def reconstruction_terms(pose, heights_rows, layout, rot_center, column_offset, 
     row_offset[k]), z_pix the record's height in pixels from the scan's first projection. row_origin: rows added to
     every pose (the slice numbering's origin). Everything the poses hold beyond the record goes into the terms, so
     z_translation_scale is 1."""
-    H = np.asarray(heights_rows, float)
-    z_pix = layout["row_sign"] * (H - H[0])
-    return dict(angles_deg=np.asarray(pose["angle_deg"], np.float64), z_translation_scale=1.0,
-                row_offset=(-(pose["row"] + row_origin) - z_readjustment - z_pix).astype(np.float32),
-                row_slope=pose["row_per_col"].astype(np.float32), slope_col=float(rot_center - column_offset),
-                col_offset=(pose["axis"] + column_offset - rot_center).astype(np.float32),
-                col_slope=pose["col_per_row"].astype(np.float32), slope_row=(layout["rows"] - 1) / 2,
-                col_scale=pose["col_scale"].astype(np.float32), scale_col=float(pose["scale_col"]),
-                row_scale=pose["row_scale"].astype(np.float32), scale_row=0.0)
+    from . import _core
+    f = lambda key: np.ascontiguousarray(pose[key], np.float64)
+    return _core.geometry_reconstruction_terms(f("row"), f("row_per_col"), f("axis"), f("col_per_row"), f("col_scale"), f("row_scale"), f("angle_deg"), float(pose["scale_col"]),
+                                               np.ascontiguousarray(heights_rows, np.float64), float(layout["row_sign"]), int(layout["rows"]), float(rot_center),
+                                               float(column_offset), float(z_readjustment), float(row_origin))
 
 
 def merged_layout(cal, poses, heights_rows, quantum=0.25):
@@ -940,29 +840,22 @@ def merged_layout(cal, poses, heights_rows, quantum=0.25):
     and row are in its terms (reconstruction_terms), which are counted from this frame, so the rounding moves
     nothing; it fixes the slices' grid, and it is what mode legacy_reference, which has no terms per projection,
     places the scans by (one axis and one vector, on the grid the reference's searches had)."""
-    L = cal["layout"]["frames"][0]
-    helix = slice(L["rest1"], L["rest1"] + L["helix"])
-    sign = cal["layout"]["row_sign"]
-    H = [np.asarray(h_, float) for h_ in heights_rows]
-    axis = [float(np.median(p_["axis"][helix])) for p_ in poses]
-    # the row a slice is read at beyond what the record alone gives (z_pix: the record's height from the scan's first frame)
-    beyond = [p_["row"][helix] + sign * (h_[helix] - h_[0]) for p_, h_ in zip(poses, H)]
-    rows = float(np.median(beyond[1] - beyond[0]))
-    q = lambda v: float(round(v / quantum) * quantum)
-    return dict(cor_main_detector=q(axis[0]), vector=(q(-rows), q(axis[0] - axis[1])),
-                measured=dict(axis_first_scan=axis[0], axis_second_scan=axis[1], second_scan_rows=rows, quantum=quantum))
+    from . import _core
+    f = lambda x: np.ascontiguousarray(x, np.float64)
+    return _core.GeometryCalibration(_text(cal)).merged_layout(f(poses[0]["axis"]), f(poses[0]["row"]), f(poses[1]["axis"]), f(poses[1]["row"]),
+                                                               f(heights_rows[0]), f(heights_rows[1]), float(quantum))
 
 
 def rolling_shutter_of(cal):
     """The rows' timing as the reconstruction takes it: the time from the first stored row to the last, in frame periods."""
-    period = cal["row_time"].get("frame_period_s") or (cal["row_time"].get("measured") or {}).get("period_s")
-    return cal["row_time"]["seconds_per_row"] * (cal["layout"]["rows"] - 1) / period
+    from . import _core
+    return _core.GeometryCalibration(_text(cal)).rolling_shutter
 
 
 def overlap_centre_of(layout):
     """overlap_centre for the layout as the step saves it: the middle of the columns both scans hold, in the first scan's columns."""
-    C, move = layout["cols"], layout["coarse_move"]
-    return 0.5 * (max(0, -move) + min(C - 1, C - 1 - move))
+    from . import _core
+    return _core.geometry_overlap_centre(int(layout["cols"]), float(layout["coarse_move"]))
 
 
 # ---------------------------------------------------------------- the step

@@ -20,30 +20,31 @@ ZERO = np.zeros(1, np.int32)
 pytestmark = pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="HELIREC_OPENJPH=OFF")
 
 
-def _chunk(stream, rows=ROWS, cols=COLS, constant=False):
+def _chunk(stream, rows=ROWS, cols=COLS, constant=False, sample_bytes=4):
     # One Blosc2 frame, one chunk, one block, with a B2JPF32 v1 wrapper.
     lo, hi = (-0.5, -0.5) if constant else (-0.5, 1.5)
     wrapper = struct.pack("<8sHHBBHQddddQ", b"B2JPF32\0", 1, 64, 32, 0,
                           4 if constant else 0, len(stream), lo, hi, lo, hi, 0)
-    payload = wrapper + stream
+    payload = wrapper + stream if sample_bytes == 4 else stream
     out = bytearray(62 + 40 + len(payload))
     out[2:9] = b"b2frame"
     struct.pack_into(">I", out, 11, 62)
-    out[62:66] = bytes([5, 1, 6 << 5, 4])
-    struct.pack_into("<III", out, 66, rows * cols * 4, rows * cols * 4, 40 + len(payload))
+    out[62:66] = bytes([5, 1, 6 << 5, sample_bytes])
+    struct.pack_into("<III", out, 66, rows * cols * sample_bytes, rows * cols * sample_bytes, 40 + len(payload))
     out[62 + 22] = 40
     struct.pack_into("<II", out, 62 + 32, 36, len(payload))
     out[102:] = payload
     return out
 
 
-def _write(path, chunk, rows=ROWS, cols=COLS, frames=1, chunk_rows=None):
+def _write(path, chunk, rows=ROWS, cols=COLS, frames=1, chunk_rows=None, dtype="float32"):
     with h5py.File(path, "w") as f:
         dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
         cr = rows if chunk_rows is None else chunk_rows
         dcpl.set_chunk((1, cr, cols))
         dcpl.set_filter(32026, h5py.h5z.FLAG_OPTIONAL, ())
-        d = h5py.h5d.create(f.id, b"data", h5py.h5t.IEEE_F32LE,
+        dt = h5py.h5t.IEEE_F32LE if dtype == "float32" else h5py.h5t.STD_U16LE
+        d = h5py.h5d.create(f.id, b"data", dt,
                            h5py.h5s.create_simple((frames, rows, cols)), dcpl)
         for k in range(frames):
             for row in range(0, rows, cr):
@@ -55,12 +56,12 @@ def _reader(path, reduce=0, selective=True, rows=ROWS, cols=COLS):
                            dtype="float32", selective=selective)
 
 
-def _samples():
+def _samples(rows=ROWS, cols=COLS, unsigned=False):
     state = 17
-    a = np.empty((ROWS, COLS), np.int64)
+    a = np.empty((rows, cols), np.int64)
     for i in range(a.size):
         state = (1664525 * state + 1013904223) & 0xffffffff
-        a.flat[i] = (state >> 6) - (1 << 25)
+        a.flat[i] = 20000 + (state >> 17) if unsigned else (state >> 6) - (1 << 25)
     return a
 
 
@@ -152,3 +153,26 @@ def test_malformed_container(tmp_path, offset, replacement):
     _write(path, chunk)
     with pytest.raises(Exception, match="compressed frame chunk"):
         _reader(path, 3).read_frames(ZERO, ZERO, n_threads=1)
+
+
+@pytest.mark.parametrize("wavelet", ["53", "97"])
+def test_uint16_selective_io(tmp_path, wavelet):
+    path = tmp_path / "uint16.h5"
+    _write(path, _chunk((DATA / f"unsigned16_{wavelet}.j2k").read_bytes(), 256, 256, sample_bytes=2),
+           rows=512, cols=256, chunk_rows=256, dtype="uint16")
+    want = _samples(256, 256, unsigned=True)
+    for r in range(4):
+        rd = _core.RawReader([str(path)], "data", 512, 256, reduce=r, decoder="openjph")
+        full = _core.RawReader([str(path)], "data", 512, 256, reduce=r, decoder="openjph", selective=False)
+        got = rd.read_frames(ZERO, ZERO, n_threads=2)
+        np.testing.assert_array_equal(got, full.read_frames(ZERO, ZERO, n_threads=2))
+        if r == 3:
+            assert rd.bytes_read < full.bytes_read / 2
+        if wavelet == "53":
+            np.testing.assert_array_equal(got[0], np.tile(want, (2, 1)))
+            want = _low_band_53(_low_band_53(want.T).T)
+        storage = rd.storage()
+        assert storage["chunk_rows"] == 256 and storage["codec"] == "JPEG 2000 (HTJ2K)"
+        assert storage["reversible"] == (wavelet == "53")
+    with pytest.raises(Exception, match="decoder"):
+        _core.RawReader([], "data", 256, 256, decoder="unsupported")

@@ -1,5 +1,8 @@
 #pragma once
-// A JSON value and its parser: what reading Zarr metadata (.zarray, .zattrs) needs.
+// A JSON value, its parser and its text: what reading Zarr metadata (.zarray, .zattrs) and the calibrations'
+// files needs.
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -27,6 +30,21 @@ struct Json {
     }
     bool is(Type t) const { return type == t; }
 
+    static Json of(double v) { Json j; j.type = Number; j.number = v; return j; }
+    static Json of(const std::string& v) { Json j; j.type = String; j.string = v; return j; }
+    static Json list() { Json j; j.type = Array; return j; }
+    static Json dict() { Json j; j.type = Object; return j; }
+    Json& set(const std::string& key, Json v) { object.emplace_back(key, std::move(v)); return *this; }
+    Json& add(Json v) { array.push_back(std::move(v)); return *this; }
+
+    // The value as JSON text. Numbers are written with 17 significant digits (they read back as they are) and
+    // always as reals; NaN and Infinity as NumPy and Python write them.
+    std::string text() const {
+        std::string s;
+        write(s);
+        return s;
+    }
+
     static Json parse(const std::string& text) {
         std::size_t i = 0;
         Json v = value(text, i);
@@ -36,6 +54,45 @@ struct Json {
     }
 
   private:
+    static void quote(std::string& s, const std::string& t) {
+        s += '"';
+        for (const char c : t) {
+            if (c == '"' || c == '\\') { s += '\\'; s += c; }
+            else if (c == '\n') s += "\\n";
+            else if (c == '\t') s += "\\t";
+            else if (c == '\r') s += "\\r";
+            else if (static_cast<unsigned char>(c) < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", static_cast<unsigned>(c)); s += b; }
+            else s += c;
+        }
+        s += '"';
+    }
+    void write(std::string& s) const {
+        switch (type) {
+            case Null: s += "null"; break;
+            case Bool: s += boolean ? "true" : "false"; break;
+            case String: quote(s, string); break;
+            case Number: {
+                if (std::isnan(number)) { s += "NaN"; break; }
+                if (std::isinf(number)) { s += number > 0 ? "Infinity" : "-Infinity"; break; }
+                char b[40];
+                std::snprintf(b, sizeof b, "%.17g", number);
+                std::string t = b;
+                if (t.find_first_of(".e") == std::string::npos) t += ".0";
+                s += t;
+                break;
+            }
+            case Array:
+                s += '[';
+                for (std::size_t k = 0; k < array.size(); ++k) { if (k) s += ", "; array[k].write(s); }
+                s += ']';
+                break;
+            case Object:
+                s += '{';
+                for (std::size_t k = 0; k < object.size(); ++k) { if (k) s += ", "; quote(s, object[k].first); s += ": "; object[k].second.write(s); }
+                s += '}';
+                break;
+        }
+    }
     static void space(const std::string& t, std::size_t& i) {
         while (i < t.size() && (t[i] == ' ' || t[i] == '\t' || t[i] == '\n' || t[i] == '\r')) ++i;
     }

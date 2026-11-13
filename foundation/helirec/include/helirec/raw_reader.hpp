@@ -24,6 +24,8 @@
 // selective=true seeks over unused resolution packets; the bytes saved depend on
 // packet order. selective=false preloads the codestream before the same decoding.
 // This reduces X/Y only: frames along Z remain independently addressable.
+// decoder="openjph" also enables selective HTJ2K reads for uint16 projections.
+// "auto" preserves OpenJPEG for uint16 and uses OpenJPH for float32.
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -38,7 +40,7 @@ class RawReader {
   public:
     // rows, cols: of a frame as stored
     RawReader(std::vector<std::string> files, std::string dataset, int rows, int cols, int reduce = 0,
-              std::string dtype = "uint16", bool selective = true);
+              std::string dtype = "uint16", bool selective = true, std::string decoder = "auto");
     ~RawReader();
 
     int rows() const { return rows_; }  // of a frame as it is read (reduced)
@@ -105,7 +107,7 @@ class RawReader {
     void read_rows_impl(const int32_t*, const int32_t*, const int32_t*, std::size_t, int, void*, int, std::size_t);
     std::string dtype_;
     int sample_bytes_;
-    bool selective_;
+    bool selective_, use_openjph_;
     std::vector<std::string> files_;
     std::string dataset_;
     int rows_, cols_;  // as read

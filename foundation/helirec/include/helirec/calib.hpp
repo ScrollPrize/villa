@@ -3,10 +3,16 @@
 // borders of the weight maps, and the detector's blur field from the noise of the flats. CPU (OpenMP); the data
 // sizes are small. (The geometry is the geometry calibration's: helirec/calibration/, python/helirec/geometry.py.)
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "helirec/common.hpp"
+
+namespace helirec {
+class RawReader;
+}
 
 namespace helirec::calib {
 
@@ -24,6 +30,41 @@ std::vector<float> apodisation_mask(int Lx, float w_left, float w_right, float m
 // Vertical border of prepare_weights_double: (1 - erf((z - L + m + cb)/w))/2 * (1 + erf((z - m - ct)/w))/2,
 // m = round_half_even(tw / 2), w = tw / 5, float32 arguments, erf evaluated in double (scipy 'f' loop)
 std::vector<float> weight_border_v(int L, double transition_width, int crop_top = 0, int crop_bottom = 0);
+
+// ---------------------------------------------------------------- darks, flats and weights
+// The mean of n frames read through `reader` (uint16 frames), as nx2etf reduces darks and flats: every frame taken
+// to float32 and added in the order given, the sum divided by n. With `dark` and `control_A` (one ring current
+// per frame), each frame F enters as dark + (F - dark) nominal_A / control_A: a flat at the nominal current.
+// progress(k): called as k more frames are done. Returns (rows, cols) of the reader.
+std::vector<float> mean_frames(RawReader& reader, const int32_t* file_index, const int32_t* frame_index, std::size_t n,
+                               const float* dark = nullptr, const double* control_A = nullptr, double nominal_A = 0,
+                               const std::function<void(std::size_t)>& progress = nullptr);
+
+// prepare_weights_double: the mean of all the flats given (each (rows, cols), added in order) over its maximum,
+// smoothed by a Gaussian of `sigma` along both axes ("reflect"), times the vertical border (weight_border_v).
+std::vector<float> weight_map(const std::vector<const float*>& flats, int rows, int cols, double transition_width_vertical = 15.0,
+                              double sigma = 10.0, int crop_top = 0, int crop_bottom = 0);
+
+// The horizontal apodisation widths (left, right) of the main scan and of the companion, as
+// prepare_weights_double --is_tetra writes them: on the main scan a slope beyond the rotation axis
+// (min(2 transition_width_horizontal, distance from the axis to the edge)) on the axis' side and a border taper
+// towards the companion; on the companion a border taper on the side facing the main scan.
+// est_cor_main_offset: the axis' column from the middle of the main scan; companion_dx: where the companion lies.
+struct ApodisationWidths {
+    double main_left = 0, main_right = 0, companion_left = 0, companion_right = 0;
+};
+ApodisationWidths apodisation_widths(int n_cols, double est_cor_main_offset, double companion_dx,
+                                     double transition_width_horizontal = 1000.0, double transition_width_borders = 50.0);
+
+// Images of the detector (darks, flats, weights: n images of (rows, cols)) as RawReader(reduce=) gives the frames
+// stored as JPEG 2000 in chunks of chunk_rows rows: `reduce` levels of the irreversible (9/7) wavelet's low band,
+// each chunk of rows an image of its own, sample (j, k) at the stored pixel (j, k) 2^reduce. A flat reduced so
+// divides a frame's fixed pattern out as the full-resolution flat does; a mean of 2^reduce pixels would not. A
+// last chunk that reaches beyond the frame holds zeros there (as the detector software stores it), which change
+// the frame's last two or three reduced rows, here as in the frames. Computed in double.
+// Returns n images of (rows >> reduce, cols halved `reduce` times, rounding up); out_rows, out_cols receive that.
+std::vector<float> at_resolution(const double* images, std::size_t n, int rows, int cols, int reduce, int chunk_rows,
+                                 int* out_rows = nullptr, int* out_cols = nullptr);
 
 // ---------------------------------------------------------------- detector blur from the noise of the flats
 // Power spectra of images on a lattice of tiles. img: (n, rows, cols); the tile at (ys[iy], xs[ix]) of every image is

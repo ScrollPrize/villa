@@ -35,32 +35,21 @@ from __future__ import annotations
 import numpy as np
 
 
-def hat(knots, frame):
-    """(index of the knot at or before `frame`, weights on it and the next): piecewise linear between knots"""
-    x = (np.asarray(frame, float) - knots[0]) / (knots[1] - knots[0])
-    i = np.clip(np.floor(x).astype(int), 0, len(knots) - 2)
-    w = x - i
-    return i, 1.0 - w, w
+def _tiles(cal):
+    """The description as the C++ side reads it (helirec/geometry.hpp, TileGeometry)."""
+    import json
 
-
-def course(knots, values, frame):
-    i, w0, w1 = hat(knots, frame)
-    return values[..., i] * w0 + values[..., i + 1] * w1
+    from . import _core
+    return _core.TileGeometry(cal if isinstance(cal, str) else json.dumps(cal, default=float))
 
 
 def frame_pose(cal, label, angle_deg, frame, row=None):
     """For frames of a tile: the angle of `row` (the middle row if None) [deg], where the sample's origin falls on
     the detector (column), and how far the sample lies from the record along the axis (rows): th, u and H of the
-    module's description, from a description `cal` of the tiles' geometry. angle_deg, frame: the record's angle and frame number of each frame."""
-    L = cal["layout"]
-    t = cal["tiles"][label]
-    K = np.array(L["knot_frames"])
-    v0 = cal["map"]["v0"]
-    frame = np.asarray(frame, float)
-    th = (np.radians(np.asarray(angle_deg, float)) + course(K, np.array(cal["angle_course_rad"]), frame) + cal["row_time"]["rad_per_row"] * ((v0 if row is None else row) - v0)
-          + t.get("yaw_rad", 0.0))
-    u = t["axis_column"] + t["place_px"][0] * np.cos(th) + t["place_px"][1] * np.sin(th) + course(K, np.array(t["column_course"]), frame)
-    return np.degrees(th), u, t["height_rows"] + course(K, np.array(t["height_course"]), frame)
+    module's description, from a description `cal` of the tiles' geometry. angle_deg, frame: the record's angle
+    and frame number of each frame. (helirec::geometry::TileGeometry::frame_pose)"""
+    f = lambda x: np.ascontiguousarray(np.atleast_1d(x), np.float64)
+    return _tiles(cal).frame_pose(label, f(angle_deg), f(frame), -1.0 if row is None else float(row))
 
 
 def reconstruction_terms(cal, label, angle_deg, height_rows, frame, rot_center, row_origin=0.0):
@@ -72,25 +61,9 @@ def reconstruction_terms(cal, label, angle_deg, height_rows, frame, rot_center, 
 
     angle_deg, height_rows, frame: the record's angle (unwrapped), its height in rows (the layout's row_sign x
     height / pixel) and the frame number of each frame used. The reconstruction puts the column m of its frame at
-    m - rot_center columns from the axis."""
-    L = cal["layout"]
-    t = cal["tiles"][label]
-    frame, Hrec = np.asarray(frame, float), np.asarray(height_rows, float)
-    th_deg, u, H = frame_pose(cal, label, angle_deg, frame)                 # at the middle row
-    th = np.radians(th_deg)
-    axis = u - (t["place_px"][0] * np.cos(th) + t["place_px"][1] * np.sin(th))
-    row = (1.0 + cal["axial_scale"]) * Hrec + H                             # content at height w is on the row w + row
-    z_pix = L["row_sign"] * (Hrec - Hrec[0])
-    # the travel per frame as a line through the 33 frames around (the encoder's own frame-to-frame differences are noise)
-    k_ = np.arange(-16, 17)
-    pad = np.concatenate([row[0] + (row[1] - row[0]) * np.arange(-16, 0), row, row[-1] + (row[-1] - row[-2]) * np.arange(1, 17)])
-    travel = np.convolve(pad, (k_ / (k_ ** 2).sum())[::-1], "valid")
-    per_row = cal["row_time"]["rad_per_row"] / np.radians(abs(L["step_deg"]))     # frames per row
-    n = len(frame)
-    return dict(angles_deg=np.asarray(th_deg, np.float64), z_translation_scale=1.0,
-                row_offset=(-(row + row_origin) - z_pix).astype(np.float32), row_slope=np.full(n, -cal["rows_slope_opposite"], np.float32), slope_col=float(rot_center),
-                col_offset=(axis - rot_center).astype(np.float32), col_slope=np.full(n, cal["axis_roll_rad"], np.float32), slope_row=(L["rows"] - 1) / 2,
-                col_scale=np.zeros(n, np.float32), scale_col=0.0, row_scale=(-travel * per_row).astype(np.float32), scale_row=0.0)
+    m - rot_center columns from the axis. (helirec::geometry::TileGeometry::reconstruction_terms)"""
+    f = lambda x: np.ascontiguousarray(x, np.float64)
+    return _tiles(cal).reconstruction_terms(label, f(angle_deg), f(height_rows), f(frame), float(rot_center), float(row_origin))
 
 
 def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origin=None, weight=None, cache_gb=0.0, reduced=None, log=print, cache_dir=None, reduce=0):

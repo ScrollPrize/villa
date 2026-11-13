@@ -48,23 +48,13 @@ class FrameSource:
                                      np.ascontiguousarray(row0, np.int32), int(nrows))
 
 
-def _mean_frames(src: FrameSource, transform=None, batch=40, progress=None) -> np.ndarray:
-    """numpy.mean(stack.astype(float32), axis=0) semantics: sequential float32 sum, then / n.
-    progress(k): called as k more frames are done."""
-    n = len(src.refs)
-    acc = None
-    for s in range(0, n, batch):
-        e = min(n, s + batch)
-        fr = src.frames(np.arange(s, e)).astype(np.float32)
-        for k in range(e - s):
-            f = fr[k] if transform is None else transform(fr[k], s + k)
-            if acc is None:
-                acc = np.array(f, np.float32, copy=True)
-            else:
-                acc += f
-        if progress:
-            progress(e - s)
-    return acc / n
+def _mean_frames(src: FrameSource, dark=None, control_A=None, progress=None) -> np.ndarray:
+    """The mean of a sequence's frames as nx2etf reduces them (helirec::calib::mean_frames): float32, added in
+    order, then / n; with dark and control_A (the ring current of every frame) each frame F enters as
+    dark + (F - dark) NOMINAL_CURRENT_A / control_A. progress(k): called as k more frames are done."""
+    refs = src.refs
+    kw = {} if dark is None else dict(dark=np.ascontiguousarray(dark, np.float32), control_A=np.ascontiguousarray(control_A, np.float64), nominal_A=NOMINAL_CURRENT_A)
+    return _core.mean_frames(src.reader, np.ascontiguousarray(refs.file_index, np.int32), np.ascontiguousarray(refs.frame_index, np.int32), progress=progress, **kw)
 
 
 def _bar(show, total, desc, unit):
@@ -78,14 +68,8 @@ def reduce_darks_flats(scan: BlissScan, progress=None):
     """dark (rows, cols) and flats (n_series, rows, cols) exactly as nx2etf stores them.
     progress(k): called as k more of the len(scan.darks) + sum(len(series)) frames are done."""
     dark = _mean_frames(FrameSource(scan.darks, scan.frame_shape), progress=progress)
-    flats = []
-    for refs, ctl in zip(scan.flats, scan.flats_control_A):
-        scale = np.float32(NOMINAL_CURRENT_A) / np.asarray(ctl, np.float32)
-
-        def tr(F, i, scale=scale):
-            return dark + (F - dark) * scale[i]
-        flats.append(_mean_frames(FrameSource(refs, scan.frame_shape), tr, progress=progress))
-    return dark.astype(np.float32), np.stack(flats).astype(np.float32)
+    flats = [_mean_frames(FrameSource(refs, scan.frame_shape), dark, ctl, progress) for refs, ctl in zip(scan.flats, scan.flats_control_A)]
+    return dark, np.stack(flats)
 
 
 def reduced_darks_flats(scan: BlissScan, cache_dir=None, log=print):
@@ -122,22 +106,6 @@ def reduced_darks_flats(scan: BlissScan, cache_dir=None, log=print):
     return dark, flats
 
 
-# the low-pass of JPEG 2000's irreversible (9/7) wavelet, taps 0, +-1, ... +-4; unit gain
-_LOW_97 = (0.6029490182363579, 0.2668641184428723, -0.07822326652898785, -0.01686411844287495, 0.02674875741080976)
-
-
-def _low_band_97(x):
-    """along the last axis: sample n is the low-pass about x[2 n] (whole-sample symmetric at both ends)"""
-    n = x.shape[-1]
-    idx = np.arange(0, n, 2)
-    out = _LOW_97[0] * x[..., idx]
-    for m in range(1, 5):
-        left, right = np.abs(idx - m), idx + m
-        right = np.where(right > n - 1, 2 * (n - 1) - right, right)
-        out = out + _LOW_97[m] * (x[..., left] + x[..., right])
-    return out
-
-
 def at_resolution(image, reduce, chunk_rows):
     """An image of the detector (a dark, a flat, a weight: (..., rows, cols)) as RawReader(reduce=) gives the
     frames stored as JPEG 2000 in chunks of chunk_rows rows: `reduce` levels of the 9/7 wavelet's low band, each
@@ -147,46 +115,27 @@ def at_resolution(image, reduce, chunk_rows):
     change the frame's last two or three reduced rows, here as in the frames. On a Paris4 frame this differs
     from the reader's reduced frame by 0.3 counts rms (the rounding), at 1, 2 and 3 levels."""
     x = np.asarray(image, np.float64)
-    rows = x.shape[-2]
-    beyond = -rows % chunk_rows
-    if beyond:
-        x = np.concatenate([x, np.zeros(x.shape[:-2] + (beyond, x.shape[-1]))], -2)
-    for level in range(int(reduce)):
-        c = chunk_rows >> level
-        x = np.concatenate([np.swapaxes(_low_band_97(np.swapaxes(x[..., a:a + c, :], -1, -2)), -1, -2) for a in range(0, x.shape[-2], c)], -2)
-        x = _low_band_97(x)
-    return x[..., :rows >> int(reduce), :].astype(np.float32)
+    out = _core.at_resolution(np.ascontiguousarray(x.reshape((-1,) + x.shape[-2:])), int(reduce), int(chunk_rows))      # helirec::calib::at_resolution
+    return out.reshape(x.shape[:-2] + out.shape[-2:])
 
 
 # ============================================================================ weights
 def weight_map(flat_stacks, transition_width_vertical=15.0, sigma=10.0, crop_top=0, crop_bottom=0) -> np.ndarray:
-    """prepare_weights_double: gaussian_filter(mean(all flats) / max, sigma) * vertical erf border."""
-    prof = 0
-    n = 0
-    for st in flat_stacks:
-        for i in range(st.shape[0]):
-            prof = prof + st[i]
-        n += st.shape[0]
-    prof = prof / n
-    prof = (prof / prof.max()).astype(np.float32)
-    g = _core.gaussian_filter1d(np.ascontiguousarray(prof), 0, sigma, "reflect")
-    g = _core.gaussian_filter1d(g, 1, sigma, "reflect")
-    border = _core.weight_border_v(prof.shape[0], transition_width_vertical, crop_top, crop_bottom)
-    return (g * border[:, None]).astype(np.float32)
+    """prepare_weights_double: gaussian_filter(mean(all flats) / max, sigma) * vertical erf border.
+    (helirec::calib::weight_map)"""
+    return _core.weight_map([np.ascontiguousarray(st, np.float32) for st in flat_stacks], float(transition_width_vertical), float(sigma), int(crop_top), int(crop_bottom))
 
 
 def apodisation_widths(n_cols, est_cor_main_offset, companion_dx, transition_width_horizontal=1000.0,
                        transition_width_borders=50.0):
     """(w_left, w_right) for (main, companion) as prepare_weights_double --is_tetra writes them.
     Main scan: 'pente' beyond the rotation axis (min(2 tw, distance axis->edge)) on the axis side and a
-    border taper towards the companion; companion: border taper on the side facing the main scan."""
-    r = (n_cols - 1) / 2 + est_cor_main_offset
-    if r < (n_cols - 1) / 2:
-        raise NotImplementedError("rotation axis in the left half of the main scan is not supported yet")
-    pente = min(2 * transition_width_horizontal, n_cols - r)
-    if companion_dx < 0:   # companion on the left of the main scan
-        return (transition_width_borders, pente), (0.0, transition_width_borders)
-    raise NotImplementedError("companion on the right of the main scan is not supported yet")
+    border taper towards the companion; companion: border taper on the side facing the main scan.
+    (helirec::calib::apodisation_widths)"""
+    try:
+        return _core.apodisation_widths(int(n_cols), float(est_cor_main_offset), float(companion_dx), float(transition_width_horizontal), float(transition_width_borders))
+    except RuntimeError as e:
+        raise NotImplementedError(str(e)) from None
 
 
 @dataclass

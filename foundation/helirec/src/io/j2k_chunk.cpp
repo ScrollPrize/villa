@@ -190,11 +190,11 @@ namespace {
 class SeekableInput final : public ojph::infile_base {
     const ReadAt& read_;
     std::size_t base_, size_, at_ = 0, begin_ = 0, valid_ = 0;
-    std::array<std::uint8_t, 65536> buffer_;
+    std::vector<std::uint8_t> buffer_;
     std::vector<std::uint8_t> whole_;
   public:
     SeekableInput(const ReadAt& read, const ChunkHeader& h, bool selective)
-        : read_(read), base_(h.offset), size_(h.size) {
+        : read_(read), base_(h.offset), size_(h.size), buffer_(h.floating ? 65536 : 8192) {
         if (!selective) {
             whole_.resize(size_);
             read_(whole_.data(), size_, base_);

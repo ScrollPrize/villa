@@ -1080,6 +1080,8 @@ class PySliceReconstructor {
 void bind_calib(nb::module_& m);  // bindings/calib_bindings.cpp
 void bind_spectra(nb::module_& m);  // bindings/spectra_bindings.cpp
 void bind_calibration(nb::module_& m);  // bindings/calibration_bindings.cpp
+void bind_projection(nb::module_& m);  // bindings/projection_bindings.cpp
+void bind_geometry(nb::module_& m);  // bindings/geometry_bindings.cpp
 
 NB_MODULE(_core, m) {
     register_filter("python", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
@@ -1089,6 +1091,8 @@ NB_MODULE(_core, m) {
     bind_calib(m);
     bind_spectra(m);
     bind_calibration(m);
+    bind_projection(m);
+    bind_geometry(m);
     m.doc() = "helirec C++/CUDA kernels";
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
@@ -1610,14 +1614,23 @@ NB_MODULE(_core, m) {
 
     m.def("htj2k_float_frames_supported", &htj2k_float_frames_supported);
     nb::class_<RawReader>(m, "RawReader", "pread-based uint16/float32 HDF5 reader with JPEG 2000 resolution selection")
-        .def(nb::init<std::vector<std::string>, std::string, int, int, int, std::string, bool>(), "files"_a, "dataset"_a, "rows"_a, "cols"_a, "reduce"_a = 0, "dtype"_a = "uint16", "selective"_a = true,
-             "dtype: uint16 detector frames or float32 reconstructed volumes. selective: seek over unused float32 HTJ2K resolutions. "
+        .def(nb::init<std::vector<std::string>, std::string, int, int, int, std::string, bool, std::string>(), "files"_a, "dataset"_a, "rows"_a, "cols"_a, "reduce"_a = 0, "dtype"_a = "uint16", "selective"_a = true, "decoder"_a = "auto",
+             "dtype: uint16 detector frames or float32 reconstructed volumes. decoder=openjph enables selective uint16 HTJ2K reads too. "
              "rows, cols: of a frame as stored. reduce 1, 2, 3: frames stored as JPEG 2000 are read at a half, a quarter, an eighth "
              "(the codestream's own lower resolutions: rows, cols and every row index are then the reduced ones; value (j, k) is "
              "the wavelet's low band at the stored pixel (j, k) * 2**reduce).")
         .def_prop_ro("rows", &RawReader::rows)
         .def_prop_ro("cols", &RawReader::cols)
         .def_prop_ro("reduce", &RawReader::reduce)
+        .def("storage", [](RawReader& r, int file) {
+            RawReader::Storage s;
+            { nb::gil_scoped_release nogil; s = r.storage(file); }
+            nb::dict d;
+            d["compressed"] = s.compressed; d["chunk_rows"] = s.chunk_rows;
+            d["codec"] = s.codec; d["reversible"] = s.reversible;
+            d["frames"] = s.frames; d["bit_depth"] = s.bit_depth;
+            return d;
+        }, "file"_a = 0)
         .def_prop_ro("dtype", &RawReader::dtype)
         .def_prop_ro("bytes_read", &RawReader::bytes_read,
                      "Payload bytes requested, excluding HDF5 metadata and filesystem read-ahead.")

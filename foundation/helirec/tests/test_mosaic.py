@@ -19,13 +19,6 @@ def _description():
                 tiles=dict(T0=tile(4106.25, (0.0, 0.0), 0.0, 0.0), T1=tile(4106.8, (10.8, -6927.8), 1.55, 3e-5)))
 
 
-def test_course_is_a_line_between_its_knots():
-    K = np.array([100.0, 200.0, 300.0])
-    v = np.array([1.0, 3.0, -1.0])
-    assert np.allclose(M.course(K, v, [100.0, 150.0, 200.0, 275.0, 300.0]), [1.0, 2.0, 3.0, 0.0, -1.0])
-    assert np.allclose(M.course(K, np.stack([v, 2 * v]), 250.0), [1.0, 2.0])           # several courses at once
-
-
 def test_frame_pose_follows_the_description():
     cal = _description()
     K, v0 = np.array(cal["layout"]["knot_frames"]), cal["map"]["v0"]

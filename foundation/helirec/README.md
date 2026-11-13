@@ -763,8 +763,8 @@ every row index of the reader in reduced rows, decoded 3.4, 12 and 44 times fast
 chunk: 8.5, 2.5, 0.7, 0.2 ms) with nothing written to disk. A reduced value is not the mean of 2^reduce pixels:
 value (j, k) is the wavelet's low band at the stored pixel (j, k) 2^reduce, each chunk of rows an image of its
 own, so a geometry in stored pixels holds for the reduced frame with every position divided by 2^reduce and
-nothing added. Darks, flats and weights are taken to the same grid by `helirec.calibration.at_resolution(image,
-reduce, chunk_rows)` (the same low-pass; it reproduces a Paris4 frame read at reduce 1, 2, 3 to 0.3 counts rms,
+nothing added. Darks, flats and weights are taken to the same grid by `helirec::calib::at_resolution`
+(`helirec.calibration.at_resolution(image, reduce, chunk_rows)` in Python) (the same low-pass; it reproduces a Paris4 frame read at reduce 1, 2, 3 to 0.3 counts rms,
 the rounding), so that a flat divides the fixed pattern out as at full resolution. Plain (uncompressed) frames
 have no such resolutions and are refused; rows, columns and rows per chunk must be multiples of 2^reduce.
 `helirec.mosaic.tile_reconstructor(..., reduce=)` reconstructs a tile on it (below); the calibration session and
@@ -799,8 +799,48 @@ must be multiples of 2^reduce; whole-frame chunks can have odd dimensions.
 
 `selective=False` preloads the full codestream for the same OpenJPH decode, useful for comparison or storage
 that favors sequential I/O. The selective and preloaded results are identical. Irreversible JPEG 2000 results
-can differ slightly between decoder implementations. The existing uint16 projection path continues to use
-OpenJPEG and load each touched compressed chunk in full.
+can differ slightly between decoder implementations. The default uint16 projection path uses OpenJPEG and
+loads each touched compressed chunk in full. Set `decoder="openjph"` to enable selective HTJ2K reads of uint16
+projections too; this chooses OpenJPH's decoded values explicitly.
+
+**Download the Paris4 projection slab at 1/8 resolution.**
+`python -m helirec.download_projections` (or `helirec-download-projections` after installation) exports all
+19 tiles to `/mnt/raid_nvme/paris4_mosaic_recon/projections/scale_0.125`. The defaults select a 256-original-slice
+slab (0.289024 mm, 32 slices on an isotropic 1/8 grid), centred at motor Z = −256.0385 mm, matching the existing
+local ROI. Each tile keeps whole source files covering the slab plus 1.5 helix turns of context on either side
+(at least one detector height), and every angle in that interval. Frames become 296 × 552; angles are not subsampled.
+
+```bash
+python -m helirec.download_projections --plan-only  # inspect selection and output size
+python -m helirec.download_projections              # download; repeat this command to resume
+tail -f /mnt/raid_nvme/paris4_mosaic_recon/projections/scale_0.125/download.log
+```
+
+The source is the mounted `keep_it_for_replaying_20260311/RAW_DATA` directory; files already in the local
+`paris4_mosaic_recon/RAW_DATA` are preferred. `--source-root`, `--local-root`, `--output`, `--tiles`, `--slices`,
+and `--center-mm` can override these defaults. `--workers` controls concurrent files (default 4), `--threads`
+the decoder threads per file (default 2). `--max-files 1` runs one pending file as a smoke test. No SDK or HDF5
+codec plugin is required; build helirec with `HELIREC_OPENJPH=ON` (the default).
+
+Projection stacks are uncompressed uint16 HDF5. Darks and flats are read at full resolution, reduced with
+`calibration.at_resolution` on the same chunk boundaries, and saved uncompressed as float32 to preserve the
+fractional low-pass values. Their sources have no stored pyramid, so their full pixels must be read.
+The output payload is approximately 209 GB; the plan reports the exact size before starting.
+
+`download.log` records starts, completions, retries, and progress every five seconds: file counts, bytes written,
+output rate, elapsed time, ETA, and active-file frame counts. `progress.json` holds the latest completed totals.
+Completed files have metadata and a SHA-256 of their pixels; atomic publication prevents partial files from
+being mistaken for completed ones. Resume validates job identity, shape, dtype, and absence of compression,
+without rereading all pixel checksums. Incompatible existing files or plans are refused. Four workers keep
+memory bounded by their batches (`--batch-frames`, default 8; calibration reads one full frame at a time).
+
+`plan.json` and each output file preserve original frame indices, angles, heights, and timestamps. Each completed
+tile receives `index.h5`, a relative-path virtual dataset per acquisition entry (`5.1/data` for projections,
+`2.1/data`, `3.1/data`, `7.1/data` for calibration), with matching metadata arrays. Original acquisition masters
+are copied into `metadata/` for reference; their original virtual datasets are not reduced-data entrypoints.
+The selection planner and uncompressed writer are also public C++ APIs in `helirec/projection_subset.hpp`,
+exposed through the Python bindings. Projection I/O skips unused HTJ2K packets; filesystem read-ahead can
+still transfer additional bytes from the mount.
 
 **Mosaics.** Scans that differ in where the sample sits on the rotation stage (the tomo configuration's
 `sample_u`, `sample_v`) and not in the lateral stage of the axis are checked as tiles, any number of them:
@@ -823,7 +863,7 @@ and its check of two tiles' overlap in the volume) was removed in November 2026 
 left there reconstructs one tile alone from a description of the tiles' geometry (the module's docstring gives
 its form; nothing in helirec makes one): `frame_pose(cal, tile, angle, frame)` gives a frame's angle, column and
 height, and `tile_reconstructor(master, cal, tile)` a `SliceReconstructor` of that tile; with `cache_dir=` the
-tile's reduced darks and flats are kept there (`calibration.reduced_darks_flats`: 46 s of a tile's start
+tile's reduced darks and flats are kept there (`calibration.reduced_darks_flats`: 8 s of a tile's start
 otherwise, 0.5 s read back), and with `reduce=1 | 2 | 3` it reconstructs at a half, a quarter, an eighth (the
 frames read at the codestream's lower resolution, the geometry divided by 2^reduce; a reduced reconstruction is
 the full one's low band, pixel for pixel from the axis, to under 0.01 of a reduced pixel in the slice). The
