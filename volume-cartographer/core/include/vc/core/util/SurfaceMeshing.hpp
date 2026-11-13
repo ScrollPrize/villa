@@ -37,9 +37,10 @@ GridMesh meshGrid(const cv::Mat_<cv::Vec3f>& points);
 // stride). Vertices are matched by grid position: fine cell (r, c) lies at
 // (r, c) / stride in the decimated grid, so a vertex on a decimated sample takes
 // that sample's UV exactly and one inside a decimated quad the barycentric mix
-// of the quad's triangle. A vertex outside the decimated quads (a hole, or the
-// rows/columns after the last sample) takes the nearest decimated vertex within
-// two cells; with none it stays invalid.
+// of the quad's triangle. A vertex outside the decimated quads (a hole, a
+// border narrower than the stride, or the rows/columns after the last sample)
+// continues the affine map of the nearest decimated quad within two cells, so
+// it keeps its own place in UV space; with none it stays invalid.
 struct LiftedUVs {
     std::vector<cv::Vec2f> uvs;
     std::vector<uint8_t> valid;
