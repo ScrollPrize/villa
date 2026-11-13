@@ -6,6 +6,8 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <string_view>
 
 #include "calibration/util.hpp"
 #include "io/json.hpp"
@@ -18,9 +20,10 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 inline double radians(double d) { return d * (kPi / 180.0); }
 inline double degrees(double r) { return r * (180.0 / kPi); }
 
-const Json& member(const Json& j, const std::string& key, const std::string& where) {
-    const Json* v = j.find(key);
-    if (!v) throw Error("geometry: " + where + " holds no \"" + key + "\"");
+// (the names by value: taken by reference, GCC's -Wdangling-reference supposes the result may refer to them)
+const Json& member(const Json& j, std::string_view key, std::string_view where) {
+    const Json* v = j.find(std::string(key));
+    if (!v) throw Error("geometry: " + std::string(where) + " holds no \"" + std::string(key) + "\"");
     return *v;
 }
 double number_of(const Json& v, const std::string& what) {
