@@ -162,12 +162,13 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
     // Apply decimation if requested: one pass, stride derived from the
     // requested keep fraction (decimationStride: round(1/sqrt(p))). Skip
     // when keep_percent >= 100 (no decimation).
+    int stride = 1;
     if (keep_percent > 0.0f && keep_percent < 100.0f) {
         std::cout << "Original grid: " << points.rows << " x " << points.cols
                   << " (" << (points.rows * points.cols) << " points)" << std::endl;
         const float ratio = keep_percent / 100.0f;
         const int rows = points.rows, cols = points.cols;
-        const int stride = vc::meshing::decimationStride(ratio);
+        stride = vc::meshing::decimationStride(ratio);
         points = vc::meshing::decimateGrid(points, stride);
         float actual_ratio = float(points.rows * points.cols) / float(rows * cols);
         std::cout << "Decimation with ratio " << ratio << " (stride=" << stride << "): "
@@ -206,13 +207,15 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
 
     // Derive UV scale from meta: surf->scale() is typically micrometers-per-pixel (or similar).
     // You asked to use the reciprocal (1/scale) as the multiplier.
+    // A decimated cell (r, c) sits at (r, c) * stride in the source grid: the
+    // stride keeps a decimated export's UVs in the units of a full one.
     cv::Vec2f s = surf->scale();           // [sx, sy]
-    float uv_fac_x = (std::isfinite(s[0]) && s[0] > 0.f) ? 1.0f / s[0] : 1.0f;
-    float uv_fac_y = (std::isfinite(s[1]) && s[1] > 0.f) ? 1.0f / s[1] : 1.0f;
+    float uv_fac_x = float(stride) * ((std::isfinite(s[0]) && s[0] > 0.f) ? 1.0f / s[0] : 1.0f);
+    float uv_fac_y = float(stride) * ((std::isfinite(s[1]) && s[1] > 0.f) ? 1.0f / s[1] : 1.0f);
     if (normalize_uv) {
         std::cout << "UVs: normalized to [0,1]\n";
     } else {
-        std::cout << "UVs: scaled by 1/scale from meta.json  (u*= " << uv_fac_x
+        std::cout << "UVs: scaled by stride/scale from meta.json  (u*= " << uv_fac_x
                   << ", v*= " << uv_fac_y << " )\n";
         std::cout << "      (meta scale = [" << s[0] << ", " << s[1] << "])\n";
     }
