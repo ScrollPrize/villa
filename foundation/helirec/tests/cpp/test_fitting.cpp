@@ -1,9 +1,14 @@
 #include "calibration/blur_model.hpp"
+#include "calibration/util.hpp"
 #include <ceres/ceres.h>
 #include <cmath>
 #include <iostream>
 
 int main() {
+    // Acquisition diagnostics report invalid observations as an unavailable fit.
+    const std::vector<double> time = {1e12,1e12+1,1e12+2};
+    const std::vector<double> invalid = {1,std::numeric_limits<double>::quiet_NaN(),3};
+    if (helirec::calibration::fit_line(time,invalid,0,time.size()).usable) return 1;
     using helirec::calibration::fitting::BlurFieldProblem;
     BlurFieldProblem model;
     model.tiles = 9; model.bins = 8;
