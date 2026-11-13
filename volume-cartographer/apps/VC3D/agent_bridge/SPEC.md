@@ -189,9 +189,12 @@ per source is tracked:
 | `growth` | segmentation growth lifecycle |
 | `lasagna` | Lasagna optimization lifecycle |
 | `catalog` | Open Data sample open lifecycle |
-| `flatten` | SLIM and straighten lifecycle |
+| `flatten` | SLIM lifecycle |
 | `seeding` | bridge-started run or expand batch |
 | `autosave` | explicit dirty-segment save |
+| `import` | `StoreImportController` (bridge and Stores menu imports) |
+| `export` | bridge-started object export |
+| `manifest` | Lasagna manifest attachment (bridge and File menu) |
 
 Application work started outside the bridge is represented when its lifecycle
 is observable, but only bridge-started seeding operations are registered as
@@ -202,13 +205,15 @@ most recently started job across all sources. Its record contains:
 
 ```text
 jobId, kind, source, label, state, message, outputPath, externalId,
-consoleTail, progressHistory, startedAtMs, finishedAtMs, result
+consoleTail, progressHistory, startedAtMs, finishedAtMs, result, progress
 ```
 
 `state` is `running`, `succeeded`, or `failed`. `consoleTail` and
 `progressHistory` are bounded. `outputPath`, `externalId`, and `finishedAtMs`
 are null when unavailable. `result` is an operation-specific object when a
-terminal job has structured output, otherwise null.
+terminal job has structured output, otherwise null; a failed job keeps any
+partial report there. `progress` is `{completed, total, detail}` for a job
+that counts its work (imports), otherwise null.
 
 ### Progress
 
@@ -261,21 +266,40 @@ dialog.
 
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
-  active segment, editing modes, viewers, point state, and active jobs.
+  active segment, editing modes, viewers, point state, and active jobs. It
+  reports `author` (the name edits are recorded under: the username setting,
+  else the login name, never empty) and `authorConfigured` (the username
+  setting names an author). `project.entries` lists the detachable volume,
+  normal-grid and regular/fiber Lasagna entries as `{kind, location, scope}`
+  (`kind` `volume`, `normal_grid`, `lasagna` or `fiber_lasagna`; `scope`
+  `everyone` or `only you`). `umbilicus` is `{volume, store, uuids}` for the
+  annotation volume's umbilicus objects in the store routed for umbilici, or
+  null without a volume or umbilicus store.
+  `segmentationGrowthMethod` reports the selected method even outside an active
+  editing session. `manualAddFollowingSheet` indicates that an extension is
+  computing; editing remains locked until its completed preview is available.
 - A project is a JSON `.vcproj` file referencing volumes, normal grids, Lasagna
   datasets, and one or more `.vcobj` stores. Each of surfaces, fibers, point
   collections, umbilici, and registrations selects one attached store for
   display and editing. `state.get.project` describes the project file;
   `stores` includes reference IDs and availability, and `routes` maps all five
   kinds to those reference IDs or null.
-- `project.create` writes a `.vcproj` referencing one local Zarr volume or remote
-  `.zarr` URL. `store` selects an existing store; `newStore` creates a store at
-  the given path. If neither is supplied, create a sibling `.vcobj`. Supplying
-  both is invalid. `overwrite` replaces only the project file and never deletes
-  or overwrites a referenced store. The result includes the store path.
-  Creation does not open the project; remote availability is checked on open.
-- `volume.open` opens a project and may select a volume. Failed opens do
-  not discard the current project.
+- `project.create` writes a `.vcproj` referencing at most one local Zarr
+  volume or remote `.zarr` URL (`volume` is optional; without it the result's
+  `volume` is null and segments are listed only once a volume is attached).
+  `store` selects an existing store, recorded read-only when this user cannot
+  write it; `newStore` creates a store at the given path. If neither is
+  supplied, create a sibling `.vcobj`. Supplying both is invalid. The project
+  is staged and published atomically; a store created for it is removed again
+  on failure. `overwrite` replaces only the project file and never deletes or
+  overwrites a referenced store; the open project is never overwritten. The
+  result includes the store path. Creation does not open the project; remote
+  availability is checked on open. The File menu's New Project shares the same
+  core (`vc::project::createProject`).
+- `volume.open` opens a project (`.vcproj`); the method keeps its historical
+  name.
+- `volume.open` may select a volume. Failed opens do not discard the current
+  project.
 - `volume.attach` loads one local zarr or remote `.zarr` URL asynchronously,
   then persists it in the project only if the same project is still open. It
   preserves the current primary volume, is idempotent by location, and rejects
@@ -299,8 +323,11 @@ own whose catalog surfaces are ordinary surfaces of it. A segment id is the
 surface's store UUID. Methods on segments need an open project and volume (-32000).
 
 - `segments.list` reports the listed surfaces: `id`, `name`, record `tags`,
-  `catalog` (an Open Data catalog surface), `bound` (bound to the open volume)
-  and `active`; `loading` is true while a listing is still being read.
+  `catalog` (an Open Data catalog surface), `bound` (bound to the open volume),
+  `active`, `store` (the project store reference it is in, null for a store
+  the project does not reference) and `writable`; `loading` is true while a
+  listing is still being read. `segments.activate` and `segments.review`
+  report the same fields.
 - `segments.activate` validates before changing selection. Activating the
   current segment is a no-op success. A catalog surface whose geometry is still
   remote is fetched first (the call blocks while it downloads).
@@ -345,7 +372,11 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
 ### Points
 
 Point collection mutations resolve every selector and validate all points
-before changing the collection. Bulk operations are all-or-nothing. Winding
+before changing the collection. `points.list` and the responses naming a
+`collectionId` also carry the collection's object `uuid` and the `store`
+reference it is kept in (null for a surface's corrections, which are not
+objects of their own). The UUID is stable across reopen and is what
+`objects.export` takes. Bulk operations are all-or-nothing. Winding
 values may be finite floats or null where the method declares clearing.
 Metadata and tags are idempotent setters. Save/load methods use explicit paths
 and never open file pickers.
@@ -355,10 +386,118 @@ and never open file pickers.
 - Lasagna service and job queries use deferred responses from the service
   manager. Optimization is tracked as a `lasagna` job.
 - Fiber ids are strings on the wire. Bulk deletion validates every id before
-  removing any fiber. Import/export paths are explicit. Save waits for the
+  removing any fiber. Export paths are explicit. Save waits for the
   controller's persistence completion signal.
+- `fiber.list` and `fiber.open` also report each fiber's object `uuid` and
+  the `store` reference of the fiber store, connecting numeric editing ids to
+  store identities (`objects.import` results, `objects.export`).
+- Fibers are imported with `objects.import kind=fiber`; `fiber.export` writes
+  every fiber of the fiber store as one collection file.
 - Fiber launch suppresses dataset pickers; missing prerequisites become
   ordinary errors.
+
+### Stores and imports
+
+Objects live in the project's `.vcobj` stores; `state.get` lists the
+references (`stores`) and each kind's selected store (`routes`).
+
+- `objects.import` copies source files into a store as new objects: tifxyz
+  surfaces (one directory or a folder of them), fiber JSON (file, collection
+  or folder), or a `vc_pointcollections` JSON. It writes to the store routed
+  for the kind, or the attached writable `store` named, and never changes
+  routing. It is an `import` job (`StoreImportController`, shared with the
+  Stores menu's Import from Folder), one at a time; a fiber import is refused
+  (-32004) during a fiber merge, split or link.
+  - `tags` absent tags each object with the last path component; `[]` adds
+    none.
+  - `bind.scale` is stored units per current-volume voxel; objects are bound
+    to the annotation volume at `scale * annotationVolume.scale`. There is no
+    default scale; without `bind` sources keep the coordinates they declare
+    (or stay unbound). An explicit binding conflicting with a source's own
+    declaration is a problem of that source.
+  - `uuidNamespace` (a UUID per dataset) derives identities for sources
+    without canonical UUIDs. Bridge imports require source UUIDs otherwise:
+    a UUID-less fiber is a problem rather than named after its file, as the
+    fiber widget and Spiral still do.
+  - The result is `{store, ingested, edgesImported, problems, uuids,
+    existing, cancelled, fatalError}`. A completed traversal succeeds even
+    with problems or existing identities. A store failure stops the import:
+    the job fails with `fatalError: {message}` and the committed part of the
+    report. `job.cancel` stops it before the next object; the job fails with
+    `cancelled: true` and the partial report. Fiber and point-collection
+    sources commit as one batch: one existing identity rejects the batch and
+    `existing` lists every clash.
+  - Closing the project or detaching the store stops the import between
+    objects; what was committed stays. When the project changed before the
+    import finished the job fails with `projectReplaced: true` and
+    `store: null` (store references belong to the old project).
+- `objects.export` writes one surface (tifxyz directory), fiber (fiber JSON)
+  or point collection (`vc_pointcollections` JSON with that collection) of an
+  attached project store, read-only stores included; objects of a hosted store
+  cannot be exported (-32602). Without `store` the UUID
+  is looked up across the project's attached stores; several matches fail
+  -32602 with the candidates. Catalog-only objects are not candidates. Pending
+  edits of the object are saved first (-32004 when an edit operation prevents
+  it, -32005 when saving fails, without export). It is an `export` job, not
+  cancellable; its result is `{path, uuid, kind, store, version,
+  geometryRevision}` from one read snapshot, `version` being the exported
+  `{store, generation, object, version}` reference. The files carry the stored frame:
+  `uuid`, `coordinates: {volume_uuid, scale_factor}` (stored units per voxel
+  of that volume, null when unknown) and `coordinate_binding` when recorded.
+  Re-importing them keeps UUID and coordinates.
+
+#### Attaching, routing and detaching stores
+
+- `stores.attach` attaches an existing local store (`readOnly` for read
+  access); a store already attached returns its reference unchanged. Its
+  result `readOnly` is the actual mode. `stores.create` creates a store at a
+  new path and attaches it, removing the file again when attaching fails.
+  Neither changes routing.
+- `stores.route` selects the store a kind (`surface`, `fiber`,
+  `point_collection`, `umbilicus`, `volume_transform`) is shown from and new
+  objects go to, as the Stores menu does; null routes none. It validates the
+  kind and reference first and persists on its own; a refused route leaves
+  the previous one.
+- `stores.detach` removes a reference, including an unavailable one; kinds
+  routed to it are routed to none. The store file is untouched. It is
+  refused (-32004) while an import or export job uses the store; the last
+  store of a project cannot be detached (-32005).
+- Store switches (detach, route, Save As) first save pending edits: point
+  collections, a pending segment autosave and idle line-annotation sessions.
+  They are refused with -32004 (`StoreSwitchRefused`) while growth or a line
+  optimization runs or when saving fails, and nothing changes.
+
+All of these persist in the `.vcproj` and survive reopening it.
+
+#### Project file and resources
+
+- `project.save_as` saves to a new `.vcproj` (refusing an existing file,
+  -32005) and reopens it, keeping the current volume. Resource locations are
+  rebased; stores are shared, not copied. Refused (-32004) while an import or
+  export job runs, since reopening detaches the stores.
+- `project.attach_normal_grid` validates and adds a normal-grid entry;
+  attaching the same location again succeeds with `alreadyAttached`.
+- `project.attach_lasagna_manifest` loads and validates a local or remote
+  manifest as a `manifest` job, as the File menu does, with the explicit
+  `role` (`regular` or `fiber`); it never infers the role. Completion after
+  the project was replaced fails without attaching. Not cancellable.
+- `project.detach_entry` removes a volume, normal-grid or Lasagna entry by
+  the exact `location` of a `state.get` `project.entries` item (-32007 when
+  there is none), with no confirmation step. Pending edits are saved first
+  (-32004 when they cannot be). The result is `{location, scope}`. Detaching
+  the current volume selects another (or none) through the same refresh as
+  the GUI. Source data is untouched.
+- `umbilicus.import` reads an umbilicus file and binds it to the current
+  volume: a stated frame is used as is; an inferred or missing one needs
+  `unitsPerVoxel` (-32602 with `data.inferred` and `data.frame` otherwise).
+  An unreadable file fails -32602 (`param: path`); a file that does not fit,
+  an existing umbilicus without `replace`, or a failed read of the umbilicus
+  store fails -32005. It needs a selected volume (-32001) and a writable umbilicus store
+  (-32009).
+- `umbilicus.remove` retires the annotation volume's umbilicus objects in the
+  umbilicus store in one transaction, so other projects sharing the store see
+  it too; `stores.route(kind="umbilicus", storeId=null)` hides umbilici for
+  this project only. No umbilicus is a success with `removed: []`.
 
 ### Seeding, rendering, flattening, and mesh operations
 
@@ -366,7 +505,7 @@ and never open file pickers.
   are synchronous requests over the existing widget state.
 - `render.tifxyz`, trace, reoptimize, and alpha-composition refinement use the
   shared `tool` source.
-- SLIM and straighten share the `flatten` source and application
+- SLIM uses the `flatten` source and application
   lifecycle.
 - Crop and area recalculation are synchronous.
 - Result paths are returned only after successful launch or completion.
@@ -412,9 +551,12 @@ is the sole bridge method without an MCP tool.
 | `vc3d_activate_segment` | `segments.activate` | Make a segment the active editing target (the programmatic equivalent of clicking it in the segment list). Required before `vc3d_enable_editing` / `vc3d_grow_segment` and after any segment switch. |
 | `vc3d_add_point_collection` | `points.add_collection` |
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
+| `vc3d_attach_lasagna_manifest` | `project.attach_lasagna_manifest` | Attach a regular or fiber Lasagna dataset by manifest, with an explicit role. A `manifest` job. |
+| `vc3d_attach_normal_grid` | `project.attach_normal_grid` | Attach a normal-grid root to the open project. |
+| `vc3d_attach_store` | `stores.attach` | Attach an existing local store to the open project without changing routing. |
 | `vc3d_attach_volume` | `volume.attach` | Attach one local zarr volume or remote `.zarr` URL to the open project without changing the current primary volume. Returns a `volume` job; compose with `vc3d_list_overlay_volumes` and `vc3d_set_overlay` to display it. |
 | `vc3d_auto_fill_windings` | `points.auto_fill_windings` |
-| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`seeding`/`lasagna` jobs are cancellable; `growth`/`flatten`/`catalog`/`volume`/`autosave` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
+| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`seeding`/`lasagna`/`import` jobs are cancellable; `growth`/`flatten`/`catalog`/`volume`/`autosave`/`export` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
 | `vc3d_center_viewer` | `viewer.center_on_point` | Center a viewer pane on a 3D volume point. |
 | `vc3d_clear_all_points` | `points.clear_all` |
 | `vc3d_clear_point_collection` | `points.clear_collection` |
@@ -422,15 +564,18 @@ is the sole bridge method without an MCP tool.
 | `vc3d_commit_points` | `points.commit` | Add annotation points (volume space) to a named collection, optionally with a winding annotation. |
 | `vc3d_commit_wrap_annotation` | `wrap_annotation.commit` | Commit the seeded same-wrap annotation preview into the point collection (the tutorial's shift+E). Requires the mode enabled. |
 | `vc3d_corrections_set_point_mode` | `segmentation.corrections.set_point_mode` |
-| `vc3d_create_project` | `project.create` | Create a `.vcproj` project that references one local zarr volume or remote `.zarr` URL without opening it. |
+| `vc3d_create_project` | `project.create` | Create a `.vcproj` project, optionally referencing one local zarr volume or remote `.zarr` URL, without opening it. |
+| `vc3d_create_store` | `stores.create` | Create a new store and attach it to the open project. |
 | `vc3d_crop_segment_bounds` | `segment.crop_bounds` | Crop a segment's surface grid to its tightest valid bounds. Synchronous. |
 | `vc3d_delete_segment` | `segments.delete` | Retire a surface in its store (it leaves the listing; store history keeps it). Requires `confirm=true`. Fails while segmentation editing is enabled and on read-only stores. |
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
+| `vc3d_detach_project_entry` | `project.detach_entry` | Remove a volume, normal-grid or Lasagna entry from the open project. |
+| `vc3d_detach_store` | `stores.detach` | Remove a store reference from the open project; the store is untouched. |
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
+| `vc3d_export_object` | `objects.export` | Export one surface, fiber or point collection of an attached store as native files, in its stored frame. An `export` job. |
 | `vc3d_fiber_delete` | `fiber.delete` |
 | `vc3d_fiber_export` | `fiber.export` |
-| `vc3d_fiber_import` | `fiber.import` |
 | `vc3d_fiber_launch` | `fiber.launch` |
 | `vc3d_fiber_list` | `fiber.list` | Per fiber includes `traceState` (`legacy`/`predictions`/`mixed`) and per-span `interpMode` (`C`/`L`/`T`) plus `fiberManifest` (predictions provenance, trace spans only). Human review state is just the ordinary `reviewed` tag in `tags`. |
 | `vc3d_fiber_open` | `fiber.open` |
@@ -438,13 +583,14 @@ is the sole bridge method without an MCP tool.
 | `vc3d_fiber_set_follow` | `fiber.set_follow` |
 | `vc3d_fiber_set_tag` | `fiber.set_tag` |
 | `vc3d_flatten_slim` | `flatten.slim` |
-| `vc3d_flatten_straighten` | `flatten.straighten` |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, highlighted surfaces). |
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open project and its stores, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
 | `vc3d_grow_surface_from_seed` | `segmentation.grow_surface_from_seed` | Create a new surface by growing it from a 3D seed point (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the finished job's output. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections; direction; steps). Async: returns a jobId. |
+| `vc3d_import_objects` | `objects.import` | Import tifxyz surfaces, fiber JSON or point collections into a project store as new objects. An `import` job reporting new UUIDs, existing identities and problems. |
+| `vc3d_import_umbilicus` | `umbilicus.import` | Import an umbilicus file for the current volume. |
 | `vc3d_job_status` | `job.status` | Poll a job by id (or the latest job): state, message, console tail. |
 | `vc3d_lasagna_cancel` | `lasagna.cancel` |
 | `vc3d_lasagna_ensure_service` | `lasagna.ensure_service` |
@@ -459,7 +605,9 @@ is the sole bridge method without an MCP tool.
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
 | `vc3d_list_segments` | `segments.list` | List the surfaces of the open volume (your store and Open Data sample stores) by UUID, with name, tags and active/catalog/bound flags. |
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
+| `vc3d_manual_add_add_constraint` | `segmentation.manual_add.add_constraint` |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
+| `vc3d_manual_add_extend` | `segmentation.manual_add.extend` |
 | `vc3d_manual_add_finish` | `segmentation.manual_add.finish` |
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
@@ -473,6 +621,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_refine_segment_alpha_comp` | `segment.refine_alpha_comp` | Alpha-composite refinement of a segment. Asynchronous (`source:"tool"`); rejects remote volumes; supports `wait: bool = false` (30-minute cap). |
 | `vc3d_remove_point_collection_tag` | `points.remove_collection_tag` |
 | `vc3d_remove_point` | `points.remove_point` |
+| `vc3d_remove_umbilicus` | `umbilicus.remove` | Retire the current volume's umbilicus in the umbilicus store. |
 | `vc3d_rename_point_collection` | `points.rename_collection` |
 | `vc3d_rename_segment` | `segments.rename` | Rename a surface (its UUID stays). `new_name` must differ from the current name. Fails in a read-only store. |
 | `vc3d_render_tifxyz` | `render.tifxyz` |
@@ -480,7 +629,9 @@ is the sole bridge method without an MCP tool.
 | `vc3d_reset_windings` | `points.reset_windings` |
 | `vc3d_review_segments` | `segments.review` | List segments with review-tag state and optional server-side filtering (the programmatic equivalent of the surface panel's review filter checkboxes). |
 | `vc3d_rotate_viewer` | `viewer.rotate` | Rotate the "seg xz"/"seg yz" axis-aligned slice plane (middle-drag equivalent). Relative delta by default. |
+| `vc3d_route_store` | `stores.route` | Choose the store a kind of object is shown from and created in, or none. |
 | `vc3d_run_trace` | `tracer.run_trace` |
+| `vc3d_save_project_as` | `project.save_as` | Save the open project to a new file and reopen it. |
 | `vc3d_save_segment` | `segmentation.save` | Write the active segment's pending edits to the store now. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
 | `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window or one viewer pane. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
 | `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |

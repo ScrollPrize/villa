@@ -1,0 +1,10 @@
+# Run after all vc_runtime binaries have been staged by CPack/cmake --install.
+execute_process(
+    COMMAND "@Python3_EXECUTABLE@" "@CMAKE_SOURCE_DIR@/scripts/deploy_macos.py"
+        --app "${CMAKE_INSTALL_PREFIX}/VC3D.app"
+        --macdeployqt "@VC_MACDEPLOYQT@"
+        --plugin-dir "@_vc_qt_plugin_dir@"
+    RESULT_VARIABLE _deploy_rc)
+if(NOT _deploy_rc EQUAL 0)
+    message(FATAL_ERROR "macOS deployment failed (rc=${_deploy_rc})")
+endif()

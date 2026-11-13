@@ -1,4 +1,5 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <vc_object_store/objects/CatalogStore.hpp>
 #include <doctest/doctest.h>
 
 #include "CState.hpp"
@@ -6,7 +7,11 @@
 #include "SurfaceCatalog.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "support/TestProject.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -16,13 +21,10 @@
 #include <QImage>
 #include <QThread>
 
-#include <nlohmann/json.hpp>
 #include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/imgcodecs.hpp>
 
-#include <filesystem>
-#include <fstream>
 #include <memory>
 #include <random>
 #include <string>
@@ -84,11 +86,11 @@ struct CatalogFixture {
         : root(tempRoot(tag))
     {
         namespace vo = vc::objects;
-        vc::test::ZarrVolumeSpec options;
-        options.shapeZYX = {4, 4, 4};
-        options.chunkShapeZYX = {4, 4, 4};
-        options.uuid = "catalog-volume";
-        volume = vc::test::createZarrVolume(root / "ct.zarr", options);
+        const std::filesystem::path volumeRoot1 = root / "ct.zarr";
+        const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+        vcr::zarr::Writer::create(volumeRoot1 / "0", levelZero1);
+        std::ofstream(volumeRoot1 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "catalog-volume"}, {"name", "catalog-volume"}, {"format", "zarr"}, {"width", 4}, {"height", 4}, {"slices", 4}, {"voxelsize", 1.0}}.dump();
+        volume = Volume::New(volumeRoot1);
         const auto storePath = root / "sample.vcobj";
         vo::OpenOptions storeOptions;
         storeOptions.author = "ink-test";
@@ -115,7 +117,12 @@ struct CatalogFixture {
                 throw std::runtime_error("offline");
             });
         const auto attachment = state.objectStoreSession()->attach(storePath, storeOptions);
-        inkFile = state.objectStoreSession()->artifactDirectory(attachment, surfaceUuid) / inkName;
+        // Published files are cached under VC3D's remote cache root: this test's.
+        const auto config = root / "config";
+        fs::create_directories(config);
+        std::ofstream(config / "cache.json") << nlohmann::json{{"version", 1}, {"root", (root / "cache").string()}}.dump();
+        qputenv("VC3D_CONFIG_DIR", QByteArray::fromStdString(config.string()));
+        inkFile = vcr::zarr::decodedCachePath(vcr::zarr::selectedVc3dCacheRoot(), "https://example.test/" + inkName);
         catalog = std::make_unique<SurfaceCatalog>(state.objectStoreSession());
         catalog->setSource(attachment, volume, {volume->id()});
         QElapsedTimer timer;
@@ -125,6 +132,12 @@ struct CatalogFixture {
             QThread::msleep(1);
         }
         REQUIRE(catalog->rows().size() == 1);
+    }
+    std::shared_ptr<QuadSurface> surface() const
+    {
+        auto shown = makeSurface(surfaceUuid);
+        shown->meta = nlohmann::json::parse(catalog->rows().begin()->second.record.meta);
+        return shown;
     }
     ~CatalogFixture()
     {
@@ -213,7 +226,7 @@ TEST_CASE("ink detection options follow the active catalog surface")
     CatalogFixture fixture("options", "prediction.jpg");
     writeFile(fixture.inkFile, "not-empty");
 
-    auto source = makeSurface(fixture.surfaceUuid);
+    auto source = fixture.surface();
     fixture.state.setSurface("segmentation", source, false, false);
 
     InkDetectionOverlayController overlay(&fixture.state);
@@ -223,7 +236,7 @@ TEST_CASE("ink detection options follow the active catalog surface")
     CHECK(overlay.options().front().name == "prediction.jpg");
 
     // A preview of the same surface keeps them; another surface has none.
-    fixture.state.setSurface("segmentation", makeSurface(fixture.surfaceUuid), false, false);
+    fixture.state.setSurface("segmentation", fixture.surface(), false, false);
     CHECK(overlay.options().size() == 1);
     fixture.state.setSurface("segmentation", makeSurface({}), false, false);
     CHECK(overlay.options().empty());
@@ -236,7 +249,7 @@ TEST_CASE("ink detection overlay flips the displayed image")
     CatalogFixture fixture("flip", "prediction.png");
     writeGrayImage(fixture.inkFile);
 
-    fixture.state.setSurface("segmentation", makeSurface(fixture.surfaceUuid), false, false);
+    fixture.state.setSurface("segmentation", fixture.surface(), false, false);
 
     InkDetectionOverlayController overlay(&fixture.state);
     overlay.setSurfaceCatalog(fixture.catalog.get());
@@ -330,11 +343,11 @@ TEST_CASE("A failed point-collection save prevents switching its store")
     const auto first = state.storeFor("point_collection");
     REQUIRE(first);
     const auto second = state.attachStore(other.storePath, "vc-test");
-    vc::test::ZarrVolumeSpec spec;
-    spec.uuid = "point-save-failure";
-    spec.shapeZYX = {4, 4, 4};
-    spec.chunkShapeZYX = {4, 4, 4};
-    auto volume = vc::test::createZarrVolume(vc::test::testProjectDirectory() / spec.uuid, spec);
+    const std::filesystem::path volumeRoot2 = vc::test::testProjectDirectory() / "point-save-failure";
+    const vcr::zarr::CreateOptions levelZero2{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot2 / "0", levelZero2);
+    std::ofstream(volumeRoot2 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "point-save-failure"}, {"name", "point-save-failure"}, {"format", "zarr"}, {"width", 4}, {"height", 4}, {"slices", 4}, {"voxelsize", 1.0}}.dump();
+    auto volume = Volume::New(volumeRoot2);
     state.setCurrentVolume(volume);
     state.pointCollection()->addPoint("unsaved", {1, 2, 3});
     const auto before = state.vpkg()->document().data();

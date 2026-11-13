@@ -30,12 +30,33 @@ the volume can be fit and evaluated.
 ## Conventions
 
 - Coordinates are in **9.6 µm voxels**, level 2 of the 2.4 µm volume `20260411134726-2.400um-0.2m-78keV-masked.zarr`
-  (multiply by 4 for that volume's level-0 voxels), matching `voxel_size_um: 9.6` in `spiral-scroll.json`.
+  (multiply by 4 for that volume's level-0 voxels), matching `"voxel_size_um": 9.6` in a fit's input manifest.
   Checked for `verified_patches/`, `outer_shell/`, `umbilicus.json`, `same_windings.json`, `relative_windings.json`
   and `abs_winding.json`.
 - Exception: `eval_fibers/` are in level-0 (2.4 µm) voxels, as their `vc_open_data_*` fields state.
 - Axis order: `umbilicus.json` uses `x`/`y`/`z` keys; points in the winding files are `[x, y, z]`; patches are
   tifxyz meshes with separate `x`, `y`, `z` images.
+
+## Fitting with this dataset
+
+`fit_spiral.py` does not scan this directory. Ingest the geometry (patches, winding
+JSONs, fibers, tracks, outer shell) into an object store once with `vc_object_ingest`
+(see the spiral-fitting README, "One-time dataset ingest"), then write an input manifest
+beside the files, e.g. `spiral-inputs.json`:
+
+```json
+{
+  "schema_version": 1,
+  "volume_uuid": "<the --volume-uuid used for the ingest>",
+  "scroll": {"name": "PHercParis4", "voxel_size_um": 9.6, "spiral_outward_sense": "CW"},
+  "umbilicus": {"path": "umbilicus.json"},
+  "lasagna": {"manifest": "lasagna_inputs/<name>.lasagna.json"}
+}
+```
+
+and run `python fit_spiral.py --inputs spiral-inputs.json --object-store <store>.vcobj`.
+Relative paths resolve against the manifest's directory. A `spiral-scroll.json`, if
+present, is no longer read; its facts belong in the manifest's `scroll` block.
 
 ## License
 

@@ -1035,7 +1035,8 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Output-mask dilation radius in exported mesh vertices")
 	p.add_argument("--approval-inpaint-tifxyz", default=None, help=argparse.SUPPRESS)
 	p.add_argument("--store", default=None,
-		help="VC object store holding the stored surfaces (vcobj:<uuid>[@<revision>]) the fit reads")
+		help="VC object store holding the stored surfaces (vcobj:<uuid>[@<generation>/<version>]) the fit reads: a store "
+			 "file or a vc_object_server endpoint (http://...)")
 	p.add_argument("--volume-uuid", default=None,
 		help="Volume whose voxels stored-surface coordinates are read in")
 	p.add_argument("--voxel-scale", type=float, default=1.0,
@@ -1344,7 +1345,7 @@ def _run_flatten_mode(
 	device = torch.device(str(getattr(args, "device", "cuda")))
 	from tifxyz_io import load_tifxyz
 	xyz, valid, meta = load_tifxyz(
-		str(ext0["path"]), device=device, store=args.store, volume=args.volume_uuid, target_scale=args.voxel_scale)
+		ext0["path"], device=device, store=args.store, volume=args.volume_uuid, target_scale=args.voxel_scale)
 	source_step = _flatten_source_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
 	scale = _scale_from_tifxyz_meta(meta, source_step)
 
@@ -1668,7 +1669,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 			raise ValueError("approval-inpaint requires service arg approval-inpaint-tifxyz")
 		from approval_inpaint import build_approval_inpaint
 		approval_surface = _scaled_approval_surface(
-			str(approval_tifxyz),
+			approval_tifxyz,
 			base_shape_zyx=lasagna_base_shape_zyx,
 			request_shape_zyx=vc3d_volume_shape_zyx,
 			store=args.store,
@@ -1745,7 +1746,6 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 			corr_point_roi_normal_data = fit_data.load_3d_streaming(
 				path=str(data_cfg.input),
 				device=device,
-				sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 				skip_channels={"cos", "pred_dt"},
 			)
 		else:
@@ -1897,7 +1897,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 	elif model_init == "ext":
 		from tifxyz_io import surface_step_stats
 		xyz_init, valid_init, _meta_init, _scale_init = _load_scaled_tifxyz(
-			str(tifxyz_init),
+			tifxyz_init,
 			device=device,
 			base_shape_zyx=lasagna_base_shape_zyx,
 			request_shape_zyx=vc3d_volume_shape_zyx,
@@ -2168,7 +2168,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 				f"external_surfaces currently requires exactly one entry, got {len(ext_surfaces_cfg)}")
 		from tifxyz_io import surface_step_stats
 		for es in ext_surfaces_cfg:
-			es_path = str(es["path"])
+			es_path = es["path"]
 			es_offset = float(es.get("offset", 1.0))
 			xyz_ext, valid_ext, meta_ext, es_scale = _load_scaled_tifxyz(
 				es_path,
@@ -2282,7 +2282,6 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 		d = fit_data.load_3d_streaming(
 			path=str(data_cfg.input),
 			device=device,
-			sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 			skip_channels=_streaming_skip_channels(needed_channels),
 			require_umbilicus=require_umbilicus,
 		)

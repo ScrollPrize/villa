@@ -1,4 +1,5 @@
 #include "TestSupport.hpp"
+#include "StoreTestSupport.hpp"
 #include "vc_object_store/objects/GeometryEdits.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
@@ -9,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <sqlite3.h>
 using namespace vc::objects;
@@ -17,8 +19,7 @@ int main() try {
     TemporaryDirectory directory;
     const auto path = directory.path / "edits.vcobj";
     OpenOptions options; options.author = "generic-edit-test";
-    { auto store = ObjectStore::create(path, options); }
-    ObjectStoreSession session; const auto attachment = session.attach(path, options);
+    auto store = ObjectStore::create(path, options);
     const std::string volume = "20260411134726";
     require(geometryCoordinates(Json{{"volume_uuid",volume}})["volume_uuid"] == volume,
             "catalog volume ID is stored verbatim");
@@ -57,24 +58,24 @@ int main() try {
         const auto annotated = std::string(kind) == "fiber" || std::string(kind) == "point_collection";
         const auto array = std::string(kind) == "fiber" ? "control_points" : "points";
         std::string initialGeometry, editedGeometry;
-        auto pins = session.act(attachment, {{uuid,{}}}, [&](auto& db, auto& txn) {
+        auto pins = storeAct(store, {{uuid,{}}}, [&](auto& db, auto& txn) {
             ObjectRecord object; object.uuid = uuid; object.kind = kind;
             if (annotated) object.meta = Json{{"source",{{std::string(kind)=="fiber"?"control_points_attributes":"point_attributes",
                 Json::array({Json{{"note","first"}},Json{{"note","second"}}})}}}}.dump();
             db.upsertObject(txn,object); initialGeometry = db.putGeometry(txn,uuid,first);
         });
-        pins = session.act(attachment,pins,[&](auto& db,auto& txn) {
+        pins = storeAct(store,pins,[&](auto& db,auto& txn) {
             editedGeometry = updateGeometryArrays(db,txn,uuid,target,initialGeometry);
             require(updateGeometryArrays(db,txn,uuid,target,editedGeometry) == editedGeometry, "identical update is a no-op");
         });
-        session.read(attachment,[&](const auto& db,const auto& txn,const auto&) {
+        storeRead(store,[&](const auto& db,const auto& txn,const auto&) {
             for (const auto& desired : target.arrays)
                 require(db.readGeometryArray(txn,editedGeometry,desired.name) == desired.bytes,"generic edit preserves exact bytes");
             for (const auto& original : first.arrays)
                 require(db.readGeometryArray(txn,initialGeometry,original.name) == original.bytes,"historical arrays are immutable");
-            if (annotated) require(Json::parse(db.geometryPointAnnotations(txn,editedGeometry,array)) ==
+            if (annotated) require(db.geometryPointAnnotations(txn,editedGeometry,array) ==
                 Json::array({Json{{"note","second"}},Json::object(),Json{{"note","first"}}}),"annotations follow stable IDs through splice");
-            // Typed views over the session's own transaction, at a pinned or the current revision.
+            // Typed views over the read's own transaction, at a pinned or the current revision.
             GeometrySnapshot inSession(db, txn);
             if (std::string(kind) == "fiber") {
                 const auto fiber = inSession.fiber(uuid);
@@ -93,7 +94,7 @@ int main() try {
                     require(loaded.arrays[i].bytes == expected->arrays[i].bytes, "pinned view loads the revision exactly");
             }
         });
-        mustFail([&] { session.act(attachment,pins,[&](auto& db,auto& txn) {
+        mustFail([&] { storeAct(store,pins,[&](auto& db,auto& txn) {
             updateGeometryArrays(db,txn,uuid,target,initialGeometry);
         }); });
     }
@@ -101,7 +102,7 @@ int main() try {
         // Packed reads decode per item with the public byte helpers.
         const auto a = util::newUuid(), b = util::newUuid();
         std::string ra, rb;
-        session.act(attachment, {{a,{}},{b,{}}}, [&](auto& db, auto& txn) {
+        storeAct(store, {{a,{}},{b,{}}}, [&](auto& db, auto& txn) {
             for (const auto& [uuid, revision, points] : {std::tuple{a, &ra, std::vector<vc::geometry::Point>{{1,2,3}}},
                                                        std::tuple{b, &rb, std::vector<vc::geometry::Point>{{4,5,6},{7,8,9}}}}) {
                 ObjectRecord object; object.uuid = uuid; object.kind = "umbilicus";
@@ -109,16 +110,12 @@ int main() try {
                 *revision = db.putGeometry(txn, uuid, vc::geometry::encode(vc::geometry::Umbilicus{points}));
             }
         });
-        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             const auto packed = db.readGeometryArrays(txn, {ra, rb}, "points");
             require(xyzFromBytes<double>(packedItem(packed, 1)) == std::vector<std::array<double, 3>>{{4,5,6},{7,8,9}} &&
                     xyzFromBytes<double>(packedItem(packed, 0)) == std::vector<std::array<double, 3>>{{1,2,3}},
                     "packed items decode to their points");
             mustFail([&] { (void)packedItem(packed, 2); });
-            ObjectSelection umbilici; umbilici.uuids = {a, b};
-            const auto heads = db.currentRevisions(txn, umbilici);
-            require(heads.size() == 2 && *heads.at(a) == db.currentObjectRevision(txn, a)->uuid &&
-                    *heads.at(b) == db.currentObjectRevision(txn, b)->uuid, "current revisions pin a selection");
         });
     }
     // Auxiliary channels and non-finite payload bits belong to the generic
@@ -130,19 +127,19 @@ int main() try {
         first.arrays[0].bytes[0] = 0x45; first.arrays[0].bytes[1] = 0x23;
         first.arrays[0].bytes[2] = 0xc1; first.arrays[0].bytes[3] = 0x7f; // NaN payload
         std::string initial, updated;
-        auto pins = session.act(attachment, {{id,{}}}, [&](auto& db, auto& txn) {
+        auto pins = storeAct(store, {{id,{}}}, [&](auto& db, auto& txn) {
             ObjectRecord object; object.uuid = id; object.kind = "surface";
             db.upsertObject(txn, object); initial = db.putGeometry(txn, id, first);
         });
         auto target = first; target.arrays.back().bytes = {3,0,4,0};
-        pins = session.act(attachment, pins, [&](auto& db, auto& txn) {
+        pins = storeAct(store, pins, [&](auto& db, auto& txn) {
             updated = db.updateSurfaceChannels(txn, id, {target.arrays.back()}, {}, initial);
             require(db.readGeometryArray(txn, updated, "review") == target.arrays.back().bytes, "channel updates replace the channel");
             require(db.readGeometryArray(txn, updated, "points") == first.arrays[0].bytes, "exact non-finite bits survive channel edits");
             require(db.readGeometryArray(txn, initial, "review") == first.arrays.back().bytes, "channel history remains immutable");
         });
         auto malformed = target; malformed.arrays.back().bytes.pop_back();
-        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) {
+        mustFail([&] { storeAct(store, pins, [&](auto& db, auto& txn) {
             db.updateSurfaceChannels(txn, id, {malformed.arrays.back()}, {}, updated);
         }); });
     }
@@ -157,7 +154,7 @@ int main() try {
             for (int64_t c = 0; c < side; ++c) surface.points.push_back({float(c), float(r), 7});
         auto first = vc::geometry::encode(surface);
         std::string initial, updated;
-        auto pins = session.act(attachment, {{id,{}}}, [&](auto& db, auto& txn) {
+        auto pins = storeAct(store, {{id,{}}}, [&](auto& db, auto& txn) {
             ObjectRecord object; object.uuid = id; object.kind = "surface";
             db.upsertObject(txn, object); initial = db.putGeometry(txn, id, first);
         });
@@ -166,10 +163,10 @@ int main() try {
         const auto target = vc::geometry::encode(surface);
         std::vector<uint8_t> run(6 * 12);
         std::memcpy(run.data(), surface.points.data() + (window - 3), run.size());
-        pins = session.act(attachment, pins, [&](auto& db, auto& txn) {
+        pins = storeAct(store, pins, [&](auto& db, auto& txn) {
             updated = db.editGeometry(txn, id, {{"points", int64_t(window - 3) * 3, run}}, initial);
         });
-        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             require(db.readGeometryArray(txn, updated, "points") == target.arrays[0].bytes, "large surfaces update exactly");
             require(db.readGeometryArray(txn, initial, "points") == first.arrays[0].bytes, "large surface history is immutable");
         });
@@ -179,7 +176,7 @@ int main() try {
     const auto uuid = util::newUuid();
     vc::geometry::Fiber original{{{0,0,0},{1,0,0}},{{0,0,0},{1,0,0}},{10,20}};
     std::string initial;
-    auto pins = session.act(attachment, {{uuid,{}}}, [&](auto& db, auto& txn) {
+    auto pins = storeAct(store, {{uuid,{}}}, [&](auto& db, auto& txn) {
         ObjectRecord object; object.uuid = uuid; object.kind = "fiber";
         object.meta = R"({"source":{"control_points_attributes":[{"segment_to_next":{"direction":[1,0,0]}},{}],"line_points_attributes":[{"label":"sample"},{}]}})";
         db.upsertObject(txn, object); initial = db.putGeometry(txn, uuid, vc::geometry::encode(original));
@@ -189,7 +186,7 @@ int main() try {
     std::reverse(reverse.controlPoints.begin(), reverse.controlPoints.end());
     std::reverse(reverse.controlPointIds.begin(), reverse.controlPointIds.end());
     bool rejected = false;
-    mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) {
+    mustFail([&] { storeAct(store, pins, [&](auto& db, auto& txn) {
         try { updateGeometryArrays(db, txn, uuid, vc::geometry::encode(reverse), initial); }
         catch (const std::exception&) { rejected = true; }
     }); });
@@ -198,21 +195,21 @@ int main() try {
     partial.controlPoints[0][0] = 9; // This sparse update precedes the failing resize.
     partial.linePoints.push_back({2,0,0});
     rejected = false;
-    mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) {
+    mustFail([&] { storeAct(store, pins, [&](auto& db, auto& txn) {
         try { updateGeometryArrays(db, txn, uuid, vc::geometry::encode(partial), initial); }
         catch (const std::exception&) { rejected = true; }
         require(db.currentGeometry(txn, uuid)->uuid == initial, "failed helper rolls back every array");
     }); });
     require(rejected, "annotated sample resize requires an explicit transform");
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+    storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
         require(db.currentGeometry(txn, uuid)->uuid == initial, "caught failures cannot partially commit");
     });
-    session.act(attachment, pins, [&](auto& db, auto& txn) {
+    storeAct(store, pins, [&](auto& db, auto& txn) {
         const auto head = updateGeometryArrays(db, txn, uuid, vc::geometry::encode(reverse), initial,
             {{"control_points", R"([{"segment_to_next":{"direction":[-1,0,0]}},{}])"}});
-        require(Json::parse(db.geometryPointAnnotations(txn, head, "control_points"))[0]["segment_to_next"]["direction"][0] == -1,
+        require(db.geometryPointAnnotations(txn, head, "control_points")[0]["segment_to_next"]["direction"][0] == -1,
             "explicit directional transform is preserved");
-        require(Json::parse(db.geometryPointAnnotations(txn, initial, "control_points"))[0]["segment_to_next"]["direction"][0] == 1,
+        require(db.geometryPointAnnotations(txn, initial, "control_points")[0]["segment_to_next"]["direction"][0] == 1,
             "initial annotations remain immutable");
     });
     {
@@ -278,7 +275,7 @@ int main() try {
         const auto seed = util::newUuid(), parent = util::newUuid();
         const vc::geometry::Fiber single{{{5,5,5}},{{5,5,5}},{0}};
         std::string seedHead;
-        auto linked = session.act(attachment, {{seed,{}},{parent,{}}}, [&](auto& db, auto& txn) {
+        auto linked = storeAct(store, {{seed,{}},{parent,{}}}, [&](auto& db, auto& txn) {
             for (const auto& id : {seed, parent}) {
                 ObjectRecord object; object.uuid = id; object.kind = "fiber"; db.upsertObject(txn, object);
                 const auto head = db.putGeometry(txn, id, vc::geometry::encode(single));
@@ -289,13 +286,13 @@ int main() try {
             db.addEdge(txn, edge);
         });
         int asked = 0;
-        session.act(attachment, linked, [&](auto& db, auto& txn) {
+        storeAct(store, linked, [&](auto& db, auto& txn) {
             const auto head = updateGeometryArrays(db, txn, seed,
                 vc::geometry::encode(vc::geometry::Fiber{{{4,5,5},{5,5,6},{6,5,5}},{{4,5,5},{6,5,5}},{1,3,2}}), seedHead, {},
                 [&](const std::vector<EdgeRecord>& affected) {
                     std::vector<GeometryEdgeEdit> result;
                     for (const auto& edge : affected) {
-                        GeometryEdgeEdit edit; edit.edgeUuid = edge.uuid; edit.expectedGeneration = edge.generation;
+                        GeometryEdgeEdit edit; edit.edgeUuid = edge.uuid; edit.expectedVersion = edge.version.value();
                         edit.action = "keep_recorded";
                         edit.aRevision = db.currentGeometry(txn, edge.aUuid)->uuid;
                         edit.bRevision = db.currentGeometry(txn, edge.bUuid)->uuid;
@@ -327,8 +324,8 @@ int main() try {
         std::string second;
         {
             auto read = store.read();
-            const auto head = store.currentObjectRevision(read, uid)->uuid;
-            auto txn = store.write({{uid, head}});
+            const auto head = store.currentVersion(read, uid);
+            auto txn = store.writeNumbered({{uid, head}});
             GeometrySequencePart part; part.count = 1; part.ids = {30}; part.bytes = doubles({7, 8, 9});
             part.annotations = R"([{"label":"C"}])";
             GeometrySequenceEdit splice; splice.array = "points"; splice.start = 1; splice.parts = {part};
@@ -338,7 +335,7 @@ int main() try {
         }
         {
             auto read = store.read();
-            require(Json::parse(store.geometryPointAnnotations(read, second, "points")) ==
+            require(store.geometryPointAnnotations(read, second, "points") ==
                     Json::array({label, Json{{"label", "C"}}, Json{{"label", "B"}}}), "annotations follow their points");
             require(scalarsFromBytes<int64_t>(store.readGeometryArray(read, second, "point_ids")) == std::vector<int64_t>{10, 30, 20},
                     "stable IDs in sequence order");
@@ -350,7 +347,7 @@ int main() try {
         require(view.point(30) == vc::geometry::Point{7, 8, 9}, "lookup by stable ID");
         std::string third;
         {
-            auto txn = store.write({{uid, view.objectRevision()}});
+            auto txn = store.writeNumbered({{uid, view.version()}});
             third = store.editGeometry(txn, uid, {{"points", 3, doubles({10, 11, 12})}}, view.revision().uuid);
             txn.commit();
         }

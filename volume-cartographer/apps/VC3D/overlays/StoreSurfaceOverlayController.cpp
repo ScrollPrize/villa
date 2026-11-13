@@ -37,7 +37,7 @@ std::vector<Run> runsOf(std::vector<vc::objects::VisibleRun>&& visible)
 {
     std::vector<Run> runs;
     runs.reserve(visible.size());
-    for (auto& run : visible) runs.push_back({std::move(run.objectUuid), std::move(run.points), std::move(run.grid)});
+    for (auto& run : visible) runs.push_back({std::move(run.objectUuid), std::move(run.points), std::move(run.grid), std::move(run.objectReference)});
     return runs;
 }
 
@@ -61,25 +61,27 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
     connect(_state, &CState::storeRoutesChanged, this, [this]() { invalidate(); });
     connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
         using Kind = vc::objects::StoreSessionEvent::Kind;
-        if (event.kind == Kind::Hub) return;
         if (event.kind == Kind::Attached || event.kind == Kind::Detached) {
             invalidate();
         } else if (event.kind == Kind::Draft) {
-            // Drafts are cut on every redraw; a draft starting or ending
-            // moves its surface between drafted and stored targets there.
             for (auto& [viewer, view] : _views) view->dirty = true;
             refreshAll();
+        } else if (event.touches({"volume_transform", "volume_transform_choice"})) {
+            invalidate();
         } else if (event.touches({"surface"})) {
             refreshCommittedSurfaces();
         }
     });
-    // volumeChanged also repeats for the same volume; only a new one changes the data.
-    connect(_state, &CState::volumeChanged, this, [this](std::shared_ptr<Volume>, const std::string& volume) {
-        if (std::exchange(_volume, volume) != volume) invalidate();
+    // A working-level change keeps the ID but changes every coordinate.
+    connect(_state, &CState::volumeChanged, this, [this](std::shared_ptr<Volume>, const std::string&) {
+        invalidate();
     });
     // Edits update their drafts before announcing the surface; intersect
     // targets and planes are named surfaces.
-    connect(_state, &CState::surfaceChanged, this, [this](std::string, std::shared_ptr<Surface>, bool) {
+    connect(_state, &CState::surfaceChanged, this, [this](std::string, std::shared_ptr<Surface> surface, bool) {
+        // Do not retain indices for selections which have left the workspace.
+        // Plane navigation alone leaves the displayed-grid cache intact.
+        if (!surface || dynamic_cast<QuadSurface*>(surface.get())) _residentSurfaces.clear();
         for (auto& [viewer, view] : _views) view->dirty = true;
         refreshAll();
     });
@@ -89,8 +91,9 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
 StoreSurfaceOverlayController::~StoreSurfaceOverlayController()
 {
     _fetchCancel->store(true);
-    for (auto& [viewer, view] : _views)
+    for (auto& [viewer, view] : _views) {
         if (view->region.cancelled) view->region.cancelled->store(true);
+    }
 }
 
 void StoreSurfaceOverlayController::setSurfaces(const std::vector<std::string>& uuids)
@@ -144,6 +147,7 @@ void StoreSurfaceOverlayController::fetch(const std::vector<std::pair<vc::object
 
 void StoreSurfaceOverlayController::invalidate()
 {
+    _residentSurfaces.clear();
     _fetchCancel->store(true);
     _fetchCancel = std::make_shared<std::atomic_bool>(false);
     _fetching.clear();
@@ -154,7 +158,10 @@ void StoreSurfaceOverlayController::invalidate()
         view->displayed.reset();
         view->targets.clear();
         view->cuts.clear();
-        view->planeRuns.clear();
+        view->displayedSurfaces.clear();
+        view->draftRevisions.clear();
+        view->drawn.reset();
+        ++view->runsVersion;
         view->dirty = true;
         view->refreshPending = false;
     }
@@ -165,7 +172,6 @@ void StoreSurfaceOverlayController::refreshCommittedSurfaces()
 {
     for (auto& [viewer, view] : _views) {
         view->dirty = true;
-        view->cutsStale = true;
         if (view->region.busy) {
             // Fetching a placeholder commits its geometry. Cancelling here
             // would repeatedly interrupt the batch that is waiting for it.
@@ -236,21 +242,6 @@ std::vector<StoreSurfaceOverlayController::PlaneCut> StoreSurfaceOverlayControll
     return cuts;
 }
 
-std::vector<Run> StoreSurfaceOverlayController::draftRuns(const std::vector<std::string>& uuids,
-                                                          const vc3d::store::Region& slab) const
-{
-    const auto session = _state->objectStoreSession();
-    if (uuids.empty() || !session || !_state->currentVolume()) return {};
-    auto options = surfaceOptions(uuids);
-    options.kind = "surface";
-    options.volume = _state->currentVolumeId();
-    std::vector<vc::objects::VisibleRun> visible;
-    // No attachments: only drafts are read, all in memory.
-    for (auto& region : session->geometryRegion({}, vc3d::store::regionSlice(slab), options))
-        for (auto& run : region.result.runs) visible.push_back(std::move(run));
-    return runsOf(std::move(visible));
-}
-
 bool StoreSurfaceOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
     if (!viewer || !_state->currentVolume() || !_state->objectStoreSession()) return false;
@@ -265,7 +256,7 @@ bool StoreSurfaceOverlayController::needsOverlayRebuild(VolumeViewerBase* viewer
     if (found == _views.end()) return true;
     const auto& v = *found->second;
     if (v.dirty || v.displayedRect != visibleSceneRect(viewer)) return true;
-    // Drafts change while they are edited, without a store event: cut them on every redraw.
+    // Revisit draft selections on redraw; unchanged revisions reuse the query.
     const auto session = _state->objectStoreSession();
     if (dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
         const auto uuids = targets(viewer);
@@ -281,22 +272,43 @@ bool StoreSurfaceOverlayController::needsOverlayRebuild(VolumeViewerBase* viewer
                        [](const PlaneCut& a, const PlaneCut& b) { return a.plane == b.plane && a.slab == b.slab; });
 }
 
-void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d::store::Region& view,
-                                            const std::vector<std::string>& uuids)
+void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const SurfaceCatalog::RegionInput& input,
+                                            const std::vector<PlaneCut>& cuts)
 {
     auto& v = *_views.at(viewer);
-    vc3d::store::requestRegion<Listing>(this, v.region, view,
+    std::vector<std::uint64_t> revisions;
+    const auto& selected = input.options.uuids.value();
+    for (const auto& uuid : selected) revisions.push_back(input.session->draftRevision(uuid));
+    // A plane viewer's moving viewport is covered by RegionRequests, including
+    // its prefetch margin. Surface viewers change the actual cutting planes.
+    const bool cutsChanged = cuts.size() != v.cuts.size() ||
+        (!cuts.empty() && (cuts.front().plane != v.cuts.front().plane || (!cuts.front().plane.empty() && cuts != v.cuts)));
+    if (v.targets != selected || v.displayedSurfaces != input.displayed ||
+        v.draftRevisions != revisions || cutsChanged) {
+        v.region.reset();
+        v.runs.clear();
+        ++v.runsVersion;
+        v.targets = selected;
+        v.displayedSurfaces = input.displayed;
+        v.draftRevisions = std::move(revisions);
+        v.cuts = cuts;
+    }
+    if (cuts.empty() || selected.empty()) return;
+    vc3d::store::requestRegion<Listing>(this, v.region, cuts.front().slab,
         [this, viewer]() -> View* {
             const auto found = _views.find(viewer);
             return found == _views.end() ? nullptr : found->second.get();
         },
-        [session = _state->objectStoreSession(), sources = _state->surfaceSources(),
-         volume = vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{})),
-         uuids](const vc3d::store::Region& query, const std::atomic_bool& cancelled) {
-            auto crossings = SurfaceCatalog::region(*session, sources, volume,
-                                                    vc3d::store::regionSlice(query), surfaceOptions(uuids),
-                                                    [&] { return cancelled.load(); });
-            return Listing{runsOf(std::move(crossings.runs)), crossings.complete, std::move(crossings.remote)};
+        [input, cuts](const vc3d::store::Region& query, const std::atomic_bool& cancelled) {
+            Listing result;
+            for (size_t i = 0; i < cuts.size(); ++i) {
+                auto crossings = input.region(vc3d::store::regionSlice(i == 0 ? query : cuts[i].slab),
+                                               [&] { return cancelled.load(); });
+                result.runs[cuts[i].plane] = runsOf(std::move(crossings.runs));
+                result.complete = result.complete && crossings.complete;
+                result.remote.insert(result.remote.end(), crossings.remote.begin(), crossings.remote.end());
+            }
+            return result;
         },
         [this, viewer](View& v, Listing* listing) {
             v.dirty = true;
@@ -307,40 +319,6 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
             }
             // Commits made while it read: show this read, then read once more.
             if (std::exchange(v.refreshPending, false)) v.region.refresh();
-            refreshViewer(viewer);
-        });
-}
-
-void StoreSurfaceOverlayController::requestCuts(VolumeViewerBase* viewer, const std::string& uuid,
-                                                const std::vector<PlaneCut>& cuts)
-{
-    auto& v = *_views.at(viewer);
-    if (v.cutsBusy) {
-        v.cutsStale = true;
-        return;
-    }
-    v.cutsBusy = true;
-    v.cutsStale = false;
-    using Cut = std::map<std::string, std::vector<Run>>;
-    vc3d::store::background<Cut>(this,
-        [session = _state->objectStoreSession(), sources = _state->surfaceSources(),
-         volume = vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{})),
-         uuid, cuts] {
-            Cut result;
-            for (const auto& cut : cuts) {
-                auto crossings = SurfaceCatalog::region(*session, sources, volume,
-                                                        vc3d::store::regionSlice(cut.slab), surfaceOptions({uuid}));
-                result[cut.plane] = runsOf(std::move(crossings.runs));
-            }
-            return result;
-        },
-        [this, viewer](vc3d::store::Outcome<Cut> outcome) {
-            const auto found = _views.find(viewer);
-            if (found == _views.end()) return;
-            auto& v = *found->second;
-            v.cutsBusy = false;
-            if (outcome.error.isEmpty()) v.planeRuns = std::move(outcome.value);
-            v.dirty = true;
             refreshViewer(viewer);
         });
 }
@@ -364,15 +342,19 @@ void StoreSurfaceOverlayController::drawPlaneViewer(VolumeViewerBase* viewer, Vi
     v.displayed = current;
     if (!current) return;
     const auto session = _state->objectStoreSession();
-    std::vector<std::string> drafted, stored;
-    for (const auto& uuid : targets(viewer)) (session->hasDraft(uuid) ? drafted : stored).push_back(uuid);
-    if (v.targets != stored) {
-        v.targets = stored;
-        v.region.reset();
-        v.runs.clear();
-        ++v.runsVersion;
-    }
-    if (!stored.empty()) request(viewer, *current, stored);
+    SurfaceCatalog::RegionInput input{session, _state->surfaceSources(),
+        vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{})),
+        surfaceOptions(targets(viewer)), {}};
+    for (const auto& name : viewer->intersects())
+        if (auto surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name)))
+            input.displayed[surface->id] = residentSurface(*surface);
+    if (auto surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation")))
+        input.displayed[surface->id] = residentSurface(*surface);
+    std::erase_if(input.displayed, [&](const auto& entry) {
+        const auto& selected = input.options.uuids.value();
+        return !std::binary_search(selected.begin(), selected.end(), entry.first) || session->hasDraft(entry.first);
+    });
+    request(viewer, input, {{"", *current}});
 
     const auto notice = !v.region.error.isEmpty() ? tr("Surfaces: %1").arg(v.region.error)
                         : !_fetching.empty() ? tr("Fetching %n surface(s)…", nullptr, int(_fetching.size()))
@@ -391,21 +373,9 @@ void StoreSurfaceOverlayController::drawPlaneViewer(VolumeViewerBase* viewer, Vi
 
     const auto style = lineStyle(viewer);
     auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface());
-    // Drafts are cut over the whole plane, again only for another plane or draft revision.
-    std::vector<std::uint64_t> revisions;
-    for (const auto& uuid : drafted) revisions.push_back(session->draftRevision(uuid));
-    const auto slab = planeSlab(*plane);
-    if (v.draftSlab != slab || v.drafted != drafted || v.draftRevisions != revisions) {
-        v.draftRuns = slab ? draftRuns(drafted, *slab) : std::vector<Run>{};
-        v.draftSlab = slab;
-        v.drafted = drafted;
-        v.draftRevisions = revisions;
-    }
-
     // Lines are redrawn for new data, plane, zoom or style, else moved.
     View::Drawn drawn;
     drawn.runsVersion = v.runsVersion;
-    drawn.draftRevisions = revisions;
     drawn.styleVersion = _styleVersion;
     drawn.origin = viewer->surfaceCoordsToScene(0, 0);
     drawn.axisU = viewer->surfaceCoordsToScene(1, 0) - drawn.origin;
@@ -425,11 +395,8 @@ void StoreSurfaceOverlayController::drawPlaneViewer(VolumeViewerBase* viewer, Vi
             return;
         }
     }
-    std::vector<Run> runs = v.draftRuns;
-    for (const auto& run : v.runs)
-        if (!std::binary_search(drafted.begin(), drafted.end(), run.uuid)) runs.push_back(run);
     OverlayBuilder lines(viewer);
-    addLines(viewer, runs, style, lines);
+    addLines(viewer, v.runs[""], style, lines);
     applyPrimitives(viewer, kStoredLinesGroup, lines.takePrimitives());
     v.drawn = drawn;
 }
@@ -451,7 +418,7 @@ StoreSurfaceOverlayController::LineStyle StoreSurfaceOverlayController::lineStyl
         if (segViewer->isCompositeEnabled()) {
             const auto& cs = segViewer->compositeRenderSettings();
             const float step = cs.reverseDirection ? -1.0f : 1.0f;
-            style.volumetric = cs.params.method == "volumetric";
+            style.volumetric = cs.params.volumetric;
             style.offsets = {offset + float(std::max(0, cs.layersFront)) * step,
                              offset - float(std::max(0, cs.layersBehind)) * step};
         } else if (std::abs(offset) > 1e-3f) {
@@ -546,29 +513,25 @@ void StoreSurfaceOverlayController::addLines(VolumeViewerBase* viewer, const std
     }
 }
 
+std::shared_ptr<vc::objects::ResidentSurface> StoreSurfaceOverlayController::residentSurface(QuadSurface& surface)
+{
+    auto& cached = _residentSurfaces[surface.id];
+    if (!cached.second || cached.first != &surface)
+        cached = {&surface, std::make_shared<vc::objects::ResidentSurface>(quad_surface_grid(surface))};
+    return cached.second;
+}
+
 void StoreSurfaceOverlayController::drawSurfaceViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder)
 {
     auto* surface = dynamic_cast<QuadSurface*>(viewer->currentSurface());
-    if (!surface || !vc::objects::util::isUuid(surface->id)) return;
-    const auto cuts = planeCuts(viewer);
-    const bool cutsChanged = cuts.size() != v.cuts.size() ||
-        !std::equal(cuts.begin(), cuts.end(), v.cuts.begin(),
-                    [](const PlaneCut& a, const PlaneCut& b) { return a.plane == b.plane && a.slab == b.slab; });
-    v.cuts = cuts;
-    if (const auto revision = _state->objectStoreSession()->draftRevision(surface->id)) {
-        if (cutsChanged || revision != v.cutRevision) {
-            v.planeRuns.clear();
-            for (const auto& cut : cuts) v.planeRuns[cut.plane] = draftRuns({surface->id}, cut.slab);
-            v.cutRevision = revision;
-        }
-    } else if (cutsChanged || v.cutsStale) {
-        v.cutRevision = 0;
-        requestCuts(viewer, surface->id, cuts);
-    }
+    if (!surface) return;
+    request(viewer, {_state->objectStoreSession(), {},
+        vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{})),
+        surfaceOptions({surface->id}), {{surface->id, residentSurface(*surface)}}}, planeCuts(viewer));
 
     const float opacity = std::clamp(viewer->intersectionOpacity() * vc3d::kActiveIntersectionOpacityScale, 0.0f, 1.0f);
     const float width = std::max(viewer->intersectionThickness(), vc3d::kActiveIntersectionMinWidthDelta);
-    for (const auto& [plane, runs] : v.planeRuns) {
+    for (const auto& [plane, runs] : v.runs) {
         QPainterPath path;
         for (const auto& run : runs) {
             if (run.uuid != surface->id || run.grid.size() < 2) continue;

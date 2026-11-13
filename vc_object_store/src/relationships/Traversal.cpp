@@ -1,41 +1,11 @@
 #include "internal/EdgeSql.hpp"
 #include "internal/History.hpp"
+#include "geometry/GeometryToken.hpp"
+#include "internal/RecordResolver.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 
 namespace vc::objects {
 using namespace detail;
-std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::string& objectUuid,
-                                             const std::optional<std::string>& edgeKind,
-                                             const std::optional<std::string>& neighbourKind, bool includeRetired,
-                                             std::optional<bool> adjacentFilter, bool applicableOnly) const
-{
-    auto* db = static_cast<sqlite3*>(connection(txn));
-    const auto id = objectIdByUuid(db, parseUuid(objectUuid));
-    if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
-    if (applicableOnly) requirePublishedGraphRead(txn);
-    const std::string filter = fiberAdjacencySql(adjacentFilter) +
-        (edgeKind ? std::string(" AND kind=?2") : " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'") +
-        (includeRetired ? "" : " AND " + activeEdgeSql());
-    // Filter before deduplication: a rejected parallel edge must not hide a
-    // later applicable edge to the same neighbour. Preserve first-edge order.
-    std::string sql = "SELECT o.uuid,e.uuid FROM (SELECT id,uuid,b_id AS neighbour FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
-        " UNION SELECT id,uuid,a_id AS neighbour FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter +
-        ") e JOIN objects o ON o.id=e.neighbour";
-    if (neighbourKind) sql += " WHERE o.kind=?3";
-    sql += " ORDER BY e.id";
-    Statement rows(db, sql, *id);
-    if (edgeKind) rows.bind(2, *edgeKind);
-    if (neighbourKind) rows.bind(3, *neighbourKind);
-    std::vector<std::string> out;
-    std::unordered_set<std::string> seen;
-    while (rows.row()) {
-        const auto next = formatUuid(rows.blob16(0));
-        if (seen.contains(next)) continue;
-        if (applicableOnly && !currentRelationshipApplicable(*this, txn, formatUuid(rows.blob16(1)))) continue;
-        seen.insert(next); out.push_back(next);
-    }
-    return out;
-}
-
 namespace {
 
 void checkTraversalCancelled(const std::atomic_bool* cancel)
@@ -54,10 +24,10 @@ std::vector<Node> breadthFirst(Node start, int maxDepth, const std::atomic_bool*
         const auto [node, depth] = queue.front(); queue.pop();
         result.push_back(node);
         if (depth >= maxDepth) continue;
-        adjacent(node, [&](Node next, auto accepted) {
+        adjacent(node, [&](Node next,auto accepted) {
             checkTraversalCancelled(cancel);
             if (!visited.contains(next) && accepted()) {
-                visited.insert(next); queue.emplace(next, depth+1);
+                visited.insert(next);queue.emplace(next, depth+1);
             }
         });
     }
@@ -69,7 +39,67 @@ struct ProgressGuard {
     ~ProgressGuard() { sqlite3_progress_handler(db, 0, nullptr, nullptr); }
 };
 
-std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int maxDepth,
+// Reuse endpoint-index probes throughout a walk, with the same visibility and
+// applicability policy for neighbours, bounded walks and whole components.
+class Adjacency {
+    sqlite3* db_;
+    bool includeRetired_, many_;
+    const ObjectStore* store_;
+    const Txn* txn_;
+    const std::atomic_bool* cancel_;
+    std::vector<std::pair<sqlite3*,std::unique_ptr<Statement>>> queries_;
+    std::unordered_map<std::string,bool> active_;
+public:
+    Adjacency(sqlite3* db,const std::vector<std::string>& kinds,bool includeRetired,std::optional<bool> adjacent,
+              const ObjectStore* store,const Txn* txn,const std::atomic_bool* cancel=nullptr)
+        : db_(db),includeRetired_(includeRetired),store_(store),txn_(txn),cancel_(cancel)
+    {
+        const auto sources=querySources(db);many_=sources.size()>1;
+        std::string filter=" AND state=0"+fiberAdjacencySql(adjacent);
+        if(kinds.empty())filter+=" AND kind<>'"+std::string(kAttachmentEdgeKind)+"'";
+        else {
+            filter+=" AND kind IN (";
+            for(size_t i=0;i<kinds.size();++i)filter+=(i?",?":"?")+std::to_string(i+2);
+            filter+=')';
+        }
+        if(!many_&&!includeRetired)filter+=" AND "+activeEdgeSql();
+        for(auto* source:sources) {
+            auto rows=std::make_unique<Statement>(source,
+                "SELECT id,b_uuid,uuid FROM edges INDEXED BY edges_a WHERE a_uuid=?1"+filter+
+                " UNION SELECT id,a_uuid,uuid FROM edges INDEXED BY edges_b WHERE b_uuid=?1"+filter+" ORDER BY id");
+            for(size_t i=0;i<kinds.size();++i)rows->bind(int(i)+2,kinds[i]);
+            queries_.emplace_back(source,std::move(rows));
+        }
+    }
+    template<class Visit> void visit(const std::string& uuid,Visit visit)
+    {
+        const auto accept=[&](const std::string& edge,const std::string& next) {
+            visit(next,[&] {
+                auto found=active_.find(next);
+                if(found==active_.end()) {
+                    const auto object=resolveObject(db_,next);
+                    found=active_.emplace(next,object&&(includeRetired_||!object->record.retired)).first;
+                }
+                return found->second&&(!store_||currentRelationshipApplicable(*store_,*txn_,edge));
+            });
+        };
+        std::vector<std::pair<std::string,std::string>> merged;
+        for(auto& [source,rows]:queries_) {
+            rows->resetKeepingBindings();rows->bind(1,parseUuid(uuid));
+            while(rows->row()) {
+                checkTraversalCancelled(cancel_);
+                const auto edge=rows->uuid(2),next=rows->uuid(1);
+                if(!many_)accept(edge,next);
+                else if(edgeSource(db_,edge)==source)merged.emplace_back(edge,next);
+            }
+        }
+        // Preserve existing ordering: local internal IDs, collection UUIDs.
+        std::sort(merged.begin(),merged.end());
+        for(const auto& [edge,next]:merged)accept(edge,next);
+    }
+};
+
+std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int maxDepth,
                                   const std::vector<std::string>& edgeKindFilter, const std::atomic_bool* cancel, bool includeRetired,
                                   std::optional<bool> adjacentFilter = std::nullopt,
                                   const ObjectStore* store = nullptr, const Txn* txn = nullptr)
@@ -82,38 +112,16 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
             db, 1000, [](void* p) { return static_cast<const std::atomic_bool*>(p)->load() ? 1 : 0; },
             const_cast<std::atomic_bool*>(cancel));
     const auto startBytes = parseUuid(startUuid);
-    if (!objectIdByUuid(db, startBytes))
-        throw std::runtime_error("object store: object not found: " + startUuid);
-    if (!includeRetired) {
-        Statement active(db, "SELECT 1 FROM objects WHERE uuid=? AND " + activeObjectSql("objects.id"), startBytes);
-        if (!active.row()) return {};
-    }
-    // Probe the endpoint indexes only for nodes reached by this traversal.
-    // Visit neighbours in stable internal-ID order.
-    std::string filter;
-    if (!edgeKindFilter.empty()) {
-        filter = " AND kind IN (";
-        for (size_t i = 0; i < edgeKindFilter.size(); ++i)
-            filter += (i ? ",?" : "?") + std::to_string(i + 2);
-        filter += ")";
-    } else {
-        filter = " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'";
-    }
-    filter += fiberAdjacencySql(adjacentFilter);
-    if (!includeRetired) filter += " AND " + activeEdgeSql();
-    // Each UNION arm uses an endpoint-leading index even without ANALYZE.
-    std::string sql = "SELECT id,b_id,uuid FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
-        " UNION SELECT id,a_id,uuid FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter + " ORDER BY id";
-    Statement adjacent(db, sql);
-    const int64_t startId = *objectIdByUuid(db, startBytes);
+    auto active=[&](const std::string& uuid) {
+        const auto object=resolveObject(db,uuid);
+        return object&&(includeRetired||!object->record.retired);
+    };
+    if(!resolveObject(db,startUuid))throw std::runtime_error("object store: object not found: "+startUuid);
+    if(!active(startUuid))return {};
+    Adjacency adjacent(db,edgeKindFilter,includeRetired,adjacentFilter,store,txn,cancel);
     try {
-        return breadthFirst(startId, maxDepth, cancel, [&](int64_t id, auto visit) {
-            adjacent.reset(); adjacent.bind(1, id);
-            for (size_t i = 0; i < edgeKindFilter.size(); ++i) adjacent.bind(int(i) + 2, edgeKindFilter[i]);
-            while (adjacent.row())
-                visit(adjacent.i64(1), [&] {
-                    return !store || currentRelationshipApplicable(*store, *txn, formatUuid(adjacent.blob16(2)));
-                });
+        return breadthFirst(formatUuid(startBytes), maxDepth, cancel, [&](const std::string& uuid, auto visit) {
+            adjacent.visit(uuid,visit);
         });
     } catch (const std::runtime_error&) {
         checkCancelled(); // Translate SQLite interrupts into the cancellation contract.
@@ -121,35 +129,63 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
     }
 }
 
-std::vector<std::string> uuidList(sqlite3* db, const std::vector<int64_t>& ids)
-{
-    Statement rows(db, "SELECT id,uuid FROM objects WHERE id IN (SELECT value FROM json_each(?))",
-        nlohmann::json(ids).dump());
-    std::unordered_map<int64_t, std::string> uuids;
-    while (rows.row()) uuids.emplace(rows.i64(0), formatUuid(rows.blob16(1)));
-    std::vector<std::string> result;
-    result.reserve(ids.size());
-    for (auto id : ids) result.push_back(uuids.at(id));
-    return result;
-}
 }  // namespace
 
-std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
-                                        const std::vector<std::string>& kinds, bool includeRetired, std::optional<bool> adjacentFilter)
+std::vector<std::string> ObjectStore::neighbours(const Txn& txn,const std::string& uuid,
+    const std::optional<std::string>& edgeKind,const std::optional<std::string>& neighbourKind,bool includeRetired,
+    std::optional<bool> adjacentFilter,bool applicableOnly) const
+{
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    const auto own=resolveObject(db,uuid);
+    if(!own||(!includeRetired&&own->record.retired))return {};
+    if(applicableOnly)requirePublishedGraphRead(txn);
+    Adjacency adjacent(db,edgeKind?std::vector{*edgeKind}:std::vector<std::string>{},includeRetired,adjacentFilter,
+                       applicableOnly?this:nullptr,&txn);
+    std::vector<std::string> result;std::unordered_set<std::string> seen;
+    adjacent.visit(uuid,[&](const auto& next,auto accepted) {
+        if(!seen.contains(next)&&accepted()&&(!neighbourKind||resolveObject(db,next)->record.kind==*neighbourKind)) {
+            seen.insert(next);result.push_back(next);
+        }
+    });
+    return result;
+}
+
+namespace {
+// The component of `start`, cached on read connections (nullptr elsewhere,
+// with the walk in `walked`).
+std::shared_ptr<StatementPool::Component> cachedComponent(
+    sqlite3* db, const std::string& start, const std::vector<std::string>& kinds, bool includeRetired,
+    std::optional<bool> adjacentFilter, const std::atomic_bool* cancel, std::vector<int64_t>& walked)
 {
     StatementPool* pool = nullptr;
     if (auto it = activeStatementPools.find(db); it != activeStatementPools.end() && it->second->readSnapshot)
         pool = it->second;
-    const auto key = nlohmann::json({formatUuid(parseUuid(start)), kinds, includeRetired, adjacentFilter ? nlohmann::json(*adjacentFilter) : nlohmann::json(nullptr)}).dump();
+    const auto prefix = nlohmann::json({kinds, includeRetired, adjacentFilter ? nlohmann::json(*adjacentFilter) : nlohmann::json(nullptr)}).dump() + "/";
+    const auto key = prefix + formatUuid(parseUuid(start));
     if (pool) if (auto it = pool->components.find(key); it != pool->components.end()) return it->second;
-    auto ids = traverse(db, start, INT_MAX, kinds, nullptr, includeRetired, adjacentFilter);
+    const auto keys=traverse(db,start,INT_MAX,kinds,cancel,includeRetired,adjacentFilter);
+    std::vector<int64_t> ids;ids.reserve(keys.size());
+    for(const auto& uuid:keys)if(const auto id=objectIdByUuid(db,parseUuid(uuid)))ids.push_back(*id);
     // Bound the transaction-local membership cache; never reuse across snapshots.
     if (pool && ids.size() <= 262144) {
         if (pool->componentNodes + ids.size() > 262144) { pool->components.clear(); pool->componentNodes = 0; }
         pool->componentNodes += ids.size();
-        pool->components.emplace(key, ids);
+        const auto shared = std::make_shared<StatementPool::Component>(StatementPool::Component{std::move(ids), std::nullopt});
+        for (const auto& uuid : keys) pool->components.emplace(prefix + uuid, shared);
+        return shared;
     }
-    return ids;
+    walked = std::move(ids);
+    return nullptr;
+}
+}  // namespace
+
+std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
+                                        const std::vector<std::string>& kinds, bool includeRetired, std::optional<bool> adjacentFilter,
+                                        const std::atomic_bool* cancel)
+{
+    std::vector<int64_t> walked;
+    const auto component = cachedComponent(db, start, kinds, includeRetired, adjacentFilter, cancel, walked);
+    return component ? component->ids : walked;
 }
 
 std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::string& objectUuid,
@@ -157,11 +193,7 @@ std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::str
                                               const std::atomic_bool* cancel, bool includeRetired,
                                               std::optional<bool> adjacentFilter, bool applicableOnly) const
 {
-    auto* db = static_cast<sqlite3*>(connection(txn));
-    if (applicableOnly) requirePublishedGraphRead(txn);
-    return uuidList(db, (cancel || applicableOnly) ? traverse(db, objectUuid, INT_MAX, edgeKindFilter, cancel, includeRetired,
-                                                           adjacentFilter, applicableOnly ? this : nullptr, &txn)
-                              : componentIds(db, objectUuid, edgeKindFilter, includeRetired, adjacentFilter));
+    return reachableWithin(txn,objectUuid,INT_MAX,edgeKindFilter,cancel,includeRetired,adjacentFilter,applicableOnly);
 }
 
 std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
@@ -172,8 +204,8 @@ std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std:
     if (maxDepth < 0) throw std::runtime_error("object store: maxDepth must be >= 0");
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (applicableOnly) requirePublishedGraphRead(txn);
-    return uuidList(db, traverse(db, objectUuid, maxDepth, edgeKindFilter, cancel, includeRetired,
-                                adjacentFilter, applicableOnly ? this : nullptr, &txn));
+    return traverse(db, objectUuid, maxDepth, edgeKindFilter, cancel, includeRetired,
+                                adjacentFilter, applicableOnly ? this : nullptr, &txn);
 }
 
 namespace {
@@ -191,8 +223,10 @@ void finishGraph(GraphReadView& result, sqlite3* db)
             result.neighbours[slot] = to; result.edgeIndices[slot] = edge;
         }
     }
-    Statement journal(db, "SELECT coalesce(max(seq),0) FROM journal");
-    (void)journal.row(); result.journalSequence = journal.i64(0);
+    if(db && historyEnabled(db)) {
+        Statement journal(db, "SELECT coalesce(max(seq),0) FROM journal");
+        (void)journal.row(); result.journalSequence = journal.i64(0);
+    }
 }
 }
 
@@ -203,71 +237,59 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     GraphReadView result;
     if (edges.endpointUuids)
         throw std::invalid_argument("graph endpoint scope is specified by its object selection");
-    std::unordered_map<int64_t, uint64_t> nodes;
-    std::vector<int64_t> ids;
-    auto objectsQuery = objectSelectionQuery(db, objects,
-        "o.id,o.uuid,o.generation,(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=o.uuid)");
-    while (objectsQuery->row()) {
+    std::unordered_map<std::string, uint64_t> nodes;
+    for(const auto& object:selectObjects(txn,objects,std::vector<std::string>{})) {
         const auto node = result.objectUuids.size();
-        const auto id = objectsQuery->i64(0);
-        nodes.emplace(id, node); ids.push_back(id);
-        result.objectUuids.push_back(formatUuid(objectsQuery->blob16(1)));
-        result.generations.push_back(objectsQuery->i64(2));
-        result.geometryRevisions.push_back(objectsQuery->isNull(3) ? std::nullopt :
-            std::optional(formatUuid(objectsQuery->blob16(3))));
+        nodes.emplace(object.uuid,node);
+        result.objectUuids.push_back(object.uuid);
+        result.versions.push_back(object.version.value_or(0));
+        result.geometryRevisions.push_back(geometryHead(db,object.uuid));
     }
     auto selection = edges; selection.bothEndpoints = true;
     selection.includeRetired = objects.includeRetired;
     // Attachments are not graph links unless asked for by kind.
     if (!selection.kind) selection.attachments = false;
-    if (selection.applicableOnly) {
-        selection.endpointUuids = result.objectUuids;
-        for (const auto& edge : selectEdges(txn, selection, std::vector<std::string>{})) {
-            result.edgeUuids.push_back(edge.uuid);
-            result.endpoints.push_back({nodes.at(*objectIdByUuid(db, parseUuid(edge.aUuid))),
-                                        nodes.at(*objectIdByUuid(db, parseUuid(edge.bUuid)))});
-        }
-    } else {
-        auto links = edgeSelectionQuery(db, selection, "uuid,a_id,b_id", ids);
-        while (links->row()) {
-            result.edgeUuids.push_back(formatUuid(links->blob16(0)));
-            result.endpoints.push_back({nodes.at(links->i64(1)), nodes.at(links->i64(2))});
-        }
+    selection.endpointUuids = result.objectUuids;
+    for (const auto& edge : selectEdges(txn, selection, std::vector<std::string>{})) {
+        result.edgeUuids.push_back(edge.uuid);
+        result.endpoints.push_back({nodes.at(edge.aUuid),nodes.at(edge.bUuid)});
     }
     finishGraph(result, db);
     return result;
 }
 
-GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelection& selection,
+GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<ObjectVersion>& versions,
                                          const EdgeSelection& edges) const
 {
-    auto* db = static_cast<sqlite3*>(connection(txn));
     requirePublishedGraphRead(txn);
+    auto result = LocalStoreReader(*this, txn).graphReadViewAt(versions, edges);
+    if (historyEnabled(ObjectStoreImplAccess::conn(txn))) result.journalSequence = journalPosition(txn);
+    return result;
+}
+
+GraphReadView StoreReader::graphReadViewAt(const std::vector<ObjectVersion>& versions, const EdgeSelection& edges) const
+{
     validateEdgeSelection(edges);
     if (edges.endpointUuids)
-        throw std::invalid_argument("graph endpoint scope is specified by its revision selection");
+        throw std::invalid_argument("graph endpoint scope is specified by its version selection");
     GraphReadView result;
     result.selectedObjects.emplace(); result.selectedRelationships.emplace();
-    RevisionSelection resolved;
-    for (const auto& [object, revision] : selection) {
-        const auto uuid = formatUuid(parseUuid(object));
-        const auto value = revision ? objectRevision(txn, *revision) : currentObjectRevision(txn, uuid);
-        if (!value || value->objectUuid != uuid || value->deleted)
-            throw std::invalid_argument("object history: selection revision does not belong to object");
-        if (!resolved.emplace(uuid, value->uuid).second)
+    std::map<std::string,ObjectRevision> resolved;
+    for(auto& value:objectsAtVersions(versions)) {
+        if(!value||value->deleted)throw std::invalid_argument("object history: selected version is unavailable or deleted");
+        if (!resolved.emplace(value->objectUuid,*value).second)
             throw std::invalid_argument("duplicate object in revision selection");
     }
     std::map<std::string, uint64_t> nodes;
-    for (const auto& [object, revision] : resolved) {
-        auto value = *objectRevision(txn, *revision);
+    for (auto& [object, value] : resolved) {
         nodes.emplace(object, result.objectUuids.size());
-        result.objectUuids.push_back(object); result.generations.push_back(value.record.generation);
+        result.objectUuids.push_back(object); result.versions.push_back(value.record.version.value_or(0));
         result.geometryRevisions.push_back(value.geometryRevision);
         result.selectedObjects->push_back(std::move(value));
     }
     auto graphEdges = edges;
     if (!graphEdges.kind) graphEdges.attachments = false;
-    for (auto& selected : relationshipsAt(txn, resolved))
+    for (auto& selected : relationshipsAt(versions))
         if (selected.applicable && matchesEdgeSelection(selected.relationship.record, graphEdges))
             result.selectedRelationships->push_back(std::move(selected.relationship));
     auto& relationships = *result.selectedRelationships;
@@ -278,8 +300,54 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
         result.edgeUuids.push_back(edge.uuid);
         result.endpoints.push_back({nodes.at(edge.aUuid), nodes.at(edge.bUuid)});
     }
-    finishGraph(result, db);
+    finishGraph(result, nullptr);
     return result;
+}
+
+GraphReadView StoreReader::graphReadViewAround(const std::vector<ObjectVersion>& versions,
+                                              const EdgeSelection& edges, const std::atomic_bool* cancel) const
+{
+    validateEdgeSelection(edges);
+    if (edges.endpointUuids)
+        throw std::invalid_argument("graph endpoint scope is specified by its version selection");
+    std::map<std::string,ObjectVersion> selected, pending;
+    std::set<std::string> pinned;
+    for (const auto& object : objectsAtVersions(versions)) {
+        if (!object || object->deleted) throw std::invalid_argument("graph seed version is unavailable or deleted");
+        const auto reference = object->reference();
+        if (!selected.emplace(reference.objectUuid, reference).second)
+            throw std::invalid_argument("duplicate object in graph seed selection");
+        pinned.insert(reference.objectUuid);
+        pending.emplace(reference.objectUuid, reference);
+    }
+    auto filter = edges;
+    if (!filter.kind) filter.attachments = false;
+    while (!pending.empty()) {
+        if (cancel && cancel->load()) throw std::runtime_error("graph selection cancelled");
+        std::vector<ObjectVersion> frontier;
+        for (const auto& [uuid, reference] : pending) frontier.push_back(reference);
+        pending.clear();
+        for (const auto& relationship : relationshipsAt(frontier)) {
+            const auto& edge = relationship.relationship;
+            if (!matchesEdgeSelection(edge.record, filter)) continue;
+            for (const auto& reference : {edge.aReference, edge.bReference}) {
+                if (reference.objectUuid.empty() || reference.storeUuid.empty() || reference.generation.empty() || reference.version <= 0)
+                    throw std::invalid_argument("recorded graph endpoint reference is unavailable");
+                if (pinned.contains(reference.objectUuid)) continue;
+                const auto found = selected.find(reference.objectUuid);
+                if (found != selected.end()) {
+                    if (found->second.storeUuid != reference.storeUuid || found->second.generation != reference.generation)
+                        throw std::invalid_argument("ambiguous recorded owners/lineages for graph endpoint " + reference.objectUuid);
+                    if (found->second.version >= reference.version) continue;
+                }
+                selected.insert_or_assign(reference.objectUuid, reference);
+                pending.insert_or_assign(reference.objectUuid, reference);
+            }
+        }
+    }
+    std::vector<ObjectVersion> closure;
+    for (const auto& [uuid, reference] : selected) closure.push_back(reference);
+    return graphReadViewAt(closure, edges);
 }
 
 std::vector<std::string> GraphReadView::reachableWithin(const std::string& objectUuid, int maxDepth,

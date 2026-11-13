@@ -28,7 +28,7 @@
 
 // OpenCV for compressed image writing
 #include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
+#include <vc_reader/image_write.hpp>
 
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/InpaintSurface.hpp"
@@ -555,8 +555,7 @@ struct Flatboi {
     int  target_max_dim;
     int  margin_px;
     int  supersample;
-    int  png_compression; // 0..9
-    HeatCfg(): target_max_dim(2048), margin_px(8), supersample(1), png_compression(9) {}
+    HeatCfg(): target_max_dim(2048), margin_px(8), supersample(1) {}
   };
 
   static inline double clamp01(double x){ return std::max(0.0, std::min(1.0,x)); }
@@ -637,21 +636,23 @@ struct Flatboi {
     return (bool)os;
   }
 
-  // OpenCV writer (PNG). Returns true on success.
-  static bool write_image_cv_png(const fs::path& out_png, const Raster& img, int compression_level){
-    cv::Mat mat(img.H, img.W, CV_8UC3);
+  // Returns true on success.
+  static bool write_image_png(const fs::path& out_png, const Raster& img){
+    std::vector<std::uint8_t> rgb(std::size_t(img.W) * img.H * 3);
+    std::size_t next = 0;
     for(int y=0;y<img.H;++y){
-      cv::Vec3b* row = mat.ptr<cv::Vec3b>(y);
       for(int x=0;x<img.W;++x){
         const int i = img.idx(x,y);
-        // OpenCV uses BGR
-        row[x] = cv::Vec3b(img.B[i], img.G[i], img.R[i]);
+        rgb[next++] = img.R[i];
+        rgb[next++] = img.G[i];
+        rgb[next++] = img.B[i];
       }
     }
-    std::vector<int> params = { cv::IMWRITE_PNG_COMPRESSION, clamp(compression_level,0,9) };
     try {
-      return cv::imwrite(out_png.string(), mat, params);
-    } catch (...) {
+      vcr::sources::writeImage(out_png, {rgb.data(), "|u1", img.H, img.W, 3});
+      return true;
+    } catch (const std::exception& error) {
+      std::cerr << "PNG write failed: " << error.what() << "\n";
       return false;
     }
   }
@@ -815,8 +816,7 @@ Flatboi::HeatPaths Flatboi::save_uv_heatmaps(const Eigen::MatrixXd& uv_in, const
       }
     }
 
-    // Try OpenCV PNG first
-    if(!write_image_cv_png(out_path, img, cfg.png_compression)){
+    if(!write_image_png(out_path, img)){
       // Fallback to PPM with same basename
       fs::path ppm = out_path; ppm.replace_extension(".ppm");
       if(write_ppm(ppm, img)){
@@ -990,7 +990,8 @@ static nlohmann::json parameters(const Options& opt)
           {"keep_percent", opt.keep_percent}, {"inpaint", opt.inpaint}};
 }
 
-// A stored surface into a new surface object; reports go to its artifact directory.
+// A stored surface into a new surface object; its reports are published as the
+// new surface's artifacts (flatboi/<file name>), kept on disk if that fails.
 static int run_store(const StoreToolOptions& output, const std::string& source, const Options& opt)
 {
   StoreSurfaces store(output.store, "flatboi");
@@ -1002,15 +1003,21 @@ static int run_store(const StoreToolOptions& output, const std::string& source, 
   if (!flat) return 3;
 
   const std::string name = output.name.value_or(
-      (surface->meta.contains("name") ? surface->meta["name"].get_string() : surface->id) + "_flatboi");
+      (surface->meta.contains("name") ? surface->meta["name"].get<std::string>() : surface->id) + "_flatboi");
   const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.volume);
-  const auto artifacts = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid);
-  for (const auto& entry : fs::directory_iterator(report_dir)) {
-    std::error_code ignored;
-    fs::copy_file(entry.path(), artifacts / entry.path().filename(), fs::copy_options::overwrite_existing, ignored);
+  std::vector<std::pair<std::string, fs::path>> reports;
+  for (const auto& entry : fs::directory_iterator(report_dir))
+    if (entry.is_regular_file()) reports.emplace_back("flatboi/" + entry.path().filename().string(), entry.path());
+  std::sort(reports.begin(), reports.end());
+  bool keep = false;
+  try {
+    if (!reports.empty()) store.objects().publishArtifacts(uuid, reports);
+  } catch (const std::exception& failure) {
+    keep = true;
+    std::cerr << "keeping flatboi reports at " << report_dir << ": " << failure.what() << std::endl;
   }
   std::error_code ignored;
-  fs::remove_all(report_dir, ignored);
+  if (!keep) fs::remove_all(report_dir, ignored);
   store.objects().finish();
   std::cout << "surface_uuid: " << uuid << std::endl;
   return 0;

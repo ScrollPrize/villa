@@ -4,8 +4,10 @@
 namespace vcr::transforms {
 struct BrightnessMultiply { Scalar factor = Uniform{.75, 1.25}; ChannelOptions options; };
 struct BrightnessAdd { Scalar shift = Normal{0, .1}; ChannelOptions options; };
-struct Contrast { Scalar factor = Uniform{.75, 1.25}; bool preserve_range = true; ChannelOptions options; };
-struct Gamma { Scalar gamma = Uniform{.7, 1.5}; double p_invert = 0, p_retain_stats = 0; ChannelOptions options; };
+// masked statistics select the associated validity mask, falling back to all
+// voxels when empty. Target::refill independently controls output padding.
+struct Contrast { Scalar factor = Uniform{.75, 1.25}; bool preserve_range = true, masked = false; ChannelOptions options; };
+struct Gamma { Scalar gamma = Uniform{.7, 1.5}; double p_invert = 0, p_retain_stats = 0; bool masked = false, clip = false; double eps = 1e-7; ChannelOptions options; };
 struct Invert { ChannelOptions options; };
 struct GaussianNoise { Scalar std = Uniform{0, .1}; bool shared_noise = false; ChannelOptions options; };
 struct RicianNoise { Scalar std = Uniform{0, .1}; bool shared_noise = false; ChannelOptions options; };

@@ -1,5 +1,6 @@
 #include "vc/core/types/ProjectDocument.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/sftp.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <algorithm>
 #include <cctype>
@@ -18,7 +19,13 @@ void checkExtension(const std::filesystem::path& path) {
 }
 bool hasWritePermission(const std::filesystem::path& path) {
     std::error_code error;
-    const auto permissions = std::filesystem::status(path, error).permissions();
+    const auto status = std::filesystem::status(path, error);
+#if defined(_WIN32)
+    // Windows ignores the read-only attribute on folders but sets it on
+    // customized ones such as Downloads, so it does not mean unwritable.
+    if (!error && std::filesystem::is_directory(status)) return true;
+#endif
+    const auto permissions = status.permissions();
     using P = std::filesystem::perms;
     return !error && (permissions & (P::owner_write | P::group_write | P::others_write)) != P::none;
 }
@@ -27,6 +34,7 @@ const std::vector<std::string>& ProjectDocument::kinds() {
     static const std::vector<std::string> value{"surface", "fiber", "point_collection", "umbilicus", "volume_transform"};
     return value;
 }
+bool ProjectDocument::hostedStore(const nlohmann::json& entry) { return entry.value("hosted", false); }
 void ProjectDocument::validate(const nlohmann::json& data) {
     if (!data.is_object() || data.value("format", std::string{}) != "vcproj" || data.at("version") != 1)
         throw std::invalid_argument("Unsupported VC3D project format or version");
@@ -37,7 +45,11 @@ void ProjectDocument::validate(const nlohmann::json& data) {
     for (const auto& store : stores) {
         const auto id = store.at("id").get<std::string>();
         const auto location = store.at("location").get<std::string>();
-        if (id.empty() || location.empty() || remote(location) || !ids.insert(id).second || !paths.insert(location).second)
+        const bool ssh = vcr::sftp::isSftpUrl(location);
+        if (hostedStore(store) && ssh) (void)vcr::sftp::parseForwardUrl(location);
+        const bool endpoint = location.rfind("http://", 0) == 0 || location.rfind("https://", 0) == 0 || ssh;
+        if (id.empty() || location.empty() || (hostedStore(store) ? !endpoint : remote(location)) ||
+            !ids.insert(id).second || !paths.insert(location).second)
             throw std::invalid_argument("Invalid or duplicate project store reference");
         (void)store.value("read_only", false);
     }
@@ -53,6 +65,15 @@ void ProjectDocument::validate(const nlohmann::json& data) {
         for (const auto& entry : data.at(key)) {
             if (entry.at("location").get<std::string>().empty()) throw std::invalid_argument("Empty resource location");
             (void)entry.at("tags").get<std::vector<std::string>>();
+            if (entry.contains("channels")) {
+                if (std::string_view(key) != "volumes")
+                    throw std::invalid_argument("Only volume entries can declare display channels");
+                const auto channels = entry.at("channels").get<std::vector<std::string>>();
+                std::set<std::string> names;
+                for (const auto& name : channels)
+                    if (name.empty() || !names.insert(name).second)
+                        throw std::invalid_argument("Empty or duplicate volume channel name");
+            }
         }
     }
     if (!data.at("view").is_object()) throw std::invalid_argument("Project view must be an object");
@@ -96,7 +117,7 @@ void ProjectDocument::replace(nlohmann::json data) {
     validate(data);
     if (data == data_) return;
     if (!writable()) throw std::runtime_error("Project is read-only: " + path_.string());
-    vc::core::util::atomicWriteString(path_, data.dump(2) + "\n");
+    vcr::zarr::atomicWrite(path_, data.dump(2) + "\n", vcr::zarr::Durability::Fsync);
     data_ = std::move(data);
 }
 std::filesystem::path ProjectDocument::resolve(const std::string& location) const {

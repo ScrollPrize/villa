@@ -21,32 +21,77 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
-#include "spatial/SurfaceGrid.hpp"
-#include "spatial/SurfaceIndex.hpp"
+#include <vc_object_store/geometry/SurfaceGrid.hpp>
+#include <vc_object_store/geometry/SurfaceIndex.hpp>
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
 
 namespace vc::object_links::detail {
 namespace {
 
-// Profile CT queries, including cache hits, used by strip marching and surface-link gates.
+// Selects CT, lasagna, packed lasagna or no normals. Profiles queries,
+// including cache hits, used by strip marching and surface-link gates.
 class SheetNormalSource {
 public:
-    SheetNormalSource(const std::filesystem::path& ctVolume, const LineSurfaceParams& params) {
-        ct_ = std::make_unique<vc::CtSheetNormalSampler>(ctVolume, params.ctLevel,
-            params.workingToBaseScale / params.ctToBaseScale);
+    SheetNormalSource(const std::filesystem::path& ctVolume, const LineSurfaceParams& params)
+        : ctVolume_(ctVolume), normalX_(params.normalXVolume), normalY_(params.normalYVolume),
+          pool_(params.normalPool), level_(params.ctLevel) {
+        checkNormalSourceChoice(ctVolume, params);
+        const double scale = params.workingToBaseScale / params.ctToBaseScale;
+        if (!ctVolume.empty())
+            ct_ = std::make_unique<vc::CtSheetNormalSampler>(ctVolume, params.ctLevel, scale);
+        else if (!params.normalXVolume.empty())
+            lasagna_ = std::make_unique<vc::LasagnaSheetNormalSampler>(
+                params.normalXVolume, params.normalYVolume, params.ctLevel, scale);
+        else if (!params.normalPool.empty())
+            pooled_ = std::make_unique<vc::PooledLasagnaSheetNormalSampler>(params.normalPool, scale);
     }
     ~SheetNormalSource() {
         if (profile_) printProfile("total");
     }
-    const char* method() const {
-        return vc::CtSheetNormalSampler::method;
+    // At most one source may be named; both lasagna volumes go together.
+    static void checkNormalSourceChoice(const std::filesystem::path& ctVolume, const LineSurfaceParams& params) {
+        if (params.normalXVolume.empty() != params.normalYVolume.empty())
+            throw std::invalid_argument("graph links: lasagna normals need both normal_x_volume and normal_y_volume");
+        if (int(!ctVolume.empty()) + int(!params.normalXVolume.empty()) + int(!params.normalPool.empty()) > 1)
+            throw std::invalid_argument("graph links: choose one normal source: ct_volume, normal_x_volume/normal_y_volume or normal_pool");
     }
+    bool available() const { return ct_ || lasagna_ || pooled_; }
+    const char* method() const {
+        if (ct_) return vc::CtSheetNormalSampler::method;
+        if (lasagna_) return vc::LasagnaSheetNormalSampler::method;
+        if (pooled_) return vc::PooledLasagnaSheetNormalSampler::method;
+        return "centerline";
+    }
+    // The source as named, for edge metadata: a CT location, the two lasagna
+    // locations, the pack, or null without normals.
+    nlohmann::json location() const {
+        if (ct_) return ctVolume_.string();
+        if (lasagna_) return {{"normal_x", normalX_.string()}, {"normal_y", normalY_.string()}};
+        if (pooled_) return {{"normal_pool", pool_.string()}};
+        return nullptr;
+    }
+    // Strip-cache identity for the selected volume(s); none without normals.
+    std::optional<nlohmann::json> identity() const;
     vc::CtSheetNormal sampleNormal(const cv::Vec3d& point, const std::atomic_bool* cancel) const {
         if (cancel && cancel->load()) throw std::runtime_error("graph links: line-surface linking cancelled");
+        if (!available()) throw std::logic_error("graph links: no sheet-normal source");
         const auto start = profile_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         vc::CtSheetNormal result;
-        result = ct_->sampleNormal(point, cancel);
+        try {
+            result = ct_ ? ct_->sampleNormal(point, cancel)
+                   : lasagna_ ? lasagna_->sampleNormal(point, cancel)
+                              : pooled_->sampleNormal(point, cancel);
+        } catch (const std::invalid_argument&) {
+            throw; // a bad query point: this line's problem
+        } catch (const vc::SheetNormalSourceError&) {
+            throw;
+        } catch (const std::exception& e) {
+            // Anything else the samplers throw is the source failing to read
+            // (vc_reader I/O), not a property of the line being linked.
+            if (cancel && cancel->load()) throw;
+            throw vc::SheetNormalSourceError(std::string("normal source ") + location().dump() + ": " + e.what());
+        }
         if (profile_) {
             seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
             ++queries_;
@@ -60,7 +105,11 @@ private:
         std::fprintf(stderr, "FIBER_SURFACE_PROFILE %s queries %zu normal_seconds %.9f invalid %zu\n",
                      phase, queries_, seconds_, invalid_);
     }
+    std::filesystem::path ctVolume_, normalX_, normalY_, pool_;
+    int level_ = 0;
     std::unique_ptr<vc::CtSheetNormalSampler> ct_;
+    std::unique_ptr<vc::LasagnaSheetNormalSampler> lasagna_;
+    std::unique_ptr<vc::PooledLasagnaSheetNormalSampler> pooled_;
     bool profile_ = std::getenv("VC_FIBER_SURFACE_PROFILE") != nullptr;
     mutable size_t queries_ = 0, invalid_ = 0;
     mutable double seconds_ = 0;
@@ -123,7 +172,7 @@ std::vector<cv::Vec3d> gaussianAlong(const std::vector<cv::Vec3d>& values, doubl
 
 // The reduced fast strip: centerline resampled every stripSpacing,
 // marched stripRowsEachSide rows out along the in-sheet cross direction
-// while following normals estimated directly from CT intensities.
+// while following the selected sheet normals (CT structure tensor or lasagna).
 std::shared_ptr<SurfaceGrid> buildStrip(const LineData& fiber, const SheetNormalSource& sampler,
                                         const LineSurfaceParams& params, const std::atomic_bool* cancel)
 {
@@ -294,10 +343,10 @@ std::shared_ptr<SurfaceGrid> buildStrip(const LineData& fiber, const SheetNormal
 // Cache source identity without traversing a potentially enormous chunk tree.
 // Volume chunks are treated as immutable; rebuildStrips explicitly refreshes
 // entries after in-place voxel edits. Read metadata once per detector run.
-nlohmann::json normalSourceIdentity(const std::filesystem::path& ct, const LineSurfaceParams& p)
+nlohmann::json volumeIdentity(const std::filesystem::path& volume, int level)
 {
     namespace fs = std::filesystem;
-    const auto location = ct.string();
+    const auto location = volume.string();
     nlohmann::json identity{{"location", location}};
     if (location.find("://") != std::string::npos) return identity;
     std::error_code ec;
@@ -314,11 +363,31 @@ nlohmann::json normalSourceIdentity(const std::filesystem::path& ct, const LineS
     };
     if (fs::is_regular_file(path)) metadata(path);
     else {
-        for (const auto& dir : {path, path / std::to_string(p.ctLevel)})
+        for (const auto& dir : {path, path / std::to_string(level)})
             for (const char* name : {".zarray", ".zattrs", ".zgroup", ".zmetadata", "zarr.json", "meta.json"})
                 metadata(dir / name);
     }
     return identity;
+}
+
+std::optional<nlohmann::json> SheetNormalSource::identity() const
+{
+    if (ct_) return volumeIdentity(ctVolume_, level_);
+    if (lasagna_) return nlohmann::json{{"normal_x", volumeIdentity(normalX_, level_)},
+                                        {"normal_y", volumeIdentity(normalY_, level_)}};
+    if (pooled_) {
+        // The pack's dataset and how it was packed, wherever it is; a pack
+        // that records no dataset is its location.
+        const auto meta = nlohmann::json::parse(pooled_->metadata());
+        nlohmann::json identity{{"array_shape", meta.at("array_shape")},
+                                {"ct_mask", meta.value("ct_mask", nlohmann::json())}};
+        if (const auto dataset = meta.find("lasagna_identity"); dataset != meta.end() && !dataset->is_null())
+            identity["lasagna_identity"] = *dataset;
+        else
+            identity["location"] = volumeIdentity(pool_, 0).at("location");
+        return nlohmann::json{{"normal_pool", identity}};
+    }
+    return std::nullopt;
 }
 
 nlohmann::json stripCacheKey(const LineData& fiber, const LineSurfaceParams& p,
@@ -560,6 +629,26 @@ std::pair<double, double> stripAgreement(const Mesh& strip, const Mesh& surface,
     return {same / weight, adjacent / weight};
 }
 
+// Without a normal field there is no strip: measure the eligible centerline
+// points themselves against the surface, by distance alone. Points farther than
+// adjacentHigh from the surface bounds cannot be on either sheet; skip them.
+std::pair<double, double> lineAgreement(const LineData& line, const Mesh& surface,
+                                        const LineSurfaceParams& p, const std::atomic_bool* cancel)
+{
+    size_t selected = 0, same = 0, adjacent = 0;
+    for (size_t i = line.firstLine; i <= line.lastLine; ++i) {
+        if (((i - line.firstLine) & 1023) == 0) checkCancelled(cancel);
+        if (!surface.inBox(line.line[i], p.adjacentHigh)) continue;
+        ++selected;
+        const auto hit = surface.nearest(line.line[i], cv::Vec3d{0, 0, 0}, p.adjacentHigh);
+        if (!hit) continue;
+        if (hit->distance <= p.sameSheet) ++same;
+        else if (hit->distance >= p.adjacentLow) ++adjacent;
+    }
+    if (selected < 5) return {0, 0};
+    return {double(same) / selected, double(adjacent) / selected};
+}
+
 struct Relation {
     std::vector<double> distance, normalDot;
     explicit Relation(size_t n) : distance(n, std::numeric_limits<double>::infinity()), normalDot(n, 0) {}
@@ -595,9 +684,12 @@ void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std
               const std::optional<nlohmann::json>& source, DetectorReport& report, const std::atomic_bool* cancel)
 {
     if (proposals.empty()) return;
-    const auto stripGeometry = cachedStrip(fiber, sampler, p, sourceScale, source, report, cancel);
-    objects::util::reportProgress(p.progress, "indexing normal strip");
-    const Mesh strip(stripGeometry);
+    std::optional<Mesh> strip;
+    if (sampler.available()) {
+        const auto stripGeometry = cachedStrip(fiber, sampler, p, sourceScale, source, report, cancel);
+        objects::util::reportProgress(p.progress, "indexing normal strip");
+        strip.emplace(stripGeometry);
+    }
     std::vector<size_t> fresh;
     std::vector<std::unique_ptr<Relation>> relations(proposals.size());
     for (size_t i = 0; i < proposals.size(); ++i) {
@@ -606,7 +698,8 @@ void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std
         const auto& surface = *surfaces[c.surface].mesh;
         c.contact = contactLength(fiber, c.contacts, p.contactGap);
         if (c.contact >= p.anchorContact) {
-            std::tie(c.stripSame, c.stripAdjacent) = stripAgreement(strip, surface, p, cancel);
+            std::tie(c.stripSame, c.stripAdjacent) = strip ? stripAgreement(*strip, surface, p, cancel)
+                                                           : lineAgreement(fiber, surface, p, cancel);
             c.anchor = c.stripSame > 0 && c.stripSame > p.stripGateRatio * c.stripAdjacent + p.stripGateMargin;
         }
         if (c.anchor) {
@@ -684,31 +777,43 @@ void validateParams(const LineSurfaceParams& p)
 void validateLineSurfaceParams(const LineSurfaceParams& params, double sourceScale)
 {
     validateParams(params);
+    validateCoordinateParams(params, sourceScale);
+    validateCoordinateParams(params, params.surfaceScale);
+    if (params.volumeUuid && params.workingToBaseScale != 1.0)
+        throw std::invalid_argument("volume_uuid requires working_to_base_scale=1 (volume voxels)");
     if (!std::isfinite(sourceScale) || sourceScale <= 0)
         throw std::invalid_argument("graph links: invalid source coordinate scale");
 }
 
-DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+Detection detectLinesToSurfaces(StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
     const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
-    const std::atomic_bool* cancel)
+    const std::atomic_bool* cancel, const LineIncremental* incremental)
 {
     validateLineSurfaceParams(params, sourceScale);
+    SheetNormalSource::checkNormalSourceChoice(ctVolume, params);
     const bool tracks = std::string(detector) == kTrackSurfaceDetector;
-    DetectorReport report;
+    Detection detection;
+    detection.detector = detector; detection.version = version;
+    detection.replaceStalePending = params.replaceStalePending;
+    DetectorReport& report = detection.report;
+    std::set<std::string> failed; // objects that could not be loaded or linked
     try {
         checkCancelled(cancel);
+        const auto objects = incremental ? incremental->surfaces : inputs.select("surface", params.surfaceUuids);
+        const auto surfaceScales = coordinateScales(objects, params, params.surfaceScale);
+        std::map<std::string, nlohmann::json> surfaceFrames;
+        for (const auto& object : objects) surfaceFrames[object.uuid] = coordinateProvenance(object, params);
         objects::util::reportProgress(params.progress, "opening normal source");
         const SheetNormalSource sampler(ctVolume, params);
         std::optional<nlohmann::json> stripSource;
-        if (!tracks) {
+        if (!tracks && sampler.available()) {
             try {
-                stripSource = normalSourceIdentity(ctVolume, params);
+                stripSource = sampler.identity();
             } catch (const std::exception& e) {
                 report.problems.push_back(std::string("fiber strip cache unavailable: ") + e.what());
             }
         }
-        const auto objects = inputs.select("surface", params.surfaceUuids);
         std::set<std::string> identities;
         auto unique = [&](const std::string& uuid) {
             if (!identities.insert(uuid).second)
@@ -728,22 +833,11 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                 const auto scale = quad->scale();
                 if (!(scale[0] > 0) || !(scale[1] > 0) || !std::isfinite(scale[0]) || !std::isfinite(scale[1]))
                     throw std::runtime_error("invalid surface scale");
-                if (params.surfaceScale != 1.0) {
-
-                    auto points = quad->rawPointsPtr()->clone();
-                    for (auto& p : points) {
-                        if (!vc::geometry::validSurfacePoint(p)) continue; // preserve holes, including the -1 sentinel
-                        const cv::Vec3d scaled = cv::Vec3d(p) * params.surfaceScale;
-                        p = cv::Vec3f(scaled);
-                        if (!vc::geometry::validSurfacePoint(p)) throw std::runtime_error("scaled surface coordinate is invalid");
-                    }
-                    // Preserve grid coordinates/UV scale. Only world XYZ changes;
-                    // use a detached surface so mapped source TIFFs stay untouched.
-                    quad = std::make_shared<SurfaceGrid>(points, scale);
-                }
+                quad = scaledSurfaceGrid(quad, surfaceScales.at(object.uuid), params.volumeUuid.has_value());
                 mesh = std::make_unique<Mesh>(quad);
             } catch (const std::exception& e) {
                 report.problems.push_back(object.uuid + ": " + e.what() + ", skipped");
+                failed.insert(object.uuid);
                 continue;
             }
             unique(uuid);
@@ -765,7 +859,8 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
         discovery.rebuild(grids);
         std::vector<LinkCandidate> candidates;
         StaleEdgeScope scope{{params.edgeKind}, {}};
-        for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
+        if (!incremental)
+            for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
         auto settings = settingsJson(params);
         settings[tracks ? "track_scale" : "fiber_scale"] = sourceScale;
         const auto linkingStage = tracks ? "linking tracks" : "linking fibers";
@@ -773,8 +868,12 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
             checkCancelled(cancel);
             objects::util::reportProgress(params.progress, linkingStage, input, lineCount, "loading line");
             auto loaded = load(input, report);
-            if (!loaded) continue;
+            if (!loaded) {
+                if (incremental) failed.insert(incremental->lines.at(input));
+                continue;
+            }
             const auto& fiber = *loaded;
+            const double lineScale = fiber.sourceScale;
             unique(fiber.uuid);
             ++report.objectsConsidered;
             const auto item = std::string(tracks ? "track " : "fiber ") +
@@ -782,6 +881,8 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
             auto lineParams = params;
             lineParams.progress = objects::util::subtaskProgress(params.progress, linkingStage, input, lineCount, item);
             std::map<size_t, std::vector<size_t>> contacts;
+            // An existing line is linked to the new surfaces alone.
+            const bool existing = incremental && !incremental->fresh.contains(fiber.uuid);
             for (size_t i = fiber.firstLine; i <= fiber.lastLine; ++i) {
                 if ((i & 255) == 0 || i == fiber.firstLine) {
                     checkCancelled(cancel);
@@ -790,8 +891,11 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                 SurfaceIndex::PointQuery q;
                 q.worldPoint = cv::Vec3f(fiber.line[i]);
                 q.tolerance = float(params.proximity);
-                for (const auto& hit : discovery.locateAll(q))
-                    contacts[surfaceIndex.at(hit.surface.get())].push_back(i);
+                for (const auto& hit : discovery.locateAll(q)) {
+                    const auto surface = surfaceIndex.at(hit.surface.get());
+                    if (existing && !incremental->fresh.contains(surfaces[surface].uuid)) continue;
+                    contacts[surface].push_back(i);
+                }
             }
             objects::util::reportProgress(lineParams.progress, "finding surface contacts",
                 fiber.lastLine - fiber.firstLine + 1, fiber.lastLine - fiber.firstLine + 1);
@@ -804,10 +908,13 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                     proposals.push_back(std::move(proposal));
                 }
             try {
-                autoLink(fiber, proposals, surfaces, sampler, lineParams, sourceScale, stripSource, report, cancel);
+                autoLink(fiber, proposals, surfaces, sampler, lineParams, lineScale, stripSource, report, cancel);
+            } catch (const vc::SheetNormalSourceError&) {
+                throw; // the source, not this line, failed: the whole run fails
             } catch (const std::exception& e) {
                 checkCancelled(cancel);
                 report.problems.push_back(fiber.uuid + ": " + e.what() + ", skipped");
+                failed.insert(fiber.uuid);
                 continue;
             }
             if (std::getenv("VC_FIBER_SURFACE_PROFILE")) {
@@ -827,7 +934,7 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                     {"max_strip_same", maxSame}, {"max_strip_adjacent", maxAdjacent}};
                 std::fprintf(stderr, "FIBER_SURFACE_FIBER %s\n", profile.dump().c_str());
             }
-            scope.objectUuids.push_back(fiber.uuid);
+            if (!incremental) scope.objectUuids.push_back(fiber.uuid);
             for (const auto& p : proposals) {
                 if (p.round < 0) continue;
                 const auto& surface = surfaces[p.surface];
@@ -838,8 +945,8 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                 c.bUuid = surface.uuid;
                 c.kind = params.edgeKind;
                 c.aAnchor.points.push_back({tracks ? "points" : "line_points", {int64_t(median)}});
-                c.aAnchor.position = std::array<double, 3>{contact[0] / sourceScale,
-                    contact[1] / sourceScale, contact[2] / sourceScale};
+                c.aAnchor.position = std::array<double, 3>{contact[0] / lineScale,
+                    contact[1] / lineScale, contact[2] / lineScale};
                 SurfaceIndex::PointQuery q;
                 q.worldPoint = cv::Vec3f(contact);
                 q.tolerance = float(params.proximity);
@@ -852,15 +959,13 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                 if (hit) {
                     const auto grid = hit->grid;
                     evidence["surface_grid"] = {grid[0], grid[1]};
-                    const auto* points = surface.mesh->quad->rawPointsPtr();
-                    const int row = std::clamp(int(std::floor(grid[1])), 0, points->rows - 2);
-                    const int col = std::clamp(int(std::floor(grid[0])), 0, points->cols - 2);
+                    const int row = hit->cell[1], col = hit->cell[0];
                     c.bAnchor.points = {{"points", {row, col}}, {"points", {row, col+1}},
                                         {"points", {row+1, col}}, {"points", {row+1, col+1}}};
                 }
                 c.score = p.anchor ? p.stripSame : p.linkedSame;
                 auto metadata = nlohmann::json{{tracks ? "track_surface" : "fiber_surface", evidence}, {"settings", settings},
-                    {"normal_source", ctVolume.string()},
+                    {"normal_source", sampler.location()},
                     {"normal_method", sampler.method()},
                     {"pred_dt_snap", false},
                     {"anchor_index_space", "line_points"}, {"anchor_position_space", "source"}, {"measurement_space", "working_voxels"}};
@@ -868,6 +973,13 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                     metadata["track_dataset_ref"] = fiber.object.track->datasetRef;
                     metadata["track_source_id"] = fiber.object.track->externalKey;
                 }
+                metadata["settings"][tracks ? "track_scale" : "fiber_scale"] = lineScale;
+                metadata["settings"]["surface_scale"] = surfaceScales.at(surface.uuid);
+                metadata["coordinate_frame"] = nullptr; // clear a previous metadata-mode declaration
+                if (params.volumeUuid)
+                    metadata["coordinate_frame"] = {{"volume_uuid", *params.volumeUuid},
+                        {"objects", {{fiber.uuid, coordinateProvenance(fiber.object, params)},
+                                     {surface.uuid, surfaceFrames.at(surface.uuid)}}}};
                 metadata["ct_volume"] = ctVolume.string();
                 c.meta = metadata.dump();
                 candidates.push_back(std::move(c));
@@ -875,22 +987,31 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
         }
         checkCancelled(cancel);
         objects::util::reportProgress(params.progress, linkingStage, lineCount, lineCount);
-        auto txn = db.write();
-        checkCancelled(cancel);
-        const auto committed = commitStoredCandidates(db, inputs, txn, detector, version, candidates, params.replaceStalePending, &scope, params.progress);
-        checkCancelled(cancel);
-        objects::util::reportProgress(params.progress, "committing links");
-        txn.commit();
-        report.candidatesFound = committed.candidatesFound;
-        report.edgesCreated = committed.edgesCreated;
-        report.edgesUpdated = committed.edgesUpdated;
-        report.edgesSkippedExisting = committed.edgesSkippedExisting;
-        report.staleRemoved = committed.staleRemoved;
+        if (incremental) scope = incrementalScope(params.edgeKind, incremental->selected, incremental->fresh, failed);
+        detection.candidates = std::move(candidates);
+        detection.scope = scope;
     } catch (const std::exception&) {
         if (!cancel || !cancel->load()) throw;
         report.problems.push_back(std::string(detector) + ": cancelled; no edges committed");
+        detection.publish = false;
     }
-    return report;
+    return detection;
+}
+
+DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+    const std::filesystem::path& ctVolume,
+    const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
+    const std::atomic_bool* cancel, const LineIncremental* incremental)
+{
+    const auto detection = detectLinesToSurfaces(inputs, lineCount, load, ctVolume, params, sourceScale, detector, version, cancel, incremental);
+    try {
+        return publishDetection(db, inputs, detection, params.progress, cancel);
+    } catch (const std::exception&) {
+        if (!cancel || !cancel->load()) throw;
+        auto report = detection.report;
+        report.problems.push_back(std::string(detector) + ": cancelled; no edges committed");
+        return report;
+    }
 }
 
 }  // namespace vc::object_links::detail

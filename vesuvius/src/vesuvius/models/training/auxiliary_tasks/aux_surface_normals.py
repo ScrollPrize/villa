@@ -7,8 +7,8 @@ auxiliary tasks from source segmentation targets.
 
 from typing import Dict, Any, Tuple, Optional
 import numpy as np
-from scipy.ndimage import distance_transform_edt
-from skimage.filters import scharr
+
+import vc_reader.transforms as A
 
 
 def create_surface_normals_config(aux_task_name: str, aux_config: Dict[str, Any], 
@@ -49,8 +49,7 @@ def create_surface_normals_config(aux_task_name: str, aux_config: Dict[str, Any]
     return target_config
 
 
-def compute_surface_normals_from_sdt(binary_mask: np.ndarray, is_2d: bool, 
-                                   epsilon: float = 1e-6, 
+def compute_surface_normals_from_sdt(binary_mask: np.ndarray, is_2d: bool,
                                    return_sdt: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Compute surface normals from a binary mask using signed distance transform.
@@ -61,8 +60,6 @@ def compute_surface_normals_from_sdt(binary_mask: np.ndarray, is_2d: bool,
         Binary mask where 1 indicates foreground
     is_2d : bool
         Whether the data is 2D or 3D
-    epsilon : float, optional
-        Small value to avoid division by zero (default: 1e-6)
     return_sdt : bool, optional
         Whether to return the signed distance transform (default: False)
         
@@ -73,34 +70,12 @@ def compute_surface_normals_from_sdt(binary_mask: np.ndarray, is_2d: bool,
     sdt : np.ndarray or None
         Signed distance transform if return_sdt is True
     """
-    # 1. Compute signed distance transform
-    inside_dist = distance_transform_edt(binary_mask)
-    outside_dist = distance_transform_edt(1 - binary_mask)
-    sdt = outside_dist - inside_dist
-    
-    # 2. Compute gradients using Scharr filter
-    if is_2d:
-        # For 2D: gradients along x and y
-        grad_x = scharr(sdt, axis=1)  # Gradient along x (width)
-        grad_y = scharr(sdt, axis=0)  # Gradient along y (height)
-        gradients = np.stack([grad_x, grad_y], axis=0)
-    else:
-        # For 3D: gradients along x, y, and z
-        grad_x = scharr(sdt, axis=2)  # Gradient along x (width)
-        grad_y = scharr(sdt, axis=1)  # Gradient along y (height)
-        grad_z = scharr(sdt, axis=0)  # Gradient along z (depth)
-        gradients = np.stack([grad_x, grad_y, grad_z], axis=0)
-    
-    # 3. Normalize gradients to unit vectors
-    magnitude = np.sqrt(np.sum(gradients**2, axis=0, keepdims=True))
-    magnitude = np.maximum(magnitude, epsilon)
-    normals = gradients / magnitude
-    
-    # 4. Handle undefined regions (optional)
-    # Where gradient magnitude is very small, normal direction is undefined
-    undefined_mask = magnitude < epsilon
-    normals = normals * (1 - undefined_mask)
-    
+    # Signed distance (outside - inside) and its Scharr gradient over
+    # max(|gradient|, 1e-6), as XYZ components.
+    out = A.DistanceTransform(on="label", normals="_normals", components="xyz", implicit_background=True)(
+        {"label": np.asarray(binary_mask)[None]}, targets={"label": A.Label()})
+    normals, sdt = out["label_normals"], out["label_sdt"][0]
+
     if return_sdt:
         return normals.astype(np.float32), sdt.astype(np.float32)
     else:

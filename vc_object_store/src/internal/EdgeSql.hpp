@@ -16,16 +16,34 @@ Anchor readAnchor(const Statement& s, int firstCol);
 
 void bindAnchor(Statement& s, int firstIdx, const Anchor& a);
 
-std::string uuidTextByObjectId(sqlite3* db, int64_t id);
 
 EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details = true,
                        const ObjectFields& fields = std::nullopt);
 std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
+EdgeRecord prepareNewEdge(const EdgeRecord&);
+std::array<unsigned char,16> normalizeNewEdge(EdgeRecord&,bool* swapped=nullptr);
+struct EdgeInsertRow {
+    const EdgeRecord* record;
+    int64_t id;
+    std::array<unsigned char,16> aUuid,bUuid;
+    std::optional<std::array<unsigned char,16>> binaryUuid;
+};
+void requireUnusedObjectUuids(sqlite3*,std::span<const EdgeInsertRow>,size_t sqlBatchRows=1);
+void insertEdgeRows(sqlite3*, std::span<const EdgeInsertRow>,int64_t commitSequence,
+    const std::string& author,const std::string& host,const std::string& time,
+    bool preserveRecord=false,size_t sqlBatchRows=1);
+void insertEdgeRow(sqlite3*, const EdgeRecord&, int64_t id,
+    int64_t commitSequence, const std::string& author, const std::string& host,
+    const std::string& time, bool preserveRecord = false);
 std::vector<int64_t> componentIds(sqlite3* db, const std::string& start,
                                  const std::vector<std::string>& kinds, bool includeRetired = false,
-                                 std::optional<bool> adjacent = std::nullopt);
+                                 std::optional<bool> adjacent = std::nullopt,
+                                 const std::atomic_bool* cancel = nullptr);
 
-std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
+// Return the normalized identity/endpoints/anchors used for insertion, so
+// dependency validation need not hydrate the just-written edge from SQL.
+// This is not a readback of generated provenance or approval stamps.
+EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
                         bool preserveRecord = false, const char* importOperation = "import");
 
 

@@ -521,44 +521,6 @@ def write_packed_track_store(
             shutil.rmtree(temporary, ignore_errors=True)
 
 
-def _load_packed_track_collection(path, z_lo=None, z_hi=None, warn=True):
-    native = _load_native_track_store()
-    if native is None:
-        return None
-    try:
-        store = track_store_path(path)
-        if not store.is_dir():
-            return None
-        with (store / 'metadata.json').open('r', encoding='utf-8') as stream:
-            metadata = json.load(stream)
-        if metadata.get('version') != TRACK_STORE_VERSION:
-            raise ValueError('unsupported packed track-store version')
-        expected = [list(item) for item in _tracks_db_signature(path)]
-        stored = metadata.get('source_db_signature')
-        if not (_db_signatures_match(stored, expected)
-                or _db_contents_match(stored, metadata.get('source_db_digest'),
-                                      path, expected)):
-            raise ValueError('source DBM changed after the packed store was written')
-        result = native.load(
-            os.fspath(store),
-            z_minimum=-(1 << 63) if z_lo is None else int(z_lo),
-            z_maximum=(1 << 63) - 1 if z_hi is None else int(z_hi),
-            workers=min(32, os.cpu_count() or 1),
-        )
-        collection = PackedTrackCollection(
-            result['coordinates'], result['offsets'], result['source_ids'],
-            result['family_codes'], result['arclengths'],
-            result['tortuosities'], store_path=store)
-        print(
-            f'loaded packed track store {store}: {len(collection)} tracks, '
-            f'{len(collection.coordinates)} points in ROI')
-        return collection
-    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
-        if warn:
-            print(f'WARNING: ignoring packed track store: {error}')
-        return None
-
-
 def _packed_store_if_current(path):
     """Return an adjacent packed store only when it matches the source DBM."""
     store = track_store_path(path)
@@ -578,141 +540,6 @@ def _packed_store_if_current(path):
         return store
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return None
-
-
-def _dbm_source_id(key_ordinal, source_index):
-    if key_ordinal >= (1 << 32) or source_index >= (1 << 32):
-        raise ValueError('track DBM key and entry indices must fit in 32 bits')
-    return (int(key_ordinal) << 32) | int(source_index)
-
-
-def load_tracks_from_dbm(
-        path, z_lo=None, z_hi=None, return_families=False,
-        return_source_ids=False, show_progress=True, low_memory=False,
-        progress=None):
-    # Load tracks written by extract_surface_tracks.py. Each DBM value is a
-    # pickled list of (N, 3) int32 zyx arrays; keep only tracks that lie entirely
-    # within the full-resolution [z_lo, z_hi) ROI.
-    path = normalize_tracks_dbm_path(path)
-    if not low_memory:
-        packed = _load_packed_track_collection(path, z_lo, z_hi)
-        if packed is not None:
-            if return_families and return_source_ids:
-                return (packed, packed.selected_family_codes,
-                        packed.selected_source_ids)
-            if return_families:
-                return packed, packed.selected_family_codes
-            if return_source_ids:
-                return packed, packed.selected_source_ids
-            return packed
-    tracks = []
-    families = []
-    source_ids = []
-    with open_tracks_dbm(path) as db:
-        keys = db.keys()
-        if progress is not None:
-            progress.begin(
-                'loading', 'Loading tracks',
-                step=0, total_steps=len(keys), unit='DB keys')
-        key_ordinals = {key: index for index, key in enumerate(sorted(keys))}
-        for key_number, key in enumerate(tqdm(
-                keys, desc='loading tracks',
-                disable=not show_progress or progress is not None), start=1):
-            family = None
-            if return_families:
-                prefix = key.decode().split(':', 1)[0]
-                family = 'horizontal' if prefix == 'h' else (
-                    'vertical' if prefix in ('vx', 'vy') else None)
-            entries = pickle.loads(db[key])
-            if not entries:
-                if progress is not None:
-                    progress.update(
-                        key_number, detail=f'{len(tracks):,} tracks retained')
-                continue
-            if low_memory:
-                for source_index, entry in enumerate(entries):
-                    if not len(entry):
-                        continue
-                    z_column = entry[:, 0]
-                    if z_lo is not None and z_column.min() < z_lo:
-                        continue
-                    if z_hi is not None and z_column.max() >= z_hi:
-                        continue
-                    # The crossing builder consumes the DBM's native int32
-                    # voxel coordinates. Avoid a second per-key float32 copy.
-                    tracks.append(np.asarray(entry))
-                    if return_families:
-                        families.append(family)
-                    if return_source_ids:
-                        source_ids.append(_dbm_source_id(
-                            key_ordinals[key], source_index))
-                if progress is not None:
-                    progress.update(
-                        key_number, detail=f'{len(tracks):,} tracks retained')
-                continue
-            # Vectorize the per-track z min/max across the whole key: concatenate
-            # every non-empty track's z column and reduce per segment, rather
-            # than calling .min()/.max() once per track.
-            idx = [i for i in range(len(entries)) if len(entries[i])]
-            if not idx:
-                if progress is not None:
-                    progress.update(
-                        key_number, detail=f'{len(tracks):,} tracks retained')
-                continue
-            lengths = np.fromiter((len(entries[i]) for i in idx), dtype=np.intp, count=len(idx))
-            zcat = np.concatenate([entries[i][:, 0] for i in idx])
-            offsets = np.zeros(len(idx), dtype=np.intp)
-            np.cumsum(lengths[:-1], out=offsets[1:])
-            zmins = np.minimum.reduceat(zcat, offsets)
-            zmaxs = np.maximum.reduceat(zcat, offsets)
-            keep = np.ones(len(idx), dtype=bool)
-            if z_lo is not None:
-                keep &= zmins >= z_lo
-            if z_hi is not None:
-                keep &= zmaxs < z_hi
-            for j in np.nonzero(keep)[0]:
-                source_index = idx[j]
-                tracks.append(entries[source_index].astype(np.float32))
-                if return_families:
-                    families.append(family)
-                if return_source_ids:
-                    source_ids.append(_dbm_source_id(
-                        key_ordinals[key], source_index))
-            if progress is not None:
-                progress.update(
-                    key_number, detail=f'{len(tracks):,} tracks retained')
-    if return_families and return_source_ids:
-        return tracks, families, np.asarray(source_ids, dtype=np.uint64)
-    if return_families:
-        return tracks, families
-    if return_source_ids:
-        return tracks, np.asarray(source_ids, dtype=np.uint64)
-    return tracks
-
-
-def _iter_tracks_from_dbm(path, z_lo=None, z_hi=None, show_progress=True):
-    """Yield native voxel tracks in stable source-id order, one DBM key at a time."""
-    path = normalize_tracks_dbm_path(path)
-    with open_tracks_dbm(path) as database:
-        keys = sorted(database.keys())
-        for key_ordinal, key in enumerate(tqdm(
-                keys, desc='streaming tracks', disable=not show_progress)):
-            prefix = key.decode().split(':', 1)[0]
-            family = 'horizontal' if prefix == 'h' else (
-                'vertical' if prefix in ('vx', 'vy') else None)
-            entries = pickle.loads(database[key])
-            for source_index, entry in enumerate(entries):
-                if not len(entry):
-                    continue
-                z_column = entry[:, 0]
-                if z_lo is not None and z_column.min() < z_lo:
-                    continue
-                if z_hi is not None and z_column.max() >= z_hi:
-                    continue
-                yield (
-                    np.asarray(entry), family,
-                    _dbm_source_id(key_ordinal, source_index),
-                )
 
 
 def validate_track_sampling_config(config):
@@ -805,78 +632,90 @@ def _track_tortuosities(tracks, arclengths):
     return result
 
 
+def _filter_tracks_by_endpoints(
+        tracks, keep_endpoints, track_families, max_points_per_chunk,
+        return_indices, label):
+    """Keep the tracks for which ``keep_endpoints`` (float32 (N, 2, 3) first
+    and last points -> bool (N,)) is true; packed or list tracks."""
+    if track_families is not None and len(track_families) != len(tracks):
+        raise ValueError('track_families must be parallel to tracks')
+    keep = np.zeros(len(tracks), dtype=bool)
+    tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
+    packed = isinstance(tracks, PackedTrackCollection)
+    if packed:
+        candidates = np.arange(len(tracks), dtype=np.int64)
+    else:
+        candidates = np.asarray(
+            [index for index, track in enumerate(tracks) if len(track)], dtype=np.int64)
+    for start in range(0, len(candidates), tracks_per_chunk):
+        batch = candidates[start:start + tracks_per_chunk]
+        if packed:
+            rows = tracks.rows[batch]
+            endpoints = np.stack((
+                tracks.coordinates[tracks.offsets[rows]],
+                tracks.coordinates[tracks.offsets[rows + 1] - 1]), axis=1)
+        else:
+            endpoints = np.stack([
+                np.stack([tracks[index][0], tracks[index][-1]]) for index in batch])
+        keep[batch] = keep_endpoints(endpoints.astype(np.float32, copy=False))
+    kept_indices = np.flatnonzero(keep)
+    if packed:
+        filtered_tracks = tracks.subset(kept_indices)
+    else:
+        filtered_tracks = [tracks[index] for index in kept_indices]
+    filtered_families = None
+    if track_families is not None:
+        filtered_families = (np.asarray(track_families)[kept_indices] if packed
+                             else [track_families[index] for index in kept_indices])
+    print(f'{label}: kept {len(filtered_tracks)} / {len(tracks)} tracks; '
+          f'excluded {len(tracks) - len(filtered_tracks)}')
+    result = (filtered_tracks, filtered_families)
+    if return_indices:
+        return (*result, kept_indices)
+    return result
+
+
+def _unfiltered(tracks, track_families, return_indices):
+    result = (tracks, track_families)
+    if return_indices:
+        return (*result, np.arange(len(tracks), dtype=np.int64))
+    return result
+
+
 def filter_tracks_to_outer_shell(
         tracks, shell_envelope, track_families=None, max_points_per_chunk=500_000,
         return_indices=False):
     """Drop tracks whose two endpoints are outside the shell envelope."""
     if shell_envelope is None or not tracks:
-        result = (tracks, track_families)
-        if return_indices:
-            return (*result, np.arange(len(tracks), dtype=np.int64))
-        return result
-    if track_families is not None and len(track_families) != len(tracks):
-        raise ValueError('track_families must be parallel to tracks')
+        return _unfiltered(tracks, track_families, return_indices)
 
-    if isinstance(tracks, PackedTrackCollection):
-        keep = np.zeros(len(tracks), dtype=bool)
-        tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
-        for start in range(0, len(tracks), tracks_per_chunk):
-            local_rows = np.arange(
-                start, min(start + tracks_per_chunk, len(tracks)),
-                dtype=np.int64)
-            rows = tracks.rows[local_rows]
-            begin = tracks.offsets[rows]
-            end = tracks.offsets[rows + 1] - 1
-            endpoints = np.stack((
-                tracks.coordinates[begin], tracks.coordinates[end]), axis=1)
-            with torch.no_grad():
-                target_radius, radius, _confidence, _valid = shell_envelope.lookup(
-                    torch.from_numpy(endpoints.reshape(-1, 3)))
-                endpoint_inside = (radius <= target_radius).view(-1, 2).any(dim=1)
-            keep[local_rows] = endpoint_inside.cpu().numpy()
-        kept_indices = np.flatnonzero(keep)
-        filtered_tracks = tracks.subset(kept_indices)
-        filtered_families = (
-            np.asarray(track_families)[kept_indices]
-            if track_families is not None else None)
-        print(
-            f'outer-shell track filter: kept {len(filtered_tracks)} / {len(tracks)} '
-            f'tracks; excluded {len(tracks) - len(filtered_tracks)} entirely '
-            'outside tracks (packed)')
-        result = (filtered_tracks, filtered_families)
-        if return_indices:
-            return (*result, kept_indices)
-        return result
-
-    keep = np.zeros(len(tracks), dtype=bool)
-    nonempty = np.asarray(
-        [index for index, track in enumerate(tracks) if len(track)], dtype=np.int64)
-    tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
-    for start in range(0, len(nonempty), tracks_per_chunk):
-        batch_indices = nonempty[start:start + tracks_per_chunk]
-        endpoints = np.stack([
-            np.stack([tracks[index][0], tracks[index][-1]])
-            for index in batch_indices
-        ]).astype(np.float32, copy=False)
+    def inside(endpoints):
         with torch.no_grad():
             target_radius, radius, _confidence, _valid = shell_envelope.lookup(
                 torch.from_numpy(endpoints.reshape(-1, 3)))
-            endpoint_inside = (radius <= target_radius).view(-1, 2).any(dim=1)
-        keep[batch_indices] = endpoint_inside.cpu().numpy()
+            return (radius <= target_radius).view(-1, 2).any(dim=1).cpu().numpy()
+    return _filter_tracks_by_endpoints(
+        tracks, inside, track_families, max_points_per_chunk, return_indices,
+        'outer-shell track filter (entirely outside tracks excluded)')
 
-    kept_indices = np.flatnonzero(keep)
-    filtered_tracks = [tracks[index] for index in kept_indices]
-    filtered_families = (
-        [track_families[index] for index in kept_indices]
-        if track_families is not None else None)
-    print(
-        f'outer-shell track filter: kept {len(filtered_tracks)} / {len(tracks)} tracks; '
-        f'excluded {len(tracks) - len(filtered_tracks)} entirely outside tracks'
-    )
-    result = (filtered_tracks, filtered_families)
-    if return_indices:
-        return (*result, kept_indices)
-    return result
+
+def filter_tracks_inside_umbilicus_radius(
+        tracks, umbilicus_z_to_yx, min_radius, track_families=None,
+        max_points_per_chunk=500_000, return_indices=False):
+    """Drop tracks whose two endpoints both lie within ``min_radius`` voxels
+    of the umbilicus axis (``umbilicus_z_to_yx``: z -> (y, x)), so a crushed
+    core does not supervise the innermost windings."""
+    if min_radius <= 0 or not tracks:
+        return _unfiltered(tracks, track_families, return_indices)
+
+    def outside(endpoints):
+        points = endpoints.reshape(-1, 3).astype(np.float64)
+        centre = np.asarray(umbilicus_z_to_yx(points[:, 0]), dtype=np.float64)
+        radius = np.hypot(points[:, 1] - centre[:, 0], points[:, 2] - centre[:, 1])
+        return (radius >= min_radius).reshape(-1, 2).any(axis=1)
+    return _filter_tracks_by_endpoints(
+        tracks, outside, track_families, max_points_per_chunk, return_indices,
+        f'inner-radius track filter (both endpoints within {min_radius:g} of the umbilicus)')
 
 
 def _length_bin_probabilities(arclengths, weights, device):
@@ -2156,7 +1995,10 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold,
 def prepare_main_phase_tracks(
         tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None,
         sampling_config=None, track_families=None, track_source_ids=None,
-        crossing_cache=None, track_graph=None, progress=None):
+        track_graph=None, progress=None):
+    # Crossings come only from ``track_graph`` (the object store's crossing
+    # links, keyed by track_source_ids); without one no crossing index is
+    # built.
     if not tracks:
         return None
     if sampling_config is not None and 'length_bin_weights' in sampling_config:
@@ -2180,17 +2022,8 @@ def prepare_main_phase_tracks(
     if (working_source_ids is not None
             and working_source_ids.shape != (len(working_tracks),)):
         raise ValueError('track_source_ids must be parallel to tracks')
-    if crossing_cache is not None and working_source_ids is None:
-        raise ValueError('a crossing cache requires stable track_source_ids')
     if track_graph is not None and working_source_ids is None:
         raise ValueError('a track graph requires stable track_source_ids')
-    if crossing_cache is not None and track_graph is not None:
-        raise ValueError('pass either crossing_cache or track_graph, not both')
-    if crossing_cache is not None and exclusion_radius > 0:
-        print(
-            'WARNING: track crossing cache cannot be used after point-level '
-            'track exclusion; rebuilding crossings from the clipped tracks')
-        crossing_cache = None
     arclengths = (working_tracks.selected_arclengths
                   if packed_input else _polyline_arclengths(working_tracks))
     if max_tortuosity is not None:
@@ -2217,7 +2050,7 @@ def prepare_main_phase_tracks(
         anchor_tree = _build_anchor_kdtree(anchor_scroll_zyxs)
 
     def finish_prepared(
-            flat_zyx_np, lengths_new, surviving_indices, prepared_track_list,
+            flat_zyx_np, lengths_new, surviving_indices,
             crossing_csr_override=None):
         offsets_new = np.empty(len(lengths_new) + 1, dtype=np.int64)
         offsets_new[0] = 0
@@ -2236,23 +2069,16 @@ def prepare_main_phase_tracks(
             'length_bin_weights': None,
             'active_max_crossings': 0,
             'crossing_precompute_max': (
-                crossing_precompute_max
-                if (working_families is not None
-                    or crossing_cache is not None
-                    or track_graph is not None)
-                else 0),
+                crossing_precompute_max if track_graph is not None else 0),
         }
-        if crossing_precompute_max > 0:
+        if crossing_precompute_max > 0 and track_graph is not None:
             crossing_index = None
             restricted_csr = crossing_csr_override
             native = _load_native_track_crossings()
-            active_crossing_cache = crossing_cache
-            if restricted_csr is None and track_graph is not None:
-                active_crossing_cache = track_graph
+            if restricted_csr is None:
                 print(
-                    f'track crossings: using TrackGraph cache for '
+                    f'track crossings: using TrackGraph for '
                     f'{len(surviving_indices)} surviving tracks')
-            if active_crossing_cache is not None:
                 eligible_source_ids = working_source_ids[surviving_indices]
                 try:
                     if (native is not None
@@ -2260,41 +2086,33 @@ def prepare_main_phase_tracks(
                                 native, 'prepare_cached_crossing_index')):
                         crossing_index = native.prepare_cached_crossing_index(
                             np.asarray(
-                                active_crossing_cache['source_ids'],
+                                track_graph['source_ids'],
                                 dtype=np.uint64),
                             np.asarray(
-                                active_crossing_cache['offsets'],
+                                track_graph['offsets'],
                                 dtype=np.int64),
                             np.asarray(
-                                active_crossing_cache['partners'],
+                                track_graph['partners'],
                                 dtype=np.int32),
                             np.asarray(
-                                active_crossing_cache['self_local'],
+                                track_graph['self_local'],
                                 dtype=np.int32),
                             np.asarray(
-                                active_crossing_cache['partner_local'],
+                                track_graph['partner_local'],
                                 dtype=np.int32),
                             np.asarray(
                                 eligible_source_ids, dtype=np.uint64),
                             np.asarray(lengths_new, dtype=np.int32))
                     else:
                         restricted_csr = _restrict_crossing_partner_csr(
-                            active_crossing_cache, eligible_source_ids)
+                            track_graph, eligible_source_ids)
                     print(
-                        f'track crossings: used cached CSR for '
+                        f'track crossings: used the crossing CSR for '
                         f'{len(eligible_source_ids)} surviving tracks')
                 except (ValueError, RuntimeError) as error:
-                    print(
-                        'WARNING: track crossing cache could not be remapped; '
-                        f'rebuilding exact crossings: {error}')
-            needs_rebuild = crossing_index is None and restricted_csr is None
-            if needs_rebuild and working_families is not None:
-                eligible_families = [
-                    working_families[index] for index in surviving_indices]
-                rebuilt_csr = _build_crossing_partner_csr(
-                    prepared_track_list, eligible_families,
-                    flat_points=flat_zyx_np, offsets=offsets_new)
-                restricted_csr = rebuilt_csr
+                    raise ValueError(
+                        'the track crossings do not cover the selected '
+                        f'tracks: {error}') from error
             if crossing_index is None and restricted_csr is not None:
                 if (native is not None
                         and hasattr(native, 'prepare_crossing_index')):
@@ -2340,16 +2158,13 @@ def prepare_main_phase_tracks(
                 return None
             flat_zyx_np, offsets_new = surviving_collection.materialize()
             lengths_new = np.diff(offsets_new)
-            prepared_track_list = _MemmapTrackCollection(
-                flat_zyx_np, offsets_new)
             print(
                 f'track radius loss: {len(surviving_collection)}/'
                 f'{len(working_tracks)} tracks survive exclusion '
                 f'(radius {exclusion_radius:.1f}); '
                 f'{len(flat_zyx_np)} points retained'
             )
-            return finish_prepared(
-                flat_zyx_np, lengths_new, surviving, prepared_track_list)
+            return finish_prepared(flat_zyx_np, lengths_new, surviving)
         surviving = np.asarray([
             index for index, track in enumerate(working_tracks) if len(track) >= 2
         ], dtype=np.int64)
@@ -2370,8 +2185,7 @@ def prepare_main_phase_tracks(
             f'track radius loss: {len(surviving_tracks)}/{len(working_tracks)} tracks survive exclusion '
             f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
         )
-        return finish_prepared(
-            flat_zyx_np, lengths_new, surviving, surviving_tracks)
+        return finish_prepared(flat_zyx_np, lengths_new, surviving)
 
     if packed_input:
         flat_zyx_np, packed_offsets = working_tracks.materialize()
@@ -2417,15 +2231,12 @@ def prepare_main_phase_tracks(
             f'track crossings: remapped TrackGraph after point exclusion '
             f'({len(crossing_csr_override["partners"])} directed crossings)')
     del keep_np, flat_zyx_np
-    prepared_track_list = _MemmapTrackCollection(
-        compact_zyx_np,
-        np.r_[np.int64(0), np.cumsum(lengths_new, dtype=np.int64)])
     print(
         f'track radius loss: {len(surviving)}/{num_tracks_orig} tracks survive exclusion '
         f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
     )
     return finish_prepared(
-        compact_zyx_np, lengths_new, surviving, prepared_track_list,
+        compact_zyx_np, lengths_new, surviving,
         crossing_csr_override=crossing_csr_override)
 
 
@@ -2735,6 +2546,13 @@ def _draw_track_sample(
     if sampling_probabilities is None:
         primary_track_idx = torch.randint(
             num_tracks, (k,), device=device, generator=generator)
+    elif device.type == 'mps':
+        # MPS multinomial asks Metal for one oversized buffer (83 GB for
+        # 144k tracks x 5k samples) and aborts; draw on the CPU instead.
+        # The MPS path never passes a generator, so the CPU draw follows
+        # the globally seeded CPU RNG and stays reproducible.
+        primary_track_idx = torch.multinomial(
+            sampling_probabilities.cpu(), k, replacement=True).to(device)
     else:
         primary_track_idx = torch.multinomial(
             sampling_probabilities, k, replacement=True, generator=generator)
@@ -2753,6 +2571,9 @@ def _draw_track_sample(
         seed = int(torch.randint(
             0, (1 << 63) - 1, (1,), dtype=torch.int64,
             device=device, generator=generator).item())
+        # MPS randint with this bound wraps to int32 and can go negative,
+        # which the native sampler's uint64 seed rejects. No-op elsewhere.
+        seed &= (1 << 63) - 1
         primary_cpu = np.asarray(
             primary_track_idx.detach().cpu(), dtype=np.int32)
         native = _load_native_track_crossings()
@@ -2993,6 +2814,33 @@ def _crossing_row_alignments(
     return row_alignment
 
 
+def _mps_shape_bucket(count):
+    """Round ``count`` up to one of 16 sizes per power of two (<= 6.25% padding)."""
+    if count <= 1024:
+        return 1024
+    step = 1 << (count.bit_length() - 5)
+    return -(-count // step) * step
+
+
+def _transform_shape_bucketed(transform, points):
+    """Apply a per-point transform with the point count rounded to a bucket on MPS.
+
+    MPS compiles and caches one graph per input shape, and each cached graph
+    keeps its own intermediate buffers alive outside the caching allocator.
+    Track samples change size every step, so without bucketing driver memory
+    grows by ~0.35 GB per fit step until the process is killed.  Padding rows
+    repeat the first point and are sliced off, so they get no gradient.
+    """
+    count = int(points.shape[0])
+    if points.device.type != 'mps' or count == 0:
+        return transform(points)
+    padded = _mps_shape_bucket(count)
+    if padded == count:
+        return transform(points)
+    pad = points[:1].expand(padded - count, *points.shape[1:])
+    return transform(torch.cat([points, pad]))[:count]
+
+
 def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_target_cache=None):
     """Yield radius then DT losses so the caller can backward them separately.
 
@@ -3024,7 +2872,8 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     row_starts = sample['row_starts']
     group_id = sample['group_id']
     num_groups = sample['num_groups']
-    sampled_spiral = slice_to_spiral_transform(sampled_scroll)
+    sampled_spiral = _transform_shape_bucketed(
+        slice_to_spiral_transform, sampled_scroll)
     theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
     shifted_radii, crossing_adjustments = _unwrap_ragged_track_radii(
         theta, shifted_radii, dr_per_winding, row_id, row_starts,
@@ -3099,7 +2948,8 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     # inputs before constructing the inverse-transform graph.
     del radius_loss, sampled_spiral, theta, shifted_radii, crossing_adjustments
     del target_radii, target_shifted_radii
-    target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs)
+    target_scroll_zyxs = _transform_shape_bucketed(
+        slice_to_spiral_transform.inv, target_spiral_zyxs)
 
     within_p = cfg['track_dt_within_track_norm_p']
     across_p = cfg['track_dt_norm_p']

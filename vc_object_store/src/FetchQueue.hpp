@@ -30,7 +30,10 @@ public:
     // Fetch again (a changed published geometry), whether or not anyone reads it.
     void refetch(const std::vector<std::string>& uuids);
     // Fetch now and block until done; false when it failed or `cancel` said so.
-    bool fetchNow(const std::string& uuid, const std::function<bool()>& cancel, std::string* error);
+    // `isLocal` says whether the geometry is there now: nothing is fetched when a fetch
+    // finished since the caller looked.
+    bool fetchNow(const std::string& uuid, const std::function<bool()>& cancel, std::string* error,
+                  const std::function<bool()>& isLocal = {});
 
     std::chrono::milliseconds requestLifetime{10000};
     std::chrono::milliseconds retryDelay{30000};

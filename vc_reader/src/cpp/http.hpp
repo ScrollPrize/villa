@@ -1,19 +1,25 @@
-// HTTP(S) GETs over a bounded pool of libcurl handles: anonymous, HTTP basic
-// auth, or signed for S3 (AWS Signature Version 4).
+// HTTP(S) requests over a bounded pool of libcurl handles: anonymous, HTTP basic
+// auth, or signed for S3 (AWS Signature Version 4). sftp:// and ssh:// URLs are
+// read through pooled OpenSSH sessions and answered with the same responses.
 #pragma once
 
+#include "reader_types.hpp"
 #include "sigv4.hpp"
+#include "vc_reader/sftp.hpp"
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <ctime>
 #include <functional>
 #include <exception>
+#include <filesystem>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,20 +30,6 @@
 
 namespace vcr {
 
-// How requests authenticate.
-struct Auth {
-    std::string kind;  // "" (anonymous), "basic" or "s3"
-    std::string user;  // basic: user name; s3: access key id
-    std::string secret;  // basic: password; s3: secret access key
-    std::string token;   // s3: session token (may be empty)
-    std::string region;  // s3: the bucket's region
-};
-
-// 401/403: the request was not allowed (missing, wrong or expired credentials).
-struct HttpDenied : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
 struct HttpOptions {
     int connections = 16;          // concurrent requests (and kept-alive connections)
     long connect_timeout_ms = 10000;
@@ -45,6 +37,8 @@ struct HttpOptions {
     int retries = 5;
     Auth auth;
     long request_timeout_ms = 0;
+    bool path_as_is = false;
+    bool bypass_proxy = false;
 };
 
 struct HttpResponse {
@@ -52,8 +46,26 @@ struct HttpResponse {
     std::string etag, modified, content_range;
     std::size_t bytes = 0;
     std::optional<std::size_t> content_length;
-    std::string content_encoding;
+    std::string content_encoding, content_type;
 };
+
+// The CA bundle to use instead of libcurl's built-in one: empty when that one exists (or
+// libcurl has none), else the first of this machine's bundles (same list as Go's crypto/x509).
+inline std::string select_ca_bundle(const std::string& builtin)
+{
+    std::error_code error;
+    if (builtin.empty() || std::filesystem::exists(builtin, error))
+        return {};
+    for (const char* candidate : {"/etc/ssl/certs/ca-certificates.crt",                // Debian, Ubuntu, Arch
+                                  "/etc/pki/tls/certs/ca-bundle.crt",                  // Fedora, RHEL
+                                  "/etc/ssl/ca-bundle.pem",                            // openSUSE
+                                  "/etc/pki/tls/cacert.pem",                           // OpenELEC
+                                  "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS, RHEL 7
+                                  "/etc/ssl/cert.pem"})                                // Alpine
+        if (std::filesystem::is_regular_file(candidate, error))
+            return candidate;
+    return {};
+}
 
 class HttpClient {
 public:
@@ -128,19 +140,88 @@ public:
                             const std::vector<std::pair<std::string, std::string>>& extra = {}, long body_status = 200,
                             std::function<void(const HttpResponse&)> begin_body = {})
     {
+        if (sftp::isSftpUrl(url))
+            return get_sftp(url, reset, write, extra, body_status, begin_body);
+        return perform("GET", url, reset, std::move(write), extra, body_status, std::move(begin_body), nullptr, 0);
+    }
+
+    // PUT `size` bytes to `url`, with the retries of a read: replacing an object is
+    // idempotent. Throws unless the server accepted it.
+    void put(const std::string& url, const void* data, std::size_t size)
+    {
+        const auto response = perform("PUT", url, [] {}, [](const char*, std::size_t) {}, {}, 200, {}, data, size);
+        if (response.status / 100 != 2)
+            throw std::runtime_error("PUT " + url + ": HTTP " + std::to_string(response.status));
+    }
+
+    // PUT one part of a multipart upload: its ETag, for completing the upload.
+    std::string put_part(const std::string& url, const void* data, std::size_t size)
+    {
+        const auto response = perform("PUT", url, [] {}, [](const char*, std::size_t) {}, {}, 200, {}, data, size);
+        if (response.status / 100 != 2 || response.etag.empty())
+            throw std::runtime_error("PUT " + url + ": HTTP " + std::to_string(response.status));
+        return response.etag;
+    }
+
+    // POST `size` bytes to `url`: the answer's body. Retried like a read, so only for requests safe to repeat.
+    std::string post(const std::string& url, const void* data, std::size_t size)
+    {
+        std::string answer;
+        const auto response = perform("POST", url, [&] { answer.clear(); }, [&](const char* p, std::size_t n) { answer.append(p, n); }, {}, 200, {}, data, size);
+        if (response.status / 100 != 2)
+            throw std::runtime_error("POST " + url + ": HTTP " + std::to_string(response.status));
+        return answer;
+    }
+
+    // A request whose answer the caller interprets: the status and whole body of
+    // any final response. Connection errors, stalls, 429 and 5xx are retried
+    // like a read, so only for requests safe to repeat (idempotent, or carrying a
+    // durable request id the server deduplicates).
+    HttpResponse exchange(const char* method, const std::string& url, const void* data, std::size_t size,
+                          const std::vector<std::pair<std::string, std::string>>& headers, std::string& answer)
+    {
+        return perform(method, url, [&] { answer.clear(); }, [&](const char* p, std::size_t n) { answer.append(p, n); },
+                       headers, 200, {}, data, size, true);
+    }
+
+    // Whether `url` exists (HEAD): false for 404.
+    bool head(const std::string& url)
+    {
+        return perform("HEAD", url, [] {}, [](const char*, std::size_t) {}, {}, 200, {}, nullptr, 0).status / 100 == 2;
+    }
+
+    // DELETE `url`. S3 answers the same whether or not the object was there.
+    void remove(const std::string& url)
+    {
+        perform("DELETE", url, [] {}, [](const char*, std::size_t) {}, {}, 204, {}, nullptr, 0);
+    }
+
+private:
+    HttpResponse perform(const char* method, const std::string& url, const std::function<void()>& reset,
+                         std::function<void(const char*, std::size_t)> write,
+                         const std::vector<std::pair<std::string, std::string>>& extra, long body_status,
+                         std::function<void(const HttpResponse&)> begin_body, const void* upload, std::size_t upload_size,
+                         bool any_status = false)
+    {
         Lease lease(*this);
         CURL* h = lease.handle;
         std::shared_ptr<const Auth> auth;
         { std::lock_guard lock(mutex_); auth = auth_; }
         float delay = 0.25f;
         std::string last_error;
+        const bool get = std::strcmp(method, "GET") == 0, post = std::strcmp(method, "POST") == 0, put = std::strcmp(method, "PUT") == 0 || post;
+        const bool upload_body = put || (any_status && upload_size > 0);
+        const std::string payload = put && auth->kind == "s3" ? payload_hash(upload, upload_size) : sigv4_empty_payload();
         for (int attempt = 0; attempt <= options_.retries; ++attempt) {
             reset();
             Transfer transfer{write, body_status, begin_body};
+            transfer.any_status = any_status;
             curl_easy_reset(h);
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+            if (options_.bypass_proxy) curl_easy_setopt(h, CURLOPT_PROXY, "");
+            curl_easy_setopt(h, CURLOPT_PATH_AS_IS, options_.path_as_is ? 1L : 0L);
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, get ? 1L : 0L);  // a redirected write is an error
             curl_easy_setopt(h, CURLOPT_USERAGENT, "vc_reader");
             curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, options_.connect_timeout_ms);
@@ -148,11 +229,42 @@ public:
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, options_.stall_timeout_s);
             curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+#if defined(_WIN32)
+            // MSYS2's OpenSSL-backed libcurl defaults to a CA bundle under /ucrt64
+            // that end-user machines lack; verify against the Windows store instead.
+            curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+            // An HTTPS proxy is verified with its own options.
+            curl_easy_setopt(h, CURLOPT_PROXY_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+#elif defined(__linux__) && LIBCURL_VERSION_NUM >= 0x075400
+            // A portable libcurl (the AppImage's Debian one) looks for its CA bundle at the
+            // path it was built with, which Fedora, RHEL and openSUSE do not have. When that
+            // bundle is missing, use the one this machine has.
+            static const std::string host_ca_bundle = [h] {
+                char* builtin = nullptr;
+                curl_easy_getinfo(h, CURLINFO_CAINFO, &builtin);
+                return select_ca_bundle(builtin ? builtin : "");
+            }();
+            if (!host_ca_bundle.empty())
+                curl_easy_setopt(h, CURLOPT_CAINFO, host_ca_bundle.c_str());
+#endif
             curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &HttpClient::receive);
             curl_easy_setopt(h, CURLOPT_WRITEDATA, &transfer);
             curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &HttpClient::header);
             curl_easy_setopt(h, CURLOPT_HEADERDATA, &transfer);
+            Upload body{static_cast<const char*>(upload), upload_size};
             HeaderList headers;
+            if (upload_body) {
+                curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
+                if (std::strcmp(method, "PUT") != 0) curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
+                curl_easy_setopt(h, CURLOPT_READFUNCTION, &HttpClient::send);
+                curl_easy_setopt(h, CURLOPT_READDATA, &body);
+                curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(upload_size));
+                headers.append("Expect:");  // no extra round trip per chunk
+            } else if (std::strcmp(method, "HEAD") == 0) {
+                curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+            } else if (!get) {
+                curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
+            }
             if (auth->kind == "basic") {
                 curl_easy_setopt(h, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
                 curl_easy_setopt(h, CURLOPT_USERNAME, auth->user.c_str());
@@ -160,7 +272,7 @@ public:
             }
             if (auth->kind == "s3") {
                 const S3Key key{auth->user, auth->secret, auth->token, auth->region};
-                for (const auto& [name, value] : sigv4_get_headers(url, key, amz_date(std::time(nullptr)), extra))
+                for (const auto& [name, value] : sigv4_headers(method, url, key, amz_date(std::time(nullptr)), extra, payload))
                     headers.append(name + ": " + value);
             } else {
                 for (const auto& [name, value] : extra) headers.append(name + ": " + value);
@@ -172,10 +284,12 @@ public:
                 long status = 0;
                 curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
                 transfer.response.status = status;
-                if (status == body_status || status == 304 || status == 404)
+                if (any_status && status != 429 && status < 500)
+                    return transfer.response;
+                if (status == body_status || status == 304 || status == 404 || (!get && status / 100 == 2))
                     return transfer.response;
                 if (status != 429 && status < 500) {
-                    const std::string what = "GET " + url + ": HTTP " + std::to_string(status) + ": " + transfer.snippet;
+                    const std::string what = std::string(method) + " " + url + ": HTTP " + std::to_string(status) + ": " + transfer.snippet;
                     if (status == 401 || status == 403) throw HttpDenied(what);
                     throw std::runtime_error(what);
                 }
@@ -186,11 +300,100 @@ public:
                 delay = std::min(delay * 2, 8.0f);
             }
         }
-        throw std::runtime_error("GET " + url + " failed after " + std::to_string(options_.retries + 1) +
+        throw std::runtime_error(std::string(method) + " " + url + " failed after " + std::to_string(options_.retries + 1) +
                                  " attempts: " + last_error);
     }
 
-private:
+    static std::string payload_hash(const void* data, std::size_t size)
+    {
+        Sha256 hash;
+        hash.update(data, size);
+        return to_hex(hash.finish());
+    }
+
+    // sftp:// and ssh:// objects through pooled OpenSSH sessions, answered like HTTP:
+    // 200/206 with the body, 404 when absent, HttpDenied when not permitted. Range
+    // and If-Match headers are honoured; the etag is the file's mtime and size.
+    HttpResponse get_sftp(const std::string& url, const std::function<void()>& reset,
+                          const std::function<void(const char*, std::size_t)>& write,
+                          const std::vector<std::pair<std::string, std::string>>& extra, long body_status,
+                          const std::function<void(const HttpResponse&)>& begin_body)
+    {
+        sftp::ByteRange range;
+        bool ranged = false;
+        std::string if_match;
+        for (const auto& [name, value] : extra) {
+            std::string lower = name;
+            for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lower == "range") {
+                ranged = true;
+                range = parse_byte_range(value);
+            } else if (lower == "if-match") {
+                if_match = value;
+            }
+        }
+        sftp::Fetcher* fetcher;
+        {
+            std::lock_guard lock(mutex_);
+            if (!sftp_) {
+                sftp::FetchOptions options;
+                options.session.connectTimeout =
+                    std::chrono::seconds(std::max<long>(1, (options_.connect_timeout_ms + 999) / 1000));
+                options.session.idleTimeout = std::chrono::milliseconds(std::max<long>(100, options_.stall_timeout_s * 1000));
+                options.sessionsPerHost = static_cast<std::size_t>(std::clamp(options_.connections, 1, 8));
+                options.retries = options_.retries;
+                sftp_ = std::make_unique<sftp::Fetcher>(std::move(options));
+            }
+            fetcher = sftp_.get();
+        }
+        HttpResponse response;
+        std::optional<sftp::Attributes> found;
+        try {
+            found = fetcher->read(url, range, [&] { reset(); response = {}; }, [&](const sftp::Attributes& a, uint64_t first, uint64_t count) {
+                if (ranged && !range.suffix && count == 0 && range.length.value_or(1) != 0)
+                    throw std::runtime_error("sftp range starts past the end of " + url);
+                response.status = ranged ? 206 : 200;
+                response.etag = "\"" + std::to_string(a.modified.value_or(0)) + "-" + std::to_string(*a.size) + "\"";
+                if (!if_match.empty() && if_match != response.etag)
+                    throw std::runtime_error("sftp object changed between reads: " + url);
+                if (ranged)
+                    response.content_range = "bytes " + std::to_string(first) + "-" +
+                                             std::to_string(first + count - 1) + "/" + std::to_string(*a.size);
+                response.content_length = count;
+                if (response.status != body_status)
+                    throw std::runtime_error("unexpected sftp response for " + url);
+                if (begin_body) begin_body(response);
+            }, [&](std::span<const std::byte> data) {
+                write(reinterpret_cast<const char*>(data.data()), data.size());
+                response.bytes += data.size();
+            });
+        } catch (const sftp::StatusError& e) {
+            if (e.status == sftp::PermissionDenied) throw HttpDenied("GET " + url + ": " + e.what());
+            throw std::runtime_error("GET " + url + ": " + e.what());
+        }
+        if (!found) {
+            response = {};
+            response.status = 404;
+        }
+        return response;
+    }
+
+    static sftp::ByteRange parse_byte_range(const std::string& value)
+    {
+        unsigned long long first = 0, last = 0;
+        sftp::ByteRange range;
+        if (std::sscanf(value.c_str(), "bytes=-%llu", &last) == 1) {
+            range.suffix = true;
+            range.length = last;
+        } else if (std::sscanf(value.c_str(), "bytes=%llu-%llu", &first, &last) == 2 && last >= first) {
+            range.offset = first;
+            range.length = last - first + 1;
+        } else {
+            throw std::invalid_argument("unsupported byte range for sftp: " + value);
+        }
+        return range;
+    }
+
     struct HeaderList {
         curl_slist* list = nullptr;
         void append(const std::string& line)
@@ -230,7 +433,23 @@ private:
         HttpResponse response;
         std::string snippet;
         std::exception_ptr error;
+        bool any_status = false;  // deliver every status's body to the sink
     };
+
+    struct Upload {
+        const char* data;
+        std::size_t left;
+    };
+
+    static std::size_t send(char* out, std::size_t size, std::size_t count, void* user) noexcept
+    {
+        auto& upload = *static_cast<Upload*>(user);
+        const auto n = std::min(size * count, upload.left);
+        std::memcpy(out, upload.data, n);
+        upload.data += n;
+        upload.left -= n;
+        return n;
+    }
 
     static std::size_t receive(char* data, std::size_t size, std::size_t count, void* user) noexcept
     {
@@ -239,7 +458,7 @@ private:
         try {
             if (t.body_status == 206 && t.response.status == 200)
                 throw std::runtime_error("server ignored HTTP Range; refusing a whole-shard download");
-            if (t.response.status == t.body_status) {
+            if (t.response.status == t.body_status || (t.any_status && t.response.status != 429 && t.response.status < 500)) {
                 if (!t.response.bytes && t.begin_body) t.begin_body(t.response);
                 t.sink(data, n);
                 t.response.bytes += n;
@@ -268,6 +487,7 @@ private:
                 if (name == "content-range") t.response.content_range = value;
                 if (name == "content-length") t.response.content_length = std::stoull(value);
                 if (name == "content-encoding") t.response.content_encoding = value;
+                if (name == "content-type") t.response.content_type = value;
             }
             return n;
         } catch (...) { t.error = std::current_exception(); return 0; }
@@ -277,6 +497,7 @@ private:
     std::vector<CURL*> handles_;
     std::vector<CURL*> free_;
     std::shared_ptr<const Auth> auth_;  // guarded by mutex_
+    std::unique_ptr<sftp::Fetcher> sftp_;  // created on the first sftp:// request; guarded by mutex_
     std::mutex mutex_;
     std::condition_variable cv_;
 };

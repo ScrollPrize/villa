@@ -1,7 +1,9 @@
 #include "CWindow.hpp"
+
+#include <vc_reader/array.hpp>
+#include <vc_reader/zarr.hpp>
 #include "VolumeComboTooltip.hpp"
 
-#include <QDateTime>
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
@@ -11,14 +13,9 @@
 #include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
-#include "vc/core/util/LoadJson.hpp"
-#include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <iostream>
 
@@ -27,38 +24,34 @@
 #include <optional>
 
 #include "VCSettings.hpp"
+#include "SessionDrafts.hpp"
 #include "Keybinds.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
-#include <QGridLayout>
+#include <QLoggingCategory>
 #include <QAction>
 #include <QVBoxLayout>
-#include <QCursor>
 #include <QEvent>
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QDateTime>
+#include <QStandardPaths>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
-#include <QBrush>
-#include <QDialog>
-#include <QDialogButtonBox>
 #include <QStyleHints>
 #include <QWindow>
 #include <QScreen>
-#include <QDesktopServices>
 #include <QUrl>
 #include <QClipboard>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QPointF>
 #include <QMessageBox>
-#include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
-#include <QFutureWatcher>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
@@ -72,54 +65,28 @@
 #include <QSize>
 #include <QVector>
 #include <QVector3D>
-#include <QLoggingCategory>
-#include <QDebug>
 #include <QFrame>
-#include <QMouseEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
-#include <QStandardPaths>
 #include <QMenu>
 #include <QMainWindow>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTreeWidget>
-#include <QHeaderView>
-#include <QFormLayout>
-#include <QProgressBar>
-#include <QColorDialog>
-#include <QListView>
-#include <QTreeView>
-#include <QPainter>
-#include <QStandardItem>
 #include <QStandardItemModel>
-#include <QStyledItemDelegate>
-#include <QStyleOptionButton>
-#include <QPersistentModelIndex>
-#include <QSet>
 #include <QPushButton>
-#include <QItemSelectionModel>
-#include <QItemSelection>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <QPointer>
-#include <QListView>
 #include <algorithm>
 #include <set>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <limits>
 #include <optional>
-#include <sstream>
-#include <cctype>
-#include <string_view>
 #include <utility>
 #include <filesystem>
 #include <system_error>
-#include <unordered_map>
 #include <vector>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <QStringList>
 #include <array>
 
@@ -127,13 +94,14 @@
 #include "viewer_controls/ViewerControlsPanel.hpp"
 #include "viewer_controls/panels/VolumeRegistrationsPanel.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
-#include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/ViewerSplitGrid.hpp"
 #include "CPointCollectionWidget.hpp"
 #include "WrapAnnotationWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberCollectionController.hpp"
+#include "fibers3d/Fiber3DPanel.hpp"
+#include "scene3d/Scene3DPanel.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -145,11 +113,10 @@
 #include "SurfaceCatalog.hpp"
 #include "overlays/StoreSurfaceOverlayController.hpp"
 #include "SurfacePanelController.hpp"
-#include "elements/DropdownChecklistButton.hpp"
 #include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
+#include "StoreImportController.hpp"
 #include "VolumeAttachmentController.hpp"
-#include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
@@ -162,15 +129,9 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/Tiff.hpp"
-#include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/LasagnaNormalSampler.hpp"
-#include <utils/zarr.hpp>
 
 
 
@@ -438,7 +399,8 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     if (!surface.isQuadValid(row, col)) {
         return std::nullopt;
     }
-    const cv::Vec3f normal = surface.gridNormal(row, col);
+    cv::Vec3f normal;
+    surface.pointAt(float(col), float(row), nullptr, normal.val);
     if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
         return std::nullopt;
     }
@@ -737,9 +699,8 @@ static bool windowStateMetaMatches(const QSettings& settings,
 }
 
 // Constructor
-CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
+CWindow::CWindow(size_t cacheSizeGB) :
     _cmdRunner(nullptr),
-    _debugDownloadQueue(debugDownloadQueue),
     _seedingWidget(nullptr),
     _point_collection_widget(nullptr)
 {
@@ -862,31 +823,19 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     }
     // setAttribute(Qt::WA_DeleteOnClose);
 
-    _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
-    std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
+    std::cout << "memory cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
-        _cacheSizeBytes);
-    _state = new CState(this, _debugDownloadQueue);
+    _state = new CState(this, nullptr, cacheSizeGB * 1024ULL * 1024ULL * 1024ULL);
     connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
     updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
-
-    _fileWatcher = std::make_unique<FileWatcherService>(_state, this);
-    connect(_fileWatcher.get(), &FileWatcherService::volumeCatalogChanged,
-            this, [this](const QString& preferredVolumeId) {
-                refreshCurrentVolumePackageUi(preferredVolumeId);
-            });
+    startDraftRecovery();
 
     _axisAlignedSliceController = std::make_unique<AxisAlignedSliceController>(_state, this);
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
-    // Let SurfaceCache tile fills serve the flattened view instead of queueing
-    // behind raw-path chunk demand for frames that never sample it, as Spiral
-    // does.
-    _viewerManager->setPreferSurfaceTileFills(true);
     if (_workspaceTabs && _spiralWorkspaceWindow) {
         const int spiralIndex = _workspaceTabs->indexOf(_spiralWorkspaceWindow);
         auto* shell = _spiralWorkspaceWindow;
@@ -953,10 +902,6 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
             &LineAnnotationController::lineAnnotationWorkspaceRequested,
             this,
             &CWindow::openLineAnnotationWorkspace);
-    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberRetired,
-            this, [this](const QString& path) {
-                if (_spiralWorkspace) _spiralWorkspace->noteFiberRetired(path);
-            });
     _fiberMapWorkspace = new FiberMapWorkspace(_state, _lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
     const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
@@ -1013,7 +958,8 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     _sharedCacheStatsLabel = new GrowOnlyLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
     _sharedCacheStatsLabel->setToolTip(
-        tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
+        tr("Shared RAM cache, downloaded bytes/chunks for this session, and viewers loading volume levels.\n"
+           "Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
     statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
     updateSharedStatusLabel();
 
@@ -1023,30 +969,41 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     _persistentCacheLowSpaceLabel->hide();
     statusBar()->addPermanentWidget(_persistentCacheLowSpaceLabel);
 
-    _hubStatusLabel = new QLabel(this);
-    _hubStatusLabel->setContentsMargins(8, 0, 8, 0);
-    _hubStatusLabel->setToolTip(tr("Sync state of the attached hosted object store replica"));
-    _hubStatusLabel->hide();
-    statusBar()->addPermanentWidget(_hubStatusLabel);
-    connect(_state, &CState::storeRoutesChanged, this, &CWindow::updateHubStatus);
-    connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-        using Kind = vc::objects::StoreSessionEvent::Kind;
-        if (event.kind != Kind::Committed && event.kind != Kind::Draft) updateHubStatus();
-    });
+    // Hosted stores: what this client knows of each, from its last status check.
+    _hostedStatusLabel = new QLabel(this);
+    _hostedStatusLabel->setObjectName(QStringLiteral("hostedStoreStatusLabel"));
+    _hostedStatusLabel->setContentsMargins(8, 0, 8, 0);
+    _hostedStatusLabel->hide();
+    statusBar()->addPermanentWidget(_hostedStatusLabel);
+    auto* hostedStatusTimer = new QTimer(this);
+    hostedStatusTimer->setInterval(1000);
+    connect(hostedStatusTimer, &QTimer::timeout, this, &CWindow::updateHostedStatus);
+    connect(_state, &CState::storeRoutesChanged, this, &CWindow::updateHostedStatus);
+    hostedStatusTimer->start();
 
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
+    // The free space of the cache root against VC's floor, every 5 s; whether vc_reader has
+    // actually refused a write is its budget's low_space(), which it decides on each write.
     auto updatePersistentCacheSpace = [this]() {
-        auto budget = vc::render::PersistentZarrCacheBudget::findForPath(
-            vc3d::remoteCachePathFs());
-        if (!budget)
+        std::error_code spaceError;
+        const auto root = vc3d::remoteCachePathFs();
+        const auto space = std::filesystem::space(root, spaceError);
+        if (spaceError)
             return;
-        const auto stats = budget->stats();
-        if (stats.lowSpace) {
-            const double freeGiB = static_cast<double>(stats.freeBytes) /
+        if (space.available < static_cast<std::uintmax_t>(vc::settings::remoteCacheMinFreeBytes())) {
+            const double freeGiB = static_cast<double>(space.available) /
                                    (1024.0 * 1024.0 * 1024.0);
-            const QString text = tr("Low disk space: %1 GiB free. Cache cleanup runs asynchronously; downloads continue and cache writes may fail if the disk fills.")
-                                     .arg(freeGiB, 0, 'f', 1);
+            bool refused = false;
+            try {
+                refused = vcr::zarr::diskBudget(root.string(), std::nullopt)->low_space();
+            } catch (const std::exception&) {
+                // No budget on this root yet: nothing has been refused.
+            }
+            const QString text = tr("Low disk space: %1 GiB free. %2 Nothing already cached was removed.")
+                                     .arg(freeGiB, 0, 'f', 1)
+                                     .arg(refused ? tr("Chunks are no longer being cached; downloads continue without caching.")
+                                                  : tr("Chunks will not be cached while the disk stays below the configured floor."));
             _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
             _persistentCacheLowSpaceLabel->show();
             if (!_persistentCacheBannerShownThisSession) {
@@ -1151,21 +1108,11 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
 
     _volumeAttachmentController =
         std::make_unique<VolumeAttachmentController>(this);
+    _storeImportController = std::make_unique<StoreImportController>(this);
 
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
-    // Wire the Actions -> Merge Surfaces... menu entry to the handler.
-    // Has to happen here (not inside CreateWidgets) because
-    // _menuController is created after CreateWidgets() returns.
-    connect(_menuController.get(), &MenuActionController::mergeSurfacesFromMenuRequested,
-            this, [this]() {
-                _segmentationCommandHandler->onMergeSurfaces(QStringList{});
-            });
-    connect(_menuController.get(), &MenuActionController::mergePatchFromMenuRequested,
-            this, [this]() {
-                _segmentationCommandHandler->onMergePatch(QStringList{});
-            });
     connect(_menuController.get(), &MenuActionController::growTrackPatchesFromMenuRequested,
             this, [this]() {
                 _segmentationCommandHandler->onGrowTrackPatches();
@@ -1194,7 +1141,6 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     const int projectIndex = _workspaceTabs->addTab(_projectWorkspace, tr("Project"));
     if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(projectIndex, QTabBar::RightSide, nullptr);
     connect(_projectWorkspace, &ProjectWorkspace::projectRenamed, this, &CWindow::updateProjectNameLabel);
-    connect(_projectWorkspace, &ProjectWorkspace::hubSyncRequested, this, &CWindow::promptHubConflicts);
     connect(_projectWorkspace, &ProjectWorkspace::volumeActivationRequested, this, [this](const QString& volumeId) {
         const auto vpkg = _state->vpkg();
         std::shared_ptr<Volume> volume;
@@ -1409,6 +1355,8 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
                                    ui.dockWidgetComposite,
                                         _inkDetectionDock,
                                    _transformsDock,
+                                   _fibers3DDock,
+                                   _scene3DDock,
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
             if (!dock) continue;
             connect(dock, &QDockWidget::topLevelChanged, this, fixGrab);
@@ -1544,7 +1492,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
         if (auto* viewer = activeBaseViewer()) {
             viewer->resetSurfaceOffsets();
             viewer->fitSurfaceInView();
-            viewer->renderVisible(true);
+            viewer->renderVisible();
         }
     });
 
@@ -1555,7 +1503,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     connect(fZoomToFitShortcut, &QShortcut::activated, [this]() {
         VolumeViewerBase* viewer = _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
         if (viewer) {
-            viewer->resetViewForCurrentContent(true);
+            viewer->resetViewForCurrentContent();
         }
     });
 
@@ -1661,9 +1609,6 @@ CWindow::~CWindow()
         qApp->removeEventFilter(this);
     }
 
-    if (_fileWatcher) {
-        _fileWatcher->stopWatching();
-    }
     setStatusBar(nullptr);
 
     if (_lineAnnotationController) {
@@ -1693,13 +1638,15 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, _transformsDock);
     addDock(menu, ui.dockWidgetComposite);
     addDock(menu, _lasagnaDock);
+    addDock(menu, _scene3DDock);
 
     addDock(menu, _point_collection_widget);
     addDock(menu, _wrapAnnotationWidget);
 
-    if (_fiberWidget) {
+    if (_fiberWidget || _fibers3DDock) {
         auto* fiberMenu = menu->addMenu(tr("Fibers"));
         addDock(fiberMenu, _fiberWidget);
+        addDock(fiberMenu, _fibers3DDock);
     }
 }
 
@@ -1799,7 +1746,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         const auto activeSurface = _state ? _state->surface("segmentation") : nullptr;
                         const bool activeSegmentHasLasagnaModel =
-                            activeSurface && LasagnaServiceManager::instance().surfaceModel(activeSurface->id);
+                            activeSurface && LasagnaServiceManager::instance().surfaceHasModel(activeSurface->id);
 
                         QMenu menu(this);
 
@@ -2103,8 +2050,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 _seedingWidget, &SeedingWidget::onMouseMove, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 _seedingWidget, &SeedingWidget::onMouseRelease, Qt::UniqueConnection);
-        connect(viewer, &CChunkedVolumeViewer::sendZSliceChanged,
-                _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
         viewer->setProperty("vc_seeding_bound", true);
     }
 
@@ -2578,6 +2523,7 @@ void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QS
     }
 
     dialog->setWorkspaceEmbedded(true);
+    dialog->enableFibers3D(_state, _lineAnnotationController.get(), _fiberCollection.get());
 
     int index = _workspaceTabs->indexOf(dialog);
     if (index < 0) {
@@ -2638,10 +2584,12 @@ void CWindow::selectLasagnaOutputSurface(const QString& surfaceUuid)
 void CWindow::loadLasagnaResults(Surface* surface)
 {
     std::optional<nlohmann::json> corr;
-    if (surface && _surfaceCatalog && _surfaceCatalog->attachment()) {
+    if (surface && _surfaceCatalog && _surfacePanel && _surfacePanel->opened() &&
+        _surfacePanel->opened()->surface.get() == surface) {
         try {
             auto& session = *_surfaceCatalog->session();
-            corr = vc::objects::attachedDocument(session, *_surfaceCatalog->attachment(), surface->id,
+            const auto& pin = _surfacePanel->opened()->pin;
+            corr = vc::objects::attachedDocument(session, pin.attachment, pin.reference(),
                                                  LasagnaServiceManager::kCorrResultsRole);
         } catch (const std::exception& error) {
             qWarning() << "Cannot read Lasagna results for" << QString::fromStdString(surface->id) << error.what();
@@ -2649,7 +2597,7 @@ void CWindow::loadLasagnaResults(Surface* surface)
     }
     if (_point_collection_widget) {
         if (corr) {
-            _point_collection_widget->loadCorrPointsResults(utils::Json::parse(corr->dump()));
+            _point_collection_widget->loadCorrPointsResults(*corr);
         } else {
             _point_collection_widget->clearCorrPointsResults();
         }
@@ -2770,12 +2718,13 @@ void CWindow::CreateWidgets(void)
         _viewerManager.get(),
         [this]() { return segmentationViewer(); },
         this);
+    _surfacePanel->setSelectionChangeGuard([this] { return !_segmentationModule || _segmentationModule->saveCorrections(); });
     _storeSurfaceOverlay = std::make_unique<StoreSurfaceOverlayController>(_state, _viewerManager.get(), this);
     connect(_surfacePanel.get(), &SurfacePanelController::visibleSurfacesChanged,
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setSurfaces);
     connect(_surfacePanel.get(), &SurfacePanelController::highlightedSurfacesChanged,
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setHighlighted);
-    // Another replica, tool or service changed the open surface: reopen it, unless
+    // Another client, tool or service changed the open surface: reopen it, unless
     // it is being edited (its edits continue from their own revisions).
     connect(_surfaceCatalog.get(), &SurfaceCatalog::surfacesCommitted, this, [this](const std::vector<std::string>& uuids) {
         const auto active = _state->activeSurface().lock();
@@ -2785,11 +2734,8 @@ void CWindow::CreateWidgets(void)
         }
         auto known = _segmentationModule ? _segmentationModule->storePin(active.get()) : std::nullopt;
         if (!known && _surfacePanel->opened()) known = _surfacePanel->opened()->pin;
-        std::optional<std::string> head;
-        _surfaceCatalog->session()->read(row->source, [&](const auto& db, const auto& txn, const auto&) {
-            if (const auto revision = db.currentObjectRevision(txn, active->id)) head = revision->uuid;
-        });
-        if (!head || (known && known->objectRevision == *head)) {
+        const auto head = _surfaceCatalog->session()->currentObject(row->source, active->id);
+        if (!head || (known && known->reference() == head->reference())) {
             return;
         }
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
@@ -2864,17 +2810,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onConvertToObj(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::mergeSurfacesRequested,
-            this, [this](const QStringList& segmentIds) {
-                _segmentationCommandHandler->onMergeSurfaces(segmentIds);
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::mergePatchRequested,
-            this, [this](const QStringList& segmentIds) {
-                _segmentationCommandHandler->onMergePatch(segmentIds);
-            });
-    // Note: the Actions -> Merge Surfaces... menu wiring lives in the
-    // constructor after _menuController is initialized -- _menuController
-    // is null inside CreateWidgets().
     connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,
             this, [this](const QString& segmentId) {
                 onVisLasagnaObj(segmentId.toStdString());
@@ -2941,18 +2876,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onSlimFlatten(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::straightenRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onStraighten(segmentId.toStdString());
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::rasterizeSegmentsRequested,
-        this, [this](const QStringList& segmentIds) {
-            _segmentationCommandHandler->onRasterizeSegments(segmentIds);
-        });
-    connect(_surfacePanel.get(), &SurfacePanelController::addIgnoreLabelRequested,
-        this, [this]() {
-            _segmentationCommandHandler->onAddIgnoreLabel();
-        });
     connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
             this, [this](const QString& message, int timeoutMs) {
                 showStatusBarMessage(message, timeoutMs);
@@ -3020,7 +2943,6 @@ void CWindow::CreateWidgets(void)
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationEdit->setViewerManager(_viewerManager.get());
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
-    _segmentationOverlay->setEditManager(_segmentationEdit.get());
     _segmentationOverlay->setViewerManager(_viewerManager.get());
     _surfaceRotationOverlay = std::make_unique<SurfaceRotationOverlayController>(_state, this);
     _surfaceRotationOverlay->setSaver([this](QuadSurface* surface) {
@@ -3044,7 +2966,7 @@ void CWindow::CreateWidgets(void)
             showStatusBarMessage(error, 15000);
             return false;
         }
-        return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
+        return true;
     });
     // Edits of the active surface commit to the store object it was opened from.
     _segmentationModule->setStorePinResolver([this](const QuadSurface* surface) -> std::optional<SegmentationModule::StoreOrigin> {
@@ -3429,6 +3351,9 @@ void CWindow::CreateWidgets(void)
                         withFiberWidget([&](CFiberWidget* listed) { listed->setDisplayOptions(options); });
                     });
             // The widget's store buttons choose where fibers are kept.
+            connect(widget, &CFiberWidget::generateFibersRequested, this, [this]() {
+                if (_fiberCollection) _fiberCollection->createCollection();
+            });
             connect(widget, &CFiberWidget::attachStoreRequested, this, [this]() {
                 if (_menuController) _menuController->attachStore(false, "fiber");
             });
@@ -3541,6 +3466,57 @@ void CWindow::CreateWidgets(void)
     ensureDockWidgetFeatures(_fiberWidget);
     connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+    _scene3DDock = new QDockWidget(tr("3D Viewer"), _segmentWorkspaceWindow);
+    _scene3DDock->setObjectName(QStringLiteral("scene3DDock"));
+    auto* scenePanel = new vc3d::scene3d::Scene3DPanel(_state, _viewerManager.get(), _scene3DDock);
+    _scene3DDock->setWidget(scenePanel);
+    ensureDockWidgetFeatures(_scene3DDock);
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _scene3DDock);
+    _scene3DDock->hide();
+    connect(_scene3DDock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_scene3DDock, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_scene3DDock, &QDockWidget::visibilityChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(scenePanel, &vc3d::scene3d::Scene3DPanel::detachRequested, this, [this] {
+        _scene3DDock->setFloating(!_scene3DDock->isFloating());
+        _scene3DDock->show();
+        _scene3DDock->raise();
+    });
+    connect(scenePanel, &vc3d::scene3d::Scene3DPanel::attachVolumeRequested, this, [this] {
+        if (_menuController) _menuController->attachVolume();
+    });
+    connect(scenePanel, &vc3d::scene3d::Scene3DPanel::importSurfaceRequested, this, [this] {
+        if (_menuController) _menuController->importIntoObjectStore();
+    });
+    _fibers3DDock = new QDockWidget(tr("Fibers 3D"), _segmentWorkspaceWindow);
+    _fibers3DDock->setObjectName(QStringLiteral("fibers3DDock"));
+    _fibers3DPanel = new vc3d::fibers3d::Fiber3DPanel(
+        _state, _viewerManager.get(), _lineAnnotationController.get(),
+        _fiberCollection.get(), _fibers3DDock);
+    _fibers3DDock->setWidget(_fibers3DPanel);
+    ensureDockWidgetFeatures(_fibers3DDock);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fibers3DDock);
+    // Opt in without disturbing an existing main workspace layout. restoreState()
+    // later restores this dock's saved visibility, size, and floating state.
+    _fibers3DDock->hide();
+    connect(_fibers3DDock, &QDockWidget::topLevelChanged,
+            this, &CWindow::scheduleWindowStateSave);
+    connect(_fibers3DDock, &QDockWidget::dockLocationChanged,
+            this, &CWindow::scheduleWindowStateSave);
+    connect(_fibers3DDock, &QDockWidget::visibilityChanged,
+            this, &CWindow::scheduleWindowStateSave);
+    connect(_fibers3DPanel, &vc3d::fibers3d::Fiber3DPanel::detachRequested, this, [this]() {
+        _fibers3DDock->setFloating(!_fibers3DDock->isFloating());
+        _fibers3DDock->show();
+        _fibers3DDock->raise();
+    });
+    for (CFiberWidget* widget : {_fiberWidget}) {
+        if (!widget) continue;
+        connect(_fibers3DPanel, &vc3d::fibers3d::Fiber3DPanel::nativeFiberSelected,
+                widget, &CFiberWidget::selectFiber);
+        connect(widget, &CFiberWidget::fiberSelectionChanged,
+                _fibers3DPanel, &vc3d::fibers3d::Fiber3DPanel::selectNativeFiber);
+    }
+
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Fibers together
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
@@ -3555,8 +3531,6 @@ void CWindow::CreateWidgets(void)
         .contents = ui.dockWidgetViewerControlsContents,
         .viewScrollArea = ui.scrollAreaView,
         .viewContents = ui.dockWidgetViewContents,
-        .overlayScrollArea = ui.scrollAreaOverlay,
-        .overlayContents = ui.dockWidgetOverlayContents,
         .normalVisualizationContents = ui.dockWidgetNormalVisContents,
         .showSurfaceNormals = ui.chkShowSurfaceNormals,
         .normalArrowLengthLabel = ui.labelNormalArrowLength,
@@ -4001,6 +3975,12 @@ void CWindow::closeEvent(QCloseEvent* event)
         });
         return;
     }
+    try { _state->savePointCollections(); }
+    catch (const std::exception& error) {
+        QMessageBox::warning(this, tr("Close blocked"), QString::fromUtf8(error.what()));
+        event->ignore();
+        return;
+    }
     _destroyingWindow = true;
     if (_lineAnnotationController) {
         _lineAnnotationController->saveOpenFibers();
@@ -4056,6 +4036,35 @@ void CWindow::UpdateVolpkgLabel(int filterCounter)
         QString label = tr("Remote: %1").arg(QString::fromStdString(_state->currentVolumeId()));
         ui.lblVpkgName->setText(label);
     }
+}
+
+void CWindow::startDraftRecovery()
+{
+    using namespace vc3d::settings;
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const int seconds = settings.value(object_store::DRAFT_CHECKPOINT_SECONDS,
+                                       object_store::DRAFT_CHECKPOINT_SECONDS_DEFAULT).toInt();
+    auto* drafts = _state->sessionDrafts();
+    if (seconds <= 0 || !drafts) return;
+    auto directory = settings.value(object_store::DRAFT_DIRECTORY).toString().trimmed();
+    if (directory.isEmpty())
+        directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/drafts");
+    QString message;
+    if (!drafts->start(directory.toStdString(), seconds * 1000)) {
+        message = tr("Crash recovery of unsaved edits is off: %1").arg(drafts->error());
+    } else if (const auto recovered = drafts->recoveredDrafts(); !recovered.empty()) {
+        message = tr("Unsaved edits of %n surface(s) were recovered from an earlier session; "
+                     "open a surface to restore or discard them.", nullptr, int(recovered.size()));
+    }
+    connect(drafts, &SessionDrafts::checkpointFailed, this, [this](const QString& error) {
+        showStatusBarMessage(tr("Unsaved edits are not crash-safe: the draft checkpoint failed: %1").arg(error), 0);
+    });
+    connect(drafts, &SessionDrafts::checkpointRestored, this, [this]() {
+        showStatusBarMessage(tr("Draft checkpoints work again."), 5000);
+    });
+    connect(drafts, &SessionDrafts::pendingResolved, this, [this](const QString& text) { showStatusBarMessage(text, 10000); });
+    if (!message.isEmpty())
+        QTimer::singleShot(0, this, [this, message]() { showStatusBarMessage(message, 15000); });
 }
 
 void CWindow::onShowStatusMessage(QString text, int timeout)
@@ -4250,7 +4259,7 @@ bool CWindow::OpenVolume(const QString& path,
     QString loadError;
     try {
         vc::project::LoadOptions options;
-        options.catalog = vc3d::opendata::cachedCatalog();
+        options.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
         package = VolumePkg::open(aVpkgPath.toStdString(), options);
     } catch (const std::exception& e) {
         Logger()->error("Failed to open project: {}", e.what());
@@ -4315,7 +4324,7 @@ bool CWindow::OpenVolume(const QString& path,
         return false;
     }
 
-    CloseVolume();
+    if (!CloseVolume()) return false;
     // Without a choice, the volume the user last viewed in the project.
     const auto ids = package->volumeIDs();
     const auto remembered = QString::fromStdString(package->currentVolumeId());
@@ -4327,9 +4336,6 @@ bool CWindow::OpenVolume(const QString& path,
         _menuController->updateRecentVolpkgList(aVpkgPath);
     }
 
-    if (_fileWatcher) {
-        _fileWatcher->startWatching();
-    }
     return true;
 }
 
@@ -4459,10 +4465,8 @@ std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const vc::
     // choices); without a store, the cached catalog's registrations.
     vc::objects::VolumeTransforms transforms;
     if (const auto attachment = _state->storeFor("volume_transform")) {
-        _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-            transforms = db.volumeTransforms(txn);
-        });
-    } else if (const auto catalog = vc3d::opendata::cachedCatalog()) {
+        transforms = _state->objectStoreSession()->volumeTransforms(*attachment);
+    } else if (const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))) {
         transforms.graph.addCatalog(*catalog);
     }
     return transforms.toVolume(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(from)}}, to.volume, to.scale);
@@ -4477,7 +4481,40 @@ void CWindow::setVolumeLevel(int level)
         syncVolumeLevelControl();
         return;
     }
+    if (_segmentationModule) {
+        const auto save = _segmentationModule->autosaveStatus();
+        if (save.saveInProgress || save.pending || save.dirtyAfterSave) {
+            if (!save.saveInProgress) _segmentationModule->flushAutosave();
+            statusBar()->showMessage(tr("Finishing the surface save before changing the working level…"), 2000);
+            QTimer::singleShot(100, this, [this, volume, level] {
+                if (_state->currentVolume() == volume && _volumeLevelSpin && _volumeLevelSpin->value() == level)
+                    setVolumeLevel(level);
+            });
+            return;
+        }
+        if (!_segmentationModule->saveCorrections()) {
+            syncVolumeLevelControl();
+            return;
+        }
+        if (_segmentationModule->hasActiveSession()) _segmentationModule->endEditingSession();
+    }
+    const auto navigation = _viewerManager ? _viewerManager->captureNavigation() : nullptr;
+    const auto oldVoxels = _state->annotationVolume().value_or(
+        vc::project::annotationVolume(_state->vpkg().get(), *volume));
+    std::optional<SurfaceCatalog::Opened> reopened;
+    std::optional<vcr::catalog::Affine> transform;
     try {
+        // Prepare geometry before persisting the new level: a failed surface
+        // read must leave both the project and the current view untouched.
+        auto nextVoxels = vc::objects::VolumeVoxels(oldVoxels);
+        nextVoxels.scale *= std::ldexp(1.0, volume->baseScaleLevel() - level);
+        transform = volumeTransformForSwitch(oldVoxels, nextVoxels);
+        if (_surfacePanel && _surfacePanel->opened() && _state->surface("segmentation")) {
+            const auto& opened = *_surfacePanel->opened();
+            reopened = SurfaceCatalog::open(_state->objectStoreSession(), opened.pin.attachment,
+                                            nextVoxels, opened.surface->id,
+                                            opened.current ? std::nullopt : std::optional(opened.pin.reference()));
+        }
         _state->vpkg()->setVolumeLevel(volume->id(), level);
     } catch (const std::exception& error) {
         QMessageBox::warning(this, tr("Working Level"),
@@ -4486,7 +4523,23 @@ void CWindow::setVolumeLevel(int level)
         syncVolumeLevelControl();
         return;
     }
+    // Drop the old-frame draft before changing the frame it is declared in.
+    if (reopened) _state->setSurface("segmentation", nullptr);
     setVolume(_state->vpkg()->volume(volume->id()));
+    if (reopened) {
+        const auto surface = reopened->surface;
+        _surfacePanel->replaceOpenedSurface(std::move(*reopened));
+        _state->setActiveSurface(surface->id, surface);
+        _state->setSurface("segmentation", surface, false, true);
+        if (_segmentationModule) {
+            try { _segmentationModule->onActiveSegmentChanged(surface.get()); }
+            catch (const std::exception& error) {
+                statusBar()->showMessage(tr("Correction editor kept: %1").arg(QString::fromUtf8(error.what())), 8000);
+            }
+        }
+        _axisAlignedSliceController->applyOrientation(surface.get());
+    }
+    if (navigation && transform) _viewerManager->restoreNavigation(navigation, *transform);
     refreshVolumeSelectionUi(QString::fromStdString(volume->id()));
 }
 
@@ -4728,27 +4781,26 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 }
 
-void CWindow::CloseVolume(void)
+bool CWindow::CloseVolume()
 {
-    if (_fileWatcher) {
-        _fileWatcher->stopWatching();
-    }
-
-
     // Tear down active segmentation editing before surfaces disappear to avoid
     // dangling pointers inside the edit manager when the underlying surfaces
     // are unloaded (reloading with editing enabled previously triggered a
     // use-after-free crash).
-    if (_segmentationModule) {
-        if (_segmentationModule->editingEnabled()) {
-            _segmentationModule->setEditingEnabled(false);
-        } else if (_segmentationModule->hasActiveSession()) {
-            _segmentationModule->endEditingSession();
-        }
+    try {
+        _state->closeAll([this] {
+            if (!_segmentationModule) return;
+            if (_segmentationModule->editingEnabled())
+                _segmentationModule->setEditingEnabled(false);
+            else if (_segmentationModule->hasActiveSession())
+                _segmentationModule->endEditingSession();
+        });
+    } catch (const std::exception& error) {
+        if (!_destroyingWindow)
+            QMessageBox::warning(this, tr("Close blocked"), QString::fromUtf8(error.what()));
+        return false;
     }
 
-    // CState::closeAll emits volumeClosing, clears surfaces, vpkg, volume, points
-    _state->closeAll();
     if (_spiralWorkspace) {
         _spiralWorkspace->synchronizeVolume(nullptr);
     }
@@ -4784,7 +4836,7 @@ void CWindow::CloseVolume(void)
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->setOverlayVolume(nullptr, {});
     }
-
+    return true;
 }
 
 // Handle open request
@@ -4806,7 +4858,7 @@ auto CWindow::can_change_volume_() -> bool
 
 void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface)
 {
-    const std::string previousSurfId = _state->activeSurfaceId();
+    const auto previousSurface = _state->activeSurface().lock();
     const std::string newSurfId = surfaceId.toStdString();
 
     if (_state && !newSurfId.empty() && surface) {
@@ -4819,7 +4871,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
 
     _state->setSurface("segmentation", surf, false, false);
 
-    if (newSurfId != previousSurfId) {
+    if (surface != previousSurface) {
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
             _segmentationModule->setEditingEnabled(false);
         } else if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {
@@ -4840,8 +4892,8 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
             }
         }
 
-        loadLasagnaResults(surf.get());
     }
+    loadLasagnaResults(surf.get());
 
     const bool moveOnSurfaceChange = moveOnSurfaceChangeEnabled();
     const bool activatingAxisAlignedPlane =
@@ -4906,7 +4958,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
 
 void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface)
 {
-    const std::string previousSurfId = _state->activeSurfaceId();
+    const auto previousSurface = _state->activeSurface().lock();
     const std::string newSurfId = surfaceId.toStdString();
 
     if (_state && !newSurfId.empty() && surface) {
@@ -4919,7 +4971,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
 
     _state->setSurface("segmentation", surf, false, false);
 
-    if (newSurfId != previousSurfId && _segmentationModule) {
+    if (surface != previousSurface && _segmentationModule) {
         try {
             _segmentationModule->onActiveSegmentChanged(surf.get());
         } catch (const std::exception& e) {
@@ -4931,8 +4983,6 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
             _state->setSurface("segmentation", nullptr, false, false);
             surf.reset();
         }
-
-        loadLasagnaResults(surf.get());
 
         const bool wantsEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
         if (wantsEditing) {
@@ -4958,6 +5008,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
         }
     }
 
+    loadLasagnaResults(surf.get());
     if (moveOnSurfaceChangeEnabled()) {
         try {
             if (surf) {
@@ -5599,51 +5650,48 @@ std::vector<vc::objects::AttachmentIdentity> openStores(const CState& state)
 }
 }
 
-void CWindow::updateHubStatus()
+void CWindow::updateHostedStatus()
 {
     const auto session = _state->objectStoreSession();
-    QStringList texts;
-    std::vector<std::string> conflicts;
+    const auto pending = session->pendingSubmissions();
+    QStringList texts, tips;
+    bool failing = false;
     for (const auto& attachment : openStores(*_state)) {
-        const auto status = session->hubStatus(attachment);
-        if (!status) continue;
-        texts << tr("%1 Hub: %2").arg(QString::fromStdString(session->path(attachment).stem().string()),
-                                       hubStatusSummary(*status));
-        for (const auto& conflict : status->conflicts) conflicts.push_back(conflict.uuid);
+        std::optional<vc::objects::HostedFreshness> freshness;
+        try { freshness = session->freshness(attachment); } catch (const std::exception&) { continue; }
+        if (!freshness) continue;
+        const auto endpoint = QString::fromStdString(session->location(attachment));
+        const auto checked = freshness->checkedAtUs
+            ? QDateTime::fromMSecsSinceEpoch(*freshness->checkedAtUs / 1000).toLocalTime().toString(QStringLiteral("HH:mm:ss"))
+            : QString();
+        QString text;
+        if (!freshness->error.empty()) {
+            failing = true;
+            text = checked.isEmpty() ? tr("%1: disconnected").arg(endpoint)
+                                     : tr("%1: disconnected, last current %2").arg(endpoint, checked);
+            tips << tr("%1: %2").arg(endpoint, QString::fromStdString(freshness->error));
+        } else if (!checked.isEmpty()) {
+            text = tr("%1: current as of %2").arg(endpoint, checked);
+        } else {
+            text = tr("%1: unknown").arg(endpoint);
+        }
+        const auto waiting = std::count_if(pending.begin(), pending.end(),
+                                           [&](const auto& p) { return p.storeUuid == attachment.storeUuid; });
+        if (waiting) text += tr(" · %n save(s) pending", nullptr, int(waiting));
+        if (freshness->status)
+            tips << tr("%1: store %2, generation %3, commit %4")
+                        .arg(endpoint, QString::fromStdString(freshness->status->storeUuid))
+                        .arg(QString::fromStdString(freshness->status->generation))
+                        .arg(freshness->status->commitSequence);
+        texts << text;
     }
     if (texts.isEmpty()) {
-        _hubStatusLabel->hide();
-        _hubPromptedConflicts.clear();
+        _hostedStatusLabel->hide();
         return;
     }
-    _hubStatusLabel->setText(texts.join(QStringLiteral("  ")));
-    _hubStatusLabel->show();
-    // Ask about a set of conflicts once; Sync Now asks again.
-    if (conflicts.empty() || conflicts == _hubPromptedConflicts) return;
-    _hubPromptedConflicts = conflicts;
-    promptHubConflicts();
+    _hostedStatusLabel->setText(texts.join(QStringLiteral("  ")));
+    _hostedStatusLabel->setToolTip(tips.join(QStringLiteral("\n")));
+    _hostedStatusLabel->setStyleSheet(failing ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
+    _hostedStatusLabel->show();
 }
 
-void CWindow::promptHubConflicts()
-{
-    const auto session = _state->objectStoreSession();
-    for (const auto& attachment : openStores(*_state)) {
-        const auto status = session->hubStatus(attachment);
-        if (!status || status->conflicts.empty()) continue;
-        QStringList uuids;
-        for (const auto& conflict : status->conflicts) uuids << QString::fromStdString(conflict.uuid);
-        QMessageBox box(QMessageBox::Warning, tr("Hosted object store conflict"),
-            tr("%n record(s) of %1 changed both here and on the hub:", nullptr, int(uuids.size()))
-                .arg(QString::fromStdString(session->path(attachment).filename().string())) +
-                QStringLiteral("\n") + uuids.mid(0, 10).join(QStringLiteral("\n")) +
-                (uuids.size() > 10 ? QStringLiteral("\n...") : QString()) +
-                tr("\n\nUse the hub's versions (discarding your changes to them), or keep yours and publish them?"),
-            QMessageBox::NoButton, this);
-        auto* useHub = box.addButton(tr("Use Hub Versions"), QMessageBox::DestructiveRole);
-        auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
-        box.addButton(tr("Later"), QMessageBox::RejectRole);
-        box.exec();
-        if (box.clickedButton() == useHub) session->resolveHubConflicts(attachment, "hub");
-        else if (box.clickedButton() == keepMine) session->resolveHubConflicts(attachment, "local");
-    }
-}

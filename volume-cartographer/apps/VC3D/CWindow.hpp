@@ -31,7 +31,7 @@
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -69,6 +69,7 @@ class SurfacePanelController;
 class SurfaceCatalog;
 class StoreSurfaceOverlayController;
 class MenuActionController;
+class StoreImportController;
 class VolumeAttachmentController;
 class SegmentationGrower;
 class ViewerControlsPanel;
@@ -79,7 +80,6 @@ class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
 class QFrame;
-class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class LineAnnotationController;
@@ -91,6 +91,7 @@ class LineAnnotationDialog;
 class SpiralWorkspace;
 class ProjectWorkspace;
 class FiberMapWorkspace;
+namespace vc3d::fibers3d { class Fiber3DPanel; }
 
 class CWindow : public QMainWindow
 {
@@ -98,6 +99,7 @@ class CWindow : public QMainWindow
     Q_OBJECT
 
     friend class MenuActionController;
+    friend class StoreImportController;
     friend class VolumeAttachmentController;
     friend class AgentBridgeServer;
 
@@ -118,17 +120,16 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, std::optional<vc::PointRef> point);
 
 public:
-    // Status bar and conflict prompt for an attached hosted replica.
-    void updateHubStatus();
-    void promptHubConflicts();
+    // Each hosted store's freshness (current as of its last check, or
+    // disconnected) and pending saves, in the status bar.
+    void updateHostedStatus();
     enum class VolumeOpenError {
         None,
         PackageLoadFailed,
         VolumeNotFound,
     };
 
-    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
-                     bool debugDownloadQueue = false);
+    explicit CWindow(size_t cacheSizeGB);
     ~CWindow(void);
 
     bool openVolumePackage(const QString& path,
@@ -174,6 +175,8 @@ private:
     void UpdateVolpkgLabel(int filterCounter);
     void updateVolumePackageEmptyState();
     void showStatusBarMessage(const QString& text, int timeout = 0);
+    // Crash recovery of drafts (settings: object_store/draft_*).
+    void startDraftRecovery();
     void clearStatusBarMessage();
 
 
@@ -190,7 +193,7 @@ private:
                     QString* errorMessage = nullptr,
                     const QString& preferredVolumeId = {},
                     VolumeOpenError* openError = nullptr);
-    void CloseVolume(void);
+    bool CloseVolume();
 
 
     void setVolume(std::shared_ptr<Volume> newvol);
@@ -276,6 +279,9 @@ private:
     CPointCollectionWidget* _point_collection_widget;
     WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
+    QDockWidget* _fibers3DDock{nullptr};
+    vc3d::fibers3d::Fiber3DPanel* _fibers3DPanel{nullptr};
+    QDockWidget* _scene3DDock{nullptr};
 
     SurfaceTreeWidget *treeWidgetSurfaces;
 
@@ -290,8 +296,7 @@ private:
     QPointer<QLabel> _lineAnnotationLengthLabel;
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
-    QLabel* _hubStatusLabel{nullptr};
-    std::vector<std::string> _hubPromptedConflicts;
+    QLabel* _hostedStatusLabel{nullptr};
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};
     QTimer* _statusMessageTimer{nullptr};
@@ -320,7 +325,6 @@ private:
 
     bool can_change_volume_();
 
-    size_t _cacheSizeBytes = 0;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
@@ -347,14 +351,13 @@ private:
     std::unique_ptr<SurfaceCatalog> _surfaceCatalog;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
+    std::unique_ptr<StoreImportController> _storeImportController;
     std::unique_ptr<MenuActionController> _menuController;
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
-    bool _debugDownloadQueue{false};
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 
-    std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::unique_ptr<LineAnnotationController> _lineAnnotationController;

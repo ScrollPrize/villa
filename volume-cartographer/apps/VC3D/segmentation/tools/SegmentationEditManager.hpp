@@ -21,13 +21,6 @@ class SegmentationEditManager : public QObject
     Q_OBJECT
 
 public:
-    enum class GridSearchResolution
-    {
-        Low,
-        Medium,
-        High
-    };
-
     struct GridKey
     {
         int row{0};
@@ -88,6 +81,11 @@ public:
         std::shared_ptr<vc::objects::ObjectStoreSession> session;
         vc::objects::CoordinateJson coordinates;
         vc::objects::AttachmentIdentity attachment;
+        // The committed version the surface was read at, and whether the
+        // surface still holds it (no unsaved edits): then the draft needs no
+        // crash-recovery checkpoint until it is edited.
+        std::optional<vc::objects::ObjectVersion> base;
+        bool saved = false;
     };
     // Edits keep the draft current (the open surface's, kept by CState).
     bool beginSession(std::shared_ptr<QuadSurface> baseSurface, DraftTarget draft);
@@ -131,8 +129,6 @@ public:
 
     std::optional<std::pair<int, int>> worldToGridIndex(const cv::Vec3f& worldPos,
                                                         float* outDistance = nullptr,
-                                                        GridSearchResolution detail =
-                                                            GridSearchResolution::High,
                                                         bool warnOnFailure = true) const;
     std::optional<cv::Vec3f> vertexWorldPosition(int row, int col) const;
 
@@ -146,7 +142,6 @@ public:
 
     [[nodiscard]] const ActiveDrag& activeDrag() const { return _activeDrag; }
     [[nodiscard]] const std::vector<GridKey>& recentTouched() const { return _recentTouched; }
-    [[nodiscard]] std::optional<cv::Rect> recentTouchedBounds() const;
     [[nodiscard]] std::vector<VertexEdit> editedVertices() const;
 
     void markNextEditsAsGrowth();

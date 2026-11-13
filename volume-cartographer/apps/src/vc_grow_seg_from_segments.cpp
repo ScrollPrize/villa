@@ -1,8 +1,11 @@
+#include <utility>
 #include <iostream>
 #include "TargetContext.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
-#include "vc/core/types/VcDataset.hpp"
+#include <vc_reader/tifxyz.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_metadata.hpp>
 
 #include <algorithm>
 #include <boost/program_options.hpp>
@@ -17,14 +20,13 @@
 #include <random>
 #include <set>
 
-#include "vc/core/util/PointIndex.hpp"
+#include <vc_object_store/geometry/VertexIndex.hpp>
 #include "vc/core/util/OpenCvCompat.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include "vc/core/util/SurfaceArea.hpp"
-#include "vc/core/util/VoxelSizeMetadata.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -37,12 +39,13 @@
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 
 
 using shape = std::vector<size_t>;
 
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 namespace po = boost::program_options;
 
 namespace {
@@ -333,15 +336,7 @@ static QuadSurface* find_source_surface_containing_point(const std::vector<QuadS
     return nullptr;
 }
 
-static nlohmann::json json_from_utils(const utils::Json& json)
-{
-    return nlohmann::json::parse(json.dump());
-}
 
-static utils::Json json_to_utils(const nlohmann::json& json)
-{
-    return utils::Json::parse(json.dump());
-}
 
 static double json_number_or(const nlohmann::json& json, const char* key, double fallback)
 {
@@ -629,7 +624,7 @@ static std::unique_ptr<QuadSurface> load_or_create_center_cutout(QuadSurface& ta
 }
 
 static DistanceStats sampled_distance_stats(const cv::Mat_<cv::Vec3f>& samples,
-                                            const PointIndex& index,
+                                            const vc::geometry::VertexIndex& index,
                                             int valid_count,
                                             int max_samples,
                                             double tolerance)
@@ -762,7 +757,7 @@ static void add_completeness_metrics(QuadSurface& result, SweepMetrics& metrics)
 
 static SweepMetrics score_surface(QuadSurface& result,
                                   QuadSurface& target,
-                                  const PointIndex& target_index,
+                                  const vc::geometry::VertexIndex& target_index,
                                   double target_area_vx2,
                                   double target_area_cm2,
                                   int target_valid_points,
@@ -774,7 +769,9 @@ static SweepMetrics score_surface(QuadSurface& result,
     metrics.has_result = true;
     metrics.valid_points = result.countValidPoints();
     metrics.valid_quads = result.countValidQuads();
-    metrics.area_vx2 = vc::surface::computeSurfaceAreaVox2(result);
+    metrics.area_vx2 = ([&] { const auto& points = *std::as_const(result).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
     metrics.area_cm2 = area_cm2_or_nan(metrics.area_vx2, voxelsize);
     if (target_area_vx2 > 0.0) {
         metrics.area_ratio = metrics.area_vx2 / target_area_vx2;
@@ -785,8 +782,8 @@ static SweepMetrics score_surface(QuadSurface& result,
     const auto* target_points = target.rawPointsPtr();
     metrics.result_to_target = sampled_distance_stats(*result_points, target_index, metrics.valid_points, max_samples, tolerance);
 
-    PointIndex result_index;
-    result_index.buildFromMat(*result_points);
+    vc::geometry::VertexIndex result_index;
+    result_index.rebuild(*result_points);
     metrics.target_to_result = sampled_distance_stats(*target_points, result_index, target_valid_points, max_samples, tolerance);
 
     metrics.result_coverage_fraction = metrics.result_to_target.samples > 0
@@ -816,7 +813,9 @@ static SweepMetrics score_surface_without_target(QuadSurface& result, double vox
     metrics.has_result = true;
     metrics.valid_points = result.countValidPoints();
     metrics.valid_quads = result.countValidQuads();
-    metrics.area_vx2 = vc::surface::computeSurfaceAreaVox2(result);
+    metrics.area_vx2 = ([&] { const auto& points = *std::as_const(result).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
     metrics.area_cm2 = area_cm2_or_nan(metrics.area_vx2, voxelsize);
     add_completeness_metrics(result, metrics);
     const double hole_penalty = 1.0 - std::clamp(metrics.enclosed_hole_fraction, 0.0, 1.0);
@@ -867,37 +866,29 @@ static void add_metric_meta(QuadSurface& surf, const SweepMetrics& metrics)
 static std::vector<QuadSurface*> load_source_surfaces(const std::filesystem::path& src_dir,
                                                       QuadSurface* src)
 {
+    // The tifxyz surfaces in src_dir with the auto-grow prefix, as vc_reader lists them (a
+    // directory missing a coordinate file is not one; unreadable metadata is skipped with a
+    // message); only surfaces with a bbox take part.
     std::vector<QuadSurface*> surfaces;
-    for (const auto& entry : std::filesystem::directory_iterator(src_dir)) {
-        if (!std::filesystem::is_directory(entry)) {
-            continue;
-        }
-
-        std::string name = entry.path().filename().string();
+    for (const auto& entry : vcr::tifxyz::list(src_dir.string(), false)) {
+        const std::filesystem::path location(entry.location);
+        const std::string name = location.filename().string();
         if (name.compare(0, std::strlen(kAutoGrowPrefix), kAutoGrowPrefix)) {
             continue;
         }
-
-        std::filesystem::path meta_fn = entry.path() / "meta.json";
-        if (!std::filesystem::exists(meta_fn)) {
+        if (!entry.error.empty()) {
+            std::cerr << "Skipping " << entry.location << ": " << entry.error << std::endl;
             continue;
         }
-
-        utils::Json meta = utils::Json::parse_file(meta_fn);
-
-        if (!meta.count("bbox")) {
-            continue;
-        }
-
-        if (meta.value("format", std::string{"NONE"}) != "tifxyz") {
+        if (!entry.metadata.bbox) {
             continue;
         }
 
         QuadSurface* sm;
-        if (src && entry.path().filename() == src->id) {
+        if (src && location.filename() == src->id) {
             sm = src;
         } else {
-            sm = new QuadSurface(entry.path(), meta);
+            sm = new QuadSurface(location);
         }
 
         surfaces.push_back(sm);
@@ -917,13 +908,13 @@ static void delete_loaded_source_surfaces(std::vector<QuadSurface*>& surfaces, Q
 
 } // namespace
 
-static void add_internal_volume_shape(utils::Json& params, const std::vector<size_t>& shape)
+static void add_internal_volume_shape(nlohmann::json& params, const std::vector<size_t>& shape)
 {
     if (shape.size() != 3) {
         throw std::runtime_error("Expected zarr dataset shape [z, y, x]");
     }
 
-    auto volume_shape = utils::Json::array();
+    auto volume_shape = nlohmann::json::array();
     volume_shape.push_back(static_cast<int>(shape[0]));
     volume_shape.push_back(static_cast<int>(shape[1]));
     volume_shape.push_back(static_cast<int>(shape[2]));
@@ -1140,15 +1131,9 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    Json params = params_path.empty() ? Json::object() : Json::parse_file(params_path);
+    Json params = params_path.empty() ? Json::object() : nlohmann::json::parse(std::ifstream(params_path));
     if (cli_max_width > 0) {
         params["max_width"] = cli_max_width;
-    }
-    // Honor optional CUDA toggle from params (default true)
-    if (params.contains("use_cuda")) {
-        set_space_tracing_use_cuda(params.value("use_cuda", true));
-    } else {
-        set_space_tracing_use_cuda(true);
     }
     // Store mode: debug snapshots go to a scratch directory that becomes part of
     // the first output's artifacts; sources are the selected stored surfaces.
@@ -1158,7 +1143,8 @@ int main(int argc, char *argv[])
         store.emplace(store_path, "vc_grow_seg_from_segments");
         tgt_dir = std::filesystem::temp_directory_path() / ("vc-grow-segments-" + vc::objects::util::newUuid());
         std::vector<std::string> uuids;
-        store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
+        store->objects().session()->readStore(store->objects().attachment(),
+                                              [&](const vc::objects::StoreReader& reader, const auto&) {
             vc::objects::ObjectSelection selection;
             selection.kind = "surface";
             if (!source_tag.empty()) selection.tag = source_tag;
@@ -1166,7 +1152,7 @@ int main(int argc, char *argv[])
                 selection.volume = volume_voxels->volume;
                 selection.targetScale = volume_voxels->scale;
             }
-            for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{})) uuids.push_back(object.uuid);
+            for (const auto& object : reader.selectObjects(selection, std::vector<std::string>{})) uuids.push_back(object.uuid);
         });
         if (!src_surface.empty() && std::find(uuids.begin(), uuids.end(), vc::objects::util::canonicalUuid(src_surface)) == uuids.end())
             uuids.push_back(src_surface);
@@ -1177,41 +1163,53 @@ int main(int argc, char *argv[])
     for (const auto& surface : stored_sources) stored_source_pointers.push_back(surface.get());
     std::vector<std::string> published;
     auto publish = [&](QuadSurface& surface, const std::string& name, const QuadSurface* source) {
-        const auto uuid = store->create(surface, name, nlohmann::json::parse(params.dump()),
+        const auto uuid = store->create(surface, name, params,
                                         source ? std::vector<std::string>{source->id} : std::vector<std::string>{},
                                         output_tags, volume_voxels);
         published.push_back(uuid);
         std::cout << "surface_uuid: " << uuid << std::endl;
     };
-    // The debug output moves into the first published surface's artifacts;
-    // across filesystems it is copied. It is kept where it is if neither works.
+    // The debug output is published as artifacts of the first published
+    // surface (grow_debug/<relative path>), then removed. It is kept where it
+    // is when publishing fails.
     auto finish_store = [&] {
         std::error_code error;
+        bool keep = false;
         if (!published.empty() && std::filesystem::exists(tgt_dir) && !std::filesystem::is_empty(tgt_dir, error)) {
-            const auto debug = store->objects().session()->artifactDirectory(store->objects().attachment(), published.front()) / "grow_debug";
-            std::filesystem::rename(tgt_dir, debug, error);
-            if (error) {
-                error.clear();
-                std::filesystem::copy(tgt_dir, debug, std::filesystem::copy_options::recursive, error);
+            std::vector<std::pair<std::string, std::filesystem::path>> files;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(tgt_dir))
+                if (entry.is_regular_file())
+                    files.emplace_back("grow_debug/" + entry.path().lexically_relative(tgt_dir).generic_string(), entry.path());
+            std::sort(files.begin(), files.end());
+            try {
+                if (!files.empty()) store->objects().publishArtifacts(published.front(), files);
+            } catch (const std::exception& failure) {
+                keep = true;
+                std::cerr << "keeping grow debug output at " << tgt_dir << ": " << failure.what() << std::endl;
             }
-            if (error) std::cerr << "keeping grow debug output at " << tgt_dir << ": " << error.message() << std::endl;
         }
-        if (!error) std::filesystem::remove_all(tgt_dir, error);
+        if (!keep) std::filesystem::remove_all(tgt_dir, error);
         store->objects().finish();
     };
     params["tgt_dir"] = tgt_dir.string();
 
-    std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / "0");
-
-    std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
-    std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
-    add_internal_volume_shape(params, ds->shape());
+    // The volume's physical level 0, wherever its pyramid puts it.
+    const auto pyramid = vcr::zarr::pyramidLevels(vol_path.string(), {});
+    const auto level0It = std::find_if(pyramid.begin(), pyramid.end(), [](const auto& level) { return level.level == 0; });
+    if (level0It == pyramid.end())
+        throw std::runtime_error("no pyramid level 0 in " + vol_path.string());
+    const auto& level0 = level0It->meta;
+    const std::vector<size_t> shape(level0.shape.begin(), level0.shape.end());
+    std::cout << "zarr dataset size for scale group 0 " << shape << std::endl;
+    std::cout << "chunk shape shape "
+              << std::vector<size_t>(level0.chunks.begin(), level0.chunks.end()) << std::endl;
+    add_internal_volume_shape(params, shape);
 
     // Resolved the same way Volume does, so a store that states its voxel size
     // only through an acquisition record is not read as 0.
     // 0 still means unknown, and every cm^2 below is then reported as null.
     float voxelsize = 0.0f;
-    if (const auto resolved = vc::metadata::resolveLocalStoreVoxelSize(vol_path)) {
+    if (const auto resolved = vcr::zarr::storeVoxelSizeUm(vol_path.string())) {
         voxelsize = static_cast<float>(*resolved);
     }
     std::cout << "voxelsize: " << voxelsize << std::endl;
@@ -1251,16 +1249,18 @@ int main(int argc, char *argv[])
         const int target_valid_points = target->countValidPoints();
         const int target_valid_quads = target->countValidQuads();
         const cv::Size target_grid_size = target->rawPointsPtr()->size();
-        const double target_area_vx2 = vc::surface::computeSurfaceAreaVox2(*target);
+        const double target_area_vx2 = ([&] { const auto& points = *std::as_const(*target).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
         const double target_area_cm2 = area_cm2_or_nan(target_area_vx2, voxelsize);
-        PointIndex target_index;
+        vc::geometry::VertexIndex target_index;
         if (!seed_only_sweep) {
-            target_index.buildFromMat(*target->rawPointsPtr());
+            target_index.rebuild(*target->rawPointsPtr());
         }
 
         std::vector<SweepRun> runs;
         try {
-            const nlohmann::json base_params = json_from_utils(params);
+            const nlohmann::json base_params = (params);
             if (sweep_strategy == "lhs") {
                 runs = sample_sweep_runs_latin_hypercube(
                     base_params,
@@ -1386,7 +1386,7 @@ int main(int argc, char *argv[])
             run_report["values"] = runs[i].values;
 
             try {
-                utils::Json run_utils_params = json_to_utils(run_params);
+                nlohmann::json run_utils_params = (run_params);
                 surf = grow_surf_from_surfs(seed.get(), surfaces, run_utils_params, voxelsize);
                 if (surf) {
                     SweepMetrics sweep_metrics = seed_only_sweep
@@ -1403,8 +1403,8 @@ int main(int argc, char *argv[])
                             sweep_max_distance_samples);
 
                     surf->meta["source"] = "vc_grow_seg_from_segments_sweep";
-                    surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(run_params);
-                    surf->meta["sweep_values"] = json_to_utils(runs[i].values);
+                    surf->meta["vc_grow_seg_from_segments_params"] = (run_params);
+                    surf->meta["sweep_values"] = (runs[i].values);
                     surf->meta["sweep_target"] = sweep_target_path.string();
                     surf->meta["sweep_seed_only"] = seed_only_sweep;
                     add_metric_meta(*surf, sweep_metrics);
@@ -1533,8 +1533,8 @@ int main(int argc, char *argv[])
             }
 
             surf->meta["source"] = "vc_grow_seg_from_segments_seed_coordinate";
-            surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
-            auto seed_coord = utils::Json::array();
+            surf->meta["vc_grow_seg_from_segments_params"] = params;
+            auto seed_coord = nlohmann::json::array();
             seed_coord.push_back(static_cast<double>(seed.point[0]));
             seed_coord.push_back(static_cast<double>(seed.point[1]));
             seed_coord.push_back(static_cast<double>(seed.point[2]));
@@ -1567,7 +1567,7 @@ int main(int argc, char *argv[])
         QuadSurface* surf = grow_surf_from_surfs(src, stored_source_pointers, params, voxelsize);
         if (surf) {
             surf->meta["source"] = "vc_grow_seg_from_segments";
-            surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
+            surf->meta["vc_grow_seg_from_segments_params"] = params;
             add_target_context(surf->meta, vol_path);
             publish(*surf, "auto_trace_" + get_surface_time_str(), src);
             delete surf;
@@ -1577,14 +1577,13 @@ int main(int argc, char *argv[])
     }
 
     std::vector<QuadSurface*> surfaces;
-    std::filesystem::path meta_fn = src_path / "meta.json";
-    if (!std::filesystem::exists(meta_fn)) {
-        std::cerr << "Error: meta.json not found at " << meta_fn << std::endl;
+    try {
+        (void)vcr::tifxyz::readMetadata(src_path.string());
+    } catch (const std::exception& error) {
+        std::cerr << "Error: cannot read the surface metadata at " << src_path << ": " << error.what() << std::endl;
         return EXIT_FAILURE;
     }
-
-    utils::Json meta = utils::Json::parse_file(meta_fn);
-    QuadSurface *src = new QuadSurface(src_path, meta);
+    QuadSurface *src = new QuadSurface(src_path);
 
     surfaces = load_source_surfaces(src_dir, src);
 
@@ -1594,7 +1593,7 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
 
     surf->meta["source"] = "vc_grow_seg_from_segments";
-    surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
+    surf->meta["vc_grow_seg_from_segments_params"] = params;
     add_target_context(surf->meta, vol_path);
     std::string uuid = "auto_trace_" + get_surface_time_str();;
     std::filesystem::path seg_dir = tgt_dir / uuid;

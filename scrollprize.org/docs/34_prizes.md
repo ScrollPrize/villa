@@ -136,7 +136,7 @@ Prizes will be awarded to any team or individual that fully digitally unrolls an
 
 **Submitting your result**
 
-If you have a qualifying result, submit it for consideration by sending an email to [grandprize@scrollprize.org](mailto:grandprize@scrollprize.org) and provide the following:
+A submission must include the following:
 
 * **Meshes.** The submission must contain a set of meshes in tifxyz format whose union corresponds to the totality of the scroll surface to be virtually unwrapped. Each tifxyz must already include a low-distortion isometric 2D parametrization (flattening). At most one mesh per full column of text (plus its margins) will be accepted; smaller meshes are not considered valid unless they localize regions where the papyrus is broken, or detached patches. Name each mesh with a sequential column number (e.g. `column_01.tifxyz`, `column_02.tifxyz`, ...) following the order of the windings, so every mesh is identifiable by its column.
 * **Images.** Submissions must include images of the virtually unwrapped papyrus, showing visible and legible text.
@@ -147,7 +147,7 @@ If you have a qualifying result, submit it for consideration by sending an email
   * Also include a single banner image spanning the full unrolled scroll, showing ink detection results across all columns, with each column's number overlaid on it — so the whole submission can be checked against the numbered meshes and images at a glance.
 * **Methodology.** A detailed technical description of how your solution works. We need to be able to reproduce your work, so please make this as easy as possible:
   * Please create a Docker image that we can easily run to reproduce your work, and please include system requirements.
-  * Attach your code/video directly to the email, or include an easily accessible link from which we can download it.
+  * Please include an easily accessible link from which we can download it.
 * **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
   * The larger your model's window size, the easier it is for it to invent plausible letterforms instead of recovering real ink. Large windows are fine, but you must demonstrate that the text is not hallucinated — for example by finding plausible text on held-out regions.
 * **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
@@ -207,7 +207,7 @@ One of the frontiers of Vesuvius Challenge is finding techniques that work acros
 While we’ve discovered text in some of our scrolls, others have not yet produced legible findings.
 For these prizes, your mission is to prove that ink detection works on scrolls where nothing has been read yet. The review bar is deliberately high — we’d rather be slow than wrong.
 
-**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their code, data, model weights and results (after winning the prize). First Letters prizes will be awarded for a maximum of 9 more scrolls — up to <span className="vc-money">\$450,000</span> in total.
+**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their code, data, model weights and results (after winning the prize). First Letters prizes will be awarded for a maximum of 8 more scrolls — up to <span className="vc-money">\$400,000</span> in total.
 
 Note the eligible set here is different than the [2027 Grand Prize](#2027-grand-prize) set: it includes several other scrolls where no text has been read yet, and excludes those where letters have now been found.
 
@@ -312,14 +312,14 @@ The prizes above feel too ambitious? There are plenty of other ways to contribut
 <div className="vc-deadline">
 
 {/* progress-prizes:deadline:start */}
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, October 31st, 2026!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, November 30th, 2026!
 {/* progress-prizes:deadline:end */}
 
 </div>
 <div className="vc-submit">
 
 {/* progress-prizes:form:start */}
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSc4flEfgK2nyjoczz2_U_XrIGMlgrnSknWatLqrFPnbtKfZwg/viewform)
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSeB6MC_--4UCCEGc3zalX57-uE4puRcE_vJoYJCrEt4uYaaaw/viewform)
 {/* progress-prizes:form:end */}
 
 </div>
@@ -337,16 +337,16 @@ We favor submissions that:
 * Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month. This includes releasing model weights and training data where applicable.
 * Actually **get used**. We’ll look for signals from the community: questions, comments, bug reports, feature requests. Our Annotation Team will publicly provide comments on tools they use.
 * Improve results quantitatively and/or qualitatively on **real data**. If you are working on [ink detection](/data_datasets#ink-labels-2026-07) or [surface prediction](/data_datasets#surface-labels-2026-07) your method should be evaluated on our public datasets. If you are working on virtual unwrapping, show visually that papyrus fibers are visible on your output surface, and it doesn't jump across sheets in cross-section.
-* Resolve outstanding **bugs in tools that people are using**, and that you are using yourself, evidenced by before/after screenshots, logs, etc.
-* Reveal **insightful, actionable** information. If you are building analytic tools, show how they facilitated improvements to unwrapping or ink detection, for example by detecting failure-cases of existing methods on real scroll data, or producing information that resulted in better model results for the relevant task (see above).
+* Resolve outstanding **bugs in tools that people are using**, and that you are using yourself, evidenced by before/after screenshots, logs, etc. Fixes for issues that are theoretically wrong but rarely or never cause problems in practice are unlikely to be awarded.
 * Are **well documented**. It helps a lot if relevant documentation, walkthroughs, images, tutorials or similar are included with the work so that others can use it!
 
 Any contribution that makes any of the [Open Problems](/2026_open_problems) easier to address will be eligible for a Progress Prize.
 We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22help%20wanted%22) of ideas that would make excellent progress prize submissions.
 [Improvements to VC3D](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3AVC3D) can be also considered for progress prizes!
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
+We discourage standalone analytic, auditing or evaluation tools, and instead encourage work that directly **advances unwrapping or ink detection**.
 
-If you make multiple small contributions in a month, for example several bugfix PRs on our [villa](https://github.com/ScrollPrize/villa) monorepo, please bundle them into a single submission. More substantial contributions (new methods, models or datasets) should each be submitted separately, unless they are closely coupled.
+If you make multiple small contributions in a month, for example improvements to tooling, please bundle them into a single submission. More substantial contributions (new methods, models or datasets) should each be submitted separately, unless they are closely coupled.
 
 <details>
 <summary>Submission criteria and requirements</summary>

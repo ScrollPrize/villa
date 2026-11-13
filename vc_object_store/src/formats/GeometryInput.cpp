@@ -14,6 +14,17 @@ std::string uuid(const Json& data)
 {
     return util::canonicalUuid(data.at("uuid").get<std::string>());
 }
+void deriveSourceUuid(Json& root, const std::string& kind, const std::string& key,
+    const std::optional<std::string>& uuidNamespace)
+{
+    if (!uuidNamespace) return;
+    const auto existing = root.find("uuid");
+    if (existing != root.end() && existing->is_string() && util::isUuid(existing->get<std::string>())) return;
+    if (key.empty()) throw std::runtime_error("cannot derive a UUID from an empty source name");
+    const auto name = kind + ":" + key;
+    root["uuid"] = util::nameUuid(*uuidNamespace, name);
+    root["uuid_derivation"] = {{"namespace", util::canonicalUuid(*uuidNamespace)}, {"name", name}};
+}
 ObjectRecord sourceObject(const Json& root, const std::string& kind, const fs::path& source)
 {
     ObjectRecord result;

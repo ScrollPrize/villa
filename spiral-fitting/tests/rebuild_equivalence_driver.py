@@ -67,13 +67,13 @@ def _build(spec, out_dir, config, cache_dir):
     """One resident-style session, built exactly as spiral_runtime builds it."""
     import fit_spiral as fs
     from config import FitConfig
-    from fit_session import conventional_input_paths, load_scroll_spec
+    from fit_session import load_input_manifest
 
-    scroll = load_scroll_spec(spec['dataset_path'])
+    scroll, paths = load_input_manifest(spec['inputs'], cache_directory=cache_dir)
     context = fs.FitContext(
         FitConfig(config),
         scroll=scroll,
-        paths=conventional_input_paths(spec['dataset_path'], scroll),
+        paths=paths,
         interactive_driver=_ResidentDriver(config),
         out_base_dir=out_dir,
         cache_dir=cache_dir)

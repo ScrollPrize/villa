@@ -1,7 +1,7 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "OpenDataSampleProject.hpp"
 
 #include <QDialog>

@@ -1,13 +1,14 @@
 #include "ProjectWorkspace.hpp"
+#include "ProjectStoreCounts.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include "CState.hpp"
 #include "MenuActionController.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "VCSettings.hpp"
 
-#include "vc/core/render/ChunkCache.hpp"
-#include "vc/core/render/DecodedChunkCacheBudget.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
+#include "OpenedVolumes.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc_object_store/objects/SurfaceTileCache.hpp"
@@ -43,11 +44,14 @@
 #include <algorithm>
 #include <filesystem>
 #include <map>
+#include "vc_reader/array.hpp"
+#include <vc_reader/source_reader.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 
 namespace {
 
 enum StoreColumn { StoreName, StoreAccess, StoreSurfaces, StoreFibers, StorePointCollections, StoreSize,
-                   StoreFolder, StoreColumns };
+                   StoreDownload, StoreFolder, StoreColumns };
 enum ResourceColumn { ResName, ResLocation, ResTags, ResShape, ResVoxel, ResLevels, ResType, ResCache,
                       ResColumns };
 // Item data: what a resource row is.
@@ -81,17 +85,6 @@ QString trimmedLocation(QString location)
 QString volumeLocation(const Volume& volume)
 {
     return trimmedLocation(QString::fromStdString(volume.isRemote() ? volume.remoteUrl() : volume.path().string()));
-}
-
-QString dtypeName(vc::render::ChunkDtype dtype)
-{
-    switch (dtype) {
-    case vc::render::ChunkDtype::UInt8: return QStringLiteral("uint8");
-    case vc::render::ChunkDtype::UInt16: return QStringLiteral("uint16");
-    case vc::render::ChunkDtype::Float32: return QStringLiteral("float32");
-    case vc::render::ChunkDtype::Opaque: return QStringLiteral("opaque");
-    }
-    return {};
 }
 
 void setBar(QProgressBar* bar, QLabel* text, quint64 used, std::optional<quint64> maximum, const QString& extra = {})
@@ -163,7 +156,7 @@ void hideEmptyColumns(QTreeWidget* tree, int first)
 void reveal(const QString& location)
 {
     if (location.isEmpty()) return;
-    if (vc::project::isLocationRemote(location.toStdString())) {
+    if (vcr::zarr::isRemote(location.toStdString())) {
         QApplication::clipboard()->setText(location);
         return;
     }
@@ -172,20 +165,6 @@ void reveal(const QString& location)
 }
 
 } // namespace
-
-QString hubStatusSummary(const vc::objects::HubSessionStatus& status)
-{
-    if (!status.conflicts.empty())
-        return QObject::tr("%n conflict(s)", nullptr, int(status.conflicts.size()));
-    if (!status.error.empty())
-        return QObject::tr("offline (%1)").arg(QString::fromStdString(status.error));
-    if (!status.pending.empty())
-        return QObject::tr("%n pending", nullptr, int(status.pending.size()));
-    if (status.syncedAtUs)
-        return QObject::tr("synced %1").arg(
-            QDateTime::fromMSecsSinceEpoch(*status.syncedAtUs / 1000).toString(QStringLiteral("HH:mm:ss")));
-    return QObject::tr("connecting");
-}
 
 ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QWidget* parent)
     : QWidget(parent), _state(state), _menu(menu)
@@ -322,18 +301,9 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     addStore->addAction(tr("New Store..."), _menu, &MenuActionController::newStore);
     addStore->addAction(tr("Attach Store..."), this, [this]() { _menu->attachStore(false); });
     addStore->addAction(tr("Attach Read-only..."), this, [this]() { _menu->attachStore(true); });
-    addStore->addAction(tr("Clone Hosted Store..."), this, [this]() { _menu->cloneHostedStore(false); });
+    addStore->addAction(tr("Attach Hosted..."), this, [this]() { _menu->attachHostedStore(); });
     connect(button(tr("Import from Folder..."), page, storeHeader), &QPushButton::clicked, _menu,
             &MenuActionController::importIntoObjectStore);
-    _syncStores = button(tr("Sync Now"), page, storeHeader);
-    _syncStores->setToolTip(tr("Sync every hosted store now."));
-    connect(_syncStores, &QPushButton::clicked, this, [this]() {
-        const auto session = _state->objectStoreSession();
-        std::vector<vc::objects::AttachmentIdentity> stores = _state->attachedStores();
-        for (const auto& store : stores)
-            if (session->hubStatus(store)) session->syncHub(store);
-        emit hubSyncRequested();
-    });
     addGap(storeHeader);
     _revealStore = button(tr("Open Folder"), page, storeHeader);
     connect(_revealStore, &QPushButton::clicked, this, [this]() {
@@ -369,7 +339,7 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     _stores->setAlternatingRowColors(true);
     _stores->setColumnCount(StoreColumns);
     _stores->setHeaderLabels({tr("Store"), tr("Access"), tr("Surfaces"), tr("Fibers"), tr("Point collections"),
-                              tr("Size"), tr("Folder")});
+                              tr("Size"), tr("Objects cache"), tr("Folder")});
     _stores->header()->setStretchLastSection(true);
     connect(_stores, &QTreeWidget::itemSelectionChanged, this, &ProjectWorkspace::updateStoreButtons);
     storeRow->addWidget(_stores, 1);
@@ -433,8 +403,8 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     addBar(0, tr("Volume chunks in memory"), tr("Decoded volume chunks held in memory, shared by every viewer."),
            _ramBar, _ramText);
     _diskCell = addBar(1, tr("Volume chunks on disk"),
-                       tr("Chunks of remote volumes downloaded to disk. Older chunks are removed past the limit, "
-                          "or when the disk runs low."),
+                       tr("Chunks of remote volumes downloaded to disk. Older chunks are removed past the limit; "
+                          "when the disk runs low, caching stops and nothing is removed."),
                        _diskBar, _diskText);
     addBar(2, tr("Surface geometry in memory"), tr("Decoded surface tiles kept for every open store."),
            _surfaceBar, _surfaceText);
@@ -446,6 +416,8 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
         _measureCaches->setText(tr("Measure Volume Caches"));
         rebuildResources();
     });
+
+    _storeCounts = new ProjectStoreCounts(this, [this] { updateStoreCounts(); });
 
     // Many store events arrive together (an import, a sync); refresh once.
     _refreshTimer = new QTimer(this);
@@ -513,7 +485,9 @@ void ProjectWorkspace::rebuild()
 
 QString ProjectWorkspace::storeDisplayName(const vc::objects::AttachmentIdentity& attachment) const
 {
-    return QString::fromStdString(_state->objectStoreSession()->path(attachment).filename().string());
+    const auto session = _state->objectStoreSession();
+    if (session->hosted(attachment)) return QString::fromStdString(session->location(attachment));
+    return QString::fromStdString(session->path(attachment).filename().string());
 }
 
 void ProjectWorkspace::rebuildProject()
@@ -537,6 +511,7 @@ void ProjectWorkspace::rebuildStores()
 {
     const auto session = _state->objectStoreSession();
     const auto attached = _state->attachedStores();
+    _storeCounts->retain(attached);
     const auto selectedId = _stores->currentItem() ? _stores->currentItem()->data(0, kStoreIndexRole).toString() : QString();
     QSignalBlocker block(_stores);
     _stores->clear();
@@ -554,7 +529,18 @@ void ProjectWorkspace::rebuildStores()
         if (selectedId == QString::fromStdString(id)) _stores->setCurrentItem(item);
         for (int c : {StoreSurfaces, StoreFibers, StorePointCollections, StoreSize})
             item->setTextAlignment(c, Qt::AlignRight | Qt::AlignVCenter);
+        if (!available && vc::project::ProjectDocument::hostedStore(reference)) {
+            const auto endpoint = QString::fromStdString(reference.at("location").get<std::string>());
+            item->setText(StoreName, endpoint);
+            item->setText(StoreAccess, tr("Unreachable"));
+            item->setToolTip(StoreAccess, tr("The service at %1 did not answer when the project opened. "
+                                             "Start it (or its SSH tunnel) and reopen the project.").arg(endpoint));
+            item->setForeground(StoreAccess, QColor(0xd2, 0x8b, 0x00));
+            item->setText(StoreFolder, tr("hosted"));
+            continue;
+        }
         if (!available) {
+            item->setText(StoreDownload, tr("Local"));
             const auto path = _state->vpkg()->document().resolve(reference.at("location"));
             item->setText(StoreName, QString::fromStdString(path.filename().string()));
             item->setText(StoreAccess, tr("Missing"));
@@ -566,42 +552,116 @@ void ProjectWorkspace::rebuildStores()
             continue;
         }
         const auto& store = *available;
-        const auto path = session->path(store);
-        item->setText(StoreName, QString::fromStdString(path.filename().string()));
+        const bool hosted = session->hosted(store);
+        const auto path = hosted ? std::filesystem::path() : session->path(store);
+        item->setText(StoreName, storeDisplayName(store));
         item->setToolTip(StoreName, tr("Store UUID %1").arg(QString::fromStdString(store.storeUuid)));
         QString access = session->writable(store) ? tr("Read-write") : tr("Read-only");
-        if (const auto hub = session->hubStatus(store)) access += tr(" · hosted, %1").arg(hubStatusSummary(*hub));
+        if (hosted) access += tr(" · hosted");
         item->setText(StoreAccess, access);
-        std::map<std::string, int64_t> counts;
-        try {
-            session->read(store, [&](const vc::objects::ObjectStore& s, const vc::objects::ReadTxn& txn,
-                                     const std::atomic_bool&) {
-                for (const auto& kind : CState::routableKinds()) counts[kind] = s.objectCount(txn, kind);
+        _storeCounts->request(store, [session, store] {
+            ProjectStoreCounts::Counts counts;
+            session->readStore(store, [&](const vc::objects::StoreReader& reader, const std::atomic_bool&) {
+                for (const auto& kind : CState::routableKinds()) counts[kind] = reader.objectCount(kind);
             });
-        } catch (const std::exception& error) {
-            item->setToolTip(StoreSurfaces, QString::fromUtf8(error.what()));
+            return counts;
+        });
+        if (hosted) {
+            item->setText(StoreFolder, tr("hosted"));
+            auto* controls = new QWidget(_stores);
+            auto* layout = new QVBoxLayout(controls);
+            layout->setContentsMargins(2, 2, 2, 2);
+            auto* progress = new QLabel(controls);
+            progress->setWordWrap(true);
+            progress->setFixedWidth(280);
+            progress->setFixedHeight(progress->fontMetrics().lineSpacing() * 3);
+            auto* download = new QPushButton(tr("Download Objects"), controls);
+            download->setObjectName(QStringLiteral("downloadStoreObjects"));
+            layout->addWidget(progress);
+            layout->addWidget(download);
+            _stores->setItemWidget(item, StoreDownload, controls);
+            const auto update = [session, store, download, progress] {
+                const auto job = session->objectPrefetch(store);
+                const auto freshness = session->freshness(store);
+                const bool reachable = freshness && freshness->error.empty();
+                if (!job) {
+                    download->setText(QObject::tr("Download Objects"));
+                    download->setEnabled(reachable);
+                    progress->setText(QObject::tr("Not downloaded"));
+                    return;
+                }
+                const auto state = job->snapshot();
+                progress->show();
+                QString text = QString::fromStdString(state.stage) +
+                    QObject::tr(" · %1/%2 objects · %3").arg(state.completed).arg(state.total).arg(bytes(state.downloadedBytes));
+                if (state.done && state.captured) text += QObject::tr(" · revision %1").arg(state.captured->commitSequence);
+                progress->setText(text);
+                QStringList errors;
+                for (const auto& error : state.errors) errors << QString::fromStdString(error);
+                progress->setToolTip(errors.join('\n'));
+                const bool newer = state.captured && freshness && freshness->status &&
+                    (state.captured->generation != freshness->status->generation ||
+                     state.captured->commitSequence != freshness->status->commitSequence);
+                download->setText(!state.done ? QObject::tr("Cancel") : newer ? QObject::tr("Update Cache") :
+                    state.complete ? QObject::tr("Check Cache") : QObject::tr("Resume Download"));
+                download->setEnabled(!state.done || reachable);
+            };
+            connect(download, &QPushButton::clicked, controls, [session, store, update, controls] {
+                try {
+                    const auto job = session->objectPrefetch(store);
+                    if (job && !job->snapshot().done) job->cancel();
+                    else session->prefetchObjects(store);
+                    update();
+                } catch (const std::exception& error) {
+                    QMessageBox::warning(controls, QObject::tr("Download Objects"), QString::fromUtf8(error.what()));
+                }
+            });
+            auto* timer = new QTimer(controls);
+            timer->setInterval(250);
+            connect(timer, &QTimer::timeout, controls, update);
+            timer->start();
+            update();
+            item->setSizeHint(StoreDownload, controls->sizeHint());
+            continue;
         }
-        const auto count = [&](const char* kind) {
-            const auto it = counts.find(kind);
-            return it == counts.end() ? QStringLiteral("?") : QLocale().toString(qlonglong(it->second));
-        };
-        item->setText(StoreSurfaces, count("surface"));
-        item->setText(StoreFibers, count("fiber"));
-        item->setText(StorePointCollections, count("point_collection"));
+        item->setText(StoreDownload, tr("Local"));
         std::error_code ec;
         const auto size = std::filesystem::file_size(path, ec);
         item->setText(StoreSize, ec ? QString() : bytes(size));
         item->setText(StoreFolder, folder(path));
         item->setToolTip(StoreFolder, QString::fromStdString(path.string()));
     }
+    updateStoreCounts();
     for (int c = 0; c < StoreFolder; ++c) _stores->resizeColumnToContents(c);
     // As tall as its rows (or the routes beside it), so the data list above gets the room.
-    const int rowHeight = _stores->topLevelItemCount() ? _stores->visualItemRect(_stores->topLevelItem(0)).height() : 0;
+    int rowsHeight = 0;
+    for (int row = 0; row < _stores->topLevelItemCount(); ++row)
+        rowsHeight += std::max(_stores->visualItemRect(_stores->topLevelItem(row)).height(), fontMetrics().height() + 4);
     _stores->setFixedHeight(std::max(_routesPanel->sizeHint().height(),
                                      _stores->header()->sizeHint().height() + 2 * _stores->frameWidth() +
-                                         std::max(1, _stores->topLevelItemCount()) *
-                                             std::max(rowHeight, fontMetrics().height() + 4) + 4));
+                                         rowsHeight + 4));
     updateStoreButtons();
+}
+
+void ProjectWorkspace::updateStoreCounts()
+{
+    for (int row = 0; row < _stores->topLevelItemCount(); ++row) {
+        auto* item = _stores->topLevelItem(row);
+        const auto store = _state->storeReference(item->data(0, kStoreIndexRole).toString().toStdString());
+        if (!store) continue;
+        const auto* snapshot = _storeCounts->snapshot(*store);
+        for (const auto& [column, kind] : {std::pair{StoreSurfaces, "surface"},
+                                         {StoreFibers, "fiber"}, {StorePointCollections, "point_collection"}}) {
+            QString count = QStringLiteral("?");
+            if (snapshot) {
+                const auto found = snapshot->values.find(kind);
+                if (found != snapshot->values.end()) count = QLocale().toString(qlonglong(found->second));
+            }
+            item->setText(column, count);
+            item->setToolTip(column, snapshot ? snapshot->error : QString());
+        }
+    }
+    for (int c : {StoreSurfaces, StoreFibers, StorePointCollections}) _stores->resizeColumnToContents(c);
 }
 
 void ProjectWorkspace::rebuildRoutes()
@@ -636,7 +696,7 @@ void ProjectWorkspace::rebuildResources()
     _resources->clear();
 
     const auto resolved = [&](const std::string& location) {
-        return trimmedLocation(vc::project::isLocationRemote(location)
+        return trimmedLocation(vcr::zarr::isRemote(location)
             ? QString::fromStdString(location)
             : QString::fromStdString(vc::project::resolveLocalPath(location, pkg->directory()).string()));
     };
@@ -662,8 +722,13 @@ void ProjectWorkspace::rebuildResources()
         const auto shape = volume.shapeXyz();
         item->setText(ResShape, QStringLiteral("%1 × %2 × %3").arg(shape[0]).arg(shape[1]).arg(shape[2]));
         if (volume.voxelSize() > 0) item->setText(ResVoxel, tr("%1 µm").arg(volume.voxelSize()));
-        item->setText(ResLevels, QString::number(volume.numScales()));
-        item->setText(ResType, dtypeName(volume.dtype()));
+        try {
+            const auto& pyramid = _state->openedVolumes()->pyramid(volume);
+            item->setText(ResLevels, QString::number(pyramid.levels.size()));
+            item->setText(ResType, QString::fromStdString(vcr::sources::dtypeName(pyramid.dtype)));
+        } catch (const std::exception& error) {
+            item->setToolTip(ResLevels, QString::fromUtf8(error.what()));
+        }
         if (volume.isRemote()) {
             const auto cache = QString::fromStdString(volume.remotePersistentCachePath().string());
             const auto measured = _cacheBytes.find(cache);
@@ -769,31 +834,35 @@ void ProjectWorkspace::rebuildResources()
 void ProjectWorkspace::updateCaches()
 {
     if (!isVisible()) return;
-    if (const auto budget = vc::render::processChunkCacheService()->decodedByteBudget()) {
-        const auto stats = budget->stats();
-        setBar(_ramBar, _ramText, stats.decodedBytes, stats.maximumBytes);
-    }
+    const auto ram = _state->openedVolumes()->cacheStats();
+    setBar(_ramBar, _ramText, ram.bytes, ram.capacity);
     const auto root = vc3d::remoteCachePathFs();
     const auto rootText = QString::fromStdString(root.string());
     _revealCache->setToolTip(rootText);
-    _diskCell->setToolTip(tr("Chunks of remote volumes downloaded to %1. Older chunks are removed past the limit, "
-                             "or when the disk runs low.").arg(rootText));
-    if (const auto budget = vc::render::PersistentZarrCacheBudget::findForPath(root)) {
-        const auto stats = budget->stats();
-        // Free space is measured with the first trim; until then it reads 0.
-        QStringList extra;
-        if (stats.freeBytes || stats.lowSpace) extra << tr("%1 free").arg(bytes(stats.freeBytes));
-        if (stats.minimumFreeBytes) extra << tr("keeps %1 free").arg(bytes(stats.minimumFreeBytes));
-        if (stats.scanInFlight) extra << tr("counting...");
-        setBar(_diskBar, _diskText, stats.managedBytes,
-               stats.maximumBytes ? std::optional<quint64>(*stats.maximumBytes) : std::nullopt,
-               extra.join(QStringLiteral(" · ")));
-        // Overrides the dimmed palette while space is low.
-        _diskText->setStyleSheet(stats.lowSpace ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
+    _diskCell->setToolTip(tr("Chunks of remote volumes downloaded to %1. Older chunks are removed past the limit; "
+                             "when the disk runs low, caching stops and nothing is removed.").arg(rootText));
+    const auto limit = vc::settings::remoteCacheMaxBytes();
+    const auto minimumFree = static_cast<std::uint64_t>(vc::settings::remoteCacheMinFreeBytes());
+    std::error_code rootError;
+    const auto space = std::filesystem::space(root, rootError);
+    const std::uint64_t freeBytes = rootError ? 0 : space.available;
+    QStringList extra;
+    if (!rootError) extra << tr("%1 free").arg(bytes(freeBytes));
+    if (minimumFree) extra << tr("stops caching under %1 free").arg(bytes(minimumFree));
+    if (limit) {
+        // A limit keeps the budget's index, built when the volumes opened.
+        setBar(_diskBar, _diskText, static_cast<quint64>(vcr::zarr::diskBudget(root.string(), std::nullopt)->total_bytes()),
+               static_cast<quint64>(*limit), extra.join(QStringLiteral(" · ")));
     } else {
+        // Without one there is no index: a total would walk every chunk of the root.
+        // Measure caches sizes the project's volumes on request.
         _diskBar->setEnabled(false);
-        _diskText->setText(tr("not in use"));
+        extra.prepend(tr("no limit"));
+        _diskText->setText(extra.join(QStringLiteral(" · ")));
     }
+    // Overrides the dimmed palette while space is low.
+    _diskText->setStyleSheet(!rootError && freeBytes < minimumFree ? QStringLiteral("color: #d28b00; font-weight: 600;")
+                                                                   : QString());
     const auto surfaces = CState::surfaceGeometryCache();
     setBar(_surfaceBar, _surfaceText, surfaces->size(), surfaces->capacity());
 }
@@ -809,12 +878,17 @@ void ProjectWorkspace::updateStoreButtons()
 {
     const auto store = selectedStore();
     _detachStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable() && _state->vpkg()->document().data().at("stores").size() > 1);
-    _revealStore->setEnabled(store.has_value());
-    _replaceStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable());
-    const auto session = _state->objectStoreSession();
-    bool hosted = false;
-    for (const auto& attached : _state->attachedStores()) hosted = hosted || session->hubStatus(attached);
-    _syncStores->setVisible(hosted);
+    const bool hostedEntry = [&] {
+        const auto* item = _stores->currentItem();
+        if (!item || !_state->vpkg()) return false;
+        const auto id = item->data(0, kStoreIndexRole).toString().toStdString();
+        for (const auto& reference : _state->vpkg()->document().data().at("stores"))
+            if (reference.at("id") == id) return vc::project::ProjectDocument::hostedStore(reference);
+        return false;
+    }();
+    // A hosted store has no folder here and no file to locate.
+    _revealStore->setEnabled(store.has_value() && !hostedEntry);
+    _replaceStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable() && !hostedEntry);
 }
 
 void ProjectWorkspace::updateResourceButtons()
@@ -825,7 +899,7 @@ void ProjectWorkspace::updateResourceButtons()
                                 _state->vpkg() && _state->vpkg()->writable());
     const auto location = item ? item->data(0, kRevealRole).toString() : QString();
     _revealResource->setEnabled(!location.isEmpty());
-    _revealResource->setText(vc::project::isLocationRemote(location.toStdString()) ? tr("Copy URL") : tr("Open Folder"));
+    _revealResource->setText(vcr::zarr::isRemote(location.toStdString()) ? tr("Copy URL") : tr("Open Folder"));
 }
 
 void ProjectWorkspace::measureVolumeCaches()

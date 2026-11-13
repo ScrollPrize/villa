@@ -1,9 +1,11 @@
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/SourceMetadata.hpp"
 #include "vc_object_store/objects/GeometryExport.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryOutput.hpp"
+#include <vc_reader/publication.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <bit>
@@ -16,12 +18,6 @@
 #include <map>
 #include <set>
 #include <system_error>
-#ifdef __linux__
-#include <fcntl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#include <linux/fs.h>
-#endif
 
 namespace vc::objects {
 namespace {
@@ -34,69 +30,66 @@ struct Stage {
 };
 void publish(const fs::path& source, const fs::path& destination, bool overwrite, bool directory)
 {
-    const auto status = fs::symlink_status(destination);
-    const bool exists = fs::exists(status);
-    if (exists && !overwrite) throw std::runtime_error("destination already exists (use overwrite): " + destination.string());
-    if (exists && (fs::is_symlink(status) || (directory ? !fs::is_directory(status) : !fs::is_regular_file(status))))
-        throw std::runtime_error("destination must have the same file/directory type and cannot be a symlink");
-#ifdef __linux__
-    // NOREPLACE closes the check/rename race; EXCHANGE replaces nonempty dirs
-    // without a missing-path window. The old destination is cleaned by Stage.
-    const unsigned flags = exists ? RENAME_EXCHANGE : RENAME_NOREPLACE;
-    if (syscall(SYS_renameat2, AT_FDCWD, source.c_str(), AT_FDCWD, destination.c_str(), flags) != 0)
-        throw std::system_error(errno, std::generic_category(), "atomic geometry export publication");
-#else
-    if (directory) throw std::runtime_error("atomic directory export requires Linux renameat2 support");
-    if (overwrite) fs::rename(source, destination);
-    else fs::create_hard_link(source, destination);
-#endif
+    if (fs::is_directory(source) != directory) throw std::runtime_error("geometry export staging type mismatch");
+    vcr::files::publishPath(source, destination, overwrite);
 }
 } // namespace
 
-std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const fs::path& destination,
-    const std::optional<std::string>& revisionUuid, bool overwrite, bool validOnly)
+ObjectVersion exportGeometry(ObjectStore& db, const std::string& objectUuid, const fs::path& destination,
+    const std::optional<ObjectVersion>& version, bool overwrite, bool validOnly)
+{
+    const auto read = db.read();
+    return exportGeometry(db, read, objectUuid, destination, version, overwrite, validOnly);
+}
+
+ObjectVersion exportGeometry(const ObjectStore& db, const ReadTxn& read, const std::string& objectUuid,
+    const fs::path& destination, const std::optional<ObjectVersion>& version, bool overwrite, bool validOnly)
+{
+    return exportGeometry(LocalStoreReader(db, read), objectUuid, destination, version, overwrite, validOnly);
+}
+
+ObjectVersion exportGeometry(const StoreReader& reader, const std::string& objectUuid,
+    const fs::path& destination, const std::optional<ObjectVersion>& version, bool overwrite, bool validOnly)
 {
     if (destination.empty()) throw std::invalid_argument("export destination is empty");
     const auto dest = fs::absolute(destination).lexically_normal();
-    const auto resolved = fs::weakly_canonical(dest);
-    const auto database = fs::weakly_canonical(db.path());
-    // Never replace the open database, a hard link to it, its sidecars, or an
-    // ancestor directory containing it, even with explicit overwrite.
-    for (auto p = database; !p.empty(); p = p.parent_path()) {
-        if (resolved == p) throw std::runtime_error("export destination contains the open object database");
-        if (p == p.root_path()) break;
-    }
-    if (resolved == database.string() + "-wal" || resolved == database.string() + "-shm" || resolved == database.string() + "-journal" ||
-        (fs::exists(dest) && fs::equivalent(dest, database)))
-        throw std::runtime_error("cannot export over the open object database or its sidecars");
+    reader.validateExportDestination(dest);
     if (!fs::is_directory(dest.parent_path())) throw std::runtime_error("export parent directory must exist");
     Snapshot snapshot;
+    ObjectVersion exported;
     Json attributes;
     std::string fiberJson;
     {
-        auto read = db.read();
-        const auto object = revisionUuid ? db.objectRevision(read, *revisionUuid) : db.currentObjectRevision(read, objectUuid);
-        if (!object || object->objectUuid != util::canonicalUuid(objectUuid) || object->deleted || object->record.retired)
-            throw std::runtime_error("active object revision not found for this object");
-        if (!object->geometryRevision) throw std::runtime_error("object revision has no geometry");
-        const auto revision = db.geometryRevision(read, *object->geometryRevision);
-        if (!revision) throw std::runtime_error("geometry revision not found");
-        RevisionSelection selection;
-        if (revisionUuid) {
-            if (!object->publishedAtUs) throw std::runtime_error("object revision has no publication time");
-            selection = db.revisionSelectionAt(read, *object->publishedAtUs, true);
-        } else {
-            ObjectSelection all; all.includeRetired = true;
-            for (const auto& record : db.selectObjects(read, all))
-                selection[record.uuid] = db.currentObjectRevision(read, record.uuid)->uuid;
+        if (version && util::canonicalUuid(version->objectUuid) != util::canonicalUuid(objectUuid))
+            throw std::invalid_argument("export version names another object");
+        auto object = reader.selectedObject(objectUuid, {}, {}, version);
+        std::vector<ObjectVersion> selection;
+        if (object && (object->record.kind == "fiber" || object->record.kind == "point_collection")) {
+            if (version) {
+                const auto graph = reader.graphReadViewAround(reader.versionsAt(*version));
+                for (const auto& selected : *graph.selectedObjects) selection.push_back(selected.reference());
+            }
+            else {
+                ObjectSelection query; query.includeRetired = true;
+                for (const auto& selected : reader.selectObjects(query)) selection.push_back(selected.reference());
+                const auto root = std::find_if(selection.begin(), selection.end(), [&](const auto& ref) { return ref.objectUuid == object->objectUuid; });
+                object = root == selection.end() ? std::nullopt : reader.selectedObject(objectUuid, {}, {}, *root);
+            }
         }
+        if (!object || object->objectUuid != util::canonicalUuid(objectUuid) || object->deleted || object->record.retired)
+            throw std::runtime_error("active object version not found for this object");
+        exported = object->reference();
+        if (!object->geometryRevision) throw std::runtime_error("object revision has no geometry");
+        const auto revision = reader.geometryRevision(*object->geometryRevision);
+        if (!revision) throw std::runtime_error("geometry revision not found");
         snapshot.revision = *revision;
         if (revision->kind == "fiber") {
-            RevisionSelection fibers;
-            for (const auto& [uuid, pin] : selection)
-                if (pin && db.objectRevision(read, *pin)->record.kind == "fiber") fibers.emplace(uuid, pin);
-            fiberJson = fiberNetworkJson(db, read, fibers, {object->objectUuid}, std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
-        } else attributes = detail::nativeMetadata(db, read, object->record, *revision, selection);
+            std::vector<ObjectVersion> fibers;
+            for (const auto& selected : reader.objectsAtVersions(selection))
+                if (selected && selected->record.kind == "fiber") fibers.push_back(selected->reference());
+            fiberJson = fiberNetworkJson(reader, fibers, {object->objectUuid},
+                                         std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
+        } else attributes = detail::nativeMetadata(reader, object->record, *revision, selection);
         if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
             throw std::runtime_error("unsupported geometry format for native export");
         const std::set<std::string> names = revision->kind == "fiber" ? std::set<std::string>{"control_points", "line_points", "control_point_ids"} :
@@ -105,7 +98,7 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
             // tifxyz carries surface channels as sidecar TIFFs.
             if (!names.contains(array.name) && revision->kind != "surface")
                 throw std::runtime_error("native export cannot represent auxiliary array: " + array.name);
-            snapshot.arrays[array.name] = db.readGeometryArray(read, revision->uuid, array.name);
+            snapshot.arrays[array.name] = reader.readGeometryArray(revision->uuid, array.name);
         }
     }
     const auto& kind = snapshot.revision.kind;
@@ -127,6 +120,6 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
     else if (kind == "umbilicus") formats::umbilicus(snapshot, attributes, output);
     else throw std::runtime_error("unsupported geometry kind for export");
     publish(output, dest, overwrite, directory);
-    return snapshot.revision.uuid;
+    return exported;
 }
 } // namespace vc::objects

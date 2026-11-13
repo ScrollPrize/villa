@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vc_reader.torch import sample_array
 import torch.nn.functional as F
 
 
@@ -237,21 +238,7 @@ def sample_xy_maps_bilinear(
         index = torch.arange(int(points.shape[1]), dtype=torch.long, device=maps.device).view(1, -1)
         valid = valid & (index < lengths.view(-1, 1))
 
-    x0 = torch.floor(torch.clamp(x, 0.0, float(width - 1))).to(torch.long)
-    y0 = torch.floor(torch.clamp(y, 0.0, float(height - 1))).to(torch.long)
-    x1 = torch.clamp(x0 + 1, max=width - 1)
-    y1 = torch.clamp(y0 + 1, max=height - 1)
-    wx = torch.clamp(x - x0.to(dtype=torch.float32), 0.0, 1.0)
-    wy = torch.clamp(y - y0.to(dtype=torch.float32), 0.0, 1.0)
-
-    batch_index = torch.arange(batch, dtype=torch.long, device=maps.device).view(batch, 1)
-    v00 = maps[batch_index, y0, x0]
-    v10 = maps[batch_index, y0, x1]
-    v01 = maps[batch_index, y1, x0]
-    v11 = maps[batch_index, y1, x1]
-    top = v00 * (1.0 - wx)[..., None] + v10 * wx[..., None]
-    bottom = v01 * (1.0 - wx)[..., None] + v11 * wx[..., None]
-    sampled = top * (1.0 - wy)[..., None] + bottom * wy[..., None]
+    sampled = sample_array(maps.permute(0, 3, 1, 2), points.flip(-1)).transpose(1, 2)
     sampled = torch.where(valid[..., None], sampled, torch.full_like(sampled, float("nan")))
     return sampled.to(dtype=torch.float32), valid
 

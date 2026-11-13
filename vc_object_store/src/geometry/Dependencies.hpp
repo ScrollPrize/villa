@@ -1,9 +1,11 @@
 #pragma once
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include <functional>
 #include "geometry/GeometryReader.hpp"
+#include "geometry/ArrayLayout.hpp"
 #include "geometry/SequenceMetadata.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 
@@ -59,6 +61,19 @@ public:
     ~DependencyScope() { if (owned_) activeDependencies = nullptr; }
 };
 
+inline DependencyGeometry dependencyGeometry(sqlite3* db,const std::string& revision)
+{
+    auto reader=std::make_shared<GeometryReader>(db,revision);
+    const auto& manifest=reader->manifest();DependencyGeometry result;
+    result.kind=manifest.at("kind");result.attributes=manifest.at("attributes").dump();
+    result.gridOrigin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
+    for(const auto& [name,a]:manifest.at("arrays").items()){
+        result.arrays.emplace(name,GeometryArrayInfo{name,a.at("dtype"),a.at("shape"),a.at("byte_length")});
+        auto descriptor=a;descriptor.erase("source_revision");result.fingerprints[name]=descriptor.dump();
+    }
+    result.read=[reader](const auto& name,auto offset,auto count){return reader->read(name,offset,count);};
+    bindSequenceIdentities(result,db,manifest);return result;
+}
 inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& txn, const GeometryRevision& revision)
 {
     const auto key = std::make_pair(&txn, revision.uuid);
@@ -66,19 +81,23 @@ inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& t
         const auto cached = activeDependencies->find(key);
         if (cached != activeDependencies->end()) return cached->second;
     }
-    DependencyGeometry result; result.kind = revision.kind; result.attributes = revision.attributes; result.gridOrigin = revision.gridOrigin;
-    for (const auto& array : revision.arrays) result.arrays.emplace(array.name, array);
-    auto reader = std::make_shared<GeometryReader>(txn, revision.uuid);
-    for (const auto& [name, a] : reader->manifest().at("arrays").items()) {
-        auto descriptor = a; descriptor.erase("source_revision");
-        result.fingerprints[name] = descriptor.dump();
-    }
-    result.read = [reader](const auto& name, auto offset, auto count) { return reader->read(name,offset,count); };
-    bindSequenceIdentities(result,ObjectStoreImplAccess::conn(txn),reader->manifest());
+    auto result=dependencyGeometry(ObjectStoreImplAccess::conn(txn),revision.uuid);
     if (activeDependencies) {
         if (activeDependencies->size() == 8) activeDependencies->erase(activeDependencies->begin());
         activeDependencies->emplace(key, result);
     }
+    return result;
+}
+
+// Over a reader (any backend): arrays read through it; point identities are
+// resolved from the ids arrays.
+inline DependencyGeometry dependencyGeometry(const StoreReader& reader, const GeometryRevision& revision)
+{
+    DependencyGeometry result; result.kind = revision.kind; result.attributes = revision.attributes; result.gridOrigin = revision.gridOrigin;
+    for (const auto& array : revision.arrays) result.arrays.emplace(array.name, array);
+    result.read = [&reader, uuid = revision.uuid](const std::string& name, int64_t offset, int64_t count) {
+        return reader.readGeometryArray(uuid, name, offset, count);
+    };
     return result;
 }
 
@@ -97,12 +116,42 @@ inline DependencyGeometry dependencyGeometry(const GeometryData& data)
 }
 
 // Missing/deleted points return nullopt. Malformed references never resolve.
+inline std::optional<std::string> dependencyCoordinateArray(const std::string& kind,const std::string& name)
+{
+    if(name=="point_ids") return kind=="point_collection"?std::optional<std::string>("points"):std::nullopt;
+    if(name=="control_point_ids") return kind=="fiber"?std::optional<std::string>("control_points"):std::nullopt;
+    if(kind=="point_collection") return std::nullopt;
+    if(kind=="fiber" ? (name!="control_points"&&name!="line_points") : name!="points") return std::nullopt;
+    return name;
+}
+
+inline std::optional<int64_t> dependencyPointOffset(const GeometryArrayInfo& array,const std::vector<int64_t>& index)
+{
+    if(array.shape.size()!=index.size()+1||array.shape.back()!=3)return std::nullopt;
+    int64_t offset=0;
+    for(size_t i=0;i<index.size();++i){
+        if(index[i]<0||index[i]>=array.shape[i])return std::nullopt;
+        offset=offset*array.shape[i]+index[i];
+    }
+    return offset;
+}
+
+inline std::optional<int64_t> dependencyIdentityOffset(const std::vector<std::pair<int64_t,int64_t>>& offsets,int64_t key)
+{
+    const auto id=std::lower_bound(offsets.begin(),offsets.end(),std::pair{key,int64_t(0)});
+    if(id==offsets.end()||id->first!=key)return std::nullopt;
+    if(id+1!=offsets.end()&&(id+1)->first==key)throw std::runtime_error("geometry dependency has ambiguous point ID");
+    return id->second;
+}
+
 inline std::optional<std::vector<uint8_t>> pointValue(const DependencyGeometry& geometry, const PointReference& point)
 {
     auto index = point.index;
     auto name = point.array;
+    const auto coordinate=dependencyCoordinateArray(geometry.kind,name);
+    if(!coordinate)return std::nullopt;
     if (name == "point_ids" || name == "control_point_ids") {
-        if ((name == "point_ids" ? geometry.kind != "point_collection" : geometry.kind != "fiber") || index.size() != 1 || index[0] < 0) return std::nullopt;
+        if (index.size() != 1 || index[0] < 0) return std::nullopt;
         if (geometry.identity && geometry.identityArrays.contains(name)) {
             auto bytes=geometry.identity(name,index[0]);
             if(bytes) {
@@ -125,45 +174,44 @@ inline std::optional<std::vector<uint8_t>> pointValue(const DependencyGeometry& 
             std::sort(cache.offsets.begin(), cache.offsets.end());
             cache.loaded = true;
         }
-        const auto id = std::lower_bound(cache.offsets.begin(), cache.offsets.end(), std::pair{index[0], int64_t(0)});
-        if (id == cache.offsets.end() || id->first != index[0]) return std::nullopt;
-        if (id + 1 != cache.offsets.end() && (id + 1)->first == index[0])
-            throw std::runtime_error("geometry dependency has ambiguous point ID");
-        index = {id->second}; name = name == "point_ids" ? "points" : "control_points";
-    } else {
-        // Collections use stable IDs, never vector offsets.
-        if (geometry.kind == "point_collection") return std::nullopt;
-        if (geometry.kind == "fiber" ? (name != "control_points" && name != "line_points") : name != "points")
-            return std::nullopt;
+        const auto row=dependencyIdentityOffset(cache.offsets,index[0]);
+        if(!row)return std::nullopt;
+        index={*row};name=*coordinate;
     }
     const auto found = geometry.arrays.find(name);
     if (found == geometry.arrays.end()) return std::nullopt;
     const auto& array = found->second;
-    if (array.shape.size() != index.size() + 1 || array.shape.back() != 3) return std::nullopt;
-    int64_t offset = 0;
-    for (size_t i = 0; i < index.size(); ++i) {
-        if (index[i] < 0 || index[i] >= array.shape[i]) return std::nullopt;
-        offset = offset * array.shape[i] + index[i];
-    }
+    const auto offset=dependencyPointOffset(array,index);
+    if(!offset)return std::nullopt;
     const int64_t stride = array.dtype == "<f8" ? 24 : 12;
-    auto bytes = geometry.read(name, offset * stride, stride);
+    auto bytes = geometry.read(name, *offset * stride, stride);
     GeometrySnapshot snapshot; snapshot.arrays["point"] = bytes;
     if (array.dtype == "<f8") (void)snapshot.values<double>("point");
     else if (array.dtype == "<f4") {
         const auto xyz = snapshot.values<float>("point");
-        if (geometry.kind == "surface" && !vc::geometry::validSurfacePoint({xyz[0], xyz[1], xyz[2]})) return std::nullopt;
+        if (geometry.kind == "surface") {
+            if (!vc::geometry::validSurfacePoint({xyz[0], xyz[1], xyz[2]})) return std::nullopt;
+            if (geometry.arrays.contains(surfaceValidChannel) &&
+                geometry.read(surfaceValidChannel, *offset, 1).at(0) == 0) return std::nullopt;
+        }
     }
     return bytes;
 }
 
-inline void validateDependencies(const Anchor& anchor, const DependencyGeometry& geometry)
+template<class HasPoint>
+inline void validateDependencyReferences(const Anchor& anchor,const HasPoint& hasPoint)
 {
     if (anchor.wholeGeometry && anchor.points.empty()) return;
     if (anchor.wholeGeometry || anchor.points.empty())
         throw std::runtime_error("geometry edit requires explicit point dependencies or whole_geometry");
     for (const auto& point : anchor.points)
-        if (!pointValue(geometry, point))
+        if (!hasPoint(point))
             throw std::runtime_error("geometry edit refers to a missing or invalid point; update or remove the relationship");
+}
+
+inline void validateDependencies(const Anchor& anchor,const DependencyGeometry& geometry)
+{
+    validateDependencyReferences(anchor,[&](const PointReference& point){return pointValue(geometry,point).has_value();});
 }
 
 inline bool dependenciesChanged(const Anchor& anchor, const DependencyGeometry& before, const DependencyGeometry& after)
@@ -202,7 +250,9 @@ inline bool dependenciesChanged(const Anchor& anchor, const DependencyGeometry& 
             };
             if (identity(before)!=identity(after)) return true;
         }
-        if (identical(point.array) && (point.array == "point_ids" ? identical("points") : point.array == "control_point_ids" ? identical("control_points") : true)) continue;
+        const bool sameValidity = before.kind != "surface" || identical(surfaceValidChannel) ||
+            (!before.arrays.contains(surfaceValidChannel) && !after.arrays.contains(surfaceValidChannel));
+        if (sameValidity && identical(point.array) && (point.array == "point_ids" ? identical("points") : point.array == "control_point_ids" ? identical("control_points") : true)) continue;
         const auto old = pointValue(before, point), next = pointValue(after, point);
         if (!old || !next || old != next) return true;
         // Positional identities cannot be assumed to survive insertion/removal.

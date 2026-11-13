@@ -1,5 +1,6 @@
 #include "SegmentationGrower.hpp"
 #include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 
 
 #include "../../NeuralTraceServiceManager.hpp"
@@ -15,7 +16,6 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
 
 #include <QtConcurrent/QtConcurrent>
 
@@ -42,7 +42,7 @@
 
 #include <opencv2/core.hpp>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "../../SocketRequest.hpp"
 
@@ -52,16 +52,6 @@ const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
 
 namespace
 {
-QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
-{
-    if (!pkg) {
-        return QString();
-    }
-
-    const QString base = QString::fromStdString(pkg->directory().string());
-    return QDir(base).filePath(QStringLiteral("cache"));
-}
-
 // The valid grid vertex nearest `worldPos` on `surface` (stored, or a draft):
 // the vertex at its nearest point, else the nearest valid one around it.
 std::optional<std::pair<int, int>> locateGridIndex(QuadSurface* surface, ViewerManager* viewerManager,
@@ -319,29 +309,31 @@ void refreshSegmentationViewers(ViewerManager* manager)
 
         if (viewer->surfName() == "segmentation") {
             viewer->invalidateVis();
-            viewer->renderVisible(true);
+            viewer->renderVisible();
         }
     });
 }
 struct CopyDisplacementJob
 {
     QString socketPath;
-    // The input surface, read at geometryRevision from the store file the
-    // service shares with this session; the outputs are new surfaces there.
+    // The input surface, read at its numbered version (in generation) from
+    // the store file the service shares with this session; the outputs are
+    // new surfaces there.
     QString store;
-    std::string surfaceUuid, geometryRevision, volumeUuid;
+    std::string surfaceUuid, volumeUuid;
+    vc::objects::ObjectVersion surfaceReference;
     QString volumeZarrPath;
     int volumeScale{0};
     QString checkpointPath;
     TtaMode ttaMode{TtaMode::Mirror};
     QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
     double ttaOutlierDropThresh{1.25};
-    utils::Json customParams;
+    nlohmann::json customParams;
 };
 
-utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
+nlohmann::json sendSocketJsonRequest(const QString& socketPath, const nlohmann::json& request)
 {
-    return utils::Json::parse(vc3d::socketRequestLine(
+    return nlohmann::json::parse(vc3d::socketRequestLine(
         socketPath.toStdString(), request.dump(), 300, "displacement copy"));  // 5 minute timeout
 }
 
@@ -349,11 +341,11 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
 {
     TracerGrowthResult result;
 
-    utils::Json request = utils::Json::object();
+    nlohmann::json request = nlohmann::json::object();
     request["request_type"] = "displacement_copy_grow";
     request["store"] = job.store.toStdString();
     request["surface_uuid"] = job.surfaceUuid;
-    request["geometry_revision"] = job.geometryRevision;
+    request["surface_reference"] = nlohmann::json::parse(vc::objects::objectVersionToJson(job.surfaceReference));
     request["volume_uuid"] = job.volumeUuid;
     request["volume_path"] = job.volumeZarrPath.toStdString();
     request["volume_scale"] = std::max(0, job.volumeScale);
@@ -385,7 +377,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
         }
     }
 
-    utils::Json response;
+    nlohmann::json response;
     try {
         response = sendSocketJsonRequest(job.socketPath, request);
     } catch (const std::exception& ex) {
@@ -396,7 +388,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     if (response.contains("error")) {
         QString serviceError;
         if (response["error"].is_string()) {
-            serviceError = QString::fromStdString(response["error"].get_string());
+            serviceError = QString::fromStdString(response["error"].get<std::string>());
         } else {
             serviceError = QString::fromStdString(response["error"].dump());
         }
@@ -419,7 +411,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
         return result;
     }
 
-    result.createdSurfaces = {outputs["front"].get_string(), outputs["back"].get_string()};
+    result.createdSurfaces = {outputs["front"].get<std::string>(), outputs["back"].get<std::string>()};
     result.statusMessage = QStringLiteral("Displacement copy completed");
     return result;
 }
@@ -569,7 +561,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         }
     }
 
-    request.directionFields = _context.widget->directionFieldConfigs();
 
     if (!_context.widget->customParamsValid()) {
         const QString errorText = _context.widget->customParamsError();
@@ -587,7 +578,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
     if (method == SegmentationGrowthMethod::Tracer || method == SegmentationGrowthMethod::Corrections) {
         if (request.customParams.is_null()) {
-            request.customParams = utils::Json::object();
+            request.customParams = nlohmann::json::object();
         }
         const int growthScale = std::clamp(_context.widget->growthScale(), 0, 5);
         if (!request.customParams.contains("growth_scale")) {
@@ -633,7 +624,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
         // Add neural socket parameters to custom params
         if (request.customParams.is_null()) {
-            request.customParams = utils::Json::object();
+            request.customParams = nlohmann::json::object();
         }
         request.customParams["neural_socket"] = socketPath.toStdString();
         request.customParams["neural_batch_size"] = batchSize;
@@ -669,25 +660,11 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     TracerGrowthContext ctx;
     ctx.resumeSurface = segmentationSurface.get();
     ctx.volume = growthVolume.get();
-    ctx.level = 0;
-    ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
     ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = volumeContext.normalGridPath;
     ctx.allowedGrowthMask = request.allowedGrowthMask;
 
     ctx.growthVolumeId = growthVolumeId;
-
-    if (ctx.cacheRoot.isEmpty()) {
-        const auto volumePath = growthVolume->path();
-        ctx.cacheRoot = QDir(QString::fromStdString(volumePath.parent_path().string()))
-                            .filePath(QStringLiteral("cache"));
-    }
-
-    if (ctx.cacheRoot.isEmpty()) {
-        qCInfo(lcSegGrowth) << "Tracer growth aborted because cache root is empty";
-        showStatus(tr("Cache root unavailable for tracer growth."), kStatusLong);
-        return false;
-    }
 
     if (method == SegmentationGrowthMethod::Corrections) {
         if (usingCorrections) {
@@ -876,7 +853,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     }
     const auto pin = _context.module->storePin(segmentationSurface.get());
     const auto* row = catalog->row(segmentationSurface->id);
-    if (!pin || !pin->geometryRevision || !row || !row->bound()) {
+    if (!pin || !pin->stored() || !pin->geometryRevision || !row || !row->bound()) {
         showStatus(tr("Copy with NT needs a surface of the writable object store that opens in the current volume."),
                    kStatusLong);
         return false;
@@ -889,13 +866,13 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         return false;
     }
 
-    utils::Json customParams = _context.widget->customParamsJson();
+    nlohmann::json customParams = _context.widget->customParamsJson();
 
     CopyDisplacementJob copyJob;
     copyJob.socketPath = socketPath;
     copyJob.store = QString::fromStdString(toolStore.store.string());
-    copyJob.surfaceUuid = pin->object.objectUuid;
-    copyJob.geometryRevision = *pin->geometryRevision;
+    copyJob.surfaceUuid = pin->reference().objectUuid;
+    copyJob.surfaceReference = pin->reference();
     // The service works in level-0 voxels of the zarr it is given, not in the
     // open volume's working level: the store volume's own voxels.
     copyJob.volumeUuid = toolStore.volume.volume;
@@ -1163,13 +1140,14 @@ void SegmentationGrower::onFutureFinished()
 
     refreshSegmentationViewers(_context.viewerManager);
 
+    bool correctionsSaved = true;
     // Keep the growth's corrections with the revisions before and after it.
     auto* annotated = primarySurface ? primarySurface : request.segmentationSurface.get();
     if (request.usingCorrections && request.beforePin && request.correctionsBounds && _context.module && annotated &&
         _context.state && _context.state->currentVolume() && _context.module->saveSurface(annotated)) {
         if (const auto afterPin = _context.module->storePin(annotated)) {
             vc3d::corrections::GrowthAnnotation annotation;
-            annotation.surfaceUuid = afterPin->object.objectUuid;
+            annotation.surfaceUuid = afterPin->reference().objectUuid;
             annotation.beforeGeometry = request.beforePin->geometryRevision.value_or("");
             annotation.afterGeometry = afterPin->geometryRevision.value_or("");
             annotation.volumeUsed = request.growthVolumeId;
@@ -1182,9 +1160,9 @@ void SegmentationGrower::onFutureFinished()
                     annotation.points.push_back({collection.id, point.id, collection.name,
                                                  {point.p[0], point.p[1], point.p[2]}, int64_t(point.creation_time)});
             try {
-                vc3d::corrections::writeGrowthAnnotation(*_context.state->objectStoreSession(), afterPin->attachment, annotation,
-                                                         _context.state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
+                _context.module->saveGrowthAnnotation(annotation);
             } catch (const std::exception& ex) {
+                correctionsSaved = false;
                 qCWarning(lcSegGrowth) << "Failed to save the corrections annotation:" << ex.what();
             }
         }
@@ -1196,17 +1174,17 @@ void SegmentationGrower::onFutureFinished()
         if (result.surface->meta.contains("grid_offset") &&
             result.surface->meta["grid_offset"].is_array() &&
             result.surface->meta["grid_offset"].size() == 2) {
-            float offsetX = result.surface->meta["grid_offset"][static_cast<size_t>(0)].get_float();
-            float offsetY = result.surface->meta["grid_offset"][static_cast<size_t>(1)].get_float();
+            float offsetX = result.surface->meta["grid_offset"][static_cast<size_t>(0)].get<float>();
+            float offsetY = result.surface->meta["grid_offset"][static_cast<size_t>(1)].get<float>();
             if (offsetX != 0.0f || offsetY != 0.0f) {
                 _context.module->applyCorrectionAnchorOffset(offsetX, offsetY);
                 // The anchors moved with the grown grid.
-                _context.module->saveCorrections();
+                correctionsSaved = _context.module->saveCorrections() && correctionsSaved;
             }
         }
     }
 
-    if (request.usingCorrections && _context.module) {
+    if (request.usingCorrections && _context.module && correctionsSaved) {
         _context.module->clearPendingCorrections();
     }
 
@@ -1214,7 +1192,9 @@ void SegmentationGrower::onFutureFinished()
     delete result.surface;
 
     QString message;
-    if (!result.statusMessage.isEmpty()) {
+    if (!correctionsSaved) {
+        message = tr("Growth completed, but corrections were not saved; pending corrections were kept.");
+    } else if (!result.statusMessage.isEmpty()) {
         message = result.statusMessage;
     } else if (request.usingCorrections) {
         message = tr("Corrections applied; tracer growth complete.");

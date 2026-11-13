@@ -28,7 +28,8 @@ public:
     struct Option {
         QString label;
         std::string name;  // the published file (vc::objects::CatalogFile::name)
-        std::filesystem::path localPath;
+        std::string url;   // where it is published
+        std::filesystem::path localPath; // its copy in VC3D's remote cache
     };
 
     explicit InkDetectionOverlayController(CState* state, QObject* parent = nullptr);
@@ -74,8 +75,6 @@ private:
         QImage image;
         cv::Mat_<uint8_t> scalar;
         bool singleChannel{false};
-        std::filesystem::path path;
-        std::string colormapId;
     };
 
     void loadSelectedImage();

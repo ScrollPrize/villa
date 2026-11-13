@@ -19,7 +19,8 @@ changed it.
 ## 2. Jobs are tagged by `source`, and concurrency is per-source
 
 Long-running operations return a `jobId` and are tagged with a `source`
-(`tool` / `growth` / `lasagna` / `catalog` / `flatten`). Starting a
+(`tool` / `growth` / `lasagna` / `catalog` / `flatten` / `import` /
+`export` / ...). Starting a
 *second* job of the **same** source while one is active fails with
 `-32004 JOB_RUNNING`. Jobs of *different* sources run fine concurrently — a
 Lasagna optimization and a render job can both be in flight at once. Poll
@@ -120,10 +121,9 @@ config VC3D resolves, not the points you commit:
   currently-open gap (unlike `vc3d_grow_surface_from_seed`, which resolves
   normal grids dynamically and does support remote stores). To seed a remote
   volume, point `normal_grid_path` at the already-fetched local cache dir for
-  that sample's normal grid: `~/.VC3D/remote_cache/normal_grids/<sampleId>/
-  <volumeId>/L<level>-<hash>/` (created by `catalog.open_sample` when you pass
-  a `normal_grids`-kind `representationRefs` entry — check `vc3d_get_state` or
-  the catalog attach result for the exact hash-suffixed directory name).
+  that sample's normal grid: its directory under the remote cache root (created by `catalog.open_sample`
+  when you pass a `normal_grids`-kind `representationRefs` entry — check
+  `vc3d_get_state` or the catalog attach result for the exact directory).
 - The volume argument itself (the actual CT data source) *does* now resolve
   correctly for remote volumes (`Volume::remoteLocator()`, issue #1188) — you
   do not need to work around that part.
@@ -131,3 +131,49 @@ config VC3D resolves, not the points you commit:
   created (it becomes the widget's combo-box selection) — commit real points
   from `canvas.get_cursor_volume_point` after a screenshot, not fabricated
   coordinates.
+
+## 10. Objects live in stores: import, then route, then use
+
+Surfaces, fibers and point collections are objects of the project's `.vcobj`
+stores. `vc3d_get_state` lists the store references (`stores`, each with
+`writable`) and the store each kind is shown from and edited in (`routes`).
+
+- **Load a folder of tifxyz segments**:
+  `vc3d_import_objects(kind="surface", path=<folder>, bind={"scale": 1}, wait=True)`,
+  then `vc3d_list_segments()` → `vc3d_activate_segment(<uuid>)` →
+  `vc3d_screenshot()`. The job result's `uuids` are the new segment ids; no
+  need to diff listings.
+- **Import never changes routing.** It writes to the kind's routed store
+  unless `store` names another one; objects imported into a store that is not
+  routed for their kind do not show up in `vc3d_list_segments` /
+  `vc3d_fiber_list` / `vc3d_list_points` until you route it
+  (`vc3d_route_store(kind, store_id=<result.store>)`). Edits of an existing
+  object always stay in the store that holds it — routing only picks what is
+  shown and where new objects go. Check `routes` and each row's `store`.
+- **`bind.scale` has no default.** It is stored units per *current-volume*
+  voxel (1 when the segments were traced on this volume at this resolution).
+  Without `bind`, sources keep the coordinates they declare; a source that
+  declares none stays unbound and is not shown on any volume.
+- **A finished import can still have imported nothing.** The job succeeds
+  once the whole source was traversed; read `problems` and `existing`.
+  `fatalError` (job failed) means the store itself failed partway.
+- **Legacy `.volpkg` data**: there is no volpkg open. Create a project on its
+  volume, then import its `paths/` with a namespace:
+  `vc3d_create_project(path=<p.vcproj>, volume=<volpkg>/volumes/<v>)`,
+  `vc3d_open_volume(path=<p.vcproj>)`,
+  `vc3d_import_objects(kind="surface", path=<volpkg>/paths, uuid_namespace=<one fresh UUID per volpkg>, bind={"scale": 1}, wait=True)`.
+  Record the namespace and reuse it for every later import of that volpkg;
+  a retry then reports `existing` instead of creating duplicates. Without a
+  namespace, UUID-less VC3D-era sources are listed as problems.
+- **Export by UUID**: `vc3d_export_object(uuid, path)` takes a segment id or
+  the `uuid` from `vc3d_fiber_list` / `vc3d_list_points` (next to the numeric
+  ids). The parent directory must exist; pending edits are saved first.
+- **Detach is not delete.** `vc3d_detach_store` and
+  `vc3d_detach_project_entry` only drop the project's reference; files and
+  stored objects stay. `vc3d_remove_umbilicus` is the exception: it retires
+  the umbilicus *in the store*, for every project sharing it — use
+  `vc3d_route_store(kind="umbilicus", store_id=None)` to hide it for this
+  project only.
+- **Store switches save first.** Route, detach and Save As save pending
+  edits before switching and fail `-32004` (changing nothing) while growth
+  or a line optimization runs; finish or wait for those first.

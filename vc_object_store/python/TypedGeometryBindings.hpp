@@ -1,10 +1,29 @@
 #pragma once
 #include "StorageBindings.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include <nanobind/stl/variant.h>
 #include <nanobind/ndarray.h>
 
 namespace {
+template<class View>
+void bindGeometryFactory(nb::class_<vo::GeometrySnapshot>& cls, const char* name,
+    View (vo::GeometrySnapshot::*current)(const std::string&, const std::optional<std::string>&) const,
+    View (vo::GeometrySnapshot::*selected)(const vo::ObjectRevision&) const)
+{
+    cls.def(name, [=](const vo::GeometrySnapshot& snapshot, const nb::object& object,
+                      const std::optional<std::string>& geometry) {
+        if (nb::isinstance<nb::str>(object)) {
+            const auto uuid = nb::cast<std::string>(object);
+            nb::gil_scoped_release release;
+            return (snapshot.*current)(uuid, geometry);
+        }
+        if (geometry) throw std::invalid_argument("selected reference cannot be combined with a geometry revision");
+        const auto reference = vo::objectVersionFromJson(jsonDumps(object));
+        nb::gil_scoped_release release;
+        return (snapshot.*selected)(snapshot.selected(reference));
+    }, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none());
+}
 vo::GeometryData geometryInputFromPy(const nb::object& input)
 {
     if (nb::isinstance<nb::dict>(input)) return geometryFromPy(nb::cast<nb::dict>(input));
@@ -144,9 +163,16 @@ inline void bindTypedGeometry(nb::module_& m)
 
     nb::class_<vo::GeometryView>(m, "GeometryView")
         .def_prop_ro("available_transforms",[](const vo::GeometryView& v){return volumeTransformsToPy(v.availableTransforms());})
-        .def("view_transformed_at",&vo::GeometryView::viewTransformedAt,nb::arg("volume"),nb::arg("target_scale")=1.)
+        .def("view_transformed_at",[](const vo::GeometryView& view,const std::string& volume,double scale) {
+            return view.viewTransformedAt(volume,scale);
+        },nb::arg("volume"),nb::arg("target_scale")=1.)
         .def_prop_ro("revision", [](const vo::GeometryView& self) { return geometryToPy(self.revision()); })
-        .def_prop_ro("object_revision", &vo::GeometryView::objectRevision, nb::rv_policy::copy);
+        .def_prop_ro("reference", [](const vo::GeometryView& self) -> nb::object {
+            const auto ref = self.reference();
+            return ref ? jsonLoads(vo::objectVersionToJson(*ref)) : nb::none();
+        })
+        .def_prop_ro("version", &vo::GeometryView::version,
+                     "The object's numbered version this view read; None for a pinned geometry revision.");
     nb::class_<vo::PointCollectionView, vo::GeometryView>(m, "PointCollectionView")
         .def("__len__", &vo::PointCollectionView::size)
         .def("ids", &vo::PointCollectionView::ids, nb::arg("start"), nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())
@@ -195,7 +221,6 @@ inline void bindTypedGeometry(nb::module_& m)
         }, nb::arg("row") = 0, nb::arg("column") = 0, nb::arg("rows") = nb::none(), nb::arg("columns") = nb::none(),
            "(points, valid): a rectangle (default: all) as a (rows, columns, 3) float32 array and the store's per-vertex validity as a bool array.");
     nb::class_<vo::TransformedGeometryView>(m,"TransformedGeometryView")
-        .def_prop_ro("object_revision",&vo::TransformedGeometryView::objectRevision)
         .def_prop_ro("canonical",&vo::TransformedGeometryView::canonical)
         .def_prop_ro("target_volume",&vo::TransformedGeometryView::targetVolume)
         .def_prop_ro("matrix",[](const vo::TransformedGeometryView& v){return jsonLoads(v.mapping().json().dump());})
@@ -211,7 +236,8 @@ inline void bindTypedGeometry(nb::module_& m)
                 item["data"]=nb::bytes(reinterpret_cast<const char*>(e.bytes.data()),e.bytes.size());result.append(item);
             }return result;
         },nb::arg("array"),nb::arg("start"),nb::arg("points"));
-    nb::class_<vo::GeometrySnapshot>(m, "GeometrySnapshot")
+    auto snapshot = nb::class_<vo::GeometrySnapshot>(m, "GeometrySnapshot");
+    snapshot
         .def("__enter__", [](nb::object self) {
             if (!nb::cast<vo::GeometrySnapshot&>(self).active()) throw std::runtime_error("geometry snapshot is closed");
             return self;
@@ -221,12 +247,12 @@ inline void bindTypedGeometry(nb::module_& m)
             return snapshot.viewTransformedAt(uuid,volume,scale);
         },nb::arg("object_uuid"),nb::arg("volume"),nb::arg("target_scale")=1.)
         .def("close", &vo::GeometrySnapshot::close)
-        .def_prop_ro("active", &vo::GeometrySnapshot::active)
-        .def("point_collection", &vo::GeometrySnapshot::pointCollection, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
-        .def("fiber", &vo::GeometrySnapshot::fiber, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
-        .def("track", &vo::GeometrySnapshot::track, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
-        .def("surface", &vo::GeometrySnapshot::surface, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
-        .def("umbilicus", &vo::GeometrySnapshot::umbilicus, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
-        .def("geometry", &vo::GeometrySnapshot::geometry, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>());
+        .def_prop_ro("active", &vo::GeometrySnapshot::active);
+    bindGeometryFactory<vo::PointCollectionView>(snapshot, "point_collection", &vo::GeometrySnapshot::pointCollection, &vo::GeometrySnapshot::pointCollection);
+    bindGeometryFactory<vo::FiberView>(snapshot, "fiber", &vo::GeometrySnapshot::fiber, &vo::GeometrySnapshot::fiber);
+    bindGeometryFactory<vo::TrackView>(snapshot, "track", &vo::GeometrySnapshot::track, &vo::GeometrySnapshot::track);
+    bindGeometryFactory<vo::SurfaceView>(snapshot, "surface", &vo::GeometrySnapshot::surface, &vo::GeometrySnapshot::surface);
+    bindGeometryFactory<vo::UmbilicusView>(snapshot, "umbilicus", &vo::GeometrySnapshot::umbilicus, &vo::GeometrySnapshot::umbilicus);
+    bindGeometryFactory<vo::TypedGeometryView>(snapshot, "geometry", &vo::GeometrySnapshot::geometry, &vo::GeometrySnapshot::geometry);
 }
 } // namespace vc::python
