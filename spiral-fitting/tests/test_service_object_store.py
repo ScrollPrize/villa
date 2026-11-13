@@ -120,7 +120,7 @@ def test_clients_cannot_choose_the_binding_or_host_input_paths(host, store_path,
         state._prepare_session_request(body)
     [detail] = refused.value.details
     assert detail['field'] == 'paths.winding_inference'
-    assert 'restart the service' in detail['message']
+    assert "the service's bindings" in detail['message']
 
 
 def test_the_binding_wins_over_a_resumed_checkpoints_store(host, store_path,

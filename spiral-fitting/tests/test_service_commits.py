@@ -349,7 +349,7 @@ def test_only_a_preview_of_this_session_is_committed(fit):
         'spiral-checkpoint', SESSION, 1, checkpoint, 'manifest.json')['id']
     with pytest.raises(ApiError, match='not a preview of this session'):
         fit.state.commit({'artifact': other})
-    with pytest.raises(ApiError, match='artifact must name'):
+    with pytest.raises(ApiError, match='artifact must refer to a published preview'):
         fit.state.commit({})
     assert fit.state.status()['commit'] is None
 
