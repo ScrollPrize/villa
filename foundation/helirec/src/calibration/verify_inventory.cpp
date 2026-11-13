@@ -634,7 +634,7 @@ void check_beam(const Record& rec, const Inventory& inv, const FlatField& ff, Re
             for (double delay : {-10.,-5.,0.,5.,10.}) {
                 std::vector<double> x(w1-w0), y(w1-w0);
                 for (std::size_t fr = w0; fr < w1; ++fr) x[fr-w0] = monitor_at(s.monitor,epoch[fr]+delay), y[fr-w0] = level[fr];
-                const auto initial = fit_line(x,y);
+                const auto initial = fit_line(x,y,0,x.size());
                 if (!initial.usable) continue;
                 double p[3] = {delay,initial.slope,initial.intercept+initial.slope*mx-my};
                 ceres::Problem problem;
