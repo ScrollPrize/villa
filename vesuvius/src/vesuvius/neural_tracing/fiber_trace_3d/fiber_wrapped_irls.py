@@ -52,37 +52,13 @@ def quadratic_step(phase, i, j, pair_target, pair_weight, unary_target,
     # Self edges have no phase derivative (but do affect per-node rejection).
     c = torch.where(i == j, 0., pair_weight)
     diag = unary_weight + _scatter_pair(c, i, j, n)
-    inv_diag = torch.where(diag > 0, diag.reciprocal(), 0.)
 
     def matvec(v):
         return unary_weight*v + _scatter_pair(c*(v[j]-v[i]), i, j, n, difference=True)
 
     rhs = unary_weight*unary_target + _scatter_pair(c*pair_target, i, j, n, difference=True)
-    x = phase.clone()
-    r = rhs-matvec(x)
-    z = r*inv_diag
-    p = z.clone()
-    rz = (r*z).sum()
-    initial = rz.clone()
-    tiny = torch.finfo(phase.dtype).tiny
-    used = 0
-    for step in range(max_cg):
-        ap = matvec(p)
-        pap = (p*ap).sum()
-        alpha = torch.where(pap > tiny, rz/pap.clamp_min(tiny), 0.)
-        x = x+alpha*p
-        r = r-alpha*ap
-        z = r*inv_diag
-        next_rz = (r*z).sum()
-        beta = torch.where(rz > tiny, next_rz/rz.clamp_min(tiny), 0.)
-        p = z+beta*p
-        rz = next_rz
-        used = step+1
-        # One scalar synchronization per ten CG steps, not per edge/iteration.
-        if used % 10 == 0 or used == max_cg:
-            if bool(rz <= cg_tolerance**2*initial.clamp_min(tiny)):
-                break
-    return x, used
+    from .fiber_matrix_free_cg import solve
+    return solve(matvec,rhs,phase,diag,iterations=max_cg,tolerance=cg_tolerance)
 
 
 def keep_step(phase, keep, i, j, target, weight, prior_target, prior_weight,

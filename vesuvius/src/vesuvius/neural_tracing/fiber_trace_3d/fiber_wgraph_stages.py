@@ -38,8 +38,39 @@ def _fiber_rows(database, run):
     with CollectionReader(str(database)) as store:
         table=next(t for t in store.extension_tables() if t['name']==PREFIX+'fibers')
         columns=[c['name'] for c in table['columns']]
-        rows=store.extension_rows(PREFIX+'fibers')
-    return {_uuid(row[0]):dict(zip(columns,row)) for row in rows if _uuid(row[1])==run}
+        rows=store.extension_rows(PREFIX+'fibers',key_filter={'run_uuid':uuid.UUID(run).bytes})
+    return {_uuid(row[0]):dict(zip(columns,row)) for row in rows}
+
+
+def _fiber_columns(database, run, ids=None, *, required=(), exact=False):
+    """One run's native numeric projection, without per-fiber Python records.
+
+    Selected run identity remains explicit. Source input pins are carried by
+    the run's ordinary input rows; these arrays do not invent new references.
+    """
+    with CollectionReader(str(database)) as store:
+        columns=store.fiber_result_columns(run)
+    source_ids=np.frombuffer(columns['uuid_ascii'],dtype='S36').astype('U36')
+    values=columns['values'];valid=columns['valid']
+    if ids is not None:
+        ids=np.asarray(ids)
+        aligned=np.array_equal(source_ids,ids)
+        if exact and not aligned:
+            raise ValueError('Result rows must cover exactly the extracted graph')
+        if not aligned:
+            index=np.searchsorted(source_ids,ids)
+            if np.any(index>=len(source_ids)) or not np.array_equal(source_ids[index],ids):
+                raise ValueError('Result rows do not cover the selected fibers')
+            values=values[index];valid=valid[index]
+        source_ids=ids
+    names=columns['columns'];out={'ids':source_ids}
+    if set(required)-set(names):raise ValueError('Unknown numeric result field')
+    for i,name in enumerate(names):
+        if name in required and not valid[:,i].all():
+            raise ValueError(f'Result run has missing {name} values')
+        out[name]=values[:,i]
+        out[name+'_valid']=valid[:,i]
+    return out
 
 
 def _run_inputs(database, run):
@@ -159,9 +190,8 @@ def run_stage(stage, config):
         prior=json.loads(Path(config['priors']).read_text())
         base=_base_database(config,prior['source_store'])
         graph=_graph(config,base)
-        classifications=_fiber_rows(config['database'],selected)
-        if set(classifications)!=set(graph.ids):raise ValueError('Classification does not cover the extracted graph')
-        keep=np.asarray([classifications[fid]['enabled'] for fid in graph.ids],np.float32)
+        classifications=_fiber_columns(config['database'],selected,graph.ids,required=('enabled',),exact=True)
+        keep=np.asarray(classifications['enabled'],np.float32)
         if not np.isin(keep,[0,1]).all():raise ValueError('Classification enabled mask is not binary')
         settings.update(database=str(base),tensor_cache=str(root/'tensors.npz'),fixed_keep=True)
         normal.prepare(settings,graph=graph)

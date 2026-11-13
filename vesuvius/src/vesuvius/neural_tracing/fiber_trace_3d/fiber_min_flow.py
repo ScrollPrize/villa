@@ -156,6 +156,7 @@ class Seam:
     is increasing atan2(Y-cY,X-cX). The seam belongs to its positive-angle side.
     """
     def __init__(self, axis, angle=-np.pi/2):
+        from vc_object_store import NativeWindingSeam
         self.axis = np.asarray(axis, float)
         self.axis = self.axis[np.argsort(self.axis[:, 2])]
         if len(self.axis) < 2 or not np.isfinite(self.axis).all() or np.any(np.diff(self.axis[:, 2]) <= 0):
@@ -163,69 +164,25 @@ class Seam:
         self.ray = np.array([np.cos(angle), np.sin(angle)])
         self.ray[abs(self.ray) < 1e-15] = 0
         self.angle = angle
+        self._native=NativeWindingSeam(np.ascontiguousarray(self.axis),float(angle))
 
     def relative(self, points):
-        p = np.asarray(points, float)
-        center = np.column_stack([np.interp(p[:, 2], self.axis[:, 2], self.axis[:, dim]) for dim in (0, 1)])
-        return p[:, :2]-center
+        return self._native.relative(np.ascontiguousarray(points,dtype=np.float64),1)
 
     def segment(self, start, end):
-        a, b = np.asarray(start, float), np.asarray(end, float)
-        if not np.isfinite([a, b]).all():
-            raise ValueError('Nonfinite path')
-        ts = np.array([0., 1.])
-        if b[2] != a[2]:
-            cuts = (self.axis[:, 2]-a[2])/(b[2]-a[2])
-            ts = np.sort(np.r_[ts, cuts[(cuts > 0)&(cuts < 1)]])
-        r = self.relative(a[None, :]+ts[:, None]*(b-a))
-        # Crossing through the axis is undefined, including a path lying along
-        # the cut and passing through its origin.
-        dr = np.diff(r, axis=0)
-        t = np.clip(-np.sum(r[:-1]*dr, axis=1)/np.maximum(np.sum(dr*dr, axis=1), 1e-300), 0, 1)
-        if np.any(np.linalg.norm(r[:-1]+t[:, None]*dr, axis=1) < 1e-8):
-            raise ValueError('Path intersects umbilicus; seam transport undefined')
-        u = r @ self.ray
-        v = self.ray[0]*r[:, 1]-self.ray[1]*r[:, 0]
-        up = (v[:-1] < 0)&(v[1:] >= 0)
-        down = (v[:-1] >= 0)&(v[1:] < 0)
-        chosen = up | down
-        if not chosen.any():
-            return 0
-        t = -v[:-1][chosen]/np.diff(v)[chosen]
-        outward = u[:-1][chosen]+t*np.diff(u)[chosen]
-        return int(np.sum(np.where(up[chosen], 1, -1)*(outward > 0)))
+        a=np.ascontiguousarray(start,dtype=np.float64).reshape(1,3)
+        b=np.ascontiguousarray(end,dtype=np.float64).reshape(1,3)
+        return int(self._native.segments(a,b,1)[0])
 
     def polyline(self, points):
         return np.r_[0, np.cumsum(self.segments(points[:-1], points[1:]))]
 
     def segments(self, start, end):
         """Batch segments within linear axis intervals; split knot crossings exactly."""
-        start, end = np.asarray(start, float), np.asarray(end, float)
+        start, end = np.ascontiguousarray(start,dtype=np.float64), np.ascontiguousarray(end,dtype=np.float64)
         if start.shape != end.shape or start.ndim != 2 or start.shape[1] != 3:
             raise ValueError('Expected matching XYZ segment arrays')
-        if not np.isfinite(start).all() or not np.isfinite(end).all():
-            raise ValueError('Nonfinite path')
-        result = np.zeros(len(start), dtype=np.int64)
-        intervals_a = np.searchsorted(self.axis[:, 2], start[:, 2], side='right')
-        intervals_b = np.searchsorted(self.axis[:, 2], end[:, 2], side='right')
-        simple = intervals_a == intervals_b
-        a, b = self.relative(start[simple]), self.relative(end[simple])
-        dr = b-a
-        t = np.clip(-np.sum(a*dr, axis=1)/np.maximum(np.sum(dr*dr, axis=1), 1e-300), 0, 1)
-        if np.any(np.linalg.norm(a+t[:, None]*dr, axis=1) < 1e-8):
-            raise ValueError('Path intersects umbilicus; seam transport undefined')
-        ua, ub = a @ self.ray, b @ self.ray
-        va = self.ray[0]*a[:, 1]-self.ray[1]*a[:, 0]
-        vb = self.ray[0]*b[:, 1]-self.ray[1]*b[:, 0]
-        up, down = (va < 0)&(vb >= 0), (va >= 0)&(vb < 0)
-        chosen = up | down
-        crossing = np.zeros(len(a), np.int64)
-        t = -va[chosen]/(vb[chosen]-va[chosen])
-        crossing[chosen] = np.where(up[chosen], 1, -1)*(ua[chosen]+t*(ub[chosen]-ua[chosen]) > 0)
-        result[simple] = crossing
-        for index in np.flatnonzero(~simple):
-            result[index] = self.segment(start[index], end[index])
-        return result
+        return self._native.segments(start,end,1)
 
 
 def corrected_targets(measured, fiber_a, fiber_b, connector):

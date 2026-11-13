@@ -7,7 +7,7 @@ import pytest
 
 from vc_object_store import CollectionReader, fiber_graph_solve_table, write_extension_store
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
-    fiber_catalog, fiber_volume, fibers_digest, read_polylines, write_initial_fibers,
+    fiber_catalog, fiber_volume, fibers_digest, read_polylines, read_polyline_arrays, write_initial_fibers,
 )
 
 
@@ -61,6 +61,9 @@ def test_initial_collection_geometry_and_identity(tmp_path, workers, packed):
     assert fiber_volume(path) == volume
     assert len(fiber_catalog(path, volume)) == 12
     loaded = read_polylines(path)
+    packed_ids,packed=read_polyline_arrays(path,[r['id'] for r,_ in curves],volume=volume)
+    assert packed_ids.tolist()==[r['id'] for r,_ in loaded]
+    np.testing.assert_array_equal(packed.values,np.concatenate([xyz for _,xyz in loaded]))
     for (row, actual), (expected, xyz) in zip(loaded, curves):
         assert row['id'] == expected['id']
         np.testing.assert_array_equal(actual, xyz)
@@ -152,6 +155,11 @@ def test_measurement_frame_and_registered_geometry(tmp_path):
     expected=np.array([[10.,-5.,2.],[18.,7.,2.]])
     for _,points in read_polylines(path,[uid(1),uid(2)],volume=target):
         np.testing.assert_array_equal(points,expected)
+    packed_ids,packed=read_polyline_arrays(path,[uid(1),uid(2)],volume=target)
+    assert packed_ids.tolist()==[uid(1),uid(2)]
+    np.testing.assert_array_equal(packed.values,np.concatenate([expected,expected]))
+    empty_ids,empty=read_polyline_arrays(path,[],volume=target)
+    assert not len(empty_ids) and empty.values.shape==(0,3)
     with CollectionReader(path) as store:
         table=fiber_constraint_extension('',coordinate_space='sample/'+target,based_on=[store.source])
     table['provisioning']['fiber_source']=fiber_source_version(path)

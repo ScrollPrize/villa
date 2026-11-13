@@ -31,6 +31,91 @@ def test_uv_can_explicitly_retain_all_components():
     np.testing.assert_array_equal(labels,s['winding'])
 
 
+def test_uv_direct_child_passes_owned_arrays_to_solver_without_staging(tmp_path,monkeypatch):
+    """Preparation and solve are one process, not NPZ-mediated subprocesses."""
+    import vc_object_store
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_wgraph_geometry as adapter
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_wgraph_stages as stages
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_min_flow_full as full
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_flow_uv as uv
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_native_prepare as native
+    ids=np.array(['first','second','unsupported'])
+    catalog=dict(source_id=ids,family=np.array([0,1,0]))
+    graph=object();events=dict(i=np.array([0]),j=np.array([1]),parallel=np.array([False]))
+    chosen=np.array([0,1]);prepared=dict(source_id=ids[:2],i=events['i'])
+    selection=dict(retained=2,global_integer_shift=5)
+    config=dict(database='winding.vcobj',result_store='uv.vcobj',output_root=str(tmp_path/'work'),
+                workers=7,component_selection='all',parameters=dict(uv_optimizer='gauss_newton_cg'))
+    input_source=dict(store_uuid='source-store',generation='source-generation',commit_sequence=9)
+    class InputReader:
+        def __init__(self,path):assert path=='winding.vcobj'
+        def __enter__(self):return self
+        def __exit__(self,*args):return False
+        source=input_source
+    def forbidden(*args,**kwargs):raise AssertionError('Direct preparation must not stage/reread NPZ or use Python event batches')
+    def prepare(c,**kwargs):
+        assert kwargs==dict(build_graph=False,in_memory=True)
+        assert c['normal_sign_run_uuid']=='sign-run'
+        return catalog,{},{}
+    class Paths:
+        def __init__(self,root):assert str(root).endswith('/work/geometry')
+        def bind_graph(self,value):assert value is graph
+    def native_events(paths,value,**kwargs):
+        assert isinstance(paths,Paths) and value is graph
+        assert kwargs==dict(workers=7,node_mask=None)
+        return events,chosen
+    def prepare_data(c,data,labels,paths,**kwargs):
+        assert data is events and isinstance(paths,Paths)
+        assert kwargs==dict(supported_input=True)
+        assert c['workers']==7 and c['input_store']=='winding.vcobj'
+        np.testing.assert_array_equal(labels,[2,3])
+        return prepared,selection
+    def solve(c,data,selected):
+        assert data is prepared and selected is selection
+        assert selected['input_fibers']==3
+        assert c['input_run_uuid']=='winding-run'
+        assert c['result_store']=='uv.vcobj'
+        assert c['input_source'] is input_source
+        return dict(run_uuid='new-uv-run',assignments_fixed=True)
+    monkeypatch.setattr(adapter,'_prepare',prepare)
+    monkeypatch.setattr(vc_object_store,'CollectionReader',InputReader)
+    monkeypatch.setattr(adapter,'_input_lineage',lambda *args:dict(classification='class-run',normal_sign='sign-run'))
+    monkeypatch.setattr(stages,'_selected_run',lambda *args:'winding-run')
+    monkeypatch.setattr(stages,'_fiber_columns',lambda *args,**kwargs:dict(selected_winding=np.array([2,3,9]),component=np.array([0,0,1])))
+    monkeypatch.setattr(stages,'_base_database',lambda *args:'source.vcobj')
+    monkeypatch.setattr(stages,'_graph',lambda *args:graph)
+    monkeypatch.setattr(full,'PackedPaths',Paths);monkeypatch.setattr(full,'event_batches',forbidden)
+    monkeypatch.setattr(native,'prepare_events',native_events)
+    monkeypatch.setattr(uv,'prepare_data',prepare_data);monkeypatch.setattr(uv,'solve',solve)
+    monkeypatch.setattr(np,'savez',forbidden);monkeypatch.setattr(np,'load',forbidden)
+    # Real timing/selection reports are small JSON metadata and remain allowed.
+    (tmp_path/'work').mkdir()
+    result=adapter._solve_uv_direct(config)
+    assert result==dict(run_uuid='new-uv-run',assignments_fixed=True)
+    assert not list((tmp_path/'work').glob('*.npz'))
+
+
+def test_uv_launcher_acquires_managed_process_before_preparation(tmp_path,monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_wgraph_geometry as adapter
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_wgraph_stages as stages
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_normal_sign as normal
+    config=dict(database='source.vcobj',result_store='uv.vcobj',output_root=str(tmp_path/'work'),
+                devices='3',workers=32,gpu_manager=dict(exclusive=False))
+    observed=[]
+    monkeypatch.setattr(stages,'_selected_run',lambda *args:'winding-run')
+    monkeypatch.setattr(adapter,'_input_lineage',lambda *args:observed.append('lineage'))
+    def forbidden(*args,**kwargs):raise AssertionError('Parent process must not construct solver tensors')
+    monkeypatch.setattr(adapter,'_prepare',forbidden)
+    def launch(settings,module,source):
+        assert observed==['lineage']
+        assert settings==dict(config,stage_mode='uv_direct')
+        assert module==adapter.__name__ and source==adapter.__file__
+        assert not any(isinstance(value,np.ndarray) for value in settings.values())
+        return dict(run_uuid='uv-run')
+    monkeypatch.setattr(normal,'launch_tensor_solve',launch)
+    assert adapter._run_uv(config)==dict(result_store='uv.vcobj',run_uuid='uv-run',solver_summary=dict(run_uuid='uv-run'))
+
+
 def test_packed_priors_match_original_polyline_sampling(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow import Seam
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_full import PackedPaths,KEY_DTYPE,PACKED_GEOMETRY_FORMAT
@@ -133,7 +218,13 @@ def test_packed_worker_reuses_graph_cache_without_readback(tmp_path,monkeypatch)
     FiberGraph(source).save_cache(cache)
     def forbidden(*args,**kwargs):raise AssertionError('Unexpected full graph readback')
     monkeypatch.setattr(FiberGraph,'__init__',forbidden)
-    monkeypatch.setattr(full,'PackedPaths',lambda *args,**kwargs:object())
+    geo=tmp_path/'work'/'geometry';geo.mkdir(parents=True)
+    np.save(geo/'graph_index.npy',np.array([0,1]))
+    class Paths:
+        root=geo
+        def bind_graph(self,graph,index):
+            np.testing.assert_array_equal(index,[0,1])
+    monkeypatch.setattr(full,'PackedPaths',lambda *args,**kwargs:Paths())
     full._init(dict(database=str(source),output_root=str(tmp_path/'work'),graph_cache=str(cache)),'constraints')
     assert len(full._worker[2].event_ids)==1
     assert not (tmp_path/'work'/'constraint_columns').exists()

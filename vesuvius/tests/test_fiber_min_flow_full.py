@@ -49,7 +49,8 @@ def test_legacy_sgd_preparation_uses_sparse_row_jobs(tmp_path,monkeypatch):
     source=tmp_path/'source';source.mkdir();(source/'geometry').mkdir()
     (source/'request.json').write_text(json.dumps(dict(config=dict(database='graph',constraint_batch=2))))
     ids=np.array([0,2**32+1,2**40,2**48,np.iinfo(np.int64).max],np.int64)
-    monkeypatch.setattr(sgd,'PackedPaths',lambda _:SimpleNamespace(ids=np.array(['fiber'])))
+    monkeypatch.setattr(sgd,'PackedPaths',lambda _:SimpleNamespace(ids=np.array(['fiber']),
+        bind_graph=lambda _:None,save_graph_index=lambda:None,graph_index=np.array([0])))
     monkeypatch.setattr(sgd.FiberGraph,'cached',lambda *args:SimpleNamespace(event_ids=ids))
     def scheduled(config,stage,jobs,worker):
         assert stage=='events' and jobs==constraint_jobs(ids,2) and len(jobs)==3
@@ -78,6 +79,29 @@ def test_packed_matches_scalar_paths_with_zero_segments_and_axis_knots(tmp_path)
     sources=np.repeat(ids,100);arcs=np.concatenate([np.linspace(0,ordinary.paths[str(s)][0][-1],100) for s in ids])
     pa,ta=ordinary.at_many(sources,arcs);pb,tb=packed.at_many(sources,arcs)
     np.testing.assert_array_equal(pa,pb);np.testing.assert_array_equal(ta,tb)
+    pc,tc=packed.at_indices(np.repeat(np.arange(len(ids)),100),arcs)
+    np.testing.assert_array_equal(pa,pc);np.testing.assert_array_equal(ta,tc)
+
+
+def test_event_batches_use_dense_graph_indices_and_reject_missing_nodes():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_full import event_batches
+    graph=object.__new__(FiberGraph)
+    graph.ids=np.array([uid(1),uid(2),uid(3)])
+    graph.event_ids=np.arange(3);graph.i=np.array([0,0,2]);graph.j=np.array([2,1,2])
+    graph.parallel=np.array([False,False,True]);graph.arc_a=np.arange(3.);graph.arc_b=np.arange(3.)+1
+    graph.distance=np.ones(3);graph.valid_a=graph.valid_b=graph.valid_connector=np.ones(3,bool)
+    graph.normal_a=graph.normal_b=graph.connector=np.tile([0.,0.,1.],(3,1))
+    # No UUID endpoint columns are present: hot-path string lookups would fail.
+    paths=object.__new__(PackedPaths);paths.ids=graph.ids[[0,2]];paths.graph_index=None
+    paths.catalog=dict(family=np.array([0,1]),normal_sign=np.ones(2))
+    paths.bind_graph(graph)
+    assert paths.graph_index.tolist()==[0,-1,1]
+    rows=list(event_batches({},paths,graph,0,3))
+    assert len(rows)==1
+    _,d=rows[0]
+    assert d['i'].tolist()==[0,1] and d['j'].tolist()==[1,1]
+    assert d['event_ids'].tolist()==[0,2]
 
 
 @pytest.mark.parametrize('supplied_curves',[False,True])
@@ -125,8 +149,8 @@ def test_geometry_worker_uses_recorded_target_frame(tmp_path,monkeypatch):
     paths=PackedPaths(root,mode='r+')
     def read(path,ids,*,volume):
         assert path=='source' and ids.tolist()==[sid] and volume==uid(901)
-        return [(dict(id=sid),xyz)]
-    monkeypatch.setattr(mod,'read_polylines',read)
+        return np.array([sid]),SimpleNamespace(values=xyz,offsets=np.array([0,2]))
+    monkeypatch.setattr(mod,'read_polyline_arrays',read)
     monkeypatch.setattr(mod,'_worker',(dict(fibers='source',output_root=str(tmp_path)),paths,None))
     result=mod.geometry_job((0,1))
     assert result['fibers']==1 and result['points']==2
@@ -143,28 +167,53 @@ def test_full_prepare_records_working_frame_but_counts_source_points(tmp_path,mo
     np.savez(comparison,ids=np.array([sid]),labels=np.array([0]))
     np.savez(normal,ids=np.array([sid]),normal_sign=np.array([1]),normal_convention='inward')
     monkeypatch.setattr(mod,'workflow_volume',lambda _:target)
-    def catalog(path,volume=None):
-        assert path=='source' and volume is None
-        return [dict(id=sid,point_count=2)]
+    def catalog(path):
+        assert path=='source'
+        return np.array([sid]),np.array([2])
     def axis(path,volume):
         assert path=='axis' and volume==target
         return np.array([[10.,0,-10],[10.,0,10]])
-    monkeypatch.setattr(mod,'fiber_catalog',catalog)
+    monkeypatch.setattr(mod,'fiber_point_counts',catalog)
     monkeypatch.setattr(normals,'load_umbilicus_frame',axis)
     monkeypatch.setattr(mod,'parallel_stage',lambda *args:[])
     def cached(database,root):
         assert database=='graph' and root==tmp_path/'shared-columns'
-        return SimpleNamespace(event_ids=np.array([0]))
+        return SimpleNamespace(event_ids=np.array([0]),ids=np.array([sid]))
     monkeypatch.setattr(mod.FiberGraph,'cached',cached)
     config=dict(fibers='source',database='graph',umbilicus='axis',comparison=str(comparison),
                 normal_solution=str(normal),output_root=str(tmp_path/'out'),graph_cache=str(tmp_path/'shared-columns'))
     result=mod.prepare(config)
     assert result['volume'].item()==target
     assert result['point_offset'].tolist()==[0,2]
+    # The caller has verified the immutable source/run pins. Reuse must not
+    # rescan descriptors or start workers just to return completed geometry.
+    (tmp_path/'out/geometry/block_00000000.json').write_text(json.dumps(dict(first=0,last=1,points=2)))
+    def forbidden_counts(_):raise AssertionError('verified geometry cache must not reread source catalog')
+    monkeypatch.setattr(mod,'fiber_point_counts',forbidden_counts)
+    def completed(config,stage,jobs,worker):
+        assert stage=='geometry' and jobs==[]
+        return []
+    monkeypatch.setattr(mod,'parallel_stage',completed)
+    reused=mod.prepare(config,build_graph=False,reuse_catalog=True)
+    np.testing.assert_array_equal(reused['point_offset'],[0,2])
+    # A cache still has to match the selected frame, axis and fiber labels.
+    np.savez(comparison,ids=np.array([sid]),labels=np.array([1]))
+    with pytest.raises(ValueError,match='Geometry catalog changed'):
+        mod.prepare(config,build_graph=False,reuse_catalog=True)
+    np.savez(comparison,ids=np.array([sid]),labels=np.array([0]))
+    monkeypatch.setattr(mod,'fiber_point_counts',catalog)
     # A prior cache may contain the same fibers but no trustworthy frame.
     np.savez(tmp_path/'out/geometry/catalog.npz',**{k:v for k,v in result.items() if k!='volume'})
     with pytest.raises(ValueError,match='Geometry catalog changed'):
         mod.prepare(config)
+
+
+def test_geometry_worker_rejects_stale_interval_marker(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_full import completed_geometry_block
+    marker=tmp_path/'block_00000000.json'
+    marker.write_text(json.dumps(dict(first=0,last=4096)))
+    assert completed_geometry_block(tmp_path,0,4096)==dict(first=0,last=4096)
+    assert completed_geometry_block(tmp_path,0,8192) is None
 
 
 def test_aggregation_preserves_objective_and_certificate():

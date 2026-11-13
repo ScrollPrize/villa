@@ -1,4 +1,4 @@
-"""Conditional fixed-flow-label geometry fit using the SGD geometry/optimizer.
+"""Conditional fixed-flow-label geometry fit with shared graph CG or L-BFGS.
 
 No probability, rejection, reclassification, or integer-label optimization.
 The selected integer separation at each event is immutable. Geometry uses the
@@ -41,25 +41,18 @@ def saved_assignment_inputs(data, solution, component_selection='largest'):
 
 
 def run_saved(config):
-    """Fixed-label UV fitting from an existing IRLS/LEMON checkpoint; no re-solve."""
-    from .fiber_min_flow_experiment import digest
+    """Fit existing signed checkpoint inputs without restaging their arrays."""
     from .fiber_graph_store import workflow_volume
-    root=Path(config['output_root']);stage=root/'fixed_input';stage.mkdir(parents=True,exist_ok=True)
-    binding=dict(request=config,sha256={str(p):digest(p) for p in
-        (config['tensor_cache'],config['solution'])})
-    manifest=stage/'binding.json'
-    if manifest.exists() and json.loads(manifest.read_text())!=binding:
-        raise ValueError('Saved assignment inputs changed; choose a new output root')
-    d,labels=saved_assignment_inputs(arrays(config['tensor_cache']),arrays(config['solution']),
-                                   config.get('component_selection','largest'))
-    np.savez(stage/'selected_tensors.npz',**d)
-    np.savez(stage/'selected_solution.npz',winding=labels)
-    fibers=stage/'selected_with_gt.vcobj'
-    if not fibers.exists():fibers.symlink_to(Path(config['fibers']).resolve())
-    write(manifest,binding)
-    fit=dict(config['parameters'],flow_root=str(stage),output_root=str(root),
-        working_volume=workflow_volume(config),
-        umbilicus=config['umbilicus'],devices=config.get('devices','0'),gpu_manager=config['gpu_manager'])
+    fit=dict(config.get('parameters',{}),output_root=config['output_root'],
+        input_store=config['fibers'],checkpoint_tensor_cache=config['tensor_cache'],
+        checkpoint_solution=config['solution'],checkpoint_arcs_unsigned=False,
+        component_selection=config.get('component_selection','largest'),
+        working_volume=workflow_volume(config),umbilicus=config['umbilicus'],
+        devices=config.get('devices','0'),gpu_manager=config['gpu_manager'])
+    # Paths/settings stay scalar provisioning. The arrays are loaded once,
+    # inside the managed child, never serialized to another input archive.
+    for key in ('packed_geometry','workers','result_store','input_run_uuid','input_source'):
+        if key in config:fit[key]=config[key]
     return run(fit)
 
 
@@ -73,77 +66,115 @@ def supported(d):
     return result,keep,edge
 
 
+def _checkpoint_binding(config, *, create):
+    """Pin explicit legacy input content; never substitute size/mtime checks."""
+    from .fiber_min_flow_experiment import digest
+    from vc_object_store import CollectionReader
+    source=config.get('input_source')
+    if source is None:
+        with CollectionReader(config['input_store']) as reader:source=reader.source
+    binding=dict(tensor_sha256=digest(config['checkpoint_tensor_cache']),
+                 solution_sha256=digest(config['checkpoint_solution']),input_source=source)
+    manifest=Path(config['output_root'])/'checkpoint-inputs.json'
+    if manifest.exists():
+        if json.loads(manifest.read_text())!=binding:
+            raise ValueError('Saved assignment inputs changed; choose a new output root')
+    elif create:
+        manifest.parent.mkdir(parents=True,exist_ok=True)
+        write(manifest,binding)
+    else:
+        raise ValueError('Completed checkpoint fit lacks its input content binding')
+    return binding
+
+
 def prepare(config):
-    from .fiber_min_flow_benchmark import Paths
-    root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
-    parent=Path(config['flow_root']);original=arrays(parent/'selected_tensors.npz')
-    sol=arrays(parent/'selected_solution.npz');d,keep,edge=supported(original)
-    if not keep.any():raise ValueError('No perpendicular-supported fibers')
-    if config.get('packed_geometry'):
-        from .fiber_min_flow_full import PackedPaths
-        from .fiber_packed_priors import geometry_priors
-        paths=PackedPaths(config['packed_geometry'],d)
-        prior=geometry_priors(paths,d['source_id'],d['family'],config.get('prior_spacing',1000))
-        directions,phase,z,radii=(prior[k] for k in ('directions','phase','z','radii'))
-        sample_owner,sample_arc,sample_phase,sample_z=(prior[k] for k in
-            ('sample_owner','sample_arc','sample_phase','sample_z'))
-        minimum_turn,maximum_turn=prior['minimum_turn'],prior['maximum_turn']
+    """Read explicit checkpoint inputs once and return native-prepared arrays.
+
+    This is an input adapter, not a cache writer. Store-to-store production
+    workflows enter prepare_data directly and do not use checkpoint files.
+    """
+    original=arrays(config['checkpoint_tensor_cache'])
+    solution=arrays(config['checkpoint_solution'])
+    if 'source_id' not in solution:solution=dict(solution,source_id=original['source_id'])
+    if 'component' not in solution:
+        solution=dict(solution,component=np.zeros(len(original['source_id']),dtype=np.int64))
+    if config.get('checkpoint_arcs_unsigned',False):
+        # The historical flow_root boundary stores unsigned measured arcs.
+        # Reuse the signed-checkpoint adapter with a neutral direction column;
+        # this never changes the physical input endpoint positions.
+        original=dict(original,node_ds=np.column_stack((np.zeros(len(original['source_id'])),
+                                                       np.asarray(original['end']))))
+    selected,labels=saved_assignment_inputs(original,solution,config.get('component_selection','all'))
+    return prepare_data(config,selected,labels)
+
+
+def prepare_data(config, data, labels, paths=None, *, supported_input=False):
+    """Prepare owned native columns in memory, without staging solver files.
+
+    Event arcs are unsigned measured arclength on entry. Native assembly can
+    already remove unsupported fibers; the saved-input adapter retains its
+    explicit selection path for existing checkpoints.
+    """
+    from .fiber_packed_priors import geometry_priors, fixed_target_columns, width_initial
+    from .fiber_min_flow_full import PackedPaths
+    started=time.monotonic()
+    if supported_input:
+        d=dict(data);keep=np.ones(len(labels),bool)
     else:
-        paths=Paths(dict(fibers=str(parent/'selected_with_gt.vcobj'),umbilicus=config['umbilicus'],
-                         working_volume=config.get('working_volume')),d)
-    if not config.get('packed_geometry'):
-        directions=[];phase=[];z=[];radii=[];sample_owner=[];sample_arc=[];sample_phase=[];sample_z=[]
-    for i,sid in enumerate(d['source_id'] if not config.get('packed_geometry') else []):
-        arc,xyz,transport=paths.paths[str(sid)];rel=paths.seam.relative(xyz)
-        p=((np.arctan2(rel[:,1],rel[:,0])-paths.seam.angle)%(2*np.pi))/(2*np.pi)
-        direction=np.sign((transport[-1]+p[-1]-p[0]) if d['family'][i]==0 else xyz[-1,2]-xyz[0,2])
-        if not direction:raise ValueError('Unidentifiable fiber direction: '+str(sid))
-        directions.append(direction);phase.append(p[0]);z.append(xyz[0,2]);radii.append(np.median(np.linalg.norm(rel,axis=1)))
-        at=np.linspace(0,arc[-1],max(2,int(np.ceil(arc[-1]/config.get('prior_spacing',1000)))+1))
-        pos,_=paths.at_many(np.full(len(at),sid),at);rel=paths.seam.relative(pos)
-        sample_owner.extend([i]*len(at));sample_arc.extend(at)
-        sample_phase.extend(((np.arctan2(rel[:,1],rel[:,0])-paths.seam.angle)%(2*np.pi))/(2*np.pi));sample_z.extend(pos[:,2])
-    if not config.get('packed_geometry'):
-        minimum_turn=np.array([paths.paths[str(s)][2].min() for s in d['source_id']])
-        maximum_turn=np.array([paths.paths[str(s)][2].max() for s in d['source_id']])
-    # All targets are read from the flow solution, never from rounded SGD values.
-    labels=sol['winding'][keep].copy()
-    shift=2-int(np.min(labels+minimum_turn))
-    labels+=shift
-    if config.get('packed_geometry'):
-        from .fiber_packed_priors import fixed_targets
-        target=fixed_targets(paths,d,labels,int(config.get('preparation_batch_size',65536)))
-    else:
-        a,ta=paths.ends('a');b,tb=paths.ends('b');connector=paths.seam.segments(a,b)
-        target=labels[d['j']]-labels[d['i']]+tb-ta-connector
+        from .fiber_uv_native_prepare import select_inputs
+        d,chosen=select_inputs(data,workers=int(config.get('workers',32)))
+        keep=chosen
+    labels=np.asarray(labels)[keep].copy()
+    if not len(labels):raise ValueError('No perpendicular-supported fibers')
+    if not np.isfinite(labels).all() or np.any(labels!=np.rint(labels)):
+        raise ValueError('Use saved integer assignments, not continuous potentials')
+    if paths is None:
+        paths=PackedPaths(config['packed_geometry']) if config.get('packed_geometry') else PackedPaths.from_store(config,d['source_id'])
+    prior=geometry_priors(paths,d['source_id'],d['family'],config.get('prior_spacing',1000.),
+                          workers=int(config.get('workers',32)))
+    phase_done=time.monotonic()
+    print(json.dumps(dict(stage='uv_geometry_priors',seconds=phase_done-started,
+        fibers=len(labels),samples=len(prior['sample_owner']))),flush=True)
+    shift=2-int(np.min(labels+prior['minimum_turn']));labels+=shift
+    directions=prior['directions']
+    target_columns=fixed_target_columns(paths,d,labels,directions,workers=int(config.get('workers',32)))
+    target=target_columns['target']
     if not ((target==0)&~d['parallel']).any():raise ValueError('No fixed same-sheet perpendicular meetings')
-    maximum=np.max(labels+maximum_turn+1)
-    bins=np.arange(int(maximum)+3)
-    # Radius supplies INITIALIZATION ONLY; there is no radius/width prior loss.
-    known=np.unique(labels);width=np.array([np.median(np.asarray(radii)[labels==k])*2*np.pi for k in known])
-    widths=np.maximum.accumulate(np.interp(bins,known,width))
-    directions=np.asarray(directions)
-    d['node_ds']*=directions[:,None]
-    d['ds_a']*=directions[d['i']];d['ds_b']*=directions[d['j']]
-    d.update(fixed_winding=labels,fixed_target=target,phase=np.array(phase),z=np.array(z),
-        width_initial=widths,direction=directions,sample_owner=np.array(sample_owner,np.int64),
-        sample_ds=np.asarray(sample_arc)*directions[np.asarray(sample_owner)],
-        sample_phase=np.array(sample_phase),sample_z=np.array(sample_z))
-    np.savez(root/'tensors.npz',**d)
-    write(root/'selection.json',dict(input_fibers=len(keep),retained=int(keep.sum()),
-        removed_source_ids=original['source_id'][~keep].tolist(),events=len(target),global_integer_shift=shift,
-        same_sheet_perpendicular=int(((target==0)&~d['parallel']).sum())))
-    print(json.dumps(dict(stage='prepared',fibers=int(keep.sum()),events=len(target))),flush=True)
+    print(json.dumps(dict(stage='uv_fixed_targets',seconds=time.monotonic()-phase_done,
+        events=len(target))),flush=True)
+    bins=np.arange(int(np.max(labels+prior['maximum_turn']+1))+3)
+    widths=width_initial(labels,prior['radii'],bins,workers=int(config.get('workers',32)))
+    owner=prior['sample_owner']
+    # These are final solver columns; no input dictionary is mutated, and no
+    # unused SGD initializer/node arrays are constructed.
+    events=d
+    d={k:events[k] for k in ('source_id','family','end','i','j','parallel')}
+    d.update(start=np.zeros(len(labels)),links=np.empty((0,4)),
+        node_ds=np.column_stack((np.zeros(len(labels)),events['end']*directions)),
+        ds_a=target_columns['ds_a'],ds_b=target_columns['ds_b'],
+        fixed_winding=labels,fixed_target=target,phase=prior['phase'],z=prior['z'],
+        width_initial=widths,direction=directions,sample_owner=owner,
+        sample_ds=prior['sample_arc']*directions[owner],
+        sample_phase=prior['sample_phase'],sample_z=prior['sample_z'])
+    selection=dict(input_fibers=len(data['source_id']),retained=len(labels),events=len(target),
+        global_integer_shift=shift,same_sheet_perpendicular=int(((target==0)&~d['parallel']).sum()))
+    return d,selection
 
 
-def solve(config):
+def solve(config, data=None, selection=None):
     import torch
     from .fiber_shared_curve import SharedCurve
     from .fiber_scaled_lbfgs import uncertainty_joint
     from . import fiber_soft_winding as soft
     torch.set_num_threads(4)
     device='cuda';dtype=torch.float64
-    root=Path(config['output_root']);d=arrays(root/'tensors.npz');started=time.monotonic()
+    root=Path(config['output_root']);d=arrays(root/'tensors.npz') if data is None else data
+    started=time.monotonic()
+    from vc_object_store import CollectionReader
+    input_store=config.get('input_store',str(Path(config.get('flow_root',root))/'selected_with_gt.vcobj'))
+    if config.get('input_source') is None:
+        with CollectionReader(input_store) as source:input_source=source.source
+        config=dict(config,input_store=input_store,input_source=input_source)
     def tensor(x,kind=dtype):return torch.as_tensor(x,device=device,dtype=kind)
     n=len(d['source_id'])
     # One node per fiber is sufficient for the EXACT straight model; it is not
@@ -182,47 +213,42 @@ def solve(config):
                 winding_assignments_changed=int((state[:,0]!=tensor(d['fixed_winding'])).sum()))
         history.append(row);write(root/'history.json',history);print(json.dumps(row),flush=True)
     record(0);save('initial.npz')
-    result=uncertainty_joint(objective,state,raw,extension,config.get('steps',1000),{},config,
-        lambda step:record(step) if step%config.get('log_every',100)==0 else None,
-        freeze_winding=True,optimize_rejection=False,objective_parts=objective.parts)
+    optimizer=config.get('uv_optimizer','gauss_newton_cg')
+    callback=lambda step:record(step) if step%config.get('log_every',100)==0 else None
+    if optimizer=='gauss_newton_cg':
+        from .fiber_flow_uv_cg import solve as solve_cg
+        result=solve_cg(objective,iterations=config.get('steps',1000),callback=callback)
+    elif optimizer=='torch_lbfgs':
+        result=uncertainty_joint(objective,state,raw,extension,config.get('steps',1000),{},config,
+            callback,freeze_winding=True,optimize_rejection=False,objective_parts=objective.parts)
+    else:
+        raise ValueError('UV optimizer must be gauss_newton_cg or torch_lbfgs')
     if history[-1]['iteration']!=result['iterations']:record(result['iterations'])
     save('solution.npz')
     assert np.array_equal(state[:,0].detach().cpu().numpy(),d['fixed_winding'])
-    from .fiber_graph_store import write_results
     # Export the evaluated curve, not raw trainable offsets. Both coordinates
     # use the same fixed hypothesis and width map as the optimized objective.
     with torch.no_grad():
         widths=soft.decode_widths(raw,config)
         q,x,v=objective.samples()
-        positions=[];node_index=np.zeros(n,np.int64)
-        for k,owner in enumerate(d['sample_owner']):
-            positions.append(dict(fiber_uuid=str(d['source_id'][owner]),layer=3,
-                hypothesis=int(d['fixed_winding'][owner]),node_index=int(node_index[owner]),
-                arc=float(d['sample_ds'][k]*d['direction'][owner]),
-                u_turns=float(q[k]-d['fixed_winding'][owner]),u_vx=float(x[k]),v_vx=float(v[k])))
-            node_index[owner]+=1
-        run_uuid=write_results(config.get('result_store',root/'solution.vcobj'),[Path(config['flow_root'])/'selected_with_gt.vcobj'],
-            'fixed_winding_uv',config.get('optimizer','torch_lbfgs'),
-            dict(positions=positions,
-                 widths=[dict(winding=i,width_vx=float(w)) for i,w in enumerate(widths.cpu().numpy())],
-                 fibers=[dict(fiber_uuid=str(fid),enabled=1,family=int(d['family'][i]),
-                              selected_winding=int(d['fixed_winding'][i])) for i,fid in enumerate(d['source_id'])]),
-            input_runs=[config.get('input_run_uuid')],
-            settings=dict(global_integer_shift=json.loads((root/'selection.json').read_text())['global_integer_shift'],
-                          batch_size=objective.batch,assignments_fixed=True))
+        from .fiber_uv_native_prepare import write_uv_results
+        shift=(selection if selection is not None else json.loads((root/'selection.json').read_text()))['global_integer_shift']
+        run_uuid=write_uv_results(dict(config,result_store=str(config.get('result_store',root/'solution.vcobj'))),
+            d,q,x,v,widths.cpu().numpy(),optimizer=optimizer,global_integer_shift=shift)
     summary=dict(run_uuid=run_uuid,optimizer=result,initial=history[0],final=history[-1],seconds=time.monotonic()-started,
         retained=n,assignments_fixed=True,disablement_possible=False,peak_vram_bytes=torch.cuda.max_memory_allocated())
     write(root/'summary.json',summary)
     return summary
 
 
-def visualize(config):
+def visualize(config, data=None):
     import torch
     from .fiber_soft_winding import points
     from .fiber_uv_layout import q_to_u
     from .fiber_uv_visualization import TiledRaster,VectorPDF,DrawingSinks
     root=Path(config['output_root']);out=root/'visualization';out.mkdir(exist_ok=True)
-    d=arrays(root/'tensors.npz');curves={};endpoints={}
+    d=arrays(root/'tensors.npz') if data is None else data
+    curves={};endpoints={}
     same=(d['fixed_target']==0)&~d['parallel']
     for name in ('initial','solution'):
         s=arrays(config['visual_initial'] if name=='initial' and config.get('visual_initial') else root/(name+'.npz'))
@@ -252,30 +278,58 @@ def visualize(config):
           h_color='blue',v_color='orange',connections='fixed same-sheet perpendicular',axis_scale='equal'))
 
 
-def run(config):
-    from .fiber_normal_sign import launch_tensor_solve
+def _solve_checkpoint(config):
+    """Managed child: prepare and solve without another process/file handoff."""
+    from vc_object_store import CollectionReader
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines,write_initial_fibers
     from .fiber_graph_store import workflow_volume
+    root=Path(config['output_root'])
+    root.mkdir(parents=True,exist_ok=True)
+    with CollectionReader(config['input_store']) as source:input_source=source.source
+    if config.get('input_source') is not None and config['input_source']!=input_source:
+        raise ValueError('UV checkpoint source snapshot changed')
+    config=dict(config,input_source=input_source)
+    _checkpoint_binding(config,create=True)
+    data,selection=prepare(config)
+    write(root/'selection.json',selection)
+    result=solve(config,data,selection)
+    if config.get('visualize',True):visualize(config,data)
+    if config.get('write_geometry_store',True) and not (root/'fibers.vcobj').exists():
+        # Explicit compatibility export only. Production store-to-store UV
+        # sets this false and retains immutable source geometry by reference.
+        volume=workflow_volume(dict(fibers=config['input_store'],working_volume=config.get('working_volume')))
+        write_initial_fibers(root/'fibers.vcobj',read_polylines(config['input_store'],data['source_id'],volume=volume),
+                             volume=volume,packed=True)
+    return result
+
+
+def run(config):
+    """Run native preparation and UV fitting in one managed process.
+
+    ``flow_root`` remains an explicit legacy input boundary; it is normalized
+    to the two existing checkpoint filenames, never copied to a new archive.
+    """
+    from .fiber_normal_sign import launch_tensor_solve
+    config=dict(config,uv_checkpoint=True)
+    if 'checkpoint_tensor_cache' not in config:
+        parent=Path(config['flow_root'])
+        config.update(checkpoint_tensor_cache=str(parent/'selected_tensors.npz'),
+                      checkpoint_solution=str(parent/'selected_solution.npz'),
+                      input_store=str(parent/'selected_with_gt.vcobj'),checkpoint_arcs_unsigned=True)
+        config.setdefault('component_selection','all')
     root=Path(config['output_root'])
     if (root/'summary.json').exists():
         frozen=json.loads((root/'config.json').read_text());frozen.pop('code_provenance',None)
         if frozen!=config:raise ValueError('Completed fit configuration differs')
-        result=json.loads((root/'summary.json').read_text())
-    else:
-        prepare(config)
-        result=launch_tensor_solve(config,__name__,Path(__file__))
-    if config.get('visualize',True):visualize(config)
-    if config.get('write_geometry_store',True) and not (root/'fibers.vcobj').exists():
-        source=Path(config['flow_root'])/'selected_with_gt.vcobj'
-        d=arrays(root/'tensors.npz')
-        volume=workflow_volume(dict(fibers=str(source),working_volume=config.get('working_volume')))
-        write_initial_fibers(root/'fibers.vcobj',read_polylines(source,d['source_id'],volume=volume),
-                             volume=volume,packed=True)
-    return result
+        _checkpoint_binding(config,create=False)
+        return json.loads((root/'summary.json').read_text())
+    return launch_tensor_solve(config,__name__,Path(__file__))
 
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--config',required=True);parser.add_argument('--unmanaged',action='store_true');parser.add_argument('--devices')
     args=parser.parse_args()
     if not args.unmanaged:raise RuntimeError('Use the managed workflow')
-    solve(json.loads(Path(args.config).read_text()))
+    config=json.loads(Path(args.config).read_text())
+    if config.get('uv_checkpoint'):_solve_checkpoint(config)
+    else:solve(config)

@@ -1,7 +1,8 @@
 """Store-to-store winding and fixed-assignment UV workflow adapters.
 
-NPZ files are disposable solver work products. Public inputs and authoritative
-outputs are immutable referenced vcobj stores; no reference/GT labels are read.
+Public inputs and authoritative outputs are immutable referenced vcobj stores;
+no reference/GT labels are read. UV preparation returns native owned arrays
+directly to the solver in the managed process, without tensor staging files.
 """
 import argparse
 import json
@@ -36,21 +37,25 @@ def _input_lineage(config, winding_run=None):
     return dict(classification=classified,normal_sign=sign)
 
 
-def _prepare(config, *, build_graph=True):
-    from .fiber_wgraph_stages import _fiber_rows, _graph, _base_database
+def _prepare(config, *, build_graph=True, in_memory=False):
+    from .fiber_wgraph_stages import _fiber_columns, _graph, _base_database
     from . import fiber_min_flow_full as flow
     from .fiber_graph_store import store_digest
     from .fiber_min_flow_experiment import arrays, write
+    started=time.monotonic();timings={}
     database=config['database']
     selected=_input_lineage(config)
     config=dict(config,classification_run_uuid=selected['classification'],normal_sign_run_uuid=selected['normal_sign'])
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
-    classifications=_fiber_rows(database,selected['classification'])
-    signs=_fiber_rows(database,selected['normal_sign'])
+    timings['lineage_and_setup']=time.monotonic()-started
+    phase=time.monotonic()
     base=_base_database(config)
     graph=_graph(config,base)
-    if set(classifications)!=set(graph.ids) or set(signs)!=set(graph.ids):
-        raise ValueError('Classification/sign rows must cover the extracted graph')
+    timings['graph_cache_open']=time.monotonic()-phase;phase=time.monotonic()
+    classifications=_fiber_columns(database,selected['classification'],graph.ids,required=('family','enabled'),exact=True)
+    timings['classification_columns']=time.monotonic()-phase;phase=time.monotonic()
+    signs=_fiber_columns(database,selected['normal_sign'],graph.ids,required=('normal_sign',),exact=True)
+    timings['sign_columns']=time.monotonic()-phase;phase=time.monotonic()
     binding=dict(config=config,source=store_digest(database),input_runs=selected)
     manifest=root/'request.json'
     if manifest.exists() and json.loads(manifest.read_text())!=binding:
@@ -66,36 +71,52 @@ def _prepare(config, *, build_graph=True):
         if geometry.exists() and geometry.resolve()!=cache:
             raise ValueError('Work geometry path differs from configured geometry_cache')
         if not geometry.exists():geometry.symlink_to(cache,target_is_directory=True)
-    labels=np.asarray([classifications[fid]['family'] for fid in graph.ids],np.int64)
-    enabled=np.asarray([classifications[fid]['enabled'] for fid in graph.ids])
+    labels=classifications['family'];enabled=classifications['enabled']
     if not np.isin(enabled,[0,1]).all() or not np.isin(labels,[0,1,2]).all():
         raise ValueError('Invalid classification readout')
     labels=np.where(enabled,labels,2)
     if not np.any(labels!=2):raise ValueError('No enabled H/V fibers remain')
-    normal_sign=np.asarray([signs[fid]['normal_sign'] for fid in graph.ids],np.int8)
+    normal_sign=np.asarray(signs['normal_sign'],np.int8)
     if not np.isin(normal_sign,[-1,1]).all():raise ValueError('Invalid normal sign')
     comparison=root/'classification.npz';normal=root/'normal_sign.npz'
-    np.savez(comparison,ids=graph.ids,labels=labels)
-    np.savez(normal,ids=graph.ids,normal_sign=normal_sign,normal_convention=np.array('inward'))
+    if not in_memory:
+        np.savez(comparison,ids=graph.ids,labels=labels)
+        np.savez(normal,ids=graph.ids,normal_sign=normal_sign,normal_convention=np.array('inward'))
     settings=dict(config,database=str(base),fibers=database,comparison=str(comparison),normal_solution=str(normal),
                   graph_cache=str(config.get('graph_cache',str(base)+'.graph-cache')))
     geometry.mkdir(exist_ok=True)
-    catalog=flow.prepare(settings) if build_graph else flow.prepare(settings,build_graph=False)
+    timings['bind_and_stage_columns']=time.monotonic()-phase;phase=time.monotonic()
+    print(json.dumps(dict(stage='geometry_readout_prepared',seconds=time.monotonic()-started,timings=timings)),flush=True)
+    if in_memory:
+        catalog=flow.prepare(settings,build_graph=build_graph,reuse_catalog=bool(config.get('geometry_cache')),
+            comparison=dict(ids=graph.ids,labels=labels),
+            normal=dict(ids=graph.ids,normal_sign=normal_sign,normal_convention=np.array('inward')))
+    elif config.get('geometry_cache'):
+        catalog=flow.prepare(settings,build_graph=build_graph,reuse_catalog=True)
+    else:
+        catalog=flow.prepare(settings) if build_graph else flow.prepare(settings,build_graph=False)
+    timings['catalog_and_geometry_and_constraints']=time.monotonic()-phase;phase=time.monotonic()
     source=geometry/'source.json'
     if source.exists() and json.loads(source.read_text())!=geometry_binding:
         raise ValueError('Geometry cache source snapshot changed')
     if not source.exists():write(source,geometry_binding)
-    if not build_graph:return catalog,selected,settings
+    if not build_graph:
+        write(root/'preparation-timings.json',dict(seconds=time.monotonic()-started,stages=timings))
+        return catalog,selected,settings
     parts=[arrays(p) for p in sorted((root/'graph_parts').glob('*.npz')) if '.partial.' not in p.name]
     if not parts:raise ValueError('No usable winding constraints')
     from .fiber_min_flow import aggregate_l1_edges
     g=aggregate_l1_edges(**{k:np.concatenate([p[k] for p in parts]) for k in ('a','b','target','weight')})
     np.savez(root/'graph.npz',**g)
+    timings['concatenate_aggregate_save']=time.monotonic()-phase
+    write(root/'preparation-timings.json',dict(seconds=time.monotonic()-started,stages=timings))
     return catalog,selected,settings
 
 
 def solve(config):
     """Managed CUDA-child entry; exact historic linear IRLS implementation."""
+    if config.get('stage_mode')=='uv_direct':
+        return _solve_uv_direct(config)
     import torch
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
@@ -148,36 +169,56 @@ def run_stage(stage,config):
 
 
 def _run_uv(config):
-    from .fiber_wgraph_stages import _selected_run,_fiber_rows
-    from .fiber_min_flow_full import PackedPaths,event_batches
-    from .fiber_flow_sgd_full import measured_geometry
-    from .fiber_flow_uv import run_saved
+    from .fiber_normal_sign import launch_tensor_solve
+    from .fiber_wgraph_stages import _selected_run
+    winding_run=_selected_run(config['database'],'winding',config.get('input_run_uuid'))
+    _input_lineage(config,winding_run)
+    result=launch_tensor_solve(dict(config,stage_mode='uv_direct'),__name__,__file__)
+    return dict(result_store=config['result_store'],run_uuid=result['run_uuid'],solver_summary=result)
+
+
+def _solve_uv_direct(config):
+    """Native parallel preparation and GPU optimization share one process."""
+    from .fiber_wgraph_stages import _selected_run,_fiber_columns
+    from .fiber_min_flow_full import PackedPaths
+    from .fiber_uv_native_prepare import prepare_events
+    from .fiber_flow_uv import prepare_data,solve as solve_uv
+    from .fiber_min_flow_experiment import write
+    from vc_object_store import CollectionReader
     root=Path(config['output_root'])
+    started=time.monotonic()
+    with CollectionReader(config['database']) as source:
+        input_source=source.source
     winding_run=_selected_run(config['database'],'winding',config.get('input_run_uuid'))
     lineage=_input_lineage(config,winding_run)
     config=dict(config,classification_run_uuid=lineage['classification'],normal_sign_run_uuid=lineage['normal_sign'])
-    winding=_fiber_rows(config['database'],winding_run)
-    catalog,_,native=_prepare(config,build_graph=False)
-    ids=catalog['source_id'];missing=set(ids)-set(winding)
-    if missing:raise ValueError('Winding readout does not cover enabled fibers')
+    catalog,_,native=_prepare(config,build_graph=False,in_memory=True)
+    ids=catalog['source_id']
+    winding=_fiber_columns(config['database'],winding_run,ids,required=('selected_winding','component'))
     paths=PackedPaths(root/'geometry')
     from .fiber_wgraph_stages import _graph,_base_database
     graph=_graph(config,_base_database(config))
-    lo,hi=map(int,graph.event_ids[[0,-1]])
-    chunks=[d for _,d in event_batches(native,paths,graph,lo,hi+1) if len(d['i'])]
-    if not chunks:raise ValueError('No usable UV constraints')
-    d={k:np.concatenate([c[k] for c in chunks]) for k in ('i','j','ds_a','ds_b','distance','sign','parallel')}
-    lengths=paths.keys['arc'][paths.offset[1:]-1]
-    measured_geometry(d,paths,ids,catalog['family'],lengths)
-    tensors=root/'uv_input.npz';solution=root/'fixed_assignments.npz'
-    np.savez(tensors,**d)
-    np.savez(solution,source_id=ids,winding=np.array([winding[f]['selected_winding'] for f in ids]),
-             component=np.array([winding[f]['component'] for f in ids]))
+    paths.bind_graph(graph)
+    selected=config.get('component_selection','all')
+    if selected not in ('all','largest'):raise ValueError('component_selection must be all or largest')
+    node_mask=None if selected=='all' else winding['component']==np.bincount(winding['component']).argmax()
+    phase=time.monotonic()
+    d,chosen=prepare_events(paths,graph,workers=int(config.get('workers',32)),node_mask=node_mask)
+    print(json.dumps(dict(stage='uv_native_events',seconds=time.monotonic()-phase,
+                         fibers=len(chosen),events=len(d['i']))),flush=True)
     parameters=dict(config.get('parameters',{}),write_geometry_store=False,packed_geometry=str(root/'geometry'),
-                    result_store=config['result_store'],input_run_uuid=winding_run)
-    result=run_saved(dict(config,tensor_cache=str(tensors),solution=str(solution),fibers=config['database'],
-                          parameters=parameters,component_selection=config.get('component_selection','all')))
-    return dict(result_store=config['result_store'],run_uuid=result['run_uuid'],solver_summary=result)
+                    workers=int(config.get('workers',32)),output_root=str(root),
+                    result_store=config['result_store'],input_run_uuid=winding_run,input_store=config['database'],
+                    input_source=input_source)
+    prepared,selection=prepare_data(parameters,d,winding['selected_winding'][chosen],paths,supported_input=True)
+    selection['input_fibers']=len(ids)
+    write(root/'selection.json',selection)
+    write(root/'uv-preparation-timings.json',dict(seconds=time.monotonic()-started,
+        fibers=len(prepared['source_id']),events=len(prepared['i']),tensor_staging_bytes=0))
+    # Release the source graph and construction-only columns before allocating
+    # GPU buffers; prepared arrays retain native ownership through capsules.
+    del d,graph,paths,catalog,winding
+    return solve_uv(parameters,prepared,selection)
 
 
 if __name__=='__main__':

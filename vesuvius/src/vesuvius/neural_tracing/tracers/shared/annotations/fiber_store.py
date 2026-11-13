@@ -58,6 +58,20 @@ def fiber_catalog(path, volume=None, *, source_version=None):
         return rows
 
 
+def fiber_point_counts(path, *, source_version=None):
+    """UUID-ordered selected line-point counts without reading XYZ payloads.
+
+    Descriptor interpretation and retained/current integrity checks are native.
+    Frozen evidence may require the same store position on both sides.
+    """
+    with open_store(path) as store:
+        _require_source_version(store, source_version)
+        columns = store.geometry_array_counts('fiber', 'line_points')
+        _require_source_version(store, source_version)
+    ids = np.frombuffer(columns['uuid_ascii'], dtype='S36').astype('U36')
+    return ids, columns['count']
+
+
 def _catalog(store, volume):
     records = store.select_objects(object_kind='fiber', volume=volume, fields=['name', 'fiber', 'meta'])
     volume = volume or _fiber_records_volume(records, 'fiber store')
@@ -69,30 +83,30 @@ def _read_rows(store, records, volume, *, require_lines=True):
     # an entire volume merely to derive current lengths/counts/bounds.
     for start in range(0, len(records), WRITE_BATCH):
         selected = records[start:start+WRITE_BATCH]
-        with store.graph_read(versions=[object_reference(r) for r in selected]) as view:
-            packed = view.read_geometry_arrays('line_points')
-            values, offsets = packed.values, packed.offsets
-            for node, record in enumerate(view.objects(['name', 'fiber', 'meta'])):
-                scale = geometry_scale_to_volume(record['meta'], volume)
-                xyz = np.array(values[offsets[node]:offsets[node+1]], dtype=np.float64)
-                if scale is None:
-                    # Registered affine frames use the native selected-state mapping,
-                    # not a reconstructed current owner or Python transform policy.
-                    with view.geometry_snapshot() as snapshot:
-                        selected_view = snapshot.fiber(object_reference(record))
-                        xyz = np.asarray(selected_view.view_transformed_at(volume).points(
-                            'line_points', 0, len(xyz)), dtype=np.float64)
-                    scale = 1.
-                if len(xyz) < 2:
-                    if require_lines:
-                        raise ValueError(f'Fiber {record["uuid"]} is not bound to volume {volume} or has no line')
-                    continue
-                xyz *= scale
-                fiber = record.get('fiber') or {}
-                yield dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
-                           length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
-                           point_count=len(xyz), bbox=[*map(float, xyz.min(0)), *map(float, xyz.max(0))],
-                           scale=scale, meta=record['meta'], reference=object_reference(record)), xyz
+        with store.graph_read(versions=[object_reference(r) for r in selected], edge_limit=0) as view:
+            yield from _view_rows(view, volume, require_lines=require_lines)
+
+
+def _view_rows(view, volume, *, require_lines=True):
+    """Adapt selected mapped geometry only for callers requiring row records."""
+    records = view.objects(['name', 'fiber', 'meta'])
+    for start in range(0, len(records), WRITE_BATCH):
+        selected = records[start:start+WRITE_BATCH]
+        packed = view.read_geometry_arrays('line_points', nodes=list(range(start, start+len(selected))), volume=volume)
+        values, offsets = packed.values, packed.offsets
+        for node, record in enumerate(selected):
+            xyz = np.array(values[offsets[node]:offsets[node+1]], dtype=np.float64)
+            if len(xyz) < 2:
+                if require_lines:
+                    raise ValueError(f'Fiber {record["uuid"]} is not bound to volume {volume} or has no line')
+                continue
+            scale = geometry_scale_to_volume(record['meta'], volume)
+            fiber = record.get('fiber') or {}
+            yield dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
+                       length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
+                       point_count=len(xyz), bbox=[*map(float, xyz.min(0)), *map(float, xyz.max(0))],
+                       scale=1. if scale is None else scale,
+                       meta=record['meta'], reference=object_reference(record)), xyz
 
 
 class FiberBlockIndex:
@@ -157,18 +171,53 @@ def iter_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
         _require_source_version(store, source_version)
         if selected == []:
             return
-        records = store.select_objects(object_kind='fiber', object_uuids=selected or [],
-                                       volume=volume, fields=['name', 'fiber', 'meta'])
-        if selected is not None and sorted(r['uuid'] for r in records) != selected:
-            raise ValueError('Unknown requested fiber')
-        yield from _read_rows(store, sorted(records, key=lambda r: r['uuid']), volume,
-                              require_lines=selected is not None)
-        _require_source_version(store, source_version)
+        position = source_version or _source_version(store)
+        cursor = None
+        while True:
+            with store.geometry_read(object_kind='fiber', object_uuids=selected or [], volume=volume,
+                                     limit=None if selected is not None else WRITE_BATCH,
+                                     after_uuid=cursor, expected_position=position) as view:
+                ids = view.object_uuids
+                if selected is not None and ids != selected:
+                    raise ValueError('Unknown requested fiber')
+                yield from _view_rows(view, volume, require_lines=selected is not None)
+            if selected is not None or len(ids) < WRITE_BATCH:
+                break
+            cursor = ids[-1]
+        _require_source_version(store, position)
 
 
 def read_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
     """Materialize raw curves; use iter_polylines for bounded streaming with the same source pin."""
     return list(iter_polylines(path, fiber_ids, volume=volume, source_version=source_version))
+
+
+def read_polyline_arrays(path, fiber_ids, *, volume=None, source_version=None):
+    """Current packed XYZ and UUID columns, without Python per-fiber records.
+
+    Native reading captures metadata/geometry together and performs coordinate
+    mapping under the same source-position guard. Returned buffers own their
+    data after the store transaction closes.
+    """
+    if fiber_ids is None:raise ValueError('Packed polyline reads require explicit fiber IDs')
+    volume = volume or fiber_volume(path)
+    from vc_object_store import canonical_uuid_ascii
+    raw = np.asarray(fiber_ids, dtype=str)
+    if raw.ndim != 1:raise ValueError('Fiber IDs must be a one-dimensional column')
+    if len(raw):
+        encoded = np.char.encode(raw, 'ascii')
+        column = encoded.view(np.uint8).reshape(len(raw), encoded.dtype.itemsize)
+        canonical = canonical_uuid_ascii(column, workers=1)
+        selected = np.unique(canonical.view('S36').ravel().astype('U36')).tolist()
+    else:
+        selected = []
+    with open_store(path) as store:
+        with store.geometry_read(object_kind='fiber', object_uuids=selected, volume=volume,
+                                 limit=0 if not selected else None, expected_position=source_version) as view:
+            ids = view.object_uuids
+            if ids != selected:raise ValueError('Unknown requested fiber')
+            packed = view.read_geometry_arrays('line_points', volume=volume)
+    return np.asarray(ids, dtype='U36'), packed
 
 
 FIBERS_DIGEST_FORMAT = 'fibers_digest v3'
@@ -378,7 +427,7 @@ class FiberStore(Sequence):
         self._require_unchanged()
         if index not in self._cache:
             row = self.catalog[index]
-            with self.store().graph_read(versions=[row['reference']]) as view:
+            with self.store().graph_read(versions=[row['reference']], edge_limit=0) as view:
                 xyz = view.read_geometry_arrays('line_points').values
             self._require_unchanged()
             if len(xyz) < 2 or not np.isfinite(xyz).all():

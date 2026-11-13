@@ -49,7 +49,7 @@ def event_job(job):
     for count,d in event_batches(config,paths,db,first,last):
         read+=count
         for side,key in [('a','i'),('b','j')]:
-            xyz,turns=paths.at_many(paths.ids[d[key]],d['ds_'+side])
+            xyz,turns=paths.at_indices(d[key],d['ds_'+side])
             rel=paths.seam.relative(xyz)
             d['phase_'+side]=turns+(np.arctan2(rel[:,1],rel[:,0])-paths.seam.angle)%(2*np.pi)/(2*np.pi)+paths.seam.angle/(2*np.pi)
         d['phase_delta']=(d['phase_b']-d['phase_a']+.5)%1-.5
@@ -71,6 +71,8 @@ def prepare(settings,config):
     if not (root/'tensors.npz').exists():
         native=dict(parent,output_root=str(root),workers=settings.get('workers',32))
         columns=FiberGraph.cached(parent['database'],root/'constraint_columns')
+        paths.bind_graph(columns)
+        paths.save_graph_index()
         batch=parent.get('constraint_batch',500000)
         jobs=constraint_jobs(columns.event_ids,batch)
         parallel_stage(native,'events',jobs,event_job)

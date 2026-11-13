@@ -9,10 +9,12 @@ from pathlib import Path
 import uuid
 
 import numpy as np
-from vc_object_store import CollectionReader, fiber_graph_solve_table, fiber_graph_solve_row, write_extension_store, geometry_scale_to_volume, store_position_from_json
+from vc_object_store import CollectionReader, fiber_graph_solve_table, fiber_graph_solve_row, write_extension_store, store_position_from_json
 
 PREFIX = 'ext_fiber_graph_solve_'
-CACHE_FORMAT = 2
+CACHE_FORMAT = 3
+CACHE_COLUMNS = ('ids','uuid_bytes','lengths','event_ids','edge_uuid_bytes','i','j','arc_a','arc_b',
+                 'normal_a','normal_b','connector','distance','parallel','valid_a','valid_b','valid_connector')
 
 
 def workflow_volume(config):
@@ -56,53 +58,84 @@ def original_fiber_source(database):
         return Path(store.resolve_store_position(pin)),pin
 
 
+class _IndexedFiberIds:
+    """Diagnostic view: selecting rows never expands the whole endpoint column."""
+    dtype=np.dtype('U36')
+    ndim=1
+    def __init__(self,ids,index):self.ids,self.index=ids,index
+    @property
+    def shape(self):return self.index.shape
+    def __len__(self):return len(self.index)
+    def __getitem__(self,key):return self.ids[self.index[key]]
+    def __array__(self,dtype=None,copy=None):
+        values=self.ids[self.index]
+        return values.astype(dtype,copy=bool(copy)) if dtype is not None else values.copy() if copy else values
+    def tolist(self):return np.asarray(self).tolist()
+    def __iter__(self):return map(self.ids.__getitem__,self.index)
+    def __eq__(self,other):
+        if isinstance(other,(str,np.str_)):
+            at=np.searchsorted(self.ids,other)
+            return self.index==at if at<len(self.ids) and self.ids[at]==other else np.zeros(len(self.index),bool)
+        return np.asarray(self)==other
+    def __ne__(self,other):return ~self.__eq__(other)
+
+
+class _BinaryUuids:
+    """Legacy text access over compact binary keys, formatting selected rows only."""
+    dtype=np.dtype('U36')
+    ndim=1
+    def __init__(self,values):self.values=values
+    @property
+    def shape(self):return self.values.shape[:-1]
+    def __len__(self):return len(self.values)
+    def __getitem__(self,key):
+        from vc_object_store import format_uuid_ascii
+        values=self.values[key]
+        if values.ndim==1:return str(uuid.UUID(bytes=values.tobytes()))
+        text=format_uuid_ascii(np.ascontiguousarray(values).reshape(-1,16))
+        return text.view('S36').reshape(values.shape[:-1]).astype('U36')
+    def __array__(self,dtype=None,copy=None):
+        values=self[:]
+        return values.astype(dtype,copy=bool(copy)) if dtype is not None else values.copy() if copy else values
+    def tolist(self):return np.asarray(self).tolist()
+    def __iter__(self):return map(self.__getitem__,range(len(self)))
+    def __eq__(self,other):
+        if isinstance(other,(str,np.str_)):
+            key=uuid.UUID(str(other)).bytes
+            return self.values.view('V16').reshape(-1)==np.void(key)
+        return np.asarray(self)==other
+    def __ne__(self,other):return ~self.__eq__(other)
+
+
 class FiberGraph:
     """One immutable graph snapshot, joined by UUID in C++, decoded once."""
-    def __init__(self, path):
+    def __init__(self, path, workers=32, progress=False):
         with CollectionReader(str(path)) as store:
             self.source = store.source
-            records = store.objects('fiber')
             tables = store.extension_tables()
             self.tables = {t['name']: t for t in tables}
             self.measurement_info = self.tables[PREFIX+'constraints']
-            data = store.fiber_constraints()
-            runs = (store.extension_rows(PREFIX+'runs') if PREFIX+'runs' in self.tables else [])
-            extraction = [r[0] for r in runs if r[1] == 'constraint_extraction']
-            if len(extraction) > 1:
-                raise ValueError('Select one extraction graph, not multiple independent graphs')
-            if extraction:
-                rows = store.extension_rows(PREFIX+'fibers')
-                selected = {str(uuid.UUID(bytes=r[0])) for r in rows if r[1] == extraction[0]}
-                records = [r for r in records if r['uuid'] in selected]
-        self.ids = np.asarray([r['uuid'] for r in records], dtype='U36')
-        volumes = {(r['meta'].get('coordinates') or {}).get('volume_uuid') for r in records}
-        frame=self.measurement_info['provisioning'].get('coordinate_space')
-        if self.measurement_info['format_version']!=4 or not frame:
-            raise ValueError('Compact format-4 graph must explicitly name its measurement volume')
-        self.volume=frame.rsplit('/',1)[-1]
-        scales=[geometry_scale_to_volume(r['meta'],self.volume) for r in records]
-        self.lengths=np.zeros(len(records),np.float64)
-        mapped=[]
-        for i,(record,scale) in enumerate(zip(records,scales)):
-            if scale is None:mapped.append(i)
-            else:self.lengths[i]=record['fiber']['length']*scale
-        if mapped:
-            from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import iter_polylines
-            curves=iter_polylines(path,self.ids[mapped],volume=self.volume)
-            for i,(row,_) in zip(mapped,curves):
-                if row['id']!=self.ids[i]:raise ValueError('Mapped fiber order differs')
-                self.lengths[i]=row['length']
-        self.event_ids = np.frombuffer(data['ids'], dtype='=i8')
-        self.edge_uuid = np.asarray(data['edge_uuid'], dtype='U36')
-        self.fiber_a = np.asarray(data['fiber_a'], dtype='U36')
-        self.fiber_b = np.asarray(data['fiber_b'], dtype='U36')
-        values = np.frombuffer(data['values'], dtype='=f8').reshape(-1, 16)
-        self.arc_a, self.arc_b = values[:, 0], values[:, 1]
-        self.normal_a, self.normal_b = values[:, 2:5], values[:, 5:8]
-        self.connector = values[:, 8:11]
-        self.distance, self.parallel = values[:, 11], values[:, 12].astype(bool)
-        self.valid_a, self.valid_b, self.valid_connector = (values[:, k].astype(bool) for k in (13,14,15))
-        self.i, self.j = self.indices(self.fiber_a), self.indices(self.fiber_b)
+            data = store.fiber_graph_columns(workers,progress)
+        # Constant column adaptation only. Native code resolves selected nodes,
+        # maps lengths, decodes measurements and joins binary UUID endpoints.
+        self.ids=data['fiber_uuid_ascii'].view('S36').reshape(-1).astype('U36')
+        self.uuid_bytes=data['fiber_uuid'];self.volume=data['volume'];self.lengths=data['lengths']
+        self.event_ids=data['event_ids'];self.edge_uuid_bytes=data['edge_uuid']
+        self.i,self.j=data['endpoints'][:,0],data['endpoints'][:,1]
+        self.arc_a,self.arc_b=data['arcs'][:,0],data['arcs'][:,1]
+        self.normal_a,self.normal_b,self.connector=data['normal_a'],data['normal_b'],data['connector']
+        self.distance=data['distance'];self.parallel=data['parallel'].view(bool)
+        self.valid_a=data['valid_a'].view(bool);self.valid_b=data['valid_b'].view(bool)
+        self.valid_connector=data['valid_connector'].view(bool)
+
+    @property
+    def fiber_a(self):return _IndexedFiberIds(self.ids,self.i)
+
+    @property
+    def fiber_b(self):return _IndexedFiberIds(self.ids,self.j)
+
+    @property
+    def edge_uuid(self):return _BinaryUuids(self.edge_uuid_bytes)
 
     @property
     def point_a(self):
@@ -116,33 +149,31 @@ class FiberGraph:
         """Decode once; worker processes share read-only memory-mapped columns."""
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
-        columns = []
-        for name, value in vars(self).items():
-            if isinstance(value, np.ndarray):
-                np.save(root/(name+'.npy'), value, allow_pickle=False)
-                columns.append(name)
-        manifest = dict(format_version=CACHE_FORMAT,source=self.source, volume=self.volume, columns=columns)
+        for name in CACHE_COLUMNS:
+            np.save(root/(name+'.npy'),getattr(self,name),allow_pickle=False)
+        manifest = dict(format_version=CACHE_FORMAT,source=self.source, volume=self.volume,
+                        columns=list(CACHE_COLUMNS),measurement_info=self.measurement_info)
         (root/'manifest.json').write_text(json.dumps(manifest, sort_keys=True))
 
     @classmethod
-    def cached(cls, path, root):
+    def cached(cls, path, root, workers=32, progress=True):
         root = Path(root)
         manifest = root/'manifest.json'
         with CollectionReader(str(path)) as store:
             source = store.source
         if not manifest.exists():
-            cls(path).save_cache(root)
+            cls(path,workers=workers,progress=progress).save_cache(root)
         info = json.loads(manifest.read_text())
         if info.get('format_version') != CACHE_FORMAT:
             raise ValueError('Constraint cache format changed; rebuild the graph cache')
-        required={'ids','lengths','event_ids','edge_uuid','fiber_a','fiber_b','arc_a','arc_b',
-                  'parallel','distance','normal_a','normal_b','connector','valid_a','valid_b','valid_connector','i','j'}
+        required=set(CACHE_COLUMNS)
         if set(info['columns']) != required:
             raise ValueError('Constraint cache columns differ; rebuild the graph cache')
         if info['source'] != source:
             raise ValueError('Constraint snapshot changed; use a new graph cache')
         result = object.__new__(cls)
         result.source, result.volume = info['source'], info['volume']
+        result.measurement_info=info['measurement_info'];result.tables={PREFIX+'constraints':result.measurement_info}
         for name in info['columns']:
             setattr(result, name, np.load(root/(name+'.npy'), mmap_mode='r', allow_pickle=False))
         return result

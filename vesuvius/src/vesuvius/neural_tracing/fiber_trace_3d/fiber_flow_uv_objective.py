@@ -24,6 +24,20 @@ class FixedFlowObjective:
         if not self.same_count:raise ValueError('No fixed same-sheet perpendicular meetings')
         self.sample_count=np.bincount(data['sample_owner'],minlength=len(state))
 
+    def quadratic_coefficients(self):
+        """Squared-residual coefficients for objective-preserving GN/CG.
+
+        These include the same full-graph class/count normalization as parts().
+        They do not change targets, masks, robustification, or prior strengths.
+        """
+        d,c=self.data,self.config;m=len(d['i']);n=len(self.state)
+        family=d['family'][d['i']];parallel=d['parallel'];weights=np.asarray(self.weights,dtype=np.float64)
+        return dict(winding=weights*((~parallel)|(family==1))/m*c.get('distance_weight',1.),
+                    vertical=weights*((~parallel)|(family==0))/m*c.get('metric_weight',1.)/c.get('v_pair_scale',1000.)**2,
+                    meeting=self.same.astype(np.float64)/self.same_count/c.get('meeting_scale',128.)**2*c.get('meeting_weight',1.),
+                    phase=1/self.sample_count[d['sample_owner']]/n*c.get('prior_weight',.000625),
+                    z=1/self.sample_count[d['sample_owner']]/n*c.get('v_prior_weight',.01)/1000.**2)
+
     def tensor(self, value, dtype=None):
         return torch.as_tensor(value,device=self.state.device,dtype=dtype or self.state.dtype)
 
