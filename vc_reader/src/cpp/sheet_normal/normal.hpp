@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -101,17 +102,59 @@ VCR_SHEET_HD inline void contribution(int i,const float* g,const float* center,
 // them immutable while evaluating nearby centers (e.g. integration stages).
 struct CpuPatch {
     std::unique_ptr<float[]> gradients=std::make_unique_for_overwrite<float[]>(6*count);
+    // Per site, the divisor contribution() applies in the refinement passes:
+    // the sigma-1 gradient magnitude, raised to the floor.
+    std::unique_ptr<float[]> divisors=std::make_unique_for_overwrite<float[]>(count);
     float floor=0;
+    // contribution() term for term. The site offsets, the isotropic exponent and the
+    // first pass's weights depend only on the center, so a thread keeps them for a
+    // repeated one; exp() runs in its own loop.
     void evaluate(const float* center,float* output) const {
         std::fill_n(output,4,0.f);
         if(!center[3]) return;
-        double normal[3]{},gap=0; bool valid=true;
-        for(int pass=0;pass<4 && valid;++pass) {
-            double sums[7]{};
-            for(int i=0;i<count;++i) contribution(i,gradients.get()+(pass ? 3*count : 0),center,normal,floor,pass!=0,sums);
-            valid=principal(sums,normal,gap);
+        struct Scratch {
+            float key[3]{NAN,NAN,NAN};
+            std::vector<float> offsets=std::vector<float>(3*count);
+            std::vector<double> base=std::vector<double>(count),first=base,weights=base;
+        };
+        thread_local Scratch s;
+        if(std::memcmp(s.key,center,sizeof s.key)) {
+            float* o=s.offsets.data();
+            for(int i=0;i<count;++i) {
+                o[i]=3*(i%sites)-center[0]; o[count+i]=3*((i/sites)%sites)-center[1]; o[2*count+i]=3*(i/(sites*sites))-center[2];
+            }
+            for(int i=0;i<count;++i) {
+                double x=o[i], y=o[count+i], z=o[2*count+i];
+                s.base[i]=(x*x+y*y+z*z)/576.;
+            }
+            for(int i=0;i<count;++i) s.first[i]=exp(-.5*s.base[i]);
+            std::memcpy(s.key,center,sizeof s.key);
+        }
+        double normal[3]{},gap=0;
+        bool valid=accumulate(s.first.data(),gradients.get(),normal,gap);
+        const float* o=s.offsets.data();
+        for(int pass=1;pass<4 && valid;++pass) {
+            for(int i=0;i<count;++i) {
+                double x=o[i], y=o[count+i], z=o[2*count+i];
+                double along=x*normal[0]+y*normal[1]+z*normal[2];
+                double exponent=s.base[i];
+                exponent+=along*along*(1./16.-1./576.);
+                s.weights[i]=-.5*exponent;
+            }
+            for(int i=0;i<count;++i) s.weights[i]=exp(s.weights[i]);
+            for(int i=0;i<count;++i) s.weights[i]/=divisors[i];
+            valid=accumulate(s.weights.data(),gradients.get()+3*count,normal,gap);
         }
         if(valid) { for(int j=0;j<3;++j) output[j]=float(normal[j]); output[3]=float(gap); }
+    }
+    static bool accumulate(const double* weights,const float* g,double* normal,double& gap) {
+        double sums[7]{};
+        for(int i=0;i<count;++i) {
+            double gx=g[i], gy=g[count+i], gz=g[2*count+i], weight=weights[i];
+            sums[0]+=weight*gx*gx; sums[1]+=weight*gx*gy; sums[2]+=weight*gx*gz;
+            sums[3]+=weight*gy*gy; sums[4]+=weight*gy*gz; sums[5]+=weight*gz*gz; sums[6]+=weight;
+        }
+        return principal(sums,normal,gap);
     }
 };
 
@@ -146,9 +189,11 @@ struct CpuWorkspace {
             for(int j=0;j<13;++j) value+=k.taps[xc][j]*y[c*ycount+row*width+3*x+j];
             g[c*count+i]=value;
         }
-        for(int i=0;i<count;++i) mags[i]=magnitude(g[3*count+i],g[4*count+i],g[5*count+i]);
+        float* d=patch.divisors.get();
+        for(int i=0;i<count;++i) mags[i]=d[i]=magnitude(g[3*count+i],g[4*count+i],g[5*count+i]);
         std::nth_element(mags.begin(),mags.begin()+count/2,mags.end());
         patch.floor=std::max(mags[count/2],1e-8f);
+        for(int i=0;i<count;++i) d[i]=d[i]>patch.floor ? d[i] : patch.floor;
     }
 };
 
