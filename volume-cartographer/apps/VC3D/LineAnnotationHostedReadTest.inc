@@ -833,6 +833,137 @@
                 publishing.setFiberManualHvTag(live->fiberId, QString::fromStdString(previous));
                 settle("the fiber-level edits are stored");
             }
+            // A background save that is stored while its read-back keeps
+            // failing: the publication stays in flight (no failure, nothing
+            // reconciled) and what is entered meanwhile is kept and saved.
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto pinBefore = live->storePin;
+                Controller::s_failSavedHeadReadsForTest = 4;
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "the save whose read-back fails starts");
+                live->fiberWidth += .25;
+                const auto later = live->fiberWidth;
+                publishing.saveSessionAsFiber(*live, false, true);
+                settle("a read-back that fails more than three times is retried until it answers");
+                require(Controller::s_failSavedHeadReadsForTest == 0 && publishing._fiberSaveFailureCount == before &&
+                        live->storePin != pinBefore && live->fiberWidth == later &&
+                        stored().width == later && stored().storePin == live->storePin &&
+                        std::any_of(publishing._panes.begin(), publishing._panes.end(),
+                                    [&](const auto& open) { return open.session == live; }),
+                        "the session kept its later edit and saved it after the delayed read-back");
+            }
+            // The same while an operation needs the answer (a join): it waits
+            // its patience once, then fails without touching the publication,
+            // which stays in flight; a reconcile asked for meanwhile waits
+            // too, so the session and its later edits are left alone.
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto pinBefore = live->storePin;
+                QScopedValueRollback<int> patience(publishing._confirmJoinPatienceMs, 100);
+                Controller::s_failSavedHeadReadsForTest = 1 << 20;
+                live->fiberWidth += .25;
+                const auto committed = live->fiberWidth;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "the save whose read-back does not answer starts");
+                live->fiberWidth += .25;
+                const auto later = live->fiberWidth;
+                require(!publishing.joinPublication() && publishing._publication &&
+                        publishing._fiberSaveFailureCount == before && live->storePin == pinBefore,
+                        "a join returns without an answer and leaves the publication running");
+                QElapsedTimer again; again.start();
+                require(!publishing.joinPublication() && again.elapsed() < 50, "a later join does not wait again");
+                publishing.saveSessionAsFiber(*live, false);
+                require(publishing._publication && publishing._fiberSaveFailureCount == before + 1,
+                        "a synchronous save on top of an unconfirmed one is refused");
+                {
+                    QTemporaryDir exportDirectory;
+                    QString exportError;
+                    require(!publishing.exportFibersToPath(fs::path(exportDirectory.path().toStdString()) / "fibers.json",
+                                                           &exportError, nullptr) && !exportError.isEmpty(),
+                            "an export that would omit edits queued behind an unconfirmed save is refused");
+                }
+                publishing.refreshChangedStoreFibers();
+                // Removing the pane now would lose the later edit with its
+                // refused close save: the pane stays until the install.
+                publishing.cleanupSurfaceName(live->surfaceName);
+                require(!publishing.settleClosedPanes(), "closed panes cannot be settled behind an unconfirmed save");
+                require(std::find(publishing._closingSurfaces.begin(), publishing._closingSurfaces.end(), live->surfaceName) !=
+                            publishing._closingSurfaces.end() && publishing.paneForSurface(live->surfaceName),
+                        "a pane removed during the unconfirmed save waits for its install");
+                std::erase(publishing._closingSurfaces, live->surfaceName);
+                std::erase_if(publishing._afterPublication, [](const auto& queued) { return queued.saveKey.starts_with("close:"); });
+                for (int i = 0; i < 10; ++i) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                require(publishing._publication && live->fiberWidth == later && live->storePin == pinBefore &&
+                        std::any_of(publishing._panes.begin(), publishing._panes.end(),
+                                    [&](const auto& open) { return open.session == live; }),
+                        "a reconcile during the unconfirmed save keeps the session and its later edit");
+                Controller::s_failSavedHeadReadsForTest = 0;
+                settle("the publication is installed once the store answers");
+                require(stored().width == committed && live->storePin == stored().storePin && live->fiberWidth == later &&
+                        std::any_of(publishing._panes.begin(), publishing._panes.end(),
+                                    [&](const auto& open) { return open.session == live; }),
+                        "the confirmed save is installed in the session that was kept");
+                publishing.saveSessionAsFiber(*live, false, true);
+                settle("the later edit is saved");
+                require(publishing._fiberSaveFailureCount == before + 1 && stored().width == later &&
+                        stored().storePin == live->storePin,
+                        "the later edit is saved on top of the confirmed one");
+            }
+            // Tags queued for two panes, the other pane's first: its replay
+            // starts a save that this pane's tag then waits behind. Removing
+            // this pane still stores its tag.
+            {
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto where = live->controlPoints.at(1).volumePoint;
+                const auto has = [&](const auto& controls, const cv::Vec3d& at) {
+                    const auto control = std::find_if(controls.begin(), controls.end(), [&](const auto& candidate) {
+                        return cv::norm(static_cast<const cv::Vec3d&>(candidate) - at) < 1e-6;
+                    });
+                    return control != controls.end() &&
+                        vc3d::line_annotation::hasControlPointTag(control->tags, vc3d::line_annotation::kBreakTag);
+                };
+                const auto otherWhere = other->controlPoints.at(1).volumePoint;
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "the save both tags queue behind starts");
+                publishing.handleGeneratedControlPointSetBreak(other->surfaceName, 1, true);
+                publishing.handleGeneratedControlPointSetBreak(live->surfaceName, 1, true);
+                require(publishing._deferredControlEdits.size() == 2 &&
+                        publishing._deferredControlEdits.front().surfaceName == other->surfaceName,
+                        "both panes' tags are queued, the other pane's first");
+                publishing.settleDeferredControlEdits(live->surfaceName);
+                require(std::none_of(publishing._deferredControlEdits.begin(), publishing._deferredControlEdits.end(),
+                                     [&](const auto& edit) { return edit.surfaceName == live->surfaceName; }) &&
+                        has(stored().controlPoints, where),
+                        "a pane's queued tag is stored although another pane's replay saved first");
+                settle("both panes' tags are stored");
+                require(publishing._fiberSaveFailureCount == before &&
+                        has(publishing.readStoredFibers(std::vector<std::string>{aUuid}, true).at(0).controlPoints, otherWhere),
+                        "the other pane's tag is stored too");
+                publishing.handleGeneratedControlPointSetBreak(other->surfaceName, 1, false);
+                publishing.handleGeneratedControlPointSetBreak(live->surfaceName, 1, false);
+                settle("the tags are removed again");
+            }
+            // A queued tag names its control, not its position: with a
+            // second control at the same position the tag goes to the one
+            // it was asked for.
+            {
+                auto& controls = live->controlPoints;
+                const size_t twin = controls.size() - 1;
+                const auto position = controls[twin].volumePoint;
+                std::vector<size_t> appliedAt;
+                live->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*live, false, true);
+                require(bool(publishing._publication), "the save the edit queues behind starts");
+                controls[twin].volumePoint = controls[twin - 1].volumePoint;
+                require(publishing.deferControlEdit(*live, {twin}, [&](const std::vector<size_t>& at) { appliedAt = at; }),
+                        "an edit of the second of two controls at one position is queued");
+                settle("the queued edit is replayed");
+                require(appliedAt == std::vector<size_t>{twin}, "the replay names the control it was queued for");
+                controls[twin].volumePoint = position;
+            }
             // A tag edit whose background save is refused (a commit by
             // another client that this controller has not seen) is reported
             // and stays in the session, like a placement whose save failed.
@@ -867,6 +998,33 @@
                 settle("a failed publication ends and its queue drains");
                 require(publishing._fiberSaveFailureCount > failures, "the failed publication is counted");
                 QCoreApplication::processEvents();
+            }
+            // A delayed read-back after another client revised the fiber
+            // again: nothing of the commit is installed for it, and the pane
+            // is reconciled like any external change (no failed save).
+            {
+                for (int i = 0; i < 10; ++i) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                publishing._panes.clear();
+                session->refresh(hosted); state.pollObjectStoreChanges();
+                QCoreApplication::processEvents();
+                const auto fresh = openSession(stored(), "publication-superseded");
+                const auto before = publishing._fiberSaveFailureCount;
+                const auto pin = fresh->storePin;
+                Controller::s_failSavedHeadReadsForTest = 2;
+                fresh->fiberWidth += .25;
+                publishing.saveSessionAsFiber(*fresh, false, true);
+                require(bool(publishing._publication), "the save that will be superseded starts");
+                QElapsedTimer waited; waited.start();
+                while (Controller::s_failSavedHeadReadsForTest == 2 && waited.elapsed() < 20000) QThread::msleep(5);
+                submitOther({SetMetaOp{cUuid, "superseded_test", "true"}}, cUuid);
+                settle("the superseded publication ends");
+                for (int i = 0; i < 10; ++i) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                require(publishing._fiberSaveFailureCount == before && Controller::s_failSavedHeadReadsForTest == 0 &&
+                        std::none_of(publishing._panes.begin(), publishing._panes.end(), [&](const auto& open) {
+                            return open.session && open.session->fiberUuid == cUuid && open.session->storePin &&
+                                open.session->storePin != pin && open.session->storePin != stored().storePin;
+                        }),
+                        "a superseded commit installs no version of its own in the session");
             }
             publishing._panes.clear();
             session->refresh(hosted); state.pollObjectStoreChanges();

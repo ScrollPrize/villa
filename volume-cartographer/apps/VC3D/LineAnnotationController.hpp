@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <limits>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -656,7 +657,9 @@ private:
     std::vector<std::string> _closingSurfaces;
     void finishDeferredClose(const std::string& surfaceName);
     // Before an open: closed windows' pending saves are made and awaited.
-    void settleClosedPanes();
+    // False when a closed pane could not be stored yet (the store does not
+    // confirm the save it waits behind).
+    bool settleClosedPanes();
     // A pane whose window was destroyed: cleaned up without blocking.
     void closeWindowlessPane(const std::string& surfaceName);
     // stillValid (optional): forwarded to each session's finalization and
@@ -1450,18 +1453,33 @@ private:
         std::vector<std::optional<vc::objects::ObjectRevision>> saved;
         // The other objects the commit revised (linked endpoints), as committed.
         std::map<std::string, vc::objects::ObjectRevision> revised;
+        // Objects another client revised again before a delayed read-back:
+        // nothing of this commit is installed for them.
+        std::set<std::string> superseded;
     };
     [[nodiscard]] FiberCommitJob prepareFiberCommit(const std::vector<FiberSaveSnapshot>& snapshots,
                                                     const std::vector<StoredFiber>& retired) const;
     static void buildFiberCommitOperations(FiberCommitJob& job, const vc::objects::StoreReader& reader);
-    static FiberCommitResult executeFiberCommit(FiberCommitJob& job, vc::objects::ObjectStoreSession& connection);
+    // A background commit's read-back: once the commit is in the store the
+    // read is retried until it answers or the controller lets go of the
+    // publication (stop); its sessions go on being edited meanwhile.
+    struct FiberCommitConfirm {
+        std::atomic<bool> stop{false};
+        // Set once the quick tries are used up: a join then waits no longer
+        // than its patience.
+        std::atomic<bool> retrying{false};
+    };
+    static FiberCommitResult executeFiberCommit(FiberCommitJob& job, vc::objects::ObjectStoreSession& connection,
+                                                FiberCommitConfirm* confirm = nullptr);
+    // Test hook: this many of the next read-backs fail.
+    static inline std::atomic<int> s_failSavedHeadReadsForTest{0};
     // An edit the store's current state refuses as built (not a transport failure).
     struct FiberCommitRefused : std::runtime_error {
         using std::runtime_error::runtime_error;
     };
     // The saved heads of a committed job.
     static void readSavedFiberHeads(const FiberCommitJob& job, vc::objects::ObjectStoreSession& connection,
-                                    FiberCommitResult& result);
+                                    FiberCommitResult& result, bool delayed = false);
     void installFiberCommit(FiberCommitJob& job, const FiberCommitResult& result);
     // A placement's (or its landing's) publication on a hosted fiber store
     // runs off the GUI thread: the commit and the decodes of what it changed
@@ -1490,11 +1508,13 @@ private:
     // Tag and span-tag edits (break, kollesis termination, gap, damaged)
     // requested while their session is still being published or solved: they
     // are applied, in order, once it is neither, to the controls they named
-    // (found again by position; an edit whose control is gone is dropped
-    // with a message).
+    // (found again by LineControlPoint::identity, or by position when the
+    // session was loaded again and exactly one control is there; an edit
+    // whose control is gone is dropped with a message).
     struct DeferredControlEdit {
         std::string surfaceName;
         std::vector<cv::Vec3d> controls;
+        std::vector<uint64_t> identities;
         std::function<void(const std::vector<size_t>&)> replay;
     };
     std::vector<DeferredControlEdit> _deferredControlEdits;
@@ -1540,9 +1560,20 @@ private:
     bool deferDuringPublication(std::function<void()> work, const std::string& surfaceName = {},
                                 const std::string& saveKey = {});
     void finishPublication(bool drainNow);
-    void joinPublication();
+    // False when the publication is still running after the wait: its commit
+    // is stored but the store does not answer the read-back.
+    bool joinPublication();
+    // The join for an operation that cannot run on top of an unconfirmed
+    // save: reports it and returns false.
+    bool joinPublicationOrReport(bool suppressDialog = false);
+    [[nodiscard]] static QString unconfirmedSaveMessage();
     void drainAfterPublication();
     void abandonPublication();
+    // What a finished publication's commit brings to the controller's state.
+    void installPublication(FiberPublication& publication);
+    // How long a join waits (once per publication) for the read-back of a
+    // commit already stored, before it returns with the publication running.
+    int _confirmJoinPatienceMs = 5000;
     void handleFiberStoreCommitEvent(const vc::objects::StoreSessionEvent& event);
     // The fiber and umbilicus attachments the controller last reset for;
     // true (and updated) when either route changed since.

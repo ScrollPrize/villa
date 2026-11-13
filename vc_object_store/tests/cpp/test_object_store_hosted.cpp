@@ -341,7 +341,9 @@ try {
             const auto unknown = util::newUuid();
             revisions.push_back(unknown);
             std::vector<std::string> names;
-            for (const auto& array : hosted.geometryRevision(revisions[0])->arrays) names.push_back(array.name);
+            // Held in a variable: a range-for over a member of the temporary would outlive it before C++23.
+            const auto firstRevision = hosted.geometryRevision(revisions[0]);
+            for (const auto& array : firstRevision->arrays) names.push_back(array.name);
             names.push_back("no-such-array");
             const auto batch = hosted.geometryBatch(revisions, names, {});
             require(batch && batch->size() == revisions.size(), "geometry batch answers every revision");
