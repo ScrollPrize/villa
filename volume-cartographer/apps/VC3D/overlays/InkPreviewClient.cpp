@@ -30,8 +30,10 @@ InkPreviewClient::InkPreviewClient(QObject* parent)
     , _network(new QNetworkAccessManager(this))
     , _url(QStringLiteral("http://127.0.0.1:8765"))
 {
-    // The server runs on this computer (or behind a local tunnel): never through a proxy.
+    // The server runs on this computer (or behind a local tunnel): never through a proxy,
+    // and never to another host by a redirect. A 3xx answer is a failure.
     _network->setProxy(QNetworkProxy::NoProxy);
+    _network->setRedirectPolicy(QNetworkRequest::ManualRedirectPolicy);
 }
 
 InkPreviewClient::~InkPreviewClient()
@@ -67,6 +69,13 @@ QUrl InkPreviewClient::endpoint(const QString& path) const
     url.setQuery(QString());
     url.setFragment(QString());
     return url;
+}
+
+QString InkPreviewClient::redirectError(int http) const
+{
+    return tr("The ink preview server at %1 answered with a redirect (HTTP %2); VC3D does not follow redirects.")
+        .arg(_url.toString())
+        .arg(http);
 }
 
 QString InkPreviewClient::transportError(QNetworkReply* reply) const
@@ -133,6 +142,10 @@ void InkPreviewClient::checkHealth(HealthDone done)
         const int http = httpStatus(reply);
         if (http == 0) {
             done(std::nullopt, transportError(reply));
+            return;
+        }
+        if (http >= 300 && http < 400) {
+            done(std::nullopt, redirectError(http));
             return;
         }
         const QByteArray body = reply->readAll();
@@ -227,6 +240,11 @@ void InkPreviewClient::requestPreview(const View& view, const Upload* upload, Pr
             done(out);
             return;
         }
+        if (out.httpStatus >= 300 && out.httpStatus < 400) {
+            out.error = redirectError(out.httpStatus);
+            done(out);
+            return;
+        }
         const QByteArray body = reply->readAll();
 
         if (out.httpStatus == 200) {
@@ -263,8 +281,23 @@ void InkPreviewClient::requestPreview(const View& view, const Upload* upload, Pr
                              need.value(QStringLiteral("w")).toInt(), need.value(QStringLiteral("h")).toInt());
             out.depth = object.value(QStringLiteral("depth")).toInt();
             out.missing = object.value(QStringLiteral("missing")).toInt();
-            if (out.need.isEmpty() || !QRect(QPoint(0, 0), view.canvas).contains(out.need) || out.depth < 1) {
-                out.error = tr("The server asked for layers of an invalid rectangle.");
+            // A patch that overlaps the view reaches at most patch - 1 pixels past it, so a
+            // need beyond that is not one the protocol produces; VC3D would sample and hold
+            // all of it in memory.
+            const int reach = std::max(0, view.patch - 1);
+            const QRect allowed = view.rect.adjusted(-reach, -reach, reach, reach) & QRect(QPoint(0, 0), view.canvas);
+            if (out.need.isEmpty() || !allowed.contains(out.need) || out.depth < 1) {
+                out.error = tr("The server asked for the layers of canvas rectangle (%1, %2, %3 x %4), which is not "
+                               "inside the view (%5, %6, %7 x %8) widened by its patch size %9.")
+                                .arg(out.need.x())
+                                .arg(out.need.y())
+                                .arg(out.need.width())
+                                .arg(out.need.height())
+                                .arg(view.rect.x())
+                                .arg(view.rect.y())
+                                .arg(view.rect.width())
+                                .arg(view.rect.height())
+                                .arg(view.patch);
                 done(out);
                 return;
             }

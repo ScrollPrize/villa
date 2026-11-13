@@ -18,18 +18,13 @@ only connects to a server you started: it launches nothing.
 
 ## Starting a server
 
-Any server that speaks the protocol below works. Start it on the same computer,
-listening on 127.0.0.1, with the model you want to see. villa's ink detection
-package includes one that runs the published checkpoints with villa's own
-inference code wherever that runs (CUDA, MPS or CPU):
-
-```bash
-python -m vesuvius.ink_detection.inference.preview_server --checkpoint CKPT
-```
+VC3D does not include a server. Any server that implements ink preview api 1
+(see the protocol below) works: start it on the same computer, listening on
+127.0.0.1, with the model you want to see. VC3D treats every such server alike.
 
 The dock starts with the address `http://127.0.0.1:8765`; enter the server's
-address there if it listens elsewhere. Other servers, for example one that runs a converted model on the Apple
-Neural Engine, are optional and live outside villa; VC3D treats them all alike.
+address there if it listens elsewhere. VC3D does not follow redirects: a `3xx`
+answer is reported as an error.
 
 ## Dock controls
 
@@ -81,14 +76,32 @@ read as zeros.
 
 The last image stays on screen, placed by its canvas rectangle, so it moves
 with pans and zooms while the next one is computed. One request is in flight at
-a time. Views over the view budget (4 megapixels of the chosen level, or the
-server's `max_view_px` if that is smaller) are not requested. The preview is
+a time. Views over the view budget (4 Mi pixels, 4,194,304 pixels of the chosen
+level, shown as 4.2 Mpx in the status line, or the server's `max_view_px` if that
+is smaller) are not requested. The preview is
 drawn in the segmentation view only, and not with the volumetric composite.
 
 Every request carries a key that changes whenever the voxels under the canvas
 could change: the segment, each edit of it, the volume, the level and the layer
 offsets. The server caches by key, so it never serves output computed from an
 older geometry.
+
+### Memory and time
+
+The layers of one request take `depth * sh * sw` voxels, and VC3D holds them
+twice while it posts them. A server answer may ask for at most `patch - 1`
+pixels past the view on each side; a larger request is reported as a server
+error and nothing is sampled. For ink_9um (17 layers, patch 128), a square
+request at the full view budget on a uint16 volume, with a need that reaches
+127 pixels past it on every side, takes about 360 MB at the peak.
+
+The copy of the segment does not depend on the view: the first sample after
+each edit copies the whole grid on the GUI thread (12 bytes per vertex), and a
+worker then builds the layer surface of the chosen level from the copy (about
+46 bytes per vertex). For a segment of 12 million vertices that is about
+700 MB, about 0.1 s on the GUI thread and about 5 s on the worker, measured on
+one Linux build; the first preview after an edit of a large segment waits for
+it.
 
 ## The reversed view
 
@@ -145,14 +158,17 @@ overlap the view, and caches each under the key, the variant and its position.
 
 ```bash
 ctest --test-dir build -R ink_preview --output-on-failure
-INK_PREVIEW_TEST_SERVER=http://127.0.0.1:8765 build/bin/test_ink_preview_client
+INK_PREVIEW_TEST_SERVER=http://127.0.0.1:8765 ctest --test-dir build -R ink_preview_server --output-on-failure
 ```
 
 `test_ink_preview_client` checks the client against an in-test server: health,
-the `409` round trip, dropped stale replies, error texts and timeouts. With
-`INK_PREVIEW_TEST_SERVER` set it also runs one round trip against that server.
+the `409` round trip, needs that reach too far past the view, redirects that
+are not followed, dropped stale replies, error texts and timeouts.
 `test_ink_preview_overlay` checks the canvas rectangle of a known camera, the
 image's placement after a pan, the requests that must not start, the key, the
-dock's Live preview group, and one round trip whose uploaded layers are compared
-with a synthetic volume; with `INK_PREVIEW_TEST_SERVER` set it also shows one
-preview from that server.
+dock's Live preview group, round trips whose uploaded layers are compared with
+`vc::sampleRenderLayers` on a synthetic volume (also after switching to a volume
+whose levels are placed differently), and a server whose `409` depth disagrees
+with its health. The `*_server` tests run one round trip against the server
+`INK_PREVIEW_TEST_SERVER` names, and are skipped when it is unset or no server
+answers there.

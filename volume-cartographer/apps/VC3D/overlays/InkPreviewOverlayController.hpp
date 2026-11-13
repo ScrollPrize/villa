@@ -134,6 +134,7 @@ private:
         bool reversed = false;
         QRect rect;
         quint64 edit = 0;
+        int patch = 0;  // the server's patch size: how far past the view a 409 may ask
         int uploads = 0;
         std::shared_ptr<std::atomic<bool>> cancel;
     };
@@ -179,6 +180,9 @@ private:
     std::string _levelsVolumeId;   // the volume `_levels` describes
     std::string _levelsPendingId;  // the volume whose levels are being read
     std::vector<LevelInfo> _levels;
+    // The key whose 409 named another depth than the server's health: its health was
+    // read again once, and a second mismatch stops the preview until the view changes.
+    QString _depthRecheckKey;
 
     // Changes on every change of the segmentation surface, edits included.
     quint64 _edit{0};

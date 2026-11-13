@@ -39,12 +39,15 @@ public:
 
     // A view of a canvas: `key` names everything that decides the canvas's voxels,
     // `rect` is the view in canvas pixels, `reversed` asks for the control view with
-    // the layer order reversed.
+    // the layer order reversed. `patch` is the server's patch size (GET /health): a
+    // 409 may ask for layers at most patch - 1 pixels past the view on each side, and
+    // a need beyond that fails.
     struct View {
         QString key;
         QSize canvas;
         QRect rect;
         bool reversed = false;
+        int patch = 0;
     };
 
     // The layers of the canvas rectangle `rect`, in forward order: depth * height *
@@ -98,6 +101,7 @@ public:
 private:
     QUrl endpoint(const QString& path) const;
     QString transportError(QNetworkReply* reply) const;
+    QString redirectError(int http) const;
     void track(QNetworkReply* reply);
 
     QNetworkAccessManager* _network{nullptr};

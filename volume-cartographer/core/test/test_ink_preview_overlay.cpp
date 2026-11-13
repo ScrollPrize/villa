@@ -1,11 +1,12 @@
 // The live ink preview's controller (apps/VC3D/overlays/InkPreviewOverlayController):
 // the canvas rectangle of a known camera, the placement of a reply after a pan, the
-// requests it does not start, the key, and one round trip against an in-test server
-// that checks the layers VC3D samples from a synthetic volume.
+// requests it does not start, the key, and round trips against an in-test server that
+// compare the layers VC3D uploads with vc::sampleRenderLayers on synthetic volumes.
 #define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
 #include "CState.hpp"
+#include "OpenedVolumes.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
@@ -14,11 +15,15 @@
 #include "support/LoopbackHttpServer.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/RenderLayers.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
 
 #include <nlohmann/json.hpp>
+#include <vc_reader/affine.hpp>
+#include <vc_reader/array.hpp>
+#include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
 
 #include <QApplication>
@@ -35,10 +40,12 @@
 #include <QGraphicsScene>
 #include <QThread>
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -238,27 +245,68 @@ constexpr int kVolumeY = 128;
 constexpr int kVolumeX = 224;
 constexpr int kSurfaceZ = 16;
 
-// A uint8 volume whose voxel at depth z reads 10 z, so a layer's value names its depth.
+// The voxel at (z, y, x) of a fixture level: it changes along every axis, by 5 per
+// step in z, so a window sampled a few pixels off, or layers out of order, differ.
+std::uint8_t fixtureValue(int z, int y, int x)
+{
+    return std::uint8_t(5 * z + x % 7 + 3 * (y % 5));
+}
+
+void writeLevel(const fs::path& path, int depth, int height, int width)
+{
+    const vcr::zarr::CreateOptions options{
+        .shape = {depth, height, width}, .chunks = {16, 64, 64}, .compressor = "", .overwrite = true};
+    auto writer = vcr::zarr::Writer::create(path, options);
+    std::vector<std::uint8_t> voxels(std::size_t(depth) * height * width);
+    for (int z = 0; z < depth; ++z) {
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                voxels[(std::size_t(z) * height + y) * width + x] = fixtureValue(z, y, x);
+            }
+        }
+    }
+    writer.writeRegion({0, 0, 0}, {depth, height, width}, voxels.data());
+}
+
+// A uint8 volume of fixtureValue. With `level1Scale`, it also has a level 1 placed at
+// that scale and `level1Translation` of level 0 (OME-Zarr multiscales).
 struct VolumeFixture {
     fs::path root;
     std::shared_ptr<Volume> volume;
 
-    VolumeFixture()
+    explicit VolumeFixture(const std::string& id = "preview-volume", double level1Scale = 0.0,
+                           double level1Translation = 0.0)
     {
         std::mt19937_64 rng(std::random_device{}());
         root = fs::temp_directory_path() / ("vc_ink_preview_overlay_" + std::to_string(rng()));
         const fs::path zarr = root / "ct.zarr";
-        const vcr::zarr::CreateOptions options{
-            .shape = {kVolumeZ, kVolumeY, kVolumeX}, .chunks = {16, 64, 64}, .compressor = "", .overwrite = true};
-        auto writer = vcr::zarr::Writer::create(zarr / "0", options);
-        std::vector<std::uint8_t> voxels(std::size_t(kVolumeZ) * kVolumeY * kVolumeX);
-        for (int z = 0; z < kVolumeZ; ++z) {
-            std::fill_n(voxels.begin() + std::ptrdiff_t(z) * kVolumeY * kVolumeX, kVolumeY * kVolumeX,
-                        std::uint8_t(10 * z));
+        writeLevel(zarr / "0", kVolumeZ, kVolumeY, kVolumeX);
+        if (level1Scale > 0.0) {
+            const auto size = [level1Scale](int n) { return int(std::ceil(n / level1Scale)); };
+            writeLevel(zarr / "1", size(kVolumeZ), size(kVolumeY), size(kVolumeX));
+            const auto dataset = [](const char* path, double scale, double translation) {
+                nlohmann::json transforms = nlohmann::json::array(
+                    {{{"type", "scale"}, {"scale", {scale, scale, scale}}}});
+                if (translation != 0.0) {
+                    transforms.push_back(
+                        {{"type", "translation"}, {"translation", {translation, translation, translation}}});
+                }
+                return nlohmann::json{{"path", path}, {"coordinateTransformations", transforms}};
+            };
+            std::ofstream(zarr / ".zgroup") << R"({"zarr_format": 2})";
+            std::ofstream(zarr / ".zattrs")
+                << nlohmann::json{{"multiscales",
+                                   {{{"version", "0.4"},
+                                     {"name", id},
+                                     {"axes", {{{"name", "z"}, {"type", "space"}},
+                                               {{"name", "y"}, {"type", "space"}},
+                                               {{"name", "x"}, {"type", "space"}}}},
+                                     {"datasets", {dataset("0", 1.0, 0.0),
+                                                   dataset("1", level1Scale, level1Translation)}}}}}}
+                       .dump();
         }
-        writer.writeRegion({0, 0, 0}, {kVolumeZ, kVolumeY, kVolumeX}, voxels.data());
-        std::ofstream(zarr / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "preview-volume"},
-                                                            {"name", "preview-volume"}, {"format", "zarr"},
+        std::ofstream(zarr / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", id},
+                                                            {"name", id}, {"format", "zarr"},
                                                             {"width", kVolumeX}, {"height", kVolumeY},
                                                             {"slices", kVolumeZ}, {"voxelsize", 9.0}}
                                                  .dump();
@@ -298,6 +346,89 @@ InkPreviewClient::Health testHealth(qint64 maxViewPx = 16777216)
     health.maxViewPx = maxViewPx;
     return health;
 }
+
+// The layers of canvas rectangle `rect` of `level` of `volume`, sampled from a fresh copy
+// of `surface` as vc_render_tifxyz -g level --scale 1 -n kDepth samples them: what an
+// upload must hold, byte for byte.
+std::string directLayers(CState& state, const std::shared_ptr<Volume>& volume, const QuadSurface& surface,
+                         int level, const QRect& rect)
+{
+    const auto opened = state.openedVolumes()->level(*volume, level);
+    const auto map = level == 0 ? vc::RenderLevelMap{} : vc::renderLevelMap(opened.working, opened.array->placement);
+    QuadSurface copy(surface.rawPointsPtr()->clone(), surface.scale());
+    const auto canvas = vc::RenderCanvas::make(copy.gridSize(), copy.scale(), double(map.voxelScale()));
+    const auto layers =
+        vc::renderSurface(copy, vcr::grid::Interpolation::Bicubic, 1.0f, false, vcr::catalog::Affine{}, map);
+    vcr::grid::Level plain;
+    plain.array = opened.array->array.get();
+    plain.type = opened.array->meta.type;
+    const cv::Mat stack = vc::sampleRenderLayers(copy, layers, plain, canvas,
+                                                 cv::Rect(rect.x(), rect.y(), rect.width(), rect.height()),
+                                                 vc::renderLayerOffsets(kDepth, 1.0));
+    return std::string(reinterpret_cast<const char*>(stack.data), stack.total() * stack.elemSize());
+}
+
+// An in-test ink preview server: 409 for the view without a body, the view at value 128
+// with one; it keeps every upload.
+struct RecordingServer {
+    struct Upload {
+        std::string key;
+        QRect rect;
+        std::string dtype;
+        std::string body;
+    };
+    std::mutex mutex;
+    std::vector<Upload> uploads;
+    vc::test::LoopbackHttpServer server;
+
+    RecordingServer()
+    {
+        server.setHandler([this](const vc::test::LoopbackHttpServer::Request& request)
+                              -> std::optional<vc::test::LoopbackHttpServer::Response> {
+            vc::test::LoopbackHttpServer::Response response;
+            if (request.path == "/health") {
+                response.body = R"({"service": "ink-preview", "api": 1, "backend": "fake", "model": "test-model",)"
+                                R"( "patch": 64, "stride": 32, "depth": 5, "voxel_um": null, "max_view_px": 16777216})";
+                return response;
+            }
+            const int w = std::stoi(request.query.at("w"));
+            const int h = std::stoi(request.query.at("h"));
+            if (request.body.empty()) {
+                response.status = 409;
+                response.body = nlohmann::json{{"need", {{"x", std::stoi(request.query.at("x"))},
+                                                         {"y", std::stoi(request.query.at("y"))},
+                                                         {"w", w}, {"h", h}}},
+                                               {"depth", kDepth}, {"missing", 1}}
+                                    .dump();
+                return response;
+            }
+            {
+                std::lock_guard lock(mutex);
+                uploads.push_back({request.query.at("key"),
+                                   QRect(std::stoi(request.query.at("sx")), std::stoi(request.query.at("sy")),
+                                         std::stoi(request.query.at("sw")), std::stoi(request.query.at("sh"))),
+                                   request.query.at("dtype"), request.body});
+            }
+            response.body.assign(std::size_t(w) * h, char(128));
+            response.headers = {{"X-Shape", std::to_string(h) + "," + std::to_string(w)},
+                                {"X-Backend", "fake"},
+                                {"X-Tiles", "4,0"}};
+            return response;
+        });
+    }
+
+    std::size_t count()
+    {
+        std::lock_guard lock(mutex);
+        return uploads.size();
+    }
+    Upload upload(std::size_t i)
+    {
+        std::lock_guard lock(mutex);
+        return uploads.at(i);
+    }
+    QUrl url() const { return QUrl(QString::fromStdString(server.url())); }
+};
 
 struct Scene {
     VolumeFixture data;
@@ -473,57 +604,11 @@ TEST_CASE("the key names the surface, its edits, the volume, the level and the l
 
 TEST_CASE("a round trip samples the layers the server asks for and draws its reply")
 {
-    using vc::test::LoopbackHttpServer;
     Scene scene;
-
-    std::mutex mutex;
-    std::string uploadError = "no upload";
-    std::vector<int> centerColumn;  // the uploaded layers at the need's center pixel
-    LoopbackHttpServer server;
-    server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
-        LoopbackHttpServer::Response response;
-        if (request.path == "/health") {
-            response.body = R"({"service": "ink-preview", "api": 1, "backend": "fake", "model": "test-model",)"
-                            R"( "patch": 64, "stride": 32, "depth": 5, "voxel_um": 9.0, "max_view_px": 16777216})";
-            return response;
-        }
-        const int w = std::stoi(request.query.at("w"));
-        const int h = std::stoi(request.query.at("h"));
-        if (request.body.empty()) {
-            response.status = 409;
-            response.body = nlohmann::json{{"need", {{"x", std::stoi(request.query.at("x"))},
-                                                     {"y", std::stoi(request.query.at("y"))},
-                                                     {"w", w}, {"h", h}}},
-                                           {"depth", kDepth}, {"missing", 1}}
-                                .dump();
-            return response;
-        }
-        {
-            std::lock_guard lock(mutex);
-            const int sw = std::stoi(request.query.at("sw"));
-            const int sh = std::stoi(request.query.at("sh"));
-            if (request.query.at("dtype") != "uint8" || request.body.size() != std::size_t(kDepth) * sw * sh) {
-                uploadError = "upload of " + std::to_string(request.body.size()) + " bytes";
-            } else {
-                uploadError.clear();
-                // The pixel of canvas (150, 80) inside the uploaded rectangle.
-                const int x = 150 - std::stoi(request.query.at("sx"));
-                const int y = 80 - std::stoi(request.query.at("sy"));
-                for (int layer = 0; layer < kDepth; ++layer) {
-                    centerColumn.push_back(
-                        std::uint8_t(request.body[std::size_t(layer) * sw * sh + std::size_t(y) * sw + x]));
-                }
-            }
-        }
-        response.body.assign(std::size_t(w) * h, char(128));
-        response.headers = {{"X-Shape", std::to_string(h) + "," + std::to_string(w)},
-                            {"X-Backend", "fake"},
-                            {"X-Tiles", "4,0"}};
-        return response;
-    });
+    RecordingServer server;
 
     ProbePreviewController preview(&scene.state);
-    preview.clientForTesting()->setServerUrl(QUrl(QString::fromStdString(server.url())));
+    preview.clientForTesting()->setServerUrl(server.url());
     preview.setEnabled(true);
     REQUIRE(preview.enabledFor(&scene.viewer));
     REQUIRE(waitFor([&] { return preview.health().has_value(); }));
@@ -540,11 +625,21 @@ TEST_CASE("a round trip samples the layers the server asks for and draws its rep
     REQUIRE_MESSAGE(waitFor([&] { return preview.statusText().startsWith(QStringLiteral("Model output")); }),
                     preview.statusText().toStdString());
     CHECK(!preview.statusIsError());
-    {
-        std::lock_guard lock(mutex);
-        CHECK(uploadError.empty());
-        // Layer i sits i - 2 voxels along the normal from depth 16: values 10 z.
-        CHECK(centerColumn == std::vector<int>{140, 150, 160, 170, 180});
+    REQUIRE(server.count() == 1);
+    const auto upload = server.upload(0);
+    CHECK(upload.rect == QRect(41, 0, 169, 110));
+    CHECK(upload.dtype == "uint8");
+    REQUIRE(upload.body.size() == std::size_t(kDepth) * 169 * 110);
+    // The window VC3D announced, sampled as vc_render_tifxyz samples it.
+    CHECK(upload.body == directLayers(scene.state, scene.data.volume, *scene.surface, 0, upload.rect));
+    // Forward order on its own: layer i sits i - 2 voxels along the normal (+z) from
+    // depth 16, so each layer of canvas pixel (150, 80) reads 5 more than the one before.
+    const std::size_t pixel = std::size_t(80 - upload.rect.y()) * upload.rect.width() + (150 - upload.rect.x());
+    const std::size_t plane = std::size_t(upload.rect.width()) * upload.rect.height();
+    for (int layer = 1; layer < kDepth; ++layer) {
+        CHECK(int(std::uint8_t(upload.body[layer * plane + pixel])) -
+                  int(std::uint8_t(upload.body[(layer - 1) * plane + pixel])) ==
+              5);
     }
 
     const auto images = preview.images(&scene.viewer);
@@ -669,20 +764,117 @@ TEST_CASE("the Ink Detection dock's live preview group drives the controller")
     qunsetenv("VC3D_CONFIG_DIR");
 }
 
-// Against a real server, when INK_PREVIEW_TEST_SERVER names one; skipped otherwise.
-TEST_CASE("the preview of a running ink preview server")
+TEST_CASE("after a switch to a volume whose levels are placed differently, the layers follow its placement")
+{
+    // The same surface on two volumes whose level 1 is placed at another scale and offset.
+    VolumeFixture a("vol-a", 2.0, 0.5);
+    VolumeFixture b("vol-b", 3.0, 1.0);
+    CState state;
+    FakeViewer viewer;
+    auto surface = makeSurface("seg-1");
+    viewer.setCurrentSurface(surface);
+    viewer.setCurrentVolume(a.volume);
+    viewer.setCamera(1.0, QPointF(100.0, 50.0));  // the whole surface
+    state.setSurface("segmentation", surface, false, false);
+    RecordingServer server;
+
+    ProbePreviewController preview(&state);
+    preview.clientForTesting()->setServerUrl(server.url());
+    preview.setLevelChoice(1);
+    preview.setEnabled(true);
+    REQUIRE(waitFor([&] { return preview.health().has_value(); }));
+    preview.images(&viewer);
+    REQUIRE_MESSAGE(waitFor([&] { return server.count() == 1 && preview.statusText().startsWith("Model output"); }),
+                    preview.statusText().toStdString());
+
+    viewer.setCurrentVolume(b.volume);
+    preview.images(&viewer);
+    REQUIRE_MESSAGE(waitFor([&] { return server.count() == 2 && preview.statusText().startsWith("Model output"); }),
+                    preview.statusText().toStdString());
+
+    const auto onA = server.upload(0);
+    const auto onB = server.upload(1);
+    CHECK(QString::fromStdString(onA.key).contains(QStringLiteral(":v=vol-a:l=1:")));
+    CHECK(QString::fromStdString(onB.key).contains(QStringLiteral(":v=vol-b:l=1:")));
+    // Level 1 of vol-a has half the voxels per unit, level 1 of vol-b a third.
+    CHECK(onA.rect == QRect(0, 0, 105, 55));
+    CHECK(onB.rect == QRect(0, 0, 70, 37));
+    CHECK(onA.body == directLayers(state, a.volume, *surface, 1, onA.rect));
+    CHECK(onB.body == directLayers(state, b.volume, *surface, 1, onB.rect));
+    // The control: vol-a's placement on vol-b's data reads other voxels.
+    CHECK(onB.body != directLayers(state, a.volume, *surface, 1, onB.rect));
+}
+
+TEST_CASE("a server whose 409 depth disagrees with its health is asked once more, then left alone")
+{
+    using vc::test::LoopbackHttpServer;
+    Scene scene;
+    std::atomic<int> healthCount{0};
+    std::atomic<int> previewCount{0};
+    LoopbackHttpServer server;
+    server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
+        LoopbackHttpServer::Response response;
+        if (request.path == "/health") {
+            ++healthCount;
+            response.body = R"({"service": "ink-preview", "api": 1, "backend": "fake", "model": "test-model",)"
+                            R"( "patch": 64, "stride": 32, "depth": 5, "voxel_um": 9.0, "max_view_px": 16777216})";
+            return response;
+        }
+        ++previewCount;
+        response.status = 409;
+        response.body = nlohmann::json{{"need", {{"x", std::stoi(request.query.at("x"))},
+                                                 {"y", std::stoi(request.query.at("y"))},
+                                                 {"w", std::stoi(request.query.at("w"))},
+                                                 {"h", std::stoi(request.query.at("h"))}}},
+                                       {"depth", 7}, {"missing", 1}}
+                            .dump();
+        return response;
+    });
+    ProbePreviewController preview(&scene.state);
+    preview.clientForTesting()->setServerUrl(QUrl(QString::fromStdString(server.url())));
+    preview.setEnabled(true);
+    REQUIRE(waitFor([&] { return preview.health().has_value(); }));
+    preview.images(&scene.viewer);
+
+    // One request, one health check again, a second request, then the error.
+    REQUIRE_MESSAGE(waitFor([&] { return preview.statusText().contains(QStringLiteral("but asks for 7")); }),
+                    preview.statusText().toStdString());
+    CHECK(preview.statusIsError());
+    // Nothing more while the view stays: give a settle several times over to show it.
+    waitFor([&] { return previewCount.load() > 2 || healthCount.load() > 2; },
+            8 * InkPreviewOverlayController::kSettleMs);
+    CHECK(healthCount.load() == 2);
+    CHECK(previewCount.load() == 2);
+    CHECK(preview.requestsStartedForTesting() == 2);
+    CHECK(!preview.settlePendingForTesting());
+
+    // A pan asks once for the new view and stops again.
+    scene.viewer.setCamera(2.0, QPointF(-20.0, 0.0));
+    preview.images(&scene.viewer);
+    REQUIRE(waitFor([&] { return previewCount.load() == 3; }));
+    waitFor([&] { return previewCount.load() > 3 || healthCount.load() > 2; },
+            8 * InkPreviewOverlayController::kSettleMs);
+    CHECK(previewCount.load() == 3);
+    CHECK(healthCount.load() == 2);
+    CHECK(preview.statusText().contains(QStringLiteral("but asks for 7")));
+}
+
+// The ctest test_ink_preview_overlay_server (--server): one preview from the server
+// INK_PREVIEW_TEST_SERVER names. It exits with kSkipped when the variable is unset or
+// no server answers there.
+constexpr int kSkipped = 77;
+bool serverSkipped = false;
+
+void runningServerPreview()
 {
     const QString address = qEnvironmentVariable("INK_PREVIEW_TEST_SERVER");
-    if (address.isEmpty()) {
-        MESSAGE("skipped: set INK_PREVIEW_TEST_SERVER to a running ink preview server's address");
-        return;
-    }
     Scene scene;
     ProbePreviewController preview(&scene.state);
     preview.clientForTesting()->setServerUrl(QUrl(address));
     preview.setEnabled(true);
     if (!waitFor([&] { return preview.health().has_value() || preview.statusIsError(); }) || !preview.health()) {
         MESSAGE("skipped: " << preview.statusText().toStdString());
+        serverSkipped = true;
         return;
     }
     // The synthetic volume holds the layers of models up to 31 deep around depth 16.
@@ -702,5 +894,15 @@ int main(int argc, char** argv)
         qputenv("QT_QPA_PLATFORM", "offscreen");
     }
     QApplication app(argc, argv);
+    if (argc > 1 && std::string(argv[1]) == "--server") {
+        if (qEnvironmentVariable("INK_PREVIEW_TEST_SERVER").isEmpty()) {
+            std::cout << "skipped: set INK_PREVIEW_TEST_SERVER to a running ink preview server's address\n";
+            return kSkipped;
+        }
+        auto& runner = ::doctest::detail::Runner::get();
+        runner.cases = {{"the preview of a running ink preview server", &runningServerPreview}};
+        const int result = ::doctest::detail::runAll();
+        return result == 0 && serverSkipped ? kSkipped : result;
+    }
     return ::doctest::detail::runAll();
 }

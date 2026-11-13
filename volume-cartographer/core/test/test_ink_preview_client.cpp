@@ -11,8 +11,10 @@
 #include <QElapsedTimer>
 #include <QThread>
 
+#include <atomic>
 #include <chrono>
 #include <functional>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <thread>
@@ -47,11 +49,6 @@ bool waitFor(const std::function<bool()>& done, int ms = 5000)
     return done();
 }
 
-void pump(int ms)
-{
-    waitFor([] { return false; }, ms);
-}
-
 QUrl urlOf(const LoopbackHttpServer& server)
 {
     return QUrl(QString::fromStdString(server.url()));
@@ -72,8 +69,12 @@ InkPreviewClient::View testView()
     view.key = QStringLiteral("vc3d:a+b&c=d:e=1");
     view.canvas = QSize(300, 200);
     view.rect = QRect(100, 50, 12, 10);
+    view.patch = 64;
     return view;
 }
+
+// A need the view's patches can produce: inside the view widened by patch - 1 = 63 px.
+const char* kNeed = R"({"need": {"x": 64, "y": 32, "w": 64, "h": 40}, "depth": 5, "missing": 1})";
 
 } // namespace
 
@@ -237,15 +238,97 @@ TEST_CASE("a reply of the wrong size and a need outside the canvas fail")
     const auto outside = preview(client, testView());
     REQUIRE(outside.has_value());
     CHECK(outside->kind == InkPreviewClient::Reply::Kind::Failed);
-    CHECK(outside->error.contains(QStringLiteral("invalid rectangle")));
+    CHECK(outside->error.contains(QStringLiteral("is not inside the view")));
+}
+
+TEST_CASE("a need may reach at most patch - 1 pixels past the view")
+{
+    std::string body;
+    LoopbackHttpServer server;
+    server.setHandler([&body](const LoopbackHttpServer::Request&) -> std::optional<Response> { return json(409, body); });
+    InkPreviewClient client;
+    client.setServerUrl(urlOf(server));
+    auto view = testView();
+    view.canvas = QSize(60000, 40000);
+    view.rect = QRect(1000, 1000, 100, 100);
+
+    // The patches of a 64 px grid that overlap the view: 63 px past it on every side.
+    body = R"({"need": {"x": 937, "y": 937, "w": 226, "h": 226}, "depth": 17, "missing": 9})";
+    const auto edge = preview(client, view);
+    REQUIRE(edge.has_value());
+    REQUIRE_MESSAGE(edge->kind == InkPreviewClient::Reply::Kind::Need, edge->error.toStdString());
+    CHECK(edge->need == QRect(937, 937, 226, 226));
+
+    // One pixel further on the left.
+    body = R"({"need": {"x": 936, "y": 937, "w": 227, "h": 226}, "depth": 17, "missing": 9})";
+    const auto further = preview(client, view);
+    REQUIRE(further.has_value());
+    CHECK(further->kind == InkPreviewClient::Reply::Kind::Failed);
+    CHECK(further->error.contains(QStringLiteral("is not inside the view (1000, 1000, 100 x 100) widened by its patch size 64")));
+
+    // The whole canvas for a 100 x 100 view: 40.8 G voxels at depth 17 are never sampled.
+    body = R"({"need": {"x": 0, "y": 0, "w": 60000, "h": 40000}, "depth": 17, "missing": 1})";
+    const auto whole = preview(client, view);
+    REQUIRE(whole.has_value());
+    CHECK(whole->kind == InkPreviewClient::Reply::Kind::Failed);
+
+    // Without a patch size the need must lie inside the view.
+    view.patch = 0;
+    body = R"({"need": {"x": 937, "y": 937, "w": 226, "h": 226}, "depth": 17, "missing": 9})";
+    const auto unknown = preview(client, view);
+    REQUIRE(unknown.has_value());
+    CHECK(unknown->kind == InkPreviewClient::Reply::Kind::Failed);
+}
+
+TEST_CASE("redirects are not followed")
+{
+    // A second server that would answer, and must hear nothing.
+    LoopbackHttpServer other;
+    other.setHandler([](const LoopbackHttpServer::Request& request) -> std::optional<Response> {
+        if (request.path == "/health") {
+            return json(200, kHealth);
+        }
+        return json(409, kNeed);
+    });
+    int status = 307;
+    LoopbackHttpServer local;
+    const std::string target = other.url();
+    local.setHandler([target, &status](const LoopbackHttpServer::Request& request) -> std::optional<Response> {
+        Response r;
+        r.status = status;
+        r.headers.push_back({"Location", target + request.target});
+        return r;
+    });
+    InkPreviewClient client;
+    client.setServerUrl(urlOf(local));
+
+    for (const int code : {307, 308, 301, 302}) {
+        CAPTURE(code);
+        status = code;
+        InkPreviewClient::Upload upload;
+        upload.rect = QRect(64, 32, 64, 40);
+        upload.voxels = QByteArray(5 * 40 * 64, 'S');
+        const auto reply = preview(client, testView(), &upload);
+        REQUIRE(reply.has_value());
+        CHECK(reply->kind == InkPreviewClient::Reply::Kind::Failed);
+        CHECK(reply->httpStatus == code);
+        CHECK(reply->error.contains(QStringLiteral("VC3D does not follow redirects")));
+
+        std::optional<QString> healthError;
+        client.checkHealth([&](const std::optional<InkPreviewClient::Health>& h, const QString& e) {
+            healthError = h ? QString() : e;
+        });
+        REQUIRE(waitFor([&] { return healthError.has_value(); }));
+        CHECK(healthError->contains(QStringLiteral("VC3D does not follow redirects")));
+    }
+    CHECK(local.requests().size() == 8);
+    CHECK(other.requests().empty());
 }
 
 TEST_CASE("the reversed view asks for variant r")
 {
     LoopbackHttpServer server;
-    server.setHandler([](const LoopbackHttpServer::Request&) -> std::optional<Response> {
-        return json(409, R"({"need": {"x": 0, "y": 0, "w": 64, "h": 64}, "depth": 5, "missing": 1})");
-    });
+    server.setHandler([](const LoopbackHttpServer::Request&) -> std::optional<Response> { return json(409, kNeed); });
     InkPreviewClient client;
     client.setServerUrl(urlOf(server));
     auto view = testView();
@@ -257,10 +340,13 @@ TEST_CASE("the reversed view asks for variant r")
 
 TEST_CASE("cancel and a new server address drop replies in flight")
 {
+    static constexpr int kHandlerMs = 300;
+    std::atomic<int> answered{0};
     LoopbackHttpServer server;
-    server.setHandler([](const LoopbackHttpServer::Request&) -> std::optional<Response> {
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        return json(409, R"({"need": {"x": 0, "y": 0, "w": 64, "h": 64}, "depth": 5, "missing": 1})");
+    server.setHandler([&answered](const LoopbackHttpServer::Request&) -> std::optional<Response> {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kHandlerMs));
+        ++answered;
+        return json(409, kNeed);
     });
     InkPreviewClient client;
     client.setServerUrl(urlOf(server));
@@ -277,8 +363,13 @@ TEST_CASE("cancel and a new server address drop replies in flight")
     CHECK(fresh->kind == InkPreviewClient::Reply::Kind::Need);
 
     client.requestPreview(testView(), nullptr, [&stale](const InkPreviewClient::Reply&) { ++stale; });
+    const int before = answered.load();
     client.setServerUrl(urlOf(server));
-    pump(700);
+    // Wait until the server has answered the dropped request (it may also never see it,
+    // since dropping the reply closes the connection), then give its answer as long
+    // again to arrive. A callback that ran would show in `stale`.
+    waitFor([&] { return answered.load() > before || stale > 0; }, 10 * kHandlerMs);
+    waitFor([&] { return stale > 0; }, kHandlerMs);
     CHECK(stale == 0);
 }
 
@@ -333,17 +424,15 @@ TEST_CASE("a server that does not answer in time fails the request")
     LoopbackHttpServer server;
     server.setHandler([](const LoopbackHttpServer::Request&) -> std::optional<Response> {
         std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-        return json(409, R"({"need": {"x": 0, "y": 0, "w": 64, "h": 64}, "depth": 5, "missing": 1})");
+        return json(409, kNeed);
     });
     InkPreviewClient client;
     client.setServerUrl(urlOf(server));
     client.setTimeouts(200, 200);
 
-    QElapsedTimer timer;
-    timer.start();
+    // The error text names the timeout, so no wall-clock bound is needed here.
     const auto reply = preview(client, testView());
     REQUIRE(reply.has_value());
-    CHECK(timer.elapsed() < 1100);
     CHECK(reply->kind == InkPreviewClient::Reply::Kind::Failed);
     CHECK(reply->httpStatus == 0);
     CHECK(reply->error.contains(QStringLiteral("did not answer within 0.2 s")));
@@ -378,15 +467,15 @@ TEST_CASE("no server and a bad address are reported")
     CHECK(!InkPreviewClient::urlProblem(QUrl(QStringLiteral("ftp://127.0.0.1:8765"))).isEmpty());
 }
 
-// Against a real server, when INK_PREVIEW_TEST_SERVER names one (for example the
-// standalone server's fake backend); skipped otherwise.
-TEST_CASE("a running ink preview server answers the round trip")
+// The ctest test_ink_preview_client_server (--server): one round trip against the server
+// INK_PREVIEW_TEST_SERVER names, for example the standalone server's fake backend. It
+// exits with kSkipped when the variable is unset or no server answers there.
+constexpr int kSkipped = 77;
+bool serverSkipped = false;
+
+void runningServerRoundTrip()
 {
     const QString address = qEnvironmentVariable("INK_PREVIEW_TEST_SERVER");
-    if (address.isEmpty()) {
-        MESSAGE("skipped: set INK_PREVIEW_TEST_SERVER to a running ink preview server's address");
-        return;
-    }
     InkPreviewClient client;
     client.setServerUrl(QUrl(address));
     client.setTimeouts(3000, 60000);
@@ -402,6 +491,7 @@ TEST_CASE("a running ink preview server answers the round trip")
     REQUIRE(waitFor([&] { return done; }, 5000));
     if (!health) {
         MESSAGE("skipped: no ink preview server at " << address.toStdString() << ": " << error.toStdString());
+        serverSkipped = true;
         return;
     }
     MESSAGE("server " << health->model.toStdString() << " (" << health->backend.toStdString() << "), depth "
@@ -411,6 +501,7 @@ TEST_CASE("a running ink preview server answers the round trip")
     view.key = QStringLiteral("vc3d-test:%1").arg(QDateTime::currentMSecsSinceEpoch());
     view.canvas = QSize(300, 200);
     view.rect = QRect(100, 50, 120, 100);
+    view.patch = health->patch;
     const auto first = preview(client, view);
     REQUIRE(first.has_value());
     REQUIRE_MESSAGE(first->kind == InkPreviewClient::Reply::Kind::Need, first->error.toStdString());
@@ -444,5 +535,15 @@ TEST_CASE("a running ink preview server answers the round trip")
 int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
+    if (argc > 1 && std::string(argv[1]) == "--server") {
+        if (qEnvironmentVariable("INK_PREVIEW_TEST_SERVER").isEmpty()) {
+            std::cout << "skipped: set INK_PREVIEW_TEST_SERVER to a running ink preview server's address\n";
+            return kSkipped;
+        }
+        auto& runner = ::doctest::detail::Runner::get();
+        runner.cases = {{"a running ink preview server answers the round trip", &runningServerRoundTrip}};
+        const int result = ::doctest::detail::runAll();
+        return result == 0 && serverSkipped ? kSkipped : result;
+    }
     return ::doctest::detail::runAll();
 }

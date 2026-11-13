@@ -157,6 +157,15 @@ vc_add_test(NAME test_ink_preview_overlay
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 set_tests_properties(test_ink_preview_overlay PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+# One round trip against the ink preview server INK_PREVIEW_TEST_SERVER names;
+# skipped (exit 77) when it is unset or no server answers there.
+add_test(NAME test_ink_preview_client_server COMMAND test_ink_preview_client --server)
+add_test(NAME test_ink_preview_overlay_server COMMAND test_ink_preview_overlay --server)
+set_tests_properties(test_ink_preview_client_server PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(test_ink_preview_overlay_server PROPERTIES
+    SKIP_RETURN_CODE 77 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+vc_register_ctest(test_ink_preview_client_server test_ink_preview_client)
+vc_register_ctest(test_ink_preview_overlay_server test_ink_preview_overlay)
 
 qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
 qt6_wrap_cpp(points_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.hpp)

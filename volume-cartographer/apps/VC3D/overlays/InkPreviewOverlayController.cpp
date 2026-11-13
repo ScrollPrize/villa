@@ -64,10 +64,13 @@ struct Sampled {
 // A copy of the segmentation surface's grid taken on the GUI thread, which workers
 // sample while the user goes on editing the original. The copy has the stored
 // surface's origin (an origin moved in memory does not move the canvas); its layer
-// surface is built once per level, on a worker.
+// surface is built once per level of one volume, on a worker. A level's layer surface
+// holds that volume's placement of the level, so another volume takes another
+// snapshot (which shares the copy of the grid).
 struct InkPreviewSnapshot {
     std::string surfaceId;
     quint64 edit = 0;
+    std::string volumeId;
     std::shared_ptr<const QuadSurface> surface;
     std::mutex mutex;
     std::map<int, std::shared_ptr<const vc::RenderSurface>> layers;
@@ -401,6 +404,7 @@ void InkPreviewOverlayController::setEnabled(bool enabled)
         _client->cancel();
         _healthPending = false;
         _health.reset();
+        _depthRecheckKey.clear();
         _shown.reset();
         _seenKey.clear();
         setStatus({});
@@ -418,6 +422,7 @@ void InkPreviewOverlayController::setServerUrl(const QUrl& url)
     _client->setServerUrl(url);
     _healthPending = false;
     _health.reset();
+    _depthRecheckKey.clear();
     // Another server may run another model.
     dropShown();
     if (_enabled) {
@@ -656,6 +661,7 @@ void InkPreviewOverlayController::startRequest()
     flight.reversed = _reversed;
     flight.rect = rect;
     flight.edit = _edit;
+    flight.patch = _health->patch;
     flight.cancel = std::make_shared<std::atomic<bool>>(false);
     _flight = std::move(flight);
     _rerun = false;
@@ -672,6 +678,7 @@ void InkPreviewOverlayController::send(const InkPreviewClient::Upload* upload)
     view.canvas = QSize(_flight->frame.canvas.size.width, _flight->frame.canvas.size.height);
     view.rect = _flight->rect;
     view.reversed = _flight->reversed;
+    view.patch = _flight->patch;
     const quint64 id = _flight->id;
     _client->requestPreview(view, upload, [this, id](const InkPreviewClient::Reply& reply) { onReply(id, reply); });
 }
@@ -688,11 +695,24 @@ void InkPreviewOverlayController::onReply(quint64 id, const InkPreviewClient::Re
         return;
     case InkPreviewClient::Reply::Kind::Need:
         if (reply.depth != int(layerOffsets().size())) {
-            // The server was restarted with another model: read its health again.
-            _health.reset();
-            setStatus(tr("The server now reads %1 layers; reconnecting.").arg(reply.depth), true);
+            if (_depthRecheckKey != _flight->frame.key) {
+                // The server may have been restarted with another model: read its health
+                // again, once per key.
+                _depthRecheckKey = _flight->frame.key;
+                _health.reset();
+                setStatus(tr("The server now reads %1 layers; reconnecting.").arg(reply.depth), true);
+                finishFlight(false);
+                _settle->start();
+                return;
+            }
+            // Its health still names another depth: stop until the view, the key or the
+            // server address changes, instead of asking again and again.
+            setStatus(tr("The server reports %1 layers in GET /health but asks for %2; the live preview stops until "
+                         "the view, the segment or the server address changes.")
+                          .arg(layerOffsets().size())
+                          .arg(reply.depth),
+                      true);
             finishFlight(false);
-            _settle->start();
             return;
         }
         if (_flight->uploads >= 2) {
@@ -728,6 +748,16 @@ void InkPreviewOverlayController::sampleNeed(const QRect& need)
         return;
     }
 
+    if (_snapshot && _snapshot->surfaceId == surface->id && _snapshot->edit == _edit &&
+        _snapshot->volumeId != volume->id()) {
+        // The same grid on another volume: its levels are placed differently.
+        auto snapshot = std::make_shared<InkPreviewSnapshot>();
+        snapshot->surfaceId = _snapshot->surfaceId;
+        snapshot->edit = _snapshot->edit;
+        snapshot->volumeId = volume->id();
+        snapshot->surface = _snapshot->surface;
+        _snapshot = std::move(snapshot);
+    }
     if (!_snapshot || _snapshot->surfaceId != surface->id || _snapshot->edit != _edit) {
         const cv::Mat_<cv::Vec3f>* points = static_cast<const QuadSurface&>(*surface).rawPointsPtr();
         if (!points || points->empty()) {
@@ -740,6 +770,7 @@ void InkPreviewOverlayController::sampleNeed(const QRect& need)
         auto snapshot = std::make_shared<InkPreviewSnapshot>();
         snapshot->surfaceId = surface->id;
         snapshot->edit = _edit;
+        snapshot->volumeId = volume->id();
         snapshot->surface = std::move(copy);
         _snapshot = std::move(snapshot);
     }
