@@ -542,6 +542,10 @@ vc_add_test(NAME test_growth_config
     LIBS doctest::doctest vc_tracer
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+vc_add_test(NAME test_growpatch_straight_loss
+    LIBS doctest::doctest opencv_core
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
 vc_add_test(NAME test_growth_helpers
     LIBS doctest::doctest vc_tracer
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
