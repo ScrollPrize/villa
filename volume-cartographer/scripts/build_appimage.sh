@@ -162,6 +162,36 @@ if [ "$BUNDLE_GLIBC" = 1 ]; then
         cp -Lv "$qpd/platforms/libqoffscreen.so" "$APPDIR/usr/plugins/platforms/"
 fi
 
+# linuxdeploy's exclude list assumes the host provides the graphics/X stack and
+# a few base libraries. That holds on a desktop, but not on a headless server or
+# a minimal container, where the CLI tools fail before main() with e.g.
+#   vc_render_tifxyz: error while loading shared libraries: libGLX.so.0
+# Copy in whatever the bundled binaries still resolve against the host, minus
+# the glibc family and the loader (handled above, under BUNDLE_GLIBC).
+bundle_host_deps() {
+    local libdir="$APPDIR/usr/lib" f soname path copied=0
+    local skip='^(ld-linux.*|linux-vdso.*|libc|libm|libmvec|libdl|libpthread|librt|libresolv|libutil|libanl|libBrokenLocale|libstdc\+\+|libgcc_s)\.so'
+    while IFS= read -r -d '' f; do
+        while read -r soname path; do
+            # ldd prints the loader as an absolute path on some distros.
+            soname="${soname##*/}"
+            [[ "$soname" =~ $skip ]] && continue
+            [ -e "$libdir/$soname" ] && continue
+            case "$path" in "$APPDIR"/*) continue ;; esac
+            [ -e "$path" ] || continue
+            cp -Lv "$path" "$libdir/$soname" && copied=$((copied + 1))
+        done < <(ldd "$f" 2>/dev/null | awk '/=> \//{print $1, $3}')
+    done < <(find "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/plugins" \
+                  -type f \( -name '*.so*' -o -perm -u+x \) -print0)
+    return_copied=$copied
+}
+
+echo "==> Bundling host libraries linuxdeploy excludes (headless/minimal hosts)"
+# Two passes: libraries copied by the first pass can pull in further host deps.
+bundle_host_deps; first=$return_copied
+bundle_host_deps; second=$return_copied
+echo "    bundled $((first + second)) additional libraries"
+
 if [ -n "$STRIP_FLAGS" ]; then
     before=$(du -sm "$APPDIR" | cut -f1)
     dbgstage=""
