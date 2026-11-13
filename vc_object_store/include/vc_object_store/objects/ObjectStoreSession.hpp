@@ -37,13 +37,12 @@ struct AttachmentIdentity {
 // which may differ from the generation that published an unchanged head.
 struct PinnedObject {
     AttachmentIdentity attachment;
-    ObjectIdentity object;
-    std::string generation;
-    int64_t version = 0;
+    ObjectVersion selected;
     std::optional<std::string> geometryRevision;
     std::string writeGeneration;
-    bool stored() const { return version > 0; }
-    ObjectVersion reference() const { return {object.storeUuid, generation, object.objectUuid, version}; }
+    bool stored() const { return selected.version > 0; }
+    const ObjectVersion& reference() const { return selected; }
+    ObjectIdentity identity() const { return {selected.storeUuid, selected.objectUuid}; }
     bool operator==(const PinnedObject&) const = default;
 };
 // The pin of a revision read from `attachment`.
@@ -266,6 +265,7 @@ public:
     std::optional<TransactionReceipt> receipt(const AttachmentIdentity&, const std::string& requestUuid);
     // Hosted: current as of the last check (or a newer read).
     std::optional<ObjectRevision> currentObject(const AttachmentIdentity&, const std::string& objectUuid);
+    ObjectVersion decodeObjectReference(const AttachmentIdentity&, const std::string& json);
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const AttachmentIdentity&, const std::vector<ObjectVersion>&);
     std::optional<GeometryRevision> geometryRevision(const AttachmentIdentity&, const std::string& revisionUuid);
     std::vector<uint8_t> readGeometryArray(const AttachmentIdentity&, const std::string& revisionUuid, const std::string& arrayName);
@@ -273,32 +273,42 @@ public:
     // (and, locally, the client catalog's unrecorded registrations).
     VolumeTransforms volumeTransforms(const AttachmentIdentity&);
     // Artifacts (objects/Artifacts.hpp) on any attachment: the manifest of an
-    // object's current version (or `version` in `generation`, default active).
+    // object's current version, a numbered version of its current owner, or a
+    // complete reference (exclusive with version/generation). Complete refs
+    // remain readable after overrides/deletion while their source is retained.
     std::vector<ArtifactFile> artifacts(const AttachmentIdentity&, const std::string& objectUuid,
                                         const std::optional<int64_t>& version = std::nullopt,
-                                         const std::optional<std::string>& generation = std::nullopt);
+                                         const std::optional<std::string>& generation = std::nullopt,
+                                         const std::optional<ObjectVersion>& reference = std::nullopt);
     // Writes those files under `destination` (local to this process; names
     // are relative paths), each atomically and verified against the manifest.
     std::vector<ArtifactFile> materializeArtifacts(const AttachmentIdentity&, const std::string& objectUuid,
                                                    const std::filesystem::path& destination,
                                                    const std::optional<int64_t>& version = std::nullopt,
-                                                   const std::optional<std::string>& generation = std::nullopt);
+                                                   const std::optional<std::string>& generation = std::nullopt,
+                                                   const std::optional<ObjectVersion>& reference = std::nullopt);
     // One artifact as a local file, kept by content: <cacheDirectory>/<sha256>/
     // <file name of `name`>, written (verified) unless it is there. nullopt
     // when that version of the object has no artifact of that name.
     std::optional<std::filesystem::path> artifactFile(const AttachmentIdentity&, const std::string& objectUuid,
                                                       const std::string& name, const std::filesystem::path& cacheDirectory,
                                                       const std::optional<int64_t>& version = std::nullopt,
-                                                      const std::optional<std::string>& generation = std::nullopt);
+                                                      const std::optional<std::string>& generation = std::nullopt,
+                                                      const std::optional<ObjectVersion>& reference = std::nullopt);
     // Stores each (name, local file) durably, then names them in the object's
     // manifest (replacing entries of the same names) in one checked request
-    // that expects `expectedVersion` of the object; returns its receipt. An
+    // that expects the complete selected reference; returns its receipt. An
     // empty author is the attachment's (newRequest).
-    TransactionReceipt publishArtifacts(const AttachmentIdentity&, const std::string& objectUuid, int64_t expectedVersion,
+    TransactionReceipt publishArtifacts(const AttachmentIdentity&, const ObjectVersion& reference,
                                         const std::vector<std::pair<std::string, std::filesystem::path>>& files,
                                         const std::string& author = {});
+    // Loaded tools retain both the selected source reference and active write lineage.
+    TransactionReceipt publishArtifacts(const PinnedObject&,
+                                        const std::vector<std::pair<std::string, std::filesystem::path>>& files,
+                                        const std::string& author = {},
+                                        const std::optional<CheckVolumeMappingOp>& mapping = {});
     // Writes by a geometry fetcher (setGeometryFetcher) on a writable attachment.
-    using FetchWrite = std::function<TransactionReceipt(const VersionSelection& expected, const Action&)>;
+    using FetchWrite = std::function<TransactionReceipt(const RecordSelection& expected, const Action&)>;
     // Fetches one object's geometry and writes it with `write`; throws when it
     // cannot. Runs on the attachment's fetch thread; must only read `store`.
     using GeometryFetcher = std::function<void(ObjectStore& store, const std::string& objectUuid, const FetchWrite& write)>;
@@ -309,7 +319,7 @@ public:
     // geometry queue its fetch (then the Committed write); refetch fetches it
     // again. An empty `fetch` removes the fetcher. Read-only attachments never fetch.
     void setGeometryFetcher(const std::string& metaKey, GeometryFetcher fetch);
-    TransactionReceipt fetchWrite(const AttachmentIdentity&, const VersionSelection& expected, const Action&);
+    TransactionReceipt fetchWrite(const AttachmentIdentity&, const RecordSelection& expected, const Action&);
     // Fetch these again (their published geometry changed), read or not.
     void refetch(const AttachmentIdentity&, const std::vector<std::string>& objectUuids);
     // Block until the object's geometry is local, fetching it now when it has
@@ -440,6 +450,8 @@ public:
     void requireCurrent(const PinnedObject&);
 
 private:
+    TransactionReceipt publishArtifactManifest(const AttachmentIdentity&, TransactionRequest,
+        const ObjectRevision&, const std::vector<std::pair<std::string, std::filesystem::path>>&);
     void submitCopy(const AttachmentIdentity& from, const AttachmentIdentity& to, const ObjectCopy&);
     struct Attachment;
     std::shared_ptr<Attachment> open(const std::filesystem::path&, const OpenOptions&);

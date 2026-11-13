@@ -3,7 +3,9 @@
 #include "vc_object_store/objects/Project.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "vc_object_store/objects/ObjectCopy.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <iostream>
@@ -35,10 +37,146 @@ Json view(ObjectStoreSession& session, const AttachmentIdentity& attachment, con
     session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) { result = projectView(reader, author); });
     return result;
 }
+
+void ownerHistoryPolicy(HistoryMode sourceMode,HistoryMode overlayMode)
+{
+    TemporaryDirectory dir;auto sourceOptions=as("test");sourceOptions.history=sourceMode;
+    const auto base=dir.path/"base.vcobj",overlay=dir.path/"overlay.vcobj";
+    const auto deleted=util::newUuid();
+    const auto resource=projectResourceRecord(kVolumeResource,"/volumes/test");
+    {auto store=ObjectStore::create(base,sourceOptions);auto w=store.write();
+        store.upsertObject(w,resource);
+        for(int i=0;i<2;++i){ObjectRecord r;r.kind=kProjectKind;store.upsertObject(w,r);}
+        ObjectRecord r;r.uuid=deleted;r.kind="note";store.upsertObject(w,r);w.commit();
+        auto remove=store.write();store.deleteObject(remove,deleted);store.seal(remove);remove.commit();}
+    auto overlayOptions=as("test");overlayOptions.history=overlayMode;
+    {auto collection=ObjectCollection::create(overlay,{base},overlayOptions);}
+    auto store=ObjectStore::open(overlay,overlayOptions);
+    const auto local=projectResourceRecord(kVolumeResource,"/volumes/local");
+    if(sourceMode!=overlayMode){
+        auto w=store.write();store.upsertObject(w,local);w.commit();
+    }
+    {
+        auto txn=store.read();LocalStoreReader reader(store,txn);
+        const auto listed=projectResources(reader,kVolumeResource);
+        if(sourceMode!=overlayMode)
+            require(listed.size()==2 && listed[0].uuid==resource.uuid && listed[1].uuid==local.uuid,
+                    "mixed history modes order resources by original creation");
+        else require(listed.size()==1,"resource discovery uses owner history policy");
+        require(projectRecord(reader).has_value(),"project ordering uses owner history policy");
+        require(reader.objectHistory(deleted,true).size()==(sourceMode==HistoryMode::On?2:0),"optional history follows winning tombstone owner");
+        require(currentVersionOf(reader,deleted)==(sourceMode==HistoryMode::On?std::optional<int64_t>(2):std::nullopt),
+            "retained tombstone version does not depend on overlay history policy");
+        if(sourceMode==HistoryMode::Off)mustFail([&]{reader.objectHistory(resource.uuid);});
+    }
+    if(sourceMode!=overlayMode) {
+        auto w=store.write();
+        auto override=resource;override.meta=R"({"reviewed":true})";
+        store.upsertObject(w,override);w.commit();
+        auto r=store.read();
+        require(projectResources(LocalStoreReader(store,r),kVolumeResource).front().uuid==resource.uuid,
+                "metadata override does not change original creation order");
+    }
+}
+
+void copyCollectionProject(bool packed,bool sharded)
+{
+    TemporaryDirectory dir;const auto sourceDir=dir.path/"source",destinationDir=dir.path/"destination";
+    std::filesystem::create_directories(sourceDir);std::filesystem::create_directories(destinationDir);
+    auto options=as("copy-test");options.history=HistoryMode::Off;options.spatialIndex=false;
+    std::filesystem::path source=sourceDir/"root.vcobj";
+    std::string artifactOwner;const auto payload=sourceDir/"payload.txt";std::ofstream(payload)<<"retained payload";
+    if(sharded){
+        const auto owner=util::newUuid(),lineage=util::newUuid();std::vector<std::filesystem::path> shards;
+        for(int i=0;i<2;++i){
+            auto opt=options;opt.creationStoreUuid=owner;opt.creationGeneration=lineage;
+            opt.objectIdRange={1+i*100,100+i*100};
+            const auto path=sourceDir/("shard"+std::to_string(i)+".vcobj");shards.push_back(path);
+            auto store=ObjectStore::create(path,opt);auto w=store.write();
+            store.upsertObject(w,projectResourceRecord(kVolumeResource,"/volume/"+std::to_string(i)));w.commit();
+            auto seal=store.write();store.seal(seal);seal.commit();
+        }
+        auto collection=ObjectCollection::publishShards(source,shards,options);
+    }else{
+        const auto base=sourceDir/"base.vcobj";createProject(base,"source project",Json::object(),options);
+        {ObjectStoreSession session;const auto attachment=session.attach(base,options);
+            addProjectResource(session,attachment,kVolumeResource,"/volume/base");
+            session.readStore(attachment,[&](const StoreReader& reader,const auto&){artifactOwner=projectRecord(reader)->uuid;});
+            session.publishArtifacts(attachment,session.currentObject(attachment,artifactOwner)->reference(),{{"note.txt",payload}},"copy-test");}
+        {auto store=ObjectStore::open(base,options);auto w=store.write();store.seal(w);w.commit();}
+        {auto collection=ObjectCollection::create(source,{base},options);}
+        {ObjectStoreSession session;const auto attachment=session.attach(source,options);
+            addProjectResource(session,attachment,kVolumeResource,"/volume/overlay");}
+    }
+    if(packed){
+        if(!sharded){auto store=ObjectStore::open(source,options);auto w=store.write();store.seal(w);w.commit();}
+        const auto output=sourceDir/"packed.vcobj";packObjectCollection(source,output);source=output;
+    }
+    const auto destination=destinationDir/"copy.vcobj";
+    {ObjectStoreSession session;auto readOptions=options;readOptions.readOnly=true;
+        const auto attachment=session.attach(source,readOptions);copyProject(session,attachment,destination,"independent",options);}
+    // The copied closure must no longer rely on either original paths or a
+    // source packed container. Renaming the temporary source tree makes that explicit.
+    std::filesystem::rename(sourceDir,dir.path/"source-unavailable");
+    {ObjectStoreSession session;const auto attachment=session.attach(destination,options);
+        require(resources(session,attachment,kVolumeResource).size()==2,"copied collection retains both resources");
+        session.readStore(attachment,[&](const StoreReader& reader,const auto&){
+            require(projectRecord(reader)->name=="independent","copied collection has a mutable independent project");});
+        if(!artifactOwner.empty()){
+            const auto files=session.artifacts(attachment,artifactOwner);
+            require(files.size()==1,"inherited artifact manifest survives copy");
+            const auto local=session.artifactFile(attachment,artifactOwner,"note.txt",dir.path/"cache");
+            require(local&&std::filesystem::file_size(*local)==16,"inherited artifact content survives copy");
+        }
+        setProjectName(session,attachment,"renamed again");}
+    {ObjectStoreSession session;const auto attachment=session.attach(destination,options);
+        require(resources(session,attachment,kVolumeResource).size()==2,"copy remains readable after another root commit");}
+}
+
+void missingArtifactExport(HistoryMode history)
+{
+    TemporaryDirectory dir;const auto source=dir.path/"source.vcobj",payload=dir.path/"payload";
+    std::ofstream(payload)<<"retained bytes";
+    auto options=as("artifact-copy");options.history=history;
+    std::string hash;
+    {auto store=ObjectStore::create(source,options);hash=store.putArtifact(payload);
+        auto w=store.write();ObjectRecord record;record.uuid=util::newUuid();record.kind="note";
+        record.meta=Json{{kArtifactsMetaKey,Json::parse(artifactManifestJson({{"note.txt",hash,14}}))}}.dump();
+        store.upsertObject(w,record);w.commit();
+        auto finish=store.write();
+        if(history==HistoryMode::On)store.removeMeta(finish,record.uuid,kArtifactsMetaKey);
+        store.seal(finish);finish.commit();}
+    // History-on: only an older revision still needs the blob. History-off:
+    // the current manifest does. Neither export may silently drop the bytes.
+    std::filesystem::remove(artifactBlobPath(source,hash));
+    for(const bool packed:{false,true}){
+        const auto target=dir.path/(packed?"packed.vcobj":"copy.vcobj");
+        mustFail([&]{if(packed)packObjectCollection(source,target);else copyObjectCollection(source,target,options);});
+        for(const auto* suffix:{"",".artifacts",".stores"})
+            require(!std::filesystem::exists(target.string()+suffix),"failed artifact export removes owned output and sidecars");
+    }
+}
 } // namespace
 
 int main() try
 {
+    for (auto history : {HistoryMode::On, HistoryMode::Off}) {
+        TemporaryDirectory dir;
+        auto options = as("copy-test"); options.history = history;
+        auto store = ObjectStore::create(dir.path / "copy.vcobj", options);
+        ObjectCopy copy;
+        copy.record.uuid = util::newUuid(); copy.record.kind = "fiber";
+        copy.geometry.emplace(); copy.geometry->kind = "surface"; // invalid for this target
+        auto write = store.write();
+        mustFail([&] { writeObjectCopy(store, write, copy); });
+        write.commit(); // catching a failure must not publish partial metadata
+        auto read = store.read();
+        require(!store.objectByUuid(read, copy.record.uuid), "failed composite copy rolled back");
+    }
+    for(const auto history:{HistoryMode::Off,HistoryMode::On})missingArtifactExport(history);
+    for(const auto source:{HistoryMode::Off,HistoryMode::On})for(const auto overlay:{HistoryMode::Off,HistoryMode::On})
+        ownerHistoryPolicy(source,overlay);
+    for(const bool packed:{false,true})for(const bool sharded:{false,true})copyCollectionProject(packed,sharded);
     TemporaryDirectory directory;
     const auto path = directory.path / "project.vcobj";
 
@@ -67,7 +205,7 @@ int main() try
             }
             {
                 auto txn = store.read();
-                sourceFirst = store.versionReference(txn, *store.currentObjectRevision(txn, owner));
+                sourceFirst = store.currentObjectRevision(txn, owner)->reference();
                 for (const auto& info : store.extensionTables(txn)) if (info.name == manual.name) sourceTable = info.tableUuid;
                 const auto status = store.status(txn);
                 require(status.extensionsPresent && storeStatusFromJson(storeStatusToJson(status)).extensionsPresent,
@@ -78,7 +216,7 @@ int main() try
                 mustFail([&] { readObjectCopy(LocalStoreReader(store, txn), project->uuid); });
             }
             {
-                auto txn = store.write(VersionSelection{{owner, sourceFirst.version}});
+                auto txn = store.writeNumbered(VersionSelection{{owner, sourceFirst.version}});
                 store.replaceExtensionRows(txn, manual.name, owner, second); txn.commit();
             }
         }
@@ -115,7 +253,7 @@ int main() try
         auto sourceRequest = direct.newRequest(attached);
         direct.readStore(attached, [&](const StoreReader& reader, const auto&) {
             const auto record = projectRecord(reader);
-            sourceRequest.expectedObjects[record->uuid] = record->version;
+            sourceRequest.expectedObjects[record->uuid] = record->reference();
             sourceRequest.operations.push_back(SetMetaOp{record->uuid, "copy_test", "true"});
         });
         direct.submit(attached, sourceRequest);
@@ -222,12 +360,34 @@ int main() try
     require(addProjectResource(session, project, kVolumeResource, local), "re-added");
     require(resources(session, project, kVolumeResource).size() == 2, "re-added resource listed");
 
+    const auto legacyPath = directory.path / "legacy-resource.vcobj";
+    auto legacy = projectResourceRecord(kVolumeResource, "/legacy");
+    legacy.uuid = util::nameUuid("vc_project_resource/volume//legacy");
+    {
+        auto store = ObjectStore::create(legacyPath, as("alice"));
+        auto w = store.write();
+        store.upsertObject(w, legacy);
+        w.commit();
+    }
+    const auto legacyProject = session.attach(legacyPath, as("alice"));
+    const auto newKey = projectResourceUuid(kVolumeResource, "/legacy");
+    bool rejectedAlias = false;
+    try { updateProjectResourceMeta(session, legacyProject, newKey, {{"checked", true}}); }
+    catch (const std::runtime_error&) { rejectedAlias = true; }
+    require(rejectedAlias, "unstored identity aliases are rejected");
+    updateProjectResourceMeta(session, legacyProject, legacy.uuid, {{"checked", true}});
+    require(resources(session, legacyProject, kVolumeResource).front().uuid == legacy.uuid, "legacy UUID retained");
+    require(!removeProjectResource(session, legacyProject, newKey), "new deterministic key is not an alias");
+    require(removeProjectResource(session, legacyProject, legacy.uuid), "stored UUID remains editable");
+
     // A resource of one owner (a path on their disk) is theirs alone, even at a path another uses.
     const std::string onDisk = "/home/user/predictions.zarr";
     require(addProjectResource(session, project, kVolumeResource, onDisk, {}, Json::object(), "alice"), "alice's own");
     require(addProjectResource(session, project, kVolumeResource, onDisk, {}, Json::object(), "bob"), "bob's own");
     require(projectResourceUuid(kVolumeResource, onDisk, "alice") != projectResourceUuid(kVolumeResource, onDisk, "bob"),
             "owners name their resources apart");
+    mustFail([&] { updateProjectResourceMeta(session, project, projectResourceUuid(kVolumeResource, onDisk, "alice"),
+                                             {{"owner", ""}}); });
     const auto seenBy = [&](const std::string& viewer) {
         std::vector<std::string> owners;
         for (const auto& resource : resources(session, project, kVolumeResource, viewer))
@@ -289,7 +449,7 @@ int main() try
             recordUuid = projectRecord(reader)->uuid;
             version = reader.currentObject(recordUuid)->version;
         });
-        aliceSession.publishArtifacts(alice, recordUuid, version, {{"notes.txt", file}});
+        aliceSession.publishArtifacts(alice, aliceSession.currentObject(alice, recordUuid)->reference(), {{"notes.txt", file}});
         const auto copyPath = directory.path / "with-artifacts.vcobj";
         copyProject(aliceSession, alice, copyPath, "with artifacts", as("alice"));
         ObjectStoreSession copied;

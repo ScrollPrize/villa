@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "internal/Database.hpp"
 
 namespace vc::objects {
 const std::vector<std::string>& tifxyzFileKeys()
@@ -36,8 +37,10 @@ void createSurface(ObjectStore& store, WriteTxn& txn, const std::string& uuid, c
                    const SurfaceProvenance& provenance, const nlohmann::json& meta, const GeometryData& geometry)
 {
     if (geometry.kind != "surface") throw std::invalid_argument("createSurface needs surface geometry");
+    detail::Savepoint save(ObjectStoreImplAccess::conn(txn));
     store.upsertObject(txn, surfaceRecord(uuid, name, tags, coordinates, provenance, meta));
     store.putGeometry(txn, uuid, geometry);
+    save.release();
 }
 
 std::vector<TransactionOperation> createSurfaceOperations(const std::string& uuid, const std::string& name,

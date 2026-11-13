@@ -1,4 +1,6 @@
 #include "geometry/GeometryDelta.hpp"
+#include "internal/ReferenceResolver.hpp"
+#include "internal/JsonFields.hpp"
 #include <zstd.h>
 
 namespace vc::objects::detail {
@@ -29,6 +31,7 @@ nlohmann::json loadGeometryManifest(sqlite3* db, const std::string& revision,
     if (geometryWork) geometryWork->manifestBytesRead += text.size();
     auto manifest = nlohmann::json::parse(text);
     if (!manifest.contains("delta")) return verifiedGeometryManifest(text, contentHash);
+    jsonArrayField(manifest.at("delta"), "chunks");
     Statement checksum(db, "SELECT manifest_hash FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
     if (!checksum.row() || hashText(text) != readDigest(checksum,0) ||
         manifest.at("delta").at("version") != 1 || manifest.at("delta").at("result_hash") != contentHash)
@@ -82,6 +85,12 @@ EncodedGeometryDelta encodeGeometryDelta(const std::vector<GeometryChunkChange>&
 }
 std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::string& revision,
                                                     const nlohmann::json& manifest) {
+    db=resolveReference(db,[&](sqlite3* source) {
+        if(!historyEnabled(source))return false;
+        Statement row(source,"SELECT 1 FROM geometry_deltas WHERE revision_uuid=?",parseUuid(revision));
+        return row.row();
+    });
+    if(!db)throw std::runtime_error("geometry delta: missing payload reference");
     const auto& d = manifest.at("delta");
     const auto rawSize = d.at("raw_size").get<int64_t>();
     if (d.at("version") != 1 || rawSize <= 0 || uint64_t(rawSize) > maxDeltaBytes)
@@ -160,30 +169,15 @@ void clearGeometryMaterialization(sqlite3* db, const std::string& object) {
         execute(db, std::string("DELETE FROM ") + table + " WHERE object_uuid=?", parseUuid(object));
     }
 }
-void materializeGeometry(sqlite3* db, const std::string& object, const std::string& revision) {
-    Statement row(db, "SELECT manifest,content_hash FROM geometry_revisions WHERE uuid=?", parseUuid(revision));
-    if (!row.row()) throw std::runtime_error("geometry: missing revision");
-    const auto descriptor = loadGeometryManifest(db, revision, row.text(0), readDigest(row,1));
-    clearGeometryMaterialization(db, object);
-    if (!descriptor.contains("delta")) {
-        execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=? WHERE uuid=?",
-            revision,descriptor.dump(),readDigest(row,1),parseUuid(object));
-        return;
-    }
+void restoreGeometryReference(sqlite3* db, const std::string& object, const std::string& revision) {
+    const auto record=resolveGeometryRecord(db,revision);
+    if (!record||record->revision.objectUuid!=object) throw std::runtime_error("geometry: missing or mismatched revision");
     GeometryReader reader(db, revision, false);
-    GeometryReader base(db, descriptor.at("delta").at("base").get<std::string>(), false);
-    const auto& manifest = reader.manifest();
-    Statement insert(db, "INSERT INTO geometry_current_chunks VALUES(?,?,?,?,?)");
-    for (const auto& [name, a] : manifest.at("arrays").items())
-        for (int64_t index = 0; index < geometryLayout(a).chunkCount(); ++index) {
-            const std::string hash = a.at("chunks").at(index);
-            if (hash == base.manifest().at("arrays").at(name).at("chunks").at(index).get<std::string>()) continue;
-            auto bytes = reader.chunk(name, index);
-            insert.run(parseUuid(object), name, index, parseDigest(hash), bytes);
-        }
-    execute(db, "INSERT INTO geometry_materializations VALUES(?,?,?)", parseUuid(object), parseUuid(revision),
-        manifest.dump());
+    const auto manifest = reader.manifest().dump();
+    clearGeometryMaterialization(db, object);
+    // The retained revision owns its delta chain. Restoring a descriptor must
+    // not copy its payload or require history tables in the destination.
     execute(db,"UPDATE objects SET storage_ref=?,geometry_manifest=?,data_checksum=? WHERE uuid=?",
-        revision,manifest.dump(),readDigest(row,1),parseUuid(object));
+        revision,manifest,record->revision.contentHash,parseUuid(object));
 }
 }

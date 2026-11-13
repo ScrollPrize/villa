@@ -11,6 +11,7 @@ bool matchesEdgeSelection(const EdgeRecord&, const EdgeSelection&);
 std::unique_ptr<Statement> edgeSelectionQuery(sqlite3* db, const EdgeSelection& selection,
     const std::string& columns, const std::optional<std::vector<int64_t>>& endpointIds = std::nullopt);
 std::string projectedEdgeColumns(sqlite3*,const ObjectFields& fields = std::nullopt);
+void validateEdgeProjection(const ObjectFields&);
 
 Anchor readAnchor(const Statement& s, int firstCol);
 

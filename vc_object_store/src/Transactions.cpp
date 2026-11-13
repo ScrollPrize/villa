@@ -2,10 +2,13 @@
 #include "internal/History.hpp"
 #include "internal/Versions.hpp"
 #include "imports/SourceIdentityIndex.hpp"
+#include "internal/CollectionReads.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 
 namespace vc::objects {
 using namespace detail;
 Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_),
+    referenceContext_(std::move(other.referenceContext_)),
     expectedRevisions_(std::move(other.expectedRevisions_)),
     receipt_(std::move(other.receipt_)), expectedObjectVersions_(std::move(other.expectedObjectVersions_)),
     expectedRelationshipVersions_(std::move(other.expectedRelationshipVersions_))
@@ -33,17 +36,19 @@ void Txn::commit()
 void Txn::release(bool commit)
 {
     auto* conn = static_cast<sqlite3*>(handle_);
-    handle_ = nullptr;
     auto releaseConnection = [&] {
+        handle_ = nullptr;
+        referenceContext_.reset();
         // Collection resolvers capture the transaction's pinned dependencies;
         // pooled connections must never retain those captures after release.
         if (const auto pool = activeStatementPools.find(conn); pool != activeStatementPools.end()) {
-            pool->second->externalGeometryChunk = {};
-            pool->second->externalGeometryChunkSize = {};
-            pool->second->externalEndpointRecord = {};
-            pool->second->externalEndpointVersion = {};
-            pool->second->externalEndpointOwner = {};
-            pool->second->externalEndpointValidateAnchor = {};
+            // Readers can hold a pinned dependency connection. Never retain
+            // such readers after releasing this collection transaction.
+            if (pool->second->referenceSource) pool->second->geometryCache.reset();
+            pool->second->referenceSource = {};
+            pool->second->objectSource = {};
+            pool->second->edgeSource = {};
+            pool->second->querySources = {};
             pool->second->currentWrite.reset();
         }
         activeStatementPools.erase(conn);
@@ -87,7 +92,7 @@ void* ObjectStore::connection(const Txn& txn) const {
     return ObjectStoreImplAccess::conn(txn);
 }
 
-ReadTxn ObjectStore::read()
+ReadTxn ObjectStore::read() const
 {
     sqlite3* conn = impl_->checkoutReader();
     try {
@@ -107,7 +112,10 @@ ReadTxn ObjectStore::read()
         impl_->checkinReader(conn);
         throw;
     }
-    return ReadTxn(this, conn);
+    ReadTxn txn(this,conn);
+    if(impl_->composed&&!impl_->options.physicalPartitionOnly)
+        txn.referenceContext_=attachCollectionReferenceResolver(conn,impl_->path,impl_->options);
+    return txn;
 }
 
 WriteTxn ObjectStore::write()
@@ -138,10 +146,13 @@ WriteTxn ObjectStore::write()
     }
     catch (...) { sqlite3_exec(impl_->writer, "ROLLBACK;", nullptr, nullptr, nullptr); activeStatementPools.erase(impl_->writer); throw; }
     lock.release(); // WriteTxn releases the mutex on commit or rollback.
-    return WriteTxn(this, impl_->writer);
+    WriteTxn txn(this,impl_->writer);
+    if(impl_->composed&&!impl_->options.physicalPartitionOnly)
+        txn.referenceContext_=attachCollectionReferenceResolver(impl_->writer,impl_->path,impl_->options);
+    return txn;
 }
 
-WriteTxn ObjectStore::write(const VersionSelection& expectedObjects)
+WriteTxn ObjectStore::write(const RecordSelection& expectedObjects)
 {
     TransactionContext context;
     context.expectedObjects = expectedObjects;
@@ -150,8 +161,23 @@ WriteTxn ObjectStore::write(const VersionSelection& expectedObjects)
 
 WriteTxn ObjectStore::write(const TransactionContext& context)
 {
-    if (context.author && context.author->empty()) throw std::invalid_argument("object store: empty transaction author");
     auto txn = write();
+    configureWrite(txn, context);
+    return txn;
+}
+
+WriteTxn ObjectStore::writeNumbered(const VersionSelection& numbers)
+{
+    auto txn = write();
+    TransactionContext context;
+    context.expectedObjects = selectCurrentExpectations(LocalStoreReader(*this, txn), numbers);
+    configureWrite(txn, context);
+    return txn;
+}
+
+void ObjectStore::configureWrite(WriteTxn& txn, const TransactionContext& context)
+{
+    if (context.author && context.author->empty()) throw std::invalid_argument("object store: empty transaction author");
     auto* db = static_cast<sqlite3*>(connection(txn));
     auto& pool = *activeStatementPools.at(db);
     if (context.requestUuid) {
@@ -165,9 +191,8 @@ WriteTxn ObjectStore::write(const TransactionContext& context)
     RevisionSelection expected;
     prepareCheckedWrite(db, context, expected);
     txn.expectedRevisions_ = expected;
-    txn.expectedObjectVersions_ = context.expectedObjects;
-    txn.expectedRelationshipVersions_ = context.expectedRelationships;
-    return txn;
+    txn.expectedObjectVersions_ = numberedSelection(context.expectedObjects);
+    txn.expectedRelationshipVersions_ = numberedSelection(context.expectedRelationships);
 }
 
 std::string ObjectStore::author() const

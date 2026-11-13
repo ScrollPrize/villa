@@ -54,7 +54,7 @@ int main(int argc,char** argv) {
                                 const auto idx=(sequence++*17)%4096;
                                 if(mode=="selected") {double p[]{2.,0.,0.,double(idx*64)};uint8_t value=0;
                                     reader.sample_nearest(p,1,&value);if(value!=42)++result.errors;}
-                                else {auto value=reader.chunk({0,0,0,int64_t(idx)});if(!value||value->front()!=42)++result.errors;}
+                                else {auto value=reader.chunk({0,0,0,int64_t(idx)});if(!value||value->empty()||(*value)[0]!=42)++result.errors;}
                             } else {
                                 auto claim=flights.acquire(keys[shared?sequence++%8:mode=="probe"?sequence++%64:w]);
                                 if(mode=="probe") {if(claim.owner()||claim.ready())++result.errors;}

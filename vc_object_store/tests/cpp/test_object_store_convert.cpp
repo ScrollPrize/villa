@@ -146,6 +146,7 @@ void requireSameHistory(const std::filesystem::path& path, const Json& expected,
         require(history.size() == recorded.size(), "revision count");
         for (size_t i = 0; i < history.size(); ++i) {
             auto want = recorded.at(i);
+            want["store"] = expected.at("store");
             if (generation) want["generation"] = *generation;
             auto& record = want.at("record");
             record["approved_version"] = record.at("approved_generation").is_null() ? Json(nullptr) : want.at("version");
@@ -192,7 +193,7 @@ void requireWritable(const std::filesystem::path& path, const std::string& objec
       const auto revision = *db.currentObjectRevision(txn, object);
       oldRecord = Json::parse(objectRevisionToJson(revision)).at("record"); publicationGeneration = revision.generation; }
     TransactionRequest r; r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
-    r.author = "convert-test"; r.expectedObjects = {{object, before}};
+    r.author = "convert-test"; r.expectedObjects = testNumberedGuards(db, {{object, before}});
     r.operations = {SetMetaOp{object, "after_conversion", std::to_string(*before + 1)}};
     const auto receipt = db.submit(r);
     require(receipt.objects.at(object) == *before + 1, "edit after conversion");
@@ -324,8 +325,7 @@ void schema21Cases(const std::filesystem::path& root)
         const auto sealedPacked=root/(history?"sealed21-history.packed":"sealed21-direct.packed");
         {PackedStoreBuilder builder(sealedPacked);builder.importDatabase(physical,source);builder.finalize(physical);}
         const auto packedArtifact=artifactBlobPath(sealedPacked,artifactHash);
-        std::filesystem::create_directories(packedArtifact.parent_path());
-        std::filesystem::copy_file(artifactBlobPath(source,artifactHash),packedArtifact);
+        require(bytesOf(packedArtifact)=="abc","packed fixture publication retains its verified artifact sidecar");
         const auto convertedPacked=root/(history?"converted21-history.packed":"converted21-direct.packed");
         migration::convertStore(sealedPacked,convertedPacked);
         {auto db=ObjectCollection::open(convertedPacked,OpenOptions{.readOnly=true});auto r=db.read();require(db.uuid(r)==storeId,"packed21 identity preserved");}
@@ -459,6 +459,12 @@ try {
         require(bytesOf(source) == before && scalar(source, "PRAGMA user_version") == 20,
                 "unsupported extension rejects in-place conversion without modifying source");
         sql(source, "DROP VIEW extension_current;");
+        const auto mapping = directory.path / "in-place-mapping.json";
+        mustFail([&] { (void)migration::convertStoreInPlace(source, [&](const auto& converted) {
+            migration::writeConversionReports(converted, mapping, directory.path / "absent" / "report.json");
+        }); });
+        require(scalar(source, "PRAGMA user_version") == 20 && !std::filesystem::exists(mapping),
+                "unstageable conversion report leaves legacy store and no partial mapping");
         const auto result = migration::convertStoreInPlace(source);
         require(Json::parse(result.reportJson).at("in_place") == true && scalar(source, "PRAGMA user_version") == 22,
                 "explicit in-place conversion publishes current schema");

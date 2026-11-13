@@ -1,22 +1,19 @@
 #include "geometry/SourceMetadata.hpp"
 #include "geometry/GeometrySnapshot.hpp"
-#include "geometry/GeometryReader.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
-#include "internal/History.hpp"
 
 namespace vc::objects::detail {
 using Json = nlohmann::json;
-Json nativeMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& object, const GeometryRevision& revision, const std::optional<RevisionSelection>& selection)
+Json nativeMetadata(const StoreReader& reader, const ObjectRecord& object, const GeometryRevision& revision, const std::vector<ObjectVersion>& selection)
 {
     const auto metadata = Json::parse(object.meta);
     auto result = geometryTransferMetadata(metadata);
     if (object.kind == "surface") result["scale"] = Json::parse(revision.attributes).at("scale");
     result.erase("origin");
-    GeometryReader structure(txn,revision.uuid);
-    if (structure.manifest().contains("sequences"))
-        for (const auto& [name,state]:structure.manifest().at("sequences").items())
+    if (object.kind != "surface")
+        for (const auto& array : revision.arrays) if (const auto& name = array.name; name == "points" || name == "control_points" || name == "line_points")
             result[object.kind=="point_collection" ? "point_attributes" : name+"_attributes"] =
-                db.geometryPointAnnotations(txn,revision.uuid,name);
+                reader.geometryPointAnnotations(revision.uuid,name);
     result["name"] = object.name;
     if (object.kind == "point_collection" && metadata.contains("source") && result.contains("tags") && result.at("tags").is_object()) {
         auto tags = Json::object();
@@ -30,7 +27,7 @@ Json nativeMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& o
     };
     if (object.kind == "point_collection") {
         GeometrySnapshot snapshot; snapshot.revision = revision;
-        snapshot.arrays["point_ids"] = db.readGeometryArray(txn, revision.uuid, "point_ids");
+        snapshot.arrays["point_ids"] = reader.readGeometryArray(revision.uuid, "point_ids");
         const auto ids = snapshot.values<int64_t>("point_ids");
         auto& extras = result["point_attributes"];
         if (extras.is_null()) extras = Json(std::vector<Json>(ids.size(), Json::object()));
@@ -38,13 +35,8 @@ Json nativeMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& o
         for (auto& point : extras) { if (point.is_null()) point = Json::object(); point["links"] = Json::array(); }
         result["windings_linked"] = Json::array();
         std::vector<EdgeRecord> edges;
-        if (selection) {
-            for (const auto& selected : ObjectStoreImplAccess::relationshipsAt(db,txn,*selection))
-                if(selected.applicable) edges.push_back(selected.relationship.record);
-        } else {
-            for(const auto& edge:db.edgesOf(txn,object.uuid))
-                if(currentRelationshipApplicable(db,txn,edge.uuid)) edges.push_back(edge);
-        }
+        for (const auto& selected : reader.relationshipsAt(selection))
+            if(selected.applicable) edges.push_back(selected.relationship.record);
         for (const auto& edge : edges) {
             if (edge.aUuid != object.uuid && edge.bUuid != object.uuid) continue;
             if (edge.kind != "point_link" && edge.kind != "collection_winding") continue;
@@ -58,11 +50,11 @@ Json nativeMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& o
                 };
                 link(edge.aUuid, edge.aAnchor, edge.bAnchor); link(edge.bUuid, edge.bAnchor, edge.aAnchor);
             } else {
-                const auto targetId=edge.aUuid == object.uuid ? edge.bUuid : edge.aUuid;
-                const auto target = selection ? std::optional(ObjectStoreImplAccess::objectRevision(db,txn,*selection->at(targetId))->record)
-                                              : db.objectByUuid(txn,targetId);
+                const auto targetId=edge.otherEndpoint(object.uuid);
+                const auto pin = std::find_if(selection.begin(), selection.end(), [&](const auto& ref) { return ref.objectUuid == targetId; });
+                const auto target = pin == selection.end() ? std::nullopt : reader.selectedObject(targetId, {}, {}, *pin);
                 if (!target) throw std::runtime_error("native winding link target is missing");
-                const auto targetMeta = Json::parse(target->meta).at("source");
+                const auto targetMeta = Json::parse(target->record.meta).at("source");
                 result["windings_linked"].push_back(std::stoll(targetMeta.at("source_collection_id").get<std::string>()));
             }
         }

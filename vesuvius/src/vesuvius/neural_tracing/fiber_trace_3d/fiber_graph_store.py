@@ -9,7 +9,7 @@ from pathlib import Path
 import uuid
 
 import numpy as np
-from vc_object_store import CollectionReader, fiber_graph_solve_table, fiber_graph_solve_row, write_extension_store, geometry_scale_to_volume
+from vc_object_store import CollectionReader, fiber_graph_solve_table, fiber_graph_solve_row, write_extension_store, geometry_scale_to_volume, store_position_from_json
 
 PREFIX = 'ext_fiber_graph_solve_'
 CACHE_FORMAT = 2
@@ -46,6 +46,14 @@ def store_digest(path):
 
 def snapshot_digest(source):
     return hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
+
+
+def original_fiber_source(database):
+    """Resolve the recorded extraction source through the native pinned scope."""
+    with CollectionReader(str(database)) as store:
+        table=next(t for t in store.extension_tables() if t['name']==PREFIX+'constraints')
+        pin=store_position_from_json(json.dumps(table['provisioning'].get('fiber_source',{})))
+        return Path(store.resolve_store_position(pin)),pin
 
 
 class FiberGraph:

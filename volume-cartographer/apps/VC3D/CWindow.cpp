@@ -902,10 +902,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
             &LineAnnotationController::lineAnnotationWorkspaceRequested,
             this,
             &CWindow::openLineAnnotationWorkspace);
-    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberRetired,
-            this, [this](const QString& path) {
-                if (_spiralWorkspace) _spiralWorkspace->noteFiberRetired(path);
-            });
     _fiberMapWorkspace = new FiberMapWorkspace(_state, _lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
     const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
@@ -2588,10 +2584,12 @@ void CWindow::selectLasagnaOutputSurface(const QString& surfaceUuid)
 void CWindow::loadLasagnaResults(Surface* surface)
 {
     std::optional<nlohmann::json> corr;
-    if (surface && _surfaceCatalog && _surfaceCatalog->attachment()) {
+    if (surface && _surfaceCatalog && _surfacePanel && _surfacePanel->opened() &&
+        _surfacePanel->opened()->surface.get() == surface) {
         try {
             auto& session = *_surfaceCatalog->session();
-            corr = vc::objects::attachedDocument(session, *_surfaceCatalog->attachment(), surface->id,
+            const auto& pin = _surfacePanel->opened()->pin;
+            corr = vc::objects::attachedDocument(session, pin.attachment, pin.reference(),
                                                  LasagnaServiceManager::kCorrResultsRole);
         } catch (const std::exception& error) {
             qWarning() << "Cannot read Lasagna results for" << QString::fromStdString(surface->id) << error.what();
@@ -2720,6 +2718,7 @@ void CWindow::CreateWidgets(void)
         _viewerManager.get(),
         [this]() { return segmentationViewer(); },
         this);
+    _surfacePanel->setSelectionChangeGuard([this] { return !_segmentationModule || _segmentationModule->saveCorrections(); });
     _storeSurfaceOverlay = std::make_unique<StoreSurfaceOverlayController>(_state, _viewerManager.get(), this);
     connect(_surfacePanel.get(), &SurfacePanelController::visibleSurfacesChanged,
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setSurfaces);
@@ -2736,7 +2735,7 @@ void CWindow::CreateWidgets(void)
         auto known = _segmentationModule ? _segmentationModule->storePin(active.get()) : std::nullopt;
         if (!known && _surfacePanel->opened()) known = _surfacePanel->opened()->pin;
         const auto head = _surfaceCatalog->session()->currentObject(row->source, active->id);
-        if (!head || (known && known->version == head->version && known->generation == head->generation)) {
+        if (!head || (known && known->reference() == head->reference())) {
             return;
         }
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
@@ -2967,7 +2966,7 @@ void CWindow::CreateWidgets(void)
             showStatusBarMessage(error, 15000);
             return false;
         }
-        return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
+        return true;
     });
     // Edits of the active surface commit to the store object it was opened from.
     _segmentationModule->setStorePinResolver([this](const QuadSurface* surface) -> std::optional<SegmentationModule::StoreOrigin> {
@@ -3976,6 +3975,12 @@ void CWindow::closeEvent(QCloseEvent* event)
         });
         return;
     }
+    try { _state->savePointCollections(); }
+    catch (const std::exception& error) {
+        QMessageBox::warning(this, tr("Close blocked"), QString::fromUtf8(error.what()));
+        event->ignore();
+        return;
+    }
     _destroyingWindow = true;
     if (_lineAnnotationController) {
         _lineAnnotationController->saveOpenFibers();
@@ -4319,7 +4324,7 @@ bool CWindow::OpenVolume(const QString& path,
         return false;
     }
 
-    CloseVolume();
+    if (!CloseVolume()) return false;
     // Without a choice, the volume the user last viewed in the project.
     const auto ids = package->volumeIDs();
     const auto remembered = QString::fromStdString(package->currentVolumeId());
@@ -4487,6 +4492,10 @@ void CWindow::setVolumeLevel(int level)
             });
             return;
         }
+        if (!_segmentationModule->saveCorrections()) {
+            syncVolumeLevelControl();
+            return;
+        }
         if (_segmentationModule->hasActiveSession()) _segmentationModule->endEditingSession();
     }
     const auto navigation = _viewerManager ? _viewerManager->captureNavigation() : nullptr;
@@ -4522,7 +4531,12 @@ void CWindow::setVolumeLevel(int level)
         _surfacePanel->replaceOpenedSurface(std::move(*reopened));
         _state->setActiveSurface(surface->id, surface);
         _state->setSurface("segmentation", surface, false, true);
-        if (_segmentationModule) _segmentationModule->onActiveSegmentChanged(surface.get());
+        if (_segmentationModule) {
+            try { _segmentationModule->onActiveSegmentChanged(surface.get()); }
+            catch (const std::exception& error) {
+                statusBar()->showMessage(tr("Correction editor kept: %1").arg(QString::fromUtf8(error.what())), 8000);
+            }
+        }
         _axisAlignedSliceController->applyOrientation(surface.get());
     }
     if (navigation && transform) _viewerManager->restoreNavigation(navigation, *transform);
@@ -4767,24 +4781,26 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 }
 
-void CWindow::CloseVolume(void)
+bool CWindow::CloseVolume()
 {
-
-
     // Tear down active segmentation editing before surfaces disappear to avoid
     // dangling pointers inside the edit manager when the underlying surfaces
     // are unloaded (reloading with editing enabled previously triggered a
     // use-after-free crash).
-    if (_segmentationModule) {
-        if (_segmentationModule->editingEnabled()) {
-            _segmentationModule->setEditingEnabled(false);
-        } else if (_segmentationModule->hasActiveSession()) {
-            _segmentationModule->endEditingSession();
-        }
+    try {
+        _state->closeAll([this] {
+            if (!_segmentationModule) return;
+            if (_segmentationModule->editingEnabled())
+                _segmentationModule->setEditingEnabled(false);
+            else if (_segmentationModule->hasActiveSession())
+                _segmentationModule->endEditingSession();
+        });
+    } catch (const std::exception& error) {
+        if (!_destroyingWindow)
+            QMessageBox::warning(this, tr("Close blocked"), QString::fromUtf8(error.what()));
+        return false;
     }
 
-    // CState::closeAll emits volumeClosing, clears surfaces, vpkg, volume, points
-    _state->closeAll();
     if (_spiralWorkspace) {
         _spiralWorkspace->synchronizeVolume(nullptr);
     }
@@ -4820,7 +4836,7 @@ void CWindow::CloseVolume(void)
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->setOverlayVolume(nullptr, {});
     }
-
+    return true;
 }
 
 // Handle open request
@@ -4842,7 +4858,7 @@ auto CWindow::can_change_volume_() -> bool
 
 void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface)
 {
-    const std::string previousSurfId = _state->activeSurfaceId();
+    const auto previousSurface = _state->activeSurface().lock();
     const std::string newSurfId = surfaceId.toStdString();
 
     if (_state && !newSurfId.empty() && surface) {
@@ -4855,7 +4871,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
 
     _state->setSurface("segmentation", surf, false, false);
 
-    if (newSurfId != previousSurfId) {
+    if (surface != previousSurface) {
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
             _segmentationModule->setEditingEnabled(false);
         } else if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {
@@ -4876,8 +4892,8 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
             }
         }
 
-        loadLasagnaResults(surf.get());
     }
+    loadLasagnaResults(surf.get());
 
     const bool moveOnSurfaceChange = moveOnSurfaceChangeEnabled();
     const bool activatingAxisAlignedPlane =
@@ -4942,7 +4958,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
 
 void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface)
 {
-    const std::string previousSurfId = _state->activeSurfaceId();
+    const auto previousSurface = _state->activeSurface().lock();
     const std::string newSurfId = surfaceId.toStdString();
 
     if (_state && !newSurfId.empty() && surface) {
@@ -4955,7 +4971,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
 
     _state->setSurface("segmentation", surf, false, false);
 
-    if (newSurfId != previousSurfId && _segmentationModule) {
+    if (surface != previousSurface && _segmentationModule) {
         try {
             _segmentationModule->onActiveSegmentChanged(surf.get());
         } catch (const std::exception& e) {
@@ -4967,8 +4983,6 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
             _state->setSurface("segmentation", nullptr, false, false);
             surf.reset();
         }
-
-        loadLasagnaResults(surf.get());
 
         const bool wantsEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
         if (wantsEditing) {
@@ -4994,6 +5008,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
         }
     }
 
+    loadLasagnaResults(surf.get());
     if (moveOnSurfaceChangeEnabled()) {
         try {
             if (surf) {

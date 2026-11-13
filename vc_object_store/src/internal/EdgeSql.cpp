@@ -2,6 +2,9 @@
 #include "internal/ExtensionHistory.hpp"
 #include "internal/SqlValues.hpp"
 #include "internal/JsonFields.hpp"
+#include "internal/ReferenceResolver.hpp"
+#include "internal/RecordResolver.hpp"
+#include "internal/Versions.hpp"
 #include "vc_object_store/objects/EdgeKinds.hpp"
 #include "geometry/GeometryInternal.hpp"
 
@@ -71,8 +74,23 @@ static constexpr const char* kEdgeCols =
     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
     "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,version,version_generation";
 
+void validateEdgeProjection(const ObjectFields& fields)
+{
+    if(!fields)return;
+    std::set<std::string> valid{"a","b","a_anchor","b_anchor","tags"};
+    std::istringstream names(kEdgeCols);std::string name;
+    while(std::getline(names,name,',')){
+        if(name.starts_with("a_anchor_")||name.starts_with("a_dir_")||name=="a_dependencies")name="a_anchor";
+        if(name.starts_with("b_anchor_")||name.starts_with("b_dir_")||name=="b_dependencies")name="b_anchor";
+        if(name!="a_uuid"&&name!="b_uuid")valid.insert(name);
+    }
+    for(const auto& field:*fields)
+        if(!valid.contains(field))throw std::invalid_argument("unknown edge projection field: "+field);
+}
+
 std::string projectedEdgeColumns(sqlite3* db,const ObjectFields& fields)
 {
+    validateEdgeProjection(fields);
     std::string sql;
     std::istringstream names(kEdgeCols);std::string name;
     while(std::getline(names,name,',')){
@@ -109,6 +127,7 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const Obje
                       const std::string* initialGeneration)
 {
     EdgeRecord rec;
+    rec.versionStoreUuid=storeUuidText(db);
     rec.aUuid = formatUuid(s.blob16(1));
     rec.bUuid = formatUuid(s.blob16(2));
     readCommon(rec, s, 0, 3, 4);
@@ -200,10 +219,12 @@ void requireUnusedObjectUuids(sqlite3* db,std::span<const EdgeInsertRow> rows,si
         std::string parameters;
         for(size_t i=0;i<count;++i){if(i)parameters+=',';parameters+='?'+std::to_string(i+1);}
         std::string sql="SELECT 1 FROM objects WHERE uuid IN ("+parameters+") LIMIT 1";
-        Statement collision(db,sql);
-        for(size_t i=0;i<count;++i){const auto& row=rows[begin+i];
-            collision.bind(int(i+1),row.binaryUuid?*row.binaryUuid:parseUuid(row.record->uuid));}
-        if(collision.row())throw std::runtime_error("object store: UUID already belongs to an object");
+        if(resolveReference(db,[&](sqlite3* source){
+            Statement collision(source,sql);
+            for(size_t i=0;i<count;++i){const auto& row=rows[begin+i];
+                collision.bind(int(i+1),row.binaryUuid?*row.binaryUuid:parseUuid(row.record->uuid));}
+            return collision.row();
+        }))throw std::runtime_error("object store: UUID already belongs to an object");
         begin+=count;
     }
 }
@@ -288,13 +309,15 @@ EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string
     // Merely reviving an endpoint never reactivates relationships. Historical
     // relationship revisions retain the earlier state independently.
     int64_t nextVersion = 1;
-    {
-        Statement previous(db, "SELECT version FROM "+edgeReadSource(db)+" WHERE uuid=? AND state=2", parseUuid(rec.uuid));
+    if(auto* source=edgeSource(db,rec.uuid,false,true)) {
+        Statement previous(source, "SELECT version,state FROM "+edgeReadSource(source)+" WHERE uuid=?", parseUuid(rec.uuid));
         if (previous.row()) {
+            if(previous.i64(1)!=2)throw std::runtime_error("object store: edge UUID already exists: "+rec.uuid);
             if (previous.i64(0) == INT64_MAX) throw std::overflow_error("relationship version exhausted");
             nextVersion = previous.i64(0) + 1;
         }
     }
+    if(nextVersion!=1)requireEdgeColumns(db,{"version","version_generation"});
     if(hasEdgeColumn(db,"state"))execute(db,"DELETE FROM edges WHERE uuid=? AND state=2",parseUuid(rec.uuid));
     insertEdgeRow(db,rec,writeCommitSequence(db),author,host,nowIsoUtc(),preserveRecord);
     if(hasEdgeColumn(db,"version")&&hasEdgeColumn(db,"version_generation"))

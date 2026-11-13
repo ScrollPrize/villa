@@ -113,9 +113,15 @@ def prepare(config):
     from .fiber_hv_stage import verify_feature_source
     from .fiber_normal_sign_visualization import umbilicus_frame
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
-    from .fiber_graph_store import workflow_volume
+    from .fiber_graph_store import workflow_volume, original_fiber_source
     started=time.monotonic();cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
-    signature={key:(fibers_digest if key=='fibers' else store_digest if key=='database' else sha256_file)(config[key]) for key in ('database','features','stage1','hv_solution','fibers','umbilicus')}
+    feature=json.loads(Path(config['features']).read_text())
+    source,source_version=original_fiber_source(config['database'])
+    source_digest=fibers_digest(source,source_version=source_version)
+    if fibers_digest(config['fibers'])!=source_digest:
+        raise ValueError('Configured geometry differs from the frozen feature source')
+    signature={key:(store_digest if key=='database' else sha256_file)(config[key]) for key in ('database','features','stage1','hv_solution','umbilicus')}
+    signature.update(fibers=source_digest,fiber_source=source_version)
     signature.update(version=2,measurement_format=4,minimum_length_mm=config.get('minimum_length_mm',10.),
                      sign_cosine_min=config.get('sign_cosine_min',.1),pilot_fibers=config.get('pilot_fibers',0))
     signature['working_volume']=workflow_volume(config)
@@ -128,7 +134,9 @@ def prepare(config):
         signature.update(version=3,layout_mode='shared_anchor',h_convention=config.get('h_convention','ccw'))
         signature.update({key:sha256_file(config[key]) for key in ('h_direction_solution','v_direction_solution')})
     if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
-    feature=json.loads(Path(config['features']).read_text());verify_feature_source(config['database'],feature)
+    graph = FiberGraph(config['database'])
+    if verify_feature_source(config['database'],feature,graph=graph)['fiber_source']!=source_version:
+        raise ValueError('Geometry/source version mismatch')
     hv_summary=json.loads((Path(config['hv_solution']).parent/'summary.json').read_text())
     if (hv_summary['input']['signature']['database']!=signature['database'] or
             hv_summary['input']['signature']['stage1']!=signature['stage1']):raise ValueError('H/V input mismatch')
@@ -147,14 +155,13 @@ def prepare(config):
     pilot=int(config.get('pilot_fibers',0))
     if pilot:
         # Deterministic central-z induced subgraph, used ONLY for timing pilot.
-        catalog=read_polylines(config['fibers'],ids[kept],volume=volume)
+        catalog=read_polylines(source,ids[kept],volume=volume,source_version=source_version)
         if [r['id'] for r,_ in catalog]!=ids[kept].tolist():raise ValueError('Pilot fiber store IDs mismatch')
         zmid=np.asarray([(xyz[:,2].min()+xyz[:,2].max())/2 for _,xyz in catalog])
         center=np.median(zmid);select=np.flatnonzero(kept)
         select=select[np.argsort(abs(zmid-center),kind='stable')[:pilot]]
         kept[:]=False;kept[select]=True
     print(f'UV prepare: {kept.sum():,} retained fibers; reading events',flush=True)
-    graph = FiberGraph(config['database'])
     if not np.array_equal(graph.ids, ids):raise ValueError('Constraint/family fiber IDs differ')
     batches=[];event_id_batches=[];original=len(graph.event_ids)
     for sl in graph.batches():
@@ -183,7 +190,8 @@ def prepare(config):
     phase=np.empty(2*ecount,np.float32);zpos=np.empty(2*ecount,np.float32)
     pieces=[];links=[];nodes=[]
     minimum=signature['minimum_length_mm']/voxel_size_mm
-    geometry=read_polylines(config['fibers'],ids[kept],volume=volume);print('UV prepare: events loaded; deriving pieces',flush=True)
+    geometry=read_polylines(source,ids[kept],volume=volume,source_version=source_version)
+    print('UV prepare: events loaded; deriving pieces',flush=True)
     for fi,(row,xyz) in enumerate(geometry):
         idx=np.searchsorted(ids,row['id']);family=labels[idx]
         if anchored(config):

@@ -25,8 +25,7 @@ struct InitialObjectIdentity { ObjectKey key; int64_t id; };
 struct InitialEdgeImportOptions {
     bool deferIndexes = true;
     std::size_t sqlBatchRows = 1;
-    // Transient per-shard measurement tables. Rows are transferred explicitly
-    // after producer-side reconciliation; none may remain at publication.
+    // TEMP-only initial measurements, reconciled before final transfer.
     std::vector<std::string> stagedExtensions;
 };
 struct CollectionMember {
@@ -36,8 +35,7 @@ struct CollectionMember {
     bool partition = false;
     std::array<int64_t,2> objectIds{};
 };
-// Numeric object rules operate on positive signed SQLite IDs; UUID rules
-// cover objects and edges. One group has one rule kind;
+// Numeric object rules operate on positive signed SQLite IDs; edges use UUIDs. One group has one rule kind;
 // ranges may have multiple disjoint entries per destination. HashV1 is the
 // documented SplitMix64 finalizer, not std::hash or a platform-dependent hash.
 enum class RoutingKind { Range, Modulo, Bits, HashV1, UuidHashV1 };
@@ -77,7 +75,7 @@ public:
     static ObjectCollection open(const std::filesystem::path&, const OpenOptions&);
     // Publish independently imported, sealed physical partitions of one logical
     // store. Each must have the same store/lineage UUID and commit sequence and
-    // disjoint reserved object ID ranges. Edges use UUIDs only. The manifest has the same state pin.
+    // disjoint reserved object ID ranges; edges are UUID-only. The manifest has the same state pin.
     static ObjectCollection publishShards(const std::filesystem::path&, const std::vector<std::filesystem::path>&, const OpenOptions&, const std::vector<KeyRoute>& routes = {});
     ObjectCollection(ObjectCollection&&) noexcept;
     ~ObjectCollection();
@@ -85,19 +83,26 @@ public:
     CollectionTxn write();
     std::string uuid(const CollectionTxn&) const;
     StoreProvisioning provisioning(const CollectionTxn&) const;
-    VolumeTransforms volumeTransforms(const CollectionTxn&) const;
     void createExtensionTable(CollectionTxn&, const ExtensionTable&);
-    // Append immutable result rows in the writable overlay. Input objects/edges
-    // stay in sealed dependencies; results do not require copied owner records.
-    void appendExtensionRows(CollectionTxn&, const std::string&, std::span<const ExtensionRow>);
     void replaceExtensionRows(CollectionTxn&, const std::string&, const ObjectKey&,
                               std::span<const ExtensionRow>);
     std::vector<ExtensionTableInfo> extensionTables(const CollectionTxn&) const;
+    VolumeTransforms volumeTransforms(const CollectionTxn&) const;
+    void appendExtensionRows(CollectionTxn&, const std::string& table, std::span<const ExtensionRow>);
     // Immutable rows overlay by primary key; versioned fields follow the winning
     // owner, including clears and deletions. A routed UUID prefix visits only the
     // relevant partition in each layer. Unfiltered scans visit all partitions.
     void scanExtensionRows(const CollectionTxn&, const std::string&,
         const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {}) const;
+    // Exact version references retain their meaning across overlays. No
+    // substitution of a newer local owner or dependency version is allowed.
+    std::optional<ObjectRevision> objectAtVersion(const CollectionTxn&, const ObjectVersion&) const;
+    std::optional<RelationshipRevision> relationshipAtVersion(const CollectionTxn&, const RelationshipVersion&) const;
+    void scanExtensionRowsAtVersion(const CollectionTxn&, const std::string&, const ObjectVersion&,
+        const std::function<bool(const ExtensionRow&)>&) const;
+    void scanExtensionRowsAtVersion(const CollectionTxn&, const std::string&, const RelationshipVersion&,
+        const std::function<bool(const ExtensionRow&)>&) const;
+    std::vector<uint8_t> readGeometryArrayAtVersion(const CollectionTxn&, const ObjectVersion&, const std::string& array) const;
     // Flush the local writer's committed WAL; referenced readonly stores are unchanged.
     void checkpoint();
     std::vector<CollectionMember> members() const;
@@ -111,6 +116,9 @@ public:
     void scanObjects(const CollectionTxn&, const std::function<bool(const CollectionObject&)>&, const std::optional<std::string>& kind = {}) const;
     std::optional<GeometryRevision> currentGeometry(const CollectionTxn&, const ObjectKey&) const;
     std::vector<uint8_t> readGeometryArray(const CollectionTxn&, const ObjectKey&, const std::string& array) const;
+    std::optional<uint64_t> artifactLength(const CollectionTxn&,const std::string& hash) const;
+    std::vector<uint8_t> readArtifact(const CollectionTxn&,const std::string& hash,uint64_t offset=0,
+                                    const std::optional<uint64_t>& count=std::nullopt) const;
     std::string putGeometry(CollectionTxn&, const ObjectKey&, const GeometryData&);
     // Same sparse-edit rules as ObjectStore. Inherited incident edges must be
     // explicitly removed/recreated locally before changing their geometry.
@@ -120,6 +128,10 @@ public:
     std::vector<CollectionEdge> edgesByKind(const CollectionTxn&, const std::string&) const;
     std::optional<CollectionEdge> edge(const CollectionTxn&, const ObjectKey&) const;
     ObjectKey upsertObject(CollectionTxn&, const ObjectRecord&);
+    // Metadata writes create a same-key record override, not a local dataset.
+    // The geometry descriptor is copied; payloads/archives and extension
+    // snapshots remain borrowed from pinned bases;
+    // file references are rebased if their owning directory changes.
     void replaceObject(CollectionTxn&, const ObjectKey&, const ObjectRecord&);
     void setMeta(CollectionTxn&, const ObjectKey&, const std::string&, const std::string& json);
     void deleteObject(CollectionTxn&, const ObjectKey&);
@@ -144,6 +156,7 @@ public:
     void removeEdge(CollectionTxn&, const ObjectKey&);
     void seal(CollectionTxn&);
 private:
+    friend void copyObjectCollection(const std::filesystem::path&, const std::filesystem::path&, const OpenOptions&);
     friend class CollectionTxn;
     friend struct detail::CollectionReadContext;
     friend struct detail::CollectionScanAccess;
@@ -152,4 +165,19 @@ private:
     explicit ObjectCollection(std::unique_ptr<Impl>);
     std::unique_ptr<Impl> impl_;
 };
+// Resolve a recorded complete store position to an independently openable root
+// in this collection's provisioned dependency closure. Never resolves a shard
+// partition as a public source; mismatches and ambiguous roots are errors.
+std::filesystem::path resolveStorePosition(const ObjectCollection&, const CollectionTxn&,
+                                         const ExtensionSource&);
+
+// Independent mutable copy of a resolved collection snapshot. The root is a
+// normal SQLite database; dependencies/partitions live in <destination>.stores
+// and artifacts in its ordinary sidecar. Relative locators make this bundle
+// movable together. Referenced immutable stores retain their logical identity.
+// A partitioned root stays sealed behind a new writable overlay; an ordinary
+// root is forked directly, preserving its retained versions under the new ID.
+// The destination and both sidecars must be absent. Failure cleans owned files.
+void copyObjectCollection(const std::filesystem::path& source, const std::filesystem::path& destination,
+                          const OpenOptions&);
 }

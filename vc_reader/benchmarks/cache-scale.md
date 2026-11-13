@@ -32,6 +32,7 @@ Aggregate last-window throughput with mean, median and range; inspect p99, hit r
 
 ## Full workload suite at virtual capacities
 
+See the [measured full matrix and real-data validation](cache-results.md).
 ```bash
 python benchmarks/run_cache_suite.py --virtual --binary build/bench_cache_scale --output /path/to/new/results
 ```

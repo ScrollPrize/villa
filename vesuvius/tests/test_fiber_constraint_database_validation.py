@@ -3,32 +3,35 @@ import uuid
 
 import numpy as np
 import pytest
-from vc_object_store import CollectionReader, fiber_constraint_extension, import_initial_records, write_extension_store
+from vc_object_store import (CollectionReader, fiber_constraint_extension, import_initial_records, write_extension_store,
+                             encode_fiber_arc, encode_fiber_direction, encode_fiber_winding)
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_constraint_database_validation import validate
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_constraint_database_report import summarize
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_oriented_normals_validation import validate as validate_normals
-from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_initial_fibers
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_initial_fibers, fiber_source_version
+from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
 from .fiber_graph_fixture import uid, measured_store
 
 
 HEADER = Path(__file__).resolve().parents[2]/'volume-cartographer/core/include/vc/fiber_tracer/FiberTraceConstraints.hpp'
 
 
-def geometry_graph(root, *, corrupt_point=False, workers=2, packed=True):
+def geometry_graph(root, *, corrupt_arc=False, arc_a=None, workers=2, packed=True):
     curves=[np.array([[0.,0,k],[10.,0,k],[10.,10,k]]) for k in range(3)]
     source=write_initial_fibers(root/'fibers.vcobj',[(dict(id=uid(k+1)),xyz) for k,xyz in enumerate(curves)],
                                 volume=uid(999),workers=workers,packed=packed)['path']
-    table=fiber_constraint_extension('')
-    fields=dict(edge_uuid=uuid.UUID(uid(100)).bytes,source_id=0,source_fiber_a=1,source_fiber_b=2,
-        source_reversed=0,arc_a=15.,arc_b=5.,parallel_score=1.,perpendicular_score=0.,
-        las_winding=1.,parallel_las_winding=1.,evidence_weight=1.,local_event=1,hard_continuity=0,
-        normal_a_valid=1,normal_b_valid=1,normal_a_x=0.,normal_a_y=0.,normal_a_z=1.,
-        normal_b_x=0.,normal_b_y=0.,normal_b_z=1.)
+    table=fiber_constraint_extension('',coordinate_space='fixture/'+uid(999))
+    table['provisioning']['fiber_source']=fiber_source_version(source)
+    fields=dict(edge_uuid=uuid.UUID(uid(100)).bytes,
+        arc_a=encode_fiber_arc(arc_a if arc_a is not None else (25. if corrupt_arc else 15.)),arc_b=encode_fiber_arc(5.),
+        normal_a=encode_fiber_direction([0.,0.,1.]),normal_b=encode_fiber_direction([0.,0.,1.]),
+        connector=encode_fiber_direction([-5.,-5.,1.]),winding_distance=encode_fiber_winding(1.),extra=None)
     record=dict(uuid=uid(100),a=uid(1),b=uid(2),kind='parallel',
-        a_anchor=dict(position=[10.,5.,0.]),b_anchor=dict(position=[6. if corrupt_point else 5.,0.,1.]))
+        a_anchor={},b_anchor={})
     edge=dict(record=record,extensions=[dict(table=table['name'],values=[fields.get(c['name']) for c in table['columns']])])
     graph=import_initial_records(root/'graph.vcobj',[],edges=[edge],extensions=[table],
-                                  dependencies=[source],workers=workers,packed=packed)['path']
+                                  dependencies=[source],workers=workers,packed=packed,
+                                  edge_columns=[],edge_adjacency_index=False)['path']
     return graph,source
 
 
@@ -36,10 +39,20 @@ def geometry_graph(root, *, corrupt_point=False, workers=2, packed=True):
 def test_validation_reads_store_geometry(tmp_path,workers,packed):
     graph,source=geometry_graph(tmp_path/'good',workers=workers,packed=packed)
     result=validate(graph,source,header=HEADER)
-    assert result['fibers']==3 and result['constraints']==1 and result['geometry_endpoints_checked']==2
-    broken,source=geometry_graph(tmp_path/'bad',corrupt_point=True,workers=workers,packed=packed)
+    assert result['fibers']==3 and result['constraints']==1 and result['arc_ranges_checked']==2
+    assert result['geometry_endpoints_checked']==0
+    for field in ('point_a','point_b'):
+        with pytest.raises(ValueError,match='do not store endpoint XYZ'):
+            getattr(FiberGraph(graph),field)
+    broken,source=geometry_graph(tmp_path/'bad',corrupt_arc=True,workers=workers,packed=packed)
     with pytest.raises(AssertionError):
         validate(broken,source,header=HEADER)
+
+
+def test_validation_rejects_next_encoded_arc_past_endpoint(tmp_path):
+    graph,source=geometry_graph(tmp_path,arc_a=float(np.nextafter(np.float32(20),np.float32(np.inf))))
+    with pytest.raises(AssertionError,match='Arc outside source fiber'):
+        validate(graph,source)
 
 
 def test_report_counts_repeated_events_and_both_endpoint_orders(tmp_path):
@@ -60,11 +73,11 @@ def normal_overlay(source,destination,*,axis_error=False,measurement_error=False
         table.pop('table_uuid')
         table.pop('last_modified_commit')
     index={c['name']:i for i,c in enumerate(table['columns'])}
-    rows[0][index['normal_a_z']]=-1.
+    rows[0][index['normal_a']]=encode_fiber_direction([0.,0.,-1.])
     if axis_error:
-        rows[0][index['normal_a_y']]=1.
+        rows[0][index['normal_a']]=encode_fiber_direction([0.,1.,-1.])
     if measurement_error:
-        rows[0][index['closest_distance']]=2.
+        rows[0][index['winding_distance']]=encode_fiber_winding(2.)
     write_extension_store(str(destination),[str(source)],[table],{table['name']:rows})
     return destination
 

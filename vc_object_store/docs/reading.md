@@ -9,6 +9,8 @@ always find them.
 
 ## Opening a store
 
+For a saved store-position pin, `resolveStorePosition` (Python `CollectionReader.resolve_store_position`) returns its independently openable root from the pinned scope; it does not substitute a partition or a newer snapshot. See [store-reference resolution](collections.md#relocating-referenced-stores).
+
 ```python
 from vc_object_store import ObjectStore
 
@@ -25,7 +27,7 @@ store = ObjectStore.open("objects.vcobj", author="reader", read_only=True)
 A writable open takes a host-local ownership lock on `<path>-owner`, shared
 between standalone writers and exclusive for the server's service owner, so a
 store served by `vc_object_server` rejects other writable opens (read-only
-ones still work). A store with an unsupported schema is rejected untouched;
+ones still work). Writable opens reject hard-linked database files because aliases would use different ownership and journal sidecars. Use a symlink or a normal store copy instead. A store with an unsupported schema is rejected untouched;
 convert it with `vc_object_convert` (see [Converting old stores](#converting-old-stores)).
 
 Closing a store with live snapshots is an error in Python. Use the store as a
@@ -45,18 +47,46 @@ rows = store.select_objects(object_kind="track", fields=["name", "track"])
 `select_objects` is the general query: kind, tag, bounding box, length
 filters, coordinate declaration, volume target, connection, limits and
 cursors, with optional `fields` projection. Each row carries `uuid`, `kind`,
-and the `version` and `version_generation` it was read at, so a listing pins
+and the `version`, `version_generation` and `version_store` it was read at, so a listing pins
 exactly what it returned (read snapshots only). `select_edges` does the same
 for relationships. On `HostedStore` these are paged; `select_all_objects` /
 `select_all_edges` return the complete result exact as of one commit and can
 raise `StoreBusy` under sustained concurrent writes. In C++ the same queries
 take an `ObjectSelection` / `EdgeSelection` in a read transaction.
 
+Use `ObjectRecord::reference()` or `ObjectRevision::reference()` in C++, and `vc_object_store.object_reference(record)` in Python, to preserve the complete `(store, generation, object, version)` identity. The attached store is a lookup scope, not necessarily the owner of a returned record. After an overlay edit, the new version belongs to the committing store; use the transaction receipt's store/generation for changed versions. Unchanged inputs retain their original references.
+
+For a selected relationship use `RelationshipRevision::reference()` or Python `relationship_reference(revision)`, yielding `{store,generation,relationship,version}`. Its owner is independent of either endpoint's owner. Keep content projections/hashes alongside that reference, not in place of its publication identity. Ordinary `StoreReader::currentObject` hides deleted records; the explicit `includeDeleted=true` form also selects the winning tombstone, independent of history retention.
+
+Geometry-fitting consumers share `fittingRelationshipInput` (`objects/RelationshipInputs.hpp`), exposed in Python as the batched `fitting_relationship_inputs`. It owns supported relationship families, endpoint kind/UUID ordering, applicability and approval exclusions. Python materialization and native fit-input comparison use this same policy; neither duplicates its family table or sorts endpoints independently. Returned decisions contain application roles/order, not replacement identity handles. Carry the original selected relationship reference alongside them. Exact publication comparisons use that complete reference; consumed-content digests remain separate application data.
+
+Carry that reference unchanged inside applications; additional application data wraps it. Do not turn it into consumer-specific tuples, strings or flattened fields. At an external request boundary, `StoreReader::decodeObjectReference(json)` or `session.decode_object_reference(attachment, input)` accepts a standard reference, a `{reference: ...}` wrapper, current UUID discovery, or `vcobj:<uuid>@<store>/<generation>/<version>` and returns the standard reference. Complete exact inputs do not require a live current head. Ownerless saved locators and alternate flattened numbered selectors are rejected; regenerate them with complete references. The shared scalar `objectVersionToJson/fromJson` codec (Python `object_version_from_json`) validates exact references without selecting current data.
+
+For numbered convenience reads, `generation` requires `version`; a generation alone is not a current selector. Surface-grid materialization with a supplied transformed view requires that view to retain the same complete selected reference and geometry payload. Anonymous payload-only views remain available for geometry-only reads, but cannot certify the metadata attached to a selected surface grid.
+
+At saved-data ingress, `store_position_from_json` validates the shared `{store, generation, commit_sequence}` position without Python numeric coercion. Numbered surface selectors likewise require positive integer values, not booleans, fractions or numeric strings. Native `manifestReferences` (`objects/ManifestReferences.hpp`), exposed as Python `manifest_references`, validates object, outer-shell and relationship membership together and returns complete reference maps. Both native and Python consumers use this boundary before filtering; it validates saved identities without requiring historical geometry to remain available.
+
+Serialized containers are validated once by their owning decoder. Native `detail::jsonArrayField`/`jsonArray` enforce declared arrays; range iteration alone also accepts object values and null and is not validation. Optional absent fields may default to empty, but that does not admit explicitly supplied null unless the format declares it nullable. Consumers use the decoded vectors without repeated guards. Python `object_versions_from_json` uses the same native array and scalar-reference codecs for captured reference lists. Application-owned saved structures (such as maps of selections) validate their own container schema, not the internal structure of a native reference. Transaction collection admission is shared by payload discovery, preparation, execution and replay, including requests whose bytes are unavailable. Do not add consumer-specific repair paths or use debug-only assertions for malformed external input.
+
+Python consumers retain a native selected answer with `vc_object_store.selected.SelectedObject(revision)` instead of copying its fields or keeping a separate reference map. It retains one revision and exposes attributes (`record`, `reference`, `geometry_revision`, kind/name/etc.); it is not a dictionary interface. `SelectedRecord(record)` provides the metadata-only listing equivalent. These are value facades, not new reference formats or alternative resolution paths: identities come from the native reference codec. Application-specific data (for example a fitter's frame) belongs beside the selected value.
+
+For a solver's selected objects and relationship membership together, use `StoreReader::selectedInputs(refs, position)` or local/hosted Python `store.selected_inputs(refs, position)`. Python positions contain `store`, `generation`, and `commit_sequence`; the result contains native `objects` and `relationships` answers with complete identities. Root-local numbered history can replay retained records. Inherited endpoints do not encode historical root membership, so those captures require the requested root commit still to be current; otherwise `StoreBusy` requires reselecting, not a current-head fallback. Hosted captures run in one server read transaction, including when called through a session reader. This API does not claim historical collection membership can be reconstructed from immutable endpoint pins alone.
+
+For repinning after a write, use `TransactionReceipt::objectReference(uuid)` or Python `receipt_object_reference(receipt, uuid)`. Receipts retain complete identities for every live expected/changed object, including unchanged inherited inputs. Do not combine the receipt's store/generation with its numeric `objects` entries: those entries also include unchanged referenced objects. Saved receipts retain their original references on replay. Receipts missing complete `object_references` are rejected with `ReceiptDecodeError`; a session retains pending request identity because failure to decode a success/replay does not prove the request failed. Resolve/recover the same request; never silently regenerate it.
+
+The native receipt decoder admits the version maps, canonicalizes UUID keys and rejects duplicate canonical identities. Non-null version projections require positive integers; a non-null commit sequence requires a nonnegative int64. Explicit null map values still mean absent records. Complete references must correspond exactly to live numeric object results, not extra or missing entries. Hosted replies, saved replay and Python receipt access share this decoder; consumers must not repair malformed receipts themselves.
+
+`object_history(uuid)` follows the winning record even when it is a deletion marker in a referenced store. It does not fall through that deletion to older live records. Ingestion also reserves deleted identities across the same scope: re-import is not a restore operation.
+
+Consumers that use history only when it is retained can request `object_history(uuid, if_retained=True)` (C++ `objectHistory(uuid, true)` on `StoreReader`). This returns no entries when that record's owner has history disabled; explicit history reads still reject unavailable history. Do not infer a referenced record's retention policy from the attached root's `history_enabled` setting.
+
 Volume-target listings (`volume=...`, the volume's `id`) match every frame
 declared in that volume, and their bbox, length filters, and length ordering
 use **volume voxels**; `include_unbound=True` appends the rest in UUID order.
 `volume` and an exact `coordinates` declaration are mutually exclusive. See
 [transforms](transforms.md#volume-target-queries).
+
+Length filtering and ordering measure the selected stored polyline, never an ingestion summary. This applies to native and volume-target selections, spatial regions and viewport regions; registering an unrelated transform does not change their semantics. Equal measured lengths sort by UUID in every frame. Length-ordered rows expose their measured cursor value as `volume_length` (C++ `volumeLength`, the existing field name), in native units without a volume target and target voxels otherwise; persisted fiber/track detail metadata is not rewritten by a query. Records without stored geometry have no measurable length and are omitted from length-filtered/ordered selections, but remain in ordinary unfiltered listings. An unbound tail explicitly requested for a volume query remains UUID-ordered without a volume length.
 
 ## Geometry: snapshots and bounded reads
 
@@ -75,18 +105,24 @@ with store.geometry_snapshot() as snapshot:
     owned = snapshot.track(track_uuid).load()     # -> vc_object_store.Track
 ```
 
-- Factories: `snapshot.surface/fiber/track/point_collection/umbilicus(uuid)`,
-  or `snapshot.geometry(uuid)` for the matching view. A kind mismatch or an
+- Factories: `snapshot.surface/fiber/track/point_collection/umbilicus(uuid_or_reference)`,
+  or `snapshot.geometry(uuid_or_reference)` for the matching view. C++ accepts an already-selected `ObjectRevision`. A kind mismatch or an
   object without stored geometry raises.
 - Views expose counts and dimensions from the pinned geometry revision (not
-  import summaries), plus `view.version` — the numbered object version read,
-  for [checked edits](editing.md).
+  import summaries), plus `view.reference` — the complete selected object identity. `view.version` is derived from it, not separately synchronized. Metadata-only versions sharing one payload keep their own coordinate binding. A payload-only `snapshot.track(uuid, geometry_revision)` (likewise other kinds) has no reference and cannot authorize inverse edits; use a selected object for [checked edits](editing.md).
 - A tile holds `points` and validity; other surface channels are read with
   `read_geometry_rectangle`. Point lookup loads the ID array once per view,
   not the coordinates.
 - Views keep their snapshot alive; closing the snapshot invalidates them.
   Snapshots are thread-confined and hold one reader slot — close them
   promptly. `load()` results stay valid after closure.
+- Explicit geometry revisions can be read even if their object is no longer visible. The revision must still belong to the requested object. For exact surface metadata and geometry together, use `readSurfaceGrid(reader, ObjectVersion, volume)` or Python `surfaces.read_surface(location, uuid, volume=..., reference=ref)`. This works through overlays and after current deletion as long as the selected source version remains retained. The older `version`/`generation` selectors remain available and select the current owner's history; they cannot identify a different source owner.
+- C++ consumers pass their selected `ObjectRevision` into `snapshot.surface(selected)` (likewise other kinds), then transform the view in its retained frame; `snapshot.viewTransformedAt(selected, volume)` is the generic convenience. Geometry views have no late metadata-override overload. Pass the selected state to `readSurfaceGrid(reader, selected, transformedView)`, never a fresh current lookup. For a payload-only selector, `StoreReader::objectAtGeometry` resolves the latest retained metadata naming that geometry through the shared scope; this is not an exact metadata-version selector and confers no edit authority.
+- Region `VisibleRun` results carry `objectReference` and `objectToVolume` (Python/wire: `object_reference`, `object_to_volume`), identifying the selected object and the affine used to draw its points. Carry those into editing and picking; do not pair the displayed geometry with a fresh current lookup. Hosted transform registrations and route choices are fetched together in one server read transaction.
+- C++ `ResidentSurface` queries an immutable, already-positioned `geometry::Surface` through the same tile index, validity and intersection kernel as stored/session-draft surfaces. Use this for a displayed historical or edited grid; never substitute current geometry merely to obtain an intersection. It does not install a draft or mutate a store.
+- `StoreReader::graphReadViewAround(selectedReferences, edgeSelection)` expands recorded endpoint evidence for off-screen neighbors without reading moving heads. Explicitly selected references always win. For unselected neighbors, the newest referenced version within one owner/lineage wins; competing owners/lineages or unavailable endpoint references fail explicitly. Final edges still pass the ordinary selected-graph applicability checks. This is a recorded-evidence closure, not a reconstructed global historical snapshot.
+- Pinned overlap materialization takes `a_reference` and `b_reference` alongside the overlap UUID, pose metadata and whole-geometry flag. Each reference is `{store, generation, object, version}`; metadata, geometry and coordinate transforms are resolved together. Its cache distinguishes complete selected states, including metadata-only coordinate edits sharing the same geometry.
+- Native export accepts the same complete reference (`export_geometry(..., reference=ref)`; CLI `--store UUID --generation UUID --version N`). Historical restore accepts `source_reference=ref`. Number-only convenience selectors still select the current owner's history; use full references for retained inherited states after an override or deletion. Native collection/fiber export uses `StoreReader::versionsAt(anchor)` for the selected owner's snapshot, not the overlay's current topology.
 - Any view can be read in another volume's frame with
   `view.view_transformed_at(target_volume)` — see
   [transforms](transforms.md#transformed-views).
@@ -137,6 +173,8 @@ content publishes a **new** checked action — see
 selection are read with `relationships_at_versions(refs)`, and the whole graph
 with `graph_read` — see [graph edges](graph-edges.md#traversal-and-graph-reads).
 
+Inside a graph read, use `graph.geometry_snapshot()` for typed geometry or transformed views of its selected references. This borrows the graph's existing pinned transaction instead of acquiring another reader-pool slot. Closing the graph invalidates the borrowed snapshot and its views, which then reject reads. A separate `store.geometry_snapshot()` owns another transaction and should not be nested inside a single-reader graph operation.
+
 ## Spatial queries
 
 Both queries use the persisted R-tree/tile index; neither quantizes bounds.
@@ -172,8 +210,9 @@ allowed. A segment counts when it crosses the slab, even with both endpoints
 outside. Fibers use `line_points` when nonempty, else controls; tracks widen
 exactly to float64. `options.uuids` restricts candidates (`None` unrestricted,
 empty = nothing), `selected` is attempted first under a limit, and only
-intersecting objects consume the limit. Family and minimum-length filters use
-import annotations, not recomputed geometry; surfaces reject them. With
+intersecting objects consume the limit. Family filters use import annotations;
+minimum length measures the selected geometry in the requested frame, as for
+length-filtered listings. Surfaces reject both filters. With
 `options.volume`, run points come back in that volume's voxels.
 
 Region work is budgeted; a stopped result is valid but incomplete. Only
@@ -207,6 +246,20 @@ force. `record_selection(query)` captures one (hosted stores too);
 (a JSON header, then 24 bytes per object), meant to be kept as an
 [artifact](writing.md#artifacts). Read the objects back with
 `objects_at_versions`. Explicit transforms and limits are refused.
+
+Selection encoding version 2 retains each object's owning store and publication lineage through a compact origin dictionary; entries remain 24 bytes. Transforms carry the same complete identity. Version-1 artifacts are rejected and must be regenerated. This is an artifact format restriction, not a database schema change. Explicit number-only selection APIs discover the current owner's lineage and immediately return complete references; saved selections must carry those references.
+
+Current listings include `version_store` alongside `version` and `version_generation`, including projected and hosted listings. This is read-result metadata derived from the owning database, not a stored per-record column. Hosted clients require this identity when creating exact references; they do not substitute the server attachment's identity when it is missing. Per-object history follows the visible owner's retained history, and historical exports use that owner's timeline (including its shards), not the overlay's publication timestamps. This does not define a combined historical timeline for independently published linked stores.
+
+Editable attached collections use `AttachedCollectionsSnapshot`: retain the returned commit sequence, owner reference, collection references and loaded coordinate mappings alongside editable UI data. `replaceAttachedCollections` requires this loaded baseline, rejects concurrent edits/removals/additions or changed mappings, and repins it from the successful receipt. Do not reconstruct a replacement baseline from current heads when saving JSON or other detached editor data. Membership uses the existing store-commit guard, conservatively rejecting unrelated commits too; an inherited owner's identity need not change when a local attachment is added. No separate membership directory is maintained.
+
+## Selected export and graphs
+
+Native geometry export accepts a `StoreReader`, so local and hosted sessions use the same selected metadata, geometry and topology path. Explicit exact references do not require a live current object. Topology-bearing exports select the owning publication snapshot (or the immutable current-only owner's state); they do not invent a cross-store historical timeline. Local destination validation protects every database/container and artifact sidecar in the dependency closure, including aliases and ancestor paths. Hosted exports write in the client's filesystem namespace.
+
+`graphReadViewAt` constructs a graph from complete selected references through the same relationship reader used by local and hosted sessions. History policy is checked on the selected owner, never on the attachment. A current-only owner cannot retain a replaced local endpoint; keeping that relationship must fail or be explicitly revalidated, rather than pretending an archive exists.
+
+Selected relationship results use relationship UUID order, then complete publication-reference order for distinct versions of one UUID. Wire decoding applies the same order to retained hosted-cache values. This replaces the earlier incidental mixed archive-UUID/synthetic-string order, so serialized fiber branch arrays can change order without changing their membership or applicability. Physical archive locators are resolved once inside the store; graph consumers never use them as alternative publication handles.
 
 ## Converting old stores
 

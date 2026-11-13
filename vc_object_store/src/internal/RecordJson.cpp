@@ -1,5 +1,6 @@
 #include "internal/RecordJson.hpp"
 #include "internal/RecordFields.hpp"
+#include "internal/ObjectVersionJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 
 namespace vc::objects::detail {
@@ -40,11 +41,9 @@ nlohmann::json commonToJson(const RecordCommon& r, const std::set<std::string>* 
 
 void commonFromJson(const nlohmann::json& j, RecordCommon& r)
 {
-    r.commitSequence = j.at("commit_sequence").get<int64_t>();
-    if (r.commitSequence < 0) throw std::runtime_error("object store: snapshot commit_sequence must not be negative");
-    r.version = j.at("version").get<int64_t>();
+    r.commitSequence = commitSequenceFrom(j.at("commit_sequence"));
+    r.version = versionNumberFrom(j.at("version"));
     r.versionGeneration = j.at("version_generation").get<std::string>();
-    if (*r.version < 1) throw std::runtime_error("object store: snapshot version must be positive");
     r.createdBy = j.at("created_by").get<std::string>();
     r.createdAt = j.at("created_at").get<std::string>();
     r.createdHost = j.at("created_host").get<std::string>();
@@ -58,7 +57,7 @@ void commonFromJson(const nlohmann::json& j, RecordCommon& r)
     r.approvedBy = optionalText("approved_by");
     r.approvedAt = optionalText("approved_at");
     r.approvedHost = optionalText("approved_host");
-    if (!j.at("approved_version").is_null()) r.approvedVersion = j.at("approved_version").get<int64_t>();
+    if (!j.at("approved_version").is_null()) r.approvedVersion = versionNumberFrom(j.at("approved_version"));
     if (r.approvalState != "pending" && r.approvalState != "approved" && r.approvalState != "rejected")
         throw std::runtime_error("object store: invalid snapshot approval state");
     if (r.approvedVersion && r.approvedVersion != r.version)
@@ -73,7 +72,10 @@ void presentCommonFromJson(const nlohmann::json& j, RecordCommon& r)
         if (!j.contains(key)) return;
         const auto& value = j.at(key);
         using T = std::remove_cvref_t<decltype(field)>;
-        if constexpr (std::is_same_v<T, std::optional<std::string>> || std::is_same_v<T, std::optional<int64_t>>) {
+        if constexpr (std::is_same_v<T, int64_t>) field = commitSequenceFrom(value);
+        else if constexpr (std::is_same_v<T, std::optional<int64_t>>) {
+            field = value.is_null() ? std::nullopt : std::optional(versionNumberFrom(value));
+        } else if constexpr (std::is_same_v<T, std::optional<std::string>>) {
             if (value.is_null()) field.reset();
             else field = value.get<typename T::value_type>();
         } else {

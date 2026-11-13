@@ -2,7 +2,6 @@
 #include "vc_object_store/migration/ConvertStore.hpp"
 #include "vc_object_store/objects/StoreConversion.hpp"
 
-#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -41,14 +40,12 @@ int main(int argc, char** argv)
         for (const auto& path : {mappingPath, reportPath})
             if (std::filesystem::exists(path) || std::filesystem::is_symlink(path))
                 throw std::runtime_error("output already exists: " + path);
-        const auto result = inPlace ? vc::objects::migration::convertStoreInPlace(destination)
+        const auto reports = [&](const auto& result) {
+            vc::objects::migration::writeConversionReports(result, mappingPath, reportPath);
+        };
+        const auto result = inPlace ? vc::objects::migration::convertStoreInPlace(destination, reports)
                                     : vc::objects::migration::convertStore(argv[1], destination);
-        for (const auto& [path, text] : {std::pair{mappingPath, result.mappingJson}, std::pair{reportPath, result.reportJson}}) {
-            std::ofstream output(path);
-            output << text << '\n';
-            output.close();
-            if (!output) throw std::runtime_error("could not write conversion report: " + path);
-        }
+        if (!inPlace) reports(result);
         std::cout << result.reportJson << '\n';
         return 0;
     } catch (const std::exception& error) {

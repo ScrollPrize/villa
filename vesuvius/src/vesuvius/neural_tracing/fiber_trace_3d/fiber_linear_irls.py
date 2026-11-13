@@ -1,11 +1,4 @@
-"""Shared linear winding IRLS, extracted from winding_fields/sheetgraph.py.
-
-Source: origin/winding-field-exps, spiral-fitting/experiments/winding_fields/
-sheetgraph.py::solve_l1. Arithmetic, float32 precision, weight schedule and
-fixed-count CG are retained so production does not import an experiment file.
-The source-file SHA256 is f625385ef5c8a60eea1cde3b150b89d83df69eb0603d2160ee7f18eda7d05b9f
-(the same source binding as the recorded full-volume IRLS benchmark).
-"""
+"""Linear winding IRLS with float32 arithmetic and fixed-count preconditioned CG."""
 import numpy as np
 import torch
 

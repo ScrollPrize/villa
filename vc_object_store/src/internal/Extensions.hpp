@@ -4,6 +4,10 @@
 
 namespace vc::objects::detail {
 bool hasExtensionTables(sqlite3*);
+ExtensionTable extensionDefinition(const ExtensionTableInfo&);
+void requireCompatibleExtension(const ExtensionTableInfo&,const ExtensionTableInfo&);
+void requireCompatibleExtension(const ExtensionTable&,const ExtensionTable&);
+std::optional<ExtensionTableInfo> resolvedExtensionTable(sqlite3*, const std::string&);
 std::vector<ExtensionTableInfo> extensionTables(sqlite3*);
 std::optional<ExtensionTableInfo> extensionTable(sqlite3*, const std::string&, bool includeMetadata = true);
 void createExtensionTable(sqlite3*, const ExtensionTable&);

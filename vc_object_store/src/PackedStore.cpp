@@ -1,7 +1,10 @@
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "internal/Publication.hpp"
+#include "internal/Artifacts.hpp"
 #include "internal/Sqlite.hpp"
+#include "internal/DatabaseCopy.hpp"
+#include "internal/JsonFields.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include <vc_reader/native/platform_io.hpp>
 #include <sqlite3.h>
@@ -196,7 +199,7 @@ Published readDirectory(const std::filesystem::path& path)
     if (out.extent < 1024u * 1024u || out.extent > 1024u * 1024u * 1024u || (out.extent & (out.extent - 1)))
         throw std::runtime_error("invalid packed extent size");
     std::vector<std::pair<std::uint64_t, std::uint64_t>> occupied;
-    for (const auto& value : json.at("databases")) {
+    for (const auto& value : detail::jsonArrayField(json, "databases")) {
         const auto uuid = util::canonicalUuid(value.at("uuid").get<std::string>());
         Member member;
         member.size = value.at("size").get<std::uint64_t>();
@@ -818,7 +821,11 @@ void writeDirectory(PhysicalFile& file, const Json& directory, std::uint64_t off
 }
 } // namespace
 
-struct PackedStoreBuilder::Impl { std::shared_ptr<BuildState> state; std::string token; };
+struct PackedStoreBuilder::Impl {
+    std::shared_ptr<BuildState> state;
+    std::string token;
+    std::map<std::string,std::filesystem::path> artifactSources;
+};
 
 const char* packedStoreVfs()
 {
@@ -937,27 +944,21 @@ std::filesystem::path PackedStoreBuilder::databasePath(const std::string& databa
 void PackedStoreBuilder::importDatabase(const std::string& databaseUuid, const std::filesystem::path& source)
 {
     const auto destination = addDatabase(databaseUuid);
-    sqlite3 *input = nullptr, *output = nullptr;
-    sqlite3_backup* backup = nullptr;
+    sqlite3 *input = nullptr;
     try {
         const auto path = isPackedDatabasePath(source) ? source : isPackedStore(source) ? packedDatabasePath(source) : source;
         check(sqlite3_open_v2(path.string().c_str(), &input, SQLITE_OPEN_READONLY, isPackedDatabasePath(path) ? packedStoreVfs() : nullptr), "open packed import source");
+        bool objectStore = false;
         {
             detail::Statement identityTable(input, "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='database_identity'");
-            if (identityTable.row()) {
+            if ((objectStore = identityTable.row())) {
                 detail::Statement identity(input, "SELECT uuid FROM database_identity WHERE singleton=1");
                 if (!identity.row() || detail::formatUuid(identity.blob16(0)) != util::canonicalUuid(databaseUuid))
                     throw std::invalid_argument("packed import database UUID does not match source identity");
             }
         }
-        check(sqlite3_open_v2(destination.string().c_str(), &output, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, packedStoreVfs()), "open packed import destination");
-        backup = sqlite3_backup_init(output, "main", input, "main");
-        if (!backup) throw std::runtime_error(sqlite3_errmsg(output));
-        const auto result = sqlite3_backup_step(backup, -1);
-        if (result != SQLITE_DONE) check(result, "copy packed database backup");
-        check(sqlite3_backup_finish(backup), "finish packed database backup"); backup = nullptr;
+        detail::copySqliteSnapshot(input,destination);
         check(sqlite3_close(input), "close packed import source"); input = nullptr;
-        check(sqlite3_close(output), "close packed import destination"); output = nullptr;
         // Backup has materialized every committed page, but it also copies the
         // source header's WAL read/write-version bytes. Before any reader opens
         // this private checkpoint, mark those bytes as rollback-journal format.
@@ -968,10 +969,18 @@ void PackedStoreBuilder::importDatabase(const std::string& databaseUuid, const s
         std::shared_ptr<MutableMember> member;
         { std::lock_guard lock(state->mutex); member = state->members.at(util::canonicalUuid(databaseUuid)); }
         if (member->size >= 100) state->write(*member, rollbackVersion.data(), rollbackVersion.size(), 18);
+        if (objectStore) {
+            // Every packed snapshot import (including compaction) preserves
+            // external targets. This private copy is not a logical edit.
+            std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> db(
+                detail::openConnection(destination, SQLITE_OPEN_READWRITE, {}, false), sqlite3_close_v2);
+            detail::Savepoint save(db.get());
+            detail::relocateExternalLocators(db.get(), path, state->destination);
+            save.release();
+        }
+        {std::lock_guard lock(state->mutex);impl_->artifactSources.emplace(databaseUuid,path);}
     } catch (...) {
-        if (backup) sqlite3_backup_finish(backup);
         if (input) sqlite3_close(input);
-        if (output) sqlite3_close(output);
         { std::lock_guard lock(impl_->state->mutex); impl_->state->failure = std::current_exception(); impl_->state->stopping = true; impl_->state->wake.notify_all(); }
         throw;
     }
@@ -1077,7 +1086,13 @@ void PackedStoreBuilder::finalize(const std::string& rootDatabaseUuid, bool comp
     state.file.reset();
     // Link publication is atomic and fails if another publisher won the name;
     // an exists()+rename pair would silently clobber that competing result.
+    std::vector<std::filesystem::path> artifactSources,artifactSnapshots;
+    for(const auto& [uuid,source]:impl_->artifactSources){
+        artifactSources.push_back(source);artifactSnapshots.push_back(packedDatabasePath(publish,uuid));
+    }
+    detail::ArtifactExport artifacts(artifactSources,state.destination,artifactSnapshots);
     detail::publishNewFile(publish, state.destination);
+    artifacts.commit();
     state.finalized = true;
     std::error_code ec;
     if (compact) std::filesystem::remove(state.staging, ec);

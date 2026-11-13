@@ -1,6 +1,8 @@
 #include "linking/StoredGeometry.hpp"
 #include "internal/Anchors.hpp"
+#include "internal/Database.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
+#include "vc_object_store/Uuid.hpp"
 
 #include <algorithm>
 #include <set>
@@ -40,6 +42,13 @@ bool isDetectorsOwnEdge(const EdgeRecord& e, const std::string& detectorName)
 
 }  // namespace
 
+std::map<std::string, int> detectorVersions()
+{
+    return {{kSurfaceOverlapDetector, kSurfaceOverlapVersion}, {kFiberSurfaceDetector, kFiberSurfaceVersion},
+            {kTrackTrackDetector, kTrackTrackVersion}, {kTrackSurfaceDetector, kTrackSurfaceVersion},
+            {kPointCollectionSurfaceDetector, kPointCollectionSurfaceVersion}};
+}
+
 static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
@@ -47,15 +56,17 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
 {
     if (detectorName.empty())
         throw std::runtime_error("object links: detector name must be non-empty");
+    objects::detail::Savepoint operation(objects::ObjectStoreImplAccess::conn(txn));
     DetectorReport report;
     report.candidatesFound = int64_t(candidates.size());
 
     std::set<std::string> kinds;
     for (const auto& c : candidates) kinds.insert(c.kind);
-    std::set<std::string> scopedKinds, scopedObjects;
+    std::set<std::string> scopedKinds, scopedObjects, touching;
     if (staleScope) {
         scopedKinds.insert(staleScope->edgeKinds.begin(), staleScope->edgeKinds.end());
-        scopedObjects.insert(staleScope->objectUuids.begin(), staleScope->objectUuids.end());
+        for (const auto& uuid : staleScope->objectUuids) scopedObjects.insert(objects::util::canonicalUuid(uuid));
+        for (const auto& uuid : staleScope->touching) touching.insert(objects::util::canonicalUuid(uuid));
         kinds.insert(scopedKinds.begin(), scopedKinds.end());
     }
 
@@ -88,6 +99,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
         for (const auto& [key, e] : existing) {
             if (staleScope && (!scopedKinds.contains(e.kind) || !scopedObjects.contains(e.aUuid) ||
                                !scopedObjects.contains(e.bUuid))) continue;
+            if (!touching.empty() && !touching.contains(e.aUuid) && !touching.contains(e.bUuid)) continue;
             if (candidateKeys.contains(key)) continue;
             if (e.approvalState != "pending") continue;  // reviewed edges are never touched
             if (!isDetectorsOwnEdge(e, detectorName)) continue;
@@ -157,6 +169,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
     }
 
     objects::util::reportProgress(progress, "writing links", candidates.size(), candidates.size());
+    operation.release();
     return report;
 }
 

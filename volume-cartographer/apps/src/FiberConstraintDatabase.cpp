@@ -81,7 +81,7 @@ Json normalJson(const std::array<double,3>& normal,bool valid){
 // selected-fiber lists in extension provisioning.
 std::string normalSourceIdentity(const Json& metadata){
     return vcr::sources::snapshotSha256({
-        {"fiber_store_uuid",metadata.at("fibers_store_uuid")},
+        {"fiber_source",metadata.at("fiber_source")},
         {"coordinate_space",metadata.at("config").at("coordinate_space")},
         {"manifest",metadata.at("normal_manifest")},
         {"provenance",metadata.at("normal_provenance")}});
@@ -163,6 +163,7 @@ nlohmann::json streamFiberConstraintDatabase(const std::filesystem::path& output
     auto constraintDefinition=vo::fiberConstraintExtension(
         {pin.storeUuid,{},{},metadata.at("config").at("coordinate_space").get<std::string>()},std::span(&pin,1));
     auto provisioning=Json::parse(constraintDefinition.provisioning);
+    provisioning["fiber_source"]=metadata.at("fiber_source");
     provisioning["normal_source_sha256"]=normalSourceIdentity(metadata);
     if(metadata.contains("winding_manifest"))
         provisioning["winding_source_sha256"]=vcr::sources::snapshotSha256({

@@ -7,7 +7,7 @@ summary, then the operations for one kind of use, with Python, C++, and CLI
 forms where they exist. Python examples assume
 `from vc_object_store import ObjectStore` and an open `store`.
 
-Current schema 22 also supports history-off stores, immutable store_references and overlays, independent shards and optional packed SQLite containers. Current versions and the store commit sequence remain available without archival history. See the [schema integration contract](schema-integration.md) for version semantics.
+Current schema 22 also supports history-off stores, immutable store_references and overlays, independent shards and optional packed SQLite containers. Current versions and the store commit sequence remain available without archival history. See [store format](store-format.md) for version semantics and the [shared API contract](store-api-contract.md) for implementation rules.
 
 | Document | Covers |
 | --- | --- |
@@ -31,8 +31,8 @@ These hold across every document:
   `{store, generation, object, version}` dict (C++ `ObjectVersion`).
   Revision UUIDs seen in geometry APIs identify immutable geometry payloads;
   they are not the public way to name an object state — use numbered versions.
-- **Checked writes.** A write expects the numbered versions it read
-  (`expected_versions` / `expectedObjects`; `None` means "must not exist").
+- **Checked writes.** A write expects the complete references it read
+  (`expected_versions` / `expectedObjects`; `None` means "no live record").
   A stale expectation conflicts (`TransactionConflict` in C++, `RuntimeError`
   in Python) and writes nothing. Unchecked convenience calls
   (`store.set_meta(...)`, `store.put_geometry(...)`) run their own transaction

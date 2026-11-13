@@ -3,8 +3,10 @@
 #include "internal/Extensions.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/EdgeLayout.hpp"
-#include "internal/JsonFields.hpp"
 #include "internal/History.hpp"
+#include "internal/ReferenceResolver.hpp"
+#include "internal/RecordOverrides.hpp"
+#include "internal/JsonFields.hpp"
 #include "geometry/SharedGeometry.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include <nlohmann/json.hpp>
@@ -27,7 +29,7 @@ Json manifest(const std::string& metadata)
 
 ExtensionTableInfo versionedTable(sqlite3* db, const std::string& name, const char* ownerTable = nullptr)
 {
-    const auto info = extensionTable(db, name);
+    const auto info=resolvedExtensionTable(db,name);
     if (!info || !info->versioned || info->keySpace.empty())
         throw std::invalid_argument("extension: operation requires a versioned owner table");
     if (ownerTable && info->keySpace != ownerTable)
@@ -99,7 +101,7 @@ std::vector<ExtensionRow> readSnapshot(sqlite3* db, const ExtensionTableInfo& ta
         throw std::runtime_error("extension: historical snapshot schema mismatch");
     const auto expectedBytes = descriptor.at("bytes").get<uint64_t>();
     std::vector<uint8_t> bytes;
-    for (const auto& hash : descriptor.at("chunks")) {
+    for (const auto& hash : jsonArrayField(descriptor, "chunks")) {
         const auto chunk = readSharedPayload(db, snapshotDomain, hash.get<std::string>());
         if (chunk.empty() || chunk.size() > geometryChunkSize ||
             bytes.size() > expectedBytes || chunk.size() > expectedBytes - bytes.size())
@@ -142,28 +144,55 @@ std::vector<ExtensionRow> readSnapshot(sqlite3* db, const ExtensionTableInfo& ta
     return rows;
 }
 
-void scanSnapshot(sqlite3* db, const ExtensionTableInfo& table, const std::string& owner,
-                  const std::string& meta, const std::function<bool(const ExtensionRow&)>& visitor)
+} // namespace
+
+bool detail::scanExtensionSnapshot(sqlite3* db, const ExtensionTableInfo& table, const std::string& owner,
+                  const std::string& meta, const std::function<bool(const ExtensionRow&)>& visitor,
+                  std::span<const ExtensionValue> prefix)
 {
-    if (!visitor) throw std::invalid_argument("extension: empty scan visitor");
+    if (!visitor || prefix.size()>table.primaryKey.size()) throw std::invalid_argument("extension: invalid scan");
     const auto descriptors = manifest(meta);
     const auto found = descriptors.find(table.name);
-    if (found == descriptors.end()) return;
-    for (const auto& row : readSnapshot(db, table, owner, *found)) if (!visitor(row)) break;
+    if (found == descriptors.end()) return true;
+    std::vector<size_t> keys;
+    for(size_t i=0;i<prefix.size();++i) {
+        const auto column=std::find_if(table.columns.begin(),table.columns.end(),
+            [&](const auto& c){return c.name==table.primaryKey[i];});
+        keys.push_back(size_t(column-table.columns.begin()));
+    }
+    for (const auto& row : readSnapshot(db, table, owner, *found)) {
+        bool match=true;
+        for(size_t i=0;i<prefix.size();++i)if(row.at(keys[i])!=prefix[i]){match=false;break;}
+        if(match&&!visitor(row))return false;
+    }
+    return true;
 }
-} // namespace
+
+void detail::scanExtensionOwnerKeys(sqlite3* db,const ExtensionTableInfo& table,
+    std::span<const ExtensionValue> prefix,const std::function<bool(const std::string&)>& visitor)
+{
+    if(!table.versioned||(table.keySpace!="objects"&&table.keySpace!="edges"))
+        throw std::invalid_argument("extension: expected versioned owner table");
+    Statement owners(db,"SELECT uuid FROM "+table.keySpace+(prefix.empty()?"":" WHERE uuid=?")+" ORDER BY uuid");
+    if(!prefix.empty())owners.bind(1,parseUuid(extensionUuid(prefix.front())));
+    while(owners.row())if(!visitor(owners.uuid(0)))break;
+}
 
 void ObjectStore::replaceExtensionRows(WriteTxn& txn, const std::string& name, const std::string& owner,
                                        std::span<const ExtensionRow> rows)
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto table = versionedTable(db, name);
+    Savepoint save(db);
+    createRecordOverride(db,table.keySpace.c_str(),owner);
+    if(!extensionTable(db,name))detail::createExtensionTable(db,extensionDefinition(table));
     if(table.keySpace=="edges")requireEdgeColumns(db,{"meta"});
     Statement existing(db, "SELECT uuid,meta FROM " + (table.keySpace=="edges"?edgeReadSource(db):table.keySpace) + " WHERE uuid=? AND state<>2", parseUuid(owner));
     if (!existing.row()) throw std::invalid_argument("extension: owner is not present in the writable store");
     auto meta = parseObjectJson(existing.text(1));
-    const auto oldRows = currentRows(db, name, owner);
-    Savepoint save(db);
+    const auto oldDescriptors=manifest(meta.dump());
+    const auto oldRows = oldDescriptors.contains(name)
+        ? readSnapshot(db,table,owner,oldDescriptors.at(name)) : currentRows(db,name,owner);
     detail::replaceCurrentExtensionRows(db, name, owner, rows);
     // SQL validates the proposed data and canonicalizes its key order. A no-op
     // rolls back even the table's mutation stamp, not just the owner version.
@@ -189,7 +218,7 @@ void ObjectStore::scanExtensionRowsAtVersion(const Txn& txn, const std::string& 
     const auto revision = objectAtVersion(txn, version);
     if (!revision) throw std::invalid_argument("extension: object version is unavailable");
     if (revision->deleted) return;
-    scanSnapshot(db, table, version.objectUuid, revision->record.meta, visitor);
+    scanExtensionSnapshot(db, table, version.objectUuid, revision->record.meta, visitor);
 }
 
 void ObjectStore::scanExtensionRowsAtVersion(const Txn& txn, const std::string& name, const RelationshipVersion& version,
@@ -199,7 +228,7 @@ void ObjectStore::scanExtensionRowsAtVersion(const Txn& txn, const std::string& 
     const auto table = versionedTable(db, name, "edges");
     const auto revision = relationshipAtVersion(txn, version);
     if (!revision) throw std::invalid_argument("extension: relationship version is unavailable");
-    scanSnapshot(db, table, version.relationshipUuid, revision->record.meta, visitor);
+    scanExtensionSnapshot(db, table, version.relationshipUuid, revision->record.meta, visitor);
 }
 
 void detail::checkExtensionMetadata(const std::string& previous, const std::string& replacement)
@@ -255,21 +284,17 @@ std::vector<std::string> detail::currentExtensionChunks(sqlite3* db)
     return {hashes.begin(), hashes.end()};
 }
 
-void detail::materializeExtensionOwner(sqlite3* source, ObjectStore& target, WriteTxn& txn,
-                                       const char* ownerTable, const std::string& owner,
-                                       const std::string& sourceMeta)
+void detail::referenceExtensionSchemas(sqlite3* source, ObjectStore& target, WriteTxn& txn,
+                                       const char* ownerTable, const std::string& sourceMeta)
+{
+    referenceExtensionSchemas(source,ObjectStoreImplAccess::conn(txn),ownerTable,sourceMeta);
+}
+void detail::referenceExtensionSchemas(sqlite3* source,sqlite3* target,const char* ownerTable,const std::string& sourceMeta)
 {
     const auto descriptors = manifest(sourceMeta);
     for (const auto& [name, descriptor] : descriptors.items()) {
         const auto table = versionedTable(source, name, ownerTable);
-        const auto rows = readSnapshot(source, table, owner, descriptor);
-        ExtensionTable spec;
-        spec.name = table.name; spec.extension = table.extension; spec.formatVersion = table.formatVersion;
-        spec.provisioning = table.provisioning; spec.basedOn = table.basedOn; spec.columns = table.columns;
-        spec.primaryKey = table.primaryKey; spec.keySpace = table.keySpace; spec.versioned = true;
-        spec.indexes = table.indexes;
-        target.createExtensionTable(txn, spec);
-        target.replaceExtensionRows(txn, name, owner, rows);
+        createExtensionTable(target, extensionDefinition(table));
     }
 }
 } // namespace vc::objects

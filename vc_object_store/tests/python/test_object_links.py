@@ -4,25 +4,7 @@ import uuid
 import numpy as np
 import pytest
 
-from object_helpers import edge_choice
-
-
-def array(name, values, dtype):
-    data = np.asarray(values, dtype=dtype)
-    return {"name": name, "dtype": dtype, "shape": list(data.shape), "data": data.tobytes()}
-
-
-def put(db, kind, arrays, attributes=None, **record):
-    uid = db.upsert_object({"kind": kind, "storage_ref": "/missing/source", **record})
-    geometry = {"kind": kind, "attributes": attributes or {}, "arrays": arrays}
-    db.put_geometry(uid, geometry)
-    return uid, geometry
-
-
-def plane(db, offset=0, name="surface"):
-    y, x = np.mgrid[:33, :33]
-    points = np.stack([x + offset, y, np.full_like(x, 20)], axis=-1)
-    return put(db, "surface", [array("points", points, "<f4")], {"scale": [1, 1]}, name=name)
+from object_helpers import array, edge_choice, plane, put
 
 
 def test_surface_discovery_uses_current_revisions_and_preserves_review(db):
@@ -157,3 +139,37 @@ def test_attached_collections_are_not_graph_links(db):
     # Listings still show the attachment.
     assert attachment in [e["uuid"] for e in db.edges_of(surface)]
     assert attachment in [e["uuid"] for e in db.select_edges()]
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_pcl_boundary_hit_keeps_the_valid_source_cell(db, transpose):
+    # Real failure: same_windings.json/same_wrap14, point 975, against
+    # verified_patches/0000_low_band_final, rows 74:77, columns 643:645.
+    # The nearest point lies at row 75, on the last valid quad's upper edge.
+    # floor(hit.grid) instead selects row 75's quad, whose next row is invalid.
+    points = np.array([
+        [[3833.2333984375, 2990.1953125, 8788.232421875],
+         [3844.4677734375, 2974.294677734375, 8788.4228515625]],
+        [[3834.103759765625, 2990.941162109375, 8808.251953125],
+         [3844.956787109375, 2974.7509765625, 8808.44140625]],
+        [[-1, -1, -1], [-1, -1, -1]],
+    ], dtype=np.float32)
+    if transpose:
+        points = points.transpose(1, 0, 2)
+    surface, _ = put(db, "surface", [array("points", points, "<f4")], {"scale": [0.05, 0.05]})
+    collection, _ = put(db, "point_collection", [
+        array("points", [[3842.944091796875, 2978.4453125, 8808.6533203125]], "<f8"),
+        array("point_ids", [975], "<i8"),
+    ])
+    report = db.link_point_collections_to_surfaces()
+    assert not report["problems"] and report["edges_created"] == 1
+    [edge] = db.edges_of(collection)
+    anchor = edge["a_anchor"] if edge["a"] == surface else edge["b_anchor"]
+    assert edge["meta"]["point_collection_surface"]["ij"][int(transpose)] == 1.0
+    for ref in anchor["points"]:
+        assert (points[tuple(ref["index"])] != -1).all()
+    assert np.linalg.norm(np.asarray(anchor["position"]) -
+                          [3842.944091796875, 2978.4453125, 8808.6533203125]) < 2.5
+    assert not db.edge_geometry_state(edge["uuid"])["stale"]
+    assert not db.link_point_collections_to_surfaces()["problems"]
+    assert len(db.edges_of(collection)) == 1

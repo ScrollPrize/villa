@@ -209,7 +209,7 @@ def test_an_unavailable_source_fails_the_run(db, tmp_path):
     before = db.status()["commit_sequence"]
     with pytest.raises(RuntimeError):
         db.link_fibers_to_surfaces(**LINE_OPTIONS, normal_pool=str(tmp_path / "no-such-pack"), ct_to_base_scale=2)
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(RuntimeError, match="no Zarr group"):
         db.link_fibers_to_surfaces(**LINE_OPTIONS, normal_x_volume=str(tmp_path / "no-x"),
                                    normal_y_volume=str(tmp_path / "no-y"), ct_to_base_scale=2)
     assert db.status()["commit_sequence"] == before
@@ -246,7 +246,7 @@ def test_a_source_that_fails_while_sampling_fails_the_run(db, tmp_path):
 # --- link_objects: the same sources as plan parameters ---
 
 def link_request(status, plan):
-    return dict(command_version=1, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
+    return dict(command_version=3, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
                 author="py", expected_objects={}, expected_relationships={}, read_dependencies={},
                 expected_commit_sequence=None, operations=[{"op": vos.LINK_OBJECTS_OPERATION, "plan": plan}])
 

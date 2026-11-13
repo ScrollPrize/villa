@@ -1,9 +1,11 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
 #include "internal/Digest.hpp"
+#include "internal/RecordResolver.hpp"
 #include <bit>
 
 using namespace vc::objects;
@@ -49,7 +51,7 @@ void transactionAuthors(HistoryMode history)
         auto txn = store.read(); const auto status = store.status(txn);
         request.requestUuid = util::newUuid(); request.storeUuid = status.storeUuid;
         request.generation = status.generation; request.author = "edge-author";
-        request.expectedObjects = {{a, store.currentVersion(txn, a)}, {b, store.currentVersion(txn, b)}};
+        request.expectedObjects = {{a, store.currentObjectRevision(txn, a)->reference()}, {b, store.currentObjectRevision(txn, b)->reference()}};
     }
     request.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});
     store.submit(request);
@@ -60,7 +62,7 @@ void transactionAuthors(HistoryMode history)
         auto txn = store.read(); const auto record = store.edgeByUuid(txn, edge.uuid);
         require(record && record->createdBy == "edge-author" && record->changedBy == "edge-author",
                 "checked request author stamps new relationships");
-        deletion.expectedObjects = {{a, store.currentVersion(txn, a)}, {b, store.currentVersion(txn, b)}};
+        deletion.expectedObjects = {{a, store.currentObjectRevision(txn, a)->reference()}, {b, store.currentObjectRevision(txn, b)->reference()}};
         snapshot = store.exportJson(txn);
         if (history == HistoryMode::On) {
             const auto events = store.journalSince(txn, 0);
@@ -173,7 +175,7 @@ void nativeChanges(HistoryMode history)
     {
         auto txn = store.write();
         // Failure rolls back the API savepoint, including any allocated ID.
-        EdgeRecord relation; relation.kind = "bad"; relation.aUuid = a; relation.bUuid = util::newUuid();
+        EdgeRecord relation; relation.kind = "declared_reference"; relation.aUuid = a; relation.bUuid = util::newUuid();
         mustFail([&] { store.addEdge(txn, relation); });
         txn.commit();
     }
@@ -277,7 +279,7 @@ void deletedGeometryRevival(HistoryMode history)
         geometry=store.putGeometry(txn,uuid,vc::geometry::encode(vc::geometry::Fiber{{},{{0,0,0},{1,0,0}},{}}));txn.commit();}
     VersionSelection selected;
     {auto txn=store.read();selected[uuid]=store.currentVersion(txn,uuid);}
-    {auto txn=store.write(selected);store.retireObject(txn,uuid);txn.commit();}
+    {auto txn=store.writeNumbered(selected);store.retireObject(txn,uuid);txn.commit();}
     {auto txn=store.write();store.deleteObject(txn,uuid);txn.commit();}
     {auto txn=store.write();store.upsertObject(txn,fiber(uuid));txn.commit();}
     auto txn=store.read();const auto revived=store.objectByUuid(txn,uuid);
@@ -364,6 +366,95 @@ void metadataImport(HistoryMode history)
     require(commitSequence(target) == 2, "real content conflict remains an error and changes nothing");
 }
 
+void metadataImportReservations(HistoryMode sourceHistory, HistoryMode targetHistory, bool referenced)
+{
+    TemporaryDirectory dir;
+    OpenOptions options; options.author = "metadata-reservations"; options.history = sourceHistory;
+    const auto sourcePath = dir.path / "source.vcobj", targetPath = dir.path / "target.vcobj";
+    const auto a = util::newUuid(), b = util::newUuid(), deletedObject = util::newUuid();
+    std::string deletedEdge, liveEdge, sourceUuid;
+    nlohmann::json snapshot;
+    {
+        auto source = ObjectStore::create(sourcePath, options);
+        {
+            auto txn = source.write();
+            for (const auto& id : {a, b, deletedObject}) source.upsertObject(txn, fiber(id));
+            EdgeRecord edge; edge.kind = "perpendicular"; edge.aUuid = a; edge.bUuid = b;
+            deletedEdge = source.addEdge(txn, edge);
+            edge.kind = "parallel";
+            liveEdge = source.addEdge(txn, edge);
+            txn.commit();
+        }
+        { auto txn = source.read(); snapshot = nlohmann::json::parse(source.exportJson(txn)); sourceUuid = source.uuid(txn); }
+        {
+            auto txn = source.write(); source.removeEdge(txn, deletedEdge); source.deleteObject(txn, deletedObject);
+            if (referenced) source.seal(txn);
+            txn.commit();
+        }
+    }
+    options.history = targetHistory;
+    if (referenced) { auto collection = ObjectCollection::create(targetPath, {sourcePath}, options); }
+    auto target = ObjectStore::open(referenced ? targetPath : sourcePath, options);
+    const auto entry = [&](const char* kind, const std::string& id) {
+        for (const auto& record : snapshot.at(kind)) if (record.at("uuid") == id) return record;
+        throw std::runtime_error("metadata reservation fixture record missing");
+    };
+    auto live = snapshot;
+    live["objects"] = nlohmann::json::array({entry("objects", a), entry("objects", b)});
+    live["edges"] = nlohmann::json::array({entry("edges", liveEdge)});
+    const auto before = commitSequence(target);
+    { auto txn = target.write(); target.importJson(txn, live.dump()); txn.commit(); }
+    require(commitSequence(target) == before, "matching live metadata import preserves publication and inherited ownership");
+    {
+        auto txn = target.read();
+        require(target.objectByUuid(txn, a)->reference().storeUuid == sourceUuid &&
+                target.edgeByUuid(txn, liveEdge)->reference().storeUuid == sourceUuid,
+                "idempotent import does not materialize inherited live records");
+    }
+    auto conflict = live;
+    conflict["objects"][0]["name"] = "conflicting imported metadata";
+    auto objectOnly = snapshot;
+    objectOnly["objects"] = nlohmann::json::array({entry("objects", deletedObject)});
+    objectOnly["edges"] = nlohmann::json::array();
+    auto edgeOnly = snapshot;
+    edgeOnly["objects"] = nlohmann::json::array();
+    edgeOnly["edges"] = nlohmann::json::array({entry("edges", deletedEdge)});
+    auto objectAtEdge = objectOnly;
+    objectAtEdge["objects"][0]["uuid"] = deletedEdge;
+    auto edgeAtObject = edgeOnly;
+    edgeAtObject["edges"][0]["uuid"] = deletedObject;
+    for (auto rejected : {conflict, objectOnly, edgeOnly, objectAtEdge, edgeAtObject}) {
+        const auto provisional = util::newUuid(), provisionalEdge = util::newUuid(), unrelated = util::newUuid();
+        auto prefixObject = entry("objects", a); prefixObject["uuid"] = provisional;
+        rejected["objects"].insert(rejected["objects"].begin(), std::move(prefixObject));
+        auto prefixEdge = entry("edges", liveEdge); prefixEdge["uuid"] = provisionalEdge;
+        rejected["edges"].insert(rejected["edges"].begin(), std::move(prefixEdge));
+        const auto prior = commitSequence(target);
+        {
+            auto txn = target.write();
+            mustFail([&] { target.importJson(txn, rejected.dump()); });
+            target.upsertObject(txn, fiber(unrelated));
+            txn.commit();
+        }
+        require(commitSequence(target) == prior + 1, "caught import rejection permits only unrelated outer work to publish");
+        auto txn = target.read();
+        require(target.objectByUuid(txn, unrelated).has_value() && !target.objectByUuid(txn, provisional) &&
+                !target.edgeByUuid(txn, provisionalEdge), "failed metadata import rolls back all earlier object and edge inserts");
+        require(!target.objectByUuid(txn, deletedObject) && !target.edgeByUuid(txn, deletedEdge),
+                "metadata import cannot resurrect deleted object or edge identities");
+        require(!target.objectByUuid(txn, deletedEdge) && !target.edgeByUuid(txn, deletedObject),
+                "deleted identities remain reserved across object and edge namespaces");
+        auto* connection = ObjectStoreImplAccess::conn(txn);
+        for (const auto& [table, id] : {std::pair{"objects", deletedObject}, std::pair{"edges", deletedEdge}}) {
+            auto* owner = std::string_view(table) == "objects" ? detail::objectSource(connection, id, false, true)
+                                                              : detail::edgeSource(connection, id, false, true);
+            require(owner && detail::storeUuidText(owner) == sourceUuid, "rejected import leaves tombstone with its original owner");
+            detail::Statement row(owner, std::string("SELECT state,version FROM ") + table + " WHERE uuid=?", detail::parseUuid(id));
+            require(row.row() && row.i64(0) == 2 && row.i64(1) == 2, "rejected import does not alter tombstone state or version");
+        }
+    }
+}
+
 
 }
 
@@ -381,4 +472,8 @@ int main()
     deletedEdgeRevival(HistoryMode::Off);
     metadataImport(HistoryMode::On);
     metadataImport(HistoryMode::Off);
+    for (const auto source : {HistoryMode::On, HistoryMode::Off}) {
+        metadataImportReservations(source, source, false);
+        for (const auto target : {HistoryMode::On, HistoryMode::Off}) metadataImportReservations(source, target, true);
+    }
 }

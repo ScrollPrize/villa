@@ -49,7 +49,8 @@ def repair_obj_lines(config):
     source=document.get('config',{}).get('fibers')
     raw=None
     if source:
-        raw={row['id']:points for row,points in read_polylines(source,[r['fiber_id'] for r in records])}
+        raw={row['id']:points for row,points in read_polylines(source,[r['fiber_id'] for r in records],
+             source_version=document.get('fiber_source',{}))}
         first=1
         for r in records:
             r['obj_first_vertex']=first;r['obj_vertex_count']=len(raw[r['fiber_id']]);first+=r['obj_vertex_count']
@@ -271,9 +272,12 @@ def export(config):
         if not np.array_equal(hv['inherited_broken'],solution['broken']) or np.any(hv['labels'][solution['broken']]!=2):
             raise ValueError('H/V changed inherited exclusions')
     graph=FiberGraph(dbpath)
-    fibers=Path(config['fibers']);volume=graph.volume
+    from .fiber_graph_store import original_fiber_source
+    fibers,source_version=original_fiber_source(dbpath);volume=graph.volume
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, FiberBlockIndex
-    if fibers_digest(dbpath)!=fibers_digest(fibers):raise ValueError('Wrong source fiber snapshot')
+    expected=fibers_digest(fibers,source_version=source_version)
+    if fibers_digest(dbpath)!=expected or fibers_digest(config['fibers'])!=expected:
+        raise ValueError('Wrong source fiber snapshot')
     selected=config.get('fiber_ids')
     bounds=config.get('bounds_xyz')
     focus=None
@@ -326,7 +330,7 @@ def export(config):
     if not all(fid in lookup for fid in selected):raise ValueError('Selection contains fibers absent from solution')
     spacing=float(config.get('arrow_spacing',256));length=float(config.get('arrow_length',64))
     if spacing<=0 or length<=0:raise ValueError('Positive arrow spacing/length required')
-    raw=read_polylines(fibers,selected,volume=volume)
+    raw=read_polylines(fibers,selected,volume=volume,source_version=source_version)
     if sum(len(points) for _,points in raw)>config.get('max_points',1000000):
         raise ValueError('Selection exceeds point limit; use fewer fibers')
     root.mkdir(parents=True)
@@ -376,7 +380,7 @@ def export(config):
     faces=np.concatenate(triangles) if triangles else np.empty((0,3),dtype=np.int32)
     color=np.concatenate(colors) if colors else np.empty((0,3),dtype=np.uint8)
     write_ply(root/'signed_normals.ply',vertices,faces,color)
-    report=dict(config=config,solution_sha256=sha256_file(solution_path),focus_fiber=focus,selection_bbox=bounds,
+    report=dict(config=dict(config,fibers=str(fibers)),fiber_source=source_version,solution_sha256=sha256_file(solution_path),focus_fiber=focus,selection_bbox=bounds,
         selection_semantics=selection_semantics,
         normal_convention='inward',display_normal_convention='outward',
         units='native L0 XYZ/base voxels',fibers=len(records),broken_fibers=sum(r['broken'] for r in records),

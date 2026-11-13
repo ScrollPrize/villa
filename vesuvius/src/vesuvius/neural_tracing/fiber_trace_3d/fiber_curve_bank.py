@@ -15,7 +15,16 @@ class CurveBank:
     """Vectorized exact polyline interpolation and shared native normal samples."""
     def __init__(self,fibers,source_ids,normal_root,normal_solution,*,volume=None):
         self.ids=np.unique(np.asarray(source_ids,dtype=str))
-        curves=read_polylines(fibers,self.ids,**({'volume':volume} if volume is not None else {}))
+        doc=json.loads((Path(normal_root)/'index.json').read_text())
+        from vc_object_store import CollectionReader
+        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+        pin=doc['provenance']['fiber_source']
+        with CollectionReader(str(fibers)) as reader:
+            source=reader.resolve_store_position(pin)
+        if fibers_digest(fibers,self.ids)!=fibers_digest(source,self.ids,source_version=pin):
+            raise ValueError('Frozen normal geometry differs from the configured fiber scope')
+        curves=read_polylines(source,self.ids,source_version=pin,
+                              **({'volume':volume} if volume is not None else {}))
         if not np.array_equal([row['id'] for row,_ in curves],self.ids):raise ValueError('Fiber source identity mismatch')
         lengths=[];arcs=[];points=[]
         for row,xyz in curves:
@@ -29,7 +38,7 @@ class CurveBank:
         self.xyz=np.concatenate(points)
         self.first=np.r_[0,np.cumsum([len(a) for a in arcs])[:-1]]
         self.last=self.first+np.asarray([len(a) for a in arcs])-1
-        self._load_normals(normal_root,normal_solution)
+        self._load_normals(normal_root,normal_solution,document=doc)
 
     @classmethod
     def from_normals(cls,source_ids,normal_root,normal_solution):
@@ -39,8 +48,8 @@ class CurveBank:
         self.lengths=np.asarray(self.normals[self.normal_first+self.normal_count-1,0])
         return self
 
-    def _load_normals(self,normal_root,normal_solution):
-        doc=json.loads((Path(normal_root)/'index.json').read_text())
+    def _load_normals(self,normal_root,normal_solution,*,document=None):
+        doc=json.loads((Path(normal_root)/'index.json').read_text()) if document is None else document
         if doc['format']!='fiber-normal-curves' or doc['columns']!=['arc','nx','ny','nz','valid']:raise ValueError('Normal curve format')
         # Rows are [fiber UUID, first sample, sample count] in UUID order.
         index_ids=np.asarray([r[0] for r in doc['index']],dtype=str)

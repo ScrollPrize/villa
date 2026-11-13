@@ -21,6 +21,18 @@ void exec(sqlite3* db, const char* sql)
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::string msg = err ? err : sqlite3_errmsg(db);
         sqlite3_free(err);
+        if(sqlite3_extended_errcode(db)==SQLITE_CONSTRAINT_FOREIGNKEY){
+            // Failed commits otherwise hide which reference could not be
+            // satisfied. This diagnostic does no work on successful writes.
+            sqlite3_stmt* check=nullptr;
+            if(sqlite3_prepare_v2(db,"PRAGMA foreign_key_check",-1,&check,nullptr)==SQLITE_OK&&sqlite3_step(check)==SQLITE_ROW){
+                msg+=" ["+std::string(reinterpret_cast<const char*>(sqlite3_column_text(check,0)))+
+                    " -> "+std::string(reinterpret_cast<const char*>(sqlite3_column_text(check,2)))+
+                    ", row "+std::to_string(sqlite3_column_int64(check,1))+
+                    ", key "+std::to_string(sqlite3_column_int(check,3))+"]";
+            }
+            sqlite3_finalize(check);
+        }
         throw std::runtime_error("sqlite exec failed: " + msg + " (" + sql + ")");
     }
 }
@@ -77,10 +89,10 @@ std::string formatUuid(const std::array<unsigned char, 16>& bytes)
     return out;
 }
 
-std::string nowIsoUtc()
+static std::string isoUtc(std::chrono::system_clock::time_point now, bool fractional)
 {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    const auto second = std::chrono::floor<std::chrono::seconds>(now);
+    const std::time_t t = std::chrono::system_clock::to_time_t(second);
     std::tm tm{};
 #ifdef _WIN32
     gmtime_s(&tm, &t);
@@ -88,8 +100,24 @@ std::string nowIsoUtc()
     gmtime_r(&t, &tm);
 #endif
     char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return buf;
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+    if (!fractional) return std::string(buf) + "Z";
+    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now-second).count();
+    return std::string(buf) + "." + std::to_string(1000000 + micros).substr(1) + "Z";
+}
+
+std::string nowIsoUtc(bool fractional)
+{
+    return isoUtc(std::chrono::system_clock::now(), fractional);
+}
+
+std::string refineCreationStamp(const std::string& created, std::optional<int64_t> publicationUs)
+{
+    if (created.size() != 20 || !publicationUs) return created;
+    const auto publication = isoUtc(std::chrono::system_clock::time_point(
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::microseconds(*publicationUs))), true);
+    return publication.compare(0, 19, created, 0, 19) == 0 ? publication : created;
 }
 
 std::string detectHostname()

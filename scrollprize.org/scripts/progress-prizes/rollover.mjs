@@ -5,9 +5,7 @@ import {
   ROLLOVER_PHASES,
   assertAutomationEnvironment,
   assertPublicResponderUri,
-  assertStagingOnlyControl,
   getCycleDeadline,
-  nextCycle,
   parseCycle,
   parseProgressPrizeMarkdown,
   planRollover,
@@ -29,19 +27,11 @@ export const ROLLOVER_FILE_ROLES = Object.freeze({
   TARGET: 'target',
 });
 
+// Only preparation writes managed state. Forms from earlier cycles may still
+// carry the retired activating/active/closed markers; nothing reads them.
 export const ROLLOVER_FILE_STATES = Object.freeze({
   COPIED: 'copied',
   PREPARED: 'prepared',
-  ACTIVATING: 'activating',
-  REWINDING: 'rewinding',
-  ACTIVE: 'active',
-  CLOSED: 'closed',
-  ARCHIVED: 'archived',
-});
-
-export const ROLLOVER_FAULTS = Object.freeze({
-  AFTER_COPY: 'after-copy',
-  AFTER_CLOSE_SOURCE: 'after-close-source',
 });
 
 const REQUIRED_GOOGLE_METHODS = Object.freeze([
@@ -58,21 +48,6 @@ const REQUIRED_GOOGLE_METHODS = Object.freeze([
 ]);
 
 const ALLOWED_EVENTS = new Set(['schedule', 'workflow_dispatch']);
-const ALLOWED_VERIFY_MODES = new Set(['prepared', 'active', 'cleaned']);
-const RECONCILABLE_SOURCE_STATES = new Set([
-  undefined,
-  ROLLOVER_FILE_STATES.COPIED,
-  ROLLOVER_FILE_STATES.PREPARED,
-  ROLLOVER_FILE_STATES.ACTIVATING,
-  ROLLOVER_FILE_STATES.ACTIVE,
-  ROLLOVER_FILE_STATES.CLOSED,
-]);
-const RECONCILABLE_TARGET_STATES = new Set([
-  ROLLOVER_FILE_STATES.COPIED,
-  ROLLOVER_FILE_STATES.PREPARED,
-  ROLLOVER_FILE_STATES.ACTIVATING,
-  ROLLOVER_FILE_STATES.ACTIVE,
-]);
 const GOOGLE_FORM_MIME_TYPE = 'application/vnd.google-apps.form';
 const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 const INITIAL_EXPLICIT_SOURCE_CYCLE = '2026-07';
@@ -87,14 +62,6 @@ const SOURCE_ORIGINS = Object.freeze({
   EXPLICIT_SHARED_DRIVE: 'explicit-shared-drive',
   EXPLICIT_MY_DRIVE: 'explicit-my-drive',
 });
-
-export class RolloverFaultError extends Error {
-  constructor(step) {
-    super(`Injected staging rollover failure at ${step}`);
-    this.name = 'RolloverFaultError';
-    this.step = step;
-  }
-}
 
 function assertNonEmptyString(value, label) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -133,55 +100,21 @@ function normalizeRuntime(runtime = {}) {
     stagingServiceAccountEmail: hasValue(runtime.stagingServiceAccountEmail)
       ? normalizeEmail(runtime.stagingServiceAccountEmail, 'stagingServiceAccountEmail')
       : undefined,
-    stagingFolderId: runtime.stagingFolderId,
     branch: assertNonEmptyString(runtime.branch, 'branch'),
     targetBranch: runtime.targetBranch ?? 'main',
     defaultTargetBranch: runtime.defaultTargetBranch ?? 'main',
-    smokeBranchPrefix: runtime.smokeBranchPrefix ?? 'staging/progress-prize-',
-    smokeDate: runtime.smokeDate,
   };
 
   assertNonEmptyString(normalized.targetBranch, 'targetBranch');
   assertNonEmptyString(normalized.defaultTargetBranch, 'defaultTargetBranch');
-  assertNonEmptyString(normalized.smokeBranchPrefix, 'smokeBranchPrefix');
-  if (normalized.stagingFolderId !== undefined) {
-    assertNonEmptyString(normalized.stagingFolderId, 'stagingFolderId');
-  }
-  if (normalized.archiveFolderId !== undefined) {
-    assertNonEmptyString(normalized.archiveFolderId, 'archiveFolderId');
-  }
   if (
     normalized.driveAdminEmail === normalized.serviceAccountEmail
     || normalized.driveAdminEmail.endsWith('.gserviceaccount.com')
   ) {
     throw new Error('driveAdminEmail must identify a separate human break-glass administrator');
   }
-  if (normalized.smokeDate !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(normalized.smokeDate)) {
-    throw new TypeError('smokeDate must use YYYY-MM-DD format');
-  }
 
   return Object.freeze(normalized);
-}
-
-function assertStagingIdentity(runtime) {
-  if (runtime.environment !== AUTOMATION_ENVIRONMENTS.STAGING) {
-    throw new Error('This operation is restricted to the staging environment');
-  }
-  if (runtime.eventName !== 'workflow_dispatch') {
-    throw new Error('Staging mutations require a workflow_dispatch event');
-  }
-  if (
-    runtime.stagingServiceAccountEmail === undefined
-    || runtime.serviceAccountEmail !== runtime.stagingServiceAccountEmail
-  ) {
-    throw new Error('Staging mutations require the configured staging service account');
-  }
-  if (runtime.stagingFolderId === undefined || runtime.folderId !== runtime.stagingFolderId) {
-    throw new Error('Staging mutations require the configured staging folder');
-  }
-  if (!runtime.branch.startsWith(runtime.smokeBranchPrefix)) {
-    throw new Error('Staging mutations require the configured smoke branch prefix');
-  }
 }
 
 /**
@@ -190,70 +123,27 @@ function assertStagingIdentity(runtime) {
  * Identifiers are compared but deliberately omitted from every error message so
  * that a failed public workflow cannot disclose private Workspace configuration.
  */
-export function assertRolloverRuntimeSafety(runtimeInput, {
-  faultInjection,
-  allowActivationRewind = false,
-} = {}) {
+export function assertRolloverRuntimeSafety(runtimeInput) {
   const runtime = normalizeRuntime(runtimeInput);
-  const hasSimulatedTime = hasValue(runtime.simulatedNow);
-  const hasFault = hasValue(faultInjection);
-
-  if (typeof allowActivationRewind !== 'boolean') {
-    throw new TypeError('allowActivationRewind must be a boolean');
+  if (runtime.environment !== AUTOMATION_ENVIRONMENTS.PRODUCTION) {
+    throw new Error('Google rollover operations run only in production');
   }
-
-  assertStagingOnlyControl({
-    environment: runtime.environment,
-    eventName: runtime.eventName,
-    controlName: 'simulated time',
-    enabled: hasSimulatedTime,
-  });
-  assertStagingOnlyControl({
-    environment: runtime.environment,
-    eventName: runtime.eventName,
-    controlName: 'fault injection',
-    enabled: hasFault,
-  });
-  assertStagingOnlyControl({
-    environment: runtime.environment,
-    eventName: runtime.eventName,
-    controlName: 'activation rewind',
-    enabled: allowActivationRewind,
-  });
-
-  if (hasFault && !Object.values(ROLLOVER_FAULTS).includes(faultInjection)) {
-    throw new Error(`Unknown staging fault injection step ${JSON.stringify(faultInjection)}`);
+  if (hasValue(runtime.simulatedNow)) {
+    throw new Error('simulated time is forbidden in production');
   }
-
-  if (runtime.environment === AUTOMATION_ENVIRONMENTS.PRODUCTION) {
-    if (runtime.targetBranch !== runtime.defaultTargetBranch) {
-      throw new Error('Production rollover cannot use an alternate target branch');
-    }
-    if (runtime.stagingFolderId !== undefined) {
-      throw new Error('Production rollover cannot be supplied a staging folder');
-    }
-    if (
-      runtime.stagingServiceAccountEmail !== undefined
-      && runtime.serviceAccountEmail === runtime.stagingServiceAccountEmail
-    ) {
-      throw new Error('Production rollover cannot use the staging service account');
-    }
+  if (runtime.targetBranch !== runtime.defaultTargetBranch) {
+    throw new Error('Production rollover cannot use an alternate target branch');
   }
-
-  if (hasSimulatedTime || hasFault || allowActivationRewind) {
-    assertStagingIdentity(runtime);
+  if (
+    runtime.stagingServiceAccountEmail !== undefined
+    && runtime.serviceAccountEmail === runtime.stagingServiceAccountEmail
+  ) {
+    throw new Error('Production rollover cannot use the staging service account');
   }
-
   return runtime;
 }
 
-function assertMutationContext(runtime) {
-  if (runtime.environment === AUTOMATION_ENVIRONMENTS.STAGING) {
-    assertStagingIdentity(runtime);
-  }
-}
-
-function assertDependencies({ google, page, clock, activationGate }) {
+function assertDependencies({ google, page, clock }) {
   if (google === null || typeof google !== 'object') {
     throw new TypeError('google must be an injected Google facade');
   }
@@ -275,9 +165,6 @@ function assertDependencies({ google, page, clock, activationGate }) {
   }
   if (clock === null || typeof clock !== 'object' || typeof clock.now !== 'function') {
     throw new TypeError('clock.now must be an injected function');
-  }
-  if (activationGate !== undefined && typeof activationGate !== 'function') {
-    throw new TypeError('activationGate must be a function when supplied');
   }
 }
 
@@ -307,15 +194,6 @@ function cycleTitle(cycle) {
   return `${deadline.monthName} ${deadline.year} Progress Prizes`;
 }
 
-function smokeDate(runtime, clock) {
-  return runtime.smokeDate ?? clock.now().toISOString().slice(0, 10);
-}
-
-function managedTitle(runtime, clock, role, cycle) {
-  const title = cycleTitle(cycle);
-  if (runtime.environment === AUTOMATION_ENVIRONMENTS.PRODUCTION) return title;
-  return `[SMOKE ${role.toUpperCase()} ${smokeDate(runtime, clock)}] ${title}`;
-}
 
 function publishState(form) {
   const settings = form?.publishSettings;
@@ -391,7 +269,7 @@ function assertSameStructure(source, target) {
 function effectiveCollaboratorPermissions(permissions) {
   // Only writer/commenter entries are reproducible form collaborators. A
   // separate effective-access comparison also detects inherited domain grants
-  // and Shared Drive organizer/fileOrganizer roles before activation.
+  // and Shared Drive organizer/fileOrganizer roles before copying.
   return permissions.filter((permission) => (
     permission
     && permission.deleted !== true
@@ -720,102 +598,12 @@ function assertExpectedPublishing(form, expected) {
   }
 }
 
-function publishingMatches(form, expected) {
-  const actual = publishState(form);
-  return actual.isPublished === expected.isPublished
-    && actual.isAcceptingResponses === expected.isAcceptingResponses;
-}
-
 // The source may already have been closed by hand at or before the deadline.
-// Preparation and activation only need it to stay published; activation closes
-// it if it is still accepting responses.
+// Preparation only needs it to stay published; a human closes it at cutoff.
 function assertSourcePublished(form) {
   if (publishState(form).isPublished !== true) {
     throw new Error('Form publishing state does not match the rollover state');
   }
-}
-
-function activationTransition(sourceSnapshot, targetSnapshot) {
-  const sourceState = sourceSnapshot.file.appProperties?.state;
-  const targetState = targetSnapshot.file.appProperties?.state;
-  const sourceOpen = publishingMatches(sourceSnapshot.form, {
-    isPublished: true,
-    isAcceptingResponses: true,
-  });
-  const sourceClosed = publishingMatches(sourceSnapshot.form, {
-    isPublished: true,
-    isAcceptingResponses: false,
-  });
-  const targetClosed = publishingMatches(targetSnapshot.form, {
-    isPublished: true,
-    isAcceptingResponses: false,
-  });
-  const targetOpen = publishingMatches(targetSnapshot.form, {
-    isPublished: true,
-    isAcceptingResponses: true,
-  });
-
-  if (
-    (sourceOpen || sourceClosed)
-    && targetClosed
-    && targetState === ROLLOVER_FILE_STATES.PREPARED
-    && ![ROLLOVER_FILE_STATES.CLOSED, ROLLOVER_FILE_STATES.ARCHIVED].includes(sourceState)
-  ) return 'prepared';
-  if (
-    sourceOpen
-    && targetClosed
-    && targetState === ROLLOVER_FILE_STATES.ACTIVATING
-    && ![ROLLOVER_FILE_STATES.CLOSED, ROLLOVER_FILE_STATES.ARCHIVED].includes(sourceState)
-  ) return 'recover-intent';
-  if (
-    sourceClosed
-    && targetClosed
-    && sourceState !== ROLLOVER_FILE_STATES.ARCHIVED
-    && targetState === ROLLOVER_FILE_STATES.ACTIVATING
-  ) return 'recover-closed';
-  if (
-    sourceClosed
-    && targetOpen
-    && sourceState === ROLLOVER_FILE_STATES.CLOSED
-    && targetState === ROLLOVER_FILE_STATES.ACTIVATING
-  ) return 'recover-opened';
-  if (
-    sourceClosed
-    && targetOpen
-    && sourceState === ROLLOVER_FILE_STATES.CLOSED
-    && targetState === ROLLOVER_FILE_STATES.ACTIVE
-  ) return 'active';
-  throw new Error('Forms are not in an allowed activation or recovery state');
-}
-
-function reconciliationMarkerState(sourceSnapshot, targetSnapshot, {
-  sourceCycle,
-  targetCycle,
-} = {}) {
-  const sourceProperties = sourceSnapshot.file.appProperties ?? {};
-  const targetProperties = targetSnapshot.file.appProperties ?? {};
-  if (
-    !RECONCILABLE_SOURCE_STATES.has(sourceProperties.state)
-    || !RECONCILABLE_TARGET_STATES.has(targetProperties.state)
-  ) {
-    throw new Error('Drive state metadata is outside guarded active reconciliation');
-  }
-  if (
-    (hasValue(sourceProperties.targetCycle) && sourceProperties.targetCycle !== targetCycle)
-    || (hasValue(targetProperties.sourceCycle) && targetProperties.sourceCycle !== sourceCycle)
-  ) {
-    throw new Error('Drive cycle metadata is outside guarded active reconciliation');
-  }
-  return Object.freeze({
-    healthy: sourceProperties.state === ROLLOVER_FILE_STATES.CLOSED
-      && sourceProperties.targetCycle === targetCycle
-      && targetProperties.state === ROLLOVER_FILE_STATES.ACTIVE
-      && targetProperties.sourceCycle === sourceCycle,
-    sourceState: sourceProperties.state,
-    sourceTargetCycle: sourceProperties.targetCycle,
-    targetState: targetProperties.state,
-    targetSourceCycle: targetProperties.sourceCycle,
-  });
 }
 
 async function ensurePublishState(google, form, expected) {
@@ -847,16 +635,6 @@ function assertSourceCapabilities(file, required = ['canCopy', 'canEdit', 'canSh
   }
 }
 
-function assertReadCopyOnlyCapabilities(file) {
-  assertSourceCapabilities(file, ['canCopy']);
-  if (
-    file?.capabilities?.canEdit !== false
-    || file?.capabilities?.canShare !== false
-  ) {
-    throw new Error('The staging identity has forbidden edit or share access to production');
-  }
-}
-
 function assertUsableFormFile(file) {
   if (file?.mimeType !== GOOGLE_FORM_MIME_TYPE) {
     throw new Error('The configured source is not a Google Form');
@@ -866,21 +644,18 @@ function assertUsableFormFile(file) {
   }
 }
 
-function assertSharedDriveLocation(file, runtime, { requireActiveFolder = true } = {}) {
+function assertSharedDriveLocation(file, runtime) {
   if (file?.driveId !== runtime.driveId) {
     throw new Error('Form is not in the configured Shared Drive');
   }
-  if (requireActiveFolder && !file?.parents?.includes(runtime.folderId)) {
+  if (!file?.parents?.includes(runtime.folderId)) {
     throw new Error('Form is not in the configured active folder');
   }
 }
 
-function assertManagedFile(file, runtime, role, cycle, {
-  state,
-  requireActiveFolder = true,
-} = {}) {
+function assertManagedFile(file, runtime, role, cycle, { state } = {}) {
   assertUsableFormFile(file);
-  assertSharedDriveLocation(file, runtime, { requireActiveFolder });
+  assertSharedDriveLocation(file, runtime);
   const expected = {
     ...managedQuery(runtime, role, cycle),
     ...(state === undefined ? {} : { state }),
@@ -962,12 +737,11 @@ export function createRolloverService({
   page,
   clock,
   runtime: runtimeInput,
-  activationGate,
 } = {}) {
-  assertDependencies({ google, page, clock, activationGate });
+  assertDependencies({ google, page, clock });
   const runtime = assertRolloverRuntimeSafety(runtimeInput);
 
-  async function findManagedFile(role, cycle, { inActiveFolder = true } = {}) {
+  async function findManagedFile(role, cycle) {
     const files = await google.listFilesByAppProperties({
       appProperties: managedQuery(runtime, role, cycle),
       driveId: runtime.driveId,
@@ -976,15 +750,13 @@ export function createRolloverService({
       throw new Error(`Multiple managed ${role} forms exist for cycle ${cycle}; refusing to guess`);
     }
     if (files[0] !== undefined) {
-      assertManagedFile(files[0], runtime, role, cycle, {
-        requireActiveFolder: inActiveFolder,
-      });
+      assertManagedFile(files[0], runtime, role, cycle);
     }
     return files[0];
   }
 
-  async function requireManagedFile(role, cycle, options) {
-    const file = await findManagedFile(role, cycle, options);
+  async function requireManagedFile(role, cycle) {
+    const file = await findManagedFile(role, cycle);
     if (file === undefined) {
       throw new Error(`Managed ${role} form is missing for cycle ${cycle}`);
     }
@@ -996,9 +768,7 @@ export function createRolloverService({
       throw new Error('Resolved source identity changed during preflight');
     }
     if (resolution.origin === SOURCE_ORIGINS.MANAGED) {
-      assertManagedFile(file, runtime, resolution.role, resolution.sourceCycle, {
-        requireActiveFolder: resolution.inActiveFolder,
-      });
+      assertManagedFile(file, runtime, resolution.role, resolution.sourceCycle);
       return;
     }
 
@@ -1012,31 +782,24 @@ export function createRolloverService({
       }
       return;
     }
-    assertSharedDriveLocation(file, runtime, {
-      requireActiveFolder: resolution.inActiveFolder,
-    });
+    assertSharedDriveLocation(file, runtime);
   }
 
-  function sourceResolution(file, origin, {
-    role,
-    sourceCycle,
-    inActiveFolder,
-  }) {
+  function sourceResolution(file, origin, { role, sourceCycle }) {
     const resolution = Object.freeze({
       file,
       origin,
       role,
       sourceCycle,
-      inActiveFolder,
     });
     assertResolvedSourceLocation(resolution, file);
     return resolution;
   }
 
-  async function resolveSource({ sourceFormId, sourceCycle, inActiveFolder = true }) {
+  async function resolveSource({ sourceFormId, sourceCycle }) {
     const [managedTarget, managedSource] = await Promise.all([
-      findManagedFile(ROLLOVER_FILE_ROLES.TARGET, sourceCycle, { inActiveFolder }),
-      findManagedFile(ROLLOVER_FILE_ROLES.SOURCE, sourceCycle, { inActiveFolder }),
+      findManagedFile(ROLLOVER_FILE_ROLES.TARGET, sourceCycle),
+      findManagedFile(ROLLOVER_FILE_ROLES.SOURCE, sourceCycle),
     ]);
     if (managedTarget !== undefined && managedSource !== undefined) {
       throw new Error(`Multiple managed source candidates exist for cycle ${sourceCycle}`);
@@ -1050,7 +813,6 @@ export function createRolloverService({
             ? ROLLOVER_FILE_ROLES.SOURCE
             : ROLLOVER_FILE_ROLES.TARGET,
           sourceCycle,
-          inActiveFolder,
         },
       );
     }
@@ -1065,19 +827,10 @@ export function createRolloverService({
         throw new Error('An explicit fallback cannot claim managed rollover metadata');
       }
       if (file.driveId === undefined || file.driveId === null) {
-        if (runtime.environment !== AUTOMATION_ENVIRONMENTS.PRODUCTION) {
-          throw new Error('A My Drive fallback source is restricted to production');
-        }
-        return sourceResolution(file, SOURCE_ORIGINS.EXPLICIT_MY_DRIVE, {
-          sourceCycle,
-          inActiveFolder,
-        });
+        return sourceResolution(file, SOURCE_ORIGINS.EXPLICIT_MY_DRIVE, { sourceCycle });
       }
-      assertSharedDriveLocation(file, runtime, { requireActiveFolder: inActiveFolder });
-      return sourceResolution(file, SOURCE_ORIGINS.EXPLICIT_SHARED_DRIVE, {
-        sourceCycle,
-        inActiveFolder,
-      });
+      assertSharedDriveLocation(file, runtime);
+      return sourceResolution(file, SOURCE_ORIGINS.EXPLICIT_SHARED_DRIVE, { sourceCycle });
     }
     throw new Error(`Managed source form is missing for cycle ${sourceCycle}`);
   }
@@ -1271,487 +1024,6 @@ export function createRolloverService({
     });
   }
 
-  function bootstrapRewindTransition(sourceSnapshot, targetSnapshot, {
-    sourceCycle,
-    targetCycle,
-  }) {
-    const sourceState = sourceSnapshot.file.appProperties?.state;
-    const targetState = targetSnapshot.file.appProperties?.state;
-    const sourceOpen = publishingMatches(sourceSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: true,
-    });
-    const sourceClosed = publishingMatches(sourceSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: false,
-    });
-    const targetClosed = publishingMatches(targetSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: false,
-    });
-    const sourceRewindBound = sourceSnapshot.file.appProperties?.rewindTargetCycle
-      === targetCycle;
-    const targetRewindBound = targetSnapshot.file.appProperties?.rewindSourceCycle
-      === sourceCycle;
-
-    if (
-      sourceState === ROLLOVER_FILE_STATES.CLOSED
-      && sourceClosed
-      && targetState === ROLLOVER_FILE_STATES.ACTIVATING
-      && targetClosed
-    ) return 'closed-activating';
-    if (
-      sourceState === ROLLOVER_FILE_STATES.CLOSED
-      && sourceClosed
-      && targetState === ROLLOVER_FILE_STATES.REWINDING
-      && targetClosed
-      && targetRewindBound
-    ) return 'target-rewinding';
-    if (
-      sourceState === ROLLOVER_FILE_STATES.ACTIVE
-      && sourceClosed
-      && targetState === ROLLOVER_FILE_STATES.REWINDING
-      && targetClosed
-      && sourceRewindBound
-      && targetRewindBound
-    ) return 'source-armed';
-    if (
-      sourceState === ROLLOVER_FILE_STATES.ACTIVE
-      && sourceClosed
-      && targetState === ROLLOVER_FILE_STATES.PREPARED
-      && targetClosed
-      && sourceRewindBound
-      && targetRewindBound
-    ) return 'target-prepared';
-    if (
-      sourceState === ROLLOVER_FILE_STATES.ACTIVE
-      && sourceOpen
-      && targetState === ROLLOVER_FILE_STATES.PREPARED
-      && targetClosed
-      && sourceRewindBound
-      && targetRewindBound
-    ) return 'rewound';
-    throw new Error('Managed staging forms are not in an allowed activation rewind state');
-  }
-
-  async function loadBootstrapRewindPair({
-    sourceFile,
-    liveSnapshot,
-    sourceCycle,
-    targetCycle,
-    collaboratorPermissions,
-    expectedSourcePermissions,
-  }) {
-    const targetFile = await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle);
-    const [sourceSnapshot, targetSnapshot] = await Promise.all([
-      loadSnapshot(sourceFile),
-      loadSnapshot(targetFile),
-    ]);
-    assertManagedFile(
-      sourceSnapshot.file,
-      runtime,
-      ROLLOVER_FILE_ROLES.SOURCE,
-      sourceCycle,
-    );
-    assertManagedFile(
-      targetSnapshot.file,
-      runtime,
-      ROLLOVER_FILE_ROLES.TARGET,
-      targetCycle,
-    );
-    assertSourceCapabilities(sourceSnapshot.file);
-    assertSourceCapabilities(targetSnapshot.file);
-    assertSameStructure(liveSnapshot.form, sourceSnapshot.form);
-    assertSameStructure(sourceSnapshot.form, targetSnapshot.form);
-    assertTitle(
-      sourceSnapshot.form,
-      sourceSnapshot.file,
-      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle),
-    );
-    assertTitle(
-      targetSnapshot.form,
-      targetSnapshot.file,
-      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
-    );
-    assertPermissionsMatch(expectedSourcePermissions, sourceSnapshot.permissions, { runtime });
-    assertPermissionsMatch(
-      expectedTargetPermissions(
-        sourceSnapshot.permissions,
-        collaboratorPermissions,
-        true,
-        SOURCE_ORIGINS.MANAGED,
-      ),
-      targetSnapshot.permissions,
-      { runtime },
-    );
-    assertSourceFingerprint(targetSnapshot.file, sourceSnapshot.file, runtime, sourceCycle);
-    if (
-      sourceSnapshot.file.appProperties?.targetCycle !== targetCycle
-      || targetSnapshot.file.appProperties?.sourceCycle !== sourceCycle
-    ) {
-      throw new Error('Managed staging activation rewind cycle binding does not match');
-    }
-    return Object.freeze({
-      sourceSnapshot,
-      targetSnapshot,
-      transition: bootstrapRewindTransition(sourceSnapshot, targetSnapshot, {
-        sourceCycle,
-        targetCycle,
-      }),
-    });
-  }
-
-  async function rewindStagingActivation({
-    sourceFile,
-    liveSnapshot,
-    sourceCycle,
-    targetCycle,
-    collaboratorPermissions,
-    expectedSourcePermissions,
-    dryRun,
-  }) {
-    const loadPair = () => loadBootstrapRewindPair({
-      sourceFile,
-      liveSnapshot,
-      sourceCycle,
-      targetCycle,
-      collaboratorPermissions,
-      expectedSourcePermissions,
-    });
-    async function restoreClosedSourceAfterValidationFailure() {
-      try {
-        const sourceForm = await google.getForm({ formId: sourceFile.id });
-        const currentPublishing = publishState(sourceForm);
-        if (!currentPublishing.isAcceptingResponses) return;
-
-        const currentFile = await google.getFile({ fileId: sourceFile.id });
-        assertManagedFile(
-          currentFile,
-          runtime,
-          ROLLOVER_FILE_ROLES.SOURCE,
-          sourceCycle,
-        );
-        const currentState = currentFile.appProperties?.state;
-        const isCloseCheckpoint = currentState === ROLLOVER_FILE_STATES.CLOSED;
-        const isRewindCheckpoint = currentState === ROLLOVER_FILE_STATES.ACTIVE
-          && currentFile.appProperties?.rewindTargetCycle === targetCycle;
-        if (!isCloseCheckpoint && !isRewindCheckpoint) {
-          throw new Error('Source is not bound to this activation rewind');
-        }
-        await ensurePublishState(google, sourceForm, {
-          isPublished: currentPublishing.isPublished,
-          isAcceptingResponses: false,
-        });
-      } catch {
-        throw new Error('Managed staging activation rewind could not restore a closed source');
-      }
-    }
-
-    let pair;
-    try {
-      pair = await loadPair();
-    } catch (error) {
-      if (!dryRun) await restoreClosedSourceAfterValidationFailure();
-      throw error;
-    }
-    if (dryRun || pair.transition === 'rewound') return pair;
-
-    if (pair.transition === 'closed-activating') {
-      await markFile(pair.targetSnapshot.file, ROLLOVER_FILE_STATES.REWINDING, {
-        sourceCycle,
-        rewindSourceCycle: sourceCycle,
-      }, {
-        expectedAppProperties: {
-          state: ROLLOVER_FILE_STATES.ACTIVATING,
-          sourceCycle,
-        },
-      });
-      pair = await loadPair();
-    }
-    if (pair.transition === 'target-rewinding') {
-      // Arm the source marker while the form is still closed. This makes a
-      // failed marker write retryable without ever exposing two open forms.
-      await markFile(pair.sourceSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
-        sourceCycle,
-        targetCycle,
-        rewindTargetCycle: targetCycle,
-      }, {
-        expectedAppProperties: {
-          state: ROLLOVER_FILE_STATES.CLOSED,
-          targetCycle,
-        },
-      });
-      pair = await loadPair();
-    }
-    if (pair.transition === 'source-armed') {
-      await markFile(pair.targetSnapshot.file, ROLLOVER_FILE_STATES.PREPARED, {
-        sourceCycle,
-        rewindSourceCycle: sourceCycle,
-      }, {
-        expectedAppProperties: {
-          state: ROLLOVER_FILE_STATES.REWINDING,
-          sourceCycle,
-          rewindSourceCycle: sourceCycle,
-        },
-      });
-      pair = await loadPair();
-    }
-    if (pair.transition === 'target-prepared') {
-      // Reload immediately before opening, then reload again afterward. If the
-      // closed target or any binding drifts across that boundary, close the
-      // source again before surfacing the failure.
-      pair = await loadPair();
-      try {
-        await ensurePublishState(google, pair.sourceSnapshot.form, {
-          isPublished: true,
-          isAcceptingResponses: true,
-        });
-        pair = await loadPair();
-        if (pair.transition !== 'rewound') {
-          throw new Error('Managed staging activation rewind did not reach its final state');
-        }
-      } catch (error) {
-        await restoreClosedSourceAfterValidationFailure();
-        throw error;
-      }
-    }
-    if (pair.transition !== 'rewound') {
-      throw new Error('Managed staging activation rewind stopped at an unsupported checkpoint');
-    }
-    return pair;
-  }
-
-  async function bootstrapStagingSource({
-    sourceFormId,
-    sourceCycle,
-    targetCycle,
-    collaboratorPermissions = [],
-    dryRun = false,
-    faultInjection,
-    allowActivationRewind = false,
-  } = {}) {
-    assertRolloverRuntimeSafety(runtime, { faultInjection, allowActivationRewind });
-    assertStagingIdentity(runtime);
-    parseCycle(sourceCycle);
-    if (allowActivationRewind) {
-      parseCycle(targetCycle);
-      if (targetCycle !== nextCycle(sourceCycle)) {
-        throw new Error('Activation rewind target cycle must immediately follow the source cycle');
-      }
-    }
-    if (sourceCycle !== INITIAL_EXPLICIT_SOURCE_CYCLE) {
-      throw new Error('Staging bootstrap is restricted to the initial explicit source cycle');
-    }
-    assertNonEmptyString(sourceFormId, 'sourceFormId');
-    assertCollaboratorConfiguration(
-      collaboratorPermissions,
-      runtime.serviceAccountEmail,
-      runtime.driveAdminEmail,
-    );
-
-    const liveFile = await google.getFile({ fileId: sourceFormId });
-    assertUsableFormFile(liveFile);
-    if (
-      (liveFile.driveId !== undefined && liveFile.driveId !== null)
-      || liveFile.appProperties?.managedBy === ROLLOVER_MANAGED_BY
-    ) {
-      throw new Error('Staging bootstrap requires the initial explicit My Drive source');
-    }
-    // Google permits detailed My Drive ACL reads only to writers/owners. The
-    // separately approved production validation checks that ACL; this staging
-    // identity must remain a Viewer and validates only its effective read/copy
-    // capabilities plus the source content and publishing state.
-    const liveSnapshot = await loadReadableSnapshot(liveFile);
-    assertReadCopyOnlyCapabilities(liveSnapshot.file);
-    assertTitle(liveSnapshot.form, liveSnapshot.file, cycleTitle(sourceCycle));
-    assertExpectedPublishing(liveSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: true,
-    });
-    await assertPageState(sourceCycle, liveSnapshot.form.responderUri);
-
-    let stagedFile = await findManagedFile(ROLLOVER_FILE_ROLES.SOURCE, sourceCycle);
-    if (stagedFile === undefined) {
-      await requireDestinationFolder();
-    }
-    if (dryRun && stagedFile === undefined) {
-      return Object.freeze({
-        action: 'bootstrap',
-        status: 'planned',
-        cycle: sourceCycle,
-        title: managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle),
-        created: false,
-        resumed: false,
-      });
-    }
-
-    let created = false;
-    if (stagedFile === undefined) {
-      stagedFile = await google.copyFile({
-        fileId: sourceFormId,
-        name: managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle),
-        parentId: runtime.folderId,
-        appProperties: managedProperties(
-          runtime,
-          ROLLOVER_FILE_ROLES.SOURCE,
-          sourceCycle,
-          ROLLOVER_FILE_STATES.COPIED,
-        ),
-      });
-      assertNonEmptyString(stagedFile?.id, 'copied form ID');
-      // The source copy inherits the live form's accepting state. Close it
-      // before trusting or reconciling any copied Drive metadata or ACLs.
-      const copiedForm = await google.getForm({ formId: stagedFile.id });
-      const closedCopy = await ensurePublishState(google, copiedForm, {
-        isPublished: true,
-        isAcceptingResponses: false,
-      });
-      assertExpectedPublishing(closedCopy, {
-        isPublished: true,
-        isAcceptingResponses: false,
-      });
-      assertManagedFile(
-        stagedFile,
-        runtime,
-        ROLLOVER_FILE_ROLES.SOURCE,
-        sourceCycle,
-        { state: ROLLOVER_FILE_STATES.COPIED },
-      );
-      created = true;
-      if (faultInjection === ROLLOVER_FAULTS.AFTER_COPY) {
-        throw new RolloverFaultError(ROLLOVER_FAULTS.AFTER_COPY);
-      }
-    }
-
-    if (dryRun && !allowActivationRewind) {
-      if (stagedFile !== undefined) {
-        const permissions = await google.getAllPermissions({ fileId: stagedFile.id });
-        assertSharedDriveManagerPermissions(permissions, runtime);
-        assertNoInheritedOrAdministrativeFormCollaborators(permissions, runtime);
-      }
-      return Object.freeze({
-        action: 'bootstrap',
-        status: 'planned',
-        cycle: sourceCycle,
-        title: managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle),
-        created: false,
-        resumed: true,
-      });
-    }
-
-    if (!dryRun && stagedFile.appProperties?.state === ROLLOVER_FILE_STATES.COPIED) {
-      const recoveryForm = await google.getForm({ formId: stagedFile.id });
-      await ensurePublishState(google, recoveryForm, {
-        isPublished: true,
-        isAcceptingResponses: false,
-      });
-    }
-    let stagedSnapshot = await loadSnapshot(stagedFile);
-    assertManagedFile(
-      stagedSnapshot.file,
-      runtime,
-      ROLLOVER_FILE_ROLES.SOURCE,
-      sourceCycle,
-    );
-    assertSourceCapabilities(stagedSnapshot.file);
-    const title = managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle);
-    const expectedPermissions = expectedTargetPermissions(
-      [ANONYMOUS_PUBLISHED_RESPONDER_PERMISSION],
-      collaboratorPermissions,
-      false,
-      SOURCE_ORIGINS.MANAGED,
-    );
-    const stagedState = stagedSnapshot.file.appProperties?.state;
-    const sourceHasRewindBinding = stagedState === ROLLOVER_FILE_STATES.ACTIVE
-      && stagedSnapshot.file.appProperties?.rewindTargetCycle === targetCycle;
-    const needsActivationRewind = allowActivationRewind
-      && (stagedState === ROLLOVER_FILE_STATES.CLOSED || sourceHasRewindBinding);
-    let rewound = false;
-    if (needsActivationRewind) {
-      const pair = await rewindStagingActivation({
-        sourceFile: stagedSnapshot.file,
-        liveSnapshot,
-        sourceCycle,
-        targetCycle,
-        collaboratorPermissions,
-        expectedSourcePermissions: expectedPermissions,
-        dryRun,
-      });
-      stagedSnapshot = pair.sourceSnapshot;
-      rewound = !dryRun;
-    } else if (dryRun) {
-      assertSharedDriveManagerPermissions(stagedSnapshot.permissions, runtime);
-      assertNoInheritedOrAdministrativeFormCollaborators(stagedSnapshot.permissions, runtime);
-    } else {
-      const titled = await updateTitles(stagedSnapshot.file, stagedSnapshot.form, title);
-      stagedSnapshot = {
-        ...stagedSnapshot,
-        ...titled,
-      };
-      stagedSnapshot.permissions = await ensurePermissions(
-        google,
-        stagedSnapshot.file.id,
-        expectedPermissions,
-        { runtime },
-      );
-      assertSameStructure(liveSnapshot.form, stagedSnapshot.form);
-      assertTitle(stagedSnapshot.form, stagedSnapshot.file, title);
-      if (
-        stagedState !== ROLLOVER_FILE_STATES.COPIED
-        && stagedState !== ROLLOVER_FILE_STATES.ACTIVE
-      ) {
-        throw new Error('Managed staging source is not in a bootstrap recovery state');
-      }
-      assertExpectedPublishing(stagedSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: stagedState === ROLLOVER_FILE_STATES.ACTIVE,
-      });
-    }
-
-    if (dryRun) {
-      return Object.freeze({
-        action: 'bootstrap',
-        status: 'planned',
-        cycle: sourceCycle,
-        title,
-        created: false,
-        resumed: true,
-      });
-    }
-
-    const liveAfter = await loadReadableSnapshot(liveFile);
-    if (
-      JSON.stringify(formStructure(liveSnapshot.form)) !== JSON.stringify(formStructure(liveAfter.form))
-      || liveSnapshot.form.info?.title !== liveAfter.form.info?.title
-      || JSON.stringify(publishState(liveSnapshot.form)) !== JSON.stringify(publishState(liveAfter.form))
-      || liveSnapshot.form.responderUri !== liveAfter.form.responderUri
-    ) {
-      throw new Error('Production source changed during staging bootstrap');
-    }
-
-    if (!rewound) {
-      stagedSnapshot.form = await ensurePublishState(google, stagedSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: true,
-      });
-      assertExpectedPublishing(stagedSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: true,
-      });
-      await markFile(stagedSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
-        sourceCycle,
-      });
-    }
-
-    return Object.freeze({
-      action: 'bootstrap',
-      status: 'active',
-      created,
-      resumed: !created,
-      ...publicSummary({ cycle: sourceCycle, title, ...stagedSnapshot }),
-    });
-  }
-
   async function prepare({
     targetCycle,
     sourceFormId,
@@ -1760,10 +1032,7 @@ export function createRolloverService({
     expectedCurrentResponderUri,
     preparationDays = 7,
     dryRun = false,
-    faultInjection,
   } = {}) {
-    assertRolloverRuntimeSafety(runtime, { faultInjection });
-    assertMutationContext(runtime);
     parseCycle(targetCycle);
     const rollover = planRollover({ targetCycle, now: clock.now(), preparationDays });
     if (rollover.phase === ROLLOVER_PHASES.WAITING) {
@@ -1792,12 +1061,7 @@ export function createRolloverService({
     });
     assertRequiredSourcePermissions(sourceSnapshot.permissions, collaboratorPermissions);
     assertSourcePublished(sourceSnapshot.form);
-    const sourceTitle = managedTitle(
-      runtime,
-      clock,
-      ROLLOVER_FILE_ROLES.SOURCE,
-      rollover.sourceCycle,
-    );
+    const sourceTitle = cycleTitle(rollover.sourceCycle);
     assertTitle(sourceSnapshot.form, sourceSnapshot.file, sourceTitle);
     const expectedPermissions = expectedTargetPermissions(
       sourceSnapshot.permissions,
@@ -1811,13 +1075,11 @@ export function createRolloverService({
       throw new Error('Managed page is not at the source or target rollover cycle');
     }
     if (currentPage.cycle === rollover.sourceCycle) {
-      const expectedCurrent = expectedCurrentResponderUri
-        ?? (runtime.environment === AUTOMATION_ENVIRONMENTS.PRODUCTION
-          ? sourceSnapshot.form.responderUri
-          : undefined);
-      if (expectedCurrent !== undefined) {
-        await assertResponderUrisMatch(page, currentPage.responderUri, expectedCurrent);
-      }
+      await assertResponderUrisMatch(
+        page,
+        currentPage.responderUri,
+        expectedCurrentResponderUri ?? sourceSnapshot.form.responderUri,
+      );
     }
 
     let targetFile = await findManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle);
@@ -1837,7 +1099,7 @@ export function createRolloverService({
         status: 'planned',
         sourceCycle: rollover.sourceCycle,
         targetCycle,
-        title: managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
+        title: cycleTitle(targetCycle),
         created: false,
         resumed: false,
       });
@@ -1847,7 +1109,7 @@ export function createRolloverService({
     if (targetFile === undefined) {
       targetFile = await google.copyFile({
         fileId: sourceSnapshot.file.id,
-        name: managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
+        name: cycleTitle(targetCycle),
         parentId: runtime.folderId,
         appProperties: {
           ...managedProperties(
@@ -1887,9 +1149,6 @@ export function createRolloverService({
         rollover.sourceCycle,
       );
       created = true;
-      if (faultInjection === ROLLOVER_FAULTS.AFTER_COPY) {
-        throw new RolloverFaultError(ROLLOVER_FAULTS.AFTER_COPY);
-      }
     }
 
     if (dryRun) {
@@ -1917,7 +1176,7 @@ export function createRolloverService({
         status: 'planned',
         sourceCycle: rollover.sourceCycle,
         targetCycle,
-        title: managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
+        title: cycleTitle(targetCycle),
         created: false,
         resumed: true,
         responderUri: assertPublicResponderUri(existing.form.responderUri),
@@ -1944,7 +1203,7 @@ export function createRolloverService({
       isPublished: true,
       isAcceptingResponses: false,
     });
-    const title = managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle);
+    const title = cycleTitle(targetCycle);
     const titled = await updateTitles(targetSnapshot.file, targetSnapshot.form, title);
     targetSnapshot = { ...targetSnapshot, ...titled };
     targetSnapshot.permissions = await ensurePermissions(
@@ -2001,29 +1260,32 @@ export function createRolloverService({
     });
   }
 
-  async function loadActivationPair({
+  async function verify({
     targetCycle,
     sourceFormId,
-    collaboratorPermissions,
-    copySourceCollaborators,
-    sourceCycle,
-  }) {
+    collaboratorPermissions = [],
+    copySourceCollaborators = true,
+  } = {}) {
+    parseCycle(targetCycle);
+    assertCollaboratorConfiguration(
+      collaboratorPermissions,
+      runtime.serviceAccountEmail,
+      runtime.driveAdminEmail,
+    );
+    const sourceCycle = previousCycle(targetCycle);
     const source = await resolveSource({ sourceFormId, sourceCycle });
     const targetFile = await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle);
     const [sourceSnapshot, targetSnapshot] = await Promise.all([
       loadSnapshot(source.file),
       loadSnapshot(targetFile),
     ]);
-    assertResolvedSourceAccess(source, sourceSnapshot);
-    assertManagedFile(
-      targetSnapshot.file,
-      runtime,
-      ROLLOVER_FILE_ROLES.TARGET,
-      targetCycle,
-    );
-    assertSourceCapabilities(targetSnapshot.file);
+    assertManagedFile(targetSnapshot.file, runtime, ROLLOVER_FILE_ROLES.TARGET, targetCycle);
     assertSourceFingerprint(targetSnapshot.file, sourceSnapshot.file, runtime, sourceCycle);
+    assertResolvedSourceAccess(source, sourceSnapshot);
+    assertSourceCapabilities(targetSnapshot.file);
     assertSameStructure(sourceSnapshot.form, targetSnapshot.form);
+    assertTitle(sourceSnapshot.form, sourceSnapshot.file, cycleTitle(sourceCycle));
+    assertTitle(targetSnapshot.form, targetSnapshot.file, cycleTitle(targetCycle));
     assertRequiredSourcePermissions(sourceSnapshot.permissions, collaboratorPermissions);
     assertPermissionsMatch(
       expectedTargetPermissions(
@@ -2035,485 +1297,24 @@ export function createRolloverService({
       targetSnapshot.permissions,
       { runtime },
     );
-    assertTitle(
-      sourceSnapshot.form,
-      sourceSnapshot.file,
-      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle),
-    );
-    assertTitle(
-      targetSnapshot.form,
-      targetSnapshot.file,
-      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
-    );
-    await assertPageState(targetCycle, targetSnapshot.form.responderUri);
-    return Object.freeze({
-      source,
-      sourceSnapshot,
-      targetSnapshot,
-    });
-  }
-
-  async function loadActivationState(options) {
-    const pair = await loadActivationPair(options);
-    return Object.freeze({
-      ...pair,
-      transition: activationTransition(pair.sourceSnapshot, pair.targetSnapshot),
-    });
-  }
-
-  async function activate({
-    targetCycle,
-    sourceFormId,
-    collaboratorPermissions = [],
-    copySourceCollaborators = true,
-    preparationDays = 7,
-    faultInjection,
-    headSha,
-  } = {}) {
-    assertRolloverRuntimeSafety(runtime, { faultInjection });
-    assertMutationContext(runtime);
-    parseCycle(targetCycle);
-    const rollover = planRollover({ targetCycle, now: clock.now(), preparationDays });
-    if (rollover.phase !== ROLLOVER_PHASES.ACTIVATE) {
-      throw new Error('Activation is forbidden before the source-cycle cutoff');
-    }
-    assertCollaboratorConfiguration(
-      collaboratorPermissions,
-      runtime.serviceAccountEmail,
-      runtime.driveAdminEmail,
-    );
-
-    const initialState = await loadActivationState({
-      targetCycle,
-      sourceFormId,
-      collaboratorPermissions,
-      copySourceCollaborators,
-      sourceCycle: rollover.sourceCycle,
-    });
-
-    if (activationGate === undefined) {
-      throw new Error('Activation requires an injected successful code and Vercel preview gate');
-    }
-    if (runtime.environment === AUTOMATION_ENVIRONMENTS.PRODUCTION) {
-      assertNonEmptyString(headSha, 'headSha');
-    }
-    const gate = await activationGate({
-      targetCycle,
-      responderUri: initialState.targetSnapshot.form.responderUri,
-      branch: runtime.branch,
-      targetBranch: runtime.targetBranch,
-      headSha,
-    });
-    if (gate !== true && gate?.ok !== true) {
-      throw new Error('Code checks and Vercel preview gate did not pass for activation');
-    }
-
-    const currentState = await loadActivationState({
-      targetCycle,
-      sourceFormId,
-      collaboratorPermissions,
-      copySourceCollaborators,
-      sourceCycle: rollover.sourceCycle,
-    });
-    await assertResponderUrisMatch(
-      page,
-      currentState.targetSnapshot.form.responderUri,
-      initialState.targetSnapshot.form.responderUri,
-    );
-
-    if (currentState.transition === 'active') {
-      return Object.freeze({
-        action: 'activate',
-        status: 'active',
-        sourceCycle: rollover.sourceCycle,
-        targetCycle,
-        sourceAcceptingResponses: false,
-        targetAcceptingResponses: true,
-        responderUri: assertPublicResponderUri(currentState.targetSnapshot.form.responderUri),
-      });
-    }
-
-    if (currentState.transition === 'prepared') {
-      await markFile(currentState.targetSnapshot.file, ROLLOVER_FILE_STATES.ACTIVATING, {
-        sourceCycle: rollover.sourceCycle,
-      });
-    }
-
-    let sourceForm = currentState.sourceSnapshot.form;
-    if (currentState.transition !== 'recover-opened') {
-      sourceForm = await ensurePublishState(google, currentState.sourceSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: false,
-      });
-      await markFile(currentState.sourceSnapshot.file, ROLLOVER_FILE_STATES.CLOSED, {
-        targetCycle,
-      });
-      if (faultInjection === ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE) {
-        throw new RolloverFaultError(ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE);
-      }
-    }
-
-    const targetForm = await ensurePublishState(google, currentState.targetSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: true,
-    });
-    await markFile(currentState.targetSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
-      sourceCycle: rollover.sourceCycle,
-    });
-
-    assertExpectedPublishing(sourceForm, {
+    assertSourcePublished(sourceSnapshot.form);
+    assertExpectedPublishing(targetSnapshot.form, {
       isPublished: true,
       isAcceptingResponses: false,
     });
-    assertExpectedPublishing(targetForm, {
-      isPublished: true,
-      isAcceptingResponses: true,
-    });
-
-    // Do not treat the mutation responses as proof of a completed rollover.
-    // Reload both resources so a concurrent ACL, title, structure, metadata,
-    // binding, marker, or publish-state change cannot escape the activation
-    // boundary and allow the website PR to merge against an invalid form pair.
-    const finalState = await loadActivationState({
-      targetCycle,
-      sourceFormId,
-      collaboratorPermissions,
-      copySourceCollaborators,
-      sourceCycle: rollover.sourceCycle,
-    });
-    await assertResponderUrisMatch(
-      page,
-      finalState.targetSnapshot.form.responderUri,
-      initialState.targetSnapshot.form.responderUri,
-    );
-    if (finalState.transition !== 'active') {
-      throw new Error('Activation did not reach the fully verified active transition');
-    }
-
-    return Object.freeze({
-      action: 'activate',
-      status: 'active',
-      sourceCycle: rollover.sourceCycle,
-      targetCycle,
-      sourceAcceptingResponses: false,
-      targetAcceptingResponses: true,
-      responderUri: assertPublicResponderUri(finalState.targetSnapshot.form.responderUri),
-    });
-  }
-
-  async function reconcileActive({
-    targetCycle,
-    sourceFormId,
-    collaboratorPermissions = [],
-    copySourceCollaborators = true,
-  } = {}) {
-    if (runtime.eventName !== 'workflow_dispatch') {
-      throw new Error('Active-state reconciliation requires a manual workflow_dispatch event');
-    }
-    if (hasValue(runtime.simulatedNow)) {
-      throw new Error('Active-state reconciliation rejects simulated clocks');
-    }
-    assertMutationContext(runtime);
-    parseCycle(targetCycle);
-    const sourceCycle = previousCycle(targetCycle);
-    assertCollaboratorConfiguration(
-      collaboratorPermissions,
-      runtime.serviceAccountEmail,
-      runtime.driveAdminEmail,
-    );
-
-    const loadAudit = async () => {
-      const pair = await loadActivationPair({
-        targetCycle,
-        sourceFormId,
-        collaboratorPermissions,
-        copySourceCollaborators,
-        sourceCycle,
-      });
-      assertExpectedPublishing(pair.sourceSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: false,
-      });
-      assertExpectedPublishing(pair.targetSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: true,
-      });
-      return Object.freeze({
-        ...pair,
-        markers: reconciliationMarkerState(pair.sourceSnapshot, pair.targetSnapshot, {
-          sourceCycle,
-          targetCycle,
-        }),
-      });
-    };
-
-    let audit = await loadAudit();
-    const reconciliationRequired = !audit.markers.healthy;
-    if (reconciliationRequired) {
-      if (
-        audit.markers.sourceState !== ROLLOVER_FILE_STATES.CLOSED
-        || audit.markers.sourceTargetCycle !== targetCycle
-      ) {
-        await markFile(audit.sourceSnapshot.file, ROLLOVER_FILE_STATES.CLOSED, {
-          targetCycle,
-        }, {
-          expectedAppProperties: {
-            state: audit.markers.sourceState,
-            targetCycle: audit.markers.sourceTargetCycle,
-          },
-        });
-      }
-      if (
-        audit.markers.targetState !== ROLLOVER_FILE_STATES.ACTIVE
-        || audit.markers.targetSourceCycle !== sourceCycle
-      ) {
-        await markFile(audit.targetSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
-          sourceCycle,
-        }, {
-          expectedAppProperties: {
-            state: audit.markers.targetState,
-            sourceCycle: audit.markers.targetSourceCycle,
-          },
-        });
-      }
-      audit = await loadAudit();
-      if (!audit.markers.healthy) {
-        throw new Error('Active-state reconciliation did not reach the exact managed marker state');
-      }
-    }
-
-    return Object.freeze({
-      action: 'reconcile-active',
-      status: 'active',
-      sourceCycle,
-      targetCycle,
-      reconciled: reconciliationRequired,
-      sourceAcceptingResponses: false,
-      targetAcceptingResponses: true,
-      responderUri: assertPublicResponderUri(audit.targetSnapshot.form.responderUri),
-    });
-  }
-
-  async function verify({
-    targetCycle,
-    sourceFormId,
-    mode = 'prepared',
-    collaboratorPermissions = [],
-    copySourceCollaborators = true,
-  } = {}) {
-    parseCycle(targetCycle);
-    if (!ALLOWED_VERIFY_MODES.has(mode)) {
-      throw new Error('verify mode must be prepared, active, or cleaned');
-    }
-    assertCollaboratorConfiguration(
-      collaboratorPermissions,
-      runtime.serviceAccountEmail,
-      runtime.driveAdminEmail,
-    );
-    const sourceCycle = previousCycle(targetCycle);
-    const inActiveFolder = mode !== 'cleaned';
-    const source = mode === 'cleaned'
-      ? Object.freeze({
-        file: await requireManagedFile(
-          ROLLOVER_FILE_ROLES.SOURCE,
-          sourceCycle,
-          { inActiveFolder: false },
-        ),
-        origin: SOURCE_ORIGINS.MANAGED,
-      })
-      : await resolveSource({ sourceFormId, sourceCycle, inActiveFolder });
-    const targetFile = await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle, {
-      inActiveFolder,
-    });
-    const [sourceSnapshot, targetSnapshot] = await Promise.all([
-      loadSnapshot(source.file),
-      loadSnapshot(targetFile),
-    ]);
-    if (mode === 'cleaned') {
-      assertSharedDriveManagerPermissions(sourceSnapshot.permissions, runtime);
-      assertNoInheritedOrAdministrativeFormCollaborators(sourceSnapshot.permissions, runtime);
-    }
-    assertManagedFile(
-      targetSnapshot.file,
-      runtime,
-      ROLLOVER_FILE_ROLES.TARGET,
-      targetCycle,
-      { requireActiveFolder: inActiveFolder },
-    );
-    assertSourceFingerprint(targetSnapshot.file, sourceSnapshot.file, runtime, sourceCycle);
-    if (mode !== 'cleaned') {
-      assertResolvedSourceAccess(source, sourceSnapshot);
-      assertSourceCapabilities(targetSnapshot.file);
-    }
-    assertSameStructure(sourceSnapshot.form, targetSnapshot.form);
-    assertTitle(
-      sourceSnapshot.form,
-      sourceSnapshot.file,
-      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle),
-    );
-    assertTitle(
-      targetSnapshot.form,
-      targetSnapshot.file,
-      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
-    );
-
-    if (mode !== 'cleaned') {
-      assertRequiredSourcePermissions(sourceSnapshot.permissions, collaboratorPermissions);
-    }
-    const expectedPermissions = expectedTargetPermissions(
-      sourceSnapshot.permissions,
-      collaboratorPermissions,
-      copySourceCollaborators,
-      source.origin,
-    );
-    assertPermissionsMatch(
-      expectedPermissions,
-      targetSnapshot.permissions,
-      { runtime },
-    );
-
-    if (mode === 'prepared') {
-      assertSourcePublished(sourceSnapshot.form);
-      assertExpectedPublishing(targetSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: false,
-      });
-    } else if (mode === 'active') {
-      assertExpectedPublishing(sourceSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: false,
-      });
-      assertExpectedPublishing(targetSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: true,
-      });
-      const markers = reconciliationMarkerState(sourceSnapshot, targetSnapshot, {
-        sourceCycle,
-        targetCycle,
-      });
-      if (!markers.healthy) {
-        throw new Error('Active form pair has stale managed Drive state metadata');
-      }
-    } else {
-      assertStagingIdentity(runtime);
-      assertNonEmptyString(runtime.archiveFolderId, 'archiveFolderId');
-      assertExpectedPublishing(sourceSnapshot.form, {
-        isPublished: false,
-        isAcceptingResponses: false,
-      });
-      assertExpectedPublishing(targetSnapshot.form, {
-        isPublished: false,
-        isAcceptingResponses: false,
-      });
-      if (
-        filterPublishedResponderPermissions(sourceSnapshot.permissions).length > 0
-        || filterPublishedResponderPermissions(targetSnapshot.permissions).length > 0
-      ) {
-        throw new Error('Cleaned staging forms still have public responder permissions');
-      }
-      for (const file of [sourceSnapshot.file, targetSnapshot.file]) {
-        if (
-          file.appProperties?.state !== ROLLOVER_FILE_STATES.ARCHIVED
-          || !file.parents?.includes(runtime.archiveFolderId)
-          || file.parents?.includes(runtime.folderId)
-        ) {
-          throw new Error('Cleaned staging forms are not in the configured archive state');
-        }
-      }
-    }
-
-    if (mode !== 'cleaned') {
-      await assertPageState(targetCycle, targetSnapshot.form.responderUri);
-    }
+    await assertPageState(targetCycle, targetSnapshot.form.responderUri);
     return Object.freeze({
       action: 'verify',
       status: 'valid',
-      mode,
       sourceCycle,
       targetCycle,
       responderUri: assertPublicResponderUri(targetSnapshot.form.responderUri),
     });
   }
 
-  async function cleanup({ targetCycle } = {}) {
-    assertStagingIdentity(runtime);
-    parseCycle(targetCycle);
-    assertNonEmptyString(runtime.archiveFolderId, 'archiveFolderId');
-    const sourceCycle = previousCycle(targetCycle);
-    const formFiles = [
-      await requireManagedFile(ROLLOVER_FILE_ROLES.SOURCE, sourceCycle, { inActiveFolder: false }),
-      await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle, { inActiveFolder: false }),
-    ];
-
-    const permissionsByFile = new Map(await Promise.all(formFiles.map(async (file) => {
-      const permissions = await google.getAllPermissions({ fileId: file.id });
-      assertSharedDriveManagerPermissions(permissions, runtime);
-      assertNoInheritedOrAdministrativeFormCollaborators(permissions, runtime);
-      return [file.id, permissions];
-    })));
-
-    for (const file of formFiles) {
-      let form = await google.getForm({ formId: file.id });
-      form = await ensurePublishState(google, form, {
-        isPublished: false,
-        isAcceptingResponses: false,
-      });
-      const permissions = permissionsByFile.get(file.id);
-      for (const permission of filterPublishedResponderPermissions(permissions)) {
-        await google.deletePermission({ fileId: file.id, permissionId: permission.id });
-      }
-
-      const current = await google.getFile({ fileId: file.id });
-      const parents = current.parents ?? [];
-      const needsParentMove = !parents.includes(runtime.archiveFolderId)
-        || parents.includes(runtime.folderId);
-      const appProperties = {
-        ...(current.appProperties ?? {}),
-        state: ROLLOVER_FILE_STATES.ARCHIVED,
-      };
-      const needsState = current.appProperties?.state !== ROLLOVER_FILE_STATES.ARCHIVED;
-      if (needsParentMove || needsState) {
-        await google.updateFile({
-          fileId: file.id,
-          appProperties,
-          addParentIds: parents.includes(runtime.archiveFolderId)
-            ? undefined
-            : [runtime.archiveFolderId],
-          removeParentIds: parents.includes(runtime.folderId)
-            ? [runtime.folderId]
-            : undefined,
-        });
-      }
-      const archived = await google.getFile({ fileId: file.id });
-      if (
-        archived.appProperties?.state !== ROLLOVER_FILE_STATES.ARCHIVED
-        || !archived.parents?.includes(runtime.archiveFolderId)
-        || archived.parents?.includes(runtime.folderId)
-      ) {
-        throw new Error('Staging form could not be verified in the configured archive');
-      }
-      assertExpectedPublishing(form, {
-        isPublished: false,
-        isAcceptingResponses: false,
-      });
-    }
-
-    return Object.freeze({
-      action: 'cleanup',
-      status: 'archived',
-      sourceCycle,
-      targetCycle,
-      archivedCount: formFiles.length,
-    });
-  }
-
   return Object.freeze({
     validate,
-    bootstrapStagingSource,
     prepare,
-    activate,
-    reconcileActive,
     verify,
-    cleanup,
   });
 }

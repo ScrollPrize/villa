@@ -16,13 +16,13 @@ import tempfile
 import uuid as uuidlib
 
 import numpy as np
-from vc_object_store import Fiber, ObjectStore, CollectionReader, import_initial_records, geometry_scale_to_volume
+from vc_object_store import Fiber, ObjectStore, import_initial_records, canonical_uuid, geometry_scale_to_volume, object_reference
+from vc_object_store.derivation import derived_metadata
 from vesuvius.neural_tracing.tracers.shared.annotations.repair import ANNOTATION_REPAIR, repair_kinks
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
 from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_ids
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, dense_line
 
-PAGE = 8192
 WRITE_BATCH = 256
 
 
@@ -32,80 +32,67 @@ def open_store(path):
 
 
 def fiber_volume(path):
-    """The one volume every fiber is bound to, across the complete collection."""
-    with CollectionReader(str(path)) as store:
-        records = store.objects('fiber')
-    return _fiber_records_volume(records,path)
+    """The one volume every fiber of the store is bound to; raises when they are unbound or bound to several."""
+    with open_store(path) as store:
+        records = store.select_objects(object_kind='fiber', fields=['meta'])
+        return _fiber_records_volume(records, path)
 
 
 def _fiber_records_volume(records, path):
-    """Resolve the unique source frame from an already-loaded record snapshot."""
     if not records:
         raise ValueError(f'No fibers in {path}')
-    volumes = {(r['meta'].get('coordinates') or {}).get('volume_uuid') for r in records}
-    if None in volumes or len(volumes) != 1:
+    volume = (records[0]['meta'].get('coordinates') or {}).get('volume_uuid')
+    if volume is None or any(geometry_scale_to_volume(row['meta'], volume) is None for row in records):
         raise ValueError(f'Fibers in {path} must be bound to one volume')
-    return volumes.pop()
+    return volume
 
 
-def fiber_catalog(path, volume=None):
-    """UUID-ordered catalog; omitted volume uses the unique source frame.
-
-    Shards/references are included, geometry is not decoded, and source-frame
-    inference reuses the same loaded record snapshot rather than rescanning.
-    """
-    with CollectionReader(str(path)) as store:
-        records = store.objects('fiber')
-    if volume is None:volume=_fiber_records_volume(records,path)
-    rows = []
-    for record in records:
-        fiber = record.get('fiber') or {}
-        scale = geometry_scale_to_volume(record['meta'], volume)
-        if scale is None or fiber.get('line_point_count', 0) < 2:
-            continue
-        bbox = fiber.get('bbox')
-        rows.append(dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
-                         length=fiber['length']*scale, point_count=fiber['line_point_count'],
-                         bbox=None if bbox is None else [v*scale for v in bbox], scale=scale, meta=record['meta']))
-    return rows
+def fiber_catalog(path, volume=None, *, source_version=None):
+    """Catalog rows of the fibers bound to ``volume``, in UUID order, measured from selected geometry:
+    dict(id, name, family, length, point_count, bbox, scale, reference); length and bbox (minx,miny,minz,maxx,maxy,maxz, or
+    None) are volume voxels. Frozen evidence can require its recorded ``source_version``."""
+    with open_store(path) as store:
+        _require_source_version(store, source_version)
+        rows = _catalog(store, volume)
+        _require_source_version(store, source_version)
+        return rows
 
 
-def iter_polylines(path, fiber_ids=None, *, volume=None):
-    """Raw UUID-ordered line points in volume voxels, without repair or resampling."""
-    volume = volume or fiber_volume(path)
-    selected = None if fiber_ids is None else sorted(set(map(str, fiber_ids)))
-    with CollectionReader(str(path)) as store:
-        if selected is None:
-            records = [r for r in store.objects('fiber')
-                       if geometry_scale_to_volume(r['meta'], volume) is not None
-                       and (r.get('fiber') or {}).get('line_point_count', 0) >= 2]
-        else:
-            records = [store.object(fid) for fid in selected]
-            if any(r is None or r['kind'] != 'fiber' for r in records):
-                raise ValueError('Unknown requested fiber')
-        # Bounded native geometry batches, not one Python/native call per sample.
-        for begin in range(0, len(records), PAGE):
-            batch = records[begin:begin+PAGE]
-            # Same-volume scalar conversion preserves the existing fast path;
-            # registered frames use the shared native double-precision affine.
-            mapped=any(geometry_scale_to_volume(r['meta'],volume) is None for r in batch)
-            arrays = store.geometry_arrays([r['uuid'] for r in batch], 'line_points',volume if mapped else None)
-            for record, array in zip(batch, arrays):
-                scale = 1. if mapped else geometry_scale_to_volume(record['meta'], volume)
-                xyz = np.frombuffer(array['data'], dtype=array['dtype']).reshape(array['shape']).astype(np.float64)
-                if scale is None or xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) < 2:
-                    raise ValueError(f'Fiber {record["uuid"]} is unbound or has no line')
+def _catalog(store, volume):
+    records = store.select_objects(object_kind='fiber', volume=volume, fields=['name', 'fiber', 'meta'])
+    volume = volume or _fiber_records_volume(records, 'fiber store')
+    return [row for row, _ in _read_rows(store, records, volume, require_lines=False)]
+
+
+def _read_rows(store, records, volume, *, require_lines=True):
+    # One selected identity per object; bound payload memory rather than loading
+    # an entire volume merely to derive current lengths/counts/bounds.
+    for start in range(0, len(records), WRITE_BATCH):
+        selected = records[start:start+WRITE_BATCH]
+        with store.graph_read(versions=[object_reference(r) for r in selected]) as view:
+            packed = view.read_geometry_arrays('line_points')
+            values, offsets = packed.values, packed.offsets
+            for node, record in enumerate(view.objects(['name', 'fiber', 'meta'])):
+                scale = geometry_scale_to_volume(record['meta'], volume)
+                xyz = np.array(values[offsets[node]:offsets[node+1]], dtype=np.float64)
+                if scale is None:
+                    # Registered affine frames use the native selected-state mapping,
+                    # not a reconstructed current owner or Python transform policy.
+                    with view.geometry_snapshot() as snapshot:
+                        selected_view = snapshot.fiber(object_reference(record))
+                        xyz = np.asarray(selected_view.view_transformed_at(volume).points(
+                            'line_points', 0, len(xyz)), dtype=np.float64)
+                    scale = 1.
+                if len(xyz) < 2:
+                    if require_lines:
+                        raise ValueError(f'Fiber {record["uuid"]} is not bound to volume {volume} or has no line')
+                    continue
                 xyz *= scale
                 fiber = record.get('fiber') or {}
-                yield (dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
-                                    length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
-                                    point_count=len(xyz), meta=record['meta']), xyz)
-
-
-
-def read_polylines(path, fiber_ids=None, *, volume=None):
-    """Materialize raw curves; use iter_polylines for bounded streaming."""
-    return list(iter_polylines(path, fiber_ids, volume=volume))
+                yield dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
+                           length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
+                           point_count=len(xyz), bbox=[*map(float, xyz.min(0)), *map(float, xyz.max(0))],
+                           scale=scale, meta=record['meta'], reference=object_reference(record)), xyz
 
 
 class FiberBlockIndex:
@@ -139,34 +126,101 @@ class FiberBlockIndex:
         return selected
 
 
-FIBERS_DIGEST_FORMAT = 'fibers_digest v2'
+def _source_version(store):
+    status = store.status()
+    return {key: status[key] for key in ('store', 'generation', 'commit_sequence')}
 
 
-def fibers_digest(path, fiber_ids=None):
-    """Content digest of a store's live fibers (all, or the given ones): SHA-256 over a format tag and each fiber's
-    UUID and numbered version (with its history generation), in UUID order, read in one snapshot. A store file's
-    bytes are not a stable identity (WAL). Format v2 (numbered versions) never equals a v1 digest (geometry
-    revision UUIDs and record generations), so data derived under v1 is reported changed and must be regenerated."""
-    selected = [] if fiber_ids is None else sorted(set(map(str, fiber_ids)))
-    with CollectionReader(str(path)) as store:
-        rows = store.objects('fiber') if fiber_ids is None else [store.object(fid) for fid in selected]
-        if any(row is None for row in rows):
+def fiber_source_version(path):
+    """Compact source identity for frozen evidence, including coordinate-registration changes."""
+    with open_store(path) as store:
+        return _source_version(store)
+
+
+def _require_source_version(store, expected):
+    if expected is not None and expected != _source_version(store):
+        raise ValueError('Fiber source changed or missing source version; regenerate frozen evidence')
+
+
+def _position(store):
+    return tuple(_source_version(store).values())
+
+
+def iter_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
+    """[(row, xyz)] of the requested fibers (all bound ones when None), in UUID order; xyz are the raw line points in
+    volume voxels (no repair or densifying). row = dict(id, name, family, length, point_count, meta, reference). ``volume``
+    defaults to the store's one volume (fiber_volume). Raises for an unknown, unbound or line-less requested fiber.
+    Frozen evidence supplies ``source_version``; both sides of the read must match that store snapshot."""
+    volume = volume or fiber_volume(path)
+    selected = None if fiber_ids is None else sorted({canonical_uuid(str(fid)) for fid in fiber_ids})
+    with open_store(path) as store:
+        _require_source_version(store, source_version)
+        if selected == []:
+            return
+        records = store.select_objects(object_kind='fiber', object_uuids=selected or [],
+                                       volume=volume, fields=['name', 'fiber', 'meta'])
+        if selected is not None and sorted(r['uuid'] for r in records) != selected:
             raise ValueError('Unknown requested fiber')
+        yield from _read_rows(store, sorted(records, key=lambda r: r['uuid']), volume,
+                              require_lines=selected is not None)
+        _require_source_version(store, source_version)
+
+
+def read_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
+    """Materialize raw curves; use iter_polylines for bounded streaming with the same source pin."""
+    return list(iter_polylines(path, fiber_ids, volume=volume, source_version=source_version))
+
+
+FIBERS_DIGEST_FORMAT = 'fibers_digest v3'
+
+
+def fibers_digest(path, fiber_ids=None, *, source_version=None):
+    """Content digest of a store's live fibers (all, or the given ones): SHA-256 over a format tag and each fiber's
+    complete owning-store/generation/object/version identity, in UUID order, read in one snapshot.
+    Format v3 includes source ownership, so divergent branches cannot collide at equal version counters."""
+    selected = [] if fiber_ids is None else sorted({canonical_uuid(str(fid)) for fid in fiber_ids})
+    with open_store(path) as store:
+        _require_source_version(store, source_version)
+        rows = (store.select_objects(object_kind='fiber', object_uuids=selected, fields=['name'])
+                if selected or fiber_ids is None else [])
+        _require_source_version(store, source_version)
     if fiber_ids is not None and sorted(r['uuid'] for r in rows) != selected:
         raise ValueError('Unknown requested fiber')
+    return _references_digest(object_reference(row) for row in rows)
+
+
+def verify_fiber_source(path, digest, source_version=None):
+    """Validate saved evidence and return the snapshot to use for subsequent reads."""
+    version = source_version if source_version is not None else fiber_source_version(path)
+    if fibers_digest(path, source_version=version) != digest:
+        raise ValueError('Saved fiber source differs; regenerate frozen evidence')
+    return version
+
+
+def verify_fiber_signature(path, signature):
+    """Validate flat or subset tensor provenance and return digest and pin."""
+    digest = (signature.get('inputs') or signature).get('fibers')
+    if not digest:
+        raise ValueError('Saved tensors have no fiber provenance; regenerate frozen evidence')
+    return digest, verify_fiber_source(path, digest, signature.get('fiber_source'))
+
+
+def _references_digest(references):
     digest = hashlib.sha256(f'{FIBERS_DIGEST_FORMAT}\n'.encode())
-    for row in sorted(rows, key=lambda r: r['uuid']):
-        digest.update(f"{row['uuid']} {row['version_generation']} {row['version']}\n".encode())
+    for ref in sorted(references, key=lambda r: r['object']):
+        digest.update(f"{ref['store']} {ref['generation']} {ref['object']} {ref['version']}\n".encode())
     return digest.hexdigest()
 
 
-def write_fibers(destination, fibers, *, volume, author=None):
+def write_fibers(destination, fibers, *, volume, author=None, metadata_policy='portable', replace=False):
     """A new store holding ``fibers``: (row, xyz) pairs, xyz in voxels of ``volume`` (bound with scale 1). row keys:
     id (a UUID to keep, or absent/None for a new one), name, family, optional meta (its coordinates are replaced).
     Each fiber gets end-point controls 0,1 and every sample as line points. Written to a sibling staging file and
-    renamed into place; an existing destination is refused. Returns dict(fibers, points, ids)."""
+    published into place; an existing destination is refused unless replace=True. Managed extension/artifact descriptors are rejected
+    unless metadata_policy='geometry_only' explicitly requests new geometry without those payloads.
+    This is a derived-data writer, not a store/relationship/history copy. Returns dict(fibers, points, ids)."""
     destination = Path(destination)
-    if destination.exists():
+    if destination.exists() and not replace:
         raise FileExistsError(f'{destination} exists')
     destination.parent.mkdir(parents=True, exist_ok=True)
     coordinates = dict(volume_uuid=str(volume), scale_factor=1)
@@ -189,7 +243,7 @@ def write_fibers(destination, fibers, *, volume, author=None):
                 xyz = np.ascontiguousarray(xyz, dtype='<f8')
                 if xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) < 2 or not np.isfinite(xyz).all():
                     raise ValueError(f'Invalid polyline for fiber {row.get("id")}')
-                fid = str(uuidlib.UUID(str(row['id']))) if row.get('id') else str(uuidlib.uuid4())
+                fid = canonical_uuid(str(row['id'])) if row.get('id') else str(uuidlib.uuid4())
                 ids.append(fid)
                 points_total += len(xyz)
                 record = dict(uuid=fid, kind='fiber', name=row.get('name', ''), format_version=4,
@@ -197,7 +251,8 @@ def write_fibers(destination, fibers, *, volume, author=None):
                                          line_point_count=len(xyz),
                                          length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
                                          bbox=[*map(float, xyz.min(0)), *map(float, xyz.max(0))]),
-                              meta={**(row.get('meta') or {}), 'coordinates': coordinates})
+                              meta={**derived_metadata(row.get('meta') or {}, policy=metadata_policy,
+                                                       reference=row.get('reference')), 'coordinates': coordinates})
                 pending.append((record, Fiber.from_arrays(np.ascontiguousarray(xyz[[0, -1]]), xyz)))
                 if len(pending) >= WRITE_BATCH:
                     flush()
@@ -206,7 +261,10 @@ def write_fibers(destination, fibers, *, volume, author=None):
             raise ValueError('Duplicate fiber UUID')
         if any(Path(str(staged)+suffix).exists() for suffix in ('-wal', '-shm')):
             raise RuntimeError('Store was not checkpointed on close')
-        os.link(staged, destination)
+        if replace:
+            staged.replace(destination)
+        else:
+            os.link(staged, destination)
     return dict(fibers=len(ids), points=points_total, ids=ids)
 
 
@@ -261,7 +319,10 @@ class FiberStore(Sequence):
         self._store = None
         self._pid = None
         self._cache = OrderedDict()
-        self.catalog = fiber_catalog(self.path, self.volume)
+        with open_store(self.path) as store:
+            self._position = _position(store)
+            self.catalog = _catalog(store, self.volume)
+            self._require_unchanged(store)
         if validation is not None:
             heldout = heldout_ids([r['id'] for r in self.catalog], validation)
             if split != 'all':
@@ -286,11 +347,23 @@ class FiberStore(Sequence):
     def __len__(self):
         return len(self.catalog)
 
+    def require_digest(self, expected):
+        """Reject a cached selection from another source before interpreting its ordinal indices."""
+        self._require_unchanged()
+        if not expected or expected != fibers_digest(self.path):
+            raise ValueError('Fiber source changed or missing source digest; rebuild the index')
+        self._require_unchanged()
+
+    def _require_unchanged(self, store=None):
+        if _position(store or self.store()) != self._position:
+            raise RuntimeError('Fiber source changed after catalog selection; reopen the dataset')
+
     def manifest_entries(self):
+        self._require_unchanged()
         ids = [r['id'] for r in self.catalog]
         # A compact collection manifest avoids hashing/expanding all polylines
         # each time a replay cache is opened by a loader worker.
-        return [dict(kind='fiber_store_catalog_v2', digest=fibers_digest(self.path, ids), volume=self.volume,
+        return [dict(kind='fiber_store_catalog_v3', digest=_references_digest(r['reference'] for r in self.catalog), volume=self.volume,
                      grid_scale=self.grid_scale, fiber_count=len(self),
                      fiber_ids_sha256=hashlib.sha256('\n'.join(ids).encode()).hexdigest(),
                      annotation_repair=ANNOTATION_REPAIR)]
@@ -302,10 +375,12 @@ class FiberStore(Sequence):
         return _Fiber(self, index, self.catalog[index])
 
     def geometry(self, index):
+        self._require_unchanged()
         if index not in self._cache:
             row = self.catalog[index]
-            with self.store().geometry_snapshot() as snapshot:
-                xyz = snapshot.fiber(row['id']).line_points_array()
+            with self.store().graph_read(versions=[row['reference']]) as view:
+                xyz = view.read_geometry_arrays('line_points').values
+            self._require_unchanged()
             if len(xyz) < 2 or not np.isfinite(xyz).all():
                 raise ValueError(f'Invalid fiber geometry: {row["id"]}')
             points = xyz*(row['scale']/self.grid_scale)
@@ -322,9 +397,12 @@ class FiberStore(Sequence):
 
     def _regions(self, lo, hi):
         """The store's spatial blocks (<= 257 line points) of this split whose bounds overlap [lo, hi] (trace grid)."""
+        self._require_unchanged()
         bbox = [*(np.asarray(lo)*self.grid_scale), *(np.asarray(hi)*self.grid_scale)]
-        return [r for r in self.store().spatial_regions(bbox, object_kind='fiber', volume=self.volume)
-                if r['array_name'] == 'line_points' and r['object_uuid'] in self.ids]
+        regions = [r for r in self.store().spatial_regions(bbox, object_kind='fiber', volume=self.volume)
+                   if r['array_name'] == 'line_points' and r['object_uuid'] in self.ids]
+        self._require_unchanged()
+        return regions
 
     def _blocks(self, lo, hi):
         """The overlapping blocks' points in trace grid units: (fiber id, first vertex, points)."""
@@ -336,6 +414,7 @@ class FiberStore(Sequence):
                 scale = self.catalog[self.id_to_index[fid]]['scale']/self.grid_scale
                 line = snapshot.fiber(fid, r['revision_uuid'])
                 blocks.append((fid, int(r['start'][0]), line.line_points_array(int(r['start'][0]), int(r['shape'][0]))*scale))
+        self._require_unchanged()
         yield from blocks
 
     def nearby_blocks(self, bounds_xyz, exclude_id, *, records=False):

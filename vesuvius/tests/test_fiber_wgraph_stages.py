@@ -11,6 +11,7 @@ from .fiber_graph_fixture import measured_store,uid
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_wgraph_stages as stages
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_normal_sign as normal
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import original_fiber_source
 
 
 def test_hvb_then_sign_preserves_classification_and_shares_graph(tmp_path,monkeypatch):
@@ -18,8 +19,9 @@ def test_hvb_then_sign_preserves_classification_and_shares_graph(tmp_path,monkey
     ids=np.asarray(list(map(uid,[10,20,30])))
     with CollectionReader(str(graph)) as store:source=store.source
     feature=tmp_path/'features.json'
+    _,fiber_source=original_fiber_source(graph)
     feature.write_text(json.dumps(dict(format='fiber-axial-priors',version=1,source_ids=ids.tolist(),
-        agreement=[-1,1,0],fibers_digest=fibers_digest(graph),umbilicus_sha256='test')))
+        agreement=[-1,1,0],fibers_digest=fibers_digest(graph),fiber_source=fiber_source,umbilicus_sha256='test')))
     priors=tmp_path/'priors.json'
     priors.write_text(json.dumps(dict(format='fiber-outward-priors',source_store=source,
                                       source_ids=ids.tolist(),agreement=[1,1,1])))
@@ -84,10 +86,14 @@ def test_axial_only_request_cannot_reorient_or_overwrite_normal_priors(tmp_path,
                 orient_database='original-orientation.vcobj',normal_curves_output='original-curves.json')
     def features(config):
         generated=config['native_config']
+        original,pin=original_fiber_source(source)
+        assert generated['fibers']==str(original) and generated['fibers']!=str(source)
+        assert generated['fiber_ids']==ids.tolist()
         assert generated['orient_normals'] is False and generated['axial_prior_only'] is True
         assert not any(key in generated for key in ('database','normal_prior_output','orient_database','normal_curves_output'))
         Path(generated['axial_prior_output']).write_text(json.dumps(dict(format='fiber-axial-priors',version=1,
-            source_ids=ids.tolist(),agreement=[-1,1],fibers_digest=fibers_digest(source),umbilicus_sha256='test')))
+            source_ids=ids.tolist(),agreement=[-1,1],fibers_digest=fibers_digest(original),
+            fiber_source=pin,umbilicus_sha256='test')))
     def solver(config,*args):
         np.savez(Path(config['output_root'])/'solution_uniform_b0.1_e0.npz',ids=ids,
                  labels=[0,1],probabilities=[[1.,0.,0.],[0.,1.,0.]])

@@ -141,14 +141,15 @@ public:
     // --- Collections ---
     VCCollection* pointCollection() const;
     // Write pending point-collection edits to the store now: the volume's,
-    // and (through pointCollectionsSaveRequested) the open surface's corrections.
+    // and the open surface's corrections. Failure vetoes close/switch.
     void savePointCollections();
+    std::function<bool()> saveSurfaceCorrections;
     // The store one of the volume's point collections is kept in; nullopt for
     // a surface's corrections and in windows without their own collections.
     std::optional<vc::objects::AttachmentIdentity> pointCollectionStore(uint64_t collectionId) const;
 
     // --- Teardown ---
-    void closeAll();
+    void closeAll(const std::function<void()>& afterSave = {});
 
     // --- Surfaces (inlined from CSurfaceCollection) ---
     void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
@@ -186,7 +187,6 @@ signals:
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
     // An umbilicus was committed, or a store was attached or detached.
     void umbilicusChanged();
-    void pointCollectionsSaveRequested();
     // The open surface has a draft recovered from an earlier session; it
     // stays undrafted until recoveredDraftResolved().
     void recoveredDraftFound(const QString& objectUuid);

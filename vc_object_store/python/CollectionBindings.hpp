@@ -46,6 +46,17 @@ inline void bindCollectionApi(nb::module_& module) {
     .def("close",&PyCollectionReader::close)
     .def("__enter__",[](PyCollectionReader& self)->PyCollectionReader&{self.check();return self;},nb::rv_policy::reference_internal)
     .def("__exit__",[](PyCollectionReader& self,nb::args){self.close();})
+    .def("resolve_store_position",[](PyCollectionReader& self,const nb::dict& input){
+        self.check();
+        auto position=nlohmann::json::parse(jsonDumps(input));
+        if(position.contains("store")) {
+            if(position.contains("store_uuid"))throw std::invalid_argument("store position has two store keys");
+            position["store_uuid"]=position.at("store");position.erase("store");
+        }
+        const auto source=vo::extensionSourcesFromJson(nlohmann::json::array({position}).dump()).at(0);
+        nb::gil_scoped_release release;
+        return vo::resolveStorePosition(*self.collection,*self.txn,source).string();
+    },"position"_a,"Resolve an exact provisioned source snapshot to its public root locator.")
     .def_prop_ro("source",[](PyCollectionReader& self){
         self.check();const auto p=self.collection->provisioning(*self.txn);
         nb::dict result;result["store_uuid"]=self.collection->uuid(*self.txn);
@@ -66,11 +77,11 @@ inline void bindCollectionApi(nb::module_& module) {
         self.check();std::vector<vo::ObjectRecord> records;
         self.collection->scanObjects(*self.txn,[&](const auto& row){records.push_back(row.record);return true;},kind);
         std::sort(records.begin(),records.end(),[](const auto& a,const auto& b){return a.uuid<b.uuid;});
-        nb::list result;for(const auto& row:records)result.append(objectToPy(row));return result;
+        nb::list result;for(const auto& row:records)result.append(recordToPy(row));return result;
     },"kind"_a=nb::none())
     .def("object",[](PyCollectionReader& self,const std::string& uuid)->nb::object{
         self.check();const auto row=self.collection->object(*self.txn,{"",uuid});
-        return row?nb::object(objectToPy(row->record)):nb::object(nb::none());
+        return row?nb::object(recordToPy(row->record)):nb::object(nb::none());
     },"uuid"_a)
     .def("geometry_arrays",[](PyCollectionReader& self,const std::vector<std::string>& uuids,const std::string& name,
                               const std::optional<std::string>& volume){
@@ -104,11 +115,11 @@ inline void bindCollectionApi(nb::module_& module) {
     .def("edges",[](PyCollectionReader& self,const std::string& kind){
         self.check();std::vector<vo::CollectionEdge> edges;
         edges=self.collection->edgesByKind(*self.txn,kind);
-        nb::list result;for(const auto& edge:edges)result.append(edgeToPy(edge.record));return result;
+        nb::list result;for(const auto& edge:edges)result.append(recordToPy(edge.record));return result;
     },"kind"_a)
     .def("edge",[](PyCollectionReader& self,const std::string& uuid)->nb::object{
         self.check();const auto edge=self.collection->edge(*self.txn,{"",uuid});
-        return edge?nb::object(edgeToPy(edge->record)):nb::object(nb::none());
+        return edge?nb::object(recordToPy(edge->record)):nb::object(nb::none());
     },"uuid"_a)
     .def("fiber_constraints",[](PyCollectionReader& self){
         self.check();std::vector<vo::CompactFiberConstraint> records;

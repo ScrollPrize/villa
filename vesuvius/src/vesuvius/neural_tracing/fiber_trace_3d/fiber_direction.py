@@ -70,13 +70,19 @@ def prepare(config):
     from .fiber_hv_stage import verify_feature_source
     from .fiber_normal_sign_visualization import load_umbilicus_frame
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
-    from .fiber_graph_store import workflow_volume
+    from .fiber_graph_store import workflow_volume, original_fiber_source
     from vesuvius.neural_tracing.tracers.shared.geometry import arclength,tangents_at
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
     start=time.monotonic();cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
     family,label,_=family_settings(config)
-    signature={k:(fibers_digest if k=='fibers' else store_digest if k=='database' else sha256_file)(config[k]) for k in ('database','fibers','features','stage1','hv_solution','umbilicus')}
+    feature=json.loads(Path(config['features']).read_text())
+    source,source_version=original_fiber_source(config['database'])
+    source_digest=fibers_digest(source,source_version=source_version)
+    if fibers_digest(config['fibers'])!=source_digest:
+        raise ValueError('Configured geometry differs from the frozen feature source')
+    signature={k:(store_digest if k=='database' else sha256_file)(config[k]) for k in ('database','features','stage1','hv_solution','umbilicus')}
+    signature.update(fibers=source_digest,fiber_source=source_version)
     signature.update(version=1,tangent_half=config.get('tangent_half',16.),prior_spacing=config.get('prior_spacing',16.),
                      axis_half=config.get('axis_half',8.),convention='axis_increasing_z_cross_outward_radius_ccw')
     signature['working_volume']=workflow_volume(config)
@@ -87,8 +93,7 @@ def prepare(config):
     if any(not np.isfinite(signature[k]) or signature[k]<=0 for k in ('tangent_half','prior_spacing','axis_half')):
         raise ValueError('Sampling spans must be positive and finite')
     if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
-    feature=json.loads(Path(config['features']).read_text());verify_feature_source(config['database'],feature)
-    if feature['fibers_digest']!=signature['fibers'] or feature['umbilicus_sha256']!=signature['umbilicus']:
+    if feature['umbilicus_sha256']!=signature['umbilicus']:
         raise ValueError('Source/feature identity mismatch')
     previous=json.loads((Path(config['hv_solution']).parent/'summary.json').read_text())
     if previous['input']['signature']['database']!=signature['database'] or previous['input']['signature']['stage1']!=signature['stage1']:
@@ -109,6 +114,7 @@ def prepare(config):
     active=np.flatnonzero(labels==label)
     if not len(active):raise ValueError('No retained family fibers')
     graph=FiberGraph(config['database'])
+    verify_feature_source(config['database'],feature,graph=graph)
     axis=load_umbilicus_frame(config['umbilicus'],graph.volume)
     records=[r for r in graph.endpoint_rows() if r['parallel']]
     rows=np.asarray([(r['event_id'],r['arc_a'],r['arc_b']) for r in records],dtype=float).reshape(-1,3)
@@ -122,7 +128,7 @@ def prepare(config):
     starts=np.searchsorted(sorted_ids,np.arange(len(active)));stops=np.searchsorted(sorted_ids,np.arange(len(active)),side='right')
     tangents=np.empty((2*count,3),np.float32);prior=np.zeros(len(active),np.float32)
     support=np.zeros(len(active),np.float32);lengths=np.zeros(len(active))
-    geometry=read_polylines(config['fibers'],ids[active],volume=graph.volume)
+    geometry=read_polylines(source,ids[active],volume=graph.volume,source_version=source_version)
     print(f'{family}-direction prepare: {len(active):,} fibers; {count:,} parallel events',flush=True)
     for n,(row,xyz) in enumerate(geometry):
         if row['id']!=ids[active[n]]:raise ValueError('Geometry order mismatch')

@@ -24,6 +24,11 @@ struct ChannelPolicy {
     std::atomic<bool> enabled{false};
     std::mutex mutex;
     std::set<std::int64_t> relevant;
+    // Immutable registrations remain alive for this policy's lifetime. A child
+    // can copy the published value without taking an inherited mutex.
+    using Channels = std::vector<std::int64_t>;
+    std::vector<std::unique_ptr<const Channels>> registrations;
+    std::atomic<const Channels*> registration{nullptr};
     // Shared by whole/selected readers. Keys include the decoded-cache namespace
     // so different cache quality/encoding views cannot exchange wrong values.
     SingleFlight<std::shared_ptr<const ChunkLoad>> reads;

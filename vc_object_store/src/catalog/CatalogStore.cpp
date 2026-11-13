@@ -4,8 +4,9 @@
 #include "formats/GeometryInput.hpp"
 #include "formats/RemoteSource.hpp"
 #include "geometry/ArrayLayout.hpp"
+#include "internal/JsonFields.hpp"
 #include <vc_reader/native/http.hpp>
-#include <fstream>
+#include <vc_reader/native/atomic_file.hpp>
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <nlohmann/json.hpp>
@@ -127,7 +128,7 @@ std::optional<CatalogReference> catalogReference(const ObjectRecord& record)
     reference.artifact = catalog->value("artifact", "");
     reference.volume = catalog->value("volume", "");
     reference.url = catalog->value("url", "");
-    for (const auto& file : catalog->value("files", Json::array()))
+    for (const auto& file : detail::jsonArrayField(*catalog, "files", true))
         reference.files.push_back({file.value("name", ""), file.value("label", ""), file.value("url", "")});
     return reference;
 }
@@ -152,7 +153,7 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
         for (auto& record : records) {
             const auto head = reader.currentObject(record.uuid);
             if (!head) {
-                request.expectedObjects[record.uuid] = currentVersionOf(reader, record.uuid);
+                request.expectedObjects[record.uuid] = currentObjectExpectation(reader, record.uuid);
                 ++report.added;
                 auto meta = Json::parse(record.meta);
                 meta["catalog_write"] = util::newUuid();
@@ -167,6 +168,11 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
                 ++report.preserved;
                 continue;
             }
+            // The placeholder provides only catalog-owned fields. Compare the
+            // resulting record, not the placeholder, with the live record.
+            auto meta = Json::parse(existing.meta);
+            meta.update(Json::parse(record.meta));
+            record.meta = meta.dump();
             if (sameCatalogRecord(existing, record)) continue;
             if (geometry) {
                 auto meta = Json::parse(record.meta);
@@ -184,9 +190,9 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
                 }
             }
             record.tags = existing.tags;
-            request.expectedObjects[record.uuid] = head->version;
+            expectObject(request, head->reference());
             ++report.updated;
-            auto meta = Json::parse(record.meta);
+            meta = Json::parse(record.meta);
             meta["catalog_write"] = util::newUuid();
             record.meta = meta.dump();
             request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
@@ -202,13 +208,9 @@ void downloadFile(const std::string& url, const fs::path& path)
     std::vector<std::uint8_t> body;
     if (!client.get(url, body)) throw std::runtime_error("cannot fetch " + url);
     fs::create_directories(path.parent_path());
-    const auto partial = path.string() + ".partial-" + util::newUuid();
-    {
-        std::ofstream output(partial, std::ios::binary);
-        output.write(reinterpret_cast<const char*>(body.data()), std::streamsize(body.size()));
-        if (!output) throw std::runtime_error("cannot write " + path.string());
-    }
-    fs::rename(partial, path);
+    vcr::AtomicFile output(path.string());
+    output.write(body.data(), body.size());
+    output.publish();
 }
 
 } // namespace detail
@@ -217,7 +219,6 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
 {
     std::optional<ObjectRecord> record;
     std::optional<std::string> geometry;
-    std::optional<int64_t> version;
     {
         auto read = db.read();
         record = db.objectByUuid(read, uuid);
@@ -226,19 +227,10 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
             if (record && locallyEdited(*record, *current)) return;
             geometry = current->uuid;
         }
-        version = db.currentVersion(read, uuid);
     }
     const auto reference = record ? catalogReference(*record) : std::nullopt;
     if (!reference || reference->url.empty()) throw std::runtime_error("not a catalog surface: " + uuid);
-    const auto staging = fs::temp_directory_path() / ("vc-catalog-fetch-" + util::newUuid());
-    fs::create_directory(staging);
-    formats::Prepared prepared;
-    try {
-        formats::fetchRemoteSurface(reference->url, staging);
-        prepared = formats::surfaceGeometry(staging);
-    } catch (...) { std::error_code ignored; fs::remove_all(staging, ignored); throw; }
-    std::error_code ignored;
-    fs::remove_all(staging, ignored);
+    auto prepared = formats::readRemoteSurfaceGeometry(reference->url);
     const auto coordinates = Json::parse(record->meta.empty() ? std::string("{}") : record->meta).value("coordinates", Json::object());
     if (const auto scale = coordinates.find("scale_factor"); scale != coordinates.end() && scale->is_number())
         centreOnReducedBlocks(prepared.geometry, scale->get<double>());
@@ -253,7 +245,7 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
     updated.surface->scale = prepared.object.surface->scale;
     // Expected at the version read: a concurrent change (another fetch, a
     // refresh) fails this write, and the next read fetches again.
-    write({{uuid, version}}, [&](ObjectStore& store, WriteTxn& txn) {
+    write({{uuid, record->reference()}}, [&](ObjectStore& store, WriteTxn& txn) {
         store.upsertObject(txn, updated);
         const auto fetched = store.putGeometry(txn, uuid, prepared.geometry, geometry);
         store.setMeta(txn, uuid, "catalog_geometry_revision", Json(fetched).dump());
@@ -285,7 +277,7 @@ void restoreCatalogVersion(ObjectStoreSession& session, const AttachmentIdentity
         for (const auto& version : reader.objectHistory(uuid))
             if (!version.deleted && Json::parse(version.record.meta).value("catalog_write", std::string()) == token)
                 return std::vector<TransactionOperation>{RestoreObjectOp{
-                    uuid, ObjectVersion{reader.status().storeUuid, version.generation, uuid, version.version}}};
+                    uuid, version.reference()}};
         throw std::runtime_error("the catalog version of " + uuid + " is not in its history");
     });
 }

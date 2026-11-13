@@ -7,6 +7,9 @@
 #include "internal/ExtensionHistory.hpp"
 #include "vc_object_store/objects/EdgeKinds.hpp"
 #include "internal/JsonFields.hpp"
+#include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
+#include "internal/VisibleRows.hpp"
 #include <nlohmann/json.hpp>
 #include <variant>
 
@@ -53,15 +56,16 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     std::sort(rec.tags.begin(), rec.tags.end());
     rec.tags.erase(std::remove(rec.tags.begin(),rec.tags.end(),std::string{}),rec.tags.end());
     rec.tags.erase(std::unique(rec.tags.begin(), rec.tags.end()), rec.tags.end());
-    if (rec.aAnchor == existing->aAnchor && rec.bAnchor == existing->bAnchor &&
-        rec.tags == existing->tags && nlohmann::json::parse(rec.meta) == nlohmann::json::parse(existing->meta)) {
-        if (!lifecycleBindingMatches(db, rec))
-            stampContentChange(db, author(), hostname(), "edges", 0,
-                               parseUuid(rec.uuid), "lifecycle_revalidated");
-        recordRelationshipValidation(db, rec);
-        return;
-    }
     Savepoint savepoint(db);
+    if (rec.aAnchor == existing->aAnchor && rec.bAnchor == existing->bAnchor &&
+        rec.tags == existing->tags && parseObjectJson(rec.meta) == parseObjectJson(existing->meta)) {
+        // An unchanged record can still explicitly revalidate edited endpoints.
+        // Otherwise keep the original owner, version and transaction sequence.
+        Statement changed(db,"SELECT 1 FROM objects WHERE uuid IN (?,?) AND commit_sequence=? LIMIT 1",
+            parseUuid(rec.aUuid),parseUuid(rec.bUuid),writeCommitSequence(db));
+        if(!changed.row()&&currentRelationshipApplicable(*this,txn,rec.uuid))return;
+    }
+    createRecordOverride(db, "edges", rec.uuid);
     using Value=std::variant<std::monostate,double,std::string>;
     std::vector<std::pair<std::string,Value>> changes;
     const auto append=[&](const std::string& field,Value value){
@@ -98,16 +102,15 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
 
 std::optional<EdgeRecord> ObjectStore::edgeByUuid(const Txn& txn, const std::string& uuid) const
 {
-    sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, "SELECT " + projectedEdgeColumns(db) + " FROM "+edgeReadSource(db)+" AS edges WHERE uuid=? AND state=0", parseUuid(uuid));
-    if (!s.row()) return std::nullopt;
-    return readEdgeRow(db, s);
+    const auto edge=resolveEdge(static_cast<sqlite3*>(connection(txn)),uuid);
+    return edge?std::optional(edge->record):std::nullopt;
 }
 
 void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
+    createRecordOverride(db, "edges", uuid);
     const auto bytes = parseUuid(uuid);
     requireEdgeColumns(db,{"state","changed_by","changed_at","changed_host"});
     Statement row(db, "SELECT uuid,kind FROM edges WHERE uuid=? AND state=0", bytes);
@@ -126,21 +129,26 @@ std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& 
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     const auto key=parseUuid(objectUuid);
     requireAdjacencyIndex(db);
-    if(!objectIdByUuid(db,key)) {
-        Statement present(db,"SELECT 1 FROM "+edgeReadSource(db)+" WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1",key);
-        if(!present.row())throw std::runtime_error("object store: object not found: "+objectUuid);
+    if(!resolveObject(db,objectUuid))throw std::runtime_error("object store: object not found: "+objectUuid);
+    if(querySources(db).size()==1){
+        Statement rows(db,"SELECT "+projectedEdgeColumns(db)+" FROM "+edgeReadSource(db)+" AS edges WHERE state=0 AND (a_uuid=?1 OR b_uuid=?1)"+
+            (includeRetired?std::string{}:" AND "+activeEdgeSql())+" ORDER BY uuid",key);
+        return readEdgeRows(db,rows);
     }
-    Statement s(db, "SELECT " + projectedEdgeColumns(db) + " FROM "+edgeReadSource(db)+" AS edges WHERE state=0 AND (a_uuid=? OR b_uuid=?)" +
-        (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY uuid", key, key);
-    return readEdgeRows(db, s);
+    EdgeSelection selection;selection.endpointUuids=std::vector{objectUuid};selection.includeRetired=includeRetired;
+    return selectEdges(txn,selection);
 }
 
 std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::string& edgeKind, bool includeRetired) const
 {
-    sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, "SELECT " + projectedEdgeColumns(db) + " FROM "+edgeReadSource(db)+" AS edges WHERE state=0 AND kind=?" +
-        (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY uuid", edgeKindCode(edgeKind));
-    return readEdgeRows(db, s);
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    if(querySources(db).size()==1){
+        Statement rows(db,"SELECT "+projectedEdgeColumns(db)+" FROM "+edgeReadSource(db)+" AS edges WHERE state=0 AND kind=?"+
+            (includeRetired?std::string{}:" AND "+activeEdgeSql())+" ORDER BY uuid",edgeKindCode(edgeKind));
+        return readEdgeRows(db,rows);
+    }
+    EdgeSelection selection;selection.kind=edgeKind;selection.includeRetired=includeRetired;
+    return selectEdges(txn,selection);
 }
 
 std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSelection& selection,
@@ -214,6 +222,22 @@ std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelec
     auto* db = static_cast<sqlite3*>(connection(txn));
     const ObjectFields fields = projection ? ObjectFields(std::in_place, projection->begin(), projection->end()) : std::nullopt;
     const auto columns = projectedEdgeColumns(db,fields);
+    if(querySources(db).size()>1){
+        validateEdgeSelection(selection);
+        if(selection.applicableOnly)requirePublishedGraphRead(txn);
+        auto physical=selection;physical.limit.reset();physical.applicableOnly=false;physical.includeRetired=true;
+        return selectVisibleRecords(db,[&](auto* source){
+            auto rows=edgeSelectionQuery(source,physical,projectedEdgeColumns(source,fields));
+            auto selected=readEdgeRows(source,*rows,fields);
+            if(!txn.write_)attachRelationshipVersions(source,selected);
+            return selected;
+            },[&](const auto& edge,auto* source){
+                if(edgeSource(db,edge.uuid)!=source)return false;
+                const auto a=resolveObject(db,edge.aUuid),b=resolveObject(db,edge.bUuid);
+                return a&&b&&(selection.includeRetired||(!a->record.retired&&!b->record.retired))&&
+                    (!selection.applicableOnly||currentRelationshipApplicable(*this,txn,edge.uuid));
+            },[](const auto& a,const auto& b){return a.uuid<b.uuid;},0,selection.limit);
+    }
     if (selection.applicableOnly) {
         validateEdgeSelection(selection);
         requirePublishedGraphRead(txn);

@@ -4,7 +4,8 @@
 #include "internal/SqlValues.hpp"
 #include "geometry/GeometryDelta.hpp"
 #include "internal/ImmutableImport.hpp"
-#include "internal/ExternalEndpoint.hpp"
+#include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -36,10 +37,9 @@ std::string detail::activeEdgeSql()
 namespace {
 ObjectRecord endpointLifecycle(sqlite3* db,const std::string& uuid)
 {
-    Statement row(db,"SELECT id,state FROM objects WHERE uuid=?",parseUuid(uuid));
-    if(!row.row())return externalEndpointRecord(db,uuid);
-    ObjectRecord record;readLifecycle(db,row.i64(0),record);
-    record.retired=record.retired||row.i64(1)!=0;return record;
+    const auto object=resolveObject(db,uuid);
+    if(!object)throw std::runtime_error("relationship endpoint is missing or deleted");
+    return object->record;
 }
 }
 
@@ -79,6 +79,7 @@ void ObjectStore::retireObject(WriteTxn& txn, const std::string& uuid)
     if (!record) throw std::invalid_argument("object lifecycle: unknown object");
     if (record->retired) return;
     Savepoint savepoint(db);
+    createRecordOverride(db,"objects",uuid);
     // Retiring is a native publication, not an independent version namespace.
     // Removing current relationships also prevents restore from silently
     // reviving observations whose endpoint was deliberately retired.
@@ -98,29 +99,23 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
     const auto current = objectByUuid(txn, uuid);
     if (!current) throw std::invalid_argument("object lifecycle: unknown object");
     if (!current->retired && !sourceVersion) return;
-    if (!historyEnabled(db)) {
-        if (sourceVersion) requireHistory(db);
-        Savepoint savepoint(db);
-        auto restored = *current;
-        restored.retired = false; restored.lifecycleEpoch = std::to_string(writeCommitSequence(db));
-        const auto id = *objectIdByUuid(db, parseUuid(uuid));
-        writeLifecycle(db, id, restored);
-        stampContentChange(db, author(), hostname(), "objects", id, parseUuid(uuid), "restore");
-        savepoint.release();
-        return;
-    }
     std::optional<ObjectRevision> source;
     if (sourceVersion) {
         source = objectAtVersion(txn, *sourceVersion);
         if (!source) throw std::invalid_argument("object lifecycle: restore source version is not recorded in this store");
     } else {
-        auto history = objectHistory(txn, uuid);
+        auto history = objectHistory(txn, uuid, true);
         for (auto it = history.rbegin(); it != history.rend(); ++it)
             if (it->publishedAtUs && !it->deleted && !it->record.retired) { source = *it; break; }
+        if (history.empty()) {
+            source = currentObjectRevision(txn, uuid);
+            if (source) source->record.retired = false;
+        }
     }
     if (!source || source->objectUuid != current->uuid || source->deleted || source->record.retired)
         throw std::invalid_argument("object lifecycle: restoration requires an active revision of this object");
     Savepoint savepoint(db);
+    createRecordOverride(db,"objects",uuid);
     // An explicit historical restore can replace active geometry/metadata.
     // Its old observations remain in history, not attached to the new current
     // state without an explicit revalidation decision.
@@ -135,12 +130,15 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
             // Install the selected managed descriptor before restoring its
             // metadata, just as an existing geometry head is preserved by
             // upsert. This also supports a metadata-only current object.
-            materializeGeometry(db,uuid,*source->geometryRevision);
+            restoreGeometryReference(db,uuid,*source->geometryRevision);
         } else {
             execute(db,"UPDATE objects SET geometry_manifest=NULL WHERE uuid=?",parseUuid(uuid));
         }
     }
     auto restored = source->record;
+    const auto origin=resolveObjectVersion(db,source->reference());
+    if(!origin)throw std::runtime_error("object lifecycle: restore source is unavailable");
+    prepareOverrideReferences(origin->source,db,restored);
     restoreCurrentExtensionRows(db, "objects", uuid, restored.meta);
     // upsert preserves identity/creation stamps and resets approval normally.
     upsertObjectImpl(db, author(), hostname(), restored, false, "restore", true);

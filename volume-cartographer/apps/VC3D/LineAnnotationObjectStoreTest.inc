@@ -4,10 +4,9 @@
 #include <QElapsedTimer>
 #include <QThread>
 #include "FiberCollectionController.hpp"
-#include "SpiralWorkspace.hpp"
-#include "SpiralServiceManager.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/AttachedDocument.hpp>
+#include <vc_object_store/objects/ObjectCollection.hpp>
 #include <vc_object_store/objects/Project.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "volume_viewers/ViewerSampling.hpp"
@@ -259,10 +258,10 @@ int runObjectStoreControllerTests()
                     "the fiber map status names the stored umbilicus");
             const auto snapshot = controller.umbilicusForSnapshot(state.annotationVolume()->volume);
             require(snapshot.message.isEmpty() && snapshot.centers.size() == 2, "the fiber map reads the stored umbilicus");
-            const auto token = controller.umbilicusFingerprint();
+            const auto token = controller.umbilicusDependency();
             add("second");
             require(controller.umbilicusStatus().text.contains("several") &&
-                    controller.umbilicusFingerprint() != token,
+                    controller.umbilicusDependency() != token,
                     "several umbilici bound to one volume are refused");
             state.closeProject();
         }
@@ -425,7 +424,7 @@ int runObjectStoreControllerTests()
                 live->surfaceName = "frame-test-session"; live->fiberId = opened.id; live->fiberUuid = opened.uuid;
                 live->fiberFileName = opened.fileName; live->fiberUsername = opened.username;
                 live->fiberStartedAt = opened.startedAt; live->fiberSequence = opened.sequence;
-                live->storePin = opened.storePin; live->coordinateIdentity = opened.coordinateIdentity; live->frame = opened.frame;
+                live->storePin = opened.storePin; live->graphCommit = opened.graphCommit; live->coordinateIdentity = opened.coordinateIdentity; live->frame = opened.frame;
                 live->fiberOptimizationMode = opened.optimizationMode; live->suppressGeneratedViews = true; live->suppressErrorDialogs = true;
                 for (size_t i = 0; i < opened.controlPoints.size(); ++i) {
                     la::LineControlPoint control(double(i), opened.controlPoints[i], i == 0, int(i));
@@ -440,6 +439,7 @@ int runObjectStoreControllerTests()
                 controller.commitFiberStoreAction(save);
                 require(stored(scaledLong).controlPoints[3] == vc::geometry::Point{16,4,6}, "a session save maps back to the stored frame");
                 live->storePin = save.front().fiber.storePin;
+                live->graphCommit = save.front().fiber.graphCommit;
                 const auto parent = controller.makeStoredFiberSessionSnapshot(*live).fiber;
                 const auto identity = [&](const char* name) {
                     la::NewFiberIdentity result; result.id = controller.nextFiberId(); result.username = "test";
@@ -516,22 +516,25 @@ int runObjectStoreControllerTests()
             catch (const std::runtime_error&) { rejected = true; }
             require(rejected, "fiber opened before reset rejects edits");
             a = resolve(a.uuid); b = resolve(b.uuid);
-            require(a.storePin->generation != a.storePin->writeGeneration,
+            require(a.storePin->reference().generation != a.storePin->writeGeneration,
                     "reopened fiber retains its publication generation");
             const auto publication = a.storePin->reference();
             a.tags.push_back("after-reset");
             batch = {controller.makeFiberSaveSnapshot(a)};
             controller.commitFiberStoreAction(batch);
             a = batch.front().fiber;
-            require(a.storePin->version == publication.version + 1 &&
-                    a.storePin->generation == a.storePin->writeGeneration,
+            require(a.storePin->reference().version == publication.version + 1 &&
+                    a.storePin->reference().generation == a.storePin->writeGeneration,
                     "reopened fiber saves in the active generation");
             a.tags.push_back("second-save");
             batch = {controller.makeFiberSaveSnapshot(a)};
             controller.commitFiberStoreAction(batch);
             a = batch.front().fiber;
-            require(a.storePin->version == publication.version + 2, "subsequent fiber saves use the new pin");
+            require(a.storePin->reference().version == publication.version + 2, "subsequent fiber saves use the new pin");
         }
+        // The preceding saves advanced the graph baseline of a only. Reopen
+        // both endpoints before the independent link-creation action.
+        a=resolve(a.uuid);b=resolve(b.uuid);
         Controller::FiberBranchRef link;
         link.controlPointIndex=0;link.branchControlPointIndex=0;link.branchFiberId=b.id;link.branchFileName=b.fileName;
         link.controlPointPosition=a.controlPoints[0];link.branchControlPointPosition=b.controlPoints[0];
@@ -639,9 +642,24 @@ int runObjectStoreControllerTests()
                 require(fiber.branches.front().edgeUuid == a.branches.front().edgeUuid, "edge UUID survives transfer");
                 require(fiber.branches.front().autoLink, "automatic mark survives transfer");
             }
+            destination.closeProject();
+            { auto db = ObjectStore::open(target, options); auto txn = db.write(); db.seal(txn); txn.commit(); }
+            const auto overlay = fs::path(transfers.path().toStdString()) / "overlay.vcobj";
+            { auto collection = ObjectCollection::create(overlay, {target}, options); }
+            openStoreAsProject(destination, QString::fromStdString(overlay.string()), "inherited-graph-test");
+            auto stale = imported.readStoredFibers(std::nullopt).front();
+            const auto loaded = stale.storePin->reference();
+            { auto db = ObjectStore::open(overlay, options); auto txn = db.write();
+              db.setApproval(txn, stale.branches.front().edgeUuid, "approved"); txn.commit(); }
+            require(destination.objectStoreSession()->currentObject(stale.storePin->attachment, stale.uuid)->reference() == loaded,
+                    "overlay relationship changes leave inherited endpoint identity unchanged");
+            bool rejected = false;
+            try { imported.commitFibers({&stale}); } catch (const TransactionConflict&) { rejected = true; }
+            require(rejected, "loaded graph baseline rejects unseen overlay relationship changes");
         }
         {
             // Approval clears the mark on the shared edge.
+            a = resolve(a.uuid);
             auto approved = a;
             approved.branches[0].pending = false;
             const auto generation = controller._fiberDataGeneration;
@@ -658,6 +676,10 @@ int runObjectStoreControllerTests()
             require(approvedCatalog(), "real commits still refresh catalog link state");
             const auto again = resolve(a.uuid);
             require(!again.branches[0].pending && !again.branches[0].autoLink, "approval clears the automatic mark");
+            auto stale = a;
+            bool staleRejected = false;
+            try { controller.commitFibers({&stale}); } catch (const TransactionConflict&) { staleRejected = true; }
+            require(staleRejected, "a loaded graph cannot overwrite a later branch approval even with unchanged geometry");
             auto pending = again;
             pending.branches[0].pending = true;
             controller.commitFibers({&pending});
@@ -673,13 +695,11 @@ int runObjectStoreControllerTests()
             Controller imported(&destination, nullptr, nullptr, nullptr);
             imported._errorDialogsSuppressed = true;
             openStoreAsProject(destination, QString::fromStdString(target.string()), "service-import-test");
-            SpiralWorkspace workspace(&destination);
-            workspace.setLineAnnotationController(&imported);
-            auto* service = workspace.findChild<SpiralServiceManager*>();
-            service->inputEditorRequested(QJsonObject{{"kind", "fiber"}, {"id", QString::fromStdString(a.uuid)}},
-                QString::fromStdString(transferPaths.at(a.uuid).string()));
-            require(imported.readStoredFibers(std::nullopt).size() == 2 && service->inputDraftStatus().size() == 2,
-                    "service-only component is imported into attached store before editing");
+            QString error;
+            if (!imported.importFibersFromPath(transferPaths.at(a.uuid), &error))
+                throw std::runtime_error(error.toStdString());
+            require(imported.readStoredFibers(std::nullopt).size() == 2,
+                    "a transported component is imported into the attached store");
             auto document = aWire;
             const auto uuid = vc::objects::util::newUuid(); document["uuid"] = uuid;
             document["branches"] = nlohmann::json::array(); document["adjacent_branches"] = nlohmann::json::array();
@@ -687,7 +707,6 @@ int runObjectStoreControllerTests()
             const auto volumeUuid = vc::objects::util::newUuid();
             document["coordinates"] = {{"volume_uuid", volumeUuid}, {"scale_factor", 4}};
             document["coordinate_binding"] = {{"active_volume_id", "display"}};
-            QString error;
             const auto single = fs::path(directory.path().toStdString()) / "optional-mode.json";
             { std::ofstream out(single); out << document.dump(); }
             if (!imported.importFibersFromPath(single, &error)) throw std::runtime_error(error.toStdString());
@@ -709,46 +728,20 @@ int runObjectStoreControllerTests()
             require(readDocument(paths.at(uuid)).at("custom_annotation") == document.at("custom_annotation"),
                     "editing preserves unknown source annotations");
         }
-        {
-            SpiralWorkspace workspace(&state);
-            workspace.setLineAnnotationController(&controller);
-            auto* service = workspace.findChild<SpiralServiceManager*>();
-            require(service, "Spiral service exists");
-            require(workspace.stageFiberInputs({a.id}), "stage a newly saved fiber");
-            auto rows = service->inputDraftStatus();
-            require(rows.size() == 2, "staging includes linked fibers");
-            for (const auto& row : rows)
-                require(row.toObject()["applied_revision"].toInteger() == 0, "staging does not apply to fit");
-            workspace.refreshTrackedFibers();
-            require(service->inputDraftStatus() == rows, "unchanged fibers are not restaged");
-            // Reopening a service input registers it even in a fresh workspace.
-            SpiralWorkspace reopened(&state);
-            reopened.setLineAnnotationController(&controller);
-            auto* reopenedService = reopened.findChild<SpiralServiceManager*>();
-            reopenedService->inputEditorRequested(QJsonObject{{"kind", "fiber"}, {"id", QString::fromStdString(a.uuid)}},
-                QString::fromStdString(transferPaths.at(a.uuid).string()));
-            require(reopenedService->inputDraftStatus().size() == 2, "reopened service fibers are tracked");
-            auto changed = a; changed.tags.push_back("spiral-draft-edit");
-            controller.commitFibers({&changed});
-            workspace.refreshTrackedFibers(); reopened.refreshTrackedFibers();
-            require(service->inputDraftStatus() != rows, "saved edits refresh tracked drafts");
-            for (const auto& row : service->inputDraftStatus())
-                require(row.toObject()["applied_revision"].toInteger() == 0, "refresh does not auto-apply");
-        }
         a = resolve(a.uuid); b = resolve(b.uuid);
         require(controller.generatedBranchLinkMarkers(a.branches).empty(), "unbound peers have no branch markers");
         {
             auto changedSession = std::make_shared<Controller::LineAnnotationSession>();
-            changedSession->fiberId = a.id; changedSession->fiberUuid = a.uuid; changedSession->storePin = a.storePin;
+            changedSession->fiberId = a.id; changedSession->fiberUuid = a.uuid; changedSession->storePin = a.storePin; changedSession->graphCommit = a.graphCommit;
             auto untouched = std::make_shared<Controller::LineAnnotationSession>();
-            untouched->fiberId = b.id; untouched->fiberUuid = b.uuid; untouched->storePin = b.storePin;
+            untouched->fiberId = b.id; untouched->fiberUuid = b.uuid; untouched->storePin = b.storePin; untouched->graphCommit = b.graphCommit;
             untouched->fiberTags = {"unsaved-work"};
             untouched->runningSolveCancel = std::make_shared<std::atomic_bool>(false);
             Controller::PaneRecord changedPane, keptPane;
             changedPane.surfaceName = "changed-test-pane"; changedPane.session = changedSession;
             keptPane.surfaceName = "kept-test-pane"; keptPane.session = untouched;
             controller._panes.push_back(changedPane); controller._panes.push_back(keptPane);
-            { auto db = ObjectStore::open(path, options); auto txn = db.write({{a.uuid, a.storePin->version}});
+            { auto db = ObjectStore::open(path, options); auto txn = db.write({{a.uuid, a.storePin->reference()}});
               db.setMeta(txn, a.uuid, "external_note", "true"); txn.commit(); }
             controller.refreshChangedStoreFibers();
             require(controller._panes.size() == 1 && controller._panes.front().session == untouched,
@@ -770,12 +763,16 @@ int runObjectStoreControllerTests()
             bool rejected = false;
             try { controller.commitFiberStoreAction(failed); } catch (...) { rejected = true; }
             require(rejected, "invalid relationship rejects after geometry edits start");
-            require(failed.front().fiber.storePin->version == invalid.storePin->version, "failed transaction leaves working pins unchanged");
+            require(failed.front().fiber.storePin->reference().version == invalid.storePin->reference().version, "failed transaction leaves working pins unchanged");
             auto db = ObjectStore::open(path, options); auto txn = db.read();
-            require(db.currentObjectRevision(txn, a.uuid)->version == a.storePin->version,
+            require(db.currentObjectRevision(txn, a.uuid)->version == a.storePin->reference().version,
                     "failed relationship rolls back geometry and metadata");
         }
         const auto edge=a.branches.front().edgeUuid;
+        const auto graphBaseline = a.graphCommit;
+        controller.commitFibers({&a});
+        controller.commitFibers({&a});
+        require(a.graphCommit == graphBaseline, "repeated no-op saves preserve the loaded graph baseline");
         a.controlPoints[0][0]=-1; a.linePoints[0][0]=-1;
         batch={controller.makeFiberSaveSnapshot(a)};
         vc3d::line_annotation::canonicalizeFiberSaveSnapshots(batch);controller.commitFiberStoreAction(batch);
@@ -800,7 +797,7 @@ int runObjectStoreControllerTests()
         batch={controller.makeFiberSaveSnapshot(a)};
         const auto stale=batch;
         a=resolve(a.uuid);
-        { auto db=ObjectStore::open(path,options);auto txn=db.write({{a.uuid,a.storePin->version}});db.setMeta(txn,a.uuid,"external","true");txn.commit(); }
+        { auto db=ObjectStore::open(path,options);auto txn=db.write({{a.uuid,a.storePin->reference()}});db.setMeta(txn,a.uuid,"external","true");txn.commit(); }
         bool conflict=false;try { auto old=stale;controller.commitFiberStoreAction(old); } catch(...) { conflict=true; }
         require(conflict,"stale controller edits reject");
         a=resolve(a.uuid);
@@ -866,6 +863,7 @@ int runObjectStoreControllerTests()
             live->fiberFileName=merged.fileName;live->fiberUsername=merged.username;
             live->fiberStartedAt=merged.startedAt;live->fiberSequence=merged.sequence;
             live->storePin=merged.storePin;
+            live->graphCommit=merged.graphCommit;
             live->coordinateIdentity=merged.coordinateIdentity;live->frame=merged.frame;
             live->fiberOptimizationMode=merged.optimizationMode;live->suppressGeneratedViews=true;live->suppressErrorDialogs=true;
             for(size_t i=0;i<merged.controlPoints.size();++i) {
@@ -879,7 +877,7 @@ int runObjectStoreControllerTests()
             const auto failures=controller._fiberSaveFailureCount;
             controller.saveSessionAsFiber(*live,false);
             require(controller._fiberSaveFailureCount==failures,"completed manual interaction commits without solver");
-            require(live->storePin->version!=merged.storePin->version,"interaction advances pin immediately");
+            require(live->storePin->reference().version!=merged.storePin->reference().version,"interaction advances pin immediately");
             const auto savedPin=live->storePin;
             controller.saveOpenFibers();
             require(live->storePin==savedPin,"Save barrier does not create another revision");
@@ -1004,7 +1002,7 @@ int runObjectStoreControllerTests()
             require(controller.readStoredFibers(std::nullopt).size()==count,"real database reopens");
             const auto restored=resolve(fiber.uuid);
             require(std::find(restored.tags.begin(),restored.tags.end(),"vc3d_smoke")!=restored.tags.end(),"real database edit persists");
-            require(restored.storePin->version!=originalPin->version,"real database revision advances");
+            require(restored.storePin->reference().version!=originalPin->reference().version,"real database revision advances");
             auto realSplit=la::planFiberSplit(restored,restored.controlPoints.size()/2,
                 identity("real-prefix.json"),identity("real-suffix.json"),true,&error);
             if(!realSplit) throw std::runtime_error("real split plan: "+error);

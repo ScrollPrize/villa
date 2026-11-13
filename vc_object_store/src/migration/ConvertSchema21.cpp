@@ -7,6 +7,7 @@
 #include "internal/Publication.hpp"
 #include "internal/JsonFields.hpp"
 #include "internal/Artifacts.hpp"
+#include "internal/RecordOverrides.hpp"
 #include "geometry/DependencyIndex.hpp"
 #include "geometry/GeometryDelta.hpp"
 #include "geometry/GeometryToken.hpp"
@@ -103,6 +104,7 @@ void copyTable(sqlite3* in,sqlite3* out,const std::string& table,bool legacy,
     }
 }
 Json copyPhysical(sqlite3* source,const std::filesystem::path& destination,
+                  const std::filesystem::path& sourceLocation,const std::filesystem::path& finalLocation,
                   const std::map<std::string,std::string>& locations){
     const auto version=pragmaInt(source,"user_version");const bool legacy=version==21;
     if(pragmaInt(source,"application_id")!=0x56434f42||(version!=21&&version!=kSchemaVersion))
@@ -178,6 +180,7 @@ Json copyPhysical(sqlite3* source,const std::filesystem::path& destination,
             throw std::runtime_error("convert: custom index "+indexes.text(0)+" on a changed core table requires explicit porting");
         exec(db,indexes.text(1).c_str());
     }
+    relocateExternalLocators(db,sourceLocation,finalLocation);
     restorePrograms(db,programs,true);
     execute(db,"UPDATE database_identity SET schema_version=?",int64_t(kSchemaVersion));
     exec(db,("PRAGMA user_version="+std::to_string(kSchemaVersion)).c_str());
@@ -309,7 +312,8 @@ ConversionResult convertSchema21(const std::filesystem::path& source,const std::
             std::filesystem::absolute(target->target).lexically_relative(std::filesystem::absolute(node->target).parent_path()).generic_string());
     try{
         Json counts=Json::object();for(auto n:order)
-            counts[nodes[n]->uuid]=copyPhysical(nodes[n]->db,nodes[n]->target,nodes[n]->locations);
+            counts[nodes[n]->uuid]=copyPhysical(nodes[n]->db,nodes[n]->target,nodes[n]->source,
+                packed?destination:nodes[n]->target,nodes[n]->locations);
         Json mapping={{"store",nodes[root]->store},{"generation",nodes[root]->generation},{"objects",Json::object()},{"relationships",Json::object()}};
         if(exists(nodes[root]->db,"object_versions")){
             Statement objects(nodes[root]->db,"SELECT revision_uuid,object_uuid,version,generation FROM object_versions");

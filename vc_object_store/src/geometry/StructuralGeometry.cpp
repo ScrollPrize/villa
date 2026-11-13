@@ -64,6 +64,20 @@ nlohmann::json ObjectStore::geometryPointAnnotations(const Txn& txn,const std::s
     GeometryReader reader(txn,revision);
     return annotations(txn,*r,reader,name);
 }
+int64_t ObjectStore::nextGeometryPointId(const Txn& txn,const std::string& object,const std::string& array) const {
+    const auto current=objectByUuid(txn,object);
+    if(current&&sequenceIdArray(current->kind,array).empty())throw std::invalid_argument("sequence has no stable point IDs");
+    MetadataCacheScope cache;
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    MetadataSnapshot allocated(db);
+    mergeRetainedAllocations(db,object,array,allocated);
+    int64_t next=0;
+    allocated.entries([&](int64_t id,const auto&){
+        if(id==INT64_MAX)throw std::overflow_error("geometry point IDs exhausted");
+        next=std::max(next,id+1);
+    });
+    return next;
+}
 std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& objectId,const GeometrySequenceEdit& edit,
     const std::string& expected,const std::vector<GeometryEdgeEdit>& edges)
 {
@@ -86,15 +100,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
         std::vector<int64_t> originalIds;
         if(!idsName.empty()) {
             originalIds=idsOf(reader,idsName,oldCount);
-            // Restoration must not allow a previously allocated ID to be reused.
-            Statement latest(db,historyEnabled(db) ? "SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY rowid DESC LIMIT 1" :
-                "SELECT geometry_manifest FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
-                parseUuid(uuid));
-            if(latest.row()) {
-                const auto tip=Json::parse(latest.text(0));
-                if(tip.at("sequences").at(edit.array).at("allocated")!=state.at("allocated"))
-                    allocated.mergeAllocated(MetadataSnapshot(db,tip.at("sequences").at(edit.array).at("allocated")));
-            }
+            mergeRetainedAllocations(db,uuid,edit.array,allocated);
         }
         const auto tail=edit.start+edit.eraseCount;
         std::set<int64_t> liveIds;
@@ -122,6 +128,9 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
                 partCoords=source.read(edit.array,part.start*stride,part.count*stride);
                 if(!idsName.empty()) {
                     pointIds.resize(part.count);copyScalars<int64_t>(source.read(idsName,part.start*8,part.count*8),pointIds);
+                    if(sourceRevision->objectUuid!=uuid)
+                        for(auto id:pointIds)if(!allocated.get(id).is_null())
+                            throw std::invalid_argument("foreign point ID already allocated by target; reference target history to restore it");
                 }
                 const auto all=annotations(txn,*sourceRevision,source,edit.array);
                 pointAttrs=Json::array();for(auto i=part.start;i<part.start+part.count;++i)pointAttrs.push_back(all.at(i));

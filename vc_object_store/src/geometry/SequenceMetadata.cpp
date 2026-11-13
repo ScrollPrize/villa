@@ -1,8 +1,31 @@
 #include "geometry/SequenceMetadata.hpp"
+#include "internal/ReferenceResolver.hpp"
+#include "internal/JsonFields.hpp"
 #include "geometry/SequenceIdentity.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 
 namespace vc::objects::detail {
+void mergeRetainedAllocations(sqlite3* db,const std::string& object,const std::string& array,MetadataSnapshot& into)
+{
+    std::set<std::string> seen;
+    const auto merge=[&](sqlite3* source,const std::string& text){
+        const auto manifest=SharedJson::parse(text);
+        if(!manifest.contains("sequences")||!manifest.at("sequences").contains(array))return;
+        const auto& sequence=manifest.at("sequences").at(array);
+        if(!sequence.contains("allocated"))return;
+        const auto& allocated=sequence.at("allocated");
+        if(seen.insert(allocated.dump()).second)into.mergeAllocated(MetadataSnapshot(source,allocated));
+    };
+    resolveReference(db,[&](sqlite3* source){
+        Statement current(source,"SELECT geometry_manifest FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",parseUuid(object));
+        if(current.row())merge(source,current.text(0));
+        if(historyEnabled(source)){
+            Statement rows(source,"SELECT DISTINCT json_extract(manifest,'$.sequences') FROM geometry_revisions WHERE object_uuid=?",parseUuid(object));
+            while(rows.row())if(!rows.isNull(0))merge(source,SharedJson{{"sequences",SharedJson::parse(rows.text(0))}}.dump());
+        }
+        return false;
+    });
+}
 namespace {
 using Json=nlohmann::json;
 struct Cached {Json value;size_t bytes;};
@@ -131,7 +154,7 @@ SharedJson packAnnotation(sqlite3* db,const SharedJson& value) {
 SharedJson unpackAnnotation(sqlite3* db,const SharedJson& value) {
     if(value.contains("inline"))return value.at("inline");
     std::vector<uint8_t> bytes;
-    for(const auto& hash:value.at("annotation_chunks")) {const auto part=readSharedPayload(db,"@annotations",hash);bytes.insert(bytes.end(),part.begin(),part.end());}
+    for(const auto& hash:jsonArrayField(value,"annotation_chunks")) {const auto part=readSharedPayload(db,"@annotations",hash);bytes.insert(bytes.end(),part.begin(),part.end());}
     if(bytes.size()!=value.at("byte_length").get<size_t>())throw std::runtime_error("invalid annotation length");
     return SharedJson::parse(bytes);
 }
@@ -143,7 +166,7 @@ void metadataPayloads(sqlite3* source,const SharedJson& root,const std::function
         const auto bucket=load(source,hash);
         for(const auto& value:bucket) {
             const auto& annotation=value.is_object()&&value.contains("annotation")?value.at("annotation"):value;
-            if(annotation.is_object()&&annotation.contains("annotation_chunks"))for(const auto& chunk:annotation.at("annotation_chunks"))transfer(chunk);
+            if(annotation.is_object()&&annotation.contains("annotation_chunks"))for(const auto& chunk:jsonArrayField(annotation,"annotation_chunks"))transfer(chunk);
         }
         transfer(hash);
     }

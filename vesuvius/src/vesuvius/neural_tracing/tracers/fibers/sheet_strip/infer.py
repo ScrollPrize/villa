@@ -31,8 +31,9 @@ checkpoint run's); models with ``strip_uncertainty`` also save their expected er
 (``expected_error_vox`` in strip.npz, its mean over the stitched rows in summary.json).
 Nodes within ``--trim`` patch voxels of either fiber end, or beyond it, are not kept (as infer_all.py).
 Arclengths and ``--step``/``--blend`` are trace voxels; ``--arc`` and ``--trim`` patch voxels.
-If trimming leaves no nodes, inference exits before writing. Missing scoring coverage leaves the predictions
-intact: summary.json records coverage counts and omits unavailable error statistics; empty patch sheets are not written.
+If trimming leaves no nodes, inference exits before writing the strip outputs (with --ct, --out already holds
+ct_normalization.json). Missing scoring coverage leaves the predictions intact: summary.json records coverage counts
+and omits unavailable error statistics; empty patch sheets are not written.
 """
 from __future__ import annotations
 
@@ -40,6 +41,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import tempfile
 import time
 
 import numpy as np
@@ -58,6 +60,7 @@ from vesuvius.neural_tracing.tracers.fibers.sheet_strip.train import load_strip_
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
     add_volume_arguments, configure_volume, resolve_checkpoint)
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
 from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder
@@ -153,6 +156,23 @@ def reuse_seed_heading(item, ct, spec, cache):
     item['fiber_family'] = family
     item['seed_tangent'] = cache[key].copy()
 
+def bind_ct_override_normalization(spec, volume, known=None):
+    """With a ``--ct`` override (``volume.ct``: another CT than the checkpoint's), bind the per-crop z-score record of
+    ``spec`` to that CT, as tracing/inference.py does; without one, leave the checkpoint's record. The record carries
+    no learned statistics, only the volume's identity (normalize_ct checks only its method), so crops are normalized
+    the same either way; what changes is which volume the bound record names. It is persisted as
+    ``volume.out``/ct_normalization.json when the options name an output folder."""
+    if not getattr(volume, 'ct', None):
+        return
+    out = getattr(volume, 'out', None)
+    if out:
+        Path(out).mkdir(parents=True, exist_ok=True)
+        prepare_normalization(out, [spec], known=known)
+    else:
+        with tempfile.TemporaryDirectory(prefix='sheet_strip_ct_normalization_') as scratch:
+            prepare_normalization(scratch, [spec], known=known)
+
+
 class StripPredictor:
     """A sheet-strip checkpoint and what its decisions need (frame model and crop builder, CT volume, umbilicus),
     loaded once; ``predict`` runs one fiber's decisions."""
@@ -167,6 +187,7 @@ class StripPredictor:
         self.data = self.ck['run_config']['data']
         self.spec = CTVolumeSpec.from_dict(self.ck['vol_spec'])
         configure_volume(volume or argparse.Namespace(), self.spec, self.cfg, path)
+        bind_ct_override_normalization(self.spec, volume, known=self.ck.get('ct_normalization'))
         self.trace_per_patch = self.spec.ct_grid_scale/self.spec.grid_scale
         self.f, self.v = (a.numpy().astype(np.float64) for a in strip_grid(self.cfg))
         self.sample_cfg = SampleConfig(**dict(self.ck['sample_cfg'], crop=self.cfg.fine,

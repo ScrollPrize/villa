@@ -84,6 +84,8 @@ surface is the same edit: `vc_object_ingest --surface-channel UUID NAME TIFF`
 
 ## Structural sequence edits
 
+C++ editors use `StoreReader::assignGeometryPointIds(uuid, array, ids)` to fill negative or duplicate IDs, or `ObjectStore::nextGeometryPointId(txn, uuid, array)` for the next available value. Both account for retained allocations across referenced stores and restored-away revisions, even when the selected current revision predates its geometry. IDs are proposals, not reservations: submit them under the expected object version. Do not keep a separate high-water counter in restorable object metadata.
+
 `edit_geometry_sequence` splices rows of `points` (point collections, tracks),
 `control_points`, or `line_points` (fibers). `start` and `erase_count` select
 the span removed; `parts` supplies the replacement, in order — new rows
@@ -95,9 +97,11 @@ or a historical revision (expect every source object in `expected_versions`):
 
 ```python
 import struct
+from vc_object_store import object_reference
 
-version = store.current_version(uid)
-with store.write(expected_versions={uid: version}) as tx:
+reference = object_reference(store.object(uid))
+version = reference["version"]
+with store.write(expected_versions={uid: reference}) as tx:
     result = tx.edit_geometry_sequence(uid, {
         "array": "points", "start": 2, "erase_count": 0,
         "parts": [{"count": 1, "ids": [42],
@@ -136,7 +140,7 @@ Stable-ID rules:
 ## Surface growth and cropping
 
 ```python
-with store.write(expected_versions={uid: version}) as tx:
+with store.write(expected_versions={uid: reference}) as tx:
     grown = tx.resize_surface(uid, {
         "row": -1, "column": -1, "rows": 37, "columns": 39, "fill": fills,
     }, version)
@@ -182,8 +186,8 @@ metadata edits leave relationships applicable. `retired` and
 `keep_recorded` requires history because it retains an observation against an earlier endpoint state. A history-off store cannot perform that decision: enable history, edit through a history-enabled overlay, or explicitly remove/revalidate affected relationships. VC3D reports this requirement when a fiber edit would keep derived links as recorded; it never silently retains stale links or removes derived evidence to make the save succeed. Edits without affected derived relationships remain available in current-only stores.
 
 ```python
-with store.write(expected_versions={a: store.current_version(a),
-                                    b: store.current_version(b)}) as tx:
+with store.write(expected_versions={a: object_reference(store.object(a)),
+                                    b: object_reference(store.object(b))}) as tx:
     tx.retire_object(a)
 
 with store.write(expected_versions=...) as tx:

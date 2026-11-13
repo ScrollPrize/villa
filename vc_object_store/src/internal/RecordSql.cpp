@@ -8,8 +8,18 @@
 #include "vc_object_store/objects/EdgeKinds.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "geometry/GeometryToken.hpp"
+#include "internal/RecordResolver.hpp"
+#include "internal/RecordOverrides.hpp"
+#include "internal/RecordJson.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
+#include "vc_object_store/objects/Project.hpp"
 
 namespace vc::objects::detail {
+bool preciseObjectTimestamp(std::string_view kind)
+{
+    return kind == kProjectKind || isProjectResourceKind(kind);
+}
+
 const char* kObjectCols =
     "id,uuid,kind,name,commit_sequence,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
     "approval_state,approved_by,approved_at,approved_host,approved_version,format_version,storage_kind,"
@@ -166,6 +176,7 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details,
                            const std::string* initialGeneration, bool lifecycle)
 {
     ObjectRecord rec;
+    rec.versionStoreUuid=storeUuidText(db);
     const int64_t id = s.i64(0);
     readCommon(rec, s, 1, 2, 4);
     rec.name = s.text(3);
@@ -390,7 +401,7 @@ void insertObjectRow(sqlite3* db,const ObjectRecord& rec,int64_t id,int64_t comm
     if (preserveRecord && rec.approvedHost) s.bind(14, *rec.approvedHost); else s.bindNull(14);
     if (preserveRecord && rec.approvedVersion) s.bind(15, *rec.approvedVersion); else s.bindNull(15);
     s.bind(16, rec.formatVersion); s.bind(17, rec.storageKind); s.bind(18, rec.storageRef); s.bind(19, int64_t(1));
-    s.bind(20, rec.dataChecksum);if(rec.meta=="{}"||rec.meta.empty())s.bindNull(21);else s.bind(21, rec.meta);s.bind(22, id);
+    s.bind(20, rec.dataChecksum);if(rec.meta=="{}"||rec.meta.empty())s.bindNull(21);else s.bind(21,rec.meta);s.bind(22,id);
     if(geometryManifest)s.bindBorrowedText(23,*geometryManifest);else s.bindNull(23);
     s.stepDone();
     if (!immutableInitial(db)) execute(db,
@@ -402,12 +413,41 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
 {
     Savepoint savepoint(db);
     auto rec=prepareObjectRecord(input);
-    const auto uuid=parseUuid(rec.uuid);
     normalizeObjectCoordinates(rec,!preserveRecord,db);
+    const auto original=resolveObject(db,rec.uuid);
+    if (original && !preserveRecord && !restoringExtensions) {
+        if (original->record.kind != rec.kind)
+            throw std::runtime_error("object store: object kind cannot change");
+        if (original->record.storageKind == "sqlite") {
+            rec.storageKind=original->record.storageKind;
+            rec.storageRef=original->record.storageRef;
+            rec.dataChecksum=original->record.dataChecksum;
+        }
+        const auto editable=[](ObjectRecord r) {
+            static const std::set<std::string> fields{"name","format_version","storage_kind","storage_ref",
+                "data_checksum","meta","tags","fiber","surface","track"};
+            std::sort(r.tags.begin(),r.tags.end());
+            r.tags.erase(std::unique(r.tags.begin(),r.tags.end()),r.tags.end());
+            if(r.meta.empty())r.meta="{}";
+            return objectToJson(r,&fields);
+        };
+        if (editable(rec)==editable(original->record)) {savepoint.release();return rec.uuid;}
+    }
+    if(auto* source=objectSource(db,rec.uuid);source&&source!=db){
+        createRecordOverride(db,"objects",rec.uuid);
+        const auto rebased=resolveObject(db,rec.uuid)->record;
+        if(rec.storageKind==original->record.storageKind&&rec.storageRef==original->record.storageRef)
+            rec.storageRef=rebased.storageRef;
+        if(rec.track&&original->record.track&&rec.track->datasetRef==original->record.track->datasetRef)
+            rec.track->datasetRef=rebased.track->datasetRef;
+    }
+    const auto uuid=parseUuid(rec.uuid);
     const auto bounds = detail::recordBounds(rec);
-    Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?", uuid);
-    if (collision.row()) throw std::runtime_error("object store: UUID already belongs to an edge");
-    const std::string now = nowIsoUtc();
+    if (resolveReference(db, [&](sqlite3* source) {
+        Statement collision(source, "SELECT 1 FROM edges WHERE uuid=?", uuid);
+        return collision.row();
+    })) throw std::runtime_error("object store: UUID already belongs to an edge");
+    const std::string now = nowIsoUtc(preciseObjectTimestamp(rec.kind));
     Statement managed(db, "SELECT version,data_checksum,storage_ref FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
         uuid);
     const bool hasGeometry = managed.row();
@@ -417,7 +457,12 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         rec.version = managed.i64(0);
         rec.dataChecksum = managed.text(1);
     } else if (rec.storageKind == "sqlite") {
-        throw std::invalid_argument("object store: managed geometry requires putGeometry, not a storage_kind override");
+        // A metadata override may retain, never invent/change, an existing
+        // managed reference. No geometry payload or descriptor is copied.
+        const auto original=resolveObject(db,rec.uuid);
+        if(!original||original->record.storageKind!=rec.storageKind||original->record.storageRef!=rec.storageRef||
+           original->record.dataChecksum!=rec.dataChecksum)
+            throw std::invalid_argument("object store: managed geometry requires putGeometry, not a storage_kind override");
     }
 
     int64_t id = 0;
@@ -438,6 +483,8 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
             version, rec.dataChecksum, rec.meta, id);
     } else {
         if (!restoringExtensions) rejectInitialExtensionMetadata(rec.meta);
+        if(!historyEnabled(db)&&nlohmann::json::parse(rec.meta).contains(kArtifactsMetaKey))
+            beforeCurrentObjectEdit(db,rec.uuid);
         id = allocateRecordId(db, "objects");
         insertObjectRow(db,rec,id,commit_sequence,author,host,now,preserveRecord);
     }
@@ -481,6 +528,8 @@ std::string jsonPathForKey(const std::string& key)
 
 std::optional<std::string> geometryHead(sqlite3* db, const std::string& objectUuid)
 {
+    db=objectSource(db,objectUuid);
+    if(!db)return std::nullopt;
     Statement s(db,"SELECT storage_ref FROM objects WHERE uuid=? AND state<>2 AND geometry_manifest IS NOT NULL",parseUuid(objectUuid));
     return s.row()?std::optional(s.text(0)):std::nullopt;
 }

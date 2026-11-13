@@ -16,7 +16,7 @@ An H fiber runs along its columns and a V fiber along its rows, higher z at the 
 in trace.json). ``expected_error.tif`` lies beside it
 when the model predicts its error (``strip_uncertainty``: the stitched expected |error| per node, voxels; NaN off the
 strip). Each finished fiber appends a line to OUT/index/shard_K.jsonl (fiber UUID, family, length, decisions, nodes,
-checkpoint, the mean expected error, seconds); a fiber already in it is skipped, so a stopped shard resumes where it
+checkpoint, the complete input reference, the mean expected error, seconds); an unchanged fiber already in it is skipped, so a stopped shard resumes where it
 left off, also with another checkpoint (run.json lists every checkpoint used). Lengths: the store catalog's, in base
 voxels of ``--base-voxel-um``.
 """
@@ -43,6 +43,11 @@ def selected_fibers(fibers, min_length_mm, base_voxel_um):
     """Catalog indices of the fibers longer than ``min_length_mm``, catalog order."""
     lengths = np.array([row['length'] for row in fibers.catalog], np.float64)*base_voxel_um/1000.
     return np.flatnonzero(lengths > min_length_mm)
+
+
+def pending_fibers(catalog, chosen, completed):
+    """Resume only identical selected inputs; UUID-only legacy completions must be regenerated."""
+    return [c for c in chosen if completed.get(catalog[c]['id']) != catalog[c]['reference']]
 
 
 def strip_of_fiber(predictor, fiber, step=STEP, blend=BLEND, trim=0.):
@@ -119,9 +124,10 @@ def main(argv=None):
         chosen = chosen[:args.limit]
     (args.out/'index').mkdir(parents=True, exist_ok=True)
     log_path = args.out/'index'/f'shard_{k}.jsonl'
-    done = set()
+    done = {}
     if log_path.exists():
-        done = {json.loads(line)['fiber'] for line in log_path.read_text().splitlines() if line.strip()}
+        done = {entry['fiber']: entry.get('source_reference') for line in log_path.read_text().splitlines()
+                if line.strip() for entry in [json.loads(line)]}
     checkpoint = predictor.source
     # A run resumed with another checkpoint keeps the earlier ones (each fiber's index line names its own).
     earlier = json.loads((args.out/'run.json').read_text()) if (args.out/'run.json').exists() else {}
@@ -134,7 +140,7 @@ def main(argv=None):
         indent=1)+'\n').encode())
     row_step, column_step = df/tpp, (v[1]-v[0])/tpp
     started, decisions = time.time(), 0
-    todo = [c for c in chosen if fibers.catalog[c]['id'] not in done]
+    todo = pending_fibers(fibers.catalog, chosen, done)
     print(f'[shard {k}/{n}] {len(chosen)} fibers, {len(chosen)-len(todo)} done already', flush=True)
     with open(log_path, 'a') as log:
         for count, catalog_index in enumerate(todo, 1):
@@ -146,14 +152,14 @@ def main(argv=None):
             out = args.out/'strips'/fiber_id[:2]/f'fiber_{fiber_id}'
             nodes = int(keep.sum())
             rows, keep, expected, layout = display_grid(rows, keep, expected, family)
-            provenance = dict(checkpoint=checkpoint, step=predictor.ck.get('step'),
+            provenance = dict(checkpoint=checkpoint, step=predictor.ck.get('step'), source_reference=row['reference'],
                               fibers=str(fibers_path), fiber=fiber_id, family=family, decision_step=args.step,
                               blend=args.blend, trim_patch_voxels=args.trim, units='patch voxels', trace_per_patch=tpp,
                               first_row_arc_patch_voxels=float((arcs[0]+f[0])/tpp), **layout)
             steps = (column_step, row_step) if layout['fiber_along'] == 'columns' else (row_step, column_step)
             write_surface(out, rows/tpp, keep, *steps, provenance, overwrite=True, voxel_size_um=args.voxel_size_um,
                           mmap_layout=True)
-            record = dict(fiber=fiber_id, catalog=int(catalog_index), family=family,
+            record = dict(fiber=fiber_id, catalog=int(catalog_index), family=family, source_reference=row['reference'],
                           length_mm=float(length)*args.base_voxel_um/1000., decisions=len(arcs),
                           nodes=nodes, path=str(out.relative_to(args.out)), checkpoint=checkpoint)
             if expected is not None:

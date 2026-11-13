@@ -1,7 +1,9 @@
 #include "internal/CoordinateFilter.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
+#include "internal/RecordSql.hpp"
 #include "internal/Spatial.hpp"
+#include "internal/VisibleRows.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include "geometry/GeometryReader.hpp"
 #include "spatial/SurfaceTiles.hpp"
@@ -61,15 +63,19 @@ std::vector<std::string> remoteSurfacesIn(sqlite3* db, const Bounds& bounds, con
         "CROSS JOIN objects o ON o.id=b.object_id "
         "WHERE o.state=0 AND o.kind='surface' AND b.array_name='' "
         "AND o.geometry_manifest IS NULL AND o.storage_kind!='' AND " + spatialOverlapSql();
-    if (includedIds) sql += " AND o.id IN (SELECT value FROM json_each(?8))";
+    if (includedIds) sql += " AND hex(o.uuid) IN (SELECT value FROM json_each(?8))";
     if (coordinates) sql += coordinateFilterSql("o", "?7");
     sql += " ORDER BY o.uuid";
-    Statement rows(db, sql);
-    for (int i = 0; i < 6; ++i) rows.bind(i + 1, bounds[i]);
-    if (coordinates) rows.bind(7, coordinateFilterValue(*coordinates));
-    if (includedIds) rows.bind(8, *includedIds);
+    VisibleObjectRows rows(db,[&](sqlite3* source){
+        requireSpatial(source);
+        auto row=std::make_unique<Statement>(source,sql);
+        for(int i=0;i<6;++i)row->bind(i+1,bounds[i]);
+        if(coordinates)row->bind(7,coordinateFilterValue(*coordinates));
+        if(includedIds)row->bind(8,*includedIds);
+        return row;
+    });
     std::vector<std::string> uuids;
-    while (rows.row()) uuids.push_back(formatUuid(rows.blob16(0)));
+    while (rows.row()) uuids.push_back(rows.values().uuid(0));
     return uuids;
 }
 
@@ -240,6 +246,28 @@ void setSpatialBounds(sqlite3* db, int64_t objectId, const std::optional<Bounds>
 {
     if (!spatialEnabled(db)) return;
     writeBounds(db, objectId, bounds, revision);
+}
+
+void inheritSpatialBounds(sqlite3* source,sqlite3* target,const ObjectRecord& object,int64_t targetId)
+{
+    if(!spatialEnabled(target))return;
+    if(!spatialEnabled(source)){
+        setSpatialBounds(target,targetId,recordBounds(object));
+        if(object.storageKind=="sqlite")refreshGeometryBounds(target,object.uuid);
+        return;
+    }
+    const auto sourceId=objectIdByUuid(source,parseUuid(object.uuid));
+    Statement bounds(source,"SELECT revision_uuid,min_x,min_y,min_z,max_x,max_y,max_z FROM object_bounds WHERE object_id=?",*sourceId);
+    if(!bounds.row())return;
+    Bounds box;for(int i=0;i<6;++i)box[i]=bounds.f64(i+1);
+    writeBounds(target,targetId,box,bounds.isNull(0)?std::nullopt:std::optional(readGeometryTokenColumn(bounds,0)));
+    Statement regions(source,"SELECT array_name,row_start,col_start,row_count,col_count,min_x,min_y,min_z,max_x,max_y,max_z "
+        "FROM spatial_regions WHERE object_id=?",*sourceId);
+    RegionWriter writer(target,targetId);
+    while(regions.row()){
+        for(int i=0;i<6;++i)box[i]=regions.f64(i+5);
+        writer.update(regions.text(0),regions.i64(1),regions.i64(2),regions.i64(3),regions.i64(4),box);
+    }
 }
 
 void indexGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revision, const GeometryData& geometry)
@@ -501,15 +529,17 @@ void createSpatialSchema(sqlite3* db)
     // Exact double bounds remain authoritative. SQLite's float R-tree is only
     // the broad phase. Saturation preserves ordering for very large doubles;
     // queries apply the same saturation and then recheck exact double bounds.
-    const std::string geometryReference = historyEnabled(db) ? " REFERENCES geometry_revisions(uuid) DEFERRABLE INITIALLY DEFERRED" : "";
-    exec(db, (R"SQL(
+    // This is the same geometry reference as the object's descriptor. Its
+    // archive may live in a pinned source; the spatial accelerator cannot
+    // require a fabricated local revision row.
+    exec(db, R"SQL(
 CREATE TABLE object_bounds(
   object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
-  revision_uuid BLOB)SQL" + geometryReference + R"SQL(,
+  revision_uuid BLOB,
   min_x REAL NOT NULL,min_y REAL NOT NULL,min_z REAL NOT NULL,
   max_x REAL NOT NULL,max_y REAL NOT NULL,max_z REAL NOT NULL
 );
-)SQL").c_str());
+)SQL");
     createRegionSchema(db);
 }
 

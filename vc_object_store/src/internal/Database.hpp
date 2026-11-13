@@ -46,14 +46,14 @@ struct CurrentWriteState {
 struct StatementPool {
     std::optional<std::set<std::string>> edgeColumnNames;
     // Installed only by a collection transaction with pinned dependencies.
-    // Hashes resolve directly through pinned readonly dependencies, without
-    // per-reference registration. Size returns zero when no dependency owns it.
-    std::function<std::vector<uint8_t>(const std::string&)> externalGeometryChunk;
-    std::function<int64_t(const std::string&)> externalGeometryChunkSize;
-    std::function<ObjectRecord(const std::string&)> externalEndpointRecord;
-    std::function<std::string(const std::string&)> externalEndpointVersion;
-    std::function<std::optional<std::string>(const std::string&)> externalEndpointOwner;
-    std::function<void(const std::string&,const Anchor&)> externalEndpointValidateAnchor;
+    // Shared lookup for immutable records and payloads. Owns no data, aliases
+    // or per-record directories; returned connections live for the transaction.
+    std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> referenceSource;
+    std::function<sqlite3*(const std::string&,bool,bool)> objectSource;
+    std::function<sqlite3*(const std::string&,bool,bool)> edgeSource;
+    // Physical query sources in this pinned logical scope; visibility is
+    // checked by key resolution before filtering/pagination is finalized.
+    std::function<std::vector<sqlite3*>()> querySources;
     std::shared_ptr<CurrentWriteState> currentWrite;
     bool historyEnabled = true;
     bool spatialEnabled = true;
@@ -120,6 +120,7 @@ struct ObjectStore::Impl {
     std::string hostname;
     bool immutableInitial = false;
     sqlite3* writer = nullptr;
+    bool composed = false;
     std::mutex writerMutex;
     std::vector<sqlite3*> readerPool;
     std::mutex poolMutex;
@@ -172,11 +173,6 @@ struct ObjectStoreImplAccess {
                                                  bool includeRetired)
     {
         return store.revisionSelectionAt(txn, publishedAtUs, includeRetired);
-    }
-    static std::vector<SelectedRelationship> relationshipsAt(const ObjectStore& store, const Txn& txn,
-                                                             const RevisionSelection& selection)
-    {
-        return store.relationshipsAt(txn, selection);
     }
 };
 

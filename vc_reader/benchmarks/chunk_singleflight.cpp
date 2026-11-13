@@ -64,7 +64,7 @@ int main(int argc,char** argv) {
                     reader.sample_nearest(point,1,&value);
                     if(value!=reference[2*plane])throw std::runtime_error("selected/range value changed");
                 } else {const auto value=reader.chunk({0,0,0,int64_t(key)});
-                    if(!value||value->size()!=bytes||(*value)[0]!=reference[0]||value->back()!=reference.back())
+                    if(!value||value->size()!=bytes||(*value)[0]!=reference[0]||(*value)[bytes-1]!=reference.back())
                         throw std::runtime_error("whole chunk value changed");}
             };
             if(hot)read(0);

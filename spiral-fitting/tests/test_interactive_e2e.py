@@ -21,6 +21,8 @@ import time
 import unittest
 
 DATASET = "/home/paul/projects/vesuvius-scrolls/spiral/dataset"
+# The fit's input manifest (fit_session.load_input_manifest).
+INPUTS = os.environ.get("SPIRAL_E2E_INPUTS", f"{DATASET}/spiral-inputs.json")
 
 
 def _fiber_with_links():
@@ -49,7 +51,7 @@ class InteractiveEndToEndTests(unittest.TestCase):
 
         from fit_session import (SessionState, SpiralInputPaths,
                                  SpiralPreviewConfig, SpiralRunConfig,
-                                 load_scroll_spec, select_startup_autosave,
+                                 load_input_manifest, select_startup_autosave,
                                  validate_autosave)
         from spiral_runtime import InteractiveFitSession
 
@@ -58,22 +60,9 @@ class InteractiveEndToEndTests(unittest.TestCase):
             cache_dir = str(Path(work) / "cache")
             os.makedirs(out_dir)
             os.makedirs(cache_dir)
+            scroll, paths = load_input_manifest(INPUTS, cache_directory=cache_dir)
             paths = SpiralInputPaths.from_mapping({
-                "dataset_root": DATASET,
-                "umbilicus": f"{DATASET}/umbilicus.json",
-                "verified_patches": f"{DATASET}/verified_patches",
-                "fibers": f"{DATASET}/fibers",
-                "tracks_dbm": f"{DATASET}/tracks/2um_ds2_ps256_surf_v2.dbm",
-                "outer_shell": f"{DATASET}/outer_shell",
-                "pcls": [
-                    {"path": f"{DATASET}/abs_winding.json", "role": "absolute"},
-                    {"path": f"{DATASET}/relative_windings.json",
-                     "role": "relative"},
-                    {"path": f"{DATASET}/same_windings.json",
-                     "role": "same_winding"},
-                    {"path": f"{DATASET}/drawn_control_points.json",
-                     "role": "drawn_control_points"},
-                ],
+                **paths.manifest(),
                 "output_directory": out_dir,
                 "cache_directory": cache_dir,
             })
@@ -90,7 +79,7 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 },
             })
             session = InteractiveFitSession(
-                paths, run, SpiralPreviewConfig(), load_scroll_spec(DATASET),
+                paths, run, SpiralPreviewConfig(), scroll,
                 status_callback=None)
             try:
                 deadline = time.monotonic() + 900
@@ -125,10 +114,10 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 # The always-loaded service selects its startup autosave
                 # from the metadata the pause writes beside it, so the
                 # sidecar has to name this session's output namespace and
-                # dataset and survive container/identity validation.
+                # volume and survive container/identity validation.
                 selection = select_startup_autosave(
                     out_dir, session_namespace=out_dir,
-                    dataset_root=DATASET)
+                    volume_uuid=paths.volume_uuid)
                 self.assertEqual(selection.selected.checkpoint, autosaves[0])
                 self.assertEqual(selection.selected.completed_iterations, 2)
                 validate_autosave(selection.selected)

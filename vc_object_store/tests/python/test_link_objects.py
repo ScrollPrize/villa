@@ -32,7 +32,7 @@ def collection(db):
 
 
 def link_request(status, plan):
-    return dict(command_version=1, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
+    return dict(command_version=3, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
                 author="py", expected_objects={}, expected_relationships={}, read_dependencies={},
                 expected_commit_sequence=None, operations=[{"op": vos.LINK_OBJECTS_OPERATION, "plan": plan}])
 
@@ -78,6 +78,22 @@ def test_link_objects_refuses_a_bad_plan(db):
     with pytest.raises(ValueError):
         db.submit(link_request(db.status(), bad))
     assert db.object(vos.link_marker_uuid()) is None
+
+
+def test_submit_retains_store_through_reentrant_progress(db):
+    plane(db), plane(db)
+    closes = []
+
+    def progress(*_):
+        with pytest.raises(RuntimeError, match="cannot close"):
+            db.close()
+        closes.append(True)
+
+    receipt = db.submit(link_request(db.status(), {
+        "detectors": [{"detector": "surface-overlap", "params": {}}], "marker": {},
+    }), progress=progress)
+    assert closes
+    assert receipt["commit_sequence"] == db.status()["commit_sequence"]
 
 
 def test_link_objects_fails_when_a_detector_cannot_run(db):

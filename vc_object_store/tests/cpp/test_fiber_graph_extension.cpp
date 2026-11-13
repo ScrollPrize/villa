@@ -1,6 +1,8 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/FiberGraphSolveExtension.hpp"
 #include "vc_object_store/objects/InitialImport.hpp"
+#include "vc_object_store/objects/ObjectCopy.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "internal/Database.hpp"
 #include <algorithm>
 #include <limits>
@@ -243,6 +245,13 @@ void shardedResults(bool packed)
         });
     auto storeReference = ObjectCollection::create(dir.path / "store-reference.vcobj", {result.path},
         OpenOptions{.history = HistoryMode::Off, .author = "fiber-graph-test"});
+    {
+        auto overlay=ObjectStore::open(dir.path / "store-reference.vcobj",OpenOptions{.readOnly=true});
+        auto read=overlay.read();
+        const LocalStoreReader reader(overlay,read);
+        require(reader.status().extensionsPresent,"referenced extension presence is visible through an ordinary reader");
+        mustFail([&]{(void)readObjectCopy(reader,fibers[0]);});
+    }
     auto txn = storeReference.read();
     for (size_t i = 0; i < count; ++i) for (size_t run = 0; run < runUuids.size(); ++run) {
         for (const auto& expected : fiberRows(fibers[i], edges[i], run)) {

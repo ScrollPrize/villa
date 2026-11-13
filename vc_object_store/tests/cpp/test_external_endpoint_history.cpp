@@ -1,67 +1,50 @@
 #include "TestSupport.hpp"
 #include "UuidStorageTest.hpp"
-#include "internal/ExternalEndpoint.hpp"
-#include "internal/History.hpp"
-#include "internal/RecordSql.hpp"
+#include "internal/RecordResolver.hpp"
+#include "internal/CollectionReads.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include <iostream>
-
 using namespace vc::objects;
 using namespace vc::objects::detail;
 
-int main() try {
+void check(HistoryMode history) {
     TemporaryDirectory directory;
-    OpenOptions options;options.author="external-history";
-    auto store=ObjectStore::create(directory.path/"store",options);
-    const auto owner=util::newUuid(),lineage=util::newUuid(),a=util::newUuid(),b=util::newUuid();
-    auto install=[&](const Txn& txn){
-        auto& pool=*activeStatementPools.at(ObjectStoreImplAccess::conn(txn));
-        pool.externalEndpointOwner=[&](const std::string& id)->std::optional<std::string>{
-            return id==a||id==b?std::optional(owner):std::nullopt;
-        };
-        pool.externalEndpointRecord=[&](const std::string& id){
-            if(id!=a&&id!=b)throw std::runtime_error("unknown external key");
-            ObjectRecord record;record.uuid=id;record.kind="fiber";record.version=3;record.versionGeneration=lineage;
-            record.meta=R"({"quality":7})";return record;
-        };
-        pool.externalEndpointVersion=[&](const std::string& id){return externalEndpointToken(owner,id,lineage,7);};
-    };
-    std::string edge,oldVersion;
+    OpenOptions options;options.author="reference-history";options.history=history;
+    const auto basePath=directory.path/"base",overlayPath=directory.path/"overlay";
+    const auto a=util::newUuid(),b=util::newUuid();
+    ObjectVersion aVersion,bVersion;
     {
-        auto txn=store.write();auto* db=ObjectStoreImplAccess::conn(txn);install(txn);
-        Statement aliases(db,"SELECT count(*) FROM sqlite_schema WHERE name IN ('external_object_keys','endpoint_keys')");
-        require(aliases.row()&&aliases.i64(0)==0,"external history must not require endpoint registration tables");
-        EdgeRecord record;record.kind="perpendicular";record.aUuid=a;record.bUuid=b;
-        record.aAnchor.wholeGeometry=record.bAnchor.wholeGeometry=true;
-        record.aAnchor.metadataKeys={"quality"};edge=store.addEdge(txn,record);txn.commit();
+        auto base=ObjectStore::create(basePath,options);auto w=base.write();
+        for(const auto& id:{a,b}){ObjectRecord r;r.uuid=id;r.kind="fiber";r.meta=R"({"quality":7})";base.upsertObject(w,r);}
+        base.seal(w);w.commit();auto r=base.read();
+        aVersion=base.currentObjectRevision(r,a)->reference();
+        bVersion=base.currentObjectRevision(r,b)->reference();
     }
+    options.history=HistoryMode::On;
+    std::string edge;
     {
-        auto txn=store.read();install(txn);auto* db=ObjectStoreImplAccess::conn(txn);requireBinaryUuidStorage(store,txn);
-        Statement objects(db,"SELECT (SELECT count(*) FROM objects),(SELECT count(*) FROM object_revisions),(SELECT count(*) FROM object_head_records)");objects.row();
-        require(objects.i64(0)==0&&objects.i64(1)==0&&objects.i64(2)==0,"external edges never fabricate objects or histories");
-        const auto pinned=store.currentObjectRevision(txn,a);require(pinned&&pinned->uuid==externalEndpointToken(owner,a,lineage,7),"external endpoint has sealed version token");
-        const auto selected=ObjectStoreImplAccess::relationshipsAt(store,txn,{{a,pinned->uuid},{b,externalEndpointToken(owner,b,lineage,7)}});
-        require(selected.size()==1&&selected[0].relationship.record.uuid==edge,"external-only relationship history remains discoverable");
-        oldVersion=selected[0].relationship.uuid;
-        require(selected[0].relationship.aRevision.starts_with("external:")&&selected[0].relationship.bRevision.starts_with("external:"),"relationship pins external versions");
-        require(selected[0].applicable,"external sealed endpoints apply to historical graph");
+        auto overlay=ObjectCollection::create(overlayPath,{basePath},options);auto w=overlay.write();
+        EdgeRecord record;record.kind="perpendicular";record.aAnchor.metadataKeys={"quality"};
+        edge=overlay.addEdge(w,{{},a},{{},b},record).objectUuid;w.commit();
     }
-    {
-        auto txn=store.read();mustFail([&]{store.currentObjectRevision(txn,a);});
+    options.physicalPartitionOnly=true;
+    auto store=ObjectStore::open(overlayPath,options);
+    for(int iteration=0;iteration<2;++iteration){
+        auto txn=store.read();auto* db=ObjectStoreImplAccess::conn(txn);
+        auto scope=attachCollectionReferenceResolver(db,overlayPath);
+        require(store.currentVersion(txn,a)==aVersion.version&&store.currentVersion(txn,b)==bVersion.version,
+            "current version reads use the same visible-object resolver");
+        requireBinaryUuidStorage(store,txn);
+        Statement count(db,"SELECT (SELECT count(*) FROM objects),(SELECT count(*) FROM object_revisions)");count.row();
+        require(count.i64(0)==0&&count.i64(1)==0,"relations do not fabricate endpoint objects or history");
+        const auto selected=store.relationshipsAt(txn,std::vector<ObjectVersion>{aVersion,bVersion});
+        require(selected.size()==1&&selected[0].relationship.record.uuid==edge&&selected[0].applicable,"normal exact-version selection resolves pinned endpoints");
+        require(bool(resolveObjectVersion(db,selected[0].relationship.aReference)),"endpoint references resolve through the normal exact-version reader");
+        auto invalid=aVersion;++invalid.version;
+        require(!store.objectAtVersion(txn,invalid),"unavailable versions cannot become current versions");
+        invalid=aVersion;invalid.generation=util::newUuid();
+        require(!store.objectAtVersion(txn,invalid),"lineage is checked");
     }
-    {
-        auto txn=store.write();install(txn);auto record=*store.edgeByUuid(txn,edge);record.meta=R"({"confidence":0.75})";
-        store.updateEdge(txn,record);txn.commit();
-    }
-    {
-        auto txn=store.read();install(txn);const auto history=ObjectStoreImplAccess::relationshipsAt(store,txn,
-            {{a,externalEndpointToken(owner,a,lineage,7)},{b,externalEndpointToken(owner,b,lineage,7)}});
-        require(history.size()==1&&history[0].relationship.uuid!=oldVersion,"editing local relationship publishes a new relation, not an external object");
-        auto& pool=*activeStatementPools.at(ObjectStoreImplAccess::conn(txn));
-        pool.externalEndpointVersion=[&](const auto& id){return externalEndpointToken(owner,id,lineage,8);};
-        mustFail([&]{ObjectStoreImplAccess::objectRevision(store,txn,externalEndpointToken(owner,a,lineage,7));});
-        pool.externalEndpointVersion=[&](const auto& id){return externalEndpointToken(owner,id,util::newUuid(),7);};
-        mustFail([&]{ObjectStoreImplAccess::objectRevision(store,txn,externalEndpointToken(owner,a,lineage,7));});
-    }
-    std::cout<<"external endpoint history tests passed\n";
-    return 0;
-}catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+}
+int main()try{check(HistoryMode::Off);check(HistoryMode::On);std::cout<<"referenced endpoint history tests passed\n";}
+catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

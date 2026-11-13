@@ -51,11 +51,11 @@ int main() try
         const auto previous=borrowed.fiber(fiber);
         require(previous.load().linePoints.back()[0]==21,"writer view reads current geometry");
         require(store.geometryLengthInVolume(txn,fiber,"b")==42,"writer transformed length before replacement");
-        require(store.editGeometry(txn,fiber,{change(22)},token)==token,
-                "current geometry identity is object plus object version");
+        require(store.editGeometry(txn,fiber,{change(22)},token)!=token,
+                "each geometry write has its own UUID even within one object version");
         mustFail([&]{previous.load();});
         require(borrowed.fiber(fiber).load().linePoints.back()[0]==22,"new writer view sees replacement at same version");
-        require(store.geometryLengthInVolume(txn,fiber,"b")==44,"writer transformed length does not cache same-token old geometry");
+        require(store.geometryLengthInVolume(txn,fiber,"b")==44,"writer transformed length does not cache replaced-geometry old geometry");
         // Roll back to preserve the fixture used by the session checks below.
     }
     ObjectStoreSession session;
@@ -71,7 +71,7 @@ int main() try
     });
     session.requireCurrent(pin);
     auto request=session.newRequest(attached);
-    request.expectedObjects[fiber]=pin.version;
+    request.expectedObjects[fiber]=pin.reference();
     request.operations.push_back(SetMetaOp{fiber,"direct","true"});
     session.submit(attached,request);
     mustFail([&]{session.requireCurrent(pin);});
@@ -80,7 +80,7 @@ int main() try
             "current-only commits invalidate without a fabricated history journal");
     require(events[0].touches({"fiber"})&&events[0].touches({"surface"}),"whole-store invalidation reaches every cache");
     auto stale=session.newRequest(attached);
-    stale.expectedObjects[fiber]=pin.version;
+    stale.expectedObjects[fiber]=pin.reference();
     stale.operations.push_back(SetMetaOp{fiber,"stale","true"});
     mustFail([&]{session.submit(attached,stale);});
     require(session.takeEvents().empty(),"stale record version rejects without a commit");
@@ -112,8 +112,8 @@ int main() try
     request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
     session.submit(attached,request);
     session.setGeometryFetcher("remote_test",[](auto& db,const std::string& uuid,const ObjectStoreSession::FetchWrite& write){
-        VersionSelection expected;
-        {auto txn=db.read();expected[uuid]=db.currentVersion(txn,uuid);}
+        RecordSelection expected;
+        {auto txn=db.read();expected[uuid]=db.currentObjectRevision(txn,uuid)->reference();}
         write(expected,[&](auto& target,auto& txn){
             vc::geometry::Fiber data;data.linePoints={{0,0,0},{7,0,0}};
             target.putGeometry(txn,uuid,vc::geometry::encode(data));

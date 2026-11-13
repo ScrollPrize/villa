@@ -3,18 +3,17 @@
 #include "internal/EdgeLayout.hpp"
 #include "internal/JsonFields.hpp"
 #include "vc_object_store/objects/EdgeKinds.hpp"
+#include "internal/RecordOverrides.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 
 namespace vc::objects {
 using namespace detail;
 namespace {
-std::pair<const char*, int64_t> recordLocation(sqlite3* db, const std::array<unsigned char, 16>& bytes, const std::string& uuid)
+std::pair<const char*, RecordCommon> currentRecord(sqlite3* db, const std::string& uuid)
 {
-    Statement object(db,"SELECT id FROM objects WHERE uuid=? AND state<>2",bytes);
-    if(object.row())return {"objects",object.i64(0)};
-    Statement edge(db,"SELECT uuid FROM "+edgeReadSource(db)+" WHERE uuid=? AND state=0",bytes);
-    if(edge.row())return {"edges",0};
+    if (const auto object = resolveObject(db, uuid)) return {"objects", object->record};
+    if (const auto edge = resolveEdge(db, uuid)) return {"edges", edge->record};
     throw std::runtime_error("object store: record not found: " + uuid);
 }
 }
@@ -28,13 +27,11 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
     if (state == "approved" && edgeByUuid(txn, recordUuid) && edgeGeometryState(txn, recordUuid).stale)
         throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
-    const auto [table, id] = recordLocation(db, bytes, recordUuid);
+    const auto [table, current] = currentRecord(db, recordUuid);
     const bool edge=std::string_view(table)=="edges";
     if(edge)requireEdgeColumns(db,{"approval_state","approved_by","approved_at","approved_host","approved_version"});
-    {
-        Statement current(db, std::string("SELECT approval_state FROM ") + table + " WHERE uuid=?", bytes);
-        if (current.row() && (edge?edgeApprovalName(current.i64(0)):current.text(0)) == state) { savepoint.release(); return; }
-    }
+    if (current.approvalState == state) return;
+    createRecordOverride(db, table, recordUuid);
     const auto version = writeRecordVersion(db, table, recordUuid);
     const int64_t commit_sequence = writeCommitSequence(db);
     Statement s(db, std::string("UPDATE ") + table +
@@ -65,21 +62,25 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
         throw std::invalid_argument("extension: vcobj_extensions is reserved; use replaceExtensionRows");
     const auto path = jsonPathForKey(key);
     const auto bytes = parseUuid(recordUuid);
-    const auto [table, id] = recordLocation(db, bytes, recordUuid);
+    const auto [table, current] = currentRecord(db, recordUuid);
     // Compare JSON values, not their spelling. Missing and explicit null are
     // distinct; removing a missing key is also a no-op. Keep approval/history
     // untouched when an autosave submits the same logical value.
     if(std::string_view(table)=="edges")requireEdgeColumns(db,{"meta"});
     {
-        Statement current(db, std::string("SELECT meta FROM ") + table + " WHERE uuid=?", bytes);
-        (void)current.row();
-        const auto meta = parseObjectJson(current.text(0));
+        const auto meta = parseObjectJson(current.meta);
         const auto found = meta.find(key);
         if (jsonValue ? found != meta.end() && *found == nlohmann::json::parse(*jsonValue)
                       : found == meta.end()) {
-            savepoint.release();
             return;
         }
+    }
+    createRecordOverride(db, table, recordUuid);
+    int64_t id=0;
+    if(std::string_view(table)=="objects") {
+        Statement location(db,"SELECT id FROM objects WHERE uuid=?",bytes);
+        if(!location.row())throw std::runtime_error("object store: record override is missing: "+recordUuid);
+        id=location.i64(0);
     }
     if(std::string_view(table)=="objects")beforeCurrentObjectEdit(db,recordUuid);
     if (jsonValue) {
@@ -113,7 +114,7 @@ SetMetaOp bindCoordinatesOperation(const ObjectRecord& object, const std::string
 {
     if (!hasGeometryCoordinates(object.kind))
         throw std::invalid_argument("objects of kind " + object.kind + " have no coordinate frame");
-    const auto meta = nlohmann::json::parse(object.meta);
+    const auto meta = parseObjectJson(object.meta);
     const auto merged = mergeGeometryCoordinates(meta.value("coordinates", nlohmann::json::object()),
                                                  volumeCoordinates(volume, storedUnitsPerVoxel));
     return {object.uuid, "coordinates", merged.dump()};

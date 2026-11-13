@@ -25,9 +25,17 @@ void restoreCurrentExtensionRows(sqlite3*, const char* ownerTable, const std::st
 void clearCurrentExtensionRows(sqlite3*, const char* ownerTable, const std::string& ownerUuid);
 // Current snapshots, not discarded historical versions, survive history removal.
 std::vector<std::string> currentExtensionChunks(sqlite3*);
-// Localize manual fields with their owner into an overlay. Immutable result
-// tables remain in the referenced store and need no copied rows.
-void materializeExtensionOwner(sqlite3* sourceDb, ObjectStore& target, WriteTxn&,
-                               const char* ownerTable, const std::string& ownerUuid,
-                               const std::string& sourceMeta);
+// Both current and historical reads follow the selected record's snapshot.
+// Returns false when the visitor stops; prefix is a primary-key prefix.
+bool scanExtensionSnapshot(sqlite3*, const ExtensionTableInfo&, const std::string& owner,
+                           const std::string& metadata, const std::function<bool(const ExtensionRow&)>&,
+                           std::span<const ExtensionValue> prefix = {});
+void scanExtensionOwnerKeys(sqlite3*, const ExtensionTableInfo&, std::span<const ExtensionValue> prefix,
+                            const std::function<bool(const std::string&)>&);
+// Copy schema/provisioning only, so preserved snapshot references remain
+// interpretable. No owner rows or snapshot payloads are copied.
+void referenceExtensionSchemas(sqlite3* sourceDb, ObjectStore& target, WriteTxn&,
+                               const char* ownerTable, const std::string& sourceMeta);
+void referenceExtensionSchemas(sqlite3* sourceDb, sqlite3* targetDb,
+                               const char* ownerTable, const std::string& sourceMeta);
 } // namespace vc::objects::detail

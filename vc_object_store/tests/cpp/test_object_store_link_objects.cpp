@@ -195,6 +195,19 @@ void localRequests(const TemporaryDirectory& directory)
         require(retried.commitSequence && *retried.commitSequence == before + 1, "re-prepared, it commits");
     }
 
+    // Caller pins, then an edit happens before detection takes its snapshot.
+    {
+        auto stale = request(status(), plan());
+        { auto txn = db.read(); expectObject(stale, db.currentObjectRevision(txn, fixture.a)->reference()); }
+        { auto txn = db.write(); db.setMeta(txn, fixture.a, "note", R"("changed before detection")"); txn.commit(); }
+        const auto before = status().commitSequence;
+        bool conflicted = false;
+        try { db.submit(stale); } catch (const TransactionConflict& conflict) {
+            conflicted = conflict.reason() == TransactionConflict::Reason::Version;
+        }
+        require(conflicted && status().commitSequence == before, "caller-to-preparation race is retryable and writes nothing");
+    }
+
     // Prepared, then an unrelated commit: the links commit without waiting.
     {
         const auto unrelated = request(status(), plan());

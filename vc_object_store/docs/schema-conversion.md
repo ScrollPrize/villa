@@ -12,7 +12,11 @@ With separate source/destination paths, the source is never modified and the des
 
 `--in-place` explicitly requests replacement. It requires exclusive access to a regular, non-symlink store, builds and validates a complete sibling conversion, and only then durably replaces the original database/container atomically. Referenced artifacts are verified and stay at their original location. A conversion/validation failure leaves the original logical store intact; an ordinary SQLite input may checkpoint its existing WAL while acquiring exclusive access. Stop all clients before conversion and reopen them afterwards.
 
+The in-place CLI prepares and publishes the mapping and report before replacing the legacy database. Their parent directories must already exist, and existing files are not overwritten. These are separate files: a complete sidecar can remain if a later publication step fails. Inspect or move it before retrying.
+
 ## Schema 21 to 22
+
+The schema-21 source must be an upstream store. Unpublished experimental stores whose history-off geometry identifiers use `current:<object>:<version>` tokens are not supported; the runtime and converter do not reinterpret them as upstream geometry UUIDs. Regenerate those experimental stores with the current importer.
 
 This conversion preserves every populated core field, logical/physical identity, extension table and payload, history policy, commit/lineage pin and retained revision. It does not automatically apply the optional slim-import layout or quantize existing extension data. Current edges become UUID-keyed `WITHOUT ROWID` rows, edge tags reference UUIDs, and built-in kind/approval strings become their schema-22 integer codes. Empty metadata/dependencies normalize to SQL NULL. Numeric edge allocators, routes and the obsolete kind/ID index are removed; table-key metadata is updated to the new keys. Unknown kind names fail explicitly until a registered conversion is available.
 

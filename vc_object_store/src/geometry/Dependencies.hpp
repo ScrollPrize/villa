@@ -5,6 +5,7 @@
 #include "geometry/GeometrySnapshot.hpp"
 #include <functional>
 #include "geometry/GeometryReader.hpp"
+#include "geometry/ArrayLayout.hpp"
 #include "geometry/SequenceMetadata.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 
@@ -188,7 +189,11 @@ inline std::optional<std::vector<uint8_t>> pointValue(const DependencyGeometry& 
     if (array.dtype == "<f8") (void)snapshot.values<double>("point");
     else if (array.dtype == "<f4") {
         const auto xyz = snapshot.values<float>("point");
-        if (geometry.kind == "surface" && !vc::geometry::validSurfacePoint({xyz[0], xyz[1], xyz[2]})) return std::nullopt;
+        if (geometry.kind == "surface") {
+            if (!vc::geometry::validSurfacePoint({xyz[0], xyz[1], xyz[2]})) return std::nullopt;
+            if (geometry.arrays.contains(surfaceValidChannel) &&
+                geometry.read(surfaceValidChannel, *offset, 1).at(0) == 0) return std::nullopt;
+        }
     }
     return bytes;
 }
@@ -245,7 +250,9 @@ inline bool dependenciesChanged(const Anchor& anchor, const DependencyGeometry& 
             };
             if (identity(before)!=identity(after)) return true;
         }
-        if (identical(point.array) && (point.array == "point_ids" ? identical("points") : point.array == "control_point_ids" ? identical("control_points") : true)) continue;
+        const bool sameValidity = before.kind != "surface" || identical(surfaceValidChannel) ||
+            (!before.arrays.contains(surfaceValidChannel) && !after.arrays.contains(surfaceValidChannel));
+        if (sameValidity && identical(point.array) && (point.array == "point_ids" ? identical("points") : point.array == "control_point_ids" ? identical("control_points") : true)) continue;
         const auto old = pointValue(before, point), next = pointValue(after, point);
         if (!old || !next || old != next) return true;
         // Positional identities cannot be assumed to survive insertion/removal.

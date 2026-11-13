@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Surface, Umbilicus
+from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Surface, Umbilicus, object_reference
 
 
 @pytest.mark.parametrize("kind,geometry,array", [
@@ -17,6 +17,9 @@ def test_explicit_view_preserves_canonical_geometry(db, kind, geometry, array):
     db.register_volume_transform("source", "target", [[2, .5, 0, 10], [0, 1, 0, 0], [0, 0, 1, -4]])
     assert db.available_transforms(uid)[0]["volume"] == "target"
     with db.geometry_snapshot() as snapshot:
+        reference = object_reference(db.object(uid))
+        assert getattr(snapshot, kind)(reference).reference == reference
+        assert snapshot.geometry(reference).reference == reference
         view = getattr(snapshot, kind)(uid).view_transformed_at("target")
         if kind == "surface":
             tile = view.read_tile(0, 0, 1, 2)

@@ -46,8 +46,11 @@ void createProject(const std::filesystem::path& path, const std::string& name, c
                    const OpenOptions& options);
 // A standalone copy of a locally attached project at `destination` (which
 // must not exist), named `name`: every object, relationship and its history,
-// under a store identity of its own, with the project's artifacts. Operational
-// retry receipts are not copied into the new store identity.
+// with its own writable store identity and the project's artifacts. Immutable
+// dependencies retain their identities in the copied closure; sharded data
+// stays sealed behind the writable root. Move the .stores/.artifacts sidecars
+// with the root file. Operational retry receipts are not copied into the new
+// writable store identity.
 void copyProject(ObjectStoreSession&, const AttachmentIdentity&, const std::filesystem::path& destination,
                  const std::string& name, const OpenOptions& options);
 // The store's project record; nullopt for a store without one.
@@ -56,22 +59,29 @@ std::optional<ObjectRecord> projectRecord(const StoreReader&);
 void setProjectName(ObjectStoreSession&, const AttachmentIdentity&, const std::string& name);
 
 // The live resources of `kind` `viewer` sees (the shared ones and those it
-// owns; every one when nullopt), in the order they were added.
+// owns; every one when nullopt), in creation order. Legacy whole-second
+// stamps are refined using same-second retained creation publications where
+// available, including on override. Remaining whole-second stamps sort after
+// precise stamps within their second, with UUID as the last tie-breaker.
 std::vector<ProjectResource> projectResources(const StoreReader&, const std::string& kind,
                                               const std::optional<std::string>& viewer = std::nullopt);
-// The resource's UUID, the same in every store.
+// Deterministic UUID for a new resource. Reads/edits always use the actual
+// stored UUID; no implicit identity aliases are supported.
 std::string projectResourceUuid(const std::string& kind, const std::string& location, const std::string& owner = {});
-// The record of a resource, as addProjectResource writes it (upsertObject).
+// Candidate record for a new resource.
 ObjectRecord projectResourceRecord(const std::string& kind, const std::string& location,
                                    const std::vector<std::string>& tags = {},
                                    const nlohmann::json& meta = nlohmann::json::object(),
                                    const std::string& owner = {});
+// Direct-store counterpart of the checked session helper, with the same
+// identity and retirement rules. Returns the actual stored UUID.
+std::string addProjectResource(ObjectStore&, ObjectRecord);
 // Add a resource (or bring back a removed one) with these tags and meta, shared
 // or `owner`'s; false when it is already there, unchanged.
 bool addProjectResource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& kind,
                         const std::string& location, const std::vector<std::string>& tags = {},
                         const nlohmann::json& meta = nlohmann::json::object(), const std::string& owner = {});
-// Merge `meta`'s keys into the resource's meta; no change, no revision.
+// Merge metadata at its stored UUID without changing the resource's owner.
 void updateProjectResourceMeta(ObjectStoreSession&, const AttachmentIdentity&, const std::string& uuid,
                                const nlohmann::json& meta);
 // Retire a resource; false when it is not there.

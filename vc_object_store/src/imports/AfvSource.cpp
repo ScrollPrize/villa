@@ -192,7 +192,7 @@ AfcSource::AfcSource(const std::filesystem::path& path,const std::string& afvUui
     detail::Statement m(p.db,"SELECT key,value FROM metadata");
     while(m.row())meta[m.text(0)]=nlohmann::json::parse(m.text(1));
     if(meta.value("format","")!="fiber-constraints" || meta.value("schema_version",0)!=1 ||
-        !meta.value("complete",false) || meta.at("provenance").at("afv_uuid").get<std::string>()!=p.uuid)
+        !meta.value("complete",false) || util::canonicalUuid(meta.at("provenance").at("afv_uuid").get<std::string>())!=p.uuid)
         throw std::invalid_argument("AFC format, completeness or AFV identity mismatch");
     p.count=meta.at("statistics").at("constraints").get<int64_t>();
     p.metadata=meta.dump();

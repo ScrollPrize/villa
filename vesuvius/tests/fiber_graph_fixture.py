@@ -3,7 +3,7 @@ import uuid
 import numpy as np
 from vc_object_store import (import_initial_records, fiber_constraint_extension,
                              encode_fiber_arc,encode_fiber_direction,encode_fiber_winding)
-from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_initial_fibers
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_initial_fibers, fiber_source_version
 
 
 def uid(number):
@@ -19,6 +19,7 @@ def measured_store(root, events, *, workers=2, packed=True, isolated_ids=(), fie
           np.asarray(curves[i]) if curves is not None else np.array([[0.,0.,0.],[10.,0.,0.]])) for i in ids],
         volume=volume or uid(999),workers=workers,packed=packed)['path']
     table=fiber_constraint_extension('',coordinate_space='fixture/'+(volume or uid(999)))
+    table['provisioning']['fiber_source']=fiber_source_version(fibers)
     edges=[]
     for eid,a,b,parallel,distance in events:
         edge_uuid=uid(1000+eid)
@@ -38,7 +39,7 @@ def measured_store(root, events, *, workers=2, packed=True, isolated_ids=(), fie
         if a>b:aa,ab=ab,aa;na,nb=nb,na
         compact=dict(edge_uuid=uuid.UUID(edge_uuid).bytes,arc_a=encode_fiber_arc(aa),arc_b=encode_fiber_arc(ab),
                      normal_a=encode_fiber_direction(na),normal_b=encode_fiber_direction(nb),
-                     connector=encode_fiber_direction((np.asarray(pb)-pa).tolist()),
+                     connector=encode_fiber_direction(((np.asarray(pb)-pa) if a<b else (np.asarray(pa)-pb)).tolist()),
                      winding_distance=encode_fiber_winding(fields['parallel_las_winding'] if parallel else fields['las_winding']),extra=None)
         if compact['winding_distance'] is None:continue
         # New-format overrides can deliberately provide malformed compact values

@@ -9,7 +9,186 @@
 using namespace vc::objects;
 using namespace vc::objects::detail;
 ObjectRecord fiber(){ObjectRecord r;r.kind="fiber";r.fiber.emplace();return r;}
+
+void metadataOverrides()
+{
+    TemporaryDirectory dir;
+    for (const auto baseHistory : {HistoryMode::Off, HistoryMode::On})
+    for (const auto overlayHistory : {HistoryMode::Off, HistoryMode::On}) {
+        const auto root = dir.path / (std::to_string(int(baseHistory)) + "-" + std::to_string(int(overlayHistory)));
+        std::filesystem::create_directories(root / "source");
+        std::filesystem::create_directories(root / "derived");
+        const auto basePath = root / "source/base.vcobj", overlayPath = root / "derived/overlay.vcobj";
+        OpenOptions options; options.history = baseHistory; options.author = "test";
+        ObjectKey managed;
+        std::vector<ObjectKey> external;
+        std::vector<std::pair<std::string, std::string>> locations{
+            {"file", "data/fiber.obj"}, {"file", (root / "absolute.obj").string()},
+            {"dataset", "s3://bucket/volume"}, {"url", "https://example.org/fiber"}};
+        std::string reference, checksum, descriptor;
+        ObjectVersion baseVersion, metadataVersion;
+        std::vector<uint8_t> bytes;
+        {
+            auto base = ObjectStore::create(basePath, options); auto w = base.write();
+            managed = {base.uuid(w), base.upsertObject(w, fiber())};
+            vc::geometry::Fiber shape; shape.linePoints = {{0, 1, 2}, {3, 4, 5}};
+            reference = base.putGeometry(w, managed.objectUuid, vc::geometry::encode(shape));
+            for (const auto& [kind, location] : locations) {
+                auto record = fiber(); record.storageKind = kind; record.storageRef = location; record.dataChecksum = "external-checksum";
+                external.push_back({base.uuid(w), base.upsertObject(w, record)});
+            }
+            w.commit();
+            { auto r = base.read(); bytes = base.readGeometryArray(r, reference, "line_points"); checksum = base.currentGeometry(r, managed.objectUuid)->contentHash;
+                Statement stored(ObjectStoreImplAccess::conn(r),"SELECT geometry_manifest FROM objects WHERE uuid=?",parseUuid(managed.objectUuid));
+                stored.row(); descriptor=stored.text(0);
+                baseVersion=base.currentObjectRevision(r,managed.objectUuid)->reference(); }
+            auto seal = base.write(); base.seal(seal); seal.commit();
+        }
+        options.history = overlayHistory;
+        {
+            auto overlay = ObjectCollection::create(overlayPath, {basePath}, options);
+            { auto w = overlay.write(); overlay.setMeta(w, managed, "discard", "true"); }
+            { auto w = overlay.write();
+                overlay.setMeta(w, managed, "label", "1");
+                auto replacement = overlay.object(w, external.front())->record;
+                replacement.meta = "{\"label\":1}";
+                overlay.replaceObject(w, external.front(), replacement);
+                for (size_t i = 1; i < external.size(); ++i) overlay.setMeta(w, external[i], "label", "1");
+                w.commit(); }
+            { auto w = overlay.write(); overlay.setMeta(w, managed, "label", "2"); w.commit(); }
+            { auto w = overlay.write();
+                auto replacement = overlay.object(w, external.front())->record;
+                replacement.name = "renamed"; overlay.replaceObject(w, external.front(), replacement); w.commit(); }
+            { auto r = overlay.read();
+                const auto object=overlay.object(r,managed)->record;
+                metadataVersion={overlay.uuid(r),object.versionGeneration,managed.objectUuid,*object.version};
+                require(overlay.readGeometryArrayAtVersion(r,baseVersion,"line_points")==bytes&&
+                    overlay.readGeometryArrayAtVersion(r,metadataVersion,"line_points")==bytes,
+                    "base and metadata-only override versions use the same geometry resolution");
+                require(overlay.currentGeometry(r, managed)->uuid == reference, "metadata edits preserve exact inherited geometry identity");
+                require(overlay.currentGeometry(r, managed)->contentHash == checksum, "metadata edits preserve geometry checksum");
+                require(overlay.readGeometryArray(r, managed, "line_points") == bytes, "borrowed geometry stays readable");
+                require(overlay.object(r, managed)->record.meta.find("discard") == std::string::npos, "rollback preserves inherited metadata");
+                for (size_t i = 0; i < external.size(); ++i) {
+                    const auto record = overlay.object(r, external[i])->record;
+                    require(record.storageKind == locations[i].first && record.dataChecksum == "external-checksum", "external kind and checksum retained");
+                    const auto expected = i == 0 ? std::string("../source/data/fiber.obj") : locations[i].second;
+                    require(record.storageRef == expected, "relative file reference rebased; opaque and absolute references unchanged");
+                }
+            }
+        }
+        {
+            auto raw = ObjectStore::open(overlayPath, OpenOptions{.physicalPartitionOnly = true, .readOnly = true}); auto r = raw.read();
+            auto* sql = ObjectStoreImplAccess::conn(r);
+            Statement payloads(sql, "SELECT count(*) FROM geometry_chunks"); payloads.row();
+            require(payloads.i64(0) == 0, "metadata override copies no geometry bytes");
+            Statement descriptors(sql, "SELECT geometry_manifest FROM objects WHERE uuid=?",parseUuid(managed.objectUuid));
+            require(descriptors.row()&&descriptors.text(0)==descriptor, "metadata override copies the complete descriptor verbatim");
+            if (overlayHistory == HistoryMode::On) {
+                Statement archives(sql, "SELECT count(*) FROM geometry_revisions"); archives.row();
+                require(archives.i64(0) == 0, "metadata history does not create geometry revisions");
+                const auto history = raw.objectHistory(r, managed.objectUuid);
+                require(history.size() == 2, "each actual metadata edit is historized");
+                require(history.front().record.meta.find("\"label\":1") != std::string::npos, "old metadata is unchanged");
+                for (const auto& version : history) require(version.geometryRevision == reference, "history preserves borrowed reference across history modes");
+                Statement pin(sql,"SELECT geometry_uuid FROM object_revisions WHERE object_uuid=?",parseUuid(managed.objectUuid));
+                while(pin.row())require(!pin.isNull(0),"borrowed references are stored directly, never replaced with null");
+                Statement keys(sql,"PRAGMA foreign_key_list(object_revisions)");
+                while(keys.row())require(keys.text(3)!="geometry_uuid","geometry references must not require local archive rows");
+            }
+        }
+        // Explicit history policy conversion may change geometry tokens, but
+        // must preserve the geometry described by the copied metadata.
+        for (const auto mode : {HistoryMode::On, HistoryMode::Off, overlayHistory}) {
+            changeHistoryMode(overlayPath, mode);
+            auto converted = ObjectCollection::open(overlayPath, options); auto r = converted.read();
+            require(converted.readGeometryArray(r, managed, "line_points") == bytes,
+                "history policy conversion preserves borrowed geometry");
+            reference=converted.currentGeometry(r,managed)->uuid;
+        }
+        {
+            auto overlay = ObjectCollection::open(overlayPath, options);
+            { auto r = overlay.read(); require(overlay.readGeometryArray(r, managed, "line_points") == bytes, "reopened overlay resolves borrowed geometry"); }
+            { auto w = overlay.write(); overlay.seal(w); w.commit(); }
+            auto child = ObjectCollection::create(root / "child.vcobj", {overlayPath}, options);
+            { auto w = child.write(); child.setMeta(w, managed, "label", "3"); w.commit(); }
+            ObjectVersion beforeEdit;
+            { auto r = child.read(); require(child.currentGeometry(r, managed)->uuid == reference && child.readGeometryArray(r, managed, "line_points") == bytes,
+                "nested metadata override retains original reference");
+                const auto record=child.object(r,managed)->record;
+                beforeEdit={child.uuid(r),record.versionGeneration,managed.objectUuid,*record.version}; }
+            GeometryArrayEdit edit{"line_points", 0, std::vector<uint8_t>(sizeof(double))};
+            double value = 12; std::memcpy(edit.bytes.data(), &value, sizeof(value));
+            { auto w = child.write(); child.editGeometry(w, managed, {edit}, reference); w.commit(); }
+            auto edited = bytes; std::memcpy(edited.data(), &value, sizeof(value));
+            { auto r = child.read(); require(child.readGeometryArray(r, managed, "line_points") == edited, "explicit geometry edit still works after metadata overrides"); }
+            if(overlayHistory==HistoryMode::On) {
+                auto r=child.read();
+                require(child.readGeometryArrayAtVersion(r,beforeEdit,"line_points")==bytes,
+                    "historical geometry follows unchanged reference after local edit");
+                require(child.currentGeometry(r,managed)->parentUuid==reference,
+                    "sparse edit keeps actual referenced parent, without a synthetic local base");
+                auto local=ObjectStore::open(root/"child.vcobj",OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
+                auto read=local.read();Statement count(ObjectStoreImplAccess::conn(read),"SELECT count(*) FROM geometry_revisions");
+                require(count.row()&&count.i64(0)==1,"one real edit creates exactly one geometry revision");
+            }
+            { auto r = overlay.read(); require(overlay.readGeometryArray(r, managed, "line_points") == bytes, "child geometry edit leaves base untouched"); }
+        }
+    }
+}
+
+void metadataOverridesOfDeltaGeometry()
+{
+    TemporaryDirectory dir;
+    const auto basePath=dir.path/"delta-base.vcobj";
+    OpenOptions options; options.author="test";
+    ObjectKey key;
+    std::string token,descriptor;
+    std::vector<uint8_t> expected;
+    GeometryArrayEdit change{"line_points",0,std::vector<uint8_t>(sizeof(double))};
+    double value=15; std::memcpy(change.bytes.data(),&value,sizeof(value));
+    {
+        auto base=ObjectStore::create(basePath,options);
+        { auto w=base.write(); key={base.uuid(w),base.upsertObject(w,fiber())};
+            vc::geometry::Fiber shape; for(int i=0;i<100000;++i)shape.linePoints.push_back({double(i),2,3});
+            token=base.putGeometry(w,key.objectUuid,vc::geometry::encode(shape)); w.commit(); }
+        { auto w=base.write(); token=base.editGeometry(w,key.objectUuid,{change},token); w.commit(); }
+        { auto r=base.read(); expected=base.readGeometryArray(r,token,"line_points");
+            Statement d(ObjectStoreImplAccess::conn(r),"SELECT geometry_manifest FROM objects WHERE uuid=?",parseUuid(key.objectUuid));d.row();descriptor=d.text(0);
+            Statement delta(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM geometry_deltas");delta.row();require(delta.i64(0)>0,"fixture must contain an archived geometry delta"); }
+        auto w=base.write();base.seal(w);w.commit();
+    }
+    for(const auto mode:{HistoryMode::Off,HistoryMode::On}){
+        options.history=mode;
+        const auto path=dir.path/("delta-overlay-"+std::to_string(int(mode)));
+        auto overlay=ObjectCollection::create(path,{basePath},options);
+        { auto w=overlay.write();overlay.setMeta(w,key,"classification","\"H\"");w.commit(); }
+        { auto r=overlay.read();require(overlay.currentGeometry(r,key)->uuid==token,"metadata edit preserves delta reference");
+            require(overlay.readGeometryArray(r,key,"line_points")==expected,"copied descriptor retains readable delta-backed payloads"); }
+        { auto local=ObjectStore::open(path,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});auto r=local.read();auto* db=ObjectStoreImplAccess::conn(r);
+            Statement d(db,"SELECT geometry_manifest FROM objects WHERE uuid=?",parseUuid(key.objectUuid));d.row();require(d.text(0)==descriptor,"delta-backed descriptor is copied verbatim");
+            Statement chunks(db,"SELECT count(*) FROM geometry_chunks");chunks.row();require(chunks.i64(0)==0,"metadata edit does not materialize delta payloads");
+            if(mode==HistoryMode::On){Statement revisions(db,"SELECT count(*) FROM geometry_revisions");revisions.row();require(revisions.i64(0)==0,"metadata edit does not create a geometry snapshot");} }
+        change.elementOffset=240000;value=30;std::memcpy(change.bytes.data(),&value,sizeof(value));
+        { auto w=overlay.write();overlay.editGeometry(w,key,{change},token);w.commit(); }
+        auto edited=expected;std::memcpy(edited.data()+change.elementOffset*sizeof(double),&value,sizeof(value));
+        { auto r=overlay.read();require(overlay.readGeometryArray(r,key,"line_points")==edited,"explicit delta-backed geometry edit still works"); }
+        if(mode==HistoryMode::On) {
+            std::string first;
+            {auto r=overlay.read();first=overlay.currentGeometry(r,key)->uuid;require(overlay.currentGeometry(r,key)->parentUuid==token,"edit references source delta directly");}
+            change.elementOffset=150000;value=47;std::memcpy(change.bytes.data(),&value,sizeof(value));
+            {auto w=overlay.write();overlay.editGeometry(w,key,{change},first);w.commit();}
+            std::memcpy(edited.data()+change.elementOffset*sizeof(double),&value,sizeof(value));
+            {auto r=overlay.read();require(overlay.readGeometryArray(r,key,"line_points")==edited,"multiple local deltas retain unchanged source-delta chunks");}
+            auto local=ObjectStore::open(path,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});auto r=local.read();
+            Statement count(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM geometry_chunks");
+            require(count.row()&&count.i64(0)==0,"sparse history-on edits do not copy inherited payloads");
+        }
+    }
+}
 int main()try{
+    metadataOverrides();
+    metadataOverridesOfDeltaGeometry();
     TemporaryDirectory dir;
     auto options=OpenOptions{.history=HistoryMode::Off,.spatialIndex=false,.author="test"};
     const auto basePath=dir.path/"base.vcobj",overlayPath=dir.path/"overlay.vcobj";
@@ -24,7 +203,8 @@ int main()try{
         auto seal=base.write();base.seal(seal);seal.commit();
     }
     auto overlay=ObjectCollection::create(overlayPath,{basePath},options);
-    mustFail([&]{ObjectStore::open(overlayPath,OpenOptions{.readOnly=true});});
+    {auto native=ObjectStore::open(overlayPath,OpenOptions{.readOnly=true});auto r=native.read();
+     require(native.objectCount(r,"fiber")==2,"ordinary store API opens logical collections");}
     {
         auto r=overlay.read();require(overlay.readGeometryArray(r,a,"line_points")==geometry,"inherited geometry exact");
         require(overlay.provisioning(r).commitSequence>overlay.members()[1].commitSequence,"derived commit sequence above parent");

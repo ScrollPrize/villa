@@ -81,6 +81,25 @@ void problem(GeometryIngestReport& report, const std::string& label, const std::
 {
     report.problems.push_back(label + ": " + error.what());
 }
+// Describe the SourceIngestOptions repairs recorded in a prepared batch's metadata.
+std::vector<std::string> repairNotices(const std::vector<Prepared>& batch, const fs::path& source)
+{
+    std::vector<std::string> result;
+    size_t renumbered = 0;
+    for (const auto& p : batch) {
+        if (p.source.value("point_ids_renumbered", false)) ++renumbered;
+        if (!p.source.contains("dropped_branches")) continue;
+        std::string targets;
+        for (const auto& branch : p.source.at("dropped_branches"))
+            targets += (targets.empty() ? "" : ", ") + branch.at("branch_file").get<std::string>();
+        result.push_back("fiber " + p.object.uuid + " (" + p.object.name + "): dropped " +
+            std::to_string(p.source.at("dropped_branches").size()) + " branch declarations to absent files: " + targets);
+    }
+    if (renumbered)
+        result.push_back(source.string() + ": renumbered point IDs of " + std::to_string(renumbered) +
+            " collections sharing IDs; file IDs kept as source_point_id");
+    return result;
+}
 }
 
 std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const fs::path& source,
@@ -95,8 +114,10 @@ std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const
 }
 
 GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::optional<fs::path>& datasetRoot,
-    const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress)
+    const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress,
+    const std::string& coordinateContext)
 {
+    geometryCoordinates(Json::parse(coordinateContext));
     GeometryIngestReport report;
     std::vector<ObjectRecord> objects;
     std::map<std::string, Expected> expectations;
@@ -127,9 +148,10 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
             Prepared p;
             if (object.kind == "track") {
                 if (!object.track) throw std::runtime_error("track detail missing");
-                fs::path path(object.track->datasetRef);
-                if (path.is_relative()) path = datasetRoot.value_or(db.path().parent_path()) / path;
-                const auto packed = resolvePackedTrackStore(path);
+                std::optional<fs::path> path;
+                { auto read = db.read(); path = db.resolveStoragePath(read, object.uuid, datasetRoot); }
+                if (!path) throw std::runtime_error("track source is unavailable");
+                const auto packed = resolvePackedTrackStore(*path);
                 auto& store = trackCache[packed];
                 if (!store) store = std::make_unique<PackedTrackStore>(packed);
                 const auto id = detail::trackSourceId(object.track->externalKey);
@@ -141,13 +163,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
                 // Remote tifxyz: fetched once, decoded here, then held by the store.
                 if (object.kind != "surface" || !formats::isRemoteSource(object.storageRef))
                     throw std::runtime_error("remote sources are tifxyz surfaces at http(s):// or s3:// URLs");
-                const auto staging = fs::temp_directory_path() / ("vc-object-fetch-" + util::newUuid());
-                fs::create_directory(staging);
-                try {
-                    formats::fetchRemoteSurface(object.storageRef, staging);
-                    p = surface(staging);
-                } catch (...) { std::error_code ignored; fs::remove_all(staging, ignored); throw; }
-                std::error_code ignored; fs::remove_all(staging, ignored);
+                p = formats::readRemoteSurfaceGeometry(object.storageRef);
                 // The registration, not the remote meta.json, is the identity.
                 p.object.uuid = object.uuid;
             } else {
@@ -169,7 +185,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
         } catch (const std::exception& error) { problem(report, object.uuid, error); }
     }
     if (report.problems.empty()) {
-        try { ingestBatch(directCommit(db), std::move(prepared), expectations, report, "{}", true); }
+        try { ingestBatch(directCommit(db), std::move(prepared), expectations, report, coordinateContext, true); }
         catch (const std::exception& error) { problem(report, "batch", error); }
     }
     util::reportProgress(progress, "ingesting geometry", objects.size(), objects.size());
@@ -184,8 +200,6 @@ struct IngestTarget {
     std::function<TransactionReceipt(const TransactionRequest&)> submit;
     // Stops before the next surface or track, or before a batch commits.
     std::function<bool()> cancelled;
-    // Relative track dataset references resolve here (the store's directory).
-    std::optional<fs::path> storeDirectory;
 };
 
 // Ends ingestion at a failure that is not the source's (stopOnInfrastructureError).
@@ -264,11 +278,11 @@ try {
                 ObjectSelection tracks; tracks.kind = "track"; tracks.includeRetired = true;
                 for (const auto& object : reader.selectObjects(tracks)) {
                     if (!object.track) continue;
-                    fs::path path(object.track->datasetRef);
-                    if (path.is_relative() && target.storeDirectory) path = *target.storeDirectory / path;
+                    const auto path = reader.resolveStoragePath(object.uuid);
+                    if (!path) continue;
                     std::error_code error;
-                    if (fs::weakly_canonical(path, error) == packed && !error) {
-                        refs.insert(object.track->datasetRef); existing.emplace(object.track->externalKey, object);
+                    if (fs::weakly_canonical(*path, error) == packed && !error) {
+                        refs.insert(path->string()); existing.emplace(object.track->externalKey, object);
                     }
                 }
             });
@@ -320,9 +334,11 @@ try {
             });
             auto batch = fromSource([&] { return prepareGeometrySource(kind, source, available, options); });
             for (auto& p : batch) addTags(p, tags);
+            const auto notices = repairNotices(batch, source);
             // The batch commits whole or not at all.
             if (target.cancelled()) { report.cancelled = true; return; }
             commitBatch(target, std::move(batch), report, coordinateContext);
+            report.notices.insert(report.notices.end(), notices.begin(), notices.end());
         }
     } catch (const std::exception& error) { failed(report, options, source.string(), error); }
 } catch (const Stopped&) {}
@@ -344,7 +360,6 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
     };
     target.submit = [&](const TransactionRequest& request) { return db.submit(request); };
     target.cancelled = [] { return false; };
-    target.storeDirectory = db.path().parent_path();
     GeometryIngestReport report;
     ingestSource(report, target, kind, source, progress, coordinateContext, tags, options);
     return report;
@@ -369,7 +384,6 @@ GeometryIngestReport ingestGeometrySource(ObjectStoreSession& session, const Att
     target.newRequest = [&] { return session.newRequest(attachment); };
     target.submit = [&](const TransactionRequest& request) { return session.submit(attachment, request); };
     target.cancelled = [&] { return !session.current(attachment) || (cancel && cancel->load()); };
-    if (!session.hosted(attachment)) target.storeDirectory = fs::path(session.location(attachment)).parent_path();
     ingestSource(report, target, kind, source, progress, coordinateContext, tags, options);
     return report;
 }

@@ -251,6 +251,7 @@ struct LineAnnotationController::LineAnnotationSession {
     uint64_t fiberId = 0;
     std::string fiberUuid = vc::objects::util::newUuid();
     std::optional<vc::objects::PinnedObject> storePin;
+    std::optional<int64_t> graphCommit;
     std::optional<vc::objects::PinnedObject> runningStorePin;
     std::string fiberUsername;
     std::string fiberStartedAt;
@@ -344,10 +345,9 @@ std::vector<vc::objects::ObjectVersion> currentFiberVersions(const vc::objects::
     objects.kind = "fiber";
     objects.includeRetired = true;
     std::vector<vc::objects::ObjectVersion> versions;
-    const auto store = reader.status().storeUuid;
     for (const auto& record : reader.selectObjects(objects, std::vector<std::string>{})) {
         if (!record.version) throw std::runtime_error("Fiber listing without versions");
-        versions.push_back({store, record.versionGeneration, record.uuid, *record.version});
+        versions.push_back(record.reference());
     }
     return versions;
 }
@@ -380,11 +380,9 @@ cv::Vec3d mapNormal(const vc::objects::VolumeAffine& m, const cv::Vec3d& n)
 std::vector<vc::geometry::Point> storedFiberLinePoints(
     const vc::objects::FiberView& view, const std::optional<vc3d::line_annotation::FiberVolumeFrame>& frame)
 {
-    if (!frame) return view.linePoints(0, view.linePointCount());
-    const auto shown = view.viewTransformedAt(frame->volume.volume, frame->volume.scale);
-    if (shown.mapping() != frame->storedToVolume)
-        throw std::runtime_error("The fiber's volume registration changed; reopen it");
-    return shown.points("line_points", 0, view.linePointCount());
+    auto points = view.linePoints(0, view.linePointCount());
+    if (frame) for (auto& point : points) point = frame->storedToVolume.apply(point);
+    return points;
 }
 
 // Link predicates shared with the save/validation helpers and the
@@ -2972,10 +2970,12 @@ std::optional<QString> LineAnnotationController::placePreparedControl(
     {
         const auto current = readStoredFiber(session.fiberId);
         if (!current || !current->storePin || !session.storePin ||
-            current->storePin->geometryRevision != session.storePin->geometryRevision) {
+            current->storePin->geometryRevision != session.storePin->geometryRevision ||
+            current->frame != session.frame || current->coordinateIdentity != session.coordinateIdentity) {
             return context.changedMessage;
         }
         session.storePin = current->storePin;
+        session.graphCommit = current->graphCommit;
     }
     const size_t countBefore = session.controlPoints.size();
     const std::vector<cv::Vec3d> currentLinePoints = linePointPositions(session.optimizedLine);
@@ -3954,6 +3954,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberId = fiber.id;
     session->fiberUuid = fiber.uuid;
     session->storePin = fiber.storePin;
+    session->graphCommit = fiber.graphCommit;
     session->fiberUsername = fiber.username;
     session->fiberStartedAt = fiber.startedAt;
     session->fiberSequence = fiber.sequence;
@@ -5476,16 +5477,14 @@ LineAnnotationController::storedUmbilicus(const vc::objects::VolumeVoxels& voxel
     return stored;
 }
 
-QString LineAnnotationController::umbilicusFingerprint() const
+vc3d::fiber_map::UmbilicusDependency LineAnnotationController::umbilicusDependency() const
 {
-    // Changes whenever the answer does: uuid@generation/version, else why there is none.
     if (!_state || !_state->storeFor("umbilicus") || !_state->annotationVolume()) {
         return {};
     }
     const auto& stored = storedUmbilicus(*_state->annotationVolume());
-    return stored.umbilicus ? QString::fromStdString(stored.umbilicus->uuid + "@" + stored.umbilicus->version.generation + "/" +
-                                                     std::to_string(stored.umbilicus->version.version))
-                            : stored.problem;
+    if (stored.umbilicus) return {stored.umbilicus->version, {}};
+    return {std::nullopt, stored.problem};
 }
 
 LineAnnotationController::UmbilicusStatus
@@ -5703,8 +5702,8 @@ void LineAnnotationController::refreshChangedStoreFibers()
     connection->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
         auto stale = [&](const auto& pin) {
             if (pin->attachment != *attachment) return true;
-            const auto head = reader.currentObject(pin->object.objectUuid);
-            return !head || head->version != pin->version || head->generation != pin->generation || head->record.retired;
+            const auto head = reader.currentObject(pin->reference().objectUuid);
+            return !head || head->reference() != pin->reference() || head->record.retired;
         };
         // A fiber not yet committed (no revision) has nothing to be stale against.
         for (const auto& pane : _panes) if (pane.session && pane.session->storePin &&
@@ -10828,11 +10827,11 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         const auto store = _state->objectStoreSession();
         currentStoreRevision = store->current(pin.attachment);
         if (currentStoreRevision) store->readStore(pin.attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-            const auto head=reader.currentObject(pin.object.objectUuid);
+            const auto head=reader.currentObject(pin.reference().objectUuid);
             // A local completed edit already advanced the session pin and epoch;
             // let the superseded-result path requeue its work without closing it.
             const auto& expected = session.storePin ? *session.storePin : pin;
-            currentStoreRevision = head ? head->version == expected.version && head->generation == expected.generation
+            currentStoreRevision = head ? head->reference() == expected.reference()
                                         : !expected.stored();
         });
     }
@@ -12248,7 +12247,7 @@ std::map<std::string, fs::path> LineAnnotationController::fiberTransportPaths(
         const auto pin = fiberPin(id);
         if (!pin || pin->attachment != *attachment)
             throw std::runtime_error("Fiber is not in the attached object store");
-        roots.push_back(pin->object.objectUuid);
+        roots.push_back(pin->reference().objectUuid);
     }
     std::map<std::string, std::string> documents;
     connection->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
@@ -12484,7 +12483,7 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
                 try {
                     StoredFiber fiber;
                     fiber.id = nextFiberId();
-                    fiber.storePin = vc::objects::PinnedObject{*attachment,{attachment->storeUuid,fiber.uuid},{},0,{}};
+                    fiber.storePin = vc::objects::PinnedObject{*attachment,{attachment->storeUuid,{},fiber.uuid,0},{}};
                     fiber.username = currentFiberUsername();
                     fiber.startedAt = currentFiberDateTimeString();
                     fiber.sequence = nextFiberSequenceForUsername(fiber.username);
@@ -12674,7 +12673,7 @@ void LineAnnotationController::ensureSessionFiberIdentity(LineAnnotationSession&
     if (!session.storePin && _state) {
         const auto attachment = _state->storeFor("fiber");
         if (!attachment) throw std::runtime_error("Open a project (or choose a fiber store) before editing fibers");
-        session.storePin = vc::objects::PinnedObject{*attachment, {attachment->storeUuid, session.fiberUuid}, {}, 0, {}};
+        session.storePin = vc::objects::PinnedObject{*attachment, {attachment->storeUuid, {}, session.fiberUuid, 0}, {}};
     }
     if (!session.fiberFileName.empty()) {
         if (session.fiberUsername.empty()) {
@@ -14422,6 +14421,7 @@ LineAnnotationController::makeIntersectionLineSession(
     session->fiberId = fiber.id;
     session->fiberUuid = fiber.uuid;
     session->storePin = fiber.storePin;
+    session->graphCommit = fiber.graphCommit;
     session->readOnly = fiber.readOnly;
     session->suppressFiberSave = fiber.readOnly;
     session->fiberUsername = fiber.username;
@@ -14558,6 +14558,7 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     fiber.uuid = session.fiberUuid;
     registerFiberId(fiber.uuid, fiber.id);
     fiber.storePin = session.storePin;
+    fiber.graphCommit = session.graphCommit;
     fiber.coordinateIdentity = session.coordinateIdentity;
     fiber.frame = session.frame;
     if ((!session.storePin || !session.storePin->stored()) && !(_state && _state->currentVolume()))
@@ -14946,6 +14947,7 @@ void LineAnnotationController::applyCommittedFibers(const std::vector<FiberSaveS
         const StoredFiber* saved = &snapshot->fiber;
         if (session.watcher && session.storePin != saved->storePin) session.solveQueue.noteSessionMutated();
         session.storePin = saved->storePin;
+        session.graphCommit = saved->graphCommit;
         session.coordinateIdentity = saved->coordinateIdentity;
         session.frame = saved->frame;
         const auto ordering = storedIndexMapForSessionControls(session.controlPoints);
@@ -15073,7 +15075,8 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     if (!attachment || (uuids && uuids->empty())) return result;
     const bool readOnly = !connection->writable(*attachment);
     connection->readStore(*attachment, [&](const StoreReader& reader, const auto& cancel) {
-        const auto activeGeneration = reader.status().generation;
+        const auto loadedStatus = reader.status();
+        const auto activeGeneration = loadedStatus.generation;
         // Fibers bound to the open volume (by scale or a registration) are read in its voxels.
         const auto transforms = context.hasVolume ? std::optional(reader.volumeTransforms()) : std::nullopt;
         auto decode = [&](const ObjectRecord& object, const ObjectRevision& head, bool withLines) {
@@ -15085,6 +15088,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             fiber.generation = object.version.value();
             fiber.tags = object.tags;
             fiber.storePin = pinOf(*attachment, head, activeGeneration);
+            fiber.graphCommit = loadedStatus.commitSequence;
             fiber.id = context.idForUuid(object.uuid);
             try {
                 if (!head.geometryRevision) throw std::runtime_error("Fiber has no geometry");
@@ -15097,7 +15101,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                 vc::geometry::Fiber geometry;
                 geometry.controlPointIds = view.controlPointIds(0, view.controlPointCount());
                 geometry.controlPoints = fiber.frame
-                    ? view.viewTransformedAt(target.volume, target.scale).points("control_points", 0, view.controlPointCount())
+                    ? GeometrySnapshot(reader).viewTransformedAt(head, target.volume, target.scale, &*transforms).points("control_points", 0, view.controlPointCount())
                     : view.controlPoints(0, view.controlPointCount());
                 if (withLines) geometry.linePoints = storedFiberLinePoints(view, fiber.frame);
                 const auto source = metadata.value("source", nlohmann::json::object());
@@ -15152,13 +15156,12 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         // version), read in batches: one listing, then the versions it names.
         std::vector<ObjectRevision> objects;
         std::set<std::string> requested;
-        const auto state = reader.status();
         auto heads = [&](ObjectSelection selection) {
             selection.kind = "fiber";
             std::vector<ObjectVersion> references;
             for (const auto& record : reader.selectObjects(selection, std::vector<std::string>{})) {
                 if (!record.version) throw std::runtime_error("Fiber listing without versions");
-                references.push_back({state.storeUuid, record.versionGeneration, record.uuid, *record.version});
+                references.push_back(record.reference());
             }
             std::map<std::string, ObjectRevision> result;
             if (references.empty()) return result;
@@ -15198,7 +15201,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         std::unordered_map<std::string, size_t> byUuid;
         for (const auto& head : objects) {
             if (cancel.load() || (context.cancelled && context.cancelled())) throw std::runtime_error("Object store read cancelled");
-            versions.push_back({state.storeUuid, head.generation, head.objectUuid, head.version});
+            versions.push_back(head.reference());
             byUuid[head.objectUuid] = decoded.size();
             decoded.push_back(decode(head.record, head, lines && requested.contains(head.objectUuid)));
         }
@@ -15212,9 +15215,9 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                 edges.endpointUuids = std::vector<std::string>{uuid};
                 for (const auto& edge : reader.selectEdges(edges)) {
                     dependency.relationships.insert(edge.uuid);
-                    const auto peer = edge.aUuid == uuid ? edge.bUuid : edge.aUuid;
+                    const auto peer = edge.otherEndpoint(uuid);
                     const auto object = reader.currentObject(peer);
-                    dependency.peers[peer] = object ? std::optional<uint64_t>(object->version) : std::nullopt;
+                    dependency.peers[peer] = object ? std::optional(object->reference()) : std::nullopt;
                 }
             }
         }
@@ -15263,6 +15266,10 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             }
         }
         for (auto& fiber : decoded) if (requested.contains(fiber.uuid)) result.push_back(std::move(fiber));
+        const auto after = reader.status();
+        if (after.storeUuid != loadedStatus.storeUuid || after.generation != loadedStatus.generation ||
+            after.commitSequence != loadedStatus.commitSequence)
+            throw std::runtime_error("Fiber graph changed while loading; reload it");
     });
     return result;
 }
@@ -15363,7 +15370,7 @@ std::vector<LineAnnotationController::StoredFiberPtr> LineAnnotationController::
     }
     // Same filter and order as readStoredFibers: requested order, first
     // occurrence, live fibers only.
-    std::vector<std::pair<std::string, uint64_t>> live;
+    std::vector<std::pair<std::string, vc::objects::ObjectVersion>> live;
     std::vector<std::string> missing;
     // The fibers' generations, and those of the peers their cached decodes
     // depend on, from one listing.
@@ -15382,9 +15389,7 @@ std::vector<LineAnnotationController::StoredFiberPtr> LineAnnotationController::
         const vc::objects::FeedCursor position{status.storeUuid, status.generation, status.commitSequence};
         if (context.position && !context.cache.empty() &&
             (context.position->generation != position.generation ||
-             context.position->sequence != position.sequence) &&
-            vc::objects::changesTouchKinds(reader, *context.position,
-                                           {"volume_transform", "volume_transform_choice", vc::objects::kAttachmentEdgeKind})) {
+             context.position->sequence != position.sequence)) {
             context.cache.clear();
             context.dependencies.clear();
             context.snapshotsInvalidated = true;
@@ -15393,20 +15398,20 @@ std::vector<LineAnnotationController::StoredFiberPtr> LineAnnotationController::
         std::map<std::string, vc::objects::ObjectRecord> records;
         for (auto& record : reader.selectObjects(selection, std::vector<std::string>{"version", "retired"}))
             records.emplace(record.uuid, std::move(record));
-        const auto generationOf = [&](const std::string& uuid) -> std::optional<uint64_t> {
+        const auto generationOf = [&](const std::string& uuid) -> std::optional<vc::objects::ObjectVersion> {
             const auto found = records.find(uuid);
-            return found == records.end() ? std::nullopt : std::optional<uint64_t>(found->second.version.value());
+            return found == records.end() ? std::nullopt : std::optional(found->second.reference());
         };
         std::set<std::string> seen;
         for (const auto& uuid : uuids)
             if (const auto object = records.find(vc::objects::util::canonicalUuid(uuid)); object != records.end()) {
                 if (object->second.kind == "fiber" && !object->second.retired && seen.insert(object->first).second)
-                    live.emplace_back(object->first, object->second.version.value());
+                    live.emplace_back(object->first, object->second.reference());
             }
         for (const auto& [uuid, generation] : live) {
             const auto cached = context.cache.find(uuid);
             const auto dependency = context.dependencies.find(uuid);
-            if (cached == context.cache.end() || cached->second->generation != generation ||
+            if (cached == context.cache.end() || !cached->second->storePin || cached->second->storePin->reference() != generation ||
                 (lines && !cached->second->linePointsLoaded) || dependency == context.dependencies.end() ||
                 std::any_of(dependency->second.peers.begin(), dependency->second.peers.end(),
                     [&](const auto& peer) { return generationOf(peer.first) != peer.second; }))
@@ -15475,16 +15480,22 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     vc3d::line_annotation::canonicalizeFiberSaveSnapshots(edits);
     vc3d::line_annotation::validateFiberSaveSnapshots(edits);
     auto request = connection->newRequest(*attachment);
-    VersionSelection expected;
-    auto expect = [&](const StoredFiber& fiber) {
+    RecordSelection expected;
+    auto expect = [&](const StoredFiber& fiber, bool loadedGraph = true) {
         if (fiber.storePin && fiber.storePin->attachment != *attachment)
             throw std::runtime_error("The fiber belongs to a previous object store attachment");
         // The request expects each fiber at its pinned version.
-        std::optional<int64_t> version;
+        RecordExpectation version;
         if (fiber.storePin && fiber.storePin->stored()) {
             if (fiber.storePin->writeGeneration != request.generation)
                 throw std::runtime_error("The fiber's pinned version is not in its object store's current history; reopen it");
-            version = fiber.storePin->version;
+            version = fiber.storePin->reference();
+            if (loadedGraph) {
+                if (!fiber.graphCommit) throw std::runtime_error("The fiber has no loaded graph baseline; reopen it");
+                if (request.expectedCommitSequence && request.expectedCommitSequence != fiber.graphCommit)
+                    throw std::runtime_error("The edited fibers have different graph baselines; reopen them together");
+                request.expectedCommitSequence = fiber.graphCommit;
+            }
         }
         const auto [it, inserted] = expected.emplace(fiber.uuid, version);
         if (!inserted && it->second != version) throw std::runtime_error("Conflicting fiber version expectations");
@@ -15504,7 +15515,9 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     for (const auto& edit : edits) {
         if (edit.fiber.readOnly) throw std::runtime_error(edit.fiber.editorError.empty() ? "Object store is attached read-only" : edit.fiber.editorError);
         expect(edit.fiber);
-        for (const auto& branch : edit.fiber.branches) expect(findFiber(branch.branchFiberId));
+        // Current branch targets contribute object expectations, not a new
+        // baseline for the editor's loaded relationship membership.
+        for (const auto& branch : edit.fiber.branches) expect(findFiber(branch.branchFiberId), false);
     }
     for (const auto& fiber : retired) expect(fiber);
     request.expectedObjects = expected;
@@ -15529,8 +15542,10 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 for (const auto& point : fiber.linePoints) edited.linePoints.push_back({point[0], point[1], point[2]});
                 const auto inverse = fiber.frame->storedToVolume.inverse();
                 auto canonical = edited;
-                if (reader.currentObject(fiber.uuid)) {
-                    const auto shown = GeometrySnapshot(reader).viewTransformedAt(fiber.uuid, fiber.frame->volume.volume,
+                if (fiber.storePin && fiber.storePin->stored()) {
+                    const auto selected = reader.selectedObject(fiber.uuid, {}, {}, fiber.storePin->reference());
+                    if (!selected) throw std::runtime_error("The edited fiber state is no longer retained");
+                    const auto shown = GeometrySnapshot(reader).viewTransformedAt(*selected, fiber.frame->volume.volume,
                                                                                 fiber.frame->volume.scale);
                     if (shown.mapping() != fiber.frame->storedToVolume)
                         throw std::runtime_error("The fiber's volume registration changed; reopen it");
@@ -15603,19 +15618,14 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             const auto& stored = inStoredFrame(fiber);
             auto incoming = fiberSourceMetadata(stored);
             source.update(incoming, true);
-            int64_t nextId = source.value("next_control_point_id", int64_t(0));
-            for (const auto& cp : fiber.controlPoints) nextId = std::max(nextId, cp.storeId + 1);
-            std::set<int64_t> ids;
             vc::geometry::Fiber geometry;
             // IDs are allocated on the working copy; positions are the stored frame's.
-            for (auto& cp : fiber.controlPoints) {
-                if (cp.storeId < 0 || ids.contains(cp.storeId)) cp.storeId = nextId++;
-                ids.insert(cp.storeId);
-                geometry.controlPointIds.push_back(cp.storeId);
-            }
+            for (const auto& cp : fiber.controlPoints) geometry.controlPointIds.push_back(cp.storeId);
+            geometry.controlPointIds = reader.assignGeometryPointIds(fiber.uuid,"control_points",std::move(geometry.controlPointIds));
+            for (size_t i=0;i<fiber.controlPoints.size();++i) fiber.controlPoints[i].storeId=geometry.controlPointIds[i];
             for (const auto& cp : stored.controlPoints) geometry.controlPoints.push_back({cp[0], cp[1], cp[2]});
             for (const auto& point : stored.linePoints) geometry.linePoints.push_back({point[0], point[1], point[2]});
-            source["next_control_point_id"] = nextId;
+            source.erase("next_control_point_id"); // allocation belongs to the geometry store, not restorable metadata
             FiberDetail detail;
             detail.controlPointCount = geometry.controlPoints.size(); detail.linePointCount = geometry.linePoints.size();
             detail.length = geometry.length(); detail.width = stored.width; detail.widthGapFraction = fiber.widthGapFraction;
@@ -15709,8 +15719,6 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         for (const auto& snapshot : edits) edited.insert(snapshot.fiber.uuid);
         for (const auto& [uuid,edge] : incident) {
             if (edge.kind != "fiber_branch") {
-                if (!reader.status().historyEnabled)
-                    throw std::runtime_error("This edit must preserve a related link's earlier state, but this store has history disabled. Enable history, edit through a history-enabled overlay, or explicitly remove/revalidate the related links before saving.");
                 operations.push_back(KeepRecordedRelationshipOp{uuid});
                 continue;
             }
@@ -15718,7 +15726,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 operations.push_back(RemoveEdgeOp{uuid});
         }
         for (const auto& fiber : retired) operations.push_back(RetireObjectOp{fiber.uuid});
-        expectRelationshipEndpoints(reader, request.expectedObjects);
+        expectRelationshipEndpoints(reader, request);
         // Branch anchors can introduce further viewed fibers after the geometry
         // edits are prepared. Check every mapping before any mutation executes.
         operations.insert(operations.begin(), mappingChecks.begin(), mappingChecks.end());
@@ -15731,14 +15739,14 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     // The saved fibers' versions: their generations and geometry heads.
     std::vector<ObjectVersion> savedVersions;
     for (const auto& snapshot : edits)
-        savedVersions.push_back({attachment->storeUuid, receipt.generation, snapshot.fiber.uuid,
-                                 receipt.objects.at(snapshot.fiber.uuid).value()});
+        savedVersions.push_back(receipt.objectReference(snapshot.fiber.uuid).value());
     const auto saved = connection->objectsAtVersions(*attachment, savedVersions);
     for (size_t i = 0; i < edits.size(); ++i) {
         auto& fiber = edits[i].fiber;
         if (!saved[i]) throw std::logic_error("A saved fiber version is not in its object store");
         fiber.generation = saved[i]->version;
         fiber.storePin = pinOf(*attachment, *saved[i], receipt.generation);
+        if (receipt.commitSequence) fiber.graphCommit = receipt.commitSequence;
         registerFiberId(fiber.uuid, fiber.id);
     }
     // Shared links also revise the other endpoint: keep its open sessions
@@ -15747,13 +15755,14 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         if (!pane.session || !pane.session->storePin) continue;
         auto& session = *pane.session;
         if (std::any_of(edits.begin(), edits.end(), [&](const auto& edit) { return edit.fiber.uuid == session.fiberUuid; })) continue;
-        const auto found = receipt.objects.find(session.fiberUuid);
-        if (found == receipt.objects.end() || !found->second ||
-            session.storePin->version == *found->second) continue;
+        const auto reference = receipt.objectReference(session.fiberUuid);
+        // A receipt is not a replacement for the other pane's loaded graph.
+        // Keep its membership baseline until that pane reloads its branches.
+        if (!reference || session.storePin->reference() == *reference) continue;
+        const auto committed = connection->objectsAtVersions(*attachment, {*reference}).front();
+        if (!committed) throw std::runtime_error("The saved endpoint version cannot be read back");
         if (session.watcher) session.solveQueue.noteSessionMutated();
-        session.storePin->version = *found->second;
-        session.storePin->generation = receipt.generation;
-        session.storePin->writeGeneration = receipt.generation;
+        session.storePin = pinOf(*attachment, *committed, receipt.generation);
     }
     snapshots = std::move(edits);
 }
@@ -15772,10 +15781,13 @@ bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
     const auto& fiber=*stored; const auto pin=*fiber.storePin;
     using Json=nlohmann::json;
     Json metadata;
+    vc::objects::ObjectRecord selected;
+    const auto target = *_state->annotationVolume();
     const auto connection=_state->objectStoreSession();
     connection->readStore(pin.attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
         const auto record=reader.objectsAtVersions({pin.reference()}).front();
         if (!record) throw std::runtime_error("Fiber revision missing");
+        selected = record->record;
         metadata=Json::parse(record->record.meta);
     });
     const Json known=metadata.value("coordinates",Json::object());
@@ -15786,12 +15798,13 @@ bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
     const auto scale=vc3d::promptStoredUnitsPerVoxel(_parentWidget.data(),tr("Bind Fiber Coordinates"),tr("fiber"),*volume,known,
         tr("Fiber bounds XYZ: (%1, %2, %3) – (%4, %5, %6)").arg(lower[0]).arg(lower[1]).arg(lower[2]).arg(upper[0]).arg(upper[1]).arg(upper[2]));
     if (!scale) return false;
-    (void)connection->editCurrent(pin.attachment,{fiber.uuid},[&](const vc::objects::StoreReader& reader,const std::string& uuid){
-        // Units per voxel of the open volume: per voxel of its store volume at its scale.
-        const auto& target=*_state->annotationVolume();
-        return std::vector<vc::objects::TransactionOperation>{
-            vc::objects::bindCoordinatesOperation(reader.currentObject(uuid)->record,target.volume,*scale*target.scale)};
+    auto request = connection->newRequest(pin.attachment);
+    connection->readStore(pin.attachment,[&](const vc::objects::StoreReader& reader,const auto&) {
+        vc::objects::editCurrentRequest(reader, request, {fiber.uuid},
+            {vc::objects::bindCoordinatesOperation(selected,target.volume,*scale*target.scale)});
     });
+    vc::objects::expectObject(request, pin.reference());
+    (void)connection->submit(pin.attachment,request);
     return true;
 }
 

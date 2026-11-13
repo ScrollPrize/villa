@@ -132,11 +132,16 @@ def run_stage(stage, config):
                 raise ValueError('hvb needs axial features, or native_config to generate them with the existing extractor')
             native=(dict(config['native_config']) if isinstance(config['native_config'],dict)
                     else json.loads(Path(config['native_config']).read_text()))
+            from .fiber_graph_store import original_fiber_source
+            from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+            fiber_source,pin=original_fiber_source(base)
+            if fibers_digest(base)!=fibers_digest(fiber_source,source_version=pin):
+                raise ValueError('Constraint graph contains geometry overrides; regenerate its evidence')
             features=root/'axial_features.json'
             native.pop('database',None)
             for key in ('normal_prior_output','normal_curves_output','orient_database'):
                 native.pop(key,None)
-            native.update(fibers=str(base),axial_prior_output=str(features),axial_prior_only=True,orient_normals=False,
+            native.update(fibers=str(fiber_source),fiber_ids=graph.ids.tolist(),axial_prior_output=str(features),axial_prior_only=True,orient_normals=False,
                           output=str(root/'axial_report.json'),progress_file=str(root/'axial_progress.jsonl'))
             hv.run_features(dict(settings,native_config=native))
             settings['features']=str(features)

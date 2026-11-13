@@ -10,6 +10,7 @@ class ObjectStoreSession;
 struct AttachmentIdentity;
 struct ObjectRecord;
 struct Txn;
+struct TransactionRequest;
 using VolumeAffine = vcr::catalog::Affine;
 struct VolumeTransforms {
     vcr::catalog::RegistrationGraph graph;
@@ -69,6 +70,9 @@ std::string registerVolumeTransform(ObjectStoreSession&,const AttachmentIdentity
                                     const std::string& target,const VolumeAffine& matrix,const std::string& name);
 std::string chooseVolumeTransform(ObjectStoreSession&,const AttachmentIdentity&,const std::string& source,
                                   const std::string& target,const std::vector<std::string>& path);
+// Prepare against one selected graph, including absence of a previous choice.
+std::string chooseVolumeTransformRequest(const StoreReader&, TransactionRequest&, const std::string& source,
+                                         const std::string& target, const std::vector<std::string>& path);
 // Conservative transformed AABB, with outward rounding for floating arithmetic.
 std::array<double,6> transformBounds(const std::array<double,6>&,const VolumeAffine&);
 }

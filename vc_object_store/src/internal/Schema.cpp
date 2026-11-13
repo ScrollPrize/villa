@@ -39,6 +39,7 @@ void createSchema(sqlite3* db, bool history, const std::optional<std::string>& s
   coordinate_scale GENERATED ALWAYS AS (json_extract(nullif(meta,''),'$.coordinates.scale_factor')) VIRTUAL
 );
 CREATE INDEX objects_coordinates ON objects(kind,coordinate_volume,coordinate_scale);
+CREATE INDEX objects_geometry_uuid ON objects(storage_ref) WHERE geometry_manifest IS NOT NULL;
 CREATE TABLE fibers(
   object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
   family TEXT NOT NULL DEFAULT '', manual_family INTEGER NOT NULL DEFAULT 0,
@@ -94,8 +95,7 @@ CREATE INDEX tracks_length ON tracks(length DESC,object_id);
   manifest TEXT NOT NULL CHECK(json_valid(manifest) AND json_type(manifest)='object'),
   object_version INTEGER NOT NULL,
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
-  UNIQUE(object_uuid,uuid),
-  FOREIGN KEY(object_uuid,parent_uuid) REFERENCES geometry_revisions(object_uuid,uuid)
+  UNIQUE(object_uuid,uuid)
 );
 CREATE INDEX geometry_history ON geometry_revisions(object_uuid,object_version);
 CREATE TABLE geometry_revision_chunks(

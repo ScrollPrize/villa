@@ -36,7 +36,6 @@ public:
     int64_t relationship(const std::string& edgeUuid, const std::optional<std::string>& revisionUuid);
     std::optional<int64_t> sequence() const { return sequence_; }
 private:
-    int64_t nextObject(const std::string& objectUuid);
     void begin();
     sqlite3* db_;
     std::string generation_;

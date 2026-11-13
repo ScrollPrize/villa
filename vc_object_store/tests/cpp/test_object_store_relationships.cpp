@@ -43,8 +43,8 @@ try {
     const auto selected = heads();
     const auto pinned = [&] {
         auto txn = db.read();
-        return std::vector<ObjectVersion>{db.versionReference(txn, *db.currentObjectRevision(txn, a)),
-                                          db.versionReference(txn, *db.currentObjectRevision(txn, b))};
+        return std::vector<ObjectVersion>{db.currentObjectRevision(txn, a)->reference(),
+                                          db.currentObjectRevision(txn, b)->reference()};
     }();
     require(component(a, false, true) == std::vector<std::string>{a, b}, "same-winding component");
     require(component(a, true, false) == std::vector<std::string>{a}, "adjacent filter");
@@ -52,7 +52,7 @@ try {
 
     // An action that changes an endpoint it did not pin rolls back entirely.
     mustFail([&] {
-        auto txn = db.write({{a, selected.at(a)}});
+        auto txn = db.writeNumbered({{a, selected.at(a)}});
         db.setMeta(txn, a, "rollback", "true");
         db.removeEdge(txn, edge);
         txn.commit();
@@ -85,11 +85,11 @@ try {
         const auto at = db.relationshipsAt(txn, pinned);
         require(at.size() == 1 && at[0].applicable, "applicable at the pinned revisions");
     }
-    { auto txn = db.write(heads());
+    { auto txn = db.writeNumbered(heads());
       db.retainRelationship(txn, edge);txn.commit(); }
     require(component(a, std::nullopt, true) == std::vector<std::string>{a, b}, "explicitly retained: applicable again");
     for (const bool retire : {true, false}) {
-        auto txn = db.write(heads());
+        auto txn = db.writeNumbered(heads());
         if (retire) db.retireObject(txn, a);
         else db.restoreObject(txn, a);
         txn.commit();

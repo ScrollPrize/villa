@@ -260,6 +260,7 @@ int main()
             require(child >= 0,"fork channel-policy regression");
             if (child == 0) {
                 alarm(2); // a regression must fail, not hang the test suite
+                if (reader.cache_channels()!=std::vector<std::int64_t>({0,2})) _exit(2);
                 auto fresh = vcr::ChannelPolicy::for_array(migration.spec.identity);
                 if (fresh.get() == policy.get() || fresh->enabled || !fresh->mutex.try_lock()) _exit(1);
                 fresh->mutex.unlock();

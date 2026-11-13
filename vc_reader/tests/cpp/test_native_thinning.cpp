@@ -71,7 +71,15 @@ void verify(bool gpu) {
         }
 #endif
     }
-    rejects([]{std::uint8_t m=1;std::int32_t l;vcr::components::label(&m,std::vector<std::size_t>{1,1},6,&l);});
+    // 3D connectivity codes on a planar mask use their in-plane neighbours.
+    // The two diagonal pixels distinguish 6 -> 4 from 18/26 -> 8.
+    for(int connectivity:{6,18,26}) {
+        const std::uint8_t mask[]{1,0,0,1};std::int32_t labels[4]{};
+        CHECK(vcr::components::label(mask,std::vector<std::size_t>{2,2},connectivity,labels)==
+              std::size_t(connectivity==6?2:1));
+        CHECK(labels[0]==1 && labels[1]==0 && labels[2]==0 && labels[3]==(connectivity==6?2:1));
+    }
+    rejects([]{std::uint8_t m=1;std::int32_t l;vcr::components::label(&m,std::vector<std::size_t>{1,1},5,&l);});
     std::vector<std::uint8_t> longLine(600,255),longOut(600);longLine[0]=0;
     vcr::distance::manhattan(longLine.data(),longOut.data(),{1,600});CHECK(longOut[254]==254 && longOut[255]==255 && longOut.back()==255);
     for(int trial=0;trial<45;++trial) {

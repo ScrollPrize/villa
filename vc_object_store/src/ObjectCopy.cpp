@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/ObjectCopy.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "internal/Database.hpp"
 #include <nlohmann/json.hpp>
 #include <limits>
 
@@ -27,7 +28,7 @@ ObjectCopy readObjectCopy(const StoreReader& reader, const std::string& objectUu
     auto meta = nlohmann::json::parse(object.meta);
     if (meta.contains("vcobj_extensions"))
         throw std::runtime_error("object copy: manual extension fields require an extension-aware copy");
-    meta["copied_from"] = {{"store_uuid", reader.status().storeUuid}, {"object_uuid", object.uuid},
+    meta["copied_from"] = {{"store_uuid", head->reference().storeUuid}, {"object_uuid", object.uuid},
         {"generation", head->generation}, {"version", head->version},
         {"geometry_revision", geometry ? nlohmann::json(*geometry) : nlohmann::json()}};
     if (geometry) {
@@ -55,8 +56,10 @@ std::vector<TransactionOperation> objectCopyOperations(const ObjectCopy& copy)
 
 std::string writeObjectCopy(ObjectStore& store, WriteTxn& txn, const ObjectCopy& copy)
 {
+    detail::Savepoint operation(ObjectStoreImplAccess::conn(txn));
     const auto uuid = store.upsertObject(txn, copy.record);
     if (copy.geometry) store.putGeometry(txn, uuid, *copy.geometry);
+    operation.release();
     return uuid;
 }
 }

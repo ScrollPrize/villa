@@ -22,7 +22,7 @@ ObjectRecord object(const std::string& kind="note")
 WriteTxn editObject(ObjectStore& store,const std::string& object)
 {
     std::optional<int64_t> version;{auto read=store.read();version=store.currentVersion(read,object);}
-    return store.write(VersionSelection{{object,version}});
+    return store.writeNumbered(VersionSelection{{object,version}});
 }
 void sourceIndex(HistoryMode history)
 {
@@ -125,9 +125,9 @@ void lifecycle(HistoryMode history)
     auto edge=[&]{EdgeRecord e;e.kind="declared_reference";e.aUuid=a.uuid;e.bUuid=b.uuid;e.aAnchor.wholeGeometry=true;e.bAnchor.wholeGeometry=true;return e;};
     {auto txn=store.write();store.upsertObject(txn,a);store.upsertObject(txn,b);relation=store.addEdge(txn,edge());txn.commit();}
     std::optional<ObjectVersion> original;
-    if(history==HistoryMode::On){auto read=store.read();original=store.versionReference(read,*store.currentObjectRevision(read,a.uuid));}
+    if(history==HistoryMode::On){auto read=store.read();original=store.currentObjectRevision(read,a.uuid)->reference();}
     auto write=[&]{
-        VersionSelection selected;if(history==HistoryMode::On){auto read=store.read();for(const auto& r:{a,b})selected[r.uuid]=store.currentVersion(read,r.uuid);}
+        RecordSelection selected;if(history==HistoryMode::On){auto read=store.read();for(const auto& r:{a,b})selected[r.uuid]=store.currentObjectRevision(read,r.uuid)->reference();}
         return history==HistoryMode::On?store.write(selected):store.write();
     };
     {auto txn=write();store.retireObject(txn,a.uuid);require(!store.edgeByUuid(txn,relation),"retire removes current edge");}

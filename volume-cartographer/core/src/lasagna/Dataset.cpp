@@ -2,15 +2,22 @@
 
 #include "vc/core/util/RemoteCacheSettings.hpp"
 
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <thread>
+#include <vector>
 
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include "vc_reader/native/http.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_reader/source_reader.hpp"
 #include "vc_reader/zarr.hpp"
@@ -157,6 +164,55 @@ LasagnaDataset::LasagnaDataset(LasagnaDatasetManifest manifest)
 {
 }
 
+namespace {
+
+[[nodiscard]] vcr::zarr::Access remoteAccess(const std::string& location, bool discoverAwsCredentials)
+{
+    return vcr::zarr::resolveAccess(
+        location, discoverAwsCredentials ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
+}
+
+// GET a remote object whole into `path` (written beside it, then renamed);
+// throws when it does not exist or cannot be fetched.
+void downloadObject(vcr::HttpClient& client, const vcr::zarr::Access& access,
+                    const std::string& location, const std::filesystem::path& path)
+{
+    std::vector<std::uint8_t> body;
+    if (!client.get(access.url(location), body))
+        throw std::runtime_error("Remote Lasagna object does not exist: " + redacted(location));
+    std::filesystem::create_directories(path.parent_path());
+    vcr::zarr::atomicWrite(path, body.data(), body.size());
+}
+
+} // namespace
+
+void cacheLasagnaProvenance(const LasagnaDatasetManifest& manifest,
+                            const LasagnaFileFetcher& fetcher)
+{
+    if (manifest.manifestIsRemote || manifest.remoteSourceBaseLocation.empty()) return;
+    const auto it = manifest.raw.find("provenance");
+    if (it == manifest.raw.end() || !it->is_string() || it->get<std::string>().empty()) return;
+    const std::filesystem::path name(it->get<std::string>());
+    if (name.is_absolute() || name.lexically_normal() != name || *name.begin() == "..")
+        throw std::runtime_error("Lasagna manifest names an unsafe provenance record: " + name.string());
+    const auto destination = manifest.baseDirectory / name;
+    if (std::filesystem::is_regular_file(destination)) return;
+    const auto location = vcr::joinLocation(manifest.remoteSourceBaseLocation, name.generic_string());
+    if (!fetcher) {
+        const auto access = remoteAccess(location, manifest.discoverAwsCredentials);
+        vcr::HttpOptions http;
+        http.connections = 1;
+        http.auth = access.auth;
+        vcr::HttpClient client(http);
+        downloadObject(client, access, location, destination);
+        return;
+    }
+    std::filesystem::create_directories(destination.parent_path());
+    const auto temporary = std::filesystem::path(destination.string() + ".partial");
+    fetcher(location, temporary);
+    std::filesystem::rename(temporary, destination);
+}
+
 MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manifestLocation, const LasagnaDatasetOpenOptions& options)
 {
     if (!vcr::zarr::isRemote(manifestLocation)) {
@@ -290,6 +346,145 @@ vcr::zarr::OpenedArray openLasagnaGroupArray(
 LasagnaDataset fiberSheetNormalDataset(const LasagnaDataset& prediction)
 {
     return LasagnaDataset(fiberNormalManifest(prediction.manifest()));
+}
+
+namespace {
+// Byte-for-byte copies of remote arrays, under the cache root at their URL's
+// place, apart from the tree vc_reader caches the same arrays in.
+constexpr const char* kLasagnaArrayCopies = "lasagna_arrays";
+} // namespace
+
+std::optional<std::filesystem::path> lasagnaChannelArrayCacheDirectory(
+    const LasagnaChannelGroup& group)
+{
+    if (!group.isRemote()) return std::nullopt;
+    return vcr::zarr::decodedCachePath(group.remoteCacheRoot / kLasagnaArrayCopies, group.sourceLocation);
+}
+
+namespace {
+
+constexpr const char* kCachedArrayMarker = ".vc-cached-array.json";
+constexpr int kCachedArrayWorkers = 64;
+
+struct ListedObject {
+    std::string relative;  // under the array's location
+    std::uint64_t size = 0;
+};
+
+// The objects a marker records, empty when there is none (or an unreadable one).
+std::vector<ListedObject> markedObjects(const std::filesystem::path& marker)
+{
+    std::vector<ListedObject> objects;
+    try {
+        std::ifstream in(marker);
+        if (!in) return {};
+        const auto document = nlohmann::json::parse(in);
+        if (document.value("version", 0) != 1) return {};
+        for (const auto& entry : document.at("objects"))
+            objects.push_back({entry.at(0).get<std::string>(), entry.at(1).get<std::uint64_t>()});
+    } catch (const std::exception&) {
+        return {};
+    }
+    return objects;
+}
+
+bool cachedWhole(const std::filesystem::path& directory, const ListedObject& object)
+{
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(directory / object.relative, ec);
+    return !ec && size == object.size;
+}
+
+std::vector<ListedObject> listArrayObjects(const LasagnaChannelGroup& group, const vcr::zarr::Access& access)
+{
+    const auto& location = group.sourceLocation;
+    std::vector<ListedObject> objects;
+    for (const auto& object : vcr::zarr::listObjects(access, location)) {
+        const std::filesystem::path relative(object.key);
+        if (object.key.empty() || object.key.back() == '/') continue;
+        if (relative.is_absolute() || relative.lexically_normal() != relative || *relative.begin() == "..")
+            throw std::runtime_error("Lasagna array " + redacted(location) + " lists an unsafe key: " + object.key);
+        objects.push_back({object.key, object.size});
+    }
+    if (objects.empty()) throw std::runtime_error("Lasagna array " + redacted(location) + " lists no objects");
+    return objects;
+}
+
+} // namespace
+
+bool cacheLasagnaChannelArray(
+    const LasagnaChannelGroup& group,
+    const std::function<void(const LasagnaArrayCacheProgress&)>& progress,
+    const std::function<bool()>& cancelled)
+{
+    const auto directory = lasagnaChannelArrayCacheDirectory(group);
+    if (!directory) throw std::runtime_error("Lasagna group " + group.name + " is not remote");
+    const auto marker = *directory / kCachedArrayMarker;
+    auto objects = markedObjects(marker);
+    const bool marked = !objects.empty();
+    if (cancelled && cancelled()) return false;
+    const auto access = remoteAccess(group.sourceLocation, group.discoverAwsCredentials);
+    if (!marked) objects = listArrayObjects(group, access);
+
+    std::vector<const ListedObject*> missing;
+    for (const auto& object : objects)
+        if (!cachedWhole(*directory, object)) missing.push_back(&object);
+    if (marked && missing.empty()) return true;
+
+    // Written whole, beside vc_reader's budgeted cache: eviction must not take
+    // the array before it is read whole.
+    vcr::HttpOptions http;
+    http.connections = kCachedArrayWorkers;
+    http.auth = access.auth;
+    vcr::HttpClient client(http);
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> done{0};
+    std::atomic<bool> stop{false};
+    std::mutex reportMutex;
+    std::exception_ptr failure;
+    auto work = [&]() {
+        for (std::size_t i = next++; i < missing.size() && !stop; i = next++) {
+            if (cancelled && cancelled()) {
+                stop = true;
+                return;
+            }
+            try {
+                const auto& object = *missing[i];
+                downloadObject(client, access, vcr::joinLocation(group.sourceLocation, object.relative),
+                               *directory / object.relative);
+                const LasagnaArrayCacheProgress snapshot{++done, missing.size()};
+                if (progress) {
+                    std::lock_guard lock(reportMutex);
+                    progress(snapshot);
+                }
+            } catch (...) {
+                std::lock_guard lock(reportMutex);
+                if (!failure) failure = std::current_exception();
+                stop = true;
+            }
+        }
+    };
+    std::vector<std::thread> workers;
+    for (int i = 0; i < kCachedArrayWorkers - 1; ++i) workers.emplace_back(work);
+    work();
+    for (auto& worker : workers) worker.join();
+    if (failure) std::rethrow_exception(failure);
+    if (stop) return false;
+
+    std::size_t refused = 0;
+    for (const auto* object : missing)
+        if (!cachedWhole(*directory, *object)) ++refused;
+    if (refused)
+        throw std::runtime_error(
+            "Kept " + std::to_string(missing.size() - refused) + " of " +
+            std::to_string(missing.size()) + " objects of " + directory->string() +
+            " (an object changed size since it was listed?)");
+    if (!marked) {
+        nlohmann::json listing = nlohmann::json::array();
+        for (const auto& object : objects) listing.push_back({object.relative, object.size});
+        vcr::zarr::atomicWrite(marker, nlohmann::json{{"version", 1}, {"objects", listing}}.dump());
+    }
+    return true;
 }
 
 } // namespace vc::lasagna

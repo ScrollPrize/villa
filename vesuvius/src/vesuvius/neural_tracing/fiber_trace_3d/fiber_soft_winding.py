@@ -376,14 +376,23 @@ def sample_arcs(arc, angle, start, end, step):
     return np.unique(np.r_[start, interior, end])
 
 
-def prepare_samples(config, d, existing=None):
+def prepare_samples(config, d, existing=None, *, source_version=None):
     """Reuse the fiber store reader and resolved curve geometry, not old three-node sampling."""
     from .fiber_normal_sign_visualization import load_umbilicus_frame
     from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
-    from .fiber_graph_store import workflow_volume
+    from .fiber_graph_store import workflow_volume, original_fiber_source
     volume = workflow_volume(config)
+    source=config['fibers']
+    if config.get('database'):
+        source,pin=original_fiber_source(config['database'])
+        if source_version is not None and source_version!=pin:
+            raise ValueError('Saved geometry and constraint source snapshots differ')
+        source_version=pin
+        if fiber_store.fibers_digest(config['fibers'])!=fiber_store.fibers_digest(source,source_version=pin):
+            raise ValueError('Configured geometry differs from the frozen source')
     axis = load_umbilicus_frame(config['umbilicus'], volume)
-    return prepare_samples_geometry(config,d,fiber_store.read_polylines(config['fibers'],np.unique(d['source_id']),volume=volume),axis,existing)
+    return prepare_samples_geometry(config,d,fiber_store.iter_polylines(source,np.unique(d['source_id']),
+                                   volume=volume,source_version=source_version),axis,existing)
 
 
 _sample_context = None
@@ -502,7 +511,6 @@ def prepare_samples_geometry(config,d,geometry,axis,existing=None):
                 if batch is not None:pending.append(pool.submit(_sample_geometry_batch,batch))
     a = np.concatenate(rows) if rows else np.empty((0,5))
     v = np.concatenate(vrows) if vrows else np.empty((0,4))
-
     return dict(owner=a[:, 0].astype(np.int64), ds=a[:, 1], phase=a[:, 2], z=a[:, 3], weight=a[:, 4],
                 v_owner=v[:, 0].astype(np.int64), v_ds=v[:, 1], v_z=v[:, 2], v_weight=v[:, 3])
 
@@ -823,17 +831,27 @@ def run(config):
     return run_prepared(config)
 
 
-def run_prepared(config):
+def run_prepared(config, *, source_version=None):
     """Launch on an explicitly prepared graph without rebuilding its selection."""
     config = dict(config, layout_mode='shared_anchor')
     validate(config)
     if Path(config['output_root'], 'summary.json').exists():
         raise FileExistsError('Completed output exists')
-    with np.load(config['tensor_cache']) as src:
+    cache = Path(config['tensor_cache'])
+    stamp = cache.with_suffix('.json')
+    if source_version is None and stamp.exists():
+        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import verify_fiber_signature
+        signature = json.loads(stamp.read_text())['signature']
+        source=config['fibers']
+        if config.get('database'):
+            from .fiber_graph_store import original_fiber_source
+            source,_=original_fiber_source(config['database'])
+        _, source_version = verify_fiber_signature(source, signature)
+    with np.load(cache) as src:
         d = {k: src[k] for k in src.files}
     root = Path(config['output_root']); root.mkdir(parents=True, exist_ok=True)
     samples = root / 'soft_samples.npz'
-    np.savez(samples, **prepare_samples(config, d))
+    np.savez(samples, **prepare_samples(config, d, source_version=source_version))
     config.update(soft_samples=str(samples), tensor_sha256=sha256_file(config['tensor_cache']),
                   samples_sha256=sha256_file(samples))
     return uv.launch_tensor_solve(config, __name__, Path(__file__))

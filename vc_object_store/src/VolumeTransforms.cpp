@@ -107,22 +107,29 @@ std::string registerVolumeTransform(ObjectStoreSession& session,const Attachment
 std::string chooseVolumeTransform(ObjectStoreSession& session,const AttachmentIdentity& attachment,const std::string& source,
     const std::string& target,const std::vector<std::string>& path) {
     auto request=session.newRequest(attachment);
-    ObjectRecord record;
+    std::string uuid;
     session.readStore(attachment,[&](const StoreReader& reader,const auto&) {
-        (void)reader.volumeTransforms().graph.resolve(source,target,path).resolved();
-        request.readDependencies=transformDependencies(reader);
-        if(const auto existing=volumeTransformChoice(reader,source,target)) {
-            record=*existing;
-            request.readDependencies.erase(record.uuid);
-            request.expectedObjects[record.uuid]=record.version;
-            request.operations.push_back(UpdateObjectOp{objectRecordJson(volumeTransformChoiceRecord(record,source,target,path))});
-        } else {
-            record.uuid=util::newUuid();
-            request.expectedObjects[record.uuid]=std::nullopt;
-            request.operations.push_back(CreateObjectOp{objectRecordJson(volumeTransformChoiceRecord(record,source,target,path))});
-        }
+        uuid=chooseVolumeTransformRequest(reader,request,source,target,path);
     });
     (void)session.submit(attachment,request);
+    return uuid;
+}
+std::string chooseVolumeTransformRequest(const StoreReader& reader,TransactionRequest& request,const std::string& source,
+    const std::string& target,const std::vector<std::string>& path) {
+    if(!request.expectedCommitSequence)request.expectedCommitSequence=reader.status().commitSequence;
+    ObjectRecord record;
+    (void)reader.volumeTransforms().graph.resolve(source,target,path).resolved();
+    mergeExpectations(request.readDependencies, transformDependencies(reader), "transform dependencies");
+    if(const auto existing=volumeTransformChoice(reader,source,target)) {
+        record=*existing;
+        request.readDependencies.erase(record.uuid);
+        expectObject(request,record.reference());
+        request.operations.push_back(UpdateObjectOp{objectRecordJson(volumeTransformChoiceRecord(record,source,target,path))});
+    } else {
+        record.uuid=util::newUuid();
+        request.expectedObjects[record.uuid]=std::nullopt;
+        request.operations.push_back(CreateObjectOp{objectRecordJson(volumeTransformChoiceRecord(record,source,target,path))});
+    }
     return record.uuid;
 }
 std::array<double,6> transformBounds(const std::array<double,6>& b,const VolumeAffine& m) {
@@ -212,6 +219,7 @@ std::string ObjectStore::registerVolumeTransform(WriteTxn& txn,const std::string
     return upsertObject(txn,volumeTransformRecord(record,source,target,matrix,name));
 }
 std::vector<std::string> ObjectStore::recordCatalogTransforms(WriteTxn& txn,const std::vector<vcr::catalog::Registration>& registrations) {
+    detail::Savepoint save(static_cast<sqlite3*>(connection(txn)));
     std::vector<std::string> changed;
     std::set<std::string> seen;
     for(const auto& registration:registrations) {
@@ -234,6 +242,7 @@ std::vector<std::string> ObjectStore::recordCatalogTransforms(WriteTxn& txn,cons
         record.meta=meta.dump();
         changed.push_back(upsertObject(txn,record));
     }
+    save.release();
     return changed;
 }
 std::string ObjectStore::chooseVolumeTransform(WriteTxn& txn,const std::string& source,const std::string& target,const std::vector<std::string>& path,

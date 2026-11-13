@@ -77,13 +77,13 @@ int main() try {
         Statement counts(ObjectStoreImplAccess::conn(r),"SELECT (SELECT count(*) FROM objects),"
             "(SELECT count(*) FROM sqlite_schema WHERE name IN ('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones')),"
             "(SELECT count(*) FROM objects WHERE geometry_manifest IS NOT NULL),(SELECT count(*) FROM geometry_chunks)");
-        // The metadata override for a retains its existing geometry descriptor
-        // in the ordinary object row, but all payload bytes remain inherited.
+        // Metadata overrides copy their small descriptor, not payloads.
+        // Adding an edge must not copy any additional endpoint records.
         require(counts.row()&&counts.i64(0)==3&&counts.i64(1)==0&&counts.i64(2)==1&&counts.i64(3)==0,
             "adding indexed edge must not copy endpoints beyond two existing overrides and the owned object");
         Statement descriptor(ObjectStoreImplAccess::conn(r),"SELECT uuid FROM objects WHERE geometry_manifest IS NOT NULL");
         require(descriptor.row()&&formatUuid(descriptor.blob16(0))==a.objectUuid&&!descriptor.row(),
-            "only the explicit metadata override retains its inherited geometry descriptor");
+            "only the metadata override copies its geometry descriptor");
     }
     const auto boundGeneration=generation(overlay);
     {
@@ -114,9 +114,11 @@ int main() try {
         auto c=ObjectCollection::create(dir.path/"metadata-overlay.vcobj",{parent},options);
         {auto w=c.write();c.setMeta(w,endpoint,"family","\"H\"");w.commit();}
         const auto before=generation(c);
-        {auto w=c.write();mustFail([&]{c.setMeta(w,endpoint,"foo","9");});
-         auto replacement=c.object(w,endpoint)->record;replacement.meta=R"({"foo":9})";
-         mustFail([&]{c.replaceObject(w,endpoint,replacement);});w.commit();}
+        // Like ordinary stores, dependencies are validated on the transaction's
+        // final state, allowing an explicit retain/remove later in the action.
+        {auto w=c.write();c.setMeta(w,endpoint,"foo","9");mustFail([&]{w.commit();});}
+        {auto w=c.write();auto replacement=c.object(w,endpoint)->record;replacement.meta=R"({"foo":9})";
+         c.replaceObject(w,endpoint,replacement);mustFail([&]{w.commit();});}
         require(generation(c)==before,"rejected inherited metadata change advanced generation");
         {auto w=c.write();c.removeEdge(w,{endpoint.storeUuid,inheritedEdge});c.setMeta(w,endpoint,"foo","9");w.commit();}
         auto r=c.read();require(nlohmann::json::parse(c.object(r,endpoint)->record.meta).at("foo")==9,"removed relationship still blocked endpoint change");r.commit();

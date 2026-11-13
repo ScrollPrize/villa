@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-import connect_overlapping_patches as cop
 import find_inconsistent_windings as fiw
 from tifxyz import Patch
 
@@ -45,7 +44,7 @@ def _relative_pcl(points):
 
 
 def _patch_graph(patch):
-    graph = cop.build_patch_graph(patch, 4.0)
+    graph = fiw.build_patch_graph(patch, 4.0)
     graph._dij_cache = {}
     return graph
 
@@ -101,3 +100,22 @@ def test_absolute_anchor_carries_the_step_to_its_attachment():
     anchors = fiw.build_abs_anchors_by_patch({0: pcl}, patches, IdentityTransform(), DR)
     assert [a['winding'] for a in anchors['P']] == [7, 7]
     assert [a['attachment_branch_delta'] for a in anchors['P']] == [1, 0]
+
+
+def test_a_fiber_point_on_two_patches_joins_them_with_a_zero_delta_edge():
+    # Store fibers list each patch contact under 'attachments'; one physical
+    # point on both patches is a same-winding tie between them.
+    patches = {'P': _arc_patch(0.998, 1.002, 3), 'R': _arc_patch(0.998, 1.002, 3)}
+    point = _point(7, 1.0, 'P', (1.0, 1.0))
+    del point['on_patch']
+    point['attachments'] = [{'id': 'P', 'ij': [1.0, 1.0]},
+                            {'id': 'R', 'ij': [1.0, 1.0]}]
+    fiber = {'name': 'fiber', 'metadata': {}, 'has_winding_annotations': False,
+             'points': {7: point},
+             'chain': SimpleNamespace(iter_chain=lambda: iter([point]))}
+
+    adjacency = fiw.build_rel_adjacency({0: fiber}, patches, IdentityTransform(), DR)
+
+    assert [edge['neighbor'] for edge in adjacency['P']] == ['R']
+    assert [edge['neighbor'] for edge in adjacency['R']] == ['P']
+    assert adjacency['P'][0]['winding_delta'] == 0

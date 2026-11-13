@@ -21,8 +21,10 @@ def test_implicit_volume_catalog_loads_records_once_and_matches_explicit(monkeyp
         def __init__(self,path):pass
         def __enter__(self):return self
         def __exit__(self,*args):pass
-        def objects(self,kind):calls.append(kind);return records
-    monkeypatch.setattr(fiber_store,'CollectionReader',Reader)
+        def select_objects(self,**query):calls.append(query['object_kind']);return records
+    monkeypatch.setattr(fiber_store,'open_store',Reader)
+    monkeypatch.setattr(fiber_store,'_read_rows',lambda store,selected,volume,**kwargs:
+                        iter([(dict(length=5.,point_count=3),np.zeros((3,3)))]))
     expected=fiber_store.fiber_catalog('source',volume)
     assert calls==['fiber'];calls.clear()
     assert fiber_store.fiber_catalog('source')==expected
@@ -40,10 +42,10 @@ def test_implicit_volume_rejects_mixed_source_frames_once(monkeypatch,resolver):
         def __init__(self,path):pass
         def __enter__(self):return self
         def __exit__(self,*args):pass
-        def objects(self,kind):
-            calls.append(kind)
+        def select_objects(self,**query):
+            calls.append(query['object_kind'])
             return [dict(meta=dict(coordinates=dict(volume_uuid=str(uuid.UUID(int=i))))) for i in (1,2)]
-    monkeypatch.setattr(fiber_store,'CollectionReader',Reader)
+    monkeypatch.setattr(fiber_store,'open_store',Reader)
     with pytest.raises(ValueError,match='must be bound to one volume'):resolver('source')
     assert calls==['fiber']
 
@@ -88,22 +90,42 @@ def test_failed_result_write_is_not_published(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize('workers,packed', [(1,False),(2,False),(2,True)])
+def test_source_position_resolves_public_collection_root(tmp_path,workers,packed):
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_source_version
+    curves=[(dict(id=str(uuid.UUID(int=i+1))),np.array([[0.,0.,0.],[10.,0.,0.]])) for i in range(2)]
+    source=write_initial_fibers(tmp_path/'source',curves,volume='123',workers=workers,packed=packed)['path']
+    pin=fiber_source_version(source)
+    with CollectionReader(source) as reader:
+        assert Path(reader.resolve_store_position(pin))==Path(source).resolve()
+        assert reader.resolve_store_position(reader.source)==reader.resolve_store_position(pin)
+        for changed in (dict(pin,store=str(uuid.uuid4())),dict(pin,generation=str(uuid.uuid4())),
+                        dict(pin,commit_sequence=pin['commit_sequence']+1),dict(pin,extra=True)):
+            with pytest.raises((ValueError,RuntimeError)):
+                reader.resolve_store_position(changed)
+    with pytest.raises(RuntimeError,match='closed'):
+        reader.resolve_store_position(pin)
+
+
 def test_typed_graph_cache_and_source_endpoint_order(tmp_path):
     from .fiber_graph_fixture import measured_store,uid
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
     path=measured_store(tmp_path,[(8,3,2,False,.25),(2,1,2,True,1.5)])
     graph=FiberGraph(path)
-    assert graph.event_ids.tolist()==[2,8]
-    assert graph.fiber_a.tolist()==[uid(1),uid(3)]
-    assert graph.fiber_b.tolist()==[uid(2),uid(2)]
-    np.testing.assert_array_equal(graph.point_a,np.zeros((2,3)))
-    np.testing.assert_array_equal(graph.point_b,[[1,0,0],[1,0,0]])
+    assert graph.event_ids.tolist()==[0,1]
+    assert graph.edge_uuid.tolist()==[uid(1002),uid(1008)]
+    assert graph.fiber_a.tolist()==[uid(1),uid(2)]
+    assert graph.fiber_b.tolist()==[uid(2),uid(3)]
+    np.testing.assert_array_equal(graph.connector,[[1,0,0],[1,0,0]])
+    for name in ('point_a','point_b'):
+        with pytest.raises(ValueError,match='do not store endpoint XYZ'):
+            getattr(graph,name)
     cached=FiberGraph.cached(path,tmp_path/'cache')
     for key,value in vars(graph).items():
         if isinstance(value,np.ndarray):
             np.testing.assert_array_equal(getattr(cached,key),value)
             assert not getattr(cached,key).flags.writeable
-    assert list(graph.batches(2,first=8,last=9))==[slice(1,2)]
+    assert list(graph.batches(2,first=1,last=2))==[slice(1,2)]
     manifest=tmp_path/'cache'/'manifest.json'
     info=json.loads(manifest.read_text());info['format_version']=-1
     manifest.write_text(json.dumps(info))
@@ -112,7 +134,9 @@ def test_typed_graph_cache_and_source_endpoint_order(tmp_path):
 
 
 def test_measurement_frame_and_registered_geometry(tmp_path):
-    from vc_object_store import ObjectStore, Fiber, import_initial_records, fiber_constraint_extension
+    from vc_object_store import (ObjectStore, Fiber, import_initial_records, fiber_constraint_extension,
+                                 encode_fiber_arc,encode_fiber_direction,encode_fiber_winding)
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_source_version
     from .fiber_graph_fixture import uid
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
     path=tmp_path/'source.vcobj'
@@ -130,16 +154,16 @@ def test_measurement_frame_and_registered_geometry(tmp_path):
         np.testing.assert_array_equal(points,expected)
     with CollectionReader(path) as store:
         table=fiber_constraint_extension('',coordinate_space='sample/'+target,based_on=[store.source])
-    fields=dict(edge_uuid=uuid.UUID(uid(100)).bytes,source_id=5,source_fiber_a=1,source_fiber_b=2,
-                source_reversed=0,arc_a=0.,arc_b=0.,parallel_score=0.,perpendicular_score=1.,
-                las_winding=.5,parallel_las_winding=.5,evidence_weight=1.,normal_a_valid=0,normal_b_valid=0)
-    for endpoint in ('a','b'):
-        fields.update({f'point_{endpoint}_{axis}':v for axis,v in zip('xyz',expected[0])})
+    table['provisioning']['fiber_source']=fiber_source_version(path)
+    fields=dict(edge_uuid=uuid.UUID(uid(100)).bytes,arc_a=encode_fiber_arc(0),arc_b=encode_fiber_arc(0),
+                normal_a=encode_fiber_direction([0,0,0]),normal_b=encode_fiber_direction([0,0,0]),
+                connector=encode_fiber_direction([0,0,0]),winding_distance=encode_fiber_winding(.5),extra=None)
     edge=dict(record=dict(uuid=uid(100),a=uid(1),b=uid(2),kind='perpendicular',
-                         a_anchor=dict(position=xyz[0].tolist()),b_anchor=dict(position=xyz[0].tolist())),
+                         a_anchor={},b_anchor={}),
               extensions=[dict(table=table['name'],values=[fields.get(c['name']) for c in table['columns']])])
     output=import_initial_records(tmp_path/'graph.vcobj',[],edges=[edge],extensions=[table],
-                                  dependencies=[path],workers=2,packed=True)['path']
+                                  dependencies=[path],workers=2,packed=True,
+                                  edge_columns=[],edge_adjacency_index=False)['path']
     graph=FiberGraph(output)
     assert graph.volume==target
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import workflow_volume
@@ -147,10 +171,11 @@ def test_measurement_frame_and_registered_geometry(tmp_path):
     with pytest.raises(ValueError,match='measurement frame'):
         workflow_volume(dict(fibers=str(path),database=output,working_volume=source))
     np.testing.assert_allclose(graph.lengths,np.sqrt(8**2+12**2))
-    np.testing.assert_array_equal(graph.point_a,expected[:1])
-    np.testing.assert_array_equal(graph.point_b,expected[:1])
+    for name in ('point_a','point_b'):
+        with pytest.raises(ValueError,match='do not store endpoint XYZ'):
+            getattr(graph,name)
     with CollectionReader(output) as store:
-        np.testing.assert_array_equal(store.edge(uid(100))['a_anchor']['position'],xyz[0])
+        assert store.edge(uid(100))['a_anchor'].get('position') is None
 
 
 def test_result_stages_share_geometry_and_preserve_runs(tmp_path):

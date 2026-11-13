@@ -1,6 +1,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
+#include "vc_object_store/objects/InitialImport.hpp"
 #include "internal/Database.hpp"
 #include <fstream>
 #include <iostream>
@@ -53,6 +54,27 @@ void plainAndNested(){
     auto collection=ObjectCollection::open(child,options);auto r=collection.read();
     require(collection.object(r,{{},uuid}).has_value(),"search options were not propagated down store_reference chains");
 }
+void shardedAlias(){
+    TemporaryDirectory temp;fs::create_directory(temp.path/"aliases");
+    InitialImportOptions options;options.store=writable();options.shards.resize(4);
+    for(size_t i=0;i<options.shards.size();++i)options.shards[i].objectIds={int64_t(i*100+1),int64_t((i+1)*100)};
+    std::vector<std::string> ids(4);
+    for(size_t i=0;i<ids.size();++i)do{ids[i]=util::newUuid();}while(uuidShardIndex(ids[i],ids.size())!=i);
+    const auto result=importInitialCollection(temp.path/"fibers.vcobj",options,[&](size_t index,InitialShardImport& shard){
+        InitialObjectRecord object;object.record.kind="note";object.record.uuid=ids[index];object.record.name="via alias";
+        shard.appendObjects(std::span(&object,1));
+    });
+    const auto alias=temp.path/"aliases"/"source.vcobj";
+    fs::create_symlink(fs::relative(result.path,alias.parent_path()),alias);
+    {auto collection=ObjectCollection::open(alias,OpenOptions{.readOnly=true});auto txn=collection.read();
+        for(const auto& uuid:ids)require(collection.object(txn,{{},uuid}).has_value(),"sharded root alias resolves its relative partitions");}
+    {auto store=ObjectStore::open(alias,OpenOptions{.readOnly=true});auto txn=store.read();
+        require(store.objectsByKind(txn,"note").size()==ids.size(),"ordinary store alias reads complete logical sharded store");}
+    const auto overlay=temp.path/"overlay.vcobj";
+    {auto collection=ObjectCollection::create(overlay,{alias},writable());}
+    {auto collection=ObjectCollection::open(overlay,OpenOptions{.readOnly=true});auto txn=collection.read();
+        for(const auto& uuid:ids)require(collection.object(txn,{{},uuid}).has_value(),"aliased dependency resolves its own relative partitions");}
+}
 void packedCandidate(){
     TemporaryDirectory temp;const auto original=temp.path/"plain.vcobj",packed=temp.path/"original.pack";
     const auto uuid=base(original);
@@ -75,6 +97,54 @@ void packedCandidate(){
     auto plainOverlay=ObjectCollection::open(plainRoot,options);auto read=plainOverlay.read();
     require(plainOverlay.object(read,{{},uuid}).has_value(),"plain dependency was not located inside supplied packed file");
 }
+
+ExtensionSource position(ObjectCollection& collection) {
+    auto txn=collection.read();const auto p=collection.provisioning(txn);
+    return {collection.uuid(txn),p.generation,p.commitSequence};
 }
-int main()try{plainAndNested();packedCandidate();std::cout<<"collection search paths passed\n";return 0;}
+void sourcePositions() {
+    TemporaryDirectory temp;
+    const auto plain=temp.path/"plain.vcobj";base(plain);
+    auto source=ObjectCollection::open(plain,OpenOptions{.readOnly=true});
+    const auto pin=position(source);
+    {auto txn=source.read();require(resolveStorePosition(source,txn,pin)==fs::canonical(plain),"plain source root resolves exactly");
+        for(int field:{0,1,2}){auto wrong=pin;
+            if(field==0)wrong.storeUuid=util::newUuid();
+            if(field==1)wrong.generation=util::newUuid();
+            if(field==2)++wrong.commitSequence;
+            mustFail([&]{resolveStorePosition(source,txn,wrong);});}}
+    const auto parent=temp.path/"parent.vcobj",child=temp.path/"child.vcobj";
+    {auto collection=ObjectCollection::create(parent,{plain},writable());auto txn=collection.write();collection.seal(txn);txn.commit();}
+    {auto collection=ObjectCollection::create(child,{parent},writable());}
+    auto overlay=ObjectCollection::open(child,OpenOptions{.readOnly=true});
+    {auto txn=overlay.read();require(resolveStorePosition(overlay,txn,pin)==fs::canonical(plain),"nested source references resolve from provisioned metadata");
+        auto foreign=source.read();mustFail([&]{resolveStorePosition(overlay,foreign,pin);});}
+    for(bool packed:{false,true}) {
+        InitialImportOptions options;options.store=writable();options.uuidHashRouting=false;
+        if(packed)options.packed=PackedStoreOptions{};
+        options.shards={InitialShardSpec{{1,100}},InitialShardSpec{{101,200}}};
+        const auto result=importInitialCollection(temp.path/(packed?"packed":"sharded"),options,
+            [](size_t i,auto& shard){InitialObjectRecord row;row.record.uuid=util::nameUuid("source-position-"+std::to_string(i));
+                row.record.kind="note";shard.appendObjects(std::span(&row,1));});
+        auto collection=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});const auto expected=position(collection);
+        auto txn=collection.read();
+        require(resolveStorePosition(collection,txn,expected)==fs::canonical(result.path),
+                "shards sharing one source position do not become ambiguous public roots");
+    }
+    // Ambiguous physical roots with one logical position must be rejected,
+    // either when their collection is admitted or when the source is selected.
+    {
+        const auto owner=util::newUuid(),generation=util::newUuid();std::vector<fs::path> copies;ExtensionSource ambiguousPin;
+        for(int i:{0,1}){auto options=writable();options.creationStoreUuid=owner;options.creationGeneration=generation;
+            options.objectIdRange={i*100+1,(i+1)*100};const auto path=temp.path/("ambiguous-"+std::to_string(i));
+            {auto store=ObjectStore::create(path,options);auto txn=store.write();store.seal(txn);txn.commit();}
+            auto copy=ObjectCollection::open(path,OpenOptions{.readOnly=true});const auto copyPin=position(copy);
+            if(i==0)ambiguousPin=copyPin;else require(copyPin==ambiguousPin,"ambiguity fixture has matching positions");
+            copies.push_back(path);}
+        mustFail([&]{auto collection=ObjectCollection::create(temp.path/"ambiguous.vcobj",copies,writable());
+            auto txn=collection.read();resolveStorePosition(collection,txn,ambiguousPin);});
+    }
+}
+}
+int main()try{plainAndNested();shardedAlias();packedCandidate();sourcePositions();std::cout<<"collection search paths passed\n";return 0;}
 catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

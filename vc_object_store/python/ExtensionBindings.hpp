@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/objects/FiberGraphSolveExtension.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 
 // Included after StorageBindings.hpp: use the same transaction wrappers and
 // JSON metadata codec, but never round-trip typed row data through JSON.
@@ -184,13 +185,11 @@ void bindExtensionApi(nb::class_<T>& cls)
         if (object == relationship) throw std::invalid_argument("extension reference needs exactly one object or relationship UUID");
         nb::list result;
         const auto visitor = [&](const vo::ExtensionRow& row) { result.append(extensionRowToPy(row)); return true; };
-        const auto store = getStr(ref, "store"), generation = getStr(ref, "generation");
-        const auto version = getInt(ref, "version");
         self.withRead([&](auto& db, auto& txn) {
             if (object) db.scanExtensionRowsAtVersion(txn, table,
-                vo::ObjectVersion{store, generation, getStr(ref, "object"), version}, visitor);
+                vo::objectVersionFromJson(jsonDumps(ref)), visitor);
             else db.scanExtensionRowsAtVersion(txn, table,
-                vo::RelationshipVersion{store, generation, getStr(ref, "relationship"), version}, visitor);
+                vo::relationshipVersionFromJson(jsonDumps(ref)), visitor);
         });
         return result;
     }, nb::arg("table"), nb::arg("reference"));

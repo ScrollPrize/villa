@@ -1,5 +1,7 @@
 #include "internal/Extensions.hpp"
 #include "internal/Database.hpp"
+#include "internal/ExtensionHistory.hpp"
+#include "internal/RecordResolver.hpp"
 #include <cctype>
 #include <cmath>
 #include <set>
@@ -218,8 +220,11 @@ void detail::createExtensionTable(sqlite3* db,const ExtensionTable& spec) {
             Statement exists(db,"SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",spec.name+"_idx"+std::to_string(i));
             const auto expected=std::string("CREATE ")+(idx.unique?"UNIQUE ":"")+"INDEX "+identifier(spec.name+"_idx"+std::to_string(i))+" ON "+name+"("+joined(idx.columns)+")";
             if(!exists.row()||exists.text(0)!=expected)throw std::invalid_argument("extension: index definition differs");}
+        (void)resolvedExtensionTable(db,spec.name);
         return;
     }
+    if(const auto visible=resolvedExtensionTable(db,spec.name))
+        requireCompatibleExtension(extensionDefinition(*visible),spec);
     Savepoint save(db);registry(db);
     exec(db,("CREATE TABLE "+name+"("+body+",PRIMARY KEY("+joined(spec.primaryKey)+")) WITHOUT ROWID").c_str());
     for(size_t i=0;i<spec.indexes.size();++i){const auto& idx=spec.indexes[i];
@@ -326,10 +331,67 @@ void detail::scanExtensionRows(sqlite3* db,const std::string& name,const std::fu
 void detail::rejectExtensionLoss(sqlite3* db,const char* operation){if(hasExtensionTables(db))
     throw std::runtime_error(std::string(operation)+": registered extension tables require a database-preserving copy; refusing silent data loss");}
 
+ExtensionTable detail::extensionDefinition(const ExtensionTableInfo& info){
+    return {info.name,info.extension,info.formatVersion,info.provisioning,info.basedOn,info.columns,
+        info.primaryKey,info.indexes,info.keySpace,info.versioned};
+}
+void detail::requireCompatibleExtension(const ExtensionTableInfo& a,const ExtensionTableInfo& b){
+    requireCompatibleExtension(extensionDefinition(a), extensionDefinition(b));
+}
+void detail::requireCompatibleExtension(const ExtensionTable& a,const ExtensionTable& b){
+    if(a.extension!=b.extension||a.formatVersion!=b.formatVersion||a.columns!=b.columns||
+       a.primaryKey!=b.primaryKey||a.keySpace!=b.keySpace||a.versioned!=b.versioned||
+       Json::parse(a.provisioning)!=Json::parse(b.provisioning))
+        throw std::runtime_error("incompatible extension definitions: "+a.name);
+}
+std::optional<ExtensionTableInfo> detail::resolvedExtensionTable(sqlite3* db,const std::string& name){
+    std::optional<ExtensionTableInfo> result;
+    for(auto* source:querySources(db))if(auto candidate=extensionTable(source,name)){
+        if(result)requireCompatibleExtension(*result,*candidate);else result=std::move(candidate);
+    }
+    return result;
+}
 void ObjectStore::createExtensionTable(WriteTxn& t,const ExtensionTable& spec){detail::createExtensionTable(static_cast<sqlite3*>(connection(t)),spec);}
-std::vector<ExtensionTableInfo> ObjectStore::extensionTables(const Txn& t) const{return detail::extensionTables(static_cast<sqlite3*>(connection(t)));}
+std::vector<ExtensionTableInfo> ObjectStore::extensionTables(const Txn& t) const{
+    std::vector<ExtensionTableInfo> result;
+    for(auto* source:querySources(static_cast<sqlite3*>(connection(t)))){
+        auto tables=detail::extensionTables(source);result.insert(result.end(),tables.begin(),tables.end());
+    }
+    return result;
+}
 void ObjectStore::appendExtensionRows(WriteTxn& t,const std::string& name,std::span<const ExtensionRow> rows){detail::appendExtensionRows(static_cast<sqlite3*>(connection(t)),name,rows);}
 void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix) const {
-    detail::scanExtensionRows(static_cast<sqlite3*>(connection(t)),name,visitor,prefix);
+    auto* db=static_cast<sqlite3*>(connection(t));
+    const auto table=resolvedExtensionTable(db,name);
+    const auto sources=querySources(db);
+    if(!table)throw std::invalid_argument("extension: unregistered table "+name);
+    if(!visitor||prefix.size()>table->primaryKey.size())throw std::invalid_argument("extension: invalid scan");
+    if(table->versioned){
+        std::set<std::string> seen;bool more=true;
+        for(auto* source:sources){
+            scanExtensionOwnerKeys(source,*table,prefix,[&](const std::string& owner){
+                if(!seen.insert(owner).second)return true;
+                std::optional<std::string> meta;
+                if(table->keySpace=="objects") {if(auto record=objectByUuid(t,owner))meta=record->meta;}
+                else if(auto record=edgeByUuid(t,owner))meta=record->meta;
+                if(meta)more=scanExtensionSnapshot(db,*table,owner,*meta,visitor,prefix);
+                return more;
+            });
+            if(!more)return;
+        }
+        return;
+    }
+    std::vector<size_t> keys;
+    for(const auto& key:table->primaryKey)keys.push_back(std::find_if(table->columns.begin(),table->columns.end(),
+        [&](const auto& c){return c.name==key;})-table->columns.begin());
+    std::set<ExtensionRow> seen;bool more=true;
+    for(auto* source:sources){
+        if(!extensionTable(source,name))continue;
+        detail::scanExtensionRows(source,name,[&](const ExtensionRow& row){
+            ExtensionRow key;for(auto i:keys)key.push_back(row.at(i));
+            if(seen.insert(std::move(key)).second)more=visitor(row);return more;
+        },prefix);
+        if(!more)return;
+    }
 }
 } // namespace vc::objects

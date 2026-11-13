@@ -1543,11 +1543,11 @@ void FiberMapWorkspace::applySceneRect()
 
 QString FiberMapWorkspace::withCachedUmbilicusStatus(const QString& status)
 {
-    const QString fingerprint =
-        _controller ? _controller->umbilicusFingerprint() : QString();
-    if (!_umbilicusStatusValid || fingerprint != _umbilicusStatusFingerprint) {
+    const auto dependency =
+        _controller ? _controller->umbilicusDependency() : vc3d::fiber_map::UmbilicusDependency{};
+    if (!_umbilicusStatusValid || dependency != _umbilicusStatusDependency) {
         _umbilicusStatusText = withUmbilicusStatus(QString(), _controller);
-        _umbilicusStatusFingerprint = fingerprint;
+        _umbilicusStatusDependency = dependency;
         _umbilicusStatusValid = true;
     }
     return status + _umbilicusStatusText;
@@ -1639,7 +1639,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _gapTiles.clear();
     _layoutGeneration = 0;
     _layoutAnnotationVolume.clear();
-    _layoutUmbilicusFingerprint.clear();
+    _layoutUmbilicusDependency = {};
     _layoutPackageGeneration = 0;
     _layoutUmbilicusGeneration = 0;
     _layoutBuilt = false;
@@ -1689,7 +1689,7 @@ FiberMapWorkspace::currentDependencies() const
     deps.fiberGeneration = _controller->fiberDataGeneration();
     deps.packageGeneration = _controller->packageGeneration();
     deps.umbilicusGeneration = _controller->umbilicusGeneration();
-    deps.umbilicusFingerprint = _controller->umbilicusFingerprint();
+    deps.umbilicusDependency = _controller->umbilicusDependency();
     if (const auto& annotation = _state->annotationVolume()) {
         deps.annotationVolume = QString::fromStdString(annotation->volume);
         deps.voxelSizeUm = annotation->voxelSizeUm;
@@ -1705,7 +1705,7 @@ FiberMapWorkspace::layoutDependencies() const
     deps.fiberGeneration = _layoutGeneration;
     deps.packageGeneration = _layoutPackageGeneration;
     deps.umbilicusGeneration = _layoutUmbilicusGeneration;
-    deps.umbilicusFingerprint = _layoutUmbilicusFingerprint;
+    deps.umbilicusDependency = _layoutUmbilicusDependency;
     deps.annotationVolume = _layoutAnnotationVolume;
     deps.voxelSizeUm = _voxelSizeUm;
     deps.catalogOrientation = _layoutCatalogOrientation;
@@ -1890,7 +1890,7 @@ struct FiberMapWorkspace::RebuildJobResult {
     bool automatic = false;
     uint64_t epoch = 0;
     // The world as of the start, for apply-time validation.
-    QString preReadUmbilicusFingerprint;
+    vc3d::fiber_map::UmbilicusDependency preReadUmbilicusDependency;
     uint64_t builtPackageGeneration = 0;
     uint64_t builtUmbilicusGeneration = 0;
     // Inputs (snapshot fibers are consumed by the worker's conversion).
@@ -2159,7 +2159,7 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild, bool automatic)
         // — the token's contract; a same-size rewrite inside one timestamp
         // tick is beyond it — leaves the recorded token disagreeing with the
         // disk, and the publish-time refresh raises the banner.
-        job->preReadUmbilicusFingerprint = _controller->umbilicusFingerprint();
+        job->preReadUmbilicusDependency = _controller->umbilicusDependency();
         QElapsedTimer snapshotTimer;
         snapshotTimer.start();
         job->snapshot = _controller->fiberMapSnapshot();
@@ -2315,7 +2315,7 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
     // re-run stays warm and cheap.
     if (_controller->fiberDataGeneration() != job->snapshot.generation ||
         _controller->umbilicusGeneration() != job->builtUmbilicusGeneration ||
-        _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint ||
+        _controller->umbilicusDependency() != job->preReadUmbilicusDependency ||
         current.catalogOrientation != catalogOrientationKey(job->snapshot.catalogVolume)) {
         _layoutCache = std::move(job->cache);
         if (isVisible()) {
@@ -2362,7 +2362,7 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _gapPublishedWanted = job.wantGapField;
     _gapPublishedError = job.gapError;
     _gapFieldParams = job.gapParams;
-    _layoutUmbilicusFingerprint = job.preReadUmbilicusFingerprint;
+    _layoutUmbilicusDependency = job.preReadUmbilicusDependency;
     _layoutCatalogOrientation = catalogOrientationKey(job.snapshot.catalogVolume);
     _layoutGeneration = job.snapshot.generation;
     _layoutAnnotationVolume = QString::fromStdString(job.snapshot.annotationVolume);

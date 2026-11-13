@@ -275,6 +275,7 @@ void chunkPipeline(){
             {"coordinate_space","synthetic/volume"},{"umbilicus_sha256","test-axis"},
             {"chunk_size_base_voxels",2.},{"chunk_geometry_halo",4.},{"normal_sample_spacing",.5}};
         Json metadata={{"config",cfg},{"fibers_store_uuid",imported.storeUuid},
+            {"fiber_source",{{"store",imported.storeUuid},{"generation",imported.generation},{"commit_sequence",imported.commitSequence}}},
             {"normal_manifest",dataset.manifest().raw},{"normal_provenance",Json::object()}};
         options.parallelThreads=workers;
         FiberConstraintDatabaseOptions database;database.workers=2;database.preparationWorkers=2;
@@ -380,6 +381,7 @@ void unresolvedChunkBoundary(){
         {"normal_prior_output",(dir.path/"priors.json").string()},{"coordinate_space","synthetic/volume"},
         {"umbilicus_sha256","test-axis"},{"chunk_size_base_voxels",2.},{"normal_sample_spacing",.5}};
     Json metadata={{"config",cfg},{"fibers_store_uuid",imported.storeUuid},
+        {"fiber_source",{{"store",imported.storeUuid},{"generation",imported.generation},{"commit_sequence",imported.commitSequence}}},
         {"normal_manifest",dataset.manifest().raw},{"normal_provenance",Json::object()}};
     ft::FiberTraceConstraintConfig options;options.localEvents=true;options.localKeepWholeFibers=true;
     options.parallelThreads=4;options.certifyWinding=false;options.enforceMaximumWindingDistance=false;
@@ -451,7 +453,9 @@ void roundTrip(size_t shards,bool packed){
     report.constraints.push_back(c);
     Json provenance={{"config",{{"fibers",source.string()},{"import_workers",shards},{"packed_store",packed},
         {"coordinate_space","synthetic/volume"}}},
-        {"fibers_store_uuid",base.storeUuid},{"normal_manifest",dataset.manifest().raw},
+        {"fibers_store_uuid",base.storeUuid},
+        {"fiber_source",{{"store",base.storeUuid},{"generation",base.generation},{"commit_sequence",base.commitSequence}}},
+        {"normal_manifest",dataset.manifest().raw},
         {"normal_provenance",{{"source_uuid","synthetic-normal-field"}}}};
     FiberConstraintDatabaseOptions options;options.workers=int(shards);options.packed=packed;
     options.baseToStored=baseToStored;

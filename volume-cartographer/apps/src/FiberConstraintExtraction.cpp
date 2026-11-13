@@ -184,6 +184,8 @@ int runFiberConstraintExtraction(int argc, char** argv)
     vc::objects::OpenOptions storeOptions; storeOptions.readOnly=true;
     auto store=vc::objects::ObjectCollection::open(cfg.at("fibers").get<std::string>(),storeOptions);
     const auto txn=store.read();
+    // Status, selection, transforms and payloads all use this same read snapshot.
+    const auto sourceStatus=store.provisioning(txn);
     vc::lasagna::LasagnaDatasetOpenOptions open;
     open.workingToBaseScale=1.;
     open.remoteCacheRoot=cfg.at("remote_cache").get<std::string>();
@@ -399,6 +401,8 @@ int runFiberConstraintExtraction(int argc, char** argv)
     std::cout<<"selected fibers="<<lines.size()<<" points="<<totalPoints<<" arc_base="<<totalArc
              <<" unsigned normals; no alignment"<<std::endl;
     Json result={{"config",cfg},{"fibers_store_uuid",store.uuid(txn)},
+        {"fiber_source",{{"store",store.uuid(txn)},{"generation",sourceStatus.generation},
+                         {"commit_sequence",sourceStatus.commitSequence}}},
         {"normal_manifest",dataset.manifest().raw},{"normal_provenance",provenance},
         {"selected_ids",ids},{"selected_fibers",lines.size()},{"points",totalPoints},
         {"fiber_base_shape_zyx",baseShapeZYX},
@@ -463,6 +467,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
                 agreement[i]=fiberAxialAlignment(lines[i].pointsBaseXYZ,axisAt,step);
         });
         Json features={{"format","fiber-axial-priors"},{"version",1},{"fibers_store_uuid",result["fibers_store_uuid"]},
+            {"fiber_source",result.at("fiber_source")},
             {"source_ids",ids},{"agreement",agreement},{"umbilicus",cfg.at("umbilicus")},
             {"fibers_digest",cfg.at("fibers_digest")},{"umbilicus_sha256",cfg.at("umbilicus_sha256")},
             {"sample_spacing_base",step},{"axis_secant_halfspan_z",8},

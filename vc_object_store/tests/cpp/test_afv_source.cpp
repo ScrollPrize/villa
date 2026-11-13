@@ -159,7 +159,7 @@ int main()
         "INSERT INTO constraints VALUES(0,0,9,1.25,2.5,1,2,3,4,5,6,0,1,.75,.25,.9,"
         "'{\"valid\":true,\"xyz\":[1,0,0]}','{\"valid\":false,\"xyz\":null}','{\"custom\":7}');");
     const Json metadata={{"format","fiber-constraints"},{"schema_version",1},{"complete",true},
-        {"provenance",{{"afv_uuid","1482bcc8-f93e-4c3b-b380-2ddf369318f4"}}},{"statistics",{{"constraints",1}}}};
+        {"provenance",{{"afv_uuid","1482BCC8-F93E-4C3B-B380-2DDF369318F4"}}},{"statistics",{{"constraints",1}}}};
     for(const auto& [key,value]:metadata.items())detail::execute(db,"INSERT INTO metadata VALUES(?,?)",key,value.dump());
     sqlite3_close(db);
     {

@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/StoreConversion.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include "internal/Database.hpp"
+#include "internal/DatabaseCopy.hpp"
 #include "internal/Schema.hpp"
 #include "internal/History.hpp"
 #include "internal/ExtensionHistory.hpp"
@@ -10,7 +11,6 @@
 #include "internal/CollectionReads.hpp"
 #include "internal/SchemaPrograms.hpp"
 #include "internal/Digest.hpp"
-#include "internal/ExternalEndpoint.hpp"
 #include "geometry/GeometryReader.hpp"
 #include "geometry/DependencyIndex.hpp"
 #include "geometry/SharedGeometry.hpp"
@@ -56,10 +56,7 @@ Db exclusive(const std::filesystem::path& path, int version)
 Db backupTo(sqlite3* source, const std::filesystem::path& path)
 {
     Db target(openConnection(path,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,{},false),sqlite3_close_v2);
-    auto* backup=sqlite3_backup_init(target.get(),"main",source,"main");
-    if (!backup) fail(target.get(),"maintenance backup");
-    const int step=sqlite3_backup_step(backup,-1), finish=sqlite3_backup_finish(backup);
-    if (step!=SQLITE_DONE || finish!=SQLITE_OK) fail(target.get(),"maintenance backup failed");
+    backupSqliteSnapshot(source,target.get());
     return target;
 }
 
@@ -78,8 +75,8 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
     if (policy.i64(3)==INT64_MAX) throw std::runtime_error("history policy: commit sequence exhausted");
     Sibling staged{path.parent_path()/(path.filename().string()+".policy-"+util::newUuid())};
     auto target=backupTo(source.get(),staged.path); auto* db=target.get();
-    auto sourceChunks=attachCollectionChunkResolver(source.get(),path);
-    auto targetChunks=attachCollectionChunkResolver(db,path);
+    auto sourceChunks=attachCollectionReferenceResolver(source.get(),path);
+    auto targetChunks=attachCollectionReferenceResolver(db,path);
     const bool hasReceipts = [&] {
         Statement receiptTable(source.get(), "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='transaction_receipts'");
         return receiptTable.row();
@@ -116,7 +113,6 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
     suspendPrograms(db,extensions,false);
     exec(db,"CREATE TABLE _policy_geometry(uuid,object_uuid,parent_uuid,content_hash,manifest,object_version,created_by,created_at,created_host);"
             "CREATE TABLE _policy_chunks(object_uuid BLOB,revision_uuid BLOB,array_name TEXT,chunk_index INTEGER,hash BLOB);"
-            "CREATE TABLE _policy_revision_ids(old_uuid BLOB PRIMARY KEY,new_uuid BLOB NOT NULL UNIQUE);"
             "CREATE TABLE _policy_bounds AS SELECT 0 object_id,NULL revision_uuid,0.0 min_x,0.0 min_y,0.0 min_z,0.0 max_x,0.0 max_y,0.0 max_z WHERE 0;");
     if (hasReceipts) exec(db, "CREATE TABLE _policy_receipts AS SELECT * FROM transaction_receipts;");
     if (policy.i64(2)) exec(db,"INSERT INTO _policy_bounds SELECT * FROM object_bounds;");
@@ -124,11 +120,14 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
         Statement heads(db,"SELECT storage_ref,uuid,version,changed_by,changed_at,changed_host "
                            "FROM objects WHERE geometry_manifest IS NOT NULL");
         while (heads.row()) {
-            const auto uuid=readGeometryTokenColumn(heads,0); GeometryReader reader(db,uuid,false);
+            const auto uuid=readGeometryTokenColumn(heads,0);
+            const auto resolved=resolveGeometryRecord(db,uuid);
+            if(!resolved)throw std::runtime_error("history policy: missing current geometry");
+            // Immutable dependencies keep their own retention policy. Do not
+            // flatten their delta chains or copy payloads to change ours.
+            if(resolved->source!=db)continue;
+            GeometryReader reader(db,uuid,false);
             const auto object=formatUuid(heads.blob16(1));
-            const auto replacement=enabled?util::newUuid():currentGeometryToken(object,heads.i64(2));
-            {Statement mapping(db,"INSERT INTO _policy_revision_ids VALUES(?,?)");
-                bindGeometryToken(mapping,1,uuid);bindGeometryToken(mapping,2,replacement);mapping.stepDone();}
             auto manifest=reader.manifest();
             for (auto& [name,array]:manifest.at("arrays").items()) {
                 array.erase("source_revision");
@@ -138,7 +137,7 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
                     const auto hash=storeSharedPayload(db,name,bytes);
                     if (hash!=chunks[i]) throw std::runtime_error("history policy: materialized chunk hash mismatch");
                     Statement chunk(db,"INSERT INTO _policy_chunks VALUES(?,?,?,?,?)");
-                    chunk.bind(1,heads.blob16(1));bindGeometryToken(chunk,2,replacement);
+                    chunk.bind(1,heads.blob16(1));bindGeometryToken(chunk,2,uuid);
                     chunk.bind(3,name);chunk.bind(4,int64_t(i));bindDigest(chunk,5,hash);chunk.stepDone();
                 }
             }
@@ -148,12 +147,12 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
                 if (storeSharedPayload(db, "@metadata", bytes) != hash)
                     throw std::runtime_error("history policy: metadata payload hash mismatch");
                 Statement chunk(db,"INSERT INTO _policy_chunks VALUES(?,?,?,?,?)");
-                chunk.bind(1,heads.blob16(1)); bindGeometryToken(chunk,2,replacement);
+                chunk.bind(1,heads.blob16(1)); bindGeometryToken(chunk,2,uuid);
                 chunk.bind(3,std::string("@metadata")); chunk.bind(4,metadataIndex++); bindDigest(chunk,5,hash); chunk.stepDone();
             }
             const auto text=manifest.dump();
             Statement geometry(db,"INSERT INTO _policy_geometry VALUES(?,?,NULL,?,?,?,?,?,?)");
-            bindGeometryToken(geometry,1,replacement);geometry.bind(2,heads.blob16(1));
+            bindGeometryToken(geometry,1,uuid);geometry.bind(2,heads.blob16(1));
             bindDigest(geometry,3,geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()),text.size())));
             geometry.bind(4,text);geometry.bind(5,heads.i64(2));geometry.bind(6,heads.text(3));
             geometry.bind(7,heads.text(4));geometry.bind(8,heads.text(5));geometry.stepDone();
@@ -216,12 +215,7 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
         while(rows.row())execute(db,"UPDATE objects SET storage_ref=?,data_checksum=?,geometry_manifest=? WHERE uuid=?",
             readGeometryTokenColumn(rows,1),readDigest(rows,2),rows.text(3),rows.blob16(0));
     }
-    {Statement sourceIndex(db,"SELECT 1 FROM sqlite_schema WHERE type='table' AND name='source_collections'");
-        if(sourceIndex.row())exec(db,"UPDATE source_collections SET revision_uuid=coalesce("
-            "(SELECT new_uuid FROM _policy_revision_ids WHERE old_uuid=revision_uuid),revision_uuid);");}
-    if (policy.i64(2)) exec(db,"UPDATE _policy_bounds SET revision_uuid=(SELECT new_uuid FROM _policy_revision_ids WHERE old_uuid=revision_uuid) "
-                            "WHERE revision_uuid IN (SELECT old_uuid FROM _policy_revision_ids);"
-                            "DELETE FROM spatial_regions WHERE array_name=''; INSERT INTO object_bounds SELECT * FROM _policy_bounds;");
+    if (policy.i64(2)) exec(db,"DELETE FROM spatial_regions WHERE array_name=''; INSERT INTO object_bounds SELECT * FROM _policy_bounds;");
     {
         Statement edges(db,"SELECT "+projectedEdgeColumns(db)+" FROM "+edgeReadSource(db)+" AS edges WHERE state=0");
         while (edges.row()) recordRelationshipValidation(db,readEdgeRow(db,edges));
@@ -236,7 +230,7 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
         }
         exec(db,"DELETE FROM geometry_chunks WHERE hash NOT IN (SELECT hash FROM _policy_chunks);");
     }
-    exec(db,"DROP TABLE _policy_geometry; DROP TABLE _policy_chunks; DROP TABLE _policy_bounds; DROP TABLE _policy_revision_ids;");
+    exec(db,"DROP TABLE _policy_geometry; DROP TABLE _policy_chunks; DROP TABLE _policy_bounds;");
     // Recreate compatible extension triggers and prepare their actions without
     // executing them. References to removed history fail on the staged copy,
     // leaving the original intact instead of publishing a broken extension.

@@ -48,12 +48,16 @@ def run_features(config):
     from .constraint_extraction import run_native_constraints
     native=(dict(config['native_config']) if isinstance(config['native_config'],dict)
             else json.loads(Path(config['native_config']).read_text()))
-    identity=lambda:dict(fibers_digest=fibers_digest(native['fibers']),umbilicus_sha256=sha256_file(native['umbilicus']))
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_source_version
+    def identity():
+        pin=fiber_source_version(native['fibers'])
+        return dict(fibers_digest=fibers_digest(native['fibers'],source_version=pin),
+                    fiber_source=pin,umbilicus_sha256=sha256_file(native['umbilicus']))
     native.update(identity())
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     frozen=root/'native_config.json';atomic_write(frozen,native,durable=False)
     run_native_constraints(frozen, config)
-    if identity()!={key:native[key] for key in ('fibers_digest','umbilicus_sha256')}:
+    if identity()!={key:native[key] for key in ('fibers_digest','fiber_source','umbilicus_sha256')}:
         target=Path(native['axial_prior_output']);target.rename(target.with_suffix('.invalid'))
         raise RuntimeError('Feature input changed during export')
 
@@ -64,11 +68,17 @@ def verify_feature_source(database,feature, *, graph=None):
     from .fiber_graph_store import snapshot_digest
     if snapshot_digest(graph.source) != store_digest(database):
         raise ValueError('Prepared graph belongs to another snapshot')
-    if fibers_digest(database) != feature['fibers_digest']:
+    from .fiber_graph_store import original_fiber_source
+    source,pin=original_fiber_source(database)
+    original_digest=fibers_digest(source,source_version=pin)
+    if fibers_digest(database) != original_digest or original_digest != feature['fibers_digest']:
         raise ValueError('Axial/source fiber store content mismatch')
+    if feature.get('fiber_source')!=pin:
+        raise ValueError('Axial/source fiber source version differs or is missing; regenerate frozen evidence')
     if not np.array_equal(graph.ids, feature['source_ids']):
         raise ValueError('Constraint/feature IDs differ')
-    return dict(fibers_digest=feature['fibers_digest'], fibers_checked=len(graph.ids))
+    return dict(fibers_digest=original_digest, fibers_checked=len(graph.ids),
+                fiber_lengths_checked=len(graph.ids),fiber_source=pin,fiber_source_path=str(source))
 
 
 def prepare(config, *, graph=None):

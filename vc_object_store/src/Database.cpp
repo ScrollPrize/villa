@@ -79,13 +79,13 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             if(features.text(0)=="object-state-v1"){stateLayout=true;continue;}
             if(features.text(0)=="binary-uuid-v1"){binaryUuids=true;continue;}
             if(features.text(0)=="uuid-hash-routing-v1")continue;
-            if (features.text(0)=="collection-v1" && options.physicalPartitionOnly) continue;
+            if (features.text(0)=="collection-v1") {impl->composed=true;continue;}
             if (features.text(0)==immutableImportFeature) {
                 if(!options.readOnly || !manifest.i64(2) || manifest.i64(1) || manifest.i64(3))
                     throw std::runtime_error("immutable initial store must be sealed, history/spatial-off and opened readonly");
                 impl->immutableInitial=true;continue;
             }
-            throw std::runtime_error("object store: unsupported required feature (use ObjectCollection for collections): " + features.text(0));
+            throw std::runtime_error("object store: unsupported required feature: " + features.text(0));
         }
         if(!currentState||!binaryHashes||!endpointKeys||!stateLayout||!binaryUuids)
             throw std::runtime_error("object store: required current-schema features are absent (direct geometry, binary hashes, direct endpoint keys, state or binary UUIDs)");

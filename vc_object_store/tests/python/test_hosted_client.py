@@ -7,9 +7,11 @@ import uuid
 import http.client
 import http.server
 import threading
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+from object_helpers import fixture_guards
 import numpy as np
 
 import vc_object_store as vos
@@ -34,9 +36,42 @@ def hosted(tmp_path):
 
 
 def request(status, operations, expected, author="py"):
-    return dict(command_version=1, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
-                author=author, expected_objects=expected, expected_relationships={}, read_dependencies={},
+    return dict(command_version=3, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
+                author=author, expected_objects=fixture_guards(status, expected), expected_relationships={}, read_dependencies={},
                 expected_commit_sequence=None, operations=operations)
+
+
+def test_selected_input_capture_uses_server_snapshot(hosted):
+    store, _ = hosted
+    status = store.status()
+    uid = str(uuid.uuid4())
+    store.submit(request(status, [dict(op="create_object", record=dict(uuid=uid, kind="note"))], {uid: None}))
+    position = store.status()
+    reference = vos.object_reference(store.current_object_revision(uid)["record"])
+    selected = store.selected_inputs([reference], position)
+    assert vos.object_reference(selected["objects"][0]["record"]) == reference
+    assert selected["relationships"] == []
+    with pytest.raises(vos.StoreBusy, match="position"):
+        store.selected_inputs([reference], dict(position, store=str(uuid.uuid4())))
+
+
+def test_server_rejects_fractional_commit_guard_before_writing(hosted):
+    store, _ = hosted
+    status = store.status()
+    uid = str(uuid.uuid4())
+    body = request(status, [dict(op='create_object', record=dict(uuid=uid, kind='note'))], {uid: None})
+    body['expected_commit_sequence'] = status['commit_sequence'] + 0.5
+    endpoint = urlsplit(store.endpoint)
+    connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=10)
+    try:
+        connection.request('POST', '/v1/transactions', json.dumps(body), {'Content-Type': 'application/json'})
+        response = connection.getresponse()
+        assert response.status == 400
+        assert 'commit_sequence' in response.read().decode()
+    finally:
+        connection.close()
+    assert store.current_object_revision(uid) is None
+    assert store.status()['commit_sequence'] == status['commit_sequence']
 
 
 @pytest.mark.parametrize("cache_bytes", [1 << 20, 8 << 20])
@@ -152,13 +187,24 @@ def test_session_typed_operations_on_hosted_and_local(hosted, tmp_path):
         assert session.objects_at_versions(attachment, [ref])[0]["record"]["name"] == "n"
         source = tmp_path / "w.bin"
         source.write_bytes(b"w" * 100)
-        session.publish_artifacts(attachment, obj, 1, {"w.bin": str(source)}, "pytest")
+        session.publish_artifacts(attachment, ref, {"w.bin": str(source)}, "pytest")
         if attachment == remote:
             session.refresh(remote)
             events = [e for e in session.take_events() if e["kind"] == "committed"]
             assert events and not events[-1]["revalidate"] and events[-1]["changes"][-1]["kind"] == "note"
         files = session.materialize_artifacts(attachment, obj, str(tmp_path / f"out-{attachment.store_uuid}"))
         assert files[0]["length"] == 100 and (tmp_path / f"out-{attachment.store_uuid}" / "w.bin").read_bytes() == b"w" * 100
+        historical = vos.object_reference(session.current_object(attachment, obj)["record"])
+        source.write_bytes(b"replacement")
+        session.publish_artifacts(attachment, historical, {"w.bin": str(source)}, "pytest")
+        session.submit(attachment, request(session.status(attachment), [dict(op="delete_object", uuid=obj)],
+                                           {obj: historical["version"] + 1}))
+        assert session.artifacts(attachment, obj, reference=historical) == files
+        selected = session.artifact_file(attachment, obj, "w.bin", str(tmp_path / "exact-cache"), reference=historical)
+        assert Path(selected).read_bytes() == b"w" * 100
+        output = tmp_path / f"exact-{attachment.store_uuid}"
+        session.materialize_artifacts(attachment, obj, str(output), reference=historical)
+        assert (output / "w.bin").read_bytes() == b"w" * 100
     with pytest.raises(ValueError):
         session.path(remote)  # hosted attachments have no local database
 

@@ -1,5 +1,6 @@
 #include "geometry/DependencyIndex.hpp"
 #include "internal/EdgeSql.hpp"
+#include "internal/RecordResolver.hpp"
 namespace vc::objects::detail {
 void createGeometryHistoryIndex(sqlite3* db) {
     // Revision allocation and latest-ledger queries must not sort full history.
@@ -9,7 +10,7 @@ void createGeometryHistoryIndex(sqlite3* db) {
 }
 std::vector<EdgeRecord> structuralEdgeCandidates(sqlite3* db,const std::string& uuid,const std::string& array,const std::vector<int64_t>& ids) {
     const auto canonical=formatUuid(parseUuid(uuid));
-    const auto object=objectIdByUuid(db,parseUuid(canonical));
+    const auto object=resolveObject(db,canonical);
     if(!object)throw std::invalid_argument("geometry dependencies: unknown object");
     const std::set<int64_t> changed(ids.begin(),ids.end());
     const auto affected=[&](const Anchor& anchor){
@@ -21,9 +22,7 @@ std::vector<EdgeRecord> structuralEdgeCandidates(sqlite3* db,const std::string& 
         return false;
     };
     std::vector<EdgeRecord> result;
-    Statement edges(db,"SELECT "+projectedEdgeColumns(db)+" FROM "+edgeReadSource(db)+" AS edges WHERE (a_uuid=?1 OR b_uuid=?1) AND state=0 ORDER BY uuid",parseUuid(canonical));
-    while(edges.row()){
-        auto edge=readEdgeRow(db,edges);
+    for(auto& edge:incidentEdges(db,canonical)){
         if((edge.aUuid==canonical&&affected(edge.aAnchor))||(edge.bUuid==canonical&&affected(edge.bAnchor)))
             result.push_back(std::move(edge));
     }

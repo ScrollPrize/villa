@@ -67,7 +67,7 @@ int main() try
             const auto expected=scalar.objectByUuid(a,entry.record.uuid),actual=initial.objectByUuid(b,entry.record.uuid);
             require(expected&&actual,"initial geometry object missing");
             require(Json::parse(expected->meta)==Json::parse(actual->meta),"initial geometry source annotations differ");
-            require(expected->storageKind==actual->storageKind&&expected->storageRef==actual->storageRef&&
+            require(expected->storageKind==actual->storageKind&&expected->storageRef!=actual->storageRef&&
                 expected->version==actual->version&&expected->dataChecksum==actual->dataChecksum,"initial managed fields differ");
             const auto ag=scalar.currentGeometry(a,entry.record.uuid),bg=initial.currentGeometry(b,entry.record.uuid);
             require(ag&&bg&&ag->contentHash==bg->contentHash,"initial manifest content differs");

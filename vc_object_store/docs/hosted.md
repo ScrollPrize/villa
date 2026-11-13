@@ -103,6 +103,14 @@ Most tools never touch the client classes directly: a store **location** is
 a file path or an `http(s)://` endpoint, and the Python helpers
 (`surfaces.read_surface`, `surfaces.create_surface`,
 `documents.attach_document`, `locations.attached(location)`) work on either.
+`locations.open_store(location, author=, read_only=, link_timeout_s=,
+cache_directory=)` yields the `ObjectStore` itself for a file and a
+`HostedStoreHandle` for an endpoint: the same reading and request methods
+(status, submit and receipts, the change feed, current and numbered records,
+relationships at versions, geometry descriptors, arrays and annotations,
+object and edge selections, pinned overlap correspondences) over one session
+attachment, with `cache_directory` as its persistent cache, so one code path
+reads, links and writes a store wherever it is.
 
 ## Sessions: `ObjectStoreSession`
 
@@ -114,7 +122,7 @@ const auto attachment = session.attach("objects.vcobj", options);
 auto request = session.newRequest(attachment);
 session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto& cancel) {
     if (cancel.load()) return;
-    request.expectedObjects[objectUuid] = reader.currentObject(objectUuid)->version;
+    request.expectedObjects[objectUuid] = reader.currentObject(objectUuid)->reference();
 });
 request.operations.push_back(vc::objects::SetMetaOp{objectUuid, "review_note", R"("checked")"});
 session.submit(attachment, request); // TransactionConflict when the object moved on
@@ -148,10 +156,14 @@ session.submit(attachment, request); // TransactionConflict when the object move
   registered for its meta key (`setGeometryFetcher`,
   [objects/CatalogStore.hpp](../include/vc_object_store/objects/CatalogStore.hpp)),
   in any writable attachment.
-- Python mirrors this: `ObjectStoreSession` with `attach_hosted`, `hosted`,
-  `attach_location`, `status`, `submit`, `receipt`, `current_object`,
-  `objects_at_versions`, `select_objects`, `read_surface_grid`,
-  `read_geometry_arrays`, `create_surface`, `attach_document`,
+- Python mirrors this: `ObjectStoreSession` with `attach_hosted` (its
+  `cache_directory`, `disk_cache_bytes` and `min_free_bytes` are the
+  persistent cache below), `hosted`, `attach_location`, `location`,
+  `status`, `submit`, `receipt`, `current_object`, `objects_at_versions`,
+  `relationships_at_versions`, `changes_since`, `select_objects`,
+  `select_edges`, `read_surface_grid`, `read_geometry_arrays`,
+  `geometry_revision`, `read_geometry_array`, `geometry_point_annotations`,
+  `overlap_correspondences_at`, `create_surface`, `attach_document`,
   `attached_document`, `point_collections`, `artifacts`,
   `publish_artifacts`, `materialize_artifacts`, and the draft calls below.
 
@@ -253,6 +265,7 @@ bytes, `Content-Length` required; 400 hash/length mismatch, 411 no length,
 | `GET /v1/objects/{uuid}/versions/{n}?store&generation` | that numbered revision or 404 |
 | `GET /v1/objects/{uuid}/history` | every recorded revision, or 404 |
 | `GET /v1/geometry/{revision}` | geometry descriptor (immutable) |
+| `GET /v1/geometry/{revision}/object` | latest retained object metadata naming that geometry, or 404; not immutable, use an exact object reference to pin metadata |
 | `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes; 413 above the response limit |
 | `GET /v1/geometry/{revision}/annotations/{name}` | per-point annotations (exact JSON, immutable) |
 | `PUT /v1/artifacts/{sha256}` (bytes) | kept durably by the store |

@@ -19,10 +19,10 @@ else()
 endif()
 
 # Shared owned geometry and operations; no SQLite, OpenCV or application types.
-add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp)
+add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp geometry/PointMap.cpp)
 target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json vc_reader::catalog)
+target_link_libraries(vc_geometry PUBLIC nlohmann_json::nlohmann_json PRIVATE vc_reader::catalog)
 target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
@@ -38,11 +38,13 @@ add_library(vc_objects ${_vc_store_library_type}
     internal/Sqlite.cpp
     internal/Schema.cpp
     internal/RecordSql.cpp
+    internal/RecordOverrides.cpp
     internal/EdgeSql.cpp
     internal/EdgeLayout.cpp
     internal/InitialEdges.cpp
     internal/InitialObjects.cpp
     internal/RecordJson.cpp
+    geometry/GeometryReference.cpp
     Uuid.cpp
     internal/JsonFields.cpp
     formats/FiberJson.cpp
@@ -51,6 +53,7 @@ add_library(vc_objects ${_vc_store_library_type}
     Extensions.cpp
     ExtensionHistory.cpp
     ObjectCollection.cpp
+    CollectionSource.cpp
     InitialImport.cpp
     PackedStore.cpp
     PackedCollection.cpp
@@ -100,6 +103,7 @@ add_library(vc_objects ${_vc_store_library_type}
     geometry/GeometryDelta.cpp
     geometry/GeometryReader.cpp
     relationships/Edges.cpp
+    relationships/RelationshipInputs.cpp
     relationships/Traversal.cpp
     relationships/EdgeGeometry.cpp
 )
@@ -159,7 +163,7 @@ add_library(vc_object_geometry ${_vc_store_library_type} geometry/GeometryIngest
     catalog/CatalogStore.cpp)
 add_library(vc_object_store::vc_object_geometry ALIAS vc_object_geometry)
 target_include_directories(vc_object_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats vc_reader::headers CURL::libcurl nlohmann_json::nlohmann_json)
+target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats vc_reader::headers CURL::libcurl nlohmann_json::nlohmann_json OpenSSL::Crypto)
 if(NOT VC_OBJECT_STORE_BUILD_LINKING)
     return()
 endif()

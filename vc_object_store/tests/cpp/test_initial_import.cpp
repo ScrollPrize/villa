@@ -60,6 +60,18 @@ void roundTrip(size_t shards,bool packed)
     require(result.path==(shards>1&&!packed?output/"collection.vcobj":output),"public root locator");
     require(result.shards.size()==shards,"all shards reported");
     require(result.totalSeconds>=result.ingestionSeconds && result.persistenceSeconds>=0,"timings reported");
+    {
+        auto native=ObjectStore::open(result.path,OpenOptions{.readOnly=true});auto read=native.read();
+        const auto graph=native.graphReadView(read);
+        require(graph.objectUuids.size()==shards+1&&graph.edgeUuids.size()==shards,
+            "ordinary graph API spans shards and their sealed dependency");
+        require(native.componentOf(read,reference.objectUuid).size()==shards+1,
+            "ordinary traversal reaches sibling-shard edges");
+        std::vector<ObjectVersion> versions;
+        for(const auto& uuid:graph.objectUuids)versions.push_back(native.currentObjectRevision(read,uuid)->reference());
+        require(native.graphReadViewAt(read,versions).edgeUuids.size()==shards,
+            "exact current-only graph retains cross-shard relationships");
+    }
     auto store=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto r=store.read();
     require(store.uuid(r)==result.storeUuid,"published logical owner");
     require(store.provisioning(r).sealed && store.provisioning(r).commitSequence>baseSequence,
@@ -84,6 +96,17 @@ void roundTrip(size_t shards,bool packed)
     }
     // A sealed output cannot be reopened writable, independently of callback lifetime.
     mustFail([&]{auto mutableStore=ObjectCollection::open(result.path,opt.store);auto w=mutableStore.write();mutableStore.seal(w);});
+    if(shards==1) {
+        const auto copied=dir.path/"copy.vcobj";
+        copyObjectCollection(result.path,copied,opt.store);
+        auto writable=ObjectStore::open(copied,opt.store);
+        auto w=writable.write();
+        writable.setMeta(w,uuids.front(),"review","true");
+        w.commit();
+        auto current=writable.read();
+        require(nlohmann::json::parse(writable.objectByUuid(current,uuids.front())->meta).at("review")==true,
+                "one-shard immutable import copies to an editable overlay");
+    }
 }
 void failures()
 {
@@ -237,7 +260,7 @@ void phaseFailures()
     std::vector<std::string> ids(3);for(auto& id:ids)id=util::newUuid();
     fail([&](size_t i,auto& shard){auto row=fiber(ids[i]);shard.appendObjects(std::span(&row,1));},[&](size_t i,auto& shard){
         bool sent=false;shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
-            EdgeRecord edge;edge.kind="bad";edge.uuid="not-a-uuid";
+            EdgeRecord edge;edge.kind="declared_reference";edge.uuid="not-a-uuid";
             batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});return true;});
     });
     // Uniqueness must reject even cross-batch duplicates before any
@@ -251,7 +274,7 @@ void phaseFailures()
                 const auto edgeUuid=util::newUuid();
                 try{shard.importEdges([&](auto& batch){
                     if(batchNumber++==2)return false;
-                    EdgeRecord edge;edge.uuid=edgeUuid;edge.kind="duplicate";
+                    EdgeRecord edge;edge.uuid=edgeUuid;edge.kind="declared_reference";
                     edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
                     batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});
                     return true;

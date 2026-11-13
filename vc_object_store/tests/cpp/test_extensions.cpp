@@ -364,7 +364,7 @@ ExtensionTable manualDefinition(const std::string& keySpace = "objects")
 ObjectVersion objectHead(ObjectStore& store, const std::string& id)
 {
     auto txn = store.read();
-    return store.versionReference(txn, *store.currentObjectRevision(txn, id));
+    return store.currentObjectRevision(txn, id)->reference();
 }
 
 template<class Version>
@@ -401,7 +401,7 @@ void versionedObject(HistoryMode history)
     first.front()[4] = std::vector<uint8_t>{};
     first.back()[4] = std::monostate{};
     {
-        auto txn = store.write(VersionSelection{{firstUuid, emptyHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, emptyHead.version}});
         store.replaceExtensionRows(txn, spec.name, firstUuid, first); txn.commit();
     }
     const auto firstHead = objectHead(store, firstUuid);
@@ -418,14 +418,14 @@ void versionedObject(HistoryMode history)
                 "manual snapshot participates in the owning object's metadata history");
     }
     {
-        auto txn = store.write(VersionSelection{{firstUuid, firstHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, firstHead.version}});
         const std::vector<ExtensionRow> reversed{first.back(), first.front()};
         store.replaceExtensionRows(txn, spec.name, firstUuid, reversed); txn.commit();
     }
     require(objectHead(store, firstUuid) == firstHead && sequence(store) == 2,
             "identical manual replacement in a different input order neither versions the owner nor publishes a commit");
     {
-        auto txn = store.write(VersionSelection{{firstUuid, firstHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, firstHead.version}});
         const std::vector<ExtensionRow> duplicate{first.front(), first.front()};
         mustFail([&] { store.replaceExtensionRows(txn, spec.name, firstUuid, duplicate); });
         const std::vector<ExtensionRow> wrongOwner{sample(secondUuid, 1)};
@@ -441,7 +441,7 @@ void versionedObject(HistoryMode history)
     for (size_t i = 0; i < payload.size(); ++i) payload[i] = uint8_t(i % 251);
     changed.front()[3] = std::string("large binary manual value");
     {
-        auto txn = store.write(VersionSelection{{firstUuid, firstHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, firstHead.version}});
         store.replaceExtensionRows(txn, spec.name, firstUuid, {});
         store.replaceExtensionRows(txn, spec.name, firstUuid, changed); txn.commit();
     }
@@ -465,9 +465,9 @@ void versionedObject(HistoryMode history)
             mustFail([&] { historicalRows(store, txn, spec.name, firstHead); });
         }
     }
-    mustFail([&] { auto txn = store.write(VersionSelection{{firstUuid, firstHead.version}}); });
+    mustFail([&] { auto txn = store.writeNumbered(VersionSelection{{firstUuid, firstHead.version}}); });
     {
-        auto txn = store.write(VersionSelection{{firstUuid, changedHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, changedHead.version}});
         store.replaceExtensionRows(txn, spec.name, firstUuid, first);
     }
     require(objectHead(store, firstUuid) == changedHead && sequence(store) == 3,
@@ -477,7 +477,7 @@ void versionedObject(HistoryMode history)
         require(rows(store, txn, spec.name) == changed, "transaction rollback also restores typed rows");
     }
     {
-        auto txn = store.write(VersionSelection{{firstUuid, changedHead.version}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, changedHead.version}});
         mustFail([&] { store.setMeta(txn, firstUuid, "vcobj_extensions", "{}"); });
         mustFail([&] { store.removeMeta(txn, firstUuid, "vcobj_extensions"); });
         auto object = *store.objectByUuid(txn, firstUuid); object.meta = "{}";
@@ -487,7 +487,7 @@ void versionedObject(HistoryMode history)
     require(sequence(store) == 3, "generic metadata edits cannot detach library-managed manual snapshots");
     if (history == HistoryMode::On) {
         {
-            auto txn = store.write(VersionSelection{{firstUuid, changedHead.version}});
+            auto txn = store.writeNumbered(VersionSelection{{firstUuid, changedHead.version}});
             store.restoreObject(txn, firstUuid, firstHead); txn.commit();
         }
         {
@@ -496,7 +496,7 @@ void versionedObject(HistoryMode history)
             require(store.currentVersion(txn, firstUuid) == 4, "restore creates a new ordinary owner version");
         }
         {
-            auto txn = store.write(VersionSelection{{firstUuid, int64_t(4)}});
+            auto txn = store.writeNumbered(VersionSelection{{firstUuid, int64_t(4)}});
             store.restoreObject(txn, firstUuid, emptyHead); txn.commit();
         }
         auto txn = store.read();
@@ -521,7 +521,7 @@ void versionedRelationship(HistoryMode history)
         txn.commit();
     }
     {
-        auto txn = store.write(VersionSelection{{firstUuid, int64_t(1)}, {secondUuid, int64_t(1)}});
+        auto txn = store.writeNumbered(VersionSelection{{firstUuid, int64_t(1)}, {secondUuid, int64_t(1)}});
         EdgeRecord edge; edge.uuid = edgeUuid; edge.kind = "declared_reference"; edge.aUuid = firstUuid; edge.bUuid = secondUuid;
         edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
         store.addEdge(txn, edge); txn.commit();
@@ -531,8 +531,8 @@ void versionedRelationship(HistoryMode history)
     const RelationshipVersion emptyHead{status.storeUuid, status.generation, edgeUuid, 1};
     const std::vector<ExtensionRow> first{sample(edgeUuid, 1)};
     TransactionContext expected;
-    expected.expectedObjects = {{firstUuid, int64_t(2)}, {secondUuid, int64_t(2)}};
-    expected.expectedRelationships = {{edgeUuid, int64_t(1)}};
+    expected.expectedObjects = testNumberedGuards(store, {{firstUuid, int64_t(2)}, {secondUuid, int64_t(2)}});
+    expected.expectedRelationships = testNumberedGuards(store, {{edgeUuid, int64_t(1)}}, true);
     {
         auto txn = store.write(expected); store.replaceExtensionRows(txn, spec.name, edgeUuid, first); txn.commit();
     }
@@ -545,8 +545,8 @@ void versionedRelationship(HistoryMode history)
         require(historicalRows(store, txn, spec.name, firstHead) == first,
                 "relationship-version references retrieve typed manual fields");
     }
-    expected.expectedObjects = {{firstUuid, int64_t(3)}, {secondUuid, int64_t(3)}};
-    expected.expectedRelationships = {{edgeUuid, int64_t(2)}};
+    expected.expectedObjects = testNumberedGuards(store, {{firstUuid, int64_t(3)}, {secondUuid, int64_t(3)}});
+    expected.expectedRelationships = testNumberedGuards(store, {{edgeUuid, int64_t(2)}}, true);
     const auto beforeNoop = sequence(store);
     {
         auto txn = store.write(expected); store.replaceExtensionRows(txn, spec.name, edgeUuid, first); txn.commit();
@@ -568,9 +568,9 @@ void versionedRelationship(HistoryMode history)
             mustFail([&] { historicalRows(store, txn, spec.name, firstHead); });
         }
     }
-    expected.expectedObjects = {{firstUuid, int64_t(4)}, {secondUuid, int64_t(4)}};
+    expected.expectedObjects = testNumberedGuards(store, {{firstUuid, int64_t(4)}, {secondUuid, int64_t(4)}});
     mustFail([&] { auto txn = store.write(expected); }); // stale relationship expectation
-    expected.expectedRelationships = {{edgeUuid, int64_t(3)}};
+    expected.expectedRelationships = testNumberedGuards(store, {{edgeUuid, int64_t(3)}}, true);
     {
         auto txn = store.write(expected); store.replaceExtensionRows(txn, spec.name, edgeUuid, {});
     }
@@ -595,7 +595,7 @@ void versionedHistoryPolicy()
         }
         oldHead = objectHead(store, firstUuid);
         {
-            auto txn = store.write(VersionSelection{{firstUuid, oldHead.version}});
+            auto txn = store.writeNumbered(VersionSelection{{firstUuid, oldHead.version}});
             store.replaceExtensionRows(txn, spec.name, firstUuid, second); txn.commit();
         }
     }
@@ -613,7 +613,7 @@ void versionedHistoryPolicy()
         auto store = ObjectStore::open(path, OpenOptions{.author = "extension-test"});
         const auto baseline = objectHead(store, firstUuid);
         {
-            auto txn = store.write(VersionSelection{{firstUuid, baseline.version}});
+            auto txn = store.writeNumbered(VersionSelection{{firstUuid, baseline.version}});
             store.replaceExtensionRows(txn, spec.name, firstUuid, first); txn.commit();
         }
         auto txn = store.read();
@@ -638,6 +638,8 @@ void storeReferenceVersionedFields(HistoryMode history)
     const std::vector<ExtensionRow> immutable{sample(firstUuid, 9)};
     OpenOptions options; options.history = history; options.author = "extension-test";
     std::string baseUuid;
+    ObjectVersion baseObjectVersion;
+    RelationshipVersion baseEdgeVersion;
     {
         auto base = ObjectStore::create(basePath, options);
         auto txn = base.write();
@@ -656,15 +658,28 @@ void storeReferenceVersionedFields(HistoryMode history)
         base.replaceExtensionRows(txn, edgeTable.name, edgeUuid, edges);
         base.appendExtensionRows(txn, immutableTable.name, immutable);
         base.seal(txn); txn.commit();
+        auto read=base.read();
+        baseObjectVersion=base.currentObjectRevision(read,firstUuid)->reference();
+        const auto sourceEdge=*base.edgeByUuid(read,edgeUuid);
+        baseEdgeVersion={baseUuid,sourceEdge.versionGeneration,edgeUuid,*sourceEdge.version};
     }
     const ObjectKey firstKey{baseUuid, firstUuid}, secondKey{baseUuid, secondUuid}, edgeKey{baseUuid, edgeUuid};
     const std::vector<ExtensionValue> firstPrefix{extensionUuid(firstUuid)};
     const std::vector<ExtensionValue> edgePrefix{extensionUuid(edgeUuid)};
     auto overlay = ObjectCollection::create(overlayPath, {basePath}, options);
     int64_t initialCommit = 0;
+    ObjectVersion borrowedSnapshotVersion;
     {
         auto txn = overlay.read();
         initialCommit = overlay.provisioning(txn).commitSequence;
+        require(overlay.objectAtVersion(txn,baseObjectVersion).has_value()&&
+            overlay.relationshipAtVersion(txn,baseEdgeVersion).has_value(),"exact object and edge versions resolve in referenced stores");
+        std::vector<ExtensionRow> oldObject,oldEdge;
+        overlay.scanExtensionRowsAtVersion(txn,objectTable.name,baseObjectVersion,[&](const auto& row){oldObject.push_back(row);return true;});
+        overlay.scanExtensionRowsAtVersion(txn,edgeTable.name,baseEdgeVersion,[&](const auto& row){oldEdge.push_back(row);return true;});
+        require(oldObject==first&&oldEdge==edges,"historical extension reads follow referenced versions before any local schema or owner exists");
+        auto missing=baseObjectVersion;++missing.version;
+        require(!overlay.objectAtVersion(txn,missing),"missing exact versions must not fall back to current state");
         require(rows(overlay, txn, objectTable.name, firstPrefix) == first &&
                 rows(overlay, txn, edgeTable.name, edgePrefix) == edges,
                 "referenced owner fields are visible before creating a local owner");
@@ -696,7 +711,19 @@ void storeReferenceVersionedFields(HistoryMode history)
     {
         auto txn = overlay.read();
         require(rows(overlay, txn, objectTable.name, firstPrefix) == first,
-                "localizing an owner for ordinary metadata preserves its typed manual fields");
+                "metadata override preserves borrowed typed manual fields");
+        const auto record=overlay.object(txn,firstKey)->record;
+        borrowedSnapshotVersion={overlay.uuid(txn),record.versionGeneration,firstUuid,*record.version};
+        auto local = ObjectStore::open(overlayPath, OpenOptions{.physicalPartitionOnly = true, .readOnly = true});
+        auto localTxn = local.read();
+        detail::Statement physical(ObjectStoreImplAccess::conn(localTxn),"SELECT count(*) FROM "+objectTable.name);
+        require(physical.row()&&physical.i64(0)==0, "metadata-only override copies no typed owner rows");
+        detail::Statement chunks(ObjectStoreImplAccess::conn(localTxn), "SELECT count(*) FROM geometry_chunks"); chunks.row();
+        require(chunks.i64(0) == 0, "metadata-only override copies no extension snapshot chunks");
+        if (history == HistoryMode::On) {
+            const auto versions = local.objectHistory(localTxn, firstUuid);
+            require(versions.size() == 1, "metadata override has only its actual edit in history");
+        }
     }
     std::vector<ExtensionRow> changed{first.front()};
     changed.front()[3] = std::string("local replacement");
@@ -766,6 +793,15 @@ void storeReferenceVersionedFields(HistoryMode history)
                 "owner tombstones also suppress inherited versioned rows in routed scans");
         require(rows(overlay, txn, immutableTable.name) == immutable,
                 "historical immutable computation results are not mistaken for editable current owner fields");
+        std::vector<ExtensionRow> oldObject,oldEdge;
+        overlay.scanExtensionRowsAtVersion(txn,objectTable.name,baseObjectVersion,[&](const auto& row){oldObject.push_back(row);return true;});
+        overlay.scanExtensionRowsAtVersion(txn,edgeTable.name,baseEdgeVersion,[&](const auto& row){oldEdge.push_back(row);return true;});
+        require(oldObject==first&&oldEdge==edges,"exact referenced versions survive overlay edits, clears and tombstones");
+        if(history==HistoryMode::On) {
+            oldObject.clear();
+            overlay.scanExtensionRowsAtVersion(txn,objectTable.name,borrowedSnapshotVersion,[&](const auto& row){oldObject.push_back(row);return true;});
+            require(oldObject==first,"historical overlay version follows its original borrowed snapshot, not current typed rows");
+        }
     }
     {
         auto base = ObjectStore::open(basePath, OpenOptions{.readOnly = true});
@@ -780,13 +816,29 @@ void storeReferenceVersionedFields(HistoryMode history)
         auto incompatible = relationship ? edgeTable : objectTable;
         incompatible.provisioning = R"({"units":{"residual":"base_voxels"},"source":"fixture"})";
         {
-            auto txn = mismatch.write(); mismatch.createExtensionTable(txn, incompatible); txn.commit();
+            auto txn = mismatch.write();
+            mustFail([&] { mismatch.createExtensionTable(txn, incompatible); }); txn.commit();
+        }
+        {
+            auto txn = mismatch.read();
+            require(rows(mismatch, txn, incompatible.name, relationship ? edgePrefix : firstPrefix) ==
+                    (relationship ? edges : first), "conflicting registration preserves the inherited definition and rows");
+        }
+        // Simulate an already-invalid collection made by an older writer; the
+        // normal API must not create this state, but every reader must reject it.
+        {
+            auto physical=ObjectStore::open(mismatchPath,OpenOptions{.physicalPartitionOnly=true,.author="fixture"});
+            auto txn=physical.write();physical.createExtensionTable(txn,incompatible);txn.commit();
         }
         int64_t before = 0;
         {
             auto txn = mismatch.read(); before = mismatch.provisioning(txn).commitSequence;
             mustFail([&] { rows(mismatch, txn, incompatible.name); });
             mustFail([&] { rows(mismatch, txn, incompatible.name, relationship ? edgePrefix : firstPrefix); });
+            mustFail([&] {
+                if(relationship)mismatch.scanExtensionRowsAtVersion(txn,incompatible.name,baseEdgeVersion,[](const auto&){return true;});
+                else mismatch.scanExtensionRowsAtVersion(txn,incompatible.name,baseObjectVersion,[](const auto&){return true;});
+            });
         }
         {
             auto txn = mismatch.write();
