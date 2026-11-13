@@ -317,6 +317,8 @@ struct PySession {
         d["du"] = r.du;
         d["correlation"] = r.correlation;
         d["evaluations"] = r.evaluations;
+        d["function_evaluations"] = r.function_evaluations;
+        d["solver"] = fit_summary_dict(r.solver);
         d["slope_a"] = r.slope_a;
         d["slope_b"] = r.slope_b;
         d["step_deg"] = r.step_deg;

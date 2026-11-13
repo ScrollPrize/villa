@@ -760,6 +760,9 @@ BFGS; exact final curvature and stationarity validate the peak independently of 
 Image buffers and correlation evaluations remain on the selected CPU/CUDA backend. CUDA returns only ten
 scalars per correlation evaluation, using a fixed double-precision reduction tree; CPU/CUDA comparisons
 retain their existing floating-point accuracy tolerances.
+Session measurements expose the final peak's `solver` diagnostics and total `function_evaluations` across
+recuts; `evaluations` retains its meaning as the number of outer window recenterings. A usable solver result
+still needs the measurement's curvature, search-window and correlation checks to set `ok`.
 
 **Partial copies.** Frame files that are not on disk are reported (`map from frame to file`, with the frames
 that are there) and their frames are never read: the master file's virtual dataset would return zeros for them.

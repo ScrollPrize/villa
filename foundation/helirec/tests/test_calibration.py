@@ -358,6 +358,8 @@ def test_session_reads_and_measures(tmp_path, monkeypatch):
     assert [r["label"] for r in res] == ["self", "outside"]
     me = res[0]
     assert me["planned"] and me["ok"] and (me["frame_a"], me["frame_b"], me["frames"], me["rows"], me["cols"], me["row_offset"]) == (12, 12, 16, 16, 32, 0)
+    assert me["solver"]["usable"] and me["solver"]["solver_version"]
+    assert me["function_evaluations"] >= me["evaluations"]
     assert abs(me["dq"]) < 1e-3 and abs(me["D"]) < 1e-3 and abs(me["du"]) < 1e-3 and me["correlation"] > 0.999 and me["stated_dq"] == 0
     assert not res[1]["planned"] and not res[1]["ok"]
     with pytest.raises(Exception):

@@ -78,7 +78,9 @@ ViewTiming& view_timing() {
     return t;
 }
 
-void keep_curvature(const Registration& r, Measured& m) {
+void keep_registration(const Registration& r, Measured& m) {
+    m.solver = r.solver;
+    m.function_evaluations += r.function_evaluations;
     const double c[6] = {r.curvature[0][0], r.curvature[0][1], r.curvature[0][2], r.curvature[1][1], r.curvature[1][2], r.curvature[2][2]};
     std::copy(c, c + 6, m.curvature);
 }
@@ -192,7 +194,7 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
         m.d[0] = r.shift[0];
         m.d[1] = extra[1] + r.shift[1];
         m.d[2] = extra[2] + r.shift[2];
-        keep_curvature(r, m);
+        keep_registration(r, m);
         if (r.whole[0] || r.whole[1] || r.whole[2]) {
             for (int j = 0; j < 3; ++j) extra[j] += r.whole[j];
             continue;
@@ -265,6 +267,8 @@ void fill(ViewMeasurement& res, const Measured& m, const Trajectory& ta) {
     res.du = m.d[2];
     res.correlation = m.correlation;
     res.evaluations = m.evaluations;
+    res.function_evaluations = m.function_evaluations;
+    res.solver = m.solver;
     res.ok = m.ok;
     res.slope_a = m.plan.slope_a;
     res.slope_b = m.plan.slope_b;
