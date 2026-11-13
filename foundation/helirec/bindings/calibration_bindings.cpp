@@ -383,6 +383,10 @@ nb::dict register_py(Block a, Block b, const std::vector<int>& margin, const std
 
 }  // namespace
 
+// The session a CalibrationSession object holds, for the bindings of what measures on one
+// (geometry_calibration_bindings.cpp).
+helirec::calibration::Session& bound_session(nb::handle h) { return *nb::cast<PySession&>(h).s; }
+
 void bind_calibration(nb::module_& m) {
     m.def("calibration_check_record", &check_record_json, "scans"_a, "checks"_a = "record,inventory,series,beam,views", "out_dir"_a = "", "inventory_dir"_a = "",
           "frames"_a = 32, "rows"_a = 256, "blocks"_a = 8, "threads"_a = 0, "device"_a = "auto", "position_target"_a = default_position_target_px, "columns"_a = 0, "column_fraction"_a = 0.5,

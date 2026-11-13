@@ -1039,7 +1039,54 @@ no time (7.5 s per 32 slices against 7.3–8.4 s); with Paganin and unsharp a sl
 rows; views a turn apart are backprojected each at its own angle since `angle_interp=views`, section 34) is listed
 in `development_notes/calibration/05_experiments.md`, section 33.
 
+### One model for any number of scans (`solve_geometry`)
+
+Beside the two-scan step, `helirec/calibration/geometry_calibration.hpp` holds a model for any number of scans of
+one sample (a scan alone, a pair moved sideways, the tiles of a mosaic), solved as one Ceres problem; the header
+states it. `helirec-calibration geometry` does not run it yet, and so far it holds each scan's own parameters (the
+axis column, its slope along the axis stage's travel, the axial scale, the rest turns' heights), the roll, and what
+the rotation stage does within a turn, shared by every scan on it: the sample's height once per turn and the axis
+column twice per turn (PHerc0343P 0.03 rows and 0.01 px; Paris4 0.26 rows and 0.25 px).
+Nothing calibrates a mosaic's places with it yet.
+
+* `read_acquisition(session)`: the layout of the session's scans, each with whatever projection stretches are on
+  disk (a helix alone, of which only a part may be on disk, or rest turns beside it): the record's angle and height
+  per frame, the sense of the rows (from helix views a turn apart where a turn's travel leaves a patch of rows in
+  common, from opposite views otherwise), the rows that hold the mount, and a coarse axis column per scan.
+* `plan(acquisition)` and `measure(session, acquisition, plan, device, patch)`: each scan's comparisons with itself
+  (opposite views from rest turns and from the helix at twelve angles a turn, the helix a turn apart, rest turns
+  against the helix), in windows of at most 512 columns inside the strip a scan's opposite views share, registered
+  once in patches. A measurement becomes a `Comparison`: two sightings (scan, stretch, frame, row, column) of the
+  same lines.
+* `solve_geometry(acquisition, comparisons, start, options)`: each sighting is taken back to the ray it records and
+  a comparison's residual is the two rays' difference in the sample (columns, rows); the frames' difference is
+  reported and not fitted. A block of unknowns per owner (detector, scan, stretch); a stage of a calibration holds
+  or frees unknowns by name (`GeometryOptions::held`, `freed`). Unknowns no comparison depends on are held and
+  named (`unused`); free unknowns that depend on each other are an error that names them (the rank check
+  `solve_linear` uses, `fitting::design_rank`). `residuals` and `GeometrySolution::left` give what is left per
+  comparison and per kind.
+
+```python
+from helirec import _core, geometry
+session = _core.CalibrationSession([master_h5], 8)
+acq = _core.geometry_read_acquisition(session, "auto", print)       # GeometryAcquisition
+acq.row_time = seconds_per_row / frame_period                       # frames per stored row; 0 if unknown
+comparisons, blocks = geometry.measure_comparisons(session, acq)
+solution = geometry.solve_geometry(acq, comparisons, start=dict(roll=0.0, scans=[dict(axis=coarse_axis)]))
+```
+
+A frames' error of a registration shows in the columns, not in the rows: content at the depth `t` from the rotation
+axis crosses `t` times the angle per frame columns per frame. And the residuals of opposite views hold what the
+model does not: on a detector position they are the detector's map, and per scan a sinusoid of the angle in the rows
+where the rotation axis is pitched towards the beam (Paris4's outer tiles: 0.5 to 0.6 rows, the phase following the
+tile; measured, not applied).
+
 ## Tests
+
+`tests/test_geometry_solve.py` and the native `geometry_solve` test check the model for any number of scans against
+a projection of points in 3D written apart from it (explicit rotation matrices, parallel rays), which is what fixes
+its signs: every sighting is the line through its point, a solve finds the parameters again, dependent unknowns are
+refused, and the plan stays inside the strip for a helix alone with its axis at the detector's edge.
 
 For an already configured build, use `cmake --build build/<configuration> -j 4` and
 `ctest --test-dir build/<configuration> --output-on-failure`. The native fitting test checks the complete

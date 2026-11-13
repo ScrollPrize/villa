@@ -198,56 +198,94 @@ def fit_refill_shots(x, n_rows, T, E, pre):
 
 # ---------------------------------------------------------------- the joint model
 
-def _acquisition_text(acq):
+def acquisition(acq):
+    """The scans' layout for the joint model as the C++ side holds it (_core.GeometryAcquisition), from a dict:
+    rows, cols, row_time [frames per row], and optionally per_turn, pixel_um, row_sign, fan, width; scans =
+    [dict(name, mid_height, axis (the coarse axis column), stretches=[dict(name, helix, angle_deg, rows, and
+    optionally index, first, end (the frames on disk))])]. A GeometryAcquisition is returned as it is."""
+    from . import _core
+    if isinstance(acq, _core.GeometryAcquisition):
+        return acq
     f = lambda x: [float(v) for v in x]
-    scans = [dict(name=str(s.get("name", k)), mid_height=float(s.get("mid_height", 0.0)),
-                  stretches=[dict(name=str(t["name"]), index=int(t.get("index", a)), helix=bool(t.get("helix", False)), angle_deg=f(t["angle_deg"]), rows=f(t["rows"]))
-                             for a, t in enumerate(s["stretches"])])
-             for k, s in enumerate(acq["scans"])]
-    return json.dumps(dict(rows=int(acq["rows"]), cols=int(acq["cols"]), row_time=float(acq.get("row_time", 0.0)), scans=scans))
+    scans = []
+    for k, s in enumerate(acq["scans"]):
+        stretches = []
+        for a, t in enumerate(s["stretches"]):
+            d = dict(name=str(t["name"]), index=int(t.get("index", a)), helix=bool(t.get("helix", False)), angle_deg=f(t["angle_deg"]), rows=f(t["rows"]))
+            d.update({key: int(t[key]) for key in ("first", "end") if key in t})
+            stretches.append(d)
+        d = dict(name=str(s.get("name", k)), mid_height=float(s.get("mid_height", 0.0)), stretches=stretches)
+        if s.get("axis") is not None:
+            d["axis"] = float(s["axis"])
+        scans.append(d)
+    top = {key: acq[key] for key in ("per_turn", "pixel_um", "row_sign", "fan", "width") if key in acq}
+    return _core.GeometryAcquisition(json.dumps(dict(top, rows=int(acq["rows"]), cols=int(acq["cols"]), row_time=float(acq.get("row_time", 0.0)), scans=scans)))
+
+
+def plan_comparisons(acquisition_, angles_per_turn=12, max_positions=48, n_rest=16, n_turn=12):
+    """The comparisons of each scan with itself, placed from the layout alone: a list of dicts (kind, scan_a, a, b
+    (the stretches in the layout), from_block, and the request's fields).
+    (helirec::calibration::geometry_calibration::plan for an Acquisition)"""
+    from . import _core
+    try:
+        return json.loads(_core.geometry_plan(acquisition(acquisition_), int(angles_per_turn), int(max_positions), int(n_rest), int(n_turn)))
+    except RuntimeError as e:
+        raise ValueError(str(e)) from None
+
+
+def measure_comparisons(session, acquisition_, device="auto", patch=128, **counts):
+    """The plan of each scan's comparisons with itself (plan_comparisons) measured once on a CalibrationSession, in
+    patches of patch x patch: the accepted ones as a list of dicts (kind, a, b, opposite, correlation, curvature,
+    block: the plan's block it came from), and the number of blocks planned.
+    (helirec::calibration::geometry_calibration::measure)"""
+    from . import _core
+    got = _core.geometry_measure(session, acquisition(acquisition_), device, int(patch), **{k: int(v) for k, v in counts.items()})
+    out = [dict(kind=k, a=a, b=b, opposite=o, correlation=float(c), curvature=cu, block=int(bl))
+           for k, a, b, o, c, cu, bl in zip(got["kinds"], got["a"], got["b"], got["opposite"], got["correlation"], got["curvature"], got["block"])]
+    return out, int(got["blocks"])
 
 
 def _parameters_text(p):
     """The joint model's parameters (a start, or a solution with whatever else it holds) as the C++ side reads them."""
-    return "" if p is None else json.dumps(dict(roll=p.get("roll", 0.0), scans=p["scans"]), default=float)
+    return "" if p is None else json.dumps(dict(roll=p.get("roll", 0.0), stage=p.get("stage", {}), scans=p["scans"]), default=float)
 
 
 def _sightings(rows):
     return np.ascontiguousarray(np.asarray(rows, np.float64).reshape(-1, 5))
 
 
-def rays(acquisition, parameters, sightings):
+def rays(acquisition_, parameters, sightings):
     """The ray each sighting (scan, stretch, frame, row, column) records under the joint model's parameters:
     (n, 3) angle [deg], distance s from the sample's origin across the beam [px], height z [rows].
     (helirec::calibration::geometry_calibration::ray_of)"""
     from . import _core
-    return _core.geometry_rays(_acquisition_text(acquisition), _parameters_text(parameters), _sightings(sightings))
+    return _core.geometry_rays(acquisition(acquisition_), _parameters_text(parameters), _sightings(sightings))
 
 
-def residuals(acquisition, parameters, comparisons):
+def residuals(acquisition_, parameters, comparisons):
     """What the parameters leave of each comparison: (n, 3) frames (the two rays' angles, less the half turn of
     opposite views), rows and columns. (helirec::calibration::geometry_calibration::residuals)"""
     from . import _core
-    return _core.geometry_residuals(_acquisition_text(acquisition), _parameters_text(parameters), _sightings([c["a"] for c in comparisons]),
+    return _core.geometry_residuals(acquisition(acquisition_), _parameters_text(parameters), _sightings([c["a"] for c in comparisons]),
                                     _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons])
 
 
-def solve_geometry(acquisition, comparisons, start=None, huber=0.03, max_iterations=100, held=(), freed=()):
+def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterations=100, held=(), freed=()):
     """The joint geometry model solved on comparisons (helirec/calibration/geometry_calibration.hpp states the model).
 
-    acquisition: dict(rows, cols, row_time [frames per row], scans=[dict(name, mid_height, stretches=[dict(name,
-    helix, angle_deg, rows)])]): what the records state per frame. comparisons: dicts with kind, a and b (each a
-    sighting: scan, stretch, frame, row, column) and opposite. start: the parameters to start from, as the result
+    acquisition_: the scans' layout (a dict as `acquisition` takes it, or a GeometryAcquisition): what the records
+    state per frame. comparisons: dicts with kind, a and b (each a sighting: scan, stretch, frame, row, column) and
+    opposite. start: the parameters to start from, as the result
     holds them (None: zeros). held, freed: names of unknowns to hold or free against the default (the scans' own
-    axis, axis_slope and axial_scale, the roll and the rest turns' heights are free; d, height and a helix' height
-    held).
+    axis, axis_slope and axial_scale, the roll, the rotation stage's height once per turn and axis column twice per
+    turn, and the rest turns' heights are free; d, height and a helix' height held).
 
-    Returns the solution (roll, scans, free, unused, solver, left) with "residual": (n, 3) frames, rows, columns.
+    Returns the solution (roll, stage, scans, free, unused, solver, left) with "residual": (n, 3) frames, rows, columns.
     It is an error if the free unknowns depend on each other.
     (helirec::calibration::geometry_calibration::solve_geometry)"""
     from . import _core
     try:
-        text, residual = _core.geometry_solve(_acquisition_text(acquisition), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
+        text, residual = _core.geometry_solve(acquisition(acquisition_), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
                                               _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons],
                                               _parameters_text(start), float(huber), int(max_iterations), list(held), list(freed))
     except RuntimeError as e:

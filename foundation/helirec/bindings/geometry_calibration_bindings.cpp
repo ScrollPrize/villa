@@ -19,6 +19,8 @@ using namespace nb::literals;
 using namespace helirec;
 namespace gc = helirec::calibration::geometry_calibration;
 
+helirec::calibration::Session& bound_session(nb::handle h);  // bindings/calibration_bindings.cpp
+
 namespace {
 
 using DoubleIn = nb::ndarray<const double, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
@@ -142,16 +144,21 @@ std::string fit_json(const std::string& rows_text, const std::string& layout, co
 
 using Table = nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
-// {rows, cols, row_time, scans: [{name, mid_height, stretches: [{name, index, helix, angle_deg: [..], rows: [..]}]}]}
+// {rows, cols, per_turn, pixel_um, row_sign, row_time, fan, width, scans: [{name, mid_height, axis, stretches:
+//  [{name, index, helix, first, end, angle_deg: [..], rows: [..]}]}]}; what is left out keeps its default (a
+//  stretch's frames on disk: all of them)
 gc::Acquisition acquisition_of(const std::string& text) {
     const Json j = Json::parse(text);
     gc::Acquisition acq;
     acq.rows = static_cast<int>(number(j, "rows")), acq.cols = static_cast<int>(number(j, "cols"));
-    acq.row_time = number(j, "row_time", 0.0);
+    acq.per_turn = static_cast<int>(number(j, "per_turn", 0.0)), acq.pixel_um = number(j, "pixel_um", 0.0);
+    acq.row_sign = number(j, "row_sign", -1.0), acq.row_time = number(j, "row_time", 0.0), acq.fan = number(j, "fan", 0.0);
+    acq.width = static_cast<int>(number(j, "width", 512.0));
     for (const Json& sj : member(j, "scans").array) {
         gc::ScanLayout sc;
         if (const Json* n = sj.find("name")) sc.name = n->string;
         sc.mid_height = number(sj, "mid_height", 0.0);
+        sc.axis = number(sj, "axis", std::nan(""));
         for (const Json& tj : member(sj, "stretches").array) {
             gc::StretchLayout st;
             st.name = member(tj, "name").string;
@@ -160,6 +167,9 @@ gc::Acquisition acquisition_of(const std::string& text) {
             for (const Json& v : member(tj, "angle_deg").array) st.course.angle_deg.push_back(v.number);
             for (const Json& v : member(tj, "rows").array) st.course.rows.push_back(v.number);
             if (st.course.angle_deg.size() != st.course.rows.size()) throw Error("geometry: a stretch's angles and heights differ in length");
+            st.first = static_cast<std::int64_t>(number(tj, "first", 0.0));
+            st.end = static_cast<std::int64_t>(number(tj, "end", static_cast<double>(st.course.rows.size())));
+            if (st.first < 0 || st.end > static_cast<std::int64_t>(st.course.rows.size()) || st.end < st.first) throw Error("geometry: a stretch's frames on disk are not among its frames");
             sc.stretches.push_back(std::move(st));
         }
         acq.scans.push_back(std::move(sc));
@@ -167,12 +177,20 @@ gc::Acquisition acquisition_of(const std::string& text) {
     return acq;
 }
 
-// as solution_json writes them: {roll, scans: [{axis, axis_slope, axial_scale, d: [d0, d1], height, stretch_height: {name: rows}}]}
+// as solution_json writes them: {roll, stage: {height_once: [cos, sin], axis_twice: [cos, sin]}, scans: [{axis,
+//  axis_slope, axial_scale, d: [d0, d1], height, stretch_height: {name: rows}}]}
 gc::Parameters parameters_of(const gc::Acquisition& acq, const std::string& text) {
     gc::Parameters p = gc::empty_parameters(acq);
     if (text.empty()) return p;
     const Json j = Json::parse(text);
     p.roll = number(j, "roll", 0.0);
+    if (const Json* st = j.find("stage")) {
+        const auto pair = [&](const char* key, double* out) {
+            if (const Json* v = st->find(key))
+                for (std::size_t i = 0; i < 2 && i < v->array.size(); ++i) out[i] = v->array[i].number;
+        };
+        pair("height_once", p.stage.height_once), pair("axis_twice", p.stage.axis_twice);
+    }
     const Json& scans = member(j, "scans");
     if (scans.array.size() != acq.scans.size()) throw Error("geometry: the parameters and the acquisition differ in their scans");
     for (std::size_t k = 0; k < scans.array.size(); ++k) {
@@ -194,14 +212,106 @@ gc::Sighting sighting_of(const double* r) { return {static_cast<int>(r[0]), stat
 }  // namespace
 
 void bind_geometry_calibration(nb::module_& m) {
+    nb::class_<gc::Acquisition>(m, "GeometryAcquisition",
+                                "The layout of the scans of one acquisition as the joint geometry model takes it: what the records state per frame, the\n"
+                                "frames on disk, the sense of the rows, a coarse axis column per scan (helirec::calibration::geometry_calibration::Acquisition).\n"
+                                "Made from JSON text (see python/helirec/geometry.py) or read from a session (geometry_read_acquisition).")
+        .def("__init__", [](gc::Acquisition* self, const std::string& text) { new (self) gc::Acquisition(acquisition_of(text)); }, "text"_a)
+        .def_rw("row_time", &gc::Acquisition::row_time, "The rows' timing in frames per stored row (signed).")
+        .def_prop_ro("summary", [](const gc::Acquisition& a) { return gc::acquisition_json(a); }, "The layout without the per-frame series, as JSON text.")
+        .def("course",
+             [](const gc::Acquisition& a, int scan, int stretch) {
+                 const calibration::Trajectory& t = a.scans.at(static_cast<std::size_t>(scan)).stretches.at(static_cast<std::size_t>(stretch)).course;
+                 auto angle = helirec::py::new_array_t<double>({t.angle_deg.size()});
+                 auto rows = helirec::py::new_array_t<double>({t.rows.size()});
+                 std::copy(t.angle_deg.begin(), t.angle_deg.end(), static_cast<double*>(angle.data()));
+                 std::copy(t.rows.begin(), t.rows.end(), static_cast<double*>(rows.data()));
+                 return nb::make_tuple(angle, rows);
+             },
+             "scan"_a, "stretch"_a, "The record's angle [deg, cumulative] and height [rows] of every frame of a stretch.");
+    m.def(
+        "geometry_read_acquisition",
+        [](nb::handle session, const std::string& device, std::optional<std::function<void(const std::string&)>> log) {
+            calibration::Session& s = bound_session(session);
+            if (device != "cpu" && device != "cuda" && device != "auto") throw Error("device is cpu, cuda or auto");
+            const Device dev = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
+            gc::Log say;
+            if (log)
+                say = [&](const std::string& line) {
+                    nb::gil_scoped_acquire gil;
+                    (*log)(line);
+                };
+            nb::gil_scoped_release nogil;
+            return gc::read_acquisition(s, dev, say);
+        },
+        "session"_a, "device"_a = "auto", "log"_a = nb::none(),
+        "The layout of a CalibrationSession's scans, each with whatever projection stretches it has on disk\n"
+        "(helirec::calibration::geometry_calibration::read_acquisition).");
+    m.def(
+        "geometry_plan",
+        [](const gc::Acquisition& acq, int angles_per_turn, int max_positions, int n_rest, int n_turn) {
+            Json out = Json::list();
+            for (const gc::Planned& p : gc::plan(acq, gc::PlanCounts{angles_per_turn, max_positions, n_rest, n_turn})) {
+                const calibration::ViewRequest& q = p.request;
+                Json d = Json::dict();
+                d.set("kind", Json::of(p.kind)).set("scan_a", whole(p.scan_a)).set("scan_b", whole(p.scan_b)).set("a", whole(p.a)).set("b", whole(p.b)).set("from_block", Json::of_bool(p.from_block));
+                d.set("stretch_a", whole(q.stretch_a)).set("stretch_b", whole(q.stretch_b)).set("frame_a", whole(q.frame_a)).set("frame_hint", whole(q.frame_hint));
+                d.set("angle_offset_deg", Json::of(q.angle_offset_deg)).set("mirror", Json::of_bool(q.mirror)).set("frames", whole(q.frames)).set("rows", whole(q.rows)).set("cols", whole(q.cols));
+                d.set("row_a", whole(q.row_a)).set("col_a", whole(q.col_a)).set("col_b", whole(q.col_b)).set("frame_shear", Json::of(q.frame_shear));
+                out.add(d);
+            }
+            return out.text();
+        },
+        "acquisition"_a, "angles_per_turn"_a = 12, "max_positions"_a = 48, "n_rest"_a = 16, "n_turn"_a = 12,
+        "The comparisons of each scan with itself, placed from the layout alone, as JSON text\n"
+        "(helirec::calibration::geometry_calibration::plan).");
+    m.def(
+        "geometry_measure",
+        [](nb::handle session, const gc::Acquisition& acq, const std::string& device, int patch, int angles_per_turn, int max_positions, int n_rest, int n_turn) {
+            calibration::Session& s = bound_session(session);
+            if (device != "cpu" && device != "cuda" && device != "auto") throw Error("device is cpu, cuda or auto");
+            const Device dev = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
+            std::vector<gc::Comparison> got;
+            std::vector<int> kept;
+            std::size_t blocks = 0;
+            {
+                nb::gil_scoped_release nogil;
+                const std::vector<gc::Planned> planned = gc::plan(acq, gc::PlanCounts{angles_per_turn, max_positions, n_rest, n_turn});
+                blocks = planned.size();
+                got = gc::measure(s, acq, planned, dev, patch, &kept);
+            }
+            const std::size_t n = got.size();
+            auto a = helirec::py::new_array_t<double>({n, std::size_t(5)});
+            auto b = helirec::py::new_array_t<double>({n, std::size_t(5)});
+            auto correlation = helirec::py::new_array_t<double>({n});
+            auto curvature = helirec::py::new_array_t<double>({n, std::size_t(6)});
+            nb::list kinds, opposite, block;
+            for (std::size_t i = 0; i < n; ++i) {
+                const gc::Comparison& c = got[i];
+                const double ra[5] = {static_cast<double>(c.a.scan), static_cast<double>(c.a.stretch), c.a.frame, c.a.row, c.a.col};
+                const double rb[5] = {static_cast<double>(c.b.scan), static_cast<double>(c.b.stretch), c.b.frame, c.b.row, c.b.col};
+                std::copy(ra, ra + 5, static_cast<double*>(a.data()) + 5 * i);
+                std::copy(rb, rb + 5, static_cast<double*>(b.data()) + 5 * i);
+                static_cast<double*>(correlation.data())[i] = c.correlation;
+                std::copy(c.curvature, c.curvature + 6, static_cast<double*>(curvature.data()) + 6 * i);
+                kinds.append(c.kind), opposite.append(c.opposite), block.append(kept[i]);
+            }
+            nb::dict out;
+            out["kinds"] = kinds, out["a"] = a, out["b"] = b, out["opposite"] = opposite, out["correlation"] = correlation, out["curvature"] = curvature;
+            out["block"] = block, out["blocks"] = blocks;
+            return out;
+        },
+        "session"_a, "acquisition"_a, "device"_a = "auto", "patch"_a = 128, "angles_per_turn"_a = 12, "max_positions"_a = 48, "n_rest"_a = 16, "n_turn"_a = 12,
+        "The plan of each scan's comparisons with itself measured once, in patches: the accepted ones as kinds, sightings a and b\n"
+        "(n, 5: scan, stretch, frame, row, column), opposite, correlation, curvature (n, 6) and the block each came from\n"
+        "(helirec::calibration::geometry_calibration::plan, measure).");
     m.def(
         "geometry_solve",
-        [](const std::string& acquisition, const std::vector<std::string>& kinds, Table a, Table b, const std::vector<bool>& opposite, const std::string& start, double huber,
+        [](const gc::Acquisition& acq, const std::vector<std::string>& kinds, Table a, Table b, const std::vector<bool>& opposite, const std::string& start, double huber,
            int max_iterations, const std::vector<std::string>& held, const std::vector<std::string>& freed) {
             const std::size_t n = kinds.size();
             if (a.shape(0) != n || b.shape(0) != n || opposite.size() != n || a.shape(1) != 5 || b.shape(1) != 5)
                 throw Error("geometry_solve: one kind, two sightings (scan, stretch, frame, row, column) and one flag per comparison");
-            const gc::Acquisition acq = acquisition_of(acquisition);
             std::vector<gc::Comparison> comparisons(n);
             for (std::size_t i = 0; i < n; ++i) {
                 comparisons[i].kind = kinds[i];
@@ -226,10 +336,9 @@ void bind_geometry_calibration(nb::module_& m) {
         "residuals (n, 3): frames, rows, columns). (helirec::calibration::geometry_calibration::solve_geometry)");
     m.def(
         "geometry_residuals",
-        [](const std::string& acquisition, const std::string& parameters, Table a, Table b, const std::vector<bool>& opposite) {
+        [](const gc::Acquisition& acq, const std::string& parameters, Table a, Table b, const std::vector<bool>& opposite) {
             const std::size_t n = opposite.size();
             if (a.shape(0) != n || b.shape(0) != n || a.shape(1) != 5 || b.shape(1) != 5) throw Error("geometry_residuals: two sightings (scan, stretch, frame, row, column) and one flag per comparison");
-            const gc::Acquisition acq = acquisition_of(acquisition);
             std::vector<gc::Comparison> comparisons(n);
             for (std::size_t i = 0; i < n; ++i) comparisons[i].a = sighting_of(a.data() + 5 * i), comparisons[i].b = sighting_of(b.data() + 5 * i), comparisons[i].opposite = opposite[i];
             const std::vector<std::array<double, 3>> r = gc::residuals(acq, parameters_of(acq, parameters), comparisons);
@@ -242,9 +351,8 @@ void bind_geometry_calibration(nb::module_& m) {
         "(helirec::calibration::geometry_calibration::residuals)");
     m.def(
         "geometry_rays",
-        [](const std::string& acquisition, const std::string& parameters, Table sightings) {
+        [](const gc::Acquisition& acq, const std::string& parameters, Table sightings) {
             if (sightings.shape(1) != 5) throw Error("geometry_rays: a sighting is scan, stretch, frame, row, column");
-            const gc::Acquisition acq = acquisition_of(acquisition);
             const gc::Parameters p = parameters_of(acq, parameters);
             const std::size_t n = sightings.shape(0);
             auto out = helirec::py::new_array_t<double>({n, std::size_t(3)});

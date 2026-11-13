@@ -45,9 +45,20 @@ model::At at_of(const Acquisition& acq, const Sighting& g) {
     return {at_frame(st.course.angle_deg, t) * (kPi / 180.0), at_frame(st.course.rows, t), acq.scans[static_cast<std::size_t>(g.scan)].mid_height, mid_row(acq)};
 }
 
+// the angle [deg] by which the ray recorded at the sighting's column is further on than the stage: the beam
+// diverges, and the ray of a column further on is that of a parallel beam further on in angle
+double fan_angle(const Acquisition& acq, const Sighting& g) {
+    if (acq.fan == 0.0) return 0.0;
+    const StretchLayout& st = stretch_of(acq, g);
+    const double t = time_of(acq, g);
+    const double step = at_frame(st.course.angle_deg, t + 0.5) - at_frame(st.course.angle_deg, t - 0.5);
+    return acq.fan * std::fabs(step) * (g.col - (acq.cols - 1) / 2.0);
+}
+
 // The unknowns as the problem holds them: a block per owner.
 struct Blocks {
     double detector[1] = {0};
+    double stage[4] = {0, 0, 0, 0};
     std::vector<std::array<double, 3>> own, place;       // per scan
     std::vector<std::vector<std::array<double, 1>>> stretch;  // per scan, per stretch
 };
@@ -55,6 +66,7 @@ Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
     if (p.scans.size() != acq.scans.size()) throw Error("geometry: the parameters hold " + std::to_string(p.scans.size()) + " scans, the acquisition " + std::to_string(acq.scans.size()));
     Blocks b;
     b.detector[0] = p.roll;
+    b.stage[0] = p.stage.height_once[0], b.stage[1] = p.stage.height_once[1], b.stage[2] = p.stage.axis_twice[0], b.stage[3] = p.stage.axis_twice[1];
     for (std::size_t k = 0; k < p.scans.size(); ++k) {
         const ScanParameters& s = p.scans[k];
         if (s.stretch_height.size() != acq.scans[k].stretches.size()) throw Error("geometry: the parameters of scan " + acq.scans[k].name + " do not hold one height per stretch");
@@ -68,6 +80,7 @@ Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
 Parameters parameters_of(const Blocks& b) {
     Parameters p;
     p.roll = b.detector[0];
+    p.stage.height_once[0] = b.stage[0], p.stage.height_once[1] = b.stage[1], p.stage.axis_twice[0] = b.stage[2], p.stage.axis_twice[1] = b.stage[3];
     for (std::size_t k = 0; k < b.own.size(); ++k) {
         ScanParameters s;
         s.axis = b.own[k][0], s.axis_slope = b.own[k][1], s.axial_scale = b.own[k][2];
@@ -88,6 +101,8 @@ struct Slot {
 std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b) {
     std::vector<Slot> out;
     out.push_back({"roll", b.detector, 1, 0, true});
+    const char* stage[4] = {"height_once_cos", "height_once_sin", "axis_twice_cos", "axis_twice_sin"};
+    for (int i = 0; i < 4; ++i) out.push_back({std::string("stage.") + stage[i], b.stage, 4, i, true});
     for (std::size_t k = 0; k < acq.scans.size(); ++k) {
         const std::string scan = "scan" + std::to_string(k) + ".";
         const char* own[3] = {"axis", "axis_slope", "axial_scale"};
@@ -107,13 +122,13 @@ struct SameLines {
     model::At a, b;
     double xa = 0, ya = 0, xb = 0, yb = 0;  // ideal positions
     bool opposite = false;
-    int at_a[3] = {0, 0, 0}, at_b[3] = {0, 0, 0};  // where the residual's parameters hold own, place, stretch (0 is the detector)
+    int at_a[3] = {0, 0, 0}, at_b[3] = {0, 0, 0};  // where the residual's parameters hold own, place, stretch (0 is the detector, 1 the stage)
 
     template <class T>
     bool operator()(T const* const* p, T* r) const {
         T sa, za, sb, zb;
-        model::ray_of(p[0], p[at_a[0]], p[at_a[1]], p[at_a[2]], a, T(xa), T(ya), sa, za);
-        model::ray_of(p[0], p[at_b[0]], p[at_b[1]], p[at_b[2]], b, T(xb), T(yb), sb, zb);
+        model::ray_of(p[0], p[1], p[at_a[0]], p[at_a[1]], p[at_a[2]], a, T(xa), T(ya), sa, za);
+        model::ray_of(p[0], p[1], p[at_b[0]], p[at_b[1]], p[at_b[2]], b, T(xb), T(yb), sb, zb);
         r[0] = opposite ? sb + sa : sb - sa;
         r[1] = zb - za;
         return true;
@@ -132,6 +147,7 @@ Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
     w.f.xa = c.a.col, w.f.ya = c.a.row, w.f.xb = c.b.col, w.f.yb = c.b.row;
     w.f.opposite = c.opposite;
     w.blocks.push_back(b.detector), w.sizes.push_back(1);
+    w.blocks.push_back(b.stage), w.sizes.push_back(4);
     const auto place = [&](double* block, int size) {
         for (std::size_t i = 0; i < w.blocks.size(); ++i)
             if (w.blocks[i] == block) return static_cast<int>(i);
@@ -177,10 +193,11 @@ Ray ray_of(const Acquisition& acq, const Parameters& p, const Sighting& g) {
     const ScanParameters& sp = p.scans[static_cast<std::size_t>(g.scan)];
     const model::At at = at_of(acq, g);
     const double detector[1] = {p.roll}, own[3] = {sp.axis, sp.axis_slope, sp.axial_scale}, place[3] = {sp.d[0], sp.d[1], sp.height};
+    const double stage[4] = {p.stage.height_once[0], p.stage.height_once[1], p.stage.axis_twice[0], p.stage.axis_twice[1]};
     const double stretch[1] = {sp.stretch_height.at(static_cast<std::size_t>(g.stretch))};
     Ray r;
-    r.angle_deg = at.th * (180.0 / kPi);
-    model::ray_of(detector, own, place, stretch, at, g.col, g.row, r.s, r.z);
+    r.angle_deg = at.th * (180.0 / kPi) + fan_angle(acq, g);
+    model::ray_of(detector, stage, own, place, stretch, at, g.col, g.row, r.s, r.z);
     return r;
 }
 
@@ -387,7 +404,10 @@ std::string solution_json(const Acquisition& acq, const GeometrySolution& s) {
     solver.set("usable", Json::of_bool(s.solver.usable)).set("termination", Json::of(s.solver.termination)).set("message", Json::of(s.solver.message));
     solver.set("solver_version", Json::of(s.solver.solver_version)).set("rank", Json::whole_number(s.rank));
     Json out = Json::dict();
-    out.set("roll", num(s.parameters.roll)).set("scans", scans).set("free", names(s.free)).set("unused", names(s.unused)).set("solver", solver).set("left", left);
+    const StageParameters& st = s.parameters.stage;
+    Json stage = Json::dict();
+    stage.set("height_once", Json::list().add(num(st.height_once[0])).add(num(st.height_once[1]))).set("axis_twice", Json::list().add(num(st.axis_twice[0])).add(num(st.axis_twice[1])));
+    out.set("roll", num(s.parameters.roll)).set("stage", stage).set("scans", scans).set("free", names(s.free)).set("unused", names(s.unused)).set("solver", solver).set("left", left);
     return out.text();
 }
 

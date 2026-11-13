@@ -29,7 +29,8 @@ class Scan:
     def __init__(self, stretches, travel=300.0, **truth):
         # stretches: (name, frames); the helix climbs `travel` rows per turn, a rest turn stands where the helix
         # starts or ends
-        self.t = dict(axis=301.3, axis_slope=0.0, axial_scale=0.0, d=(0.0, 0.0), height=0.0, roll=0.0, row_time=0.0, stretch_height={})
+        self.t = dict(axis=301.3, axis_slope=0.0, axial_scale=0.0, d=(0.0, 0.0), height=0.0, roll=0.0, row_time=0.0, stretch_height={},
+                      height_once=(0.0, 0.0), axis_twice=(0.0, 0.0))
         self.t.update(truth)
         self.stretches, H, angle0 = [], 0.0, 12.0
         for name, n in stretches:
@@ -52,6 +53,9 @@ class Scan:
         H = np.interp(t, np.arange(len(st["rows"])), st["rows"])
         on_stage = np.asarray(p, float) + [tr["d"][0], tr["d"][1], 0.0]            # the sample's place on the stage
         x, _, z = _stage(th) @ on_stage                                            # the stage turned; parallel rays: the depth is dropped
+        # what the stage does within a turn: it lifts the sample once per turn and moves its axis across the detector twice
+        z += tr["height_once"][0] * np.cos(th) + tr["height_once"][1] * np.sin(th)
+        x += tr["axis_twice"][0] * np.cos(2 * th) + tr["axis_twice"][1] * np.sin(2 * th)
         x += tr["axis_slope"] * (H - self.mid_height)                              # the axis stage does not travel along the axis as the detector sees it
         z += tr["height"] + tr["stretch_height"].get(st["name"], 0.0) + (1.0 + tr["axial_scale"]) * H   # and it travels further than the record says
         c, v = _about_beam(tr["roll"]) @ [x, z - mid]
@@ -68,12 +72,12 @@ class Scan:
 
     def parameters(self):
         t = self.t
-        return dict(roll=t["roll"], scans=[dict(axis=t["axis"], axis_slope=t["axis_slope"], axial_scale=t["axial_scale"], d=list(t["d"]), height=t["height"],
+        return dict(roll=t["roll"], stage=dict(height_once=list(t["height_once"]), axis_twice=list(t["axis_twice"])), scans=[dict(axis=t["axis"], axis_slope=t["axis_slope"], axial_scale=t["axial_scale"], d=list(t["d"]), height=t["height"],
                                                  stretch_height=dict(t["stretch_height"]))])
 
 
 def _acquisition(scan):
-    return dict(rows=ROWS, cols=COLS, row_time=scan.t["row_time"], scans=[scan.layout()])
+    return G.acquisition(dict(rows=ROWS, cols=COLS, row_time=scan.t["row_time"], scans=[scan.layout()]))
 
 
 def _points(rng, scan, stretch, n, radius=250.0):
@@ -99,7 +103,12 @@ def _same_point(scan, kind, sa, sb, p, ta, tb, rng=None, noise=0.0):
     return dict(kind=kind, a=a, b=b, opposite=kind == "opposite")
 
 
-TRUTH = dict(axis=310.4, axis_slope=4e-4, axial_scale=3.3e-3, d=(7.0, -4.0), height=2.5, roll=3e-4, row_time=2e-3)
+TRUTH = dict(axis=310.4, axis_slope=4e-4, axial_scale=3.3e-3, d=(7.0, -4.0), height=2.5, roll=3e-4, row_time=2e-3, height_once=(0.21, -0.13), axis_twice=(0.11, 0.17))
+STAGE = ["stage.height_once_cos", "stage.height_once_sin", "stage.axis_twice_cos", "stage.axis_twice_sin"]
+
+
+def _stage_found(got, abs_=2e-3):
+    return got["stage"]["height_once"] == pytest.approx(list(TRUTH["height_once"]), abs=abs_) and got["stage"]["axis_twice"] == pytest.approx(list(TRUTH["axis_twice"]), abs=abs_)
 
 
 def test_the_projection_itself():
@@ -136,6 +145,11 @@ def test_rays_are_the_points_lines():
     assert np.allclose(got[:, 0], expect[:, 0], atol=1e-9)
     # the model is linear in the small angles; the projection turns by them exactly (roll^2 x 300 px = 3e-5)
     assert np.abs(got[:, 1:] - expect[:, 1:]).max() < 2e-4
+    # the beam's divergence is in the angle alone: fan frames of angle per column from the detector's middle
+    acq = dict(rows=ROWS, cols=COLS, row_time=scan.t["row_time"], fan=2e-4, scans=[scan.layout()])
+    fanned = G.rays(acq, scan.parameters(), sightings)
+    cols = np.array(sightings)[:, 4]
+    assert np.allclose(fanned[:, 0] - got[:, 0], 2e-4 * (360.0 / PER_TURN) * (cols - (COLS - 1) / 2), atol=1e-12) and np.array_equal(fanned[:, 1:], got[:, 1:])
 
 
 def _helix_comparisons(rng, scan, stretch, n, noise):
@@ -164,8 +178,19 @@ def test_a_helix_alone_gives_its_own_parameters():
     start = dict(roll=0.0, scans=[dict(axis=TRUTH["axis"] + 2.7)])
     got = G.solve_geometry(acq, comparisons, start=start)
     s = got["scans"][0]
-    assert got["free"] == ["roll", "scan0.axis", "scan0.axis_slope", "scan0.axial_scale"] and got["unused"] == []
-    assert got["solver"]["rank"] == 4 and got["solver"]["usable"]
+    assert got["free"] == ["roll"] + STAGE + ["scan0.axis", "scan0.axis_slope", "scan0.axial_scale"] and got["unused"] == []
+    assert got["solver"]["rank"] == 8 and got["solver"]["usable"] and _stage_found(got)
+    # the stage's motion held at nothing, it is what the opposite views are left with: twice the height's once per
+    # turn in their rows, twice the axis column's twice per turn in their columns; views a turn apart see none of it
+    without = G.solve_geometry(acq, comparisons, start=start, held=STAGE)
+    opposite = np.array([c["kind"] == "opposite" for c in comparisons])
+    th = np.radians(G.rays(acq, without, [c["a"] for c in comparisons])[:, 0])
+    rows, cols = without["residual"][:, 1], without["residual"][:, 2]
+    X1 = np.stack([np.cos(th), np.sin(th), np.ones_like(th)], 1)[opposite]
+    X2 = np.stack([np.cos(2 * th), np.sin(2 * th), np.ones_like(th)], 1)[opposite]
+    assert np.linalg.lstsq(X1, rows[opposite], rcond=None)[0][:2] == pytest.approx([-2 * 0.21, 2 * 0.13], abs=0.02)
+    assert np.linalg.lstsq(X2, cols[opposite], rcond=None)[0][:2] == pytest.approx([2 * 0.11, 2 * 0.17], abs=0.02)     # (the columns' residual is a sum)
+    assert np.abs(rows[~opposite]).max() < 0.05 and np.abs(cols[~opposite]).max() < 0.05
     assert s["axis"] == pytest.approx(TRUTH["axis"], abs=2e-3)
     assert s["axis_slope"] == pytest.approx(TRUTH["axis_slope"], abs=5e-6)        # 0.006 px over the helix' 1500 rows
     assert s["axial_scale"] == pytest.approx(TRUTH["axial_scale"], abs=2e-5)
@@ -201,7 +226,7 @@ def test_rest_turns_and_the_refusal_of_dependent_unknowns():
     assert s["axis"] == pytest.approx(TRUTH["axis"], abs=2e-3) and s["axial_scale"] == pytest.approx(TRUTH["axial_scale"], abs=2e-5)
     assert s["axis_slope"] == pytest.approx(TRUTH["axis_slope"], abs=5e-6) and got["roll"] == pytest.approx(TRUTH["roll"], abs=1e-5)
     assert s["stretch_height"]["rest1"] == pytest.approx(heights["rest1"], abs=3e-3)
-    assert s["stretch_height"]["rest2"] == pytest.approx(heights["rest2"], abs=3e-3)
+    assert s["stretch_height"]["rest2"] == pytest.approx(heights["rest2"], abs=3e-3) and _stage_found(got)
     # every stretch's height free: only their differences are seen, and the solve says so
     with pytest.raises(ValueError, match="RANK_DEFICIENT.*height"):
         G.solve_geometry(acq, comparisons, start=start, freed=["scan0.helix.height"])
@@ -214,7 +239,64 @@ def test_rest_turns_and_the_refusal_of_dependent_unknowns():
         G.solve_geometry(acq, rest_only, start=start)
     alone = G.solve_geometry(acq, rest_only, start=start, held=["scan0.axis_slope"])
     assert alone["unused"] == ["scan0.axial_scale", "scan0.rest1.height", "scan0.rest2.height"]
-    assert alone["free"] == ["roll", "scan0.axis"]
+    assert alone["free"] == ["roll"] + STAGE + ["scan0.axis"] and _stage_found(alone, 5e-3)
     # the first rest turn stands at the helix' start, mid_height rows from where the axis column is counted
     there = TRUTH["axis"] + TRUTH["axis_slope"] * (0.0 - scan.mid_height)
     assert alone["scans"][0]["axis"] == pytest.approx(there, abs=2e-3)
+
+
+def _layout(rows, cols, per_turn, travel, axis, stretches, sense=-1.0):
+    """A layout as read_acquisition gives it: stretches = (name, frames, first, end); the helix travels `travel`
+    rows per turn in the sense of the rows."""
+    out, H, angle0 = [], 0.0, 0.0
+    for name, n, first, end in stretches:
+        f = np.arange(n)
+        h = H + (sense * f * (travel / per_turn) if name == "helix" else np.zeros(n))
+        out.append(dict(name=name, helix=name == "helix", angle_deg=angle0 + f * (360.0 / per_turn), rows=h, first=first, end=end))
+        H, angle0 = h[-1], angle0 + n * (360.0 / per_turn)
+    return G.acquisition(dict(rows=rows, cols=cols, per_turn=per_turn, row_sign=sense, fan=1e-5, width=512, scans=[dict(name="scan", axis=axis, stretches=out)]))
+
+
+def test_plan_of_a_helix_alone_stays_in_the_strip():
+    """Paris4's layout: a helix of which three turns are on disk, the axis 306 columns from the detector's edge, a
+    turn's travel 65 rows short of the detector's height."""
+    rows, cols, N, axis = 2368, 4416, 10000, 4110.3
+    acq = _layout(rows, cols, N, 2303.0, axis, [("helix", 250000, 109700, 140300)])
+    plan = G.plan_comparisons(acq)
+    assert {p["kind"] for p in plan} == {"opposite"} and len(plan) > 100          # a turn on shares 65 rows: no turn pairs
+    strip = (2 * axis - (cols - 1), cols - 1)
+    for p in plan:
+        assert p["mirror"] and p["from_block"] and p["cols"] == 512 and p["angle_offset_deg"] == 180.0 and p["frame_hint"] == N // 2
+        for c in (p["col_a"], p["col_b"]):
+            assert strip[0] + 30 <= c and c + p["cols"] + 30 <= cols                 # inside the strip, with room for the cut's margins
+        assert p["col_a"] + p["col_b"] + p["cols"] - 1 == round(2 * axis)
+        assert 109700 <= p["frame_a"] and p["frame_a"] + N // 2 + 64 <= 140300      # on disk, half a turn on too
+        # A's rows and B's, half a turn's travel lower, on the detector
+        assert 0 <= p["row_a"] and p["row_a"] + p["rows"] <= rows and p["row_a"] - 1152 >= 0
+    frames = sorted({p["frame_a"] for p in plan})
+    assert len(frames) >= 24 and np.allclose(np.diff(frames), N / 12, atol=1)        # twelve angles a turn, evenly
+    angles = np.array(frames) % N
+    assert len(np.unique(np.round(angles / (N / 12)).astype(int) % 12)) == 12
+
+
+def test_plan_with_rest_turns():
+    """343P's layout: a rest turn, a helix, a rest turn; the axis well inside the field."""
+    rows, cols, N = 1200, 2528, 8000
+    acq = _layout(rows, cols, N, 1053.0, 1684.8, [("rest1", N, 0, N), ("helix", 7 * N, 0, 7 * N), ("rest2", N, 0, N)])
+    plan = G.plan_comparisons(acq)
+    kinds = [p["kind"] for p in plan]
+    assert set(kinds) == {"opposite", "turn", "resthelix"}
+    for p in plan:
+        assert 0 <= p["col_a"] and p["col_a"] + p["cols"] <= cols and 0 <= p["col_b"] and p["col_b"] + p["cols"] <= cols
+        assert p["row_a"] == -1 or (0 <= p["row_a"] and p["row_a"] + p["rows"] <= rows)
+        if p["kind"] == "opposite":
+            assert p["col_a"] + p["col_b"] + p["cols"] - 1 == round(2 * 1684.8) and p["from_block"] == (p["a"] == 1)
+        else:
+            assert p["col_a"] == p["col_b"] and not p["mirror"]
+    helix = sorted({p["frame_a"] for p in plan if p["kind"] == "opposite" and p["a"] == 1})
+    assert 24 <= len(helix) <= 48                                                    # a long helix: whole turns are passed over
+    assert len(np.unique(np.round((np.array(helix) - helix[0]) % N / (N / 12)).astype(int) % 12)) == 12
+    assert {p["a"] for p in plan if p["kind"] == "resthelix"} == {0, 2} and {p["b"] for p in plan if p["kind"] == "resthelix"} == {1}
+    # an axis at the detector's edge leaves no window for opposite views
+    with pytest.raises(ValueError, match="too close"):
+        G.plan_comparisons(_layout(rows, cols, N, 1053.0, 2500.0, [("helix", 3 * N, 0, 3 * N)]))

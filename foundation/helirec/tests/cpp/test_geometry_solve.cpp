@@ -18,6 +18,7 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 
 struct Truth {
     double axis = 310.4, axis_slope = 4e-4, axial_scale = 3.3e-3, d[2] = {7.0, -4.0}, height = 2.5, roll = 3e-4, row_time = 2e-3, rest_height = -0.4;
+    double height_once[2] = {0.21, -0.13}, axis_twice[2] = {0.11, 0.17};  // what the stage does within a turn
 };
 
 void times(const double m[3][3], const double v[3], double out[3]) {
@@ -36,8 +37,8 @@ void seen(const gc::Acquisition& acq, const Truth& tr, int stretch, const double
     const double on_stage[3] = {p[0] + tr.d[0], p[1] + tr.d[1], p[2]};
     double lab[3];
     times(stage, on_stage, lab);  // lab[1] is the depth along the beam: parallel rays drop it
-    const double x = lab[0] + tr.axis_slope * (H - acq.scans[0].mid_height);
-    const double z = lab[2] + tr.height + (st.helix ? 0.0 : tr.rest_height) + (1.0 + tr.axial_scale) * H;
+    const double x = lab[0] + tr.axis_slope * (H - acq.scans[0].mid_height) + tr.axis_twice[0] * std::cos(2 * th) + tr.axis_twice[1] * std::sin(2 * th);
+    const double z = lab[2] + tr.height + (st.helix ? 0.0 : tr.rest_height) + (1.0 + tr.axial_scale) * H + tr.height_once[0] * std::cos(th) + tr.height_once[1] * std::sin(th);
     // the detector, with the axis rolled against its columns
     col = tr.axis + std::cos(tr.roll) * x + std::sin(tr.roll) * (z - mid);
     row = mid - std::sin(tr.roll) * x + std::cos(tr.roll) * (z - mid);
@@ -76,6 +77,7 @@ int main() {
 
     gc::Parameters truth = gc::empty_parameters(acq);
     truth.roll = tr.roll;
+    for (int i = 0; i < 2; ++i) truth.stage.height_once[i] = tr.height_once[i], truth.stage.axis_twice[i] = tr.axis_twice[i];
     gc::ScanParameters& sp = truth.scans[0];
     sp.axis = tr.axis, sp.axis_slope = tr.axis_slope, sp.axial_scale = tr.axial_scale, sp.d[0] = tr.d[0], sp.d[1] = tr.d[1], sp.height = tr.height;
     sp.stretch_height = {tr.rest_height, 0.0};
@@ -118,7 +120,10 @@ int main() {
     start.scans[0].axis = tr.axis - 2.2;
     const gc::GeometrySolution got = gc::solve_geometry(acq, comparisons, start);
     const gc::ScanParameters& q = got.parameters.scans[0];
-    if (got.rank != 5 || got.free.size() != 5 || !got.unused.empty()) return fail("the free unknowns are not the roll, the scan's own three and the rest turn's height");
+    if (got.rank != 9 || got.free.size() != 9 || !got.unused.empty()) return fail("the free unknowns are not the roll, the stage's four, the scan's own three and the rest turn's height");
+    for (int i = 0; i < 2; ++i)
+        if (std::fabs(got.parameters.stage.height_once[i] - tr.height_once[i]) > 2e-3 || std::fabs(got.parameters.stage.axis_twice[i] - tr.axis_twice[i]) > 2e-3)
+            return fail("the stage's motion within a turn was not found again");
     if (std::fabs(q.axis - tr.axis) > 2e-3 || std::fabs(q.axis_slope - tr.axis_slope) > 5e-6 || std::fabs(q.axial_scale - tr.axial_scale) > 2e-5 ||
         std::fabs(got.parameters.roll - tr.roll) > 1e-5 || std::fabs(q.stretch_height[0] - tr.rest_height) > 3e-3)
         return fail("the parameters were not found again");
