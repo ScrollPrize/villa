@@ -31,6 +31,7 @@ Frames::Frames(const Record& rec, int n_threads) : rec_(&rec), n_threads_(n_thre
         piece_file_.push_back(std::move(of_piece));
     }
     reader_ = std::make_unique<RawReader>(std::move(files), dataset, rows_, cols_);
+    reader_->set_cache_bytes(default_cache_bytes);
 }
 
 Frames::~Frames() = default;
@@ -53,6 +54,21 @@ void Frames::read_rows(int stretch, const std::int64_t* frame, const std::int32_
     for (std::size_t i = 0; i < n; ++i) locate(stretch, frame[i], file[i], idx[i]);
     reader_->read_rows(file.data(), idx.data(), row0, n, nrows, out, n_threads_);
 }
+
+void Frames::set_cache_bytes(std::size_t bytes) { reader_->set_cache_bytes(bytes); }
+void Frames::set_prefetch_threads(int threads) { reader_->set_prefetch_threads(threads); }
+void Frames::prefetch_rows(int stretch, std::int64_t first, std::int64_t count, int row0, int nrows) {
+    std::vector<std::int32_t> file, idx, r0;
+    const Stretch& s = rec_->stretches.at(stretch);
+    for (std::int64_t f = std::max<std::int64_t>(0, first); f < first + count && f < s.n_frames; ++f) {
+        if (!s.on_disk(f)) continue;
+        std::int32_t a = 0, b = 0;
+        locate(stretch, f, a, b);
+        file.push_back(a), idx.push_back(b), r0.push_back(row0);
+    }
+    if (!file.empty()) reader_->prefetch_rows(file.data(), idx.data(), r0.data(), file.size(), nrows);
+}
+void Frames::cache_counts(std::uint64_t& hits, std::uint64_t& decoded) const { reader_->cache_counts(hits, decoded); }
 
 void Frames::read(int stretch, std::int64_t first, std::int64_t count, std::uint16_t* out) {
     std::vector<std::int64_t> frame(count);
@@ -195,9 +211,15 @@ void line_integrals(const FlatField& ff, const std::uint16_t* raw, const std::in
 
 void DetectorMap::displacement(double c, double v, double& du, double& dv) const {
     const double x = (c - c0) / cs, y = (v - v0) / vs;
+    // the powers of x and y by repeated multiplication, as the reconstruction forms them (detector_map_core.hpp):
+    // a block's resampling asks for three displacements per sample, and std::pow was most of its time
+    constexpr int top = 8;
+    double xp[top + 1], yp[top + 1];
+    xp[0] = yp[0] = 1.0;
+    for (int d = 1; d <= top; ++d) xp[d] = xp[d - 1] * x, yp[d] = yp[d - 1] * y;
     du = dv = 0;
     for (std::size_t k = 0; k < i.size(); ++k) {
-        const double m = std::pow(x, i[k]) * std::pow(y, j[k]);
+        const double m = (i[k] >= 0 && i[k] <= top ? xp[i[k]] : std::pow(x, i[k])) * (j[k] >= 0 && j[k] <= top ? yp[j[k]] : std::pow(y, j[k]));
         du += eu[k] * m;
         dv += ev[k] * m;
     }
@@ -266,12 +288,32 @@ void line_integrals_mapped(Frames& frames, const FlatField& ff, const DetectorMa
     plain.resize(n * static_cast<std::size_t>(nr) * nc);
     frames.read_rows(stretch, frame, r0.data(), n, nr, raw.data());
     line_integrals(ff, raw.data(), r0.data(), n, nr, c_min, nc, false, plain.data());
-#pragma omp parallel for collapse(2) schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i)
-        for (int r = 0; r < nrows; ++r) {
-            const float* src = plain.data() + static_cast<std::size_t>(i) * nr * nc;
-            float* dst = out + (static_cast<std::size_t>(i) * nrows + r) * ncols;
-            const Tap* tp = taps.data() + static_cast<std::size_t>(r) * ncols;
+    // A row of the block in every frame before the next row: its taps stay in the cache over the frames. Where the
+    // sixteen samples of every tap of the row lie inside what was read (everywhere but at the detector's edge)
+    // they are taken without holding their indices inside; the sums are the same either way.
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < nrows; ++r) {
+        const Tap* tp = taps.data() + static_cast<std::size_t>(r) * ncols;
+        bool inside = true;
+        for (int c = 0; c < ncols && inside; ++c) inside = tp[c].r - 1 >= r_min && tp[c].r + 2 <= r_max && tp[c].c - 1 >= c_min && tp[c].c + 2 <= c_max;
+        for (std::size_t i = 0; i < n; ++i) {
+            const float* src = plain.data() + i * nr * nc;
+            float* dst = out + (i * nrows + r) * ncols;
+            if (inside) {
+                for (int c = 0; c < ncols; ++c) {
+                    const Tap& t = tp[c];
+                    const float* first = src + static_cast<std::size_t>(t.r - 1 - r_min) * nc + (t.c - 1 - c_min);
+                    float sum = 0;
+                    for (int a = 0; a < 4; ++a) {
+                        const float* line = first + static_cast<std::size_t>(a) * nc;
+                        float s = 0;
+                        for (int b = 0; b < 4; ++b) s += t.wc[b] * line[b];
+                        sum += t.wr[a] * s;
+                    }
+                    dst[c] = sum;
+                }
+                continue;
+            }
             for (int c = 0; c < ncols; ++c) {
                 const Tap& t = tp[c];
                 float sum = 0;
@@ -284,13 +326,15 @@ void line_integrals_mapped(Frames& frames, const FlatField& ff, const DetectorMa
                 dst[c] = sum;
             }
         }
+    }
 }
 
 void shear_frames(float* block, std::size_t n, int nrows, int ncols, double shear) {
     if (shear == 0.0 || n < 2) return;
-    static std::vector<float> copy;
+    static thread_local std::vector<float> copy;  // per thread: the patches of a block are sheared side by side (measure_patches)
     const std::size_t plane = static_cast<std::size_t>(nrows) * ncols;
     copy.assign(block, block + n * plane);
+    const float* const src = copy.data();  // the loop's threads have buffers of their own: this thread's is meant
     const std::ptrdiff_t last = static_cast<std::ptrdiff_t>(n) - 1;
 #pragma omp parallel for collapse(2) schedule(static)
     for (std::ptrdiff_t q = 0; q < static_cast<std::ptrdiff_t>(n); ++q)
@@ -303,20 +347,22 @@ void shear_frames(float* block, std::size_t n, int nrows, int ncols, double shea
                 cubic_weights(static_cast<float>(at - static_cast<double>(k)), w);
                 float sum = 0;
                 for (int a = 0; a < 4; ++a)
-                    sum += w[a] * copy[static_cast<std::size_t>(std::clamp<std::ptrdiff_t>(k - 1 + a, 0, last)) * plane + static_cast<std::size_t>(r) * ncols + c];
+                    sum += w[a] * src[static_cast<std::size_t>(std::clamp<std::ptrdiff_t>(k - 1 + a, 0, last)) * plane + static_cast<std::size_t>(r) * ncols + c];
                 dst[c] = sum;
             }
         }
 }
 
-void shift_columns(const float* wide, std::size_t n, int nrows, int ncols, int pad, const double* shift, bool flip_cols, float* out) {
+void shift_columns(const float* wide, std::size_t n, int nrows, int ncols, int pad, const double* shift, bool flip_cols, float* out,
+                   const double* per_row, double row0) {
     const int nw = ncols + 2 * pad;
 #pragma omp parallel for collapse(2) schedule(static)
     for (std::ptrdiff_t q = 0; q < static_cast<std::ptrdiff_t>(n); ++q)
         for (int r = 0; r < nrows; ++r) {
-            const double whole = std::floor(shift[q]);
+            const double s = shift[q] + (per_row ? per_row[q] * (row0 + r) : 0.0);
+            const double whole = std::floor(s);
             float w[4];
-            cubic_weights(static_cast<float>(shift[q] - whole), w);
+            cubic_weights(static_cast<float>(s - whole), w);
             const int k = pad + static_cast<int>(whole);
             const float* src = wide + (static_cast<std::size_t>(q) * nrows + r) * nw;
             float* dst = out + (static_cast<std::size_t>(q) * nrows + r) * ncols;

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <thread>
 
 #include "calibration/util.hpp"
 
@@ -77,6 +78,11 @@ ViewTiming& view_timing() {
     return t;
 }
 
+void keep_curvature(const Registration& r, Measured& m) {
+    const double c[6] = {r.curvature[0][0], r.curvature[0][1], r.curvature[0][2], r.curvature[1][1], r.curvature[1][2], r.curvature[2][2]};
+    std::copy(c, c + 6, m.curvature);
+}
+
 bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const RegistrationOptions& ropt, const ViewOptions& opt, Measured& m) {
     // Crop corresponding rays, keeping the mirror centre unchanged for opposite views.
     // This changes only the measurement support, never the raw images or trajectory.
@@ -127,19 +133,28 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
         if (plan.max_row_shift + 3 > mg[1]) return false;  // the margin of rows cannot take the pre-alignment
         if (plan.j0 - mg[0] < 0 || plan.j0 + n[0] + mg[0] > nb) return false;
         // a sway of B's content along the columns: whole columns go into the cut, the rest is resampled per frame
-        std::vector<double> sway;
+        std::vector<double> sway, sway_per_row;
         int sway_whole = 0, pad = 0;
+        const int row_b = cut.row_a + plan.row_offset + extra[1] - mg[1];
+        const double row_ref = 0.5 * (rows - 1);  // the row the frame's angle is taken to belong to
         if (P.sway_px != 0.0) {
             sway.resize(static_cast<std::size_t>(L[0]));
-            for (int q = 0; q < L[0]; ++q)
-                sway[q] = P.sway_px * std::cos((P.tb->angle_deg[static_cast<std::size_t>(plan.j0 - mg[0] + q)] - P.sway_phase_deg) * (M_PI / 180.0));
+            sway_per_row.resize(static_cast<std::size_t>(L[0]));
+            for (int q = 0; q < L[0]; ++q) {
+                const double a = (P.tb->angle_deg[static_cast<std::size_t>(plan.j0 - mg[0] + q)] - P.sway_phase_deg) * (M_PI / 180.0);
+                sway[q] = P.sway_px * std::cos(a);
+                sway_per_row[q] = -P.sway_px * std::sin(a) * P.sway_row_deg * (M_PI / 180.0);
+            }
             sway_whole = static_cast<int>(std::lround(sway[static_cast<std::size_t>(mg[0] + n[0] / 2)]));
+            const double far = std::max(std::fabs(row_b - row_ref), std::fabs(row_b + L[1] - 1 - row_ref));
             double largest = 0;
-            for (double& v : sway) v -= sway_whole, largest = std::max(largest, std::fabs(v));
+            for (int q = 0; q < L[0]; ++q) {
+                sway[q] -= sway_whole;
+                largest = std::max(largest, std::fabs(sway[q]) + std::fabs(sway_per_row[q]) * far);
+            }
             pad = static_cast<int>(std::ceil(largest)) + 3;
         }
         const int col_b = (P.mirror ? cut.col_b - extra[2] : cut.col_b + extra[2]) - mg[2] + sway_whole;
-        const int row_b = cut.row_a + plan.row_offset + extra[1] - mg[1];
         if (col_b - pad < 0 || col_b + L[2] + pad > cols || row_b < 0 || row_b + L[1] > rows) return false;
         for (int q = 0; q < L[0]; ++q) frame[q] = plan.j0 - mg[0] + q, row0[q] = row_b;
         t0 = std::chrono::steady_clock::now();
@@ -156,7 +171,7 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
                 t0 = std::chrono::steady_clock::now();
                 line_integrals(*P.B.ff, raw.data(), row0.data(), L[0], L[1], col_b - pad, nw, false, wide.data());
             }
-            shift_columns(wide.data(), L[0], L[1], L[2], pad, sway.data(), P.mirror, b);
+            shift_columns(wide.data(), L[0], L[1], L[2], pad, sway.data(), P.mirror, b, P.sway_row_deg != 0.0 ? sway_per_row.data() : nullptr, row_b - row_ref);
         } else if (modelled_b) {
             line_integrals_mapped(*P.B.frames, *P.B.ff, *map_b, P.sb, frame.data(), row_b, L[0], L[1], col_b, L[2], P.mirror, b);
         } else {
@@ -177,6 +192,7 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
         m.d[0] = r.shift[0];
         m.d[1] = extra[1] + r.shift[1];
         m.d[2] = extra[2] + r.shift[2];
+        keep_curvature(r, m);
         if (r.whole[0] || r.whole[1] || r.whole[2]) {
             for (int j = 0; j < 3; ++j) extra[j] += r.whole[j];
             continue;
@@ -197,7 +213,66 @@ struct Session::Impl {
     std::map<std::pair<int, int>, Trajectory> trajectories;  // (scan, stretch), for trajectory_sign
     double trajectory_sign = 0;
     std::vector<DetectorMap> maps;  // per scan; empty: its blocks are cut from the frames as stored
+    int read_ahead = std::max(2, static_cast<int>(std::thread::hardware_concurrency()) / 3);  // workers that decode ahead, per scan
+    bool read_ahead_set = false;
+
+    // what every measurement starts with: the sense of the rows, the device of the registrars, the readers' workers
+    void begin(Session& s, double row_sign, Device device) {
+        if (row_sign != 1.0 && row_sign != -1.0) throw Error("calibration session: row_sign is +1 or -1");
+        if (trajectory_sign != row_sign) {
+            trajectories.clear();
+            trajectory_sign = row_sign;
+        }
+        if (registrars().device != device) registrars().items.clear();
+        registrars().device = device;
+        if (!read_ahead_set) {
+            for (std::size_t k = 0; k < s.size(); ++k) s.frames(static_cast<int>(k)).set_prefetch_threads(read_ahead);
+            read_ahead_set = true;
+        }
+    }
+    const Trajectory& trajectory_of(const Session& s, int scan, int stretch) {
+        const auto key = std::make_pair(scan, stretch);
+        auto it = trajectories.find(key);
+        if (it == trajectories.end()) {
+            const Record& rec = s.record(scan);
+            const Stretch& st = rec.stretches.at(static_cast<std::size_t>(stretch));
+            if (!st.latched()) throw Error("stretch " + st.entry + " has no latched angles");
+            it = trajectories.emplace(key, trajectory(rec, st, trajectory_sign)).first;
+        }
+        return it->second;
+    }
 };
+
+namespace {
+
+// a measurement as the caller gets it (the columns of views.tsv)
+void fill(ViewMeasurement& res, const Measured& m, const Trajectory& ta) {
+    res.frame_a = m.plan.p0;
+    res.frame_b = m.plan.j0;
+    res.frames = m.plan.n;
+    res.row_a = m.cut.row_a;
+    res.rows = m.cut.rows.n;
+    res.row_offset = m.plan.row_offset;
+    res.col_a = m.cut.col_a;
+    res.col_b = m.cut.col_b;
+    res.cols = m.cut.cols.n;
+    res.stated_dq = m.plan.stated_dq;
+    res.dq = m.d[0];
+    res.stated_dv = m.plan.stated_dv();
+    res.dv = m.d[1];
+    res.stated_D = m.plan.stated_D;
+    res.D = measured_D(m.plan, m.d[0], m.d[1]);
+    res.du = m.d[2];
+    res.correlation = m.correlation;
+    res.evaluations = m.evaluations;
+    res.ok = m.ok;
+    res.slope_a = m.plan.slope_a;
+    res.slope_b = m.plan.slope_b;
+    res.step_deg = m.plan.step_deg;
+    res.angle_a_deg = ta.angle_deg[static_cast<std::size_t>(m.plan.p0 + m.plan.n / 2)];
+}
+
+}  // namespace
 
 Session::Session(const std::vector<std::string>& scans, int threads) : impl_(std::make_unique<Impl>()) {
     if (scans.empty()) throw Error("calibration session: no scan");
@@ -228,80 +303,180 @@ void Session::set_detector_map(const DetectorMap& map, int scan) {
 }
 const DetectorMap& Session::detector_map(int scan) const { return impl_->maps.at(static_cast<std::size_t>(scan)); }
 
+void Session::set_read_ahead(int threads) {
+    impl_->read_ahead = std::max(0, threads);
+    impl_->read_ahead_set = false;
+}
+
 std::vector<ViewMeasurement> Session::measure(const std::vector<ViewRequest>& requests, double row_sign, Device device) {
-    if (row_sign != 1.0 && row_sign != -1.0) throw Error("calibration session: row_sign is +1 or -1");
-    if (impl_->trajectory_sign != row_sign) {
-        impl_->trajectories.clear();
-        impl_->trajectory_sign = row_sign;
-    }
-    const auto traj = [&](int scan, int stretch) -> const Trajectory& {
-        const auto key = std::make_pair(scan, stretch);
-        auto it = impl_->trajectories.find(key);
-        if (it == impl_->trajectories.end()) {
-            const Record& rec = record(scan);
-            const Stretch& s = rec.stretches.at(static_cast<std::size_t>(stretch));
-            if (!s.latched()) throw Error("stretch " + s.entry + " has no latched angles");
-            it = impl_->trajectories.emplace(key, trajectory(rec, s, row_sign)).first;
-        }
-        return it->second;
-    };
-    if (registrars().device != device) registrars().items.clear();
-    registrars().device = device;
+    impl_->begin(*this, row_sign, device);
+    const auto traj = [&](int scan, int stretch) -> const Trajectory& { return impl_->trajectory_of(*this, scan, stretch); };
     const RegistrationOptions ropt;
     const ViewOptions vopt;  // no diagnostic crop: the caller places the columns
+    // every request placed first (what the record says, no frame read), so that the frames of the ones that
+    // follow can be decoded while one is measured
+    struct Placed {
+        bool planned = false;
+        BlockPlan plan;
+        Cut cut;
+    };
+    std::vector<Placed> placed(requests.size());
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        const ViewRequest& q = requests[i];
+        const Trajectory& ta = traj(q.scan_a, q.stretch_a);
+        const Trajectory& tb = traj(q.scan_b, q.stretch_b);
+        (void)flat_field(q.scan_a);
+        (void)flat_field(q.scan_b);
+        const int rows = frames(q.scan_a).rows();
+        Placed& pl = placed[i];
+        const Size fsize = pick_size(q.frames + 24, q.frames, 8);
+        if (!fsize.n || !plan_block(ta, tb, q.frame_a, fsize.n, fsize.m, q.frame_hint, q.angle_offset_deg, pl.plan)) continue;
+        const int row_margin = static_cast<int>(std::ceil(pl.plan.max_row_shift)) + 8;
+        pl.cut.rows = pick_size(std::min(rows - std::abs(pl.plan.row_offset) - 4, q.rows + 2 * row_margin + 48), q.rows, row_margin);
+        pl.cut.cols = pick_size(q.cols + 64, q.cols, 8);
+        pl.cut.col_a = q.col_a;
+        pl.cut.col_b = q.col_b;
+        if (!pl.cut.rows.n || !pl.cut.cols.n) continue;
+        if (q.row_a >= 0) pl.cut.row_a = q.row_a;
+        else if (!place_rows(rows, pl.plan.row_offset, pl.cut.rows, pl.cut.row_a)) continue;
+        pl.planned = true;
+    }
+    const auto announce = [&](std::size_t i) {
+        if (i >= requests.size() || !placed[i].planned || !impl_->read_ahead) return;
+        const ViewRequest& q = requests[i];
+        const Placed& pl = placed[i];
+        const int pad = 8;  // rows a detector map may reach beyond the block
+        frames(q.scan_a).prefetch_rows(q.stretch_a, pl.plan.p0, pl.plan.n, pl.cut.row_a - pad, pl.cut.rows.n + 2 * pad);
+        frames(q.scan_b).prefetch_rows(q.stretch_b, pl.plan.j0 - pl.plan.margin, pl.plan.n + 2 * pl.plan.margin, pl.cut.row_a + pl.plan.row_offset - pl.cut.rows.m - pad,
+                                       pl.cut.rows.total() + 2 * pad);
+    };
     std::vector<ViewMeasurement> out;
     out.reserve(requests.size());
-    for (const ViewRequest& q : requests) {
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        const ViewRequest& q = requests[i];
         ViewMeasurement r;
         r.label = q.label;
         out.push_back(r);
         ViewMeasurement& res = out.back();
+        announce(i + 1);
+        announce(i + 2);
+        if (!placed[i].planned) continue;
         const Trajectory& ta = traj(q.scan_a, q.stretch_a);
         const Trajectory& tb = traj(q.scan_b, q.stretch_b);
         const Pairing P{{&record(q.scan_a), &frames(q.scan_a), &flat_field(q.scan_a)},
                         {&record(q.scan_b), &frames(q.scan_b), &flat_field(q.scan_b)},
                         q.stretch_a, q.stretch_b, &ta, &tb, q.angle_offset_deg, q.mirror, &impl_->maps[static_cast<std::size_t>(q.scan_a)],
-                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear, q.sway_px, q.sway_phase_deg};
-        const int rows = P.A.frames->rows();
-        const Size fsize = pick_size(q.frames + 24, q.frames, 8);
-        BlockPlan plan;
-        if (!fsize.n || !plan_block(ta, tb, q.frame_a, fsize.n, fsize.m, q.frame_hint, q.angle_offset_deg, plan)) continue;
-        Cut cut;
-        const int row_margin = static_cast<int>(std::ceil(plan.max_row_shift)) + 8;
-        cut.rows = pick_size(std::min(rows - std::abs(plan.row_offset) - 4, q.rows + 2 * row_margin + 48), q.rows, row_margin);
-        cut.cols = pick_size(q.cols + 64, q.cols, 8);
-        cut.col_a = q.col_a;
-        cut.col_b = q.col_b;
-        if (!cut.rows.n || !cut.cols.n) continue;
-        if (q.row_a >= 0) cut.row_a = q.row_a;
-        else if (!place_rows(rows, plan.row_offset, cut.rows, cut.row_a)) continue;
+                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear, q.sway_px, q.sway_phase_deg, q.sway_row_deg};
         res.planned = true;
         Measured m;
-        calibration::measure(P, plan, cut, ropt, vopt, m);
-        res.frame_a = m.plan.p0;
-        res.frame_b = m.plan.j0;
-        res.frames = m.plan.n;
-        res.row_a = m.cut.row_a;
-        res.rows = m.cut.rows.n;
-        res.row_offset = m.plan.row_offset;
-        res.col_a = m.cut.col_a;
-        res.col_b = m.cut.col_b;
-        res.cols = m.cut.cols.n;
-        res.stated_dq = m.plan.stated_dq;
-        res.dq = m.d[0];
-        res.stated_dv = m.plan.stated_dv();
-        res.dv = m.d[1];
-        res.stated_D = m.plan.stated_D;
-        res.D = measured_D(m.plan, m.d[0], m.d[1]);
-        res.du = m.d[2];
-        res.correlation = m.correlation;
-        res.evaluations = m.evaluations;
-        res.ok = m.ok;
-        res.slope_a = m.plan.slope_a;
-        res.slope_b = m.plan.slope_b;
-        res.step_deg = m.plan.step_deg;
-        res.angle_a_deg = ta.angle_deg[static_cast<std::size_t>(m.plan.p0 + m.plan.n / 2)];
+        calibration::measure(P, placed[i].plan, placed[i].cut, ropt, vopt, m);
+        fill(res, m, ta);
     }
+    return out;
+}
+
+std::vector<PatchMeasurement> Session::measure_patches(const std::vector<ViewRequest>& requests, int patch_rows, int patch_cols, double row_sign, Device device, bool from_block) {
+    if (patch_rows < 2 || patch_cols < 2) throw Error("calibration session: a patch has at least two rows and two columns");
+    impl_->begin(*this, row_sign, device);
+    const auto traj = [&](int scan, int stretch) -> const Trajectory& { return impl_->trajectory_of(*this, scan, stretch); };
+    const RegistrationOptions ropt;
+    // every request placed first, as in measure(): the plan of its block, and its patches
+    struct Placed {
+        bool planned = false;
+        BlockPlan plan;
+        std::vector<Cut> cuts;
+        std::vector<std::pair<int, int>> place;  // (column index, row index) of each
+        Cut whole;                               // the block as one cut, as measure() takes it
+        bool has_whole = false;
+        int row_lo = 0, row_n = 0;               // A's rows of all patches
+    };
+    std::vector<Placed> placed(requests.size());
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        const ViewRequest& q = requests[i];
+        const Trajectory& ta = traj(q.scan_a, q.stretch_a);
+        const Trajectory& tb = traj(q.scan_b, q.stretch_b);
+        (void)flat_field(q.scan_a);
+        (void)flat_field(q.scan_b);
+        const int rows = frames(q.scan_a).rows();
+        Placed& pl = placed[i];
+        const Size fsize = pick_size(q.frames + 24, q.frames, 8);
+        if (!fsize.n || !plan_block(ta, tb, q.frame_a, fsize.n, fsize.m, q.frame_hint, q.angle_offset_deg, pl.plan)) continue;
+        const int pr = std::min(patch_rows, q.rows), pc = std::min(patch_cols, q.cols);
+        const int row_margin = static_cast<int>(std::ceil(pl.plan.max_row_shift)) + 8;
+        const Size sr = pick_size(std::min(rows - std::abs(pl.plan.row_offset) - 4, pr + 2 * row_margin + 48), pr, row_margin);
+        const Size sc = pick_size(pc + 64, pc, 8);
+        if (!sr.n || !sc.n) continue;
+        const int nj = std::max(1, q.rows / pr), ni = std::max(1, q.cols / pc);
+        int row0 = q.row_a;
+        if (row0 < 0 && !place_rows(rows, pl.plan.row_offset, Size{(nj - 1) * pr + sr.n, sr.m}, row0)) continue;
+        for (int j = 0; j < nj; ++j)
+            for (int k = 0; k < ni; ++k) {
+                Cut c;
+                c.rows = sr;
+                c.cols = sc;
+                c.row_a = row0 + j * pr;
+                c.col_a = q.col_a + k * pc;
+                c.col_b = q.mirror ? q.col_b + (q.cols - pc) - k * pc : q.col_b + k * pc;  // a mirrored B's patches run the other way
+                pl.cuts.push_back(c);
+                pl.place.emplace_back(k, j);
+            }
+        pl.row_lo = row0;
+        pl.row_n = (nj - 1) * pr + sr.n;
+        pl.planned = true;
+        if (from_block && pl.cuts.size() > 1) {
+            pl.whole.rows = pick_size(std::min(rows - std::abs(pl.plan.row_offset) - 4, q.rows + 2 * row_margin + 48), q.rows, row_margin);
+            pl.whole.cols = pick_size(q.cols + 64, q.cols, 8);
+            pl.whole.row_a = row0, pl.whole.col_a = q.col_a, pl.whole.col_b = q.col_b;
+            pl.has_whole = pl.whole.rows.n && pl.whole.cols.n;
+        }
+    }
+    const auto announce = [&](std::size_t i) {
+        if (i >= requests.size() || !placed[i].planned || !impl_->read_ahead) return;
+        const ViewRequest& q = requests[i];
+        const Placed& pl = placed[i];
+        const int pad = 8, m = pl.cuts.front().rows.m;
+        frames(q.scan_a).prefetch_rows(q.stretch_a, pl.plan.p0, pl.plan.n, pl.row_lo - pad, pl.row_n + 2 * pad);
+        frames(q.scan_b).prefetch_rows(q.stretch_b, pl.plan.j0 - pl.plan.margin, pl.plan.n + 2 * pl.plan.margin, pl.row_lo + pl.plan.row_offset - m - pad, pl.row_n + 2 * m + 2 * pad);
+    };
+    std::vector<PatchMeasurement> out;
+    std::vector<Measured> measured;
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        const ViewRequest& q = requests[i];
+        announce(i + 1);
+        announce(i + 2);
+        if (!placed[i].planned) {
+            PatchMeasurement r;
+            r.request = static_cast<int>(i);
+            r.m.label = q.label;
+            out.push_back(r);
+            continue;
+        }
+        const Trajectory& ta = traj(q.scan_a, q.stretch_a);
+        const Trajectory& tb = traj(q.scan_b, q.stretch_b);
+        const Pairing P{{&record(q.scan_a), &frames(q.scan_a), &flat_field(q.scan_a)},
+                        {&record(q.scan_b), &frames(q.scan_b), &flat_field(q.scan_b)},
+                        q.stretch_a, q.stretch_b, &ta, &tb, q.angle_offset_deg, q.mirror, &impl_->maps[static_cast<std::size_t>(q.scan_a)],
+                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear, q.sway_px, q.sway_phase_deg, q.sway_row_deg};
+        calibration::measure_patches(P, placed[i].plan, placed[i].cuts, ropt, device, measured, placed[i].has_whole ? &placed[i].whole : nullptr);
+        for (std::size_t k = 0; k < measured.size(); ++k) {
+            PatchMeasurement r;
+            r.request = static_cast<int>(i);
+            r.i = placed[i].place[k].first;
+            r.j = placed[i].place[k].second;
+            r.m.label = q.label;
+            r.m.planned = true;
+            fill(r.m, measured[k], ta);
+            std::copy(measured[k].curvature, measured[k].curvature + 6, r.curvature);
+            out.push_back(r);
+        }
+    }
+    return out;
+}
+
+MeasureTiming measure_timing(bool reset) {
+    ViewTiming& t = view_timing();
+    const MeasureTiming out{t.read, t.integrals, t.registration, t.blocks, t.registrations};
+    if (reset) t = ViewTiming{};
     return out;
 }
 

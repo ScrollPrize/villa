@@ -30,6 +30,15 @@ class Frames {
     // Rows outside the detector are 0.
     void read_rows(int stretch, const std::int64_t* frame, const std::int32_t* row0, std::size_t n, int nrows,
                    std::uint16_t* out);
+    // Decoded chunks of compressed frames are kept between reads up to this many bytes (the default is
+    // default_cache_bytes: blocks of a calibration come back to the same frames; 0: nothing is kept).
+    static constexpr std::size_t default_cache_bytes = std::size_t(3) << 30;
+    void set_cache_bytes(std::size_t bytes);
+    void cache_counts(std::uint64_t& hits, std::uint64_t& decoded) const;
+    // Decoding ahead (RawReader): workers of the reader's own, and the rows of a read_rows that is coming. Frames
+    // that are not on disk are left to the read to report.
+    void set_prefetch_threads(int threads);
+    void prefetch_rows(int stretch, std::int64_t first, std::int64_t count, int row0, int nrows);
     // frames [first, first + count) of a stretch, whole
     void read(int stretch, std::int64_t first, std::int64_t count, std::uint16_t* out);
     // visit(frame, data): every frame in [first, first + count), whole, from the reading threads in any order
@@ -88,7 +97,15 @@ struct DetectorMap {
     double c0 = 0, cs = 1, v0 = 0, vs = 1;
     std::vector<int> i, j;
     std::vector<double> eu, ev;
-    bool empty() const { return i.empty(); }
+    // no term, or every coefficient zero: nothing is displaced, and blocks are cut from the frames as stored (a
+    // resampling at whole pixels returns the pixels: the same values, for the time of reading them)
+    bool empty() const {
+        for (double e : eu)
+            if (e != 0.0) return false;
+        for (double e : ev)
+            if (e != 0.0) return false;
+        return true;
+    }
     void displacement(double c, double v, double& du, double& dv) const;
     // the detector position (c, v) whose ray is the ideal position (x, y)
     void source(double x, double y, double& c, double& v) const;
@@ -105,10 +122,13 @@ void line_integrals_mapped(Frames& frames, const FlatField& ff, const DetectorMa
 // a block read at an angle that changes with the column, as the divergence of the beam makes opposite views do.
 void shear_frames(float* block, std::size_t n, int nrows, int ncols, double shear);
 
-// out(q, r, c) <- wide(q, r, pad + c + shift[q]) (pad + ncols - 1 - c + shift[q] with flip_cols), cubic along the
-// columns: a block cut `pad` columns wider on both sides, each frame read `shift[q]` columns further on. What a
-// sample displaced on the rotation stage does to a tile of a mosaic against another: its content sways along the
-// columns once per turn. |shift| must stay below pad - 2.
-void shift_columns(const float* wide, std::size_t n, int nrows, int ncols, int pad, const double* shift, bool flip_cols, float* out);
+// out(q, r, c) <- wide(q, r, pad + c + s) (pad + ncols - 1 - c + s with flip_cols), cubic along the columns, with
+// s = shift[q] + (per_row ? per_row[q] (row0 + r) : 0): a block cut `pad` columns wider on both sides, each frame
+// read `shift[q]` columns further on. What a sample displaced on the rotation stage does to a tile of a mosaic
+// against another: its content sways along the columns once per turn; and with rows exposed one after another,
+// each row at its own angle, by an amount that is a line in the row (per_row, with row0 the block's first row
+// counted from the row the frame's angle belongs to). |s| must stay below pad - 2.
+void shift_columns(const float* wide, std::size_t n, int nrows, int ncols, int pad, const double* shift, bool flip_cols, float* out,
+                   const double* per_row = nullptr, double row0 = 0);
 
 }  // namespace helirec::calibration

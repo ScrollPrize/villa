@@ -88,6 +88,76 @@ def reduce_darks_flats(scan: BlissScan, progress=None):
     return dark.astype(np.float32), np.stack(flats).astype(np.float32)
 
 
+def reduced_darks_flats(scan: BlissScan, cache_dir=None, log=print):
+    """reduce_darks_flats(scan), kept in cache_dir: one file per scan, named after the scan and valid for the
+    dark and flat files it was made from (path, size, time of change), the frames taken from them and the flats'
+    ring current. Reducing a scan's 1200 frames takes most of a minute; reading the file a fraction of a second.
+    cache_dir None: nothing is kept."""
+    if not cache_dir:
+        return reduce_darks_flats(scan)
+    import hashlib
+    h = hashlib.sha256(f"helirec-darks-flats-v{CALIBRATION_VERSION}|{list(scan.frame_shape)}".encode())
+    for refs in (scan.darks, *scan.flats):
+        for k in np.unique(refs.file_index):
+            st = os.stat(refs.files[int(k)])
+            h.update(f"{os.path.abspath(refs.files[int(k)])}|{st.st_size}|{st.st_mtime_ns}".encode())
+        h.update(refs.file_index.tobytes())
+        h.update(refs.frame_index.tobytes())
+    for ctl in scan.flats_control_A:
+        h.update(np.ascontiguousarray(ctl, np.float64).tobytes())
+    fp = h.hexdigest()
+    path = os.path.join(cache_dir, f"darks_flats_{scan.name}.npz")
+    if os.path.exists(path):
+        with np.load(path) as z:
+            if "_fingerprint" in z.files and str(z["_fingerprint"]) == fp:
+                return z["dark"], z["flats"]
+        log(f"darks and flats in {path}: of other files, made again")
+    dark, flats = reduce_darks_flats(scan)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    def save(t):
+        with open(t, "wb") as fh:
+            np.savez(fh, _fingerprint=np.array(fp), dark=dark, flats=flats)
+    _atomic_write(path, save)
+    return dark, flats
+
+
+# the low-pass of JPEG 2000's irreversible (9/7) wavelet, taps 0, +-1, ... +-4; unit gain
+_LOW_97 = (0.6029490182363579, 0.2668641184428723, -0.07822326652898785, -0.01686411844287495, 0.02674875741080976)
+
+
+def _low_band_97(x):
+    """along the last axis: sample n is the low-pass about x[2 n] (whole-sample symmetric at both ends)"""
+    n = x.shape[-1]
+    idx = np.arange(0, n, 2)
+    out = _LOW_97[0] * x[..., idx]
+    for m in range(1, 5):
+        left, right = np.abs(idx - m), idx + m
+        right = np.where(right > n - 1, 2 * (n - 1) - right, right)
+        out = out + _LOW_97[m] * (x[..., left] + x[..., right])
+    return out
+
+
+def at_resolution(image, reduce, chunk_rows):
+    """An image of the detector (a dark, a flat, a weight: (..., rows, cols)) as RawReader(reduce=) gives the
+    frames stored as JPEG 2000 in chunks of chunk_rows rows: `reduce` levels of the 9/7 wavelet's low band, each
+    chunk of rows an image of its own, sample (j, k) at the stored pixel (j, k) 2^reduce. A flat reduced so
+    divides a frame's fixed pattern out as the full-resolution flat does; a mean of 2^reduce pixels would not.
+    A last chunk that reaches beyond the frame holds zeros there (as the detector software stores it), which
+    change the frame's last two or three reduced rows, here as in the frames. On a Paris4 frame this differs
+    from the reader's reduced frame by 0.3 counts rms (the rounding), at 1, 2 and 3 levels."""
+    x = np.asarray(image, np.float64)
+    rows = x.shape[-2]
+    beyond = -rows % chunk_rows
+    if beyond:
+        x = np.concatenate([x, np.zeros(x.shape[:-2] + (beyond, x.shape[-1]))], -2)
+    for level in range(int(reduce)):
+        c = chunk_rows >> level
+        x = np.concatenate([np.swapaxes(_low_band_97(np.swapaxes(x[..., a:a + c, :], -1, -2)), -1, -2) for a in range(0, x.shape[-2], c)], -2)
+        x = _low_band_97(x)
+    return x[..., :rows >> int(reduce), :].astype(np.float32)
+
+
 # ============================================================================ weights
 def weight_map(flat_stacks, transition_width_vertical=15.0, sigma=10.0, crop_top=0, crop_bottom=0) -> np.ndarray:
     """prepare_weights_double: gaussian_filter(mean(all flats) / max, sigma) * vertical erf border."""

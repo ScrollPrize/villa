@@ -2,11 +2,21 @@
 
 #include <algorithm>
 #include <cstring>
+#include <array>
+#include <cmath>
+#include <limits>
 
 #include "helirec/common.hpp"
 
 #if HELIREC_WITH_OPENJPEG
 #include <openjpeg.h>
+#endif
+
+#if HELIREC_WITH_OPENJPH
+#include <ojph_codestream.h>
+#include <ojph_file.h>
+#include <ojph_mem.h>
+#include <ojph_params.h>
 #endif
 
 namespace helirec::j2k {
@@ -32,24 +42,68 @@ constexpr std::uint8_t kCodecJ2k = 40;       // the JPEG 2000 codec's id (blosc2
 
 }  // namespace
 
-Codestream codestream_of_chunk(const std::uint8_t* chunk, std::size_t size, std::size_t nbytes) {
-    if (size < kFrameHeaderMin || std::memcmp(chunk + 2, "b2frame", 7) != 0) bad("not a blosc2 frame");
-    const std::size_t header = be32(chunk + 11);
-    if (header < kFrameHeaderMin || header + kChunkHeader + 8 > size) bad("blosc2 frame header of an unexpected length");
-    const std::uint8_t* c = chunk + header;
-    const std::size_t c_nbytes = le32(c + 4), c_block = le32(c + 8), c_bytes = le32(c + 12);
-    if (c_nbytes != nbytes) bad("it holds " + std::to_string(c_nbytes) + " bytes of values where the dataset's chunk has " + std::to_string(nbytes));
+ChunkHeader chunk_header(const ReadAt& read, std::size_t size, std::size_t nbytes, int sample_bytes) {
+    auto take = [&](void* dst, std::size_t n, std::size_t off) {
+        if (off > size || n > size - off) bad("truncated container");
+        read(dst, n, off);
+    };
+    std::array<std::uint8_t, 64> f{};
+    take(f.data(), kFrameHeaderMin, 0);
+    if (std::memcmp(f.data() + 2, "b2frame", 7) != 0) bad("not a blosc2 frame");
+    const std::size_t header = be32(f.data() + 11);
+    if (header < kFrameHeaderMin) bad("unexpected blosc2 frame header length");
+    take(f.data(), kChunkHeader + 4, header);
+    const std::size_t c_nbytes = le32(f.data() + 4), c_block = le32(f.data() + 8), c_bytes = le32(f.data() + 12);
+    if (c_nbytes != nbytes) bad("uncompressed size does not match the dataset chunk");
     if (c_block != c_nbytes) bad("more than one block per chunk is not supported");
-    if (c[3] != 2) bad("values are not two bytes wide");
-    if ((c[2] >> 5) != kCodecUser || c[22] != kCodecJ2k) bad("its codec is not the JPEG 2000 codec (blosc2 codec " + std::to_string(c[2] >> 5) + ", user codec " + std::to_string(c[22]) + ")");
-    if (header + c_bytes > size) bad("truncated");
-    const std::size_t start = le32(c + kChunkHeader);
-    if (start < kChunkHeader + 4 || start + 4 > c_bytes) bad("unexpected block offset");
-    const std::size_t length = le32(c + start);
-    if (start + 4 + length > c_bytes || length < 4) bad("unexpected stream length");
-    Codestream cs{c + start + 4, length};
-    if (be32(cs.data) != 0xff4fff51u) bad("the stream is not a JPEG 2000 codestream");
-    return cs;
+    if (f[3] != sample_bytes) bad("sample size does not match the dataset dtype");
+    if ((f[2] >> 5) != kCodecUser || f[22] != kCodecJ2k) bad("not the JPEG 2000 codec (blosc2 codec 40)");
+    if (c_bytes < kChunkHeader + 8 || c_bytes > size - header) bad("truncated blosc2 chunk");
+    const std::size_t start = le32(f.data() + kChunkHeader);
+    if (start < kChunkHeader + 4 || start > c_bytes - 4) bad("unexpected block offset");
+    take(f.data(), 4, header + start);
+    const std::size_t length = le32(f.data());
+    if (length > c_bytes - start - 4 || length < 4) bad("unexpected stream length");
+    ChunkHeader out;
+    out.offset = header + start + 4;
+    out.size = length;
+    if (sample_bytes == 4) {
+        if (length < 64) bad("truncated float32 header");
+        take(f.data(), 64, out.offset);
+        auto le16 = [](const std::uint8_t* p) { return unsigned(p[0]) | (unsigned(p[1]) << 8); };
+        auto le64 = [](const std::uint8_t* p) { return std::uint64_t(le32(p)) | (std::uint64_t(le32(p + 4)) << 32); };
+        auto f64 = [&](const std::uint8_t* p) { const auto bits = le64(p); double v; std::memcpy(&v, &bits, 8); return v; };
+        // blosc2_htj2k B2JPF32 v1: uint quantization plus an affine float32 mapping.
+        // Signed codestream samples are centred about 2^(quant_bits-1).
+        if (std::memcmp(f.data(), "B2JPF32\0", 8) || le16(f.data() + 8) != 1 || le16(f.data() + 10) != 64)
+            bad("unsupported B2JPF32 header");
+        out.floating = true;
+        out.quant_bits = f[12];
+        const unsigned flags = le16(f.data() + 14);
+        if ((out.quant_bits != 8 && out.quant_bits != 16 && out.quant_bits != 32) || f[13] != 0 || (flags & ~15u))
+            bad("unsupported float quantization or NaN policy");
+        out.constant = (flags & 4) != 0;
+        out.scale_min = f64(f.data() + 24);
+        out.scale_max = f64(f.data() + 32);
+        if (!std::isfinite(out.scale_min) || !std::isfinite(out.scale_max) || out.scale_max < out.scale_min)
+            bad("invalid float quantization range");
+        const auto payload = le64(f.data() + 16);
+        if (payload != length - 64 || (!out.constant && payload < 4)) bad("invalid float payload length");
+        out.offset += 64;
+        out.size = static_cast<std::size_t>(payload);
+    } else if (sample_bytes != 2) {
+        bad("unsupported sample size");
+    }
+    if (!out.constant) {
+        take(f.data(), 4, out.offset);
+        if (be32(f.data()) != 0xff4fff51u) bad("the stream is not a JPEG 2000 codestream");
+    }
+    return out;
+}
+
+Codestream codestream_of_chunk(const std::uint8_t* chunk, std::size_t size, std::size_t nbytes) {
+    const auto h = chunk_header([&](void* dst, std::size_t n, std::size_t off) { std::memcpy(dst, chunk + off, n); }, size, nbytes, 2);
+    return {chunk + h.offset, h.size};
 }
 
 Info info(const Codestream& cs) {
@@ -60,6 +114,7 @@ Info info(const Codestream& cs) {
     p += 2;  // at SIZ
     {
         const std::size_t length = be16(p + 2);
+        if (length < 41 || length > static_cast<std::size_t>(end - p) - 2) bad("truncated SIZ marker");
         const std::uint32_t rsiz = be16(p + 4), x1 = be32(p + 6), y1 = be32(p + 10), x0 = be32(p + 14), y0 = be32(p + 18);
         out.high_throughput = (rsiz & 0x4000u) != 0;
         out.width = static_cast<int>(x1 - x0);
@@ -71,10 +126,12 @@ Info info(const Codestream& cs) {
     }
     while (p + 4 <= end && p[0] == 0xff && p[1] != 0x90) {  // up to the first tile part
         const std::size_t length = be16(p + 2);
-        if (p[1] == 0x52 && p + 4 + 10 <= end) {            // COD
+        if (length < 2 || length > static_cast<std::size_t>(end - p) - 2) bad("truncated main header");
+        if (p[1] == 0x52 && length >= 12) {            // COD
             out.layers = static_cast<int>(be16(p + 6));
             out.levels = p[9];
             out.reversible = p[13] == 1;
+            return out;
         }
         p += 2 + length;
     }
@@ -86,6 +143,116 @@ bool available() {
     return true;
 #else
     return false;
+#endif
+}
+
+bool openjph_available() {
+#if HELIREC_WITH_OPENJPH
+    return true;
+#else
+    return false;
+#endif
+}
+
+#if HELIREC_WITH_OPENJPH
+namespace {
+// A bounded, buffered codestream view. A seek changes the cursor without reading
+// the skipped bytes. In RPCL/RLCP streams, this omits the high-resolution packets.
+class SeekableInput final : public ojph::infile_base {
+    const ReadAt& read_;
+    std::size_t base_, size_, at_ = 0, begin_ = 0, valid_ = 0;
+    std::array<std::uint8_t, 65536> buffer_;
+    std::vector<std::uint8_t> whole_;
+  public:
+    SeekableInput(const ReadAt& read, const ChunkHeader& h, bool selective)
+        : read_(read), base_(h.offset), size_(h.size) {
+        if (!selective) {
+            whole_.resize(size_);
+            read_(whole_.data(), size_, base_);
+        }
+    }
+    std::size_t read(void* dst, std::size_t n) override {
+        n = std::min(n, size_ - at_);
+        if (!whole_.empty()) {
+            std::memcpy(dst, whole_.data() + at_, n);
+            at_ += n;
+            return n;
+        }
+        std::size_t done = 0;
+        while (done < n) {
+            if (at_ < begin_ || at_ - begin_ >= valid_) {
+                begin_ = at_;
+                valid_ = std::min(buffer_.size(), size_ - at_);
+                read_(buffer_.data(), valid_, base_ + at_);
+            }
+            const auto take = std::min(n - done, valid_ - (at_ - begin_));
+            std::memcpy(static_cast<std::uint8_t*>(dst) + done, buffer_.data() + (at_ - begin_), take);
+            at_ += take;
+            done += take;
+        }
+        return done;
+    }
+    int seek(ojph::si64 off, enum ojph::infile_base::seek origin) override {
+        const auto base = static_cast<ojph::si64>(origin == OJPH_SEEK_CUR ? at_ : origin == OJPH_SEEK_END ? size_ : 0);
+        if (off < -base || off > static_cast<ojph::si64>(size_) - base) return -1;
+        at_ = static_cast<std::size_t>(base + off);
+        return 0;
+    }
+    ojph::si64 tell() override { return static_cast<ojph::si64>(at_); }
+    bool eof() override { return at_ == size_; }
+};
+}  // namespace
+#endif
+
+void decode_htj2k(const ReadAt& read, std::size_t size, std::size_t nbytes, int sample_bytes,
+                  int stored_width, int stored_height, int reduce, void* out, bool selective) {
+#if HELIREC_WITH_OPENJPH
+    if (reduce < 0 || reduce > 3 || stored_width < 1 || stored_height < 1) bad("invalid shape or resolution");
+    const auto h = chunk_header(read, size, nbytes, sample_bytes);
+    const int width = 1 + ((stored_width - 1) >> reduce), height = 1 + ((stored_height - 1) >> reduce);
+    if (h.constant) {
+        std::fill_n(static_cast<float*>(out), static_cast<std::size_t>(width) * height, static_cast<float>(h.scale_min));
+        return;
+    }
+    SeekableInput input(read, h, selective);
+    ojph::codestream cs;
+    cs.read_headers(&input);
+    const auto siz = cs.access_siz();
+    const auto extent = siz.get_image_extent(), origin = siz.get_image_offset();
+    if (siz.get_num_components() != 1 || origin.x || origin.y || extent.x != static_cast<unsigned>(stored_width) ||
+        extent.y != static_cast<unsigned>(stored_height) || siz.get_downsampling(0).x != 1 || siz.get_downsampling(0).y != 1)
+        bad("unexpected HTJ2K component geometry");
+    const int bits = static_cast<int>(siz.get_bit_depth(0));
+    const bool signed_samples = siz.is_signed(0);
+    if (h.floating ? bits != h.quant_bits : (bits > 16 || signed_samples)) bad("unexpected HTJ2K sample precision");
+    if (static_cast<unsigned>(reduce) > cs.access_cod().get_num_decompositions())
+        bad("the codestream has no resolution " + std::to_string(reduce) + " levels below the stored one");
+    cs.restrict_input_resolution(reduce, reduce);
+    cs.set_planar(true);
+    if (siz.get_recon_width(0) != static_cast<unsigned>(width) || siz.get_recon_height(0) != static_cast<unsigned>(height))
+        bad("unexpected HTJ2K output shape");
+    cs.create();
+    const double scale = h.floating ? (h.scale_max - h.scale_min) / static_cast<double>((std::uint64_t{1} << bits) - 1) : 0;
+    for (int y = 0; y < height; ++y) {
+        ojph::ui32 comp = 0;
+        auto* line = cs.pull(comp);
+        if (!line || comp != 0 || !line->i32) bad("missing HTJ2K output row");
+        const auto offset = static_cast<std::size_t>(y) * width;
+        if (h.floating) {
+            float* dst = static_cast<float*>(out) + offset;
+            for (int x = 0; x < width; ++x) {
+                const std::uint64_t q = signed_samples ? static_cast<std::int64_t>(line->i32[x]) + (std::int64_t{1} << (bits - 1))
+                                                       : static_cast<std::uint32_t>(line->i32[x]);
+                dst[x] = static_cast<float>(h.scale_min + static_cast<double>(q) * scale);
+            }
+        } else {
+            auto* dst = static_cast<std::uint16_t*>(out) + offset;
+            for (int x = 0; x < width; ++x) dst[x] = static_cast<std::uint16_t>(std::clamp(line->i32[x], 0, 65535));
+        }
+    }
+#else
+    (void)read; (void)size; (void)nbytes; (void)sample_bytes; (void)stored_width; (void)stored_height; (void)reduce; (void)out; (void)selective;
+    bad("float32 HTJ2K needs a build with HELIREC_OPENJPH=ON");
 #endif
 }
 
@@ -149,7 +316,9 @@ void quiet(const char*, void*) {}
 
 }  // namespace
 
-void decode(const Codestream& cs, int width, int height, std::uint16_t* out) {
+void decode(const Codestream& cs, int width, int height, std::uint16_t* out, int reduce) {
+    if (reduce < 0 || (reduce > 0 && reduce > info(cs).levels))
+        bad("the codestream has no resolution " + std::to_string(reduce) + " levels below the stored one");
     Reader reader{cs.data, cs.size, 0};
     opj_stream_t* stream = opj_stream_create(std::min<std::size_t>(cs.size, 1u << 20), OPJ_TRUE);
     opj_codec_t* codec = opj_create_decompress(OPJ_CODEC_J2K);
@@ -167,6 +336,7 @@ void decode(const Codestream& cs, int width, int height, std::uint16_t* out) {
         opj_set_warning_handler(codec, quiet, nullptr);
         opj_dparameters_t par;
         opj_set_default_decoder_parameters(&par);
+        par.cp_reduce = static_cast<OPJ_UINT32>(reduce);
         if (!opj_setup_decoder(codec, &par) || !opj_read_header(stream, codec, &image) || !opj_decode(codec, stream, image) ||
             !opj_end_decompress(codec, stream)) {
             error = "OpenJPEG could not decode the codestream";
@@ -255,7 +425,7 @@ std::vector<std::uint8_t> encode_chunk(const std::uint16_t* values, int width, i
 
 #else
 
-void decode(const Codestream&, int, int, std::uint16_t*) {
+void decode(const Codestream&, int, int, std::uint16_t*, int) {
     throw Error("frames stored as JPEG 2000 need helirec built with OpenJPEG (libopenjp2 >= 2.5: apt install libopenjp2-7-dev, brew install openjpeg)");
 }
 std::vector<std::uint8_t> encode_chunk(const std::uint16_t*, int, int) {

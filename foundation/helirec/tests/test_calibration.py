@@ -460,6 +460,93 @@ def test_session_detector_map_per_scan(tmp_path, monkeypatch):
     assert abs(r["du"]) < 1e-3 and abs(r["D"]) < 1e-3
 
 
+def _low_band_53(x):
+    """the low band of JPEG 2000's reversible 5/3 wavelet along the last axis (whole-sample symmetric extension):
+    sample n sits at the input's position 2 n"""
+    x = x.astype(np.int64)
+    n = x.shape[-1]
+    even, odd = x[..., 0::2], x[..., 1::2]
+    right = np.concatenate([even[..., 1:], even[..., -1:]], -1)[..., :odd.shape[-1]] if n % 2 == 0 else even[..., 1:]
+    d = odd - (even[..., :odd.shape[-1]] + right) // 2
+    left = np.concatenate([d[..., :1], d], -1)[..., :even.shape[-1]]
+    here = d if d.shape[-1] == even.shape[-1] else np.concatenate([d, d[..., -1:]], -1)
+    return even + (left + here + 2) // 4
+
+
+def test_frames_at_reduced_resolution(tmp_path):
+    """RawReader(reduce=1, 2, 3): JPEG 2000 frames at a half, a quarter, an eighth, from the codestream's own
+    lower resolutions. Exactly the wavelet's low band of each chunk (a reversible codestream), whose sample k
+    sits at the stored pixel k 2^reduce; any rows, across chunks and beyond the frame; refused for plain frames
+    and for a codestream without that many levels."""
+    if not _core.jpeg2000_frames_supported():
+        pytest.skip("built without OpenJPEG")
+    rng = np.random.default_rng(31)
+    rows, cols, chunk = 512, 320, 256
+    jj, kk = np.mgrid[0:rows, 0:cols]
+    data = np.stack([20000 + 37 * jj + 11 * kk,                                    # a ramp: the low band is the ramp at every 2^r-th pixel
+                     rng.integers(20000, 30000, (rows, cols))]).astype(np.uint16)       # noise that stays within 16 bits in the low band
+    _write_frames(tmp_path / "j.h5", data, chunk_rows=chunk)
+    _write_frames(tmp_path / "plain.h5", data)
+    dataset = "/entry_0000/instrument/det3/data"
+    zero = np.zeros(2, np.int32)
+    full = _core.RawReader([str(tmp_path / "j.h5")], dataset, rows, cols)
+    assert (full.rows, full.cols, full.reduce) == (rows, cols, 0)
+    assert np.array_equal(full.read_frames(zero, np.arange(2, dtype=np.int32)), data)
+    for r in (1, 2, 3):
+        f = 1 << r
+        rd = _core.RawReader([str(tmp_path / "j.h5")], dataset, rows, cols, reduce=r)
+        assert (rd.rows, rd.cols, rd.reduce) == (rows // f, cols // f, r)
+        got = rd.read_frames(zero, np.arange(2, dtype=np.int32))
+        assert got.shape == (2, rows // f, cols // f) and got.dtype == np.uint16
+        want = data.astype(np.int64)
+        for _ in range(r):                                                      # each chunk is an image of its own: rows first, then columns
+            want = np.concatenate([np.swapaxes(_low_band_53(np.swapaxes(want[:, a:a + (chunk >> _)], 1, 2)), 1, 2) for a in range(0, want.shape[1], chunk >> _)], 1)
+            want = _low_band_53(want)
+        assert np.array_equal(got, want), r
+        inner = (slice(4, chunk // f - 4), slice(4, -4))                        # where no edge of the chunk is felt
+        assert np.array_equal(got[0][inner], data[0, ::f, ::f][inner])          # not the mean of f x f pixels (that would be 24 (f - 1) more)
+        rd.set_cache_bytes(1 << 24)
+        for row0, nrows in ((0, rows // f), (3, 5), (chunk // f - 2, 7), (-2, 6), (rows // f - 3, 6)):
+            part = rd.read_rows(zero, np.arange(2, dtype=np.int32), np.full(2, row0, np.int32), nrows)
+            ref = np.zeros((2, nrows, cols // f), np.uint16)
+            a, b = max(0, row0), min(rows // f, row0 + nrows)
+            ref[:, a - row0:b - row0] = got[:, a:b]
+            assert np.array_equal(part, ref), (r, row0, nrows)
+        with pytest.raises(Exception, match="JPEG 2000 only"):
+            _core.RawReader([str(tmp_path / "plain.h5")], dataset, rows, cols, reduce=r).read_frames(zero[:1], zero[:1])
+    with pytest.raises(Exception, match="reduce must be"):
+        _core.RawReader([str(tmp_path / "j.h5")], dataset, rows, cols, reduce=4)
+    with pytest.raises(Exception, match="not multiples"):
+        _core.RawReader([str(tmp_path / "j.h5")], dataset, rows, cols + 2, reduce=2)
+    # a codestream of small chunks has fewer levels than asked for
+    small = rng.integers(1000, 60000, (1, 64, 96)).astype(np.uint16)
+    _write_frames(tmp_path / "small.h5", small, chunk_rows=32)
+    with pytest.raises(Exception, match="levels"):
+        _core.RawReader([str(tmp_path / "small.h5")], dataset, 64, 96, reduce=1).read_frames(zero[:1], zero[:1])
+
+
+def test_images_at_reduced_resolution():
+    """calibration.at_resolution: a dark or flat on the grid of RawReader(reduce=) for irreversibly coded frames.
+    Unit gain, a ramp kept at every 2^reduce-th pixel (the low band's sample sits on the stored pixel, not between
+    pixels), each chunk of rows filtered alone, zeros beyond the frame in a last chunk that is not whole."""
+    from helirec import calibration
+    jj, kk = np.mgrid[0:512, 0:160].astype(np.float64)
+    ramp = 500.0 + 7.0 * jj + 3.0 * kk
+    for r in (1, 2, 3):
+        f = 1 << r
+        got = calibration.at_resolution(ramp, r, 256)
+        assert got.shape == (512 // f, 160 // f) and got.dtype == np.float32
+        # a symmetric low-pass of unit gain keeps a ramp, 8 reduced samples and more from an edge of a chunk (rows) or of the image (columns)
+        for a in range(0, 512 // f, 256 // f):
+            inner = (slice(a + 8, a + 256 // f - 8), slice(8, 160 // f - 8))
+            assert np.allclose(got[inner], ramp[::f, ::f][inner], atol=2e-3), r
+        assert np.allclose(calibration.at_resolution(np.full((2, 512, 160), 41.0), r, 256), 41.0, atol=1e-4)      # a stack, and unit gain
+    one = calibration.at_resolution(ramp, 1, 256)
+    assert np.allclose(one[:128], calibration.at_resolution(ramp[:256], 1, 256), atol=1e-4)   # a chunk does not see the next
+    part = calibration.at_resolution(np.full((48, 80), 100.0), 1, 32)                          # 48 rows in chunks of 32: 16 rows of zeros below
+    assert part.shape == (24, 40) and np.allclose(part[:21], 100.0, atol=1e-3) and abs(part[23, 5] - 100.0) > 1.0
+
+
 def test_frames_stored_as_jpeg2000(tmp_path):
     """Projections stored as one JPEG 2000 codestream per chunk of rows (blosc2 filter 32026): read back exactly
     from a reversible codestream, whatever rows are asked for, and reported by the inventory."""
@@ -483,6 +570,13 @@ def test_frames_stored_as_jpeg2000(tmp_path):
         a, b = max(0, row0), min(ROWS, row0 + nrows)
         want[:, a - row0:b - row0] = stored[frames, a:b]
         assert np.array_equal(got, want), (row0, nrows)
+    # decoded chunks are kept between reads (blocks of a calibration come back to the same frames): the same values
+    before = s.cache_counts()
+    again = s.read_rows(0, 2, frames, 3, 14)
+    after = s.cache_counts()
+    assert np.array_equal(again, stored[frames, 3:17]) and after["decoded"] == before["decoded"] and after["hits"] == before["hits"] + 6
+    s.set_cache(0.0)
+    assert np.array_equal(s.read_rows(0, 2, frames, 3, 14), again) and s.cache_counts()["decoded"] == after["decoded"] + 6
     report = json.loads(_core.calibration_verify([str(master)], checks="record,inventory"))
     f = _by_quantity(report, "every frame on disk")[0]
     assert f["verdict"] == "verified" and f["numbers"]["mismatched"] == 0, f       # the recorded sums are of these values
@@ -505,6 +599,30 @@ def test_frames_stored_as_jpeg2000(tmp_path):
         d.id.write_direct_chunk((2, 0, 0), bytes(raw))
     with pytest.raises(Exception, match="not a blosc2 frame"):
         _core.CalibrationSession([str(master)]).read_rows(0, 2, np.array([2], dtype=np.int64), 0, 4)
+
+
+def test_comparisons_decode_ahead(tmp_path, monkeypatch):
+    """Comparisons on compressed frames: the frames of the ones that follow are decoded ahead by the reader's own
+    workers and kept; the measurements are the same with and without."""
+    if not _core.jpeg2000_frames_supported():
+        pytest.skip("built without OpenJPEG")
+    import sys
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "ROWS", 48)
+    monkeypatch.setattr(module, "COLS", 80)
+    monkeypatch.setattr(module, "PER_TURN", 40)
+    master = _write_record(tmp_path, np.random.default_rng(23), compressed=("4.1",))
+    reqs = [dict(label=str(p), stretch_a=2, frame_a=p, frames=16, rows=16, cols=32, row_a=14, col_a=20, col_b=20) for p in (10, 11, 12, 13, 14)]
+    results = []
+    for ahead in (0, 3):
+        s = _core.CalibrationSession([str(master)])
+        s.set_read_ahead(ahead)
+        results.append(s.measure(reqs, -1.0, "cpu"))
+        counts = s.cache_counts()
+        assert counts["hits"] > counts["decoded"]            # the blocks overlap: most chunks are decoded once
+    assert all(r["ok"] and r["correlation"] > 0.999 for r in results[0])
+    for r0, r1 in zip(*results):     # the same values were registered: equal up to the rounding of sums taken by several threads
+        assert all(r0[key] == pytest.approx(r1[key], abs=1e-9) for key in r0 if key != "label")
 
 
 def test_frames_not_on_disk(tmp_path):
@@ -595,6 +713,18 @@ def test_sway_between_tiles(tmp_path, monkeypatch):
     assert with_sway["planned"] and with_sway["ok"] and with_sway["correlation"] > 0.98, with_sway
     assert with_sway["du"] == pytest.approx(left, abs=0.01) and abs(with_sway["dq"]) < 0.02 and abs(with_sway["D"]) < 0.01, with_sway
     assert without["correlation"] < with_sway["correlation"] - 0.03, without       # unstated, the sway blurs the match
+    # rows exposed one after another: each row of the other tile at its own angle, rho degrees per row from the frame's
+    rho = 0.25                                         # small enough for the sway to be a line in the row over the block
+    row = np.arange(ROWS)[None, :, None] - (ROWS - 1) / 2
+    sway_rows = amplitude * np.cos(np.radians(angle[:, None, None] + rho * row - phase)) + left
+    moved = np.fft.ifft(np.fft.fft(field, axis=2) * np.exp(-2j * np.pi * k[2][:1] * sway_rows), axis=2).real
+    r_dir = tmp_path / "R"
+    r_dir.mkdir()
+    mr = _write_record(r_dir, np.random.default_rng(1), name="sample_R", place=(0.1, 0.0), frames={"4.1": counts(moved)})
+    s = _core.CalibrationSession([str(ma), str(mr)])
+    per_row, per_frame = s.measure([dict(base, sway_px=amplitude, sway_phase_deg=phase, sway_row_deg=rho), dict(base, sway_px=amplitude, sway_phase_deg=phase)], -1.0, "cpu")
+    assert per_row["ok"] and per_row["correlation"] > 0.98 and per_row["du"] == pytest.approx(left, abs=0.01), per_row
+    assert per_frame["correlation"] < per_row["correlation"], (per_frame, per_row)
     # B's columns reversed (as for opposite views): the sway is stated in B's own columns, before the reversal.
     # C(q, y) = A(q, K - y) read sway columns further on, K the sum of the two blocks' end columns
     K = base["col_a"] + base["col_b"] + base["cols"] - 1
@@ -608,3 +738,95 @@ def test_sway_between_tiles(tmp_path, monkeypatch):
     assert mirrored["ok"] and mirrored["cols"] == base["cols"] and mirrored["correlation"] > 0.98, mirrored
     assert abs(mirrored["du"]) == pytest.approx(left, abs=0.01), mirrored
 
+
+
+def test_measure_patches_equals_measure(tmp_path, monkeypatch):
+    """CalibrationSession.measure_patches: a block cut into patches, every patch measured from one reading of the
+    block's frames. Each patch is what measure() returns for a request of the patch's size at the patch's place: with
+    and without a sway, with B's columns reversed, where the registration moves a patch by whole columns inside what
+    was read and beyond it (a second reading), and on CUDA as on the CPU."""
+    import sys
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "ROWS", 64)
+    monkeypatch.setattr(module, "COLS", 160)
+    monkeypatch.setattr(module, "PER_TURN", 40)
+    rng = np.random.default_rng(43)
+    n, amplitude, phase, left, rho = 40, 3.3, 25.0, 0.3, 0.2
+    k = np.meshgrid(np.fft.fftfreq(n), np.fft.fftfreq(ROWS), np.fft.fftfreq(COLS), indexing="ij")
+    spectrum = np.fft.fftn(rng.standard_normal((n, ROWS, COLS))) * np.exp(-((k[0] / 0.12) ** 2 + (k[1] / 0.08) ** 2 + (k[2] / 0.08) ** 2))
+    field = np.fft.ifftn(spectrum).real
+    field *= 0.2 / field.std()
+
+    def counts(f):
+        return np.round(300 + 15000 * np.exp(-f)).astype(np.uint16)
+
+    def record(name, data, place):
+        d = tmp_path / name
+        d.mkdir()
+        return _write_record(d, np.random.default_rng(1), name=f"sample_{name}", place=place, frames={"4.1": counts(data)})
+
+    ma = record("A", field, (0.0, 0.0))
+    with h5py.File(ma) as f:
+        angle = f["4.1/instrument/mrsrot_trig/data"][:] + f["4.1/instrument/mrsrot_delta/data"][:] / 2
+    row = np.arange(ROWS)[None, :, None] - (ROWS - 1) / 2
+    sway = amplitude * np.cos(np.radians(angle[:, None, None] + rho * row - phase)) + left
+    shifted = lambda f, by: np.fft.ifft(np.fft.fft(f, axis=2) * np.exp(-2j * np.pi * k[2][:1] * by), axis=2).real
+    mb = record("B", shifted(field, sway), (0.1, 0.0))
+    base = dict(scan_a=0, scan_b=1, stretch_a=2, stretch_b=2, frame_a=12, frames=16, rows=32, cols=64, row_a=14, col_a=44, col_b=44)
+    K = base["col_a"] + base["col_b"] + base["cols"] - 1
+    mc = record("C", shifted(field[:, :, (K - np.arange(COLS)) % COLS], sway), (0.1, 0.0))
+    stated = dict(sway_px=amplitude, sway_phase_deg=phase, sway_row_deg=rho)
+    integers = ("planned", "ok", "frame_a", "frame_b", "frames", "row_a", "rows", "row_offset", "col_a", "col_b", "cols", "evaluations")
+    reals = ("stated_dq", "dq", "stated_dv", "dv", "stated_D", "D", "du", "correlation")
+
+    def check(session, request, device="cpu", expect_ok=True):
+        got = session.measure_patches([request], -1.0, 16, 32, device)
+        assert [(g["request"], g["patch_i"], g["patch_j"]) for g in got] == [(0, i, j) for j in (0, 1) for i in (0, 1)]
+        for g in got:
+            assert (g["row_a"], g["col_a"]) == (request["row_a"] + 16 * g["patch_j"], request["col_a"] + 32 * g["patch_i"])
+            assert g["col_b"] == request["col_b"] + (32 - 32 * g["patch_i"] if request.get("mirror") else 32 * g["patch_i"])
+        alone = session.measure([dict(request, rows=16, cols=32, row_a=g["row_a"], col_a=g["col_a"], col_b=g["col_b"]) for g in got], -1.0, device)
+        for g, r in zip(got, alone):
+            assert all(g[key] == r[key] for key in integers), (g, r)
+            assert all(g[key] == pytest.approx(r[key], abs=2e-5) for key in reals), (g, r)
+            if expect_ok:
+                assert g["ok"] and g["correlation"] > 0.95, g
+                c = g["curvature"]       # a maximum: the curvature is negative along each axis
+                assert c[0] < 0 and c[3] < 0 and c[5] < 0, c
+        return got
+
+    s = _core.CalibrationSession([str(ma), str(mb)])
+    got = check(s, dict(base, **stated))
+    assert all(g["du"] == pytest.approx(left, abs=0.02) for g in got), got
+    check(s, dict(base, scan_b=0))                                      # a block against itself: no sway, nothing resampled
+    moved = check(s, dict(base, **stated, col_b=46))                    # two columns off: cut again from the same reading
+    assert all(g["du"] == pytest.approx(left - 2, abs=0.02) for g in moved), moved
+    # five columns off: beyond what was read, so B is read again. (A patch this small this far off may find a false
+    # maximum, by either route alike; the ones that register are where they should be.)
+    far = [g for g in check(s, dict(base, **stated, col_b=49), expect_ok=False) if g["ok"]]
+    assert len(far) >= 3 and all(g["du"] == pytest.approx(left - 5, abs=0.02) for g in far), far
+    # ... unless the block is registered whole first and its patches start where it ends: then every patch is found,
+    # and where both routes find one they end on the same cut and the same numbers
+    seeded = s.measure_patches([dict(base, **stated, col_b=49)], -1.0, 16, 32, "cpu", from_block=True)
+    assert len(seeded) == 4 and all(g["ok"] and g["du"] == pytest.approx(left - 5, abs=0.02) for g in seeded), seeded
+    for g in far:
+        r = seeded[2 * g["patch_j"] + g["patch_i"]]
+        assert all(g[key] == r[key] for key in integers if key != "evaluations") and all(g[key] == pytest.approx(r[key], abs=2e-5) for key in reals), (g, r)
+    # a request the record cannot hold: one entry, no patch
+    out = s.measure_patches([dict(base, frame_a=30)], -1.0, 16, 32, "cpu")
+    assert len(out) == 1 and (out[0]["patch_i"], out[0]["patch_j"], out[0]["planned"], out[0]["ok"]) == (-1, -1, False, False)
+    with pytest.raises(Exception):
+        s.measure_patches([base], -1.0, 1, 32, "cpu")
+    s = _core.CalibrationSession([str(ma), str(mc)])
+    mirrored = check(s, dict(base, mirror=True, **stated))
+    assert all(abs(g["du"]) == pytest.approx(left, abs=0.02) for g in mirrored), mirrored
+    # B sheared along the frames across its columns (what opposite views in a fan ask for): the patches are sheared
+    # side by side, each thread on work memory of its own (they once shared it, and half of them came out wrong)
+    for _ in range(4):
+        sheared = check(s, dict(base, mirror=True, frame_shear=0.004, **stated), expect_ok=False)
+        assert all(g["ok"] and g["correlation"] > 0.9 for g in sheared), sheared
+    if _core.cuda_available():
+        on_device = s.measure_patches([dict(base, mirror=True, **stated)], -1.0, 16, 32, "cuda")
+        for g, r in zip(on_device, mirrored):
+            assert all(g[key] == r[key] for key in integers if key != "evaluations") and all(g[key] == pytest.approx(r[key], abs=1e-4) for key in reals), (g, r)
+        check(s, dict(base, mirror=True, **stated), "cuda")

@@ -45,6 +45,7 @@ struct Pairing {
     const DetectorMap* map_b = nullptr;  // B's own map: what differs between two scans is tested on one of them
     double frame_shear = 0;            // B's frames are read at an angle that changes by this many frames per column
     double sway_px = 0, sway_phase_deg = 0;  // B's frames are read sway_px cos(angle - phase) columns further on (verify.hpp)
+    double sway_row_deg = 0;                 // ... each row at its own angle, this many degrees per row from the frame's
 };
 
 struct Cut {
@@ -57,6 +58,9 @@ struct Measured {
     Cut cut;
     double d[3] = {0, 0, 0};  // registration: frames against the plan; rows and columns including whole re-cuts
     double correlation = 0;
+    // of the correlation at the registration (registration.hpp): frames^2, frames rows, frames columns, rows^2,
+    // rows columns, columns^2
+    double curvature[6] = {0, 0, 0, 0, 0, 0};
     int evaluations = 0;
     bool ok = false;
 };
@@ -81,7 +85,17 @@ struct ViewTiming {
 };
 ViewTiming& view_timing();
 
+void keep_curvature(const Registration& r, Measured& m);
+
 // cut both blocks, register, and cut B again by whole samples until less than a sample is left
 bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const RegistrationOptions& ropt, const ViewOptions& opt, Measured& m);
+
+// Many small blocks (patches) of one pair of views, all of one size and on one plan: each is measured as measure()
+// measures it (the same cut, the same registration, the same re-cuts), but the frames are read once for all of
+// them, and the patches are registered side by side (one registrar per thread on the CPU, the device's own on
+// CUDA). A patch that needs frames or rows beyond what was read is measured by measure() itself. out: one per cut.
+// whole: the block as one cut; it is registered first and the patches start where it ends (see the function).
+void measure_patches(const Pairing& P, const BlockPlan& plan, const std::vector<Cut>& cuts, const RegistrationOptions& ropt, Device device, std::vector<Measured>& out,
+                     const Cut* whole = nullptr);
 
 }  // namespace helirec::calibration

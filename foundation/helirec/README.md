@@ -696,6 +696,42 @@ checks cut and register theirs (C++: `helirec::calibration::Session`, `ViewReque
 under `development_notes/calibration/04_experiments/` are written on these; none of them uses the
 reconstruction's calibration.
 
+**Patches.** `measure_patches(requests, row_sign, patch_rows, patch_cols, device)` cuts the block of each request
+into patches and measures every patch as `measure` measures a request of that size at that place: the same cut,
+the same registration, the same re-cuts by whole samples, and the same numbers (equal on CUDA, to 2e-7 px on the
+CPU, whose registrars here run on one thread each so that the result does not depend on the number of threads).
+What differs is the work: the frames of a block are read and converted once for all its patches, a patch that
+the registration moves by whole frames, rows or columns is cut again from that reading (B is read once more only
+where patches drift past a margin of 1 frame and 4 rows and columns), and the patches are registered side by
+side, one per thread on the CPU and four at a time on a CUDA device (C++: `Session::measure_patches`,
+`PatchMeasurement`; `src/calibration/view_patches.cpp`). Each patch also returns `curvature`, the second
+derivatives of the correlation at its maximum over frames, rows and columns: how sharply each shift is determined
+and how the three are tied. `calibration_measure_timing(reset)` says where the time of `measure` and
+`measure_patches` went. On PHerc0343P the 1320 blocks of the geometry step's plan as 20 256 patches of
+32 frames × 128 × 128 take 91 s on an RTX 5090 (22 s reading, 9 s converting, 58 s registering) and 218 s on 24
+cores (183 s registering); half of those patches as requests of their own through `measure` took 448 s on the
+CPU. `tests/test_calibration.py::test_measure_patches_equals_measure` holds the two routes together. With
+`from_block=True` each block is registered whole first, from the same readings, and its patches start where it
+ends instead of at the plan: for a plan that is further off than a patch can find by itself (the test's patches
+five columns off: three of four found without it, all four with it). Where the plan is within a patch's reach
+it costs more than it saves (Paris4, 128 opposite-view blocks across tiles: 137 ms a block with it, 102 ms
+without, 76 ms for the blocks alone), so it is off unless asked for.
+
+**The solver.** A geometry step's model is stated as equations over named unknowns and solved by helirec's own
+solver; there is no outside one. `helirec.solve.Problem` takes blocks of unknowns (`unknowns("axis", n)`),
+equations with their terms (`e = equations(measured, fit=...)`, `e.add("axis", tile, coefficient)`: one line of
+code per term of the model, for all measurements at once) and returns the unknowns by name and what every
+equation leaves, fitted or held out. Underneath, `helirec::calibration::solve_linear`
+(`include/helirec/calibration/solve.hpp`, `calibration_solve` in Python) is a linear least squares under a Huber
+loss: the columns scaled to unit length (a calibration's unknowns run from 1e-7 to thousands), weighted solves
+repeated with the weights of the solve before, the normal equations factored by a Cholesky decomposition with
+pivoting and each solve refined against the equations; an unknown the equations do not determine comes out zero
+and is counted out of `rank`. A model that is not a line in its unknowns (an angle that multiplies a place) is
+written as a line about the values in hand and solved again. The mosaic step's `fit` is written on it and is that
+step's only fit (on Paris4 1025 unknowns and about 12 000 equations, a second or two a round); against the
+hand-built matrices it replaces it gives the same numbers where they were right and a lower sum of squares where numpy's least squares on unscaled
+columns was not (`tests/test_solve.py`, `tests/test_mosaic.py`). The two-scan step's fit is to follow.
+
 **Partial copies.** Frame files that are not on disk are reported (`map from frame to file`, with the frames
 that are there) and their frames are never read: the master file's virtual dataset would return zeros for them.
 Reading such a frame through `CalibrationSession` or `Frames` is an error; `stretches(scan)[i]["on_disk"]` lists
@@ -704,11 +740,33 @@ the ranges that can be read.
 **Frames stored as JPEG 2000.** Projections written as one JPEG 2000 (HTJ2K) codestream per chunk of rows through
 the blosc2 HDF5 filter (id 32026), as ESRF BM18 writes them, are read by `RawReader` when helirec is built with
 OpenJPEG (see Build); only the chunks a request touches are decoded, in parallel (about 140 whole frames of
-2368 × 4416 per second on 24 cores; a block of 56 frames × 300 rows in 0.1 s). The container is parsed by helirec
-itself, so neither the blosc2 library nor the HDF5 filter plugin is needed. Such frames are usually compressed
+2368 × 4416 per second on 24 cores; a block of 56 frames × 300 rows in 0.1 s). A chunk is always decoded whole:
+OpenJPEG 2.5.4 returns only the level shift for a decode area of an HTJ2K codestream. The container is parsed by
+helirec itself, so neither the blosc2 library nor the HDF5 filter plugin is needed. Where each chunk lies in a
+file is listed in one pass over the dataset's index (HDF5 1.14 and later; asked chunk by chunk before, which
+was 2 to 3 s of a reconstruction's first slab over a hundred files). `RawReader::set_cache_bytes`
+keeps decoded chunks between reads (off by default; the calibration's `Frames` keep 3 GB per scan,
+`CalibrationSession.set_cache(gigabytes)`, `cache_counts()`): comparisons placed at the same frames, measured
+in the order of their frames, then decode each chunk once (164 → 60 ms per comparison on Paris4, same results).
+The session also decodes the frames of the comparisons that follow the one in hand ahead, on workers of the
+reader's own (`RawReader::set_prefetch_threads`, `prefetch_rows`; `CalibrationSession.set_read_ahead(threads)`,
+default a third of the machine's threads, 0 for none): 60 → 56 ms, since decoding already fills the cores. Such frames are usually compressed
 irreversibly: the inventory reports the codec, the transform and the bits per value of each stretch
 (`how the frames are stored`), the decoded values are OpenJPEG's (another decoder may differ by a count), and
 their noise is not the detector's.
+
+**At a half, a quarter, an eighth.** A JPEG 2000 codestream holds its image at lower resolutions too, and
+`RawReader(files, dataset, rows, cols, reduce=1 | 2 | 3)` reads the frames there: (rows, cols) / 2^reduce values,
+every row index of the reader in reduced rows, decoded 3.4, 12 and 44 times faster than the whole (a Paris4
+chunk: 8.5, 2.5, 0.7, 0.2 ms) with nothing written to disk. A reduced value is not the mean of 2^reduce pixels:
+value (j, k) is the wavelet's low band at the stored pixel (j, k) 2^reduce, each chunk of rows an image of its
+own, so a geometry in stored pixels holds for the reduced frame with every position divided by 2^reduce and
+nothing added. Darks, flats and weights are taken to the same grid by `helirec.calibration.at_resolution(image,
+reduce, chunk_rows)` (the same low-pass; it reproduces a Paris4 frame read at reduce 1, 2, 3 to 0.3 counts rms,
+the rounding), so that a flat divides the fixed pattern out as at full resolution. Plain (uncompressed) frames
+have no such resolutions and are refused; rows, columns and rows per chunk must be multiples of 2^reduce.
+`helirec.mosaic.tile_reconstructor(..., reduce=)` reconstructs a tile on it (below); the calibration session and
+the pair pipeline read at full resolution only.
 
 **Mosaics.** Scans that differ in where the sample sits on the rotation stage (the tomo configuration's
 `sample_u`, `sample_v`) and not in the lateral stage of the axis are checked as tiles, any number of them:
@@ -722,8 +780,47 @@ line `s = c − axis − n(θ)·d`, so two tiles record the same lines at equal 
 apart: a sinusoid once per turn. A request to `measure` states it as `sway_px`, `sway_phase_deg` (tile B's
 frames are read `sway_px cos(angle − sway_phase_deg)` columns further on, in B's own columns, resampled per
 frame by cubic convolution) and the registration returns what is left of it. With `mirror` and
-`angle_offset_deg=180` the same request compares one tile with the opposite views of another. The geometry
-calibration step and the reconstruction do not take mosaics yet (see Limitations).
+`angle_offset_deg=180` the same request compares one tile with the opposite views of another; `sway_row_deg`
+takes each row of B at its own angle (rows exposed one after another: between two tiles that is a shear of the
+tiles' distance times the angle per row).
+
+`helirec.mosaic` is the geometry step for a mosaic, in work: `calibrate_mosaic(masters)` finds the layout from
+the frames (the helix of each tile, the rows' sense, axis columns, which tiles are neighbours and their places),
+then registers the four kinds of comparison on the current map's grid and fits, pass by pass, one detector map,
+the roll, the rows' timing and per tile an axis column, a place on the stage, a height, and courses of the
+column and the height along the frames, with one course of the angle for all tiles (they repeat the stages'
+errors along the trajectory) and each tile's own turn about the axis against the first (`yaw_rad`: up to 0.12
+frames on Paris4, which the frame shifts between tiles ask for). The fit is one model on helirec's solver
+(above); `fit(..., terms=...)` also holds terms that were tried on Paris4 and left out of the step (a lean with
+depth, the fan's scale, a tilt per tile, courses shared by the tiles, a field on the detector beside the map).
+`calibrate_mosaic(..., patch=128)` registers the plan's blocks as patches (Paris4: 3433 blocks as 46 687
+patches in 420 s on an RTX 5090; the blocks alone take about four minutes), which leaves the same residuals as
+the blocks do. `frame_pose(cal, tile, angle, frame)` gives a frame's angle, column and height;
+`tile_reconstructor(master, cal, tile)` a `SliceReconstructor` of one tile alone on that geometry, for checking
+the calibration on slices; with `cache_dir=` the tile's reduced darks and flats are kept there
+(`calibration.reduced_darks_flats`: 46 s of a tile's start otherwise, 0.5 s read back). `overlaps(cal, masters)`
+is that check for every pair of neighbours (Paris4: 12 overlaps in two slabs each, 4 minutes; a slab not read
+before costs 8 to 10 s, of which 6 to 7 s is decoding its 10 400 frames, a further overlap of the same slab 2 s).
+Both take `reduce=1 | 2 | 3` (a half, a quarter, an eighth: the frames read at the codestream's lower
+resolution, the geometry divided by 2^reduce; a reduced reconstruction is the full one's low band, pixel for
+pixel from the axis, to under 0.01 of a reduced pixel in the slice). `overlaps` reports in full-resolution
+pixels at every `reduce`. With `coarse=` it first registers the two slabs of an overlap whole, for a
+calibration whose tiles are still pixels from their places. `place_tiles(cal, table)` is the simplest fit on that
+table: one shift per tile (in the slice and along the axis) by least squares on the overlaps' median
+displacements, returned with what the shifts leave; `overlap_means(table)` gives those medians. The axis column
+along the scan is measured, not fitted:
+`mirror_along(session, layout, model)` registers each tile's opposite views at positions along the frames on disk
+and `axis_course(cal, table)` writes what the tiles show in common into every tile's `column_course`
+(`course_of_mirror`: a comparison of the frames p and p + N/2 gives the mean of the axis column at the two; a
+drift and what repeats every half turn come out exactly, what changes sign after half a turn is not in opposite
+views); its summary says how well each tile follows the others.
+On Paris4 (7 tiles) it converges in three passes and predicts held-out comparisons
+to 0.13–0.25 px and 0.14–0.27 rows; the overlap of two tiles reconstructed from each still differs by half a
+pixel to a pixel on average. Most of what the fit leaves is not a missing term: blocks compared at the same
+frames in different places on the detector disagree with each other by about 0.1 px, in a way that changes
+over a few hundred frames, and the stages move by 0.2 px between the positions the plan compares (500 frames).
+It is not a finished calibration and has no command line yet; the reconstruction
+of a mosaic as one volume does not exist (see Limitations).
 
 For measurement-support diagnostics, `--columns N --column-fraction F` selects a narrower
 window within each overlap (`N=0` keeps the full overlap; `F=0`, `0.5`, `1` selects left,
@@ -746,6 +843,7 @@ step that writes what it measured (JSON), and it is the reconstruction's only ge
 ```bash
 helirec-geometry <main.h5> <companion.h5> --out geometry.json            # main: the scan with the axis inside the field
 helirec-geometry <main.h5> <companion.h5> --out geometry.json --row-time-us -19.87   # if no stretch holds a refill
+helirec-geometry <main.h5> <companion.h5> --out geometry.json --patch 128 --passes 1  # the map from patches, measured once
 ```
 
 ```python
@@ -778,8 +876,21 @@ What it does (`python/helirec/geometry.py`):
 
 `geometry.json` holds the layout, the row time, the map (`i`, `j`, `eu`, `ev` with its normalisation), the poses
 and what every pass left per kind of comparison. On PHerc0343P (two scans of 49,202 frames, RTX 5090) it takes
-9 minutes and five passes for the map and 4 minutes for the motion; `development_notes/calibration/05_experiments.md`, experiment 31, sets its result
-beside the one found by hand and tests it on slices reconstructed twice from disjoint frames. The step uses
+10 minutes: 20 s for the layout and the rows' timing, five passes for the map (44 s for the first, on the frames
+as stored, 72 s each for the others) and 4 minutes for the motion; `development_notes/calibration/05_experiments.md`, experiment 31, sets its result
+beside the one found by hand and tests it on slices reconstructed twice from disjoint frames.
+
+**Patches (`--patch 128`, `calibrate_geometry(..., patch=128)`).** The passes exist because a block of 1024
+columns is registered as one rigid displacement while the map stretches it by up to a pixel: the blocks have to
+be cut on a grid that already holds the map. A patch of 128 x 128 is stretched by a tenth of that, so the plan's
+blocks cut into patches (`CalibrationSession.measure_patches`: the frames of a block read once) give the map
+from the frames as stored. On PHerc0343P the first pass (20 256 patches, 15 008 accepted) takes 99 s with its
+fit, and the step with `--passes 1` 6 minutes in all, the motion as before. Slices reconstructed twice from
+disjoint frames agree as well with that calibration as with the passes' (within a scan 0.073, 0.056, 0.065 px
+rms at three heights against 0.072, 0.058, 0.070; between the scans 0.099, 0.145, 0.102, 0.117 against 0.105,
+0.143, 0.102, 0.119; the test's floor is 0.013 to 0.020). Left to run to the tolerance, the patches measured
+again on the map's grid correct it by up to 0.066 px and then 0.007 (three passes), which that test does not
+see. The default is the blocks (`--patch 0`), whose result is unchanged. The step uses
 `helirec::calibration`'s session (raw frames, the scan's own dark and mean flat, the registration on CPU or CUDA)
 and none of the pipeline's calibration.
 
@@ -845,7 +956,8 @@ These raise explicit errors:
 * an acquisition the geometry calibration step can read: a helix whose travel per turn is less than the
   detector's height, a turn at rest before and after it, two scans of equally long stretches;
 * a mosaic (tiles that differ in the sample's place on the rotation stage) is checked by `helirec-calibration`
-  and measured through `CalibrationSession`, and not yet taken by `helirec-geometry` or the reconstruction;
+  and calibrated, in work, by `helirec.mosaic`; `helirec-geometry` and `helirec-slices` do not take one, and a
+  tile can only be reconstructed alone (`helirec.mosaic.tile_reconstructor`);
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.
 

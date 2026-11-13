@@ -1608,30 +1608,61 @@ NB_MODULE(_core, m) {
              "clip_outer_circle"_a = false, "clip_radius"_a = -1.f, "set"_a = 0,
              "feed one slice's filtered sinogram (host array) -- for tests; the pipeline feeds device data");
 
-    nb::class_<RawReader>(m, "RawReader", "pread-based reader of one-chunk-per-frame uint16 HDF5 frame stacks")
-        .def(nb::init<std::vector<std::string>, std::string, int, int>(), "files"_a, "dataset"_a, "rows"_a, "cols"_a)
+    m.def("htj2k_float_frames_supported", &htj2k_float_frames_supported);
+    nb::class_<RawReader>(m, "RawReader", "pread-based uint16/float32 HDF5 reader with JPEG 2000 resolution selection")
+        .def(nb::init<std::vector<std::string>, std::string, int, int, int, std::string, bool>(), "files"_a, "dataset"_a, "rows"_a, "cols"_a, "reduce"_a = 0, "dtype"_a = "uint16", "selective"_a = true,
+             "dtype: uint16 detector frames or float32 reconstructed volumes. selective: seek over unused float32 HTJ2K resolutions. "
+             "rows, cols: of a frame as stored. reduce 1, 2, 3: frames stored as JPEG 2000 are read at a half, a quarter, an eighth "
+             "(the codestream's own lower resolutions: rows, cols and every row index are then the reduced ones; value (j, k) is "
+             "the wavelet's low band at the stored pixel (j, k) * 2**reduce).")
         .def_prop_ro("rows", &RawReader::rows)
         .def_prop_ro("cols", &RawReader::cols)
+        .def_prop_ro("reduce", &RawReader::reduce)
+        .def_prop_ro("dtype", &RawReader::dtype)
+        .def_prop_ro("bytes_read", &RawReader::bytes_read,
+                     "Payload bytes requested, excluding HDF5 metadata and filesystem read-ahead.")
+        .def("set_prefetch_threads", &RawReader::set_prefetch_threads, "threads"_a)
+        .def("prefetch_rows", [](RawReader& r, IntIn files, IntIn frames, IntIn row0, int nrows) {
+            require(files.shape(0) == frames.shape(0) && files.shape(0) == row0.shape(0), "index arrays must have equal length");
+            require(nrows >= 0, "nrows must be nonnegative");
+            nb::gil_scoped_release nogil;
+            r.prefetch_rows(files.data(), frames.data(), row0.data(), files.shape(0), nrows);
+        }, "file_index"_a, "frame_index"_a, "row0"_a, "nrows"_a)
+        .def("set_cache_bytes", &RawReader::set_cache_bytes, "bytes"_a,
+             "Decoded chunks of compressed frames kept between reads, up to this many bytes (0, the default: none).")
         .def("read_rows",
-             [](RawReader& r, IntIn file_index, IntIn frame_index, IntIn row0, int nrows, int n_threads) {
+             [](RawReader& r, IntIn file_index, IntIn frame_index, IntIn row0, int nrows, int n_threads) -> nb::ndarray<nb::numpy> {
                  const std::size_t n = file_index.shape(0);
                  require(frame_index.shape(0) == n && row0.shape(0) == n, "index arrays must have equal length");
+                 require(nrows >= 0, "nrows must be nonnegative");
+                 if (r.dtype() == "float32") {
+                     auto out = new_array_t<float>({n, static_cast<std::size_t>(nrows), static_cast<std::size_t>(r.cols())});
+                     nb::gil_scoped_release nogil;
+                     r.read_rows(file_index.data(), frame_index.data(), row0.data(), n, nrows, out.data(), n_threads);
+                     return nb::ndarray<nb::numpy>(out);
+                 }
                  auto out = new_array_t<uint16_t>({n, static_cast<std::size_t>(nrows), static_cast<std::size_t>(r.cols())});
                  nb::gil_scoped_release nogil;
                  r.read_rows(file_index.data(), frame_index.data(), row0.data(), n, nrows,
                              static_cast<uint16_t*>(out.data()), n_threads);
-                 return out;
+                 return nb::ndarray<nb::numpy>(out);
              },
              "file_index"_a, "frame_index"_a, "row0"_a, "nrows"_a, "n_threads"_a = 0,
-             "rows [row0, row0+nrows) of each frame -> (n, nrows, cols) uint16; outside rows are 0")
+             "rows [row0, row0+nrows) of each frame -> (n, nrows, cols) in reader dtype; outside rows are 0")
         .def("read_frames",
-             [](RawReader& r, IntIn file_index, IntIn frame_index, int n_threads) {
+             [](RawReader& r, IntIn file_index, IntIn frame_index, int n_threads) -> nb::ndarray<nb::numpy> {
                  const std::size_t n = file_index.shape(0);
                  require(frame_index.shape(0) == n, "index arrays must have equal length");
+                 if (r.dtype() == "float32") {
+                     auto out = new_array_t<float>({n, static_cast<std::size_t>(r.rows()), static_cast<std::size_t>(r.cols())});
+                     nb::gil_scoped_release nogil;
+                     r.read_frames(file_index.data(), frame_index.data(), n, out.data(), n_threads);
+                     return nb::ndarray<nb::numpy>(out);
+                 }
                  auto out = new_array_t<uint16_t>({n, static_cast<std::size_t>(r.rows()), static_cast<std::size_t>(r.cols())});
                  nb::gil_scoped_release nogil;
                  r.read_frames(file_index.data(), frame_index.data(), n, static_cast<uint16_t*>(out.data()), n_threads);
-                 return out;
+                 return nb::ndarray<nb::numpy>(out);
              },
              "file_index"_a, "frame_index"_a, "n_threads"_a = 0);
     m.def("minus_log", &minus_log_py, "x"_a, "clip_min"_a = 1e-6f, "clip_max"_a = 10.f, "device"_a = "cpu");

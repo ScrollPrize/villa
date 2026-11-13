@@ -56,6 +56,38 @@ if(HELIREC_OPENJPEG)
 endif()
 message(STATUS "helirec: JPEG 2000 frames (OpenJPEG) ${OPENJP2_FOUND}")
 
+# HTJ2K with 32-bit samples and seekable reduced-resolution decoding. The pinned
+# source is built into helirec; no SDK or separately installed library is needed.
+# Offline builds: -DFETCHCONTENT_SOURCE_DIR_OPENJPH=<source directory>.
+option(HELIREC_OPENJPH "Read float32 HTJ2K volumes with OpenJPH" ON)
+if(HELIREC_OPENJPH)
+  include(FetchContent)
+  function(helirec_add_openjph)
+    set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+    set(BUILD_SHARED_LIBS OFF)
+    set(OJPH_BUILD_EXECUTABLES OFF)
+    set(OJPH_BUILD_STREAM_EXPAND OFF)
+    set(OJPH_ENABLE_TIFF_SUPPORT OFF)
+    set(OJPH_BUILD_TESTS OFF)
+    set(OJPH_BUILD_FUZZER OFF)
+    FetchContent_Declare(openjph
+      URL https://codeload.github.com/aous72/OpenJPH/tar.gz/refs/tags/0.32.0
+      URL_HASH SHA256=5cb1ebe18e5ee1322d23ff2130b37562d447d1ad5586c3d16cf84be3ae30f719
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+      SOURCE_SUBDIR helirec-unused)
+    # Add explicitly with EXCLUDE_FROM_ALL (also on CMake 3.24) to avoid
+    # installing OpenJPH's headers, archive and package files into our wheel.
+    FetchContent_MakeAvailable(openjph)
+    add_subdirectory("${openjph_SOURCE_DIR}" "${openjph_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    if(HELIREC_PYTHON)
+      install(FILES "${openjph_SOURCE_DIR}/LICENSE" DESTINATION helirec/licenses RENAME OpenJPH.txt)
+    else()
+      install(FILES "${openjph_SOURCE_DIR}/LICENSE" DESTINATION share/helirec/licenses RENAME OpenJPH.txt)
+    endif()
+  endfunction()
+  helirec_add_openjph()
+endif()
+
 # vc-delta3d (lossless uint8 chunk codec of vc_reader / VC3D), pinned to the revision vc_reader uses
 # so that everything helirec writes is readable there. Offline builds: -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>
 option(HELIREC_DELTA3D "Build the vc-delta3d chunk codec (uint8 OME-Zarr output)" ON)
@@ -90,6 +122,10 @@ endif()
 if(HELIREC_OPENJPEG AND OPENJP2_FOUND)
   target_link_libraries(helirec PRIVATE PkgConfig::OPENJP2)
   target_compile_definitions(helirec PRIVATE HELIREC_WITH_OPENJPEG=1)
+endif()
+if(HELIREC_OPENJPH AND TARGET openjph)
+  target_link_libraries(helirec PRIVATE openjph)
+  target_compile_definitions(helirec PRIVATE HELIREC_WITH_OPENJPH=1)
 endif()
 
 if(HELIREC_WITH_CUDA)

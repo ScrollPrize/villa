@@ -329,6 +329,7 @@ bool newton_step(const double H[3][3], const double g[3], const bool active[3], 
 struct Step {
     double delta[3] = {0, 0, 0};  // remaining displacement of the (displaced) b against a
     double correlation = 0;
+    double curvature[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};  // of the correlation at delta, active axes
     bool at_edge = false, at_maximum = false;
 };
 
@@ -381,6 +382,8 @@ Step evaluate(RegistrationBackend& be, const RegistrationGeometry& geom, const R
     }
     for (int j = 0; j < 3; ++j) step.delta[j] = geom.active[j] ? at[j] : 0.0;
     step.correlation = r / std::sqrt(ea * eb);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) step.curvature[i][j] = geom.active[i] && geom.active[j] ? H[i][j] / std::sqrt(ea * eb) : 0.0;
     return step;
 }
 
@@ -431,9 +434,14 @@ Registration Registrar::run(const float* a, const float* b, const double* row_sh
     be.set_b(b, row_shift);
     Registration out;
     double d[3] = {0, 0, 0};
+    const auto keep_curvature = [&](const Step& st) {
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) out.curvature[i][j] = st.curvature[i][j];
+    };
     Step s = evaluate(be, geom, opt, ea, d, true);
     out.evaluations = 1;
     out.correlation = s.correlation;
+    keep_curvature(s);
     out.at_edge = s.at_edge;
     for (int j = 0; j < 3; ++j) {
         out.shift[j] = s.delta[j];
@@ -471,6 +479,7 @@ Registration Registrar::run(const float* a, const float* b, const double* row_sh
         s = evaluate(be, geom, opt, ea, d, false);
         ++out.evaluations;
         out.correlation = s.correlation;
+        keep_curvature(s);
         double left = 0;
         for (int j = 0; j < 3; ++j) {
             out.shift[j] = d[j] + s.delta[j];

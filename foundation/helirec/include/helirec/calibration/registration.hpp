@@ -43,6 +43,9 @@ struct Registration {
     // and the registration repeated; `shift` is then only the first estimate.
     int whole[3] = {0, 0, 0};
     double correlation = 0;       // of the band-passed blocks at that shift, -1..1
+    // Second derivatives of that correlation with respect to the displacement (frames, rows, columns) at the shift:
+    // how sharply each direction is determined, and how they are tied. Zero for an axis that is not registered.
+    double curvature[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
     bool at_edge = false;         // the integer maximum lies on the border of the search window
     bool converged = false;
     int evaluations = 0;

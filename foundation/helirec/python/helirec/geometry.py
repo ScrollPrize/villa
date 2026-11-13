@@ -199,13 +199,80 @@ def read_layout(session, device="auto", log=print):
 
 # ---------------------------------------------------------------- the time of a detector row
 
+def fit_refill_shots(x, n_rows, T, E, pre):
+    """The time of a row from the beam dips of a refill. x: (frames, rows), the logarithm of each row's level in
+    frames around the refill (of columns in air, or of all columns where nothing is: a row's level is compared
+    with the same row some frames before and after, against which the sample changes slowly). T, E: the frame
+    period and the gate [s]; pre: the number of frames at the start that lie before the refill (what a band of
+    rows scatters by without a shot is taken from them if there are enough, otherwise from frames between shots).
+    Returns (least-squares result, standard error of the row time, shots, noise) or None if fewer than 12 shots
+    are found. The fitted parameters start with the row time [s per row, signed] and the dips' decay."""
+    from scipy.optimize import least_squares
+
+    B = 20
+    nb = n_rows // B
+    vc = (np.arange(nb) + 0.5) * B - 0.5
+    u = (vc - (n_rows - 1) / 2) / (n_rows / 2)
+
+    def dip(n):
+        before, after = x[n - 7:n - 2].mean(0), x[n + 4:n + 9].mean(0)
+        return x[n] - (before + (after - before) * (4.5 / 10.5))
+
+    shots = []
+    for n in range(max(16, pre - 8), len(x) - 16):
+        d = dip(n).mean()
+        if d < -0.003:
+            if shots and n - shots[-1] <= 2:
+                if d < dip(shots[-1]).mean():
+                    shots[-1] = n
+            else:
+                shots.append(n)
+    shots = np.array(shots)
+    if len(shots) < 12:
+        return None
+    band = lambda n: dip(n)[:nb * B].reshape(nb, B).mean(1)
+    data = np.array([[band(n + o) for o in (-1, 0, 1)] for n in shots])
+    quiet = list(range(16, pre - 16)) if pre > 80 else [n for n in range(16, len(x) - 16) if np.abs(shots - n).min() > 3]
+    noise = float(np.std([band(n) for n in quiet]))
+    # the raster: the gaps between neighbouring shots are whole steps of it (a shot may be missing)
+    t = (shots - shots[0]) * T
+    gaps = np.diff(t)
+    raster = float(gaps[gaps < 1.5 * gaps.min()].mean())
+    j = np.concatenate([[0.0], np.cumsum(np.round(gaps / raster))])
+    raster = float(np.polyfit(j, t, 1)[0])
+
+    def model(p):
+        tau, theta, t0, ras = p[0], abs(p[1]), p[2], p[3]
+        alpha = 1 + p[4] * u + p[5] * u**2 + p[6] * u**3 + p[7] * u**4
+        out = np.empty_like(data)
+        P = lambda z: np.where(z > 0, 1 - np.exp(-np.clip(z, 0, None) / theta), 0.0)
+        for jj, o in enumerate((-1, 0, 1)):
+            s_ = ((shots - shots[0] + o) * T)[:, None] + tau * vc[None, :] - (t0 + j * ras)[:, None]
+            out[:, jj, :] = -p[8:][:, None] * alpha[None, :] * (P(s_ + E) - P(s_))
+        return out
+
+    best = None
+    for tau0 in (-0.6 * T / n_rows, 0.6 * T / n_rows):
+        start = None
+        for t0 in np.arange(-1.3 * T, 1.3 * T, T / 16):
+            p = np.array([tau0, 0.003, t0, raster, 0, 0, 0, 0] + [0.009] * len(shots))
+            c = ((model(p) - data) ** 2).sum()
+            if start is None or c < start[0]:
+                start = (c, p)
+        scale = np.array([1e-6, 1e-3, 1e-3, 1e-5, .1, .1, .1, .1] + [1e-3] * len(shots))
+        r = least_squares(lambda q: (model(q) - data).ravel() / noise, start[1], x_scale=scale)
+        if best is None or r.cost < best.cost:
+            best = r
+    dof = best.fun.size - best.x.size
+    se = float(np.sqrt(np.linalg.pinv(best.jac.T @ best.jac)[0, 0] * 2 * best.cost / dof))
+    return best, se, shots, noise
+
+
 def row_time_from_refill(session, lay, log=print):
     """Seconds per stored row (signed: negative if a larger row index is exposed earlier), from the beam dips of a
     refill; None if no stretch holds one. The method of development_notes/calibration/04_experiments (exp. 2): each
     injection shot dips the beam for a few milliseconds, the shots sit on a raster, and which rows of which frame
-    record a shot depends on the row time through the frame period and the gate only."""
-    from scipy.optimize import least_squares
-
+    record a shot depends on the row time through the frame period and the gate only (fit_refill_shots)."""
     for scan in (0, 1):
         for name in ("helix", "rest1", "rest2"):
             st = lay.stretches[scan][name]
@@ -245,62 +312,10 @@ def row_time_from_refill(session, lay, log=print):
             for i0 in range(0, len(frames), 64):
                 raw = session.read_rows(scan, st, frames[i0:i0 + 64], 0, lay.rows)
                 x[i0:i0 + 64] = np.log(np.clip(raw[:, :, c0:c1].mean(2, dtype=np.float64) - dark, 1, None))
-            B = 20
-            nb = lay.rows // B
-            vc = (np.arange(nb) + 0.5) * B - 0.5
-            u = (vc - (lay.rows - 1) / 2) / (lay.rows / 2)
-
-            def dip(n):
-                before, after = x[n - 7:n - 2].mean(0), x[n + 4:n + 9].mean(0)
-                return x[n] - (before + (after - before) * (4.5 / 10.5))
-
-            shots = []
-            for n in range(max(16, pre - 8), len(frames) - 16):
-                d = dip(n).mean()
-                if d < -0.003:
-                    if shots and n - shots[-1] <= 2:
-                        if d < dip(shots[-1]).mean():
-                            shots[-1] = n
-                    else:
-                        shots.append(n)
-            shots = np.array(shots)
-            if len(shots) < 12:
+            got = fit_refill_shots(x, lay.rows, T, E, pre)
+            if got is None:
                 continue
-            band = lambda n: dip(n)[:nb * B].reshape(nb, B).mean(1)
-            data = np.array([[band(n + o) for o in (-1, 0, 1)] for n in shots])
-            quiet = list(range(16, pre - 16)) if pre > 80 else [n for n in range(16, len(frames) - 16) if np.abs(shots - n).min() > 3]
-            noise = float(np.std([band(n) for n in quiet]))
-            # the raster: the gaps between neighbouring shots are whole steps of it (a shot may be missing)
-            t = (shots - shots[0]) * T
-            gaps = np.diff(t)
-            raster = float(gaps[gaps < 1.5 * gaps.min()].mean())
-            j = np.concatenate([[0.0], np.cumsum(np.round(gaps / raster))])
-            raster = float(np.polyfit(j, t, 1)[0])
-
-            def model(p):
-                tau, theta, t0, ras = p[0], abs(p[1]), p[2], p[3]
-                alpha = 1 + p[4] * u + p[5] * u**2 + p[6] * u**3 + p[7] * u**4
-                out = np.empty_like(data)
-                P = lambda z: np.where(z > 0, 1 - np.exp(-np.clip(z, 0, None) / theta), 0.0)
-                for jj, o in enumerate((-1, 0, 1)):
-                    s_ = ((shots - shots[0] + o) * T)[:, None] + tau * vc[None, :] - (t0 + j * ras)[:, None]
-                    out[:, jj, :] = -p[8:][:, None] * alpha[None, :] * (P(s_ + E) - P(s_))
-                return out
-
-            best = None
-            for tau0 in (-0.6 * T / lay.rows, 0.6 * T / lay.rows):
-                start = None
-                for t0 in np.arange(-1.3 * T, 1.3 * T, T / 16):
-                    p = np.array([tau0, 0.003, t0, raster, 0, 0, 0, 0] + [0.009] * len(shots))
-                    c = ((model(p) - data) ** 2).sum()
-                    if start is None or c < start[0]:
-                        start = (c, p)
-                scale = np.array([1e-6, 1e-3, 1e-3, 1e-5, .1, .1, .1, .1] + [1e-3] * len(shots))
-                r = least_squares(lambda q: (model(q) - data).ravel() / noise, start[1], x_scale=scale)
-                if best is None or r.cost < best.cost:
-                    best = r
-            dof = best.fun.size - best.x.size
-            se = float(np.sqrt(np.linalg.pinv(best.jac.T @ best.jac)[0, 0] * 2 * best.cost / dof))
+            best, se, shots, noise = got
             log(f"  refill in scan {scan} {name}, frames {f_lo}..{f_hi}: {len(shots)} shots on a raster of {best.x[3] * 1e3:.3f} ms, air columns {c0}..{c1}; "
                 f"row time {best.x[0] * 1e6:+.3f} +- {se * 1e6:.3f} us per stored row")
             return dict(seconds_per_row=float(best.x[0]), se=se, scan=scan, stretch=name, frames=[f_lo, f_hi], shots=int(len(shots)), raster_s=float(best.x[3]), air_columns=[int(c0), int(c1)],
@@ -368,9 +383,14 @@ def _rows(lay, scan, name):
     return lay._heights[(scan, name)]
 
 
-def measure(session, lay, m, lines, device="auto"):
+def measure(session, lay, m, lines, device="auto", patch=0):
     """One pass: every comparison of the plan registered on the grid of map `m` (the second scan with its line of
-    the stretch added). Returns the accepted ones with the quantities the fit is written in."""
+    the stretch added). Returns the accepted ones with the quantities the fit is written in.
+
+    patch: 0 registers each block of the plan as one (a rigid displacement of 1024 columns: right only on a grid
+    that already holds the map, hence the passes). N > 0 cuts every block into patches of N x N and registers each
+    (CalibrationSession.measure_patches: the block's frames read once): the map's stretch inside a patch is a
+    hundredth of a pixel, so a pass on the frames as stored already gives the map."""
     reqs, meta = plan(lay)
     out = []
     by = {}
@@ -380,9 +400,16 @@ def measure(session, lay, m, lines, device="auto"):
         _set_map(session, m)
         if key:
             _set_map(session, with_line(m, *lines[key], about=overlap_centre(lay) + lay.move), 1)
+        if patch:    # the blocks in the order of their frames: neighbours read the same part of the files
+            items.sort(key=lambda qm: (qm[1]["scan_a"], qm[1]["stretch_a"], qm[0]["frame_a"]))
         for i0 in range(0, len(items), 400):
             chunk = items[i0:i0 + 400]
-            for (q, mm), r in zip(chunk, session.measure([c[0] for c in chunk], lay.row_sign, device)):
+            if patch:
+                got = session.measure_patches([c[0] for c in chunk], lay.row_sign, int(patch), int(patch), device)
+                results = [(chunk[r["request"]], r) for r in got if r["patch_i"] >= 0]
+            else:
+                results = zip(chunk, session.measure([c[0] for c in chunk], lay.row_sign, device))
+            for (q, mm), r in results:
                 if not (r["planned"] and r["ok"] and r["correlation"] > 0.3):
                     continue
                 if lay.is_blocked(mm["scan_a"], mm["stretch_a"], r["frame_a"], r["row_a"] - 8, r["row_a"] + r["rows"] + 8):
@@ -560,6 +587,16 @@ def second_scan_fit(table, rows, total):
     return P
 
 
+def _measure_blocks(session, requests, row_sign, device):
+    """session.measure(requests), each block read once: where the registration moves a block by whole frames, rows
+    or columns it is cut again from that reading instead of from the files (CalibrationSession.measure_patches with
+    the block as its one patch). The same numbers; the files are read about half as often."""
+    out = [None] * len(requests)
+    for r in session.measure_patches(requests, row_sign, 1 << 20, 1 << 20, device):
+        out[r["request"]] = r
+    return out
+
+
 def measure_motion(session, lay, m, lines, tau, period, device="auto", log=print):
     """What the sample and the rotating body do within a turn, on the grid of the map (experiment 21 of the notes):
 
@@ -625,7 +662,7 @@ def measure_motion(session, lay, m, lines, tau, period, device="auto", log=print
 
     def run(reqs_, meta_):
         for i0 in range(0, len(reqs_), 250):
-            for mm, r in zip(meta_[i0:i0 + 250], session.measure(reqs_[i0:i0 + 250], lay.row_sign, device)):
+            for mm, r in zip(meta_[i0:i0 + 250], _measure_blocks(session, reqs_[i0:i0 + 250], lay.row_sign, device)):
                 if not (r["planned"] and r["ok"] and r["correlation"] > 0.3):
                     continue
                 if lay.is_blocked(mm["scan"], mm["a"], r["frame_a"], r["row_a"] - 8, r["row_a"] + r["rows"] + 8) or \
@@ -925,11 +962,12 @@ def overlap_centre_of(layout):
 
 # ---------------------------------------------------------------- the step
 
-def calibrate_geometry(scans, row_time=None, device="auto", order=3, passes=6, tolerance=0.02, threads=8, motion=True, log=print):
+def calibrate_geometry(scans, row_time=None, device="auto", order=3, passes=6, tolerance=0.02, threads=8, motion=True, log=print, patch=0):
     """The geometry calibration of a two-scan helical acquisition. scans: the two master files, the scan with the
     rotation axis inside the detector's field first. row_time: seconds per stored row (signed), if it is known for
     this camera configuration; otherwise it is measured from a refill, and it is an error if no stretch holds one.
-    Returns a dict (see `save`)."""
+    patch: 0 measures the plan's blocks whole; N cuts them into patches of N x N (see `measure`), with which the
+    first pass, on the frames as stored, gives the map and the second confirms it. Returns a dict (see `save`)."""
     from . import _core
 
     t_start = time.time()
@@ -950,7 +988,7 @@ def calibrate_geometry(scans, row_time=None, device="auto", order=3, passes=6, t
     history = []
     log("map")
     for it in range(passes):
-        rows = measure(session, lay, m, lines, device)
+        rows = measure(session, lay, m, lines, device, patch)
         f = fit(rows, lay, m, row_time, period)
         du, dv = _update_range(m, f)
         dl = max(abs(v_) for st in f["lines"].values() for v_ in st) * lay.cols / 2
@@ -991,7 +1029,8 @@ def calibrate_geometry(scans, row_time=None, device="auto", order=3, passes=6, t
                 layout=dict(rows=lay.rows, cols=lay.cols, frames=[dict(lay.lengths[k]) for k in (0, 1)], frames_per_turn=lay.per_turn, pixel_um=lay.pixel_um, row_sign=lay.row_sign, coarse_mirror_column=lay.axis, coarse_move=lay.move, window_columns=lay.width,
                             blocked_rows={f"scan {k} {name}": dict(frames=[int(x) for x, hit in zip(fr, mask) if hit.any()], first_row=[int(np.nonzero(hit)[0].min()) for hit in mask if hit.any()],
                                                                     last_row=[int(np.nonzero(hit)[0].max()) for hit in mask if hit.any()]) for (k, name), (fr, mask) in lay.blocked.items()}),
-                row_time=dict(seconds_per_row=row_time, frame_period_s=period, measured=timing), map=m, poses=poses, passes=history, converged=bool(max(du, dv, dl) < tolerance))
+                row_time=dict(seconds_per_row=row_time, frame_period_s=period, measured=timing), map=m, poses=poses, passes=history, converged=bool(max(du, dv, dl) < tolerance),
+                patch=int(patch))
 
 
 def save(cal, path):
@@ -1011,8 +1050,9 @@ def main(argv=None):
     ap.add_argument("--device", default="auto", choices=("auto", "cuda", "cpu"))
     ap.add_argument("--order", type=int, default=3, help="order of the map's polynomial")
     ap.add_argument("--passes", type=int, default=6)
+    ap.add_argument("--patch", type=int, default=0, help="0: the plan's blocks registered whole (several passes); N: cut into patches of N x N, the frames of a block read once (try 128)")
     a = ap.parse_args(argv)
-    cal = calibrate_geometry([a.main, a.companion], None if a.row_time_us is None else a.row_time_us * 1e-6, a.device, a.order, a.passes)
+    cal = calibrate_geometry([a.main, a.companion], None if a.row_time_us is None else a.row_time_us * 1e-6, a.device, a.order, a.passes, patch=a.patch)
     save(cal, a.out)
     print(f"written to {a.out} ({cal['seconds']} s; {'converged' if cal['converged'] else 'NOT converged'})")
 
