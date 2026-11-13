@@ -120,7 +120,7 @@ static cv::Mat_<cv::Vec3f> build_vertex_normals_from_faces(
     return nsum;
 }
 
-static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_fn, bool normalize_uv, bool align_grid, float keep_percent, bool clean_surface, float clean_sigma_k, bool inpaint_holes)
+static bool surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_fn, bool normalize_uv, bool align_grid, float keep_percent, bool clean_surface, float clean_sigma_k, bool inpaint_holes)
 {
     cv::Mat_<cv::Vec3f> points = surf->rawPoints();
     
@@ -190,7 +190,7 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
     std::ofstream out(out_fn);
     if (!out) {
         std::cerr << "Failed to open for write: " << out_fn << "\n";
-        return;
+        return false;
     }
     out << std::fixed << std::setprecision(6);
 
@@ -235,6 +235,13 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
                    << b[1] + 1 << "/" << b[1] + 1 << "/" << b[1] + 1 << " "
                    << b[2] + 1 << "/" << b[2] + 1 << "/" << b[2] + 1 << '\n';
     }
+    // A full disk shows up here, not when the file is opened.
+    out.close();
+    if (!out) {
+        std::cerr << "Failed to write: " << out_fn << "\n";
+        return false;
+    }
+    return true;
 }
 
 int main(int argc, char *argv[])
@@ -359,7 +366,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes);
+    if (!surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes)) {
+        std::error_code ignored;
+        if (!scratch.empty()) std::filesystem::remove_all(scratch, ignored);
+        return EXIT_FAILURE;
+    }
     if (store_options) {
         int status = EXIT_SUCCESS;
         try {
