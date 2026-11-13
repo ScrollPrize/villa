@@ -78,10 +78,14 @@ fi
 
 LOADER="$LIBDIR/ld-linux-x86-64.so.2"
 if [ -e "$LOADER" ]; then
-    # glibc-bundle mode: charset modules + resolve NSS/glibc satellites and
-    # dlopened Qt-plugin deps from our own libs.
+    # glibc-bundle mode: charset modules; --library-path resolves NSS/glibc
+    # satellites and dlopened Qt-plugin deps from our own libs.
+    # LD_LIBRARY_PATH is deliberately not exported: the loader ignores it when
+    # --library-path is given, and every program the app starts (sh, python,
+    # nice, ssh, ...) would inherit it and load our glibc with the host's
+    # loader, which fails unless the host glibc is the same version. Bundled
+    # tools started from the GUI go through this loader (apps/VC3D/ToolProcess).
     export GCONV_PATH="$LIBDIR/gconv"
-    export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     exec "$LOADER" --library-path "$LIBDIR" "$HERE/usr/bin/$BIN" "$@"
 else
     exec "$HERE/usr/bin/$BIN" "$@"
