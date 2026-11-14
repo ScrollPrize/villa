@@ -770,6 +770,15 @@ def _run_training(request: TrainingRequest) -> int:
         if config.scan_transfer is None
         else ScanTransfer.from_config(config.scan_transfer, accelerator.device)
     )
+    scan_transfer_skip = None
+    if scan_transfer is not None and config.scan_transfer.skip_datasets:
+        skipped = [
+            index
+            for index, source in enumerate(dataset_config.active_datasets)
+            if any(part in str(source.segments_path) for part in config.scan_transfer.skip_datasets)
+        ]
+        scan_transfer_skip = torch.tensor(skipped, dtype=torch.long, device=accelerator.device)
+        accelerator.print(f"scan_transfer: not converting already-native datasets {skipped}")
 
     for step in progress:
         model.train()
@@ -795,7 +804,10 @@ def _run_training(request: TrainingRequest) -> int:
                 batch, label_distance, supervision_distance
             )
         if scan_transfer is not None:
-            batch["image"] = scan_transfer(batch["image"])
+            eligible = None
+            if scan_transfer_skip is not None and "dataset_idx" in batch:
+                eligible = ~torch.isin(batch["dataset_idx"].to(scan_transfer_skip.device), scan_transfer_skip)
+            batch["image"] = scan_transfer(batch["image"], eligible)
 
         with accelerator.accumulate(model):
             with accelerator.autocast():

@@ -641,6 +641,7 @@ class InkDataset(Dataset):
             data["image_raw_mean"] = torch.tensor(raw_mean, dtype=torch.float32)
             data["image_raw_std"] = torch.tensor(raw_std, dtype=torch.float32)
         data["is_unlabeled"] = torch.tensor(patch.is_unlabeled, dtype=torch.bool)
+        data["dataset_idx"] = torch.tensor(patch.segment.dataset_idx, dtype=torch.long)
         return data
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:

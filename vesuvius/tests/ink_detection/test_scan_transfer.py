@@ -118,3 +118,23 @@ def test_only_selected_samples_change():
 def test_rejects_wrong_layout():
     with pytest.raises(ValueError, match="expects"):
         ScanTransfer(_delta(), probability=1.0)(torch.randn(2, 5, 24, 24))
+
+
+def test_skip_datasets_round_trip_and_validation():
+    config = _parse(
+        _training_mapping(scan_transfer={"enabled": True, "kernel": "k.json", "skip_datasets": ["native9"]})
+    ).scan_transfer
+    assert config.skip_datasets == ("native9",)
+    assert _parse(_training_mapping(scan_transfer={"enabled": True, "kernel": "k.json"})).scan_transfer.skip_datasets == ()
+    with pytest.raises(TypeError, match="skip_datasets"):
+        _parse(_training_mapping(scan_transfer={"enabled": True, "kernel": "k.json", "skip_datasets": "native9"}))
+
+
+def test_ineligible_samples_are_never_converted():
+    image = torch.randn(8, 1, 5, 24, 24)
+    eligible = torch.tensor([True, False] * 4)
+    out = ScanTransfer(_delta(), probability=1.0, noise_amplitude=0.5)(image, eligible)
+    changed = (out - image).flatten(1).abs().amax(1) > 1e-6
+    assert torch.equal(changed, eligible)
+    untouched = ScanTransfer(_delta(), probability=1.0, noise_amplitude=0.5)(image, torch.zeros(8, dtype=torch.bool))
+    assert torch.equal(untouched, image)

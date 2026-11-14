@@ -17,13 +17,20 @@ All numbers are forward direction (the reverse direction is ~0.5 throughout).
 | baseline recipe | 0.743 | 0.779 | 0.790 | 0.821 |
 | baseline, 3 seeds (42 / 43 / 44) | 0.743 / 0.783 / 0.763 | 0.779 / 0.800 / 0.792 | | 0.821 / 0.822 / 0.831 |
 | + scan transfer (`scan_transfer`) | 0.785 | 0.797 | | 0.826 |
-| + self-training, round 1 (`background="mean"`) | 0.786 | 0.796 | 0.803 | 0.844 |
-| + self-training, safer background (`background="max"`) | **0.804** | **0.813** | **0.818** | 0.835 |
+| + scan transfer, 3 seeds (42 / 43 / 44) | 0.785 / 0.789 / 0.786 | 0.797 / 0.800 / 0.806 | | 0.826 / 0.825 / 0.832 |
+| + self-training, round 1 (`background="mean"`), transductive | 0.786 | 0.796 | 0.803 | 0.844 |
+| + self-training, safer background (`background="max"`), transductive | 0.804 | 0.813 | 0.818 | 0.835 |
 | 4-model average (3 seeds + a 78k-step run), the teacher | 0.799 | 0.808 | | 0.850 |
-| + self-training on 3 segments only (split test, see below) | **0.812** | **0.820** | | 0.838 |
+| + self-training on 3 segments only (3 of the 5 scored segments adapted) | 0.812 | 0.820 | | 0.838 |
+| **+ self-training, unadapted segments only, 3 seeds (42 / 43 / 44; split test, section 3)** | **0.796 / 0.797 / 0.803** | **0.808 / 0.809 / 0.809** | | |
+
+Rows marked transductive were scored on the same native segments they were self-trained on; the last row scores every
+segment with a model that never got a label, true or pseudo, on it (section 3).
 
 Stroke-centreline recall (share of the true strokes' skeleton recovered at 75% pixel precision, a readability-oriented
-companion to AUC): baseline 0.447, safer-background self-training 0.590 (mirror + depth windows).
+companion to AUC; each segment's threshold is chosen on the other four segments and applied blind, realised pixel
+precision 0.75-0.76), mirror TTA, seed 42: baseline 0.446, scan transfer 0.563, safer-background self-training 0.628
+(three-seed means: baseline 0.532, scan transfer 0.586).
 
 ## 1. Mirror TTA (no code change)
 
@@ -35,17 +42,28 @@ single-model seed mean 0.763 -> 0.790) at ~4x inference cost. Averaging three de
 
 A registered pooled/native pair of the same surface (PHerc 0814 segment 46527) shows the native render is, to first
 order, the pooled one blurred over ~3 depth planes and slightly in-plane, plus smooth low-frequency intensity differences
-(`scan_transfer_fit.py`: held-out R^2 0.740 vs 0.623 for resampling alone; three PHerc 0846A pairs give the same
-picture). The augmentation applies that kernel plus a matching smooth random field to a share of the training samples:
+(`scan_transfer_fit.py`: R^2 0.707 vs 0.580 for resampling alone on held-out 256 px spatial blocks with a guard band;
+0.711 vs 0.590 on randomly held-out pixels, so neighbouring-pixel leakage is negligible; three PHerc 0846A pairs give
+the same picture). The augmentation applies that kernel plus a matching smooth random field to a share of the training
+samples:
 
 ```json
 "scan_transfer": {"enabled": true, "kernel": "builtin:pooled_to_native_pherc0814", "probability": 0.5,
-                  "noise_amplitude": 0.5, "noise_sigma_xy": 4.0, "noise_sigma_z": 1.5}
+                  "noise_amplitude": 0.5, "noise_sigma_xy": 4.0, "noise_sigma_z": 1.5, "skip_datasets": ["native9"]}
 ```
 
-Leave-one-scroll-out: native 0.743 -> 0.785 for the same seed, higher on all 5 segments (+0.024 to +0.059), with no loss
-on pooled renders. It needs no data from the target scroll. With mirror TTA the same-seed gain is +0.019 (0.779 -> 0.797);
-against the three-seed mean it is smaller (0.790 -> 0.797), so treat it as a consistent but modest gain.
+`skip_datasets` lists substrings of a dataset group's `segments_path`; samples from matching groups (scans that are
+already native, such as the ink_9um `native9-*` labels) are never converted. An earlier revision of this pull request
+converted every training sample, native ones included. The leave-one-scroll-out runs below are unaffected (all their
+training groups are pooled renders); the production models were retrained with the fix (see "Other unseen scrolls").
+
+Leave-one-scroll-out, three seeds, each run paired with the baseline of the same seed: plain native AUC 0.763 -> 0.787
+(+0.024, SE 0.003 across segments; higher on all 5 segments and in 13 of 15 segment-seed pairs; per seed +0.042 / +0.005
+/ +0.023), with no loss on pooled renders (0.824 -> 0.828). With mirror TTA the gain shrinks to +0.011 (SE 0.005;
+0.790 -> 0.801; per seed +0.019 / +0.000 / +0.014; 9 of 15 pairs), and the three-seed averages differ by +0.008
+(0.803 -> 0.811). Blind stroke-centreline recall, mirror TTA, seed mean: 0.532 -> 0.586. It needs no data from the
+target scroll. Seed 42, used in the first rows of the table, is the most favourable pairing: treat the transfer as a
+consistent gain under plain inference and a small one once mirror TTA is used.
 
 ## 3. Self-training on the target scroll (`pseudo_labels.py`)
 
@@ -65,19 +83,50 @@ the target scroll and read others. In the table above all 5 native segments were
 segments that were never pseudo-labelled the round-1 student matches its teacher (0.850 vs 0.846) while the safer-background
 student is lower (0.830), so check transfer to unadapted regions before relying on it.
 
-**Split test (the First Letters setting).** Self-training on native w035, w040 and w044 only (safer-background labels from
-the same four teachers), then reading w039 and w041, which never contributed a label:
+**Split test (the First Letters setting).** Self-train on some native segments, read the others. Split A adapts on
+w035, w040 and w044 and reads w039 and w041; split B adapts on w039 and w041 and reads w035, w040 and w044 (the same
+safer-background labels from the same four teachers, 16 of 64 batch slots). Together they score every native segment
+with a model that never got a label, true or pseudo, on it. Three seeds, each paired with the baseline of the same seed:
 
-| native AUC, mirror TTA | w039 (unadapted) | w041 (unadapted) | mean of the two |
-|---|---|---|---|
-| baseline seed 42 | 0.735 | 0.803 | 0.769 |
-| baseline seeds 42 / 43 / 44, mean | 0.757 | 0.815 | 0.786 |
-| 4-model teacher | 0.778 | 0.828 | 0.803 |
-| **split self-trained (seed 42)** | **0.770** | **0.841** | **0.806** |
+| native AUC, unadapted segments only | seed 42 | seed 43 | seed 44 | paired gain (SE across segments) |
+|---|---|---|---|---|
+| baseline, mirror TTA | 0.779 | 0.800 | 0.792 | |
+| self-trained, mirror TTA | 0.808 | 0.809 | 0.809 | +0.018 (0.006); 13 of 15 segment-seed pairs |
+| baseline, plain | 0.743 | 0.783 | 0.763 | |
+| self-trained, plain | 0.796 | 0.797 | 0.803 | +0.035 (0.006); 13 of 15 |
 
-Adapting on some regions of a scroll improves reading of its other regions (+0.037 over the same seed, +0.020 over the
-seed mean), so one model matches the four-model ensemble there. Stroke-centreline recall over all five segments: 0.580
-(teacher 0.544, baseline 0.416). One seed, one held-out scroll.
+Adapting on some regions of a scroll improves reading of its other regions: one self-trained model matches the
+four-model teacher there (0.808 with mirror TTA), and the three self-trained models averaged reach 0.815 (the three
+baselines averaged: 0.803). Seed 42 is the most favourable seed (+0.029; seeds 43 and 44: +0.009 and +0.017).
+Stroke-centreline recall, blind thresholds as above, seed means: 0.626 against 0.532 for the baselines (teacher 0.588).
+The reverse direction (the other face) stays at 0.51-0.55 for every model. On the four pooled 0139 renders that no run
+pseudo-labelled (w016 w017 w029 w043), the six self-trained runs score 0.833-0.851 against 0.805-0.831 for the
+baselines. One held-out scroll.
+
+## Other unseen scrolls
+
+Two scrolls that no model here was trained on, read with the production models (trained on all four labelled scrolls,
+25k steps, mirror TTA), ROC-AUC:
+
+- PHerc 0841, human labels, the inkbench `p0841` protocol (three overlapping segments, compat label transfer, tie-aware
+  AUC inside validation AND supervision, mean over segments). Our renders of the published 9.366 um meshes, read in
+  reverse (the text side on these renders). Anchor: the public ink_9um seed-42 checkpoint scores 0.763 here (inkbench
+  reports 0.739 for it).
+- PHerc 0343P, IR-photograph letter truth on the 8.64 um / 116 keV scan (masks from DomRusso2/ir-truth-9um, segment
+  20250511003658), forward.
+
+| production models, seeds 42 / 43 / 44 (ensemble) | PHerc 0841 | PHerc 0343P |
+|---|---|---|
+| recipe, no scan transfer | 0.767 / 0.748 / 0.755 (0.769) | 0.746 / 0.746 / 0.767 (0.766) |
+| + scan transfer, earlier revision (native groups converted too) | 0.758 / 0.769 / 0.777 (0.780) | 0.732 / 0.719 / 0.742 (0.740) |
+| + scan transfer, `skip_datasets: ["native9"]` | 0.753 / 0.774 / 0.781 (0.782) | 0.748 / 0.741 / 0.759 (0.759) |
+
+For reference, dense_native (Nieuwlaar, MIT) scores 0.814 / 0.768; inkbench publishes 0.867 for Reader V3 on 0841.
+With the earlier revision the conversion did not carry over consistently (seed mean / ensemble against the recipe:
++0.011 / +0.011 on 0841, within that benchmark's noise; -0.022 / -0.026 on 0343P, a 116 keV scan unlike the 0814 pair
+the kernel was fitted on). With `skip_datasets` the 0343P loss is gone (0.749 / 0.759 against 0.753 / 0.766) and 0841
+keeps the small gain (0.769 / 0.782 against 0.757 / 0.769, within the benchmark's noise). Seed 44 of the fixed row was
+trained on a different GPU with the same code and config.
 
 ## Reproduce
 

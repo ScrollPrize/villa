@@ -102,10 +102,14 @@ class ScanTransfer:
         return noise / (noise.flatten(1).std(1).view(-1, 1, 1, 1, 1) + 1e-6)
 
     @torch.no_grad()
-    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+    def __call__(self, image: torch.Tensor, eligible: torch.Tensor | None = None) -> torch.Tensor:
+        """Convert a random ``probability`` share of the samples; ``eligible`` (B,) bool restricts the draw to samples
+        from pooled representations (already-native samples must not be converted again)."""
         if image.ndim != 5 or image.shape[1] != 1:
             raise ValueError(f"scan_transfer expects (B, 1, Z, Y, X), got {tuple(image.shape)}")
         selected = torch.rand(image.shape[0], device=image.device, generator=self.generator) < self.p
+        if eligible is not None:
+            selected = selected & eligible.to(device=image.device, dtype=torch.bool).view(-1)
         if not bool(selected.any()):
             return image
         x = image[selected].float()

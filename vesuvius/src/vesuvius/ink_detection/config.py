@@ -187,6 +187,8 @@ class ScanTransferConfig:
     noise_amplitude: float = 0.5
     noise_sigma_xy: float = 4.0
     noise_sigma_z: float = 1.5
+    # Datasets whose segments_path contains any of these substrings are already native scans and are never converted.
+    skip_datasets: tuple[str, ...] = ()
 
 
 def _scan_transfer_config(
@@ -212,12 +214,16 @@ def _scan_transfer_config(
         raise ValueError("scan_transfer.noise_amplitude must be nonnegative")
     if sigma_xy <= 0.0 or sigma_z <= 0.0:
         raise ValueError("scan_transfer noise sigmas must be positive")
+    skip = value.get("skip_datasets", ())
+    if isinstance(skip, str) or not all(isinstance(s, str) and s for s in skip):
+        raise TypeError("scan_transfer.skip_datasets must be a list of non-empty strings")
     return ScanTransferConfig(
         kernel=str(kernel),
         probability=probability,
         noise_amplitude=amplitude,
         noise_sigma_xy=sigma_xy,
         noise_sigma_z=sigma_z,
+        skip_datasets=tuple(skip),
     )
 
 
