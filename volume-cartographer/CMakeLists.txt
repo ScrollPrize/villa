@@ -690,6 +690,11 @@ foreach(_dir IN LISTS _vc_install_dirs)
     get_filename_component(_dir "${_dir}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
     get_property(_dir_targets DIRECTORY "${_dir}"
                  PROPERTY BUILDSYSTEM_TARGETS)
+    if(_dir STREQUAL _vc_object_store_dir AND TARGET vc_object_convert)
+        # VC3D runs vc_object_convert from its own folder to upgrade an old
+        # project store. The tool is defined one folder above vc_objects.
+        list(APPEND _dir_targets vc_object_convert)
+    endif()
     foreach(_tgt IN LISTS _dir_targets)
         get_target_property(_tgt_type ${_tgt} TYPE)
         if(_tgt_type STREQUAL "EXECUTABLE" OR _tgt_type STREQUAL "SHARED_LIBRARY")
