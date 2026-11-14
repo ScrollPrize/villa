@@ -473,6 +473,9 @@ int main()
             auto grid = flatGrid(4, 6);
             const vcr::grid::Surface flat({grid.data(), 4, 6, 18});
             require(near(vcr::grid::pixelsPerVoxel(flat, {0.5, 0.5, 0.25, 0.25, 8, 8}), 2.0f), "pixels per voxel");
+            // The same raster rotated by 90 degrees (pixel columns along grid rows) is as magnified.
+            require(near(vcr::grid::pixelsPerVoxel(flat, {0.5, 0.5, 0, 0, 8, 8, 0.25, 0.25}), 2.0f),
+                    "pixels per voxel of a rotated raster");
             require(vcr::grid::pixelsPerVoxel(flat, {50, 50, 0.25, 0.25, 8, 8}) == 0.0f, "no surface under the view");
         }
 

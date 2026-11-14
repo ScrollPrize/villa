@@ -221,7 +221,8 @@ std::array<float, 18> magnificationPoints(const Raster& raster);
 // View pixels per working voxel over a raster, from a surface's column and row tangents
 // at magnificationPoints(raster): the most magnified direction (smallest singular value
 // of the pixel-step Jacobian). 0 when no tangent pair is usable (holes, boundaries).
-float pixelsPerVoxel(const float* columnTangents, const float* rowTangents, std::size_t n, double sx, double sy);
+float pixelsPerVoxel(const float* columnTangents, const float* rowTangents, std::size_t n, double sx, double sy,
+                     double kx = 0, double ky = 0);
 float pixelsPerVoxel(const Surface& surface, const Raster& raster);
 
 // What a frame samples: a plane, or a raster over a surface (kept alive by the frame).
