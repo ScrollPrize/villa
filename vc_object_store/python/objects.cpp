@@ -1045,6 +1045,19 @@ NB_MODULE(_native, m)
         const auto ref=vo::transactionReceiptFromJson(jsonDumps(receipt)).objectReference(uuid);
         return ref?jsonLoads(vo::objectVersionToJson(*ref)):nb::none();
     },nb::arg("receipt"),nb::arg("object_uuid"),"Exact committed reference, including unchanged inherited inputs.");
+    m.def("receipt_object_references", [](const nb::dict& receipt,const std::vector<std::string>& uuids) {
+        // Decodes the receipt once: receipt_object_reference decodes it on
+        // every call, which a receipt of millions of entries cannot afford
+        // per object.
+        const auto decoded=vo::transactionReceiptFromJson(jsonDumps(receipt));
+        nb::dict result;
+        for(const auto& uuid:uuids){
+            const auto ref=decoded.objectReference(uuid);
+            result[nb::str(uuid.c_str())]=ref?jsonLoads(vo::objectVersionToJson(*ref)):nb::none();
+        }
+        return result;
+    },nb::arg("receipt"),nb::arg("object_uuids"),
+       "receipt_object_reference of each UUID, as {uuid: reference or None}, decoding the receipt once.");
     m.def("object_reference", [](const nb::dict& record) {
         vo::ObjectRecord value;
         value.uuid=nb::cast<std::string>(record["uuid"]);

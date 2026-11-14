@@ -2605,10 +2605,12 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, head, in
     # The links' commit versions every endpoint it touched: the pins are
     # those versions, at the links' commit.
     references = dict(pins.references)
-    from vc_object_store import receipt_object_reference
-    for uuid, version in (receipt.get('objects') or {}).items():
-        if uuid in references and version is not None:
-            references[uuid] = receipt_object_reference(receipt, uuid)
+    from vc_object_store import receipt_object_references
+    touched = [uuid for uuid, version in (receipt.get('objects') or {}).items()
+               if uuid in references and version is not None]
+    # One call: the receipt of a large link commit has millions of entries
+    # and is decoded per call.
+    references.update(receipt_object_references(receipt, touched))
     lines.append(f'links committed at commit {receipt["commit_sequence"]} (linked at {head})')
     return LinkResult(lines, plan, receipt, dataclasses.replace(
         pins, position=dataclasses.replace(position, commit_sequence=int(receipt['commit_sequence'])),
