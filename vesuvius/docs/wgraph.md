@@ -5,6 +5,7 @@ For the complete command sequence, brief stage descriptions, and measured full-v
 `vc_wgraph` exposes the shared importer, extractor and solver stages. It does not embed datasets, host paths or alternative solver implementations. Install the normal `vesuvius` package to receive the console command; an existing development environment can also run `python -m vesuvius.wgraph` or `python vesuvius/scripts/vc_wgraph`.
 
 ```sh
+# AFV source: import first. For an existing neural-tracer fibers.vcobj, skip this line.
 vc_wgraph import import-settings.json -i fibers.afv -o fibers.vcobj
 vc_wgraph extract extraction.json -i fibers.vcobj -o constraints.vcobj
 vc_wgraph hvb solve-settings.json -i constraints.vcobj -o classes.vcobj
@@ -14,6 +15,12 @@ vc_wgraph uv solve-settings.json -i windings.vcobj -o uv.vcobj
 ```
 
 Each stage accepts an optional profile name or arbitrary JSON configuration file; omission selects `default`. `-i/--input` and `-o/--output` override the actual input/output store paths. They never silently replace a separately configured report or working directory. JSON paths retain the existing native convention: relative paths are relative to the process's working directory, not the profile's directory.
+
+## Current input and solver support
+
+The `import` subcommand accepts AFV databases through the native parallel/sharded importer. An existing compatible vcobj fiber store, including the neural full-volume tracer's `fibers.vcobj`, starts at `extract`; no AFV conversion, reimport or producer changes are required. Independent Python adapters also accept completed compound stream-tracer tiles and reduced route pages, but those formats are not yet selectable backends of the `import` subcommand. See [accepted inputs](wgraph-quickstart.md#accepted-fiber-inputs) for their entry points and preparation limitations.
+
+The current winding command consumes extracted measurements and saved classification/sign runs, not arbitrary pre-existing `fiber_branch` annotation links. H/V/broken and normal signs use wrapped IRLS; winding uses linear GPU IRLS; UV uses the fixed-assignment optimizer described below. The separate LEMON comparison implementation is not a selectable `vc_wgraph winding` backend. There is no `vc_wgraph compare` subcommand. Existing application reference-evaluation helpers do not change these command-line capabilities.
 
 | Stage | Input configuration key | Output store key | Other outputs |
 |---|---|---|---|
@@ -67,9 +74,9 @@ Each store-to-store solver stage prepares and optimizes inside one managed proce
 
 `graph_cache`, `geometry_cache` and `tensor_cache` are not used for store-to-store stage handoffs. Geometry is read through the native store API into process-owned RAM under the consumed source snapshot. Large working allocations belong to process memory, not files under `/dev/shm` or scratch.
 
-Bulk geometry reads use `CollectionReader.geometry_array_columns` with the configured preparation workers. Sealed inputs permit independent native worker transactions sharing the immutable routing topology; each transaction processes coarse UUID blocks without reopening the collection for every block. Mutable inputs require an explicit single-worker snapshot. Generated H/V axial priors consume these coordinate buffers with the same shared midpoint-quadrature and umbilicus-center kernels as native extraction, returning only the needed per-fiber scalar array.
+Bulk geometry reads use `CollectionReader.geometry_array_columns` with the configured preparation workers. Sealed or history-enabled inputs permit independent native worker transactions sharing one routing topology; each transaction processes coarse UUID blocks without reopening the collection for every block. History-enabled sources may remain unsealed. Extraction captures and retains the consumed publication, and derived store references continue reading that publication after source edits while the required history remains available. An explicit saved `position` also supports reopening a historical source for parallel reads; an unpinned mutable root instead rejects advancement during a parallel read. Unsealed history-off sources are not valid reusable dependencies because replaced states cannot be retained. Generated H/V axial priors consume these coordinate buffers with the same shared midpoint-quadrature and umbilicus-center kernels as native extraction, returning only the needed per-fiber scalar array. See [store reading](../../vc_object_store/docs/reading.md) for position selection and capability limits.
 
-The batch solver workflow targets sealed history-off snapshots and opts into `trusted_immutable` geometry reading: it is not an integrity audit. Generated axial evidence is an in-process typed buffer bound to the consumed graph snapshot, rather than a simulated external feature file requiring repeated full-fiber digest scans. Explicit legacy feature files retain their original provenance validation. Bulk worker startup disables SQLite's global memory accounting by default (`sqlite_memory_statistics: false`); set it to `true` for diagnostic accounting. `sqlite_pagecache_bulk_bytes` remains zero unless explicitly configured. Both are startup options, not changes to the objective or numeric precision.
+The batch solver workflow automatically uses `trusted_immutable` geometry reading only when the complete referenced scope is sealed and history-off: this fast path is not an integrity audit. History-enabled scopes use checked reads. If a source has advanced, retained metadata and membership changed since the pin are reconstructed in connection-local RAM; geometry payloads remain referenced in their source store. Historical selection therefore has additional setup cost, not a promise of identical throughput to an immutable import. Generated axial evidence is an in-process typed buffer bound to the consumed graph snapshot, rather than a simulated external feature file requiring repeated full-fiber digest scans. Explicit legacy feature files retain their original provenance validation. Bulk worker startup disables SQLite's global memory accounting by default (`sqlite_memory_statistics: false`); set it to `true` for diagnostic accounting. `sqlite_pagecache_bulk_bytes` remains zero unless explicitly configured. Both are startup options, not changes to the objective or numeric precision.
 
 ### Bulk preparation and UV optimization
 
