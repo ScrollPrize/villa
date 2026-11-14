@@ -35,6 +35,11 @@ fs::path tmpDir(const std::string& tag)
     return dir;
 }
 
+struct DirectoryCleanup {
+    fs::path path;
+    ~DirectoryCleanup() { std::error_code ec; fs::remove_all(path, ec); }
+};
+
 void createU8Zarr(
     const fs::path& path,
     std::vector<size_t> shape,
@@ -112,6 +117,7 @@ TEST_CASE("LasagnaNormalSampler selects packed 4D channel groups")
 TEST_CASE("Packed prediction sheet normals preserve channel identity and odd base extents")
 {
     const auto dir=tmpDir("sheet_packed");
+    const DirectoryCleanup cleanup{dir};
     // Channel chunking deliberately differs from total channels. Direction is
     // +X, sheet normal +Y: reading the direction by mistake must fail this test.
     auto packed=vcr::zarr::Writer::create(dir/"sd2/2",{
@@ -128,9 +134,10 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
         packed.writeChunk({int64_t(c),0,0,0},bytes.data(),bytes.size());
     }
     writeText(dir/".zattrs",R"({"lasagna":{"version":3,"base_shape_zyx":[7,7,7],
-        "source_to_base":1.0,"groups":{"sd2":{"scaledown":2,"zarr":"sd2/2",
+        "source_to_base":1.0,"validity_channel":"presence","groups":{"sd2":{"scaledown":2,"zarr":"sd2/2",
         "channels":["presence","nx","ny","width","sheet_nx","sheet_ny","sheet_grad_mag"]}}}})");
     auto prediction=vc::lasagna::LasagnaDataset::open(dir);
+    CHECK(prediction.manifest().raw.at("validity_channel")=="presence");
     auto normals=vc::lasagna::fiberSheetNormalDataset(prediction);
     CHECK(normals.manifest().groups.size()==1);
     CHECK_NOTHROW(vc::lasagna::validateLasagnaNormalDatasetStructure(normals));
@@ -213,14 +220,13 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
     auto bad=prediction.manifest(); bad.groups[0].channels.pop_back();
     CHECK_THROWS(vc::lasagna::bindLasagnaChannel(bad,"nx",arrays));
     CHECK_THROWS(vc::lasagna::fiberSheetNormalDataset(vc::lasagna::LasagnaDataset(bad)));
-    fs::remove_all(dir);
 }
 
 TEST_CASE("packed corner batches combine channels without changing corner values")
 {
     using namespace vc::lasagna;
     const auto dir=tmpDir("channel_batch");
-    struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path,ec); } } cleanup{dir};
+    const DirectoryCleanup cleanup{dir};
     for (bool floats : {false,true}) {
         const auto root=dir/(floats?"float":"byte"); fs::create_directories(root);
         auto writer=vcr::zarr::Writer::create(root/"pred.zarr",{
