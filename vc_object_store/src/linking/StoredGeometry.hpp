@@ -87,6 +87,20 @@ std::optional<std::set<std::string>> newAmong(const std::optional<std::vector<st
 // edges stay). Nothing is removed when no new object survived.
 StaleEdgeScope incrementalScope(const std::string& edgeKind, const std::vector<std::string>& selected,
     const std::set<std::string>& fresh, const std::set<std::string>& failed);
+// Marks the write transaction failed when the scope is left by an exception:
+// the transaction's commit then throws and rolls everything back, so a
+// caller that catches the error cannot commit what was written before it.
+class FailTransactionOnError {
+public:
+    explicit FailTransactionOnError(objects::WriteTxn& txn);
+    FailTransactionOnError(const FailTransactionOnError&) = delete;
+    FailTransactionOnError& operator=(const FailTransactionOnError&) = delete;
+    ~FailTransactionOnError();
+
+private:
+    void* db_; // the transaction's sqlite3 connection
+    int exceptions_;
+};
 DetectorReport commitStoredCandidates(objects::ObjectStore& db, const StoredGeometry& inputs,
     objects::WriteTxn& txn, const std::string& detectorName, int detectorVersion,
     const std::vector<LinkCandidate>& candidates, bool replaceStalePending,

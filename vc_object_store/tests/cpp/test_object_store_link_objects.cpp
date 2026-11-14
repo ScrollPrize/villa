@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -323,24 +324,30 @@ void failedApplyCannotCommit(const TemporaryDirectory& directory)
     OpenOptions options; options.author = "links-test";
     auto db = ObjectStore::create(directory.path / "failed-apply.vcobj", options);
     populate(db);
-    PrepareOptions prepare;
-    prepare.progress = [](const util::ProgressUpdate& update) {
-        if (std::string(update.stage).find("writing links") != std::string::npos && update.completed == 1 && update.total == 2)
-            throw StopWriting("stop after the first link");
-    };
     const auto operation = links::linkObjectsOperation(plan());
-    const auto prepared = links::prepareLinkObjects(db, operation, prepare);
-    bool failed = false, committed = false;
-    {
-        auto txn = db.write();
-        try { prepared.apply(db, txn); } catch (const StopWriting&) { failed = true; }
-        require(failed, "the apply fails after its first link");
-        try { txn.commit(); committed = true; } catch (const std::exception&) {}
-    }
-    require(!committed, "a transaction whose link apply failed cannot commit");
-    require(edgeCount(db, "point-surface") == 0 && edgeCount(db, "same-surface") == 0,
-            "no link of a failed apply is stored");
-    {
+    // After the first link of the first detector, and after every link,
+    // before the marker.
+    const std::vector<std::function<bool(const util::ProgressUpdate&)>> failures{
+        [](const util::ProgressUpdate& update) {
+            return std::string(update.stage).find("writing links") != std::string::npos && update.completed == 1 && update.total == 2;
+        },
+        [](const util::ProgressUpdate& update) { return update.stage == "publishing the link marker"; }};
+    for (const auto& fails : failures) {
+        PrepareOptions prepare;
+        prepare.progress = [&fails](const util::ProgressUpdate& update) {
+            if (fails(update)) throw StopWriting("stop");
+        };
+        const auto prepared = links::prepareLinkObjects(db, operation, prepare);
+        bool failed = false, committed = false;
+        {
+            auto txn = db.write();
+            try { prepared.apply(db, txn); } catch (const StopWriting&) { failed = true; }
+            require(failed, "the apply fails part way");
+            try { txn.commit(); committed = true; } catch (const std::exception&) {}
+        }
+        require(!committed, "a transaction whose link apply failed cannot commit");
+        require(edgeCount(db, "point-surface") == 0 && edgeCount(db, "same-surface") == 0,
+                "no link of a failed apply is stored");
         auto txn = db.write();
         ObjectRecord record; record.kind = "note";
         db.upsertObject(txn, record);

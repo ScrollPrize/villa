@@ -42,26 +42,6 @@ bool isDetectorsOwnEdge(const EdgeRecord& e, const std::string& detectorName)
     }
 }
 
-// Marks the write transaction failed when the scope is left by an
-// exception: its commit then throws and rolls everything back.
-class FailTransactionOnError {
-public:
-    explicit FailTransactionOnError(sqlite3* db) : db_(db) {}
-    FailTransactionOnError(const FailTransactionOnError&) = delete;
-    FailTransactionOnError& operator=(const FailTransactionOnError&) = delete;
-    ~FailTransactionOnError()
-    {
-        if (std::uncaught_exceptions() <= exceptions_) return;
-        if (const auto pool = objects::activeStatementPools.find(db_);
-            pool != objects::activeStatementPools.end())
-            pool->second->actionConflict = true;
-    }
-
-private:
-    sqlite3* db_;
-    int exceptions_ = std::uncaught_exceptions();
-};
-
 }  // namespace
 
 std::map<std::string, int> detectorVersions()
@@ -69,6 +49,16 @@ std::map<std::string, int> detectorVersions()
     return {{kSurfaceOverlapDetector, kSurfaceOverlapVersion}, {kFiberSurfaceDetector, kFiberSurfaceVersion},
             {kTrackTrackDetector, kTrackTrackVersion}, {kTrackSurfaceDetector, kTrackSurfaceVersion},
             {kPointCollectionSurfaceDetector, kPointCollectionSurfaceVersion}};
+}
+
+detail::FailTransactionOnError::FailTransactionOnError(objects::WriteTxn& txn)
+    : db_(objects::ObjectStoreImplAccess::conn(txn)), exceptions_(std::uncaught_exceptions()) {}
+
+detail::FailTransactionOnError::~FailTransactionOnError()
+{
+    if (std::uncaught_exceptions() <= exceptions_) return;
+    if (const auto pool = objects::activeStatementPools.find(static_cast<sqlite3*>(db_)); pool != objects::activeStatementPools.end())
+        pool->second->actionConflict = true;
 }
 
 static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::WriteTxn& txn,
@@ -89,8 +79,8 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
     // failed, so a caller that catches the error still cannot commit the
     // links written before it.
     std::optional<objects::detail::Savepoint> operation;
-    std::optional<FailTransactionOnError> failTransaction;
-    if (transactionRollsBack) failTransaction.emplace(objects::ObjectStoreImplAccess::conn(txn));
+    std::optional<detail::FailTransactionOnError> failTransaction;
+    if (transactionRollsBack) failTransaction.emplace(txn);
     else operation.emplace(objects::ObjectStoreImplAccess::conn(txn));
     DetectorReport report;
     report.candidatesFound = int64_t(candidates.size());
