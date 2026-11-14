@@ -386,6 +386,7 @@ Optimization, execution, and artifact controls:
 | `ema` | `enabled`, `decay`, `start_step`, `update_every_steps`, `validate`, and `save_in_checkpoint`. |
 | `val_every`, `val_steps`, `val_preview_batches` | Validation and preview cadence. |
 | `save_every`, `log_every` | Checkpoint and log cadence. |
+| `keep_last_checkpoints` | Optional integer: keep only the newest N periodic `ckpt_<iteration>.pth` files and delete older ones after each save. `save_iterations` milestones and `best_*.pth` are never deleted. Default `null` keeps every checkpoint. |
 | `best_checkpoint_metric` | `val_loss`, `val_balanced_accuracy`, or null. |
 | `verify_finite_gradients_steps`, `max_amp_overflow_events` | Optional gradient/AMP health checks. |
 | `checkpoint`, `weights_only` | Resume from a checkpoint path, or load only its model weights. Relative checkpoint paths resolve beside the JSON file. |
