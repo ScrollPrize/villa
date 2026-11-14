@@ -19,6 +19,7 @@
 #include "vc_reader/array.hpp"
 #include "files.hpp"
 #include "../chunk_io.hpp"
+#include "../platform_io.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -300,21 +301,6 @@ fs::path utf8Path(const std::string& value)
     return fs::path(std::u8string(value.begin(), value.end()));
 }
 
-std::optional<fs::path> homeDirectory()
-{
-#ifdef _WIN32
-    if (const wchar_t* profile = _wgetenv(L"USERPROFILE"); profile && *profile)
-        return fs::path(profile);
-    const wchar_t* drive = _wgetenv(L"HOMEDRIVE");
-    const wchar_t* homePath = _wgetenv(L"HOMEPATH");
-    if (drive && *drive && homePath && *homePath)
-        return fs::path(std::wstring(drive) + homePath);
-#endif
-    if (const char* home = std::getenv("HOME"); home && *home)
-        return utf8Path(home);
-    return std::nullopt;
-}
-
 std::optional<fs::path> configDirectory()
 {
 #ifdef _WIN32
@@ -324,7 +310,7 @@ std::optional<fs::path> configDirectory()
     if (const char* configured = std::getenv("VC3D_CONFIG_DIR"); configured && *configured)
         return utf8Path(configured);
 #endif
-    const auto home = homeDirectory();
+    const auto home = platform::home_directory();
     return home ? std::optional<fs::path>(*home / ".VC3D") : std::nullopt;
 }
 
@@ -404,7 +390,7 @@ std::optional<fs::path> configuredCacheRoot(const fs::path& configDir)
 // The roots after cache.json, in order.
 std::vector<fs::path> cacheRootCandidates(const std::optional<fs::path>& configDir)
 {
-    const auto home = homeDirectory();
+    const auto home = platform::home_directory();
     std::vector<fs::path> candidates;
     if (configDir)
         if (auto root = iniCacheRoot(*configDir, home))
