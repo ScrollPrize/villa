@@ -16,8 +16,6 @@ def fork_channel_registration(reader, connection):
         connection.send(error)
     finally:
         connection.close()
-
-
 class ChannelStorageHttpTests(RemoteFixtureCase):
     def make_volume(self, name, version, sharded=False):
         shape = (7, 64, 64, 64)

@@ -15,8 +15,52 @@ ROLES = ("runs", "inputs", "fibers", "samples", "hypotheses", "widths",
          "positions", "relations", "metrics")
 
 
+def test_piece_normal_frames_are_not_a_persisted_workflow_role():
+    with pytest.raises(ValueError):
+        fiber_graph_solve_table("normal_frames")
+
+
 def unpack(spec, row):
     return dict(zip((c["name"] for c in spec["columns"]), row))
+
+
+@pytest.mark.parametrize('workers,packed',[(1,False),(3,True)])
+def test_bulk_fiber_result_columns_match_filtered_overlay_rows(tmp_path,workers,packed):
+    import numpy as np
+    from vc_object_store import CollectionReader, import_initial_records, write_extension_store
+    spec=fiber_graph_solve_table('fibers');run=str(uuid.uuid4());other=str(uuid.uuid4())
+    ids=sorted(str(uuid.uuid4()) for _ in range(4))
+    objects=[]
+    for i,fiber in enumerate(ids):
+        row=fiber_graph_solve_row('fibers',dict(fiber_uuid=extension_uuid(fiber),run_uuid=extension_uuid(run),
+            family=i%3,enabled=int(i!=2)))
+        alternate=fiber_graph_solve_row('fibers',dict(fiber_uuid=extension_uuid(fiber),run_uuid=extension_uuid(other),normal_sign=1))
+        objects.append(dict(record=dict(uuid=fiber,kind='fiber'),extensions=[row,alternate]))
+    base=tmp_path/'base.vcobj'
+    import_initial_records(base,objects,extensions=[spec],workers=workers,packed=packed)
+    changed=fiber_graph_solve_row('fibers',dict(fiber_uuid=extension_uuid(ids[1]),run_uuid=extension_uuid(run),
+        family=1,enabled=0,normal_sign=-1,selected_winding=-3,component=7))
+    overlay=tmp_path/'overlay.vcobj'
+    write_extension_store(overlay,[base],[spec],{spec['name']:[changed['values']]})
+    for path in (base,overlay):
+        with CollectionReader(path) as store:
+            rows=store.extension_rows(spec['name'],key_filter={'run_uuid':extension_uuid(run)})
+            result=store.fiber_result_columns(run)
+        actual=np.frombuffer(result['uuid_ascii'],dtype='S36').astype('U36')
+        assert actual.tolist()==ids
+        assert result['fiber_uuid'].shape==(4,16) and result['values'].shape==(4,5)
+        assert not result['values'].flags.writeable and not result['valid'].flags.writeable
+        by_id={extension_uuid(row[0]):row for row in rows}
+        for i,fiber in enumerate(ids):
+            assert bytes(result['fiber_uuid'][i])==uuid.UUID(fiber).bytes
+            for j,value in enumerate(by_id[fiber][2:7]):
+                assert bool(result['valid'][i,j])==(value is not None)
+                if value is not None:assert result['values'][i,j]==value
+        assert result['values'][1,1]==(0 if path==overlay else 1)
+    with CollectionReader(overlay) as store:
+        alternative=store.fiber_result_columns(other)
+        assert alternative['valid'][:,2].all() and not alternative['valid'][:,0].any()
+        assert store.fiber_result_columns(str(uuid.uuid4()))['values'].shape==(0,5)
 
 
 def append(tx, row):
@@ -26,7 +70,7 @@ def append(tx, row):
 def test_workflow_two_runs_share_graph(db):
     fiber = db.upsert_object(dict(kind="fiber"))
     other = db.upsert_object(dict(kind="fiber"))
-    edge = db.add_edge(dict(kind="test_link", a=fiber, b=other,
+    edge = db.add_edge(dict(kind="declared_reference", a=fiber, b=other,
                             a_anchor=dict(whole_geometry=True), b_anchor=dict(whole_geometry=True)))
     source_state = db.status()
     source_fiber_version = db.current_version(fiber)
@@ -104,7 +148,9 @@ def test_metadata_is_constructed_not_copied():
     assert fiber_source_extension("")["provisioning"] == {}
     constraints = fiber_constraint_extension(source, constraint_count=12)
     assert constraints["provisioning"] == dict(fiber_source_uuid=source, constraint_count=12,
-        length_units="base_voxels", winding_units="turns", endpoint_order="source")
+        length_units="base_voxels", winding_units="turns", endpoint_order="canonical",
+        arc_encoding="float32-le", direction_encoding="lasagna-xy-u8-hemisphere-i8",
+        connector_direction="a_to_b", winding_scale=16, winding_code_offset=1, winding_invalid_code=0)
     with pytest.raises(TypeError):
         fiber_source_extension({"uuid": source, "selected_ids": list(range(100)), "path": "/not/copied"})
     run = str(uuid.uuid4())

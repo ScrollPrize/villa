@@ -1,73 +1,88 @@
-"""Read-only integrity, measurement round-trip and object-store fiber geometry checks."""
+"""Read-only compact-measurement and source object-store geometry checks."""
 import argparse
 import json
-import math
 from pathlib import Path
-import re
-import sqlite3
+import uuid
 
-from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, read_polylines
+import numpy as np
+from vc_object_store import (CollectionReader, fiber_constraint_extension,
+                             decode_fiber_arc, decode_fiber_direction, decode_fiber_winding)
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
+    fiber_catalog, fibers_digest, read_polylines,
+)
+from .fiber_graph_store import FiberGraph, PREFIX
 
 
-def validate(path, fibers, all_measurements=False, *, header):
-    db = sqlite3.connect(path.resolve().as_uri()+"?mode=ro", uri=True)
-    assert db.execute("pragma integrity_check").fetchall() == [("ok",)]
-    assert not db.execute("pragma foreign_key_check").fetchall()
-    meta = {k: json.loads(v) for k,v in db.execute("select key,value from metadata")}
-    assert meta["complete"] and meta["format"] == "fiber-constraints"
-    count = db.execute("select count(*) from constraints").fetchone()[0]
-    assert count == meta["statistics"]["constraints"]
-    assert db.execute("select count(*) from fibers").fetchone()[0] == meta["statistics"]["fibers"]
-    volume = meta["provenance"]["config"]["coordinate_space"].split("/")[-1]
-    source_ids = {r["id"] for r in fiber_catalog(fibers, volume)}
-    ids = {r[0] for r in db.execute("select id from fibers")}
-    assert ids <= source_ids
-    if meta["provenance"]["config"].get("full_volume"):
-        assert ids == source_ids
-    header = Path(header).read_text()
-    struct_body = header.split("struct FiberTraceConstraint {",1)[1].split("\n};",1)[0]
-    # Every declared field must be serialized, including optional/null fields.
-    expected = set(re.findall(r"(?:std::\w+(?:<[^;]+?>)?|double|bool|int|cv::Vec3d)\s+(\w+)\s*(?:=|\{|;)", struct_body))
-    expected |= {"supportAEnd", "supportBEnd"}
-    step = 1 if all_measurements else max(1,count//1000)
-    rows = db.execute("select id,fiber_a,fiber_b,arc_a,arc_b,ax,ay,az,bx,by,bz,parallel_score,perpendicular_score,winding_distance,parallel_winding_distance,evidence_weight,normal_a,normal_b,measurement from constraints where id % ?=0", (step,))
-    checked=0
-    for row in rows:
-        m = json.loads(row[-1]); assert set(m) == expected, (set(m)^expected)
-        assert m["localEvent"] and not m["hardContinuity"] and m["signedWindingDelta"] is None
-        assert [m[k] for k in ("arcABaseVoxels","arcBBaseVoxels")] == list(row[3:5])
-        assert m["pointABaseXYZ"] == list(row[5:8]) and m["pointBBaseXYZ"] == list(row[8:11])
-        assert [m[k] for k in ("parallelScore","perpendicularScore","windingDistance","parallelWindingDistance","evidenceWeight")] == list(row[11:16])
-        for side in range(2):
-            n=json.loads(row[16+side])
-            if n["valid"]:
-                assert all(math.isfinite(x) for x in n["xyz"])
-                assert abs(math.sqrt(sum(x*x for x in n["xyz"]))-1)<1e-5
-            else:
-                assert n["xyz"] is None
-            # Check a bounded deterministic sample against original unsimplified geometry.
-            if checked < 100:
-                points=read_polylines(fibers,[row[1+side]],volume=volume)[0][1].tolist()
-                target=row[3+side];remaining=target; actual=None
-                for a,b in zip(points,points[1:]):
-                    length=math.dist(a,b)
-                    if remaining<=length+1e-7:
-                        f=min(1,max(0,remaining/length)) if length else 0
-                        actual=[x+f*(y-x) for x,y in zip(a,b)];break
-                    remaining-=length
-                assert actual is not None and math.dist(actual,row[5+3*side:8+3*side])<1e-5
-        checked+=1
-    degrees=dict(db.execute("select f.id,coalesce(a.n,0)+coalesce(b.n,0) from fibers f left join (select fiber_a id,count(*) n from constraints group by fiber_a) a on a.id=f.id left join (select fiber_b id,count(*) n from constraints group by fiber_b) b on b.id=f.id"))
-    assert sum(degrees.values())==2*count
-    assert sum(v==0 for v in degrees.values())==meta["statistics"]["isolated_fibers"]
-    result={"integrity":"ok","fibers":len(ids),"constraints":count,"measurement_rows_checked":checked,"geometry_endpoints_checked":2*min(checked,100),"degree_sum":sum(degrees.values())}
-    print(json.dumps(result,indent=2))
+def validate(path, fibers, all_measurements=False, *, header=None):
+    """Check every persisted field; omitted XYZ is deliberately not reconstructed.
+
+    The legacy header argument is accepted for CLI compatibility. The current
+    storage contract is the native compact extension, not the extraction's
+    larger transient candidate structure.
+    """
+    graph = FiberGraph(path)
+    source_ids = {r['id'] for r in fiber_catalog(fibers, graph.volume)}
+    assert set(graph.ids) <= source_ids, 'Graph refers to missing source fibers'
+    assert fibers_digest(path, graph.ids) == fibers_digest(fibers, graph.ids), 'Source fiber version mismatch'
+    expected = fiber_constraint_extension('')['columns']
+    assert graph.measurement_info['format_version'] == 4
+    assert graph.measurement_info['columns'] == expected, 'Unexpected compact measurement schema'
+    count = len(graph.event_ids)
+    step = 1 if all_measurements else max(1, count//1000)
+    take = np.arange(0, count, step)
+    table = PREFIX+'constraints'
+    columns = [c['name'] for c in expected]
+    endpoint_ids = np.unique(np.r_[graph.fiber_a[take], graph.fiber_b[take]])
+    # Geometry is read only to determine the legal arc range, never to invent
+    # a stored measurement XYZ value or validate it against a reconstruction.
+    lengths = {row['id']: float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum())
+               for row, xyz in read_polylines(fibers, endpoint_ids, volume=graph.volume)}
+    with CollectionReader(str(path)) as store:
+        for k in take:
+            values = store.extension_rows(table, [uuid.UUID(graph.edge_uuid[k]).bytes])
+            assert len(values) == 1, 'Missing or ambiguous measurement row'
+            row = dict(zip(columns, values[0]))
+            assert row['edge_uuid'] == uuid.UUID(graph.edge_uuid[k]).bytes
+            for side in ('a', 'b'):
+                arc = decode_fiber_arc(row['arc_'+side])
+                assert arc == getattr(graph, 'arc_'+side)[k]
+                length = lengths[getattr(graph, 'fiber_'+side)[k]]
+                # Compare in the stored float32 domain: rounding the true end
+                # position gives the greatest legal encoded arc, with no
+                # additional tolerance admitting another representable value.
+                maximum_arc = float(np.float32(length))
+                assert np.isfinite(arc) and 0 <= arc <= maximum_arc, 'Arc outside source fiber'
+            for field, validity in (('normal_a','valid_a'), ('normal_b','valid_b'),
+                                    ('connector','valid_connector')):
+                raw = row[field]
+                assert len(raw) == 3
+                vector = np.asarray(decode_fiber_direction(raw))
+                valid = raw[2] != 0
+                assert bool(getattr(graph, validity)[k]) == valid
+                assert np.array_equal(vector, getattr(graph, field)[k]), field
+                if valid:
+                    assert np.isfinite(vector).all() and abs(np.linalg.norm(vector)-1) < 1e-12
+                else:
+                    assert np.array_equal(vector, np.zeros(3))
+            winding = decode_fiber_winding(row['winding_distance'])
+            assert winding == graph.distance[k]
+            if row['extra'] is not None:
+                assert isinstance(json.loads(row['extra']), dict), 'Extension extra must be a JSON object'
+    degrees = np.bincount(np.r_[graph.i, graph.j], minlength=len(graph.ids))
+    assert degrees.sum() == 2*count
+    result = dict(integrity='ok', integrity_scope='native snapshot and all persisted compact measurement fields; not SQLite page integrity',
+                  fibers=len(graph.ids), constraints=count, measurement_rows_checked=len(take),
+                  arc_ranges_checked=2*len(take), geometry_endpoints_checked=0,
+                  endpoint_xyz='absent; access fails explicitly', degree_sum=int(degrees.sum()))
+    print(json.dumps(result, indent=2))
     return result
 
 
-if __name__=="__main__":
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument("database",type=Path)
-    p.add_argument("--fibers",type=Path,required=True)
-    p.add_argument("--header",type=Path,required=True)
-    p.add_argument("--all-measurements",action="store_true")
-    a=p.parse_args();validate(a.database,a.fibers,a.all_measurements,header=a.header)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('database', type=Path)
+    parser.add_argument('--fibers', type=Path, required=True)
+    parser.add_argument('--header', type=Path)
+    parser.add_argument('--all-measurements', action='store_true')
+    args = parser.parse_args()
+    validate(args.database, args.fibers, args.all_measurements, header=args.header)

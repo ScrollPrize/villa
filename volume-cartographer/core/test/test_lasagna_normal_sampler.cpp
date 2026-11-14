@@ -77,15 +77,17 @@ void writeText(const fs::path& path, const std::string& text)
 
 } // namespace
 
-TEST_CASE("LasagnaNormalSampler rejects 4D channel groups")
+TEST_CASE("LasagnaNormalSampler selects packed 4D channel groups")
 {
     const auto dir = tmpDir("4d");
     const auto zarrPath = dir / "pred.zarr";
     std::vector<uint8_t> payload(3 * 2 * 2 * 2, 128);
+    std::fill(payload.begin(),payload.begin()+16,255);
     createU8Zarr(zarrPath, {3, 2, 2, 2}, {3, 2, 2, 2}, &payload);
     const auto manifestPath = dir / "dataset.lasagna.json";
     writeText(manifestPath, R"({
         "version": 2,
+        "packed_channel_view": true,
         "source_to_base": 1.0,
         "grad_mag_encode_scale": 255.0,
         "grad_mag_factor": 1.0,
@@ -99,11 +101,170 @@ TEST_CASE("LasagnaNormalSampler rejects 4D channel groups")
     })");
 
     const vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    CHECK_THROWS_WITH_AS(
-        vc::lasagna::LasagnaNormalSampler(dataset),
-        doctest::Contains("must reference a 3D (Z,Y,X) zarr"),
-        std::runtime_error);
+    const auto sample=vc::lasagna::LasagnaNormalSampler(dataset).sampleNormal({0.5,0.5,0.5});
+    CHECK(sample.valid);
+    CHECK(sample.normal[0]==doctest::Approx(1));
+    CHECK(sample.normal[1]==doctest::Approx(0));
+    CHECK(sample.normal[2]==doctest::Approx(0));
     fs::remove_all(dir);
+}
+
+TEST_CASE("Packed prediction sheet normals preserve channel identity and odd base extents")
+{
+    const auto dir=tmpDir("sheet_packed");
+    // Channel chunking deliberately differs from total channels. Direction is
+    // +X, sheet normal +Y: reading the direction by mistake must fail this test.
+    auto packed=vcr::zarr::Writer::create(dir/"sd2/2",{
+        .shape={7,2,2,2},.chunks={4,2,2,2},.compressor="",.fillValue=0.});
+    const std::array<uint8_t,8> values{255,255,128,80,128,255,255,0};
+    for(size_t c=0;c<2;++c) {
+        std::vector<uint8_t> bytes(32);
+        for(size_t k=0;k<4;++k)
+            std::fill(bytes.begin()+8*k,bytes.begin()+8*(k+1),values[4*c+k]);
+        // Only one sheet-normal corner is valid. The other seven are blank,
+        // not diagonal normals, even though decoding (0,0) produces an axis.
+        if(c==1) for(size_t k=0;k<3;++k)
+            std::fill(bytes.begin()+8*k+1,bytes.begin()+8*(k+1),uint8_t{0});
+        packed.writeChunk({int64_t(c),0,0,0},bytes.data(),bytes.size());
+    }
+    writeText(dir/".zattrs",R"({"lasagna":{"version":3,"base_shape_zyx":[7,7,7],
+        "source_to_base":1.0,"groups":{"sd2":{"scaledown":2,"zarr":"sd2/2",
+        "channels":["presence","nx","ny","width","sheet_nx","sheet_ny","sheet_grad_mag"]}}}})");
+    auto prediction=vc::lasagna::LasagnaDataset::open(dir);
+    auto normals=vc::lasagna::fiberSheetNormalDataset(prediction);
+    CHECK(normals.manifest().groups.size()==1);
+    CHECK_NOTHROW(vc::lasagna::validateLasagnaNormalDatasetStructure(normals));
+    vc::lasagna::LasagnaNormalSampler sampler(normals);
+    CHECK(sampler.masksInvalidCorners());
+    const auto n=sampler.sampleNormal({2,2,2});
+    REQUIRE(n.valid);
+    CHECK(n.normal[0]==doctest::Approx(0));
+    CHECK(n.normal[1]==doctest::Approx(1));
+    CHECK(n.normal[2]==doctest::Approx(0));
+    CHECK_FALSE(sampler.sampleNormal({4,4,4}).valid);
+    std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> sampled;
+    (void)sampler.sampleNormalBatch(std::vector<cv::Vec3f>{{2,2,2},{4,4,4}},2,sampled);
+    REQUIRE(sampled.size()==2);
+    CHECK(sampled[0].valid);
+    CHECK(sampled[0].normal[0]==doctest::Approx(0));
+    CHECK(sampled[0].normal[1]==doctest::Approx(1));
+    CHECK_FALSE(sampled[1].valid);
+    std::vector<vc::lasagna::NormalSampleWithDerivative> doubles;
+    (void)sampler.sampleNormalBatch(std::vector<cv::Vec3d>{{2,2,2},{4,4,4}},false,2,doubles);
+    REQUIRE(doubles.size()==2);
+    CHECK(doubles[0].sample.valid);
+    CHECK(doubles[0].sample.normal[1]==doctest::Approx(1));
+    CHECK_FALSE(doubles[1].sample.valid);
+    // Policy sampling must preserve the corner-buffer reference exactly, with
+    // channel chunking, replicated volume edges, invalid corners and bad points.
+    vc::lasagna::LasagnaNormalSamplerOptions fusedOptions;
+    fusedOptions.channelCache=true;
+    fusedOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
+    vc::lasagna::LasagnaNormalSampler fused(normals,fusedOptions);
+    auto referenceOptions=fusedOptions;
+    referenceOptions.pointInterpolation=false;
+    referenceOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
+    vc::lasagna::LasagnaNormalSampler reference(normals,referenceOptions);
+    const std::vector<cv::Vec3f> locations{{0,0,0},{2,2,2},{4,0,0},{4,4,4},
+        {-1,0,0},{8,0,0},{NAN,0,0},{INFINITY,0,0},{1,2,3},{2,2,2}};
+    std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> policyValues,cornerValues;
+    (void)fused.sampleNormalBatch(locations,1,policyValues);
+    (void)reference.sampleNormalBatch(locations,1,cornerValues);
+    REQUIRE(policyValues.size()==cornerValues.size());
+    for(size_t i=0;i<locations.size();++i) {
+        CHECK(policyValues[i].valid==cornerValues[i].valid);
+        CHECK(policyValues[i].normal==cornerValues[i].normal);
+    }
+    CHECK(fusedOptions.memoryCache->nbytes()==24);
+    CHECK(fusedOptions.memoryCache->size()==3);
+    CHECK((fused.regionChannels()[0].array->cache_channels()==std::vector<int64_t>{4,5,6}));
+    auto floatPacked=vcr::zarr::Writer::create(dir/"float",{
+        .shape={7,2,2,2},.chunks={4,2,2,2},.dtype="<f4",.compressor="",.fillValue=0.});
+    for(size_t c=0;c<2;++c) {
+        std::vector<float> bytes(32);
+        for(size_t k=0;k<4;++k)
+            std::fill(bytes.begin()+8*k,bytes.begin()+8*(k+1),float(values[4*c+k]));
+        if(c==1)for(size_t k=0;k<3;++k)
+            std::fill(bytes.begin()+8*k+1,bytes.begin()+8*(k+1),0.f);
+        floatPacked.writeChunk({int64_t(c),0,0,0},reinterpret_cast<const uint8_t*>(bytes.data()),bytes.size()*sizeof(float));
+    }
+    auto floatManifest=normals.manifest();
+    for(auto& group:floatManifest.groups) {
+        group.relativeZarrKey=(dir/"float").string();
+        group.sourceLocation=(dir/"float").string();
+        group.zarrPath=dir/"float";
+    }
+    const vc::lasagna::LasagnaDataset floatDataset(floatManifest);
+    fusedOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
+    referenceOptions.memoryCache=std::make_shared<vcr::MemoryCache>(1<<20);
+    vc::lasagna::LasagnaNormalSampler floatFused(floatDataset,fusedOptions),floatReference(floatDataset,referenceOptions);
+    REQUIRE(floatFused.regionChannels()[0].float32);
+    (void)floatFused.sampleNormalBatch(locations,1,policyValues);
+    (void)floatReference.sampleNormalBatch(locations,1,cornerValues);
+    for(size_t i=0;i<locations.size();++i) {
+        CHECK(policyValues[i].valid==cornerValues[i].valid);
+        CHECK(policyValues[i].normal==cornerValues[i].normal);
+    }
+    CHECK(fusedOptions.memoryCache->nbytes()==96);
+    vc::lasagna::LasagnaGroupArrays arrays(0);
+    const auto direction=vc::lasagna::bindLasagnaChannel(prediction.manifest(),"nx",arrays);
+    CHECK(vc::lasagna::sampleLasagnaChannel(direction,cv::Vec3d{2,2,2}).value()==255);
+    CHECK(prediction.manifest().groupForChannel("sheet_nx")->channelIndex("sheet_nx")==4);
+    auto bad=prediction.manifest(); bad.groups[0].channels.pop_back();
+    CHECK_THROWS(vc::lasagna::bindLasagnaChannel(bad,"nx",arrays));
+    CHECK_THROWS(vc::lasagna::fiberSheetNormalDataset(vc::lasagna::LasagnaDataset(bad)));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("packed corner batches combine channels without changing corner values")
+{
+    using namespace vc::lasagna;
+    const auto dir=tmpDir("channel_batch");
+    struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path,ec); } } cleanup{dir};
+    for (bool floats : {false,true}) {
+        const auto root=dir/(floats?"float":"byte"); fs::create_directories(root);
+        auto writer=vcr::zarr::Writer::create(root/"pred.zarr",{
+            .shape={7,3,3,3},.chunks={4,3,3,3},.dtype=floats?"<f4":"|u1",.compressor="blosc"});
+        for (int c=0;c<2;++c) {
+            std::vector<uint8_t> bytes(4*27);
+            std::vector<float> f(4*27);
+            for (size_t i=0;i<bytes.size();++i) {
+                bytes[i]=uint8_t((c*108+i)%256); f[i]=bytes[i];
+            }
+            writer.writeChunk({c,0,0,0},floats?reinterpret_cast<const uint8_t*>(f.data()):bytes.data(),
+                              floats?f.size()*sizeof(float):bytes.size());
+        }
+        writeText(root/"dataset.lasagna.json",R"({"version":2,"packed_channel_view":true,
+            "source_to_base":1,"grad_mag_encode_scale":255,"grad_mag_factor":1,
+            "groups":{"pred":{"zarr":"pred.zarr","scaledown":0,
+                "channels":["extra0","extra1","extra2","extra3","nx","ny","grad_mag"]}}})");
+        const auto dataset=LasagnaDataset::open(root/"dataset.lasagna.json");
+        for (bool channelCache : {false,true}) {
+            LasagnaGroupArrays arrays(1<<20,channelCache);
+            const auto nx=bindLasagnaChannel(dataset.manifest(),"nx",arrays);
+            const auto ny=bindLasagnaChannel(dataset.manifest(),"ny",arrays);
+            const auto mag=bindLasagnaChannel(dataset.manifest(),"grad_mag",arrays);
+            const std::vector<const LasagnaChannelBinding*> bindings{&ny,&mag,&nx,&ny};
+            const std::vector<cv::Vec3f> points{{0.2f,0.4f,0.8f},{1.9f,1.4f,1.1f},{2,2,2},{-1,0,0},{0.2f,0.4f,0.8f}};
+            LasagnaCornerBatch batch;
+            sampleLasagnaChannelCornerBatch(bindings,points,batch);
+            for(size_t b=0;b<bindings.size();++b) {
+                std::vector<cv::Vec3d> doublePoints;
+                for(const auto& p:points)doublePoints.emplace_back(p[0],p[1],p[2]);
+                LasagnaCubes scalar;readLasagnaCubes(*bindings[b],doublePoints,scalar);
+                CHECK(batch.valid==scalar.valid);
+                for(size_t i=0;i<points.size();++i)if(batch.valid[i])
+                    for(size_t k=0;k<8;++k)CHECK(batch.values[b][i][k]==scalar.values[i][k]);
+            }
+        }
+        LasagnaNormalSamplerOptions options;
+        options.autoCacheFraction=0.5;options.channelCache=true;
+        LasagnaNormalSampler automatic(dataset,options);
+        const auto channels=automatic.regionChannels();
+        REQUIRE(channels[0].array->memory_cache());
+        CHECK(channels[0].array->memory_cache()==channels[1].array->memory_cache());
+        CHECK(channels[0].array->memory_cache()->max_bytes()>0);
+    }
 }
 
 TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordinate scaling")
@@ -243,6 +404,10 @@ TEST_CASE("Batched aligned winding tracks scalar sampling on varying fields")
         connectors, 0.37, 1);
     const auto batchFour = sampler.normalAlignedWindingDistancesBatch(
         connectors, 0.37, 4);
+    vc::lasagna::LasagnaNormalSamplerOptions referenceOptions;
+    referenceOptions.windingPointInterpolation=false;
+    vc::lasagna::LasagnaNormalSampler reference(dataset,referenceOptions);
+    const auto referenceBatch=reference.normalAlignedWindingDistancesBatch(connectors,0.37,1);
     REQUIRE(batchOne.size() == connectors.size());
     REQUIRE(batchFour.size() == connectors.size());
     for (size_t index = 0; index < connectors.size(); ++index) {
@@ -250,7 +415,52 @@ TEST_CASE("Batched aligned winding tracks scalar sampling on varying fields")
             connectors[index].first, connectors[index].second, 0.37);
         CHECK(batchOne[index] == doctest::Approx(scalar).epsilon(2.0e-5));
         CHECK(batchFour[index] == batchOne[index]);
+        CHECK(batchOne[index] == referenceBatch[index]);
     }
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Interpolated winding samples preserve independent chunk layouts and bounded tiles")
+{
+    const auto dir=tmpDir("winding_independent_chunks");
+    createConstantChunkedU8Zarr(dir/"density",{12,12,12},{5,4,3},255);
+    createConstantChunkedU8Zarr(dir/"nx",{12,12,12},{3,4,5},220);
+    auto writer=vcr::zarr::Writer::create(dir/"ny",{
+        .shape={1,12,12,12},.chunks={1,4,3,2},.dtype="<f4",.compressor=""});
+    const std::vector<float> bytes(4*3*2,128.f);
+    for(int64_t z=0;z<3;++z)for(int64_t y=0;y<4;++y)for(int64_t x=0;x<6;++x)
+        writer.writeChunk({0,z,y,x},reinterpret_cast<const uint8_t*>(bytes.data()),bytes.size()*sizeof(float));
+    writeText(dir/"dataset.lasagna.json",R"({"version":2,"packed_channel_view":true,"grad_mag_encode_scale":100.0,"grad_mag_factor":1.0,
+        "groups":{"density":{"zarr":"density","scaledown":0,"channels":["grad_mag"]},
+                  "nx":{"zarr":"nx","scaledown":0,"channels":["nx"]},
+                  "ny":{"zarr":"ny","scaledown":0,"channels":["ny"]}}})");
+    const auto dataset=vc::lasagna::LasagnaDataset::open(dir/"dataset.lasagna.json");
+    vc::lasagna::LasagnaNormalSamplerOptions directOptions;directOptions.readerThreads=4;
+    vc::lasagna::LasagnaNormalSampler direct(dataset,directOptions);
+    vc::lasagna::LasagnaNormalSamplerOptions referenceOptions;
+    referenceOptions.windingPointInterpolation=false;referenceOptions.readerThreads=1;
+    vc::lasagna::LasagnaNormalSampler reference(dataset,referenceOptions);
+    std::vector<std::pair<cv::Vec3d,cv::Vec3d>> connectors;
+    for(size_t i=0;i<1025;++i)
+        connectors.push_back({{0.17,0.31,double(i%10)+0.44},{10.73,9.82,double(i%10)+0.19}});
+    connectors.push_back({{11,11,11},{1,1,1}});
+    connectors.push_back({{-1,0,0},{1,1,1}});
+    connectors.push_back({{NAN,0,0},{1,1,1}});
+    connectors.push_back({{1,1,1},{1,1,1}});
+    const auto actual=direct.normalAlignedWindingDistancesBatch(connectors,0.37,4);
+    const auto repeated=direct.normalAlignedWindingDistancesBatch(connectors,0.37,4);
+    std::vector<std::pair<cv::Vec3d,cv::Vec3d>> expanded;
+    for(int copy=0;copy<4;++copy)expanded.insert(expanded.end(),connectors.begin(),connectors.end());
+    const auto expandedValues=direct.normalAlignedWindingDistancesBatch(expanded,0.37,4);
+    for(size_t i=0;i<expandedValues.size();++i)CHECK(expandedValues[i]==actual[i%actual.size()]);
+    const auto expected=reference.normalAlignedWindingDistancesBatch(connectors,0.37,1);
+    vc::lasagna::LasagnaNormalSamplerOptions tiledOptions;
+    tiledOptions.windingRegionBaseVoxels=2.;tiledOptions.windingBatchPoints=17;
+    vc::lasagna::LasagnaNormalSampler tiled(dataset,tiledOptions);
+    const auto tiledValues=tiled.normalAlignedWindingDistancesBatch(connectors,0.37,4);
+    REQUIRE(actual.size()==expected.size());
+    REQUIRE(tiledValues.size()==actual.size());
+    for(size_t i=0;i<actual.size();++i){CHECK(actual[i]==expected[i]);CHECK(tiledValues[i]==actual[i]);CHECK(repeated[i]==actual[i]);}
     fs::remove_all(dir);
 }
 

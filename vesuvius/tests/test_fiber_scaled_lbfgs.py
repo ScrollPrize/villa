@@ -4,6 +4,42 @@ import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_scaled_lbfgs import scaled_joint
 
 
+@pytest.mark.parametrize('edge_batch,prior_batch',[(1,1),(2,3),(20,20)])
+def test_disjoint_pair_prior_global_parts_match_full(edge_batch,prior_batch):
+    from .test_fiber_bucket_uv import fixture
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_soft_winding as soft
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_implicit_winding as imp
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_bucket_uv import BucketUV
+    d,cfg,_,s,w=fixture()
+    d['links']=np.array([[0.,1.,50.,70.]])
+    cfg.update(cavity_winding_sigma=False,predicted_only_geometry=True,
+        straight_fixed_length_geometry=True,shared_curve_geometry=True,
+        shared_curve_integer_geometry=True,shared_curve_hypothesis_mapping=True,
+        reuse_constraint_work=True)
+    owners=np.array([1,0,1,0,1,0,1])
+    samples=dict(owner=owners,ds=np.linspace(1,290,7),phase=np.linspace(.1,.9,7),
+        z=np.arange(7.),weight=np.full(7,.25),v_owner=owners[::-1].copy(),
+        v_ds=np.linspace(2,270,7),v_z=np.arange(7.)*20,v_weight=np.full(7,.25))
+    data,nodes=soft.tensor_inputs(d,samples,cfg,'cpu')
+    state=s.detach().double().requires_grad_();initial=w.detach().double()
+    raw=soft.encode_widths(initial,cfg).requires_grad_()
+    ext=BucketUV(d,cfg,'cpu').double();ext.prepare_fields(d,samples)
+    ext.curve.initialize(state,initial)
+    params=[state,raw,*ext.parameters()]
+    loss,expected=soft.objective(state,raw,initial,data,nodes,cfg,pair_cost=imp.pair_cost,extension=ext)
+    gradients=torch.autograd.grad(loss,params,allow_unused=True)
+    actual={};accum=[torch.zeros_like(p) for p in params]
+    for value,terms in soft.full_objective_parts(state,raw,initial,data,nodes,cfg,imp.pair_cost,ext,edge_batch,prior_batch):
+        for key,v in terms.items():actual[key]=actual.get(key,0)+v.detach()
+        gs=torch.autograd.grad(value,params,allow_unused=True)
+        for total,g in zip(accum,gs):
+            if g is not None:total.add_(g)
+    assert actual.keys()==expected.keys()
+    for key in actual:torch.testing.assert_close(actual[key],expected[key],rtol=1e-6,atol=1e-8)
+    for got,want,p in zip(accum,gradients,params):
+        torch.testing.assert_close(got,torch.zeros_like(p) if want is None else want,rtol=1e-6,atol=1e-8)
+
+
 def test_fixed_length_vram_estimate():
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_scaled_lbfgs import estimated_fixed_length_vram
     gib=1024**3
@@ -100,6 +136,33 @@ def test_squared_cache_preserves_trajectory(matched):
     uncached,a=run(False);cached,b=run(True)
     torch.testing.assert_close(cached,uncached,rtol=0,atol=0)
     assert b['evaluations']<a['evaluations'] and b['cache_hits']>0
+
+
+def test_first_gradient_profile_logs_once_without_extra_evaluations(capsys):
+    import json
+    def run(profile):
+        state=torch.tensor([[2.,0.,0.,100.]],dtype=torch.float64,requires_grad=True)
+        raw=torch.tensor([1500.,.1,.2],dtype=torch.float64,requires_grad=True)
+        history=[]
+        def objective():
+            return ((raw[0]-2000)/100).square()+((raw[1:]-.3)/.1).square().sum()+state[:,0].square().sum(),{}
+        result=scaled_joint(objective,state,raw,torch.nn.Module(),10,
+            callback=lambda i:history.append(torch.cat((state.detach().flatten(),raw.detach())).clone()),
+            monotone_widths=True,relative_widths=True,optimizer_kind='torch_lbfgs',
+            profile_first_gradient=profile,optimizer_progress_every=1 if profile else 0)
+        return torch.stack(history),result
+    reference,a=run(False)
+    assert not capsys.readouterr().out
+    measured,b=run(True)
+    rows=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    first=[row for row in rows if row['stage']=='optimizer_first_gradient']
+    progress=[row for row in rows if row['stage']=='optimizer_progress']
+    assert len(first)==1
+    assert first[0]['parameters']==4 and first[0]['seconds']>=0 and first[0]['peak_vram_bytes']==0
+    assert [row['iteration'] for row in progress]==list(range(1,b['iterations']+1))
+    assert progress[-1]['evaluations']==b['evaluations']
+    assert a['evaluations']==b['evaluations'] and a['iterations']==b['iterations'] and a['cache_hits']==b['cache_hits']
+    torch.testing.assert_close(measured,reference,atol=0,rtol=0)
 
 
 @pytest.mark.parametrize('name',['width_coordinate_scale','phase_coordinate_scale'])

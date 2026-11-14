@@ -4,6 +4,7 @@
 #pragma once
 
 #include "lzw.hpp"
+#include "decoder_context.hpp"
 
 #include <blosc.h>
 #include <lz4.h>
@@ -102,12 +103,14 @@ inline void decode(Codec codec, const std::uint8_t* src, std::size_t n, std::uin
         if (nbytes != dst_n || cbytes > n)
             throw std::runtime_error("blosc chunk decodes to " + std::to_string(nbytes) + " bytes, expected " +
                                      std::to_string(dst_n));
-        if (blosc_decompress_ctx(src, dst, dst_n, 1) != static_cast<int>(dst_n))
+        auto scratch=workerScratch().lease();
+        if (scratch.resource<DecoderContexts>().decodeBlosc(src,n,dst,dst_n) != static_cast<int>(dst_n))
             throw std::runtime_error("blosc decode failed");
         return;
     }
     case Codec::Zstd: {
-        const auto size = ZSTD_decompress(dst, dst_n, src, n);
+        auto scratch=workerScratch().lease();
+        const auto size = ZSTD_decompressDCtx(scratch.resource<DecoderContexts>().zstdContext(),dst, dst_n, src, n);
         if (ZSTD_isError(size))
             throw std::runtime_error(std::string("zstd decode failed: ") + ZSTD_getErrorName(size));
         if (size != dst_n)

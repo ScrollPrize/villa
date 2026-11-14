@@ -1,10 +1,14 @@
 #include "vc_object_store/objects/ObjectCollection.hpp"
+#include "vc_object_store/ParallelFor.hpp"
 #include "internal/InitialEdges.hpp"
 #include "internal/InitialObjects.hpp"
 #include "internal/ImmutableImport.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/ObjectScan.hpp"
 #include "internal/EdgeSql.hpp"
+#include "vc_object_store/objects/EdgeKinds.hpp"
+#include "internal/CollectionSchema.hpp"
 #include "internal/RecordJson.hpp"
 #include "internal/History.hpp"
 #include "internal/Versions.hpp"
@@ -19,16 +23,16 @@
 #include "internal/Extensions.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "internal/DatabaseCopy.hpp"
+#include "internal/HistoricalSnapshot.hpp"
 #include <variant>
 #include <limits>
+#include <numeric>
 
 namespace vc::objects {
 using namespace detail;
 std::size_t uuidShardIndex(const std::string& uuid,std::size_t shardCount) {
     if(!shardCount)throw std::invalid_argument("collection: UUID shard count must be positive");
-    uint64_t hash=UINT64_C(14695981039346656037);
-    for(const auto byte:parseUuid(uuid)){hash^=byte;hash*=UINT64_C(1099511628211);}
-    return hash%shardCount;
+    return util::uuidHash64(parseUuid(uuid))%shardCount;
 }
 bool KeyRoute::matchesUuid(const std::string& uuid) const {
     if(kind!=RoutingKind::UuidHashV1)return false;
@@ -54,25 +58,8 @@ bool hasCollection(sqlite3* db) {
     Statement s(db,"SELECT 1 FROM store_required_features WHERE name='collection-v1'"); return s.row();
 }
 void collectionSchema(sqlite3* db) {
-    exec(db,R"SQL(
-CREATE TABLE collection_members(
- ordinal INTEGER PRIMARY KEY, database_uuid BLOB NOT NULL UNIQUE CHECK(length(database_uuid)=16),
- store_uuid BLOB NOT NULL CHECK(length(store_uuid)=16), generation BLOB NOT NULL CHECK(length(generation)=16),
- commit_sequence INTEGER NOT NULL CHECK(commit_sequence>0),
- locator TEXT NOT NULL, partition INTEGER NOT NULL CHECK(partition IN (0,1)),
- object_low INTEGER NOT NULL, object_high INTEGER NOT NULL, edge_low INTEGER NOT NULL, edge_high INTEGER NOT NULL
-);
-CREATE TABLE collection_routes(
- key_space TEXT NOT NULL CHECK(key_space IN ('objects','edges','objects.uuid','edges.uuid')),
- kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 4),
- lower_bound INTEGER NOT NULL CHECK(lower_bound>0), upper_bound INTEGER NOT NULL CHECK(upper_bound>=lower_bound),
- divisor INTEGER NOT NULL CHECK(divisor>0), remainder INTEGER NOT NULL CHECK(remainder>=0 AND remainder<divisor),
- shift INTEGER NOT NULL CHECK(shift BETWEEN 0 AND 62),
- database_uuid BLOB NOT NULL REFERENCES collection_members(database_uuid),
- PRIMARY KEY(key_space,lower_bound,upper_bound,remainder)
-) WITHOUT ROWID;
-INSERT INTO store_required_features VALUES('collection-v1');
-)SQL");
+    createCollectionTables(db);
+    exec(db,"INSERT INTO store_required_features VALUES('collection-v1')");
     if(!immutableInitial(db))for(const auto* table:{"collection_members","collection_routes"})
         for(const auto* op:{"INSERT","UPDATE","DELETE"})
             exec(db,(std::string("CREATE TRIGGER ")+table+"_"+op+" AFTER "+op+" ON "+table+
@@ -81,7 +68,10 @@ INSERT INTO store_required_features VALUES('collection-v1');
 std::filesystem::path normalized(const std::filesystem::path& path) {
     if(isPackedDatabasePath(path)) return path;
     if(isPackedStore(path)) return packedDatabasePath(path);
-    return std::filesystem::absolute(path).lexically_normal();
+    // Manifest-relative locations belong to the backing file, not a symlink
+    // used to open it. Preserve support for unpublished destination names by
+    // canonicalizing the existing prefix rather than requiring the leaf.
+    return std::filesystem::weakly_canonical(std::filesystem::absolute(path));
 }
 std::filesystem::path resolve(const std::filesystem::path& parent,const std::string& ref) {
     if(ref.starts_with("@packed:")) return resolvePackedDatabasePath(parent,ref);
@@ -114,16 +104,26 @@ std::array<int64_t,2> reservation(sqlite3* db,const char* name) {
     if(!s.row()) throw std::runtime_error("collection: missing key reservation");
     return {s.i64(0),s.i64(1)};
 }
+// A dependency pin selects its retained publication, not the owner's moving
+// head. Partitions and sources without history still require exact equality.
+void requireDependencySnapshot(sqlite3* db,const CollectionMember& expected) {
+    Statement pin(db,"SELECT s.uuid,d.uuid,m.generation,m.commit_sequence,m.sealed,m.history_enabled FROM main.store_identity s,main.database_identity d,main.store_manifest m");
+    if(!pin.row()||formatUuid(pin.blob16(0))!=expected.storeUuid||formatUuid(pin.blob16(1))!=expected.databaseUuid||
+       (!pin.i64(4)&&(expected.partition||!pin.i64(5)))||
+       (expected.partition&&(reservation(db,"objects")!=expected.objectIds||pin.i64(3)!=expected.commitSequence||pin.uuid(2)!=expected.generation)))
+        throw StoreBusy("collection: dependency snapshot changed, missing, or lacks sealed/history-enabled retention");
+    if(pin.i64(3)!=expected.commitSequence||pin.uuid(2)!=expected.generation)
+        requireRetainedPublication(db,{expected.storeUuid,expected.generation,expected.commitSequence});
+}
 void insertMember(sqlite3* db,int64_t ordinal,const CollectionMember& m,const std::string& ref) {
     const auto objects=m.partition?m.objectIds:std::array<int64_t,2>{0,0};
-    const auto edges=m.partition?m.edgeIds:std::array<int64_t,2>{0,0};
-    execute(db,"INSERT INTO collection_members VALUES(?,?,?,?,?,?,?,?,?,?,?)",ordinal,parseUuid(m.databaseUuid),
-        parseUuid(m.storeUuid),parseUuid(m.generation),m.commitSequence,ref,int64_t(m.partition),objects[0],objects[1],edges[0],edges[1]);
+    execute(db,"INSERT INTO collection_members VALUES(?,?,?,?,?,?,?,?,?)",ordinal,parseUuid(m.databaseUuid),
+        parseUuid(m.storeUuid),parseUuid(m.generation),m.commitSequence,ref,int64_t(m.partition),objects[0],objects[1]);
 }
 std::vector<KeyRoute> rangeRoutes(const std::vector<CollectionMember>& members) {
     std::vector<KeyRoute> routes;routes.reserve(2*members.size());
-    for(const auto& m:members)for(const auto* space:{"objects","edges"}) {
-        const auto r=std::string_view(space)=="objects"?m.objectIds:m.edgeIds;
+    for(const auto& m:members)for(const auto* space:{"objects"}) {
+        const auto r=m.objectIds;
         routes.push_back({space,RoutingKind::Range,r[0],r[1],1,0,0,m.databaseUuid});
     }
     return routes;
@@ -151,7 +151,7 @@ ObjectKey canonical(ObjectKey key) {
     key.objectUuid=util::canonicalUuid(key.objectUuid);return key;
 }
 void validateRoutes(const std::vector<KeyRoute>& routes,const std::vector<CollectionMember>& members) {
-    for(const auto* space:{"objects","edges"}){
+    for(const auto* space:{"objects"}){
         std::vector<KeyRoute> group;for(const auto& r:routes)if(r.keySpace==space)group.push_back(r);
         if(group.empty())throw std::invalid_argument("collection: missing key-space routing");
         for(size_t a=0;a<group.size();++a){const auto& r=group[a];
@@ -163,7 +163,7 @@ void validateRoutes(const std::vector<KeyRoute>& routes,const std::vector<Collec
                 throw std::invalid_argument("collection: one authoritative partition rule required per key space");
             auto m=std::find_if(members.begin(),members.end(),[&](auto& m){return m.databaseUuid==r.databaseUuid&&m.partition;});
             if(m==members.end())throw std::invalid_argument("collection: route destination is not a partition");
-            const auto range=r.keySpace=="objects"?m->objectIds:m->edgeIds;
+            const auto range=m->objectIds;
             if(r.lower<range[0]||r.upper>range[1])throw std::invalid_argument("collection: route exceeds reserved namespace");
             if(r.kind==RoutingKind::Bits&&(r.divisor&(r.divisor-1)))throw std::invalid_argument("collection: bit routing divisor must be power of two");
             for(size_t b=0;b<a;++b)if(r.lower<=group[b].upper&&group[b].lower<=r.upper&&
@@ -184,36 +184,55 @@ void validateRoutes(const std::vector<KeyRoute>& routes,const std::vector<Collec
                 throw std::invalid_argument("collection: UUID destination is not a partition");
         }
     }
-    for(auto& r:routes)if(r.keySpace!="objects"&&r.keySpace!="edges"&&r.keySpace!="objects.uuid"&&r.keySpace!="edges.uuid")throw std::invalid_argument("collection: unknown key space");
+    for(auto& r:routes)if(r.keySpace!="objects"&&r.keySpace!="objects.uuid"&&r.keySpace!="edges.uuid")throw std::invalid_argument("collection: unknown key space");
 }
 }
 
 struct ObjectCollection::Impl {
-    struct Node { std::unique_ptr<ObjectStore> store; CollectionMember member; bool collection=false; std::vector<KeyRoute> routes; std::vector<std::string> children; };
+    struct Node { std::unique_ptr<ObjectStore> store; CollectionMember member; bool collection=false; std::vector<KeyRoute> routes; std::vector<std::string> children;
+        // Immutable table-level facts, never per-object routing/cache entries.
+        // Mutable stores remain conservative so later inserts stay visible.
+        bool objectsMayExist=true,edgesMayExist=true;
+        bool mutableReference=false;
+    };
     std::vector<Node> nodes;
     OpenOptions options;
     // DFS insertion order is explicit precedence: local, then bases in manifest order.
     // Originals are resolved only after considering all overrides/tombstones.
     std::map<std::string,size_t> byDatabase;
     std::map<std::string,std::pair<std::string,int64_t>> pinned;
-    std::vector<size_t> uuidReadOrder(const std::string& uuid,const char* space)const{
-        std::vector<size_t> order;std::set<size_t> included;std::set<std::pair<size_t,bool>> visited;
-        const std::string keySpace=std::string(space)+".uuid";
+    struct ReadStep {
+        size_t node;
+        std::optional<std::pair<uint64_t,uint64_t>> objects,edges;
+    };
+    std::vector<ReadStep> readPlan;
+    std::vector<size_t> scanOrder;
+    // Compile only the immutable database/route topology, never object keys.
+    // Keep conditional duplicate steps: the first eligible occurrence wins.
+    void buildReadPlan(){
+        readPlan.clear();scanOrder.clear();
+        std::vector<bool> included(nodes.size(),false);
+        std::set<std::pair<size_t,bool>> visited;
+        const auto add=[&](ReadStep step){
+            if(!included[step.node]){included[step.node]=true;scanOrder.push_back(step.node);}
+            readPlan.push_back(std::move(step));
+        };
         std::function<void(size_t,bool)> visit=[&](size_t n,bool local){
             if(!visited.emplace(n,local).second)return;
-            if(local&&included.insert(n).second)order.push_back(n);
-            std::optional<std::string> routed;
-            std::optional<size_t> remainder;
-            for(const auto& r:nodes[n].routes)if(r.keySpace==keySpace){
-                if(!remainder)remainder=uuidShardIndex(uuid,r.divisor);
-                if(*remainder==r.remainder)routed=r.databaseUuid;
-            }
+            if(local)add({n,{},{}});
             // Sibling partitions are one overlay layer, not ordered bases.
-            // Query its selected local row before ANY partition's dependencies;
+            // Query its local rows (only the routed partition for a UUID
+            // lookup, all partitions for a scan) before ANY dependencies;
             // otherwise an earlier unselected shard can expose a base record
             // that incorrectly shadows the selected shard's replacement.
             for(const auto& child:nodes[n].children){const auto i=byDatabase.at(child);
-                if(nodes[i].member.partition&&(!routed||*routed==child)&&included.insert(i).second)order.push_back(i);
+                if(!nodes[i].member.partition)continue;
+                ReadStep step{i,{},{}};
+                for(const auto& r:nodes[n].routes)if(r.databaseUuid==child){
+                    if(r.keySpace=="objects.uuid")step.objects=std::pair{r.divisor,r.remainder};
+                    if(r.keySpace=="edges.uuid")step.edges=std::pair{r.divisor,r.remainder};
+                }
+                add(std::move(step));
             }
             for(const auto& child:nodes[n].children){const auto i=byDatabase.at(child);
                 // Even an unselected shard can hold store_references to readonly dependencies.
@@ -221,7 +240,23 @@ struct ObjectCollection::Impl {
                 visit(i,!nodes[i].member.partition);
             }
         };
-        visit(0,true);return order;
+        visit(0,true);
+    }
+    std::vector<size_t> readOrder(const std::string* uuid=nullptr,const char* space=nullptr)const{
+        if(!uuid)return scanOrder;
+        const auto hash=util::uuidHash64(parseUuid(*uuid));
+        std::vector<unsigned char> included(nodes.size(),0);
+        std::vector<size_t> order;order.reserve(scanOrder.size());
+        for(const auto& step:readPlan){
+            const auto* rule=space&&std::string_view(space)=="objects"?&step.objects:
+                             space&&std::string_view(space)=="edges"?&step.edges:nullptr;
+            if(rule&&*rule&&hash%(*rule)->first!=(*rule)->second)continue;
+            if(!included[step.node]){included[step.node]=1;order.push_back(step.node);}
+        }
+        return order;
+    }
+    std::vector<size_t> uuidReadOrder(const std::string& uuid,const char* space)const{
+        return readOrder(&uuid,space);
     }
     void load(const std::filesystem::path&,bool,const std::optional<CollectionMember>&,std::set<std::string>&,sqlite3* existingRoot=nullptr);
     bool depends(size_t n,size_t target)const{
@@ -253,23 +288,59 @@ struct ObjectCollection::Impl {
             }
             return nullptr;
         };
-        pool->objectSource=[this,n,get,scope](const std::string& uuid,bool inherited,bool includeDeleted)->sqlite3*{
+        pool->objectSource=[this,n,get,scope](const std::string& uuid,bool inherited,bool includeDeleted,sqlite3* knownLiveSource)->sqlite3*{
             const auto found=locateSourceSql({{},uuid},get,0,[&](size_t i){
                 return scope.contains(i)&&(!inherited||i!=n);
-            },includeDeleted);
+            },includeDeleted,knownLiveSource);
             return found?get(*found):nullptr;
         };
         // Edges and objects have the same UUID/tombstone routing semantics.
         const auto visibleScope=scope;
-        pool->edgeSource=[this,n,get,visibleScope](const std::string& uuid,bool inherited,bool includeDeleted)->sqlite3*{
+        pool->edgeSource=[this,n,get,visibleScope](const std::string& uuid,bool inherited,bool includeDeleted,sqlite3* knownLiveSource)->sqlite3*{
             for(const auto i:uuidReadOrder(uuid,"edges"))if(visibleScope.contains(i)&&(!inherited||i!=n)){
-                auto* source=get(i);Statement row(source,"SELECT state FROM edges WHERE uuid=?",parseUuid(uuid));
+                if(!nodes[i].edgesMayExist)continue;
+                auto* source=get(i);if(source==knownLiveSource)return source;
+                Statement row(source,"SELECT "+edgeReadColumn(source,"state")+" FROM edges WHERE uuid=?",parseUuid(uuid));
                 if(row.row())return includeDeleted||row.i64(0)!=2?source:nullptr;
             }
             return nullptr;
         };
-        pool->querySources=[get,visibleScope]{std::vector<sqlite3*> result;
-            for(auto i:visibleScope)result.push_back(get(i));return result;};
+        // Scans use the same overlay-layer precedence as keyed reads. DFS
+        // node indices can place a shared base before a later sibling shard.
+        pool->querySources=[this,get,visibleScope]{std::vector<sqlite3*> result;
+            for(auto i:readOrder())if(visibleScope.contains(i))result.push_back(get(i));return result;};
+        pool->objectSelectionArguments=[this,get,visibleScope](const std::vector<std::string>& keys){
+            StatementPool::ObjectSelectionArguments result;
+            struct Candidate {
+                bool unrestricted=false;
+                std::vector<std::pair<uint64_t,uint64_t>> rules;
+                std::vector<std::string>* keys=nullptr;
+            };
+            std::vector<Candidate> candidates;
+            std::map<size_t,size_t> positions;
+            for(const auto& step:readPlan){
+                if(!visibleScope.contains(step.node)||!nodes[step.node].objectsMayExist)continue;
+                auto [at,inserted]=positions.emplace(step.node,candidates.size());
+                if(inserted){
+                    auto& values=result[get(step.node)];
+                    candidates.push_back({false,{},&values});
+                }
+                auto& candidate=candidates[at->second];
+                if(step.objects)candidate.rules.push_back(*step.objects);
+                else candidate.unrestricted=true;
+            }
+            for(auto& candidate:candidates)candidate.keys->reserve(candidate.unrestricted?keys.size():keys.size()/std::max(size_t(1),candidates.size()));
+            for(const auto& key:keys){
+                const auto hash=util::uuidHash64(parseUuid(key));
+                for(auto& candidate:candidates){
+                    const bool matches=candidate.unrestricted||std::any_of(candidate.rules.begin(),candidate.rules.end(),[&](const auto& rule){
+                        return hash%rule.first==rule.second;
+                    });
+                    if(matches)candidate.keys->push_back(key);
+                }
+            }
+            return result;
+        };
     }
     void check(const CollectionTxn&) const;
     const Txn& txn(const CollectionTxn&,size_t) const;
@@ -279,8 +350,9 @@ struct ObjectCollection::Impl {
         return {nodes[n].member.storeUuid,uuid};
     }
     std::optional<size_t> locateSourceSql(const ObjectKey&,const std::function<sqlite3*(size_t)>&,size_t start=0,
-                                         const std::function<bool(size_t)>& eligible={},bool includeDeleted=false) const;
-    ObjectKey insertEdge(CollectionTxn&,const ObjectKey&,const ObjectKey&,const EdgeRecord&,std::optional<int64_t>);
+                                         const std::function<bool(size_t)>& eligible={},bool includeDeleted=false,
+                                         sqlite3* knownLiveSource=nullptr) const;
+    ObjectKey insertEdge(CollectionTxn&,const ObjectKey&,const ObjectKey&,const EdgeRecord&);
 };
 struct CollectionTxn::Impl {
     ObjectCollection::Impl* owner;
@@ -298,12 +370,19 @@ struct CollectionTxn::Impl {
     const Txn& get(size_t n) const {
         const Txn* txn=nullptr;
         if(n==0)txn=&std::visit([](auto& x)->const Txn&{return x;},root);
-        else {auto& r=reads[n];if(!r)r=std::make_unique<ReadTxn>(owner->nodes[n].store->read());txn=r.get();}
+        else {auto& r=reads[n];if(!r){
+            auto read=std::make_unique<ReadTxn>(owner->nodes[n].store->read());
+            if(owner->nodes[n].mutableReference)
+                requireDependencySnapshot(ObjectStoreImplAccess::conn(*read),owner->nodes[n].member);
+            r=std::move(read);
+        }txn=r.get();}
         auto* db=ObjectStoreImplAccess::conn(*txn);
         auto* pool=activeStatementPools.at(db);
         if(configured.insert(pool).second){
-            try{owner->installCallbacks(db,n,[this](size_t i){return ObjectStoreImplAccess::conn(get(i));});}
-            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};configured.erase(pool);throw;}
+            try{owner->installCallbacks(db,n,[this](size_t i){return ObjectStoreImplAccess::conn(get(i));});
+                if(owner->nodes[n].mutableReference){const auto& pin=owner->nodes[n].member;
+                    pool->historicalSnapshot=historicalSnapshot(db,{pin.storeUuid,pin.generation,pin.commitSequence});}}
+            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};pool->objectSelectionArguments={};configured.erase(pool);throw;}
         }
         return *txn;
     }
@@ -323,10 +402,26 @@ void ObjectCollection::Impl::check(const CollectionTxn& t)const{
 const Txn& ObjectCollection::Impl::txn(const CollectionTxn& t,size_t n)const{
     check(t);return t.impl_->get(n);
 }
+std::vector<detail::CollectionScanPartition> detail::CollectionScanAccess::partitions(
+    const ObjectCollection& store,const CollectionTxn& txn) {
+    store.impl_->check(txn);
+    std::vector<CollectionScanPartition> result;
+    for(auto n:store.impl_->readOrder()) {
+        CollectionScanPartition part{store.impl_->db(txn,n),{}};
+        for(const auto& parent:store.impl_->nodes)for(const auto& route:parent.routes)
+            if(route.databaseUuid==store.impl_->nodes[n].member.databaseUuid &&
+               route.kind==RoutingKind::UuidHashV1)part.uuidRoutes.push_back(route);
+        result.push_back(std::move(part));
+    }
+    return result;
+}
 WriteTxn& ObjectCollection::Impl::writer(CollectionTxn& t){check(t);if(!t.writable())throw std::runtime_error("collection: read-only transaction");if(t.impl_->producingInitialEdges)throw std::runtime_error("collection: initial edge producer cannot mutate the destination");return std::get<WriteTxn>(t.impl_->root);}
 
 void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,const std::optional<CollectionMember>& expected,std::set<std::string>& visiting,sqlite3* existingRoot) {
     auto path=input;auto opt=root?options:readonlyOptions(options);opt.physicalPartitionOnly=true;
+    // Collection callbacks must be installed before reconstructing borrowed
+    // archive parents; this layer owns position selection for physical handles.
+    opt.readPosition.reset();
     std::unique_ptr<ObjectStore> store;std::unique_ptr<ReadTxn> read;
     if(expected&&!existingRoot){
         // Reuse the successful candidate's connection/snapshot. This is file
@@ -337,15 +432,11 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
             try{
                 if(isPackedDatabasePath(candidate))selected=candidate;
                 else if(isPackedStore(candidate))selected=packedDatabasePath(candidate,expected->databaseUuid);
-                else selected=std::filesystem::absolute(candidate).lexically_normal();
+                else selected=normalized(candidate);
                 if(!attempted.insert(selected).second)return false;
                 auto opened=std::make_unique<ObjectStore>(ObjectStore::open(selected,opt));
                 auto snapshot=std::make_unique<ReadTxn>(opened->read());auto* candidateSql=ObjectStoreImplAccess::conn(*snapshot);
-                Statement pin(candidateSql,"SELECT s.uuid,d.uuid,m.generation,m.commit_sequence,m.sealed FROM store_identity s,database_identity d,store_manifest m");
-                if(!pin.row()||formatUuid(pin.blob16(0))!=expected->storeUuid||formatUuid(pin.blob16(1))!=expected->databaseUuid||
-                   formatUuid(pin.blob16(2))!=expected->generation||pin.i64(3)!=expected->commitSequence||pin.i64(4)==0||
-                   (expected->partition&&(reservation(candidateSql,"objects")!=expected->objectIds||reservation(candidateSql,"edges")!=expected->edgeIds)))
-                    throw std::runtime_error("dependency identity/lineage/commit sequence/sealed policy/reservation mismatch");
+                requireDependencySnapshot(candidateSql,*expected);
                 path=std::move(selected);store=std::move(opened);read=std::move(snapshot);return true;
             }catch(const std::bad_alloc&){throw;}
             catch(const std::exception& error){if(directError.empty())directError=error.what();return false;}
@@ -371,22 +462,31 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
     Statement header(sql,"SELECT s.uuid,d.uuid,m.generation,m.commit_sequence,m.sealed FROM store_identity s,database_identity d,store_manifest m");
     if(!header.row())throw std::runtime_error("collection: absent manifest identity");
     DatabaseIdentity id;id.uuid=formatUuid(header.blob16(1));
-    CollectionMember member{id.uuid,formatUuid(header.blob16(0)),formatUuid(header.blob16(2)),header.i64(3),path,expected?expected->partition:false,reservation(sql,"objects"),reservation(sql,"edges")};
-    if(!root&&header.i64(4)==0)throw std::runtime_error("collection: dependency is not sealed: "+path.string());
-    if(expected&&(member.databaseUuid!=expected->databaseUuid||member.storeUuid!=expected->storeUuid||member.generation!=expected->generation||member.commitSequence!=expected->commitSequence||
-                  (expected->partition&&(member.objectIds!=expected->objectIds||member.edgeIds!=expected->edgeIds))))
-        throw std::runtime_error("collection: dependency identity/lineage/commit sequence/reservation mismatch: "+path.string());
+    CollectionMember member{id.uuid,formatUuid(header.blob16(0)),formatUuid(header.blob16(2)),header.i64(3),path,expected?expected->partition:false,reservation(sql,"objects")};
+    if(!root)requireDependencySnapshot(sql,*expected);
+    const bool historical=expected&&member.commitSequence!=expected->commitSequence;
+    if(expected){member.generation=expected->generation;member.commitSequence=expected->commitSequence;}
+    const bool rootHistorical=root&&options.readPosition&&header.i64(3)!=options.readPosition->commitSequence;
+    if(root&&options.readPosition){
+        requireRetainedPublication(sql,*options.readPosition);
+        member.generation=util::canonicalUuid(options.readPosition->generation);member.commitSequence=options.readPosition->commitSequence;
+    }
     if(visiting.contains(id.uuid))throw std::runtime_error("collection: cyclic database dependency");
-    if(byDatabase.contains(id.uuid))return;
+    if(const auto known=byDatabase.find(id.uuid);known!=byDatabase.end()){
+        const auto& previous=nodes[known->second].member;
+        if(previous.storeUuid!=member.storeUuid||previous.generation!=member.generation||previous.commitSequence!=member.commitSequence)
+            throw std::runtime_error("collection: conflicting retained publication pins for one database");
+        return;
+    }
     const auto statePin=std::pair{member.generation,member.commitSequence};
     if(auto it=pinned.find(member.storeUuid);it!=pinned.end()&&it->second!=statePin)
         throw std::runtime_error("collection: inconsistent repeated store lineage or commit sequence");
     pinned[member.storeUuid]=statePin;
     bool composed=hasCollection(sql);std::vector<CollectionMember> children;std::vector<KeyRoute> routes;
     if(composed){
-        Statement s(sql,"SELECT database_uuid,store_uuid,generation,commit_sequence,locator,partition,object_low,object_high,edge_low,edge_high FROM collection_members ORDER BY ordinal");
+        Statement s(sql,"SELECT database_uuid,store_uuid,generation,commit_sequence,locator,partition,object_low,object_high FROM collection_members ORDER BY ordinal");
         while(s.row()){
-            CollectionMember child{formatUuid(s.blob16(0)),formatUuid(s.blob16(1)),formatUuid(s.blob16(2)),s.i64(3),resolve(path,s.text(4)),s.i64(5)!=0,{s.i64(6),s.i64(7)},{s.i64(8),s.i64(9)}};
+            CollectionMember child{formatUuid(s.blob16(0)),formatUuid(s.blob16(1)),formatUuid(s.blob16(2)),s.i64(3),resolve(path,s.text(4)),s.i64(5)!=0,{s.i64(6),s.i64(7)}};
             // load() identifies external packed files and selects the pinned
             // physical member while trying the recorded/search locators.
             if(child.partition?(child.storeUuid!=member.storeUuid||child.generation!=member.generation||child.commitSequence!=member.commitSequence):
@@ -399,7 +499,13 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
         if(!routes.empty()||std::any_of(children.begin(),children.end(),[](auto& c){return c.partition;}))validateRoutes(routes,children);
     }
     if(read)read->commit();byDatabase[id.uuid]=nodes.size();std::vector<std::string> childIds;for(auto& c:children)childIds.push_back(c.databaseUuid);
-    nodes.push_back({std::move(store),member,composed,routes,childIds});visiting.insert(id.uuid);
+    bool objectsMayExist=true,edgesMayExist=true;
+    if(header.i64(4)!=0&&!historical&&!rootHistorical){
+        Statement present(sql,"SELECT EXISTS(SELECT 1 FROM objects),EXISTS(SELECT 1 FROM edges)");present.row();
+        objectsMayExist=present.i64(0)!=0;edgesMayExist=present.i64(1)!=0;
+    }
+    nodes.push_back({std::move(store),member,composed,routes,childIds,objectsMayExist,edgesMayExist,
+        (root&&options.readPosition.has_value())||(!root&&(header.i64(4)==0||historical))});visiting.insert(id.uuid);
     for(const auto& child:children)load(child.locator,false,child,visiting);
     visiting.erase(id.uuid);
 }
@@ -409,16 +515,18 @@ struct detail::CollectionReadContext {
     std::unique_ptr<StatementPool> rootPool;
     StatementPool* borrowedPool=nullptr;
     std::function<sqlite3*(const std::function<bool(sqlite3*)>&)> previousReferences;
-    std::function<sqlite3*(const std::string&,bool,bool)> previousObjects;
-    std::function<sqlite3*(const std::string&,bool,bool)> previousEdges;
+    std::function<sqlite3*(const std::string&,bool,bool,sqlite3*)> previousObjects;
+    std::function<sqlite3*(const std::string&,bool,bool,sqlite3*)> previousEdges;
     std::function<std::vector<sqlite3*>()> previousQueries;
+    std::function<StatementPool::ObjectSelectionArguments(const std::vector<std::string>&)> previousObjectArguments;
     std::map<size_t,std::unique_ptr<ReadTxn>> readers;
     std::set<StatementPool*> configured;
     CollectionReadContext(sqlite3* sql,const std::filesystem::path& path,const OpenOptions& options):root(sql){
-        collection.options=readonlyOptions(options);std::set<std::string> visiting;collection.load(path,true,{},visiting,sql);
+        collection.options=readonlyOptions(options);std::set<std::string> visiting;collection.load(path,true,{},visiting,sql);collection.buildReadPlan();
         if(const auto found=activeStatementPools.find(root);found!=activeStatementPools.end()) {
             borrowedPool=found->second;previousReferences=borrowedPool->referenceSource;previousObjects=borrowedPool->objectSource;
             previousEdges=borrowedPool->edgeSource;previousQueries=borrowedPool->querySources;
+            previousObjectArguments=borrowedPool->objectSelectionArguments;
         } else {
             rootPool=std::make_unique<StatementPool>();rootPool->historyEnabled=historyEnabled(root);rootPool->spatialEnabled=spatialEnabled(root);
             activeStatementPools[root]=rootPool.get();
@@ -430,22 +538,30 @@ struct detail::CollectionReadContext {
         const bool borrowedActive=active!=activeStatementPools.end()&&active->second==borrowedPool;
         for(auto* p:configured){
             if(p==borrowedPool&&!borrowedActive)continue; // Lease already returned by commit/rollback.
-            p->geometryCache.reset();p->referenceSource={};p->objectSource={};p->edgeSource={};p->querySources={};
+            p->geometryCache.reset();p->referenceSource={};p->objectSource={};p->edgeSource={};p->querySources={};p->objectSelectionArguments={};
         }
         if(rootPool)activeStatementPools.erase(root);
         else if(const auto found=activeStatementPools.find(root);found!=activeStatementPools.end()&&found->second==borrowedPool){
             borrowedPool->referenceSource=std::move(previousReferences);borrowedPool->objectSource=std::move(previousObjects);
             borrowedPool->edgeSource=std::move(previousEdges);borrowedPool->querySources=std::move(previousQueries);
+            borrowedPool->objectSelectionArguments=std::move(previousObjectArguments);
         }
     }
     ~CollectionReadContext(){detach();}
     sqlite3* get(size_t n){
         sqlite3* sql=root;
-        if(n){auto& r=readers[n];if(!r)r=std::make_unique<ReadTxn>(collection.nodes[n].store->read());sql=ObjectStoreImplAccess::conn(*r);}
+        if(n){auto& r=readers[n];if(!r){
+            auto read=std::make_unique<ReadTxn>(collection.nodes[n].store->read());
+            if(collection.nodes[n].mutableReference)
+                requireDependencySnapshot(ObjectStoreImplAccess::conn(*read),collection.nodes[n].member);
+            r=std::move(read);
+        }sql=ObjectStoreImplAccess::conn(*r);}
         auto* pool=activeStatementPools.at(sql);
         if(configured.insert(pool).second){
-            try{collection.installCallbacks(sql,n,[this](size_t i){return get(i);});}
-            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};configured.erase(pool);throw;}
+            try{collection.installCallbacks(sql,n,[this](size_t i){return get(i);});
+                if(collection.nodes[n].mutableReference){const auto& pin=collection.nodes[n].member;
+                    pool->historicalSnapshot=historicalSnapshot(sql,{pin.storeUuid,pin.generation,pin.commitSequence});}}
+            catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};pool->objectSelectionArguments={};configured.erase(pool);throw;}
         }
         return sql;
     }
@@ -457,11 +573,22 @@ std::shared_ptr<void> detail::attachCollectionReferenceResolver(sqlite3* db,cons
     return hasCollection(db)?std::make_shared<CollectionReadContext>(db,path,options):std::shared_ptr<void>{};
 }
 std::optional<size_t> ObjectCollection::Impl::locateSourceSql(const ObjectKey& key,
-    const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible,bool includeDeleted)const{
+    const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible,bool includeDeleted,
+    sqlite3* knownLiveSource)const{
     // UUID is the complete key. The first present row wins, including deletion.
-    for(const auto n:uuidReadOrder(key.objectUuid,"objects"))if(n>=start&&(!eligible||eligible(n))){
+    // Walk the already compiled route plan directly. A known live row stops
+    // resolution after higher-precedence eligible layers, without allocating
+    // an included-node vector and materialized read order for every object.
+    const auto bytes=parseUuid(key.objectUuid);
+    const auto hash=util::uuidHash64(bytes);
+    for(const auto& step:readPlan){
+        const auto n=step.node;
+        if(step.objects&&hash%step.objects->first!=step.objects->second)continue;
+        if(n<start||(eligible&&!eligible(n)))continue;
+        if(!nodes[n].objectsMayExist)continue;
         auto* sql=get(n);
-        Statement state(sql,"SELECT state FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
+        if(sql==knownLiveSource)return n;
+        Statement state(sql,"SELECT state FROM objects WHERE uuid=?",bytes);
         if(!state.row())continue;
         if(state.i64(0)==2&&!includeDeleted)return {};
         return n;
@@ -473,15 +600,17 @@ ObjectCollection::ObjectCollection(std::unique_ptr<Impl> p):impl_(std::move(p)){
 ObjectCollection::ObjectCollection(ObjectCollection&&) noexcept=default;
 ObjectCollection::~ObjectCollection()=default;
 ObjectCollection ObjectCollection::open(const std::filesystem::path& path,const OpenOptions& options){
-    auto p=std::make_unique<Impl>();p->options=options;std::set<std::string> visiting;p->load(path,true,{},visiting);return ObjectCollection(std::move(p));
+    if(options.readPosition&&!options.readOnly)throw std::invalid_argument("a historical read position requires a read-only open");
+    auto p=std::make_unique<Impl>();p->options=options;std::set<std::string> visiting;p->load(path,true,{},visiting);p->buildReadPlan();return ObjectCollection(std::move(p));
 }
 ObjectCollection ObjectCollection::create(const std::filesystem::path& path,const std::vector<std::filesystem::path>& bases,const OpenOptions& options){
     std::vector<CollectionMember> members;int64_t commitSequence=options.initialCommitSequence;
     const auto readOptions=readonlyOptions(options);
     for(const auto& base:bases){auto c=open(base,readOptions);auto t=c.read();auto p=c.provisioning(t);
-        if(!p.sealed)throw std::runtime_error("collection: base must be sealed");
+        if(!p.sealed&&p.history!=HistoryMode::On)throw std::runtime_error("collection: base must be sealed or history enabled");
         if(p.commitSequence>=INT64_MAX-1)throw std::runtime_error("collection: dependency commit sequence exhausted");
-        commitSequence=std::max(commitSequence,p.commitSequence);members.push_back(c.impl_->nodes[0].member);
+        commitSequence=std::max(commitSequence,p.commitSequence);auto member=c.impl_->nodes[0].member;
+        member.generation=p.generation;member.commitSequence=p.commitSequence;members.push_back(std::move(member));
     }
     auto opt=options;opt.initialCommitSequence=std::max(opt.initialCommitSequence,commitSequence);opt.physicalPartitionOnly=true;
     StagedDatabase staged(path,isBuildingPackedDatabasePath(path));
@@ -494,16 +623,25 @@ ObjectCollection ObjectCollection::create(const std::filesystem::path& path,cons
     return open(path,options);
 }
 ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::path& path,
-    const std::vector<std::filesystem::path>& bases,const OpenOptions& options)
+    const std::vector<std::filesystem::path>& bases,const OpenOptions& options,std::span<const ExtensionSource> pins)
 {
     // This path is private to the initial builder, which owns staging and
     // publication. No intermediate writable store is published or reopened.
     std::vector<CollectionMember> members;int64_t commitSequence=options.initialCommitSequence;
     const auto readOptions=readonlyOptions(options);
     for(const auto& base:bases){auto c=ObjectCollection::open(base,readOptions);auto r=c.read();
-        const auto p=c.provisioning(r);if(!p.sealed||p.commitSequence>=INT64_MAX-1)
-            throw std::runtime_error("initial collection needs sealed, non-exhausted dependencies");
-        commitSequence=std::max(commitSequence,p.commitSequence);members.push_back(c.impl_->nodes[0].member);}
+        const auto p=c.provisioning(r);if((!p.sealed&&p.history!=HistoryMode::On)||p.commitSequence>=INT64_MAX-1)
+            throw std::runtime_error("initial collection needs sealed or history-enabled, non-exhausted dependencies");
+        auto member=c.impl_->nodes[0].member;member.generation=p.generation;member.commitSequence=p.commitSequence;
+        for(const auto& pin:pins)if(util::canonicalUuid(pin.storeUuid)==member.storeUuid){
+            member.generation=util::canonicalUuid(pin.generation);member.commitSequence=pin.commitSequence;
+            requireDependencySnapshot(c.impl_->db(r,0),member);
+        }
+        commitSequence=std::max(commitSequence,member.commitSequence);members.push_back(std::move(member));}
+    std::set<std::string> specified;
+    for(const auto& pin:pins){const auto owner=util::canonicalUuid(pin.storeUuid);
+        if(!specified.insert(owner).second||std::none_of(members.begin(),members.end(),[&](const auto& m){return m.storeUuid==owner;}))
+            throw std::invalid_argument("initial dependency pins must name distinct direct source stores");}
     auto opt=options;opt.initialCommitSequence=commitSequence;opt.physicalPartitionOnly=true;
     auto store=std::make_unique<ObjectStore>(ObjectStoreImplAccess::createInitial(path,opt));
     auto p=std::make_unique<ObjectCollection::Impl>();p->options=opt;
@@ -511,7 +649,7 @@ ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::
      int64_t ordinal=0;for(const auto& m:members){
         if(m.storeUuid==store->uuid(w))throw std::runtime_error("initial collection needs independent dependency ownership");
         insertMember(db,ordinal++,m,locator(normalized(path),m.locator));}
-     CollectionMember root{store->databaseIdentity(w).uuid,store->uuid(w),activeGeneration(db),writeCommitSequence(db),path,false,opt.objectIdRange,opt.edgeIdRange};
+     CollectionMember root{store->databaseIdentity(w).uuid,store->uuid(w),activeGeneration(db),writeCommitSequence(db),path,false,opt.objectIdRange};
      std::vector<std::string> children;for(const auto& m:members)children.push_back(m.databaseUuid);
      p->byDatabase.emplace(root.databaseUuid,0);p->pinned.emplace(root.storeUuid,std::pair{root.generation,root.commitSequence});
      p->nodes.push_back({nullptr,std::move(root),true,{},std::move(children)});
@@ -520,15 +658,32 @@ ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::
     // Pre-existing external dependencies still require their ordinary readers.
     std::set<std::string> visiting{p->nodes[0].member.databaseUuid};
     for(const auto& m:members)p->load(m.locator,false,m,visiting);
-    p->nodes[0].store=std::move(store);return ObjectCollection(std::move(p));
+    p->nodes[0].store=std::move(store);p->buildReadPlan();return ObjectCollection(std::move(p));
 }
 CollectionMember detail::InitialCollectionAccess::sealShard(ObjectCollection& collection,CollectionTxn& transaction) {
+    if(hasInitialExtensionStages(collection.impl_->db(transaction,0)))
+        throw std::runtime_error("initial import cannot publish untransferred staged extensions");
     collection.seal(transaction);
     auto member=collection.impl_->nodes[0].member;
     member.commitSequence=writeCommitSequence(collection.impl_->db(transaction,0));
     member.partition=true;
     transaction.commit();collection.checkpoint();
     return member;
+}
+std::vector<CollectionMember> detail::InitialCollectionAccess::mutableDependencyPins(const ObjectCollection& collection) {
+    std::vector<CollectionMember> result;
+    for(const auto& node:collection.impl_->nodes)if(node.mutableReference)result.push_back(node.member);
+    return result;
+}
+void detail::InitialCollectionAccess::verifyMutableDependencyPins(std::span<const CollectionMember> members) {
+    OpenOptions options;options.readOnly=true;options.physicalPartitionOnly=true;options.readerPoolSize=1;
+    for(const auto& member:members){
+        auto source=ObjectStore::open(member.locator,options);auto read=source.read();
+        requireDependencySnapshot(ObjectStoreImplAccess::conn(read),member);
+    }
+}
+sqlite3* detail::InitialCollectionAccess::connection(ObjectCollection& collection,CollectionTxn& transaction) {
+    collection.impl_->writer(transaction);return collection.impl_->db(transaction,0);
 }
 void detail::InitialCollectionAccess::writeManifest(const std::filesystem::path& path,
     const std::vector<CollectionMember>& members,const OpenOptions& options,bool uuidHashRouting) {
@@ -557,9 +712,11 @@ ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& pa
     // Custom routing is verified once at publication. Readers only trust the
     // sealed manifest and never rescan all IDs on every open.
     if(!requestedRoutes.empty())for(auto& m:members){auto store=ObjectStore::open(m.locator,OpenOptions{.readOnly=true});auto r=store.read();
-        for(const auto* space:{"objects","edges"}){Statement ids(ObjectStoreImplAccess::conn(r),std::string("SELECT id FROM ")+space);
+        for(const auto* space:{"objects"}){Statement ids(ObjectStoreImplAccess::conn(r),std::string("SELECT id FROM ")+space);
             while(ids.row()){size_t matches=0;for(auto& route:routes)if(route.keySpace==space&&route.matches(ids.i64(0))){if(route.databaseUuid!=m.databaseUuid)throw std::runtime_error("collection: misplaced shard key");++matches;}
                 if(matches!=1)throw std::runtime_error("collection: shard key not uniquely routed");}
+        }
+        for(const auto* space:{"objects","edges"}){
             const auto uuidSpace=std::string(space)+".uuid";
             if(std::any_of(routes.begin(),routes.end(),[&](const auto& route){return route.keySpace==uuidSpace;})){
                 Statement keys(ObjectStoreImplAccess::conn(r),std::string("SELECT uuid FROM ")+space);
@@ -583,6 +740,156 @@ void ObjectCollection::checkpoint(){impl_->nodes[0].store->checkpoint();}
 CollectionTxn ObjectCollection::write(){if(!impl_->nodes[0].collection)throw std::runtime_error("collection: use ObjectStore to edit a plain store");return CollectionTxn(std::make_unique<CollectionTxn::Impl>(impl_.get(),true));}
 std::string ObjectCollection::uuid(const CollectionTxn& t)const{impl_->check(t);return impl_->nodes[0].member.storeUuid;}
 StoreProvisioning ObjectCollection::provisioning(const CollectionTxn& t)const{return impl_->nodes[0].store->provisioning(impl_->txn(t,0));}
+
+bool ObjectCollection::supportsTrustedGeometryReads(const CollectionTxn& txn)const {
+    impl_->check(txn);
+    for(size_t i=0;i<impl_->nodes.size();++i){
+        const auto policy=impl_->nodes[i].store->provisioning(impl_->txn(txn,i));
+        if(!policy.sealed||policy.history!=HistoryMode::Off)return false;
+    }
+    return true;
+}
+ObjectCollection::GeometryArrayColumns ObjectCollection::readGeometryArrayColumns(const CollectionTxn& txn,
+    std::span<const std::array<unsigned char,16>> requested,const std::string& name,
+    const std::optional<std::string>& kind,const std::optional<std::string>& volume,
+    const std::optional<StoreStatus>& expected,size_t workers,bool profile,bool trustedImmutable)const
+{
+    using Clock=std::chrono::steady_clock;
+    const auto stamp=[&]{return profile?Clock::now():Clock::time_point{};};
+    const auto seconds=[&](Clock::time_point begin){return profile?std::chrono::duration<double>(Clock::now()-begin).count():0.;};
+    const auto started=stamp();auto phase=started;
+    if(!workers)throw std::invalid_argument("geometry array workers must be positive");
+    impl_->check(txn);
+    GeometryArrayColumns result;
+    auto& root=*impl_->nodes[0].store;
+    result.source=root.status(impl_->txn(txn,0));
+    const auto requirePosition=[&](const StoreStatus& actual){
+        const auto& position=expected?*expected:result.source;
+        if(position.commitSequence<0||actual.storeUuid!=util::canonicalUuid(position.storeUuid)||
+           actual.generation!=util::canonicalUuid(position.generation)||actual.commitSequence!=position.commitSequence)
+            throw StoreBusy("geometry array read: source position changed");
+    };
+    requirePosition(result.source);
+    if(trustedImmutable){
+        // This explicit mode is only valid for a complete immutable scope.
+        // Prove it once, before allowing internal readers to skip integrity
+        // rechecks; never infer it from a read-only SQLite connection.
+        if(!supportsTrustedGeometryReads(txn))
+            throw std::invalid_argument("trusted immutable geometry reads require sealed history-off stores throughout the collection");
+    }
+    const auto rootPolicy=provisioning(txn);
+    if(workers>1&&!rootPolicy.sealed&&rootPolicy.history!=HistoryMode::On)
+        throw std::invalid_argument("parallel geometry reads require a sealed store or history-enabled snapshot; use one worker otherwise");
+    if(profile)result.timings["snapshot_validation_seconds"]=seconds(phase);
+    phase=stamp();
+    result.objectUuids.assign(requested.begin(),requested.end());
+    std::sort(result.objectUuids.begin(),result.objectUuids.end());
+    result.objectUuids.erase(std::unique(result.objectUuids.begin(),result.objectUuids.end()),result.objectUuids.end());
+    if(profile)result.timings["uuid_sort_seconds"]=seconds(phase);
+    if(result.objectUuids.empty()){
+        if(volume&&name=="line_points"){result.geometry.dtype="<f8";result.geometry.shape={0,3};}
+        if(profile)result.timings["total_seconds"]=seconds(started);
+        return result;
+    }
+    constexpr size_t blockRows=4096;
+    const auto blocks=result.objectUuids.size()/blockRows+(result.objectUuids.size()%blockRows!=0);
+    std::vector<PackedGeometryArray> values(blocks);
+    std::vector<double> selectionTimes(profile?blocks:0),payloadTimes(profile?blocks:0);
+    const auto readBlock=[&](const ObjectCollection& collection,const CollectionTxn& snapshot,size_t block){
+        auto phase=stamp();
+        const auto begin=block*blockRows,end=std::min(result.objectUuids.size(),begin+blockRows);
+        ObjectSelection selection;selection.kind=kind;
+        // Explicit requested keys must all be returned or fail. In the trusted
+        // batch path, the mapped array read immediately below already checks
+        // the target frame, so do not parse every metadata record twice.
+        if(!trustedImmutable)selection.volume=volume;
+        selection.uuids.reserve(end-begin);
+        for(size_t i=begin;i<end;++i)selection.uuids.push_back(formatUuid(result.objectUuids[i]));
+        const auto& store=*collection.impl_->nodes[0].store;
+        const auto& read=collection.impl_->txn(snapshot,0);
+        const auto view=trustedImmutable?
+            ObjectStoreImplAccess::trustedCurrentGeometryRead(store,read,selection,result.source):
+            store.geometryReadView(read,selection,result.source);
+        if(view.objectUuids!=selection.uuids)
+            throw std::invalid_argument("geometry array read: unknown, ineligible or deleted requested object");
+        if(!view.selectedObjects)throw std::logic_error("geometry array read lost its selected metadata");
+        if(profile)selectionTimes[block]=seconds(phase);
+        phase=stamp();
+        values[block]=trustedImmutable?
+            ObjectStoreImplAccess::trustedCurrentGeometryArrays(store,read,*view.selectedObjects,name,volume):
+            store.readSelectedGeometryArrays(read,*view.selectedObjects,name,volume);
+        if(profile)payloadTimes[block]=seconds(phase);
+    };
+    const auto count=std::min(workers,blocks);
+    std::vector<double> snapshotTimes(profile?count:0);
+    auto closing=Clock::time_point{};
+    phase=stamp();
+    if(workers==1){
+        for(size_t block=0;block<blocks;++block)readBlock(*this,txn,block);
+        if(profile)result.timings["worker_wall_seconds"]=seconds(phase);
+    }else{
+        if(count>=size_t(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("geometry array worker count is too large");
+        // Open once, not per UUID block. All workers share immutable routing
+        // metadata and each owns its transaction/leased SQLite connections.
+        auto options=readonlyOptions(impl_->options);options.readerPoolSize=int(count+1);
+        auto collection=ObjectCollection::open(root.path(),options);
+        if(profile)result.timings["collection_open_seconds"]=seconds(phase);
+        phase=stamp();
+        std::atomic<size_t> next{0};std::atomic<bool> cancelled{false};
+        parallelFor(count,count,[&](size_t worker){
+            try{
+                const auto begin=stamp();
+                auto snapshot=collection.read();
+                requirePosition(collection.impl_->nodes[0].store->status(collection.impl_->txn(snapshot,0)));
+                if(profile)snapshotTimes[worker]=seconds(begin);
+                for(size_t block;!cancelled.load()&&(block=next.fetch_add(1))<blocks;)readBlock(collection,snapshot,block);
+            }catch(...){cancelled.store(true);throw;}
+        });
+        if(profile)result.timings["worker_wall_seconds"]=seconds(phase);
+        auto final=collection.read();
+        requirePosition(collection.impl_->nodes[0].store->status(collection.impl_->txn(final,0)));
+        closing=stamp();
+    }
+    if(profile&&workers>1)result.timings["collection_close_seconds"]=seconds(closing);
+    phase=stamp();
+    auto& out=result.geometry;
+    out.dtype=values.front().dtype;out.shape=values.front().shape;out.shape[0]=0;
+    out.offsets.resize(result.objectUuids.size()+1);
+    std::vector<size_t> byteOffsets(blocks);size_t bytes=0;
+    for(size_t block=0;block<blocks;++block){
+        const auto& value=values[block];
+        const auto begin=block*blockRows,end=std::min(result.objectUuids.size(),begin+blockRows);
+        if(value.dtype!=out.dtype||value.shape.size()!=out.shape.size()||value.shape.empty()||
+           !std::equal(value.shape.begin()+1,value.shape.end(),out.shape.begin()+1)||value.offsets.size()!=end-begin+1)
+            throw std::invalid_argument("geometry: packed arrays require matching dtype and trailing dimensions");
+        if(value.shape[0]<0||value.shape[0]>std::numeric_limits<int64_t>::max()-out.shape[0]||
+           value.data.size()>out.data.max_size()-bytes)
+            throw std::overflow_error("geometry: packed array size overflow");
+        byteOffsets[block]=bytes;bytes+=value.data.size();
+        for(size_t i=0;i+1<value.offsets.size();++i)out.offsets[begin+i]=uint64_t(out.shape[0])+value.offsets[i];
+        out.shape[0]+=value.shape[0];
+    }
+    out.offsets.back()=uint64_t(out.shape[0]);out.data.resize(bytes);
+    if(profile)result.timings["assembly_allocation_seconds"]=seconds(phase);
+    phase=stamp();
+    parallelFor(blocks,count,[&](size_t block){
+        const auto& source=values[block].data;
+        if(!source.empty())std::memcpy(out.data.data()+byteOffsets[block],source.data(),source.size());
+        // Do not retain both copies until every other block has finished.
+        std::vector<uint8_t>().swap(values[block].data);
+    });
+    if(profile){
+        result.timings["copy_seconds"]=seconds(phase);
+        result.timings["selection_seconds_sum"]=std::accumulate(selectionTimes.begin(),selectionTimes.end(),0.);
+        result.timings["payload_mapping_seconds_sum"]=std::accumulate(payloadTimes.begin(),payloadTimes.end(),0.);
+        result.timings["worker_snapshot_seconds_sum"]=std::accumulate(snapshotTimes.begin(),snapshotTimes.end(),0.);
+        result.timings["total_seconds"]=seconds(started);
+        result.timings["workers"]=double(count);result.timings["blocks"]=double(blocks);
+        result.timings["objects"]=double(result.objectUuids.size());result.timings["bytes"]=double(bytes);
+    }
+    return result;
+}
 void ObjectCollection::createExtensionTable(CollectionTxn& t,const ExtensionTable& table){
     auto& w=impl_->writer(t);impl_->nodes[0].store->createExtensionTable(w,table);
 }
@@ -590,12 +897,20 @@ void ObjectCollection::replaceExtensionRows(CollectionTxn& t,const std::string& 
                                              std::span<const ExtensionRow> rows){
     impl_->nodes[0].store->replaceExtensionRows(impl_->writer(t),table,canonical(input).objectUuid,rows);
 }
+void ObjectCollection::appendExtensionRows(CollectionTxn& t,const std::string& table,std::span<const ExtensionRow> rows){
+    auto& writer=impl_->writer(t);
+    impl_->nodes[0].store->appendExtensionRows(writer,table,rows);
+}
+VolumeTransforms ObjectCollection::volumeTransforms(const CollectionTxn& t)const{
+    return impl_->nodes[0].store->volumeTransforms(impl_->txn(t,0));
+}
 std::vector<ExtensionTableInfo> ObjectCollection::extensionTables(const CollectionTxn& t)const{
     return impl_->nodes[0].store->extensionTables(impl_->txn(t,0));
 }
 void ObjectCollection::scanExtensionRows(const CollectionTxn& t,const std::string& name,
-    const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix)const{
-    impl_->nodes[0].store->scanExtensionRows(impl_->txn(t,0),name,visitor,prefix);
+    const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix,
+    const ExtensionKeyFilter& filter)const{
+    impl_->nodes[0].store->scanExtensionRows(impl_->txn(t,0),name,visitor,prefix,filter);
 }
 std::vector<CollectionMember> ObjectCollection::members()const{std::vector<CollectionMember> r;for(const auto& n:impl_->nodes)r.push_back(n.member);return r;}
 
@@ -719,10 +1034,11 @@ std::optional<CollectionObject> ObjectCollection::objectById(const CollectionTxn
     return found?object(t,*found):std::nullopt;
 }
 void ObjectCollection::scanObjects(const CollectionTxn& t,const std::function<bool(const CollectionObject&)>& visit,const std::optional<std::string>& kind)const{
-    ObjectSelection selection;selection.kind=kind;selection.limit=4096;
-    while(true){const auto rows=impl_->nodes[0].store->selectObjects(impl_->txn(t,0),selection);if(rows.empty())break;
-        for(const auto& row:rows){const auto resolved=object(t,{uuid(t),row.uuid});if(resolved&&!visit(*resolved))return;}
-        selection.afterUuid=rows.back().uuid;}
+    ObjectSelection selection;selection.kind=kind;
+    scanVisibleObjects(impl_->db(t,0),selection,std::nullopt,[&](ObjectRecord&& row){
+        const ObjectKey key{row.versionStoreUuid,row.uuid};
+        return visit(CollectionObject{key,std::move(row)});
+    });
 }
 std::optional<GeometryRevision> ObjectCollection::currentGeometry(const CollectionTxn& t,const ObjectKey& key)const{
     return impl_->nodes[0].store->currentGeometry(impl_->txn(t,0),canonical(key).objectUuid);
@@ -757,19 +1073,6 @@ std::optional<CollectionEdge> ObjectCollection::edge(const CollectionTxn& t,cons
     const auto a=object(t,result.a),b=object(t,result.b);
     return a&&b&&!a->record.retired&&!b->record.retired?std::optional(std::move(result)):std::nullopt;
 }
-std::optional<CollectionEdge> ObjectCollection::edgeById(const CollectionTxn& t,const std::string& owner,int64_t id)const{
-    const auto uuid=util::canonicalUuid(owner);std::optional<std::string> routed;std::optional<ObjectKey> found;
-    for(const auto& node:impl_->nodes)if(node.member.storeUuid==uuid&&!node.routes.empty()){
-        for(const auto& rule:node.routes)if(rule.keySpace=="edges"&&rule.matches(id)){
-            if(routed&&*routed!=rule.databaseUuid)throw std::runtime_error("collection: conflicting edge routing");routed=rule.databaseUuid;}
-        if(!routed)return {};
-    }
-    for(size_t n=0;n<impl_->nodes.size();++n){auto& m=impl_->nodes[n].member;
-        if(m.storeUuid!=uuid||id<m.edgeIds[0]||id>m.edgeIds[1]||(routed&&m.databaseUuid!=*routed))continue;
-        Statement row(impl_->db(t,n),"SELECT uuid FROM edges WHERE id=?",id);if(row.row()){
-            if(found)throw std::runtime_error("collection: ambiguous numeric edge key");found=ObjectKey{uuid,formatUuid(row.blob16(0))};}}
-    return found?edge(t,*found):std::nullopt;
-}
 ObjectKey ObjectCollection::upsertObject(CollectionTxn& t,const ObjectRecord& r){
     auto& w=impl_->writer(t);
     if(!r.uuid.empty()){
@@ -791,18 +1094,15 @@ void ObjectCollection::setMeta(CollectionTxn& t,const ObjectKey& input,const std
 void ObjectCollection::deleteObject(CollectionTxn& t,const ObjectKey& input){
     impl_->nodes[0].store->deleteObject(impl_->writer(t),canonical(input).objectUuid);
 }
-ObjectKey ObjectCollection::Impl::insertEdge(CollectionTxn& t,const ObjectKey& a,const ObjectKey& b,const EdgeRecord& input,std::optional<int64_t> id){
+ObjectKey ObjectCollection::Impl::insertEdge(CollectionTxn& t,const ObjectKey& a,const ObjectKey& b,const EdgeRecord& input){
     GeometryPhase phase("collection.edge");
     auto& w=writer(t);Savepoint save(db(t,0));
     auto r=input;r.aUuid=canonical(a).objectUuid;r.bUuid=canonical(b).objectUuid;
-    const auto result=id?nodes[0].store->insertEdgeWithId(w,r,*id):nodes[0].store->addEdge(w,r);
+    const auto result=nodes[0].store->addEdge(w,r);
     save.release();return {nodes[0].member.storeUuid,result};
 }
 ObjectKey ObjectCollection::addEdge(CollectionTxn& t,const ObjectKey& a,const ObjectKey& b,const EdgeRecord& input){
-    return impl_->insertEdge(t,a,b,input,{});
-}
-ObjectKey ObjectCollection::insertEdgeWithId(CollectionTxn& t,const ObjectKey& a,const ObjectKey& b,const EdgeRecord& input,int64_t id){
-    return impl_->insertEdge(t,a,b,input,id);
+    return impl_->insertEdge(t,a,b,input);
 }
 int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
     const std::function<bool(std::vector<InitialCollectionEdge>&)>& producer,
@@ -813,6 +1113,7 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
     auto& w=impl_->writer(t);auto* db=impl_->db(t,0);
     Savepoint save(db);
     detail::InitialEdgeInserter writer(*impl_->nodes[0].store,w,options.deferIndexes,options.sqlBatchRows);
+    detail::createInitialExtensionStages(db,options.stagedExtensions);
     std::vector<InitialCollectionEdge> batch;
     std::vector<EdgeRecord> native;
     int64_t count=0;
@@ -841,7 +1142,7 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
         writer.append(native);
         std::vector<const InitialExtensionRow*> extensions;
         for(const auto& input:batch)for(const auto& row:input.extensions)extensions.push_back(&row);
-        detail::appendInitialExtensions(db,extensions);
+        detail::appendInitialExtensions(db,extensions,options.stagedExtensions);
         count+=static_cast<int64_t>(native.size());
     }
     writer.finish();

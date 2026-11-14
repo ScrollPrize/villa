@@ -1,6 +1,6 @@
 # Packed stores
 
-Packed storage is optional. Ordinary schema-21 databases remain ordinary SQLite files. `PackedStore.hpp` provides a builder and a SQLite VFS for a container of independent databases; the container format version is separate from the vcobj logical version and SQL schema version. Store references (`store_reference`), table routing, shard ownership, and lineage UUIDs and commit sequences remain in the vcobj manifests rather than the VFS.
+Packed storage is optional. Ordinary schema-22 databases remain ordinary SQLite files. `PackedStore.hpp` provides a builder and a SQLite VFS for a container of independent databases; the container format version is separate from the vcobj logical version and SQL schema version. Store references (`store_reference`), table routing, shard ownership, and lineage UUIDs and commit sequences remain in the vcobj manifests rather than the VFS.
 
 ## Creating and reading
 

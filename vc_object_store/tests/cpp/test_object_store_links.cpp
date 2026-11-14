@@ -159,7 +159,7 @@ void callerCanCommitAfterFailedCandidateBatch(const TemporaryDirectory& director
     auto db = create(directory, "candidate-savepoint.vcobj");
     const auto a = plane(db), b = plane(db), c = plane(db);
     links::LinkCandidate candidate;
-    candidate.kind = "surface-overlap"; candidate.aUuid = a; candidate.bUuid = b;
+    candidate.kind = "same-surface"; candidate.aUuid = a; candidate.bUuid = b;
     candidate.aAnchor.wholeGeometry = candidate.bAnchor.wholeGeometry = true;
     require(links::commitCandidates(db,"atomic-test",1,{candidate},false).edgesCreated == 1,
             "candidate to be replaced is published");
@@ -198,7 +198,7 @@ void staleScopesUseCanonicalIds(const TemporaryDirectory& directory)
                 if (referenced) { auto collection = ObjectCollection::create(overlay, {path}, options); }
                 auto db = ObjectStore::open(referenced ? overlay : path, options);
                 links::LinkCandidate candidate;
-                candidate.kind = "scope-link"; candidate.aUuid = a; candidate.bUuid = b;
+                candidate.kind = "declared_reference"; candidate.aUuid = a; candidate.bUuid = b;
                 candidate.aAnchor.wholeGeometry = candidate.bAnchor.wholeGeometry = true;
                 const auto add = [&] {
                     require(links::commitCandidates(db,"scope-test",1,{candidate},false).edgesCreated == 1,
@@ -385,7 +385,7 @@ void attachedCollectionsAreNotGraphLinks(const TemporaryDirectory& directory)
     require(refused, "a role-carrying collection is refused by name");
 
     // Traversal and graph reads skip attachments unless asked for by kind.
-    const auto overlap = link(surface, other, "surface-overlap", "{}");
+    const auto overlap = link(surface, other, "same-surface", "{}");
     auto txn = db.read();
     const auto neighbours = db.neighbours(txn, surface);
     require(std::find(neighbours.begin(), neighbours.end(), results) == neighbours.end(), "attachments are not neighbours");

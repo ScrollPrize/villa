@@ -38,7 +38,7 @@ nlohmann::json snapshot(sqlite3* db) {
     nlohmann::json rows=nlohmann::json::array();
     Statement s(db,"SELECT e.uuid,e.a_uuid,e.b_uuid,e.kind,e.version,e.approval_state,e.meta,e.a_dependencies,e.b_dependencies "
         "FROM edges e "
-        "ORDER BY e.id");
+        "ORDER BY e.uuid");
     while(s.row()) {nlohmann::json row=nlohmann::json::array();
         for(int i=0;i<9;++i) {
             if(i<3) row.push_back(formatUuid(s.blob16(i)));
@@ -102,11 +102,11 @@ void failures(size_t sqlRows=1) {
     auto store=ObjectStore::create(dir.path/"failures.vcobj",opts);
     {auto tx=store.write();objects(store,tx,true);tx.commit();}
     auto run=[&](std::vector<EdgeRecord> input) {
-        auto tx=store.write();auto* db=ObjectStoreImplAccess::conn(tx);const auto before=scalar(db,"SELECT next_id FROM key_allocators WHERE name='edges'");
+        auto tx=store.write();auto* db=ObjectStoreImplAccess::conn(tx);
         {Savepoint whole(db);InitialEdgeInserter initial(store,tx,true,sqlRows);
             mustFail([&]{initial.append(input);});mustFail([&]{initial.finish();});}
         require(scalar(db,"SELECT count(*) FROM edges")==0,"whole stream rolled back");
-        require(scalar(db,"SELECT next_id FROM key_allocators WHERE name='edges'")==before,"allocator rolled back");
+        require(scalar(db,"SELECT count(*) FROM key_allocators WHERE name='edges'")==0,"UUID edges have no allocator");
         require(scalar(db,"SELECT count(*) FROM sqlite_schema WHERE name='edges_a'")==1,"deferred indexes rolled back");tx.commit();
     };
     auto good=edge(true),bad=good;run({good,bad});
@@ -125,13 +125,12 @@ void failures(size_t sqlRows=1) {
 }
 void exhaustIds() {
     TemporaryDirectory dir;OpenOptions opts;opts.author="test";opts.history=HistoryMode::Off;
-    opts.edgeIdRange={std::numeric_limits<int64_t>::max()-1,std::numeric_limits<int64_t>::max()};
     auto store=ObjectStore::create(dir.path/"range.vcobj",opts);auto tx=store.write();auto* db=ObjectStoreImplAccess::conn(tx);
     objects(store,tx);Savepoint whole(db);InitialEdgeInserter initial(store,tx,false,2);
     auto first=edge();initial.append(std::span(&first,1));
     auto second=edge();initial.append(std::span(&second,1));initial.finish();whole.release();
-    require(scalar(db,"SELECT count(*) FROM edges WHERE id=9223372036854775807")==1,"maximum ID allocated without overflow");
-    require(scalar(db,"SELECT next_id IS NULL FROM key_allocators WHERE name='edges'")==1,"range exhausted");tx.commit();
+    require(scalar(db,"SELECT count(*) FROM edges")==2,"UUID edges do not need numeric allocation");
+    require(scalar(db,"SELECT count(*) FROM key_allocators WHERE name='edges'")==0,"no numeric edge allocator");tx.commit();
 }
 void trustedEndpointInputs() {
     TemporaryDirectory dir;OpenOptions opts;opts.author="test";opts.history=HistoryMode::Off;

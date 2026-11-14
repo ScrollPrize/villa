@@ -1,4 +1,5 @@
 #include "vc_object_store/migration/ConvertStore.hpp"
+#include "migration/ConvertSchema21.hpp"
 #include "internal/Database.hpp"
 #include "internal/DatabaseCopy.hpp"
 #include "internal/Sqlite.hpp"
@@ -11,6 +12,8 @@
 #include "geometry/GeometryDelta.hpp"
 #include "geometry/GeometryReader.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
+#include "vc_object_store/objects/EdgeKinds.hpp"
+#include "vc_object_store/objects/PackedStore.hpp"
 #include "vc_reader/native/platform_io.hpp"
 #include "vc_reader/native/atomic_file.hpp"
 
@@ -294,7 +297,6 @@ void retainDeletedVersions(sqlite3* db, const std::map<std::string, Json>& recor
     // Upstream keeps a deleted object's last number only in history. Current
     // tombstones now retain that number even after history is disabled.
     int64_t nextObject = scalar(db, "SELECT coalesce(max(id),0) FROM objects");
-    int64_t nextEdge = scalar(db, "SELECT coalesce(max(id),0) FROM edges");
     int64_t objectCount = 0, edgeCount = 0;
     Statement objects(db, "SELECT v.object_uuid,v.version,v.generation,v.commit_seq,v.revision_uuid "
         "FROM object_versions v JOIN object_revisions r ON r.uuid=v.revision_uuid WHERE r.deleted=1 "
@@ -317,10 +319,9 @@ void retainDeletedVersions(sqlite3* db, const std::map<std::string, Json>& recor
         "AND NOT EXISTS(SELECT 1 FROM edges e WHERE e.uuid=v.edge_uuid)");
     while (edges.row()) {
         if (edges.isNull(4)) throw std::runtime_error("convert: deleted relationship has no recorded endpoints");
-        if (nextEdge == INT64_MAX) throw std::overflow_error("convert: relationship ID exhausted by tombstones");
         auto value = numberedRecord(Json::parse(edges.text(4)), edges.i64(1), edges.isNull(3) ? 0 : edges.i64(3), edges.uuid(2));
         auto record = edgeFromJson(value);
-        insertEdgeRow(db, record, ++nextEdge, edges.isNull(3) ? 0 : edges.i64(3),
+        insertEdgeRow(db, record, edges.isNull(3) ? 0 : edges.i64(3),
                       record.createdBy, record.createdHost, record.createdAt, true);
         execute(db, "UPDATE edges SET state=2,version=?,version_generation=?,changed_by=?,changed_at=?,changed_host=? WHERE uuid=?",
             edges.i64(1), edges.blob16(2), record.changedBy, record.changedAt, record.changedHost, edges.blob16(0));
@@ -364,7 +365,7 @@ void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesyst
     // These upstream programs belonged to structures replaced by direct keys,
     // inline current geometry and the shared state field. Everything else
     // must have a current-schema successor; do not silently discard extensions.
-    for (const auto* name : {"objects_kind", "edges_unique", "retired_objects", "geometry_dependencies_edge", "geometry_revision_generation"})
+    for (const auto* name : {"objects_kind", "edges_unique", "edges_kind_id", "retired_objects", "geometry_dependencies_edge", "geometry_revision_generation"})
         knownPrograms.emplace("index", name);
     for (const auto* name : {"geometry_dependencies_insert", "geometry_dependencies_update", "source_identity_head_insert",
                              "source_identity_head_update", "source_identity_head_delete"})
@@ -461,6 +462,19 @@ void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesyst
     edges.expressions["a_uuid"] = "(SELECT o.uuid FROM src.objects o WHERE o.id=s.a_id)";
     edges.expressions["b_uuid"] = "(SELECT o.uuid FROM src.objects o WHERE o.id=s.b_id)";
     edges.removedColumns.insert("a_id"); edges.removedColumns.insert("b_id");
+    edges.removedColumns.insert("id");
+    {
+        const auto fields=copiedColumns(db,"main","edges");
+        const auto kind=std::find(fields.begin(),fields.end(),"kind")-fields.begin();
+        const auto approval=std::find(fields.begin(),fields.end(),"approval_state")-fields.begin();
+        edges.adjust=[kind,approval](Statement& source,Statement& target){
+            target.bind(int(kind+1),edgeKindCode(source.text(int(kind))));
+            target.bind(int(approval+1),edgeApprovalCode(source.text(int(approval))));return true;
+        };
+    }
+    transforms["edge_tags"].expressions["edge_uuid"]="(SELECT e.uuid FROM src.edges e WHERE e.id=s.edge_id)";
+    transforms["edge_tags"].uuidColumns.insert("edge_uuid");
+    transforms["edge_tags"].removedColumns.insert("edge_id");
     auto& geometries = transforms.at("geometry_revisions");
     geometries.expressions["object_version"] = "coalesce((SELECT min(v.version) FROM src.object_versions v "
         "JOIN src.object_revisions r ON r.uuid=v.revision_uuid WHERE " + keySql("r.geometry_uuid") + "=" + keySql("s.uuid") + "),0)";
@@ -500,7 +514,7 @@ void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesyst
             current.run(geometry.manifest().dump(), heads.uuid(1), heads.hash(2), heads.blob16(0));
         }
     }
-    for (const auto* table : {"objects", "edges"}) {
+    for (const auto* table : {"objects"}) {
         const auto last = scalar(db, std::string("SELECT coalesce(max(id),0) FROM ") + table);
         execute(db, "UPDATE key_allocators SET namespace_uuid=(SELECT uuid FROM store_identity),next_id=? WHERE name=?",
             last == INT64_MAX ? std::optional<int64_t>() : std::optional(last + 1), std::string(table));
@@ -933,6 +947,7 @@ ConversionResult convertStoreImpl(const std::filesystem::path& source, const std
 
 ConversionResult convertStore(const std::filesystem::path& source, const std::filesystem::path& destination)
 {
+    if(isSchema21Store(source))return convertSchema21(source,destination);
     return convertStoreImpl(source, destination);
 }
 
@@ -963,26 +978,32 @@ ConversionResult convertStoreInPlace(const std::filesystem::path& input,
         throw std::invalid_argument("convert: in-place input must be a regular non-symlink SQLite file");
     OwnershipGuard ownership(source, OwnershipGuard::Mode::Service);
     Connection locked;
-    locked.db = openRaw(source, SQLITE_OPEN_READWRITE);
+    const bool packed=isPackedStore(source);
+    if(!packed)locked.db = openRaw(source, SQLITE_OPEN_READWRITE);
     // Switch out of WAL before replacement: no old sidecar may be replayed
     // against the newly published schema. Exclusive locking is retained by
     // this connection while its snapshot is copied and validated.
-    exec(locked.db, "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE; COMMIT;");
+    if(!packed)exec(locked.db, "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE; COMMIT;");
     const auto sibling = source.parent_path() / (source.filename().string() + ".convert-" + util::newUuid());
+    const auto members = source.parent_path() / (source.filename().string() + ".members-" + util::newUuid());
     const auto siblingArtifacts = artifactBlobDirectory(sibling).parent_path();
     if (std::filesystem::exists(sibling) || std::filesystem::is_symlink(sibling) ||
         std::filesystem::exists(siblingArtifacts) || std::filesystem::is_symlink(siblingArtifacts))
         throw std::runtime_error("convert: private sibling path already exists");
     struct Cleanup {
         std::filesystem::path path;
+        std::filesystem::path members;
+        bool published=false;
         ~Cleanup() {
             std::error_code ignored;
             for (const auto* suffix : {"", "-wal", "-shm", "-journal", "-owner"})
                 std::filesystem::remove(path.string() + suffix, ignored);
             std::filesystem::remove_all(artifactBlobDirectory(path).parent_path(), ignored);
+            if(!published)std::filesystem::remove_all(members,ignored);
         }
-    } cleanup{sibling};
-    auto result = convertStoreImpl(source, sibling, locked.db);
+    } cleanup{sibling,members};
+    auto result = packed?convertSchema21(source,sibling,nullptr,members):
+        pragmaInt(locked.db,"user_version")==21?convertSchema21(source,sibling,locked.db,members):convertStoreImpl(source, sibling, locked.db);
     auto report = Json::parse(result.reportJson);
     report["destination"] = source.string();
     report["in_place"] = true;
@@ -992,6 +1013,7 @@ ConversionResult convertStoreInPlace(const std::filesystem::path& input,
     // replacement keeps the original, identical content-addressed files;
     // only the SQLite file changes atomically. The verified copies are private.
     vcr::platform::replace_file(sibling, source, true);
+    cleanup.published=true;
     vcr::platform::sync_directory(source.parent_path(), "vcobj schema conversion");
     return result;
 }

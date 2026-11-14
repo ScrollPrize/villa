@@ -3,6 +3,7 @@ import pytest
 import torch
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_event_offsets as eo
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_layout as uv
+from .fiber_graph_fixture import uid, measured_store
 
 
 def test_short_arc_shared_parameters_exact_and_gradients():
@@ -97,12 +98,10 @@ def test_offsets_cannot_change_coarse_loss():
 
 
 def test_prepare_reads_true_arcs_and_serializes(tmp_path):
-    import sqlite3
-    path=tmp_path/'events.sqlite';f,g='00000000-0000-4000-8000-000000000010','00000000-0000-4000-8000-000000000020'
-    with sqlite3.connect(path) as db:
-        db.execute('CREATE TABLE fibers(id TEXT PRIMARY KEY)')
-        db.execute('CREATE TABLE constraints(id INTEGER PRIMARY KEY,fiber_a TEXT,fiber_b TEXT,arc_a,arc_b)')
-        db.executemany('INSERT INTO constraints VALUES(?,?,?,?,?)',[(7,f,g,40.,90.),(8,f,g,60.,70.)])
+    f,g=uid(10),uid(20)
+    path=measured_store(tmp_path,[(7,10,20,False,.5),(8,10,20,False,.5)],
+        curves={i:np.array([[0.,0,0],[100.,0,0]]) for i in [10,20]},
+        field_overrides={7:dict(arc_a=40.,arc_b=90.),8:dict(arc_a=60.,arc_b=70.)})
     d=dict(event_ids=np.array([7,8]),i=np.array([0,1]),j=np.array([2,2]),
            source_id=np.array([f,f,g]),family=np.array([0,0,1]),
            start=np.array([0,50,0]),end=np.array([50,100,100]))

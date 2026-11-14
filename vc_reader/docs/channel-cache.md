@@ -38,6 +38,15 @@ Local files and ranged HTTP/S3/SFTP sources, including indexed Zarr shards, use 
 
 ## Lock profiling
 
+### Shared chunk-load coordination
+
+Whole-chunk and channel-selective decoded reads use the same per-key in-flight result, across reader instances and local, remote, or computed sources. The key includes the decoded-cache quality namespace. A short-lived registration entry shares the producer's result or exception with concurrent waiters; failures do not poison subsequent retries. Partial results can supply the requested channel planes; another request loads only planes still missing. Resident cache hits bypass registration entirely.
+
+Registration maps use independent hash shards (hardware concurrency by default), like the decoded LRU, but do not share its locks. No registration lock covers source I/O, decoding, cache admission, or waiting on another producer. Different chunks that hash to the same shard only serialize their brief registration/completion steps, not their source work. Cache-only requests return a miss rather than wait on an active source load. Explicit caller-thread-only computed sources retain caller-thread execution. Uncached raw range streaming retains bounded range reads rather than materializing an entire chunk just to share it.
+
+See [coordination benchmarks](../benchmarks/singleflight.md) for reproducible whole/selected read cases and sustained contention tests, including oversubscribed users.
+
+For sampled producer/waiter/queued-task counts on real workloads, see [coordination profiling](coordination-profiling.md).
 C++ callers can opt in with `MemoryCache::enable_profiling()` and read `profile()` snapshots. Counters distinguish acquisition wait and time holding shard mutexes for get, put, erase and clear, aggregated across shards. Memory-availability probe time and refresh call counts are separate. The legacy `refresh` lock-timing member is zero in the sharded implementation: pressure trimming across shards is not currently instrumented. Profiling is off by default; enabled timing uses the real steady clock, independently of the injectable budget clock. Counters are updated under the owning mutex without another counter lock. Clock reads and counter updates perturb the measured workload, so compare a profiling-disabled control. Wait times sum across threads: they are not wall-clock percentages. Two readers sharing a cache report the same counters; do not sum those snapshots twice.
 
 ## Validation
@@ -53,7 +62,6 @@ Hits, misses and replacements that preserve the byte count require no shared ato
 Equal-size replacements update the existing entry in place and release the old payload outside the shard lock. Aggregate statistics visit the shards and are not a globally atomic snapshot during concurrent operations. Clear also visits shards, so callers requiring an empty cache must stop concurrent insertions first.
 
 Effective channel registrations are published as immutable snapshots. A forked Python reader copies that shared snapshot before reopening its engine, including channels registered only by other readers; this never takes a mutex inherited from the parent.
-
 ## Background maintenance and caller assistance
 
 Fixed-size and auto-sized caches start four maintenance workers by default; zero-byte fixed caches need none. Each writer can try one sampled batch inline when it crosses the eviction watermark and no other reclaimer is active. If it encounters contention or doesn't reclaim enough, the background workers take over. Selection is based on pressure and contention, not the number of callers. Native callers can construct `MemoryCache(budget_or_options, shards, false)` for synchronous eviction, or enable a custom maintenance policy on that cache before concurrent use. Injected auto-budget callbacks must support access from the maintenance thread. Construct native caches after forking; do not use or destroy inherited caches in the child. Python reader wrappers rebuild their cache on first use in a child process. Destruction stops and joins the maintenance threads.
@@ -68,4 +76,4 @@ Admission reserves bytes atomically against the shared budget. If a fitting chun
 
 `maintenance_stats()` reports admission bytes, total eviction bytes/batches, effective headroom, pending reclamation, oversized admission skips, caller-assisted puts/bytes/batches, candidate-array scans, prefix byte claims and evicted entry counts. `wait_for_maintenance()` is an explicit diagnostic drain barrier with a timeout, not part of ordinary reads or writes. Auto-budget shrink is asynchronous in this mode, so existing occupancy can temporarily exceed a newly reduced budget; new growth is still constrained by admission reservations. Statistics are concurrent snapshots, not a transactionally consistent view.
 
-`test_native_cache_maintenance` covers 1/2/4/8 maintenance workers, concurrent admissions, no capacity-based skips, reader-held payload lifetime, large incoming chunks, budget shrink, clear and destruction. Use the contention benchmark's maintenance and pacing arguments to compare foreground latency, accepted work, hit retention, assistance and headroom—not just raw request rate.
+`test_native_cache_maintenance` covers 1/2/4/8 maintenance workers, concurrent admissions, no capacity-based skips, global cold-before-hot eviction, reader-held payload lifetime, large incoming chunks, budget shrink, clear and destruction. Use the contention benchmark's maintenance and pacing arguments to compare foreground latency, accepted work, hit retention, assistance and headroom—not just raw request rate.

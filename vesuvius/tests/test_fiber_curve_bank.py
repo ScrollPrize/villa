@@ -22,6 +22,14 @@ def test_curve_bank_actual_polyline_and_normal_invalidity(tmp_path):
     point,n,ok=bank.sample(np.array([0,0,0]),np.array([5.,15.,20.]))
     np.testing.assert_allclose(point,[[5,0,10],[10,5,10],[10,10,10]])
     np.testing.assert_allclose(n,np.tile([0,0,-1],(3,1)));assert ok.all()
+    def no_geometry(*_):
+        raise AssertionError('Normal-only sampling must not load fiber geometry')
+    monkeypatch.setattr(m,'read_polylines',no_geometry)
+    normal_bank=m.CurveBank.from_normals([fid],tmp_path,sign)
+    sampled,valid=normal_bank.sample_normals(np.array([0,0,0]),np.array([5.,15.,20.]))
+    np.testing.assert_array_equal(sampled,n)
+    np.testing.assert_array_equal(valid,ok)
+    monkeypatch.setattr(m,'read_polylines',lambda _,ids:[({'id':str(i)},xyz) for i in ids])
     with pytest.raises(ValueError,match='outside'):bank.sample(np.array([0]),np.array([21.]))
     del bank
     normals[1,4]=0;normals.tofile(tmp_path/'normals.bin')

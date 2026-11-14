@@ -2,32 +2,35 @@
 import argparse
 import json
 from pathlib import Path
-import sqlite3
-import statistics
+import numpy as np
+from .fiber_graph_store import FiberGraph
 
 
 def summarize(path):
-    db=sqlite3.connect(path.resolve().as_uri()+"?mode=ro",uri=True)
-    meta={k:json.loads(v) for k,v in db.execute("select key,value from metadata")}
-    assert meta["complete"]
-    n=db.execute("select count(*) from fibers").fetchone()[0]
-    e=db.execute("select count(*) from constraints").fetchone()[0]
-    pairs=db.execute("select count(*) from (select fiber_a,fiber_b from constraints group by fiber_a,fiber_b)").fetchone()[0]
-    neighbors={r[0]:r[1] for r in db.execute("select id,count(*) from (select fiber_a id,fiber_b neighbor from constraints union select fiber_b id,fiber_a neighbor from constraints) group by id")}
-    degrees=sorted(neighbors.get(r[0],0) for r in db.execute("select id from fibers"))
+    path=Path(path)
+    graph=FiberGraph(path);n=len(graph.ids);e=len(graph.event_ids)
+    pair_rows=np.unique(np.sort(np.column_stack((graph.i,graph.j)),axis=1),axis=0)
+    pairs=len(pair_rows)
+    degrees=np.sort(np.bincount(pair_rows.ravel(),minlength=n))
+    connected=int(np.count_nonzero(degrees))
     distance=[]
     for kind in ("parallel","orthogonal"):
-        op=">" if kind=="parallel" else "<="
-        for bucket,count,mean in db.execute(f"select cast(round(winding_distance*2) as integer),count(*),avg(winding_distance) from constraints where parallel_score {op} perpendicular_score group by 1 order by 1"):
-            distance.append(dict(kind=kind,nearest_half_winding=bucket/2,events=count,mean_distance=mean))
-    stats=meta["statistics"]
+        values=graph.distance[graph.parallel if kind=='parallel' else ~graph.parallel]
+        # SQLite ROUND uses half-away-from-zero, unlike NumPy's ties-to-even.
+        buckets=np.copysign(np.floor(abs(values)*2+.5),values).astype(np.int64)
+        for bucket in np.unique(buckets):
+            selected=values[buckets==bucket]
+            distance.append(dict(kind=kind,nearest_half_winding=float(bucket/2),events=len(selected),mean_distance=float(selected.mean())))
+    stats=dict(fibers=n,constraints=e,isolated_fibers=n-connected,
+               parallel=int(graph.parallel.sum()),orthogonal=int((~graph.parallel).sum()))
     return dict(database=str(path.resolve()),database_bytes=path.stat().st_size,fibers=n,events=e,
         event_statistics=stats,unique_fiber_pairs=pairs,
-        neighbor_degree=dict(mean=2*pairs/n,median=statistics.median(degrees),p95=degrees[int(.95*(n-1))],maximum=max(degrees)),
-        fibers_with_constraints=len(neighbors),coverage_percent=100*len(neighbors)/n,
-        parallel_percent=100*stats["parallel"]/e,orthogonal_percent=100*stats["orthogonal"]/e,
+        neighbor_degree=dict(mean=2*pairs/n if n else 0,median=float(np.median(degrees)) if n else 0,
+                             p95=int(degrees[int(.95*(n-1))]) if n else 0,maximum=int(degrees[-1]) if n else 0),
+        fibers_with_constraints=connected,coverage_percent=100*connected/n if n else 0,
+        parallel_percent=100*stats["parallel"]/e if e else 0,orthogonal_percent=100*stats["orthogonal"]/e if e else 0,
         winding_distance_bins=distance,
-        note="Degree counts both endpoints; local events repeat between pairs. Bins are nearest half-winding measurements, not ground-truth winding labels.")
+        note="Degree counts both endpoints; local events repeat between pairs. Bins are nearest half-winding measurements, not ground-truth winding labels. database_bytes is only the root container; referenced stores are not counted.")
 
 
 if __name__=="__main__":

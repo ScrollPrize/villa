@@ -3,10 +3,11 @@ import pytest
 from scipy import sparse
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_surface_refinement as ref
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_event_offsets as eo
+from .fiber_graph_fixture import uid, measured_store
 
 
 def fid(k):
-    return f'00000000-0000-4000-8000-{k:012d}'
+    return uid(k)
 
 
 def graph(family,buckets,source,i,j,shift,sign):
@@ -77,15 +78,13 @@ def test_refined_curve_interpolation_and_source_boundaries():
 
 
 def test_initialize_filtered_links_and_nonzero_parent_offsets(tmp_path):
-    import sqlite3
     d,s,w,c=graph([0,0,0,1],[0,0,0,0],[1,1,1,2],[0,2],[3,3],[0,0],[1,1])
     d.update(start=np.array([0.,10.,20.,0.]),end=np.array([10.,20.,30.,30.]),
         event_ids=np.array([100,101]),ds_a=np.array([5.,5.]),ds_b=np.array([5.,25.]),
         links=np.array([[0,1,10,0],[1,2,10,0]],dtype=float))
-    db=tmp_path/'constraints.sqlite'
-    with sqlite3.connect(db) as con:
-        con.execute('CREATE TABLE constraints(id INTEGER,fiber_a TEXT,fiber_b TEXT,arc_a REAL,arc_b REAL)')
-        con.executemany('INSERT INTO constraints VALUES (?,?,?,?,?)',[(100,fid(1),fid(2),5,5),(101,fid(1),fid(2),25,25)])
+    db=measured_store(tmp_path,[(100,1,2,False,.5),(101,1,2,False,.5)],
+        curves={i:np.array([[0.,0,0],[30.,0,0]]) for i in [1,2]},
+        field_overrides={100:dict(arc_a=5.,arc_b=5.),101:dict(arc_a=25.,arc_b=25.)})
     c.update(database=str(db),event_uv_offsets=True,event_offset_tie_distance_base=4.)
     meta=eo.prepare(d,c)
     parent=dict(state=s,widths=w,event_ids=d['event_ids'],

@@ -33,7 +33,8 @@ def scaled_joint(objective, state, raw, extension, steps, callback=None,
                  plateau_window=0, plateau_rtol=1e-6, plateau_atol=1e-9,
                  square_match_initial_scale=False, closure_cache=True, soft_minimum_width=False,
                  lbfgs_lr=1., winding_coordinate_scale=1., rejection_coordinate_scale=1.,
-                 vertical_coordinate_scale=100., frozen_fiber_mask=None, freeze_widths=False):
+                 vertical_coordinate_scale=100., frozen_fiber_mask=None, freeze_widths=False,
+                 freeze_winding=False, profile_first_gradient=False, optimizer_progress_every=0):
     """Exact GT-probe scales, line search, tolerances and full objective.
 
     SciPy owns the optimizer/history; tensors may reside on CPU or CUDA.
@@ -43,6 +44,7 @@ def scaled_joint(objective, state, raw, extension, steps, callback=None,
         raise ValueError('Optimizer coordinate scales must be finite and positive')
     if soft_minimum_width and (optimizer_kind!='torch_lbfgs' or not relative_widths):
         raise ValueError('Soft minimum experiment requires Torch L-BFGS relative widths')
+    if optimizer_progress_every<0:raise ValueError('optimizer_progress_every must be nonnegative')
     named=list(extension.named_parameters())
     if not all(np.isfinite(x) and x>0 for x in (lbfgs_lr,winding_coordinate_scale,rejection_coordinate_scale,vertical_coordinate_scale)):
         raise ValueError('Optimizer step and scales must be finite and positive')
@@ -73,6 +75,7 @@ def scaled_joint(objective, state, raw, extension, steps, callback=None,
     masks=[torch.zeros_like(state,dtype=torch.bool),torch.ones_like(raw,dtype=torch.bool)]+[
         torch.ones_like(p,dtype=torch.bool) for _,p in named]
     masks[0][:,0]=True
+    if freeze_winding:masks[0][:,0]=False
     curve=getattr(extension,'curve',None)
     if curve is not None and hasattr(curve,'owner'):
         if len(torch.unique(curve.owner))!=len(state):
@@ -111,8 +114,8 @@ def scaled_joint(objective, state, raw, extension, steps, callback=None,
     def evaluate():
         value=state.new_zeros(())
         gradients=[torch.zeros_like(p) for p in targets]
-        # Each weighted part includes its share of global regularizers; sum of
-        # shares is one. Release its graph before constructing the next part.
+        # Parts sum to the exact full objective. Release each graph before
+        # constructing the next; globals need not be repeated in each part.
         parts=objective_parts() if objective_parts is not None else (objective(),)
         for part,_ in parts:
             if not torch.isfinite(part):raise FloatingPointError('Nonfinite L-BFGS objective')
@@ -162,10 +165,18 @@ def scaled_joint(objective, state, raw, extension, steps, callback=None,
                 for point,value,gradient in cache:
                     if torch.equal(point,coordinate.detach()):
                         coordinate.grad=gradient.clone();cache_hits+=1;return value
+            profile=profile_first_gradient and evaluations==0
+            if profile and coordinate.is_cuda:torch.cuda.synchronize(coordinate.device)
             started_eval=time.perf_counter()
             value,grad=evaluate();evaluations+=1
             coordinate.grad=grad*torch.where(bounded,2*coordinate.detach()/factor.square(),torch.ones_like(coordinate))
-            eval_seconds+=time.perf_counter()-started_eval
+            if profile and coordinate.is_cuda:torch.cuda.synchronize(coordinate.device)
+            elapsed=time.perf_counter()-started_eval
+            eval_seconds+=elapsed
+            if profile:
+                print(json.dumps(dict(stage='optimizer_first_gradient',seconds=elapsed,
+                    parameters=coordinate.numel(),loss=float(value),
+                    peak_vram_bytes=torch.cuda.max_memory_allocated(coordinate.device) if coordinate.is_cuda else 0)),flush=True)
             if closure_cache:
                 cache.append((coordinate.detach().clone(),value,coordinate.grad.clone()))
                 if len(cache)>4:cache.pop(0)
@@ -193,11 +204,16 @@ def scaled_joint(objective, state, raw, extension, steps, callback=None,
                 cache_hits=cache_hits,scaled_gradient_max=float(np.abs(fit.jac).max()))
         # Evaluate accepted positions explicitly: step() returns the PRE-step
         # loss, which must not be mistaken for the accepted line-search value.
+        progress_started=time.perf_counter() if optimizer_progress_every else None
         best=float(closure());history=[best];message='Iteration budget exhausted';success=False
         iteration=0
         for iteration in range(1,steps+1):
             opt.step(closure)
             value=float(closure());best=min(best,value);history.append(best)
+            if optimizer_progress_every and iteration%optimizer_progress_every==0:
+                print(json.dumps(dict(stage='optimizer_progress',iteration=iteration,loss=value,best_loss=best,
+                    seconds=time.perf_counter()-progress_started,evaluations=evaluations,
+                    cache_hits=cache_hits,evaluation_seconds=eval_seconds)),flush=True)
             if callback is not None:callback(iteration)
             if float(coordinate.grad.abs().max())<=1e-8:
                 success=True;message='Gradient tolerance reached';break
@@ -287,6 +303,8 @@ def uncertainty_joint(objective,state,raw,extension,steps,data,config,callback=N
     kwargs['plateau_atol']=float(config.get('lbfgs_plateau_atol',1e-9))
     kwargs['square_match_initial_scale']=bool(config.get('lbfgs_square_match_initial_scale',False))
     kwargs['closure_cache']=bool(config.get('lbfgs_closure_cache',True))
+    kwargs['profile_first_gradient']=bool(config.get('profile_first_gradient',False))
+    kwargs['optimizer_progress_every']=int(config.get('optimizer_progress_every',0))
     kwargs['soft_minimum_width']=bool(config.get('soft_minimum_width',False))
     kwargs['minimum_winding_width']=float(config.get('minimum_winding_width',1000.))
     kwargs['width_coordinate_scale']=float(config.get('lbfgs_width_coordinate_scale',1000.))
@@ -304,6 +322,7 @@ def uncertainty_joint(objective,state,raw,extension,steps,data,config,callback=N
         if blocks or not getattr(getattr(extension,'cavity',None),'ready',False):
             extension.update(state,decode_widths(raw,config),data,len(blocks)*interval)
         offset=completed
+        kwargs['profile_first_gradient']=bool(config.get('profile_first_gradient',False)) and not blocks
         result=scaled_joint(objective,state,raw,extension,min(interval,steps-completed),
             (lambda iteration:callback(offset+iteration)) if callback else None,**kwargs)
         blocks.append(result)
@@ -342,24 +361,34 @@ def managed_solve(config,state,raw,widths,data,nodes,d,extension,pair_cost,diagn
     edge_count=len(data.get('i',[]))
     batch=int(config.get('lbfgs_edge_batch_size',max(1,edge_count)))
     if batch<1:raise ValueError('lbfgs_edge_batch_size must be positive')
+    prior_batch=int(config.get('lbfgs_prior_batch_size',batch))
+    if prior_batch<1:raise ValueError('lbfgs_prior_batch_size must be positive')
+    parts_calls=0
     def parts():
-        count=len(data['i'])
-        for start in range(0,count,batch):
-            edges=torch.arange(start,min(start+batch,count),device=state.device)
-            value,terms=soft.objective(state,raw,widths,data,nodes,config,edges=edges,pair_cost=pair_cost,extension=extension)
-            weight=len(edges)/count
-            yield value*weight,{k:v*weight for k,v in terms.items()}
+        nonlocal parts_calls
+        parts_calls+=1
+        progress=int(config.get('lbfgs_objective_progress_every',0)) if parts_calls==1 else 0
+        part_started=time.monotonic()
+        if not edge_count:
+            yield soft.objective(state,raw,widths,data,nodes,config,pair_cost=pair_cost,extension=extension)
+            return
+        for index,part in enumerate(soft.full_objective_parts(state,raw,widths,data,nodes,config,pair_cost,extension,batch,prior_batch),1):
+            yield part
+            if progress and index%progress==0:
+                print(json.dumps(dict(stage='initial_objective',parts_completed=index,
+                    terms=list(part[1]),seconds=time.monotonic()-part_started)),flush=True)
     def objective():
-        if batch<edge_count:
-            terms={}
-            for _,piece in parts():
-                for k,v in piece.items():terms[k]=terms.get(k,0)+v
-            return sum(terms.values()),terms
-        return soft.objective(state,raw,widths,data,nodes,config,pair_cost=pair_cost,extension=extension)
+        terms={}
+        for _,piece in parts():
+            for k,v in piece.items():terms[k]=terms.get(k,0)+v
+        return sum(terms.values()),terms
     def save(path):
         np.savez(path,state=state.detach().cpu().numpy(),widths=soft.decode_widths(raw,config).detach().cpu().numpy(),
             **extension.arrays(),**{k:d[k] for k in ('source_id','start','end','family')})
+    diagnostic_seconds=0.
     def record(iteration):
+        nonlocal diagnostic_seconds
+        diagnostic_started=time.monotonic()
         with torch.no_grad():
             value,terms=objective();p=state[:,3].sigmoid()
             row=dict(iteration=iteration,loss=float(value),seconds=time.monotonic()-started,
@@ -368,6 +397,11 @@ def managed_solve(config,state,raw,widths,data,nodes,d,extension,pair_cost,diagn
                 terms={k:float(v) for k,v in terms.items()})
             if diagnostics is not None:row.update(diagnostics(state,config))
             row.update(extension.diagnostics())
+        diagnostic_duration=time.monotonic()-diagnostic_started
+        diagnostic_seconds+=diagnostic_duration
+        row.update(diagnostic_seconds=diagnostic_duration,
+            cumulative_diagnostic_seconds=diagnostic_seconds,
+            optimizer_seconds=time.monotonic()-started-diagnostic_seconds)
         history.append(row);atomic_write(root/'history.json',history,durable=False)
         print(json.dumps(row),flush=True)
         if config.get('save_diagnostic_checkpoints'):
@@ -379,7 +413,7 @@ def managed_solve(config,state,raw,widths,data,nodes,d,extension,pair_cost,diagn
                         optimize_rejection=not config.get('force_keep_fibers',False),
                         local_gap_scaling=config.get('lbfgs_local_gap_scaling',False),
                         direct_rejection=config.get('lbfgs_direct_rejection',False),fixed_enabled_mask=fixed,
-                        objective_parts=parts if batch<edge_count else None,
+                        objective_parts=parts,
                         frozen_fiber_mask=(np.isin(d['source_id'],config['freeze_source_ids'])
                             if config.get('freeze_source_ids') else None),
                         freeze_widths=bool(config.get('freeze_widths',False)))

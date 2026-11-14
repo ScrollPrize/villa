@@ -90,6 +90,18 @@ def test_bent_axis_segment_is_split_at_knots():
     assert seam.segment([1, -1, 1], [1, -1, 2]) == 1
 
 
+def test_batched_seams_equal_scalar_with_knots_and_endpoint_ties():
+    rng = np.random.default_rng(734)
+    seam = Seam([[0, 0, -2], [2, 1, 0], [-1, 0, 2]])
+    a = rng.normal(size=(1000, 3))*10
+    b = rng.normal(size=(1000, 3))*10
+    np.testing.assert_array_equal(seam.segments(a, b), [seam.segment(x, y) for x, y in zip(a, b)])
+    flat = Seam([[0, 0, -2], [0, 0, 2]])
+    a = np.array([[-1,-2,0], [0,-2,0], [1,-2,0]])
+    b = np.array([[0,-2,0], [1,-2,0], [-1,-2,0]])
+    np.testing.assert_array_equal(flat.segments(a, b), [flat.segment(x, y) for x, y in zip(a, b)])
+
+
 def test_adapter_fiber_connector_and_signed_hinge():
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_benchmark import graph
     class Paths:

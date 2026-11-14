@@ -1,5 +1,7 @@
 #pragma once
 #include "StorageBindings.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include <nanobind/ndarray.h>
 #include <thread>
 
@@ -22,7 +24,12 @@ struct PyGraphReadView {
     std::shared_ptr<vo::ObjectStore> store;
     std::unique_ptr<vo::ReadTxn> txn;
     std::shared_ptr<vo::GraphReadView> graph;
+    // Borrow the graph's existing transaction, never another pool lease.
+    // Invalidate the shared snapshot state before freeing that transaction.
+    std::optional<vo::GeometrySnapshot> geometry;
     std::thread::id thread = std::this_thread::get_id();
+
+    ~PyGraphReadView() { if(geometry)geometry->close(); }
 
     void require() const {
         if (thread != std::this_thread::get_id()) throw std::runtime_error("graph read view is thread-confined");
@@ -30,6 +37,8 @@ struct PyGraphReadView {
     }
     void close() {
         if (thread != std::this_thread::get_id()) throw std::runtime_error("graph read view is thread-confined");
+        if(geometry)geometry->close();
+        geometry.reset();
         txn.reset(); graph.reset(); store.reset();
     }
     nb::capsule owner() const {
@@ -65,6 +74,14 @@ void bindGraphReadView(nb::module_& m) {
         .def("__enter__", [](nb::object self) { nb::cast<PyGraphReadView&>(self).require(); return self; })
         .def("__exit__", [](PyGraphReadView& self, nb::args) { self.close(); })
         .def("close", &PyGraphReadView::close)
+        .def("status",[](PyGraphReadView& self){
+            self.require();return jsonLoads(vo::storeStatusToJson(self.store->status(*self.txn)));
+        },"Store position of this pinned read, not a newly opened transaction.")
+        .def("geometry_snapshot", [](PyGraphReadView& self) {
+            self.require();
+            if(!self.geometry || !self.geometry->active())self.geometry.emplace(*self.store,*self.txn);
+            return *self.geometry;
+        }, "A geometry snapshot borrowing this graph's pinned transaction; closing the graph invalidates its geometry views.")
         .def_prop_ro("object_uuids", [](PyGraphReadView& self) { self.require(); return self.graph->objectUuids; })
         .def_prop_ro("edge_uuids", [](PyGraphReadView& self) { self.require(); return self.graph->edgeUuids; })
         .def_prop_ro("geometry_revisions", [](PyGraphReadView& self) { self.require(); return self.graph->geometryRevisions; })
@@ -131,21 +148,30 @@ void bindGraphReadView(nb::module_& m) {
             return recordsToPy(records,fields);
         }, nb::arg("fields") = std::nullopt)
         .def("read_geometry_arrays", [](PyGraphReadView& self, const std::string& name,
-                                        const std::optional<std::vector<size_t>>& nodes) {
+                                        const std::optional<std::vector<size_t>>& nodes,
+                                        const std::optional<std::string>& volume) {
             self.require();
             std::vector<std::string> revisions;
+            std::vector<vo::ObjectRevision> subset;
             auto append = [&](size_t node) {
                 const auto& revision = self.graph->geometryRevisions.at(node);
                 if (!revision) throw std::invalid_argument("graph node has no stored geometry");
                 revisions.push_back(*revision);
+                if(self.graph->selectedObjects&&nodes)subset.push_back(self.graph->selectedObjects->at(node));
             };
             if (nodes) for (auto node : *nodes) append(node);
             else for (size_t node = 0; node < self.graph->objectUuids.size(); ++node) append(node);
             std::shared_ptr<vo::PackedGeometryArray> packed;
             { nb::gil_scoped_release release;
-              packed = std::make_shared<vo::PackedGeometryArray>(self.store->readGeometryArrays(*self.txn, revisions, name)); }
+              if(self.graph->selectedObjects){
+                  const auto selected=nodes?std::span<const vo::ObjectRevision>(subset):std::span<const vo::ObjectRevision>(*self.graph->selectedObjects);
+                  packed=std::make_shared<vo::PackedGeometryArray>(self.store->readSelectedGeometryArrays(*self.txn,selected,name,volume));
+              }else{
+                  if(volume)throw std::invalid_argument("mapped packed read requires selected object metadata; use geometry_read");
+                  packed = std::make_shared<vo::PackedGeometryArray>(self.store->readGeometryArrays(*self.txn, revisions, name));
+              } }
             return PyPackedGeometryArray{std::move(packed)};
-        }, nb::arg("array_name"), nb::arg("nodes") = std::nullopt)
+        }, nb::arg("array_name"), nb::arg("nodes") = std::nullopt,nb::arg("volume")=std::nullopt)
         .def("read_geometry_ranges", [](PyGraphReadView& self, size_t node, const std::string& name,
                                          const std::vector<std::array<int64_t, 2>>& ranges) {
             self.require();

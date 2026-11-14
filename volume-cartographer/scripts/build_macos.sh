@@ -107,6 +107,8 @@ required_formulae=(
   eigen
   opencv
   c-blosc
+  c-blosc2
+  concurrentqueue
   zstd
   lz4
   boost

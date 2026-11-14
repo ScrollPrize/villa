@@ -21,6 +21,7 @@
 #include "vc_object_store/objects/ManifestReferences.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "internal/Database.hpp"
+#include "internal/RecordResolver.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include <fstream>
 #include <iostream>
@@ -35,6 +36,16 @@ namespace {
 OpenOptions options(HistoryMode mode){OpenOptions o;o.author="coherent-api";o.history=mode;o.spatialIndex=false;return o;}
 ObjectRecord track(const std::string& id){ObjectRecord r;r.uuid=id;r.kind="track";r.track.emplace();r.track->externalKey="0";r.track->datasetRef=id;r.meta=R"({"quality":7})";return r;}
 GeometryData shape(){return vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,6},{7,8,9}}});}
+struct DenyRelationshipReads {
+    std::vector<sqlite3*> sources;
+    explicit DenyRelationshipReads(sqlite3* db):sources(querySources(db)) {
+        for(auto* source:sources)sqlite3_set_authorizer(source,
+            [](void*,int action,const char* table,const char*,const char*,const char*){
+                return action==SQLITE_READ&&table&&std::string_view(table)=="edges"?SQLITE_DENY:SQLITE_OK;
+            },nullptr);
+    }
+    ~DenyRelationshipReads(){for(auto* source:sources)sqlite3_set_authorizer(source,nullptr,nullptr);}
+};
 ExtensionTable extension(){
     ExtensionTable spec;spec.name="ext_manual_edges";spec.extension="manual";spec.keySpace="edges";spec.versioned=true;
     spec.columns={{"owner",ExtensionType::Blob},{"value",ExtensionType::Integer}};spec.primaryKey={"owner"};return spec;
@@ -54,7 +65,7 @@ struct Fixture {
                 ObjectRecord source;source.uuid=file;source.kind="fiber";source.storageKind="file";source.storageRef="fiber.json";
                 store.upsertObject(w,source);
                 std::ofstream(base.parent_path()/"fiber.json")<<"{\"uuid\":\""<<file<<"\",\"line_points\":[]}";
-                EdgeRecord e;e.kind="related";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
+                EdgeRecord e;e.kind="declared_reference";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
                 e.aAnchor.metadataKeys=e.bAnchor.metadataKeys={"quality"};edge=store.addEdge(w,e);
                 if(extensions)store.createExtensionTable(w,extension());w.commit();
             }
@@ -87,6 +98,11 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
         require(store.graphReadView(r).objectUuids.size()==3,"ordinary graph includes inherited objects");
         const auto graph=store.graphReadViewAt(r,std::vector<ObjectVersion>{f.av,f.bv});
         require(graph.objectUuids.size()==2&&graph.edgeUuids.size()==1,"exact graphs work for current-only and archived sources");
+        {DenyRelationshipReads guard(ObjectStoreImplAccess::conn(r));EdgeSelection noEdges;noEdges.limit=0;
+            const auto geometry=store.graphReadViewAt(r,{f.av,f.bv},noEdges);
+            require(geometry.objectUuids==graph.objectUuids&&geometry.geometryRevisions==graph.geometryRevisions&&
+                    geometry.edgeUuids.empty()&&geometry.selectedObjects->size()==2,
+                    "zero edge limit retains selected geometry/identity without any relationship read");}
         require(store.resolveStoragePath(r,f.file)==f.base.parent_path()/"fiber.json","relative sources use their owner's path");
         std::vector<ExtensionRow> rows;store.scanExtensionRows(r,extension().name,[&](const auto& row){rows.push_back(row);return true;});
         require(rows.size()==1&&std::get<int64_t>(rows[0][1])==4,"ordinary extension reader resolves inherited snapshots");
@@ -252,7 +268,7 @@ void followupRegressions(){
             newGeometry=store.editGeometry(w,a,{{"line_points",0,scalarBytes<double>(xyz)}},oldGeometry);w.commit();}
         {auto r=store.read();newVersion=store.currentObjectRevision(r,a)->reference();}
         {auto w=store.writeNumbered(VersionSelection{{retired,1},{a,newVersion.version},{b,1}});store.retireObject(w,retired);
-            EdgeRecord e;e.kind="related";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
+            EdgeRecord e;e.kind="declared_reference";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
             edge=store.addEdge(w,e);store.seal(w);w.commit();}
     }
     const auto overlay=[&](const char* name){const auto path=dir.path/name;
@@ -267,7 +283,7 @@ void followupRegressions(){
     }
     {auto store=overlay("collision.vcobj");
         mustFail([&]{auto w=store.write();auto r=track(edge);store.upsertObject(w,r);w.commit();});
-        mustFail([&]{auto w=store.write();EdgeRecord e;e.uuid=point;e.kind="related";e.aUuid=a;e.bUuid=b;
+        mustFail([&]{auto w=store.write();EdgeRecord e;e.uuid=point;e.kind="declared_reference";e.aUuid=a;e.bUuid=b;
             e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;store.addEdge(w,e);w.commit();});
         {auto w=store.write();store.removeEdge(w,edge);w.commit();}
         mustFail([&]{auto w=store.write();store.upsertObject(w,track(edge));w.commit();});
@@ -564,13 +580,13 @@ void inventorySelectedMembership() {
     const auto a=util::newUuid(),b=util::newUuid();std::vector<ObjectVersion> refs;std::string edge;
     {auto store=ObjectStore::create(base,options(HistoryMode::On));
         {auto w=store.write();store.upsertObject(w,track(a));store.upsertObject(w,track(b));
-            EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="old";edge=store.addEdge(w,e);w.commit();}
+            EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="parallel";edge=store.addEdge(w,e);w.commit();}
         {auto r=store.read();refs={store.currentObjectRevision(r,a)->reference(),store.currentObjectRevision(r,b)->reference()};}
-        {auto w=store.write();store.removeEdge(w,edge);EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="new";store.addEdge(w,e);store.seal(w);w.commit();}}
+        {auto w=store.write();store.removeEdge(w,edge);EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="perpendicular";store.addEdge(w,e);store.seal(w);w.commit();}}
     {auto collection=ObjectCollection::create(overlay,{base},options(HistoryMode::Off));}
     auto store=ObjectStore::open(overlay,options(HistoryMode::Off));auto r=store.read();
     const auto graph=LocalStoreReader(store,r).graphReadViewAt(refs);
-    require(graph.selectedRelationships->size()==1&&graph.selectedRelationships->front().record.kind=="old",
+    require(graph.selectedRelationships->size()==1&&graph.selectedRelationships->front().record.kind=="parallel",
         "history-off attachment cannot substitute newer source graph memberships");
 }
 

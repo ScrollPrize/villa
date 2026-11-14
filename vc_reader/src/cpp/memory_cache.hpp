@@ -5,6 +5,7 @@
 #include <cstdint>
 #include "lru.hpp"
 #include "available_memory.hpp"
+#include "chunk_buffer.hpp"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -23,8 +24,7 @@
 
 namespace vcr {
 
-using Chunk = std::vector<std::uint8_t>;
-using ChunkPtr = std::shared_ptr<const Chunk>;  // nullptr: the chunk is not stored (reads as fill)
+// A null ChunkPtr denotes missing data and reads as the array's fill value.
 
 class MemoryCache {
 public:
@@ -310,8 +310,7 @@ private:
             // Independent bounded scans, without a shared RNG on each batch.
             if(!cursor.random)cursor.random=eviction_cursor_.fetch_add(1,std::memory_order_relaxed)+1;
             cursor.random^=cursor.random<<13;cursor.random^=cursor.random>>7;cursor.random^=cursor.random<<17;
-            const auto count=shards_.size();
-            const auto start=cursor.random%count;
+            const auto count=shards_.size(),start=cursor.random%count;
             EvictionCursor::Candidate best{empty_epoch,0};
             for(std::size_t i=0;i<candidate_scan_;++i) {
                 const auto shard=(start+i)%count;
@@ -528,8 +527,7 @@ private:
                 }
                 const double elapsed=std::chrono::duration<double>(now-last_control).count();
                 if(elapsed>=.01) {
-                    const auto offered=offered_.load(),bypassed=pressure_events_.load();
-                    const auto budget=max_bytes();
+                    const auto offered=offered_.load(),bypassed=pressure_events_.load(),budget=max_bytes();
                     const auto alpha=-std::expm1(-elapsed/.1);
                     rate+=alpha*((offered-previous_offered)/elapsed-rate);
                     const double cap=budget*.05, floor=std::min(cap,std::max(64.,budget*.001));

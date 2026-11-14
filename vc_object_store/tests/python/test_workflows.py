@@ -22,6 +22,26 @@ def versions(db, *ids):
     return {uid: db.current_version(uid) for uid in ids}
 
 
+def test_graph_geometry_snapshot_reuses_single_reader_and_invalidates_on_close(tmp_path):
+    from vc_object_store import object_reference
+    with ObjectStore.create(str(tmp_path/'one-reader.vcobj'),author='test',reader_pool_size=1) as db:
+        uid=db.upsert_object(dict(kind='fiber',meta=dict(coordinates=dict(volume_uuid='source',scale_factor=1))))
+        db.put_geometry(uid,Fiber([],[[0.,0.,0.],[1.,2.,3.]]))
+        db.register_volume_transform('source','target',[[2,0,0,10],[0,3,0,-5],[0,0,1,2]])
+        ref=object_reference(db.object(uid))
+        with db.graph_read(versions=[ref]) as graph:
+            snapshot=graph.geometry_snapshot()
+            selected=snapshot.fiber(ref)
+            transformed=selected.view_transformed_at('target')
+            np.testing.assert_array_equal(transformed.points('line_points',0,2),[[10.,-5.,2.],[12.,1.,5.]])
+            graph.close()
+            assert not snapshot.active
+            with pytest.raises(RuntimeError,match='closed'):
+                selected.load()
+            with pytest.raises(RuntimeError,match='closed'):
+                transformed.points('line_points',0,2)
+
+
 def put(db, geometry, kind='track', **options):
     record = dict(kind=kind)
     if kind == 'track':
@@ -60,7 +80,7 @@ def test_owned_views_native_export_and_one_time_ingest(db, tmp_path, kind, geome
     db.set_meta(uid, 'source', {'coordinates': {'scale_factor': 7}, 'volume_uuid': 'stale', 'coordinate_binding': {'active_volume_id': 'stale'}, 'retained_note': 'native'})
     output = tmp_path / 'native'
     assert db.export_geometry(uid, output) == refs(db, uid)[0]
-    with pytest.raises((RuntimeError, ValueError)):
+    with pytest.raises((RuntimeError, ValueError, FileExistsError)):
         db.export_geometry(uid, output)
     with ObjectStore.create(str(tmp_path / 'import.vcobj'), author='import') as other:
         report = other.ingest_geometry_source(kind, output)
@@ -384,7 +404,7 @@ def test_record_fields_and_transaction_bindings(db, kind, detail):
                 'version_store': record['version_store']} == record
     with db.write() as tx:
         peer = tx.upsert_object(dict(kind='note'))
-        edge = tx.add_edge(dict(a=uid, b=peer, kind='related'))
+        edge = tx.add_edge(dict(a=uid, b=peer, kind='declared_reference'))
         tx.remove_edge(edge)
     assert db.edge(edge) is None
     with pytest.raises(RuntimeError, match='finished'):

@@ -3,6 +3,7 @@
 #include "internal/ImmutableImport.hpp"
 #include "internal/Versions.hpp"
 #include "internal/Extensions.hpp"
+#include "internal/EdgeLayout.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -25,6 +26,7 @@ int64_t detail::writeRecordVersion(sqlite3* db, const char* table, const std::st
 {
     const std::string name(table);
     if (name != "objects" && name != "edges") throw std::invalid_argument("invalid versioned record table");
+    if(name=="edges")requireEdgeColumns(db,{"version","version_generation"});
     const auto key = parseUuid(uuid);
     const auto sequence = writeCommitSequence(db);
     Statement current(db, "SELECT version,commit_sequence FROM " + name + " WHERE uuid=?", key);
@@ -94,7 +96,7 @@ void detail::createProvisioning(sqlite3* db, bool history, bool spatial)
     exec(db, R"SQL(
 CREATE TABLE store_manifest(
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
- schema_version INTEGER NOT NULL CHECK(schema_version=21),
+ schema_version INTEGER NOT NULL CHECK(schema_version=22),
  commit_sequence INTEGER NOT NULL CHECK(commit_sequence>=0),
  generation BLOB NOT NULL CHECK(length(generation)=16),
  initial_generation BLOB NOT NULL CHECK(length(initial_generation)=16),
@@ -107,7 +109,7 @@ CREATE TABLE store_required_features(name TEXT PRIMARY KEY);
 CREATE TABLE store_write_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), dirty INTEGER NOT NULL CHECK(dirty IN (0,1)));
 INSERT INTO store_write_state VALUES(1,0);
 CREATE TABLE key_allocators(
- name TEXT PRIMARY KEY CHECK(name IN ('objects','edges')),
+ name TEXT PRIMARY KEY CHECK(name='objects'),
  namespace_uuid BLOB NOT NULL CHECK(length(namespace_uuid)=16),
  lower_bound INTEGER NOT NULL CHECK(lower_bound>0),
  upper_bound INTEGER NOT NULL CHECK(upper_bound>=lower_bound),
@@ -115,7 +117,7 @@ CREATE TABLE key_allocators(
 );
 )SQL");
     const auto lineage = parseUuid(util::newUuid());
-    execute(db, "INSERT INTO store_manifest VALUES(1,21,0,?,?,0,?,0,?)", lineage, lineage, int64_t(history), int64_t(spatial));
+    execute(db, "INSERT INTO store_manifest VALUES(1,22,0,?,?,0,?,0,?)", lineage, lineage, int64_t(history), int64_t(spatial));
 }
 
 void detail::createChangeTracking(sqlite3* db)

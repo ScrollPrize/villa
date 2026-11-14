@@ -27,7 +27,7 @@ std::string headKey(const std::string& object) { return "head/" + util::canonica
 // Conversion preserves logical identities, but schema-20 cached JSON has the
 // old generation fields. Version metadata separately; raw payload keys stay
 // unchanged so a schema upgrade never duplicates geometry/artifact blocks.
-std::string metadataKey(const std::string& key) { return "schema21/" + key; }
+std::string metadataKey(const std::string& key) { return "schema22/" + key; }
 std::string versionKey(const ObjectVersion& v) { return metadataKey("version/" + v.storeUuid + "/" + v.generation + "/" + v.objectUuid + "/" + std::to_string(v.version)); }
 bool isTransformKind(const std::string& kind)
 {

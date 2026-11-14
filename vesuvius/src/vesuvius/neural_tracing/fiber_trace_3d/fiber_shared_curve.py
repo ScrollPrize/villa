@@ -11,13 +11,27 @@ def interpolation_plan(owner, arc, query_owner, query_arc):
     """Linear interpolation AND endpoint extrapolation; no new free knots."""
     left=np.full(len(query_owner),-1,np.int64);right=left.copy()
     alpha=np.zeros(len(left),np.float64)
-    for f in np.unique(query_owner):
-        knots=np.flatnonzero(owner==f);rows=np.flatnonzero(query_owner==f)
-        if not len(knots):raise ValueError(f'Fiber {f} has no perpendicular nodes; filter it before solving')
-        if len(knots)==1:left[rows]=right[rows]=knots[0];continue
-        a=arc[knots];idx=np.searchsorted(a,query_arc[rows],side='right')-1
-        idx=np.clip(idx,0,len(a)-2);l=knots[idx];r=knots[idx+1]
-        left[rows]=l;right[rows]=r;alpha[rows]=(query_arc[rows]-arc[l])/(arc[r]-arc[l])
+    if not len(query_owner):return left,right,alpha
+    # Structured lexicographic search avoids imprecise packed floating keys.
+    # Sort once, then query in bounded native batches, never scan all nodes/fiber.
+    order=np.lexsort((arc,owner));oo=owner[order]
+    unique,starts,counts=np.unique(oo,return_index=True,return_counts=True)
+    dtype=np.dtype([('owner',np.int64),('arc',np.float64)])
+    keys=np.empty(len(owner),dtype);keys['owner']=oo;keys['arc']=arc[order]
+    for start in range(0,len(query_owner),1000000):
+        sl=slice(start,start+1000000);qo=query_owner[sl];qa=query_arc[sl]
+        group=np.searchsorted(unique,qo)
+        valid=group<len(unique)
+        if np.any(~valid) or np.any(unique[group]!=qo):
+            raise ValueError('Fiber has no perpendicular nodes; filter it before solving')
+        query=np.empty(len(qo),dtype);query['owner']=qo;query['arc']=qa
+        first=starts[group];last=first+counts[group]-1
+        ix=np.searchsorted(keys,query,side='right')-1
+        ix=np.maximum(first,np.minimum(ix,np.maximum(first,last-1)))
+        l=order[ix];r=order[np.minimum(ix+1,last)]
+        left[sl]=l;right[sl]=r
+        multi=l!=r
+        np.divide(qa-arc[l],arc[r]-arc[l],out=alpha[sl],where=multi)
     return left,right,alpha
 
 
@@ -52,7 +66,8 @@ class SharedCurve(torch.nn.Module):
             end=np.asarray(d.get('end',np.asarray(d['start'])+np.abs(d['node_ds'][:,-1])))
             self.affine=AffineOffsets(owner,arc,d['start'],end,device,torch.float64)
             self.affine.initialize(torch.zeros(n,1,2,device=device,dtype=torch.float64))
-        triples=np.array([[j-2,j-1,j] for j in range(2,n) if owner[j]==owner[j-2]],dtype=np.int64).reshape(-1,3)
+        middle=np.flatnonzero(owner[2:]==owner[:-2])+1
+        triples=np.column_stack((middle-1,middle,middle+1))
         self.register_buffer('triples',torch.as_tensor(triples,device=device))
         self.add_plan('_anchor',np.arange(len(d['family'])),np.zeros(len(d['family'])))
         for key,default in [('shared_curve_length_weight',10.),('shared_curve_alignment_weight',10.),('shared_curve_bend_weight',.1)]:
@@ -119,6 +134,17 @@ class SharedCurve(torch.nn.Module):
         if 'reference_owner' in d:raise ValueError('Shared curve pilot has no fixed reference training')
 
     def add_plan(self,key,ids,ds):
+        if self.straight:
+            # Exact straight curves only consume owner + signed arc. Retain the
+            # common five-field interface with zero-storage broadcast placeholders.
+            owner=torch.as_tensor(ids,device=self.u.device,dtype=torch.long)
+            distance=torch.as_tensor(ds,device=self.u.device)
+            zero=owner.new_zeros(()).expand(len(ids))
+            self.plans[key]=(owner,distance,zero,zero,distance.new_zeros(()).expand(len(ids)))
+            self.fixed_slices={};offset=0
+            for name,p in self.plans.items():
+                self.fixed_slices[name]=slice(offset,offset+len(p[0]));offset+=len(p[0])
+            return
         arc=self.meta['start'][ids]+ds*np.sign(self.meta['node_ds'][ids,-1])
         plan=interpolation_plan(self.owner.cpu().numpy(),self.arc.cpu().numpy(),ids,arc)
         self.plans[key]=tuple(torch.as_tensor(x,device=self.u.device) for x in (ids,ds,*plan))
@@ -137,13 +163,13 @@ class SharedCurve(torch.nn.Module):
     def evaluate(self,state,widths,key,edges=None):
         if self.integer_geometry:
             from .fiber_implicit_winding import hypotheses
-            h,lp=hypotheses(state,self.sigma_values if self.sigma_values is not None else self.config.get('winding_sigma',.5),
-                            self.config.get('sigma_max',1.) if self.sigma_values is not None else None)
             plan=self.plans[key]
             if edges is not None:plan=tuple(x[edges] for x in plan)
             ids=plan[0]
-            values=self.hypothesis_queries(state,widths,plan,h[ids,:,0])
-            return tuple((v*lp[ids].exp()).sum(1).to(state) for v in values)
+            h,lp=hypotheses(state[ids],self.sigma_values[ids] if self.sigma_values is not None else self.config.get('winding_sigma',.5),
+                            self.config.get('sigma_max',1.) if self.sigma_values is not None else None)
+            values=self.hypothesis_queries(state,widths,plan,h[:,:,0])
+            return tuple((v*lp.exp()).sum(1).to(state) for v in values)
         if self.config.get('fixed_shared_queries',False):
             result=self.evaluate_fixed(state,widths)[self.fixed_slices[key]]
             if edges is not None:result=result.index_select(0,edges)
@@ -174,6 +200,8 @@ class SharedCurve(torch.nn.Module):
         Group membership is prepared with the plans, not decided on GPU each
         update. All queries use the same node interpolation.
         """
+        if self.straight:
+            return torch.cat([torch.stack(self.evaluate(state,widths,key),-1) for key in self.plans])
         if self.integer_geometry:
             from .fiber_implicit_winding import hypotheses
             h,lp=hypotheses(state,self.sigma_values if self.sigma_values is not None else self.config.get('winding_sigma',.5),

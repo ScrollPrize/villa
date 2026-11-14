@@ -74,10 +74,14 @@ inline std::string geometryPayloadHash(const std::string& name, std::span<const 
 {
     return formatDigest(geometryPayloadDigest(name,bytes));
 }
-inline nlohmann::json verifiedGeometryManifest(const std::string& text, const std::string& hash)
+inline void verifyGeometryManifestHash(const std::string& text,const std::string& hash)
 {
     if (geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size())) != hash)
         throw std::runtime_error("geometry: corrupt revision manifest");
+}
+inline nlohmann::json verifiedGeometryManifest(const std::string& text, const std::string& hash)
+{
+    verifyGeometryManifestHash(text,hash);
     return nlohmann::json::parse(text);
 }
 inline void verifyGeometryChunk(std::span<const uint8_t> bytes, const std::string& storedHash,

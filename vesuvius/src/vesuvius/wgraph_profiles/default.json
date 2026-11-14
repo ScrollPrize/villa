@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "stages": {
+    "import": {
+      "shards": 32,
+      "readers": 32,
+      "fiber_limit": 0,
+      "verify_readback": false
+    },
+    "extract": {
+      "orient_normals": true,
+      "repetitions": 1,
+      "full_volume": true,
+      "chunk_size_base_voxels": 2048,
+      "normal_cache_mode": "auto",
+      "normal_cache_fraction": 0.5,
+      "normal_channel_cache": true
+    },
+    "hvb": {},
+    "sign": {},
+    "winding": {},
+    "uv": {}
+  }
+}

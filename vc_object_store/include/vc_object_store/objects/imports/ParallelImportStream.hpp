@@ -81,6 +81,28 @@ public:
             for(auto& job:jobs_)if(job.valid())job.wait();}
     }
     void fail(std::exception_ptr error){failure_.fail(error);}
+    // Push sources may already own a worker pool (e.g. constraint extraction).
+    // Each source worker owns one emitter; no second pool or ordered handoff is
+    // needed. The producer must join all its workers before returning.
+    void startEdgeProducer(size_t workers,
+        std::function<void(std::vector<std::unique_ptr<EdgeEmitter>>&)> producer) {
+        if(started_)throw std::logic_error("parallel import stream already started");
+        if(!workers||!producer)throw std::invalid_argument("missing edge producer/workers");
+        started_=true;readers.resize(workers);jobs_.reserve(1);
+        jobs_.push_back(std::async(std::launch::async,[this,workers,producer=std::move(producer)]{
+            try {
+                objects_.close();
+                std::vector<std::unique_ptr<EdgeEmitter>> emitters;
+                for(size_t i=0;i<workers;++i)
+                    emitters.push_back(std::make_unique<EdgeEmitter>(edges_,failure_,options_));
+                producer(emitters);
+                for(size_t i=0;i<workers;++i) {
+                    emitters[i]->finish();readers[i].queueWaitSeconds=emitters[i]->waitSeconds;
+                }
+                edges_.close();
+            }catch(...){fail(std::current_exception());throw;}
+        }));
+    }
     // Each callback runs only on its indexed reader. Source cursors may be kept
     // there and reused for successive tasks. All callbacks are joined on finish.
     void start(size_t objectTasks,size_t edgeTasks,

@@ -277,22 +277,46 @@ def topology(d, merge_distance=4., *, event_mask=None, piece_local=False):
     """
     if not np.isfinite(merge_distance) or merge_distance < 0:
         raise ValueError('v_offset_merge_distance must be finite and nonnegative')
-    owners = np.r_[d['i'], d['j']]
+    event_count=len(d['i'])
+    if event_mask is not None:
+        event_mask=np.asarray(event_mask,dtype=bool)
+        if event_mask.shape!=(event_count,):raise ValueError('Invalid topology event mask')
+        events=np.flatnonzero(event_mask)
+        selected=np.r_[events,events+event_count]
+        owners=np.r_[d['i'][events],d['j'][events]]
+        distances=np.r_[d['ds_a'][events],d['ds_b'][events]]
+    else:
+        selected=np.arange(2*event_count)
+        owners=np.r_[d['i'],d['j']]
+        distances=np.r_[d['ds_a'],d['ds_b']]
     direction = np.sign(d['node_ds'][:, -1])
     if not np.allclose(d['node_ds'][:,0],0) or not np.allclose(
             np.abs(d['node_ds'][:,-1]),d['end']-d['start'],rtol=1e-5,atol=.01):
         raise ValueError('V offsets require start-anchored signed arc-length geometry')
     if not np.isin(direction, [-1, 1]).all():
         raise ValueError('V offsets require resolved signed arc directions')
-    arc = d['start'][owners] + direction[owners] * np.r_[d['ds_a'], d['ds_b']]
+    arc = d['start'][owners] + direction[owners] * distances
     source = owners if piece_local else d['source_id'][owners]
-    selected=np.arange(len(owners))
-    if event_mask is not None:
-        event_mask=np.asarray(event_mask,dtype=bool)
-        if event_mask.shape!=(len(d['i']),):raise ValueError('Invalid topology event mask')
-        selected=selected[np.tile(event_mask,2)]
-    order = selected[np.lexsort((arc[selected], source[selected]))]
-    mapping = np.full(len(owners), -1, dtype=np.int64)
+    order = np.lexsort((arc,source))
+    mapping = np.full(2*event_count, -1, dtype=np.int64)
+    if merge_distance == 0:
+        # Exact-location nodes: one native segmented pass instead of a Python
+        # iteration (and several NumPy calls) per endpoint. Preserve sorted IDs.
+        ss=source[order];aa=arc[order];ff=d['family'][owners[order]]
+        if len(order):
+            same=ss[1:]==ss[:-1]
+            if np.any(same & (ff[1:]!=ff[:-1])):
+                raise ValueError('One original fiber has inconsistent H/V families')
+            first=np.r_[True,(~same)|(aa[1:]!=aa[:-1])]
+            mapping[selected[order]]=np.cumsum(first,dtype=np.int64)-1
+            sources=ss[first];positions=aa[first];families=ff[first]
+            right=np.flatnonzero(sources[1:]==sources[:-1])+1
+        else:
+            sources=np.empty(0,np.int64);positions=np.empty(0,float)
+            families=np.empty(0,np.int64);right=np.empty(0,np.int64)
+        return dict(v_offset_source=sources,v_offset_arc=positions,v_offset_family=families,
+            v_offset_left=right-1,v_offset_right=right,
+            v_offset_a=mapping[:len(d['i'])],v_offset_b=mapping[len(d['i']):])
     sources, positions, families, left, right = [], [], [], [], []
     cursor = 0
     while cursor < len(order):
@@ -302,7 +326,7 @@ def topology(d, merge_distance=4., *, event_mask=None, piece_local=False):
         group = order[cursor:stop]; family = d['family'][owners[group]]
         if not np.all(family == family[0]):
             raise ValueError('One original fiber has inconsistent H/V families')
-        node = len(sources); mapping[group] = node
+        node = len(sources); mapping[selected[group]] = node
         if sources and sources[-1] == source[first]:
             if families[-1] != family[0]:
                 raise ValueError('One original fiber has inconsistent H/V families')

@@ -21,7 +21,7 @@ void detail::createStoreSchema(sqlite3* db, const std::string& generation)
     createSchema(db, true, std::nullopt, false);
     execute(db, "UPDATE store_manifest SET generation=?,initial_generation=?", parseUuid(generation), parseUuid(generation));
     Statement owner(db, "SELECT uuid FROM store_identity"); owner.row();
-    for (const char* name : {"objects", "edges"})
+    for (const char* name : {"objects"})
         execute(db, "INSERT INTO key_allocators VALUES(?,?,1,?,1)", std::string(name), owner.blob16(0), int64_t(INT64_MAX));
     createHistorySchema(db);
     createVersionSchema(db, generation);
@@ -37,10 +37,11 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
 {
     const int kApplicationId = 0x56434f42;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
+    if(options.readPosition&&(!options.readOnly||create))throw std::invalid_argument("a historical read position requires a read-only open");
     if (options.serviceOwner && options.readOnly) throw std::invalid_argument("hosting service requires writable access");
     if (create && (options.initialCommitSequence<0 || options.initialCommitSequence==INT64_MAX))
         throw std::invalid_argument("object store: invalid initial generation");
-    if (create) for (const auto& range : {options.objectIdRange,options.edgeIdRange})
+    if (create) for (const auto& range : {options.objectIdRange})
         if(range[0]<1 || range[1]<range[0]) throw std::invalid_argument("object store: invalid reserved ID range");
     if (sqlite3_threadsafe() == 0)
         throw std::runtime_error("object store: SQLite build is not thread-safe");
@@ -120,13 +121,13 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         exec(impl->writer, "BEGIN IMMEDIATE;");
         try {
             createProvisioning(impl->writer, options.history == HistoryMode::On, options.spatialIndex);
-            createSchema(impl->writer, options.history == HistoryMode::On, options.creationStoreUuid,immutable);
+            createSchema(impl->writer, options.history == HistoryMode::On, options.creationStoreUuid,immutable,options);
             if(immutable)execute(impl->writer,"INSERT INTO store_required_features VALUES(?)",std::string(immutableImportFeature));
             const auto lineage = parseUuid(options.creationGeneration.value_or(util::newUuid()));
             execute(impl->writer,"UPDATE store_manifest SET commit_sequence=?,generation=?,initial_generation=?",
                 options.initialCommitSequence,lineage,lineage);
             Statement owner(impl->writer,"SELECT uuid FROM store_identity"); owner.row();
-            for (const auto& [name,range] : {std::pair{"objects",options.objectIdRange},std::pair{"edges",options.edgeIdRange}})
+            for (const auto& [name,range] : {std::pair{"objects",options.objectIdRange}})
                 execute(impl->writer,"INSERT INTO key_allocators VALUES(?,?,?,?,?)",std::string(name),owner.blob16(0),range[0],range[1],range[0]);
             if (options.history == HistoryMode::On) {
                 createHistorySchema(impl->writer);

@@ -1,4 +1,5 @@
 #include "internal/Schema.hpp"
+#include "internal/EdgeLayout.hpp"
 #include "internal/Spatial.hpp"
 namespace vc::objects::detail {
 void createGeometryChunkTable(sqlite3* db, const std::string& name)
@@ -9,7 +10,7 @@ void createGeometryChunkTable(sqlite3* db, const std::string& name)
     exec(db,("CREATE TABLE "+quoted+"(hash BLOB PRIMARY KEY CHECK(typeof(hash)='blob' AND length(hash)=32),"
         "data BLOB NOT NULL CHECK(length(data)>0 AND length(data)<=1048576))").c_str());
 }
-void createSchema(sqlite3* db, bool history, const std::optional<std::string>& storeUuid, bool immutable) {
+void createSchema(sqlite3* db, bool history, const std::optional<std::string>& storeUuid, bool immutable, const OpenOptions& options) {
     exec(db,"INSERT INTO store_required_features VALUES('direct-geometry-v1'),('binary-sha256-v1'),('direct-endpoint-keys-v1'),('object-state-v1'),('binary-uuid-v1');");
     exec(db, R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,
@@ -31,11 +32,11 @@ void createSchema(sqlite3* db, bool history, const std::optional<std::string>& s
   storage_kind TEXT NOT NULL DEFAULT '', storage_ref TEXT NOT NULL DEFAULT '',
   data_checksum TEXT,
   geometry_manifest TEXT,
-  meta TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(meta) AND json_type(meta)='object'),
+  meta TEXT CHECK(meta IS NULL OR meta='' OR (json_valid(meta) AND json_type(meta)='object')),
   -- The geometry coordinate binding, exactly as json_extract reads it (no
   -- affinity), so volume frames resolve by index instead of parsing meta.
-  coordinate_volume GENERATED ALWAYS AS (json_extract(meta,'$.coordinates.volume_uuid')) VIRTUAL,
-  coordinate_scale GENERATED ALWAYS AS (json_extract(meta,'$.coordinates.scale_factor')) VIRTUAL
+  coordinate_volume GENERATED ALWAYS AS (json_extract(nullif(meta,''),'$.coordinates.volume_uuid')) VIRTUAL,
+  coordinate_scale GENERATED ALWAYS AS (json_extract(nullif(meta,''),'$.coordinates.scale_factor')) VIRTUAL
 );
 CREATE INDEX objects_coordinates ON objects(kind,coordinate_volume,coordinate_scale);
 CREATE INDEX objects_geometry_uuid ON objects(storage_ref) WHERE geometry_manifest IS NOT NULL;
@@ -75,45 +76,11 @@ CREATE INDEX object_tags_tag ON object_tags(tag);
 );
 CREATE INDEX journal_record ON journal(record_uuid, seq);
 )SQL");
-    exec(db, R"SQL(CREATE TABLE edges(
-  id INTEGER PRIMARY KEY,
-  uuid BLOB NOT NULL UNIQUE,
-  state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0,2)),
-  a_uuid BLOB NOT NULL CHECK(length(a_uuid)=16),
-  b_uuid BLOB NOT NULL CHECK(length(b_uuid)=16),
-  kind TEXT NOT NULL CHECK(length(kind)>0),
-  commit_sequence INTEGER NOT NULL DEFAULT 0,
-  version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
-  version_generation BLOB CHECK(version_generation IS NULL OR length(version_generation)=16),
-  created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
-  changed_by TEXT NOT NULL, changed_at TEXT NOT NULL, changed_host TEXT NOT NULL,
-  approval_state TEXT NOT NULL DEFAULT 'pending' CHECK(approval_state='pending' OR approval_state='approved' OR approval_state='rejected'),
-  approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_version INTEGER,
-  a_anchor_x REAL, a_anchor_y REAL, a_anchor_z REAL,
-  a_dir_x REAL, a_dir_y REAL, a_dir_z REAL,
-  b_anchor_x REAL, b_anchor_y REAL, b_anchor_z REAL,
-  b_dir_x REAL, b_dir_y REAL, b_dir_z REAL,
-  meta TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(meta) AND json_type(meta)='object'),
-  a_dependencies TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(a_dependencies)),
-  b_dependencies TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(b_dependencies)),
-  CHECK(a_uuid <> b_uuid OR (COALESCE(json_array_length(a_dependencies,'$.points'),0)>0 AND COALESCE(json_array_length(b_dependencies,'$.points'),0)>0 AND a_dependencies <> b_dependencies))
-);
-CREATE INDEX edges_a ON edges(a_uuid, kind);
-CREATE INDEX edges_b ON edges(b_uuid, kind);
-CREATE TABLE edge_tags(
-  edge_id INTEGER NOT NULL REFERENCES edges(id) ON DELETE CASCADE,
-  tag TEXT NOT NULL, PRIMARY KEY(edge_id, tag)
-);
-CREATE INDEX edge_tags_tag ON edge_tags(tag);
-
-)SQL");
+    createEdgeSchema(db,options,immutable);
     // Query accelerators for the interactive editor, not format requirements.
     // Sealed initial datasets keep only identity/adjacency/coordinate indexes.
     if(!immutable)exec(db,R"SQL(
 CREATE INDEX objects_approval ON objects(approval_state);
-CREATE INDEX edges_kind_approval_uuid ON edges(kind,approval_state,uuid);
-CREATE INDEX edges_kind_uuid ON edges(kind,uuid);
-CREATE INDEX edges_kind_id ON edges(kind,id);
 CREATE INDEX fibers_family_length ON fibers(family,length DESC,object_id);
 CREATE INDEX fibers_length ON fibers(length DESC,object_id);
 CREATE INDEX tracks_family_length ON tracks(family,length DESC,object_id);

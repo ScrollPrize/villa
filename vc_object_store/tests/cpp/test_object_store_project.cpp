@@ -90,7 +90,7 @@ void copyCollectionProject(bool packed,bool sharded)
         const auto owner=util::newUuid(),lineage=util::newUuid();std::vector<std::filesystem::path> shards;
         for(int i=0;i<2;++i){
             auto opt=options;opt.creationStoreUuid=owner;opt.creationGeneration=lineage;
-            opt.objectIdRange={1+i*100,100+i*100};opt.edgeIdRange=opt.objectIdRange;
+            opt.objectIdRange={1+i*100,100+i*100};
             const auto path=sourceDir/("shard"+std::to_string(i)+".vcobj");shards.push_back(path);
             auto store=ObjectStore::create(path,opt);auto w=store.write();
             store.upsertObject(w,projectResourceRecord(kVolumeResource,"/volume/"+std::to_string(i)));w.commit();

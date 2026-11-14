@@ -272,7 +272,8 @@ LasagnaDataset LasagnaDataset::open(const std::filesystem::path& manifestPath,
                                     LasagnaDatasetOpenOptions options)
 {
     validateOpenOptions(options);
-    auto manifest = LasagnaDatasetManifest::parseFile(manifestPath);
+    auto manifest = LasagnaDatasetManifest::parseFile(
+        std::filesystem::is_directory(manifestPath) ? manifestPath/".zattrs" : manifestPath);
     manifest.manifestLocation = manifest.manifestPath.string();
     manifest.manifestIsRemote = false;
     manifest.workingToBaseScale = options.workingToBaseScale;
@@ -325,19 +326,26 @@ bool LasagnaDataset::hasNormalSource() const noexcept
 }
 
 vcr::zarr::OpenedArray openLasagnaGroupArray(
-    const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache)
+    const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache,std::size_t readerThreads)
 {
     if (!group.isRemote()) {
         vcr::zarr::OpenOptions options;
         options.memoryCache = std::move(cache);
+        options.threads=readerThreads;
         return vcr::zarr::openArray(lasagnaGroupSourceLocation(group), options);
     }
     // Chunks cache under the group's root with VC's byte limit, floor and parallelism.
     const auto& location = group.sourceLocation;
     auto options = vc::settings::remoteOpenOptions(group.remoteCacheRoot);
     options.memoryCache = std::move(cache);
+    if(readerThreads)options.threads=readerThreads;
     options.access = vcr::zarr::resolveAccess(location, group.discoverAwsCredentials ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
     return vcr::zarr::openArray(location, options);
+}
+
+LasagnaDataset fiberSheetNormalDataset(const LasagnaDataset& prediction)
+{
+    return LasagnaDataset(fiberNormalManifest(prediction.manifest()));
 }
 
 namespace {

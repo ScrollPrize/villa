@@ -43,9 +43,21 @@ std::optional<std::array<double, 6>> readBbox(const Statement& s, int firstCol);
 
 void bindBbox(Statement& s, int firstIdx, const std::optional<std::array<double, 6>>& box);
 
-ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details = true);
+ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details = true,
+                           const std::string* initialGeneration = nullptr, bool lifecycle = true,
+                           const std::string* ownerStore = nullptr);
+// Complete current publication identity, shared by record hydration and
+// compact reference-only scans. Supplied source defaults belong to the same
+// pinned physical snapshot; a non-NULL row generation always wins.
+ObjectVersion readObjectReferenceColumns(sqlite3*,const Statement&,int uuidColumn,int versionColumn,int generationColumn,
+    const std::string* initialGeneration=nullptr,const std::string* ownerStore=nullptr,
+    const std::string* selectedUuid=nullptr);
 
 std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
+// Hydrate one physical source's decoded rows in a bounded batch. IDs and rows
+// are in the same order; complete owner/version identities are retained.
+void hydrateObjectRows(sqlite3*, std::vector<ObjectRecord>&, std::span<const int64_t>,
+                       const ObjectFields& fields = std::nullopt);
 
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 
@@ -68,7 +80,6 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
                              bool preserveRecord = false, const char* importOperation = "import",
                              bool restoringExtensions = false);
 
-std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 
 // Shared content-mutation stamp: advances the ordinary record version once per transaction,
 // restamps changed_*, resets approval and journals.

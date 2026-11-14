@@ -1,6 +1,6 @@
 # Typed extension tables
 
-Extensions add ordinary, typed SQL tables without adding domain-specific columns to core objects or relationships. Core schema 21 owns table registration, common input-state references and transactional change stamps. Each extension owns its column layout, indexes, format version and small provisioning JSON object. Existing object/edge UUIDs remain the references: results do not require duplicate geometry, proxy objects or an attachment edge per row.
+Extensions add ordinary, typed SQL tables without adding domain-specific columns to core objects or relationships. The core schema owns table registration, common input-state references and transactional change stamps (introduced in schema 21 and retained in schema 22). Each extension owns its column layout, indexes, format version and small provisioning JSON object. Existing object/edge UUIDs remain the references: results do not require duplicate geometry, proxy objects or an attachment edge per row.
 
 Use this for measurements and derived results that generic viewers need not understand, such as fiber-constraint distances, classifications or winding runs. Keep ordinary geometry, endpoint anchors and graph relationships in the core tables. Arbitrary `meta` JSON remains available, but large numerical result sets belong in typed columns rather than JSON blobs.
 
@@ -11,7 +11,7 @@ The optional `extension_tables` registry has one descriptor per physical extensi
 | Information | Meaning |
 | --- | --- |
 | Extension identifier | The consumer-defined extension family |
-| Extension format version | The interpretation of this extension's data, independent of core schema 21 |
+| Extension format version | The interpretation of this extension's data, independent of the core schema version |
 | Physical table UUID/name | The table instance registered in the existing directory |
 | `basedOn` | Common input-state references for the rows in this table |
 | `lastModifiedCommit` | Destination-store commit which last wrote this table through the extension API |
@@ -97,7 +97,7 @@ Immutable computation results and editable extension data have different write p
 
 These are not separate numerical change clocks. The store's commit sequence describes committed writes; ordinary owner versions describe editable record states; input references describe the state a computation used. Enabling history retains the corresponding editable states, while history-off retains current state and freshness checks without pretending old versions can be reconstructed.
 
-For editable fields, set `versioned=true` and `keySpace="objects"` or `"edges"`. The first primary-key column must be the owner's binary UUID; additional key columns allow multiple rows per owner. `ObjectStore::replaceExtensionRows(write, tableName, ownerUuid, rows)` replaces that owner's complete row set, not the whole table. An empty row set removes those fields. The direct store operation requires a local owner; the collection operation described below creates writable owner overrides for referenced records.
+For editable fields, set `versioned=true` and `keySpace="objects"` or `"edges"`. The first primary-key column must be the owner's binary UUID; additional key columns allow multiple rows per owner. `ObjectStore::replaceExtensionRows(write, tableName, ownerUuid, rows)` replaces that owner's complete row set, not the whole table. An empty row set removes those fields. The operation creates a writable owner override when the selected owner is inherited; both store and collection APIs use the same implementation.
 
 ```cpp
 // Create a separate manual table with its own immutable schema definition.
@@ -137,6 +137,8 @@ matches = store.extension_rows("ext_fiber_classification",
 
 `extension_rows` materializes its result; use `scan_extension_rows(table, visitor, key_prefix=...)` for streaming. A callback returning `False` stops the scan; `None` continues. `extension_rows_at_version` takes the ordinary version-reference dictionary with `store`, `generation`, `version` and exactly one of `object` or `relationship`.
 
+Both current-row methods also accept `key_filter={column: value, ...}` for equality on any subset of primary-key columns, including non-prefix columns such as a run UUID. Immutable scans push these predicates into SQLite, allowing a declared run index to serve the query without materializing other runs. Only primary-key columns are accepted: filtering mutable payload columns before overlay resolution could incorrectly reveal an older row. Versioned fields apply the same key predicates to the selected owner's snapshot rows. A prefix and a key filter are combined with AND.
+
 ## Parallel construction and store_reference reads
 
 Extension payloads use the existing bounded object/edge import stream and are written beside their owning object or edge in the same transaction. They do not require another source scan, a per-object routing directory or cross-shard endpoint reads.
@@ -151,48 +153,55 @@ Result provenance does not become current merely because a core object is overri
 
 ## Compatibility and preservation
 
-The core SQLite schema remains 21. An optional extension has its own format version; it is not a fractional SQLite schema version. Readers that do not understand an extension can still use core geometry and edges. Such readers must not infer that extension results describe newly edited inputs.
+The core SQLite schema is 22. An optional extension has its own format version; it is not a fractional SQLite schema version. Readers that do not understand an extension can still use core geometry and edges. Such readers must not infer that extension results describe newly edited inputs.
 
 Operations that preserve complete databases retain optional tables. `exportJson` rejects a store with registered extensions, including projected metadata exports, because that format has no table/row representation. `readObjectCopy` likewise rejects a source reporting extensions rather than silently making a core-only copy. Use a database-preserving copy when the whole store is wanted; extension-aware selected-object copy/export is not implemented. An extension that changes the meaning of core data cannot rely on optional discovery: it needs an explicit required capability or a core format change.
 
 Generic extension read/write methods are currently local C++/Python APIs. `HostedStore`, server transaction operations and hosted extension-row queries have not been added. Hosting a store does not make its optional rows remotely queryable through core object listings. Existing core reads remain usable, but remote consumers must not treat those listings or object-copy operations as a complete extension export.
 
-## Fiber graph solve extension, format 1
+## Fiber graph solve extension
 
 The shared extension family is `ext_fiber_graph_solve`. Import definitions and row builders are in [`objects/FiberImportExtension.hpp`](../include/vc_object_store/objects/FiberImportExtension.hpp); workflow-result definitions are in [`objects/FiberGraphSolveExtension.hpp`](../include/vc_object_store/objects/FiberGraphSolveExtension.hpp). These are optional typed tables, not additional core-schema columns. Importers create only the applicable source/constraint tables; merely requesting a solver-table definition creates nothing. This supplies storage for workflows without changing or rerunning any solver algorithm.
+
+Formats are table-specific. Source and workflow-result tables use format 1. Native extraction and AFC import publish compact constraint format 4 on core schema 22. The numerical graph reader rejects earlier measurement formats explicitly; a core-schema conversion preserves unknown extension tables but does not reinterpret their payloads.
 
 ### Imported observations
 
 | Table | Key/routing | Contents |
 | --- | --- | --- |
 | `ext_fiber_graph_solve_sources` | `fiber_uuid`, object shard | Original numeric `source_id` and free-form source `annotation` |
-| `ext_fiber_graph_solve_constraints` | `edge_uuid`, edge shard | Typed extraction measurements and diagnostics |
+| `ext_fiber_graph_solve_constraints` | `edge_uuid`, edge shard | Compact canonical-endpoint observations |
 
-Fiber line geometry, names, family, length/bounds and coordinate bindings stay in their existing core representation. Each source constraint produces exactly one ordinary core edge carrying its endpoint UUIDs, kind and XYZ anchors, plus one `ext_fiber_graph_solve_constraints` row. A measured distance such as 1.3 remains one REAL value; import does not expand it into separate integer-step edges or duplicate the endpoints.
+Chunk extraction stages piece-local measurements on the existing shard-writer connections. A TEMP-only staging payload identifies source fibers and exact sample arcs for the final sign transport. Once identical shared-boundary samples determine the along-fiber signs, transfer writes ordinary format-4 rows with aligned normal bytes. Unresolved pieces produce undefined endpoint normals. No piece IDs, correction tables or source-ID directories persist. See [initial import staging](initial-import.md).
 
-`ext_fiber_graph_solve_constraints` contains these fields:
+The obsolete `normal_frames` workflow role is not exposed by current factories. Legacy extension data remains accessible through generic extension APIs without being silently accepted as a compact numerical graph.
 
-| Group | Columns |
-| --- | --- |
-| Source identity/order | `source_id`, `source_fiber_a`, `source_fiber_b`, `source_reversed` |
-| Base-point arc positions | `arc_a`, `arc_b` |
-| Classification/evidence | `parallel_score`, `perpendicular_score`, `evidence_weight` |
-| Lasagna measurements | `las_winding`, `parallel_las_winding` |
-| Endpoint sheet normals | For each of `normal_a` and `normal_b`: `_valid`, `_x`, `_y`, `_z`, `_reason` |
-| Local relation diagnostics | `piece_a`, `piece_b`, `closest_distance`, `hard_continuity`, `artificial_tile_seam`, `allow_measurement_disable`, `local_event`, `local_orientation` |
-| Parallel support/fit | `support_a_begin`, `support_a_end`, `support_b_begin`, `support_b_end`, `parallel_correspondence_samples`, `parallel_advance_residual`, `parallel_connector_tangent_dot`, `parallel_connector_length_change`, `parallel_connector_direction_change`, `parallel_limit_hit_fraction` |
-| Signed/orientation evidence | `signed_winding_delta`, `perpendicular_normal_alignment`, `winding_normal_component`, `signed_parallel_winding_delta`, `parallel_normal_alignment` |
-| Unrecognized or inconsistent source extras | Nullable `extra` JSON text, not the ordinary measurement payload |
+Fiber line geometry and source identity remain in the core objects and source extension. Each accepted observation creates one core edge and one measurement row, without integer-step expansion. The core edge carries UUID endpoints and integer kind; it does not carry XYZ anchors or dependency JSON in this workflow. Adjacency indexes are disabled.
 
-Arc/length values use base voxels; winding distances use turns. Supported numerical fields are nullable typed scalars, not zero-filled for absent measurements. Normals remain sheet normals; they are not inserted into the core anchor's fiber-tangent direction field. Source normal validity and reason are retained separately from coordinates.
+| Column | Encoding | Value bytes |
+| --- | --- | --- |
+| `edge_uuid` | Binary UUID, primary key | 16 |
+| `arc_a`, `arc_b` | Separate little-endian float32 BLOBs, base voxels | 4 each |
+| `normal_a`, `normal_b` | Lasagna compact XY plus hemisphere sign | 3 each |
+| `connector` | Compact signed unit direction from canonical A to B | 3 |
+| `winding_distance` | Unsigned byte; code 0 invalid, otherwise (code−1)/16 turns | 1 |
+| `extra` | Explicitly supplied optional JSON | NULL normally |
 
-Core edges canonicalize their endpoint UUID order. Measurement fields deliberately retain the source A/B convention: `source_reversed=1` means source A/B is opposite to core edge A/B. Consumers map endpoint fields accordingly. The importer does not guess sign inversions for measured scalars merely because UUID ordering changed.
+The maximum winding distance is 15.875 turns. Extraction/import skips larger measurements before quantization; it never clamps them into range. Endpoint arcs use the canonical core A/B order. A normal blob is two unsigned Lasagna hemisphere coordinates plus an int8 sign: 0 undefined, +1 positive Z, −1 negative Z. The shared `vc_reader/compact_normal.hpp` implementation is also used by the Lasagna sampler. The connector supplies ordering direction only, not physical connector length. Coincident endpoints have an undefined connector.
 
-The source's `measurement` JSON repeats some scalar and XYZ data. Equal duplicate copies are omitted from the extension payload; differing copies are retained in `extra`, together with genuinely unknown fields. Supported diagnostics and normals are typed columns. The fiber's original free-form annotation remains opaque JSON text because this importer does not impose a schema on arbitrary source annotations.
+No source constraint ID, source fiber IDs, reversal flag, scores, evidence weight, endpoint XYZ, temporary piece IDs, support diagnostics or winding-distance index is persisted. Persistent identity comes from UUIDs; source catalog mapping remains per fiber in the source extension. Runtime graph indices are dense positions in deterministic edge-UUID order, not persistent identities.
 
-Provisioning is explicitly constructed from compact typed inputs, not copied or filtered out of a source metadata/configuration tree. `FiberSourceInfo` supplies the source UUID when known, optional SHA-256 and optional fiber/point counts. `FiberConstraintSourceInfo` supplies the input fiber-source UUID when known, optional constraint-file SHA-256 and optional constraint count, plus fixed units/order conventions. AFC has no independent file UUID: its AFV UUID identifies the input fibers, not the constraint file. Unknown identity is omitted, never guessed. Filesystem paths, reports, selection-ID lists and nested source configuration are not stored in provisioning. Per-fiber source annotations are a separate opaque source field, not provisioning.
+Provisioning is explicitly constructed from compact metadata: known source UUID/checksum, optional counts, units, coordinate space and codec conventions. It is never copied wholesale from configuration or source metadata. Paths, selection lists and lengthy numerical arrays are forbidden. Source annotations are separate opaque source data, not provisioning.
 
-The source table indexes `source_id`; the constraint table indexes `source_id` and `las_winding` in addition to its edge UUID primary key. Existing core adjacency indexes still find relationships from a fiber; the extension row is then looked up by edge UUID.
+Stored XYZ access fails explicitly; consumers needing source geometry evaluate it separately at the requested arc. Numerical winding and UV consumers do not request or reconstruct missing measurement XYZ. The compact graph reader supports plain, sharded, packed and referenced collections through `ObjectCollection`, resolves overlay ownership, and validates byte lengths, normal signs, canonical UUID order and finite arc values.
+
+Native extraction records the selected cohort in `_fibers` rows under a `constraint_extraction` run, including fibers without observations. These refer to existing core objects rather than copying geometry. `_inputs` and table `basedOn` identify the input snapshot; compact `normal_source_sha256` identifies the normal source.
+
+Measurement provisioning may include `fiber_source` as the standard `{store, generation, commit_sequence}` snapshot pin, preserved unchanged by normal overlays; generic format-4 reads accept its absence, while consumers requiring frozen feature or geometry evidence reject a missing pin explicitly.
+
+Normal orientation writes changed measurement rows into a sealed derived store referencing the input graph. Edge UUIDs, canonical arcs and every non-normal field are retained. Subsequent normal-curve/prior export requires matching normal-source identity, sampling spacing and endpoint validity. Since float32 arc and compact-axis quantization are intentional, it checks transported orientation and reports mean/max angular discrepancies rather than asserting impossible float64 byte equality. An arc rounded upward at the final endpoint is accepted only up to the exact float32 representation of that endpoint and is evaluated at the source endpoint.
+
+Python `CollectionReader.fiber_constraints()` returns the same composed compact graph. Shared winding workflows use `fiber_graph_store.FiberGraph` and UUID-indexed geometry rather than opening SQLite directly. See [fiber storage and extraction](../../vesuvius/docs/fiber_layout.md#storage-and-identities).
 
 ### Run results
 
@@ -211,6 +220,8 @@ Every following table name begins with `ext_fiber_graph_solve`. Multiple runs sh
 | `_metrics` | `run_uuid, iteration, scope, name` | One floating value or integer count, with units |
 
 Fiber-owned tables route with object UUIDs and relation results with edge UUIDs. Run-oriented tables are not object aliases; each run/input/width/metric record is stored once in a chosen database and found by ordinary collection scans. Run-to-fiber and run-to-edge indexes support lookup from the result as well as from its source entity.
+
+For numerical stage setup, `CollectionReader.fiber_result_columns(run_uuid)` returns owned, read-only NumPy columns in fiber-UUID order: `fiber_uuid` (`uint8[N,16]`), contiguous `uuid_ascii` bytes (36 bytes per UUID), `values` (`int64[N,5]`) and `valid` (`uint8[N,5]`). `columns` names the five integer fields: family, enabled, normal sign, selected winding and component. A false validity byte means SQL NULL; zero in the value buffer does not imply a resolved label. The native reader selects only the requested run and applies the same referenced/sharded overlay semantics as ordinary extension scans. These are result projections, not replacements for the run's recorded source/input references.
 
 `fiberGraphRunRow` accepts a stage/method identifier and a map of boolean, integer or finite real settings. It does not accept an arbitrary configuration/report object. `fiberGraphInputRow` stores each input pin as a typed row. A later run can reference an earlier result by its store/lineage/commit plus `input_run_uuid`; this does not overwrite the earlier run or update its source pins. Role names distinguish multiple inputs to one run. Per-run input pins are not repeated in every table's provisioning.
 

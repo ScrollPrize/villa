@@ -27,6 +27,7 @@ target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
 add_library(vc_objects ${_vc_store_library_type}
+    SqliteRuntime.cpp
     internal/Anchors.cpp
     internal/Ownership.cpp
     Versions.cpp
@@ -37,9 +38,11 @@ add_library(vc_objects ${_vc_store_library_type}
     client/HostedStore.cpp
     internal/Sqlite.cpp
     internal/Schema.cpp
+    internal/HistoricalSnapshot.cpp
     internal/RecordSql.cpp
     internal/RecordOverrides.cpp
     internal/EdgeSql.cpp
+    internal/EdgeLayout.cpp
     internal/InitialEdges.cpp
     internal/InitialObjects.cpp
     internal/RecordJson.cpp
@@ -52,13 +55,16 @@ add_library(vc_objects ${_vc_store_library_type}
     Extensions.cpp
     ExtensionHistory.cpp
     ObjectCollection.cpp
+    CollectionSource.cpp
     InitialImport.cpp
     PackedStore.cpp
     PackedCollection.cpp
     StoreConversion.cpp
     imports/AfvSource.cpp
     imports/FiberImportExtension.cpp
+    imports/FiberConstraintGraph.cpp
     imports/FiberGraphSolveExtension.cpp
+    imports/FiberUvExport.cpp
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
     HostedSession.cpp
@@ -115,7 +121,7 @@ target_link_libraries(vc_objects PUBLIC vc_geometry vc_reader::catalog nlohmann_
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
 # Offline schema conversion; the runtime library knows only the current schema.
-add_library(vc_object_migration STATIC migration/ConvertStore.cpp)
+add_library(vc_object_migration STATIC migration/ConvertStore.cpp migration/ConvertSchema21.cpp)
 target_include_directories(vc_object_migration PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 # geometry/GeometryInternal.hpp includes <openssl/evp.h>; Homebrew OpenSSL is not on the default include path.
 target_link_libraries(vc_object_migration PUBLIC vc_objects PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
@@ -155,6 +161,7 @@ target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_C
 target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF vc_geometry PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
 add_library(vc_object_geometry ${_vc_store_library_type} geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
+    imports/FiberAxialPriors.cpp
     formats/GeometryInput.cpp formats/FiberInput.cpp formats/SurfaceInput.cpp
     formats/PointCollectionInput.cpp formats/UmbilicusInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp formats/RemoteSource.cpp
     catalog/CatalogStore.cpp)

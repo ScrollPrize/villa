@@ -9,6 +9,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
+#include <stdexcept>
 #include <map>
 #include <memory>
 #include <optional>
@@ -25,15 +27,25 @@ namespace vcr::reader_cuda { class Reader; }
 
 namespace vc::lasagna {
 
+// Encoded byte channels may also be stored as float32 integer values.
+inline uint8_t encodedLasagnaByteValue(double value)
+{
+    if(!std::isfinite(value)||value<0||value>255)
+        throw std::runtime_error("invalid packed encoded byte value");
+    return static_cast<uint8_t>(std::lround(value));
+}
+
 // The channel-group arrays of one dataset, each opened once through vc_reader
 // (openLasagnaGroupArray) and sharing one memory cache. Channels of one packed
 // group share its array.
 struct LasagnaGroupArrays {
-    explicit LasagnaGroupArrays(std::size_t memoryCacheBytes)
-        : cache(std::make_shared<vcr::MemoryCache>(memoryCacheBytes)) {}
-    explicit LasagnaGroupArrays(std::shared_ptr<vcr::MemoryCache> sharedCache)
-        : cache(std::move(sharedCache)) {}
+    explicit LasagnaGroupArrays(std::size_t memoryCacheBytes, bool channelCache = false)
+        : cache(std::make_shared<vcr::MemoryCache>(memoryCacheBytes)), channelCache(channelCache) {}
+    explicit LasagnaGroupArrays(std::shared_ptr<vcr::MemoryCache> sharedCache, bool channelCache = false)
+        : cache(std::move(sharedCache)), channelCache(channelCache) {}
     std::shared_ptr<vcr::MemoryCache> cache;
+    bool channelCache = false;
+    std::size_t readerThreads=0;
     // The opened level of each group, whole: its cache layers (and a VC3D layer's lease)
     // live as long as any binding shares its array.
     std::map<const LasagnaChannelGroup*, std::shared_ptr<vcr::zarr::OpenedArray>> arrays;
@@ -72,8 +84,8 @@ struct LasagnaChannelBinding {
 // Trilinear cubes. A point's cube is the voxel below it (floor of p / spacing)
 // and the seven above; corner k adds (k & 1, k >> 1 & 1, k >> 2) to (x, y, z),
 // clamped to the last voxel. Points that are not finite or lie outside
-// [0, n - 1] on an axis have none. Each binding's corners are one
-// Array::read_points call; chunks that are not stored read as the fill value.
+// [0, n - 1] on an axis have none. CPU bindings sharing a packed array are read
+// together; chunks that are not stored read as the fill value.
 
 // Byte channels (uint8, or float32 holding integers in [0, 255]) in float
 // geometry (p / float(spacing)), for the tracer's hot paths. All bindings must

@@ -179,10 +179,10 @@ void leanDependencies(HistoryMode history)
         b=store.upsertObject(txn,record);
         // Reverse insertion-ID order and use disjoint dependencies: the native
         // canonical endpoint swap must also swap validation metadata correctly.
-        EdgeRecord edge;edge.kind="related";edge.aUuid=b;edge.bUuid=a;
+        EdgeRecord edge;edge.kind="declared_reference";edge.aUuid=b;edge.bUuid=a;
         edge.aAnchor.metadataKeys={"null"};edge.bAnchor.metadataKeys={"important","missing"};
         anchored=store.addEdge(txn,edge);
-        edge.kind="unanchored";edge.aAnchor.metadataKeys.clear();edge.bAnchor.metadataKeys.clear();empty=store.addEdge(txn,edge);
+        edge.kind="declared_reference";edge.aAnchor.metadataKeys.clear();edge.bAnchor.metadataKeys.clear();empty=store.addEdge(txn,edge);
         txn.commit();
     }
     {

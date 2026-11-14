@@ -4,7 +4,7 @@ from pathlib import Path
 import argparse
 import csv
 import json
-import sqlite3
+from .fiber_graph_store import FiberGraph, store_digest
 
 import numpy as np
 from scipy.optimize import linprog
@@ -210,42 +210,36 @@ def audit_measurements(config, data, sources):
         raise ValueError('Tensor cache differs from expected hash')
     missing = [str(sources[k]) for k in ('database', 'stage1') if not Path(sources[k]).is_file()]
     if missing:
-        return dict(source_afc_recomputation='unavailable', missing_inputs=missing, rows_verified=0,
+        return dict(source_graph_recomputation='unavailable', missing_inputs=missing, rows_verified=0,
                     tensor_sha256=actual, expected_tensor_hash_checked=bool(config.get('tensor_sha256')))
     normal = inward_solution(arrays(sources['stage1']))
-    with sqlite3.connect(Path(sources['database']).resolve().as_uri()+'?mode=ro', uri=True) as db:
-        db.execute('CREATE TEMP TABLE selected(id INTEGER PRIMARY KEY)')
-        db.executemany('INSERT INTO selected VALUES (?)', ((int(i),) for i in np.unique(data['event_ids'])))
-        rows = db.execute('SELECT id,fiber_a,fiber_b,ax,ay,az,bx,by,bz,parallel_score,perpendicular_score,'
-            'winding_distance,parallel_winding_distance,normal_a,normal_b FROM constraints '
-            'WHERE id IN (SELECT id FROM selected)').fetchall()
-    by_id = {r[0]: r for r in rows}
-    if any(int(i) not in by_id for i in data['event_ids']):
-        raise ValueError('Cached event ID missing from source AFC')
-    rows = [by_id[int(i)] for i in data['event_ids']]
-    if not rows:
-        return dict(source_afc_recomputation='verified', rows_verified=0)
-    ids = np.array([r[1:3] for r in rows], dtype=str)
+    graph = FiberGraph(sources['database'])
+    take = np.searchsorted(graph.event_ids, data['event_ids'])
+    if np.any(take >= len(graph.event_ids)) or not np.array_equal(graph.event_ids[take], data['event_ids']):
+        raise ValueError('Cached event ID missing from source graph')
+    if not len(take):
+        return dict(source_graph_recomputation='verified', rows_verified=0)
+    ids = np.column_stack((graph.fiber_a[take], graph.fiber_b[take]))
     expected = np.column_stack([data['source_id'][data['i']], data['source_id'][data['j']]])
     if not np.array_equal(ids, expected):
-        raise ValueError('Source AFC endpoint identity differs from cache')
+        raise ValueError('Source graph endpoint identity differs from cache')
     lookup = {str(s): i for i, s in enumerate(normal['ids'])}
     if any(str(s) not in lookup for s in ids.flat):
-        raise ValueError('Source AFC fiber missing from normal solution')
+        raise ValueError('Source graph fiber missing from normal solution')
     ends = np.array([[lookup[str(s)] for s in pair] for pair in ids])
-    nums = np.array([r[3:13] for r in rows], float)
-    par = nums[:, 6] > nums[:, 7]
-    distance = np.where(par, nums[:, 9], nums[:, 8])
-    def normals(column, side):
-        records = [json.loads(r[column]) for r in rows]
-        return np.array([r['xyz'] if r['valid'] else [np.nan]*3 for r in records])*normal['normal_sign'][ends[:, side], None]
-    sign = signed_order(nums[:, 3:6]-nums[:, :3], normals(13, 0), normals(14, 1), sources.get('sign_cosine_min', .1))
+    par = graph.parallel[take]
+    distance = graph.distance[take]
+    def normals(values, valid, side):
+        return np.where(valid[take,None], values[take], np.nan)*normal['normal_sign'][ends[:,side],None]
+    sign = signed_order(graph.connector[take],
+        normals(graph.normal_a, graph.valid_a, 0), normals(graph.normal_b, graph.valid_b, 1),
+        sources.get('sign_cosine_min', .1))
     if not np.array_equal(sign, data['sign']) or not np.array_equal(par, data['parallel']) or not np.allclose(distance, data['distance'], rtol=1e-7, atol=1e-8):
-        raise ValueError('Source AFC measurements do not match cached constraints')
-    return dict(source_afc_recomputation='verified', rows_verified=len(rows), signs_identical=True,
+        raise ValueError('Source graph measurements do not match cached constraints')
+    return dict(source_graph_recomputation='verified', rows_verified=len(take), signs_identical=True,
         family_classification_identical=True, distance_max_roundoff=float(np.max(abs(distance-data['distance']))),
         sign_cosine_min=sources.get('sign_cosine_min', .1), tensor_sha256=actual,
-        input_sha256={k: digest(sources[k]) for k in ('database', 'stage1')})
+        input_sha256=dict(database=store_digest(sources['database']), stage1=digest(sources['stage1'])))
 
 def export_rows(path, rows):
     with Path(path).open('w', newline='') as stream:
@@ -402,7 +396,7 @@ def validate_solution(case, data, solution):
         # Their endpoint/target/weight arrays and all transport are still checked.
         if key == 'flow_event_index' and key not in solution and case.get('target_mode') == 'rounded':
             continue
-        if key not in solution or not np.array_equal(value, solution[key], equal_nan=True):
+        if key not in solution or not np.array_equal(value, solution[key], equal_nan=np.asarray(value).dtype.kind in 'fc'):
             raise ValueError('Saved solution/config mismatch: '+key)
     if len(solution['winding']) != n or not np.all(np.isfinite(solution['winding'])) or not np.array_equal(solution['winding'], np.rint(solution['winding'])):
         raise ValueError('Saved winding labels must be finite integers with matching node count')

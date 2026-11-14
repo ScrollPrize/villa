@@ -57,9 +57,9 @@ void traversal(bool history)
             link(db,w,"00000000-0000-4000-8000-000000000003",a,b);
             link(db,w,"00000000-0000-4000-8000-000000000004",b,c);w.commit();}
         {auto r=db.read();
-            require(db.neighbours(r,a)==std::vector{c,b},"local neighbours preserve insertion order and deduplicate parallel edges");
-            require(db.reachableWithin(r,a,1)==std::vector{a,c,b},"local indexed BFS preserves neighbour order");
-            require(db.componentOf(r,a)==std::vector{a,c,b},"cycles do not duplicate local component nodes");}
+            require(db.neighbours(r,a)==std::vector{b,c},"local neighbours preserve edge-UUID order and deduplicate parallel edges");
+            require(db.reachableWithin(r,a,1)==std::vector{a,b,c},"local indexed BFS preserves edge-UUID neighbour order");
+            require(db.componentOf(r,a)==std::vector{a,b,c},"cycles do not duplicate local component nodes");}
         {auto w=db.write();db.seal(w);w.commit();}
     }
     {auto collection=ObjectCollection::create(overlay,{base},options);}

@@ -1,23 +1,32 @@
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
+#include "vc/core/util/SpatialBatches.hpp"
+#include <vc_object_store/objects/InitialImport.hpp>
+#include <vc_object_store/objects/FiberConstraintGraph.hpp>
+#include <vc_object_store/objects/FiberGraphSolveExtension.hpp>
+#include <vc_object_store/objects/imports/ParallelImportStream.hpp>
+#include <vc_object_store/Uuid.hpp>
 #include <vc_reader/zarr.hpp>
-#include <sqlite3.h>
+#include <vc_reader/sources.hpp>
 #include <algorithm>
-#include <chrono>
-#include <iostream>
-#include <memory>
-#include <stdexcept>
-#include <cmath>
-#include <unordered_map>
-#include <limits>
-#include <fstream>
-#include <array>
 #include <bit>
-
+#include <cstring>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <numeric>
+#include <unordered_map>
+#include <atomic>
+#include <mutex>
+#include <iterator>
 namespace {
-using Json = nlohmann::json;
-Json point(const cv::Vec3d& p) { return {p[0],p[1],p[2]}; }
+namespace vo=vc::objects;
+using Json=nlohmann::json;
+using Clock=std::chrono::steady_clock;
+Json point(const cv::Vec3d& p){return {p[0],p[1],p[2]};}
 Json measurement(const vc::fiber_tracer::FiberTraceConstraint& c) {
     Json j;
 #define FIELD(x) j[#x]=c.x
@@ -38,272 +47,446 @@ Json measurement(const vc::fiber_tracer::FiberTraceConstraint& c) {
 #undef OPTIONAL
     return j;
 }
+vo::ExtensionSource snapshot(const vo::ObjectCollection& store,const vo::CollectionTxn& txn){
+    const auto p=store.provisioning(txn);return {store.uuid(txn),p.generation,p.commitSequence};
+}
+vo::InitialImportOptions importOptions(const std::filesystem::path& dependency,const FiberConstraintDatabaseOptions& settings){
+    const auto workers=settings.workers;
+    if(workers<1||workers>1024)throw std::invalid_argument("import_workers must be in 1..1024");
+    vo::InitialImportOptions options;options.store.author="fiber-constraints";
+    options.store.edgeColumns=std::vector<std::string>{};options.store.edgeAdjacencyIndex=false;
+    options.dependencies={dependency};options.shards.resize(workers);
+    const auto stride=INT64_MAX/workers;
+    for(int i=0;i<workers;++i)options.shards[i].objectIds={1+i*stride,(i+1)*stride};
+    options.store.sqliteCacheBytes=settings.sqliteCacheBytes;
+    if(settings.packed)options.packed=settings.packedOptions;
+    return options;
+}
+void appendRun(vo::InitialShardImport& writer,const std::string& run,const std::string& stage,
+    const vo::ExtensionSource& input,const std::map<std::string,vo::FiberGraphSetting>& settings={}){
+    const auto r=vo::fiberGraphRunRow(run,stage,"native",settings);
+    writer.appendExtensionRows(r.table,std::span(&r.values,1));
+    const auto i=vo::fiberGraphInputRow(run,"input",input);
+    writer.appendExtensionRows(i.table,std::span(&i.values,1));
+}
+void resultDefinitions(vo::InitialImportOptions& options,const vo::ExtensionSource& input){
+    for(auto kind:{vo::FiberGraphTable::Runs,vo::FiberGraphTable::Inputs,vo::FiberGraphTable::FiberResults}){
+        auto table=vo::fiberGraphSolveTable(kind);table.basedOn={input};options.extensions.push_back(std::move(table));
+    }
+}
+Json normalJson(const std::array<double,3>& normal,bool valid){
+    return {{"valid",valid},{"xyz",valid?Json(normal):Json(nullptr)}};
+}
+// Preserve the source equality check without storing manifests, paths or
+// selected-fiber lists in extension provisioning.
+std::string normalSourceIdentity(const Json& metadata){
+    return vcr::sources::snapshotSha256({
+        {"fiber_source",metadata.at("fiber_source")},
+        {"coordinate_space",metadata.at("config").at("coordinate_space")},
+        {"manifest",metadata.at("normal_manifest")},
+        {"provenance",metadata.at("normal_provenance")}});
+}
+}
+
+FiberConstraintDatabaseOptions fiberConstraintDatabaseOptions(const nlohmann::json& cfg){
+    FiberConstraintDatabaseOptions options;
+    options.workers=cfg.value("import_workers",options.workers);
+    options.preparationWorkers=cfg.value("import_readers",options.workers);
+    options.preparationBatchRows=cfg.value("import_batch_rows",options.preparationBatchRows);
+    options.sqliteCacheBytes=cfg.value("sqlite_cache_bytes",options.sqliteCacheBytes);
+    options.packed=cfg.value("packed_store",options.packed);
+    options.packedOptions.residentBytes=cfg.value("import_resident_bytes",options.packedOptions.residentBytes);
+    options.packedOptions.exportWorkers=cfg.value("import_export_workers",options.packedOptions.exportWorkers);
+    return options;
 }
 
 void verifyFiberConstraintDatabaseMeasurements(const std::filesystem::path& path,
-    const vc::fiber_tracer::FiberTraceConstraintReport& report)
-{
-    sqlite3* raw=nullptr;
-    const auto name=path.u8string();
-    const int opened=sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()),&raw,SQLITE_OPEN_READONLY,nullptr);
-    std::unique_ptr<sqlite3,decltype(&sqlite3_close)> db(raw,sqlite3_close);
-    if(opened!=SQLITE_OK)throw std::runtime_error("Cannot open comparison database");
-    sqlite3_stmt* stmt=nullptr;
-    if(sqlite3_prepare_v2(db.get(),"SELECT id,measurement FROM constraints ORDER BY id",-1,&stmt,nullptr)!=SQLITE_OK)
-        throw std::runtime_error(sqlite3_errmsg(db.get()));
-    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> query(stmt,sqlite3_finalize);
-    for(size_t i=0;i<report.constraints.size();++i) {
-        if(sqlite3_step(stmt)!=SQLITE_ROW || sqlite3_column_int64(stmt,0)!=static_cast<int64_t>(i) ||
-            measurement(report.constraints[i]).dump()!=reinterpret_cast<const char*>(sqlite3_column_text(stmt,1)))
-            throw std::runtime_error("Constraint audit differs from saved measurement at index "+std::to_string(i));
+    const vc::fiber_tracer::FiberTraceConstraintReport& report,const std::vector<std::string>& sourceIds){
+    vo::OpenOptions options;options.readOnly=true;auto store=vo::ObjectCollection::open(path,options);auto txn=store.read();
+    const auto rows=vo::readFiberConstraintGraph(store,txn);
+    const auto key=[](const std::string& aUuid,const std::string& bUuid,bool parallel,std::vector<uint8_t> a,std::vector<uint8_t> b,std::vector<uint8_t> connector,uint8_t distance){
+        const auto pack=[&](const auto& x,const auto& y,const auto& c){std::vector<uint8_t> out{uint8_t(parallel),distance};
+            const auto au=std::get<std::vector<uint8_t>>(vo::extensionUuid(aUuid)),bu=std::get<std::vector<uint8_t>>(vo::extensionUuid(bUuid));
+            out.insert(out.end(),au.begin(),au.end());out.insert(out.end(),bu.begin(),bu.end());
+            out.insert(out.end(),x.begin(),x.end());out.insert(out.end(),y.begin(),y.end());out.insert(out.end(),c.begin(),c.end());return out;};
+        return pack(a,b,connector);
+    };
+    std::vector<std::vector<uint8_t>> expected,actual;
+    for(const auto& c:report.constraints){const bool parallel=c.parallelScore>c.perpendicularScore;
+        const auto code=vo::encodeFiberWindingDistance(parallel?c.parallelWindingDistance:c.windingDistance);if(!code)continue;
+        const auto& a=sourceIds.at(report.pieces.at(c.pieceA).traceIndex);
+        const auto& b=sourceIds.at(report.pieces.at(c.pieceB).traceIndex);
+        const bool reversed=b<a;
+        const auto delta=reversed?c.pointABaseXYZ-c.pointBBaseXYZ:c.pointBBaseXYZ-c.pointABaseXYZ;
+        expected.push_back(key(reversed?b:a,reversed?a:b,parallel,vo::encodeFiberArc(reversed?c.arcBBaseVoxels:c.arcABaseVoxels),vo::encodeFiberArc(reversed?c.arcABaseVoxels:c.arcBBaseVoxels),
+            vo::encodeFiberDirection({delta[0],delta[1],delta[2]}),*code));
     }
-    if(sqlite3_step(stmt)!=SQLITE_DONE)throw std::runtime_error("Constraint comparison row count differs");
+    for(const auto& row:rows){const auto& v=row.measurement.values;
+        actual.push_back(key(row.a,row.b,row.parallel,std::get<std::vector<uint8_t>>(v[1]),std::get<std::vector<uint8_t>>(v[2]),
+            std::get<std::vector<uint8_t>>(v[5]),std::get<std::vector<uint8_t>>(v[6]).at(0)));}
+    std::sort(expected.begin(),expected.end());std::sort(actual.begin(),actual.end());
+    if(actual!=expected)throw std::runtime_error("Compact constraint measurements differ after canonical ordering/quantization");
 }
 
-nlohmann::json writeFiberConstraintDatabase(
-    const std::filesystem::path& output, const std::vector<std::string>& sourceIds,
-    const vc::fiber_tracer::FiberTraceConstraintReport& report,
-    const vc::lasagna::LasagnaNormalSampler& normals, int threads, const Json& metadata)
-{
-    const auto start=std::chrono::steady_clock::now();
-    auto temporary=output;
-    temporary += ".partial";
-    if(std::filesystem::exists(output) || std::filesystem::exists(temporary))
-        throw std::runtime_error("Refusing to overwrite constraint database or partial file");
-    std::filesystem::create_directories(output.parent_path());
-    sqlite3* raw=nullptr;
-    const auto name=temporary.u8string();
-    const int opened=sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()),&raw,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,nullptr);
-    std::unique_ptr<sqlite3,decltype(&sqlite3_close)> db(raw,sqlite3_close);
-    if(opened!=SQLITE_OK)throw std::runtime_error("Cannot create constraint database");
-    const auto check=[&](int rc){if(rc!=SQLITE_OK && rc!=SQLITE_DONE)throw std::runtime_error(sqlite3_errmsg(db.get()));};
-    const auto exec=[&](const char* sql){check(sqlite3_exec(db.get(),sql,nullptr,nullptr,nullptr));};
-    using Statement=std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)>;
-    const auto prepare=[&](const char* sql){sqlite3_stmt* p=nullptr;check(sqlite3_prepare_v2(db.get(),sql,-1,&p,nullptr));return Statement(p,sqlite3_finalize);};
-    const auto text=[&](sqlite3_stmt* p,int col,const std::string& value){check(sqlite3_bind_text(p,col,value.c_str(),int(value.size()),SQLITE_TRANSIENT));};
-    exec("PRAGMA application_id=1447249475; PRAGMA user_version=1; PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;"
-         "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
-         // Fibers are identified by their object-store UUIDs.
-         "CREATE TABLE fibers(id TEXT PRIMARY KEY,source_index INTEGER UNIQUE NOT NULL,length_base REAL NOT NULL);"
-         "CREATE TABLE constraints(id INTEGER PRIMARY KEY,fiber_a TEXT NOT NULL REFERENCES fibers(id),"
-         "fiber_b TEXT NOT NULL REFERENCES fibers(id),arc_a REAL NOT NULL,arc_b REAL NOT NULL,"
-         "ax REAL NOT NULL,ay REAL NOT NULL,az REAL NOT NULL,bx REAL NOT NULL,by REAL NOT NULL,bz REAL NOT NULL,"
-         "parallel_score REAL NOT NULL,perpendicular_score REAL NOT NULL,winding_distance REAL NOT NULL,"
-         "parallel_winding_distance REAL NOT NULL,evidence_weight REAL NOT NULL,"
-         "normal_a TEXT NOT NULL,normal_b TEXT NOT NULL,measurement TEXT NOT NULL);");
-    auto meta=prepare("INSERT INTO metadata VALUES(?,?)");
-    const auto putMeta=[&](const char* key,const Json& value){text(meta.get(),1,key);text(meta.get(),2,value.dump());check(sqlite3_step(meta.get()));check(sqlite3_reset(meta.get()));};
-    putMeta("format","fiber-constraints"); putMeta("schema_version",1); putMeta("provenance",metadata);
-    putMeta("normal_semantics","unoriented sheet-normal axes sampled at exact constraint base points; invalid values are null");
-    auto fiber=prepare("INSERT INTO fibers VALUES(?,?,?)");
-    if(report.pieces.size()!=sourceIds.size())throw std::runtime_error("Export requires whole source fibers");
-    std::vector<size_t> degree(sourceIds.size());
-    for(const auto& p:report.pieces) {
-        text(fiber.get(),1,sourceIds.at(p.traceIndex));
-        check(sqlite3_bind_int64(fiber.get(),2,p.traceIndex));
-        check(sqlite3_bind_double(fiber.get(),3,p.endArcBaseVoxels-p.beginArcBaseVoxels));
-        check(sqlite3_step(fiber.get()));check(sqlite3_reset(fiber.get()));
+nlohmann::json writeFiberConstraintDatabase(const std::filesystem::path& output,
+    const std::vector<std::string>& ids,const vc::fiber_tracer::FiberTraceConstraintReport& report,
+    const vc::lasagna::LasagnaNormalSampler& normals,int threads,const Json& metadata,
+    const vc::fiber_tracer::FiberTraceConstraintProgressCallback& progress,const FiberConstraintDatabaseOptions& options){
+    size_t position=0;
+    return streamFiberConstraintDatabase(output,ids,report.pieces,[&](std::stop_token){
+        const auto end=std::min(position+8192,report.constraints.size());
+        std::vector<vc::fiber_tracer::FiberTraceConstraint> batch(report.constraints.begin()+position,report.constraints.begin()+end);
+        position=end;return batch;
+    },normals,threads,metadata,progress,options,report.constraints.size());
+}
+
+nlohmann::json streamFiberConstraintDatabase(const std::filesystem::path& output,
+    const std::vector<std::string>& ids,std::span<const vc::fiber_tracer::FiberTraceConstraintPiece> pieces,
+    const FiberConstraintBatchSource& source,const vc::lasagna::LasagnaNormalSampler& normals,
+    int threads,const Json& metadata,const vc::fiber_tracer::FiberTraceConstraintProgressCallback& progress,
+    const FiberConstraintDatabaseOptions& settings,size_t expectedEvents,
+    const FiberConstraintBatchProducer& producer,size_t producerWorkers){
+    (void)threads; // Sampling parallelism is owned by preparationWorkers, not nested teams.
+    const auto start=Clock::now();
+    if(pieces.size()!=ids.size())throw std::invalid_argument("Extraction import requires whole source fibers");
+    if(!settings.baseToStored.empty()&&settings.baseToStored.size()!=ids.size())
+        throw std::invalid_argument("Expected one anchor-frame mapping per source fiber");
+    const std::filesystem::path dependency=metadata.at("config").at("fibers").get<std::string>();
+    auto sourcePosition=metadata.at("fiber_source");
+    sourcePosition["store_uuid"]=sourcePosition.at("store");sourcePosition.erase("store");
+    const auto pin=vo::extensionSourcesFromJson(Json::array({sourcePosition}).dump()).at(0);
+    auto options=importOptions(dependency,settings);
+    options.dependencyPins={pin};
+    if(settings.preparationWorkers<1||settings.preparationWorkers>1024||!settings.preparationBatchRows)
+        throw std::invalid_argument("Positive import preparation workers and batch rows required");
+    if(settings.normalSamples && (producer ||
+       settings.normalSamples->endpoints.size()!=2*expectedEvents || settings.normalSamples->valid.size()!=2*expectedEvents))
+        throw std::invalid_argument("Prepared attachment normals require a matching materialized source");
+    auto constraintDefinition=vo::fiberConstraintExtension(
+        {pin.storeUuid,{},{},metadata.at("config").at("coordinate_space").get<std::string>()},std::span(&pin,1));
+    auto provisioning=Json::parse(constraintDefinition.provisioning);
+    provisioning["fiber_source"]=metadata.at("fiber_source");
+    provisioning["normal_source_sha256"]=normalSourceIdentity(metadata);
+    if(metadata.contains("winding_manifest"))
+        provisioning["winding_source_sha256"]=vcr::sources::snapshotSha256({
+            {"manifest",metadata.at("winding_manifest")},{"provenance",metadata.at("winding_provenance")}});
+    constraintDefinition.provisioning=provisioning.dump();
+    options.extensions.push_back(std::move(constraintDefinition));
+    resultDefinitions(options,pin);
+    if(settings.finalizeMeasurements)options.edges.stagedExtensions={vo::kFiberConstraintTable};
+    std::vector<double> transferSeconds(settings.workers);
+    std::vector<int64_t> transferRows(settings.workers);
+    const auto run=vo::util::newUuid();
+    const auto normalRun=settings.normalSamples||settings.batchNormalSamples?vo::util::newUuid():std::string{};
+    std::vector<std::vector<vo::ExtensionRow>> participants(settings.workers);
+    for(const auto& id:ids){
+        auto row=vo::fiberGraphSolveRow(vo::FiberGraphTable::FiberResults,
+            {{"fiber_uuid",vo::extensionUuid(id)},{"run_uuid",vo::extensionUuid(run)}});
+        participants[vo::uuidShardIndex(id,settings.workers)].push_back(std::move(row.values));
     }
-    auto insert=prepare("INSERT INTO constraints VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    size_t invalidNormals=0,parallel=0;
-    double samplingSeconds=0.;
-    for(size_t begin=0;begin<report.constraints.size();begin+=8192) {
-        const size_t end=std::min(begin+8192,report.constraints.size());
-        std::vector<cv::Vec3d> points; points.reserve(2*(end-begin));
-        for(size_t i=begin;i<end;++i){points.push_back(report.constraints[i].pointABaseXYZ);points.push_back(report.constraints[i].pointBBaseXYZ);}
-        std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
-        const auto samplingStart=std::chrono::steady_clock::now();
-        (void)normals.sampleNormalBatch(points,false,threads,samples);
-        samplingSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-samplingStart).count();
-        if(samples.size()!=points.size())throw std::runtime_error("Normal batch size mismatch");
-        for(size_t i=begin;i<end;++i) {
-            const auto& c=report.constraints[i];
-            const auto a=report.pieces.at(c.pieceA).traceIndex,b=report.pieces.at(c.pieceB).traceIndex;
-            ++degree.at(a);++degree.at(b);parallel+=c.parallelScore>c.perpendicularScore;
-            check(sqlite3_bind_int64(insert.get(),1,i));text(insert.get(),2,sourceIds.at(a));text(insert.get(),3,sourceIds.at(b));
-            const double values[]={c.arcABaseVoxels,c.arcBBaseVoxels,c.pointABaseXYZ[0],c.pointABaseXYZ[1],c.pointABaseXYZ[2],c.pointBBaseXYZ[0],c.pointBBaseXYZ[1],c.pointBBaseXYZ[2],c.parallelScore,c.perpendicularScore,c.windingDistance,c.parallelWindingDistance,c.evidenceWeight};
-            for(int k=0;k<13;++k)check(sqlite3_bind_double(insert.get(),4+k,values[k]));
-            for(int side=0;side<2;++side) {
-                const auto& n=samples[2*(i-begin)+side].sample;invalidNormals+=!n.valid;
-                text(insert.get(),17+side,Json{{"valid",n.valid},{"xyz",n.valid?point(n.normal):Json(nullptr)},{"reason",n.reason}}.dump());
+    vo::imports::ParallelImportOptions queueOptions;
+    queueOptions.shards=settings.workers;queueOptions.readers=settings.preparationWorkers;
+    vo::imports::ParallelImportStream stream(queueOptions);
+    struct Stats {size_t events=0,invalid=0,parallel=0,skippedDistance=0;double sampling=0,encoding=0,claiming=0;};
+    std::vector<Stats> stats(producer?producerWorkers:queueOptions.readers);
+    size_t claimed=0;bool eof=false;std::mutex sourceMutex;
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> skippedDistance{0};
+    std::stop_source stop;
+    const auto encode=[&](size_t worker,size_t first,
+        std::span<const vc::fiber_tracer::FiberTraceConstraint> batch,auto& emitter) {
+            auto& counters=stats.at(worker);
+            std::vector<vc::lasagna::NormalSampleWithDerivative> sampled;
+            const auto* batchNormals=settings.batchNormalSamples?settings.batchNormalSamples(worker):nullptr;
+            if(settings.batchNormalSamples&&!batchNormals)throw std::invalid_argument("Chunk producer supplied no attachment normals");
+            if(batchNormals && (batchNormals->endpoints.size()!=2*batch.size() || batchNormals->valid.size()!=2*batch.size()))
+                throw std::invalid_argument("Chunk attachment normal count differs");
+            if(!settings.normalSamples && !batchNormals) {
+                std::vector<cv::Vec3d> points;points.reserve(2*batch.size());
+                for(const auto& c:batch){points.push_back(c.pointABaseXYZ);points.push_back(c.pointBBaseXYZ);}
+                const auto sampling=Clock::now();
+                (void)normals.sampleNormalBatch(points,false,1,sampled);
+                counters.sampling+=std::chrono::duration<double>(Clock::now()-sampling).count();
+                if(sampled.size()!=points.size())throw std::runtime_error("Constraint normal sample count mismatch");
             }
-            text(insert.get(),19,measurement(c).dump());check(sqlite3_step(insert.get()));check(sqlite3_reset(insert.get()));
-        }
-        if(begin%262144==0)std::cout<<"export constraints "<<end<<"/"<<report.constraints.size()<<std::endl;
+            const auto encoding=Clock::now();const auto waitBefore=emitter.waitSeconds;
+            for(size_t i=0;i<batch.size();++i){
+                const auto& c=batch[i];vo::InitialCollectionEdge edge;
+                const bool parallel=c.parallelScore>c.perpendicularScore;
+                const auto distance=parallel?c.parallelWindingDistance:c.windingDistance;
+                if(!vo::encodeFiberWindingDistance(distance)){++counters.skippedDistance;++skippedDistance;continue;}
+                const auto event=first+i;
+                edge.record.uuid=vo::util::nameUuid(run,"constraint:"+std::to_string(event));
+                if(c.pieceA>=pieces.size()||c.pieceB>=pieces.size())throw std::runtime_error("Invalid piece index");
+                const auto a=pieces[c.pieceA].traceIndex,b=pieces[c.pieceB].traceIndex;
+                edge.record.aUuid=ids.at(a);edge.record.bUuid=ids.at(b);
+                edge.record.kind=parallel?"parallel":"perpendicular";counters.parallel+=parallel;
+                const std::array<std::array<double,3>,2> measuredPoints{{
+                    {c.pointABaseXYZ[0],c.pointABaseXYZ[1],c.pointABaseXYZ[2]},
+                    {c.pointBBaseXYZ[0],c.pointBBaseXYZ[1],c.pointBBaseXYZ[2]}}};
+                const bool reversed=edge.record.bUuid<edge.record.aUuid;
+                if(reversed){std::swap(edge.record.aUuid,edge.record.bUuid);std::swap(edge.record.aAnchor,edge.record.bAnchor);}
+                edge.a={"",edge.record.aUuid};edge.b={"",edge.record.bUuid};
+                vo::FiberConstraintData data;
+                for(int side=0;side<2;++side){
+                    auto& n=data.normals[side];
+                    if(const auto* prepared=batchNormals?batchNormals:settings.normalSamples) {
+                        const auto slot=2*(batchNormals?i:event)+side;const bool ok=prepared->valid.at(slot);n.valid=ok;
+                        if(ok)for(int k=0;k<3;++k)n.xyz[k]=prepared->endpoints.at(slot)[k];
+                    } else {
+                        const auto& sample=sampled[2*i+side].sample;n.valid=sample.valid;
+                        if(sample.valid)for(int k=0;k<3;++k)n.xyz[k]=sample.normal[k];
+                    }
+                    counters.invalid+=!n.valid.value();}
+                data.values={c.arcABaseVoxels,c.arcBBaseVoxels,c.parallelScore,c.perpendicularScore,
+                    c.windingDistance,c.parallelWindingDistance,c.evidenceWeight};
+                data.measuredPoints=measuredPoints;
+                edge.extensions.push_back(vo::fiberConstraintRow(edge.record.uuid,event,a,b,reversed,std::move(data)));
+                if(settings.finalizeMeasurements){
+                    // Exact source arcs and source indices are TEMP-only; final
+                    // measurements contain neither piece IDs nor source IDs.
+                    const std::array<uint64_t,4> transient{uint64_t(reversed?b:a),uint64_t(reversed?a:b),
+                        std::bit_cast<uint64_t>(reversed?c.arcBBaseVoxels:c.arcABaseVoxels),
+                        std::bit_cast<uint64_t>(reversed?c.arcABaseVoxels:c.arcBBaseVoxels)};
+                    auto& payload=edge.extensions.back().stagingPayload;payload.resize(sizeof(transient));
+                    std::memcpy(payload.data(),transient.data(),sizeof(transient));
+                }
+                const auto id=edge.record.uuid;const auto bytes=sizeof(edge)+vo::extensionPayloadBytes(edge.extensions);
+                emitter.emit(std::move(edge),bytes,id);
+                ++counters.events;
+            }
+            counters.encoding+=std::chrono::duration<double>(Clock::now()-encoding).count()-(emitter.waitSeconds-waitBefore);
+            const auto done=completed.fetch_add(batch.size())+batch.size();
+            if(progress)progress({"export",done,expectedEvents,expectedEvents});
+    };
+    if(producer) {
+        stream.startEdgeProducer(producerWorkers,[&](auto& emitters) {
+            producer([&](size_t worker,size_t first,auto batch) {
+                encode(worker,first,batch,*emitters.at(worker));
+            });
+        });
+    } else {
+        // Materialized input has a cheap sequential cursor; sampling and
+        // encoding remain parallel. Live extraction uses the push API above.
+        stream.start(0,queueOptions.readers,[](size_t,size_t,auto&){},[&](size_t worker,size_t,auto& emitter){
+          try {auto& counters=stats[worker];while(true){
+            std::vector<vc::fiber_tracer::FiberTraceConstraint> batch;
+            size_t first=0;const auto claiming=Clock::now();
+            {
+                std::lock_guard lock(sourceMutex);
+                if(stop.stop_requested()||eof)break;
+                first=claimed;batch.reserve(settings.preparationBatchRows);
+                while(batch.size()<settings.preparationBatchRows){
+                    auto next=source(stop.get_token());
+                    if(next.empty()){eof=true;break;}
+                    batch.insert(batch.end(),std::make_move_iterator(next.begin()),std::make_move_iterator(next.end()));
+                }
+                claimed+=batch.size();
+            }
+            counters.claiming+=std::chrono::duration<double>(Clock::now()-claiming).count();
+            if(batch.empty())break;
+            encode(worker,first,batch,emitter);
+          }}catch(...){stop.request_stop();throw;}
+        });
     }
-    std::sort(degree.begin(),degree.end());
-    const auto quantile=[&](double p){return degree.empty()?0.:double(degree[size_t(p*(degree.size()-1))]);};
-    Json stats={{"fibers",sourceIds.size()},{"constraints",report.constraints.size()},
-        {"parallel",parallel},{"orthogonal",report.constraints.size()-parallel},{"invalid_endpoint_normals",invalidNormals},
-        {"isolated_fibers",std::count(degree.begin(),degree.end(),size_t(0))},
-        {"mean_degree",sourceIds.empty()?0.:2.*report.constraints.size()/sourceIds.size()},
-        {"median_degree",quantile(.5)},{"p95_degree",quantile(.95)},{"max_degree",quantile(1)},
-        {"endpoint_normal_sampling_seconds",samplingSeconds}};
-    putMeta("statistics",stats);putMeta("complete",true);
-    exec("CREATE INDEX constraint_a ON constraints(fiber_a); CREATE INDEX constraint_b ON constraints(fiber_b); COMMIT;");
-    auto integrity=prepare("PRAGMA quick_check");
-    if(sqlite3_step(integrity.get())!=SQLITE_ROW || std::string(reinterpret_cast<const char*>(sqlite3_column_text(integrity.get(),0)))!="ok")throw std::runtime_error("Constraint database integrity check failed");
-    auto fk=prepare("PRAGMA foreign_key_check");if(sqlite3_step(fk.get())!=SQLITE_DONE)throw std::runtime_error("Constraint database foreign key failure");
-    fk.reset();integrity.reset();insert.reset();fiber.reset();meta.reset();db.reset();
-    std::filesystem::rename(temporary,output);
-    stats["export_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
-    stats["database_bytes"]=std::filesystem::file_size(output);
-    return stats;
+    options.beforePublish=[&]{
+        stream.finish();if(expectedEvents&&completed.load()!=expectedEvents)throw std::runtime_error("Extraction event count changed");
+        if(settings.finalizeMeasurements) {
+            int64_t transferred=0;for(const auto count:transferRows)transferred+=count;
+            if(transferred!=int64_t(completed.load()-skippedDistance.load()))throw std::logic_error("Transferred measurement count differs from emitted constraints");
+        }
+        if(metadata.at("config").value("profile_stages",false)) {
+            double queueWait=0.,encoding=0.;
+            for(const auto& reader:stream.readers)queueWait+=reader.queueWaitSeconds;
+            for(const auto& worker:stats)encoding+=worker.encoding;
+            std::cout<<"IMPORT_PROFILE "<<Json{{"phase","ingestion_finished"},
+                {"seconds",std::chrono::duration<double>(Clock::now()-start).count()},
+                {"events",completed.load()},{"queue_wait_worker_seconds",queueWait},{"encoding_worker_seconds",encoding},
+                {"monotonic_seconds",std::chrono::duration<double>(Clock::now().time_since_epoch()).count()}}.dump()<<std::endl;
+        }
+    };
+    std::filesystem::create_directories(output.parent_path());vo::InitialImportResult result;
+    try{result=vo::importInitialCollection(output,options,[&](size_t shard,auto& writer){
+        if(shard==0) {
+            appendRun(writer,run,"constraint_extraction",pin);
+            if(!normalRun.empty())appendRun(writer,normalRun,"normal_orientation",pin,
+                {{"sample_spacing_base",settings.normalSamples?
+                    settings.normalSamples->statistics.at("sample_spacing_base").get<double>():
+                    metadata.at("config").value("normal_sample_spacing",4.)}});
+        }
+        writer.appendExtensionRows(vo::fiberGraphSolveTable(vo::FiberGraphTable::FiberResults).name,participants[shard]);
+    },[&](size_t shard,auto& writer){
+        writer.importEdges([&](auto& batch){return stream.popEdges(shard,batch,[&]{writer.checkCancelled();});});
+        if(settings.finalizeMeasurements) {
+            const auto transferring=Clock::now();
+            transferRows[shard]=settings.finalizeMeasurements(shard,writer);
+            transferSeconds[shard]=std::chrono::duration<double>(Clock::now()-transferring).count();
+        }
+    });}catch(...){stop.request_stop();stream.fail(std::current_exception());throw;}
+    size_t events=0,invalid=0,parallel=0;double sampleSeconds=0,encodingSeconds=0,claimSeconds=0,queueSeconds=0;
+    for(const auto& s:stats){events+=s.events;invalid+=s.invalid;parallel+=s.parallel;sampleSeconds+=s.sampling;
+        encodingSeconds+=s.encoding;claimSeconds+=s.claiming;}
+    for(const auto& s:stream.readers)queueSeconds+=s.queueWaitSeconds;
+    int64_t transferred=0;double transferWorkerSeconds=0.,transferMaximumSeconds=0.;
+    for(size_t i=0;i<transferRows.size();++i){transferred+=transferRows[i];transferWorkerSeconds+=transferSeconds[i];transferMaximumSeconds=std::max(transferMaximumSeconds,transferSeconds[i]);}
+    return {{"format","vcobj"},{"schema_version",22},{"path",result.path.string()},{"run_uuid",run},
+        {"measurement_format",vo::kFiberConstraintFormat},{"skipped_winding_distance",skippedDistance.load()},
+        {"measurement_staging",bool(settings.finalizeMeasurements)},
+        {"measurement_transfer_rows",transferred},{"measurement_transfer_worker_seconds",transferWorkerSeconds},
+        {"measurement_transfer_max_shard_seconds",transferMaximumSeconds},
+        {"source_store",{{"store_uuid",result.storeUuid},{"generation",result.generation},{"commit_sequence",result.commitSequence}}},
+        {"normal_samples_reused",settings.normalSamples!=nullptr || bool(settings.batchNormalSamples)},
+        {"fibers",ids.size()},{"constraints",events},{"parallel",parallel},{"perpendicular",events-parallel},
+        {"invalid_endpoint_normals",invalid},{"sampling_seconds",sampleSeconds},
+        {"encoding_worker_seconds",encodingSeconds},{"source_claim_worker_seconds",claimSeconds},
+        {"queue_wait_worker_seconds",queueSeconds},{"preparation_workers",producer?producerWorkers:size_t(settings.preparationWorkers)},
+        {"shared_extraction_preparation_workers",bool(producer)},
+        {"writer_workers",settings.workers},{"preparation_batch_rows",settings.preparationBatchRows},
+        {"ingestion_seconds",result.ingestionSeconds},{"persistence_seconds",result.persistenceSeconds},
+        {"seconds",std::chrono::duration<double>(Clock::now()-start).count()}};
 }
 
-nlohmann::json orientFiberConstraintDatabase(
-    const std::filesystem::path& input, const std::filesystem::path& output,
+namespace {
+struct NormalEndpoint {size_t slot;double arc;};
+struct NormalSweepResult {FiberConstraintNormalSamples data;Json curveIndex;};
+NormalSweepResult sampleFiberNormalSweep(
     const std::vector<std::string>& sourceIds,
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
-    const vc::lasagna::LasagnaNormalSampler& normals, int threads,
-    double sampleSpacing, const Json& provenance, const vc::core::util::Umbilicus* priorUmbilicus,
-    bool exportNormalCurves)
-{
+    const std::vector<std::vector<NormalEndpoint>>& endpoints,size_t events,
+    const vc::lasagna::LasagnaNormalSampler& normals,int threads,double sampleSpacing,
+    const vc::core::util::Umbilicus* priorUmbilicus,std::ofstream* curveOutput=nullptr,
+    const FiberNormalBatchOptions& batching={}) {
     using namespace vc::fiber_tracer;
-    using Clock=std::chrono::steady_clock;
-    const auto started=Clock::now();
-    if(!std::isfinite(sampleSpacing) || sampleSpacing<=0. || threads<1 || lines.size()!=sourceIds.size())
-        throw std::invalid_argument("Invalid normal orientation sampling configuration");
-    auto partial=output;
-    partial += ".partial";
-    if(std::filesystem::exists(output) || std::filesystem::exists(partial))
-        throw std::runtime_error("Refusing to overwrite oriented database or partial output");
-    using Database=std::unique_ptr<sqlite3,decltype(&sqlite3_close)>;
-    using Statement=std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)>;
-    const auto open=[](const auto& path,int flags) {
-        const auto name=path.u8string();
-        sqlite3* raw=nullptr; const int rc=sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()),&raw,flags,nullptr);
-        Database db(raw,sqlite3_close);
-        if(rc!=SQLITE_OK)throw std::runtime_error("Cannot open constraint database: "+path.string());
-        return db;
-    };
-    auto src=open(input,SQLITE_OPEN_READONLY);
-    if(sqlite3_exec(src.get(),"BEGIN",nullptr,nullptr,nullptr)!=SQLITE_OK)
-        throw std::runtime_error("Cannot acquire source database snapshot");
-    const auto check=[](sqlite3* db,int rc) {
-        if(rc!=SQLITE_OK && rc!=SQLITE_DONE)throw std::runtime_error(sqlite3_errmsg(db));
-    };
-    const auto prepare=[&](sqlite3* db,const char* sql) {
-        sqlite3_stmt* raw=nullptr;check(db,sqlite3_prepare_v2(db,sql,-1,&raw,nullptr));
-        return Statement(raw,sqlite3_finalize);
-    };
-    const auto metaValue=[&](const char* key) {
-        auto s=prepare(src.get(),"SELECT value FROM metadata WHERE key=?");
-        check(src.get(),sqlite3_bind_text(s.get(),1,key,-1,SQLITE_STATIC));
-        if(sqlite3_step(s.get())!=SQLITE_ROW)throw std::runtime_error("Missing source metadata");
-        return Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(s.get(),0)));
-    };
-    if(metaValue("format")!="fiber-constraints" || metaValue("schema_version")!=((priorUmbilicus || exportNormalCurves)?2:1) || metaValue("complete")!=true)
-        throw std::runtime_error("Orientation requires schema1; prior extraction requires oriented schema2");
-    if((priorUmbilicus || exportNormalCurves) && metaValue("normal_orientation").at("sample_spacing_base")!=sampleSpacing)
-        throw std::runtime_error("Prior sweep spacing must match baked orientation");
-    const auto original=metaValue("provenance");
-    if(!original.contains("fiber_source"))
-        throw std::runtime_error("Missing fiber source version; regenerate frozen evidence");
-    for(const char* key:{"fiber_source","normal_manifest","normal_provenance"})
-        if(original.at(key)!=provenance.at(key))throw std::runtime_error(std::string("Source mismatch: ")+key);
-
-    struct Endpoint { size_t slot; double arc; cv::Vec3d point; };
-    std::vector<std::vector<Endpoint>> endpoints(sourceIds.size());
-    std::unordered_map<std::string,size_t> index;
-    std::vector<double> lengths(sourceIds.size());
-    for(size_t i=0;i<sourceIds.size();++i) {
-        if(!index.emplace(sourceIds[i],i).second)throw std::runtime_error("Duplicate source fiber");
-        lengths[i]=makePolylineArcGeometry(lines[i].pointsBaseXYZ).length();
-    }
-    auto fiberQuery=prepare(src.get(),"SELECT id,source_index,length_base FROM fibers ORDER BY source_index");
-    const auto columnText=[](sqlite3_stmt* s,int col) {
-        const auto* value=sqlite3_column_text(s,col);
-        return value ? std::string(reinterpret_cast<const char*>(value)) : std::string{};
-    };
-    size_t fiberCount=0; int rc;
-    while((rc=sqlite3_step(fiberQuery.get()))==SQLITE_ROW) {
-        if(fiberCount>=sourceIds.size() || columnText(fiberQuery.get(),0)!=sourceIds[fiberCount] ||
-           sqlite3_column_int64(fiberQuery.get(),1)!=static_cast<int64_t>(fiberCount) ||
-           std::abs(sqlite3_column_double(fiberQuery.get(),2)-lengths[fiberCount])>1e-6)
-            throw std::runtime_error("Source fiber identity/order/length differs");
-        ++fiberCount;
-    }
-    check(src.get(),rc);
-    if(fiberCount!=sourceIds.size())throw std::runtime_error("Source fiber count differs");
-    auto query=prepare(src.get(),"SELECT id,fiber_a,fiber_b,arc_a,arc_b,ax,ay,az,bx,by,bz FROM constraints ORDER BY id");
-    size_t events=0;
-    while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
-        if(sqlite3_column_int64(query.get(),0)!=static_cast<int64_t>(events))throw std::runtime_error("Non-contiguous constraint IDs");
-        for(int side=0;side<2;++side) {
-            const auto i=index.at(columnText(query.get(),1+side));
-            const double arc=sqlite3_column_double(query.get(),3+side);
-            if(!std::isfinite(arc) || arc<0 || arc>lengths[i]+1e-6)throw std::runtime_error("Invalid constraint arc");
-            const int c=5+side*3;
-            endpoints[i].push_back({2*events+side,arc,{sqlite3_column_double(query.get(),c),
-                sqlite3_column_double(query.get(),c+1),sqlite3_column_double(query.get(),c+2)}});
-        }
-        ++events;
-    }
-    check(src.get(),rc);query.reset();fiberQuery.reset();
+    if(threads<1 || !(sampleSpacing>0.) || !std::isfinite(sampleSpacing) ||
+       sourceIds.size()!=lines.size() || endpoints.size()!=lines.size() ||
+       !(batching.regionBaseVoxels>0.) || !std::isfinite(batching.regionBaseVoxels) || !batching.maximumPoints)
+        throw std::invalid_argument("Invalid fiber normal sweep inputs");
+    const bool exportNormalCurves=curveOutput!=nullptr;
+    std::ofstream unused;auto& curveStream=curveOutput?*curveOutput:unused;
+    Json curveIndex=Json::array();size_t curveSamples=0;
     std::vector<cv::Vec3d> baked(2*events);
     std::vector<double> priorSum(lines.size(),0.),priorWeight(lines.size(),0.);
     std::vector<unsigned char> valid(2*events,0);
-    size_t samplesTotal=0,flips=0,endpointFlips=0,invalid=0,invalidEndpoints=0,invalidFibers=0;
-    double sampleSeconds=0.;
+    struct SweepStats {
+        size_t samples=0,flips=0,endpointFlips=0,invalid=0,invalidEndpoints=0,invalidFibers=0;
+        double sampleSeconds=0.;
+        std::vector<std::pair<size_t,std::string>> invalidReasons;
+    };
     const auto sweepStarted=Clock::now();
-    std::ofstream curveStream;
-    Json curveIndex=Json::array();size_t curveSamples=0;
-    if(exportNormalCurves) {
-        if(priorUmbilicus)throw std::invalid_argument("Choose curve export OR outward priors");
-        // Portable explicit little-endian float64 payload, regular arc + normal
-        // + validity. Geometry remains in the object store, not this cache.
-        std::filesystem::create_directories(partial);
-        curveStream.open(partial/"normals.bin",std::ios::binary);
-        if(!curveStream)throw std::runtime_error("Cannot create normal curve payload");
-    }
-    for(size_t begin=0;begin<lines.size();begin+=256) {
-        struct Sample { double arc; cv::Vec3d point; size_t slot; double weight=0.; };
-        const size_t end=std::min(begin+256,lines.size()), regular=std::numeric_limits<size_t>::max();
-        std::vector<Sample> ordered;std::vector<size_t> offsets{0};
-        for(size_t i=begin;i<end;++i) {
-            const auto geometry=makePolylineArcGeometry(lines[i].pointsBaseXYZ);
-            const size_t first=ordered.size();
-            for(double arc=0;arc<geometry.length();arc+=sampleSpacing)
-                ordered.push_back({arc,samplePolylineArc(geometry,arc).point,regular});
-            ordered.push_back({geometry.length(),samplePolylineArc(geometry,geometry.length()).point,regular});
-            for(size_t j=first;j<ordered.size();++j) {
-                const double left=j==first?ordered[j].arc:ordered[j-1].arc;
-                const double right=j+1==ordered.size()?ordered[j].arc:ordered[j+1].arc;
-                ordered[j].weight=(right-left)*.5;
-            }
-            for(const auto& e:endpoints[i])ordered.push_back({e.arc,e.point,e.slot});
-            std::stable_sort(ordered.begin()+first,ordered.end(),[](const auto& a,const auto& b){return a.arc<b.arc;});
-            offsets.push_back(ordered.size());
+    const size_t regular=std::numeric_limits<size_t>::max();
+    struct Sample {double arc;cv::Vec3d point;size_t slot;double weight=0.;};
+    // Construct the unchanged arc-ordered scientific samples, independently of
+    // their read order. UUID/storage order never selects an I/O batch.
+    std::vector<std::vector<Sample>> perFiber(lines.size());
+    std::exception_ptr preparationFailure;std::mutex preparationMutex;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for(std::ptrdiff_t f=0;f<static_cast<std::ptrdiff_t>(lines.size());++f)try {
+        auto& samples=perFiber[f];const auto geometry=makePolylineArcGeometry(lines[f].pointsBaseXYZ);
+        for(double arc=0;arc<geometry.length();arc+=sampleSpacing)
+            samples.push_back({arc,samplePolylineArc(geometry,arc).point,regular});
+        samples.push_back({geometry.length(),samplePolylineArc(geometry,geometry.length()).point,regular});
+        for(size_t j=0;j<samples.size();++j) {
+            const double left=j==0?samples[j].arc:samples[j-1].arc;
+            const double right=j+1==samples.size()?samples[j].arc:samples[j+1].arc;
+            samples[j].weight=(right-left)*.5;
         }
-        std::vector<cv::Vec3d> points;points.reserve(ordered.size());
-        for(const auto& s:ordered)points.push_back(s.point);
+        // Explicit source-geometry evaluation for this sampling operation;
+        // stored measurement XYZ is intentionally unavailable in format 4.
+        for(const auto& e:endpoints[f])samples.push_back({e.arc,samplePolylineArc(geometry,std::min(e.arc,geometry.length())).point,e.slot});
+        std::stable_sort(samples.begin(),samples.end(),[](const auto& a,const auto& b){return a.arc<b.arc;});
+    }catch(...){std::lock_guard lock(preparationMutex);if(!preparationFailure)preparationFailure=std::current_exception();}
+    if(preparationFailure)std::rethrow_exception(preparationFailure);
+    std::vector<size_t> offsets(lines.size()+1,0);
+    for(size_t f=0;f<lines.size();++f)offsets[f+1]=offsets[f]+perFiber[f].size();
+    std::vector<Sample> ordered(offsets.back());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for(std::ptrdiff_t f=0;f<static_cast<std::ptrdiff_t>(lines.size());++f) {
+        std::move(perFiber[f].begin(),perFiber[f].end(),ordered.begin()+offsets[f]);
+        std::vector<Sample>().swap(perFiber[f]);
+    }
+    std::vector<std::vector<Sample>>().swap(perFiber);
+    const auto preparedAt=Clock::now();
+    auto plan=vc::core::util::spatialBatches(ordered.size(),batching.regionBaseVoxels,
+        batching.maximumPoints,threads,[&](size_t i){return ordered[i].point;});
+    const auto plannedAt=Clock::now();
+    std::vector<cv::Vec3d> sampledNormals(ordered.size());
+    std::vector<unsigned char> sampledValid(ordered.size(),0);
+    const size_t readWorkers=std::min<size_t>(threads,plan.batches.size());
+    std::vector<double> readSeconds(readWorkers,0.);
+    std::vector<std::unordered_map<size_t,std::string>> readReasons(readWorkers);
+    struct ReadScratch {
+        std::vector<cv::Vec3d> points;
         std::vector<vc::lasagna::NormalSampleWithDerivative> sampled;
-        const auto sampleStarted=Clock::now();
-        (void)normals.sampleNormalBatch(points,false,threads,sampled);
-        sampleSeconds+=std::chrono::duration<double>(Clock::now()-sampleStarted).count();
-        if(sampled.size()!=ordered.size())throw std::runtime_error("Normal batch size differs");
-        for(size_t f=0;f+1<offsets.size();++f) {
+    };
+    std::vector<ReadScratch> readScratch(readWorkers);
+    std::atomic<size_t> donePoints{0};
+    std::atomic<double> lastReadLog{0.};std::mutex readLogMutex;
+    vc::core::util::parallelSpatialBatches(plan.batches.size(),threads,[&](size_t job,size_t worker,int innerWorkers){
+        auto& points=readScratch[worker].points;auto& sampled=readScratch[worker].sampled;
+            const auto [begin,end,weight]=plan.batches[job];points.resize(end-begin);
+            for(size_t j=begin;j<end;++j)points[j-begin]=ordered[plan.order[j]].point;
+            const auto started=Clock::now();
+            (void)normals.sampleNormalBatch(points,false,innerWorkers,sampled);
+            readSeconds[worker]+=std::chrono::duration<double>(Clock::now()-started).count();
+            if(sampled.size()!=points.size())throw std::runtime_error("Normal batch size differs");
+            for(size_t j=begin;j<end;++j) {
+                const auto index=plan.order[j];const auto& value=sampled[j-begin].sample;
+                sampledNormals[index]=value.normal;sampledValid[index]=value.valid;
+                if(!value.valid&&ordered[index].slot!=regular)readReasons[worker].emplace(index,value.reason);
+            }
+            const auto done=donePoints.fetch_add(weight)+weight;
+            const auto seconds=std::chrono::duration<double>(Clock::now()-plannedAt).count();
+            if(done==ordered.size()||seconds-lastReadLog.load()>5.) {
+                std::lock_guard lock(readLogMutex);
+                if(done==ordered.size()||seconds-lastReadLog.load()>5.) {
+                    lastReadLog.store(seconds);
+                    std::cout<<"sample normals points="<<done<<"/"<<ordered.size()<<" seconds="<<seconds<<std::endl;
+                }
+            }
+    });
+    std::unordered_map<size_t,std::string> sampledReasons;
+    for(auto& reasons:readReasons)for(auto& [index,reason]:reasons)sampledReasons.emplace(index,std::move(reason));
+    const auto sampledAt=Clock::now();
+    const auto readBatches=plan.batches.size(),readRegions=plan.regions,maximumBatchPoints=plan.maximumWeight;
+    plan={};
+    // Only the cheap orientation scan is fiber-based: it consumes the already
+    // sampled values in exactly the original arc order. It performs no reads.
+    const size_t fiberBatch=std::max<size_t>(1,std::min<size_t>(256,(lines.size()+threads-1)/threads));
+    const auto workerCount=exportNormalCurves?size_t{1}:std::min<size_t>(threads,(lines.size()+fiberBatch-1)/fiberBatch);
+    std::vector<SweepStats> sweepStats(workerCount);
+    std::atomic<size_t> nextFiber{0},doneFibers{0};std::atomic<bool> failed{false};
+    std::mutex progressMutex;std::vector<std::future<void>> sweepJobs;
+    for(size_t worker=0;worker<workerCount;++worker)sweepJobs.push_back(std::async(std::launch::async,[&,worker]{
+      try {
+       auto& stats=sweepStats[worker];
+       for(size_t begin;!failed.load()&&(begin=nextFiber.fetch_add(fiberBatch))<lines.size();) {
+        const size_t end=std::min(begin+fiberBatch,lines.size());
+        for(size_t f=begin;f<end;++f) {
             FiberNormalOrientationSweep sweep;size_t good=0;
             const auto firstSample=curveSamples;
             for(size_t j=offsets[f];j<offsets[f+1];++j) {
-                auto n=sampled[j].sample.normal;const bool ok=sampled[j].sample.valid;
+                auto n=sampledNormals[j];const bool ok=sampledValid[j];
                 if(ok && (!std::isfinite(n.dot(n)) || std::abs(n.dot(n)-1.)>1e-6))
                     throw std::runtime_error("Non-unit valid normal");
                 const bool flipped=sweep.orient(n,ok);
-                flips+=flipped;invalid+=!ok;good+=ok;
+                stats.flips+=flipped;stats.invalid+=!ok;good+=ok;
                 if(priorUmbilicus && ok && ordered[j].weight>0.) {
                     const cv::Vec3f p(ordered[j].point);
                     const cv::Vec3d radial(-priorUmbilicus->vector_to_umbilicus(p));
                     const double r=cv::norm(radial);
                     if(r>0.) {
-                        priorSum[begin+f]+=ordered[j].weight*n.dot(radial/r);
-                        priorWeight[begin+f]+=ordered[j].weight;
+                        priorSum[f]+=ordered[j].weight*n.dot(radial/r);
+                        priorWeight[f]+=ordered[j].weight;
                     }
                 }
                 if(ordered[j].slot!=regular) {
                     const auto slot=ordered[j].slot;baked[slot]=n;valid[slot]=ok;
-                    endpointFlips+=flipped;invalidEndpoints+=!ok;
+                    if(!ok)stats.invalidReasons.emplace_back(slot,sampledReasons.at(j));
+                    stats.endpointFlips+=flipped;stats.invalidEndpoints+=!ok;
                 }
                 else if(exportNormalCurves) {
                     std::array<double,5> record{ordered[j].arc,n[0],n[1],n[2],ok?1.:0.};
@@ -315,111 +498,229 @@ nlohmann::json orientFiberConstraintDatabase(
                     ++curveSamples;
                 }
             }
-            if(exportNormalCurves)curveIndex.push_back({sourceIds[begin+f],firstSample,curveSamples-firstSample});
-            invalidFibers+=good==0;
+            if(exportNormalCurves)curveIndex.push_back({sourceIds[f],firstSample,curveSamples-firstSample});
+            stats.invalidFibers+=good==0;
         }
-        samplesTotal+=ordered.size();
-        if(begin%8192==0 || end==lines.size())std::cout<<"orient normals fibers="<<end<<"/"<<lines.size()
-            <<" samples="<<samplesTotal<<" seconds="<<std::chrono::duration<double>(Clock::now()-sweepStarted).count()<<std::endl;
-    }
+        stats.samples+=offsets[end]-offsets[begin];const auto done=doneFibers.fetch_add(end-begin)+(end-begin);
+        if(done%8192==0 || done==lines.size()){
+            std::lock_guard lock(progressMutex);
+            std::cout<<"orient normals fibers="<<done<<"/"<<lines.size()
+                <<" seconds="<<std::chrono::duration<double>(Clock::now()-sweepStarted).count()<<std::endl;
+        }
+       }
+      }catch(...){failed.store(true);throw;}
+    }));
+    std::exception_ptr sweepFailure;
+    for(auto& job:sweepJobs)try{job.get();}catch(...){if(!sweepFailure)sweepFailure=std::current_exception();}
+    if(sweepFailure)std::rethrow_exception(sweepFailure);
+    size_t samplesTotal=0,flips=0,endpointFlips=0,invalid=0,invalidEndpoints=0,invalidFibers=0;
+    double sampleSeconds=std::accumulate(readSeconds.begin(),readSeconds.end(),0.);
+    for(const auto& s:sweepStats){samplesTotal+=s.samples;flips+=s.flips;endpointFlips+=s.endpointFlips;
+        invalid+=s.invalid;invalidEndpoints+=s.invalidEndpoints;invalidFibers+=s.invalidFibers;sampleSeconds+=s.sampleSeconds;}
+
     const double sweepSeconds=std::chrono::duration<double>(Clock::now()-sweepStarted).count();
-    if(priorUmbilicus || exportNormalCurves) {
-        // Verify the gauge against ALL stored endpoint normals before exporting priors.
-        query=prepare(src.get(),"SELECT normal_a,normal_b FROM constraints ORDER BY id");
-        size_t count=0;
-        while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
-            for(int side=0;side<2;++side) {
-                const auto slot=2*count+side;
-                const auto n=Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(query.get(),side)));
-                if(n.at("valid").get<bool>()!=bool(valid[slot]))throw std::runtime_error("Prior endpoint validity mismatch");
-                if(valid[slot]) {
-                    const auto& p=n.at("xyz");const cv::Vec3d old{p[0].get<double>(),p[1].get<double>(),p[2].get<double>()};
-                    if(cv::norm(old-baked[slot])>1e-12)throw std::runtime_error("Prior sweep differs from baked normal gauge");
-                }
-            }
-            ++count;
+    size_t attachmentSamples=0;
+    for(const auto& e:endpoints)attachmentSamples+=e.size();
+    FiberConstraintNormalSamples result;
+    result.endpoints=std::move(baked);result.valid=std::move(valid);
+    for(auto& worker:sweepStats)for(auto& [slot,reason]:worker.invalidReasons)
+        result.invalidReasons.emplace(slot,std::move(reason));
+    result.outwardAgreement.resize(lines.size());
+    for(size_t i=0;i<lines.size();++i)
+        result.outwardAgreement[i]=priorWeight[i]>0?priorSum[i]/priorWeight[i]:0.;
+    result.validArcWeight=std::move(priorWeight);
+    result.statistics={{"fibers",lines.size()},{"constraints",events},{"samples",samplesTotal},
+        {"regular_samples",samplesTotal-attachmentSamples},{"attachment_samples",attachmentSamples},
+        {"flipped_samples",flips},{"flipped_endpoints",endpointFlips},{"invalid_samples",invalid},
+        {"invalid_endpoints",invalidEndpoints},{"fibers_without_valid_normals",invalidFibers},
+        {"sample_spacing_base",sampleSpacing},{"sampling_seconds",sampleSeconds},
+        {"sweep_seconds",sweepSeconds},{"sweep_workers",workerCount},
+        {"normal_sample_passes",1},{"cross_fiber_alignment",false},
+        {"read_region_base_voxels",batching.regionBaseVoxels},{"read_point_limit",batching.maximumPoints},
+        {"read_batches",readBatches},{"read_regions",readRegions},{"maximum_batch_points",maximumBatchPoints},
+        {"read_workers",readWorkers},{"coordinate_prepare_seconds",std::chrono::duration<double>(preparedAt-sweepStarted).count()},
+        {"spatial_plan_seconds",std::chrono::duration<double>(plannedAt-preparedAt).count()},
+        {"sampling_wall_seconds",std::chrono::duration<double>(sampledAt-plannedAt).count()},
+        {"orientation_seconds",std::chrono::duration<double>(Clock::now()-sampledAt).count()}};
+    return {std::move(result),std::move(curveIndex)};
+}
+} // namespace
+
+FiberConstraintNormalSamples sampleFiberConstraintNormals(
+    const std::vector<std::string>& sourceIds,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
+    const vc::fiber_tracer::FiberTraceConstraintReport& report,
+    const vc::lasagna::LasagnaNormalSampler& normals,int threads,double sampleSpacing,
+    const vc::core::util::Umbilicus* umbilicus,const FiberNormalBatchOptions& batching) {
+    std::vector<std::vector<NormalEndpoint>> endpoints(lines.size());
+    for(size_t i=0;i<report.constraints.size();++i) {
+        const auto& c=report.constraints[i];
+        endpoints.at(report.pieces.at(c.pieceA).traceIndex).push_back({2*i,c.arcABaseVoxels});
+        endpoints.at(report.pieces.at(c.pieceB).traceIndex).push_back({2*i+1,c.arcBBaseVoxels});
+    }
+    return sampleFiberNormalSweep(sourceIds,lines,endpoints,report.constraints.size(),
+        normals,threads,sampleSpacing,umbilicus,nullptr,batching).data;
+}
+
+void writeFiberConstraintOutwardPriors(const std::filesystem::path& output,
+    const std::vector<std::string>& sourceIds,const FiberConstraintNormalSamples& samples,
+    const Json& sourceSnapshot,const Json& provenance) {
+    if(std::filesystem::exists(output))throw std::runtime_error("Prior output already exists");
+    Json document={{"format","fiber-outward-priors"},{"version",1},{"source_store",sourceSnapshot},
+        {"umbilicus_sha256",provenance.at("config").at("umbilicus_sha256")},
+        {"source_ids",sourceIds},{"agreement",samples.outwardAgreement},
+        {"valid_arc_weight",samples.validArcWeight},{"provenance",provenance},{"statistics",samples.statistics}};
+    std::filesystem::create_directories(output.parent_path());
+    vcr::zarr::atomicWrite(output,document.dump()+"\n");
+}
+
+nlohmann::json orientFiberConstraintDatabase(const std::filesystem::path& input,const std::filesystem::path& output,
+    const std::vector<std::string>& sourceIds,const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
+    const vc::lasagna::LasagnaNormalSampler& normals,int threads,double sampleSpacing,const Json& provenance,
+    const vc::core::util::Umbilicus* priorUmbilicus,bool exportNormalCurves,bool selectedNormalCurves){
+    using namespace vc::fiber_tracer;
+    const auto started=Clock::now();
+    if(sampleSpacing<=0||!std::isfinite(sampleSpacing)||threads<1||lines.size()!=sourceIds.size())
+        throw std::invalid_argument("Invalid normal sampling configuration");
+    if(selectedNormalCurves&&(!exportNormalCurves||sourceIds.empty()))throw std::invalid_argument("Selected export requires fibers and curve output");
+    if(std::filesystem::exists(output))throw std::runtime_error("Output already exists");
+    vo::OpenOptions options;options.readOnly=true;
+    auto store=vo::ObjectCollection::open(input,options);auto txn=store.read();const auto pin=snapshot(store,txn);
+    const auto graphStarted=Clock::now();
+    std::cout<<"reading constraint graph"<<std::endl;
+    auto records=vo::readCompactFiberConstraintGraph(store,txn,threads,[&](const char* stage,size_t count,size_t shard){
+        std::cout<<"graph "<<stage<<" rows="<<count<<" shard="<<shard
+                 <<" seconds="<<std::chrono::duration<double>(Clock::now()-graphStarted).count()<<std::endl;
+    });
+    const double graphSeconds=std::chrono::duration<double>(Clock::now()-graphStarted).count();
+    std::cout<<"read constraint graph events="<<records.size()<<" seconds="<<graphSeconds<<std::endl;
+    const auto schemas=store.extensionTables(txn);
+    const auto spec=std::find_if(schemas.begin(),schemas.end(),[](const auto& t){return t.name==vo::kFiberConstraintTable;});
+    if(spec==schemas.end())throw std::runtime_error("Missing measurement definition");
+    if(Json::parse(spec->provisioning).at("normal_source_sha256")!=normalSourceIdentity(provenance))
+        throw std::runtime_error("Normal source identity differs from extracted measurements");
+    const auto runTable=vo::fiberGraphSolveTable(vo::FiberGraphTable::Runs);
+    bool oriented=false;
+    store.scanExtensionRows(txn,runTable.name,[&](const auto& row){
+        if(std::get<std::string>(row[1])!="normal_orientation")return true;
+        oriented=true;
+        if((priorUmbilicus||exportNormalCurves) &&
+            Json::parse(std::get<std::string>(row[3])).at("sample_spacing_base")!=sampleSpacing)
+            throw std::runtime_error("Normal export spacing must match baked orientation");
+        return true;
+    });
+    if(oriented!=bool(priorUmbilicus||exportNormalCurves))
+        throw std::runtime_error("Orientation requires unaligned input; normal exports require oriented input");
+    std::unordered_map<std::string,size_t> columns;
+    for(size_t i=0;i<spec->columns.size();++i)columns[spec->columns[i].name]=i;
+    std::vector<std::vector<NormalEndpoint>> endpoints(sourceIds.size());
+    struct UuidHash{size_t operator()(const vo::FiberGraphUuid& key)const{
+        uint64_t h=14695981039346656037ULL;for(auto b:key){h^=b;h*=1099511628211ULL;}return h;}};
+    std::unordered_map<vo::FiberGraphUuid,size_t,UuidHash> index;
+    std::vector<double> lengths(sourceIds.size());
+    for(size_t i=0;i<sourceIds.size();++i){
+        if(!index.emplace(vo::fiberGraphUuid(sourceIds[i]),i).second)throw std::runtime_error("Duplicate source fiber");
+        lengths[i]=makePolylineArcGeometry(lines[i].pointsBaseXYZ).length();
+    }
+    if(selectedNormalCurves)std::erase_if(records,[&](const auto& r){return !index.contains(r.a)&&!index.contains(r.b);});
+    const auto events=records.size();const auto fiberCount=sourceIds.size();
+    std::vector<unsigned char> selectedSlots(2*events);
+    for(size_t e=0;e<events;++e)for(int side=0;side<2;++side){
+        const auto& r=records[e];const auto found=index.find(side?r.b:r.a);
+        selectedSlots[2*e+side]=found!=index.end();
+        if(found==index.end()){if(!selectedNormalCurves)throw std::runtime_error("Missing constraint fiber");continue;}
+        const auto arc=side?r.arcB:r.arcA;const auto length=lengths[found->second];
+        if(arc<0||arc>std::max(length,double(float(length))))throw std::runtime_error("Invalid constraint arc");
+        endpoints[found->second].push_back({2*e+side,arc});
+    }
+    auto partial=output;partial+=".partial";
+    if(std::filesystem::exists(partial))throw std::runtime_error("Partial export already exists");
+    struct Cleanup{std::filesystem::path path;~Cleanup(){std::error_code e;std::filesystem::remove_all(path,e);}} cleanup{partial};
+    std::ofstream curveStream;
+    if(exportNormalCurves){
+        if(priorUmbilicus)throw std::invalid_argument("Choose curve export or outward priors");
+        std::filesystem::create_directories(partial);curveStream.open(partial/"normals.bin",std::ios::binary);
+        if(!curveStream)throw std::runtime_error("Cannot create curve payload");
+    }
+    auto sweep=sampleFiberNormalSweep(sourceIds,lines,endpoints,events,normals,threads,sampleSpacing,
+        priorUmbilicus,exportNormalCurves?&curveStream:nullptr);
+    const auto& baked=sweep.data.endpoints;const auto& valid=sweep.data.valid;
+    const auto& curveIndex=sweep.curveIndex;
+    // Keep the original geometric sweep: validity, axes and gauge are checked.
+    size_t checkedEndpoints=0,changed=0,comparedNormals=0;
+    double axisAngleSum=0.,axisAngleMax=0.,orientedAngleSum=0.,orientedAngleMax=0.;
+    for(size_t e=0;e<events;++e)for(int side=0;side<2;++side){
+        const auto slot=2*e+side;if(!selectedSlots[slot])continue;++checkedEndpoints;
+        const auto& r=records[e];const bool ok=side?r.validB:r.validA;const auto& p=side?r.normalB:r.normalA;
+        if(ok!=bool(valid[slot]))throw std::runtime_error("Endpoint validity changed");
+        if(ok){const cv::Vec3d old(p[0],p[1],p[2]);
+            const auto quantized=vo::decodeFiberDirection(vo::encodeFiberDirection({baked[slot][0],baked[slot][1],baked[slot][2]}));
+            const cv::Vec3d decoded(quantized[0],quantized[1],quantized[2]);
+            // Arc float32 storage and compact axes are deliberately quantized;
+            // source identity is checked above, orientation is checked here.
+            const auto dot=std::clamp(old.dot(decoded),-1.,1.);
+            const double angle=std::acos(dot)*180./std::acos(-1.);
+            const double axisAngle=std::acos(std::abs(dot))*180./std::acos(-1.);
+            ++comparedNormals;axisAngleSum+=axisAngle;axisAngleMax=std::max(axisAngleMax,axisAngle);
+            orientedAngleSum+=angle;orientedAngleMax=std::max(orientedAngleMax,angle);
+            if((priorUmbilicus||exportNormalCurves)&&old.dot(decoded)<0.)throw std::runtime_error("Requested export needs previously oriented normals");
         }
-        check(src.get(),rc);if(count!=events)throw std::runtime_error("Prior endpoint count mismatch");
-        if(exportNormalCurves) {
-            curveStream.close();if(!curveStream)throw std::runtime_error("Normal curve write failed");
-            Json stats={{"fibers",fiberCount},{"checked_endpoints",2*events},{"samples",curveSamples},
-                {"invalid_samples",invalid},{"sample_spacing_base",sampleSpacing},
-                {"sampling_seconds",sampleSeconds},{"sweep_seconds",sweepSeconds},
-                {"total_seconds",std::chrono::duration<double>(Clock::now()-started).count()}};
-            Json doc={{"format","fiber-normal-curves"},{"version",1},{"dtype","<f8"},
-                {"columns",{"arc","nx","ny","nz","valid"}},
-                {"index",curveIndex},{"statistics",stats},{"provenance",provenance},
-                {"normal_convention","fiber-local baked gauge; apply stage1 normal_sign"}};
-            vcr::zarr::atomicWrite(partial/"index.json",doc.dump()+"\n");
-            std::filesystem::rename(partial,output);return stats;
-        }
-        std::vector<double> agreement(lines.size());
-        for(size_t i=0;i<lines.size();++i)agreement[i]=priorWeight[i]>0?priorSum[i]/priorWeight[i]:0.;
-        Json stats={{"fibers",fiberCount},{"checked_endpoints",2*events},{"sample_spacing_base",sampleSpacing},
-            {"invalid_samples",invalid},{"sweep_seconds",sweepSeconds},
-            {"total_seconds",std::chrono::duration<double>(Clock::now()-started).count()}};
-        Json document={{"format","fiber-outward-priors"},{"version",1},{"source_database",input.string()},
-            {"source_database_sha256",provenance.at("config").at("source_database_sha256")},
-            {"umbilicus_sha256",provenance.at("config").at("umbilicus_sha256")},
-            {"source_ids",sourceIds},{"agreement",agreement},{"valid_arc_weight",priorWeight},
-            {"provenance",provenance},{"statistics",stats}};
-        std::filesystem::create_directories(output.parent_path());
-        vcr::zarr::atomicWrite(output,document.dump()+"\n");
+    }
+    auto stats=sweep.data.statistics;
+    stats["compact_resampled_normal_comparisons"]=comparedNormals;
+    stats["compact_resampled_axis_angle_mean_degrees"]=comparedNormals?axisAngleSum/comparedNormals:0.;
+    stats["compact_resampled_axis_angle_max_degrees"]=axisAngleMax;
+    stats["compact_resampled_oriented_angle_mean_degrees"]=comparedNormals?orientedAngleSum/comparedNormals:0.;
+    stats["compact_resampled_oriented_angle_max_degrees"]=orientedAngleMax;
+    stats["checked_endpoints"]=checkedEndpoints;stats["graph_read_seconds"]=graphSeconds;
+    if(exportNormalCurves){
+        curveStream.close();if(!curveStream)throw std::runtime_error("Normal curve write failed");
+        Json doc={{"format","fiber-normal-curves"},{"version",1},{"dtype","<f8"},
+            {"columns",{"arc","nx","ny","nz","valid"}},{"index",curveIndex},{"statistics",stats},
+            {"provenance",provenance},{"normal_convention","fiber-local baked gauge; apply stage1 normal_sign"}};
+        vcr::zarr::atomicWrite(partial/"index.json",doc.dump()+"\n");
+        std::filesystem::rename(partial,output);return stats;
+    }
+    if(priorUmbilicus){
+        writeFiberConstraintOutwardPriors(output,sourceIds,sweep.data,
+            {{"store_uuid",pin.storeUuid},{"generation",pin.generation},{"commit_sequence",pin.commitSequence}},provenance);
         return stats;
     }
-    std::filesystem::create_directories(output.parent_path());
-    auto dst=open(partial,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
-    std::cout<<"orientation: cloning original database"<<std::endl;
-    sqlite3_backup* backup=sqlite3_backup_init(dst.get(),"main",src.get(),"main");
-    if(!backup)throw std::runtime_error(sqlite3_errmsg(dst.get()));
-    const int copyRc=sqlite3_backup_step(backup,-1);const int finishRc=sqlite3_backup_finish(backup);
-    check(dst.get(),copyRc);check(dst.get(),finishRc);
-    const auto exec=[&](const char* sql){check(dst.get(),sqlite3_exec(dst.get(),sql,nullptr,nullptr,nullptr));};
-    exec("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; ALTER TABLE fibers ADD COLUMN normal_sign INTEGER NOT NULL DEFAULT 1 CHECK(normal_sign IN(-1,1)); PRAGMA user_version=2;");
-    auto update=prepare(dst.get(),"UPDATE constraints SET normal_a=?,normal_b=? WHERE id=?");
-    query=prepare(src.get(),"SELECT id,normal_a,normal_b FROM constraints ORDER BY id");
-    size_t count=0;
-    while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
-        for(int side=0;side<2;++side) {
-            const auto slot=2*count+side;
-            auto n=Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(query.get(),1+side)));
-            if(n.at("valid").get<bool>()!=bool(valid[slot]))throw std::runtime_error("Endpoint validity changed");
-            if(valid[slot]) {
-                const auto& p=n.at("xyz");const cv::Vec3d old{p[0].get<double>(),p[1].get<double>(),p[2].get<double>()};
-                if(std::min(cv::norm(old-baked[slot]),cv::norm(old+baked[slot]))>1e-12)
-                    throw std::runtime_error("Endpoint normal axis changed, not merely sign");
-                n["xyz"]=point(baked[slot]);
+    auto importing=importOptions(input,fiberConstraintDatabaseOptions(provenance.at("config")));
+    vo::ExtensionTable measured;measured.name=spec->name;measured.extension=spec->extension;measured.formatVersion=spec->formatVersion;
+    measured.provisioning=spec->provisioning;measured.basedOn={pin};measured.columns=spec->columns;measured.primaryKey=spec->primaryKey;
+    measured.indexes=spec->indexes;measured.keySpace=spec->keySpace;
+    importing.extensions.push_back(measured);resultDefinitions(importing,pin);
+    vo::imports::ParallelImportOptions queueOptions;
+    queueOptions.shards=importing.shards.size();queueOptions.batchRows=4096;
+    vo::imports::StreamFailure failure;
+    vo::imports::ShardQueues<vo::ExtensionRow> queues(queueOptions.shards,queueOptions.queueBytes/queueOptions.shards,failure);
+    std::atomic<size_t> changedRows{0};
+    auto scanMeasurements=vo::prepareFiberConstraintMeasurementScan(store,txn,records,threads,[&](vo::FiberMeasurementBatch&& batch){
+            vo::imports::ShardEmitter<vo::ExtensionRow> emitter(queues,failure,queueOptions);
+            for(auto& [e,row]:batch){bool different=false;
+                for(int side=0;side<2;++side)if(valid[2*e+side]){
+                    auto& value=std::get<std::vector<uint8_t>>(row[columns.at(side?"normal_b":"normal_a")]);
+                    const auto& n=baked[2*e+side];const auto now=vo::encodeFiberDirection({n[0],n[1],n[2]});
+                    different|=value!=now;value=now;
+                }
+                if(different){const auto bytes=row.size()*sizeof(vo::ExtensionValue);
+                    emitter.emit(std::move(row),bytes,vo::fiberGraphUuid(records[e].uuid));++changedRows;}
             }
-            const auto str=n.dump();check(dst.get(),sqlite3_bind_text(update.get(),side+1,str.c_str(),int(str.size()),SQLITE_TRANSIENT));
-        }
-        check(dst.get(),sqlite3_bind_int64(update.get(),3,count));check(dst.get(),sqlite3_step(update.get()));
-        check(dst.get(),sqlite3_reset(update.get()));++count;
-        if(count%262144==0)std::cout<<"oriented endpoint publication "<<count<<"/"<<events<<std::endl;
-    }
-    check(src.get(),rc);
-    if(count!=events)throw std::runtime_error("Endpoint count changed");
-    Json stats={{"fibers",fiberCount},{"constraints",events},{"samples",samplesTotal},{"flipped_samples",flips},
-        {"flipped_endpoints",endpointFlips},{"invalid_samples",invalid},{"invalid_endpoints",invalidEndpoints},
-        {"fibers_without_valid_normals",invalidFibers},{"sample_spacing_base",sampleSpacing},
-        {"sampling_seconds",sampleSeconds},{"sweep_seconds",sweepSeconds},
-        {"source_database",input.string()},{"cross_fiber_alignment",false}};
-    auto meta=prepare(dst.get(),"INSERT OR REPLACE INTO metadata VALUES(?,?)");
-    const auto put=[&](const char* key,const Json& value) {
-        const auto str=value.dump();check(dst.get(),sqlite3_bind_text(meta.get(),1,key,-1,SQLITE_STATIC));
-        check(dst.get(),sqlite3_bind_text(meta.get(),2,str.c_str(),int(str.size()),SQLITE_TRANSIENT));
-        check(dst.get(),sqlite3_step(meta.get()));check(dst.get(),sqlite3_reset(meta.get()));
-    };
-    put("schema_version",2);put("normal_orientation",stats);put("normal_orientation_provenance",provenance);
-    put("normal_semantics","fiber-local signed unit sheet normals; effective normal=normal_sign*baked normal; first valid sample anchors gauge; invalid gaps retain last valid orientation; no cross-fiber alignment");
-    exec("COMMIT;");
-    auto integrity=prepare(dst.get(),"PRAGMA quick_check");
-    if(sqlite3_step(integrity.get())!=SQLITE_ROW || std::string(reinterpret_cast<const char*>(sqlite3_column_text(integrity.get(),0)))!="ok")
-        throw std::runtime_error("Oriented database integrity failure");
-    auto fk=prepare(dst.get(),"PRAGMA foreign_key_check");
-    if(sqlite3_step(fk.get())!=SQLITE_DONE)throw std::runtime_error("Oriented database foreign-key failure");
-    fk.reset();integrity.reset();meta.reset();update.reset();query.reset();dst.reset();src.reset();
-    std::filesystem::rename(partial,output);
-    stats["total_seconds"]=std::chrono::duration<double>(Clock::now()-started).count();
-    stats["database_bytes"]=std::filesystem::file_size(output);
-    return stats;
+            emitter.finish();
+        });
+    const auto run=vo::util::newUuid();
+    std::filesystem::create_directories(output.parent_path());
+    auto producer=std::async(std::launch::async,[&]{try{scanMeasurements();queues.close();
+    }catch(...){failure.fail(std::current_exception());throw;}});
+    vo::InitialImportResult result;
+    try{result=vo::importInitialCollection(output,importing,[&](size_t shard,auto& writer){
+        if(shard==0)appendRun(writer,run,"normal_orientation",pin,{{"sample_spacing_base",sampleSpacing}});
+        std::vector<vo::ExtensionRow> batch;
+        while(queues.pop(shard,batch,[&]{writer.checkCancelled();}))writer.appendExtensionRows(vo::kFiberConstraintTable,batch);
+    });producer.get();}catch(...){failure.fail(std::current_exception());if(producer.valid())producer.wait();throw;}
+    changed=changedRows.load();
+    stats["updated_constraints"]=changed;stats["run_uuid"]=run;stats["path"]=result.path.string();
+    stats["ingestion_seconds"]=result.ingestionSeconds;stats["persistence_seconds"]=result.persistenceSeconds;
+    stats["total_seconds"]=std::chrono::duration<double>(Clock::now()-started).count();return stats;
 }

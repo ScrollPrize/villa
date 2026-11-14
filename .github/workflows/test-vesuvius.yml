@@ -43,8 +43,10 @@ jobs:
             curl \
             git \
             libblosc-dev \
+            libblosc2-dev \
             libboost-dev \
             libceres-dev \
+            libconcurrentqueue-dev \
             libcurl4-openssl-dev \
             libeigen3-dev \
             liblz4-dev \

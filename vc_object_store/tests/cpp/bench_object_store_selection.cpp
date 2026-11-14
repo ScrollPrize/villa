@@ -15,6 +15,8 @@
 //   bench_object_store_selection geometry STORE [COUNT] [ITERATIONS]
 //       Times local geometry reads of COUNT fibers: descriptors and control
 //       points one revision at a time, and one packed batch.
+//   bench_object_store_selection scan STORE [COUNT] [ITERATIONS]
+//       Read-only bounded composed-catalog scan; records SQL work and CPU/wall.
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
@@ -22,6 +24,9 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Selections.hpp"
 #include "vc_object_store/server/Server.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
+#include "internal/CollectionReads.hpp"
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <atomic>
@@ -33,6 +38,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <string_view>
 
 #include <sys/resource.h>
 
@@ -41,6 +47,55 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 double seconds(Clock::time_point start) { return std::chrono::duration<double>(Clock::now() - start).count(); }
+
+double cpuSeconds()
+{
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    return double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
+        double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
+}
+
+int scan(const std::string& path, int64_t count, int iterations)
+{
+    if(count<1||iterations<1)throw std::invalid_argument("scan count and iterations must be positive");
+    OpenOptions options;options.readOnly=true;
+    auto opened=Clock::now();
+    auto store=ObjectCollection::open(path,options);auto txn=store.read();
+    const auto parts=detail::CollectionScanAccess::partitions(store,txn);
+    struct Counters {size_t statements=0,stateProbes=0,decodedRows=0;} counters;
+    struct Traces {
+        std::vector<sqlite3*> connections;
+        ~Traces(){for(auto* db:connections)sqlite3_trace_v2(db,0,nullptr,nullptr);}
+    } traces;
+    for(const auto& part:parts){
+        traces.connections.push_back(part.db);
+        sqlite3_trace_v2(part.db,SQLITE_TRACE_STMT|SQLITE_TRACE_ROW,
+            [](unsigned event,void* value,void* query,void*){
+                auto& c=*static_cast<Counters*>(value);auto* statement=static_cast<sqlite3_stmt*>(query);
+                if(event==SQLITE_TRACE_STMT){
+                    ++c.statements;
+                    const std::string_view sql=sqlite3_sql(statement);
+                    if(sql.starts_with("SELECT state FROM objects WHERE uuid="))++c.stateProbes;
+                }else if(sqlite3_column_count(statement)>=23&&
+                    std::string_view(sqlite3_column_name(statement,0))=="id"&&
+                    std::string_view(sqlite3_column_name(statement,1))=="uuid")++c.decodedRows;
+                return 0;
+            },&counters);
+    }
+    const auto openSeconds=seconds(opened);
+    for(int iteration=0;iteration<iterations;++iteration){
+        counters={};size_t rows=0;auto start=Clock::now();const auto cpu=cpuSeconds();
+        store.scanObjects(txn,[&](const CollectionObject&){return ++rows<size_t(count);},"fiber");
+        const auto elapsed=seconds(start);
+        std::cout<<nlohmann::json{{"mode","scan"},{"iteration",iteration},{"rows",rows},
+            {"open_seconds",openSeconds},{"wall_seconds",elapsed},{"cpu_seconds",cpuSeconds()-cpu},
+            {"rows_per_second",rows/elapsed},{"sql_statements",counters.statements},
+            {"state_probes",counters.stateProbes},{"decoded_rows",counters.decodedRows},
+            {"physical_sources",parts.size()}}.dump()<<'\n';
+    }
+    return 0;
+}
 
 long maxRssMiB()
 {
@@ -378,6 +433,8 @@ int geometry(const std::string& path, std::int64_t count, int iterations)
 int main(int argc, char** argv)
 try {
     const std::string mode = argc > 1 ? argv[1] : "";
+    if (mode == "scan" && argc >= 3 && argc <= 5)
+        return scan(argv[2],argc >= 4 ? std::stoll(argv[3]) : 10000,argc == 5 ? std::stoi(argv[4]) : 3);
     if (mode == "create" && argc == 4) return create(argv[2], std::stoll(argv[3]));
     if (mode == "list" && (argc == 3 || argc == 4)) return list(argv[2], argc == 4 ? std::stoi(argv[3]) : 3);
     if (mode == "record" && (argc == 3 || argc == 4)) return record(argv[2], argc == 4 ? std::stoi(argv[3]) : 3);
@@ -386,7 +443,8 @@ try {
     if (mode == "geometry" && argc >= 3 && argc <= 5)
         return geometry(argv[2], argc >= 4 ? std::stoll(argv[3]) : 10000, argc == 5 ? std::stoi(argv[4]) : 5);
     std::cerr << "usage: bench_object_store_selection create STORE COUNT | list STORE [ITERATIONS] |"
-                 " versions STORE [COUNT] [ITERATIONS] | record STORE [ITERATIONS] | geometry STORE [COUNT] [ITERATIONS]\n";
+                 " versions STORE [COUNT] [ITERATIONS] | record STORE [ITERATIONS] | geometry STORE [COUNT] [ITERATIONS] |"
+                 " scan STORE [COUNT] [ITERATIONS]\n";
     return 2;
 } catch (const std::exception& error) {
     std::cerr << "bench_object_store_selection: " << error.what() << "\n";

@@ -234,7 +234,7 @@ int main() try
     const auto edge = util::newUuid();
     {
         auto request = metaRequest(identity, expected, {{a, "note", "1"}, {b, "note", "2"}});
-        EdgeRecord link; link.uuid = edge; link.kind = "mixed"; link.aUuid = a; link.bUuid = b;
+        EdgeRecord link; link.uuid = edge; link.kind = "declared_reference"; link.aUuid = a; link.bUuid = b;
         request.operations.push_back(AddEdgeOp{edgeRecordJson(link)});
         session.submit(identity, request);
     }
@@ -242,7 +242,7 @@ int main() try
     require(events.size() == 1 && events[0].changes.size() == 3, "mixed request notification");
     require(events[0].attachment == identity && events[0].journalPosition > 0, "event identity and journal");
     for (const auto& change : events[0].changes)
-        require(change.kind == (change.recordUuid == edge ? "mixed" : change.recordUuid == a ? "fiber" : "point_collection"), "changes carry record kinds");
+        require(change.kind == (change.recordUuid == edge ? "declared_reference" : change.recordUuid == a ? "fiber" : "point_collection"), "changes carry record kinds");
     const auto committed = heads(identity);
     mustFail([&] { session.submit(identity, metaRequest(identity, expected, {{a, "stale", "true"}})); });
     require(heads(identity) == committed && session.takeEvents().empty(), "conflict leaves no changes");
@@ -274,7 +274,7 @@ int main() try
     require(events.size() == 1 && events[0].changes.size() == 1 && events[0].changes[0].recordUuid == b, "external notification");
     { auto txn = external.write(); external.removeEdge(txn, edge); txn.commit(); }
     events = session.takeEvents();
-    require(events.size() == 1 && events[0].changes[0].kind == "mixed", "deletions keep their record kind");
+    require(events.size() == 1 && events[0].changes[0].kind == "declared_reference", "deletions keep their record kind");
 
     // Same expected version submitted concurrently: exactly one request wins.
     expected = heads(identity);
@@ -611,7 +611,7 @@ int main() try
         session.submit(directAttachment, create(directAttachment, {peerRecord}));
         auto link = session.newRequest(directAttachment);
         link.expectedObjects = testNumberedGuards(session, directAttachment, {{uuid, 3}, {peer, 1}});
-        EdgeRecord edge; edge.uuid = util::newUuid(); edge.kind = "test_link";
+        EdgeRecord edge; edge.uuid = util::newUuid(); edge.kind = "declared_reference";
         edge.aUuid = uuid; edge.bUuid = peer;
         edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
         link.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});

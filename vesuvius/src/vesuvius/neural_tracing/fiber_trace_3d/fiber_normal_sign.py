@@ -3,13 +3,13 @@ import argparse
 import json
 import os
 from pathlib import Path
-import sqlite3
 import sys
 import time
 import subprocess
 
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
+from .fiber_graph_store import FiberGraph, store_digest, write_results
 
 
 def sign_alignment_terms(sign_logits, prior, i, j, dot, keep=None):
@@ -49,69 +49,58 @@ def metrics(u, v, a, i, j, dot):
                     uncertain_signs_percent=float(100*((u.sigmoid()>.1)&(u.sigmoid()<.9)).float().mean()))
 
 
-def prepare(config):
+def prepare(config, *, graph=None, return_arrays=False, prior=None):
     """Convert fixed evidence once; no geometry or model evaluation in optimization."""
     started = time.monotonic()
     db_path, prior_path = Path(config['database']), Path(config['priors'])
-    signature = dict(version=2, database_sha256=sha256_file(db_path), priors_sha256=sha256_file(prior_path))
-    cache = Path(config['tensor_cache'])
+    signature = dict(version=3, database_sha256=store_digest(db_path), priors_sha256=sha256_file(prior_path))
+    cache = Path(config.get('tensor_cache',Path(config.get('output_root','.'))/'tensors.npz'))
     stamp = cache.with_suffix('.json')
-    if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature'] == signature:
+    if not return_arrays and cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature'] == signature:
         return cache
-    prior = json.loads(prior_path.read_text())
-    if prior['format'] != 'fiber-outward-priors' or Path(prior['source_database']).resolve()!=db_path.resolve():
-        raise ValueError('Prior database identity differs')
-    if prior.get('source_database_sha256')!=signature['database_sha256']:
-        raise ValueError('Priors were generated from different database content (or lack a fingerprint)')
-    db = sqlite3.connect(db_path.resolve().as_uri()+'?mode=ro', uri=True)
-    meta = {k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
-    if meta['schema_version']!=2 or not meta['complete']:
-        raise ValueError('Signed schema2 database required')
-    fibers = db.execute('SELECT id,normal_sign FROM fibers ORDER BY source_index').fetchall()
-    ids = np.asarray([f[0] for f in fibers], dtype=str)
-    if not all(f[1]==1 for f in fibers) or not np.all(ids[1:]>ids[:-1]):
-        raise ValueError('Expected original +1 gauge multipliers and ascending source IDs')
-    if not np.array_equal(ids,np.asarray(prior['source_ids'],dtype=str)):
+    prior = json.loads(prior_path.read_text()) if prior is None else prior
+    graph = FiberGraph(db_path) if graph is None else graph
+    from .fiber_graph_store import snapshot_digest
+    if snapshot_digest(graph.source) != signature['database_sha256']:
+        raise ValueError('Prepared graph belongs to another snapshot')
+    if prior['format'] != 'fiber-outward-priors' or prior.get('source_store') != graph.source:
+        raise ValueError('Priors were generated from another store snapshot')
+    ids = graph.ids
+    if not np.array_equal(ids, np.asarray(prior['source_ids'], dtype=str)):
         raise ValueError('Prior/source fiber IDs differ')
-    a = np.asarray(prior['agreement'],dtype=np.float32)
-    if len(a)!=len(ids) or not np.isfinite(a).all() or np.any(abs(a)>1.000001):
+    a = np.asarray(prior['agreement'], dtype=np.float32)
+    if len(a) != len(ids) or not np.isfinite(a).all() or np.any(abs(a) > 1.000001):
         raise ValueError('Invalid radial priors')
-    if prior['statistics']['sample_spacing_base']!=meta['normal_orientation']['sample_spacing_base']:
-        raise ValueError('Prior orientation sampling differs')
-    terms = [f"json_extract(normal_a,'$.xyz[{k}]')*json_extract(normal_b,'$.xyz[{k}]')" for k in range(3)]
-    eligible = "perpendicular_score>parallel_score"
-    valid = "json_extract(normal_a,'$.valid') AND json_extract(normal_b,'$.valid')"
-    total = db.execute(f'SELECT count(*) FROM constraints WHERE {eligible}').fetchone()[0]
-    cursor = db.execute(f'SELECT id,fiber_a,fiber_b,{"+".join(terms)} FROM constraints WHERE {eligible} AND {valid} ORDER BY id')
-    chunks=[]
-    while rows:=cursor.fetchmany(65536):
-        chunks.append((np.asarray([r[0] for r in rows],dtype=np.int64),np.asarray([r[1:3] for r in rows],dtype=str),
-                       np.asarray([r[3] for r in rows],dtype=np.float64)))
-    event_ids=np.concatenate([c[0] for c in chunks]) if chunks else np.empty(0,dtype=np.int64)
-    endpoints=np.concatenate([c[1] for c in chunks]) if chunks else np.empty((0,2),dtype=ids.dtype)
-    dot=np.concatenate([c[2] for c in chunks]) if chunks else np.empty(0,dtype=np.float64)
-    indices=np.searchsorted(ids,endpoints)
-    if np.any(indices>=len(ids)) or not np.array_equal(ids[indices],endpoints):
-        raise ValueError('Unknown constraint fiber')
+    eligible = ~graph.parallel
+    valid = eligible & graph.valid_a & graph.valid_b
+    total = int(eligible.sum())
+    event_ids = graph.event_ids[valid]
+    indices = np.column_stack((graph.i[valid], graph.j[valid]))
+    dot = np.sum(graph.normal_a[valid]*graph.normal_b[valid], axis=1)
     dot=dot.astype(np.float32)
     if not np.isfinite(dot).all() or np.any(abs(dot)>1.000001):
         raise ValueError('Invalid normal dot products')
     dot=np.clip(dot,-1,1)
-    cache.parent.mkdir(parents=True,exist_ok=True)
-    temporary=cache.with_suffix('.partial.npz')
-    np.savez(temporary,ids=ids,prior=a,i=indices[:,0],j=indices[:,1],dot=dot,event_ids=event_ids)
-    temporary.replace(cache)
+    data=dict(ids=ids,lengths=graph.lengths.copy() if return_arrays else graph.lengths,
+              prior=a,i=indices[:,0],j=indices[:,1],dot=dot,event_ids=event_ids)
     degree=np.bincount(indices.ravel(),minlength=len(ids))
     stats=dict(signature=signature,fibers=len(ids),perpendicular_events=total,
                used_events=len(dot),invalid_events_skipped=total-len(dot),
-               isolated_fibers=int((degree==0).sum()),tensor_bytes=cache.stat().st_size,
+               isolated_fibers=int((degree==0).sum()),tensor_bytes=0,
                seconds=time.monotonic()-started)
+    if return_arrays:return data,stats
+    cache.parent.mkdir(parents=True,exist_ok=True)
+    temporary=cache.with_suffix('.partial.npz');np.savez(temporary,**data);temporary.replace(cache)
+    stats['tensor_bytes']=cache.stat().st_size
     atomic_write(stamp,stats,durable=False)
     print('tensor preparation '+json.dumps(stats),flush=True)
     return cache
 
 
 def solve(config):
+    if config.get('optimizer')=='wrapped_irls':
+        from .fiber_wrapped_stages import solve_stage
+        return solve_stage(config,'normal_sign')
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA required for production sign solve; no CPU fallback')
@@ -160,10 +149,18 @@ def solve(config):
             total.backward();optimizer.step()
         with torch.no_grad():
             from .fiber_normal_convention import inward_solution
-            np.savez(root/f'solution_{label}.npz',**inward_solution(dict(ids=data['ids'],
+            saved=inward_solution(dict(ids=data['ids'],
                      sign_probability=u.sigmoid().cpu().numpy(),broken_probability=v.sigmoid().cpu().numpy(),
                      normal_sign=torch.where(u>=0,1,-1).cpu().numpy().astype(np.int8),
-                     broken=(v>=0).cpu().numpy(),sign_logit=u.cpu().numpy(),broken_logit=v.cpu().numpy())))
+                     broken=(v>=0).cpu().numpy(),sign_logit=u.cpu().numpy(),broken_logit=v.cpu().numpy()))
+            np.savez(root/f'solution_{label}.npz',**saved)
+        if config.get('write_result_store',True):
+            write_results(root/f'solution_{label}.vcobj',[config['database']], 'normal_sign', method,
+                {'fibers':[dict(fiber_uuid=str(fid),normal_sign=int(sign),enabled=int(not broken),
+                                sign_probability=float(p),p_broken=float(pb))
+                    for fid,sign,broken,p,pb in zip(saved['ids'],saved['normal_sign'],saved['broken'],
+                                                   saved['sign_probability'],saved['broken_probability'])]},
+                settings=dict(broken_penalty=float(penalty),steps=steps,lr=float(lr)))
         summaries.append(dict(broken_penalty=penalty,initial=history[0],final=history[-1],
                               all_broken_objective=penalty+weak*(1-float(a.abs().mean()))/2))
     summary=dict(config=config,baselines=baselines,runs=summaries,
@@ -260,6 +257,9 @@ def launch_tensor_solve(config,module,source):
     config=dict(config,code_provenance=dict(
         revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),
         optimizer_sha256=sha256_file(source)))
+    if config.get('optimizer')=='wrapped_irls':
+        for name in ('fiber_wrapped_irls','fiber_wrapped_stages'):
+            config['code_provenance'][name+'_sha256']=sha256_file(Path(__file__).with_name(name+'.py'))
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     frozen=root/'config.json'
     if (root/'summary.json').exists(): raise FileExistsError('Completed output exists')
@@ -275,12 +275,12 @@ def run_priors(config):
     from .constraint_extraction import run_native_constraints
     native=json.loads(Path(config['native_config']).read_text())
     source=Path(native['orient_database']);umbilicus=Path(native['umbilicus'])
-    native['source_database_sha256']=sha256_file(source)
+    native['source_database_sha256']=store_digest(source)
     native['umbilicus_sha256']=sha256_file(umbilicus)
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     frozen=root/'native_config.json';atomic_write(frozen,native,durable=False)
     run_native_constraints(frozen, config)
-    if sha256_file(source)!=native['source_database_sha256'] or sha256_file(umbilicus)!=native['umbilicus_sha256']:
+    if store_digest(source)!=native['source_database_sha256'] or sha256_file(umbilicus)!=native['umbilicus_sha256']:
         artifact=Path(native['normal_prior_output'])
         artifact.rename(artifact.with_name(artifact.name+'.invalid'))
         raise RuntimeError('Inputs changed during prior export; output must not be used')

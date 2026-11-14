@@ -5,6 +5,7 @@
 #include "atomic_file.hpp"
 #include "lru.hpp"
 #include "platform_io.hpp"
+#include "coordination_trace.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -138,13 +139,14 @@ public:
     explicit File(int fd) : fd_(fd) {}
     File(File&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
     File& operator=(File&& o) noexcept { std::swap(fd_, o.fd_); return *this; }
-    ~File() { if (fd_ >= 0) ::close(fd_); }
+    ~File() { if (fd_ >= 0) { diagnostics::SourceElapsed elapsed(diagnostics::SchedulerMetric::FileClose); ::close(fd_); } }
     int fd() const noexcept { return fd_; }
     explicit operator bool() const noexcept { return fd_ >= 0; }
 
     // Opens for reading; an empty File if it does not exist.
     static File open_read(const std::string& path)
     {
+        diagnostics::SourceElapsed elapsed(diagnostics::SchedulerMetric::FileOpen);
         const int fd = platform::open_file(path, O_RDONLY);
         if (fd < 0 && errno != ENOENT && errno != ENOTDIR)
             throw std::system_error(errno, std::generic_category(), "open " + path);
@@ -164,6 +166,7 @@ inline bool exists(const std::string& path)
 // Reads exactly n bytes at offset; throws on a short read.
 inline void pread_exact(int fd, std::uint8_t* dst, std::size_t n, std::int64_t offset, const std::string& what)
 {
+    diagnostics::SourceElapsed elapsed(diagnostics::SchedulerMetric::FileRead,n);
     std::size_t got = 0;
     while (got < n) {
         const auto k = platform::pread(fd, dst + got, n - got, offset + static_cast<std::int64_t>(got));

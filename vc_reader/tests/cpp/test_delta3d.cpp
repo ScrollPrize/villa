@@ -16,7 +16,7 @@ int main()
                 for (std::size_t i = 0; i < raw.size(); ++i) raw[i] = (i * 17 + i / 113) % 256;
                 const auto encoded = vcr::encode_delta3d(raw.data(), raw.size(), shape, itemsize);
                 require(vcr::delta3d_lossless(encoded.data(), encoded.size()), "lossless cache rejected");
-                std::vector<std::uint8_t> decoded(raw.size());
+                std::vector<std::uint8_t> decoded(raw.size(),0xa5);
                 vcr::decode(vcr::Codec::Delta3d, encoded.data(), encoded.size(), decoded.data(), decoded.size());
                 require(decoded == raw, "roundtrip mismatch");
                 const auto bytes = std::as_bytes(std::span(raw));

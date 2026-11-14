@@ -172,9 +172,9 @@ def test_unusable_edges_report_errors_independently(db):
     # Edges from before the pose's frame and direction were recorded must be re-detected.
     old_fit = {k: v for k, v in edge["meta"]["fit"].items() if k != "pose_from"}
     results = db.overlap_correspondences([
-        whole_edge(db, "explicit", {"fit": edge["meta"]["fit"], "coordinate_frame": None}),
-        whole_edge(db, "old", dict(edge["meta"], fit=old_fit)),
-        edge["uuid"], whole_edge(db, "plain")], VOLUME)
+        whole_edge(db, "same-surface", {"fit": edge["meta"]["fit"], "coordinate_frame": None}),
+        whole_edge(db, "same-surface", dict(edge["meta"], fit=old_fit)),
+        edge["uuid"], whole_edge(db, "same-surface")], VOLUME)
     assert [r["error"] is None for r in results] == [False, False, True, False]
     assert all("rerun surface-overlap detection" in r["error"] for r in results[:2])
     assert results[3]["error"] == "edge has no overlap pose"
@@ -204,7 +204,7 @@ def test_correspondence_agreement_boundary(db, radius, accepted):
     # six voxels apart. Equality is accepted, a smaller radius rejects it.
     fit = dict(edge["meta"]["fit"], pose=[1, 0, 0, 0, 1, 0], agreement_radius=float(radius))
     [result] = db.overlap_correspondences(
-        [whole_edge(db, "boundary", dict(edge["meta"], fit=fit), edge["a"], edge["b"])], VOLUME)
+        [whole_edge(db, "same-surface", dict(edge["meta"], fit=fit), edge["a"], edge["b"])], VOLUME)
     assert bool(result["pairs"]) == accepted
     if accepted:
         assert result["error"] is None and all(pair["distance"] == 6 for pair in result["pairs"])

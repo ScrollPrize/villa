@@ -201,7 +201,7 @@ void referencedGraphCache()
             for(const auto& ref:refs)expectObject(value,ref);
             return value;
         };
-        EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="test";edge.aUuid=refs[0].objectUuid;edge.bUuid=refs[1].objectUuid;
+        EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="declared_reference";edge.aUuid=refs[0].objectUuid;edge.bUuid=refs[1].objectUuid;
         auto add=request();add.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});const auto added=writer.submit(add);
         cached.refresh();require(cached.relationshipsAt(refs).size()==1,"refresh invalidates inherited graph disk cache");
         detail::HostedAttachment reopened(endpoint,settings);

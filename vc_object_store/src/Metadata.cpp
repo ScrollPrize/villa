@@ -1,5 +1,8 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/EdgeLayout.hpp"
+#include "internal/JsonFields.hpp"
+#include "vc_object_store/objects/EdgeKinds.hpp"
 #include "internal/RecordOverrides.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
@@ -25,13 +28,15 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
         throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
     const auto [table, current] = currentRecord(db, recordUuid);
+    const bool edge=std::string_view(table)=="edges";
+    if(edge)requireEdgeColumns(db,{"approval_state","approved_by","approved_at","approved_host","approved_version"});
     if (current.approvalState == state) return;
     createRecordOverride(db, table, recordUuid);
     const auto version = writeRecordVersion(db, table, recordUuid);
     const int64_t commit_sequence = writeCommitSequence(db);
     Statement s(db, std::string("UPDATE ") + table +
-                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=?,commit_sequence=? WHERE uuid=?",
-        state);
+                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=?,commit_sequence=? WHERE uuid=?");
+    if(edge)s.bind(1,edgeApprovalCode(state));else s.bind(1,state);
     if (state == "pending") {
         s.bindNull(2); s.bindNull(3); s.bindNull(4); s.bindNull(5);
     } else {
@@ -61,8 +66,9 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
     // Compare JSON values, not their spelling. Missing and explicit null are
     // distinct; removing a missing key is also a no-op. Keep approval/history
     // untouched when an autosave submits the same logical value.
+    if(std::string_view(table)=="edges")requireEdgeColumns(db,{"meta"});
     {
-        const auto meta = nlohmann::json::parse(current.meta);
+        const auto meta = parseObjectJson(current.meta);
         const auto found = meta.find(key);
         if (jsonValue ? found != meta.end() && *found == nlohmann::json::parse(*jsonValue)
                       : found == meta.end()) {
@@ -70,15 +76,18 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
         }
     }
     createRecordOverride(db, table, recordUuid);
-    Statement location(db, std::string("SELECT id FROM ") + table + " WHERE uuid=?", bytes);
-    location.row();
-    const auto id = location.i64(0);
+    int64_t id=0;
+    if(std::string_view(table)=="objects") {
+        Statement location(db,"SELECT id FROM objects WHERE uuid=?",bytes);
+        if(!location.row())throw std::runtime_error("object store: record override is missing: "+recordUuid);
+        id=location.i64(0);
+    }
     if(std::string_view(table)=="objects")beforeCurrentObjectEdit(db,recordUuid);
     if (jsonValue) {
-        execute(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?", path, *jsonValue,
-            id);
+        execute(db, std::string("UPDATE ") + table + " SET meta=json_set(coalesce(nullif(meta,''),'{}'),?,json(?)) WHERE uuid=?", path, *jsonValue,
+            bytes);
     } else {
-        execute(db, std::string("UPDATE ") + table + " SET meta=json_remove(meta,?) WHERE id=?", path, id);
+        execute(db, std::string("UPDATE ") + table + " SET meta=nullif(json_remove(coalesce(nullif(meta,''),'{}'),?),'{}') WHERE uuid=?", path, bytes);
     }
     stampContentChange(db, author, host, table, id, bytes, "meta");
     savepoint.release();
@@ -105,7 +114,7 @@ SetMetaOp bindCoordinatesOperation(const ObjectRecord& object, const std::string
 {
     if (!hasGeometryCoordinates(object.kind))
         throw std::invalid_argument("objects of kind " + object.kind + " have no coordinate frame");
-    const auto meta = nlohmann::json::parse(object.meta);
+    const auto meta = parseObjectJson(object.meta);
     const auto merged = mergeGeometryCoordinates(meta.value("coordinates", nlohmann::json::object()),
                                                  volumeCoordinates(volume, storedUnitsPerVoxel));
     return {object.uuid, "coordinates", merged.dump()};

@@ -160,6 +160,7 @@ all = [
 Homepage = "https://github.com/ScrollPrize/villa"
 
 [project.scripts]
+"vc_wgraph" = "vesuvius.wgraph:main"
 "vesuvius.predict" = "vesuvius.models.run.inference:main"
 "vesuvius.blend_logits" = "vesuvius.models.run.blending:main"
 "vesuvius.blend_and_finalize" = "vesuvius.models.run.blending:blend_and_finalize_main"
@@ -186,6 +187,9 @@ vesuvius = [
     "install/configs/cubes.yaml",
     "ink_detection/configs/*.json",
     "tifxyz_label_transfer/*.cpp",
+    "neural_tracing/fiber_trace_3d/fiber_lemon.cpp",
+    "neural_tracing/fiber_trace_3d/fiber_pns.cpp",
+    "wgraph_profiles/*.json",
     "tifxyz_label_transfer/*.md",
     "tifxyz_label_transfer/docs/*.md",
     "fiber_spline_generator/extend/*.pt",

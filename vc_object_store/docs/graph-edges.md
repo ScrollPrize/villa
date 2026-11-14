@@ -10,6 +10,10 @@ explicit decision for that edge. Edges are added by
 [source files](#edges-imported-from-sources), by the
 [detectors](#discovering-edges-detectors), or directly with `add_edge`.
 
+In schema 22 the core edge key is its binary UUID (`WITHOUT ROWID`), not a numeric SQLite row ID. Tags refer to that UUID. Kind names remain the API representation and map to stable built-in integer codes in storage; see [store format](store-format.md#uuid-only-edges-and-optional-columns). Unsupported custom kinds fail rather than creating an undocumented code.
+
+Creation may explicitly omit optional edge columns through `OpenOptions::edgeColumns` / Python `edge_columns`. Omitted fields read as their defined defaults, but writes to unsupported fields fail. This does not make the store readonly. `edgeAdjacencyIndex` / `edge_adjacency_index` separately controls adjacency-index creation; neighbour/adjacency operations require the accelerator, whereas full graph scans do not.
+
 ## The record
 
 ```python
@@ -29,6 +33,7 @@ store.set_approval(edge, "approved")     # new edges start life "pending" unless
   same transaction — checked writes must expect both versions.
 - Anchors declare dependencies through `points` (IDs/indices), `channels`,
   `metadata_keys` (top-level keys), or `whole_geometry`.
+- Dependency and metadata SQL NULL/empty-string values read as `{}`. Empty dependencies mean unspecified dependencies; they do not waive geometry-edit validation. Bulk winding constraints deliberately omit their endpoint coordinates; requesting those stored positions must fail, not reconstruct hidden substitute coordinates.
 - A relationship version pins both endpoints' object versions
   (`a_version`/`b_version`) and their geometry. Resolve those pins; never
   substitute current heads when reading history.
@@ -40,8 +45,7 @@ store.set_approval(edge, "approved")     # new edges start life "pending" unless
 
 ## Edge kinds
 
-Kinds are names, not an enum; new kinds need no schema change. The kinds the
-store and its tools write:
+The API uses names, while schema 22 stores stable built-in integer codes. Unknown names or codes are rejected; custom kind registration is not yet supported. The kinds the store and its tools write include:
 
 | Kind | Meaning | Written by |
 | --- | --- | --- |

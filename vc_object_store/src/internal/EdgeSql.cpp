@@ -1,9 +1,11 @@
 #include "internal/EdgeSql.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "internal/SqlValues.hpp"
+#include "internal/JsonFields.hpp"
 #include "internal/ReferenceResolver.hpp"
-#include "internal/Versions.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/Versions.hpp"
+#include "vc_object_store/objects/EdgeKinds.hpp"
 #include "geometry/GeometryInternal.hpp"
 
 namespace vc::objects::detail {
@@ -21,7 +23,7 @@ std::string fiberAdjacencySql(std::optional<bool> adjacent)
 {
     if (!adjacent) return {};
     // Only JSON booleans (or an absent flag) describe this relation.
-    return " AND kind='fiber_branch' AND coalesce(json_type(meta,'$.adjacent'),'false')='" +
+    return " AND kind=5 AND coalesce(json_type(nullif(meta,''),'$.adjacent'),'false')='" +
         std::string(*adjacent ? "true" : "false") + "'";
 }
 
@@ -66,31 +68,40 @@ bool matchesEdgeSelection(const EdgeRecord& edge, const EdgeSelection& selection
     return true;
 }
 
-const char* kEdgeCols =
-    "id,uuid,a_uuid,b_uuid,kind,commit_sequence,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
+static constexpr const char* kEdgeCols =
+    "uuid,a_uuid,b_uuid,kind,commit_sequence,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
     "approval_state,approved_by,approved_at,approved_host,approved_version,"
     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
     "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,version,version_generation";
 
-std::string projectedEdgeColumns(const ObjectFields& fields)
+void validateEdgeProjection(const ObjectFields& fields)
 {
-    if (!fields) return kEdgeCols;
-    std::string sql;
-    std::set<std::string> valid{"a", "b", "a_anchor", "b_anchor", "tags"};
-    std::istringstream input(kEdgeCols);
-    std::string name;
-    while (std::getline(input, name, ',')) {
-        std::string field = name;
-        if (name.starts_with("a_anchor_") || name.starts_with("a_dir_") || name == "a_dependencies") field = "a_anchor";
-        if (name.starts_with("b_anchor_") || name.starts_with("b_dir_") || name == "b_dependencies") field = "b_anchor";
-        const bool identity = name == "id" || name == "uuid" || name == "kind" || name == "a_uuid" || name == "b_uuid";
-        if (!identity || name == "uuid" || name == "kind") valid.insert(field);
-        if (!sql.empty()) sql += ',';
-        sql += identity || fields->contains(field) ? name :
-            (name == "meta" || name.ends_with("_dependencies") ? "'{}'" : "NULL");
+    if(!fields)return;
+    std::set<std::string> valid{"a","b","a_anchor","b_anchor","tags"};
+    std::istringstream names(kEdgeCols);std::string name;
+    while(std::getline(names,name,',')){
+        if(name.starts_with("a_anchor_")||name.starts_with("a_dir_")||name=="a_dependencies")name="a_anchor";
+        if(name.starts_with("b_anchor_")||name.starts_with("b_dir_")||name=="b_dependencies")name="b_anchor";
+        if(name!="a_uuid"&&name!="b_uuid")valid.insert(name);
     }
-    for (const auto& field : *fields)
-        if (!valid.contains(field)) throw std::invalid_argument("unknown edge projection field: " + field);
+    for(const auto& field:*fields)
+        if(!valid.contains(field))throw std::invalid_argument("unknown edge projection field: "+field);
+}
+
+std::string projectedEdgeColumns(sqlite3* db,const ObjectFields& fields)
+{
+    validateEdgeProjection(fields);
+    std::string sql;
+    std::istringstream names(kEdgeCols);std::string name;
+    while(std::getline(names,name,',')){
+        std::string field=name;
+        if(name.starts_with("a_anchor_")||name.starts_with("a_dir_")||name=="a_dependencies")field="a_anchor";
+        if(name.starts_with("b_anchor_")||name.starts_with("b_dir_")||name=="b_dependencies")field="b_anchor";
+        const bool identity=name=="uuid"||name=="a_uuid"||name=="b_uuid"||name=="kind";
+        if(!sql.empty())sql+=',';
+        if(!identity&&fields&&!fields->contains(field))sql+="NULL";
+        else sql+=edgeReadColumn(db,name);
+    }
     return sql;
 }
 
@@ -112,31 +123,34 @@ void bindAnchor(Statement& s, int firstIdx, const Anchor& a)
     }
 }
 
-EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const ObjectFields& fields)
+EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const ObjectFields& fields,
+                      const std::string* initialGeneration)
 {
     EdgeRecord rec;
     rec.versionStoreUuid=storeUuidText(db);
-    const int64_t id = s.i64(0);
-    rec.aUuid = formatUuid(s.blob16(2));
-    rec.bUuid = formatUuid(s.blob16(3));
-    readCommon(rec, s, 1, 4, 5);
+    rec.aUuid = formatUuid(s.blob16(1));
+    rec.bUuid = formatUuid(s.blob16(2));
+    readCommon(rec, s, 0, 3, 4);
+    rec.kind=edgeKindName(s.i64(3));
+    rec.approvalState=edgeApprovalName(s.isNull(11)?0:s.i64(11));
     if (wants(fields, "a_anchor")) {
-        rec.aAnchor = readAnchor(s, 17);
-        dependenciesFromJson(rec.aAnchor, nlohmann::json::parse(s.text(30)));
+        rec.aAnchor = readAnchor(s, 16);
+        dependenciesFromJson(rec.aAnchor, parseObjectJson(s.text(29)));
     }
     if (wants(fields, "b_anchor")) {
-        rec.bAnchor = readAnchor(s, 23);
-        dependenciesFromJson(rec.bAnchor, nlohmann::json::parse(s.text(31)));
+        rec.bAnchor = readAnchor(s, 22);
+        dependenciesFromJson(rec.bAnchor, parseObjectJson(s.text(30)));
     }
-    rec.meta = s.text(29);
-    rec.version = s.i64(32);
-    if (!s.isNull(33)) rec.versionGeneration = s.uuid(33);
+    rec.meta = canonicalObjectJson(s.text(28));
+    rec.version = s.i64(31);
+    if (!s.isNull(32)) rec.versionGeneration = s.uuid(32);
+    else if(initialGeneration) rec.versionGeneration=*initialGeneration;
     else {
         Statement lineage(db, "SELECT initial_generation FROM store_manifest WHERE singleton=1");
         if (lineage.row()) rec.versionGeneration = lineage.uuid(0);
     }
     if (!details) return rec;
-    Statement tags(db, "SELECT tag FROM edge_tags WHERE edge_id=? ORDER BY tag", id);
+    Statement tags(db, "SELECT tag FROM edge_tags WHERE edge_uuid=? ORDER BY tag", parseUuid(rec.uuid));
     while (tags.row()) rec.tags.push_back(tags.text(0));
     return rec;
 }
@@ -144,19 +158,26 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const Obje
 std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectFields& fields)
 {
     std::vector<EdgeRecord> result;
-    std::unordered_map<int64_t, size_t> positions;
-    nlohmann::json ids = nlohmann::json::array();
+    std::unordered_map<std::string, size_t> positions;
+    std::optional<std::string> initialGeneration;
     while (rows.row()) {
-        positions.emplace(rows.i64(0), result.size());
-        ids.push_back(rows.i64(0));
-        result.push_back(readEdgeRow(db, rows, false, fields));
+        if(rows.isNull(32)&&!initialGeneration){
+            Statement lineage(db,"SELECT initial_generation FROM store_manifest WHERE singleton=1");
+            if(lineage.row())initialGeneration=lineage.uuid(0);
+        }
+        positions.emplace(rows.uuid(0), result.size());
+        result.push_back(readEdgeRow(db, rows, false, fields,initialGeneration?&*initialGeneration:nullptr));
     }
     if (result.empty()) return result;
-    const auto selection = ids.dump();
     if (wants(fields, "tags")) {
-        Statement tags(db, "SELECT edge_id,tag FROM edge_tags "
-            "WHERE edge_id IN (SELECT value FROM json_each(?)) ORDER BY edge_id,tag", selection);
-        while (tags.row()) result.at(positions.at(tags.i64(0))).tags.push_back(tags.text(1));
+        const auto batch=std::min(size_t(1024),size_t(sqlite3_limit(db,SQLITE_LIMIT_VARIABLE_NUMBER,-1)));
+        for(size_t first=0;first<result.size();first+=batch){
+            const auto n=std::min(batch,result.size()-first);
+            std::string query="SELECT edge_uuid,tag FROM edge_tags WHERE edge_uuid IN (";
+            for(size_t i=0;i<n;++i){if(i)query+=',';query+='?';}query+=") ORDER BY edge_uuid,tag";
+            Statement tags(db,query);for(size_t i=0;i<n;++i)tags.bind(int(i+1),parseUuid(result[first+i].uuid));
+            while(tags.row())result.at(positions.at(tags.uuid(0))).tags.push_back(tags.text(1));
+        }
     }
     return result;
 }
@@ -176,16 +197,15 @@ std::array<unsigned char,16> normalizeNewEdge(EdgeRecord& rec,bool* swapped)
     if(swapped)*swapped=reversed;
     if (rec.uuid.empty())
         rec.uuid = util::newUuid();
-    if (rec.meta.empty())
-        rec.meta = "{}";
+    rec.meta=canonicalObjectJson(rec.meta);
     return parseUuid(rec.uuid);
 }
 
-void insertEdgeRow(sqlite3* db,const EdgeRecord& rec,int64_t id,
+void insertEdgeRow(sqlite3* db,const EdgeRecord& rec,
                    int64_t commit_sequence,const std::string& author,const std::string& host,
                    const std::string& now,bool preserveRecord)
 {
-    const EdgeInsertRow row{&rec,id,parseUuid(rec.aUuid),parseUuid(rec.bUuid)};
+    const EdgeInsertRow row{&rec,parseUuid(rec.aUuid),parseUuid(rec.bUuid)};
     insertEdgeRows(db,std::span(&row,1),commit_sequence,author,host,now,preserveRecord);
 }
 
@@ -213,54 +233,66 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t comm
                    const std::string& author,const std::string& host,const std::string& now,
                    bool preserveRecord,size_t sqlBatchRows)
 {
-    if(!preserveRecord){
-        // New records share provenance. Approval defaults are the same as the
-        // ordinary insert; avoid rebinding shared/default values per row.
-        writeSqlValuesShared(db,"INSERT INTO edges(uuid,a_uuid,b_uuid,kind,commit_sequence,created_by,created_at,created_host,"
-            "changed_by,changed_at,changed_host,a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-            "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id)",
-            4,20,rows.size(),sqlBatchRows,[](size_t offset){
-                std::string pattern="(";
-                for(size_t i=1;i<=20;++i){
-                    if(i!=1)pattern+=',';
-                    pattern+='?'+std::to_string(offset+i);
-                    if(i==4)pattern+=",?1,?2,?3,?4,?2,?3,?4";
-                }
-                return pattern+')';
-            },[&](Statement& s){s.bind(1,commit_sequence);s.bindBorrowedText(2,author);s.bindBorrowedText(3,now);s.bindBorrowedText(4,host);},
-            [&](Statement& s,size_t index,int offset){
-                const auto& row=rows[index];const auto& rec=*row.record;
-                s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aUuid);s.bind(offset+3,row.bUuid);s.bindBorrowedText(offset+4,rec.kind);
-                bindAnchor(s,offset+5,rec.aAnchor);bindAnchor(s,offset+11,rec.bAnchor);
-                s.bindBorrowedText(offset+17,rec.meta);bindDependencies(s,offset+18,rec.aAnchor);
-                bindDependencies(s,offset+19,rec.bAnchor);s.bind(offset+20,row.id);
-            });
-    }else{
-    writeSqlValues(db,"INSERT INTO edges(uuid,a_uuid,b_uuid,kind,commit_sequence,created_by,created_at,created_host,changed_by,changed_at,"
-                    "changed_host,approval_state,approved_by,approved_at,approved_host,approved_version,"
-                    "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-                    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id)",
-        "",32,rows.size(),sqlBatchRows,[&](Statement& s,size_t index,int offset){
-    const auto& row=rows[index];const auto& rec=*row.record;
-    s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aUuid);s.bind(offset+3,row.bUuid);
-    s.bind(offset+4,rec.kind);s.bind(offset+5,commit_sequence);
-    s.bind(offset+6,author);s.bind(offset+7,now);s.bind(offset+8,host);
-    s.bind(offset+9,author);s.bind(offset+10,now);s.bind(offset+11,host);
-    const std::string state = preserveRecord ? rec.approvalState : "pending";
-    s.bind(offset+12, state.empty() ? std::string("pending") : state);
-    if (preserveRecord && rec.approvedBy) s.bind(offset+13, *rec.approvedBy); else s.bindNull(offset+13);
-    if (preserveRecord && rec.approvedAt) s.bind(offset+14, *rec.approvedAt); else s.bindNull(offset+14);
-    if (preserveRecord && rec.approvedHost) s.bind(offset+15, *rec.approvedHost); else s.bindNull(offset+15);
-    if (preserveRecord && rec.approvedVersion) s.bind(offset+16, *rec.approvedVersion); else s.bindNull(offset+16);
-    bindAnchor(s, offset+17, rec.aAnchor);
-    bindAnchor(s, offset+23, rec.bAnchor);
-    s.bind(offset+29, rec.meta);
-    bindDependencies(s,offset+30,rec.aAnchor);
-    bindDependencies(s,offset+31,rec.bAnchor);
-    s.bind(offset+32, row.id);
-    });
+    const auto present=edgeColumns(db);const auto specs=edgeColumnSpecs();
+    std::vector<size_t> selected;std::string prefix="INSERT INTO edges(";
+    for(size_t i=0;i<specs.size();++i)if(present.contains(specs[i].name)){
+        if(!selected.empty())prefix+=',';prefix+=specs[i].name;selected.push_back(i);
     }
-    for(const auto& row:rows) insertTags(db,"edge_tags","edge_id",row.id,row.record->tags);
+    prefix+=')';
+    const auto unsupported=[&](const char* field,bool supplied){
+        if(supplied&&!present.contains(field))throw std::runtime_error("edge field is not supported by this table layout: "+std::string(field));
+    };
+    for(const auto& row:rows){const auto& r=*row.record;
+        unsupported("a_anchor_x",bool(r.aAnchor.position));unsupported("a_anchor_y",bool(r.aAnchor.position));unsupported("a_anchor_z",bool(r.aAnchor.position));
+        unsupported("b_anchor_x",bool(r.bAnchor.position));unsupported("b_anchor_y",bool(r.bAnchor.position));unsupported("b_anchor_z",bool(r.bAnchor.position));
+        unsupported("a_dir_x",bool(r.aAnchor.direction));unsupported("a_dir_y",bool(r.aAnchor.direction));unsupported("a_dir_z",bool(r.aAnchor.direction));
+        unsupported("b_dir_x",bool(r.bAnchor.direction));unsupported("b_dir_y",bool(r.bAnchor.direction));unsupported("b_dir_z",bool(r.bAnchor.direction));
+        unsupported("meta",!r.meta.empty()&&r.meta!="{}");
+        const auto declared=[](const Anchor& a){return a.wholeGeometry||!a.points.empty()||!a.channels.empty()||!a.metadataKeys.empty();};
+        unsupported("a_dependencies",declared(r.aAnchor));unsupported("b_dependencies",declared(r.bAnchor));
+        unsupported("approval_state",edgeApprovalCode(r.approvalState)!=0);
+        unsupported("approved_by",r.approvedBy.has_value());unsupported("approved_at",r.approvedAt.has_value());
+        unsupported("approved_host",r.approvedHost.has_value());unsupported("approved_version",r.approvedVersion.has_value());
+        if(preserveRecord){unsupported("version",r.version&&*r.version!=1);unsupported("version_generation",!r.versionGeneration.empty());}
+        if(preserveRecord)for(const auto& [field,value]:{std::pair{"created_by",&r.createdBy},{"created_at",&r.createdAt},{"created_host",&r.createdHost},
+                {"changed_by",&r.changedBy},{"changed_at",&r.changedAt},{"changed_host",&r.changedHost}})
+            unsupported(field,!value->empty());
+    }
+    writeSqlValuesShared(db,prefix,1,selected.size()-1,rows.size(),sqlBatchRows,[&](size_t offset){
+        std::string pattern="(";size_t bound=0;for(size_t i=0;i<selected.size();++i){
+            if(i)pattern+=',';pattern+=selected[i]==5?"?1":"?"+std::to_string(offset+(++bound));
+        }return pattern+')';
+    },[&](Statement& s){s.bind(1,commit_sequence);},[&](Statement& s,size_t index,int offset){
+        const auto& row=rows[index];const auto& r=*row.record;int at=offset;
+        for(auto field:selected){if(field==5)continue;++at;
+            switch(field){
+            case 0:s.bind(at,row.binaryUuid?*row.binaryUuid:parseUuid(r.uuid));break;
+            case 1:s.bind(at,int64_t(0));break;
+            case 2:s.bind(at,row.aUuid);break;case 3:s.bind(at,row.bUuid);break;
+            case 4:s.bind(at,edgeKindCode(r.kind));break;
+            case 6:s.bind(at,preserveRecord?r.version.value_or(1):int64_t(1));break;
+            case 7:if(!preserveRecord||r.versionGeneration.empty())s.bindNull(at);else s.bind(at,parseUuid(r.versionGeneration));break;
+            case 8:s.bind(at,preserveRecord?r.createdBy:author);break;
+            case 9:s.bind(at,preserveRecord?r.createdAt:now);break;
+            case 10:s.bind(at,preserveRecord?r.createdHost:host);break;
+            case 11:s.bind(at,preserveRecord?r.changedBy:author);break;
+            case 12:s.bind(at,preserveRecord?r.changedAt:now);break;
+            case 13:s.bind(at,preserveRecord?r.changedHost:host);break;
+            case 14:s.bind(at,edgeApprovalCode(r.approvalState));break;
+            case 15:s.bind(at,r.approvedBy);break;case 16:s.bind(at,r.approvedAt);break;
+            case 17:s.bind(at,r.approvedHost);break;case 18:s.bind(at,r.approvedVersion);break;
+            case 19:case 20:case 21:if(r.aAnchor.position)s.bind(at,(*r.aAnchor.position)[field-19]);else s.bindNull(at);break;
+            case 22:case 23:case 24:if(r.aAnchor.direction)s.bind(at,(*r.aAnchor.direction)[field-22]);else s.bindNull(at);break;
+            case 25:case 26:case 27:if(r.bAnchor.position)s.bind(at,(*r.bAnchor.position)[field-25]);else s.bindNull(at);break;
+            case 28:case 29:case 30:if(r.bAnchor.direction)s.bind(at,(*r.bAnchor.direction)[field-28]);else s.bindNull(at);break;
+            case 31:if(r.meta.empty()||r.meta=="{}")s.bindNull(at);else s.bind(at,r.meta);break;
+            case 32:case 33:{const auto value=dependenciesToJson(field==32?r.aAnchor:r.bAnchor);if(value.empty())s.bindNull(at);else s.bind(at,value.dump());break;}
+            default:throw std::logic_error("unknown edge binding column");
+            }
+        }
+    });
+    for(const auto& row:rows)for(const auto& tag:row.record->tags)if(!tag.empty())
+        execute(db,"INSERT INTO edge_tags(edge_uuid,tag) VALUES(?,?) ON CONFLICT(edge_uuid,tag) DO NOTHING",row.binaryUuid?*row.binaryUuid:parseUuid(row.record->uuid),tag);
 }
 
 EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
@@ -271,25 +303,26 @@ EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string
     auto rec=prepareNewEdge(input);
     rejectInitialExtensionMetadata(rec.meta);
     if(preserveRecord&&rec.aUuid!=formatUuid(parseUuid(input.aUuid)))swapEndpoints(rec);
-    const EdgeInsertRow identity{&rec,0,{},{}};requireUnusedObjectUuids(db,std::span(&identity,1));
+    const EdgeInsertRow identity{&rec,{},{}};requireUnusedObjectUuids(db,std::span(&identity,1));
     if(!lifecycleBindingMatches(db,rec)) throw std::runtime_error("relationship endpoints must be active");
     // A caller explicitly inserting this UUID may replace its deletion marker.
     // Merely reviving an endpoint never reactivates relationships. Historical
     // relationship revisions retain the earlier state independently.
     int64_t nextVersion = 1;
     if(auto* source=edgeSource(db,rec.uuid,false,true)) {
-        Statement previous(source, "SELECT version,state FROM edges WHERE uuid=?", parseUuid(rec.uuid));
+        Statement previous(source, "SELECT version,state FROM "+edgeReadSource(source)+" WHERE uuid=?", parseUuid(rec.uuid));
         if (previous.row()) {
             if(previous.i64(1)!=2)throw std::runtime_error("object store: edge UUID already exists: "+rec.uuid);
             if (previous.i64(0) == INT64_MAX) throw std::overflow_error("relationship version exhausted");
             nextVersion = previous.i64(0) + 1;
         }
     }
-    execute(db,"DELETE FROM edges WHERE uuid=? AND state=2",parseUuid(rec.uuid));
-    const auto id=allocateRecordId(db,"edges");
-    insertEdgeRow(db,rec,id,writeCommitSequence(db),author,host,nowIsoUtc(),preserveRecord);
-    execute(db, "UPDATE edges SET version=?,version_generation=NULLIF((SELECT generation FROM store_manifest),(SELECT initial_generation FROM store_manifest)) WHERE id=?",
-        nextVersion, id);
+    if(nextVersion!=1)requireEdgeColumns(db,{"version","version_generation"});
+    if(hasEdgeColumn(db,"state"))execute(db,"DELETE FROM edges WHERE uuid=? AND state=2",parseUuid(rec.uuid));
+    insertEdgeRow(db,rec,writeCommitSequence(db),author,host,nowIsoUtc(),preserveRecord);
+    if(hasEdgeColumn(db,"version")&&hasEdgeColumn(db,"version_generation"))
+        execute(db, "UPDATE edges SET version=?,version_generation=NULLIF((SELECT generation FROM store_manifest),(SELECT initial_generation FROM store_manifest)) WHERE uuid=?",
+            nextVersion, parseUuid(rec.uuid));
     if (preserveRecord) restoreCommon(db, "edges", rec);
     appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.commitSequence : writeCommitSequence(db), preserveRecord ? importOperation : "add_edge");
     savepoint.release();

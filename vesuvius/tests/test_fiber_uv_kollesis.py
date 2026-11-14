@@ -1,11 +1,36 @@
 import numpy as np
+import json
+import pytest
 
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_kollesis import (
     Maps, conditional_abs, conditional_discrepancy, length_maps, ratio, edge_maps, write_plots)
+from .fiber_graph_fixture import measured_store
 
 
 def fid(k):
     return f'00000000-0000-4000-8000-{k:012d}'
+
+
+def test_event_geometry_reads_native_uuid_graph_and_preserves_integer_event_ids(tmp_path):
+    from lasagna.inference_provenance import sha256_file
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import store_digest
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_kollesis import event_geometry
+    # Event IDs must not travel through float64, which loses this low bit.
+    eid=2**53+7
+    database=measured_store(tmp_path,[(eid,1,2,False,.5),(eid+1,1,3,False,.5)],
+                            field_overrides={eid+1:dict(normal_b_valid=0)})
+    stage=tmp_path/'normal.npz';np.savez(stage,normal_sign=[1,1,1])
+    tensor=tmp_path/'tensors.npz'
+    signature=dict(database=store_digest(database),stage1=sha256_file(stage))
+    tensor.with_suffix('.json').write_text(json.dumps(dict(signature=signature)))
+    config=dict(database=str(database),stage1=str(stage),tensor_cache=str(tensor))
+    d=dict(event_ids=np.array([eid,eid+1],dtype=np.int64))
+    geom=event_geometry(config,d,tmp_path)
+    np.testing.assert_array_equal(geom[0],[1.,0.,1.])
+    assert np.isnan(geom[1]).all()
+    np.testing.assert_array_equal(event_geometry(config,d,tmp_path),geom)
+    with pytest.raises(ValueError,match='provenance mismatch'):
+        event_geometry(config,dict(event_ids=np.array([eid+1],dtype=np.int64)),tmp_path)
 
 
 def test_cumulative_expectation_matches_bruteforce():

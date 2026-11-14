@@ -2,6 +2,7 @@
 #include "internal/ExtensionHistory.hpp"
 #include "internal/Extensions.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/EdgeLayout.hpp"
 #include "internal/History.hpp"
 #include "internal/ReferenceResolver.hpp"
 #include "internal/RecordOverrides.hpp"
@@ -19,7 +20,7 @@ constexpr const char* snapshotDomain = "@extension-rows-v1";
 
 Json manifest(const std::string& metadata)
 {
-    const auto meta = Json::parse(metadata);
+    const auto meta = parseObjectJson(metadata);
     const auto found = meta.find(extensionManifestKey);
     if (found == meta.end()) return Json::object();
     if (!found->is_object()) throw std::runtime_error("extension: invalid owner snapshot manifest");
@@ -185,10 +186,10 @@ void ObjectStore::replaceExtensionRows(WriteTxn& txn, const std::string& name, c
     Savepoint save(db);
     createRecordOverride(db,table.keySpace.c_str(),owner);
     if(!extensionTable(db,name))detail::createExtensionTable(db,extensionDefinition(table));
-    Statement existing(db, "SELECT id,meta FROM " + table.keySpace + " WHERE uuid=? AND state<>2", parseUuid(owner));
+    if(table.keySpace=="edges")requireEdgeColumns(db,{"meta"});
+    Statement existing(db, "SELECT uuid,meta FROM " + (table.keySpace=="edges"?edgeReadSource(db):table.keySpace) + " WHERE uuid=? AND state<>2", parseUuid(owner));
     if (!existing.row()) throw std::invalid_argument("extension: owner is not present in the writable store");
-    const auto id = existing.i64(0);
-    auto meta = Json::parse(existing.text(1));
+    auto meta = parseObjectJson(existing.text(1));
     const auto oldDescriptors=manifest(meta.dump());
     const auto oldRows = oldDescriptors.contains(name)
         ? readSnapshot(db,table,owner,oldDescriptors.at(name)) : currentRows(db,name,owner);
@@ -203,8 +204,8 @@ void ObjectStore::replaceExtensionRows(WriteTxn& txn, const std::string& name, c
     if (descriptors.empty()) meta.erase(extensionManifestKey);
     else meta[extensionManifestKey] = std::move(descriptors);
     if (table.keySpace == "objects") beforeCurrentObjectEdit(db, owner);
-    execute(db, "UPDATE " + table.keySpace + " SET meta=? WHERE id=?", meta.dump(), id);
-    stampContentChange(db, author(), hostname(), table.keySpace.c_str(), id, parseUuid(owner), "extension");
+    execute(db, "UPDATE " + table.keySpace + " SET meta=nullif(?,'{}') WHERE uuid=?", meta.dump(), parseUuid(owner));
+    stampContentChange(db, author(), hostname(), table.keySpace.c_str(), 0, parseUuid(owner), "extension");
     if (table.keySpace == "edges") recordRelationshipValidation(db, *edgeByUuid(txn, owner));
     save.release();
 }
@@ -233,8 +234,8 @@ void ObjectStore::scanExtensionRowsAtVersion(const Txn& txn, const std::string& 
 void detail::checkExtensionMetadata(const std::string& previous, const std::string& replacement)
 {
     if (!mayContainExtensionManifest(previous) && !mayContainExtensionManifest(replacement)) return;
-    const auto proposed = Json::parse(replacement);
-    const auto old = Json::parse(previous);
+    const auto proposed = parseObjectJson(replacement);
+    const auto old = parseObjectJson(previous);
     const auto before = old.find(extensionManifestKey), after = proposed.find(extensionManifestKey);
     if ((before == old.end()) != (after == proposed.end()) ||
         (before != old.end() && *before != *after))
@@ -267,8 +268,8 @@ std::vector<std::string> detail::currentExtensionChunks(sqlite3* db)
     if (!hasExtensionTables(db)) return {};
     std::set<std::string> hashes;
     for (const auto* ownerTable : {"objects", "edges"}) {
-        Statement owners(db, std::string("SELECT uuid,meta FROM ") + ownerTable +
-            " WHERE state<>2 AND json_type(meta,'$.vcobj_extensions') IS NOT NULL");
+        Statement owners(db, std::string("SELECT uuid,meta FROM ") + (std::string_view(ownerTable)=="edges"?edgeReadSource(db):std::string(ownerTable)) +
+            " WHERE state<>2 AND json_type(nullif(meta,''),'$.vcobj_extensions') IS NOT NULL");
         while (owners.row()) {
           const auto descriptors = manifest(owners.text(1));
           for (const auto& [name, descriptor] : descriptors.items()) {

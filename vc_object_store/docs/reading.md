@@ -9,6 +9,8 @@ always find them.
 
 ## Opening a store
 
+For a saved store-position pin, `resolveStorePosition` (Python `CollectionReader.resolve_store_position`) returns its independently openable root from the pinned scope; it does not substitute a partition or a newer snapshot. See [store-reference resolution](collections.md#relocating-referenced-stores).
+
 ```python
 from vc_object_store import ObjectStore
 
@@ -18,8 +20,8 @@ store = ObjectStore.open("objects.vcobj", author="reader", read_only=True)
 
 | Form | Notes |
 | --- | --- |
-| Python | `ObjectStore.create(path, author=..., catalog=None)`, `ObjectStore.open(path, author=None, read_only=False, catalog=None)`; `catalog` is a `vc_reader.Catalog` (or its dict form) supplying registrations the store has not recorded — see [transforms](transforms.md#registrations-and-route-choices) |
-| C++ | `ObjectStore::create` / `::open` with `OpenOptions` (`author`, `readOnly`, `catalogTransforms`, `serviceOwner`) |
+| Python | `ObjectStore.create(path, author=..., catalog=None)`, `ObjectStore.open(path, author=None, read_only=False, catalog=None, position=None)`; `catalog` is a `vc_reader.Catalog` (or its dict form) supplying registrations the store has not recorded — see [transforms](transforms.md#registrations-and-route-choices) |
+| C++ | `ObjectStore::create` / `::open` with `OpenOptions` (`author`, `readOnly`, `catalogTransforms`, `serviceOwner`, `readPosition`) |
 | Hosted | Python `HostedStore(endpoint)`; C++ `vc::objects::HostedStore` or a session attachment — see [hosted](hosted.md) |
 
 A writable open takes a host-local ownership lock on `<path>-owner`, shared
@@ -31,7 +33,33 @@ convert it with `vc_object_convert` (see [Converting old stores](#converting-old
 Closing a store with live snapshots is an error in Python. Use the store as a
 context manager, or call `store.close()` after closing snapshots and graphs.
 
+To reopen a retained publication of a history-enabled source, pass its saved `{store, generation, commit_sequence}` position to `ObjectStore.open(path, read_only=True, position=position)` or `CollectionReader(path, position=position)`. C++ uses `OpenOptions::readPosition`. UUID-based reads then select that publication's metadata, geometry and membership, including after later source edits; explicit complete version references still select the exact version they name. This is read-only selection, not a rollback or a copy. Missing retained history fails explicitly. Referenced stores apply their recorded positions automatically. See [historical store references](collections.md).
+
 ## Listing and selecting records
+
+For measured fiber-graph computation, `CollectionReader.fiber_graph_columns(workers=32, progress=False)` reads one coherent snapshot into owned NumPy buffers. The native `readFiberGraphColumns` API is declared in `objects/FiberConstraintGraph.hpp`. It resolves visible records, extraction-run membership, measurement-frame lengths and endpoint UUID joins before returning; consumers need not materialize object dictionaries or UUID strings per constraint. `progress=True` emits coarse native stage/row markers without Python callbacks in worker threads. These numeric arrays are analysis projections, not edit-authorizing references; retain the reader's source snapshot when publishing derived results.
+
+| Columns | Representation |
+| --- | --- |
+| `fiber_uuid`, `fiber_uuid_ascii`, `lengths` | Binary UUIDs `[N,16]`, ASCII UUIDs `[N,36]`, float64 lengths in the declared measurement frame |
+| `edge_uuid`, `event_ids` | Binary UUIDs `[M,16]` and int64 runtime indices, in UUID order |
+| `endpoints`, `arcs` | Int64 dense fiber indices `[M,2]` and float64 endpoint arclengths `[M,2]` |
+| `normal_a`, `normal_b`, `connector`, `distance` | Decoded float64 measurement columns, preserving their validity masks |
+| `parallel`, `valid_a`, `valid_b`, `valid_connector` | Byte-valued flags; consumers may view them as NumPy booleans |
+
+For numeric setup that needs array sizes rather than lengths or bounds, `ObjectStore.geometry_array_counts(object_kind, array_name, limit=None)` returns UUID-ordered, owned NumPy columns: `object_uuid` (`uint8[N,16]`) and `count` (`int64[N]`), plus a contiguous `uuid_ascii` byte string for clients using textual UUID arrays. The C++ equivalent is `ObjectStore::geometryArrayCounts` in one caller-owned transaction. Counts come from selected geometry descriptors, not ingestion summaries, and no coordinate chunks are loaded. Missing geometry/arrays have count zero; deleted and retired objects are omitted. The buffers remain valid after closing the read. These are numeric values from a snapshot, not edit-authorizing object references; retain complete references when an operation requires them. Use the ordinary geometry API to obtain measured lengths, bounds or coordinates.
+
+For bulk coordinates, `CollectionReader.geometry_array_columns(object_uuid, array_name, object_kind=None, volume=None, expected_position=None, workers=32, profile=False, trusted_immutable=False)` accepts a binary `uint8[N,16]` UUID column and returns UUID-sorted unique `object_uuid`/`uuid_ascii` arrays, an owned `geometry` packed array, and its consumed `source` position. C++ callers use `ObjectCollection::readGeometryArrayColumns`. Buffers remain usable after closing the reader and pass directly to NumPy/PyTorch; no intermediate files are created. Unknown, deleted, ineligible or geometry-less requested objects fail rather than disappearing from the result. Dtype/trailing dimensions must agree across the packed arrays; the existing mapped-read contract supports float64 fiber `line_points` when `volume` is requested. `profile=True` adds coarse setup/selection/payload/copy timings without per-object instrumentation.
+
+With one worker the operation uses the caller's existing snapshot, including mutable stores. Multiple workers require a sealed or history-enabled root and use independent native transactions under the same complete source-position guard. Without an explicit root position, a history-enabled mutable root must still match the caller's source commit in every worker and at the final check; advancement raises `StoreBusy`. Open with `position` to select a retained historical root consistently across workers instead. Referenced sources always use their saved publication pins. One worker-capable collection is opened for the operation, not for every work block; routing, descriptor/hash validation and coordinate mapping reuse the ordinary store APIs. Worker transactions consume reader connections across the referenced scope, so provision process file-descriptor limits and memory for the chosen worker count. The library does not alter operating-system limits.
+
+`trusted_immutable=True` is an explicit throughput option for healthy, sealed, history-off snapshots. The operation checks that policy once across the scope, then skips redundant per-object history/descriptor audits and payload SHA checks. It is not an integrity audit: use the default checked mode for that. Requested-key existence, snapshot routing, array layout and byte bounds, and coordinate-frame mapping remain enforced. Ordinary read APIs retain their normal checks.
+
+`CollectionReader.supports_trusted_geometry_reads` checks that policy for the complete pinned scope. Consumers can select checked reads for history-enabled dependencies without catching failures or weakening integrity checks. The fiber workflow's `read_polyline_arrays(..., trusted_immutable="auto")` uses this capability; an explicit `True` still rejects an ineligible scope.
+
+Parallel batch applications can call `configure_sqlite_runtime(memory_statistics=False, pagecache_bulk_bytes=0)` once at process startup, before SQLite initializes. C++ uses `configureSqliteRuntime` from `SqliteRuntime.hpp`. This optional startup configuration disables SQLite's process-global allocator accounting (a contention source across otherwise independent connections); it does not alter transactions, values or read validation. A nonzero `pagecache_bulk_bytes` requests an initial allocation per connection's page cache. Unspecified options preserve SQLite defaults. Requests after initialization fail explicitly; the API never shuts down active SQLite connections. Ordinary store opens do not change process-global runtime options.
+
+When reading selected geometry through a graph snapshot, use `store.graph_read(versions=references, edge_limit=0)` to explicitly omit relationships. This preserves the complete selected object identities and their geometry revisions, but does not enumerate relationship evidence merely to discard it. The C++ equivalent is `StoreReader::graphReadViewAt` with `EdgeSelection.limit=0`. A normal graph read still includes its requested relationships. Geometry-only consumers should not pay for incident-edge searches, particularly when the source deliberately omits adjacency indexes.
 
 ```python
 store.object(uuid)                       # current record, or None
@@ -149,6 +177,17 @@ checksum-verified: damaged payloads raise instead of returning bytes.
 `geometry_point_annotations` returns per-point annotations aligned with that
 revision's sequence (by stable ID, not array order).
 
+For resident packed polylines, `geometry/PolylineArc.hpp` provides a non-owning
+`vc::geometry::PolylineArcIndex` over point offsets and a possibly strided
+float64 arc column. Python `PolylineArcIndex(offsets, arc).locate(owner, arc)`
+retains its buffers and returns read-only NumPy `segment` and `fraction` columns.
+Owner indices refer to this packed array, not persistent object identities.
+Each polyline must contain at least two finite, nondecreasing arc values from
+zero. Lookup searches only the selected polyline and preserves right-sided
+selection at duplicate knots; bounded endpoint representation roundoff is
+clamped to the first/last arc. The caller uses the returned intervals to read
+and interpolate the required point rows without constructing UUID queries.
+
 ## History reads
 
 ```python
@@ -170,6 +209,25 @@ content publishes a **new** checked action — see
 [retire and restore](editing.md#retire-restore-delete). Relationships at a
 selection are read with `relationships_at_versions(refs)`, and the whole graph
 with `graph_read` — see [graph edges](graph-edges.md#traversal-and-graph-reads).
+
+Inside a graph read, use `graph.geometry_snapshot()` for typed geometry or transformed views of its selected references. This borrows the graph's existing pinned transaction instead of acquiring another reader-pool slot. Closing the graph invalidates the borrowed snapshot and its views, which then reject reads. A separate `store.geometry_snapshot()` owns another transaction and should not be nested inside a single-reader graph operation.
+
+### Current bulk geometry without graph/history work
+
+For current geometry rather than a saved version selection, `geometry_read` captures metadata and geometry heads together in one read transaction. It does not enumerate relationships or resolve each object through numbered history. This works with either history policy, including referenced, packed and sharded stores:
+
+```python
+with store.geometry_read(object_kind="fiber", object_uuids=fiber_uuids,
+                         volume="target-volume", expected_position=source_position) as view:
+    rows = view.objects(["name", "fiber", "meta"])
+    packed = view.read_geometry_arrays("line_points", volume="target-volume")
+    xyz, offsets = packed.values, packed.offsets
+    position = view.status()  # this same pinned transaction
+```
+
+Omit `expected_position` for current discovery. When supplied, it is the ordinary `{store, generation, commit_sequence}` source position and is checked inside the geometry read's transaction. `limit` and `after_uuid` provide UUID-ordered pages; `volume` filters to fibers with a resolvable frame before applying the limit. This geometry-only API does not support measured-length, spatial or connection filters. Exact saved object references still use `graph_read(versions=..., edge_limit=0)`; a current read never substitutes for an explicitly requested historical version.
+
+Packed coordinate mapping currently supports float64 fiber `line_points`. It uses the captured metadata and native transform context, checks the current descriptor against the resolved immutable payload, and retains ordinary chunk-checksum verification. Direct same-volume scales use scalar multiplication; registered frames use the native affine mapping. Other arrays remain available as canonical packed reads without `volume`. Packed arrays own their storage and stay valid after closing the view; an absent selected geometry head does not fall through to a retained archive or base.
 
 ## Spatial queries
 
@@ -232,6 +290,8 @@ or per tile), without geometry reconstruction.
 
 ## Selection records
 
+For a compact current-input identity, `ObjectStore.selected_reference_digest(object_kind="fiber", object_uuids=None, domain="fibers_digest v3")` streams the selected live objects in UUID order into SHA-256 within one read snapshot. It reads complete owning-store, generation, object UUID and numbered-version references, not geometry or Python record dictionaries. `None` selects all matching live objects; an explicit empty list hashes an empty selection, and missing explicitly requested UUIDs are rejected. The byte encoding is UTF-8 `domain + "\n"`, followed by `"store generation object version\n"` per object. `object_references_digest(references, domain=...)` applies the same codec to already selected references. A digest detects input changes; it does not replace the references or store-position pins required to reproduce a historical selection.
+
 A selection record freezes the exact result of an object selection at one
 commit, so a long job or training set can read its inputs back later at the
 same versions while the store moves on. It holds the query, store, generation,
@@ -259,7 +319,7 @@ Selected relationship results use relationship UUID order, then complete publica
 
 ## Converting old stores
 
-The runtime opens schema 21 only. Upstream schemas 16–20 require conversion; unpublished experimental layouts are not supported. Stop every client, then convert into a new
+The runtime opens schema 22 only. Upstream schemas 16–21 require explicit conversion; unpublished experimental layouts are not supported. Stop every client, then convert into a new
 file (the source is never changed):
 
 ```sh
