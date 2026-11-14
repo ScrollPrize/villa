@@ -26,14 +26,14 @@ from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
 WRITE_BATCH = 256
 
 
-def open_store(path):
+def open_store(path, *, position=None):
     """A read-only handle; a context manager. Not shareable across processes: open one per process."""
-    return ObjectStore.open(str(path), read_only=True, reader_pool_size=1)
+    return ObjectStore.open(str(path), read_only=True, reader_pool_size=1,position=position)
 
 
-def fiber_volume(path):
+def fiber_volume(path, *, source_version=None):
     """The one volume every fiber of the store is bound to; raises when they are unbound or bound to several."""
-    with open_store(path) as store:
+    with open_store(path,position=source_version) as store:
         records = store.select_objects(object_kind='fiber', fields=['meta'])
         return _fiber_records_volume(records, path)
 
@@ -51,7 +51,7 @@ def fiber_catalog(path, volume=None, *, source_version=None):
     """Catalog rows of the fibers bound to ``volume``, in UUID order, measured from selected geometry:
     dict(id, name, family, length, point_count, bbox, scale, reference); length and bbox (minx,miny,minz,maxx,maxy,maxz, or
     None) are volume voxels. Frozen evidence can require its recorded ``source_version``."""
-    with open_store(path) as store:
+    with open_store(path,position=source_version) as store:
         _require_source_version(store, source_version)
         rows = _catalog(store, volume)
         _require_source_version(store, source_version)
@@ -64,7 +64,7 @@ def fiber_point_counts(path, *, source_version=None):
     Descriptor interpretation and retained/current integrity checks are native.
     Frozen evidence may require the same store position on both sides.
     """
-    with open_store(path) as store:
+    with open_store(path,position=source_version) as store:
         _require_source_version(store, source_version)
         columns = store.geometry_array_counts('fiber', 'line_points')
         _require_source_version(store, source_version)
@@ -74,7 +74,7 @@ def fiber_point_counts(path, *, source_version=None):
 
 def fiber_count(path, *, source_version=None):
     """Count live fibers natively without materializing their identities."""
-    with open_store(path) as store:
+    with open_store(path,position=source_version) as store:
         _require_source_version(store, source_version)
         result = store.object_count('fiber')
         _require_source_version(store, source_version)
@@ -174,9 +174,9 @@ def iter_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
     volume voxels (no repair or densifying). row = dict(id, name, family, length, point_count, meta, reference). ``volume``
     defaults to the store's one volume (fiber_volume). Raises for an unknown, unbound or line-less requested fiber.
     Frozen evidence supplies ``source_version``; both sides of the read must match that store snapshot."""
-    volume = volume or fiber_volume(path)
+    volume = volume or fiber_volume(path,source_version=source_version)
     selected = None if fiber_ids is None else sorted({canonical_uuid(str(fid)) for fid in fiber_ids})
-    with open_store(path) as store:
+    with open_store(path,position=source_version) as store:
         _require_source_version(store, source_version)
         if selected == []:
             return
@@ -207,17 +207,21 @@ def read_polyline_arrays(path, fiber_ids, *, volume=None, source_version=None, w
     Native reading captures metadata/geometry together and performs coordinate
     mapping under the same source-position guard. Returned buffers own their
     data after the store transaction closes.
+    trusted_immutable='auto' uses trusted reads only for a fully sealed,
+    history-off scope; regular history-enabled inputs use checked reads.
     """
     from vc_object_store import CollectionReader,fiber_uuid_bytes
     if fiber_ids is None:raise ValueError('Packed polyline reads require explicit fiber IDs')
-    volume = volume or fiber_volume(path)
+    volume = volume or fiber_volume(path,source_version=source_version)
     raw=np.asarray(fiber_ids if isinstance(fiber_ids,np.ndarray) else list(fiber_ids),dtype=str)
     if raw.ndim!=1:raise ValueError('Fiber IDs must be a one-dimensional column')
     if len(raw):
         encoded=np.char.encode(raw,'ascii')
         binary=fiber_uuid_bytes(encoded.view(np.uint8).reshape(len(raw),encoded.dtype.itemsize),workers)
     else:binary=np.empty((0,16),np.uint8)
-    with CollectionReader(str(path)) as store:
+    with CollectionReader(str(path),position=source_version) as store:
+        if trusted_immutable == 'auto':
+            trusted_immutable = store.supports_trusted_geometry_reads
         columns=store.geometry_array_columns(binary,'line_points',object_kind='fiber',volume=volume,
                                              expected_position=source_version,workers=workers,
                                              trusted_immutable=trusted_immutable)
@@ -244,7 +248,7 @@ def fibers_digest(path, fiber_ids=None, *, source_version=None):
     complete owning-store/generation/object/version identity, in UUID order, read in one snapshot.
     Format v3 includes source ownership, so divergent branches cannot collide at equal version counters."""
     selected = None if fiber_ids is None else _canonical_fiber_ids(fiber_ids)
-    with open_store(path) as store:
+    with open_store(path,position=source_version) as store:
         _require_source_version(store, source_version)
         result = store.selected_reference_digest(object_kind='fiber',object_uuids=selected,domain=FIBERS_DIGEST_FORMAT)
         _require_source_version(store, source_version)

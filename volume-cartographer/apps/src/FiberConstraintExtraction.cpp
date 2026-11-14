@@ -186,6 +186,8 @@ int runFiberConstraintExtraction(int argc, char** argv)
     const auto txn=store.read();
     // Status, selection, transforms and payloads all use this same read snapshot.
     const auto sourceStatus=store.provisioning(txn);
+    if(!sourceStatus.sealed&&sourceStatus.history!=vc::objects::HistoryMode::On)
+        throw std::invalid_argument("Fiber source must be sealed or history enabled; input was not modified");
     vc::lasagna::LasagnaDatasetOpenOptions open;
     open.workingToBaseScale=1.;
     open.remoteCacheRoot=cfg.at("remote_cache").get<std::string>();
@@ -262,8 +264,14 @@ int runFiberConstraintExtraction(int argc, char** argv)
     constexpr size_t kLoadBatch=1024;
     std::vector<std::future<void>> loaders;
     for(int worker=0;worker<std::min<int>(loadThreads,ids.size());++worker)loaders.push_back(std::async(std::launch::async,[&]{
-        auto reader=vc::objects::ObjectCollection::open(cfg.at("fibers").get<std::string>(),storeOptions);
+        auto pinnedOptions=storeOptions;
+        pinnedOptions.readPosition=vc::objects::StoreStatus{store.uuid(txn),sourceStatus.generation,sourceStatus.commitSequence};
+        auto reader=vc::objects::ObjectCollection::open(cfg.at("fibers").get<std::string>(),pinnedOptions);
         auto read=reader.read();
+        const auto workerStatus=reader.provisioning(read);
+        if(reader.uuid(read)!=store.uuid(txn)||workerStatus.generation!=sourceStatus.generation||
+           workerStatus.commitSequence!=sourceStatus.commitSequence)
+            throw vc::objects::StoreBusy("Fiber source changed before parallel geometry loading");
         for(size_t begin;(begin=next.fetch_add(kLoadBatch))<ids.size();){
             const auto end=std::min(ids.size(),begin+kLoadBatch);
             for(size_t i=begin;i<end;++i){

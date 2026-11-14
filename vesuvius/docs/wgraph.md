@@ -1,5 +1,7 @@
 # `vc_wgraph`: reusable winding-graph stages
 
+For the complete command sequence, brief stage descriptions, and measured full-volume runtimes, see the [workflow quickstart](wgraph-quickstart.md).
+
 `vc_wgraph` exposes the shared importer, extractor and solver stages. It does not embed datasets, host paths or alternative solver implementations. Install the normal `vesuvius` package to receive the console command; an existing development environment can also run `python -m vesuvius.wgraph` or `python vesuvius/scripts/vc_wgraph`.
 
 ```sh

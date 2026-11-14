@@ -140,3 +140,17 @@ def test_native_dispatch_reuses_existing_native_workflow(tmp_path, monkeypatch):
     config['native_timeout_seconds'] = 30
     cli.run_stage('import', config)
     assert calls[1][1] == {'timeout': 30}
+
+
+def test_native_extraction_accepts_tracer_store_without_import_dispatch(tmp_path,monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_wrapped_full
+    calls=[]
+    monkeypatch.setattr(fiber_wrapped_full,'native_step',lambda *args,**kwargs:calls.append((args,kwargs)))
+    source=tmp_path/'tracing'/'fibers.vcobj'
+    config=cli.stage_config('extract',input_path=str(source),output_path=str(tmp_path/'constraints.vcobj'))
+    cli.run_stage('extract',config)
+    assert len(calls)==1
+    (workflow,stage,binary,settings),kwargs=calls[0]
+    assert stage=='extract' and binary=='vc_fiber_constraints'
+    assert settings['fibers']==str(source)
+    assert 'source' not in settings  # No AFV importer or implicit converter.

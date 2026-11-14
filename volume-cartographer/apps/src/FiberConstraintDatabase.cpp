@@ -152,9 +152,11 @@ nlohmann::json streamFiberConstraintDatabase(const std::filesystem::path& output
     if(!settings.baseToStored.empty()&&settings.baseToStored.size()!=ids.size())
         throw std::invalid_argument("Expected one anchor-frame mapping per source fiber");
     const std::filesystem::path dependency=metadata.at("config").at("fibers").get<std::string>();
-    vo::OpenOptions readOptions;readOptions.readOnly=true;
-    auto input=vo::ObjectCollection::open(dependency,readOptions);auto read=input.read();const auto pin=snapshot(input,read);
+    auto sourcePosition=metadata.at("fiber_source");
+    sourcePosition["store_uuid"]=sourcePosition.at("store");sourcePosition.erase("store");
+    const auto pin=vo::extensionSourcesFromJson(Json::array({sourcePosition}).dump()).at(0);
     auto options=importOptions(dependency,settings);
+    options.dependencyPins={pin};
     if(settings.preparationWorkers<1||settings.preparationWorkers>1024||!settings.preparationBatchRows)
         throw std::invalid_argument("Positive import preparation workers and batch rows required");
     if(settings.normalSamples && (producer ||

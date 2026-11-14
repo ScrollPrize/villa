@@ -82,7 +82,7 @@ def axial_evidence(config, *, graph):
     if not umbilicus:raise ValueError('Native axial priors require an umbilicus input')
     before=sha256_file(umbilicus);started=time.monotonic()
     ids,geometry=read_polyline_arrays(config['database'],graph.ids,volume=graph.volume,source_version=graph.source,
-                                    workers=int(config.get('workers',32)),trusted_immutable=True)
+                                    workers=int(config.get('workers',32)),trusted_immutable='auto')
     if not np.array_equal(ids,graph.ids):raise ValueError('Axial geometry identity differs')
     print(json.dumps(dict(stage='axial_geometry_read',seconds=time.monotonic()-started,
         fibers=len(ids),points=len(geometry.values))),flush=True)
