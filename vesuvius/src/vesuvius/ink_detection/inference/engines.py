@@ -240,6 +240,12 @@ class WindowCache:
             except Exception:
                 # a failed read ahead is read again here, so any error is this call's own
                 pass
+        # drop the kept span before reading another, so a sweep or folder run
+        # never holds two windows at once
+        with self._lock:
+            if self._entry is entry:
+                self._entry = None
+        del entry
         span = _shared(read())
         future: Future = Future()
         future.set_result(span)

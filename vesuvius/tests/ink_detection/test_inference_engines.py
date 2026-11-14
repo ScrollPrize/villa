@@ -795,6 +795,38 @@ def test_window_cache_keeps_one_span_and_never_a_failed_read():
     assert (cache.span(("e", "0", True, 0, 1), read(8)) == 8).all()
 
 
+class _TrackedSpan(np.ndarray):
+    """An array that can be weakly referenced, to see when the cache lets go of it."""
+
+
+def test_window_cache_drops_the_kept_span_before_reading_another():
+    # a depth sweep or folder run reads one window per request; holding the last one during the next
+    # read would need two windows of host memory where one fits
+    cache = WindowCache()
+    refs = []
+
+    def first():
+        span = np.zeros((1, 2, 2), np.uint8).view(_TrackedSpan)
+        refs.append(weakref.ref(span))
+        return span
+
+    cache.span(("a", "0", True, 0, 1), first)
+    [released] = refs
+    assert released() is not None
+    alive_during_read = []
+
+    def second():
+        alive_during_read.append(released() is not None)
+        return np.ones((1, 2, 2), np.uint8)
+
+    gc.disable()
+    try:
+        assert (cache.span(("b", "0", True, 0, 1), second) == 1).all()
+    finally:
+        gc.enable()
+    assert alive_during_read == [False]
+
+
 def test_engine_shape_mismatch_is_an_error_not_a_written_map(tmp_path):
     surface, _ = _write_surface(tmp_path / "surface.zarr")
     checkpoint = _save_checkpoint(tmp_path / "model.pth")
