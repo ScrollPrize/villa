@@ -69,6 +69,7 @@ ResultImportPlan resultImportPlan(const std::filesystem::path& dependency,const 
         for(size_t i=task*resultBatch;i<std::min(n,(task+1)*resultBatch);++i)plan.order[cursors[routes[i]]++]=i;
     });
     auto& options=plan.options;options.shards.resize(workers);options.dependencies={dependency};
+    options.dependencyPins={plan.consumed};
     options.store.author="fiber-workflow";options.store.edgeAdjacencyIndex=false;
     options.packed=PackedStoreOptions{};
     options.packed->residentBytes=256*1024*1024;options.packed->exportWorkers=std::min(workers,size_t(8));

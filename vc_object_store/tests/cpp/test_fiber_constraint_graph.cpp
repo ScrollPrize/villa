@@ -1,6 +1,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/FiberConstraintGraph.hpp"
 #include "vc_object_store/objects/InitialImport.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include <future>
 #include <mutex>
 #include <iostream>
@@ -9,6 +10,9 @@ using namespace vc::objects;
 void compare(ObjectCollection& store) {
     auto txn=store.read();const auto rich=readFiberConstraintGraph(store,txn);
     for(size_t workers:{1,4}){
+        const auto columns=readFiberGraphColumns(store,txn,workers);
+        require(columns.nodes==8,"graph retains all fibers");
+        for(size_t i=0;i<columns.nodes;++i)require(columns.lengths[i]==5.,"length comes from selected geometry, not ingestion summary");
         const auto rows=readCompactFiberConstraintGraph(store,txn,workers);
         require(rows.size()==rich.size(),"compact graph event count");
         for(size_t i=0;i<rows.size();++i){const auto& a=rows[i];const auto& b=rich[i];
@@ -48,7 +52,10 @@ void run(bool packed,bool legacy) {
     }
     const auto result=importInitialCollection(dir.path/"graph",options,[&](size_t shard,auto& writer){
         std::vector<InitialObjectRecord> records;
-        for(const auto& id:fibers)if(uuidShardIndex(id,4)==shard){InitialObjectRecord r;r.record.uuid=id;r.record.kind="fiber";r.record.fiber.emplace();records.push_back(std::move(r));}
+        for(const auto& id:fibers)if(uuidShardIndex(id,4)==shard){InitialObjectRecord r;r.record.uuid=id;r.record.kind="fiber";r.record.fiber.emplace();
+            r.record.fiber->length=999.;r.record.meta=R"({"coordinates":{"volume_uuid":"volume","scale_factor":1}})";
+            vc::geometry::Fiber shape;shape.linePoints={{0,0,0},{3,4,0}};r.geometry=vc::geometry::encode(shape);
+            records.push_back(std::move(r));}
         writer.appendObjects(records);
     },[&](size_t shard,auto& writer){bool sent=false;writer.importEdges([&](auto& batch){if(sent)return false;sent=true;
         for(const auto& e:edges)if(uuidShardIndex(e.record.uuid,4)==shard)batch.push_back(e);return !batch.empty();});});
@@ -57,6 +64,10 @@ void run(bool packed,bool legacy) {
     compare(store);
     auto overlay=ObjectCollection::create(dir.path/"overlay",{result.path},OpenOptions{.history=HistoryMode::Off,.author="compact-graph-test"});
     {auto w=overlay.write();overlay.createExtensionTable(w,schema);auto row=edges[0].extensions[0].values;
+        // A sparse metadata replacement borrows its geometry chunks from the
+        // sharded dependency. Workers must own the corresponding resolver.
+        const ObjectKey key{"",fibers.front()};auto record=overlay.object(w,key)->record;
+        record.name="metadata-only override";overlay.replaceObject(w,key,record);
         size_t column=0;while(schema.columns[column].name!="normal_a")++column;row[column]=encodeFiberDirection({-.25,1.,0.});
         overlay.appendExtensionRows(w,schema.name,std::span(&row,1));w.commit();}
     compare(overlay);

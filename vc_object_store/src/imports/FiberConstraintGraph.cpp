@@ -135,25 +135,21 @@ static std::vector<CompactFiberConstraint> readCompactFiberConstraintGraphImpl(c
     if(nodes){
         const auto transforms=store.volumeTransforms(txn);
         std::vector<std::vector<FiberGraphNodeColumn>> batches(parts.size());
-        parallelFor(parts.size(),workers,[&](size_t n){
-            auto* db=parts[n].db;auto& output=batches[n];
-            Statement rows(db,"SELECT o.uuid,f.length,o.coordinate_volume,o.coordinate_scale,o.storage_ref,o.geometry_manifest IS NOT NULL "
-                "FROM objects o LEFT JOIN fibers f ON f.object_id=o.id WHERE o.kind='fiber' AND o.state=0 ORDER BY o.uuid");
+        CollectionScanAccess::resolvedPartitions(store,txn,workers,[&](size_t n,sqlite3* db){
+            auto& output=batches[n];
+            Statement rows(db,"SELECT uuid,coordinate_volume,coordinate_scale,storage_ref,geometry_manifest IS NOT NULL "
+                "FROM objects WHERE kind='fiber' AND state=0 ORDER BY uuid");
             while(rows.row()){
                 const auto uuid=rows.blob16(0);
                 if(objectOwner(uuid).first!=n||(selected&&!std::binary_search(selected->begin(),selected->end(),uuid)))continue;
-                const auto source=rows.text(2);const auto scale=rows.f64(3);
-                if(rows.isNull(2)||source.empty()||rows.isNull(3)||!std::isfinite(scale)||scale<=0)
+                const auto source=rows.text(1);const auto scale=rows.f64(2);
+                if(rows.isNull(1)||source.empty()||rows.isNull(2)||!std::isfinite(scale)||scale<=0)
                     throw std::invalid_argument("fiber has no valid coordinate frame");
-                double length;
-                if(source==volume&&!rows.isNull(1))length=rows.f64(1)*(1./scale);
-                else{
-                    const auto mapping=source==volume?std::optional(VolumeAffine::scale(1./scale)):
-                        frameMapping(nlohmann::json{{"volume_uuid",source},{"scale_factor",scale}},volume,&transforms);
-                    if(!mapping)throw std::invalid_argument("fiber is not mapped to the measurement volume");
-                    if(rows.isNull(4)||!rows.i64(5))throw std::invalid_argument("mapped fiber has no geometry");
-                    length=transformedLength(db,readGeometryTokenColumn(rows,4),*mapping,"fiber");
-                }
+                const auto mapping=source==volume?std::optional(VolumeAffine::scale(1./scale)):
+                    frameMapping(nlohmann::json{{"volume_uuid",source},{"scale_factor",scale}},volume,&transforms);
+                if(!mapping)throw std::invalid_argument("fiber is not mapped to the measurement volume");
+                if(rows.isNull(3)||!rows.i64(4))throw std::invalid_argument("mapped fiber has no geometry");
+                const auto length=transformedLength(db,readGeometryTokenColumn(rows,3),*mapping,"fiber");
                 if(!std::isfinite(length)||length<0)throw std::invalid_argument("invalid measured fiber length");
                 output.push_back({uuid,length});
             }

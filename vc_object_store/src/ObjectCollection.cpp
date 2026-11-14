@@ -415,6 +415,24 @@ std::vector<detail::CollectionScanPartition> detail::CollectionScanAccess::parti
     }
     return result;
 }
+void detail::CollectionScanAccess::resolvedPartitions(const ObjectCollection& store,const CollectionTxn& txn,
+    size_t workers,const std::function<void(size_t,sqlite3*)>& visit) {
+    const auto parts=partitions(store,txn);
+    if(workers==1||txn.writable()) {
+        for(size_t i=0;i<parts.size();++i)visit(i,parts[i].db);
+        return;
+    }
+    auto options=readonlyOptions(store.impl_->options);
+    options.readPosition=store.impl_->nodes[0].store->status(store.impl_->txn(txn,0));
+    options.readerPoolSize=int(std::min(workers,parts.size())+1);
+    auto collection=ObjectCollection::open(store.impl_->nodes[0].store->path(),options);
+    const auto order=collection.impl_->readOrder();
+    if(order.size()!=parts.size())throw StoreBusy("collection partition snapshot changed");
+    parallelFor(parts.size(),workers,[&](size_t i){
+        auto snapshot=collection.read();
+        visit(i,collection.impl_->db(snapshot,order[i]));
+    });
+}
 WriteTxn& ObjectCollection::Impl::writer(CollectionTxn& t){check(t);if(!t.writable())throw std::runtime_error("collection: read-only transaction");if(t.impl_->producingInitialEdges)throw std::runtime_error("collection: initial edge producer cannot mutate the destination");return std::get<WriteTxn>(t.impl_->root);}
 
 void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,const std::optional<CollectionMember>& expected,std::set<std::string>& visiting,sqlite3* existingRoot) {

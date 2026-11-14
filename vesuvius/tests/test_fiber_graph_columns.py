@@ -67,6 +67,25 @@ def test_native_graph_rejects_bad_worker_count(tmp_path):
             reader.fiber_graph_columns(0)
 
 
+@pytest.mark.parametrize('workers',[1,4])
+def test_graph_lengths_follow_selected_geometry_not_ingestion_summary(tmp_path,workers):
+    from vc_object_store import ObjectStore
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers
+    source=tmp_path/'mutable.vcobj'
+    write_fibers(source,[(dict(id=uid(i)),np.array([[0.,0.,0.],[10.,0.,0.]])) for i in (10,20)],volume=uid(999))
+    # Measure the edited geometry from a history-enabled dependency.
+    from vc_object_store import write_extension_store
+    graph=measured_store(tmp_path/'fixture',[(1,10,20,False,.5)],workers=workers)
+    with ObjectStore.open(str(source),author='edit') as store:
+        store.edit_geometry(uid(10),[dict(array='line_points',element_offset=3,
+            data=np.array([25.,0.,0.]).tobytes())],store.current_version(uid(10)))
+    # Reuse measured relations but override their fiber geometry through a newer layer.
+    write_extension_store(str(tmp_path/'overlay.vcobj'),[str(source),str(graph)],[],{})
+    with CollectionReader(str(tmp_path/'overlay.vcobj')) as reader:
+        result=reader.fiber_graph_columns(workers)
+    np.testing.assert_array_equal(result['lengths'],[25.,10.])
+
+
 def test_fiber_graph_import_never_uses_python_record_or_uuid_list_paths(tmp_path,monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph,CACHE_COLUMNS
     source=measured_store(tmp_path,[(1,10,20,False,.5)])

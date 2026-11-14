@@ -15,6 +15,10 @@ struct CollectionScanPartition {
 };
 struct CollectionScanAccess {
     static std::vector<CollectionScanPartition> partitions(const ObjectCollection&, const CollectionTxn&);
+    // Geometry callbacks and statement pools are thread-local: resolved reads
+    // must own their collection transaction on the executing worker.
+    static void resolvedPartitions(const ObjectCollection&, const CollectionTxn&, size_t workers,
+        const std::function<void(size_t,sqlite3*)>&);
 };
 // Offline maintenance already holds the root connection exclusively. Reuse
 // its snapshot, open only policy-eligible pinned dependencies, and install the common verified

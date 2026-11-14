@@ -1,5 +1,6 @@
 """Typed result exports match existing extension rows without Python corpus rows."""
 import json
+import uuid
 import numpy as np
 import pytest
 from vc_object_store import CollectionReader,fiber_graph_solve_table
@@ -66,3 +67,25 @@ def test_fiber_result_column_export_rejects_invalid_values_atomically(tmp_path):
     with pytest.raises(ValueError,match='integer'):
         write_fiber_result_columns(tmp_path/'fractional.vcobj',source,pin,'test','test',ids,
                                   dict(family=np.array([0.,1.5])),workers=2)
+
+
+def test_result_export_keeps_consumed_mutable_dependency_position(tmp_path):
+    from vc_object_store import ObjectStore
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers
+    source=tmp_path/'source.vcobj';key=uid(10)
+    xyz=np.array([[0.,0.,0.],[10.,0.,0.]])
+    write_fibers(source,[(dict(id=key),xyz)],volume=uid(999))
+    with CollectionReader(source) as reader:pin=reader.source
+    target=tmp_path/'result.vcobj'
+    write_fiber_result_columns(target,source,pin,'classification','test',np.array([key]),
+        dict(family=np.array([0])),workers=4)
+    with ObjectStore.open(str(source),author='edit') as store:
+        store.edit_geometry(key,[dict(array='line_points',element_offset=0,
+            data=np.ascontiguousarray(xyz+100).tobytes())],store.current_version(key))
+    with CollectionReader(target) as reader:
+        dependency=next(m for m in reader.members if m['store_uuid']==pin['store_uuid'])
+        assert dependency['generation']==pin['generation']
+        assert dependency['commit_sequence']==pin['commit_sequence']
+        result=reader.geometry_array_columns(np.array([list(uuid.UUID(key).bytes)],np.uint8),
+            'line_points',object_kind='fiber',volume=uid(999),workers=4)
+    np.testing.assert_array_equal(result['geometry'].values,xyz)
