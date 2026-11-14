@@ -209,7 +209,7 @@ def test_an_unavailable_source_fails_the_run(db, tmp_path):
     before = db.status()["commit_sequence"]
     with pytest.raises(RuntimeError):
         db.link_fibers_to_surfaces(**LINE_OPTIONS, normal_pool=str(tmp_path / "no-such-pack"), ct_to_base_scale=2)
-    with pytest.raises(RuntimeError, match="no Zarr group"):
+    with pytest.raises(FileNotFoundError, match="no Zarr group"):
         db.link_fibers_to_surfaces(**LINE_OPTIONS, normal_x_volume=str(tmp_path / "no-x"),
                                    normal_y_volume=str(tmp_path / "no-y"), ct_to_base_scale=2)
     assert db.status()["commit_sequence"] == before
