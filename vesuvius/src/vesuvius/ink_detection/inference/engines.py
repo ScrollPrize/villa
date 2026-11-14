@@ -511,7 +511,11 @@ def _inkrs_open(module: Any, checkpoint: Path, device_index: int) -> Any:
     """
 
     try:
-        return module.Engine(checkpoint, device=device_index)
+        # exporting a .pth builds the PyTorch model, which draws from torch's
+        # generator; a fallback then builds its own, and must draw the same
+        # random weights for any keys the checkpoint lacks as a PyTorch run
+        with torch.random.fork_rng(devices=[]):
+            return module.Engine(checkpoint, device=device_index)
     except module.UnsupportedError as exc:
         raise EngineUnavailable(
             f"inkrs cannot load {checkpoint.name} on device {device_index}: {exc}"

@@ -348,14 +348,19 @@ def test_inkrs_load_falls_back_only_when_inkrs_calls_it_unsupported(
     tmp_path, monkeypatch, caplog
 ):
     def refuse(checkpoint, *, device):
+        # inkrs's export builds the PyTorch model, drawing from torch's generator, before it refuses
+        torch.rand(16)
         raise _UnsupportedError("checkpoint is not the hybrid_3d2d-seed42 contract")
 
     monkeypatch.setitem(sys.modules, "inkrs", _fake_inkrs(refuse))
+    rng = torch.get_rng_state()
     with caplog.at_level("WARNING"):
         engine = select_engine(
             _engine_args(tmp_path), _inkrs_shaped_model(), torch.device("cuda", 0)
         )
     assert engine is None
+    # the fallback model then draws the same weights for missing keys as a PyTorch-only run
+    assert torch.equal(torch.get_rng_state(), rng)
     assert "inkrs cannot load m.pth on device 0" in caplog.text
     assert "hybrid_3d2d-seed42 contract" in caplog.text
 
@@ -395,9 +400,12 @@ def test_installed_inkrs_declines_a_checkpoint_villa_loads_non_strictly(
             parse_args(["in.zarr", str(checkpoint), "out.tif", "--engine", "inkrs", *extra])
         )
 
+    rng = torch.get_rng_state()
     with caplog.at_level("WARNING"):
         engine = select_engine(command(), _inkrs_shaped_model(), torch.device("cuda", 0))
     assert engine is None
+    # inkrs's export built a model to compare keys; PyTorch's fallback build must not see its draws
+    assert torch.equal(torch.get_rng_state(), rng)
     assert f"inkrs cannot load {edit}.pth on device 0" in caplog.text
     assert expected in caplog.text
     assert "Continuing with PyTorch" in caplog.text
