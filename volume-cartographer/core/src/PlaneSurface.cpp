@@ -98,13 +98,14 @@ static cv::Vec3f rotateAroundAxis(const cv::Vec3f& vector, const cv::Vec3f& axis
     axis_d /= axis_norm;
 
     cv::Mat R;
-    cv::Mat rot_vec = (cv::Mat_<double>(3, 1)
-        << axis_d[0] * static_cast<double>(angle),
-           axis_d[1] * static_cast<double>(angle),
-           axis_d[2] * static_cast<double>(angle));
+    // A 3x1 CV_64F column from a Vec3d: OpenCV 5.1 dropped the Mat_ comma
+    // initializer (`Mat_<double>(3, 1) << a, b, c`) these lines used.
+    cv::Mat rot_vec(cv::Vec3d(axis_d[0] * static_cast<double>(angle),
+                              axis_d[1] * static_cast<double>(angle),
+                              axis_d[2] * static_cast<double>(angle)));
     cv::Rodrigues(rot_vec, R);
 
-    cv::Mat v = (cv::Mat_<double>(3, 1) << vector[0], vector[1], vector[2]);
+    cv::Mat v(cv::Vec3d(vector[0], vector[1], vector[2]));
     cv::Mat res = R * v;
     return cv::Vec3f(static_cast<float>(res.at<double>(0)),
                      static_cast<float>(res.at<double>(1)),
